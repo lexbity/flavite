@@ -8,6 +8,8 @@ pub mod cov;
 pub mod s1_caret_probe;
 pub mod s1_probe;
 pub mod setup;
+pub mod spike_s3;
+pub mod spike_s3_fs;
 
 use anyhow::{Context, Result};
 

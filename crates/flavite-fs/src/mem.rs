@@ -23,6 +23,10 @@ use crate::fs::{DirEntry, Fs, FsError, Metadata, Result};
 /// The root path for `MemFs`. All paths are absolute under this root.
 const ROOT: &str = "/";
 
+/// `MemFs` models exactly one volume (the real per-volume identity split is
+/// `OsFs`'s job, per the S3-2 evidence); every path reports this volume id.
+const MEM_VOLUME_ID: u64 = 1;
+
 #[derive(Debug)]
 struct MemState {
     /// Volatile file contents (OS-visible right now).
@@ -507,6 +511,7 @@ impl Fs for MemFs {
                     size,
                     mtime_ns,
                     native_id,
+                    volume_id: MEM_VOLUME_ID,
                     is_symlink: kind == PathKind::Symlink,
                     is_dir: kind == PathKind::Dir,
                     mode,

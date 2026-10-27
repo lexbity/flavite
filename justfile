@@ -29,6 +29,11 @@ arch-check:
 arch-gen:
     cargo xtask arch gen
 
+# S3 watcher-truth probe (PLAN-C C1, §9 S3-1): per-OS watcher evidence with a
+# D5 nomination-property self-check. CI runs scenarios 1–3 on Linux headless.
+spike-s3 *args:
+    cargo run -p xtask --bin s3_watcher_probe -- {{args}}
+
 # G0 — local fast gate (§10.3): fmt + clippy + test + arch check. ≤ 5 min budget.
 gate: fmt clippy test arch-check
     @just gc
@@ -63,7 +68,7 @@ network-denied:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo test --workspace --no-run
-    @echo "=== network-denied: running tests under unshare -n ==="
+    echo "=== network-denied: running tests under unshare -n ==="
     if command -v unshare >/dev/null 2>&1; then
         unshare -n cargo test --workspace || {
             echo "network-denied: tests failed under network namespace"

@@ -35,6 +35,7 @@ jobs:
       - name: Coverage (Linux only)
         if: matrix.os == 'ubuntu-latest'
         run: |
+          mkdir -p target/llvm-cov
           cargo llvm-cov --workspace --all-features --lcov --output-path target/llvm-cov/lcov.info
           just cov-check
 
@@ -57,6 +58,24 @@ jobs:
 
       - name: MSRV build
         run: just msrv
+
+  # PLAN-C slice C1: re-run watcher probe scenarios 1–3 on Linux headless and
+  # verify the D5 nomination property (eventual path nomination or explicit
+  # overflow). Measurements, never operation-count equality.
+  s3-watcher-probe:
+    name: S3 watcher probe (C1, Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
+      - name: Probe scenarios 1–3 with self-check
+        run: just spike-s3 --scenarios 1,2,3 --self-check --json target/s3-watcher-report.json
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-watcher-report-linux
+          path: target/s3-watcher-report.json
+          if-no-files-found: error
 
   # Negative tests (AC-28/29): seed violations, assert failure.
   arch-edges-negative:
