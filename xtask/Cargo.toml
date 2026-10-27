@@ -7,7 +7,11 @@ repository.workspace = true
 description = "Development tooling: arch graph generation, verification, query CLI (§10.2)"
 
 [[bin]]
-name = "xtask"
+name = "cargo-xtask"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = { workspace = true }
+walkdir = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,5 @@
+# Cargo configuration for the flavite workspace.
+
+[alias]
+# `cargo xtask <args>` → `cargo run -p xtask -- <args>` (§10.2, §10.10).
+xtask = "run -p xtask --"
