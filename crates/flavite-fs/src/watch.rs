@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -113,7 +113,10 @@ impl FsWatcher {
     }
 
     /// Watch a path for changes.
-    pub fn watch<P: AsRef<Path>>(&mut self, path: P) -> std::result::Result<(), crate::fs::FsError> {
+    pub fn watch<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+    ) -> std::result::Result<(), crate::fs::FsError> {
         let path = path.as_ref().to_path_buf();
         {
             let mut watched = self.watched.lock().unwrap();
@@ -143,7 +146,12 @@ impl FsWatcher {
 
                         // Process the event
                         let sender_guard = sender.lock().unwrap();
-                        process_event(event, sender_guard.clone(), rename_pairs.clone(), config.debounce_ms);
+                        process_event(
+                            event,
+                            sender_guard.clone(),
+                            rename_pairs.clone(),
+                            config.debounce_ms,
+                        );
                     }
                     Err(e) => {
                         let sender_guard = sender.lock().unwrap();
@@ -162,7 +170,9 @@ impl FsWatcher {
         // Watch the path
         watcher
             .watch(&path, RecursiveMode::Recursive)
-            .map_err(|e| crate::fs::FsError::Io(format!("failed to watch {}: {}", path.display(), e)))?;
+            .map_err(|e| {
+                crate::fs::FsError::Io(format!("failed to watch {}: {}", path.display(), e))
+            })?;
 
         self.watcher = watcher;
         Ok(())
@@ -181,7 +191,7 @@ impl FsWatcher {
         thread::spawn(move || {
             loop {
                 thread::sleep(Duration::from_millis(config.debounce_ms));
-                
+
                 let in_scan = *in_initial_scan.lock().unwrap();
                 if in_scan {
                     continue;
@@ -196,7 +206,12 @@ impl FsWatcher {
                 let events = std::mem::take(&mut *buffer);
                 for event in events {
                     let sender_guard = sender.lock().unwrap();
-                    process_event(event, sender_guard.clone(), rename_pairs.clone(), config.debounce_ms);
+                    process_event(
+                        event,
+                        sender_guard.clone(),
+                        rename_pairs.clone(),
+                        config.debounce_ms,
+                    );
                 }
             }
         });
@@ -230,15 +245,18 @@ impl FsWatcher {
     }
 
     /// Unwatch a path.
-    pub fn unwatch<P: AsRef<Path>>(&mut self, path: P) -> std::result::Result<(), crate::fs::FsError> {
+    pub fn unwatch<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+    ) -> std::result::Result<(), crate::fs::FsError> {
         let path = path.as_ref().to_path_buf();
         {
             let mut watched = self.watched.lock().unwrap();
             watched.remove(&path);
         }
-        self.watcher
-            .unwatch(&path)
-            .map_err(|e| crate::fs::FsError::Io(format!("failed to unwatch {}: {}", path.display(), e)))?;
+        self.watcher.unwatch(&path).map_err(|e| {
+            crate::fs::FsError::Io(format!("failed to unwatch {}: {}", path.display(), e))
+        })?;
         Ok(())
     }
 
@@ -256,11 +274,7 @@ fn process_event(
     _debounce_ms: u64,
 ) {
     // Extract paths from the event
-    let paths: Vec<PathBuf> = event
-        .paths
-        .iter()
-        .map(|p| normalize_path(p))
-        .collect();
+    let paths: Vec<PathBuf> = event.paths.iter().map(|p| normalize_path(p)).collect();
 
     if paths.is_empty() {
         return;
@@ -338,10 +352,7 @@ pub mod platform {
         // On Unix, we can detect rename events through the Modify kind
         // This is a simplified check; actual implementation would need
         // to inspect platform-specific event data
-        matches!(
-            event.kind,
-            EventKind::Modify(ModifyKind::Metadata(_))
-        )
+        matches!(event.kind, EventKind::Modify(ModifyKind::Metadata(_)))
     }
 
     /// Check if an event represents a rename on non-Unix platforms.

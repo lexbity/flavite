@@ -97,6 +97,11 @@
     },
     {
       "from": "xtask",
+      "to": "blake3",
+      "kind": "normal"
+    },
+    {
+      "from": "xtask",
       "to": "cosmic-text",
       "kind": "normal"
     },

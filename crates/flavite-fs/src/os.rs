@@ -52,9 +52,8 @@ impl OsFs {
 impl Fs for OsFs {
     fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
         // Simplified: use std's canonicalize
-        std::fs::canonicalize(path).map_err(|e| {
-            FsError::Io(format!("failed to canonicalize {}: {}", path.display(), e))
-        })
+        std::fs::canonicalize(path)
+            .map_err(|e| FsError::Io(format!("failed to canonicalize {}: {}", path.display(), e)))
     }
 
     fn resolve_symlink(&self, path: &Path) -> Result<PathBuf> {
@@ -73,9 +72,8 @@ impl Fs for OsFs {
     }
 
     fn decode_path_key(&self, key: &[u8]) -> Result<PathBuf> {
-        let s = std::str::from_utf8(key).map_err(|_| {
-            FsError::InvalidPath("invalid UTF-8 in path key".into())
-        })?;
+        let s = std::str::from_utf8(key)
+            .map_err(|_| FsError::InvalidPath("invalid UTF-8 in path key".into()))?;
         Ok(PathBuf::from(s))
     }
 
@@ -93,14 +91,21 @@ impl Fs for OsFs {
         match std::fs::read(path) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(FsError::Io(format!("failed to read {}: {}", path.display(), e))),
+            Err(e) => Err(FsError::Io(format!(
+                "failed to read {}: {}",
+                path.display(),
+                e
+            ))),
         }
     }
 
     fn read_capped(&self, path: &Path, max: u64) -> Result<Vec<u8>> {
         let bytes = self.read_if_exists(path)?;
         match bytes {
-            Some(b) if b.len() as u64 > max => Err(FsError::ReadTooLarge { path: path.to_path_buf(), max }),
+            Some(b) if b.len() as u64 > max => Err(FsError::ReadTooLarge {
+                path: path.to_path_buf(),
+                max,
+            }),
             Some(b) => Ok(b),
             None => Err(FsError::NotFound(path.to_path_buf())),
         }
@@ -140,9 +145,9 @@ impl Fs for OsFs {
         let mut result = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| FsError::Io(format!("dir entry error: {}", e)))?;
-            let ft = entry.file_type().map_err(|e| {
-                FsError::Io(format!("failed to get file type: {}", e))
-            })?;
+            let ft = entry
+                .file_type()
+                .map_err(|e| FsError::Io(format!("failed to get file type: {}", e)))?;
             result.push(DirEntry {
                 name: entry.file_name(),
                 path: entry.path(),
@@ -163,11 +168,11 @@ impl Fs for OsFs {
 
     fn write_new(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         if let Some(parent) = path.parent()
-            && parent != Path::new("") && !parent.exists()
+            && parent != Path::new("")
+            && !parent.exists()
         {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                FsError::Io(format!("failed to create parent: {}", e))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| FsError::Io(format!("failed to create parent: {}", e)))?;
         }
         std::fs::write(path, bytes).map_err(|e| {
             if e.kind() == io::ErrorKind::AlreadyExists {
@@ -184,9 +189,8 @@ impl Fs for OsFs {
     }
 
     fn create_dir_all(&self, path: &Path) -> Result<()> {
-        std::fs::create_dir_all(path).map_err(|e| {
-            FsError::Io(format!("failed to create dir: {}", e))
-        })?;
+        std::fs::create_dir_all(path)
+            .map_err(|e| FsError::Io(format!("failed to create dir: {}", e)))?;
         Ok(())
     }
 
@@ -237,9 +241,8 @@ impl Fs for OsFs {
                 FsError::Io(format!("failed to open: {}", e))
             }
         })?;
-        file.sync_all().map_err(|e| {
-            FsError::FsyncFailed(format!("failed to fsync: {}", e))
-        })?;
+        file.sync_all()
+            .map_err(|e| FsError::FsyncFailed(format!("failed to fsync: {}", e)))?;
         Ok(())
     }
 
@@ -253,13 +256,14 @@ impl Fs for OsFs {
                     FsError::Io(format!("failed to open dir: {}", e))
                 }
             })?;
-            dir.sync_all().map_err(|e| {
-                FsError::FsyncUnsupported(format!("dir fsync failed: {}", e))
-            })?;
+            dir.sync_all()
+                .map_err(|e| FsError::FsyncUnsupported(format!("dir fsync failed: {}", e)))?;
         }
         #[cfg(windows)]
         {
-            return Err(FsError::FsyncUnsupported("dir fsync not supported on Windows".into()));
+            return Err(FsError::FsyncUnsupported(
+                "dir fsync not supported on Windows".into(),
+            ));
         }
         Ok(())
     }

@@ -291,6 +291,8 @@ pub struct LatencyStats {
     pub median: u64,
     /// 95th-percentile sample (nearest rank).
     pub p95: u64,
+    /// 99th-percentile sample (nearest rank; PLAN-C C4 reads p99 during writes).
+    pub p99: u64,
     /// Maximum sample.
     pub max: u64,
 }
@@ -304,6 +306,7 @@ pub fn latency_stats(samples: &[u64]) -> LatencyStats {
             min: 0,
             median: 0,
             p95: 0,
+            p99: 0,
             max: 0,
         };
     }
@@ -315,6 +318,7 @@ pub fn latency_stats(samples: &[u64]) -> LatencyStats {
         min: sorted[0],
         median: sorted[sorted.len() / 2],
         p95: sorted[(sorted.len() * 95 / 100).min(last)],
+        p99: sorted[(sorted.len() * 99 / 100).min(last)],
         max: sorted[last],
     }
 }
@@ -1429,6 +1433,7 @@ mod tests {
         assert_eq!(stats.median, 4);
         assert_eq!(stats.max, 9);
         assert_eq!(stats.p95, 9);
+        assert_eq!(stats.p99, 9);
     }
 
     #[test]
@@ -1437,7 +1442,18 @@ mod tests {
         assert_eq!(stats.count, 1);
         assert_eq!(stats.median, 42);
         assert_eq!(stats.p95, 42);
+        assert_eq!(stats.p99, 42);
         assert_eq!(stats.max, 42);
+    }
+
+    #[test]
+    fn latency_stats_p99_nearest_rank() {
+        // 0..=99 → nearest-rank index `len*99/100` = 99 (the max), and
+        // `len*95/100` = 95 for p95.
+        let samples: Vec<u64> = (0..100).collect();
+        let stats = latency_stats(&samples);
+        assert_eq!(stats.p95, 95);
+        assert_eq!(stats.p99, 99);
     }
 
     // --- Coverage ---

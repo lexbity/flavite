@@ -821,24 +821,24 @@ impl ShaderPrimitive for ProbePrimitive {
         // A zero-instance draw is skipped entirely rather than issued with a
         // count of zero: wgpu would still require every declared vertex
         // buffer slot to be bound.
-        if let Some(buffer) = &pipeline.node_slot.buffer {
-            if self.node_count > 0 {
-                render_pass.set_pipeline(&pipeline.nodes);
-                render_pass.set_bind_group(0, &pipeline.camera_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, pipeline.node_corners.slice(..));
-                render_pass.set_vertex_buffer(1, buffer.slice(..));
-                render_pass.draw(0..4, 0..self.node_count);
-            }
+        if let Some(buffer) = &pipeline.node_slot.buffer
+            && self.node_count > 0
+        {
+            render_pass.set_pipeline(&pipeline.nodes);
+            render_pass.set_bind_group(0, &pipeline.camera_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, pipeline.node_corners.slice(..));
+            render_pass.set_vertex_buffer(1, buffer.slice(..));
+            render_pass.draw(0..4, 0..self.node_count);
         }
 
-        if let Some(buffer) = &pipeline.edge_slot.buffer {
-            if self.edge_count > 0 {
-                render_pass.set_pipeline(&pipeline.edges);
-                render_pass.set_bind_group(0, &pipeline.camera_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, pipeline.edge_corners.slice(..));
-                render_pass.set_vertex_buffer(1, buffer.slice(..));
-                render_pass.draw(0..4, 0..self.edge_count);
-            }
+        if let Some(buffer) = &pipeline.edge_slot.buffer
+            && self.edge_count > 0
+        {
+            render_pass.set_pipeline(&pipeline.edges);
+            render_pass.set_bind_group(0, &pipeline.camera_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, pipeline.edge_corners.slice(..));
+            render_pass.set_vertex_buffer(1, buffer.slice(..));
+            render_pass.draw(0..4, 0..self.edge_count);
         }
 
         self.timings.record_draw(started.elapsed());

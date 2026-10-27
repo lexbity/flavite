@@ -10,6 +10,7 @@ pub mod s1_probe;
 pub mod setup;
 pub mod spike_s3;
 pub mod spike_s3_fs;
+pub mod spike_s4_db;
 pub mod spike_s4_search;
 
 use anyhow::{Context, Result};

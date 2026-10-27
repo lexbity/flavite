@@ -19,7 +19,9 @@ pub fn lexical_canonicalize(path: &Path) -> PathBuf {
         match component {
             Component::RootDir => out.push("/"),
             Component::CurDir => {}
-            Component::ParentDir => { out.pop(); }
+            Component::ParentDir => {
+                out.pop();
+            }
             Component::Normal(name) => out.push(name),
             Component::Prefix(_) => {}
         }

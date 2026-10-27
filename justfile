@@ -48,6 +48,14 @@ spike-s3-fs *args:
 spike-s4-search *args:
     cargo run -p xtask --bin s4_search_probe -- {{args}}
 
+# S4 DB probe (PLAN-C C4, §9 S4): WAL single-writer + read-pool behavior under
+# reconcile load — read p99 during writes, write throughput, batch-apply and
+# generation-bump timing, tantivy writer ops during reconcile, open-time
+# generation check. Evidence for C7 (`pool.rs`, `tantivy.rs`) and C8 batch
+# sizing. CI re-runs the scaled-down (2k-note) self-check on Linux.
+spike-s4-db *args:
+    cargo run -p xtask --bin s4_db_probe -- {{args}}
+
 # G0 — local fast gate (§10.3): fmt + clippy + test + arch check. ≤ 5 min budget.
 gate: fmt clippy test arch-check
     @just gc

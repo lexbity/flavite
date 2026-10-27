@@ -76,6 +76,7 @@ No dependencies.
 
 Normal/build:
 
+- `blake3` (normal)
 - `cosmic-text` (normal)
 - `iced` (normal)
 - `notify` (normal)
@@ -84,7 +85,7 @@ Normal/build:
 
 ## First-party external dependencies
 
-- `blake3` ← flavite-fs
+- `blake3` ← flavite-fs, xtask
 - `cosmic-text` ← xtask
 - `iced` ← flavite-ui, xtask
 - `notify` ← flavite-fs, flavite-fs, xtask

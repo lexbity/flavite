@@ -124,6 +124,25 @@ jobs:
           path: target/s4-search-report.json
           if-no-files-found: error
 
+  # C4 (§9 S4): DB probe — WAL single-writer + read pool under reconcile load,
+  # batch-size and pool-size sweeps, generation-bump cost, tantivy writer ops,
+  # open-time generation check. CI re-runs the scaled-down (2k-note) self-check;
+  # the full probe is 20k. Linux only (§9: Windows/macOS evidence deferred).
+  s4-db-probe:
+    name: S4 DB probe (C4, Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
+      - name: Probe all scenarios (2k notes) with self-check
+        run: just spike-s4-db --scenarios all --notes 2000 --dir target/s4-db-probe --self-check --json target/s4-db-report.json
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: s4-db-report-linux
+          path: target/s4-db-report.json
+          if-no-files-found: error
+
   # Negative tests (AC-28/29): seed violations, assert failure.
   arch-edges-negative:
     name: arch-edges-negative (AC-28)

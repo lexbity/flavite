@@ -541,7 +541,9 @@ pub fn reopen_index(dir: &Path) -> Result<(Index, Fields)> {
     Ok((index, fields))
 }
 
-fn index_doc(fields: &Fields, note: &Note) -> TantivyDocument {
+/// Build the probe document for a note (both tokenizer pipelines, one doc).
+#[must_use]
+pub fn index_doc(fields: &Fields, note: &Note) -> TantivyDocument {
     doc!(
         fields.note_id => note.note_id,
         fields.title_bigram => note.title.as_str(),

@@ -21,14 +21,14 @@ const TEMP_PREFIX: &str = ".flavite-atomic-";
 fn temp_path<F: Fs>(fs: &F, target: &Path) -> Result<PathBuf> {
     let dir = target.parent().unwrap_or(Path::new("."));
     let canonical_dir = fs.canonicalize(dir)?;
-    
+
     // Generate a unique temp filename
     use std::time::SystemTime;
     let timestamp = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    
+
     let temp_name = format!("{}{}", TEMP_PREFIX, timestamp);
     Ok(canonical_dir.join(temp_name))
 }
@@ -47,28 +47,28 @@ fn temp_path<F: Fs>(fs: &F, target: &Path) -> Result<PathBuf> {
 pub fn atomic_write<F: Fs>(fs: &F, path: &Path, bytes: &[u8]) -> Result<[u8; 32]> {
     // Step 1: Resolve symlink
     let target = fs.resolve_symlink(path)?;
-    
+
     // Step 2: Generate temp path in same directory
     let temp_path = temp_path(fs, &target)?;
-    
+
     // Step 3: Write temp file
     fs.write_new(&temp_path, bytes)?;
-    
+
     // Step 4: Copy permissions (if source exists)
     // Note: OsFs::copy_mode is a no-op for now; real implementation would copy mode bits
     let _ = fs.copy_mode(&target, &temp_path);
-    
+
     // Step 5: fsync the temp file
     fs.fsync_file(&temp_path)?;
-    
+
     // Step 6: Atomic rename (replace existing)
     fs.rename_replace(&temp_path, &target)?;
-    
+
     // Step 7: fsync the directory
     if let Some(dir) = target.parent() {
         let _ = fs.fsync_dir(dir);
     }
-    
+
     // Step 8: Hash the written file
     let hash = crate::fs::hash_file(fs, &target)?;
     Ok(hash)
@@ -91,14 +91,14 @@ pub fn read_prior_bytes<F: Fs>(fs: &F, path: &Path) -> Result<Option<(Vec<u8>, [
 pub fn list_orphan_temps<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<PathBuf>> {
     let entries = fs.read_dir(dir)?;
     let mut orphans = Vec::new();
-    
+
     for entry in entries {
         let name = entry.name.to_string_lossy();
         if name.starts_with(TEMP_PREFIX) {
             orphans.push(entry.path);
         }
     }
-    
+
     Ok(orphans)
 }
 
@@ -106,11 +106,11 @@ pub fn list_orphan_temps<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<PathBuf>> {
 pub fn cleanup_orphan_temps<F: Fs>(fs: &F, dir: &Path) -> Result<usize> {
     let orphans = list_orphan_temps(fs, dir)?;
     let mut count = 0;
-    
+
     for orphan in orphans {
         let _ = fs.remove(&orphan);
         count += 1;
     }
-    
+
     Ok(count)
 }
