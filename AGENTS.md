@@ -1,2 +1,2 @@
-devdocs/ stays gitignored
+scratch-devdocs/ stays gitignored
 
