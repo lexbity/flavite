@@ -7,3 +7,24 @@ repository.workspace = true
 description = "EditorModel/ropey, undo tree, D7 state machine (§4.1)"
 
 [dependencies]
+# Pure Rust text buffer
+ropey = { workspace = true }
+# Text snapshot and coordinate types from flavite-syntax
+flavite-syntax = { path = "../flavite-syntax" }
+# Error handling
+thiserror = { workspace = true }
+# Serialization for recovery files
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# Hashing for content addressing
+blake3 = { workspace = true }
+# Compression for recovery files (optional, behind feature)
+zstd = { workspace = true, optional = true }
+
+[features]
+default = []
+compression = ["zstd"]
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
