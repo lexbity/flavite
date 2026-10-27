@@ -22,6 +22,7 @@ pub enum WellKnownKey {
 impl WellKnownKey {
     /// Parse a string into a well-known key.
     #[must_use]
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "aliases" => Some(Self::Aliases),
@@ -48,11 +49,7 @@ pub fn normalize_tag(tag: &str) -> String {
 
 /// Derive the title from available sources.
 #[must_use]
-pub fn derive_title(
-    frontmatter_title: Option<&str>,
-    first_h1: Option<&str>,
-    stem: &str,
-) -> String {
+pub fn derive_title(frontmatter_title: Option<&str>, first_h1: Option<&str>, stem: &str) -> String {
     frontmatter_title
         .map(String::from)
         .or_else(|| first_h1.map(String::from))
@@ -65,7 +62,10 @@ mod tests {
 
     #[test]
     fn well_known_key_from_str() {
-        assert_eq!(WellKnownKey::from_str("aliases"), Some(WellKnownKey::Aliases));
+        assert_eq!(
+            WellKnownKey::from_str("aliases"),
+            Some(WellKnownKey::Aliases)
+        );
         assert_eq!(WellKnownKey::from_str("tags"), Some(WellKnownKey::Tags));
         assert_eq!(WellKnownKey::from_str("tag"), Some(WellKnownKey::Tag));
         assert_eq!(WellKnownKey::from_str("title"), Some(WellKnownKey::Title));
@@ -85,13 +85,7 @@ mod tests {
             derive_title(Some("Frontmatter"), Some("H1"), "stem"),
             "Frontmatter"
         );
-        assert_eq!(
-            derive_title(None, Some("H1"), "stem"),
-            "H1"
-        );
-        assert_eq!(
-            derive_title(None, None, "stem"),
-            "stem"
-        );
+        assert_eq!(derive_title(None, Some("H1"), "stem"), "H1");
+        assert_eq!(derive_title(None, None, "stem"), "stem");
     }
 }

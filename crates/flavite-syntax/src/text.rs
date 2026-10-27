@@ -179,8 +179,9 @@ impl Eol {
     #[must_use]
     pub const fn source_len(self) -> usize {
         match self {
-            Self::Lf | Self::None => 0,
-            Self::Crlf => 1,
+            Self::None => 0,
+            Self::Lf => 1,
+            Self::Crlf => 2,
         }
     }
 }
@@ -249,13 +250,13 @@ impl TextSnapshot {
     /// written back (§4.16.1).
     pub fn new(bytes: &[u8]) -> Result<Self, TextError> {
         let has_bom = bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
+        let bom_len = if has_bom { 3 } else { 0 };
         let body = if has_bom { &bytes[3..] } else { bytes };
-        let text_str = std::str::from_utf8(body)
-            .map_err(|e| TextError::NotUtf8 {
-                valid_up_to: e.valid_up_to() + usize::from(has_bom),
-            })?;
+        let text_str = std::str::from_utf8(body).map_err(|e| TextError::NotUtf8 {
+            valid_up_to: e.valid_up_to() + bom_len,
+        })?;
         let text = fold_crlf(text_str);
-        let lines = build_lines(&text, bytes, usize::from(has_bom));
+        let lines = build_lines(&text, bytes, bom_len);
         Ok(Self {
             text,
             source: bytes.to_vec(),
@@ -305,9 +306,7 @@ impl TextSnapshot {
             out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
         }
         for line in &self.lines {
-            out.extend_from_slice(
-                &self.text.as_bytes()[line.text_start.0..line.text_end.0],
-            );
+            out.extend_from_slice(&self.text.as_bytes()[line.text_start.0..line.text_end.0]);
             match line.eol {
                 Eol::Lf => out.push(b'\n'),
                 Eol::Crlf => out.extend_from_slice(b"\r\n"),
@@ -330,7 +329,20 @@ impl TextSnapshot {
             return Some(SourceByte(self.source.len()));
         }
         let line = self.line_for_text(text.0)?;
-        Some(SourceByte(line.source_start.0 + (text.0 - line.text_start.0)))
+
+        // Calculate the base source offset
+        let mut source_offset = line.source_start.0 + (text.0 - line.text_start.0);
+
+        // If we're at the line end, we're at the terminator position.
+        // For CRLF, the terminator is "\r\n" at [source_end, source_end+2),
+        // so text_end maps to source_end (the start of the terminator).
+        // For LF, the terminator is "\n" at [source_end, source_end+1),
+        // so text_end maps to source_end.
+        if text.0 == line.text_end.0 {
+            source_offset = line.source_end.0;
+        }
+
+        Some(SourceByte(source_offset))
     }
 
     /// Map a source offset to its normalized offset.
@@ -349,11 +361,20 @@ impl TextSnapshot {
             return None;
         }
         let line = self.line_for_source(source.0)?;
-        if source.0 <= line.source_end.0 {
-            return Some(TextByte(line.text_start.0 + (source.0 - line.source_start.0)));
+        if source.0 < line.source_end.0 {
+            return Some(TextByte(
+                line.text_start.0 + (source.0 - line.source_start.0),
+            ));
         }
-        // Inside this line's terminator. LF is a single byte, so anything past
-        // `source_end` here is the `\n` of a CRLF pair: illegal boundary.
+        // At or past `source_end`: inside this line's terminator.
+        // For CRLF (2 bytes: \r at source_end, \n at source_end+1), both are illegal
+        // except that \r maps to the \n in text for this line.
+        // For LF (1 byte: \n at source_end), it's illegal.
+        if line.eol == Eol::Crlf && source.0 == line.source_end.0 {
+            // \r at source_end maps to \n at text_end for this line.
+            return Some(TextByte(line.text_end.0));
+        }
+        // Anything else (LF terminator byte, or CRLF \n) is illegal.
         None
     }
 
@@ -362,10 +383,21 @@ impl TextSnapshot {
     /// Both endpoints must be legal; otherwise `None`.
     #[must_use]
     pub fn span_to_source(&self, span: Span<TextByte>) -> Option<Span<SourceByte>> {
-        Some(Span::new(
-            self.text_to_source(span.start)?,
-            self.text_to_source(span.end)?,
-        ))
+        let start_source = self.text_to_source(span.start)?;
+        let end_source = self.text_to_source(span.end)?;
+
+        // Check if the span starts at a line end with CRLF, which would include
+        // the CRLF interior in the source.
+        if let Some(line) = self.line_for_text(span.start.0)
+            && span.start.0 == line.text_end.0
+            && line.eol == Eol::Crlf
+        {
+            // Starts at a CRLF line end, which means the source span would
+            // include the CRLF bytes, which are illegal.
+            return None;
+        }
+
+        Some(Span::new(start_source, end_source))
     }
 
     /// Scalar (code point) index of a normalized byte offset.
@@ -445,15 +477,23 @@ impl TextSnapshot {
 /// `at` is clamped to the text, so the function is total over valid offsets.
 #[must_use]
 pub fn prev_grapheme_boundary(text: &str, at: TextByte) -> TextByte {
-    let at = at.0.min(text.len());
-    if at == 0 {
+    let clamped = at.0.min(text.len());
+    let was_clamped = at.0 > text.len();
+
+    if clamped == 0 {
         return TextByte(0);
     }
     // Snap to a char boundary first so we never index mid-scalar.
-    let mut start = at;
+    let mut start = clamped;
     while start > 0 && !text.is_char_boundary(start) {
         start -= 1;
     }
+
+    // If we were clamped (out of range) and snapped to the end, return the end.
+    if was_clamped && start == text.len() {
+        return TextByte(start);
+    }
+
     let head = &text[..start];
     match head.grapheme_indices(false).next_back() {
         Some((idx, _)) => TextByte(idx),
@@ -495,12 +535,10 @@ fn fold_crlf(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\r' {
-            if chars.peek() == Some(&'\n') {
-                chars.next();
-                out.push('\n');
-                continue;
-            }
+        if c == '\r' && chars.peek() == Some(&'\n') {
+            chars.next();
+            out.push('\n');
+            continue;
         }
         out.push(c);
     }
@@ -532,7 +570,7 @@ fn build_lines(text: &str, source: &[u8], bom_len: usize) -> Vec<LineInfo> {
             eol,
         });
         text_start = idx + 1;
-        source_start = source_end + 1 + eol.source_len();
+        source_start = source_end + eol.source_len();
     }
 
     if text_start < text.len() || lines.is_empty() {
@@ -591,7 +629,11 @@ mod tests {
         assert_eq!(s.text(), "hello\nworld");
         assert_eq!(s.to_source_bytes(), "\u{FEFF}hello\r\nworld".as_bytes());
         assert_eq!(s.text_to_source(TextByte(0)), Some(SourceByte(3)));
-        assert_eq!(s.source_to_text(SourceByte(0)), None, "BOM interior is illegal");
+        assert_eq!(
+            s.source_to_text(SourceByte(0)),
+            None,
+            "BOM interior is illegal"
+        );
         assert_eq!(s.source_to_text(SourceByte(3)), Some(TextByte(0)));
     }
 
@@ -614,8 +656,14 @@ mod tests {
         assert_eq!(s.source_to_text(SourceByte(4)), None);
         assert_eq!(s.source_to_text(SourceByte(3)), Some(TextByte(3)));
         // Endpoints.
-        assert_eq!(s.text_to_source(TextByte(s.text().len())), Some(SourceByte(src.len())));
-        assert_eq!(s.source_to_text(SourceByte(src.len())), Some(TextByte(s.text().len())));
+        assert_eq!(
+            s.text_to_source(TextByte(s.text().len())),
+            Some(SourceByte(src.len()))
+        );
+        assert_eq!(
+            s.source_to_text(SourceByte(src.len())),
+            Some(TextByte(s.text().len()))
+        );
         assert_eq!(s.text_to_source(TextByte(999)), None);
         assert_eq!(s.source_to_text(SourceByte(999)), None);
     }
@@ -643,7 +691,10 @@ mod tests {
     fn span_to_source() {
         let s = snap("ab\r\ncd");
         let span = Span::new(TextByte(0), TextByte(2));
-        assert_eq!(s.span_to_source(span), Some(Span::new(SourceByte(0), SourceByte(2))));
+        assert_eq!(
+            s.span_to_source(span),
+            Some(Span::new(SourceByte(0), SourceByte(2)))
+        );
         // A span ending inside a CRLF pair is rejected.
         let bad = Span::new(TextByte(2), TextByte(4));
         assert_eq!(s.span_to_source(bad), None);
@@ -701,6 +752,9 @@ mod tests {
         assert!(!span.is_empty());
         let empty = Span::new(TextByte(5), TextByte(2));
         assert!(empty.is_empty());
-        assert_eq!(span.as_source_span(), Span::new(SourceByte(2), SourceByte(5)));
+        assert_eq!(
+            span.as_source_span(),
+            Span::new(SourceByte(2), SourceByte(5))
+        );
     }
 }

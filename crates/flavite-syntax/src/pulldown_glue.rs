@@ -9,8 +9,8 @@
 //! tree-sitter never decides this (D10). Both parse paths use the same scanner,
 //! which is what makes AC-5 parity possible.
 
-use crate::mask::{math_ranges, TextMask};
-use crate::scanner::{scan_inline, ScannedSpan, SpanKind};
+use crate::mask::{TextMask, math_ranges};
+use crate::scanner::{ScannedSpan, SpanKind, scan_inline};
 use crate::text::{Span, TextByte, TextSnapshot};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use std::ops::Range;
@@ -102,29 +102,63 @@ pub fn parse_note(bytes: &[u8]) -> Result<ParsedNote, String> {
     let mut current_heading_level: Option<HeadingLevel> = None;
     let mut current_heading_text = String::new();
     let mut in_code_block = false;
+    let mut text_buffer = String::new();
+    let mut text_start = 0usize;
 
     for (event, range) in parser.into_offset_iter() {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
+                // Flush any buffered text before the heading
+                if !text_buffer.is_empty() {
+                    scan_buffer(
+                        &snapshot,
+                        &mask,
+                        &text_buffer,
+                        text_start,
+                        &mut links,
+                        &mut tags,
+                        &mut block_ids,
+                    );
+                    text_buffer.clear();
+                }
                 current_heading_level = Some(level);
                 current_heading_text.clear();
             }
             Event::End(TagEnd::Heading(_)) => {
-                if let Some(level) = current_heading_level.take() {
-                    if !current_heading_text.is_empty() {
-                        headings.push((level, current_heading_text.clone()));
-                    }
+                if let Some(level) = current_heading_level.take()
+                    && !current_heading_text.is_empty()
+                {
+                    headings.push((level, current_heading_text.clone()));
                 }
+                // Reset text buffer after heading
+                text_buffer.clear();
+                text_start = range.end;
             }
             Event::Start(Tag::CodeBlock(_)) => {
+                // Flush any buffered text before the code block
+                if !text_buffer.is_empty() {
+                    scan_buffer(
+                        &snapshot,
+                        &mask,
+                        &text_buffer,
+                        text_start,
+                        &mut links,
+                        &mut tags,
+                        &mut block_ids,
+                    );
+                    text_buffer.clear();
+                }
                 in_code_block = true;
             }
             Event::End(TagEnd::CodeBlock) => {
                 in_code_block = false;
+                text_buffer.clear();
+                text_start = range.end;
             }
             Event::Text(_) => {
                 // Skip text in code blocks
                 if in_code_block {
+                    text_buffer.clear();
                     continue;
                 }
 
@@ -137,48 +171,61 @@ pub fn parse_note(bytes: &[u8]) -> Result<ParsedNote, String> {
                     continue;
                 }
 
-                // Get the absolute byte range of this text
-                let absolute_range = range.start..range.end;
-
-                // Skip if this text is in an excluded range
-                if mask.is_masked(absolute_range.start) {
-                    continue;
+                // Buffer text for scanning (to handle split wikilinks)
+                if text_buffer.is_empty() {
+                    text_start = range.start;
                 }
-
-                // Scan inline syntax in this text event
-                let spans = scan_inline(&snapshot, absolute_range);
-                for span in spans {
-                    match span.kind {
-                        SpanKind::Link => {
-                            if let Some(link) = Link::from_scanned(span) {
-                                links.push(link);
-                            }
-                        }
-                        SpanKind::Embed => {
-                            if let Some(link) = Link::from_scanned(span) {
-                                links.push(link);
-                            }
-                        }
-                        SpanKind::Tag => {
-                            tags.push(span.span);
-                        }
-                        SpanKind::BlockId => {
-                            block_ids.push(span.span);
-                        }
-                    }
-                }
+                text_buffer.push_str(text_content);
             }
-
             Event::Code(_) => {
-                // Inline code spans are single events, not start/end pairs
-                // Mark the range as excluded but don't track state
-                // The range is already handled above
+                // Inline code span - flush buffer and mark as excluded
+                if !text_buffer.is_empty() {
+                    scan_buffer(
+                        &snapshot,
+                        &mask,
+                        &text_buffer,
+                        text_start,
+                        &mut links,
+                        &mut tags,
+                        &mut block_ids,
+                    );
+                    text_buffer.clear();
+                }
+                text_buffer.clear();
+                text_start = range.end;
             }
             Event::Html(_) => {
-                // HTML is already in the mask
+                // HTML - flush buffer
+                if !text_buffer.is_empty() {
+                    scan_buffer(
+                        &snapshot,
+                        &mask,
+                        &text_buffer,
+                        text_start,
+                        &mut links,
+                        &mut tags,
+                        &mut block_ids,
+                    );
+                    text_buffer.clear();
+                }
+                text_buffer.clear();
+                text_start = range.end;
             }
             _ => {}
         }
+    }
+
+    // Flush any remaining buffered text
+    if !text_buffer.is_empty() {
+        scan_buffer(
+            &snapshot,
+            &mask,
+            &text_buffer,
+            text_start,
+            &mut links,
+            &mut tags,
+            &mut block_ids,
+        );
     }
 
     Ok(ParsedNote {
@@ -189,6 +236,48 @@ pub fn parse_note(bytes: &[u8]) -> Result<ParsedNote, String> {
         headings,
         mask,
     })
+}
+
+/// Scan a buffered text region and extract spans.
+fn scan_buffer(
+    snapshot: &TextSnapshot,
+    mask: &TextMask,
+    buffer: &str,
+    buffer_start: usize,
+    links: &mut Vec<Link>,
+    tags: &mut Vec<Span<TextByte>>,
+    block_ids: &mut Vec<Span<TextByte>>,
+) {
+    let buffer_end = buffer_start + buffer.len();
+    let buffer_range = buffer_start..buffer_end;
+
+    // Skip if the entire buffer is masked
+    if mask.is_masked(buffer_start) {
+        return;
+    }
+
+    // Scan inline syntax in this buffered text
+    let spans = scan_inline(snapshot, buffer_range);
+    for span in spans {
+        match span.kind {
+            SpanKind::Link => {
+                if let Some(link) = Link::from_scanned(span) {
+                    links.push(link);
+                }
+            }
+            SpanKind::Embed => {
+                if let Some(link) = Link::from_scanned(span) {
+                    links.push(link);
+                }
+            }
+            SpanKind::Tag => {
+                tags.push(span.span);
+            }
+            SpanKind::BlockId => {
+                block_ids.push(span.span);
+            }
+        }
+    }
 }
 
 /// Build the exclusion mask from code spans/blocks, raw HTML, and math.
@@ -208,45 +297,13 @@ fn build_mask(text: &str) -> (TextMask, usize) {
         }
     }
 
-    // Parse again to collect code/HTML regions.
+    // Parse to collect code/HTML regions in a single pass.
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_FOOTNOTES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
 
-    let parser = Parser::new_ext(text, opts);
-
-    for (event, range) in parser.into_offset_iter() {
-        match event {
-            Event::Start(Tag::CodeBlock(_)) => {
-                // Mark the start of a code block
-                // We'll find the end and add the range
-            }
-            Event::End(TagEnd::CodeBlock) => {
-                // Code block end - range includes the content
-            }
-            Event::Code(_) => {
-                // Inline code span
-                excluded.push(range.start..range.end);
-            }
-            Event::Html(_) => {
-                // HTML block or inline
-                excluded.push(range.start..range.end);
-            }
-            Event::InlineMath(_) => {
-                // Inline math (if enabled)
-                excluded.push(range.start..range.end);
-            }
-            Event::DisplayMath(_) => {
-                // Display math (if enabled)
-                excluded.push(range.start..range.end);
-            }
-            _ => {}
-        }
-    }
-
-    // Add code block ranges - parse again to get them properly
     let parser = Parser::new_ext(text, opts);
     let mut code_block_start: Option<usize> = None;
 
@@ -257,20 +314,37 @@ fn build_mask(text: &str) -> (TextMask, usize) {
             }
             Event::End(TagEnd::CodeBlock) => {
                 if let Some(start) = code_block_start.take() {
+                    // Include everything from start to end of the code block
                     excluded.push(start..range.end);
                 }
+            }
+            Event::Code(_) => {
+                // Inline code span - exclude this range
+                excluded.push(range.clone());
+            }
+            Event::Html(_) => {
+                // HTML block or inline - exclude this range
+                excluded.push(range.clone());
+            }
+            Event::InlineMath(_) => {
+                // Inline math (if enabled by pulldown)
+                excluded.push(range.clone());
+            }
+            Event::DisplayMath(_) => {
+                // Display math (if enabled by pulldown)
+                excluded.push(range.clone());
             }
             _ => {}
         }
     }
 
     // Add math ranges (they're not natively supported by pulldown-cmark without extensions).
-    // We scan the body text (excluding already-masked regions).
+    // We scan the full text (excluding already-masked regions).
     let math_ranges = math_ranges(text, &excluded);
     excluded.extend(math_ranges);
 
     // Merge and sort.
-    excluded.sort_by(|a, b| a.start.cmp(&b.start));
+    excluded.sort_by_key(|a| a.start);
 
     (TextMask::new(excluded, text.len()), body_start)
 }
@@ -299,7 +373,7 @@ mod tests {
     fn parses_basic_note() {
         let src = "# Hello\n\nThis is a [[link]].\n";
         let result = parse_note(src.as_bytes()).expect("parse");
-        assert!(result.headings.len() >= 1, "Expected at least one heading");
+        assert!(!result.headings.is_empty(), "Expected at least one heading");
         if !result.headings.is_empty() {
             assert_eq!(result.headings[0].0, HeadingLevel::H1);
         }

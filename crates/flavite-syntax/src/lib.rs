@@ -17,4 +17,4 @@ pub use mask::TextMask;
 pub use pulldown_glue::{Link, ParsedNote};
 pub use scanner::{LinkPayload, ScannedSpan, SpanKind};
 pub use text::{Eol, LineInfo, SourceByte, Span, TextByte, TextError, TextSnapshot};
-pub use wellknown::{normalize_tag, WellKnownKey};
+pub use wellknown::{WellKnownKey, normalize_tag};

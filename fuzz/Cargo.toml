@@ -26,6 +26,7 @@ image = { version = "0.25", default-features = false, features = [
 # fuzz targets appear (scanner, frontmatter_patcher, rename_planner,
 # path_safety, parity).
 flavite-fs = { path = "../crates/flavite-fs" }
+flavite-syntax = { path = "../crates/flavite-syntax" }
 
 [[bin]]
 name = "parser"
@@ -38,3 +39,15 @@ path = "fuzz_targets/image_limits.rs"
 [[bin]]
 name = "path_safety"
 path = "fuzz_targets/path_safety.rs"
+
+[[bin]]
+name = "scanner"
+path = "fuzz_targets/scanner.rs"
+
+[[bin]]
+name = "frontmatter_patcher"
+path = "fuzz_targets/frontmatter_patcher.rs"
+
+[[bin]]
+name = "parity"
+path = "fuzz_targets/parity.rs"

@@ -89,11 +89,12 @@ pub fn scan_inline(snapshot: &TextSnapshot, range: Range<usize>) -> Vec<ScannedS
         match bytes.get(i) {
             Some(b'[') => {
                 // Potential wikilink or embed: try `[[` or `![[`
-                if i + 1 < end && bytes[i + 1] == b'[' {
-                    if let Some(span) = scan_wikilink(bytes, &mut i, end, SpanKind::Link) {
-                        spans.push(span);
-                        continue;
-                    }
+                if i + 1 < end
+                    && bytes[i + 1] == b'['
+                    && let Some(span) = scan_wikilink(bytes, &mut i, end, SpanKind::Link)
+                {
+                    spans.push(span);
+                    continue;
                 }
                 i += 1;
             }
@@ -111,11 +112,11 @@ pub fn scan_inline(snapshot: &TextSnapshot, range: Range<usize>) -> Vec<ScannedS
             }
             Some(b'#') => {
                 // Potential tag: must be at a word boundary
-                if is_word_boundary(text, i) {
-                    if let Some(span) = scan_tag(bytes, &mut i, end) {
-                        spans.push(span);
-                        continue;
-                    }
+                if is_word_boundary(text, i)
+                    && let Some(span) = scan_tag(bytes, &mut i, end)
+                {
+                    spans.push(span);
+                    continue;
                 }
                 i += 1;
             }
@@ -140,12 +141,7 @@ pub fn scan_inline(snapshot: &TextSnapshot, range: Range<usize>) -> Vec<ScannedS
 ///
 /// Advances `i` to just past the closing `]]`.
 /// Returns `None` if the link is malformed (no closing `]]`).
-fn scan_wikilink(
-    bytes: &[u8],
-    i: &mut usize,
-    end: usize,
-    kind: SpanKind,
-) -> Option<ScannedSpan> {
+fn scan_wikilink(bytes: &[u8], i: &mut usize, end: usize, kind: SpanKind) -> Option<ScannedSpan> {
     let start = *i;
     *i += 2; // Skip `[[`
 
@@ -161,17 +157,17 @@ fn scan_wikilink(
             *i += 2; // Skip `]]`
 
             // Determine the target end - it's before either | or #
-            let target_end = alias_start
-                .or(anchor_start)
-                .unwrap_or(content_end);
-            
+            let target_end = alias_start.or(anchor_start).unwrap_or(content_end);
+
             // If there's an anchor but no alias, the target is before the #
             let target_raw = if let Some(a) = anchor_start {
                 if alias_start.is_none() {
                     String::from_utf8_lossy(&bytes[content_start..a]).to_string()
-                } else {
+                } else if let Some(alias_s) = alias_start {
                     // Anchor after alias: target is before |
-                    String::from_utf8_lossy(&bytes[content_start..alias_start.unwrap()]).to_string()
+                    String::from_utf8_lossy(&bytes[content_start..alias_s]).to_string()
+                } else {
+                    String::from_utf8_lossy(&bytes[content_start..a]).to_string()
                 }
             } else {
                 // No anchor, just alias or plain target
@@ -206,7 +202,7 @@ fn scan_wikilink(
                 }),
             });
         }
-        
+
         // Check for `|` (alias separator) or `#` (anchor)
         // Only one of these can be present
         match bytes[*i] {
@@ -218,7 +214,7 @@ fn scan_wikilink(
             }
             _ => {}
         }
-        
+
         *i += 1;
     }
 
@@ -303,7 +299,7 @@ fn is_word_boundary(text: &str, i: usize) -> bool {
         return true;
     }
     let prev = text[..i].chars().next_back();
-    !prev.map_or(false, |c| c.is_alphanumeric() || c == '_')
+    !prev.is_some_and(|c| c.is_alphanumeric() || c == '_')
 }
 
 /// Returns `true` if `b` is a valid character in a tag.

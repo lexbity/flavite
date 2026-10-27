@@ -59,7 +59,10 @@ No dependencies.
 
 ### `flavite-syntax`
 
-No dependencies.
+Normal/build:
+
+- `pulldown-cmark` (normal)
+- `tree-sitter` (normal)
 
 ### `flavite-ui`
 
@@ -89,8 +92,10 @@ Normal/build:
 - `cosmic-text` ← xtask
 - `iced` ← flavite-ui, xtask
 - `notify` ← flavite-fs, flavite-fs, xtask
+- `pulldown-cmark` ← flavite-syntax
 - `rusqlite` ← xtask
 - `tantivy` ← xtask
+- `tree-sitter` ← flavite-syntax
 
 ## Layering rules (§10.2)
 

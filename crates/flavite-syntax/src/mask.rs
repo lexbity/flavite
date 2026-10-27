@@ -52,7 +52,11 @@ impl TextMask {
             let total = prefix.last().copied().unwrap_or(0) + (r.end - r.start);
             prefix.push(total);
         }
-        Self { ranges: merged, prefix, len }
+        Self {
+            ranges: merged,
+            prefix,
+            len,
+        }
     }
 
     /// A mask that excludes nothing.
@@ -93,18 +97,17 @@ impl TextMask {
         if pos >= self.len {
             return false;
         }
-        match self.ranges.binary_search_by(|r| {
-            if pos < r.start {
-                std::cmp::Ordering::Greater
-            } else if pos >= r.end {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        }) {
-            Ok(_) => true,
-            Err(_) => false,
-        }
+        self.ranges
+            .binary_search_by(|r| {
+                if pos < r.start {
+                    std::cmp::Ordering::Greater
+                } else if pos >= r.end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
     }
 
     /// Total number of masked bytes inside `span`.
@@ -170,10 +173,10 @@ impl TextMask {
         }
         let idx = self.index_of(pos);
         let mut total = self.prefix[idx.min(self.ranges.len())];
-        if let Some(r) = self.ranges.get(idx) {
-            if r.start < pos {
-                total += pos.min(r.end) - r.start;
-            }
+        if let Some(r) = self.ranges.get(idx)
+            && r.start < pos
+        {
+            total += pos.min(r.end) - r.start;
         }
         total.min(pos).min(self.len)
     }
@@ -206,9 +209,7 @@ pub fn math_ranges(content: &str, excluded: &[Range<usize>]) -> Vec<Range<usize>
         // Currency guard: `$5` / `5$` are not delimiters.
         let prev = prev_char(content, i);
         let next = next_char(content, i + 1);
-        if prev.map_or(false, |c| c.is_alphanumeric())
-            || next.map_or(false, |c| c.is_ascii_digit())
-        {
+        if prev.is_some_and(|c| c.is_alphanumeric()) || next.is_some_and(|c| c.is_ascii_digit()) {
             i += 1;
             continue;
         }
@@ -290,6 +291,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn masked_length_and_unmasked_split() {
         let m = TextMask::new(vec![4..8], 16);
         assert_eq!(m.masked_length(&(0..16)), 4);
@@ -310,7 +312,8 @@ mod tests {
     #[test]
     fn inline_math_span() {
         let c = "cost is $x+1$ today";
-        assert_eq!(math_ranges(c, &[]), vec![9..14]);
+        // "$x+1$" is 5 bytes starting at index 8
+        assert_eq!(math_ranges(c, &[]), vec![8..13]);
     }
 
     #[test]
@@ -319,6 +322,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn math_ignores_masked_code() {
         let c = "`$x$` and $y$";
         let excluded = vec![0..5usize];

@@ -102,7 +102,8 @@ pub fn parse_frontmatter(snapshot: &TextSnapshot) -> Result<Option<Frontmatter>,
     for line in rest.lines() {
         let trimmed = line.trim();
         if trimmed == "---" || trimmed == "..." {
-            closing_offset = Some(after_open + line_start + line.len());
+            // Close at the start of this line (exclude the closing delimiter line)
+            closing_offset = Some(after_open + line_start);
             break;
         }
         line_start += line.len() + 1;
@@ -121,10 +122,61 @@ pub fn parse_frontmatter(snapshot: &TextSnapshot) -> Result<Option<Frontmatter>,
     let mut title: Option<String> = None;
     let mut ord = 0;
 
-    for line in yaml_text.lines() {
+    let yaml_lines: Vec<&str> = yaml_text.lines().collect();
+    let mut i = 0;
+
+    while i < yaml_lines.len() {
+        let line = yaml_lines[i];
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            i += 1;
             continue;
+        }
+
+        // Check if this is a list item (starts with `-` after indentation)
+        let trimmed_for_list = trimmed.trim_start();
+        if let Some(stripped) = trimmed_for_list.strip_prefix('-') {
+            // This is a list item - need to find its parent key
+            // Look backwards for the most recent key
+            let mut key_line_idx = i;
+            let mut found_key = None;
+            // Start from the previous line and go backwards
+            while key_line_idx > 0 {
+                key_line_idx -= 1;
+                let prev_line = yaml_lines[key_line_idx];
+                let prev_trimmed = prev_line.trim();
+                if !prev_trimmed.is_empty() {
+                    if let Some((key, _)) = prev_trimmed.split_once(':') {
+                        let key = key.trim();
+                        if let Some(wk) = WellKnownKey::from_str(key) {
+                            found_key = Some((key.to_string(), wk));
+                            break;
+                        } else {
+                            // Not a well-known key, stop looking
+                            break;
+                        }
+                    } else if prev_trimmed.starts_with('-')
+                        || prev_trimmed.starts_with('"')
+                        || prev_trimmed.starts_with('\'')
+                    {
+                        // Another list item or value, continue looking back
+                        continue;
+                    } else {
+                        // No colon, stop looking
+                        break;
+                    }
+                }
+            }
+
+            if let Some((_, wk)) = found_key {
+                // Extract the value after the `-`
+                let value = stripped.trim_start().trim_matches('"').to_string();
+                if !value.is_empty() {
+                    well_known.entry(wk).or_default().push(value);
+                }
+                i += 1;
+                continue;
+            }
         }
 
         // Parse key: value
@@ -135,18 +187,29 @@ pub fn parse_frontmatter(snapshot: &TextSnapshot) -> Result<Option<Frontmatter>,
             if let Some(wk) = WellKnownKey::from_str(key) {
                 // Extract string or list values.
                 let values = parse_yaml_value(value);
-                well_known.entry(wk).or_default().extend(values);
+                for v in values {
+                    if !v.is_empty() {
+                        well_known.entry(wk).or_default().push(v);
+                    }
+                }
 
                 if wk == WellKnownKey::Title {
-                    title = well_known.get(&WellKnownKey::Title).and_then(|v| v.first().cloned());
+                    title = well_known
+                        .get(&WellKnownKey::Title)
+                        .and_then(|v| v.first().cloned());
                 }
             } else {
                 // Arbitrary property.
                 let prop_value = PropertyValue::Text(value.to_string());
-                properties.entry(key.to_string()).or_default().push((ord, prop_value));
+                properties
+                    .entry(key.to_string())
+                    .or_default()
+                    .push((ord, prop_value));
                 ord += 1;
             }
         }
+
+        i += 1;
     }
 
     // Deduplicate.
@@ -165,10 +228,11 @@ pub fn parse_frontmatter(snapshot: &TextSnapshot) -> Result<Option<Frontmatter>,
 }
 
 /// Parse a simple YAML value (string or list).
+/// This handles both inline lists `[a, b]` and multi-line lists with `-` prefix.
 fn parse_yaml_value(value: &str) -> Vec<String> {
     let trimmed = value.trim();
 
-    // Check for list: starts with `[` or `-`
+    // Check for list: starts with `[`
     if trimmed.starts_with('[') {
         // Parse comma-separated list
         trimmed
@@ -178,16 +242,8 @@ fn parse_yaml_value(value: &str) -> Vec<String> {
             .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
             .filter(|s| !s.is_empty())
             .collect()
-    } else if trimmed.starts_with('-') {
-        // Parse dash-separated list (one per line)
-        trimmed
-            .lines()
-            .filter(|l| l.trim().starts_with('-'))
-            .map(|l| l.trim().trim_start_matches('-').trim().trim_matches('"').to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
     } else {
-        // Single string value
+        // Single string value - trim quotes
         vec![trimmed.trim_matches('"').to_string()]
     }
 }
@@ -205,7 +261,9 @@ mod tests {
     fn parse_frontmatter_basic() {
         let s = "---\ntitle: My Note\naliases:\n  - a\n  - b\n---\nBody";
         let snapshot = snap(s);
-        let fm = parse_frontmatter(&snapshot).expect("parse").expect("has frontmatter");
+        let fm = parse_frontmatter(&snapshot)
+            .expect("parse")
+            .expect("has frontmatter");
         assert_eq!(fm.title, Some("My Note".to_string()));
         assert_eq!(
             fm.well_known.get(&WellKnownKey::Aliases),
@@ -227,19 +285,16 @@ mod tests {
             derive_title(Some("Frontmatter"), Some("H1"), "stem"),
             "Frontmatter"
         );
-        assert_eq!(
-            derive_title(None, Some("H1"), "stem"),
-            "H1"
-        );
-        assert_eq!(
-            derive_title(None, None, "stem"),
-            "stem"
-        );
+        assert_eq!(derive_title(None, Some("H1"), "stem"), "H1");
+        assert_eq!(derive_title(None, None, "stem"), "stem");
     }
 
     #[test]
     fn well_known_key_from_str() {
-        assert_eq!(WellKnownKey::from_str("aliases"), Some(WellKnownKey::Aliases));
+        assert_eq!(
+            WellKnownKey::from_str("aliases"),
+            Some(WellKnownKey::Aliases)
+        );
         assert_eq!(WellKnownKey::from_str("tags"), Some(WellKnownKey::Tags));
         assert_eq!(WellKnownKey::from_str("tag"), Some(WellKnownKey::Tag));
         assert_eq!(WellKnownKey::from_str("title"), Some(WellKnownKey::Title));
