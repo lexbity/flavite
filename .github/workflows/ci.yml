@@ -28,8 +28,19 @@ jobs:
       - name: Setup (tools + nightly)
         run: just setup
 
+      # Linux only: lavapipe, so the wgpu half of the S2-1 shader gate has a
+      # device. See `just gpu-setup` for why this cannot be optional.
+      - name: GPU setup (Linux only — lavapipe software Vulkan)
+        if: matrix.os == 'ubuntu-latest'
+        run: just gpu-setup
+
       - name: G0 (fmt + clippy + test + arch check)
         run: just gate
+        env:
+          # On Linux the step above installed lavapipe, so "no adapter" is a
+          # real defect rather than an absent GPU — fail instead of skipping.
+          # Elsewhere the value is empty and the test skips honestly.
+          FLAVITE_REQUIRE_WGPU_ADAPTER: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
 
       # Linux-only: coverage merge + fuzz smoke + network-denied.
       - name: Coverage (Linux only)

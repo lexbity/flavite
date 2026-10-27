@@ -123,6 +123,33 @@ fuzz-smoke-ci:
 setup:
     cargo xtask setup
 
+# Headless GPU setup (PLAN-B §5, B2): install lavapipe so a CI runner with no
+# graphics card can still create a wgpu device.
+#
+# `crates/flavite-ui/tests/shader_validation.rs` has two halves. The naga half
+# runs everywhere; the *link* half needs a real driver, and with no adapter it
+# can only skip. CI sets FLAVITE_REQUIRE_WGPU_ADAPTER=1 next to this recipe so
+# that "skipped" becomes a hard failure — this recipe is what supplies the
+# device that makes the requirement satisfiable. Idempotent, and a no-op
+# where apt-get is absent (macOS/Windows runners never install it).
+gpu-setup:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "gpu-setup: apt-get not found — nothing to install (non-Debian host)."
+        exit 0
+    fi
+    sudo apt-get update
+    sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers vulkan-tools
+    if command -v vulkaninfo >/dev/null 2>&1; then
+        vulkaninfo --summary 2>/dev/null \
+            | grep -iE "deviceName|apiVersion" \
+            | sort -u \
+            || echo "gpu-setup: vulkaninfo reported no devices."
+    else
+        echo "gpu-setup: vulkaninfo unavailable; the adapter requirement will surface the real error."
+    fi
+
 # Full cleanup (§10.10): removes target/, fuzz/target/, fuzz/artifacts/,
 # profiling intermediates. Pass --dry-run to preview without removing.
 clean *args:
