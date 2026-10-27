@@ -37,10 +37,17 @@ flavite-ui = "iced application (§4.1)"
 # (`cargo xtask arch gen`) in the same PR — an architecture change is a
 # spec change.
 #
-# Current state (A4): flavite-fs has no internal deps. xtask depends on
+# Current state (B2): flavite-fs has no internal deps. xtask depends on
 # workspace crates but is tooling (not gated). All other crates are empty
-# skeletons with no internal edges yet.
-active = []
+# skeletons with no internal edges yet, except:
+#
+#   flavite-ui → flavite-graph   (PLAN-B slice B2)
+#
+# `flavite-ui::graph` consumes `flavite_graph::GraphSnapshot` as the
+# CPU-authoritative model behind an `Arc` (D15); `flavite-graph` stays
+# cpu-only, so the edge points one way only and `cargo xtask arch check`'s
+# layering rule still holds.
+active = [{ from = "flavite-ui", to = "flavite-graph" }]
 
 [layering]
 # Core-tier crates whose transitive closure of normal+build deps MUST NOT

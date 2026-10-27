@@ -53,6 +53,10 @@
       "kind": "external"
     },
     {
+      "id": "notify",
+      "kind": "external"
+    },
+    {
       "id": "xtask",
       "kind": "workspace"
     }
@@ -64,6 +68,26 @@
       "kind": "normal"
     },
     {
+      "from": "flavite-fs",
+      "to": "notify",
+      "kind": "dev"
+    },
+    {
+      "from": "flavite-fs",
+      "to": "notify",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "flavite-graph",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "iced",
+      "kind": "normal"
+    },
+    {
       "from": "xtask",
       "to": "cosmic-text",
       "kind": "normal"
@@ -71,6 +95,11 @@
     {
       "from": "xtask",
       "to": "iced",
+      "kind": "normal"
+    },
+    {
+      "from": "xtask",
+      "to": "notify",
       "kind": "normal"
     }
   ]

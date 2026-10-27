@@ -43,6 +43,11 @@ No dependencies.
 Normal/build:
 
 - `blake3` (normal)
+- `notify` (normal)
+
+Dev-only:
+
+- `notify`
 
 ### `flavite-graph`
 
@@ -58,7 +63,10 @@ No dependencies.
 
 ### `flavite-ui`
 
-No dependencies.
+Normal/build:
+
+- `flavite-graph` (normal)
+- `iced` (normal)
 
 ### `flavite-vault`
 
@@ -70,12 +78,14 @@ Normal/build:
 
 - `cosmic-text` (normal)
 - `iced` (normal)
+- `notify` (normal)
 
 ## First-party external dependencies
 
 - `blake3` ← flavite-fs
 - `cosmic-text` ← xtask
-- `iced` ← xtask
+- `iced` ← flavite-ui, xtask
+- `notify` ← flavite-fs, flavite-fs, xtask
 
 ## Layering rules (§10.2)
 
