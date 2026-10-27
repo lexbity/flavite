@@ -7,6 +7,7 @@ pub mod clean;
 pub mod cov;
 pub mod setup;
 pub mod spike_s3;
+pub mod spike_s3_fs;
 
 use anyhow::{Context, Result};
 

@@ -1,7 +1,8 @@
+# devdocs/ stays gitignored (AGENTS.md). The architecture artifacts
+# (devdocs/architecture/{crate-graph.json,DEPENDENCIES.md}) are regenerated
+# locally by `cargo xtask arch gen`; `arch check` compares against the
+# on-disk artifacts, so local gates work with devdocs/ untracked.
 devdocs/
-# architecture artifacts (§10.2, "checked in") live there. The generated
-# artifacts are drift-checked by `cargo xtask arch check`; a fresh clone
-# must have them or the weekly fresh-clone gate fails.
 /target
 /fuzz/target
 /fuzz/artifacts

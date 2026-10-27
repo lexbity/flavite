@@ -276,19 +276,23 @@ fn ms_since(t0: Instant) -> u64 {
     u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Delivery-latency statistics over millisecond samples.
+/// Delivery-latency statistics over samples in one unit.
+///
+/// The unit is whatever the caller recorded: the watcher probe (C1) records
+/// milliseconds, the filesystem probe (C2) records microseconds. Field names
+/// are deliberately unit-neutral; renderers state the unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct LatencyStats {
     /// Number of samples.
     pub count: usize,
     /// Minimum sample.
-    pub min_ms: u64,
+    pub min: u64,
     /// Upper-median sample.
-    pub median_ms: u64,
+    pub median: u64,
     /// 95th-percentile sample (nearest rank).
-    pub p95_ms: u64,
+    pub p95: u64,
     /// Maximum sample.
-    pub max_ms: u64,
+    pub max: u64,
 }
 
 /// Nearest-rank latency statistics. Empty input yields an all-zero report.
@@ -297,10 +301,10 @@ pub fn latency_stats(samples: &[u64]) -> LatencyStats {
     if samples.is_empty() {
         return LatencyStats {
             count: 0,
-            min_ms: 0,
-            median_ms: 0,
-            p95_ms: 0,
-            max_ms: 0,
+            min: 0,
+            median: 0,
+            p95: 0,
+            max: 0,
         };
     }
     let mut sorted = samples.to_vec();
@@ -308,10 +312,10 @@ pub fn latency_stats(samples: &[u64]) -> LatencyStats {
     let last = sorted.len() - 1;
     LatencyStats {
         count: sorted.len(),
-        min_ms: sorted[0],
-        median_ms: sorted[sorted.len() / 2],
-        p95_ms: sorted[(sorted.len() * 95 / 100).min(last)],
-        max_ms: sorted[last],
+        min: sorted[0],
+        median: sorted[sorted.len() / 2],
+        p95: sorted[(sorted.len() * 95 / 100).min(last)],
+        max: sorted[last],
     }
 }
 
@@ -1119,8 +1123,8 @@ pub fn render_summary(summary: &RunSummary) -> String {
                 r.ops,
                 r.nominated,
                 r.ops,
-                r.stats.median_ms,
-                r.stats.p95_ms,
+                r.stats.median,
+                r.stats.p95,
                 r.events.len()
             )),
             ScenarioReport::Rename(r) => out.push_str(&format!(
@@ -1174,7 +1178,7 @@ fn render_modify(out: &mut String, r: &ModifyReport) {
     ));
     out.push_str(&format!(
         "| delivery latency min / median / p95 / max (ms) | {} / {} / {} / {} |\n",
-        r.stats.min_ms, r.stats.median_ms, r.stats.p95_ms, r.stats.max_ms
+        r.stats.min, r.stats.median, r.stats.p95, r.stats.max
     ));
     out.push_str(&format!("| events captured | {} |\n", r.events.len()));
     out.push_str(&format!(
@@ -1414,26 +1418,26 @@ mod tests {
     fn latency_stats_empty() {
         let stats = latency_stats(&[]);
         assert_eq!(stats.count, 0);
-        assert_eq!(stats.max_ms, 0);
+        assert_eq!(stats.max, 0);
     }
 
     #[test]
     fn latency_stats_known_samples() {
         let stats = latency_stats(&[9, 1, 4, 2, 7]);
         assert_eq!(stats.count, 5);
-        assert_eq!(stats.min_ms, 1);
-        assert_eq!(stats.median_ms, 4);
-        assert_eq!(stats.max_ms, 9);
-        assert_eq!(stats.p95_ms, 9);
+        assert_eq!(stats.min, 1);
+        assert_eq!(stats.median, 4);
+        assert_eq!(stats.max, 9);
+        assert_eq!(stats.p95, 9);
     }
 
     #[test]
     fn latency_stats_single_sample() {
         let stats = latency_stats(&[42]);
         assert_eq!(stats.count, 1);
-        assert_eq!(stats.median_ms, 42);
-        assert_eq!(stats.p95_ms, 42);
-        assert_eq!(stats.max_ms, 42);
+        assert_eq!(stats.median, 42);
+        assert_eq!(stats.p95, 42);
+        assert_eq!(stats.max, 42);
     }
 
     // --- Coverage ---
