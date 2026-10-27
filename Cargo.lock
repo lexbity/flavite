@@ -1105,6 +1105,7 @@ dependencies = [
  "libc",
  "notify",
  "proptest",
+ "tempfile",
  "thiserror 2.0.21",
  "unicode-normalization",
  "windows-sys 0.60.2",

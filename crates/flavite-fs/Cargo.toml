@@ -31,3 +31,4 @@ windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage
 proptest = { workspace = true }
 # notify crate is used by the watcher wrapper; also needed for dev tests.
 notify = { workspace = true }
+tempfile = "3"
