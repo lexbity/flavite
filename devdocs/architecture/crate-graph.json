@@ -57,11 +57,19 @@
       "kind": "external"
     },
     {
+      "id": "pulldown-cmark",
+      "kind": "external"
+    },
+    {
       "id": "rusqlite",
       "kind": "external"
     },
     {
       "id": "tantivy",
+      "kind": "external"
+    },
+    {
+      "id": "tree-sitter",
       "kind": "external"
     },
     {
@@ -83,6 +91,16 @@
     {
       "from": "flavite-fs",
       "to": "notify",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-syntax",
+      "to": "pulldown-cmark",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-syntax",
+      "to": "tree-sitter",
       "kind": "normal"
     },
     {
