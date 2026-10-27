@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Development tooling: arch graph generation, verification, query CLI (§10.2)"
+# The `cargo xtask` alias is `cargo run -p xtask --`; with multiple binaries in
+# this package, `cargo run` needs a default. The spike probes are invoked
+# explicitly with `--bin` (e.g. `just spike-s3`).
+default-run = "cargo-xtask"
 
 [lib]
 name = "xtask"
@@ -20,3 +24,6 @@ walkdir = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.8"
+# S3 watcher-truth probe (PLAN-C C1): the same crate and major the production
+# watcher wrapper (flavite-fs `watch.rs`, slice C5) will use (§2, D5).
+notify = { workspace = true }

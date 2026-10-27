@@ -1,4 +1,7 @@
 devdocs/
+# architecture artifacts (§10.2, "checked in") live there. The generated
+# artifacts are drift-checked by `cargo xtask arch check`; a fresh clone
+# must have them or the weekly fresh-clone gate fails.
 /target
 /fuzz/target
 /fuzz/artifacts

@@ -6,6 +6,7 @@ pub mod arch;
 pub mod clean;
 pub mod cov;
 pub mod setup;
+pub mod spike_s3;
 
 use anyhow::{Context, Result};
 
