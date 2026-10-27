@@ -310,7 +310,11 @@ mod tests {
     fn store_publishes_positions_paired_with_their_snapshot() {
         let buffer = PositionBuffer::new();
         let snapshot = snapshot_of(4);
-        let generation = buffer.store(Arc::clone(&snapshot), positions(4, 1.0), LayoutState::Active);
+        let generation = buffer.store(
+            Arc::clone(&snapshot),
+            positions(4, 1.0),
+            LayoutState::Active,
+        );
 
         assert_eq!(generation, 1);
         let frame = buffer.load();
@@ -342,7 +346,11 @@ mod tests {
         assert_eq!(buffer.load().generation(), 16);
         // Earlier frames stay valid for a reader that still holds them.
         let old = buffer.load();
-        let _ = buffer.store(Arc::clone(&snapshot), positions(1, 99.0), LayoutState::Active);
+        let _ = buffer.store(
+            Arc::clone(&snapshot),
+            positions(1, 99.0),
+            LayoutState::Active,
+        );
         assert_eq!(old.generation(), 16, "a held frame is never invalidated");
         assert_eq!(old.positions()[0][1], 15.0);
     }
@@ -351,7 +359,11 @@ mod tests {
     fn mark_changes_only_the_state() {
         let buffer = PositionBuffer::new();
         let snapshot = snapshot_of(3);
-        let _ = buffer.store(Arc::clone(&snapshot), positions(3, 2.0), LayoutState::Active);
+        let _ = buffer.store(
+            Arc::clone(&snapshot),
+            positions(3, 2.0),
+            LayoutState::Active,
+        );
 
         let generation = buffer.mark(LayoutState::Paused);
         assert_eq!(generation, 2, "marking publishes a new generation");
@@ -377,7 +389,11 @@ mod tests {
                     let _ = buffer.store(
                         Arc::clone(&snapshot),
                         positions(8, i as f32),
-                        if i % 3 == 0 { LayoutState::Active } else { LayoutState::Frozen },
+                        if i % 3 == 0 {
+                            LayoutState::Active
+                        } else {
+                            LayoutState::Frozen
+                        },
                     );
                 }
             })

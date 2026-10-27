@@ -53,7 +53,7 @@ use crossbeam::channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use rayon::ThreadPoolBuilder;
 
 use crate::delta::{Delta, EdgeDelta, NodeDelta};
-use crate::layout::{LayoutParams, Layout};
+use crate::layout::{Layout, LayoutParams};
 use crate::model::{GraphModel, GraphSnapshot};
 use crate::position::{LayoutState, PositionBuffer};
 
@@ -298,7 +298,8 @@ impl LayoutTelemetry {
     fn record_step(&self, step_ms: f64, frozen: bool) {
         self.steps.fetch_add(1, Ordering::Relaxed);
         atomic_add_f64(&self.step_ms_total, step_ms);
-        self.step_ms_last.store(step_ms.to_bits(), Ordering::Relaxed);
+        self.step_ms_last
+            .store(step_ms.to_bits(), Ordering::Relaxed);
         atomic_max_f64(&self.step_ms_max, step_ms);
         if frozen {
             if !self.frozen.swap(true, Ordering::Relaxed) {
@@ -313,7 +314,8 @@ impl LayoutTelemetry {
     fn record_frame(&self, generation: u64, topology_version: u64) {
         self.frames.fetch_add(1, Ordering::Relaxed);
         self.generation.store(generation, Ordering::Relaxed);
-        self.topology_version.store(topology_version, Ordering::Relaxed);
+        self.topology_version
+            .store(topology_version, Ordering::Relaxed);
     }
 
     /// Record a topology change that woke the layout.
@@ -509,7 +511,10 @@ fn run(
             if engine.config.min_step_interval > Duration::ZERO {
                 // Throttled: sleep between steps, but wake the moment a
                 // command arrives rather than after the whole interval.
-                match engine.commands.recv_timeout(engine.config.min_step_interval) {
+                match engine
+                    .commands
+                    .recv_timeout(engine.config.min_step_interval)
+                {
                     Ok(command) => {
                         if !engine.handle(command) {
                             break 'outer;
@@ -571,10 +576,7 @@ impl Engine {
     ) -> Self {
         let params = config.params.sanitized();
         Self {
-            config: LayoutWorkerConfig {
-                params,
-                ..config
-            },
+            config: LayoutWorkerConfig { params, ..config },
             pool,
             commands,
             events,
@@ -732,7 +734,10 @@ impl Engine {
     fn step(&mut self) {
         let started = Instant::now();
         let Self {
-            layout, pool, scratch, ..
+            layout,
+            pool,
+            scratch,
+            ..
         } = self;
         let outcome = catch_unwind(AssertUnwindSafe(|| layout.step_into(pool, scratch)));
 
@@ -772,8 +777,11 @@ impl Engine {
         }
         let mut positions = Vec::with_capacity(self.layout.node_count());
         self.layout.write_positions_f32(&mut positions);
-        let generation = self.positions.store(Arc::clone(&self.current), positions, state);
-        self.telemetry.record_frame(generation, self.current.topology_version);
+        let generation = self
+            .positions
+            .store(Arc::clone(&self.current), positions, state);
+        self.telemetry
+            .record_frame(generation, self.current.topology_version);
     }
 
     /// Queue an event. The channel is unbounded and the events are rare, so
@@ -922,9 +930,12 @@ mod tests {
     fn a_worker_steps_and_publishes_frames() {
         let worker = LayoutWorker::spawn_running(config(2), path(24)).expect("worker starts");
         let buffer = worker.positions();
-        assert!(wait_until(Duration::from_secs(10), || {
-            buffer.load().generation() >= 5
-        }), "the worker must publish frames");
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                buffer.load().generation() >= 5
+            }),
+            "the worker must publish frames"
+        );
         assert_eq!(worker.threads(), 2);
 
         let frame = buffer.load();
@@ -936,9 +947,12 @@ mod tests {
         }
         // Positions are actually moving, not a frozen publish loop.
         let first = frame.positions().to_vec();
-        assert!(wait_until(Duration::from_secs(10), || {
-            buffer.load().positions() != first.as_slice()
-        }), "positions must change between frames");
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                buffer.load().positions() != first.as_slice()
+            }),
+            "positions must change between frames"
+        );
 
         let telemetry = worker.telemetry().snapshot();
         assert!(telemetry.steps > 0);
@@ -1088,17 +1102,28 @@ mod tests {
         );
 
         worker.send(LayoutCommand::Start);
-        assert!(wait_until(Duration::from_secs(5), || {
-            let frame = buffer.load();
-            frame.state() == LayoutState::Active && frame.generation() > paused.generation
-        }), "start resumes stepping");
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                let frame = buffer.load();
+                frame.state() == LayoutState::Active && frame.generation() > paused.generation
+            }),
+            "start resumes stepping"
+        );
         let events = drain(&worker);
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, LayoutEvent::State { state: LayoutState::Paused, .. })));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, LayoutEvent::State { state: LayoutState::Active, .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LayoutEvent::State {
+                state: LayoutState::Paused,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LayoutEvent::State {
+                state: LayoutState::Active,
+                ..
+            }
+        )));
         assert!(worker.shutdown());
     }
 
@@ -1132,7 +1157,10 @@ mod tests {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                LayoutEvent::Panicked { context: "install", .. }
+                LayoutEvent::Panicked {
+                    context: "install",
+                    ..
+                }
             )),
             "the panic is reported with its context: {events:?}"
         );
@@ -1187,7 +1215,10 @@ mod tests {
         let events = drain(&worker);
         assert!(events.iter().any(|event| matches!(
             event,
-            LayoutEvent::Panicked { context: "step" | "install", .. }
+            LayoutEvent::Panicked {
+                context: "step" | "install",
+                ..
+            }
         )));
         assert!(worker.is_alive());
         // Nothing was published with mangled positions: the frame still
@@ -1235,10 +1266,11 @@ mod tests {
         assert_eq!(worker.telemetry().snapshot().steps, 0);
 
         let events = drain(&worker);
-        assert!(events.iter().any(|event| matches!(
-            event,
-            LayoutEvent::Installed { node_count: 4, .. }
-        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, LayoutEvent::Installed { node_count: 4, .. }))
+        );
         assert!(worker.shutdown());
     }
 

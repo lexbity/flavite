@@ -11,7 +11,7 @@ fn cli_runs() {
         .current_dir("../../..")
         .output()
         .expect("Failed to execute cargo");
-    
+
     // The CLI should at least run (exit code might be non-zero due to missing args)
     // We just check it doesn't panic during compilation
 }
@@ -24,7 +24,7 @@ fn cli_runs_with_cargo() {
         .current_dir("../../..")
         .output()
         .expect("Failed to execute cargo");
-    
+
     // The binary should run (may exit with error, but it runs)
     // We just verify it compiles and executes
 }

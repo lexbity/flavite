@@ -35,8 +35,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use flavite_graph::{
-    Delta, EdgeDelta, EdgeKind, GraphModel, GraphSnapshot, Layout, LayoutParams, LayoutWorkerConfig,
-    NodeDelta, NodeId,
+    Delta, EdgeDelta, EdgeKind, GraphModel, GraphSnapshot, Layout, LayoutParams,
+    LayoutWorkerConfig, NodeDelta, NodeId,
 };
 
 // ---------------------------------------------------------------------------
@@ -49,7 +49,11 @@ struct Rng(u64);
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        Self(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
+        Self(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -73,7 +77,11 @@ impl Rng {
 fn fixture(nodes: usize, edges: usize, seed: u64) -> Arc<GraphSnapshot> {
     let mut model = GraphModel::new();
     let node_deltas: Vec<Delta> = (0..nodes as u64)
-        .map(|id| Delta::Node(NodeDelta::Added { id: NodeId::note(id) }))
+        .map(|id| {
+            Delta::Node(NodeDelta::Added {
+                id: NodeId::note(id),
+            })
+        })
         .collect();
     for batch in node_deltas.chunks(50_000) {
         model.apply(batch);
@@ -193,7 +201,15 @@ fn print_table(title: &str, rows: &[Timing]) {
     for row in rows {
         println!(
             "{:<10} {:>8} {:>9} {:>8} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>9.3}",
-            row.label, row.nodes, row.edges, row.samples, row.p50, row.p95, row.p99, row.mean, row.max
+            row.label,
+            row.nodes,
+            row.edges,
+            row.samples,
+            row.p50,
+            row.p95,
+            row.p99,
+            row.mean,
+            row.max
         );
     }
 }
@@ -215,11 +231,7 @@ impl Args {
 
     /// Samples per scenario (after warmup).
     fn samples(&self) -> usize {
-        if self.quick {
-            40
-        } else {
-            200
-        }
+        if self.quick { 40 } else { 200 }
     }
 
     /// Warmup duration per scenario.
@@ -246,7 +258,10 @@ fn main() {
         args.warmup(),
         if args.quick { " · --quick" } else { "" }
     );
-    println!("θ = {:.2} · repulsion 2.0 · attraction 1.0 · gravity 1.0", LayoutParams::default().theta);
+    println!(
+        "θ = {:.2} · repulsion 2.0 · attraction 1.0 · gravity 1.0",
+        LayoutParams::default().theta
+    );
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
@@ -255,7 +270,12 @@ fn main() {
 
     // --- 1. Per-step cost across the reference scales --------------------
     let mut step_rows = Vec::new();
-    for &(nodes, edges) in &[(5_000, 15_000), (20_000, 60_000), (50_000, 200_000), (100_000, 400_000)] {
+    for &(nodes, edges) in &[
+        (5_000, 15_000),
+        (20_000, 60_000),
+        (50_000, 200_000),
+        (100_000, 400_000),
+    ] {
         let snapshot = fixture(nodes, edges, 20_250_101);
         let mut layout = Layout::from_snapshot(&snapshot, LayoutParams::default());
 
@@ -276,7 +296,10 @@ fn main() {
         }
         step_rows.push(summarise("step", nodes, snapshot.edge_count(), samples));
     }
-    print_table("layout step (ms) — one Barnes-Hut step, parallel over the pool", &step_rows);
+    print_table(
+        "layout step (ms) — one Barnes-Hut step, parallel over the pool",
+        &step_rows,
+    );
 
     // --- 2. Topology change (the wake path) ------------------------------
     let snapshot = fixture(50_000, 200_000, 20_250_101);
@@ -290,7 +313,11 @@ fn main() {
     let mut churn = GraphModel::new();
     churn.apply(
         &(0..50_025u64)
-            .map(|id| Delta::Node(NodeDelta::Added { id: NodeId::note(id) }))
+            .map(|id| {
+                Delta::Node(NodeDelta::Added {
+                    id: NodeId::note(id),
+                })
+            })
             .collect::<Vec<_>>(),
     );
     let next = Arc::new(churn.snapshot());
@@ -326,9 +353,15 @@ fn main() {
                 layout.step_into(&pool, &mut scratch);
                 steps += 1;
             }
-            assert!(layout.is_converged(), "the layout must freeze within budget");
+            assert!(
+                layout.is_converged(),
+                "the layout must freeze within budget"
+            );
             samples.push(started.elapsed().as_secs_f64() * 1_000.0);
-            print!("  {nodes} nodes: {steps} steps to freeze in {:.3} ms\r", samples.last().unwrap());
+            print!(
+                "  {nodes} nodes: {steps} steps to freeze in {:.3} ms\r",
+                samples.last().unwrap()
+            );
         }
         println!();
         converge_rows.push(summarise("converge", nodes, edges, samples));

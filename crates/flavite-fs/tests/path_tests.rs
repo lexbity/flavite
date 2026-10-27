@@ -31,18 +31,12 @@ fn has_non_normal_components_normal() {
 
 #[test]
 fn lexical_canonicalize_simple() {
-    assert_eq!(
-        lexical_canonicalize(Path::new("a/b/c")),
-        Path::new("a/b/c")
-    );
+    assert_eq!(lexical_canonicalize(Path::new("a/b/c")), Path::new("a/b/c"));
 }
 
 #[test]
 fn lexical_canonicalize_with_current_dir() {
-    assert_eq!(
-        lexical_canonicalize(Path::new("a/./b")),
-        Path::new("a/b")
-    );
+    assert_eq!(lexical_canonicalize(Path::new("a/./b")), Path::new("a/b"));
     assert_eq!(
         lexical_canonicalize(Path::new("./a/./b/.")),
         Path::new("a/b")
@@ -55,10 +49,7 @@ fn lexical_canonicalize_with_parent_dir() {
         lexical_canonicalize(Path::new("a/b/../c")),
         Path::new("a/c")
     );
-    assert_eq!(
-        lexical_canonicalize(Path::new("a/../b")),
-        Path::new("b")
-    );
+    assert_eq!(lexical_canonicalize(Path::new("a/../b")), Path::new("b"));
 }
 
 #[test]
@@ -69,10 +60,7 @@ fn lexical_canonicalize_multiple_parents() {
         Path::new("a/d")
     );
     // This pops beyond the start, resulting in just "a"
-    assert_eq!(
-        lexical_canonicalize(Path::new("../../a")),
-        Path::new("a")
-    );
+    assert_eq!(lexical_canonicalize(Path::new("../../a")), Path::new("a"));
 }
 
 #[test]
@@ -81,10 +69,7 @@ fn lexical_canonicalize_root() {
         lexical_canonicalize(Path::new("/a/b/../c")),
         Path::new("/a/c")
     );
-    assert_eq!(
-        lexical_canonicalize(Path::new("/")),
-        Path::new("/")
-    );
+    assert_eq!(lexical_canonicalize(Path::new("/")), Path::new("/"));
 }
 
 #[test]
@@ -97,8 +82,5 @@ fn lexical_canonicalize_complex() {
 
 #[test]
 fn lexical_canonicalize_empty() {
-    assert_eq!(
-        lexical_canonicalize(Path::new("")),
-        Path::new("")
-    );
+    assert_eq!(lexical_canonicalize(Path::new("")), Path::new(""));
 }

@@ -674,7 +674,10 @@ fn report(probe: &Probe, timings: &TimingsSnapshot) {
     println!("{}", report_header());
     println!(
         "{}",
-        probe.layout_frame_stats.snapshot().report_row("frame (layout)")
+        probe
+            .layout_frame_stats
+            .snapshot()
+            .report_row("frame (layout)")
     );
     println!(
         "{}",
@@ -781,19 +784,16 @@ fn build_geometry_loop(
         }
 
         let started = Instant::now();
-        let built = ProbeGeometry::from_snapshot(&frame.snapshot, &frame.positions, frame.generation);
+        let built =
+            ProbeGeometry::from_snapshot(&frame.snapshot, &frame.positions, frame.generation);
         last_finished = Some(Instant::now());
         last_built = frame.generation;
 
         match built {
             Ok(geometry) => {
                 let took = started.elapsed();
-                *slot
-                    .lock()
-                    .expect("the geometry slot is not poisoned") = Arc::new(geometry);
-                let mut stats = stats
-                    .lock()
-                    .expect("the geometry stats are not poisoned");
+                *slot.lock().expect("the geometry slot is not poisoned") = Arc::new(geometry);
+                let mut stats = stats.lock().expect("the geometry stats are not poisoned");
                 stats.builds += 1;
                 stats.total += took;
                 stats.max = stats.max.max(took);
@@ -803,7 +803,10 @@ fn build_geometry_loop(
                 // Counted as consumed so a fixture the renderer cannot
                 // build cannot spin the loop; the run carries on with the
                 // last geometry that did build.
-                eprintln!("geometry rebuild failed at generation {}: {error}", frame.generation);
+                eprintln!(
+                    "geometry rebuild failed at generation {}: {error}",
+                    frame.generation
+                );
             }
         }
     }

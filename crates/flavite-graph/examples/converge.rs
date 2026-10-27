@@ -18,9 +18,7 @@ fn note(id: u64) -> NodeId {
 fn build(nodes: usize, m: usize) -> flavite_graph::GraphSnapshot {
     let mut model = GraphModel::new();
     let mut deltas: Vec<Delta> = (0..nodes as u64)
-        .map(|i| {
-            Delta::Node(NodeDelta::Added { id: note(i) })
-        })
+        .map(|i| Delta::Node(NodeDelta::Added { id: note(i) }))
         .collect();
     // Preferential attachment, deterministic.
     let mut stubs: Vec<u64> = Vec::new();
@@ -107,8 +105,13 @@ fn main() {
                 let first = positions[0];
                 println!(
                     "    step {steps:>6}  extent {extent:>9.3}  closest {closest:>9.3e}  force {:>9.3e}  speed {:.4}  eff {:.3}  swing {:>9.3e}  mean {:>9.3e}  p0 [{:>8.4}, {:>8.4}]",
-                    s.max_force, s.global_speed, s.speed_efficiency,
-                    s.swinging_per_mass, s.mean_displacement, first[0], first[1],
+                    s.max_force,
+                    s.global_speed,
+                    s.speed_efficiency,
+                    s.swinging_per_mass,
+                    s.mean_displacement,
+                    first[0],
+                    first[1],
                 );
             }
             let done = s.frozen;

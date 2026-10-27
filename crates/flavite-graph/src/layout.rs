@@ -245,7 +245,13 @@ impl LayoutParams {
     #[must_use]
     pub fn sanitized(self) -> Self {
         let d = Self::default();
-        let positive = |v: f64, fallback: f64| if v.is_finite() && v > 0.0 { v } else { fallback };
+        let positive = |v: f64, fallback: f64| {
+            if v.is_finite() && v > 0.0 {
+                v
+            } else {
+                fallback
+            }
+        };
         Self {
             theta: positive(self.theta, d.theta).clamp(0.05, 1.5),
             repulsion: positive(self.repulsion, d.repulsion),
@@ -467,12 +473,20 @@ impl QuadTree {
             // send both bodies down one level. The parent's accumulation is
             // already final, so only the children accumulate again.
             let displaced = self.regions[index].body as usize;
-            let quadrant = Region::quadrant_of(cx, cy, positions[displaced][0], positions[displaced][1]);
+            let quadrant =
+                Region::quadrant_of(cx, cy, positions[displaced][0], positions[displaced][1]);
             let children = self.subdivide(index, cx, cy, half);
             self.regions[index].body = NO_BODY;
             let displaced_child = children[quadrant];
             let incoming = children[Region::quadrant_of(cx, cy, x, y)];
-            self.insert(displaced_child, displaced, positions, masses, depth + 1, max_depth);
+            self.insert(
+                displaced_child,
+                displaced,
+                positions,
+                masses,
+                depth + 1,
+                max_depth,
+            );
             self.insert(incoming, body, positions, masses, depth + 1, max_depth);
             return;
         }
@@ -500,14 +514,19 @@ impl QuadTree {
         let child_half = half * 0.5;
         let mut children = [NO_CHILD; 4];
         for quadrant in 0..4 {
-            let offset_x = if quadrant % 2 == 0 { -child_half } else { child_half };
-            let offset_y = if quadrant < 2 { -child_half } else { child_half };
+            let offset_x = if quadrant % 2 == 0 {
+                -child_half
+            } else {
+                child_half
+            };
+            let offset_y = if quadrant < 2 {
+                -child_half
+            } else {
+                child_half
+            };
             let child = self.regions.len() as u32;
-            self.regions.push(Region::empty(
-                cx + offset_x,
-                cy + offset_y,
-                child_half,
-            ));
+            self.regions
+                .push(Region::empty(cx + offset_x, cy + offset_y, child_half));
             children[quadrant] = child;
         }
         self.regions[index].children = children;
@@ -563,7 +582,15 @@ impl QuadTree {
                 return;
             }
             debug_assert_eq!(r.mass, masses[j]);
-            add_pair_repulsion(dx, dy, d_2, coefficient * masses[i] * masses[j], i, region, out);
+            add_pair_repulsion(
+                dx,
+                dy,
+                d_2,
+                coefficient * masses[i] * masses[j],
+                i,
+                region,
+                out,
+            );
             return;
         }
 
@@ -1163,22 +1190,21 @@ impl Layout {
 
         // Pass 2 — warm start the newcomers at their neighbours' centroid.
         if !cold_start && placed > 0 {
-            let neighbour_centroid =
-                |positions: &[[f64; 2]], index: usize| -> Option<[f64; 2]> {
-                    let start = snapshot.adj_offsets[index] as usize;
-                    let end = snapshot.adj_offsets[index + 1] as usize;
-                    let mut sum = [0.0_f64; 2];
-                    let mut count = 0_usize;
-                    for row in start..end {
-                        let neighbour = snapshot.adj_indices[row] as usize;
-                        if neighbour < node_count && !positions[neighbour][0].is_nan() {
-                            sum[0] += positions[neighbour][0];
-                            sum[1] += positions[neighbour][1];
-                            count += 1;
-                        }
+            let neighbour_centroid = |positions: &[[f64; 2]], index: usize| -> Option<[f64; 2]> {
+                let start = snapshot.adj_offsets[index] as usize;
+                let end = snapshot.adj_offsets[index + 1] as usize;
+                let mut sum = [0.0_f64; 2];
+                let mut count = 0_usize;
+                for row in start..end {
+                    let neighbour = snapshot.adj_indices[row] as usize;
+                    if neighbour < node_count && !positions[neighbour][0].is_nan() {
+                        sum[0] += positions[neighbour][0];
+                        sum[1] += positions[neighbour][1];
+                        count += 1;
                     }
-                    (count > 0).then(|| [sum[0] / count as f64, sum[1] / count as f64])
-                };
+                }
+                (count > 0).then(|| [sum[0] / count as f64, sum[1] / count as f64])
+            };
             let global_centroid = {
                 let mut sum = [0.0_f64; 2];
                 let mut count = 0_usize;
@@ -1256,7 +1282,10 @@ impl Layout {
 /// The same convention the B2 fixture generator uses, so a probe that hands
 /// the layout a disc it can see the layout start from a comparable map
 /// instead of a collapsed point.
-#[allow(clippy::cast_precision_loss, reason = "index -> f64 radius, exact enough")]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "index -> f64 radius, exact enough"
+)]
 fn cold_start_position(index: usize) -> [f64; 2] {
     let i = index as f64;
     let radius = COLD_START_SCALE * i.sqrt();
@@ -1472,7 +1501,10 @@ mod tests {
         assert!(stats.mean_displacement < params.convergence_epsilon);
         // The pair stays centred: gravity pulls the centroid to the origin.
         let centre = (layout.positions[0][0] + layout.positions[1][0]) * 0.5;
-        assert!(centre.abs() < 0.5, "centroid pulled to origin, got {centre}");
+        assert!(
+            centre.abs() < 0.5,
+            "centroid pulled to origin, got {centre}"
+        );
     }
 
     #[test]
@@ -1605,8 +1637,11 @@ mod tests {
         // A cold start must not begin from a single point: the first step
         // would then be nothing but the co-location nudge.
         let layout = Layout::from_snapshot(&path(100), LayoutParams::default());
-        let mut distances: Vec<f64> =
-            layout.positions().iter().map(|[x, y]| x.hypot(*y)).collect();
+        let mut distances: Vec<f64> = layout
+            .positions()
+            .iter()
+            .map(|[x, y]| x.hypot(*y))
+            .collect();
         distances.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(distances[0], 0.0, "node 0 starts at the origin");
         assert!(
@@ -1653,7 +1688,14 @@ mod tests {
             }),
         ]);
         let stats = layout.retarget(&model.snapshot());
-        assert_eq!(stats, RetargetStats { kept: 3, placed: 1, removed: 0 });
+        assert_eq!(
+            stats,
+            RetargetStats {
+                kept: 3,
+                placed: 1,
+                removed: 0
+            }
+        );
         assert!(stats.changed());
         // Survivors keep their exact positions — a topology change is not a
         // restart.
@@ -1783,7 +1825,11 @@ mod tests {
             assert!(all_finite(&layout), "finite at step {step}: {stats:?}");
             assert_eq!(stats.diverged, 0, "no limit projection at step {step}");
         }
-        let radii: Vec<f64> = layout.positions().iter().map(|[x, y]| x.hypot(*y)).collect();
+        let radii: Vec<f64> = layout
+            .positions()
+            .iter()
+            .map(|[x, y]| x.hypot(*y))
+            .collect();
         assert!(
             radii.iter().any(|r| *r > 0.5),
             "co-located bodies must separate, radii {radii:?}"
@@ -1808,13 +1854,17 @@ mod tests {
         assert!(all_finite(&layout));
         let distance = (layout.positions[0][0] - layout.positions[1][0])
             .hypot(layout.positions[0][1] - layout.positions[1][1]);
-        assert!(distance > 0.0, "the twins must separate, distance {distance}");
+        assert!(
+            distance > 0.0,
+            "the twins must separate, distance {distance}"
+        );
     }
 
     #[test]
     fn an_empty_layout_steps_and_freezes() {
         let pool = pool(1);
-        let mut layout = Layout::from_snapshot(&GraphModel::new().snapshot(), LayoutParams::default());
+        let mut layout =
+            Layout::from_snapshot(&GraphModel::new().snapshot(), LayoutParams::default());
         assert_eq!(layout.node_count(), 0);
         let step = layout.step(&pool);
         assert!(step.displacements.is_empty());
