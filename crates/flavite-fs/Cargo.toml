@@ -13,6 +13,21 @@ fault = []
 [dependencies]
 blake3 = { workspace = true }
 thiserror = { workspace = true }
+# Cross-platform directory detection for OS data/cache dirs (§1.2).
+directories = "6"
+# File locking primitives (advisory locks, §4.12).
+fs4 = "0.11"
+unicode-normalization = "0.1"
+# File system notification library for the watcher wrapper
+notify = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# notify crate is used by the watcher wrapper; also needed for dev tests.
+notify = { workspace = true }

@@ -25,6 +25,7 @@ image = { version = "0.25", default-features = false, features = [
 # flavite-syntax / flavite-fs path deps are added by PLAN-C slices as their
 # fuzz targets appear (scanner, frontmatter_patcher, rename_planner,
 # path_safety, parity).
+flavite-fs = { path = "../crates/flavite-fs" }
 
 [[bin]]
 name = "parser"
@@ -33,3 +34,7 @@ path = "fuzz_targets/parser.rs"
 [[bin]]
 name = "image_limits"
 path = "fuzz_targets/image_limits.rs"
+
+[[bin]]
+name = "path_safety"
+path = "fuzz_targets/path_safety.rs"

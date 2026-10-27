@@ -11,8 +11,12 @@
 //! both **ProcessCrash** (retain volatile state) and **PowerLoss** (revert to
 //! durable state) models.
 
+pub mod atomic;
 pub mod fs;
 pub mod mem;
+pub mod os;
+pub mod path;
+pub mod watch;
 
 #[cfg(feature = "fault")]
 pub mod fault;
@@ -20,8 +24,11 @@ pub mod fault;
 #[cfg(test)]
 mod proptests;
 
+pub use atomic::{atomic_write, cleanup_orphan_temps, list_orphan_temps, read_prior_bytes};
 pub use fs::{DirEntry, Fs, FsError, Metadata, Result, hash_file};
 pub use mem::MemFs;
+pub use os::OsFs;
+pub use path::{has_non_normal_components, lexical_canonicalize};
 
 #[cfg(feature = "fault")]
 pub use fault::{
