@@ -918,6 +918,9 @@ dependencies = [
 [[package]]
 name = "flavite-graph"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+]
 
 [[package]]
 name = "flavite-index"
@@ -930,6 +933,13 @@ version = "0.1.0"
 [[package]]
 name = "flavite-ui"
 version = "0.1.0"
+dependencies = [
+ "flavite-graph",
+ "futures",
+ "iced",
+ "naga",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "flavite-vault"
