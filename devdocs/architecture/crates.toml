@@ -42,12 +42,16 @@ flavite-ui = "iced application (§4.1)"
 # skeletons with no internal edges yet, except:
 #
 #   flavite-ui → flavite-graph   (PLAN-B slice B2)
+#   flavite-index → flavite-syntax (C7 - index uses syntax for attachment extensions)
 #
 # `flavite-ui::graph` consumes `flavite_graph::GraphSnapshot` as the
 # CPU-authoritative model behind an `Arc` (D15); `flavite-graph` stays
 # cpu-only, so the edge points one way only and `cargo xtask arch check`'s
 # layering rule still holds.
-active = [{ from = "flavite-ui", to = "flavite-graph" }]
+active = [
+    { from = "flavite-ui", to = "flavite-graph" },
+    { from = "flavite-index", to = "flavite-syntax" },
+]
 
 [layering]
 # Core-tier crates whose transitive closure of normal+build deps MUST NOT

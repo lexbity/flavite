@@ -1162,6 +1162,19 @@ dependencies = [
 [[package]]
 name = "flavite-index"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "crossbeam",
+ "flavite-syntax",
+ "proptest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tantivy",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+]
 
 [[package]]
 name = "flavite-syntax"
@@ -3811,6 +3824,7 @@ dependencies = [
  "unwrap-infallible",
  "uuid",
  "winapi",
+ "zstd",
 ]
 
 [[package]]
