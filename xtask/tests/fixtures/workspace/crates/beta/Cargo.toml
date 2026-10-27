@@ -1,0 +1,7 @@
+[package]
+name = "beta"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alpha = { path = "../alpha" }

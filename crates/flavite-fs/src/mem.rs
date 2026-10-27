@@ -583,7 +583,7 @@ impl Fs for MemFs {
         // Collect all ancestor paths that need to be created.
         let mut to_create = Vec::new();
         let mut current = path.to_path_buf();
-        while !state.vol_dirs.contains_key(&current) && current != *ROOT {
+        while !state.vol_dirs.contains_key(&current) && current.as_path() != Path::new(ROOT) {
             to_create.push(current.clone());
             match current.parent() {
                 Some(p) => current = p.to_path_buf(),

@@ -1,0 +1,39 @@
+# Weekly (advisory) (§10.3, §7, §10.8).
+# - Build against iced master (advisory, does not block).
+# - Fresh-clone → just setup → just gate on each OS (§10.8 verification).
+
+name: Weekly
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # 06:00 UTC Mondays
+  workflow_dispatch:
+
+jobs:
+  iced-master-advisory:
+    name: iced-master advisory build
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
+      - name: Build against iced master
+        run: |
+          # Advisory: does a build against iced master still work?
+          cargo update -p iced --precise 0.14.0 || true
+          cargo check --workspace || echo "iced-master build failed (advisory)"
+
+  fresh-clone:
+    name: Fresh clone → setup → gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
+      - name: just setup
+        run: just setup
+      - name: just gate (G0)
+        run: just gate

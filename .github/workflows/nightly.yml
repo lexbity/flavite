@@ -1,0 +1,61 @@
+# Nightly (not blocking) (§10.3).
+# Long fuzz campaigns (≥ 1 h/target, AC-20), corpus minimization, coverage
+# and benchmark trends.
+
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 2 * * *' # 02:00 UTC daily
+  workflow_dispatch:
+
+jobs:
+  long-fuzz:
+    name: Long fuzz (≥ 1 h/target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
+      - name: Setup
+        run: just setup
+      - name: Long fuzz campaigns
+        run: |
+          cd fuzz
+          for target in $(ls fuzz_targets/*.rs | xargs -n1 basename | sed 's/\.rs$//'); do
+            echo "=== long fuzz: $target (1 h) ==="
+            cargo +nightly fuzz run "$target" -- -max_total_time=3600 -rss_limit_mb=4096 || true
+          done
+
+  corpus-minimize:
+    name: Corpus minimization
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
+      - name: Setup
+        run: just setup
+      - name: cargo fuzz cmin
+        run: |
+          cd fuzz
+          for target in $(ls fuzz_targets/*.rs | xargs -n1 basename | sed 's/\.rs$//'); do
+            echo "=== cmin: $target ==="
+            cargo +nightly fuzz cmin "$target" || true
+          done
+
+  coverage-trend:
+    name: Coverage trend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
+      - name: Setup
+        run: just setup
+      - name: Measure coverage
+        run: |
+          cargo llvm-cov --workspace --all-features --lcov --output-path target/llvm-cov/lcov.info
+          just cov-check || true
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: target/llvm-cov/lcov.info

@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "Development tooling: arch graph generation, verification, query CLI (§10.2)"
 
+[lib]
+name = "xtask"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cargo-xtask"
 path = "src/main.rs"
@@ -15,3 +19,4 @@ anyhow = { workspace = true }
 walkdir = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = "0.8"

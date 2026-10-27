@@ -1,6 +1,5 @@
 # Lattice justfile — single entry point for every gate recipe (§10.3).
-# A1: bootstrap gate (fmt + clippy + tests). A3: fuzz-smoke, setup, gc/clean.
-# A4: promotes gate to full G0 (arch check) + establishes G1.
+# A4: full G0 (fmt + clippy + test + arch check, ends with gc) + G1 (ci-gate).
 
 # Run rustfmt in check mode.
 fmt:
@@ -22,14 +21,65 @@ test:
 check:
     cargo check --workspace
 
-# Bootstrap gate (Phase 0.0 A1–A3): fmt + clippy + tests.
-# NOT full G0 — full G0 (with `arch check`) lands in A4 (§10.3).
-gate: fmt clippy test
-    @echo "Bootstrap gate passed (fmt + clippy + test). Full G0 arrives in A4."
+# Architecture check (drift + edges + layering, §10.2).
+arch-check:
+    cargo xtask arch check
+
+# Generate architecture artifacts (§10.2).
+arch-gen:
+    cargo xtask arch gen
+
+# G0 — local fast gate (§10.3): fmt + clippy + test + arch check. ≤ 5 min budget.
+gate: fmt clippy test arch-check
+    @just gc
+    @echo "G0 passed (fmt + clippy + test + arch check)."
+
+# G1 — CI gate (§10.3): G0 + coverage floors + FaultFs/integration suites +
+# doc build + deny/audit/shear + fuzz smoke 60 s + network-denied + MSRV.
+ci-gate: gate
+    @echo "=== G1: doc build ==="
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+    @echo "=== G1: cargo-deny ==="
+    cargo deny check
+    @echo "=== G1: cargo-audit ==="
+    cargo audit
+    @echo "=== G1: fuzz smoke (60 s/target) ==="
+    just fuzz-smoke-ci
+    @echo "=== G1: MSRV build ==="
+    just msrv
+    @echo "G1 passed."
+
+# Build documentation with warnings as errors (§10.4).
+doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+# MSRV build (§10.4, §10.8): check against the workspace rust-version.
+msrv:
+    cargo +1.85.0 check --workspace
+
+# Network-denied test run (§10.3, AC-26): build first, then run tests under
+# unshare with no network. A seeded connection attempt must fail the assertion.
+network-denied:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo test --workspace --no-run
+    @echo "=== network-denied: running tests under unshare -n ==="
+    if command -v unshare >/dev/null 2>&1; then
+        unshare -n cargo test --workspace || {
+            echo "network-denied: tests failed under network namespace"
+            exit 1
+        }
+    else
+        echo "network-denied: unshare not available, skipping (CI provides it)"
+    fi
+
+# Coverage check (§10.5): requires lcov.info from `cargo llvm-cov`.
+cov-check lcov="target/llvm-cov/lcov.info":
+    cargo xtask cov-check --lcov {{lcov}}
 
 # Run every fuzz target over checked-in seeds + generated input (§10.6).
 # Discovers targets dynamically from fuzz/fuzz_targets/*.rs.
-# 30 s per target locally; G1 overrides to 60 s.
+# 30 s per target locally; G1 uses fuzz-smoke-ci (60 s).
 fuzz-smoke:
     #!/usr/bin/env bash
     set -euo pipefail

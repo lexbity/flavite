@@ -6,10 +6,10 @@
 //! # Crash models (§10.6.1)
 //!
 //! [`MemFs`] has separate volatile and durable state for both file bytes and
-//! directory entries. [`FaultFs`](fault::FaultFs) (behind the `fault` feature)
-//! wraps any [`Fs`] with scriptable fault injection at modeled operation
-//! boundaries, supporting both **ProcessCrash** (retain volatile state) and
-//! **PowerLoss** (revert to durable state) models.
+//! directory entries. `FaultFs` (behind the `fault` feature) wraps any [`Fs`]
+//! with scriptable fault injection at modeled operation boundaries, supporting
+//! both **ProcessCrash** (retain volatile state) and **PowerLoss** (revert to
+//! durable state) models.
 
 pub mod fs;
 pub mod mem;

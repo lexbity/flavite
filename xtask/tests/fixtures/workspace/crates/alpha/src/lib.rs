@@ -1,0 +1,1 @@
+//! Alpha crate (fixture).
