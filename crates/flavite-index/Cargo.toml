@@ -1,0 +1,9 @@
+[package]
+name = "flavite-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite, tantivy, resolver, query exec (§4.1)"
+
+[dependencies]

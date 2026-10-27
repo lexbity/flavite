@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 493607fc1d8c40caeb046c79ef179b68e0b2875791d0ceb7b6253fb1a7ebd1ff # shrinks to kind = PartialWriteThenError
+cc fe31176b71d412745deebd97c42897899cd0352e1c4a66e66d8497e74f224874 # shrinks to kind = PowerLoss, fsync_file = false, fsync_dir = true
+cc 9b888a8c9e41faae0b5f90aa344e67be2ad9a42bb7470042988bbaf5d6d1041d # shrinks to ops = [Write("/file1.md", [0]), Rename("/file1.md", "/file1.md")]
+cc 088be11ae46f653347a58006c2b18896239eadc150842b440b41e43a539ad7d3 # shrinks to script = FaultScript { faults: [PlannedFault { point: FaultPoint { method: "write_new", occurrence: 1, boundary: Before }, kind: Error }, PlannedFault { point: FaultPoint { method: "write_new", occurrence: 2, boundary: Progress }, kind: ExternalWrite }] }, num_ops = 2

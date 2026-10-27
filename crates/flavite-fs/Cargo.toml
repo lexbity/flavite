@@ -1,0 +1,18 @@
+[package]
+name = "flavite-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fs trait, atomic_write, watcher, path safety; FaultFs behind feature \"fault\" (§4.1)"
+
+[features]
+# FaultFs — scriptable fault injection over any Fs. A library, not #[cfg(test)] (§10.6).
+fault = []
+
+[dependencies]
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

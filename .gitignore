@@ -1,0 +1,13 @@
+devdocs/
+/target
+/fuzz/target
+/fuzz/artifacts
+*.profraw
+*.profdata
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

@@ -1,0 +1,19 @@
+# cargo-deny configuration (§10.4)
+# License allowlist only; copyleft requires a recorded decision — default reject.
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"

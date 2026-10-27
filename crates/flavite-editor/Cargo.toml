@@ -1,0 +1,9 @@
+[package]
+name = "flavite-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "iced widget over EditorModel (iced permitted here and in flavite-ui only) (§4.1)"
+
+[dependencies]

@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Development tooling: arch graph generation, verification, query CLI (§10.2)"
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]

@@ -1,0 +1,2 @@
+# MSRV matches workspace rust-version (§10.4, §10.8).
+msrv = "1.85.0"

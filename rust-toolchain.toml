@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned exact stable release (§10.8). MSRV is `rust-version` in the workspace,
+# enforced by the G1 MSRV job — not by this pinned toolchain.
+channel = "1.98.1"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
+profile = "minimal"

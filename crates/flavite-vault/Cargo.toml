@@ -1,0 +1,9 @@
+[package]
+name = "flavite-vault"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Session/BufferManager ownership + actors, journal, history, recovery (§4.1)"
+
+[dependencies]

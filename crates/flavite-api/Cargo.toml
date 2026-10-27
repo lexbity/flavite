@@ -1,0 +1,9 @@
+[package]
+name = "flavite-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Registry, typed commands/results, revisioned views, events, capabilities (§4.1)"
+
+[dependencies]

@@ -1,0 +1,9 @@
+[package]
+name = "flavite-buffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "EditorModel/ropey, undo tree, D7 state machine (§4.1)"
+
+[dependencies]
