@@ -63,7 +63,7 @@ network-denied:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo test --workspace --no-run
-    @echo "=== network-denied: running tests under unshare -n ==="
+    echo "=== network-denied: running tests under unshare -n ==="
     if command -v unshare >/dev/null 2>&1; then
         unshare -n cargo test --workspace || {
             echo "network-denied: tests failed under network namespace"
