@@ -77,6 +77,24 @@ jobs:
           path: target/s3-watcher-report.json
           if-no-files-found: error
 
+  # C2 (§9 S3-2): filesystem-semantics probe — rename-over, symlink identity,
+  # fsync, placeholder, advisory lock after kill -9, no-clobber rename. The
+  # self-check asserts the `Fs` trait contract's per-OS assumptions on Linux.
+  s3-fs-probe:
+    name: S3 fs probe (C2, Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
+      - name: Probe all scenarios with self-check
+        run: just spike-s3-fs --scenarios all --self-check --json target/s3-fs-report.json
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-fs-report-linux
+          path: target/s3-fs-report.json
+          if-no-files-found: error
+
   # Negative tests (AC-28/29): seed violations, assert failure.
   arch-edges-negative:
     name: arch-edges-negative (AC-28)

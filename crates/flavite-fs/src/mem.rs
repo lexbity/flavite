@@ -196,6 +196,66 @@ impl MemFs {
         }
     }
 
+    /// Resolve every *parent* component of `path`, symlink-expanding each
+    /// intermediate component. The final component is left untouched so callers
+    /// keep lstat (symlink itself) vs. follow (target) semantics.
+    ///
+    /// This closes the S3-2 opened-target gap (§4.16.2): opening
+    /// `/vault/alias/note.md` where `alias -> /vault` must land on the target's
+    /// inode, not report NotFound. Depth is capped at 32 to match
+    /// [`Fs::canonicalize`]'s bound, so reads and writes agree on how deep a
+    /// link chain is honoured.
+    fn resolve_parents(state: &MemState, path: &Path) -> PathBuf {
+        let components: Vec<Component> = path.components().collect();
+        let last = components.len().saturating_sub(1);
+        let mut cur = PathBuf::new();
+        let mut hops = 0usize;
+        for (i, component) in components.into_iter().enumerate() {
+            match component {
+                Component::RootDir => cur.push(ROOT),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    cur.pop();
+                }
+                Component::Normal(name) => {
+                    cur.push(name);
+                    if i == last {
+                        break; // final component: never expanded here
+                    }
+                    // Expand symlinks at this intermediate position.
+                    while hops < 32 {
+                        let target = match state.symlinks.get(&cur) {
+                            Some(t) => t.clone(),
+                            None => break,
+                        };
+                        hops += 1;
+                        let resolved = if target.is_absolute() {
+                            target
+                        } else {
+                            cur.parent().map(|p| p.join(&target)).unwrap_or(target)
+                        };
+                        // Lexically canonicalize the resolved path.
+                        let mut canon = PathBuf::new();
+                        for c in resolved.components() {
+                            match c {
+                                Component::RootDir => canon.push(ROOT),
+                                Component::CurDir => {}
+                                Component::ParentDir => {
+                                    canon.pop();
+                                }
+                                Component::Normal(n) => canon.push(n),
+                                Component::Prefix(_) => {}
+                            }
+                        }
+                        cur = canon;
+                    }
+                }
+                Component::Prefix(_) => {}
+            }
+        }
+        cur
+    }
+
     /// Add a path to its parent's volatile directory entries.
     fn add_dir_entry(state: &mut MemState, path: &Path) {
         if let Some(parent) = path.parent() {
@@ -438,49 +498,51 @@ impl Fs for MemFs {
 
     fn read_if_exists(&self, path: &Path) -> Result<Option<Vec<u8>>> {
         let state = self.lock();
-        match Self::path_kind(&state, path) {
+        let resolved = Self::resolve_parents(&state, path);
+        match Self::path_kind(&state, &resolved) {
             None => Ok(None),
             Some(PathKind::Dir) => Err(FsError::Io(format!(
                 "path is a directory: {}",
-                path.display()
+                resolved.display()
             ))),
             Some(PathKind::Symlink) => {
                 let target = state
                     .symlinks
-                    .get(path)
-                    .ok_or_else(|| FsError::NotFound(path.to_path_buf()))?
+                    .get(&resolved)
+                    .ok_or_else(|| FsError::NotFound(resolved.clone()))?
                     .clone();
                 drop(state);
                 self.read_if_exists(&target)
             }
-            Some(PathKind::File) => {
-                Ok(Some(state.vol_files.get(path).cloned().unwrap_or_default()))
-            }
+            Some(PathKind::File) => Ok(Some(
+                state.vol_files.get(&resolved).cloned().unwrap_or_default(),
+            )),
         }
     }
 
     fn read_capped(&self, path: &Path, max: u64) -> Result<Vec<u8>> {
         let state = self.lock();
-        match Self::path_kind(&state, path) {
-            None => Err(FsError::NotFound(path.to_path_buf())),
+        let resolved = Self::resolve_parents(&state, path);
+        match Self::path_kind(&state, &resolved) {
+            None => Err(FsError::NotFound(resolved)),
             Some(PathKind::Dir) => Err(FsError::Io(format!(
                 "path is a directory: {}",
-                path.display()
+                resolved.display()
             ))),
             Some(PathKind::Symlink) => {
                 let target = state
                     .symlinks
-                    .get(path)
-                    .ok_or_else(|| FsError::NotFound(path.to_path_buf()))?
+                    .get(&resolved)
+                    .ok_or_else(|| FsError::NotFound(resolved.clone()))?
                     .clone();
                 drop(state);
                 self.read_capped(&target, max)
             }
             Some(PathKind::File) => {
-                let bytes = state.vol_files.get(path).cloned().unwrap_or_default();
+                let bytes = state.vol_files.get(&resolved).cloned().unwrap_or_default();
                 if bytes.len() as u64 > max {
                     Err(FsError::ReadTooLarge {
-                        path: path.to_path_buf(),
+                        path: resolved,
                         max,
                     })
                 } else {
@@ -492,21 +554,22 @@ impl Fs for MemFs {
 
     fn metadata(&self, path: &Path) -> Result<Metadata> {
         let state = self.lock();
-        match Self::path_kind(&state, path) {
-            None => Err(FsError::NotFound(path.to_path_buf())),
+        let resolved = Self::resolve_parents(&state, path);
+        match Self::path_kind(&state, &resolved) {
+            None => Err(FsError::NotFound(resolved)),
             Some(kind) => {
                 let size = match kind {
                     PathKind::File => state
                         .vol_files
-                        .get(path)
+                        .get(&resolved)
                         .map(|b| b.len() as u64)
                         .unwrap_or(0),
                     PathKind::Dir => 0,
                     PathKind::Symlink => 0,
                 };
-                let native_id = *state.identities.get(path).unwrap_or(&0);
-                let mode = *state.modes.get(path).unwrap_or(&0o644);
-                let mtime_ns = *state.mtimes.get(path).unwrap_or(&0);
+                let native_id = *state.identities.get(&resolved).unwrap_or(&0);
+                let mode = *state.modes.get(&resolved).unwrap_or(&0o644);
+                let mtime_ns = *state.mtimes.get(&resolved).unwrap_or(&0);
                 Ok(Metadata {
                     size,
                     mtime_ns,
@@ -522,13 +585,14 @@ impl Fs for MemFs {
 
     fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>> {
         let state = self.lock();
-        if !Self::path_exists(&state, path) {
-            return Err(FsError::DirNotFound(path.to_path_buf()));
+        let resolved = Self::resolve_parents(&state, path);
+        if !Self::path_exists(&state, &resolved) {
+            return Err(FsError::DirNotFound(resolved));
         }
-        if !state.vol_dirs.contains_key(path) && !state.symlinks.contains_key(path) {
-            return Err(FsError::NotADirectory(path.to_path_buf()));
+        if !state.vol_dirs.contains_key(&resolved) && !state.symlinks.contains_key(&resolved) {
+            return Err(FsError::NotADirectory(resolved));
         }
-        let children = state.vol_dirs.get(path).cloned().unwrap_or_default();
+        let children = state.vol_dirs.get(&resolved).cloned().unwrap_or_default();
         let mut entries = Vec::new();
         for child in children {
             let name = child.file_name().map(OsString::from).unwrap_or_default();
@@ -546,7 +610,8 @@ impl Fs for MemFs {
 
     fn exists(&self, path: &Path) -> Result<bool> {
         let state = self.lock();
-        Ok(Self::path_exists(&state, path))
+        let resolved = Self::resolve_parents(&state, path);
+        Ok(Self::path_exists(&state, &resolved))
     }
 
     fn is_placeholder(&self, _path: &Path) -> Result<bool> {
@@ -1501,6 +1566,70 @@ mod tests {
         let fs = fs();
         fs.create_symlink(Path::new("/dangling.md"), Path::new("/nonexistent.md"));
         assert_eq!(fs.read_if_exists(Path::new("/dangling.md")).unwrap(), None);
+    }
+
+    // --- S3-2 opened-target hazard: intermediate symlink components (§4.16.2) ---
+
+    #[test]
+    fn read_through_symlinked_parent_resolves_to_target() {
+        let fs = fs();
+        fs.create_dir_all(Path::new("/vault")).unwrap();
+        write(&fs, "/vault/note.md", b"through alias");
+        fs.create_symlink(Path::new("/vault/alias"), Path::new("/vault"));
+        // The parent component `alias` is a symlink; the read must land on the
+        // target file, not report NotFound (S3-2 scenario 6).
+        assert_eq!(
+            fs.read_if_exists(Path::new("/vault/alias/note.md"))
+                .unwrap(),
+            Some(b"through alias".to_vec())
+        );
+        assert_eq!(
+            fs.read_capped(Path::new("/vault/alias/note.md"), 100)
+                .unwrap(),
+            b"through alias".to_vec()
+        );
+        assert!(fs.exists(Path::new("/vault/alias/note.md")).unwrap());
+    }
+
+    #[test]
+    fn metadata_through_symlinked_parent_reports_target_identity() {
+        let fs = fs();
+        fs.create_dir_all(Path::new("/vault")).unwrap();
+        write(&fs, "/vault/note.md", b"identity check");
+        fs.create_symlink(Path::new("/vault/alias"), Path::new("/vault"));
+        let direct = fs.metadata(Path::new("/vault/note.md")).unwrap();
+        let via_alias = fs.metadata(Path::new("/vault/alias/note.md")).unwrap();
+        // Identity is the (volume_id, native_id) pair, not the pathname: the
+        // same file reached through a symlinked parent must report the pair.
+        assert_eq!(via_alias.native_id, direct.native_id);
+        assert_eq!(via_alias.volume_id, direct.volume_id);
+        assert_eq!(via_alias.size, direct.size);
+        assert!(!via_alias.is_symlink);
+    }
+
+    #[test]
+    fn read_dir_through_symlinked_parent_resolves() {
+        let fs = fs();
+        fs.create_dir_all(Path::new("/vault/dir")).unwrap();
+        write(&fs, "/vault/dir/note.md", b"x");
+        fs.create_symlink(Path::new("/vault/alias"), Path::new("/vault"));
+        // `alias` is an intermediate component; listing through it must reach
+        // the target directory rather than fail on the link itself.
+        let entries = fs.read_dir(Path::new("/vault/alias/dir")).unwrap();
+        assert!(entries.iter().any(|e| e.name == "note.md"));
+    }
+
+    #[test]
+    fn read_through_relative_symlinked_parent_resolves() {
+        let fs = fs();
+        fs.create_dir_all(Path::new("/vault/sub")).unwrap();
+        write(&fs, "/vault/sub/note.md", b"relative alias");
+        // Relative target: resolved against the symlink's parent (/vault).
+        fs.create_symlink(Path::new("/vault/up"), Path::new("sub"));
+        assert_eq!(
+            fs.read_if_exists(Path::new("/vault/up/note.md")).unwrap(),
+            Some(b"relative alias".to_vec())
+        );
     }
 
     #[test]

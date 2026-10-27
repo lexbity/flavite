@@ -92,8 +92,7 @@ fn run() -> anyhow::Result<ExitCode> {
 
     let vault = xtask::spike_s3::TempVault::new("fs-probe");
     eprintln!("probe vault: {}", vault.path().display());
-    let summary =
-        spike_s3_fs::run_all(vault.path(), &selection, extra_fsync_dir.as_deref())?;
+    let summary = spike_s3_fs::run_all(vault.path(), &selection, extra_fsync_dir.as_deref())?;
     print!("{}", spike_s3_fs::render_summary(&summary));
 
     if markdown {

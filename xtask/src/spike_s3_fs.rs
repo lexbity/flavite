@@ -95,7 +95,7 @@ pub fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
 #[cfg(windows)]
 pub fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
+    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
     use windows_sys::Win32::System::IO::OVERLAPPED;
     let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
@@ -133,8 +133,8 @@ pub fn native_identity(path: &Path) -> Result<NativeIdentity> {
 pub fn native_identity(path: &Path) -> Result<NativeIdentity> {
     use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateFileW, GetFileInformationByHandle,
-        FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_READ_ATTRIBUTES, GetFileInformationByHandle,
     };
     const OPEN_EXISTING: u32 = 3;
     let wide = wide_path(path);
@@ -154,7 +154,9 @@ pub fn native_identity(path: &Path) -> Result<NativeIdentity> {
     }
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
-    unsafe { _ = close_handle(handle); }
+    unsafe {
+        _ = close_handle(handle);
+    }
     if ok == 0 {
         anyhow::bail!("GetFileInformationByHandle failed for {}", path.display());
     }
@@ -190,14 +192,15 @@ pub fn detect_placeholder(path: &Path) -> Result<bool> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Storage::FileSystem::{
-            GetFileAttributesW, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
-            FILE_ATTRIBUTE_RECALL_ON_OPEN,
+            FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN, GetFileAttributesW,
         };
         let attrs = unsafe { GetFileAttributesW(wide_path(path).as_ptr()) };
         if attrs == u32::MAX {
             anyhow::bail!("GetFileAttributesW failed for {}", path.display());
         }
-        return Ok(attrs & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN) != 0);
+        return Ok(
+            attrs & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN) != 0,
+        );
     }
     #[cfg(target_os = "macos")]
     {
@@ -495,8 +498,7 @@ pub fn run_rename_over(dir: &Path) -> Result<RenameOverReport> {
         let dst_md = std::fs::metadata(&dst).context("stat dst")?;
         let content_replaced = std::fs::read(&dst).context("read dst")? == b"new";
         let mode_preserved = dst_md.permissions().mode() & 0o777 == 0o640;
-        let mtime_preserved = dst_md.mtime() == src_mtime
-            && dst_md.mtime_nsec() == src_mtime_nsec;
+        let mtime_preserved = dst_md.mtime() == src_mtime && dst_md.mtime_nsec() == src_mtime_nsec;
         Ok(RenameOverReport {
             measured: true,
             os: std::env::consts::OS.to_string(),
@@ -515,10 +517,8 @@ pub fn run_rename_over(dir: &Path) -> Result<RenameOverReport> {
             mode_preserved: false,
             content_replaced: false,
             mtime_preserved: false,
-            note: Some(
-                "pending manual run: ReplaceFileW vs MoveFileExW comparison on Windows",
-            )
-            .map(str::to_string),
+            note: Some("pending manual run: ReplaceFileW vs MoveFileExW comparison on Windows")
+                .map(str::to_string),
         })
     }
 }
@@ -548,8 +548,8 @@ pub fn run_symlink(dir: &Path) -> Result<SymlinkReport> {
         std::fs::write(&tmp, b"Y").context("write tmp")?;
         std::fs::rename(&tmp, &resolved).context("rename over resolved target")?;
         let final_md = std::fs::symlink_metadata(&link).context("lstat final link")?;
-        let resolve_first_preserves_link =
-            final_md.file_type().is_symlink() && std::fs::read(&target).context("read target")? == b"Y";
+        let resolve_first_preserves_link = final_md.file_type().is_symlink()
+            && std::fs::read(&target).context("read target")? == b"Y";
         Ok(SymlinkReport {
             measured: true,
             hazard_demonstrated,
@@ -601,14 +601,14 @@ fn fsync_dir_once(path: &Path) -> std::result::Result<u64, String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FlushFileBuffers, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FlushFileBuffers,
     };
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     wide.push(0);
     let handle: HANDLE = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            1, // FILE_LIST_DIRECTORY
+            1,         // FILE_LIST_DIRECTORY
             1 | 2 | 4, // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
             std::ptr::null(),
             3, // OPEN_EXISTING
@@ -625,7 +625,9 @@ fn fsync_dir_once(path: &Path) -> std::result::Result<u64, String> {
     let t0 = Instant::now();
     let ok = unsafe { FlushFileBuffers(handle) };
     let elapsed = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
-    unsafe { CloseHandle(handle); }
+    unsafe {
+        CloseHandle(handle);
+    }
     if ok == 0 {
         return Err(format!(
             "FlushFileBuffers (dir) failed: {}",
@@ -715,6 +717,9 @@ pub fn hold_lock_child(path: &Path) -> Result<()> {
         .create(true)
         .read(true)
         .write(true)
+        // Lock file: create if missing, never truncate (another holder's
+        // content must survive our open).
+        .truncate(false)
         .open(path)
         .with_context(|| format!("open lock file: {}", path.display()))?;
     loop {
@@ -760,8 +765,9 @@ pub fn run_lock(dir: &Path) -> Result<LockReport> {
             confirmed_held: false,
             reacquired: false,
             reacquire_ms: None,
-            note: Some("child never reported the lock (timeout or acquisition failure)"
-                .to_string()),
+            note: Some(
+                "child never reported the lock (timeout or acquisition failure)".to_string(),
+            ),
         });
     }
     let file = std::fs::OpenOptions::new()
@@ -844,8 +850,10 @@ pub fn run_identity(dir: &Path) -> Result<IdentityReport> {
             alias_matches: false,
             distinct_differs: false,
             opened_target_matches: false,
-            note: Some("pending manual run: GetFileInformationByHandle volume/file-index comparison"
-                .to_string()),
+            note: Some(
+                "pending manual run: GetFileInformationByHandle volume/file-index comparison"
+                    .to_string(),
+            ),
         })
     }
 }
@@ -1084,9 +1092,7 @@ pub fn self_check_fsync(report: &FsyncReport) -> Result<()> {
     // On Linux, directory fsync must be supported somewhere (tmpfs and disk
     // filesystems both honor it); an unsupported dir fsync there is a
     // regression in the measurement path, not platform evidence.
-    if cfg!(target_os = "linux")
-        && !report.locations.iter().any(|l| l.dir_fsync_supported)
-    {
+    if cfg!(target_os = "linux") && !report.locations.iter().any(|l| l.dir_fsync_supported) {
         anyhow::bail!("fsync: no Linux location supported directory fsync");
     }
     Ok(())
@@ -1186,10 +1192,7 @@ pub fn self_check(summary: &RunSummary) -> Vec<String> {
 /// Render a compact human-readable summary (bin stdout).
 #[must_use]
 pub fn render_summary(summary: &RunSummary) -> String {
-    let mut out = format!(
-        "s3_fs_probe: os={} arch={}\n",
-        summary.os, summary.arch
-    );
+    let mut out = format!("s3_fs_probe: os={} arch={}\n", summary.os, summary.arch);
     for named in &summary.scenarios {
         out.push_str(&format!("scenario {}: ", named.name));
         match &named.report {
@@ -1216,7 +1219,10 @@ pub fn render_summary(summary: &RunSummary) -> String {
                         let dir = if l.dir_fsync_supported {
                             format!("{}us p95={}", l.dir_fsync_us.median, l.dir_fsync_us.p95)
                         } else {
-                            format!("unsupported ({})", l.dir_fsync_note.as_deref().unwrap_or("?"))
+                            format!(
+                                "unsupported ({})",
+                                l.dir_fsync_note.as_deref().unwrap_or("?")
+                            )
                         };
                         format!(
                             "{}[{}] file {}us p95={} dir {}",
@@ -1276,7 +1282,10 @@ impl RunSummary {
                     out.push_str("| metric | value |\n| --- | --- |\n");
                     out.push_str(&format!("| measured | {} |\n", r.measured));
                     out.push_str(&format!("| mode preserved | {} |\n", r.mode_preserved));
-                    out.push_str(&format!("| content replaced (inode swap) | {} |\n", r.content_replaced));
+                    out.push_str(&format!(
+                        "| content replaced (inode swap) | {} |\n",
+                        r.content_replaced
+                    ));
                     out.push_str(&format!("| mtime preserved | {} |\n", r.mtime_preserved));
                     if let Some(note) = &r.note {
                         out.push_str(&format!("| note | {note} |\n"));
@@ -1338,12 +1347,12 @@ impl RunSummary {
                     out.push_str("### Scenario 5 — advisory lock after kill -9 (§4.12)\n\n");
                     out.push_str("| metric | value |\n| --- | --- |\n");
                     out.push_str(&format!("| child held lock | {} |\n", r.child_held));
-                    out.push_str(&format!("| parent confirmed held | {} |\n", r.confirmed_held));
-                    out.push_str(&format!("| reacquired after kill | {} |\n", r.reacquired));
                     out.push_str(&format!(
-                        "| reacquire time (ms) | {:?} |\n",
-                        r.reacquire_ms
+                        "| parent confirmed held | {} |\n",
+                        r.confirmed_held
                     ));
+                    out.push_str(&format!("| reacquired after kill | {} |\n", r.reacquired));
+                    out.push_str(&format!("| reacquire time (ms) | {:?} |\n", r.reacquire_ms));
                     if let Some(note) = &r.note {
                         out.push_str(&format!("| note | {note} |\n"));
                     }
@@ -1353,8 +1362,14 @@ impl RunSummary {
                     out.push_str("### Scenario 6 — native identity / same-root aliases / opened targets (§4.16.2/§4.13)\n\n");
                     out.push_str("| metric | value |\n| --- | --- |\n");
                     out.push_str(&format!("| measured | {} |\n", r.measured));
-                    out.push_str(&format!("| alias has same identity as root | {} |\n", r.alias_matches));
-                    out.push_str(&format!("| distinct file differs | {} |\n", r.distinct_differs));
+                    out.push_str(&format!(
+                        "| alias has same identity as root | {} |\n",
+                        r.alias_matches
+                    ));
+                    out.push_str(&format!(
+                        "| distinct file differs | {} |\n",
+                        r.distinct_differs
+                    ));
                     out.push_str(&format!(
                         "| note via symlinked parent resolves to target identity | {} |\n",
                         r.opened_target_matches
@@ -1365,12 +1380,23 @@ impl RunSummary {
                     out.push('\n');
                 }
                 ScenarioReport::NoClobber(r) => {
-                    out.push_str("### Scenario 7 — no-clobber rename (`rename_no_replace` contract)\n\n");
+                    out.push_str(
+                        "### Scenario 7 — no-clobber rename (`rename_no_replace` contract)\n\n",
+                    );
                     out.push_str("| metric | value |\n| --- | --- |\n");
                     out.push_str(&format!("| measured | {} |\n", r.measured));
-                    out.push_str(&format!("| plain `rename(2)` clobbers existing destination | {} |\n", r.plain_rename_clobbers));
-                    out.push_str(&format!("| no-clobber primitive succeeds into missing destination | {} |\n", r.noreplace_succeeds_when_missing));
-                    out.push_str(&format!("| no-clobber primitive fails `EEXIST` over existing destination | {} |\n", r.noreplace_fails_when_present));
+                    out.push_str(&format!(
+                        "| plain `rename(2)` clobbers existing destination | {} |\n",
+                        r.plain_rename_clobbers
+                    ));
+                    out.push_str(&format!(
+                        "| no-clobber primitive succeeds into missing destination | {} |\n",
+                        r.noreplace_succeeds_when_missing
+                    ));
+                    out.push_str(&format!(
+                        "| no-clobber primitive fails `EEXIST` over existing destination | {} |\n",
+                        r.noreplace_fails_when_present
+                    ));
                     if let Some(note) = &r.note {
                         out.push_str(&format!("| note | {note} |\n"));
                     }
@@ -1394,7 +1420,15 @@ mod tests {
     #[test]
     fn parse_selection_all_and_subsets() {
         let all = parse_selection("all").expect("all parses");
-        assert!(all.rename_over && all.symlink && all.fsync && all.placeholder && all.lock && all.identity && all.no_clobber);
+        assert!(
+            all.rename_over
+                && all.symlink
+                && all.fsync
+                && all.placeholder
+                && all.lock
+                && all.identity
+                && all.no_clobber
+        );
         let subset = parse_selection("1,3,5,7").expect("subset parses");
         assert!(subset.rename_over);
         assert!(!subset.symlink);
