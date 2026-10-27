@@ -34,6 +34,13 @@ arch-gen:
 spike-s3 *args:
     cargo run -p xtask --bin s3_watcher_probe -- {{args}}
 
+# S3 filesystem-semantics probe (PLAN-C C2, §9 S3-2): rename/symlink/fsync/
+# placeholder/advisory-lock/no-clobber evidence feeding the `Fs` trait contract.
+# Scenario 5 (advisory lock after kill -9) is proven by spawning the probe
+# binary, not by `cargo test`.
+spike-s3-fs *args:
+    cargo run -p xtask --bin s3_fs_probe -- {{args}}
+
 # G0 — local fast gate (§10.3): fmt + clippy + test + arch check. ≤ 5 min budget.
 gate: fmt clippy test arch-check
     @just gc
