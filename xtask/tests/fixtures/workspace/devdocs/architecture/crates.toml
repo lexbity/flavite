@@ -1,0 +1,22 @@
+# Fixture crates.toml for integration tests.
+
+[tiers]
+tier1 = ["alpha", "beta", "gamma"]
+tier2 = []
+tier3 = []
+
+[responsibilities]
+alpha = "Alpha fixture crate"
+beta = "Beta fixture crate (depends on alpha)"
+gamma = "Gamma fixture crate"
+
+[edges]
+active = [{ from = "beta", to = "alpha" }]
+
+[layering]
+core_tier = ["alpha", "beta", "gamma"]
+forbidden = ["iced", "winit"]
+ui_crates = []
+
+[first_party_externals]
+names = ["iced", "winit"]

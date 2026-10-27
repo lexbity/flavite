@@ -1,0 +1,25 @@
+# Coverage floors (§10.5).
+# Consumed by `cargo xtask cov-check` and rendered into DEPENDENCIES.md.
+# Floors are enforced on Linux (G1); macOS/Windows report but do not gate.
+
+[floors]
+# Tier → minimum line coverage percentage.
+tier1 = 90.0
+tier2 = 80.0
+# Tier 3 is measured and reported, not gating.
+tier3 = 0.0
+
+[crates]
+# Crate → tier mapping. A crate with zero executable lines reports N/A
+# and is inactive for floors; the first executable implementation
+# activates its floor in the same slice (§10.5).
+flavite-fs = "tier1"
+flavite-syntax = "tier1"
+flavite-buffer = "tier1"
+flavite-vault = "tier1"
+flavite-index = "tier1"
+flavite-api = "tier2"
+flavite-graph = "tier2"
+flavite-cli = "tier3"
+flavite-editor = "tier3"
+flavite-ui = "tier3"
