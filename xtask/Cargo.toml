@@ -46,6 +46,13 @@ cosmic-text = "0.15"
 # S3 watcher-truth probe (PLAN-C C1): the same crate and major the production
 # watcher wrapper (flavite-fs `watch.rs`, slice C5) will use (§2, D5).
 notify = { workspace = true }
+# S4 search probe (PLAN-C C3): the same tantivy major the production index
+# adapter (C7 `tantivy.rs`) will use (§2, D12).
+tantivy = { workspace = true }
+# S4 search probe (PLAN-C C3): the diagnostic SQLite mirror (§4.14) that the
+# checkpoint-publication scenario crashes around. `bundled` keeps the probe
+# self-contained; WAL concurrency itself is C4's job.
+rusqlite = { workspace = true, features = ["bundled"] }
 
 [target."cfg(unix)".dependencies]
 libc = "0.2"

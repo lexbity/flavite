@@ -41,6 +41,13 @@ spike-s3 *args:
 spike-s3-fs *args:
     cargo run -p xtask --bin s3_fs_probe -- {{args}}
 
+# S4 search probe (PLAN-C C3, §9 S4): CJK bigram-tokenizer quality vs a plain
+# pipeline, deferred commits under 1 s autosave load, `committed_generation`
+# replay after a crash, and atomic checkpoint publication (D12 go/no-go on
+# tantivy vs FTS5). CI re-runs the scaled-down (2k-note) self-check on Linux.
+spike-s4-search *args:
+    cargo run -p xtask --bin s4_search_probe -- {{args}}
+
 # G0 — local fast gate (§10.3): fmt + clippy + test + arch check. ≤ 5 min budget.
 gate: fmt clippy test arch-check
     @just gc
