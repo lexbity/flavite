@@ -42,16 +42,16 @@ pub fn parse_lcov(lcov_content: &str) -> HashMap<String, CrateCoverage> {
     for line in lcov_content.lines() {
         if let Some(path) = line.strip_prefix("SF:") {
             // Flush previous file.
-            if let Some(file) = current_file.take() {
-                if let Some(crate_name) = file_to_crate(&file) {
-                    let entry = crates.entry(crate_name).or_insert(CrateCoverage {
-                        lines_found: 0,
-                        lines_hit: 0,
-                        pct: 0.0,
-                    });
-                    entry.lines_found += lines_found;
-                    entry.lines_hit += lines_hit;
-                }
+            if let Some(file) = current_file.take()
+                && let Some(crate_name) = file_to_crate(&file)
+            {
+                let entry = crates.entry(crate_name).or_insert(CrateCoverage {
+                    lines_found: 0,
+                    lines_hit: 0,
+                    pct: 0.0,
+                });
+                entry.lines_found += lines_found;
+                entry.lines_hit += lines_hit;
             }
             current_file = Some(path.to_string());
             lines_found = 0;
@@ -66,16 +66,16 @@ pub fn parse_lcov(lcov_content: &str) -> HashMap<String, CrateCoverage> {
                 }
             }
         } else if line == "end_of_record" {
-            if let Some(file) = current_file.take() {
-                if let Some(crate_name) = file_to_crate(&file) {
-                    let entry = crates.entry(crate_name).or_insert(CrateCoverage {
-                        lines_found: 0,
-                        lines_hit: 0,
-                        pct: 0.0,
-                    });
-                    entry.lines_found += lines_found;
-                    entry.lines_hit += lines_hit;
-                }
+            if let Some(file) = current_file.take()
+                && let Some(crate_name) = file_to_crate(&file)
+            {
+                let entry = crates.entry(crate_name).or_insert(CrateCoverage {
+                    lines_found: 0,
+                    lines_hit: 0,
+                    pct: 0.0,
+                });
+                entry.lines_found += lines_found;
+                entry.lines_hit += lines_hit;
             }
             lines_found = 0;
             lines_hit = 0;
@@ -83,16 +83,16 @@ pub fn parse_lcov(lcov_content: &str) -> HashMap<String, CrateCoverage> {
     }
 
     // Flush last file if no end_of_record.
-    if let Some(file) = current_file {
-        if let Some(crate_name) = file_to_crate(&file) {
-            let entry = crates.entry(crate_name).or_insert(CrateCoverage {
-                lines_found: 0,
-                lines_hit: 0,
-                pct: 0.0,
-            });
-            entry.lines_found += lines_found;
-            entry.lines_hit += lines_hit;
-        }
+    if let Some(file) = current_file
+        && let Some(crate_name) = file_to_crate(&file)
+    {
+        let entry = crates.entry(crate_name).or_insert(CrateCoverage {
+            lines_found: 0,
+            lines_hit: 0,
+            pct: 0.0,
+        });
+        entry.lines_found += lines_found;
+        entry.lines_hit += lines_hit;
     }
 
     // Compute percentages.

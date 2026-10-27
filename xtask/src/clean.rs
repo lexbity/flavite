@@ -91,14 +91,14 @@ pub fn verify_in_root(root: &Path, path: &Path) -> Result<()> {
         return Ok(());
     }
     // If the path doesn't exist yet, check its parent.
-    if !path.exists() {
-        if let Some(parent) = path.parent() {
-            let canon_parent = parent
-                .canonicalize()
-                .context("failed to canonicalize parent")?;
-            if canon_parent.starts_with(&canon_root) {
-                return Ok(());
-            }
+    if !path.exists()
+        && let Some(parent) = path.parent()
+    {
+        let canon_parent = parent
+            .canonicalize()
+            .context("failed to canonicalize parent")?;
+        if canon_parent.starts_with(&canon_root) {
+            return Ok(());
         }
     }
     anyhow::bail!(

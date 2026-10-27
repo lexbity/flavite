@@ -5,6 +5,10 @@
       "kind": "external"
     },
     {
+      "id": "cosmic-text",
+      "kind": "external"
+    },
+    {
       "id": "flavite-api",
       "kind": "workspace"
     },
@@ -57,6 +61,11 @@
     {
       "from": "flavite-fs",
       "to": "blake3",
+      "kind": "normal"
+    },
+    {
+      "from": "xtask",
+      "to": "cosmic-text",
       "kind": "normal"
     },
     {

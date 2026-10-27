@@ -1,5 +1,6 @@
-devdocs/
+/devdocs
 /target
+/fuzz/corpus
 /fuzz/target
 /fuzz/artifacts
 *.profraw

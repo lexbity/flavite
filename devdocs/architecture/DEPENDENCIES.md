@@ -68,11 +68,13 @@ No dependencies.
 
 Normal/build:
 
+- `cosmic-text` (normal)
 - `iced` (normal)
 
 ## First-party external dependencies
 
 - `blake3` ← flavite-fs
+- `cosmic-text` ← xtask
 - `iced` ← xtask
 
 ## Layering rules (§10.2)

@@ -50,7 +50,7 @@ fn sample_text_non_empty() {
 #[test]
 fn scale_factors_in_range() {
     for &scale in SCALE_FACTORS {
-        assert!(scale >= 1.0 && scale <= 2.0, "Scale {} out of range", scale);
+        assert!((1.0..=2.0).contains(&scale), "Scale {} out of range", scale);
     }
 }
 
@@ -93,9 +93,6 @@ fn results_have_valid_scales() {
 /// Test that the error bound is positive and reasonable.
 #[test]
 fn error_bound_is_reasonable() {
-    assert!(MAX_ROUNDTRIP_ERROR > 0.0, "Error bound must be positive");
-    assert!(
-        MAX_ROUNDTRIP_ERROR <= 1.0,
-        "Error bound of 0.5 px is the accepted spec value"
-    );
+    const { assert!(MAX_ROUNDTRIP_ERROR > 0.0) };
+    const { assert!(MAX_ROUNDTRIP_ERROR <= 1.0) };
 }
