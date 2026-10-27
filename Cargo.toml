@@ -29,6 +29,10 @@ nucleo = "0.5"
 image = "0.25"
 tracing = "0.1"
 crossbeam = "0.8"
+# Layout worker (PLAN-B B3, D15): rayon for the Barnes-Hut force pass,
+# arc-swap for the lock-free position double buffer.
+rayon = "1"
+arc-swap = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Error handling (§10.4 convention: thiserror for libraries, anyhow for binaries)
