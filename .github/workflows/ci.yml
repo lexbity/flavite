@@ -95,6 +95,24 @@ jobs:
           path: target/s3-fs-report.json
           if-no-files-found: error
 
+  # C3 (§9 S4): search probe — CJK bigram quality vs plain, deferred commits
+  # under autosave, committed_generation replay, atomic checkpoint publication.
+  # CI re-runs the scaled-down (2k-note) self-check; the full probe is 20k.
+  s4-search-probe:
+    name: S4 search probe (C3, Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
+      - name: Probe all scenarios (2k notes) with self-check
+        run: just spike-s4-search --scenarios all --notes 2000 --self-check --json target/s4-search-report.json
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: s4-search-report-linux
+          path: target/s4-search-report.json
+          if-no-files-found: error
+
   # Negative tests (AC-28/29): seed violations, assert failure.
   arch-edges-negative:
     name: arch-edges-negative (AC-28)

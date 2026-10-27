@@ -170,10 +170,10 @@ impl MemFs {
         if path == Path::new(ROOT) {
             return true;
         }
-        if let Some(parent) = path.parent() {
-            if let Some(children) = state.vol_dirs.get(parent) {
-                return children.contains(path);
-            }
+        if let Some(parent) = path.parent()
+            && let Some(children) = state.vol_dirs.get(parent)
+        {
+            return children.contains(path);
         }
         false
     }
@@ -269,10 +269,10 @@ impl MemFs {
 
     /// Remove a path from its parent's volatile directory entries.
     fn remove_dir_entry(state: &mut MemState, path: &Path) {
-        if let Some(parent) = path.parent() {
-            if let Some(children) = state.vol_dirs.get_mut(parent) {
-                children.remove(path);
-            }
+        if let Some(parent) = path.parent()
+            && let Some(children) = state.vol_dirs.get_mut(parent)
+        {
+            children.remove(path);
         }
     }
 
@@ -625,10 +625,11 @@ impl Fs for MemFs {
             return Err(FsError::AlreadyExists(path.to_path_buf()));
         }
         // Ensure parent directory exists.
-        if let Some(parent) = path.parent() {
-            if !state.vol_dirs.contains_key(parent) && parent != Path::new(ROOT) {
-                return Err(FsError::NotFound(parent.to_path_buf()));
-            }
+        if let Some(parent) = path.parent()
+            && !state.vol_dirs.contains_key(parent)
+            && parent != Path::new(ROOT)
+        {
+            return Err(FsError::NotFound(parent.to_path_buf()));
         }
         state.vol_files.insert(path.to_path_buf(), bytes.to_vec());
         Self::add_dir_entry(&mut state, path);

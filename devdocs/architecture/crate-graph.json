@@ -53,6 +53,18 @@
       "kind": "external"
     },
     {
+      "id": "notify",
+      "kind": "external"
+    },
+    {
+      "id": "rusqlite",
+      "kind": "external"
+    },
+    {
+      "id": "tantivy",
+      "kind": "external"
+    },
+    {
       "id": "xtask",
       "kind": "workspace"
     }
@@ -71,6 +83,21 @@
     {
       "from": "xtask",
       "to": "iced",
+      "kind": "normal"
+    },
+    {
+      "from": "xtask",
+      "to": "notify",
+      "kind": "normal"
+    },
+    {
+      "from": "xtask",
+      "to": "rusqlite",
+      "kind": "normal"
+    },
+    {
+      "from": "xtask",
+      "to": "tantivy",
       "kind": "normal"
     }
   ]

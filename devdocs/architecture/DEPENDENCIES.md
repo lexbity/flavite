@@ -70,12 +70,18 @@ Normal/build:
 
 - `cosmic-text` (normal)
 - `iced` (normal)
+- `notify` (normal)
+- `rusqlite` (normal)
+- `tantivy` (normal)
 
 ## First-party external dependencies
 
 - `blake3` ← flavite-fs
 - `cosmic-text` ← xtask
 - `iced` ← xtask
+- `notify` ← xtask
+- `rusqlite` ← xtask
+- `tantivy` ← xtask
 
 ## Layering rules (§10.2)
 
