@@ -6,11 +6,24 @@ license.workspace = true
 repository.workspace = true
 description = "Layout, spatial — CPU only (§4.1)"
 
-# No internal dependencies at B1: rayon lands in B3 (LayoutWorker), the
-# flavite-index edge lands in B5 (GraphFeed) — PLAN-B §5. The crate MUST
-# stay CPU-only: no iced/winit/wgpu/cosmic-text, ever (§4.1, enforced
-# transitively by `cargo xtask arch check`).
+# No internal dependencies: the flavite-index edge lands in B5 (GraphFeed) —
+# PLAN-B §5. The crate MUST stay CPU-only — no UI framework, no GPU stack, no
+# text shaper, ever (§4.1, enforced transitively by `cargo xtask arch check`).
+# `rayon` (LayoutWorker force pass) and `arc-swap` (lock-free PositionBuffer)
+# are third-party CPU dependencies added in B3.
 [dependencies]
+arc-swap = { workspace = true }
+crossbeam = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+
+# Zero-dependency benchmark harness (PLAN-B §5: `cargo bench -p
+# flavite-graph`), with warmup + samples + a p50/p95/p99 table. See
+# `benches/layout.rs` for the rationale (no criterion: the measurement is a
+# percentile table over a fixed fixture, not a comparison of means).
+[[bench]]
+name = "layout"
+harness = false
