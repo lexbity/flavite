@@ -1,0 +1,8 @@
+[floors]
+tier1 = 90.0
+tier2 = 80.0
+tier3 = 0.0
+
+[crates]
+alpha = "tier1"
+beta = "tier1"

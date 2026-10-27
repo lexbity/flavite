@@ -1,0 +1,89 @@
+# Hand-maintained architecture configuration (§10.2).
+# This file is the SOURCE for `cargo xtask arch check`'s edge and layering
+# checks. The generated artifacts (crate-graph.json, DEPENDENCIES.md) are
+# derived from `cargo metadata` + this file. Do not hand-edit the generated
+# files — update this file and run `cargo xtask arch gen`.
+
+[tiers]
+# Tier 1 — durability-critical (§10.5: ≥ 90% line coverage floor).
+tier1 = [
+    "flavite-fs",
+    "flavite-syntax",
+    "flavite-buffer",
+    "flavite-vault",
+    "flavite-index",
+]
+# Tier 2 (§10.5: ≥ 80% line coverage floor).
+tier2 = ["flavite-api", "flavite-graph"]
+# Tier 3 — measured, not gating until Phase 6 (§10.5).
+tier3 = ["flavite-cli", "flavite-editor", "flavite-ui"]
+
+[responsibilities]
+flavite-fs = "Fs trait, atomic_write, watcher, path safety; FaultFs behind feature \"fault\" (§4.1)"
+flavite-syntax = "Scanner, frontmatter patcher, pulldown glue — pure, IO-free (§4.1)"
+flavite-index = "SQLite, tantivy, resolver, query exec (§4.1)"
+flavite-buffer = "EditorModel/ropey, undo tree, D7 state machine (§4.1)"
+flavite-vault = "Session/BufferManager ownership + actors, journal, history, recovery (§4.1)"
+flavite-api = "Registry, typed commands/results, revisioned views, events, capabilities (§4.1)"
+flavite-graph = "Layout, spatial — CPU only (§4.1)"
+flavite-cli = "Headless CLI; consumes flavite-api (D16 dogfood) (§4.1)"
+flavite-editor = "iced widget over EditorModel (iced permitted here and in flavite-ui only) (§4.1)"
+flavite-ui = "iced application (§4.1)"
+
+[edges]
+# Active internal edges for this checkout. A4 initially records the
+# implemented edges, not future dependencies on empty crates (§10.2).
+# Each edge-adding slice updates this list AND regenerates artifacts
+# (`cargo xtask arch gen`) in the same PR — an architecture change is a
+# spec change.
+#
+# Current state (B2): flavite-fs has no internal deps. xtask depends on
+# workspace crates but is tooling (not gated). All other crates are empty
+# skeletons with no internal edges yet, except:
+#
+#   flavite-ui → flavite-graph   (PLAN-B slice B2)
+#
+# `flavite-ui::graph` consumes `flavite_graph::GraphSnapshot` as the
+# CPU-authoritative model behind an `Arc` (D15); `flavite-graph` stays
+# cpu-only, so the edge points one way only and `cargo xtask arch check`'s
+# layering rule still holds.
+active = [{ from = "flavite-ui", to = "flavite-graph" }]
+
+[layering]
+# Core-tier crates whose transitive closure of normal+build deps MUST NOT
+# contain any forbidden crate (§10.2 check 3).
+core_tier = [
+    "flavite-fs",
+    "flavite-syntax",
+    "flavite-index",
+    "flavite-buffer",
+    "flavite-vault",
+    "flavite-api",
+    "flavite-graph",
+    "flavite-cli",
+]
+# Forbidden in core-tier transitive closure (normal+build deps only;
+# dev-deps are exempt but listed in the artifact).
+forbidden = ["iced", "iced_*", "winit", "wgpu", "cosmic-text"]
+# UI crates — the only crates that MAY depend on forbidden crates.
+ui_crates = ["flavite-editor", "flavite-ui"]
+
+[first_party_externals]
+# External deps tracked as nodes in the crate graph (§10.2).
+names = [
+    "iced",
+    "winit",
+    "wgpu",
+    "cosmic-text",
+    "ropey",
+    "rusqlite",
+    "tantivy",
+    "pulldown-cmark",
+    "notify",
+    "tree-sitter",
+    "blake3",
+    "zstd",
+    "nucleo",
+    "image",
+    "tracing",
+]

@@ -1,0 +1,73 @@
+{
+  "nodes": [
+    {
+      "id": "blake3",
+      "kind": "external"
+    },
+    {
+      "id": "flavite-api",
+      "kind": "workspace"
+    },
+    {
+      "id": "flavite-buffer",
+      "kind": "workspace"
+    },
+    {
+      "id": "flavite-cli",
+      "kind": "workspace"
+    },
+    {
+      "id": "flavite-editor",
+      "kind": "workspace"
+    },
+    {
+      "id": "flavite-fs",
+      "kind": "workspace"
+    },
+    {
+      "id": "flavite-graph",
+      "kind": "workspace"
+    },
+    {
+      "id": "flavite-index",
+      "kind": "workspace"
+    },
+    {
+      "id": "flavite-syntax",
+      "kind": "workspace"
+    },
+    {
+      "id": "flavite-ui",
+      "kind": "workspace"
+    },
+    {
+      "id": "flavite-vault",
+      "kind": "workspace"
+    },
+    {
+      "id": "iced",
+      "kind": "external"
+    },
+    {
+      "id": "xtask",
+      "kind": "workspace"
+    }
+  ],
+  "edges": [
+    {
+      "from": "flavite-fs",
+      "to": "blake3",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "flavite-graph",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "iced",
+      "kind": "normal"
+    }
+  ]
+}
