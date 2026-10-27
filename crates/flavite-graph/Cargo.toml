@@ -6,4 +6,11 @@ license.workspace = true
 repository.workspace = true
 description = "Layout, spatial — CPU only (§4.1)"
 
+# No internal dependencies at B1: rayon lands in B3 (LayoutWorker), the
+# flavite-index edge lands in B5 (GraphFeed) — PLAN-B §5. The crate MUST
+# stay CPU-only: no iced/winit/wgpu/cosmic-text, ever (§4.1, enforced
+# transitively by `cargo xtask arch check`).
 [dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }
