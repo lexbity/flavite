@@ -66,11 +66,14 @@ No dependencies.
 
 ### `xtask`
 
-No dependencies.
+Normal/build:
+
+- `iced` (normal)
 
 ## First-party external dependencies
 
 - `blake3` ← flavite-fs
+- `iced` ← xtask
 
 ## Layering rules (§10.2)
 

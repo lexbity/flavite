@@ -5,6 +5,8 @@
 pub mod arch;
 pub mod clean;
 pub mod cov;
+pub mod s1_caret_probe;
+pub mod s1_probe;
 pub mod setup;
 
 use anyhow::{Context, Result};

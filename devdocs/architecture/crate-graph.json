@@ -45,6 +45,10 @@
       "kind": "workspace"
     },
     {
+      "id": "iced",
+      "kind": "external"
+    },
+    {
       "id": "xtask",
       "kind": "workspace"
     }
@@ -53,6 +57,11 @@
     {
       "from": "flavite-fs",
       "to": "blake3",
+      "kind": "normal"
+    },
+    {
+      "from": "xtask",
+      "to": "iced",
       "kind": "normal"
     }
   ]

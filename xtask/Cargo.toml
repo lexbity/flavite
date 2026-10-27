@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Development tooling: arch graph generation, verification, query CLI (§10.2)"
+# `cargo xtask <cmd>` (the alias in .cargo/config.toml) runs this binary by default.
+default-run = "cargo-xtask"
 
 [lib]
 name = "xtask"
@@ -14,9 +16,28 @@ path = "src/lib.rs"
 name = "cargo-xtask"
 path = "src/main.rs"
 
+# S1 IME event-delivery probe (§9 Phase 0 spike S1, PLAN-A slice A5).
+# xtask is dev tooling, not a product crate: it is not layering-gated (§4.1,
+# §10.2 — "xtask → any (tooling)"), and the probe is the spike's instrument.
+[[bin]]
+name = "s1_ime_probe"
+path = "src/bin/s1_ime_probe.rs"
+
+# S1 caret geometry and hit-test probe (§9 Phase 0 spike S1, PLAN-A slice A6).
+[[bin]]
+name = "s1_caret_probe"
+path = "src/bin/s1_caret_probe.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 walkdir = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.8"
+# iced for the S1 probe widget (slice A5). The `advanced` feature gates
+# `iced::advanced`, where the custom `Widget` trait lives. Default features
+# (wgpu + tiny-skia + x11 + wayland) match what flavite-editor/flavite-ui
+# will run with, so the probe exercises the real delivery path.
+iced = { workspace = true, features = ["advanced"] }
+# cosmic-text for the caret probe (slice A6).
+cosmic-text = "0.15"

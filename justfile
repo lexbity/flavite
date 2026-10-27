@@ -55,7 +55,7 @@ doc:
 
 # MSRV build (§10.4, §10.8): check against the workspace rust-version.
 msrv:
-    cargo +1.85.0 check --workspace
+    cargo +1.90.0 check --workspace
 
 # Network-denied test run (§10.3, AC-26): build first, then run tests under
 # unshare with no network. A seeded connection attempt must fail the assertion.
