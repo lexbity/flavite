@@ -39,6 +39,7 @@ pub use identity::{
 pub use instance::{
     AdvisoryLock, FocusIpc, InstanceError, InstanceManager, InstanceResult, is_instance_running,
 };
+pub use journal::executor::{FilePatch, JournalExecutor, RecoveryReport};
 pub use journal::manifest::{
     JournalManifest, MANIFEST_VERSION, TransactionItem, TransactionItemState, TransactionPhase,
     TransactionState,

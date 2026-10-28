@@ -6,6 +6,10 @@
 #![no_main]
 
 use libfuzzer_sys::arbitrary::{Arbitrary, Result, Unstructured};
+use flavite_fs::{Fs, MemFs};
+use flavite_vault::RenamePlanner;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// Minimal input for rename planner fuzzing.
 #[derive(Debug)]
@@ -25,9 +29,15 @@ impl<'a> Arbitrary<'a> for RenamePlannerInput {
     }
 }
 
-/// Fuzz target entry point.
-/// This is a minimal stub that will be expanded when the rename planner is fully implemented.
-libfuzzer_sys::fuzz_target!(|_input: RenamePlannerInput| {
-    // Minimal stub - the planner will be fully tested when implemented
-    // This ensures the fuzz target compiles and can be included in fuzz-smoke
+libfuzzer_sys::fuzz_target!(|input: RenamePlannerInput| {
+    let fs = MemFs::new();
+    let _ = fs.create_dir_all(Path::new("/vault"));
+    let _ = fs.write_new(Path::new("/vault/source.md"), b"bounded payload");
+    let planner = RenamePlanner::new(std::sync::Arc::new(fs), PathBuf::from("/vault"), 1024);
+    let _ = planner.plan_rename(
+        PathBuf::from(input.from_path),
+        PathBuf::from(input.to_path),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
 });

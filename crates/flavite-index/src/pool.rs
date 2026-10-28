@@ -71,6 +71,16 @@ pub struct SearchPage {
 /// One matching note from a text or hybrid query.
 pub type SearchNote = (i64, String, String);
 
+/// Indexed source span for one inbound link used by journaled note renames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundLinkSpan {
+    pub source_path_native: Vec<u8>,
+    pub source_hash: [u8; 32],
+    pub span_start: u64,
+    pub span_end: u64,
+    pub target_raw: String,
+}
+
 /// Pool error type.
 #[derive(Debug, Error)]
 pub enum PoolError {
@@ -474,6 +484,143 @@ impl IndexActor {
             .query_map([], |row| row.get::<_, Vec<u8>>(0))
             .map_err(|e| e.to_string())?;
         rows.map(|row| row.map_err(|e| e.to_string())).collect()
+    }
+
+    /// Return indexed links targeting a note stem, including path-suffix and
+    /// explicit `.md` forms. The caller MUST verify each source hash again.
+    pub fn inbound_links_for_stem(&self, stem: &str) -> Result<Vec<InboundLinkSpan>, String> {
+        let stem = stem.to_lowercase();
+        let explicit = format!("{stem}.md");
+        let mut statement = self
+            .writer
+            .conn()
+            .prepare(
+                "SELECT n.path_native,n.content_hash,l.span_start,l.span_end,l.dst_raw
+             FROM links l JOIN notes n ON n.note_id=l.src
+             WHERE l.by_id=0 AND (l.target_key=?1 OR l.target_key=?2
+                OR l.target_key LIKE '%/' || ?1 OR l.target_key LIKE '%/' || ?2)
+             ORDER BY n.path_native,l.span_start",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map((&stem, &explicit), |row| {
+                let hash: Vec<u8> = row.get(1)?;
+                let source_hash: [u8; 32] =
+                    hash.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let start: i64 = row.get(2)?;
+                let end: i64 = row.get(3)?;
+                Ok(InboundLinkSpan {
+                    source_path_native: row.get(0)?,
+                    source_hash,
+                    span_start: start.cast_unsigned(),
+                    span_end: end.cast_unsigned(),
+                    target_raw: row.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.map(|row| row.map_err(|e| e.to_string())).collect()
+    }
+
+    /// List native path keys for indexed attachments.
+    pub fn indexed_attachment_paths(&self) -> Result<Vec<Vec<u8>>, String> {
+        let mut statement = self
+            .writer
+            .conn()
+            .prepare("SELECT path_native FROM attachments")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|e| e.to_string())?;
+        rows.map(|row| row.map_err(|e| e.to_string())).collect()
+    }
+
+    /// Whether indexed attachment metadata and, when available, content hash match.
+    pub fn attachment_matches(
+        &self,
+        path_native: &[u8],
+        size: u64,
+        mtime_ns: i64,
+        content_hash: Option<[u8; 32]>,
+        hydrated: bool,
+        scan_ns: i64,
+    ) -> Result<bool, String> {
+        let current: Option<(i64, i64, Option<Vec<u8>>, bool)> = self
+            .writer
+            .conn()
+            .query_row(
+                "SELECT size,mtime_ns,content_hash,hydrated FROM attachments WHERE path_native=?1",
+                [path_native],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((old_size, old_mtime, old_hash, old_hydrated)) = current else {
+            return Ok(false);
+        };
+        let fresh = mtime_ns >= scan_ns.saturating_sub(2_000_000_000);
+        Ok(!fresh
+            && u64::try_from(old_size).ok() == Some(size)
+            && old_mtime == mtime_ns
+            && old_hydrated == hydrated
+            && content_hash.is_none_or(|hash| old_hash.as_deref() == Some(hash.as_slice())))
+    }
+
+    /// Insert or refresh one attachment row and advance structural generation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_attachment(
+        &mut self,
+        path_native: &[u8],
+        path: &str,
+        path_key: &str,
+        stem_key: &str,
+        kind: crate::schema::AttachmentKind,
+        size: u64,
+        content_hash: Option<[u8; 32]>,
+        mtime_ns: i64,
+        scan_ns: i64,
+        hydrated: bool,
+    ) -> Result<u64, String> {
+        let conn = &mut self.writer.conn;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let generation = get_meta_u64(&tx, MetaKey::Generation)
+            .map_err(|e| e.to_string())?
+            .unwrap_or(0)
+            .saturating_add(1);
+        tx.execute("INSERT INTO attachments(path,path_native,path_key,stem_key,kind,mime,size,content_hash,width,height,mtime_ns,scan_ns,hydrated,generation) VALUES(?1,?2,?3,?4,?5,NULL,?6,?7,NULL,NULL,?8,?9,?10,?11) ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,kind=excluded.kind,size=excluded.size,content_hash=excluded.content_hash,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,hydrated=excluded.hydrated,generation=excluded.generation",
+            rusqlite::params![path, path_native, path_key, stem_key, kind.as_str(), i64::try_from(size).map_err(|e| e.to_string())?, content_hash.map(|hash| hash.to_vec()), mtime_ns, scan_ns, hydrated, i64::try_from(generation).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
+        let filename = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(path)
+            .to_lowercase();
+        tx.execute("UPDATE links SET dst_note=NULL,dst_att=(SELECT MIN(att_id) FROM attachments WHERE stem_key=links.target_key OR lower(path)=links.target_key OR lower(path) LIKE '%/' || links.target_key),res_state=CASE WHEN (SELECT COUNT(*) FROM attachments WHERE stem_key=links.target_key OR lower(path)=links.target_key OR lower(path) LIKE '%/' || links.target_key)=1 THEN 'resolved' ELSE 'ambiguous' END WHERE kind='embed' AND (target_key=?1 OR target_key=?2 OR target_key=?3)", rusqlite::params![stem_key, filename, path_key]).map_err(|e| e.to_string())?;
+        crate::schema::set_meta(&tx, MetaKey::Generation, &generation.to_string())
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(generation)
+    }
+
+    /// Remove an attachment by native path key.
+    pub fn remove_attachment_path(&mut self, path_native: &[u8]) -> Result<bool, String> {
+        let conn = &mut self.writer.conn;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let changed = tx
+            .execute(
+                "DELETE FROM attachments WHERE path_native=?1",
+                [path_native],
+            )
+            .map_err(|e| e.to_string())?
+            != 0;
+        if changed {
+            let generation = get_meta_u64(&tx, MetaKey::Generation)
+                .map_err(|e| e.to_string())?
+                .unwrap_or(0)
+                .saturating_add(1);
+            crate::schema::set_meta(&tx, MetaKey::Generation, &generation.to_string())
+                .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(changed)
     }
 
     /// Check whether one native path key is already indexed.
@@ -1020,6 +1167,26 @@ mod tests {
         assert_eq!(stats.available, DEFAULT_POOL_SIZE);
         assert_eq!(stats.in_use, 0);
         assert_eq!(stats.max_size, DEFAULT_POOL_SIZE);
+    }
+
+    #[test]
+    fn metadata_fast_path_rehashes_recently_modified_notes() {
+        let temp = NamedTempFile::new().unwrap();
+        drop(crate::open_or_init(temp.path()).unwrap());
+        let mut index = IndexActor::new(temp.path(), 1).unwrap();
+        index
+            .apply_saved_note(b"a.md", "a.md", b"body", 10_000_000_000, 10_000_000_000)
+            .unwrap();
+        assert!(
+            !index
+                .note_metadata_matches(b"a.md", 4, 10_000_000_000, 11_000_000_000)
+                .unwrap()
+        );
+        assert!(
+            index
+                .note_metadata_matches(b"a.md", 4, 10_000_000_000, 13_000_000_000)
+                .unwrap()
+        );
     }
 
     #[test]
