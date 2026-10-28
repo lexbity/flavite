@@ -57,6 +57,10 @@
       "kind": "external"
     },
     {
+      "id": "nucleo",
+      "kind": "external"
+    },
+    {
       "id": "pulldown-cmark",
       "kind": "external"
     },
@@ -242,6 +246,11 @@
     {
       "from": "flavite-ui",
       "to": "iced",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "nucleo",
       "kind": "normal"
     },
     {

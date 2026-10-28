@@ -9,7 +9,7 @@
 //! All external consumers (GUI, CLI, future plugins) interact with the core
 //! system through this facade.
 
-use crate::command::{CommandRegistry, Invocation};
+use crate::command::{ArgSchema, Chord, CommandRegistry, CommandSpec, Invocation};
 use crate::event::Event;
 use crate::result::{
     ExecutionResult, LocalError, LocalResult, LocalSuccess, RejectedResult, RejectionReason,
@@ -176,9 +176,65 @@ impl Lattice {
 
     /// Register built-in commands.
     fn register_builtin_commands(&self) -> Result<(), LatticeError> {
-        // Register core commands
-        // Note: Full command implementations will be added as other slices land
+        static SAVE_KEYBINDING: std::sync::LazyLock<[Chord; 1]> =
+            std::sync::LazyLock::new(|| [Chord::new(2, "S")]);
+        for spec in [
+            CommandSpec::new("note.open", "Open note", ArgSchema),
+            CommandSpec::new("note.close", "Close note", ArgSchema),
+            CommandSpec::with_availability(
+                "note.save",
+                "Save note",
+                ArgSchema,
+                None,
+                &SAVE_KEYBINDING[..],
+            ),
+            CommandSpec::new("vault.reconcile", "Refresh vault", ArgSchema),
+            CommandSpec::new("buffer.undo", "Undo", ArgSchema),
+            CommandSpec::new("buffer.redo", "Redo", ArgSchema),
+        ] {
+            self.command_registry.register(spec).map_err(|error| {
+                let message = match error {
+                    crate::command::CommandRegistrationError::DuplicateId(id) => {
+                        format!("duplicate command id: {id}")
+                    }
+                };
+                LatticeError::CommandRegistration(message)
+            })?;
+        }
         Ok(())
+    }
+
+    /// Read the versioned vault settings document through the API boundary.
+    pub fn read_settings(&self) -> Result<Option<String>, LatticeError> {
+        let path = self.vault_ref.root.join(".flavite").join("settings.toml");
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(LatticeError::SettingsIo(
+                "settings.toml must not be a symlink".into(),
+            ));
+        }
+        match std::fs::read_to_string(path) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(LatticeError::SettingsIo(error.to_string())),
+        }
+    }
+
+    /// Atomically write the versioned vault settings document through the API boundary.
+    pub fn write_settings(&self, contents: &str) -> Result<(), LatticeError> {
+        let directory = self.vault_ref.root.join(".flavite");
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| LatticeError::SettingsIo(error.to_string()))?;
+        let path = directory.join("settings.toml");
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(LatticeError::SettingsIo(
+                "settings.toml must not be a symlink".into(),
+            ));
+        }
+        flavite_fs::atomic::atomic_write(&flavite_fs::OsFs::new(), &path, contents.as_bytes())
+            .map(|_| ())
+            .map_err(|error| LatticeError::SettingsIo(error.to_string()))
     }
 
     /// Get the vault reference.
@@ -227,8 +283,36 @@ impl Lattice {
         self.session.execute(command)
     }
 
+    /// Drain lossy pulse events through the public host boundary.
+    pub fn drain_pulses(&self) -> Vec<flavite_vault::channels::Pulse> {
+        self.session.drain_pulses()
+    }
+
+    /// Drain lossless notices through the public host boundary.
+    pub fn drain_notices(&self) -> Vec<flavite_vault::channels::Notice> {
+        self.session.drain_notices()
+    }
+
+    /// Acknowledge notice presentation. This does not complete commands or journal work.
+    pub fn acknowledge_notice(&self, notice: &flavite_vault::channels::Notice) {
+        self.session.acknowledge_notice(notice);
+    }
+
     /// Execute a typed command through the registry.
     pub fn execute(&self, invocation: Invocation) -> ExecutionResult {
+        if self
+            .command_registry
+            .get_spec(invocation.command_id)
+            .is_none()
+        {
+            return ExecutionResult::Rejected(
+                RejectedResult::with_request(RejectionReason::Unavailable, invocation.request_id)
+                    .with_message(format!(
+                        "command is not registered: {}",
+                        invocation.command_id
+                    )),
+            );
+        }
         // Check if read-only and command requires write access
         if self.read_only && invocation.command_id.starts_with("write:") {
             return ExecutionResult::Rejected(RejectedResult {
@@ -258,17 +342,17 @@ impl Lattice {
         // For now, directly map known command IDs to Session commands
         // In the future, this will use a proper handler registry
         match invocation.command_id {
-            "open_note" => {
+            "open_note" | "note.open" => {
                 let path: PathBuf = serde_json::from_value(invocation.args.clone())
                     .map_err(|e| LatticeError::InvalidArgs(e.to_string()))?;
                 Ok(self.session.execute(SessionCommand::OpenNote { path }))
             }
-            "close_note" => {
+            "close_note" | "note.close" => {
                 let path: PathBuf = serde_json::from_value(invocation.args.clone())
                     .map_err(|e| LatticeError::InvalidArgs(e.to_string()))?;
                 Ok(self.session.execute(SessionCommand::CloseNote { path }))
             }
-            "save_note" => {
+            "save_note" | "note.save" => {
                 let path: PathBuf = serde_json::from_value(invocation.args.clone())
                     .map_err(|e| LatticeError::InvalidArgs(e.to_string()))?;
                 Ok(self.session.execute(SessionCommand::SaveNote { path }))
@@ -311,7 +395,7 @@ impl Lattice {
                     ops,
                 }))
             }
-            "undo" => {
+            "undo" | "buffer.undo" => {
                 #[derive(Deserialize)]
                 struct UndoArgs {
                     buffer_id: u64,
@@ -324,7 +408,7 @@ impl Lattice {
                     revision: Revision::new(args.revision),
                 }))
             }
-            "redo" => {
+            "redo" | "buffer.redo" => {
                 #[derive(Deserialize)]
                 struct RedoArgs {
                     buffer_id: u64,
@@ -337,7 +421,7 @@ impl Lattice {
                     revision: Revision::new(args.revision),
                 }))
             }
-            "reconcile" => {
+            "reconcile" | "vault.reconcile" => {
                 #[derive(Deserialize)]
                 struct ReconcileArgs {
                     scope: String,
@@ -642,6 +726,14 @@ pub enum LatticeError {
     #[error("buffer manager lock is poisoned")]
     BufferManagerPoisoned,
 
+    /// The vault settings document could not be read or written.
+    #[error("Settings I/O failed: {0}")]
+    SettingsIo(String),
+
+    /// The command registry rejected a built-in command.
+    #[error("Command registration failed: {0}")]
+    CommandRegistration(String),
+
     /// Session error.
     #[error("Session error: {0}")]
     SessionError(#[from] SessionError),
@@ -660,6 +752,12 @@ pub mod session {
     pub use flavite_vault::session::{
         CommandResult, ConflictResolution, SessionCommand, SessionError, SessionResult,
     };
+}
+
+/// Host-facing channel payloads for iced subscriptions and CLI adapters.
+pub mod channels {
+    pub use flavite_buffer::manager::NoteRef;
+    pub use flavite_vault::channels::{Notice, Pulse, RenameTier};
 }
 
 #[cfg(test)]

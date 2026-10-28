@@ -215,7 +215,18 @@ impl CommandRegistry {
     #[must_use]
     pub fn command_ids(&self) -> Vec<&'static str> {
         let specs = self.specs.read().unwrap();
-        specs.keys().copied().collect()
+        let mut ids = specs.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Return the registered command specifications in stable display order.
+    #[must_use]
+    pub fn specs(&self) -> Vec<CommandSpec> {
+        let specs = self.specs.read().unwrap();
+        let mut values = specs.values().cloned().collect::<Vec<_>>();
+        values.sort_by_key(|spec| spec.id);
+        values
     }
 }
 

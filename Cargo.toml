@@ -49,3 +49,5 @@ directories = "5"
 # Serialization
 hex = "0.4"
 toml = "0.8"
+# Fuzzy matching (§4.7: command palette + quick switcher are in-memory nucleo)
+nucleo = "0.5"

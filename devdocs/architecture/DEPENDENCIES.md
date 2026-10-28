@@ -99,6 +99,7 @@ Normal/build:
 - `flavite-buffer` (normal)
 - `flavite-graph` (normal)
 - `iced` (normal)
+- `nucleo` (normal)
 
 ### `flavite-vault`
 
@@ -134,6 +135,7 @@ Normal/build:
 - `cosmic-text` ← flavite-editor, xtask
 - `iced` ← flavite-editor, flavite-ui, xtask
 - `notify` ← flavite-fs, flavite-fs, xtask
+- `nucleo` ← flavite-ui
 - `pulldown-cmark` ← flavite-index, flavite-syntax
 - `ropey` ← flavite-buffer
 - `rusqlite` ← flavite-graph, flavite-index, xtask
