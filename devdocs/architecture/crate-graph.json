@@ -91,6 +91,26 @@
   ],
   "edges": [
     {
+      "from": "flavite-api",
+      "to": "flavite-buffer",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-api",
+      "to": "flavite-index",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-api",
+      "to": "flavite-syntax",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-api",
+      "to": "flavite-vault",
+      "kind": "normal"
+    },
+    {
       "from": "flavite-buffer",
       "to": "blake3",
       "kind": "normal"
@@ -108,6 +128,36 @@
     {
       "from": "flavite-buffer",
       "to": "zstd",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-cli",
+      "to": "flavite-api",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-cli",
+      "to": "flavite-buffer",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-cli",
+      "to": "flavite-fs",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-cli",
+      "to": "flavite-index",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-cli",
+      "to": "flavite-vault",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-cli",
+      "to": "tracing",
       "kind": "normal"
     },
     {
@@ -178,6 +228,41 @@
     {
       "from": "flavite-ui",
       "to": "iced",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-vault",
+      "to": "blake3",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-vault",
+      "to": "flavite-buffer",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-vault",
+      "to": "flavite-fs",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-vault",
+      "to": "flavite-index",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-vault",
+      "to": "flavite-syntax",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-vault",
+      "to": "notify",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-vault",
+      "to": "tracing",
       "kind": "normal"
     },
     {

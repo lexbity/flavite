@@ -7,3 +7,29 @@ repository.workspace = true
 description = "Registry, typed commands/results, revisioned views, events, capabilities (§4.1)"
 
 [dependencies]
+# Core tier dependencies (flavite-vault, flavite-index, flavite-buffer)
+flavite-vault = { path = "../flavite-vault" }
+flavite-index = { path = "../flavite-index" }
+flavite-buffer = { path = "../flavite-buffer" }
+flavite-syntax = { path = "../flavite-syntax" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+
+# Concurrency
+crossbeam = "0.8"
+
+# UUID support
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Hex encoding
+hex = "0.4"
+
+[dev-dependencies]
+# For tests
+tempfile = "3"
+proptest = "1"

@@ -4,6 +4,7 @@
 //! epoch/generation counters, vault references, scope definitions, and
 //! reconcile modes.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +14,9 @@ use std::time::Duration;
 ///
 /// An epoch is created when SQLite is recreated (e.g., after corruption).
 /// Generations are monotonic only within an epoch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 pub struct Epoch(pub u64);
 
 impl Epoch {
@@ -46,7 +49,9 @@ impl fmt::Display for Epoch {
 ///
 /// Bumps on every structural write transaction. Used for invalidation
 /// tracking and search checkpoint alignment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 pub struct Generation(pub u64);
 
 impl Generation {

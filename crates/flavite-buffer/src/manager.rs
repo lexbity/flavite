@@ -11,6 +11,7 @@
 //! and apply `EditOp`s through its BufferManager.
 
 use flavite_syntax::text::TextSnapshot;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -54,7 +55,7 @@ impl BufferStateChanged {
 }
 
 /// Reference to a note (path + optional stable_id).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NoteRef {
     /// The path to the note.
     pub path: PathBuf,

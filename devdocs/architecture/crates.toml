@@ -56,6 +56,23 @@ active = [
     { from = "flavite-index", to = "flavite-syntax" },
     { from = "flavite-graph", to = "flavite-index" },
     { from = "flavite-buffer", to = "flavite-syntax" },
+    # flavite-vault dependencies
+    { from = "flavite-vault", to = "flavite-buffer" },
+    { from = "flavite-vault", to = "flavite-fs" },
+    { from = "flavite-vault", to = "flavite-index" },
+    { from = "flavite-vault", to = "flavite-syntax" },
+    # C14 - flavite-api depends on core tier crates
+    { from = "flavite-api", to = "flavite-vault" },
+    { from = "flavite-api", to = "flavite-index" },
+    { from = "flavite-api", to = "flavite-buffer" },
+    { from = "flavite-api", to = "flavite-syntax" },
+    # C14 - CLI consumes flavite-api (D16 dogfood)
+    { from = "flavite-cli", to = "flavite-api" },
+    # C14 - CLI still needs vault/index/buffer for now
+    { from = "flavite-cli", to = "flavite-vault" },
+    { from = "flavite-cli", to = "flavite-index" },
+    { from = "flavite-cli", to = "flavite-buffer" },
+    { from = "flavite-cli", to = "flavite-fs" },
 ]
 
 [layering]
