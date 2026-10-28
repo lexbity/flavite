@@ -125,6 +125,8 @@ All 77 tests in flavite-vault pass, including:
 - ✅ `cargo build --workspace` succeeds
 - ✅ `cargo test --package flavite-vault` passes (77 tests)
 - ✅ `cargo clippy --package flavite-vault` passes (0 warnings)
+- ✅ `cargo clippy --workspace --all-targets -- -D warnings` passes
+- ✅ `just gate` passes (fmt + clippy + test + arch check)
 
 ## Dependencies
 

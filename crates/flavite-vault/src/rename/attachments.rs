@@ -145,7 +145,8 @@ impl AttachmentRenameManager {
             if let Some(att) = attachments_by_path.get(path) {
                 if let Some(hash) = &att.content_hash {
                     // Only consider if size is reasonable
-                    if att.size >= 64 && att.size <= flavite_index::types::ATTACHMENT_HASH_MAX as i64
+                    if att.size >= 64
+                        && att.size <= flavite_index::types::ATTACHMENT_HASH_MAX as i64
                     {
                         hash_to_vanished
                             .entry(hash.clone())
@@ -247,7 +248,12 @@ impl AttachmentRenameManager {
     }
 
     /// Register a T0 (in-app) attachment rename.
-    pub fn register_t0_rename(&self, from: PathBuf, to: PathBuf, embed_count: u32) -> AttachmentRename {
+    pub fn register_t0_rename(
+        &self,
+        from: PathBuf,
+        to: PathBuf,
+        embed_count: u32,
+    ) -> AttachmentRename {
         AttachmentRename {
             from,
             to,
@@ -288,7 +294,6 @@ pub trait EmbedCountProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     fn mock_attachment(path: &str, content_hash: Option<Vec<u8>>, size: i64) -> Attachment {
         Attachment {
@@ -339,7 +344,7 @@ mod tests {
             &notice_channel,
         );
 
-        assert!(result.renames.len() > 0);
+        assert!(!result.renames.is_empty());
         let rename = &result.renames[0];
         assert_eq!(rename.from, PathBuf::from("old.png"));
         assert_eq!(rename.to, PathBuf::from("new.png"));
@@ -372,7 +377,7 @@ mod tests {
         );
 
         // Should detect based on stem similarity
-        assert!(result.renames.len() > 0);
+        assert!(!result.renames.is_empty());
         let rename = &result.renames[0];
         assert_eq!(rename.tier, RenameTier::T4);
     }
@@ -392,9 +397,6 @@ mod tests {
             AttachmentRenameManager::path_to_stem("My Diagram.png"),
             "my diagram"
         );
-        assert_eq!(
-            AttachmentRenameManager::path_to_stem("image.jpg"),
-            "image"
-        );
+        assert_eq!(AttachmentRenameManager::path_to_stem("image.jpg"), "image");
     }
 }
