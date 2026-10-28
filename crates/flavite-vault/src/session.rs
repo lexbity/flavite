@@ -380,6 +380,14 @@ impl Session {
         }
     }
 
+    /// Return the current indexed note-title and alias snapshot for UI
+    /// autocomplete. This is a read-only request to the VaultActor.
+    pub fn completion_candidates(
+        &self,
+    ) -> Result<Vec<flavite_index::types::CompletionCandidate>, String> {
+        self.actor.completion_candidates()
+    }
+
     /// Process ready worker replies and return every terminal result that has
     /// not yet been presented to the host. This is lossless: completions stay
     /// queued until the host drains them.

@@ -5,9 +5,11 @@
 #![forbid(unsafe_code)]
 
 pub mod keymap;
+pub mod links;
 pub mod surface;
 pub mod viewport;
 pub mod widget;
 
-pub use surface::{EditorAction, EditorSurface, EditorView};
+pub use links::NoteCandidate;
+pub use surface::{EditorAction, EditorSurface, EditorView, LinkNavigation};
 pub use widget::EditorWidget;

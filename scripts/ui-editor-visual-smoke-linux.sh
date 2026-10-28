@@ -80,14 +80,23 @@ sleep 1
 xdotool mousemove --sync --window "$window_id" 80 205
 xdotool click --clearmodifiers 1
 xdotool key --clearmodifiers ctrl+a
+xdotool type --clearmodifiers --delay 80 "[[Vis"
+sleep 1
+import -window "$window_id" "$visual_dir/editor-autocomplete.png"
+xdotool key --clearmodifiers Escape
+sleep 0.2
+xdotool key --clearmodifiers ctrl+a
+sleep 0.2
+xdotool key --clearmodifiers BackSpace
+sleep 0.2
 xdotool type --clearmodifiers --delay 100 "Visual editor input confirmed"
 for _ in $(seq 1 60); do
-    if grep -Fq "Visual editor input confirmed" "$vault_dir/demo.md"; then
+    if [[ "$(cat "$vault_dir/demo.md")" == "Visual editor input confirmed" ]]; then
         break
     fi
     sleep 0.1
 done
-if ! grep -Fq "Visual editor input confirmed" "$vault_dir/demo.md"; then
+if [[ "$(cat "$vault_dir/demo.md")" != "Visual editor input confirmed" ]]; then
     cat "$visual_dir/editor-app.log" >&2
     cat "$vault_dir/demo.md" >&2
     import -window "$window_id" "$visual_dir/editor-failure.png" 2>/dev/null || true

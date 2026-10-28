@@ -50,6 +50,8 @@ pub enum VaultActorMsg {
         path: std::path::PathBuf,
         reply: Sender<VaultActorResp>,
     },
+    /// Read the indexed title/alias snapshot for editor autocomplete.
+    CompletionCandidates { reply: Sender<VaultActorResp> },
     /// Save immutable serialized bytes through the D6 path.
     Save {
         request: SaveRequest,
@@ -94,6 +96,8 @@ pub enum VaultActorResp {
     Error(String),
     /// File bytes, or `None` when absent.
     File(Option<Vec<u8>>),
+    /// Indexed note completion candidates.
+    CompletionCandidates(Result<Vec<flavite_index::types::CompletionCandidate>, String>),
     /// Save completion after the structural index callback.
     Saved(Result<SaveReceipt, SaveFailure>),
     /// Durable history snapshot record.
@@ -162,6 +166,21 @@ impl VaultActorHandle {
             VaultActorResp::File(bytes) => Ok(bytes),
             VaultActorResp::Error(_) => Err(VaultActorError::NotRunning),
             _ => Err(VaultActorError::NotRunning),
+        }
+    }
+
+    /// Read indexed note title and alias candidates.
+    pub fn completion_candidates(
+        &self,
+    ) -> Result<Vec<flavite_index::types::CompletionCandidate>, String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::CompletionCandidates { reply })
+            .map_err(|error| error.to_string())?;
+        match response.recv().map_err(|error| error.to_string())? {
+            VaultActorResp::CompletionCandidates(result) => result,
+            VaultActorResp::Error(error) => Err(error),
+            _ => Err("unexpected completion-candidate response".to_owned()),
         }
     }
 
@@ -420,6 +439,11 @@ impl VaultActor {
                     .read_if_exists(&path)
                     .map(VaultActorResp::File)
                     .unwrap_or_else(|e| VaultActorResp::Error(e.to_string()));
+                let _ = reply.try_send(response);
+            }
+            VaultActorMsg::CompletionCandidates { reply } => {
+                let response =
+                    VaultActorResp::CompletionCandidates(self.index.completion_candidates());
                 let _ = reply.try_send(response);
             }
             VaultActorMsg::Save { request, reply } => self.handle_save(request, reply),

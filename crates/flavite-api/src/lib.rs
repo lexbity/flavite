@@ -45,6 +45,7 @@ pub use types::*;
 
 // Re-export Query AST from flavite-index (D13)
 pub use flavite_index::query::Query;
+pub use flavite_index::types::CompletionCandidate;
 pub use flavite_index::types::{Cursor as IndexCursor, NoteRef as IndexNoteRef};
 
 // Re-export types from vault for consumer convenience

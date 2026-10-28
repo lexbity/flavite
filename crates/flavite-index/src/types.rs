@@ -73,6 +73,19 @@ pub struct Note {
     pub generation: i64,
 }
 
+/// Indexed note data used to build in-memory link autocomplete snapshots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionCandidate {
+    /// Vault-relative path without the `.md` suffix.
+    pub target: String,
+    /// Indexed display title.
+    pub title: String,
+    /// Frontmatter aliases.
+    pub aliases: Vec<String>,
+    /// Stable ID, omitted when the ID is conflicted.
+    pub stable_id: Option<String>,
+}
+
 impl Note {
     #[must_use]
     pub fn note_ref(&self) -> NoteRef {

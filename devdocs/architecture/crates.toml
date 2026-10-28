@@ -115,6 +115,7 @@ names = [
     "blake3",
     "zstd",
     "nucleo",
+    "nucleo-matcher",
     "image",
     "tracing",
     "similar",

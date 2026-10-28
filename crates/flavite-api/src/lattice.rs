@@ -176,8 +176,22 @@ impl Lattice {
 
     /// Register built-in commands.
     fn register_builtin_commands(&self) -> Result<(), LatticeError> {
-        // Register core commands
-        // Note: Full command implementations will be added as other slices land
+        for (id, title) in [
+            ("note.open", "Open note"),
+            ("open_note", "Open note"),
+            ("apply_edits", "Apply editor edits"),
+            ("link.insert", "Insert link"),
+        ] {
+            self.command_registry
+                .register(crate::command::CommandSpec::new(
+                    id,
+                    title,
+                    crate::command::ArgSchema,
+                ))
+                .map_err(|error| {
+                    LatticeError::InvalidArgs(format!("command registration: {error:?}"))
+                })?;
+        }
         Ok(())
     }
 
@@ -222,6 +236,14 @@ impl Lattice {
         &self.session
     }
 
+    /// Return a revision-independent snapshot of indexed note titles, aliases,
+    /// and unconflicted stable IDs for autocomplete consumers.
+    pub fn completion_candidates(&self) -> Result<Vec<crate::CompletionCandidate>, LatticeError> {
+        self.session
+            .completion_candidates()
+            .map_err(LatticeError::IndexError)
+    }
+
     /// Execute a Session command directly.
     pub fn execute_session(&self, command: SessionCommand) -> SessionResult {
         self.session.execute(command)
@@ -258,9 +280,18 @@ impl Lattice {
         // For now, directly map known command IDs to Session commands
         // In the future, this will use a proper handler registry
         match invocation.command_id {
-            "open_note" => {
-                let path: PathBuf = serde_json::from_value(invocation.args.clone())
-                    .map_err(|e| LatticeError::InvalidArgs(e.to_string()))?;
+            "note.open" | "open_note" => {
+                #[derive(Deserialize)]
+                #[serde(untagged)]
+                enum OpenArgs {
+                    Path(PathBuf),
+                    Object { path: PathBuf },
+                }
+                let path = match serde_json::from_value::<OpenArgs>(invocation.args.clone())
+                    .map_err(|e| LatticeError::InvalidArgs(e.to_string()))?
+                {
+                    OpenArgs::Path(path) | OpenArgs::Object { path } => path,
+                };
                 Ok(self.session.execute(SessionCommand::OpenNote { path }))
             }
             "close_note" => {
@@ -273,7 +304,7 @@ impl Lattice {
                     .map_err(|e| LatticeError::InvalidArgs(e.to_string()))?;
                 Ok(self.session.execute(SessionCommand::SaveNote { path }))
             }
-            "apply_edits" => {
+            "apply_edits" | "link.insert" => {
                 // Deserialize edit operations
                 #[derive(Deserialize)]
                 struct ApplyEditsArgs {
@@ -649,6 +680,10 @@ pub enum LatticeError {
     /// Vault open error.
     #[error("Vault open error: {0}")]
     VaultOpenError(String),
+
+    /// Indexed lookup failed.
+    #[error("Index error: {0}")]
+    IndexError(String),
 
     /// JSON serialization error.
     #[error("JSON error: {0}")]

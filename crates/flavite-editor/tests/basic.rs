@@ -1,5 +1,5 @@
 use flavite_api::lattice::session::SessionCommand;
-use flavite_editor::{EditorAction, EditorSurface, EditorView};
+use flavite_editor::{EditorAction, EditorSurface, EditorView, LinkNavigation};
 use flavite_syntax::text::{Span, TextByte};
 use std::path::PathBuf;
 
@@ -61,4 +61,28 @@ fn history_actions_remain_typed_session_commands() {
     assert!(
         matches!(redo, SessionCommand::Redo { buffer_id, revision } if buffer_id.as_u64() == 42 && revision.as_u64() == 7)
     );
+}
+
+#[test]
+fn link_activation_becomes_revision_guarded_note_open_invocation() {
+    let action = EditorAction::open_link(
+        &view(),
+        LinkNavigation {
+            target: "Ideas".into(),
+            alias: Some("Ideas".into()),
+            anchor: Some("Plan".into()),
+            by_id: false,
+            span: Span::new(TextByte(0), TextByte(12)),
+            create_if_unresolved: true,
+        },
+    );
+    let invocation = action
+        .into_link_invocation(73, PathBuf::from("ideas.md"))
+        .expect("link action should become a host command");
+    assert_eq!(invocation.command_id, "note.open");
+    assert_eq!(invocation.request_id, 73);
+    assert_eq!(invocation.preconditions.buffer_id, Some(42));
+    assert_eq!(invocation.preconditions.expected_revision, Some(7));
+    assert_eq!(invocation.args["target"], "Ideas");
+    assert_eq!(invocation.args["path"], "ideas.md");
 }

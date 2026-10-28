@@ -331,6 +331,61 @@ impl IndexActor {
         self.read_pool.stats()
     }
 
+    /// Read the indexed note title/alias snapshot for editor autocomplete.
+    ///
+    /// # Errors
+    /// Returns a pool or SQLite error when the read connection is unavailable.
+    pub fn completion_candidates(&self) -> Result<Vec<crate::types::CompletionCandidate>, String> {
+        let connection = self
+            .read_pool
+            .get(Some(std::time::Duration::from_secs(2)))
+            .map_err(|error| error.to_string())?;
+        let mut aliases_by_note = std::collections::HashMap::<i64, Vec<String>>::new();
+        {
+            let mut statement = connection
+                .prepare("SELECT note_id, alias FROM aliases ORDER BY note_id, alias_key")
+                .map_err(|error| error.to_string())?;
+            let aliases = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| error.to_string())?;
+            for alias in aliases {
+                let (note_id, value) = alias.map_err(|error| error.to_string())?;
+                aliases_by_note.entry(note_id).or_default().push(value);
+            }
+        }
+        let mut statement = connection
+            .prepare(
+                "SELECT note_id, path, title, stable_id, id_conflict FROM notes ORDER BY path_key, path",
+            )
+            .map_err(|error| error.to_string())?;
+        let note_rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, bool>(4)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut candidates = Vec::new();
+        for row in note_rows {
+            let (note_id, path, title, stable_id, id_conflict) =
+                row.map_err(|error| error.to_string())?;
+            let target = path.strip_suffix(".md").unwrap_or(&path).to_owned();
+            candidates.push(crate::types::CompletionCandidate {
+                target,
+                title,
+                aliases: aliases_by_note.remove(&note_id).unwrap_or_default(),
+                stable_id: (!id_conflict).then_some(stable_id).flatten(),
+            });
+        }
+        Ok(candidates)
+    }
+
     /// Apply the exact bytes installed by a save to SQLite in one structural
     /// transaction. The caller owns this actor on the sole index-writer thread.
     ///
@@ -678,6 +733,11 @@ mod tests {
             .apply_saved_note(b"notes/a.md", "notes/a.md", original, 98, 99)
             .unwrap();
         assert_eq!((epoch, generation), (1, 1));
+        let candidates = index.completion_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].target, "notes/a");
+        assert_eq!(candidates[0].title, "Alpha");
+        assert_eq!(candidates[0].aliases, ["A", "B"]);
 
         {
             let conn = index.writer().conn();

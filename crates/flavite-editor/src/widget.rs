@@ -1,12 +1,17 @@
 //! Custom iced editor widget over a revisioned, immutable API view.
 
 use crate::keymap::KeyAction;
-use crate::surface::{EditorAction, EditorSurface, EditorView};
+use crate::links::{
+    LinkResolution, LinkSpan, NoteCandidate, match_candidates, resolve_link, scan_decorations,
+    scan_links,
+};
+use crate::surface::{EditorAction, EditorSurface, EditorView, LinkNavigation};
 use crate::viewport::{
     Viewport, clamp_char_boundary, next_grapheme_boundary, previous_grapheme_boundary,
 };
 use cosmic_text::{Attrs, Buffer as ShapingBuffer, FontSystem, Metrics, Shaping};
 use flavite_api::BufferView;
+use flavite_syntax::SpanKind;
 use iced::advanced::{
     Clipboard, Layout, Renderer as AdvancedRenderer, Shell, Widget,
     layout::{Limits, Node},
@@ -32,6 +37,8 @@ thread_local! {
 /// this widget never mutates a buffer or accesses the filesystem itself.
 pub struct EditorWidget<'a, Message> {
     view: EditorView,
+    candidates: Vec<NoteCandidate>,
+    stable_links: bool,
     on_action: Box<dyn Fn(EditorAction) -> Message + 'a>,
     width: Length,
     height: Length,
@@ -43,11 +50,28 @@ impl<'a, Message> EditorWidget<'a, Message> {
     pub fn new(view: &'a BufferView, on_action: impl Fn(EditorAction) -> Message + 'a) -> Self {
         Self {
             view: EditorView::from(view),
+            candidates: Vec::new(),
+            stable_links: false,
             on_action: Box::new(on_action),
             width: Length::Fill,
             height: Length::Fill,
             _message: PhantomData,
         }
+    }
+
+    /// Supply an indexed title/alias snapshot for in-memory autocomplete.
+    #[must_use]
+    pub fn with_candidates(mut self, candidates: Vec<NoteCandidate>) -> Self {
+        self.candidates = candidates;
+        self
+    }
+
+    /// Opt in to inserting stable-ID link syntax when a candidate has an
+    /// unconflicted stable ID. Defaults to ordinary readable wikilinks.
+    #[must_use]
+    pub fn with_stable_links(mut self, enabled: bool) -> Self {
+        self.stable_links = enabled;
+        self
     }
 
     /// Set the requested widget width.
@@ -83,6 +107,70 @@ impl<'a, Message> EditorWidget<'a, Message> {
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
     ) -> bool {
+        if state.autocomplete_start.is_some() {
+            match key {
+                Key::Named(Named::Escape) => {
+                    state.close_autocomplete();
+                    return true;
+                }
+                Key::Named(Named::ArrowUp) => {
+                    state.autocomplete_selected = state.autocomplete_selected.saturating_sub(1);
+                    return true;
+                }
+                Key::Named(Named::ArrowDown) => {
+                    let count = autocomplete_count(self, state);
+                    state.autocomplete_selected = state
+                        .autocomplete_selected
+                        .saturating_add(1)
+                        .min(count.saturating_sub(1));
+                    return true;
+                }
+                Key::Named(Named::Enter) => {
+                    let matches = match_candidates(&self.candidates, &state.autocomplete_query, 8);
+                    if let Some(candidate) = matches.get(state.autocomplete_selected) {
+                        let start = state.autocomplete_start.unwrap_or(state.caret);
+                        let inserted = format_link(candidate, self.stable_links);
+                        self.emit(
+                            shell,
+                            EditorAction::insert_link(
+                                &self.view,
+                                start,
+                                state.caret,
+                                inserted.clone(),
+                            ),
+                        );
+                        state.caret = start + inserted.len();
+                        state.anchor = state.caret;
+                    } else if state.autocomplete_selected == matches.len()
+                        && !state.autocomplete_query.trim().is_empty()
+                    {
+                        let start = state.autocomplete_start.unwrap_or(state.caret);
+                        let target = state.autocomplete_query.trim().to_owned();
+                        self.emit(
+                            shell,
+                            EditorAction::open_link(
+                                &self.view,
+                                LinkNavigation {
+                                    target,
+                                    alias: None,
+                                    anchor: None,
+                                    by_id: false,
+                                    span: flavite_syntax::text::Span::new(
+                                        flavite_syntax::TextByte(start),
+                                        flavite_syntax::TextByte(state.caret),
+                                    ),
+                                    create_if_unresolved: true,
+                                },
+                            ),
+                        );
+                    }
+                    state.close_autocomplete();
+                    state.ensure_caret_visible(&self.view.text);
+                    return true;
+                }
+                _ => {}
+            }
+        }
         let action = key_action(key, modifiers, text);
         let range = state.selection();
         let (start, end) = range;
@@ -100,6 +188,19 @@ impl<'a, Message> EditorWidget<'a, Message> {
                     state.caret = start + replacement.len();
                     state.anchor = state.caret;
                     self.emit(shell, edit);
+                    if action == KeyAction::Insert && replacement == "[" && start == end {
+                        if state.caret >= 2
+                            && self.view.text.get(state.caret - 2..state.caret - 1) == Some("[")
+                        {
+                            state.open_autocomplete(state.caret - 2);
+                        } else if state.autocomplete_start.is_some() {
+                            state.autocomplete_query.push('[');
+                            state.autocomplete_selected = 0;
+                        }
+                    } else if state.autocomplete_start.is_some() && action == KeyAction::Insert {
+                        state.autocomplete_query.push_str(replacement);
+                        state.autocomplete_selected = 0;
+                    }
                     emitted = true;
                 }
             }
@@ -139,6 +240,10 @@ impl<'a, Message> EditorWidget<'a, Message> {
                     );
                     state.caret = from;
                     state.anchor = from;
+                    if state.autocomplete_start.is_some() {
+                        state.autocomplete_query.pop();
+                        state.autocomplete_selected = 0;
+                    }
                     emitted = true;
                 }
             }
@@ -200,10 +305,17 @@ impl<'a, Message> EditorWidget<'a, Message> {
 #[derive(Debug, Default)]
 pub struct EditorState {
     buffer_id: Option<u64>,
+    revision: Option<u64>,
+    link_spans: Vec<LinkSpan>,
+    decorations: Vec<flavite_syntax::ScannedSpan>,
     caret: usize,
     anchor: usize,
     focused: bool,
     selecting: bool,
+    modifiers: Modifiers,
+    autocomplete_start: Option<usize>,
+    autocomplete_query: String,
+    autocomplete_selected: usize,
     viewport: Viewport,
 }
 
@@ -220,6 +332,18 @@ impl EditorState {
         (self.caret.min(self.anchor), self.caret.max(self.anchor))
     }
 
+    fn open_autocomplete(&mut self, start: usize) {
+        self.autocomplete_start = Some(start);
+        self.autocomplete_query.clear();
+        self.autocomplete_selected = 0;
+    }
+
+    fn close_autocomplete(&mut self) {
+        self.autocomplete_start = None;
+        self.autocomplete_query.clear();
+        self.autocomplete_selected = 0;
+    }
+
     fn move_to(&mut self, byte: usize, extend: bool) {
         self.caret = byte;
         if !extend {
@@ -227,7 +351,7 @@ impl EditorState {
         }
     }
 
-    fn reconcile(&mut self, view: &EditorView) {
+    fn reconcile(&mut self, view: &EditorView, candidates: &[NoteCandidate]) {
         if self
             .buffer_id
             .is_some_and(|buffer_id| buffer_id != view.buffer_id)
@@ -235,6 +359,14 @@ impl EditorState {
             *self = Self::default();
         }
         self.buffer_id = Some(view.buffer_id);
+        if self.revision != Some(view.revision) {
+            self.link_spans = scan_links(&view.text);
+            for span in &mut self.link_spans {
+                span.resolution = resolve_link(span, candidates);
+            }
+            self.decorations = scan_decorations(&view.text);
+            self.revision = Some(view.revision);
+        }
         self.caret = clamp_char_boundary(&view.text, self.caret);
         self.anchor = clamp_char_boundary(&view.text, self.anchor);
         self.viewport.line_height = LINE_HEIGHT;
@@ -332,6 +464,46 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 }
             }
         }
+        // Use the semantic scanner for link decorations. No markdown parser or
+        // second link grammar is embedded in the widget.
+        for run in &runs {
+            let line_start = source_start + line_start_byte(&visible_text, run.line_i);
+            for glyph in run.glyphs {
+                let glyph_start = line_start + glyph.start;
+                let glyph_end = line_start + glyph.end;
+                let link_resolution = state
+                    .link_spans
+                    .iter()
+                    .find(|span| span.span.start < glyph_end && span.span.end > glyph_start)
+                    .map(|span| span.resolution);
+                let other_decoration = state.decorations.iter().any(|span| {
+                    matches!(span.kind, SpanKind::Tag | SpanKind::BlockId)
+                        && span.span.start.0 < glyph_end
+                        && span.span.end.0 > glyph_start
+                });
+                if link_resolution.is_some() || other_decoration {
+                    let color = match link_resolution {
+                        Some(LinkResolution::Unresolved) => Color::from_rgb(0.95, 0.48, 0.43),
+                        Some(LinkResolution::Ambiguous) => Color::from_rgb(0.96, 0.73, 0.32),
+                        _ => Color::from_rgb(0.35, 0.67, 0.98),
+                    };
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: Rectangle::new(
+                                Point::new(
+                                    bounds.x + PAD_X + glyph.x,
+                                    bounds.y + PAD_Y + run.line_top + LINE_HEIGHT - 2.0,
+                                ),
+                                Size::new(glyph.w.max(1.0), 1.0),
+                            ),
+                            border: Border::default(),
+                            ..renderer::Quad::default()
+                        },
+                        Background::Color(color),
+                    );
+                }
+            }
+        }
         renderer.fill_text(
             text::Text {
                 content: visible_text.clone(),
@@ -351,6 +523,81 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             Color::from_rgb(0.88, 0.90, 0.93),
             clip,
         );
+        if state.autocomplete_start.is_some() {
+            let matches = match_candidates(&self.candidates, &state.autocomplete_query, 8);
+            let has_create = !state.autocomplete_query.trim().is_empty();
+            if !matches.is_empty() || has_create {
+                let row_count = matches.len() + usize::from(has_create);
+                let line = self.view.text[..state.caret.min(self.view.text.len())]
+                    .matches('\n')
+                    .count();
+                let popup = Rectangle::new(
+                    Point::new(
+                        bounds.x + PAD_X,
+                        bounds.y
+                            + PAD_Y
+                            + (line.saturating_sub(state.viewport.first_line) as f32 + 1.0)
+                                * LINE_HEIGHT,
+                    ),
+                    Size::new(320.0, row_count as f32 * 23.0 + 8.0),
+                );
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: popup,
+                        border: Border::default(),
+                        ..renderer::Quad::default()
+                    },
+                    Background::Color(Color::from_rgb(0.15, 0.17, 0.20)),
+                );
+                for (index, candidate) in matches.iter().enumerate() {
+                    let color = if index == state.autocomplete_selected {
+                        Color::from_rgb(0.55, 0.78, 1.0)
+                    } else {
+                        Color::from_rgb(0.82, 0.84, 0.87)
+                    };
+                    renderer.fill_text(
+                        text::Text {
+                            content: format!("{}  ·  {}", candidate.title, candidate.target),
+                            bounds: Size::new(304.0, 22.0),
+                            size: iced::Pixels(14.0),
+                            line_height: text::LineHeight::Absolute(iced::Pixels(18.0)),
+                            font: iced::Font::MONOSPACE,
+                            align_x: text::Alignment::Left,
+                            align_y: iced::alignment::Vertical::Center,
+                            shaping: text::Shaping::Advanced,
+                            wrapping: text::Wrapping::None,
+                        },
+                        Point::new(popup.x + 8.0, popup.y + 4.0 + index as f32 * 23.0),
+                        color,
+                        clip,
+                    );
+                }
+                if has_create {
+                    let index = matches.len();
+                    let color = if index == state.autocomplete_selected {
+                        Color::from_rgb(0.55, 0.78, 1.0)
+                    } else {
+                        Color::from_rgb(0.82, 0.84, 0.87)
+                    };
+                    renderer.fill_text(
+                        text::Text {
+                            content: format!("Create note: {}", state.autocomplete_query.trim()),
+                            bounds: Size::new(304.0, 22.0),
+                            size: iced::Pixels(14.0),
+                            line_height: text::LineHeight::Absolute(iced::Pixels(18.0)),
+                            font: iced::Font::MONOSPACE,
+                            align_x: text::Alignment::Left,
+                            align_y: iced::alignment::Vertical::Center,
+                            shaping: text::Shaping::Advanced,
+                            wrapping: text::Wrapping::None,
+                        },
+                        Point::new(popup.x + 8.0, popup.y + 4.0 + index as f32 * 23.0),
+                        color,
+                        clip,
+                    );
+                }
+            }
+        }
         if state.focused
             && state.caret >= source_start
             && state.caret <= source_start + visible_text.len()
@@ -382,7 +629,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
     fn diff(&self, tree: &mut Tree) {
         tree.state
             .downcast_mut::<EditorState>()
-            .reconcile(&self.view);
+            .reconcile(&self.view, &self.candidates);
     }
 
     fn update(
@@ -398,8 +645,25 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
     ) {
         let state = tree.state.downcast_mut::<EditorState>();
         match event {
+            iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                state.modifiers = *modifiers;
+            }
             iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(position) = cursor.position_in(layout.bounds()) {
+                    let byte = hit_test_visible(
+                        &self.view.text,
+                        state.viewport,
+                        position.x - PAD_X,
+                        position.y - PAD_Y,
+                        (layout.bounds().width - PAD_X * 2.0).max(1.0),
+                    );
+                    if (state.modifiers.command() || state.modifiers.control())
+                        && let Some(action) = link_action_at(&self.view, &state.link_spans, byte)
+                    {
+                        self.emit(shell, action);
+                        shell.capture_event();
+                        return;
+                    }
                     state.focused = true;
                     state.selecting = true;
                     state.place_caret_from_point(
@@ -486,6 +750,11 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
     }
 }
 
+fn autocomplete_count<Message>(widget: &EditorWidget<'_, Message>, state: &EditorState) -> usize {
+    match_candidates(&widget.candidates, &state.autocomplete_query, 8).len()
+        + usize::from(!state.autocomplete_query.trim().is_empty())
+}
+
 impl<Message> EditorSurface for EditorWidget<'_, Message> {
     fn view(&self) -> &EditorView {
         &self.view
@@ -530,6 +799,37 @@ fn key_action(key: &Key, modifiers: Modifiers, text: Option<&str>) -> KeyAction 
         }
         _ => KeyAction::Ignore,
     }
+}
+
+fn format_link(candidate: &NoteCandidate, stable_links: bool) -> String {
+    if stable_links && let Some(id) = &candidate.stable_id {
+        return format!("[[id:{id}|{}]]", candidate.title);
+    }
+    if candidate.target == candidate.title {
+        format!("[[{}]]", candidate.target)
+    } else {
+        format!("[[{}|{}]]", candidate.target, candidate.title)
+    }
+}
+
+fn link_action_at(view: &EditorView, spans: &[LinkSpan], byte: usize) -> Option<EditorAction> {
+    let link = spans
+        .iter()
+        .find(|span| !span.embed && span.span.start <= byte && byte < span.span.end)?;
+    Some(EditorAction::open_link(
+        view,
+        LinkNavigation {
+            target: link.payload.target_raw.clone(),
+            alias: link.payload.alias.clone(),
+            anchor: link.payload.anchor.clone(),
+            by_id: link.payload.by_id,
+            span: flavite_syntax::text::Span::new(
+                flavite_syntax::TextByte(link.span.start),
+                flavite_syntax::TextByte(link.span.end),
+            ),
+            create_if_unresolved: true,
+        },
+    ))
 }
 
 fn shape_text(text: &str, width: f32) -> ShapingBuffer {
@@ -640,6 +940,124 @@ mod tests {
             key_action(&Key::Character("e".into()), Modifiers::empty(), Some("é")),
             KeyAction::Insert
         );
+    }
+
+    #[test]
+    fn autocomplete_selection_emits_revision_guarded_link_insert() {
+        let view = test_view("[[In", 97);
+        let widget = EditorWidget::new(&view, |action| action).with_candidates(vec![
+            NoteCandidate::new("notes/inbox", "Inbox"),
+            NoteCandidate::new("Ideas", "Ideas"),
+        ]);
+        let mut state = EditorState {
+            caret: view.text.len(),
+            anchor: view.text.len(),
+            ..EditorState::default()
+        };
+        state.open_autocomplete(0);
+        state.autocomplete_query = "In".into();
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        assert!(widget.execute_key(
+            &mut state,
+            &Key::Named(Named::Enter),
+            Modifiers::empty(),
+            None,
+            &mut clipboard,
+            &mut shell,
+        ));
+        drop(shell);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].expected_revision, 11);
+        assert_eq!(messages[0].command_id, "link.insert");
+        assert_eq!(
+            messages[0].edits[0].range,
+            Span::new(TextByte(0), TextByte(4))
+        );
+        assert_eq!(messages[0].edits[0].replacement, "[[notes/inbox|Inbox]]");
+        let invocation = messages[0]
+            .clone()
+            .into_invocation(88)
+            .expect("registry invocation");
+        assert_eq!(invocation.command_id, "link.insert");
+        assert_eq!(invocation.args["ops"][0]["range"][0], 0);
+        assert_eq!(
+            invocation.args["ops"][0]["replacement"],
+            "[[notes/inbox|Inbox]]"
+        );
+        assert_eq!(state.caret(), "[[notes/inbox|Inbox]]".len());
+        assert!(state.autocomplete_start.is_none());
+    }
+
+    #[test]
+    fn autocomplete_create_row_opens_unresolved_note_for_creation() {
+        let view = test_view("[[New", 103);
+        let widget = EditorWidget::new(&view, |action| action)
+            .with_candidates(vec![NoteCandidate::new("Ideas", "Ideas")]);
+        let mut state = EditorState {
+            caret: view.text.len(),
+            anchor: view.text.len(),
+            ..EditorState::default()
+        };
+        state.open_autocomplete(0);
+        state.autocomplete_query = "New note".into();
+        state.autocomplete_selected = 0; // no matching notes, so the create row is selected
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+
+        assert!(widget.execute_key(
+            &mut state,
+            &Key::Named(Named::Enter),
+            Modifiers::empty(),
+            None,
+            &mut clipboard,
+            &mut shell,
+        ));
+        drop(shell);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].command_id, "note.open");
+        let navigation = messages[0].navigation.as_ref().expect("create navigation");
+        assert_eq!(navigation.target, "New note");
+        assert!(navigation.create_if_unresolved);
+        assert_eq!(navigation.span, Span::new(TextByte(0), TextByte(5)));
+        assert!(state.autocomplete_start.is_none());
+    }
+
+    #[test]
+    fn link_insert_supports_readable_aliases_and_opt_in_stable_form() {
+        let mut candidate = NoteCandidate::new("notes/concepts", "Concepts");
+        candidate.stable_id = Some("01J9ZK".into());
+        assert_eq!(
+            format_link(&candidate, false),
+            "[[notes/concepts|Concepts]]"
+        );
+        assert_eq!(format_link(&candidate, true), "[[id:01J9ZK|Concepts]]");
+    }
+
+    #[test]
+    fn link_activation_emits_target_syntax_and_never_opens_embeds_as_notes() {
+        let text = "[[Ideas#Plan|Ideas]] ![[diagram.png]]";
+        let spans = scan_links(text);
+        let view = EditorView {
+            buffer_id: 88,
+            revision: 15,
+            text: text.into(),
+            path: std::path::PathBuf::from("source.md"),
+            state: "Clean".into(),
+        };
+        let action = link_action_at(&view, &spans, 4).expect("link activation");
+        assert_eq!(action.buffer_id, 88);
+        assert_eq!(action.expected_revision, 15);
+        assert!(action.edits.is_empty());
+        let navigation = action.navigation.expect("navigation action");
+        assert_eq!(navigation.target, "Ideas");
+        assert_eq!(navigation.alias.as_deref(), Some("Ideas"));
+        assert_eq!(navigation.anchor.as_deref(), Some("Plan"));
+        assert!(navigation.create_if_unresolved);
+        assert!(link_action_at(&view, &spans, text.find("diagram").unwrap()).is_none());
     }
 
     #[test]
@@ -855,7 +1273,7 @@ mod tests {
             text: "x".into(),
             ..old.clone()
         };
-        state.reconcile(&shorter_same_buffer);
+        state.reconcile(&shorter_same_buffer, &[]);
         assert_eq!(state.selection(), (1, 1));
 
         let reopened = EditorView {
@@ -864,7 +1282,7 @@ mod tests {
             ..shorter_same_buffer
         };
         state.focused = true;
-        state.reconcile(&reopened);
+        state.reconcile(&reopened, &[]);
         assert_eq!(state.caret(), 0);
         assert_eq!(state.selection(), (0, 0));
         assert!(!state.focused);

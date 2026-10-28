@@ -251,30 +251,19 @@ fn scan_buffer(
     let buffer_end = buffer_start + buffer.len();
     let buffer_range = buffer_start..buffer_end;
 
-    // Skip if the entire buffer is masked
-    if mask.is_masked(buffer_start) {
-        return;
-    }
-
-    // Scan inline syntax in this buffered text
-    let spans = scan_inline(snapshot, buffer_range);
-    for span in spans {
-        match span.kind {
-            SpanKind::Link => {
-                if let Some(link) = Link::from_scanned(span) {
-                    links.push(link);
+    // A masked prefix must not discard valid prose later in the same parser
+    // text buffer (for example, a wikilink after inline math). Scan each
+    // unmasked interval with the one shared inline grammar.
+    for range in mask.unmasked(&buffer_range) {
+        for span in scan_inline(snapshot, range) {
+            match span.kind {
+                SpanKind::Link | SpanKind::Embed => {
+                    if let Some(link) = Link::from_scanned(span) {
+                        links.push(link);
+                    }
                 }
-            }
-            SpanKind::Embed => {
-                if let Some(link) = Link::from_scanned(span) {
-                    links.push(link);
-                }
-            }
-            SpanKind::Tag => {
-                tags.push(span.span);
-            }
-            SpanKind::BlockId => {
-                block_ids.push(span.span);
+                SpanKind::Tag => tags.push(span.span),
+                SpanKind::BlockId => block_ids.push(span.span),
             }
         }
     }

@@ -1,8 +1,8 @@
 //! Minimal end-to-end host for the custom editor and Session save path.
 
 use flavite_api::lattice::session::{CommandResult, SessionCommand, SessionResult};
-use flavite_api::{BufferView, Lattice, VaultConfig};
-use flavite_editor::{EditorAction, EditorWidget};
+use flavite_api::{BufferView, ExecutionResult, Lattice, LocalResult, VaultConfig};
+use flavite_editor::{EditorAction, EditorWidget, NoteCandidate};
 use iced::widget::{button, column, container, text};
 use iced::{Element, Length, Subscription, time};
 use std::path::PathBuf;
@@ -26,6 +26,7 @@ enum Message {
 struct App {
     lattice: Option<Lattice>,
     view: Option<BufferView>,
+    candidates: Vec<NoteCandidate>,
     status: String,
     last_edit: Instant,
     pending_save: Option<u64>,
@@ -38,6 +39,7 @@ impl App {
             Err(error) => Self {
                 lattice: None,
                 view: None,
+                candidates: Vec::new(),
                 status: format!("Could not open demo vault: {error}"),
                 last_edit: Instant::now(),
                 pending_save: None,
@@ -72,9 +74,21 @@ impl App {
                 let view = lattice
                     .get_buffer_view(buffer_id, None)
                     .map_err(|error| error.to_string())?;
+                let candidates = lattice
+                    .completion_candidates()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|candidate| NoteCandidate {
+                        target: candidate.target,
+                        title: candidate.title,
+                        aliases: candidate.aliases,
+                        stable_id: candidate.stable_id,
+                    })
+                    .collect();
                 Ok(Self {
                     lattice: Some(lattice),
                     view: Some(view),
+                    candidates,
                     status: "Ready".into(),
                     last_edit: Instant::now(),
                     pending_save: None,
@@ -92,7 +106,45 @@ impl App {
         match message {
             Message::Edit(action) => {
                 let Some(lattice) = &self.lattice else { return };
+                if let Some(navigation) = &action.navigation {
+                    let Some(path) =
+                        safe_note_target(&lattice.vault_ref().root, &navigation.target)
+                    else {
+                        self.status = "Link target is not a safe vault-relative note path".into();
+                        return;
+                    };
+                    let target = navigation.target.clone();
+                    let invocation = action.into_link_invocation(
+                        lattice.command_registry().next_request_id(),
+                        path.clone(),
+                    );
+                    let Some(invocation) = invocation else { return };
+                    match lattice.execute(invocation) {
+                        ExecutionResult::Local(LocalResult::Success(_)) => {
+                            self.status = format!("Opened link: {target}");
+                            if let Some(buffer_id) = lattice.session().get_buffer_id(&path) {
+                                self.refresh(buffer_id.as_u64());
+                            }
+                        }
+                        other => self.status = format!("Could not open link: {other:?}"),
+                    }
+                    return;
+                }
                 let buffer_id = action.buffer_id;
+                if action.command_id == "link.insert" {
+                    let invocation =
+                        action.into_invocation(lattice.command_registry().next_request_id());
+                    let Some(invocation) = invocation else { return };
+                    match lattice.execute(invocation) {
+                        ExecutionResult::Local(LocalResult::Success(_)) => {
+                            self.status = "Link inserted".into();
+                            self.refresh(buffer_id);
+                        }
+                        other => self.status = format!("Link insertion failed: {other:?}"),
+                    }
+                    self.last_edit = Instant::now();
+                    return;
+                }
                 let result = lattice.execute_session(action.into_session_command());
                 self.status = match result {
                     SessionResult::Success(_) => "Editing".into(),
@@ -166,6 +218,7 @@ impl App {
                 column![
                     header,
                     EditorWidget::new(view, Message::Edit)
+                        .with_candidates(self.candidates.clone())
                         .width(Length::Fill)
                         .height(Length::Fill),
                 ]
@@ -177,6 +230,84 @@ impl App {
             container(header).padding(18).into()
         }
     }
+}
+
+fn safe_note_target(root: &std::path::Path, target: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let root = std::fs::canonicalize(root).ok()?;
+    let candidate = std::path::Path::new(target);
+    if candidate.as_os_str().is_empty()
+        || candidate
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || target
+            .chars()
+            .any(|character| character == ':' || character == '\\' || character.is_control())
+    {
+        return None;
+    }
+    let mut relative = candidate.to_path_buf();
+    if relative.extension().is_none() {
+        relative.set_extension("md");
+    } else if !relative
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+    {
+        return None;
+    }
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        let name = name.to_string_lossy();
+        if name.ends_with(['.', ' '])
+            || name.chars().any(|character| "<>\"|?*".contains(character))
+            || is_windows_reserved_name(&name)
+        {
+            return None;
+        }
+    }
+    let path = root.join(relative);
+    let parent = std::fs::canonicalize(path.parent()?).ok()?;
+    if !parent.starts_with(&root) {
+        return None;
+    }
+    if std::fs::symlink_metadata(&path).is_ok() {
+        let resolved = std::fs::canonicalize(&path).ok()?;
+        if !resolved.starts_with(&root) {
+            return None;
+        }
+    }
+    Some(path)
+}
+
+fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default();
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 fn terminal_save_status(result: &SessionResult) -> String {
