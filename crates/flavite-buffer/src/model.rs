@@ -20,9 +20,6 @@ use crate::eol::EolTable;
 use crate::revision::{BaseHash, BufferId, Revision};
 use crate::undo::{EditOp, UndoTree};
 
-/// Maximum allowed note size in bytes (§4.10).
-const MAX_NOTE_BYTES: usize = 32 * 1024 * 1024; // 32 MB
-
 /// A selection range in TextByte coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
@@ -295,13 +292,6 @@ impl EditorModel {
             return self.revision;
         }
 
-        // Check size limit
-        if self.len() + text.len() > MAX_NOTE_BYTES {
-            // In a real implementation, we'd return an error or truncate
-            // For now, we just skip
-            return self.revision;
-        }
-
         // Count newlines in the inserted text
         let newlines = text.chars().filter(|&c| c == '\n').count();
 
@@ -343,8 +333,9 @@ impl EditorModel {
         }
 
         let edit = EditOp::new(range, replacement.to_string());
+        let old_text = self.text().to_string();
         let revision = self.apply_edit_op(edit);
-        self.rebuild_eol_table();
+        self.rebuild_eol_table(&old_text);
         revision
     }
 
@@ -377,9 +368,6 @@ impl EditorModel {
     pub fn apply_snapshot_boundary(&mut self, snapshot: TextSnapshot) -> Revision {
         let old_text = self.text().to_string();
         let new_text = snapshot.text().to_string();
-        if old_text.len() > MAX_NOTE_BYTES || new_text.len() > MAX_NOTE_BYTES {
-            return self.revision;
-        }
         let edit = EditOp::new(
             Span::new(TextByte(0), TextByte(old_text.len())),
             new_text.clone(),
@@ -436,7 +424,7 @@ impl EditorModel {
             Span::new(TextByte(start), TextByte(end)),
             replacement,
         ));
-        self.rebuild_eol_table();
+        self.rebuild_eol_table(&old_text);
         revision
     }
 
@@ -661,16 +649,43 @@ impl EditorModel {
     /// Rebuild the EOL table from the current rope state.
     ///
     /// This is called when we can't easily update the EOL table incrementally.
-    fn rebuild_eol_table(&mut self) {
+    fn rebuild_eol_table(&mut self, old_text: &str) {
         let dominant = self.eol_table.dominant_eol();
         let has_bom = self.eol_table.has_bom();
         let snapshot =
             TextSnapshot::new(self.text().as_bytes()).expect("EditorModel text is valid UTF-8");
         let mut new_table = EolTable::from_snapshot(&snapshot);
-        for ending in &mut new_table.line_endings {
-            if *ending == crate::eol::LineEnding::Lf {
-                *ending = dominant;
-            }
+        let old_lines = logical_lines(old_text);
+        let new_lines = logical_lines(self.text());
+        let mut prefix = 0;
+        while prefix < old_lines.len()
+            && prefix < new_lines.len()
+            && old_lines[prefix] == new_lines[prefix]
+        {
+            prefix += 1;
+        }
+        let mut suffix = 0;
+        while suffix < old_lines.len().saturating_sub(prefix)
+            && suffix < new_lines.len().saturating_sub(prefix)
+            && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+        let old_middle = old_lines.len() - prefix - suffix;
+        let new_middle = new_lines.len() - prefix - suffix;
+        for (line, ending) in new_table.line_endings.iter_mut().enumerate() {
+            let old_line = if line < prefix {
+                Some(line)
+            } else if line >= prefix + new_middle {
+                Some(old_lines.len() - (new_lines.len() - line))
+            } else if old_middle == new_middle {
+                Some(line)
+            } else {
+                None
+            };
+            *ending = old_line
+                .and_then(|old_line| self.eol_table.get(old_line))
+                .unwrap_or(dominant);
         }
         new_table.has_bom = has_bom;
 
@@ -680,6 +695,14 @@ impl EditorModel {
     /// Set the coalesce window for the undo tree.
     pub fn set_coalesce_window(&mut self, window: Duration) {
         self.undo_tree.set_coalesce_window(window);
+    }
+}
+
+fn logical_lines(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        vec![""]
+    } else {
+        text.split_inclusive('\n').collect()
     }
 }
 
