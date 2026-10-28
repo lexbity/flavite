@@ -10,17 +10,23 @@ description = "iced application (§4.1)"
 # iced/wgpu are permitted here (and in flavite-editor) only — §4.1/§10.2;
 # `cargo xtask arch check` enforces the layering rule transitively.
 iced = { workspace = true }
+# §4.7/D1: the command palette matches registry commands in memory with nucleo.
+nucleo = { workspace = true }
 flavite-graph = { path = "../flavite-graph" }
 flavite-api = { path = "../flavite-api" }
 flavite-buffer = { path = "../flavite-buffer" }
 # §10.4 convention: thiserror for libraries. Used for the CPU-side geometry
 # error type (`graph::instance::GeometryError`).
 thiserror = { workspace = true }
-# serde for serialization in card content
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 # Headless wgpu validation tests drive wgpu's async device/adapter futures.
 futures = "0.3"
+# Fixture vaults for app-state and pump tests.
+tempfile = { workspace = true }
 # Headless WGSL validation: parses/validates the probe's shader and asserts
 # the Rust ↔ WGSL uniform layout contract without needing a GPU adapter, so
 # the shader gate runs on every CI platform (PLAN-B §5 B2).

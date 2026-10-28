@@ -49,13 +49,20 @@ env -u WAYLAND_DISPLAY WINIT_UNIX_BACKEND=x11 \
     "$target_dir/debug/examples/editor-demo" "$vault_dir" \
     >"$visual_dir/editor-app.log" 2>&1 &
 app_pid=$!
+window_id=""
 cleanup() {
+    if [[ -n "$window_id" ]]; then
+        xdotool windowclose "$window_id" 2>/dev/null || true
+    fi
+    for _ in $(seq 1 20); do
+        kill -0 "$app_pid" 2>/dev/null || break
+        sleep 0.1
+    done
     kill "$app_pid" 2>/dev/null || true
     wait "$app_pid" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-window_id=""
 for _ in $(seq 1 100); do
     window_id="$(xdotool search --onlyvisible --name '^Lattice editor demo$' 2>/dev/null | head -n 1 || true)"
     if [[ -n "$window_id" ]]; then

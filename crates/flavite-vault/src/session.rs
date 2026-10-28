@@ -396,6 +396,29 @@ impl Session {
         self.completions.lock().unwrap().drain(..).collect()
     }
 
+    /// Drain lossy vault pulses for a host adapter.
+    pub fn drain_pulses(&self) -> Vec<crate::channels::Pulse> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.pulse.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// Drain lossless, coalesced notices for a host adapter.
+    pub fn drain_notices(&self) -> Vec<crate::channels::Notice> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.notice.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// Acknowledge notice presentation. This never changes operation state.
+    pub fn acknowledge_notice(&self, notice: &crate::channels::Notice) {
+        self.notice.ack(notice);
+    }
+
     /// CLI/headless convenience for commands that promise a disk mutation.
     /// GUI hosts use `drain_operation_completions` from their normal pump.
     pub fn wait_for_operation(&self, request_id: u64) -> SessionResult {
