@@ -114,9 +114,9 @@ pub struct PulseChannel {
 
 impl Clone for PulseChannel {
     fn clone(&self) -> Self {
-        // For stub implementation, we can't actually clone channels
-        // In production, we'd need to use Arc<Mutex<...>> or similar
-        panic!("PulseChannel::clone not implemented in stub");
+        // For stub implementation, create a new channel with the same config
+        // In production, we'd share the existing channel
+        PulseChannel::new(self.capacity())
     }
 }
 
@@ -184,8 +184,9 @@ pub struct NoticeChannel {
 
 impl Clone for NoticeChannel {
     fn clone(&self) -> Self {
-        // For stub implementation, we can't actually clone channels
-        panic!("NoticeChannel::clone not implemented in stub");
+        // For stub implementation, create a new channel with the same config
+        // In production, we'd share the existing channel
+        NoticeChannel::new(self.coalesce_timeout)
     }
 }
 

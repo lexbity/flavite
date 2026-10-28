@@ -295,14 +295,10 @@ impl Drop for FocusIpc {
 
 /// Single-instance manager.
 ///
-/// This manages the root guard + UUID lock ordering and focus IPC
-/// according to §4.13.
+/// This manages the focus IPC mechanism according to §4.12, §4.13.
+/// Locks (root guard and UUID lock) are managed separately by IdentityManager.
 #[derive(Debug)]
 pub struct InstanceManager {
-    /// Root ownership guard.
-    root_guard: AdvisoryLock,
-    /// UUID instance lock.
-    uuid_lock: AdvisoryLock,
     /// Focus IPC endpoint (server).
     focus_ipc: FocusIpc,
     /// The vault identity.
@@ -312,32 +308,13 @@ pub struct InstanceManager {
 impl InstanceManager {
     /// Create a new instance manager.
     ///
-    /// This follows the startup sequence from §4.13:
-    /// 1. Acquire root guard
-    /// 2. Select identity read-only
-    /// 3. Acquire UUID lock
-    /// 4. Verify binding
+    /// Locks are managed by IdentityManager. This only manages the focus IPC.
     pub fn new(identity: VaultIdentity) -> InstanceResult<Self> {
-        // Step 1: Root guard
-        let root_guard_path = get_root_guard_path(&identity.root_key);
-
-        let root_guard = AdvisoryLock::acquire(&root_guard_path)?;
-
-        // Step 2: Identity selection happens externally (passed in)
-
-        // Step 3: UUID lock
-        let uuid_lock_path =
-            uuid_lock_path(identity.uuid).ok_or(InstanceError::UuidLockPathUnavailable)?;
-
-        let uuid_lock = AdvisoryLock::acquire(&uuid_lock_path)?;
-
-        // Step 4: Create focus IPC
+        // Create focus IPC
         let ipc_path = get_ipc_path(identity.uuid)?;
         let focus_ipc = FocusIpc::new(ipc_path, true)?;
 
         Ok(Self {
-            root_guard,
-            uuid_lock,
             focus_ipc,
             identity,
         })
