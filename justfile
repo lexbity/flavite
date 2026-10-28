@@ -185,6 +185,23 @@ gpu-setup:
         echo "gpu-setup: vulkaninfo unavailable; the adapter requirement will surface the real error."
     fi
 
+# Linux-only rendered UI smoke: real iced window under Xvfb + lavapipe, with a
+# PNG emitted to target/ui-visual/ for human/agent inspection.
+ui-visual-smoke:
+    xvfb-run -a -s "-screen 0 1280x900x24" bash scripts/ui-visual-smoke-linux.sh
+
+# Linux-only dependencies for the rendered UI smoke. Kept separate from
+# gpu-setup so shader validation and visual window capture remain distinct.
+ui-visual-setup:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "ui-visual-setup: apt-get not found; install Xvfb, xdotool, and ImageMagick manually."
+        exit 2
+    fi
+    sudo apt-get update
+    sudo apt-get install -y --no-install-recommends xvfb xdotool imagemagick
+
 # Full cleanup (§10.10): removes target/, fuzz/target/, fuzz/artifacts/,
 # profiling intermediates. Pass --dry-run to preview without removing.
 clean *args:

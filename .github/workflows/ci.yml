@@ -34,6 +34,25 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: just gpu-setup
 
+      # The shader test above validates GPU pipeline construction headlessly.
+      # This separate Linux smoke launches an actual iced window and captures
+      # its rendered contents for visual review.
+      - name: Linux visual smoke setup
+        if: matrix.os == 'ubuntu-latest'
+        run: just ui-visual-setup
+
+      - name: Linux rendered UI smoke
+        if: matrix.os == 'ubuntu-latest'
+        run: just ui-visual-smoke
+
+      - name: Upload Linux UI screenshot
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lattice-ui-visual-smoke
+          path: target/ui-visual/graph.png
+          if-no-files-found: error
+
       - name: G0 (fmt + clippy + test + arch check)
         run: just gate
         env:

@@ -457,6 +457,14 @@ impl Lattice {
             SessionResult::Pending { request_id: req_id } => {
                 ExecutionResult::Pending { request_id: req_id }
             }
+            SessionResult::Superseded {
+                request_id: req_id,
+                by_request,
+            } => ExecutionResult::Local(LocalResult::Error(LocalError::with_request(
+                "superseded",
+                format!("Save request {req_id} was superseded by request {by_request}"),
+                req_id,
+            ))),
             SessionResult::Error { message } => ExecutionResult::Local(LocalResult::Error(
                 LocalError::new("session_error", message),
             )),
@@ -466,7 +474,7 @@ impl Lattice {
                     format!("Conflict detected: {}", path.to_string_lossy()),
                 )))
             }
-            SessionResult::MergeReady { path, result } => {
+            SessionResult::MergeReady { path, result, .. } => {
                 let data = serde_json::json!({
                     "path": path.to_string_lossy(),
                     "merged": result.merged,
