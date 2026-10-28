@@ -234,7 +234,7 @@ impl Default for CardLayerHarness {
         use crate::graph::ProbeGeometry;
         use iced::Point;
         Self {
-            geometry: Arc::new(ProbeGeometry::new(0, vec![], vec![])),
+            geometry: Arc::new(ProbeGeometry::new(0, vec![], vec![], vec![])),
             camera: ZoomableCamera::centered(),
             bounds: Rectangle::new(Point::new(0.0, 0.0), iced::Size::new(800.0, 600.0)),
             cache: LayoutCache::new(),
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn card_layer_inactive_below_threshold() {
-        let geometry = Arc::new(crate::graph::ProbeGeometry::new(1, vec![], vec![]));
+        let geometry = Arc::new(crate::graph::ProbeGeometry::new(1, vec![], vec![], vec![]));
         let mut harness = CardLayerHarness::new(Arc::clone(&geometry));
         harness.camera.zoom = CARD_ZOOM_THRESHOLD - 0.1;
 
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn card_layer_active_above_threshold() {
-        let geometry = Arc::new(crate::graph::ProbeGeometry::new(1, vec![], vec![]));
+        let geometry = Arc::new(crate::graph::ProbeGeometry::new(1, vec![], vec![], vec![]));
         let mut harness = CardLayerHarness::new(Arc::clone(&geometry));
         harness.camera.zoom = CARD_ZOOM_THRESHOLD + 0.1;
 
@@ -465,7 +465,7 @@ Some more content."#;
 
     #[test]
     fn card_layer_harness_starts_empty() {
-        let geometry = Arc::new(crate::graph::ProbeGeometry::new(1, vec![], vec![]));
+        let geometry = Arc::new(crate::graph::ProbeGeometry::new(1, vec![], vec![], vec![]));
         let harness = CardLayerHarness::new(Arc::clone(&geometry));
         assert_eq!(harness.cached_count(), 0);
         assert_eq!(harness.toggle_count(), 0);
@@ -473,7 +473,7 @@ Some more content."#;
 
     #[test]
     fn card_layer_status_widget_builds() {
-        let geometry = Arc::new(crate::graph::ProbeGeometry::new(1, vec![], vec![]));
+        let geometry = Arc::new(crate::graph::ProbeGeometry::new(1, vec![], vec![], vec![]));
         let mut harness = CardLayerHarness::new(Arc::clone(&geometry));
         harness.camera.zoom = CARD_ZOOM_THRESHOLD + 0.1;
 

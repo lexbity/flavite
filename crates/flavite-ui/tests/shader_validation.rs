@@ -344,6 +344,7 @@ fn probe_pipelines_compile_and_link_on_a_real_device() {
             width: 1.0,
             pad: [0.0; 2],
         }],
+        vec![],
     ));
     let primitive = ProbePrimitive::new(
         geometry,

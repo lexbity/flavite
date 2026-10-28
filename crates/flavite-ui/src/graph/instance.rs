@@ -11,7 +11,7 @@
 use std::cmp::Ordering;
 use std::mem::size_of;
 
-use flavite_graph::{GraphSnapshot, NodeKind};
+use flavite_graph::{GraphSnapshot, NodeId, NodeKind};
 
 /// Vertex-layout stride of [`NodeInstance`], in bytes.
 ///
@@ -399,6 +399,9 @@ pub struct ProbeGeometry {
     generation: u64,
     nodes: Vec<NodeInstance>,
     edges: Vec<EdgeInstance>,
+    /// Node identities, in dense order, parallel to `nodes`.
+    /// Added in B6 for hit-testing: mapping dense indices back to [`NodeId`].
+    node_ids: Vec<NodeId>,
 }
 
 impl ProbeGeometry {
@@ -429,6 +432,7 @@ impl ProbeGeometry {
             });
         }
 
+        let node_ids: Vec<NodeId> = snapshot.node_ids.clone();
         let nodes = (0..node_count)
             .map(|i| {
                 let kind = snapshot.node_kinds[i];
@@ -482,16 +486,23 @@ impl ProbeGeometry {
             generation,
             nodes,
             edges,
+            node_ids,
         })
     }
 
     /// Build geometry directly (used by tests that do not need a snapshot).
     #[must_use]
-    pub fn new(generation: u64, nodes: Vec<NodeInstance>, edges: Vec<EdgeInstance>) -> Self {
+    pub fn new(
+        generation: u64,
+        nodes: Vec<NodeInstance>,
+        edges: Vec<EdgeInstance>,
+        node_ids: Vec<NodeId>,
+    ) -> Self {
         Self {
             generation,
             nodes,
             edges,
+            node_ids,
         }
     }
 
@@ -513,6 +524,14 @@ impl ProbeGeometry {
         &self.edges
     }
 
+    /// Node identities, in dense order (parallel to [`Self::nodes`]).
+    ///
+    /// Added in B6 for hit-testing: maps dense indices back to [`NodeId`].
+    #[must_use]
+    pub fn node_ids(&self) -> &[NodeId] {
+        &self.node_ids
+    }
+
     /// Number of nodes.
     #[must_use]
     pub fn node_count(&self) -> usize {
@@ -529,6 +548,14 @@ impl ProbeGeometry {
     #[must_use]
     pub fn visible_edge_count(&self, zoom: f32) -> usize {
         edge_cap(self.edges.len(), zoom)
+    }
+
+    /// Get the node identity for a dense index.
+    ///
+    /// Returns `None` if the index is out of range.
+    #[must_use]
+    pub fn node_id(&self, index: usize) -> Option<NodeId> {
+        self.node_ids.get(index).copied()
     }
 }
 

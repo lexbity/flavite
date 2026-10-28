@@ -44,6 +44,7 @@ use crate::graph::instance::{
     self, CAMERA_UNIFORM_SIZE, Camera, CameraUniform, EDGE_INSTANCE_SIZE, NODE_INSTANCE_SIZE,
     ProbeGeometry,
 };
+use flavite_graph::NodeId;
 
 /// The probe's WGSL module: camera uniform, instanced nodes, instanced edges.
 ///
@@ -853,6 +854,7 @@ impl ShaderPrimitive for ProbePrimitive {
 ///
 /// Cloned into the widget by the application's `view`, so the camera it
 /// carries is always the application's authoritative one for that frame.
+#[derive(Debug, Clone)]
 pub struct ProbeProgram {
     geometry: Arc<ProbeGeometry>,
     camera: Camera,
@@ -1064,6 +1066,7 @@ mod tests {
                 };
                 10
             ],
+            vec![NodeId::note(1), NodeId::note(2)],
         ))
     }
 
@@ -1196,6 +1199,7 @@ mod tests {
                 };
                 300_000
             ],
+            vec![],
         ));
         let zoomed_out = Camera {
             center: [0.0, 0.0],
@@ -1219,7 +1223,7 @@ mod tests {
         );
 
         // An empty geometry draws nothing.
-        let empty = Arc::new(ProbeGeometry::new(3, vec![], vec![]));
+        let empty = Arc::new(ProbeGeometry::new(3, vec![], vec![], vec![]));
         let primitive = ProbePrimitive::new(empty, Camera::default(), timings);
         assert_eq!(primitive.node_count(), 0);
         assert_eq!(primitive.edge_count(), 0);
