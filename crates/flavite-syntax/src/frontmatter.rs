@@ -81,19 +81,14 @@ pub struct Frontmatter {
 /// Extract frontmatter from a snapshot, if present.
 pub fn parse_frontmatter(snapshot: &TextSnapshot) -> Result<Option<Frontmatter>, FrontmatterError> {
     let text = snapshot.text();
-    let bom_len = if snapshot.has_bom() { 3 } else { 0 };
-
     // Look for `---` at the start.
-    let start = text[bom_len..]
-        .find("---")
-        .map(|i| bom_len + i)
-        .unwrap_or(bom_len);
-
-    if start != bom_len {
+    // TextSnapshot removes the BOM from normalized text, so all parser
+    // offsets here are already in TextByte coordinates.
+    if !text.starts_with("---") {
         return Ok(None);
     }
 
-    let after_open = start + 3;
+    let after_open = 3;
     let rest = &text[after_open..];
 
     // Find closing `---` or `...` on its own line.
@@ -220,7 +215,7 @@ pub fn parse_frontmatter(snapshot: &TextSnapshot) -> Result<Option<Frontmatter>,
 
     Ok(Some(Frontmatter {
         yaml_text,
-        range: bom_len..(bom_len + close),
+        range: 0..close,
         well_known,
         properties,
         title,
@@ -277,6 +272,38 @@ mod tests {
         let snapshot = snap(s);
         let fm = parse_frontmatter(&snapshot).expect("parse");
         assert!(fm.is_none());
+        assert!(parse_frontmatter(&snap("")).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_frontmatter_handles_bom_lists_properties_and_missing_delimiters() {
+        let snapshot = snap(
+            "\u{FEFF}---\ntitle: A title\naliases: [z, a, z]\ntags: one\ntags: two\ncustom: value\ncustom: next\n...\nbody",
+        );
+        let fm = parse_frontmatter(&snapshot).unwrap().unwrap();
+        assert_eq!(fm.range.start, 0);
+        assert_eq!(fm.title.as_deref(), Some("A title"));
+        assert_eq!(fm.well_known[&WellKnownKey::Aliases], ["a", "z"]);
+        assert_eq!(fm.well_known[&WellKnownKey::Tags], ["one", "two"]);
+        assert_eq!(fm.properties["custom"].len(), 2);
+
+        assert!(
+            parse_frontmatter(&snap("prefix\n---\nx\n---"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_frontmatter(&snap("---\nno closing delimiter"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_frontmatter(&snap("---\n\n---\nbody"))
+                .unwrap()
+                .unwrap()
+                .title
+                .is_none()
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@
 //!
 //! Every publish gets a monotonically increasing `generation`, so a consumer
 //! can tell "nothing changed" from "something changed" in O(1)
-//! ([`crate::graph`] reuses this to skip geometry rebuilds), and can order two
+//! so consumers can skip geometry rebuilds, and can order two
 //! frames it happens to hold. Generation `0` is reserved for the initial
 //! empty frame a [`PositionBuffer`] starts with: it is never a real publish.
 
@@ -206,7 +206,7 @@ impl PositionBuffer {
     /// Publish a frame and return its generation.
     ///
     /// The positions must be dense-indexed by `snapshot` — the debug assert
-    /// in [`PositionFrame::new`] checks it, so a mismatched pair cannot be
+    /// in the private frame constructor checks it, so a mismatched pair cannot be
     /// published even by mistake.
     ///
     /// The frame is swapped into place *before* the generation counter
@@ -390,11 +390,19 @@ mod tests {
         // every frame must satisfy: positions and snapshot agree on the node
         // count, and the generation only ever moves forward.
         let buffer = Arc::new(PositionBuffer::new());
+        let snapshot = snapshot_of(8);
+        // Seed a complete frame before starting the reader. This keeps the
+        // assertion meaningful without depending on OS thread scheduling.
+        let _ = buffer.store(
+            Arc::clone(&snapshot),
+            positions(8, 0.0),
+            LayoutState::Active,
+        );
         let writer = {
             let buffer = Arc::clone(&buffer);
             std::thread::spawn(move || {
                 let snapshot = snapshot_of(8);
-                for i in 0..400 {
+                for i in 1..400 {
                     let _ = buffer.store(
                         Arc::clone(&snapshot),
                         positions(8, i as f32),

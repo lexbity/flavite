@@ -94,6 +94,8 @@ pub enum TransitionReason {
     SaveCompleted,
     /// User performed a merge.
     Merge,
+    /// User restored a crash recovery snapshot.
+    RecoveryRestored,
 }
 
 /// Information about a state transition.
@@ -133,6 +135,8 @@ pub struct Buffer {
     state: BufferState,
     /// The base hash of the content when last loaded or saved.
     base_hash: Option<BaseHash>,
+    /// Exact bytes corresponding to `base_hash`, retained as the merge base.
+    base_bytes: Vec<u8>,
     /// The disk hash at the time of the last disk check.
     /// Used to detect external changes.
     disk_hash: Option<BaseHash>,
@@ -149,6 +153,7 @@ impl Buffer {
             model,
             state: BufferState::Clean,
             base_hash: Some(hash),
+            base_bytes: snapshot.source().to_vec(),
             disk_hash: Some(hash),
         }
     }
@@ -189,6 +194,20 @@ impl Buffer {
     #[must_use]
     pub fn base_hash(&self) -> Option<BaseHash> {
         self.base_hash
+    }
+
+    /// Exact source bytes for the current merge base.
+    #[must_use]
+    pub fn base_bytes(&self) -> &[u8] {
+        &self.base_bytes
+    }
+
+    /// Record the exact source bytes known to be the current disk base.
+    pub fn set_base_snapshot(&mut self, bytes: Vec<u8>) {
+        let hash = BaseHash::from_bytes(*blake3::hash(&bytes).as_bytes());
+        self.base_hash = Some(hash);
+        self.disk_hash = Some(hash);
+        self.base_bytes = bytes;
     }
 
     /// Get the disk hash.
@@ -233,10 +252,10 @@ impl Buffer {
         self.model.len()
     }
 
-    /// Whether the buffer holds no bytes.
+    /// Whether the buffer contains no text bytes.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.model.len() == 0
+        self.model.is_empty()
     }
 
     /// Get the line count.
@@ -427,6 +446,7 @@ impl Buffer {
             self.model = EditorModel::from_snapshot(snapshot);
             self.disk_hash = Some(new_hash);
             self.base_hash = Some(new_hash);
+            self.base_bytes = self.model.to_source_bytes();
             self.state = BufferState::Clean;
 
             Some(StateTransition::new(
@@ -439,6 +459,37 @@ impl Buffer {
         }
     }
 
+    /// Restore dirty text from a validated recovery snapshot while keeping
+    /// the current disk bytes as the concurrency and merge base.
+    pub fn restore_recovery(
+        &mut self,
+        recovered_bytes: &[u8],
+        disk_bytes: &[u8],
+        recovered_base_hash: Option<BaseHash>,
+    ) -> Option<StateTransition> {
+        let recovered = TextSnapshot::new(recovered_bytes).ok()?;
+        let disk = TextSnapshot::new(disk_bytes).ok()?;
+        let old_state = self.state;
+        let recovered_hash = BaseHash::from_snapshot(&recovered);
+        let disk_hash = BaseHash::from_snapshot(&disk);
+        self.model.replace_snapshot(recovered);
+        self.base_hash = Some(disk_hash);
+        self.disk_hash = Some(disk_hash);
+        self.base_bytes = disk_bytes.to_vec();
+        self.state = if recovered_hash == disk_hash {
+            BufferState::Clean
+        } else if recovered_base_hash.is_some_and(|base| base != disk_hash) {
+            BufferState::Conflicted
+        } else {
+            BufferState::Dirty
+        };
+        Some(StateTransition::new(
+            old_state,
+            self.state,
+            TransitionReason::RecoveryRestored,
+        ))
+    }
+
     /// User chose to keep local changes.
     ///
     /// Saves the local changes over the disk content.
@@ -447,13 +498,29 @@ impl Buffer {
         let old_state = self.state;
         let new_state = BufferState::Dirty;
 
-        // Update base hash to match current content
-        self.base_hash = Some(self.content_hash());
-        // Disk hash remains as is (we'll detect future changes)
+        // This legacy transition has no observed disk bytes. A caller that
+        // resolves a real conflict must use `resolve_keep_local` below.
 
         self.state = new_state;
 
         StateTransition::new(old_state, new_state, TransitionReason::KeepLocal)
+    }
+
+    /// Resolve a detected conflict by retaining mine against the exact disk
+    /// bytes observed and snapshotted by the caller.
+    pub fn resolve_keep_local(&mut self, disk_bytes: &[u8]) -> Option<StateTransition> {
+        let old_state = self.state;
+        let snapshot = TextSnapshot::new(disk_bytes).ok()?;
+        let hash = BaseHash::from_snapshot(&snapshot);
+        self.base_hash = Some(hash);
+        self.disk_hash = Some(hash);
+        self.base_bytes = disk_bytes.to_vec();
+        self.state = BufferState::Dirty;
+        Some(StateTransition::new(
+            old_state,
+            BufferState::Dirty,
+            TransitionReason::KeepLocal,
+        ))
     }
 
     /// User chose to discard local changes.
@@ -471,6 +538,7 @@ impl Buffer {
             self.model = EditorModel::from_snapshot(snapshot);
             self.base_hash = Some(new_hash);
             self.disk_hash = Some(new_hash);
+            self.base_bytes = self.model.to_source_bytes();
             self.state = BufferState::Clean;
 
             return StateTransition::new(old_state, BufferState::Clean, TransitionReason::Discard);
@@ -494,6 +562,7 @@ impl Buffer {
 
         // Update base hash to match current content
         self.base_hash = Some(self.content_hash());
+        self.base_bytes = self.model.to_source_bytes();
         // Disk hash now matches base hash
         self.disk_hash = self.base_hash;
 
@@ -501,6 +570,50 @@ impl Buffer {
         self.state = new_state;
 
         StateTransition::new(old_state, new_state, TransitionReason::SaveCompleted)
+    }
+
+    /// Record a save receipt for the exact revision that was serialized.
+    ///
+    /// The disk base advances even if the user typed while that save was in
+    /// flight. In that case the buffer remains dirty and its newer contents
+    /// continue to compare against the bytes now on disk.
+    pub fn handle_save_completed_revision(
+        &mut self,
+        saved_revision: Revision,
+        saved_bytes: &[u8],
+    ) -> StateTransition {
+        let old_state = self.state;
+        let hash = BaseHash::from_bytes(*blake3::hash(saved_bytes).as_bytes());
+        self.base_hash = Some(hash);
+        self.disk_hash = Some(hash);
+        self.base_bytes = saved_bytes.to_vec();
+
+        let new_state = if self.model.revision() == saved_revision {
+            BufferState::Clean
+        } else {
+            BufferState::Dirty
+        };
+        self.state = new_state;
+        StateTransition::new(old_state, new_state, TransitionReason::SaveCompleted)
+    }
+
+    /// Record bytes known to have reached disk after a save whose later
+    /// durability/index stage failed. The buffer remains dirty until the full
+    /// save milestone is acknowledged, but retries compare against this disk
+    /// state instead of blindly replaying an obsolete base precondition.
+    pub fn record_replaced_disk_hash(&mut self, hash: BaseHash) {
+        self.base_hash = Some(hash);
+        self.disk_hash = Some(hash);
+        self.base_bytes = self.model.to_source_bytes();
+    }
+
+    /// Record a particular saved revision as the disk base without replacing
+    /// the current buffer text, which may contain newer edits.
+    pub fn record_replaced_disk_snapshot(&mut self, bytes: &[u8]) {
+        let hash = BaseHash::from_bytes(*blake3::hash(bytes).as_bytes());
+        self.base_hash = Some(hash);
+        self.disk_hash = Some(hash);
+        self.base_bytes = bytes.to_vec();
     }
 
     /// Handle file rename.
@@ -525,22 +638,6 @@ impl Buffer {
         self.state = BufferState::Clean;
 
         StateTransition::new(old_state, BufferState::Clean, TransitionReason::Reopened)
-    }
-
-    /// Merge with external changes.
-    ///
-    /// This is a placeholder for the three-way merge operation.
-    /// In a full implementation, this would use the history store.
-    pub fn merge(&mut self, _base: &[u8], _theirs: &[u8]) -> Option<StateTransition> {
-        // For now, we'll just mark as clean (merge successful)
-        let old_state = self.state;
-        self.state = BufferState::Clean;
-
-        Some(StateTransition::new(
-            old_state,
-            BufferState::Clean,
-            TransitionReason::Merge,
-        ))
     }
 
     /// Check if the buffer allows autosave.
@@ -746,6 +843,65 @@ mod tests {
     }
 
     #[test]
+    fn recovery_restore_keeps_disk_as_base_and_marks_buffer_dirty() {
+        let mut buffer = Buffer::from_text("disk");
+        let id = buffer.buffer_id();
+        let revision = buffer.revision();
+        buffer
+            .restore_recovery(
+                b"recovered",
+                b"disk",
+                Some(BaseHash::from_bytes(*blake3::hash(b"disk").as_bytes())),
+            )
+            .expect("valid UTF-8 recovery and disk bytes");
+        assert_eq!(buffer.buffer_id(), id);
+        assert!(buffer.revision() > revision);
+        assert_eq!(buffer.text(), "recovered");
+        assert_eq!(buffer.base_bytes(), b"disk");
+        assert_eq!(buffer.state(), BufferState::Dirty);
+    }
+
+    #[test]
+    fn recovery_restore_detects_disk_divergence_from_saved_base() {
+        let mut buffer = Buffer::from_text("disk changed");
+        buffer
+            .restore_recovery(
+                b"recovered",
+                b"disk changed",
+                Some(BaseHash::from_bytes(*blake3::hash(b"disk").as_bytes())),
+            )
+            .expect("valid snapshots");
+        assert_eq!(buffer.state(), BufferState::Conflicted);
+        assert_eq!(buffer.base_bytes(), b"disk changed");
+    }
+
+    #[test]
+    fn in_flight_save_advances_disk_base_without_cleaning_newer_edits() {
+        let mut buffer = Buffer::from_text("base");
+        let base_revision = buffer.revision();
+        let first =
+            crate::undo::EditOp::new(Span::new(TextByte(4), TextByte(4)), " saved".to_owned());
+        buffer.apply_local_edit(first);
+        let saved_revision = buffer.revision();
+        let saved_bytes = buffer.model().to_source_bytes();
+        let second =
+            crate::undo::EditOp::new(Span::new(TextByte(10), TextByte(10)), " newer".to_owned());
+        buffer.apply_local_edit(second);
+
+        let transition = buffer.handle_save_completed_revision(saved_revision, &saved_bytes);
+
+        assert_eq!(transition.to, BufferState::Dirty);
+        assert_eq!(buffer.state(), BufferState::Dirty);
+        assert_eq!(buffer.base_bytes(), saved_bytes);
+        assert_eq!(
+            buffer.base_hash(),
+            Some(BaseHash::from_bytes(*blake3::hash(&saved_bytes).as_bytes()))
+        );
+        assert!(buffer.revision() > saved_revision);
+        assert!(buffer.revision() > base_revision);
+    }
+
+    #[test]
     fn autosave_disabled_in_conflicted() {
         let mut buffer = Buffer::from_text("hello");
         buffer.check_external_change(b"goodbye");
@@ -765,6 +921,60 @@ mod tests {
         let mut buffer2 = Buffer::from_text("hello");
         buffer2.handle_file_deleted();
         assert!(!buffer2.allows_manual_save());
+    }
+
+    #[test]
+    fn buffer_accessors_invalid_disk_inputs_and_explicit_base_updates() {
+        let mut empty = Buffer::default();
+        assert!(empty.is_empty());
+        assert_eq!((empty.len(), empty.line_count()), (0, 1));
+        empty.set_base_snapshot(b"base".to_vec());
+        assert_eq!(empty.base_bytes(), b"base");
+        assert_eq!(empty.base_hash(), Some(empty.disk_hash().unwrap()));
+        assert!(empty.check_external_change(b"base").is_none());
+        assert!(empty.check_external_change(&[0xff]).is_none());
+        assert!(empty.handle_file_recreated(&[0xff]).is_none());
+        assert!(empty.reload_from_disk(&[0xff]).is_none());
+        assert!(empty.resolve_keep_local(&[0xff]).is_none());
+
+        let mut buffer = Buffer::from_text("base");
+        buffer.handle_file_deleted();
+        assert!(buffer.is_orphaned());
+        let recreated = buffer.handle_file_recreated(b"other").unwrap();
+        assert_eq!(recreated.to, BufferState::Conflicted);
+        assert!(buffer.is_conflicted());
+        assert!(buffer.needs_resolution());
+        let resolved = buffer.resolve_keep_local(b"other").unwrap();
+        assert_eq!(resolved.reason, TransitionReason::KeepLocal);
+        assert_eq!(buffer.base_bytes(), b"other");
+        assert_eq!(buffer.state(), BufferState::Dirty);
+
+        buffer.record_replaced_disk_snapshot(b"saved");
+        assert_eq!(buffer.base_bytes(), b"saved");
+        buffer.record_replaced_disk_hash(BaseHash::from_bytes(*blake3::hash(b"hashed").as_bytes()));
+        assert_eq!(buffer.base_bytes(), buffer.model().to_source_bytes());
+        let reopened = buffer.reopen();
+        assert_eq!(reopened.reason, TransitionReason::Reopened);
+        assert_eq!(buffer.state(), BufferState::Clean);
+        let saved = buffer.handle_save_completed_revision(buffer.revision(), b"disk");
+        assert_eq!(saved.to, BufferState::Clean);
+        assert_eq!(buffer.base_bytes(), b"disk");
+        assert!(format!("{buffer}").starts_with("Buffer(id="));
+
+        assert!(BufferState::Clean.allows_autosave());
+        assert!(BufferState::Clean.allows_manual_save());
+        assert!(BufferState::Orphaned.allows_autosave());
+        assert!(BufferState::Orphaned.needs_resolution());
+        assert_eq!(BufferState::Dirty.to_string(), "Dirty");
+        assert_eq!(
+            StateTransition::new(
+                BufferState::Clean,
+                BufferState::Dirty,
+                TransitionReason::Merge
+            )
+            .reason,
+            TransitionReason::Merge
+        );
     }
 
     #[test]

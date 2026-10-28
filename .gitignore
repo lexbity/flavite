@@ -5,6 +5,10 @@
 scratch-devdocs/
 /target
 /fuzz/corpus
+!/fuzz/corpus/
+/fuzz/corpus/**
+!/fuzz/corpus/scanner/
+!/fuzz/corpus/scanner/03be744b6b0d16f09bdae0c4bb5286e3adacea73
 /fuzz/target
 /fuzz/artifacts
 *.profraw

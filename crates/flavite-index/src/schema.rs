@@ -639,4 +639,56 @@ mod tests {
         assert_eq!(version.epoch, INITIAL_EPOCH);
         assert_eq!(version.generation, 0);
     }
+
+    #[test]
+    fn attachment_kinds_and_meta_helpers_round_trip() {
+        for (name, kind) in [
+            ("image", AttachmentKind::Image),
+            ("pdf", AttachmentKind::Pdf),
+            ("audio", AttachmentKind::Audio),
+            ("video", AttachmentKind::Video),
+            ("archive", AttachmentKind::Archive),
+            ("other", AttachmentKind::Other),
+        ] {
+            assert_eq!(name.parse::<AttachmentKind>().unwrap(), kind);
+            assert_eq!(kind.as_str(), name);
+        }
+        assert!("unknown".parse::<AttachmentKind>().is_err());
+
+        let temp = NamedTempFile::new().unwrap();
+        let mut conn = Connection::open(temp.path()).unwrap();
+        create_schema(&mut conn).unwrap();
+        set_meta(&conn, MetaKey::VaultUuid, "vault").unwrap();
+        assert_eq!(
+            get_meta(&conn, MetaKey::VaultUuid).unwrap().as_deref(),
+            Some("vault")
+        );
+        assert_eq!(
+            get_meta(&conn, MetaKey::ParserVersion).unwrap(),
+            Some(PARSER_VERSION.to_string())
+        );
+        assert_eq!(
+            get_meta(&conn, MetaKey::LogFloor).unwrap(),
+            Some("0".into())
+        );
+        assert_eq!(
+            get_meta(&conn, MetaKey::TantivyCommittedGeneration).unwrap(),
+            Some("0".into())
+        );
+        assert_eq!(
+            get_meta_u32(&conn, MetaKey::ParserVersion).unwrap(),
+            Some(PARSER_VERSION)
+        );
+        assert_eq!(get_meta_u32(&conn, MetaKey::VaultUuid).unwrap(), Some(0));
+        assert_eq!(get_epoch(&conn).unwrap(), INITIAL_EPOCH);
+        assert_eq!(get_generation(&conn).unwrap(), 0);
+        assert_eq!(next_generation(&mut conn).unwrap(), 1);
+        assert_eq!(get_generation(&conn).unwrap(), 1);
+        assert_eq!(DbVersion::get(&conn).unwrap().generation, 1);
+
+        set_meta(&conn, MetaKey::Epoch, "invalid").unwrap();
+        assert!(get_epoch(&conn).is_err());
+        set_meta(&conn, MetaKey::Generation, "invalid").unwrap();
+        assert!(get_generation(&conn).is_err());
+    }
 }

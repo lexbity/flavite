@@ -446,4 +446,55 @@ mod tests {
         assert_eq!(checkpoint.epoch, 1);
         assert_eq!(checkpoint.generation, 0);
     }
+
+    #[test]
+    fn dirty_search_commits_and_publishes_checkpoint() {
+        let temp_dir = tempdir().unwrap();
+        let cache_dir = temp_dir.path().join("cache");
+        let temp = NamedTempFile::new().unwrap();
+        let mut conn = Connection::open(temp.path()).unwrap();
+        create_schema(&mut conn).unwrap();
+        set_meta(&conn, MetaKey::Generation, "4").unwrap();
+
+        let mut backend = StubSearchBackend::new(conn, &cache_dir).unwrap();
+        backend.apply_document(8, "title", "body").unwrap();
+        backend.delete_document(9).unwrap();
+        assert!(
+            backend
+                .search(&QueryAst::Unresolved, &[], 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(backend.committed_generation(), 4);
+        let checkpoint = backend.checkpoint().unwrap();
+        assert_eq!((checkpoint.epoch, checkpoint.generation), (1, 4));
+        assert!(cache_dir.join("checkpoints/checkpoint-1-4").exists());
+        assert_eq!(
+            backend
+                .searcher()
+                .unwrap()
+                .search(&QueryAst::Text("x".into()), &[], 1)
+                .unwrap(),
+            Vec::<i64>::new()
+        );
+        assert_eq!(backend.load_checkpoint().unwrap(), checkpoint);
+    }
+
+    #[test]
+    fn explicit_generation_and_commit_manager_are_idempotent() {
+        let temp_dir = tempdir().unwrap();
+        let cache_dir = temp_dir.path().join("cache");
+        let temp = NamedTempFile::new().unwrap();
+        let mut conn = Connection::open(temp.path()).unwrap();
+        create_schema(&mut conn).unwrap();
+        set_meta(&conn, MetaKey::Generation, "3").unwrap();
+
+        let backend = StubSearchBackend::new(conn, &cache_dir).unwrap();
+        backend.set_committed_generation(2).unwrap();
+        assert_eq!(backend.committed_generation(), 2);
+        let db = Connection::open(temp.path()).unwrap();
+        let manager = CommitManager::new(Arc::new(Mutex::new(Box::new(backend))), db);
+        manager.ensure_committed().unwrap();
+        manager.commit_if_dirty().unwrap();
+    }
 }

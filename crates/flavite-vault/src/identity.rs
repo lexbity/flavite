@@ -492,9 +492,44 @@ mod tests {
 
         // We can't easily test this without a real filesystem
         // but we can at least check the structure
-        let _root = Path::new("/test");
-        // This would fail on most systems, but we're just checking it compiles
-        // In a real test, we'd use a test filesystem
+        use flavite_fs::MemFs;
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/vault")).unwrap();
+        let key = compute_root_key(&fs, Path::new("/vault")).unwrap();
+        assert_eq!(key.len(), 16);
+        assert!(matches!(
+            compute_root_key(&fs, Path::new("/missing")),
+            Err(IdentityError::Fs(_))
+        ));
+    }
+
+    #[test]
+    fn vault_toml_read_write_and_directory_setup_cover_invalid_inputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        assert_eq!(read_vault_toml(root).unwrap(), None);
+        let uuid = Uuid::now_v7();
+        write_vault_toml(root, uuid).unwrap();
+        assert_eq!(read_vault_toml(root).unwrap(), Some(uuid));
+        ensure_flavite_dir(root).unwrap();
+        assert!(root.join(".flavite/journal").is_dir());
+
+        let path = vault_toml_path(root);
+        fs::write(&path, "not toml = [").unwrap();
+        assert!(matches!(
+            read_vault_toml(root),
+            Err(IdentityError::TomlParseError(_))
+        ));
+        fs::write(&path, "[other]\nvalue = 1\n").unwrap();
+        assert!(matches!(
+            read_vault_toml(root),
+            Err(IdentityError::MalformedToml(_))
+        ));
+        fs::write(&path, "[vault]\nuuid = 'not-a-uuid'\n").unwrap();
+        assert!(matches!(
+            read_vault_toml(root),
+            Err(IdentityError::MalformedToml(_))
+        ));
     }
 
     #[test]

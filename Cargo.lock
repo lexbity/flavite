@@ -149,12 +149,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arraydeque"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
-
-[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1009,16 +1003,7 @@ version = "5.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a49173b84e034382284f27f1af4dcbbd231ffa358c0fe316541a7337f376a35"
 dependencies = [
- "dirs-sys 0.4.1",
-]
-
-[[package]]
-name = "directories"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16f5094c54661b38d03bd7e50df373292118db60b585c08a411c6d840017fe7d"
-dependencies = [
- "dirs-sys 0.5.0",
+ "dirs-sys",
 ]
 
 [[package]]
@@ -1029,20 +1014,8 @@ checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
 dependencies = [
  "libc",
  "option-ext",
- "redox_users 0.4.6",
+ "redox_users",
  "windows-sys 0.48.0",
-]
-
-[[package]]
-name = "dirs-sys"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
-dependencies = [
- "libc",
- "option-ext",
- "redox_users 0.5.3",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1108,15 +1081,6 @@ name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
-
-[[package]]
-name = "encoding_rs"
-version = "0.8.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
-dependencies = [
- "cfg-if",
-]
 
 [[package]]
 name = "endi"
@@ -1273,13 +1237,10 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "flavite-syntax",
- "proptest",
  "ropey",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.21",
- "zstd",
 ]
 
 [[package]]
@@ -1289,7 +1250,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "directories 5.0.1",
+ "directories",
  "flavite-api",
  "serde",
  "serde_json",
@@ -1309,15 +1270,10 @@ name = "flavite-fs"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "directories 6.0.0",
- "fs4 0.11.1",
- "libc",
  "notify",
  "proptest",
  "tempfile",
  "thiserror 2.0.21",
- "unicode-normalization",
- "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1338,28 +1294,20 @@ name = "flavite-index"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "crossbeam",
  "flavite-syntax",
- "proptest",
+ "pulldown-cmark",
  "rusqlite",
  "serde",
  "serde_json",
- "tantivy",
  "tempfile",
  "thiserror 2.0.21",
- "tracing",
 ]
 
 [[package]]
 name = "flavite-syntax"
 version = "0.1.0"
 dependencies = [
- "proptest",
  "pulldown-cmark",
- "saphyr",
- "saphyr-parser",
- "serde",
- "serde_json",
  "thiserror 2.0.21",
  "tree-sitter",
  "tree-sitter-md",
@@ -1382,18 +1330,14 @@ dependencies = [
 name = "flavite-vault"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "blake3",
- "chrono",
  "crossbeam",
- "directories 5.0.1",
+ "directories",
  "flavite-buffer",
  "flavite-fs",
  "flavite-index",
  "flavite-syntax",
  "hex",
- "notify",
- "proptest",
  "serde",
  "serde_json",
  "tempfile",
@@ -1401,6 +1345,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
@@ -1494,16 +1439,6 @@ name = "frostem"
 version = "1.20260821.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e2488a10218a17366ce6bd38b6d081b4387a9548d350029db9feddc9bb44d6d"
-
-[[package]]
-name = "fs4"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e871a4cfa68bb224863b53149d973df1ac8d1ed2fa1d1bfc37ac1bb65dd37207"
-dependencies = [
- "rustix 0.38.44",
- "windows-sys 0.52.0",
-]
 
 [[package]]
 name = "fs4"
@@ -3481,16 +3416,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "redox_users"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60dc65c0ff1a7ae1294b0c67b9f14baf70b644404010370171787bfac1038fc0"
-dependencies = [
- "libredox",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "regex"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3637,29 +3562,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "saphyr"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aa37a62b2a28868277e83b6f651dc9581751db73d1cb51132c73c0b4ec7f70a"
-dependencies = [
- "encoding_rs",
- "hashlink",
- "ordered-float",
- "saphyr-parser",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "saphyr-parser"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48cf5a82d41247a625f040af08e91008fec945bce3b0bffba992c44af092caa2"
-dependencies = [
- "arraydeque",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4090,7 +3992,7 @@ dependencies = [
  "fastdivide",
  "fnv",
  "frostem",
- "fs4 0.13.1",
+ "fs4",
  "htmlescape",
  "itertools",
  "levenshtein_automata",
@@ -4123,7 +4025,6 @@ dependencies = [
  "unwrap-infallible",
  "uuid",
  "winapi",
- "zstd",
 ]
 
 [[package]]

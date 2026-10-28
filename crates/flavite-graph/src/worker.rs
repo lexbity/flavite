@@ -8,7 +8,7 @@
 //! - **commands in** ([`LayoutCommand`]): an unbounded channel, so a topology
 //!   change can never be lost to backpressure;
 //! - **frames out** ([`PositionBuffer`]): an atomic swap of an immutable
-//!   [`PositionFrame`], so the render thread never waits (D15: no locks on
+//!   [`crate::position::PositionFrame`], so the render thread never waits (D15: no locks on
 //!   the frame path);
 //! - **events out** ([`LayoutEvent`]): rare, must-not-be-lost transitions
 //!   (installed, state change, panic), plus lossless aggregate counters in

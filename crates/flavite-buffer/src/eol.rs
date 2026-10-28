@@ -423,4 +423,36 @@ mod tests {
         assert_eq!(stats.lf_count, 1);
         assert_eq!(stats.none_count, 1);
     }
+
+    #[test]
+    fn mutable_eol_table_operations_keep_trailing_state_consistent() {
+        let mut table = EolTable::default();
+        assert_eq!(table.pop(), None);
+        table.push(LineEnding::Crlf);
+        assert!(table.has_trailing_newline());
+        table.set(0, LineEnding::None);
+        assert!(!table.has_trailing_newline());
+        table.insert(0, LineEnding::Lf);
+        assert_eq!(table.remove(1), LineEnding::None);
+        assert!(table.has_trailing_newline());
+        assert_eq!(table.pop(), Some(LineEnding::Lf));
+        assert!(table.line_endings.is_empty());
+
+        table.push(LineEnding::Crlf);
+        table.apply_to_inserted(1, 2);
+        table.apply_to_inserted(0, 1);
+        table.clear();
+        assert_eq!(table.line_count(), 0);
+        assert!(!table.has_trailing_newline());
+    }
+
+    #[test]
+    fn syntax_eol_conversion_covers_every_variant() {
+        assert_eq!(LineEnding::from(SyntaxEol::Lf), LineEnding::Lf);
+        assert_eq!(LineEnding::from(SyntaxEol::Crlf), LineEnding::Crlf);
+        assert_eq!(LineEnding::from(SyntaxEol::None), LineEnding::None);
+        assert_eq!(SyntaxEol::from(LineEnding::Lf), SyntaxEol::Lf);
+        assert_eq!(SyntaxEol::from(LineEnding::Crlf), SyntaxEol::Crlf);
+        assert_eq!(SyntaxEol::from(LineEnding::None), SyntaxEol::None);
+    }
 }

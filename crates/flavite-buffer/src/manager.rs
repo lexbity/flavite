@@ -584,4 +584,64 @@ mod tests {
         let paths = manager.open_notes();
         assert_eq!(paths.len(), 2);
     }
+
+    #[test]
+    fn id_routes_invalid_utf8_and_missing_notifications_are_safe() {
+        let mut manager = BufferManager::with_settings(std::time::Duration::from_millis(10), 7);
+        let path = PathBuf::from("invalid.md");
+        let (buffer, _) = manager.open_note(path.clone(), &[0xff]);
+        let id = buffer.buffer_id();
+        assert_eq!(buffer.text(), "");
+        assert!(manager.get_buffer_by_id_mut(id).is_some());
+        assert!(
+            manager
+                .apply_edit_by_id(
+                    id,
+                    EditOp::new(Span::new(TextByte(0), TextByte(0)), "ok".into())
+                )
+                .is_some()
+        );
+        assert_eq!(manager.dirty_buffers().len(), 1);
+        assert!(
+            manager
+                .notify_external_change(&PathBuf::from("missing.md"), b"x")
+                .is_empty()
+        );
+        assert!(
+            manager
+                .notify_file_deleted(&PathBuf::from("missing.md"))
+                .is_empty()
+        );
+        assert!(
+            manager
+                .notify_file_recreated(&PathBuf::from("missing.md"), b"x")
+                .is_empty()
+        );
+        assert!(
+            manager
+                .notify_save_completed(&PathBuf::from("missing.md"))
+                .is_empty()
+        );
+        assert!(manager.close_buffer(id).is_some());
+        assert!(manager.get_buffer_by_id(id).is_none());
+        assert!(manager.close_buffer(id).is_none());
+        assert!(
+            manager
+                .apply_edit_by_id(
+                    id,
+                    EditOp::new(Span::new(TextByte(0), TextByte(0)), "x".into())
+                )
+                .is_none()
+        );
+        assert!(manager.get_buffer(&path).is_none());
+        assert_eq!(manager.recovery_interval(), 7);
+        assert_eq!(
+            format!("{manager}"),
+            "BufferManager(buffers=0, dirty=0, conflicted=0, orphaned=0)"
+        );
+        manager.open_note(PathBuf::from("clear.md"), b"x");
+        manager.clear();
+        assert_eq!(manager.buffer_count(), 0);
+        assert!(manager.get_buffer_by_id(id).is_none());
+    }
 }

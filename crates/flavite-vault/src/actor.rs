@@ -10,16 +10,19 @@
 //! It runs the reconcile algorithm on a worker thread and coordinates
 //! with the Session via bounded channels.
 
-use crate::IndexPlaceholder;
 use crate::channels::{NoticeChannel, PulseChannel};
 use crate::coalesce::{CoalescerConfig, EventCoalescer, VaultWatcher, WatcherEvent};
+use crate::history::HistoryStore;
+use crate::history::{HistoryReason, SnapshotRef};
 use crate::reconcile::{ReconcileConfig, ReconcileState};
+use crate::save::{SaveFailure, SaveReceipt, SaveRequest};
 use crate::tokens::WriteTokenManager;
 use crate::types::{
     ReconcileMode, ReconcileScope, ReconcileSummary, VaultConfig, VaultIdentity, Version,
 };
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use flavite_fs::Fs;
+use flavite_index::IndexActor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -42,6 +45,35 @@ pub enum VaultActorMsg {
     GetIdentity,
     /// Shutdown.
     Shutdown,
+    /// Read note bytes for opening/reloading a buffer.
+    ReadFile {
+        path: std::path::PathBuf,
+        reply: Sender<VaultActorResp>,
+    },
+    /// Save immutable serialized bytes through the D6 path.
+    Save {
+        request: SaveRequest,
+        reply: Sender<VaultActorResp>,
+    },
+    /// Persist bytes observed during an explicit merge/conflict resolution.
+    SnapshotHistory {
+        note_key: Vec<u8>,
+        bytes: Vec<u8>,
+        reason: HistoryReason,
+        reply: Sender<VaultActorResp>,
+    },
+    /// Persist and pin a merge base before a dirty checkpoint or save.
+    PinMergeBase {
+        note_key: Vec<u8>,
+        bytes: Vec<u8>,
+        reply: Sender<VaultActorResp>,
+    },
+    /// Release a superseded merge-base pin after a durable save.
+    UnpinMergeBase {
+        note_key: Vec<u8>,
+        hash: String,
+        reply: Sender<VaultActorResp>,
+    },
 }
 
 /// Responses from the VaultActor.
@@ -60,6 +92,12 @@ pub enum VaultActorResp {
     Ack,
     /// Error.
     Error(String),
+    /// File bytes, or `None` when absent.
+    File(Option<Vec<u8>>),
+    /// Save completion after the structural index callback.
+    Saved(Result<SaveReceipt, SaveFailure>),
+    /// Durable history snapshot record.
+    HistorySnapshot(Result<SnapshotRef, String>),
 }
 
 /// Errors from the VaultActor.
@@ -108,16 +146,124 @@ impl VaultActorHandle {
             _ => Err(VaultActorError::NotRunning),
         }
     }
+
+    /// Send a correlated read request and receive only its reply.
+    pub fn read_file(&self, path: std::path::PathBuf) -> Result<Option<Vec<u8>>, VaultActorError> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::ReadFile { path, reply })
+            .map_err(|_| VaultActorError::ChannelDisconnected)?;
+        match response
+            .recv()
+            .map_err(|_| VaultActorError::ChannelDisconnected)?
+        {
+            VaultActorResp::File(bytes) => Ok(bytes),
+            VaultActorResp::Error(_) => Err(VaultActorError::NotRunning),
+            _ => Err(VaultActorError::NotRunning),
+        }
+    }
+
+    /// Send a correlated save request and receive its terminal result.
+    pub fn save(
+        &self,
+        request: SaveRequest,
+    ) -> Result<Result<SaveReceipt, SaveFailure>, VaultActorError> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::Save { request, reply })
+            .map_err(|_| VaultActorError::ChannelDisconnected)?;
+        match response
+            .recv()
+            .map_err(|_| VaultActorError::ChannelDisconnected)?
+        {
+            VaultActorResp::Saved(result) => Ok(result),
+            _ => Err(VaultActorError::NotRunning),
+        }
+    }
+
+    /// Snapshot observed bytes to local safety history before a destructive
+    /// conflict action.
+    pub fn snapshot_history(
+        &self,
+        note_key: Vec<u8>,
+        bytes: Vec<u8>,
+        reason: HistoryReason,
+    ) -> Result<SnapshotRef, VaultActorError> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::SnapshotHistory {
+                note_key,
+                bytes,
+                reason,
+                reply,
+            })
+            .map_err(|_| VaultActorError::ChannelDisconnected)?;
+        match response
+            .recv()
+            .map_err(|_| VaultActorError::ChannelDisconnected)?
+        {
+            VaultActorResp::HistorySnapshot(Ok(record)) => Ok(record),
+            VaultActorResp::HistorySnapshot(Err(_)) | VaultActorResp::Error(_) => {
+                Err(VaultActorError::NotRunning)
+            }
+            _ => Err(VaultActorError::NotRunning),
+        }
+    }
+
+    /// Ensure the exact note merge base is durably stored and pinned.
+    pub fn pin_merge_base(
+        &self,
+        note_key: Vec<u8>,
+        bytes: Vec<u8>,
+    ) -> Result<SnapshotRef, VaultActorError> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::PinMergeBase {
+                note_key,
+                bytes,
+                reply,
+            })
+            .map_err(|_| VaultActorError::ChannelDisconnected)?;
+        match response
+            .recv()
+            .map_err(|_| VaultActorError::ChannelDisconnected)?
+        {
+            VaultActorResp::HistorySnapshot(Ok(record)) => Ok(record),
+            VaultActorResp::HistorySnapshot(Err(_)) | VaultActorResp::Error(_) => {
+                Err(VaultActorError::NotRunning)
+            }
+            _ => Err(VaultActorError::NotRunning),
+        }
+    }
+
+    /// Release the prior merge-base pin once a successor is durable.
+    pub fn unpin_merge_base(&self, note_key: Vec<u8>, hash: String) -> Result<(), VaultActorError> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::UnpinMergeBase {
+                note_key,
+                hash,
+                reply,
+            })
+            .map_err(|_| VaultActorError::ChannelDisconnected)?;
+        match response
+            .recv()
+            .map_err(|_| VaultActorError::ChannelDisconnected)?
+        {
+            VaultActorResp::Ack => Ok(()),
+            _ => Err(VaultActorError::NotRunning),
+        }
+    }
 }
 
 /// The VaultActor itself.
 pub struct VaultActor {
     /// The filesystem.
-    fs: Box<dyn Fs + Send + Sync>,
+    fs: Arc<dyn Fs + Send + Sync>,
     /// Vault identity.
     identity: VaultIdentity,
     /// The index.
-    index: IndexPlaceholder,
+    index: IndexActor,
     /// Vault configuration.
     config: VaultConfig,
     /// Event coalescer.
@@ -130,6 +276,8 @@ pub struct VaultActor {
     notice: NoticeChannel,
     /// Write token manager.
     token_manager: WriteTokenManager,
+    /// Content-addressed local safety history.
+    history: Option<HistoryStore>,
     /// Reconcile state.
     reconcile_state: ReconcileState,
     /// Reconcile config.
@@ -147,7 +295,7 @@ impl VaultActor {
     pub fn new(
         fs: Box<dyn Fs + Send + Sync>,
         identity: VaultIdentity,
-        _index: IndexPlaceholder,
+        index: IndexActor,
         config: VaultConfig,
         pulse: PulseChannel,
         notice: NoticeChannel,
@@ -162,16 +310,18 @@ impl VaultActor {
         // TODO: Implement proper Fs cloning when flavite-fs supports it
         let _watcher = None; // VaultWatcher::new(fs, &coalescer);
 
+        let fs: Arc<dyn Fs + Send + Sync> = Arc::from(fs);
         Self {
             fs,
             identity,
-            index: IndexPlaceholder,
+            index,
             config,
             coalescer,
             _watcher,
             pulse,
             notice,
             token_manager: WriteTokenManager::new(),
+            history: None,
             reconcile_state: ReconcileState::default(),
             reconcile_config: ReconcileConfig::default(),
             is_running: AtomicBool::new(false),
@@ -263,7 +413,125 @@ impl VaultActor {
                 let _ = self.resp_sender.try_send(VaultActorResp::Ack);
                 // Shutdown will happen when the channel is dropped
             }
+            VaultActorMsg::ReadFile { path, reply } => {
+                let response = self
+                    .fs
+                    .read_if_exists(&path)
+                    .map(VaultActorResp::File)
+                    .unwrap_or_else(|e| VaultActorResp::Error(e.to_string()));
+                let _ = reply.try_send(response);
+            }
+            VaultActorMsg::Save { request, reply } => self.handle_save(request, reply),
+            VaultActorMsg::SnapshotHistory {
+                note_key,
+                bytes,
+                reason,
+                reply,
+            } => {
+                let result = self.history_store().and_then(|history| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    history
+                        .snapshot(&note_key, &bytes, reason, false, now)
+                        .map_err(|error| error.to_string())
+                });
+                let _ = reply.try_send(VaultActorResp::HistorySnapshot(result));
+            }
+            VaultActorMsg::PinMergeBase {
+                note_key,
+                bytes,
+                reply,
+            } => {
+                let result = self.history_store().and_then(|history| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    history
+                        .pin_merge_base(&note_key, &bytes, now)
+                        .map_err(|error| error.to_string())
+                });
+                let _ = reply.try_send(VaultActorResp::HistorySnapshot(result));
+            }
+            VaultActorMsg::UnpinMergeBase {
+                note_key,
+                hash,
+                reply,
+            } => {
+                let result = self.history_store().and_then(|history| {
+                    history
+                        .unpin_merge_base(&note_key, &hash)
+                        .map_err(|error| error.to_string())
+                });
+                let response = result
+                    .map(|()| VaultActorResp::Ack)
+                    .unwrap_or_else(VaultActorResp::Error);
+                let _ = reply.try_send(response);
+            }
         }
+    }
+
+    fn handle_save(&mut self, request: SaveRequest, reply: Sender<VaultActorResp>) {
+        let failure_context = request.clone();
+        let result = (|| {
+            if self.history.is_none() {
+                let data = crate::identity::get_data_dir()
+                    .ok_or_else(|| SaveFailure::from_message("OS data directory is unavailable"))?;
+                let root = data
+                    .join("flavite")
+                    .join("vaults")
+                    .join(self.identity.uuid.to_string())
+                    .join("history");
+                self.history =
+                    Some(HistoryStore::open(self.fs.clone(), root).map_err(SaveFailure::from)?);
+            }
+            let history = self.history.as_mut().expect("history initialized");
+            let index = &mut self.index;
+            let display_path = request
+                .path
+                .strip_prefix(&self.identity.root)
+                .map_err(SaveFailure::from_message)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let scan_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .min(i64::MAX as u128) as i64;
+            crate::save::save(
+                &*self.fs,
+                history,
+                request.clone(),
+                |_path, bytes, mtime_ns| {
+                    index.apply_saved_note(
+                        &request.note_key,
+                        &display_path,
+                        bytes,
+                        mtime_ns,
+                        scan_ns,
+                    )
+                },
+            )
+        })()
+        .map_err(|failure| failure.for_request(&failure_context));
+        let _ = reply.try_send(VaultActorResp::Saved(result));
+    }
+
+    fn history_store(&mut self) -> Result<&mut HistoryStore, String> {
+        if self.history.is_none() {
+            let data = crate::identity::get_data_dir()
+                .ok_or_else(|| "OS data directory is unavailable".to_owned())?;
+            let root = data
+                .join("flavite")
+                .join("vaults")
+                .join(self.identity.uuid.to_string())
+                .join("history");
+            self.history =
+                Some(HistoryStore::open(self.fs.clone(), root).map_err(|error| error.to_string())?);
+        }
+        Ok(self.history.as_mut().expect("history initialized"))
     }
 
     /// Handle a reconcile request.
@@ -321,7 +589,7 @@ impl<T: Fs + Clone + Send + Sync + 'static> FsExt for T {
 pub struct VaultActorBuilder {
     fs: Option<Box<dyn Fs + Send + Sync>>,
     identity: Option<VaultIdentity>,
-    index: Option<IndexPlaceholder>,
+    index: Option<IndexActor>,
     config: Option<VaultConfig>,
 }
 
@@ -348,7 +616,7 @@ impl VaultActorBuilder {
 
     /// Set the index.
     #[must_use]
-    pub fn with_index(mut self, index: IndexPlaceholder) -> Self {
+    pub fn with_index(mut self, index: IndexActor) -> Self {
         self.index = Some(index);
         self
     }
@@ -365,7 +633,7 @@ impl VaultActorBuilder {
         Ok(VaultActor::new(
             self.fs.ok_or("Missing filesystem")?,
             self.identity.ok_or("Missing identity")?,
-            self.index.unwrap_or_default(),
+            self.index.ok_or("Missing structural index")?,
             self.config.unwrap_or_default(),
             PulseChannel::new(1024),
             NoticeChannel::new(std::time::Duration::from_millis(300)),
@@ -376,7 +644,7 @@ impl VaultActorBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flavite_fs::MemFs;
+    use flavite_fs::{Fs, MemFs};
 
     #[test]
     fn test_write_token() {
@@ -405,14 +673,97 @@ mod tests {
             vec![1, 2, 3, 4],
         );
 
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        drop(flavite_index::open_or_init(temp.path()).unwrap());
+        let index = IndexActor::new(temp.path(), 1).unwrap();
         let actor = VaultActorBuilder::new()
             .with_fs(fs)
             .with_identity(identity)
-            .with_index(IndexPlaceholder)
+            .with_index(index)
             .build()
             .unwrap();
 
         // The actor should be created but not started
         assert!(!actor.is_running.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn actor_save_reaches_disk_history_and_structural_sqlite_before_ack() {
+        let fs = MemFs::new();
+        fs.create_dir_all(std::path::Path::new("/vault/notes"))
+            .unwrap();
+        fs.write_new(std::path::Path::new("/vault/notes/a.md"), b"# Base")
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("index.sqlite3");
+        drop(flavite_index::open_or_init(&db_path).unwrap());
+        let index = IndexActor::new(&db_path, 1).unwrap();
+        let identity = VaultIdentity::new(
+            uuid::Uuid::now_v7(),
+            std::path::PathBuf::from("/vault"),
+            vec![1, 2, 3, 4],
+        );
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs.clone()))
+            .with_identity(identity)
+            .with_index(index)
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        assert!(actor.get_version().is_ok());
+        assert_eq!(
+            actor
+                .read_file(std::path::PathBuf::from("/vault/notes/a.md"))
+                .unwrap(),
+            Some(b"# Base".to_vec())
+        );
+        assert_eq!(
+            actor
+                .read_file(std::path::PathBuf::from("/vault/missing.md"))
+                .unwrap(),
+            None
+        );
+        let snapshot = actor
+            .snapshot_history(
+                b"notes/a.md".to_vec(),
+                b"pre-conflict".to_vec(),
+                HistoryReason::ConflictResolution,
+            )
+            .unwrap();
+        assert_eq!(snapshot.note_key, "6e6f7465732f612e6d64");
+        let merge_base = actor
+            .pin_merge_base(b"notes/a.md".to_vec(), b"# Base".to_vec())
+            .unwrap();
+        assert!(
+            actor
+                .unpin_merge_base(b"notes/a.md".to_vec(), merge_base.hash)
+                .is_ok()
+        );
+        let prior_hash = *blake3::hash(b"# Base").as_bytes();
+        let request = SaveRequest {
+            request_id: 17,
+            path: std::path::PathBuf::from("/vault/notes/a.md"),
+            note_key: b"notes/a.md".to_vec(),
+            bytes: b"# Saved\n\n[[Other]]".to_vec(),
+            precondition: crate::save::DiskPrecondition::Existing(prior_hash),
+            buffer_id: 5,
+            revision: 8,
+        };
+        let receipt = actor.save(request).unwrap().unwrap();
+        assert_eq!((receipt.epoch, receipt.generation), (1, 1));
+        assert_eq!(
+            fs.read_if_exists(std::path::Path::new("/vault/notes/a.md"))
+                .unwrap()
+                .unwrap(),
+            b"# Saved\n\n[[Other]]"
+        );
+        let check = flavite_index::Writer::new(&db_path).unwrap();
+        let indexed: String = check
+            .conn()
+            .query_row("SELECT body_text FROM search_docs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(indexed, "# Saved\n\n[[Other]]");
+        drop(actor);
     }
 }

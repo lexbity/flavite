@@ -110,13 +110,14 @@ pub enum NoticeKind {
 pub struct PulseChannel {
     sender: Sender<Pulse>,
     receiver: Receiver<Pulse>,
+    capacity: usize,
 }
 
 impl Clone for PulseChannel {
     fn clone(&self) -> Self {
         // For stub implementation, create a new channel with the same config
         // In production, we'd share the existing channel
-        PulseChannel::new(self.capacity())
+        PulseChannel::new(self.capacity)
     }
 }
 
@@ -124,13 +125,32 @@ impl PulseChannel {
     /// Create a new pulse channel with the specified capacity.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         let (sender, receiver) = bounded(capacity);
-        Self { sender, receiver }
+        Self {
+            sender,
+            receiver,
+            capacity,
+        }
     }
 
     /// Send a pulse event. Drops oldest if full.
     pub fn send(&self, pulse: Pulse) -> Result<(), crossbeam::channel::SendError<Pulse>> {
-        self.sender.send(pulse)
+        match self.sender.try_send(pulse) {
+            Ok(()) => Ok(()),
+            Err(crossbeam::channel::TrySendError::Disconnected(pulse)) => {
+                Err(crossbeam::channel::SendError(pulse))
+            }
+            Err(crossbeam::channel::TrySendError::Full(pulse)) => {
+                let _ = self.receiver.try_recv();
+                self.sender.try_send(pulse).map_err(|error| match error {
+                    crossbeam::channel::TrySendError::Full(pulse)
+                    | crossbeam::channel::TrySendError::Disconnected(pulse) => {
+                        crossbeam::channel::SendError(pulse)
+                    }
+                })
+            }
+        }
     }
 
     /// Try to send a pulse event. Returns the pulse if full.
@@ -151,9 +171,7 @@ impl PulseChannel {
     /// Get the capacity of the channel.
     #[must_use]
     pub const fn capacity(&self) -> usize {
-        // We can't get the exact capacity from crossbeam, but we know what we set.
-        // This is just for documentation purposes.
-        1024
+        self.capacity
     }
 
     /// Get a receiver for this channel (for consumers).
@@ -319,7 +337,7 @@ impl ChannelSet {
 
     /// Send a pulse.
     pub fn send_pulse(&self, pulse: Pulse) {
-        let _ = self.pulse.try_send(pulse);
+        let _ = self.pulse.send(pulse);
     }
 
     /// Send a notice.
@@ -402,6 +420,77 @@ mod tests {
             }
             _ => panic!("Expected Conflict notice"),
         }
+    }
+
+    #[test]
+    fn pulse_capacity_clone_and_overflow_keep_the_latest_generation() {
+        let channel = PulseChannel::new(2);
+        assert_eq!(channel.capacity(), 2);
+        let cloned = channel.clone();
+        assert_eq!(cloned.capacity(), 2);
+
+        for generation in 1..=3 {
+            channel
+                .send(Pulse::VaultChanged {
+                    epoch: Epoch::new(4),
+                    generation: Generation::new(generation),
+                    summary: ReconcileSummary::default(),
+                })
+                .unwrap();
+        }
+        assert!(
+            matches!(channel.recv().unwrap(), Pulse::VaultChanged { generation, .. } if generation == Generation::new(2))
+        );
+        assert!(
+            matches!(channel.recv().unwrap(), Pulse::VaultChanged { generation, .. } if generation == Generation::new(3))
+        );
+        assert!(matches!(PulseChannel::new(0).capacity(), 1));
+    }
+
+    #[test]
+    fn notice_keys_and_ack_cover_each_notice_kind() {
+        let channel = NoticeChannel::new(Duration::ZERO);
+        let note = NoteRef::with_stable_id(PathBuf::from("note.md"), "stable".into());
+        let notices = [
+            Notice::RenameSuggested {
+                from: PathBuf::from("old.md"),
+                to: PathBuf::from("new.md"),
+                tier: RenameTier::T1,
+                inbound: 2,
+            },
+            Notice::Conflict { note: note.clone() },
+            Notice::RecoveryOffer { note: note.clone() },
+            Notice::ActionRequired {
+                code: "confirm",
+                note: Some(note.clone()),
+            },
+            Notice::ActionRequired {
+                code: "global",
+                note: None,
+            },
+        ];
+        for notice in &notices {
+            let key = NoticeChannel::key_for_notice(notice);
+            channel.send(notice.clone());
+            assert!(channel.pending.lock().unwrap().contains_key(&key));
+            channel.ack(notice);
+            assert!(!channel.pending.lock().unwrap().contains_key(&key));
+        }
+        assert_eq!(
+            NoticeChannel::key_for_notice(&notices[0]).note.path,
+            PathBuf::from("old.md")
+        );
+        assert_eq!(
+            NoticeChannel::key_for_notice(&notices[4]).note.path,
+            PathBuf::from("unknown")
+        );
+        let (sender, receiver) = (channel.sender(), channel.receiver());
+        assert_eq!(receiver.try_iter().count(), notices.len());
+        sender.send(Notice::Conflict { note }).unwrap();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            Notice::Conflict { .. }
+        ));
     }
 
     #[test]

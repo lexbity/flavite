@@ -289,4 +289,35 @@ mod tests {
         assert_eq!(display.len(), 64); // 32 bytes * 2 hex chars each
         assert!(display.chars().all(|c| c.is_ascii_hexdigit()));
     }
+
+    #[test]
+    fn revision_and_buffer_id_conversions_and_defaults() {
+        let first = BufferId::default();
+        let second = BufferId::from(first.as_u64());
+        assert_eq!(first, second);
+        assert_eq!(first.as_u64(), second.as_u64());
+        assert_eq!(Revision::default(), Revision::INITIAL);
+        assert_eq!(Revision::new(7).as_u64(), 7);
+        assert!(Revision::new(7).is_after(Revision::new(6)));
+        assert!(Revision::new(6).is_before(Revision::new(7)));
+    }
+
+    #[test]
+    fn base_hash_slice_and_content_hash_implementations_agree() {
+        let bytes = b"same content";
+        let expected = BaseHash::from_slice(blake3::hash(bytes).as_bytes());
+        assert_eq!(BaseHash::from_bytes(expected.as_bytes()), expected);
+        assert_eq!(<[u8] as ContentHash>::content_hash(bytes), expected);
+        assert_eq!(<str as ContentHash>::content_hash("same content"), expected);
+        let snapshot = TextSnapshot::new(bytes).unwrap();
+        assert_eq!(snapshot.content_hash(), expected);
+        let array: [u8; 32] = expected.into();
+        assert_eq!(BaseHash::from(array), expected);
+    }
+
+    #[test]
+    #[should_panic(expected = "BaseHash must be 32 bytes")]
+    fn base_hash_slice_rejects_wrong_length() {
+        let _ = BaseHash::from_slice(&[0; 31]);
+    }
 }

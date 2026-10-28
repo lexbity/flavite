@@ -500,4 +500,60 @@ mod tests {
             assert!(inv.generation > 50);
         }
     }
+
+    #[test]
+    fn cursor_epoch_reset_bulk_recording_and_prune_thresholds() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut conn = Connection::open(temp.path()).unwrap();
+        create_schema(&mut conn).unwrap();
+        let mut feed = InvalidationFeed::with_budget(conn, 1);
+        assert_eq!(feed.budget, MIN_LOG_BUDGET);
+
+        feed.record_invalidations(&[(ChangeKind::Note, 1), (ChangeKind::Outgoing, 2)])
+            .unwrap();
+        assert!(
+            feed.get_invalidations_since(IndexVersion {
+                epoch: 1,
+                generation: 0
+            })
+            .unwrap()
+            .is_empty()
+        );
+        feed.apply_batch(&[(ChangeKind::Attachment, 3)]).unwrap();
+        assert!(matches!(
+            feed.get_invalidations_since(IndexVersion {
+                epoch: 1,
+                generation: 2
+            }),
+            Err(IndexError::StaleCursor)
+        ));
+        assert!(
+            feed.get_invalidations_since(IndexVersion {
+                epoch: 99,
+                generation: 0
+            })
+            .unwrap()
+            .is_empty()
+        );
+        assert!(feed.needs_prune(0).unwrap());
+        assert!(!feed.needs_prune(usize::MAX).unwrap());
+
+        assert_eq!(feed.new_epoch().unwrap(), 2);
+        assert_eq!(
+            feed.current_cursor().unwrap(),
+            IndexVersion {
+                epoch: 2,
+                generation: 0
+            }
+        );
+        assert_eq!(feed.log_floor().unwrap(), 0);
+        assert!(
+            feed.get_invalidations_since(IndexVersion {
+                epoch: 2,
+                generation: 0
+            })
+            .unwrap()
+            .is_empty()
+        );
+    }
 }

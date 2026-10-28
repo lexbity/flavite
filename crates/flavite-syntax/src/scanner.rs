@@ -156,37 +156,28 @@ fn scan_wikilink(bytes: &[u8], i: &mut usize, end: usize, kind: SpanKind) -> Opt
             let content_end = *i;
             *i += 2; // Skip `]]`
 
-            // Determine the target end - it's before either | or #
-            let target_end = alias_start.or(anchor_start).unwrap_or(content_end);
-
-            // If there's an anchor but no alias, the target is before the #
-            let target_raw = if let Some(a) = anchor_start {
-                if alias_start.is_none() {
-                    String::from_utf8_lossy(&bytes[content_start..a]).to_string()
-                } else if let Some(alias_s) = alias_start {
-                    // Anchor after alias: target is before |
-                    String::from_utf8_lossy(&bytes[content_start..alias_s]).to_string()
-                } else {
-                    String::from_utf8_lossy(&bytes[content_start..a]).to_string()
-                }
-            } else {
-                // No anchor, just alias or plain target
-                String::from_utf8_lossy(&bytes[content_start..target_end]).to_string()
-            };
-
-            let alias = alias_start.map(|a| {
-                // Alias goes from after | to either end or #
-                let alias_end = anchor_start.unwrap_or(content_end);
-                String::from_utf8_lossy(&bytes[a + 1..alias_end]).to_string()
+            // Both common orders are accepted: target#anchor|alias and
+            // target|alias#anchor. Each field is bounded by the other
+            // separator only when that separator follows it. Compute ranges
+            // from ordered positions so malformed/arbitrary input can never
+            // create a reversed slice.
+            let target_end = [alias_start, anchor_start]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(content_end);
+            let target_raw = String::from_utf8_lossy(&bytes[content_start..target_end]).to_string();
+            let alias = alias_start.map(|separator| {
+                let alias_end = anchor_start
+                    .filter(|anchor| *anchor > separator)
+                    .unwrap_or(content_end);
+                String::from_utf8_lossy(&bytes[separator + 1..alias_end]).to_string()
             });
-
-            let anchor = anchor_start.map(|a| {
-                // Anchor goes from after # to end of content
-                // But if there's an alias, the anchor is after the alias separator? No, that doesn't make sense
-                // Actually, the format is: target|alias#anchor or target#anchor|alias
-                // For now, we only support target#anchor and target|alias
-                // Let's keep it simple: anchor is after # to end
-                String::from_utf8_lossy(&bytes[a + 1..content_end]).to_string()
+            let anchor = anchor_start.map(|separator| {
+                let anchor_end = alias_start
+                    .filter(|alias| *alias > separator)
+                    .unwrap_or(content_end);
+                String::from_utf8_lossy(&bytes[separator + 1..anchor_end]).to_string()
             });
 
             let by_id = target_raw.starts_with("id:");
@@ -203,13 +194,13 @@ fn scan_wikilink(bytes: &[u8], i: &mut usize, end: usize, kind: SpanKind) -> Opt
             });
         }
 
-        // Check for `|` (alias separator) or `#` (anchor)
-        // Only one of these can be present
+        // Record the first occurrence of each separator. Their order is
+        // handled when the closed link's field ranges are constructed.
         match bytes[*i] {
             b'|' if alias_start.is_none() => {
                 alias_start = Some(*i);
             }
-            b'#' if alias_start.is_none() => {
+            b'#' if anchor_start.is_none() => {
                 anchor_start = Some(*i);
             }
             _ => {}
@@ -360,6 +351,18 @@ mod tests {
         let p = spans[0].payload.as_ref().unwrap();
         assert_eq!(p.target_raw, "target");
         assert_eq!(p.anchor, Some("heading".to_string()));
+    }
+
+    #[test]
+    fn wikilink_alias_and_anchor_are_order_independent_and_bounded() {
+        for input in ["[[target#heading|alias]]", "[[target|alias#heading]]"] {
+            let spans = scan(input);
+            assert_eq!(spans.len(), 1, "input: {input}");
+            let payload = spans[0].payload.as_ref().unwrap();
+            assert_eq!(payload.target_raw, "target", "input: {input}");
+            assert_eq!(payload.alias.as_deref(), Some("alias"), "input: {input}");
+            assert_eq!(payload.anchor.as_deref(), Some("heading"), "input: {input}");
+        }
     }
 
     #[test]

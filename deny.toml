@@ -7,6 +7,10 @@ allow = [
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    # Recorded license decision: BSL-1.0 is permissive and not copyleft. It
+    # arrives only through iced's Windows clipboard backend (`clipboard-win`
+    # and `error-code`); that platform backend is required by the editor.
+    "BSL-1.0",
     "ISC",
     "Unicode-DFS-2016",
     # Recorded decision (§10.4, §10.9 waiver): Unicode-3.0 is the Unicode
@@ -26,6 +30,32 @@ allow = [
     "CC0-1.0",
 ]
 confidence-threshold = 0.8
+
+[advisories]
+unsound = "all"
+ignore = [
+    # Review by 2027-04-30. `paste` is a proc-macro dependency of `metal`,
+    # pulled by iced/wgpu; it is not included in shipped runtime code and the
+    # advisory reports no patched version. Re-evaluate when the renderer
+    # dependency stack offers a maintained version.
+    { id = "RUSTSEC-2024-0436", reason = "Transitive proc-macro dependency of iced/wgpu with no patched release; review by 2027-04-30." },
+    # Review by 2027-04-30. `ttf-parser` remains in cosmic-text/fontdb and
+    # winit's font stack; RustSec reports no patched release. Re-evaluate on
+    # iced's maintained font stack update.
+    { id = "RUSTSEC-2026-0192", reason = "Transitive font parser used by iced's cosmic-text/font stack; no patched release; review by 2027-04-30." },
+    # Review by 2027-04-30. zbus 5's name/value crates enter through iced's
+    # Linux window backend; RustSec reports the migration is only available
+    # in zbus 6, which is not the version used by iced 0.14.
+    { id = "RUSTSEC-2026-0370", reason = "zbus 5 transitive Linux window-backend dependency; migration requires upstream iced update; review by 2027-04-30." },
+    { id = "RUSTSEC-2026-0371", reason = "zbus 5 transitive Linux window-backend dependency; migration requires upstream iced update; review by 2027-04-30." },
+    { id = "RUSTSEC-2026-0372", reason = "zbus 5 transitive Linux window-backend dependency; migration requires upstream iced update; review by 2027-04-30." },
+    # Review by 2027-04-30. lru 0.16.4 is used only by cryoglyph's glyph
+    # cache. The advisory requires a panicking Drop implementation for a key
+    # and unwind recovery followed by another eviction; the concrete cache key
+    # is an internal value type and this app never catches panics around that
+    # cache. cryoglyph's semver range prevents a direct patched-version update.
+    { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 is transitive through iced/cryoglyph; its concrete glyph-cache key does not have a panicking destructor and the app does not catch rendering panics; upstream semver update review by 2027-04-30." },
+]
 
 [bans]
 multiple-versions = "warn"

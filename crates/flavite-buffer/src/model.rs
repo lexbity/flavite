@@ -83,8 +83,16 @@ impl Selection {
     /// Move both anchor and head by an offset.
     #[must_use]
     pub fn offset(self, by: i64) -> Self {
-        let new_anchor = (self.anchor.0 as i64 + by).clamp(0, usize::MAX as i64) as usize;
-        let new_head = (self.head.0 as i64 + by).clamp(0, usize::MAX as i64) as usize;
+        let shift = |position: usize| {
+            if by >= 0 {
+                position.saturating_add(by as usize)
+            } else {
+                let magnitude = usize::try_from(by.unsigned_abs()).unwrap_or(usize::MAX);
+                position.saturating_sub(magnitude)
+            }
+        };
+        let new_anchor = shift(self.anchor.0);
+        let new_head = shift(self.head.0);
         Self {
             anchor: TextByte(new_anchor),
             head: TextByte(new_head),
@@ -135,6 +143,18 @@ impl EditorModel {
             base_hash: Some(BaseHash::from_snapshot(&snapshot)),
             is_dirty: false,
         }
+    }
+
+    /// Replace the document snapshot while preserving buffer identity and
+    /// advancing its revision. Used when restoring a durable recovery file.
+    pub fn replace_snapshot(&mut self, snapshot: TextSnapshot) {
+        self.rope = Rope::from_str(snapshot.text());
+        self.eol_table = EolTable::from_snapshot(&snapshot);
+        self.selections.clear();
+        self.undo_tree = UndoTree::new(snapshot.clone());
+        self.revision = self.revision.next();
+        self.base_hash = Some(BaseHash::from_snapshot(&snapshot));
+        self.is_dirty = false;
     }
 
     /// Create a new empty editor model.
@@ -513,7 +533,7 @@ impl EditorModel {
             // line_end is the start of the next line (after the newline)
             // If this line has an EOL (not None), subtract 1 to exclude the newline
             let eol = self.eol_table.get(line);
-            let break_pos = if eol != Some(crate::eol::LineEnding::None) {
+            let break_pos = if eol.is_some_and(|eol| eol != crate::eol::LineEnding::None) {
                 // This line has an EOL, so line_end is after the newline
                 // Subtract 1 to get the position before the newline
                 TextByte(line_end.0 - 1)
@@ -845,5 +865,62 @@ mod tests {
         let r2 = model.insert(TextByte(1), "b");
         assert_eq!(r2, Revision::new(2));
         assert_eq!(model.revision(), Revision::new(2));
+    }
+
+    #[test]
+    fn model_snapshot_slices_positions_and_selection_edges() {
+        let mut model = EditorModel::from_text("a\né");
+        assert!(!model.is_empty());
+        assert_eq!(model.char_at(TextByte(0)), Some('a'));
+        assert_eq!(model.char_at(TextByte(2)), Some('é'));
+        assert_eq!(model.char_at(TextByte(3)), None);
+        assert_eq!(model.slice_str(Span::new(TextByte(0), TextByte(1))), "a");
+        assert_eq!(model.line_count(), 2);
+        assert_eq!(model.line_start(1), TextByte(2));
+        assert_eq!(model.line_end(0), TextByte(2));
+        assert_eq!(model.line_end(1), TextByte(4));
+        assert_eq!(model.line_at(TextByte(2)), 1);
+        assert_eq!(model.primary_selection(), Selection::caret(TextByte(0)));
+
+        let reversed = Selection::new(TextByte(4), TextByte(1));
+        assert!(!reversed.is_caret());
+        assert_eq!(reversed.start(), TextByte(1));
+        assert_eq!(reversed.end(), TextByte(4));
+        assert_eq!(reversed.span(), Span::new(TextByte(1), TextByte(4)));
+        assert!(reversed.contains(TextByte(1)) && reversed.contains(TextByte(4)));
+        assert!(!reversed.contains(TextByte(5)));
+        assert_eq!(reversed.offset(-9), Selection::caret(TextByte(0)));
+
+        model.set_base_hash(BaseHash::from_bytes([9; 32]));
+        model.set_dirty(true);
+        model.set_primary_selection(reversed);
+        model.add_selection(Selection::caret(TextByte(2)));
+        model.replace_snapshot(TextSnapshot::new(b"fresh\n").unwrap());
+        assert_eq!(model.text(), "fresh\n");
+        assert_eq!(model.revision(), Revision::new(1));
+        assert!(!model.is_dirty());
+        assert_eq!(model.selections().len(), 0);
+        assert!(model.base_hash().is_some());
+    }
+
+    #[test]
+    fn edit_batches_empty_operations_and_clear_keep_revision_contract() {
+        let mut model = EditorModel::from_text("abc");
+        let initial = model.revision();
+        assert_eq!(model.apply_edit_ops(&[]), initial);
+        assert_eq!(
+            model.replace(Span::new(TextByte(1), TextByte(1)), ""),
+            initial
+        );
+        assert_eq!(model.insert(TextByte(0), ""), initial);
+        assert_eq!(model.delete(Span::new(TextByte(1), TextByte(1))), initial);
+        assert_eq!(
+            model.apply_edit_ops(&[EditOp::new(Span::new(TextByte(1), TextByte(2)), "X".into(),)]),
+            Revision::new(1)
+        );
+        assert_eq!(model.text(), "aXc");
+        model.clear();
+        assert!(model.is_empty());
+        assert!(model.to_source_bytes().is_empty());
     }
 }

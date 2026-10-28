@@ -1,10 +1,9 @@
 //! Exclusion masks: byte ranges whose contents are *not* Markdown prose.
 //!
-//! [`TextMask`] marks code spans, code blocks, raw HTML and math. Both parse
-//! paths ([`crate::pulldown_glue`] and [`crate::ts_ranges`]) build the same
-//! mask over the same content, which is what makes the scanner's link/tag
-//! rules agree between the indexer parse and the editor parse (RFC-0001 §4.3
-//! acceptance criterion AC-5).
+//! [`TextMask`] marks code spans, code blocks, raw HTML and math. The Markdown
+//! parser integration builds the mask over the content before invoking the
+//! shared scanner, which keeps link and tag semantics in one place (RFC-0001
+//! §4.3 acceptance criterion AC-5).
 //!
 //! The mask is *exclusion*-based rather than an inclusion list of prose text
 //! events: an inclusion list built from pulldown `Text` events would drop

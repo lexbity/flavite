@@ -702,4 +702,78 @@ mod tests {
         let (rev, _) = tree.redo().unwrap();
         assert_eq!(rev, Revision::new(1));
     }
+
+    #[test]
+    fn undo_tree_navigation_branching_and_snapshotless_nodes() {
+        let snap = |s: &str| TextSnapshot::new(s.as_bytes()).unwrap();
+        let mut tree = UndoTree::with_coalesce_window(snap(""), Duration::ZERO);
+        assert!(tree.current().unwrap().is_root());
+        assert!(tree.position().unwrap().is_leaf());
+        assert_eq!(tree.coalesce_window(), Duration::ZERO);
+        let edit = EditOp::new(Span::new(TextByte(0), TextByte(0)), "a".into());
+        tree.apply(edit.clone(), snap("a"));
+        tree.apply(
+            EditOp::new(Span::new(TextByte(1), TextByte(1)), "b".into()),
+            snap("ab"),
+        );
+        assert_eq!(tree.depth(), 2);
+        assert_eq!(tree.history().len(), 3);
+        assert!(tree.goto(1));
+        assert_eq!(tree.position_revision(), Revision::new(1));
+        assert!(!tree.goto(99));
+        assert!(tree.undo().is_some());
+        assert!(tree.redo().is_some());
+        tree.clear();
+        assert_eq!(tree.depth(), 0);
+        assert_eq!(tree.history().len(), 1);
+        assert_eq!(tree.current_revision(), Revision::INITIAL);
+
+        let node = UndoNode::new_no_snapshot(1, Revision::new(1), edit, 0);
+        assert!(!node.is_root());
+        assert!(node.is_leaf());
+        assert!(node.snapshot.is_none());
+        assert!(UndoTree::default().current().is_none());
+    }
+
+    #[test]
+    fn edit_group_and_linear_stack_cover_empty_expired_and_redo_paths() {
+        let first = EditOp::new(Span::new(TextByte(0), TextByte(0)), "a".into());
+        let next = EditOp::new(Span::new(TextByte(1), TextByte(1)), "b".into());
+        assert!(!first.is_noop());
+        assert!(!first.can_coalesce(&next));
+        let adjacent = EditOp::new(Span::new(TextByte(0), TextByte(1)), "x".into());
+        assert!(first.can_coalesce(&adjacent));
+        assert_eq!(first.coalesce(&adjacent).replacement, "ax");
+        let gapped = EditOp::new(Span::new(TextByte(2), TextByte(2)), "z".into());
+        assert_eq!(first.coalesce(&gapped).replacement, "a z");
+
+        let now = Instant::now();
+        let mut group = EditGroup::new(vec![first.clone()], now, Revision::INITIAL);
+        assert!(group.can_absorb(&adjacent, now, Duration::from_secs(1)));
+        assert!(!group.can_absorb(&next, now + Duration::from_secs(2), Duration::from_secs(1)));
+        group.absorb(adjacent);
+        assert_eq!(group.total_change(), (2, 1));
+        assert!(EditGroup::new(vec![], now, Revision::INITIAL).can_absorb(
+            &next,
+            now,
+            Duration::ZERO
+        ));
+
+        let mut stack = LinearUndoStack::new();
+        assert!(stack.undo("x").is_none());
+        assert!(stack.redo().is_none());
+        stack.set_coalesce_window(Duration::ZERO);
+        stack.push(first.clone(), "");
+        stack.push(next, "a");
+        assert_eq!(stack.undo_count(), 2);
+        assert!(stack.undo("ab").is_some());
+        assert_eq!(stack.redo_count(), 1);
+        assert!(stack.redo().is_some());
+        stack.undo("ab");
+        stack.push(first, "a");
+        assert_eq!(stack.redo_count(), 0);
+        stack.clear();
+        assert_eq!(stack.undo_count(), 0);
+        assert_eq!(stack.current_revision(), Revision::INITIAL);
+    }
 }

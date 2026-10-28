@@ -607,4 +607,116 @@ mod tests {
         let page = query.execute(&conn, 10, None).unwrap();
         assert_eq!(page.items.len(), 1);
     }
+
+    #[test]
+    fn sql_translation_covers_composites_properties_and_attachment_filters() {
+        let note = NoteRef::new(7, b"notes/seven.md".to_vec());
+        let cases = [
+            Query::Tag {
+                name: "x/".into(),
+                hierarchical: true,
+            },
+            Query::LinksTo(note.clone()),
+            Query::LinkedFrom(note),
+            Query::Unresolved,
+            Query::Text("ignored by sqlite".into()),
+            Query::Attachment {
+                kind: None,
+                name: None,
+            },
+            Query::Attachment {
+                kind: Some(crate::schema::AttachmentKind::Image),
+                name: None,
+            },
+            Query::Attachment {
+                kind: None,
+                name: Some("cover".into()),
+            },
+            Query::And(vec![Query::Text("a".into()), Query::Unresolved]),
+            Query::Or(vec![Query::Text("a".into()), Query::Unresolved]),
+            Query::Not(Box::new(Query::Unresolved)),
+        ];
+        for query in cases {
+            let (sql, _) = query.to_sql();
+            assert!(!sql.is_empty());
+        }
+
+        let properties = [
+            (CmpOp::Eq, PropertyValue::Text("value".into())),
+            (CmpOp::Neq, PropertyValue::Number(3.5)),
+            (CmpOp::Lt, PropertyValue::Number(2.0)),
+            (CmpOp::Lte, PropertyValue::Number(2.0)),
+            (CmpOp::Gt, PropertyValue::Number(2.0)),
+            (CmpOp::Gte, PropertyValue::Number(2.0)),
+            (CmpOp::Contains, PropertyValue::Text("mid".into())),
+            (CmpOp::StartsWith, PropertyValue::Text("pre".into())),
+            (CmpOp::EndsWith, PropertyValue::Text("suf".into())),
+            (CmpOp::Eq, PropertyValue::Bool(true)),
+            (CmpOp::Eq, PropertyValue::Date("2026-01-01".into())),
+            (
+                CmpOp::Eq,
+                PropertyValue::Datetime("2026-01-01T00:00:00Z".into()),
+            ),
+            (CmpOp::Eq, PropertyValue::Null),
+            (CmpOp::Neq, PropertyValue::Null),
+        ];
+        for (op, value) in properties {
+            let (sql, params) = Query::Prop {
+                key: "k".into(),
+                op,
+                value,
+            }
+            .to_sql();
+            assert!(sql.contains("properties"));
+            assert!(params.len() >= 2);
+        }
+        assert!(Query::And(vec![]).to_sql().0.is_empty());
+        assert!(Query::Or(vec![]).to_sql().0.is_empty());
+    }
+
+    #[test]
+    fn execution_rejects_invalid_cursors_and_builds_next_page_cursor() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut conn = Connection::open(temp.path()).unwrap();
+        create_schema(&mut conn).unwrap();
+        for id in 1..=2 {
+            conn.execute(
+                "INSERT INTO notes (note_id, path, path_native, path_key, stem_key, title, content_hash, size, mtime_ns, scan_ns, generation) VALUES (?1, '', ?2, '', '', '', X'00', 0, 0, 0, 0)",
+                rusqlite::params![id, vec![id as u8]],
+            ).unwrap();
+        }
+        let query = Query::Not(Box::new(Query::Unresolved));
+        let first = query.execute(&conn, 1, None).unwrap();
+        assert_eq!(first.items.len(), 1);
+        let cursor = first.next.unwrap();
+        assert_eq!(cursor.note_id, Some(1));
+        assert_eq!(
+            query.execute(&conn, 1, Some(&cursor)).unwrap().items[0].note_id,
+            2
+        );
+
+        let mut stale = cursor.clone();
+        stale.epoch += 1;
+        assert!(
+            query
+                .execute(&conn, 1, Some(&stale))
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        let mut ahead = cursor.clone();
+        ahead.generation = u64::MAX;
+        assert!(matches!(
+            query.execute(&conn, 1, Some(&ahead)),
+            Err(IndexError::StaleCursor)
+        ));
+        let mut expired = cursor;
+        expired.generation = 0;
+        conn.execute("UPDATE meta SET value = '2' WHERE key = 'log_floor'", [])
+            .unwrap();
+        assert!(matches!(
+            query.execute(&conn, 1, Some(&expired)),
+            Err(IndexError::ResetRequired)
+        ));
+    }
 }

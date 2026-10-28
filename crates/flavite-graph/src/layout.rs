@@ -134,7 +134,7 @@ pub const DEFAULT_THETA: f64 = 0.8;
 /// Smallest distance any two bodies are allowed to act across, in world
 /// units. Below it, the `1/d²` repulsion would dominate every other force and
 /// the direction would be undefined, so co-located bodies are separated by
-/// [`nudge`] instead.
+/// a deterministic fallback direction instead.
 pub const MIN_SEPARATION: f64 = 1.0e-3;
 
 /// [`MIN_SEPARATION`] squared, precomputed at the one place it is needed.

@@ -51,7 +51,7 @@ pub struct Link {
 
 impl Link {
     /// Convert from a [`ScannedSpan`] with a [`SpanKind::Link`] or [`SpanKind::Embed`].
-    fn from_scanned(span: ScannedSpan) -> Option<Self> {
+    pub(super) fn from_scanned(span: ScannedSpan) -> Option<Self> {
         let payload = span.payload?;
         Some(Self {
             span: span.span,

@@ -426,4 +426,33 @@ mod tests {
         let result = get_data_dir();
         assert!(result.is_ok() || result.is_err());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn focus_ipc_client_failure_and_lock_cleanup_paths() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("focus.sock");
+        let client = FocusIpc::new(socket.clone(), false).unwrap();
+        assert!(client.check_focus().unwrap().is_empty());
+        assert!(client.send_focus().is_err());
+        drop(client);
+        assert!(!socket.exists());
+
+        let lock_path = dir.path().join("nested/instance.lock");
+        let lock = AdvisoryLock::acquire(&lock_path).unwrap();
+        lock.release();
+        assert!(!AdvisoryLock::exists(&lock_path));
+    }
+
+    #[test]
+    fn nonexisting_instance_cannot_be_focused_and_root_keys_are_stable() {
+        let identity =
+            VaultIdentity::new(Uuid::now_v7(), PathBuf::from("/vault"), vec![0, 1, 0xfe]);
+        assert!(matches!(
+            InstanceManager::try_focus_existing(&identity),
+            Err(InstanceError::IpcConnectionFailed(_)) | Err(InstanceError::NoProjectDirs)
+        ));
+        let path = get_root_guard_path(&identity.root_key);
+        assert!(path.ends_with("0001fe.lock"));
+    }
 }

@@ -642,6 +642,138 @@ mod tests {
     }
 
     #[test]
+    fn resolver_handles_paths_ids_embeds_ambiguity_and_invalidation() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut conn = Connection::open(temp.path()).unwrap();
+        create_schema(&mut conn).unwrap();
+        for (id, path, native, stem, stable) in [
+            (
+                1,
+                "notes/one.md",
+                b"notes/one.md".as_slice(),
+                "one",
+                "shared",
+            ),
+            (
+                2,
+                "notes/two.md",
+                b"notes/two.md".as_slice(),
+                "two",
+                "shared",
+            ),
+            (
+                3,
+                "notes/cover.md",
+                b"notes/cover.md".as_slice(),
+                "cover",
+                "cover-id",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO notes (note_id,path,path_native,path_key,stem_key,title,stable_id,content_hash,size,mtime_ns,scan_ns,generation) VALUES (?1,?2,?3,?2,?4,'',?5,X'00',0,0,0,0)",
+                params![id, path, native, stem, stable],
+            ).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO aliases (note_id,alias,alias_key) VALUES (1,'first','alias')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO attachments (att_id,path,path_native,path_key,stem_key,kind,size,mtime_ns,scan_ns,generation) VALUES (5,'images/cover.png',X'696d61676573','images/cover.png','cover','image',1,0,0,0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO links (src,ord,kind,dst_raw,target_key,by_id,span_start,span_end,res_state) VALUES (1,0,'link','two','two',0,0,0,'unresolved')",
+            [],
+        ).unwrap();
+
+        let mut resolver = Resolver::new(conn);
+        resolver.refresh_cache().unwrap();
+        assert_eq!(
+            resolver
+                .resolve("cover-id", "id:cover-id", false, None)
+                .note
+                .unwrap()
+                .note_id,
+            3
+        );
+        assert_eq!(
+            resolver
+                .resolve("notes/one.md", "notes/one.md", false, None)
+                .note
+                .unwrap()
+                .note_id,
+            1
+        );
+        assert_eq!(
+            resolver
+                .resolve("images/cover.png", "images/cover.png", true, None)
+                .attachment
+                .unwrap()
+                .att_id,
+            5
+        );
+        assert_eq!(
+            resolver
+                .resolve("alias", "first", false, None)
+                .note
+                .unwrap()
+                .note_id,
+            1
+        );
+        let ambiguous = resolver.resolve("cover", "cover", true, None);
+        assert!(ambiguous.is_ambiguous);
+        assert_eq!(ambiguous.note.unwrap().note_id, 3);
+
+        resolver.re_resolve_all().unwrap();
+        let state: String = resolver
+            .conn
+            .query_row(
+                "SELECT res_state FROM links WHERE src=1 AND ord=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "resolved");
+        resolver.invalidate_for_note(1).unwrap();
+        resolver.invalidate_for_attachment(5).unwrap();
+        assert!(
+            resolver
+                .resolve("alias", "first", false, None)
+                .is_unresolved
+        );
+        resolver.refresh_cache().unwrap();
+        let resolution = Resolution::ambiguous();
+        resolver.update_link_resolution(1, 0, &resolution).unwrap();
+        let state: String = resolver
+            .conn
+            .query_row(
+                "SELECT res_state FROM links WHERE src=1 AND ord=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "ambiguous");
+        resolver
+            .update_link_resolution(1, 0, &Resolution::unresolved())
+            .unwrap();
+        resolver
+            .update_link_resolution(
+                1,
+                0,
+                &Resolution {
+                    note: None,
+                    attachment: None,
+                    is_ambiguous: false,
+                    is_unresolved: false,
+                    state: ResState::Resolved,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn test_attachment_extension() {
         assert!(is_attachment_extension("image.png"));
         assert!(is_attachment_extension("doc.pdf"));

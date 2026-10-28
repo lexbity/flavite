@@ -444,6 +444,13 @@ impl Lattice {
                         })
                     }
                     crate::session::CommandResult::ConflictResolved => serde_json::Value::Null,
+                    crate::session::CommandResult::RecoveryRestored {
+                        buffer_id,
+                        revision,
+                    } => serde_json::json!({
+                        "buffer_id": buffer_id.as_u64(),
+                        "revision": revision.as_u64(),
+                    }),
                 };
                 ExecutionResult::Local(LocalResult::Success(LocalSuccess::new(request_id, data)))
             }
@@ -458,6 +465,21 @@ impl Lattice {
                     "conflict",
                     format!("Conflict detected: {}", path.to_string_lossy()),
                 )))
+            }
+            SessionResult::MergeReady { path, result } => {
+                let data = serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "merged": result.merged,
+                    "conflicts": result.conflicts.iter().map(|conflict| {
+                        serde_json::json!({
+                            "base_start_line": conflict.base_start_line,
+                            "base_end_line": conflict.base_end_line,
+                            "mine": conflict.mine,
+                            "theirs": conflict.theirs,
+                        })
+                    }).collect::<Vec<_>>(),
+                });
+                ExecutionResult::Local(LocalResult::Success(LocalSuccess::new(request_id, data)))
             }
             SessionResult::ActionRequired { code, data } => ExecutionResult::Local(
                 LocalResult::Error(LocalError::new(code, data.unwrap_or_default())),

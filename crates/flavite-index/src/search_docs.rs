@@ -408,4 +408,43 @@ mod tests {
         assert!(cache.get(2).unwrap().is_some());
         assert!(cache.get(3).unwrap().is_none());
     }
+
+    #[test]
+    fn cache_bulk_paths_empty_batches_and_rebuild() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut conn = Connection::open(temp.path()).unwrap();
+        create_schema(&mut conn).unwrap();
+        for id in 1..=105 {
+            conn.execute(
+                "INSERT INTO notes (note_id,path,path_native,path_key,stem_key,title,content_hash,size,mtime_ns,scan_ns,generation,parse_ok) VALUES (?1,'',?2,'','','',X'00',0,0,0,0,?3)",
+                params![id, vec![id as u8], i64::from(id != 2)],
+            ).unwrap();
+        }
+        let mut cache = SearchDocCache::new(conn);
+        assert!(cache.get_many(&[]).unwrap().is_empty());
+        cache.delete_many(&[]).unwrap();
+        for id in 1..=105 {
+            cache.set(id, b"hash", "body").unwrap();
+        }
+        let ids: Vec<i64> = (1..=105).collect();
+        assert_eq!(cache.get_many(&ids).unwrap().len(), 105);
+        assert_eq!(cache.get_many(&[4, 105, 999]).unwrap().len(), 2);
+        cache.delete_many(&ids[..3]).unwrap();
+        assert!(cache.get(1).unwrap().is_none());
+
+        let mut batch = SearchDocBatch::new();
+        assert!(batch.is_empty());
+        batch.upsert(1, b"new".to_vec(), "rebuilt".into());
+        batch.delete(105);
+        assert!(!batch.is_empty());
+        batch.apply(&mut cache).unwrap();
+        batch.clear();
+        assert!(batch.is_empty());
+        assert_eq!(cache.get(1).unwrap().unwrap().body_text, "rebuilt");
+        cache.rebuild().unwrap();
+        assert!(cache.get(1).unwrap().is_some());
+        assert!(cache.get(2).unwrap().is_none());
+        cache.clear().unwrap();
+        assert!(cache.get_many(&ids).unwrap().is_empty());
+    }
 }

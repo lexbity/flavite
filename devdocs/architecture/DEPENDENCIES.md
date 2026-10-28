@@ -39,7 +39,6 @@ Normal/build:
 - `blake3` (normal)
 - `flavite-syntax` (normal)
 - `ropey` (normal)
-- `zstd` (normal)
 
 ### `flavite-cli`
 
@@ -76,9 +75,8 @@ Normal/build:
 
 - `blake3` (normal)
 - `flavite-syntax` (normal)
+- `pulldown-cmark` (normal)
 - `rusqlite` (normal)
-- `tantivy` (normal)
-- `tracing` (normal)
 
 ### `flavite-syntax`
 
@@ -103,8 +101,12 @@ Normal/build:
 - `flavite-fs` (normal)
 - `flavite-index` (normal)
 - `flavite-syntax` (normal)
-- `notify` (normal)
 - `tracing` (normal)
+- `zstd` (normal)
+
+Dev-only:
+
+- `flavite-fs`
 
 ### `xtask`
 
@@ -122,14 +124,14 @@ Normal/build:
 - `blake3` ← flavite-buffer, flavite-fs, flavite-index, flavite-vault, xtask
 - `cosmic-text` ← xtask
 - `iced` ← flavite-ui, xtask
-- `notify` ← flavite-fs, flavite-fs, flavite-vault, xtask
-- `pulldown-cmark` ← flavite-syntax
+- `notify` ← flavite-fs, flavite-fs, xtask
+- `pulldown-cmark` ← flavite-index, flavite-syntax
 - `ropey` ← flavite-buffer
 - `rusqlite` ← flavite-graph, flavite-index, xtask
-- `tantivy` ← flavite-index, xtask
-- `tracing` ← flavite-cli, flavite-index, flavite-vault
+- `tantivy` ← xtask
+- `tracing` ← flavite-cli, flavite-vault
 - `tree-sitter` ← flavite-syntax
-- `zstd` ← flavite-buffer
+- `zstd` ← flavite-vault
 
 ## Layering rules (§10.2)
 

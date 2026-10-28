@@ -492,4 +492,129 @@ mod tests {
         assert!(changed.is_empty());
         assert!(vanished.is_empty());
     }
+
+    #[test]
+    fn full_reconcile_adds_valid_notes_skips_hidden_and_emits_versions() {
+        let fs = MemFs::new();
+        let root = Path::new("/vault");
+        fs.create_dir_all(&root.join("notes")).unwrap();
+        fs.create_dir_all(&root.join(".flavite")).unwrap();
+        fs.write_new(&root.join("notes/ok.md"), b"# valid").unwrap();
+        fs.write_new(&root.join("notes/binary.md"), &[0xff])
+            .unwrap();
+        fs.write_new(&root.join(".flavite/vault.toml"), b"ignored")
+            .unwrap();
+        fs.write_new(&root.join(".private.md"), b"ignored").unwrap();
+
+        let pulse = PulseChannel::new(4);
+        let config = ReconcileConfig {
+            verification_interval: Duration::ZERO,
+            ..ReconcileConfig::default()
+        };
+        let mut index = IndexPlaceholder;
+        let mut state = ReconcileState::default();
+        let mut context = ReconcileContext {
+            fs: &fs,
+            index: &mut index,
+            vault_root: root,
+            pulse: &pulse,
+            config: &config,
+            state: &mut state,
+        };
+        let result = reconcile(
+            &mut context,
+            ReconcileScope::Directory(root.join("notes")),
+            ReconcileMode::FastMetadata,
+        );
+        assert_eq!(result.summary.added, 1);
+        assert_eq!(result.version.generation, Generation::new(1));
+        assert!(result.verification_needed);
+        assert!(context.state.verification_overdue);
+        assert!(matches!(
+            pulse.recv().unwrap(),
+            Pulse::VaultChanged { generation, summary, .. }
+                if generation == Generation::new(1) && summary.added == 1
+        ));
+
+        context.state.last_verification = Some(Instant::now() - Duration::from_secs(2));
+        context
+            .config
+            .drift_found_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let verified = verify_content_full(&mut context);
+        assert_eq!(verified.summary.added, 1);
+        assert_eq!(verified.version.generation, Generation::new(2));
+        assert!(verified.verification_needed);
+    }
+
+    #[test]
+    fn fast_metadata_identifies_metadata_drift_and_parse_errors() {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/vault")).unwrap();
+        let path = PathBuf::from("/vault/note.md");
+        fs.write_new(&path, b"note").unwrap();
+        let disk = scan_disk(
+            &fs,
+            Path::new("/vault"),
+            &ReconcileScope::Single(path.clone()),
+        );
+        let mut indexed = disk.clone();
+        let current = indexed.get_mut(&path).unwrap();
+        current.size = disk.get(&path).unwrap().size;
+        current.mtime_ns = disk.get(&path).unwrap().mtime_ns;
+        let scan_time = current.mtime_ns + 2_000_000_001;
+        let mut placeholder = IndexPlaceholder;
+        let pulse = PulseChannel::new(1);
+        let config = ReconcileConfig::default();
+        let mut state = ReconcileState::default();
+        let ctx = ReconcileContext {
+            fs: &fs,
+            index: &mut placeholder,
+            vault_root: Path::new("/vault"),
+            pulse: &pulse,
+            config: &config,
+            state: &mut state,
+        };
+        let (changed, vanished, added) = identify_changes(
+            &ctx,
+            &disk,
+            &indexed,
+            ReconcileMode::FastMetadata,
+            scan_time,
+        );
+        assert!(changed.is_empty());
+        assert!(vanished.is_empty());
+        assert!(added.is_empty());
+        let (changed, _, _) = identify_changes(
+            &ctx,
+            &disk,
+            &indexed,
+            ReconcileMode::VerifyContent,
+            scan_time,
+        );
+        assert_eq!(changed.len(), 1);
+
+        let config = ReconcileConfig {
+            max_note_bytes: 1,
+            ..ReconcileConfig::default()
+        };
+        assert!(read_and_parse(&fs, &path, &config).is_err());
+        assert!(read_and_parse(&fs, Path::new("/missing"), &config).is_err());
+        assert!(
+            scan_disk(
+                &fs,
+                Path::new("/vault"),
+                &ReconcileScope::Single(PathBuf::from("/missing"))
+            )
+            .is_empty()
+        );
+        assert!(
+            scan_disk(
+                &fs,
+                Path::new("/vault"),
+                &ReconcileScope::Directory(PathBuf::from("/missing"))
+            )
+            .is_empty()
+        );
+    }
 }

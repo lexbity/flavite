@@ -15,7 +15,7 @@ use flavite_graph::{GraphSnapshot, NodeId, NodeKind};
 
 /// Vertex-layout stride of [`NodeInstance`], in bytes.
 ///
-/// Enforced by [`const_assert`] at compile time so the Rust layout and the
+/// Enforced by compile-time assertions so the Rust layout and the
 /// WGSL attribute offsets in [`crate::graph::shader_probe`] can never drift
 /// apart silently.
 pub const NODE_INSTANCE_SIZE: usize = 32;
