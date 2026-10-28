@@ -85,9 +85,7 @@ pub fn parse_frontmatter(snapshot: &TextSnapshot) -> Option<Frontmatter> {
         line_start += line.len() + 1;
     }
 
-    let Some(close) = closing_offset else {
-        return None;
-    };
+    let close = closing_offset?;
 
     let yaml_text = text[after_open..close].to_string();
 

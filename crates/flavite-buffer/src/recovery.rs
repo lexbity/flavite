@@ -540,12 +540,12 @@ impl RecoveryWriter {
             }
         };
 
-        if let Err(_) = file.write_all(&bytes) {
+        if file.write_all(&bytes).is_err() {
             fs::remove_file(&temp_path).ok();
             return None;
         }
 
-        if let Err(_) = file.sync_all() {
+        if file.sync_all().is_err() {
             fs::remove_file(&temp_path).ok();
             return None;
         }
@@ -553,7 +553,7 @@ impl RecoveryWriter {
         drop(file);
 
         // Rename atomically
-        if let Err(_) = fs::rename(&temp_path, &path) {
+        if fs::rename(&temp_path, &path).is_err() {
             fs::remove_file(&temp_path).ok();
             return None;
         }
@@ -661,19 +661,19 @@ impl RecoveryWriter {
             }
         };
 
-        if let Err(_) = file.write_all(&bytes) {
+        if file.write_all(&bytes).is_err() {
             fs::remove_file(&temp_path).ok();
             return None;
         }
 
-        if let Err(_) = file.sync_all() {
+        if file.sync_all().is_err() {
             fs::remove_file(&temp_path).ok();
             return None;
         }
 
         drop(file);
 
-        if let Err(_) = fs::rename(&temp_path, &path) {
+        if fs::rename(&temp_path, &path).is_err() {
             fs::remove_file(&temp_path).ok();
             return None;
         }

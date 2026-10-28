@@ -4,27 +4,21 @@
 //!
 //! # Doctor Checks
 //!
-//! The doctor command performs the following checks:
-//! 1. SQLite quick_check
-//! 2. Tantivy generation vs SQLite
-//! 3. Sample-N hash verification against disk
-//! 4. Orphan temp files
-//! 5. Pending journals
-//! 6. Duplicate and conflicting IDs
-//! 7. NFC/case collisions
-//! 8. Broken and ambiguous link counts
-//! 9. Attachment orphans and unhydrated placeholders
-//! 10. History size/pinned bytes
-//! 11. UUID/root binding conflicts
-//! 12. Orphan instance sockets
-//! 13. Search checkpoint/log coverage
-//! 14. Verification lag
-//! 15. Live journal payload/checkpoint integrity
+//! The current checks inspect SQLite quick_check, indexed note hashes, links,
+//! stable IDs, orphan temps, journals, path collisions, history size, stale
+//! registry records, and orphan IPC sockets. Checks owned by unfinished slices
+//! are omitted until they can report real results.
 //!
 //! Doctor never cleans files referenced by a live journal.
 
 use crate::types::ApiVaultRef;
+use directories::ProjectDirs;
+use flavite_fs::{OsFs, list_orphan_temps};
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 /// A doctor check result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -196,228 +190,485 @@ impl DoctorSummary {
     }
 }
 
-/// Doctor checker for a vault.
+/// Doctor checker for checks supported by the current storage slices.
 #[derive(Debug)]
 pub struct DoctorChecker {
     vault: ApiVaultRef,
+    db: PathBuf,
 }
 
 impl DoctorChecker {
-    /// Create a new doctor checker for a vault.
     #[must_use]
     pub fn new(vault: ApiVaultRef) -> Self {
-        Self { vault }
+        let db = cache_db_path(vault.uuid);
+        Self { vault, db }
     }
 
-    /// Run all doctor checks and return a report.
-    ///
-    /// This is a stub implementation that will be filled in as the various
-    /// subsystems are implemented.
+    #[cfg(test)]
+    fn with_db_path(vault: ApiVaultRef, db: PathBuf) -> Self {
+        Self { vault, db }
+    }
+
+    /// Run checks against the opened vault and its read-only cache.
     pub fn run(&self) -> DoctorReport {
         let mut report = DoctorReport::new(self.vault.clone());
-
-        // 1. SQLite quick_check
-        report.add_check(self.check_sqlite_quick_check());
-
-        // 2. Tantivy generation vs SQLite
-        report.add_check(self.check_tantivy_generation());
-
-        // 3. Sample-N hash verification
-        report.add_check(self.check_sample_hash_verification());
-
-        // 4. Orphan temp files
-        report.add_check(self.check_orphan_temp_files());
-
-        // 5. Pending journals
-        report.add_check(self.check_pending_journals());
-
-        // 6. Duplicate and conflicting IDs
-        report.add_check(self.check_duplicate_ids());
-
-        // 7. NFC/case collisions
-        report.add_check(self.check_nfc_collisions());
-
-        // 8. Broken and ambiguous links
-        report.add_check(self.check_broken_links());
-
-        // 9. Attachment orphans and unhydrated placeholders
-        report.add_check(self.check_attachment_orphans());
-
-        // 10. History size/pinned bytes
-        report.add_check(self.check_history_size());
-
-        // 11. UUID/root binding conflicts
-        report.add_check(self.check_uuid_binding());
-
-        // 12. Orphan instance sockets
-        report.add_check(self.check_orphan_instance_sockets());
-
-        // 13. Search checkpoint/log coverage
-        report.add_check(self.check_search_checkpoint());
-
-        // 14. Verification lag
-        report.add_check(self.check_verification_lag());
-
-        // 15. Live journal integrity
-        report.add_check(self.check_journal_integrity());
-
+        let conn = Connection::open_with_flags(&self.db, OpenFlags::SQLITE_OPEN_READ_ONLY).ok();
+        report.add_check(sqlite_check(conn.as_ref(), &self.db));
+        if !self.db.exists() {
+            report.add_check(DoctorCheck::ok(
+                "broken_links",
+                "Index cache is not present; link counts unavailable",
+            ));
+            report.add_check(DoctorCheck::ok(
+                "ambiguous_links",
+                "Index cache is not present; ambiguity counts unavailable",
+            ));
+            report.add_check(DoctorCheck::ok(
+                "duplicate_ids",
+                "Index cache is not present; stable ID counts unavailable",
+            ));
+        } else {
+            report.add_check(db_count_check(
+                conn.as_ref(),
+                "broken_links",
+                "SELECT count(*) FROM links WHERE res_state = 'unresolved'",
+                "Unresolved links",
+            ));
+            report.add_check(db_count_check(
+                conn.as_ref(),
+                "ambiguous_links",
+                "SELECT count(*) FROM links WHERE res_state = 'ambiguous'",
+                "Ambiguous links",
+            ));
+            report.add_check(duplicate_ids_check(conn.as_ref()));
+        }
+        report.add_check(temp_check(&self.vault.root));
+        report.add_check(journal_check(&self.vault.root));
+        report.add_check(collision_check(&self.vault.root));
+        report.add_check(history_check(self.vault.uuid));
+        report.add_check(sample_hash_check(conn.as_ref(), &self.vault.root));
+        report.add_check(registry_check());
+        report.add_check(orphan_socket_check());
         report.summary.calculate_total();
         report
     }
+}
 
-    /// Check SQLite integrity with quick_check.
-    fn check_sqlite_quick_check(&self) -> DoctorCheck {
-        // In a full implementation, we would run PRAGMA quick_check on the SQLite DB
-        // For now, this is a placeholder that checks if we can access the vault path
-        let vault_path = &self.vault.root;
-        if vault_path.exists() {
-            let flavite_dir = vault_path.join(".flavite");
-            if flavite_dir.exists() {
-                DoctorCheck::ok("sqlite_quick_check", "SQLite database integrity check")
-            } else {
-                DoctorCheck::warn(
-                    "sqlite_quick_check",
-                    "SQLite database integrity check",
-                    ".flavite directory not found",
-                )
+/// Locate the current schema's disposable SQLite cache for a vault identity.
+#[must_use]
+pub fn cache_db_path(uuid: uuid::Uuid) -> PathBuf {
+    ProjectDirs::from("com", "flavite", "Flavite")
+        .map(|p| {
+            p.cache_dir()
+                .join("flavite")
+                .join(uuid.to_string())
+                .join(format!("v{}", flavite_index::SCHEMA_MAJOR))
+                .join("index.sqlite3")
+        })
+        .unwrap_or_default()
+}
+
+fn sqlite_check(conn: Option<&Connection>, path: &Path) -> DoctorCheck {
+    if !path.exists() {
+        return DoctorCheck::ok(
+            "sqlite_quick_check",
+            "Index cache has not been created; no database to check",
+        );
+    }
+    let Some(conn) = conn else {
+        return DoctorCheck::error("sqlite_quick_check", "SQLite integrity check", format!("Cannot open cache database read-only: {}", path.display()), "Open the vault once to create its index; if this database should exist, restore or rebuild the cache".to_string());
+    };
+    match conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)) {
+        Ok(result) if result == "ok" => {
+            DoctorCheck::ok("sqlite_quick_check", "SQLite quick_check passed")
+        }
+        Ok(result) => DoctorCheck::error(
+            "sqlite_quick_check",
+            "SQLite quick_check failed",
+            result,
+            "Close Flavite and rebuild the disposable index cache".to_string(),
+        ),
+        Err(e) => DoctorCheck::error(
+            "sqlite_quick_check",
+            "SQLite quick_check failed",
+            e.to_string(),
+            "Close Flavite and rebuild the disposable index cache".to_string(),
+        ),
+    }
+}
+fn db_count_check(conn: Option<&Connection>, name: &str, sql: &str, label: &str) -> DoctorCheck {
+    let Some(conn) = conn else {
+        return DoctorCheck::error(
+            name,
+            label,
+            "Index database unavailable".to_string(),
+            "Open the vault once or rebuild its cache".to_string(),
+        );
+    };
+    match conn.query_row(sql, [], |r| r.get::<_, i64>(0)) {
+        Ok(0) => DoctorCheck::ok(name, format!("No {} found", label.to_lowercase())),
+        Ok(n) => DoctorCheck::warn(name, label, format!("{n} found")),
+        Err(e) => DoctorCheck::error(
+            name,
+            label,
+            e.to_string(),
+            "Rebuild the disposable index cache".to_string(),
+        ),
+    }
+}
+fn duplicate_ids_check(conn: Option<&Connection>) -> DoctorCheck {
+    let Some(conn) = conn else {
+        return DoctorCheck::error(
+            "duplicate_ids",
+            "Stable ID check",
+            "Index database unavailable".to_string(),
+            "Open the vault once or rebuild its cache".to_string(),
+        );
+    };
+    let total_notes = conn.query_row("SELECT count(*) FROM notes", [], |r| r.get::<_, i64>(0));
+    let ids_present = conn.query_row("SELECT count(stable_id) FROM notes", [], |r| {
+        r.get::<_, i64>(0)
+    });
+    if let (Ok(total), Ok(0)) = (total_notes, ids_present)
+        && total > 0
+    {
+        return DoctorCheck::warn(
+            "duplicate_ids",
+            "Stable IDs are not yet extracted",
+            format!(
+                "{total} indexed note(s) have no stable_id value; duplicate detection becomes meaningful when extraction lands"
+            ),
+        );
+    }
+    let result = conn.query_row("SELECT count(*) FROM (SELECT stable_id FROM notes WHERE stable_id IS NOT NULL GROUP BY stable_id HAVING count(*) > 1)", [], |r| r.get::<_, i64>(0));
+    match result {
+        Ok(0) => DoctorCheck::ok("duplicate_ids", "No duplicate stable IDs"),
+        Ok(n) => DoctorCheck::warn(
+            "duplicate_ids",
+            "Duplicate stable IDs",
+            format!("{n} duplicated IDs"),
+        ),
+        Err(e) => DoctorCheck::error(
+            "duplicate_ids",
+            "Stable ID check",
+            e.to_string(),
+            "Rebuild the disposable index cache".to_string(),
+        ),
+    }
+}
+
+fn sample_hash_check(conn: Option<&Connection>, root: &Path) -> DoctorCheck {
+    let Some(conn) = conn else {
+        return DoctorCheck::ok(
+            "sample_hash_verification",
+            "Index unavailable; no sample to verify",
+        );
+    };
+    let mut stmt = match conn.prepare("SELECT path, content_hash FROM notes ORDER BY path LIMIT 10")
+    {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            return DoctorCheck::error(
+                "sample_hash_verification",
+                "Sample hash verification",
+                e.to_string(),
+                "Rebuild the disposable index cache".to_string(),
+            );
+        }
+    };
+    let rows = match stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return DoctorCheck::error(
+                "sample_hash_verification",
+                "Sample hash verification",
+                e.to_string(),
+                "Rebuild the disposable index cache".to_string(),
+            );
+        }
+    };
+    let mut checked = 0;
+    let mut bad = Vec::new();
+    for row in rows.flatten() {
+        let (relative, expected) = row;
+        let path = root.join(&relative);
+        let Ok(real) = fs::canonicalize(&path) else {
+            bad.push(format!("{relative} is missing"));
+            continue;
+        };
+        if !real.starts_with(root) {
+            bad.push(format!("{relative} resolves outside the vault"));
+            continue;
+        }
+        match fs::read(real) {
+            Ok(bytes) => {
+                checked += 1;
+                if blake3::hash(&bytes).as_bytes() != expected.as_slice() {
+                    bad.push(format!("{relative} hash differs"));
+                }
             }
-        } else {
-            DoctorCheck::error(
-                "sqlite_quick_check",
-                "SQLite database integrity check",
-                format!("Vault path {} does not exist", vault_path.display()),
-                "Ensure the vault path is correct and accessible".to_string(),
-            )
+            Err(e) => bad.push(format!("{relative}: {e}")),
         }
     }
-
-    /// Check Tantivy generation matches SQLite.
-    fn check_tantivy_generation(&self) -> DoctorCheck {
-        // This will check that tantivy.committed_generation matches
-        // the SQLite index.generation
-        // Placeholder for now
-        DoctorCheck::ok("tantivy_generation", "Tantivy generation matches SQLite")
-    }
-
-    /// Check sample-N hash verification against disk.
-    fn check_sample_hash_verification(&self) -> DoctorCheck {
-        // This will sample N notes and verify their content hashes match disk
-        // Placeholder for now
+    if bad.is_empty() {
         DoctorCheck::ok(
             "sample_hash_verification",
-            "Sample hash verification against disk",
+            format!("Verified {checked} indexed note(s)"),
+        )
+    } else {
+        DoctorCheck::warn(
+            "sample_hash_verification",
+            "Indexed note samples differ from disk",
+            bad.join(", "),
         )
     }
+}
 
-    /// Check for orphan temp files.
-    fn check_orphan_temp_files(&self) -> DoctorCheck {
-        // Look for .flavite-tmp.* files that might be left over from crashes
-        let vault_path = &self.vault.root;
-
-        // This is a simplified check - in production we'd walk the vault
-        // and look for temp files older than some threshold
-        if vault_path.exists() {
-            // For now, just check if .flavite directory exists
-            // A real implementation would look for actual temp files
-            DoctorCheck::ok("orphan_temp_files", "No orphan temp files found")
-        } else {
-            DoctorCheck::warn(
-                "orphan_temp_files",
-                "Cannot check for orphan temp files",
-                "Vault does not exist",
-            )
+fn registry_check() -> DoctorCheck {
+    let Some(project) = ProjectDirs::from("com", "flavite", "Flavite") else {
+        return DoctorCheck::warn(
+            "registry_records",
+            "Registry unavailable",
+            "OS data directory unavailable",
+        );
+    };
+    let dir = project.data_dir().join("flavite/vaults");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return DoctorCheck::ok("registry_records", "No vault registry records found");
+    };
+    let mut stale = Vec::new();
+    let mut invalid = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "toml") {
+            continue;
+        }
+        match fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| toml::from_str::<flavite_vault::RegistryEntry>(&s).ok())
+        {
+            Some(record) if !Path::new(&record.root_path).exists() => stale.push(record.root_path),
+            Some(_) => (),
+            None => invalid.push(path.display().to_string()),
         }
     }
-
-    /// Check for pending journals.
-    fn check_pending_journals(&self) -> DoctorCheck {
-        // Check for uncommitted/preparing journal entries
-        // Placeholder for now
-        DoctorCheck::ok("pending_journals", "No pending journal entries")
-    }
-
-    /// Check for duplicate and conflicting IDs.
-    fn check_duplicate_ids(&self) -> DoctorCheck {
-        // Check the index for duplicate stable_id values
-        // Placeholder for now
-        DoctorCheck::ok("duplicate_ids", "No duplicate or conflicting IDs found")
-    }
-
-    /// Check for NFC/case collisions.
-    fn check_nfc_collisions(&self) -> DoctorCheck {
-        // Check for files that would collide under NFC normalization
-        // Placeholder for now
-        DoctorCheck::ok("nfc_collisions", "No NFC/case collisions detected")
-    }
-
-    /// Check for broken and ambiguous links.
-    fn check_broken_links(&self) -> DoctorCheck {
-        // Check the link table for unresolved/ambiguous entries
-        // Placeholder for now
-        DoctorCheck::ok("broken_links", "No broken or ambiguous links found")
-    }
-
-    /// Check for attachment orphans and unhydrated placeholders.
-    fn check_attachment_orphans(&self) -> DoctorCheck {
-        // Check for attachments not referenced by any note
-        // and cloud placeholders that haven't been hydrated
-        // Placeholder for now
+    if stale.is_empty() && invalid.is_empty() {
         DoctorCheck::ok(
-            "attachment_orphans",
-            "No attachment orphans or unhydrated placeholders",
+            "registry_records",
+            "Vault registry records point to existing vaults",
+        )
+    } else {
+        stale.extend(invalid.into_iter().map(|p| format!("invalid record {p}")));
+        DoctorCheck::warn(
+            "registry_records",
+            "Registry records without a readable vault",
+            stale.join(", "),
         )
     }
+}
 
-    /// Check history size and pinned bytes.
-    fn check_history_size(&self) -> DoctorCheck {
-        // Check that history store is within bounds
-        // Placeholder for now
-        DoctorCheck::ok("history_size", "History store is within size limits")
-    }
-
-    /// Check UUID/root binding conflicts.
-    fn check_uuid_binding(&self) -> DoctorCheck {
-        // Check that the registry doesn't have conflicting bindings
-        // Placeholder for now
-        DoctorCheck::ok("uuid_binding", "No UUID/root binding conflicts")
-    }
-
-    /// Check for orphan instance sockets.
-    fn check_orphan_instance_sockets(&self) -> DoctorCheck {
-        // Check for stale IPC sockets in the OS data directory
-        // Placeholder for now
+fn orphan_socket_check() -> DoctorCheck {
+    let Some(project) = ProjectDirs::from("com", "flavite", "Flavite") else {
+        return DoctorCheck::warn(
+            "orphan_instance_sockets",
+            "Socket check unavailable",
+            "OS data directory unavailable",
+        );
+    };
+    let dir = project.data_dir().join("flavite/vaults");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return DoctorCheck::ok("orphan_instance_sockets", "No instance sockets found");
+    };
+    let orphans: Vec<_> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let socket = path.join("instance.ipc");
+            (socket.exists() && !path.join("instance.lock").exists())
+                .then(|| socket.display().to_string())
+        })
+        .collect();
+    if orphans.is_empty() {
         DoctorCheck::ok(
             "orphan_instance_sockets",
             "No orphan instance sockets found",
         )
-    }
-
-    /// Check search checkpoint and log coverage.
-    fn check_search_checkpoint(&self) -> DoctorCheck {
-        // Check that the search checkpoint is consistent with the log
-        // Placeholder for now
-        DoctorCheck::ok(
-            "search_checkpoint",
-            "Search checkpoint is consistent with log",
+    } else {
+        DoctorCheck::warn(
+            "orphan_instance_sockets",
+            "Instance socket without a lock",
+            orphans.join(", "),
         )
     }
-
-    /// Check verification lag.
-    fn check_verification_lag(&self) -> DoctorCheck {
-        // Check if verification is overdue
-        // Placeholder for now
-        DoctorCheck::ok("verification_lag", "Verification is up to date")
+}
+fn temp_check(root: &Path) -> DoctorCheck {
+    let fs = OsFs::new();
+    let mut found = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        if let Ok(entries) = list_orphan_temps(&fs, &dir) {
+            found.extend(entries);
+        }
+        if let Ok(entries) = flavite_fs::Fs::read_dir(&fs, &dir) {
+            for entry in entries {
+                if entry.is_dir && !entry.is_symlink {
+                    if entry.name != ".obsidian" {
+                        dirs.push(entry.path);
+                    }
+                } else if entry.name.to_string_lossy().contains(".flavite-tmp.") {
+                    found.push(entry.path);
+                }
+            }
+        }
     }
-
-    /// Check live journal payload and checkpoint integrity.
-    fn check_journal_integrity(&self) -> DoctorCheck {
-        // Check that all live journal entries have valid payloads/checkpoints
-        // Placeholder for now
-        DoctorCheck::ok(
-            "journal_integrity",
-            "Live journal payloads and checkpoints are intact",
+    if found.is_empty() {
+        DoctorCheck::ok("orphan_temp_files", "No orphan temporary files found")
+    } else {
+        DoctorCheck::warn(
+            "orphan_temp_files",
+            "Orphan temporary files",
+            found
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
         )
     }
+}
+fn journal_check(root: &Path) -> DoctorCheck {
+    let dir = root.join(".flavite/journal");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return DoctorCheck::ok("pending_journals", "No pending journals found");
+    };
+    let paths: Vec<_> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    if paths.is_empty() {
+        DoctorCheck::ok("pending_journals", "No pending journals found")
+    } else {
+        DoctorCheck::warn(
+            "pending_journals",
+            "Pending rename journals",
+            format!(
+                "{} journal file(s): {}",
+                paths.len(),
+                paths
+                    .iter()
+                    .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+    }
+}
+fn collision_check(root: &Path) -> DoctorCheck {
+    let mut nfc: HashMap<String, Vec<String>> = HashMap::new();
+    let mut folded: HashMap<String, Vec<String>> = HashMap::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path
+                .file_name()
+                .is_some_and(|n| n == ".flavite" || n == ".obsidian")
+            {
+                continue;
+            }
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                dirs.push(path.clone());
+            }
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            use unicode_normalization::UnicodeNormalization;
+            let normalized: String = rel.nfc().collect();
+            nfc.entry(normalized.clone()).or_default().push(rel.clone());
+            folded
+                .entry(flavite_syntax::text::fold_key(&normalized))
+                .or_default()
+                .push(rel);
+        }
+    }
+    let nfc_groups: Vec<_> = nfc.into_values().filter(|v| v.len() > 1).collect();
+    let case_groups: Vec<_> = folded
+        .into_values()
+        .filter(|v| v.len() > 1 && v.iter().collect::<std::collections::HashSet<_>>().len() > 1)
+        .collect();
+    let total = nfc_groups.len() + case_groups.len();
+    if total == 0 {
+        DoctorCheck::ok("nfc_collisions", "No NFC or case-folding path collisions")
+    } else {
+        let mut details = Vec::new();
+        for g in nfc_groups {
+            details.push(format!("NFC: {}", g.join(" <> ")));
+        }
+        for g in case_groups {
+            details.push(format!("Case: {}", g.join(" <> ")));
+        }
+        DoctorCheck::warn(
+            "nfc_collisions",
+            "Path collisions detected",
+            details.join("; "),
+        )
+    }
+}
+fn history_check(uuid: uuid::Uuid) -> DoctorCheck {
+    let Some(project) = ProjectDirs::from("com", "flavite", "Flavite") else {
+        return DoctorCheck::warn(
+            "history_size",
+            "History size unavailable",
+            "OS data directory unavailable",
+        );
+    };
+    let path = project
+        .data_dir()
+        .join("flavite/vaults")
+        .join(uuid.to_string())
+        .join("history");
+    let bytes = tree_size(&path);
+    const LIMIT: u64 = 1024 * 1024 * 1024;
+    if bytes <= LIMIT {
+        DoctorCheck::ok(
+            "history_size",
+            format!("History store is {bytes} bytes (1 GiB cap)"),
+        )
+    } else {
+        DoctorCheck::error(
+            "history_size",
+            "History store exceeds its cap",
+            format!("{bytes} bytes; cap is {LIMIT}"),
+            "Review history retention and remove old snapshots through the history manager"
+                .to_string(),
+        )
+    }
+}
+fn tree_size(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| {
+            let p = e.path();
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                tree_size(&p)
+            } else {
+                e.metadata().map(|m| m.len()).unwrap_or(0)
+            }
+        })
+        .sum()
 }
 
 /// Run doctor checks on a vault.
@@ -426,6 +677,23 @@ impl DoctorChecker {
 pub fn run_doctor(vault: ApiVaultRef) -> DoctorReport {
     let checker = DoctorChecker::new(vault);
     checker.run()
+}
+
+/// Resolve the vault's persisted/registered identity and hold its root and
+/// instance guards while running diagnostics, without opening the writable
+/// index actor or reconciling the vault.
+pub fn run_doctor_root(root: PathBuf) -> Result<DoctorReport, String> {
+    let fs = OsFs::new();
+    let root = std::fs::canonicalize(&root).map_err(|e| e.to_string())?;
+    if !root.is_dir() {
+        return Err(format!("{} is not a vault directory", root.display()));
+    }
+    let identity = flavite_vault::IdentityManager::open(&fs, root)
+        .map_err(|e| format!("Cannot acquire vault identity/instance lock: {e}"))?;
+    let vault_ref = ApiVaultRef::new(identity.identity().uuid, identity.identity().root.clone());
+    let report = DoctorChecker::new(vault_ref).run();
+    drop(identity);
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -482,25 +750,97 @@ mod tests {
         assert_eq!(report.status(), CheckStatus::Error);
     }
 
-    #[test]
-    fn doctor_checker_basic() {
-        // Use a temp directory that exists
-        let temp_dir = std::env::temp_dir();
-        let vault_ref = ApiVaultRef::new(Uuid::new_v4(), temp_dir);
-        let checker = DoctorChecker::new(vault_ref);
-        let report = checker.run();
+    fn fixture() -> (tempfile::TempDir, PathBuf, ApiVaultRef) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".flavite/journal")).unwrap();
+        let db = root.path().join("index.sqlite3");
+        flavite_index::open_or_init(&db).unwrap();
+        let vault = ApiVaultRef::new(Uuid::new_v4(), root.path().to_path_buf());
+        (root, db, vault)
+    }
 
-        // Should have all checks
-        assert!(!report.checks.is_empty());
-        // Note: The report may not be healthy if the temp dir doesn't have .flavite
-        // This is expected for the stub implementation
+    fn check(checker: &DoctorChecker, name: &str) -> DoctorCheck {
+        checker
+            .run()
+            .checks
+            .into_iter()
+            .find(|c| c.name == name)
+            .unwrap()
     }
 
     #[test]
-    fn run_doctor_basic() {
-        let vault_ref = ApiVaultRef::new(Uuid::new_v4(), PathBuf::from("/test"));
-        let report = run_doctor(vault_ref);
+    fn corruption_is_reported_by_quick_check() {
+        let (root, db, vault) = fixture();
+        std::fs::write(&db, b"not a sqlite database").unwrap();
+        let c = DoctorChecker::with_db_path(vault, db);
+        assert!(check(&c, "sqlite_quick_check").has_issues());
+        drop(root);
+    }
 
-        assert!(!report.checks.is_empty());
+    #[test]
+    fn unresolved_and_ambiguous_links_are_counted() {
+        let (_root, db, vault) = fixture();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("INSERT INTO notes(path,path_native,path_key,stem_key,title,content_hash,size,mtime_ns,scan_ns,generation) VALUES('a.md',X'61','a','a','a',X'00',0,0,0,0)", []).unwrap();
+        conn.execute("INSERT INTO links(src,ord,kind,dst_raw,target_key,span_start,span_end,res_state) VALUES(1,0,'link','lost','lost',0,0,'unresolved')", []).unwrap();
+        conn.execute("INSERT INTO links(src,ord,kind,dst_raw,target_key,span_start,span_end,res_state) VALUES(1,1,'link','maybe','maybe',0,0,'ambiguous')", []).unwrap();
+        drop(conn);
+        let c = DoctorChecker::with_db_path(vault, db);
+        assert!(check(&c, "broken_links").has_issues());
+        assert!(check(&c, "ambiguous_links").has_issues());
+    }
+
+    #[test]
+    fn changed_disk_note_is_reported_by_sample_hash_check() {
+        let (root, db, vault) = fixture();
+        std::fs::write(root.path().join("sample.md"), b"current bytes").unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO notes(path,path_native,path_key,stem_key,title,content_hash,size,mtime_ns,scan_ns,generation) VALUES('sample.md',X'73616d706c65','sample.md','sample','sample',?1,13,0,0,0)",
+            [blake3::hash(b"indexed bytes").as_bytes()],
+        ).unwrap();
+        drop(conn);
+        let checker = DoctorChecker::with_db_path(vault, db);
+        assert!(check(&checker, "sample_hash_verification").has_issues());
+    }
+
+    #[test]
+    fn duplicate_ids_temps_journals_and_collisions_are_reported() {
+        let (root, db, vault) = fixture();
+        let conn = Connection::open(&db).unwrap();
+        for (id, path) in [(1, "a.md"), (2, "b.md")] {
+            conn.execute("INSERT INTO notes(note_id,path,path_native,path_key,stem_key,title,stable_id,content_hash,size,mtime_ns,scan_ns,generation) VALUES(?1,?2,?2,?2,?2,?2,'same',X'00',0,0,0,0)", (id,path)).unwrap();
+        }
+        drop(conn);
+        std::fs::write(root.path().join(".note.md.flavite-tmp.xyz"), b"tmp").unwrap();
+        std::fs::write(
+            root.path().join(".flavite/journal/txn.json"),
+            b"{\"state\":\"applying\"}",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("Readme.md"), b"a").unwrap();
+        std::fs::write(root.path().join("README.md"), b"b").unwrap();
+        let c = DoctorChecker::with_db_path(vault, db);
+        for name in [
+            "duplicate_ids",
+            "orphan_temp_files",
+            "pending_journals",
+            "nfc_collisions",
+        ] {
+            assert!(check(&c, name).has_issues(), "{name}");
+        }
+    }
+
+    #[test]
+    fn healthy_fixture_and_json_shape() {
+        let (_root, db, vault) = fixture();
+        let report = DoctorChecker::with_db_path(vault, db).run();
+        assert!(report.is_healthy());
+        let value = serde_json::to_value(report).unwrap();
+        for c in value["checks"].as_array().unwrap() {
+            for field in ["name", "status", "details", "fix"] {
+                assert!(c.get(field).is_some(), "missing {field}");
+            }
+        }
     }
 }

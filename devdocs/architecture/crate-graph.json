@@ -104,6 +104,11 @@
   "edges": [
     {
       "from": "flavite-api",
+      "to": "blake3",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-api",
       "to": "flavite-buffer",
       "kind": "normal"
     },
@@ -125,6 +130,11 @@
     {
       "from": "flavite-api",
       "to": "flavite-vault",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-api",
+      "to": "rusqlite",
       "kind": "normal"
     },
     {

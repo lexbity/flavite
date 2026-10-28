@@ -37,3 +37,4 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 # Testing utilities
+tempfile = "3"

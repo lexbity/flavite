@@ -250,9 +250,8 @@ impl EventCoalescer {
             if let Some(batch) = self.try_recv_batch() {
                 return batch;
             }
-            match self.event_receiver.recv_timeout(Duration::from_millis(10)) {
-                Ok(event) => self.ingest(event),
-                Err(_) => {}
+            if let Ok(event) = self.event_receiver.recv_timeout(Duration::from_millis(10)) {
+                self.ingest(event);
             }
         }
     }

@@ -332,6 +332,9 @@ impl IndexActor {
     }
 
     /// Read the structural index's authoritative epoch and generation.
+    ///
+    /// # Errors
+    /// Returns the underlying error text when the `meta` table cannot be read.
     pub fn current_version(&self) -> Result<(u64, u64), String> {
         let epoch = get_meta_u64(self.writer.conn(), MetaKey::Epoch)
             .map_err(|error| error.to_string())?
@@ -398,6 +401,10 @@ impl IndexActor {
     }
 
     /// List native path keys currently represented in the structural index.
+    ///
+    /// # Errors
+    /// Returns the underlying error text when the query cannot be prepared or
+    /// a row cannot be read.
     pub fn indexed_note_paths(&self) -> Result<Vec<Vec<u8>>, String> {
         let mut statement = self
             .writer
@@ -411,6 +418,9 @@ impl IndexActor {
     }
 
     /// Check whether one native path key is already indexed.
+    ///
+    /// # Errors
+    /// Returns the underlying error text when the lookup query fails.
     pub fn contains_note_path(&self, path_native: &[u8]) -> Result<bool, String> {
         self.writer
             .conn()
@@ -424,6 +434,10 @@ impl IndexActor {
 
     /// Remove a vanished note and its dependent structural/search rows in one
     /// transaction. Returns whether an indexed note was removed.
+    ///
+    /// # Errors
+    /// Returns the underlying error text when the transaction cannot be
+    /// started, a query fails, or the commit fails.
     pub fn remove_note_path(&mut self, path_native: &[u8]) -> Result<bool, String> {
         let tx = self.writer.conn.transaction().map_err(|e| e.to_string())?;
         let note_id: Option<i64> = tx

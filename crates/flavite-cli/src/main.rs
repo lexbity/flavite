@@ -211,12 +211,18 @@ impl CliDriver {
     fn run_doctor(&self, vault_path: &Path, json: bool) -> Result<()> {
         info!("Running doctor on vault: {}", vault_path.display());
 
-        // Create a vault reference
-        let uuid = uuid::Uuid::new_v4(); // In real impl, we'd read this from the vault
-        let vault_ref = ApiVaultRef::new(uuid, vault_path.to_path_buf());
-
-        // Run doctor checks through the API
-        let report = flavite_api::doctor::run_doctor(vault_ref);
+        let vault_path = std::fs::canonicalize(vault_path)
+            .with_context(|| format!("Cannot canonicalize vault path: {}", vault_path.display()))?;
+        anyhow::ensure!(
+            vault_path.is_dir(),
+            "Vault does not exist at {}",
+            vault_path.display()
+        );
+        // Resolve persisted identity and hold the normal root/instance guards,
+        // without opening a writer or mutating/reconciling the disposable cache.
+        let report = flavite_api::doctor::run_doctor_root(vault_path.clone())
+            .map_err(anyhow::Error::msg)
+            .context("Cannot run doctor while the vault is open or identity cannot be resolved")?;
 
         if json {
             // Output as JSON
@@ -228,7 +234,7 @@ impl CliDriver {
             self.print_doctor_report(&report);
         }
 
-        // Return error if there are errors
+        // Preserve the report contract: errors fail the command; warnings remain visible.
         if !report.is_healthy() {
             anyhow::bail!("Doctor found issues in vault: {}", report.status_as_str());
         }
@@ -365,10 +371,6 @@ impl CliDriver {
             Invocation::new(request_id, "test.cmd", serde_json::Value::Null, Origin::Cli);
         println!("Created invocation: {:?}", invocation);
 
-        // Test doctor
-        let doctor_report = flavite_api::doctor::run_doctor(vault_ref);
-        println!("Doctor report has {} checks", doctor_report.checks.len());
-
         Ok(())
     }
 }
@@ -384,6 +386,7 @@ fn init_tracing(verbose: bool) {
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 
     debug!("Tracing initialized at level: {}", level);

@@ -26,11 +26,13 @@ Generated from `cargo metadata --format-version 1 --all-features`.
 
 Normal/build:
 
+- `blake3` (normal)
 - `flavite-buffer` (normal)
 - `flavite-fs` (normal)
 - `flavite-index` (normal)
 - `flavite-syntax` (normal)
 - `flavite-vault` (normal)
+- `rusqlite` (normal)
 
 ### `flavite-buffer`
 
@@ -132,7 +134,7 @@ Normal/build:
 
 ## First-party external dependencies
 
-- `blake3` ← flavite-buffer, flavite-fs, flavite-index, flavite-vault, xtask
+- `blake3` ← flavite-api, flavite-buffer, flavite-fs, flavite-index, flavite-vault, xtask
 - `cosmic-text` ← flavite-editor, xtask
 - `iced` ← flavite-editor, flavite-ui, xtask
 - `notify` ← flavite-fs, flavite-fs, xtask
@@ -140,7 +142,7 @@ Normal/build:
 - `nucleo-matcher` ← flavite-editor
 - `pulldown-cmark` ← flavite-index, flavite-syntax
 - `ropey` ← flavite-buffer
-- `rusqlite` ← flavite-graph, flavite-index, xtask
+- `rusqlite` ← flavite-api, flavite-graph, flavite-index, xtask
 - `similar` ← flavite-vault
 - `tantivy` ← xtask
 - `tracing` ← flavite-cli, flavite-vault
