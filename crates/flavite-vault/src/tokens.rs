@@ -66,12 +66,28 @@ impl WriteToken {
 ///
 /// This manages a set of active write tokens and provides methods
 /// for acquiring, releasing, and checking tokens.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WriteTokenManager {
     /// Map from path to token.
     tokens: RwLock<HashMap<PathBuf, WriteToken>>,
     /// Default timeout for new tokens.
     default_timeout: Duration,
+}
+
+impl Default for WriteTokenManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for WriteTokenManager {
+    fn clone(&self) -> Self {
+        // Clone with a new empty token map but same timeout
+        Self {
+            tokens: RwLock::new(HashMap::new()),
+            default_timeout: self.default_timeout,
+        }
+    }
 }
 
 impl WriteTokenManager {
@@ -223,15 +239,6 @@ impl WriteTokenManager {
     pub fn paths(&self) -> Vec<PathBuf> {
         let tokens = self.tokens.read().unwrap();
         tokens.keys().cloned().collect()
-    }
-}
-
-impl Clone for WriteTokenManager {
-    fn clone(&self) -> Self {
-        Self {
-            tokens: RwLock::new(self.tokens.read().unwrap().clone()),
-            default_timeout: self.default_timeout,
-        }
     }
 }
 

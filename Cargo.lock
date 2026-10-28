@@ -1251,8 +1251,10 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 name = "flavite-api"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "crossbeam",
  "flavite-buffer",
+ "flavite-fs",
  "flavite-index",
  "flavite-syntax",
  "flavite-vault",
@@ -1285,13 +1287,10 @@ name = "flavite-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "directories 5.0.1",
  "flavite-api",
- "flavite-buffer",
- "flavite-fs",
- "flavite-index",
- "flavite-vault",
  "serde",
  "serde_json",
  "tempfile",

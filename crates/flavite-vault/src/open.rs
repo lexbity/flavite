@@ -28,6 +28,7 @@ use crate::types::{VaultConfig, VaultIdentity};
 use flavite_buffer::manager::BufferManager;
 use flavite_fs::Fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -82,8 +83,8 @@ pub struct Vault {
     instance_manager: InstanceManager,
     /// Vault actor handle.
     actor: VaultActorHandle,
-    /// Session.
-    session: Session,
+    /// Session (wrapped in Arc for sharing).
+    session: Arc<Session>,
     /// Channel set.
     channels: ChannelSet,
     /// Configuration.
@@ -170,7 +171,7 @@ impl Vault {
             identity_manager,
             instance_manager,
             actor,
-            session,
+            session: Arc::new(session),
             channels,
             config,
         })
@@ -213,6 +214,14 @@ impl Vault {
     #[must_use]
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// Get the session as an Arc.
+    ///
+    /// This is useful for sharing the session between multiple owners.
+    #[must_use]
+    pub fn session_arc(&self) -> Arc<Session> {
+        self.session.clone()
     }
 
     /// Get the actor handle.

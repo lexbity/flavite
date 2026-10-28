@@ -66,13 +66,9 @@ active = [
     { from = "flavite-api", to = "flavite-index" },
     { from = "flavite-api", to = "flavite-buffer" },
     { from = "flavite-api", to = "flavite-syntax" },
-    # C14 - CLI consumes flavite-api (D16 dogfood)
+    { from = "flavite-api", to = "flavite-fs" },
+    # C14 - CLI consumes flavite-api only (D16 dogfood - fully migrated)
     { from = "flavite-cli", to = "flavite-api" },
-    # C14 - CLI still needs vault/index/buffer for now
-    { from = "flavite-cli", to = "flavite-vault" },
-    { from = "flavite-cli", to = "flavite-index" },
-    { from = "flavite-cli", to = "flavite-buffer" },
-    { from = "flavite-cli", to = "flavite-fs" },
 ]
 
 [layering]

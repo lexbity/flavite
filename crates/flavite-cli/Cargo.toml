@@ -12,13 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 # Workspace crates
-# TODO: Remove direct flavite-vault/flavite-index imports after C14
-# (Phase 4 exit gate: CLI must talk to core only through flavite-api)
+# Phase 4: CLI consumes flavite-api only (D16 dogfood)
 flavite-api = { path = "../flavite-api" }
-flavite-vault = { path = "../flavite-vault" }
-flavite-index = { path = "../flavite-index" }
-flavite-buffer = { path = "../flavite-buffer" }
-flavite-fs = { path = "../flavite-fs" }
 
 # CLI parsing
 clap = { version = "4", features = ["derive", "cargo"] }
@@ -40,6 +35,9 @@ uuid = { version = "1", features = ["v4"] }
 # Filesystem
 walkdir = "2"
 directories = "5"
+
+# Time handling (for doctor timestamps)
+chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 # Testing utilities

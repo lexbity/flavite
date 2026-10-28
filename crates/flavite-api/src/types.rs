@@ -68,7 +68,52 @@ impl ApiBufferRef {
 
 /// Preconditions for command execution.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Preconditions;
+pub struct Preconditions {
+    /// Optional buffer ID this command requires.
+    pub buffer_id: Option<u64>,
+    /// Optional expected revision.
+    pub expected_revision: Option<u64>,
+    /// Whether this command requires write access.
+    pub requires_write: bool,
+    /// Whether this command can run in read-only mode.
+    pub allow_read_only: bool,
+}
+
+impl Preconditions {
+    /// Create empty preconditions.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set buffer ID requirement.
+    #[must_use]
+    pub fn with_buffer_id(mut self, buffer_id: u64) -> Self {
+        self.buffer_id = Some(buffer_id);
+        self
+    }
+
+    /// Set expected revision.
+    #[must_use]
+    pub fn with_revision(mut self, revision: u64) -> Self {
+        self.expected_revision = Some(revision);
+        self
+    }
+
+    /// Mark as requiring write access.
+    #[must_use]
+    pub fn requires_write(mut self) -> Self {
+        self.requires_write = true;
+        self
+    }
+
+    /// Allow in read-only mode.
+    #[must_use]
+    pub fn allow_read_only(mut self) -> Self {
+        self.allow_read_only = true;
+        self
+    }
+}
 
 #[cfg(test)]
 mod tests {

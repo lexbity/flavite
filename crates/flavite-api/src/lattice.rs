@@ -130,6 +130,34 @@ impl Lattice {
         Ok(lattice)
     }
 
+    /// Create a new Lattice with a shared Session reference.
+    ///
+    /// This is useful when the Session is owned by another component
+    /// (e.g., the Vault in the CLI integration).
+    pub fn with_vault(
+        identity: VaultIdentity,
+        session: Arc<Session>,
+        _config: VaultConfig,
+    ) -> Result<Self, LatticeError> {
+        let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
+        let (event_sender, event_receiver) = unbounded();
+
+        let lattice = Self {
+            identity,
+            session,
+            command_registry: CommandRegistry::new(),
+            event_sender,
+            _event_receiver: event_receiver,
+            subscribers: Arc::new(Mutex::new(Vec::new())),
+            vault_ref,
+            read_only: false,
+        };
+
+        lattice.register_builtin_commands()?;
+
+        Ok(lattice)
+    }
+
     /// Register built-in commands.
     fn register_builtin_commands(&self) -> Result<(), LatticeError> {
         // Register core commands
@@ -189,6 +217,8 @@ impl Lattice {
         if self.read_only && invocation.command_id.starts_with("write:") {
             return ExecutionResult::Rejected(RejectedResult {
                 reason: RejectionReason::ReadOnly,
+                request_id: None,
+                message: None,
             });
         }
 

@@ -216,6 +216,14 @@ impl Session {
         }
     }
 
+    /// Create a new Session with shared references.
+    ///
+    /// This is useful when you need to share the Session between multiple owners.
+    #[must_use]
+    pub fn to_arc(self) -> Arc<Session> {
+        Arc::new(self)
+    }
+
     /// Generate a new request ID.
     fn next_request_id(&self) -> u64 {
         self.request_counter.fetch_add(1, Ordering::SeqCst)
@@ -538,6 +546,24 @@ impl Session {
     pub fn get_buffer_id(&self, path: &Path) -> Option<BufferId> {
         let open_buffers = self.open_buffers.lock().unwrap();
         open_buffers.get(path).copied()
+    }
+}
+
+impl Clone for Session {
+    fn clone(&self) -> Self {
+        Self {
+            identity: self.identity.clone(),
+            actor: self.actor.clone(),
+            buffer_manager: self.buffer_manager.clone(),
+            open_buffers: self.open_buffers.clone(),
+            request_counter: AtomicU64::new(0), // Reset for new clone
+            pending: Arc::new(Mutex::new(HashMap::new())), // New pending map
+            token_manager: self.token_manager.clone(),
+            pulse: self.pulse.clone(),
+            notice: self.notice.clone(),
+            config: self.config.clone(),
+            read_only: self.read_only,
+        }
     }
 }
 

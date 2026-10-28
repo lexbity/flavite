@@ -16,6 +16,7 @@
 //! - **Event System**: Versioned events for plugin compatibility
 //! - **Query AST**: Re-exported from flavite-index
 //! - **Capabilities**: Declared capability system
+//! - **Doctor**: Vault diagnostics
 //!
 //! # Dogfooding (D16)
 //!
@@ -25,8 +26,10 @@
 pub mod capability;
 pub mod channel;
 pub mod command;
+pub mod doctor;
 pub mod event;
 pub mod lattice;
+pub mod open;
 pub mod result;
 pub mod types;
 
@@ -34,6 +37,7 @@ pub mod types;
 pub use capability::*;
 pub use channel::*;
 pub use command::*;
+pub use doctor::*;
 pub use event::*;
 pub use lattice::*;
 pub use result::*;
@@ -44,7 +48,13 @@ pub use flavite_index::query::Query;
 pub use flavite_index::types::{Cursor as IndexCursor, NoteRef as IndexNoteRef};
 
 // Re-export types from vault for consumer convenience
-pub use flavite_vault::types::{Epoch, Generation, ReconcileMode, ReconcileScope, Version};
+pub use flavite_vault::open::{Vault, vault_exists};
+pub use flavite_vault::types::{
+    Epoch, Generation, ReconcileMode, ReconcileScope, VaultConfig, VaultIdentity, Version,
+};
+
+// Re-export Fs trait for CLI convenience
+pub use flavite_fs::OsFs;
 
 /// API version for wire compatibility (D16).
 pub const API_VERSION: &str = "0.1.0";

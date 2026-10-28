@@ -16,19 +16,96 @@ pub struct CommandSpec {
     pub title: &'static str,
     /// Argument schema.
     pub args: ArgSchema,
+    /// Optional predicate for when this command is available.
+    pub when: Option<CommandAvailability>,
+    /// Optional keybindings.
+    pub keys: &'static [Chord],
 }
 
 impl CommandSpec {
     /// Create a new command specification.
     #[must_use]
     pub const fn new(id: &'static str, title: &'static str, args: ArgSchema) -> Self {
-        Self { id, title, args }
+        Self {
+            id,
+            title,
+            args,
+            when: None,
+            keys: &[],
+        }
+    }
+
+    /// Create a new command specification with availability and keys.
+    #[must_use]
+    pub const fn with_availability(
+        id: &'static str,
+        title: &'static str,
+        args: ArgSchema,
+        when: Option<CommandAvailability>,
+        keys: &'static [Chord],
+    ) -> Self {
+        Self {
+            id,
+            title,
+            args,
+            when,
+            keys,
+        }
     }
 }
 
 /// Argument schema for a command.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ArgSchema;
+
+/// A keyboard chord (combination of modifier and key).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Chord {
+    /// Modifier keys (Ctrl, Shift, Alt, etc.).
+    pub modifiers: u8,
+    /// The key.
+    pub key: String,
+}
+
+impl Chord {
+    /// Create a new chord.
+    #[must_use]
+    pub fn new(modifiers: u8, key: &str) -> Self {
+        Self {
+            modifiers,
+            key: key.to_string(),
+        }
+    }
+}
+
+/// Command availability predicate.
+#[derive(Debug, Clone)]
+pub enum CommandAvailability {
+    /// Command is always available.
+    Always,
+    /// Command is available when a note is open.
+    NoteOpen,
+    /// Command is available when a buffer is dirty.
+    BufferDirty,
+    /// Command is available when a buffer is in conflict.
+    BufferConflict,
+    /// Command is available in read-only mode.
+    ReadOnly,
+}
+
+/// A keyboard modifier mask.
+pub mod modifiers {
+    /// No modifier.
+    pub const NONE: u8 = 0b0000;
+    /// Shift key.
+    pub const SHIFT: u8 = 0b0001;
+    /// Control key (Ctrl on Windows/Linux, Command on macOS).
+    pub const CTRL: u8 = 0b0010;
+    /// Alt key (Option on macOS).
+    pub const ALT: u8 = 0b0100;
+    /// Super key (Windows key on Windows, Command on macOS).
+    pub const SUPER: u8 = 0b1000;
+}
 
 /// An invocation of a command.
 #[derive(Debug, Clone)]
@@ -59,7 +136,25 @@ impl Invocation {
             command_id,
             args,
             origin,
-            preconditions: Preconditions,
+            preconditions: Preconditions::new(),
+        }
+    }
+
+    /// Create a new invocation with preconditions.
+    #[must_use]
+    pub fn with_preconditions(
+        request_id: RequestId,
+        command_id: &'static str,
+        args: serde_json::Value,
+        origin: Origin,
+        preconditions: Preconditions,
+    ) -> Self {
+        Self {
+            request_id,
+            command_id,
+            args,
+            origin,
+            preconditions,
         }
     }
 }

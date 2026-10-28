@@ -27,6 +27,7 @@ Generated from `cargo metadata --format-version 1 --all-features`.
 Normal/build:
 
 - `flavite-buffer` (normal)
+- `flavite-fs` (normal)
 - `flavite-index` (normal)
 - `flavite-syntax` (normal)
 - `flavite-vault` (normal)
@@ -45,11 +46,6 @@ Normal/build:
 Normal/build:
 
 - `flavite-api` (normal)
-- `flavite-buffer` (normal)
-- `flavite-fs` (normal)
-- `flavite-index` (normal)
-- `flavite-syntax` (normal)
-- `flavite-vault` (normal)
 - `tracing` (normal)
 
 ### `flavite-editor`

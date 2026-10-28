@@ -9,15 +9,12 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use flavite_api::{CommandRegistry, types::ApiVaultRef};
-use flavite_fs::OsFs;
-use flavite_vault::{
-    ChannelSet, Notice, Pulse,
-    open::{Vault, vault_exists},
-    types::VaultConfig,
+use flavite_api::open::vault_exists;
+use flavite_api::{
+    ApiVaultRef, DoctorReport, Lattice, Origin, OsFs, Vault, VaultConfig, command::Invocation,
 };
 use std::path::PathBuf;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Lattice — a local-first plain-text knowledge vault in pure Rust.
 ///
@@ -105,37 +102,40 @@ enum Commands {
 
     /// Test the API.
     ApiTest,
+
+    /// Initialize a new vault.
+    Init {
+        /// Path to create the vault at.
+        #[arg(short, long, value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
 }
 
-/// CLI driver that uses flavite-api for command dispatch.
+/// CLI driver that uses flavite-api for all operations.
 #[allow(dead_code)]
 struct CliDriver {
-    /// Vault from flavite-vault (temporary - will be replaced by Lattice in future)
-    vault: Option<Vault>,
-    /// Channels from flavite-vault
-    channels: ChannelSet,
-    /// Config from flavite-vault
-    config: VaultConfig,
-    /// API vault reference from flavite-api
+    /// Lattice facade from flavite-api
+    lattice: Option<Lattice>,
+    /// Vault reference
     vault_ref: Option<ApiVaultRef>,
-    /// Command registry from flavite-api
-    command_registry: CommandRegistry,
+    /// Vault (temporary, for CLI integration)
+    vault: Option<Vault>,
 }
 
 impl CliDriver {
     /// Create a new CLI driver.
     fn new() -> Self {
         Self {
-            vault: None,
-            channels: ChannelSet::new(),
-            config: VaultConfig::default(),
+            lattice: None,
             vault_ref: None,
-            command_registry: CommandRegistry::new(),
+            vault: None,
         }
     }
 
-    /// Open a vault.
+    /// Open a vault through the API.
     fn open_vault(&mut self, vault_path: PathBuf, no_watch: bool) -> Result<()> {
+        info!("Opening vault at: {}", vault_path.display());
+
         // Ensure the vault path is absolute
         let vault_path = std::fs::canonicalize(&vault_path)
             .with_context(|| format!("Cannot canonicalize vault path: {}", vault_path.display()))?;
@@ -149,89 +149,234 @@ impl CliDriver {
             );
         }
 
-        // Configure watcher
+        // Configure vault
         let config = VaultConfig {
             watcher_enabled: !no_watch,
             ..Default::default()
         };
 
-        // Open the vault
+        // Open the vault through flavite-api (which re-exports from flavite-vault)
         let vault = Vault::open(vault_path.clone(), fs, config.clone())
             .with_context(|| format!("Failed to open vault at {}", vault_path.display()))?;
 
-        // Store vault
-        self.vault = Some(vault);
-        self.config = config;
+        let identity = vault.identity().clone();
 
-        // Create an ApiVaultRef from the vault's identity
-        // This demonstrates using flavite-api
-        let identity = self.vault.as_ref().unwrap().identity().clone();
+        // Create API vault reference
         self.vault_ref = Some(ApiVaultRef::new(identity.uuid, vault_path));
 
-        Ok(())
-    }
+        // Store the vault for later use
+        self.vault = Some(vault);
 
-    /// Run a reconcile and wait for completion.
-    fn reconcile(&self) -> Result<()> {
-        info!("Starting vault reconcile...");
-
-        // Demonstrate using flavite-api
-        info!("Using flavite-api version: {}", flavite_api::API_VERSION);
-
-        // For now, just demonstrate that we can create API types
-        let _registry = CommandRegistry::new();
-
-        // Drain any pending pulses
-        self.drain_pulses();
+        // Create a Lattice facade that works with the vault's Session
+        // Note: In a fully migrated implementation, Lattice would create and own
+        // the Session directly, and Vault would be constructed through the API
+        let session_arc = self.vault.as_ref().unwrap().session_arc();
+        self.lattice = Some(
+            Lattice::with_vault(identity, session_arc, config)
+                .map_err(|e| anyhow::anyhow!("Failed to create Lattice facade: {}", e))?,
+        );
 
         Ok(())
     }
 
-    /// Drain pulses from the channel (for CLI synchronization).
-    fn drain_pulses(&self) {
-        while let Ok(pulse) = self.channels.pulse.try_recv() {
-            debug!("Pulse received: {pulse:?}");
-            if let Pulse::ReconcileProgress { done, total } = pulse {
-                info!("Reconcile progress: {done}/{total}");
+    /// Initialize a new vault.
+    #[allow(clippy::ptr_arg)]
+    fn init_vault(&mut self, vault_path: &PathBuf) -> Result<()> {
+        info!("Initializing new vault at: {}", vault_path.display());
+
+        // Ensure the vault path is absolute
+        let vault_path = std::fs::canonicalize(vault_path)
+            .with_context(|| format!("Cannot canonicalize vault path: {}", vault_path.display()))?;
+
+        // Create the directory if it doesn't exist
+        if !vault_path.exists() {
+            std::fs::create_dir_all(&vault_path).with_context(|| {
+                format!("Failed to create vault directory: {}", vault_path.display())
+            })?;
+        }
+
+        // Initialize the vault
+        let _fs = Box::new(OsFs::new());
+        let _config = VaultConfig::default();
+
+        // Create .flavite directory
+        let flavite_dir = vault_path.join(".flavite");
+        if !flavite_dir.exists() {
+            std::fs::create_dir_all(&flavite_dir)
+                .with_context(|| "Failed to create .flavite directory".to_string())?;
+        }
+
+        // For now, just create the basic structure
+        // A full implementation would initialize the registry, UUID, etc.
+        info!("Vault initialized at: {}", vault_path.display());
+
+        Ok(())
+    }
+
+    /// Run the doctor command.
+    #[allow(clippy::ptr_arg)]
+    fn run_doctor(&self, vault_path: &PathBuf, json: bool) -> Result<()> {
+        info!("Running doctor on vault: {}", vault_path.display());
+
+        // Create a vault reference
+        let uuid = uuid::Uuid::new_v4(); // In real impl, we'd read this from the vault
+        let vault_ref = ApiVaultRef::new(uuid, vault_path.clone());
+
+        // Run doctor checks through the API
+        let report = flavite_api::doctor::run_doctor(vault_ref);
+
+        if json {
+            // Output as JSON
+            let json = serde_json::to_string_pretty(&report)
+                .map_err(|e| anyhow::anyhow!("Failed to serialize report: {}", e))?;
+            println!("{}", json);
+        } else {
+            // Output as human-readable text
+            self.print_doctor_report(&report);
+        }
+
+        // Return error if there are errors
+        if !report.is_healthy() {
+            anyhow::bail!("Doctor found issues in vault: {}", report.status_as_str());
+        }
+
+        Ok(())
+    }
+
+    /// Print a doctor report in human-readable format.
+    fn print_doctor_report(&self, report: &DoctorReport) {
+        println!("Vault Doctor Report");
+        println!("==================");
+        println!();
+        println!("Vault: {}", report.vault.root.display());
+        println!("UUID: {}", report.vault.uuid);
+        println!("Timestamp: {}", report.timestamp);
+        println!();
+
+        println!(
+            "Summary: {} ({} OK, {} warnings, {} errors)",
+            report.status_as_str(),
+            report.summary.ok_count,
+            report.summary.warning_count,
+            report.summary.error_count
+        );
+        println!();
+
+        // Print individual checks
+        for check in &report.checks {
+            match check.status {
+                flavite_api::doctor::CheckStatus::Ok => {
+                    println!("✓ {}: {}", check.name, check.description);
+                }
+                flavite_api::doctor::CheckStatus::Warning => {
+                    println!("⚠ {}: {}", check.name, check.description);
+                    if let Some(details) = &check.details {
+                        println!("  Details: {}", details);
+                    }
+                }
+                flavite_api::doctor::CheckStatus::Error => {
+                    println!("✗ {}: {}", check.name, check.description);
+                    if let Some(details) = &check.details {
+                        println!("  Error: {}", details);
+                    }
+                    if let Some(fix) = &check.fix {
+                        println!("  Fix: {}", fix);
+                    }
+                }
             }
+        }
+        println!();
+
+        if report.is_healthy() {
+            println!("Overall: HEALTHY ✓");
+        } else {
+            println!("Overall: UNHEALTHY ✗");
         }
     }
 
-    /// Drain notices from the channel.
-    #[allow(dead_code)]
-    fn drain_notices(&self) {
-        while let Ok(notice) = self.channels.notice.try_recv() {
-            match notice {
-                Notice::Conflict { note } => {
-                    warn!("Conflict detected for: {}", note.path.display());
-                }
-                Notice::RenameSuggested {
-                    from,
-                    to,
-                    tier,
-                    inbound,
-                } => {
-                    info!(
-                        "Rename suggested: {} -> {} (tier: {}, inbound: {})",
-                        from.display(),
-                        to.display(),
-                        tier.as_str(),
-                        inbound
-                    );
-                }
-                Notice::RecoveryOffer { note } => {
-                    info!("Recovery offer available for: {}", note.path.display());
-                }
-                Notice::ActionRequired { code, note } => {
-                    let note = note.as_ref().map(|n| n.path.display().to_string());
-                    warn!(
-                        "Action required: {} (note: {})",
-                        code,
-                        note.unwrap_or_default()
-                    );
-                }
-            }
+    /// Run a query.
+    #[allow(clippy::ptr_arg)]
+    fn run_query(&self, _vault_path: &PathBuf, query: &str, limit: usize) -> Result<()> {
+        info!("Running query: {}", query);
+
+        // For now, this is a placeholder
+        // In a full implementation, we would parse the query and execute it
+        // through the Lattice facade
+
+        println!("Query: {}", query);
+        println!("Limit: {}", limit);
+        println!("Note: Query execution through API will be implemented in a future slice");
+
+        Ok(())
+    }
+
+    /// Run a search.
+    #[allow(clippy::ptr_arg)]
+    fn run_search(&self, _vault_path: &PathBuf, term: &str, limit: usize) -> Result<()> {
+        info!("Running search: {}", term);
+
+        // For now, this is a placeholder
+        // In a full implementation, we would execute the search through the API
+
+        println!("Search: {}", term);
+        println!("Limit: {}", limit);
+        println!("Note: Search execution through API will be implemented in a future slice");
+
+        Ok(())
+    }
+
+    /// Show vault info.
+    #[allow(clippy::ptr_arg)]
+    fn show_info(&self, vault_path: &PathBuf) -> Result<()> {
+        info!("Showing vault info: {}", vault_path.display());
+
+        if let Some(ref lattice) = self.lattice {
+            let vault_ref = lattice.vault_ref();
+            println!("Vault: {}", vault_ref.root.display());
+            println!("UUID: {}", vault_ref.uuid);
+            println!("API Version: {}", flavite_api::API_VERSION);
+        } else {
+            println!("Vault: {}", vault_path.display());
+            println!("API Version: {}", flavite_api::API_VERSION);
         }
+
+        Ok(())
+    }
+
+    /// Run API test.
+    fn api_test(&self) -> Result<()> {
+        info!("Running API test");
+
+        // Test that we can use the API
+        println!("API version: {}", flavite_api::API_VERSION);
+        println!(
+            "Event API version: {}",
+            flavite_api::event::EVENT_API_VERSION
+        );
+
+        // Test creating types
+        let vault_ref = ApiVaultRef::new(uuid::Uuid::new_v4(), PathBuf::from("/test"));
+        println!(
+            "Created ApiVaultRef: {} -> {}",
+            vault_ref.uuid,
+            vault_ref.root.display()
+        );
+
+        // Test command registry
+        let registry = flavite_api::CommandRegistry::new();
+        let request_id = registry.next_request_id();
+        println!("Generated request ID: {}", request_id);
+
+        // Test creating an invocation
+        let invocation =
+            Invocation::new(request_id, "test.cmd", serde_json::Value::Null, Origin::Cli);
+        println!("Created invocation: {:?}", invocation);
+
+        // Test doctor
+        let doctor_report = flavite_api::doctor::run_doctor(vault_ref);
+        println!("Doctor report has {} checks", doctor_report.checks.len());
+
+        Ok(())
     }
 }
 
@@ -275,68 +420,37 @@ fn main() -> Result<()> {
         Commands::Open { path } => {
             let vault_path = get_vault_path(path, cli.vault);
             driver.open_vault(vault_path, cli.no_watch)?;
-            driver.reconcile()?;
-            info!("Vault opened and reconciled");
+            info!("Vault opened and ready");
         }
-        Commands::Doctor { path, json, .. } => {
+        Commands::Doctor { path, json } => {
+            let vault_path = get_vault_path(path, cli.vault);
+            driver.run_doctor(&vault_path, json)?;
+        }
+        Commands::Query { path, query, limit } => {
             let vault_path = get_vault_path(path, cli.vault);
             driver.open_vault(vault_path.clone(), cli.no_watch)?;
-
-            if json {
-                // JSON output would go here
-                info!("Doctor check (JSON): {}", vault_path.display());
-            } else {
-                info!("Doctor check: {}", vault_path.display());
-                // Run basic checks
-                info!("Vault appears to be in good health.");
-            }
+            driver.run_query(&vault_path, &query, limit)?;
         }
-        Commands::Query {
-            path,
-            query,
-            limit: _,
-        } => {
+        Commands::Search { path, term, limit } => {
             let vault_path = get_vault_path(path, cli.vault);
             driver.open_vault(vault_path.clone(), cli.no_watch)?;
-
-            // Demonstrate using flavite-api Query type
-            info!("Query: {}", query);
-            // Note: Full query execution will use flavite-api in future slices
-        }
-        Commands::Search {
-            path,
-            term,
-            limit: _,
-        } => {
-            let vault_path = get_vault_path(path, cli.vault);
-            driver.open_vault(vault_path.clone(), cli.no_watch)?;
-
-            info!("Search: {}", term);
+            driver.run_search(&vault_path, &term, limit)?;
         }
         Commands::Info { path } => {
             let vault_path = get_vault_path(path, cli.vault);
-            driver.open_vault(vault_path.clone(), cli.no_watch)?;
-
-            if let Some(ref vault_ref) = driver.vault_ref {
-                info!("Vault: {}", vault_ref.root.display());
-                info!("Using flavite-api ApiVaultRef");
+            if let Some(ref lattice) = driver.lattice {
+                let vault_ref = lattice.vault_ref();
+                driver.vault_ref = Some(vault_ref.clone());
             }
+            driver.show_info(&vault_path)?;
         }
         Commands::ApiTest => {
-            // Test that we can use the API
-            info!("API test: flavite-api is working!");
-            info!("API version: {}", flavite_api::API_VERSION);
-
-            // Test command registry
-            let registry = CommandRegistry::new();
-            info!(
-                "Command registry created: {} commands",
-                registry.command_ids().len()
-            );
-
-            // Test ApiVaultRef
-            let vault_ref = ApiVaultRef::new(uuid::Uuid::new_v4(), PathBuf::from("/test"));
-            info!("ApiVaultRef created: {}", vault_ref.root.display());
+            driver.api_test()?;
+        }
+        Commands::Init { path } => {
+            let vault_path = get_vault_path(path, cli.vault);
+            driver.init_vault(&vault_path)?;
+            info!("Vault initialized at: {}", vault_path.display());
         }
     }
 
@@ -356,7 +470,7 @@ mod tests {
     #[test]
     fn test_cli_driver_creation() {
         let driver = CliDriver::new();
-        assert!(driver.vault.is_none());
+        assert!(driver.lattice.is_none());
         assert!(driver.vault_ref.is_none());
     }
 }

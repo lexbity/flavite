@@ -29,6 +29,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Hex encoding
 hex = "0.4"
 
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Filesystem (re-exported for CLI)
+flavite-fs = { path = "../flavite-fs" }
+
 [dev-dependencies]
 # For tests
 tempfile = "3"
