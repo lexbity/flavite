@@ -39,9 +39,9 @@ pub mod synthetic;
 pub mod zoomable;
 
 pub use card_layer::{
-    CARD_ZOOM_THRESHOLD, CardEditSink, CardLayerHarness, CardLayerMessage, IndexedCardContent,
-    LoggingSink, MAX_CARDS as CARD_LAYER_MAX_CARDS, NoopSink, card_layer_status,
-    cards_from_snapshot, compute_card_layer_state,
+    BufferState, CARD_ZOOM_THRESHOLD, CardContent, CardLayerMessage, CardLayerState,
+    IndexedCardContent, MAX_CARDS as CARD_LAYER_MAX_CARDS, TaskLine, card_layer_status,
+    cards_from_snapshot, compute_card_layer_state, legacy_cards_from_snapshot,
 };
 pub use fallback::{
     FALLBACK_NODE_CAP, FallbackCamera, FallbackGeometry, FallbackGeometryError, FallbackPrimitive,
@@ -64,6 +64,6 @@ pub use stats::{FrameStats, StatsSnapshot, percentile, report_header};
 pub use synthetic::{Rng, SyntheticGraph, SyntheticOptions, generate};
 pub use zoomable::{
     CARD_CAP as ZOOMABLE_CARD_CAP, CARD_DISTANCE_THRESHOLD, Card, CardIdentity, CardLayout,
-    LayoutCache, QuantizedScale, SCALE_MIN, SCALE_STEP_BASE, ZoomableCamera, ZoomableState,
-    build_card, compute_zoomable_state,
+    CardMessage, LayoutCache, QuantizedScale, SCALE_MIN, SCALE_STEP_BASE, ZoomableCamera,
+    ZoomableState, build_card, compute_zoomable_state,
 };

@@ -288,6 +288,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn lod_zoom_threshold_is_positive() {
         assert!(LOD_ZOOM_THRESHOLD > 0.0);
     }

@@ -152,11 +152,6 @@
     },
     {
       "from": "flavite-cli",
-      "to": "flavite-syntax",
-      "kind": "normal"
-    },
-    {
-      "from": "flavite-cli",
       "to": "flavite-vault",
       "kind": "normal"
     },
@@ -223,6 +218,16 @@
     {
       "from": "flavite-syntax",
       "to": "tree-sitter",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "flavite-api",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "flavite-buffer",
       "kind": "normal"
     },
     {

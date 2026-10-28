@@ -44,6 +44,7 @@ use crate::graph::instance::{
     self, CAMERA_UNIFORM_SIZE, Camera, CameraUniform, EDGE_INSTANCE_SIZE, NODE_INSTANCE_SIZE,
     ProbeGeometry,
 };
+#[allow(unused_imports)]
 use flavite_graph::NodeId;
 
 /// The probe's WGSL module: camera uniform, instanced nodes, instanced edges.
@@ -277,6 +278,7 @@ impl ProbeMessage {
 /// `Default` is required by [`ShaderProgram::State`]. It holds only input
 /// bookkeeping — the geometry and camera live elsewhere on purpose.
 #[derive(Debug, Default, Clone, PartialEq)]
+#[allow(clippy::new_without_default)]
 pub struct ProbeState {
     dragging: bool,
     drag_anchor: Option<Point>,

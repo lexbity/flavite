@@ -73,6 +73,9 @@ active = [
     { from = "flavite-cli", to = "flavite-index" },
     { from = "flavite-cli", to = "flavite-buffer" },
     { from = "flavite-cli", to = "flavite-fs" },
+    # B7 - Card layer uses API and buffer for production wiring
+    { from = "flavite-ui", to = "flavite-api" },
+    { from = "flavite-ui", to = "flavite-buffer" },
 ]
 
 [layering]
