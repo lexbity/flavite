@@ -1319,10 +1319,13 @@ dependencies = [
 name = "flavite-ui"
 version = "0.1.0"
 dependencies = [
+ "flavite-api",
+ "flavite-buffer",
  "flavite-graph",
  "futures",
  "iced",
  "naga",
+ "serde",
  "thiserror 2.0.21",
 ]
 

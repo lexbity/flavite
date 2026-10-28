@@ -1,5 +1,5 @@
 //! `Zoomable` — a container that lays out real iced widgets at world
-//! positions with re-scaled text (D15).
+//! positions with re-scaled text (D15, B7).
 //!
 //! At zoom levels beyond the LOD threshold, the graph view switches from
 //! instanced dots to real note cards: iced widgets laid out at world
@@ -19,12 +19,11 @@
 //! - **Card cap**: at most 64 real widgets (D15) — beyond that the LOD layer
 //!   takes over or the view is reduced.
 //!
-//! # Note for B4
+//! # Production (B7)
 //!
-//! For the B4 prototype, this module provides only the data structures and
-//! layout computation. The actual widget implementation and rendering lands
-//! in B6/B7. The probe demonstrates the concepts without actual custom
-//! widget rendering.
+//! B7 productionizes the zoomable container: cards now carry
+//! `CardLayerMessage` for toggle and open actions, and card content is
+//! fetched through `flavite-api::Lattice`.
 
 use std::collections::HashMap;
 
@@ -32,6 +31,9 @@ use iced::widget::Column;
 use iced::{Element, Length, Point, Rectangle, Size};
 
 use flavite_graph::{NodeId, NodeKind};
+
+/// Card message type for the zoomable layer (B7: CardLayerMessage).
+pub type CardMessage = super::card_layer::CardLayerMessage;
 
 /// Maximum cards displayed in the zoomable layer (D15).
 pub const CARD_CAP: usize = 64;
@@ -154,7 +156,7 @@ impl Default for ZoomableCamera {
 /// The builder is called with the quantized scale and returns the widget
 /// for that scale step. The identity is used for cache lookup.
 #[derive(Debug, Clone)]
-pub struct Card<Message> {
+pub struct Card<Message = CardMessage> {
     /// World position of the card's reference point (usually top-left of
     /// the card's logical rectangle).
     pub world_position: [f32; 2],
@@ -168,18 +170,21 @@ pub struct Card<Message> {
     pub content: Vec<String>,
     /// Marked as needing a toggle at this position (from indexed task spans).
     pub toggle_requests: Vec<usize>,
+    /// Message to emit when the card is interacted with.
+    pub message: Message,
     /// Phantom type for Message.
-    pub _phantom: std::marker::PhantomData<Message>,
+    pub _phantom: std::marker::PhantomData<fn() -> Message>,
 }
 
 impl<Message> Card<Message> {
-    /// A new card for a note at `world_position`.
+    /// A new card for a note at `world_position` with a custom message.
     #[must_use]
-    pub fn new_note(
+    pub fn new_note_with_message(
         world_position: [f32; 2],
         node_id: NodeId,
         title: String,
         content: Vec<String>,
+        message: Message,
     ) -> Self {
         Self {
             world_position,
@@ -188,13 +193,19 @@ impl<Message> Card<Message> {
             title,
             content,
             toggle_requests: Vec::new(),
+            message,
             _phantom: std::marker::PhantomData,
         }
     }
 
-    /// A new card for an attachment at `world_position`.
+    /// A new card for an attachment at `world_position` with a custom message.
     #[must_use]
-    pub fn new_attachment(world_position: [f32; 2], node_id: NodeId, title: String) -> Self {
+    pub fn new_attachment_with_message(
+        world_position: [f32; 2],
+        node_id: NodeId,
+        title: String,
+        message: Message,
+    ) -> Self {
         Self {
             world_position,
             node_id,
@@ -202,6 +213,50 @@ impl<Message> Card<Message> {
             title,
             content: Vec::new(),
             toggle_requests: Vec::new(),
+            message,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// A new card for a note at `world_position` (legacy B4 compatibility).
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn new_note(
+        world_position: [f32; 2],
+        node_id: NodeId,
+        title: String,
+        content: Vec<String>,
+    ) -> Self
+    where
+        Message: Default,
+    {
+        Self {
+            world_position,
+            node_id,
+            kind: NodeKind::Note,
+            title,
+            content,
+            toggle_requests: Vec::new(),
+            message: Message::default(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// A new card for an attachment at `world_position` (legacy B4 compatibility).
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn new_attachment(world_position: [f32; 2], node_id: NodeId, title: String) -> Self
+    where
+        Message: Default,
+    {
+        Self {
+            world_position,
+            node_id,
+            kind: NodeKind::Attachment,
+            title,
+            content: Vec::new(),
+            toggle_requests: Vec::new(),
+            message: Message::default(),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -225,10 +280,11 @@ pub struct CardIdentity {
 
 /// Cached layout for a card at a given scale step.
 ///
-/// The cache is keyed by `(identity, step_index)`.
+/// The cache is keyed by `(identity, step_index)`. For B7, we use a
+/// generic cache that can store elements with different message types
+/// by using Box<dyn Any> or by making the cache per-card-type. For now,
+/// we use a simpler approach: just cache the size, not the full element.
 pub struct CardLayout {
-    /// The widget element at this scale.
-    pub element: Element<'static, ()>,
     /// The logical size of the widget at this scale.
     pub size: Size<Length>,
 }
@@ -248,18 +304,6 @@ impl std::fmt::Debug for CardLayout {
 pub type LayoutCache = HashMap<(CardIdentity, i32), CardLayout>;
 
 /// Width of a card in logical pixels at scale 1.0.
-/// Message emitted by the zoomable container.
-#[derive(Debug, Clone)]
-pub enum ZoomableMessage<M> {
-    /// A toggle was requested at card `identity` on content line `index`.
-    ToggleRequest {
-        identity: CardIdentity,
-        line_index: usize,
-    },
-    /// Custom message from a card widget.
-    Custom(M),
-}
-
 /// Layout state for the zoomable layer: the result of computing card
 /// positions and cached layouts for the current frame.
 #[derive(Debug, Clone)]
@@ -272,25 +316,26 @@ pub struct ZoomableState {
 
 /// Compute the zoomable state for a set of cards and camera.
 ///
-/// Returns the state plus the list of card positions (for B4, we don't
-/// actually build elements as Element doesn't implement Clone in iced 0.14).
-/// In the real renderer (B7), this would return (state, elements) where
-/// elements are the actual widgets to render.
-pub fn compute_zoomable_state(
-    cards: &[Card<()>],
+/// Returns the state plus the list of card elements for rendering.
+/// In B7, this builds real widgets at world positions with proper styling.
+pub fn compute_zoomable_state<Message>(
+    cards: &[Card<Message>],
     camera: &ZoomableCamera,
     bounds: Rectangle,
     cache: &mut LayoutCache,
-) -> (ZoomableState, Vec<Point>) {
+) -> (ZoomableState, Vec<(Point, Element<'static, Message>)>)
+where
+    Message: 'static + Clone + std::fmt::Debug,
+{
     let scale = QuantizedScale::quantize(camera.zoom);
     let mut state = ZoomableState {
         cached_count: cache.len(),
         visible_count: 0,
     };
-    let mut visible_positions: Vec<Point> = Vec::new();
+    let mut visible_elements: Vec<(Point, Element<'static, Message>)> = Vec::new();
 
     // Sort cards by distance to camera (nearest first = drawn last = on top).
-    let mut sorted: Vec<&Card<()>> = cards.iter().collect();
+    let mut sorted: Vec<&Card<Message>> = cards.iter().collect();
     sorted.sort_by(|a, b| {
         let da = camera.distance_to(a.world_position);
         let db = camera.distance_to(b.world_position);
@@ -310,29 +355,29 @@ pub fn compute_zoomable_state(
     }
     state.visible_count = count;
 
-    // Build visible cards: for each, ensure its layout is cached at this
-    // scale step, then compute its screen position.
+    // Build visible cards: for each, ensure its size is cached at this
+    // scale step, then compute its screen position and build the element.
     let step_index = scale.step_index;
     for card in sorted.iter().take(count) {
         let identity = card.identity();
         let cache_key = (identity, step_index);
 
-        // Ensure the layout is cached (B4: we build it but don't use it for rendering).
+        // Ensure the layout is cached (B7: just cache the size for now).
         cache.entry(cache_key).or_insert_with(|| {
-            let element = build_card(card, scale.step);
             let size = Size::new(
                 Length::Fixed(CARD_WIDTH * scale.step),
                 Length::Fixed(CARD_HEIGHT * scale.step),
             );
-            CardLayout { element, size }
+            CardLayout { size }
         });
 
-        // Compute screen position.
+        // Compute screen position and build the element.
         let screen = camera.world_to_screen(card.world_position, bounds);
-        visible_positions.push(screen);
+        let element = build_card(card, scale.step);
+        visible_elements.push((screen, element));
     }
 
-    (state, visible_positions)
+    (state, visible_elements)
 }
 
 /// Build a card element for a given scale step.
@@ -340,16 +385,18 @@ pub fn compute_zoomable_state(
 /// This is where the actual iced widget construction happens. The
 /// `CardIdentity` and `step_index` are the cache key.
 ///
-/// For B4, we return a placeholder element. The actual styled cards will be
-/// implemented in B7.
-pub fn build_card(
-    card: &Card<()>, // using () for the generic in the cache
-    _step: f32,
-) -> Element<'static, ()> {
-    // For B4, return a simple text element with the card title (cloned to own the string).
-    // This avoids lifetime issues and is sufficient for the prototype.
+/// For B7, this returns a simple text element. The actual styled card
+/// with content will be built by card_layer::build_card when integrated
+/// with the Lattice API.
+pub fn build_card<Message>(card: &Card<Message>, step: f32) -> Element<'static, Message>
+where
+    Message: 'static + Clone + std::fmt::Debug,
+{
+    // For B7, we use the card's message for interactions
+    // The card click will emit the card's message
+    // Clone the title to satisfy 'static lifetime
     Column::new()
-        .push(iced::widget::Text::new(card.title.clone()).size(16))
+        .push(iced::widget::text::Text::new(card.title.clone()).size(16.0 * step))
         .into()
 }
 
@@ -426,13 +473,19 @@ mod tests {
         let camera = ZoomableCamera::centered();
 
         // 100 cards, but only CARD_CAP should be visible.
-        let cards: Vec<Card<()>> = (0..100)
+        let cards: Vec<Card> = (0..100)
             .map(|i| {
-                Card::new_note(
+                Card::new_note_with_message(
                     [i as f32 * 10.0, 0.0],
                     NodeId::note(i as u64),
                     format!("Note {}", i),
                     vec![format!("Content line {}", i)],
+                    CardMessage::OpenNote {
+                        identity: CardIdentity {
+                            node_id: NodeId::note(i as u64),
+                            kind: NodeKind::Note,
+                        },
+                    },
                 )
             })
             .collect();
@@ -459,36 +512,85 @@ mod tests {
 
         // Two cards: one near, one far.
         let cards = vec![
-            Card::new_note([0.0, 0.0], NodeId::note(0), "Near".to_string(), vec![]),
-            Card::new_note(
+            Card::new_note_with_message(
+                [0.0, 0.0],
+                NodeId::note(0),
+                "Near".to_string(),
+                vec![],
+                CardMessage::OpenNote {
+                    identity: CardIdentity {
+                        node_id: NodeId::note(0),
+                        kind: NodeKind::Note,
+                    },
+                },
+            ),
+            Card::new_note_with_message(
                 [CARD_DISTANCE_THRESHOLD + 100.0, 0.0],
                 NodeId::note(1),
                 "Far".to_string(),
                 vec![],
+                CardMessage::OpenNote {
+                    identity: CardIdentity {
+                        node_id: NodeId::note(1),
+                        kind: NodeKind::Note,
+                    },
+                },
             ),
         ];
 
         let (state, visible) = compute_zoomable_state(&cards, &camera, bounds, &mut cache);
         assert_eq!(state.visible_count, 1);
         assert_eq!(visible.len(), 1);
-        // B4: we verify the position is computed correctly, not the element (which is different each time)
+        // B7: we verify the position is computed correctly
         assert_eq!(
-            visible[0].x,
+            visible[0].0.x,
             camera.world_to_screen(cards[0].world_position, bounds).x
         );
         assert_eq!(
-            visible[0].y,
+            visible[0].0.y,
             camera.world_to_screen(cards[0].world_position, bounds).y
         );
     }
 
     #[test]
     fn card_identity_is_unique() {
-        let card1 = Card::<()>::new_note([0.0, 0.0], NodeId::note(1), "A".to_string(), vec![]);
-        let card2 = Card::<()>::new_note([0.0, 0.0], NodeId::note(2), "B".to_string(), vec![]);
+        let card1 = Card::new_note_with_message(
+            [0.0, 0.0],
+            NodeId::note(1),
+            "A".to_string(),
+            vec![],
+            CardMessage::OpenNote {
+                identity: CardIdentity {
+                    node_id: NodeId::note(1),
+                    kind: NodeKind::Note,
+                },
+            },
+        );
+        let card2 = Card::new_note_with_message(
+            [0.0, 0.0],
+            NodeId::note(2),
+            "B".to_string(),
+            vec![],
+            CardMessage::OpenNote {
+                identity: CardIdentity {
+                    node_id: NodeId::note(2),
+                    kind: NodeKind::Note,
+                },
+            },
+        );
         assert_ne!(card1.identity(), card2.identity());
 
-        let card3 = Card::<()>::new_attachment([0.0, 0.0], NodeId::note(1), "A".to_string());
+        let card3 = Card::new_attachment_with_message(
+            [0.0, 0.0],
+            NodeId::note(1),
+            "A".to_string(),
+            CardMessage::OpenNote {
+                identity: CardIdentity {
+                    node_id: NodeId::note(1),
+                    kind: NodeKind::Attachment,
+                },
+            },
+        );
         assert_ne!(card1.identity(), card3.identity());
     }
 

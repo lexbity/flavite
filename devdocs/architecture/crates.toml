@@ -69,6 +69,9 @@ active = [
     { from = "flavite-api", to = "flavite-fs" },
     # C14 - CLI consumes flavite-api only (D16 dogfood - fully migrated)
     { from = "flavite-cli", to = "flavite-api" },
+    # B7 - Card layer uses API and buffer for production wiring
+    { from = "flavite-ui", to = "flavite-api" },
+    { from = "flavite-ui", to = "flavite-buffer" },
 ]
 
 [layering]

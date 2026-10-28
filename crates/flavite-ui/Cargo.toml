@@ -11,9 +11,13 @@ description = "iced application (§4.1)"
 # `cargo xtask arch check` enforces the layering rule transitively.
 iced = { workspace = true }
 flavite-graph = { path = "../flavite-graph" }
+flavite-api = { path = "../flavite-api" }
+flavite-buffer = { path = "../flavite-buffer" }
 # §10.4 convention: thiserror for libraries. Used for the CPU-side geometry
 # error type (`graph::instance::GeometryError`).
 thiserror = { workspace = true }
+# serde for serialization in card content
+serde = { workspace = true }
 
 [dev-dependencies]
 # Headless wgpu validation tests drive wgpu's async device/adapter futures.

@@ -201,6 +201,16 @@
     },
     {
       "from": "flavite-ui",
+      "to": "flavite-api",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "flavite-buffer",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
       "to": "flavite-graph",
       "kind": "normal"
     },

@@ -89,6 +89,8 @@ Normal/build:
 
 Normal/build:
 
+- `flavite-api` (normal)
+- `flavite-buffer` (normal)
 - `flavite-graph` (normal)
 - `iced` (normal)
 

@@ -27,6 +27,12 @@ pub struct ProbeState {
     camera: Camera,
 }
 
+impl Default for ProbeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProbeState {
     /// Initialize the state.
     pub fn new() -> Self {
