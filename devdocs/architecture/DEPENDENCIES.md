@@ -31,6 +31,7 @@ Normal/build:
 - `flavite-index` (normal)
 - `flavite-syntax` (normal)
 - `flavite-vault` (normal)
+- `rusqlite` (normal)
 
 ### `flavite-buffer`
 
@@ -84,6 +85,7 @@ Normal/build:
 - `flavite-syntax` (normal)
 - `pulldown-cmark` (normal)
 - `rusqlite` (normal)
+- `tantivy` (normal)
 
 ### `flavite-syntax`
 
@@ -140,9 +142,9 @@ Normal/build:
 - `nucleo-matcher` ← flavite-editor
 - `pulldown-cmark` ← flavite-index, flavite-syntax
 - `ropey` ← flavite-buffer
-- `rusqlite` ← flavite-graph, flavite-index, xtask
+- `rusqlite` ← flavite-api, flavite-graph, flavite-index, xtask
 - `similar` ← flavite-vault
-- `tantivy` ← xtask
+- `tantivy` ← flavite-index, xtask
 - `tracing` ← flavite-cli, flavite-vault
 - `tree-sitter` ← flavite-syntax
 - `zstd` ← flavite-vault

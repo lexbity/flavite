@@ -9,6 +9,7 @@
 //! hard cap 8.
 
 use crate::schema::{MetaKey, get_meta_u64};
+use crate::search::SearchBackend;
 use blake3::Hash;
 use flavite_syntax::{pulldown_glue::parse_note, text::TextSnapshot};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Result};
@@ -52,7 +53,23 @@ pub struct Writer {
 pub struct IndexActor {
     writer: Writer,
     read_pool: ReadPool,
+    search: crate::search::TantivyBackend,
+    last_search_commit: Instant,
 }
+
+/// Text-search results paired with the structural index version used to fetch them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPage {
+    /// Structural epoch.
+    pub epoch: u64,
+    /// Structural generation.
+    pub generation: u64,
+    /// Matching note ID, vault-relative path, and title rows.
+    pub items: Vec<SearchNote>,
+}
+
+/// One matching note from a text or hybrid query.
+pub type SearchNote = (i64, String, String);
 
 /// Pool error type.
 #[derive(Debug, Error)]
@@ -309,8 +326,50 @@ impl IndexActor {
     pub fn new(db_path: &Path, pool_size: usize) -> Result<Self> {
         let writer = Writer::new(db_path)?;
         let read_pool = ReadPool::new(db_path, pool_size)?;
+        let cache_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+        let (search, search_recreated) =
+            if let Ok(search) = crate::search::TantivyBackend::open(db_path, cache_dir) {
+                (search, false)
+            } else {
+                // Tantivy is a derived cache. A malformed or incompatible
+                // directory is discarded and rebuilt from the structural DB.
+                let path = cache_dir.join("tantivy");
+                if path.exists() {
+                    std::fs::remove_dir_all(&path)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                }
+                (
+                    crate::search::TantivyBackend::open(db_path, cache_dir)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    true,
+                )
+            };
+        let sqlite_generation =
+            crate::schema::get_meta_u64(writer.conn(), MetaKey::Generation)?.unwrap_or(0);
+        let committed = search.committed_generation();
+        if search_recreated || committed > sqlite_generation {
+            search
+                .rebuild_from_sqlite()
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        } else if committed < sqlite_generation {
+            let floor = crate::schema::get_meta_u64(writer.conn(), MetaKey::LogFloor)?.unwrap_or(0);
+            if committed < floor {
+                search
+                    .rebuild_from_sqlite()
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            } else {
+                search
+                    .replay_since(committed)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            }
+        }
 
-        Ok(Self { writer, read_pool })
+        Ok(Self {
+            writer,
+            read_pool,
+            search,
+            last_search_commit: Instant::now(),
+        })
     }
 
     /// Get the writer connection.
@@ -386,6 +445,36 @@ impl IndexActor {
         Ok(candidates)
     }
 
+    /// Return true when stat data safely proves the indexed note unchanged.
+    /// Recently modified files remain racy for two seconds and must be hashed.
+    ///
+    /// # Errors
+    /// Returns an error when SQLite cannot read the indexed metadata.
+    pub fn note_metadata_matches(
+        &self,
+        path_native: &[u8],
+        size: u64,
+        mtime_ns: i64,
+        scan_ns: i64,
+    ) -> Result<bool, String> {
+        let indexed: Option<(i64, i64, i64, bool)> = self
+            .writer
+            .conn()
+            .query_row(
+                "SELECT size,mtime_ns,scan_ns,parse_ok FROM notes WHERE path_native=?1",
+                [path_native],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((indexed_size, indexed_mtime, _indexed_scan, parse_ok)) = indexed else {
+            return Ok(false);
+        };
+        let size_matches = u64::try_from(indexed_size).ok() == Some(size);
+        let not_racy = mtime_ns < scan_ns.saturating_sub(2_000_000_000);
+        Ok(parse_ok && size_matches && indexed_mtime == mtime_ns && not_racy)
+    }
+
     /// Apply the exact bytes installed by a save to SQLite in one structural
     /// transaction. The caller owns this actor on the sole index-writer thread.
     ///
@@ -447,7 +536,12 @@ impl IndexActor {
                     },
                 )
                 .map_err(|error| error.to_string())?;
-            tx.rollback().map_err(|error| error.to_string())?;
+            tx.execute(
+                "UPDATE notes SET mtime_ns=?1,scan_ns=?2 WHERE path_native=?3",
+                rusqlite::params![mtime_ns, scan_ns, path_native],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
             return Ok((epoch, current_generation));
         }
         let generation = current_generation
@@ -533,6 +627,8 @@ impl IndexActor {
             .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM tags WHERE note_id = ?1", [note_id])
             .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM aliases WHERE note_id = ?1", [note_id])
+            .map_err(|e| e.to_string())?;
         for (ord, link) in parsed.links.iter().enumerate() {
             let source_span = snapshot
                 .span_to_source(link.span)
@@ -599,7 +695,194 @@ impl IndexActor {
         )
         .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
+        let mut alias_stmt = conn
+            .prepare("SELECT alias FROM aliases WHERE note_id=?1 ORDER BY alias_key")
+            .map_err(|e| e.to_string())?;
+        let aliases = alias_stmt
+            .query_map([note_id], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let mut tag_stmt = conn
+            .prepare("SELECT tag FROM tags WHERE note_id=?1 ORDER BY tag")
+            .map_err(|e| e.to_string())?;
+        let tags = tag_stmt
+            .query_map([note_id], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        self.search
+            .apply_document_full(note_id, &title, &aliases, &tags, parsed.snapshot.text())
+            .map_err(|e| e.to_string())?;
         Ok((epoch, generation))
+    }
+
+    /// Search the derived Tantivy view. Dirty documents are committed before
+    /// the query so every acknowledged save is visible (D4/D12).
+    ///
+    /// # Errors
+    /// Returns an error when a commit or Tantivy search fails.
+    pub fn search_text(
+        &mut self,
+        text: &str,
+        note_ids: &[i64],
+        limit: usize,
+    ) -> Result<Vec<i64>, String> {
+        let hits = self
+            .search
+            .search_text(text, note_ids, limit)
+            .map_err(|e| e.to_string())?;
+        self.last_search_commit = Instant::now();
+        Ok(hits)
+    }
+
+    /// Commit the search view after bulk reconcile or when its deferred timer expires.
+    ///
+    /// # Errors
+    /// Returns an error when Tantivy or generation metadata cannot be committed.
+    pub fn commit_search_if_due(&mut self, force: bool) -> Result<(), String> {
+        if force
+            || (self.search.is_dirty()
+                && self.last_search_commit.elapsed()
+                    >= std::time::Duration::from_secs(crate::search::DEFAULT_COMMIT_INTERVAL_SECS))
+        {
+            self.search.commit().map_err(|e| e.to_string())?;
+            self.last_search_commit = Instant::now();
+        }
+        Ok(())
+    }
+
+    /// Search generation counters used by diagnostics and tests.
+    ///
+    /// # Errors
+    /// Returns an error when SQLite generation metadata cannot be read.
+    pub fn search_generations(&self) -> Result<(u64, u64), String> {
+        Ok((
+            crate::schema::get_meta_u64(self.writer.conn(), MetaKey::Generation)
+                .map_err(|e| e.to_string())?
+                .unwrap_or(0),
+            self.search.committed_generation(),
+        ))
+    }
+
+    /// Execute text search and the supported `AND` hybrid form against the
+    /// structural read pool. Results are returned with stable note metadata.
+    ///
+    /// # Errors
+    /// Returns an error when the query shape is unsupported or either index fails.
+    #[allow(clippy::type_complexity)]
+    pub fn search_notes(
+        &mut self,
+        query: &crate::query::Query,
+        limit: usize,
+    ) -> Result<SearchPage, String> {
+        self.search_notes_with_filter_limit(query, limit, crate::search::MAX_TANTIVY_FILTER_SIZE)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn search_notes_with_filter_limit(
+        &mut self,
+        query: &crate::query::Query,
+        limit: usize,
+        filter_limit: usize,
+    ) -> Result<SearchPage, String> {
+        use crate::query::Query;
+        let (text, structural) = match query {
+            Query::Text(text) => (text.clone(), None),
+            Query::And(parts) => {
+                let mut text = Vec::new();
+                let mut filters = Vec::new();
+                for part in parts {
+                    if let Query::Text(value) = part {
+                        text.push(value.as_str());
+                    } else {
+                        filters.push(part.clone());
+                    }
+                }
+                (text.join(" "), Some(Query::And(filters)))
+            }
+            _ => return Err("query does not contain a text clause".into()),
+        };
+        if text.trim().is_empty() {
+            return Err("text query must contain at least one searchable token".into());
+        }
+        let structural_ids = if let Some(structural) = structural {
+            if matches!(&structural, Query::And(parts) if parts.is_empty()) {
+                Vec::new()
+            } else {
+                let conn = self
+                    .read_pool
+                    .get(Some(Duration::from_secs(2)))
+                    .map_err(|e| e.to_string())?;
+                structural
+                    .execute(&conn, 100_000, None)
+                    .map_err(|e| e.to_string())?
+                    .items
+                    .into_iter()
+                    .map(|v| v.note_id)
+                    .collect::<Vec<_>>()
+            }
+        } else {
+            Vec::new()
+        };
+        let has_structural = matches!(query, Query::And(_));
+        if has_structural && structural_ids.is_empty() {
+            // Even an empty hybrid result is still a search operation: preserve
+            // D12's commit-before-search ordering for every admitted query.
+            self.search_text(&text, &[], 1)?;
+            let (epoch, generation) = self.version()?;
+            return Ok(SearchPage {
+                epoch,
+                generation,
+                items: Vec::new(),
+            });
+        }
+        let filter = if has_structural && structural_ids.len() <= filter_limit {
+            structural_ids.as_slice()
+        } else {
+            &[]
+        };
+        let mut hits = self.search_text(
+            &text,
+            filter,
+            if has_structural && structural_ids.len() > filter_limit {
+                100_000
+            } else {
+                limit.saturating_add(1)
+            },
+        )?;
+        if has_structural && structural_ids.len() > filter_limit {
+            let allowed = structural_ids
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            hits.retain(|id| allowed.contains(id));
+        }
+        hits.truncate(limit.saturating_add(1));
+        hits.truncate(limit);
+        let conn = self
+            .read_pool
+            .get(Some(Duration::from_secs(2)))
+            .map_err(|e| e.to_string())?;
+        let mut rows = Vec::new();
+        for id in hits {
+            if let Some(row) = conn
+                .query_row(
+                    "SELECT note_id,path,title FROM notes WHERE note_id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+            {
+                rows.push(row);
+            }
+        }
+        let (epoch, generation) = self.version()?;
+        Ok(SearchPage {
+            epoch,
+            generation,
+            items: rows,
+        })
     }
 
     /// Current structural index version.
@@ -799,5 +1082,204 @@ mod tests {
                 .is_err()
         );
         assert_eq!(index.version().unwrap(), (1, 2));
+    }
+
+    fn searchable_index() -> (tempfile::TempDir, IndexActor) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite3");
+        drop(crate::schema::open_or_init(&db).unwrap());
+        let index = IndexActor::new(&db, 1).unwrap();
+        (dir, index)
+    }
+
+    #[test]
+    fn acknowledged_save_is_visible_to_immediate_search_and_commits_once() {
+        let (_dir, mut index) = searchable_index();
+        for n in 0..25 {
+            let path = format!("notes/{n}.md");
+            let body = format!("# Note {n}\n\nunique_saved_content_{n}");
+            index
+                .apply_saved_note(path.as_bytes(), &path, body.as_bytes(), n, n)
+                .unwrap();
+        }
+        let mid = index
+            .search_notes(
+                &crate::query::Query::Text("unique_saved_content_24".into()),
+                10,
+            )
+            .unwrap();
+        assert_eq!(mid.items.len(), 1);
+        assert_eq!(
+            index.search_generations().unwrap(),
+            (25, 25),
+            "the mid-stream query commits preceding saves"
+        );
+        for n in 25..50 {
+            let path = format!("notes/{n}.md");
+            let body = format!("# Note {n}\n\nunique_saved_content_{n}");
+            index
+                .apply_saved_note(path.as_bytes(), &path, body.as_bytes(), n, n)
+                .unwrap();
+        }
+        let (generation, committed) = index.search_generations().unwrap();
+        assert_eq!(generation, 50);
+        assert_eq!(
+            committed, 25,
+            "writes must remain deferred after the mid-stream query"
+        );
+        let hits = index
+            .search_notes(
+                &crate::query::Query::Text("unique_saved_content_49".into()),
+                10,
+            )
+            .unwrap();
+        assert_eq!(hits.items.len(), 1);
+        assert_eq!(hits.items[0].1, "notes/49.md");
+        assert_eq!(index.search_generations().unwrap(), (50, 50));
+    }
+
+    #[test]
+    fn deferred_commit_timer_commits_dirty_writer_after_five_seconds() {
+        let (_dir, mut index) = searchable_index();
+        index
+            .apply_saved_note(b"timer.md", "timer.md", b"timercommitword", 1, 1)
+            .unwrap();
+        index.commit_search_if_due(false).unwrap();
+        assert_eq!(index.search_generations().unwrap(), (1, 0));
+        index.last_search_commit = Instant::now().checked_sub(Duration::from_secs(6)).unwrap();
+        index.commit_search_if_due(false).unwrap();
+        assert_eq!(index.search_generations().unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn uncommitted_changes_replay_after_reopen_and_counter_converges() {
+        let (dir, mut index) = searchable_index();
+        let db = dir.path().join("index.sqlite3");
+        for n in 0..4 {
+            let path = format!("{n}.md");
+            let body = format!("# Recovery\n\nreplayneedle{n}");
+            index
+                .apply_saved_note(path.as_bytes(), &path, body.as_bytes(), n, n)
+                .unwrap();
+        }
+        assert_eq!(index.search_generations().unwrap(), (4, 0));
+        drop(index);
+        let mut reopened = IndexActor::new(&db, 1).unwrap();
+        let result = reopened
+            .search_notes(&crate::query::Query::Text("replayneedle3".into()), 10)
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(reopened.search_generations().unwrap(), (4, 4));
+    }
+
+    #[test]
+    fn ahead_and_corrupt_search_cache_rebuild_without_touching_structure() {
+        let (dir, mut index) = searchable_index();
+        let db = dir.path().join("index.sqlite3");
+        index
+            .apply_saved_note(b"one.md", "one.md", b"# Title\n\nrebuildneedle", 1, 1)
+            .unwrap();
+        index.commit_search_if_due(true).unwrap();
+        drop(index);
+        let conn = Connection::open(&db).unwrap();
+        crate::schema::set_meta(&conn, MetaKey::TantivyCommittedGeneration, "99").unwrap();
+        drop(conn);
+        let mut rebuilt = IndexActor::new(&db, 1).unwrap();
+        assert_eq!(
+            rebuilt
+                .search_notes(&crate::query::Query::Text("rebuildneedle".into()), 10)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        assert_eq!(rebuilt.search_generations().unwrap(), (1, 1));
+        let count: i64 = rebuilt
+            .writer()
+            .conn()
+            .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(rebuilt);
+        std::fs::write(dir.path().join("tantivy/meta.json"), b"corrupt").unwrap();
+        let mut recovered = IndexActor::new(&db, 1).unwrap();
+        assert_eq!(
+            recovered
+                .search_notes(&crate::query::Query::Text("rebuildneedle".into()), 10)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        assert_eq!(recovered.search_generations().unwrap(), (1, 1));
+        let count: i64 = recovered
+            .writer()
+            .conn()
+            .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn cjk_bigram_and_diacritic_folding_find_notes() {
+        let (_dir, mut index) = searchable_index();
+        for (path, body) in [
+            ("ja.md", "東京の地図"),
+            ("zh.md", "北京数据中心"),
+            ("ko.md", "서울시 한국어"),
+            ("accent.md", "un café noir"),
+        ] {
+            index
+                .apply_saved_note(path.as_bytes(), path, body.as_bytes(), 1, 1)
+                .unwrap();
+        }
+        for query in ["東京", "数据", "서울", "cafe"] {
+            assert!(
+                !index
+                    .search_notes(&crate::query::Query::Text(query.into()), 10)
+                    .unwrap()
+                    .items
+                    .is_empty(),
+                "query {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_search_uses_filter_and_intersection_paths() {
+        let (_dir, mut index) = searchable_index();
+        index
+            .apply_saved_note(
+                b"a.md",
+                "a.md",
+                b"---\ntags: [project]\n---\ntextneedle",
+                1,
+                1,
+            )
+            .unwrap();
+        index
+            .apply_saved_note(
+                b"b.md",
+                "b.md",
+                b"---\ntags: [other]\n---\ntextneedle",
+                1,
+                1,
+            )
+            .unwrap();
+        let query = crate::query::Query::And(vec![
+            crate::query::Query::Tag {
+                name: "project".into(),
+                hierarchical: false,
+            },
+            crate::query::Query::Text("textneedle".into()),
+        ]);
+        let filtered = index
+            .search_notes_with_filter_limit(&query, 10, 10)
+            .unwrap();
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].1, "a.md");
+        let intersected = index.search_notes_with_filter_limit(&query, 10, 0).unwrap();
+        assert_eq!(intersected.items.len(), 1);
+        assert_eq!(intersected.items[0].1, "a.md");
     }
 }

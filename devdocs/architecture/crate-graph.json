@@ -128,6 +128,11 @@
       "kind": "normal"
     },
     {
+      "from": "flavite-api",
+      "to": "rusqlite",
+      "kind": "normal"
+    },
+    {
       "from": "flavite-buffer",
       "to": "blake3",
       "kind": "normal"
@@ -225,6 +230,11 @@
     {
       "from": "flavite-index",
       "to": "rusqlite",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-index",
+      "to": "tantivy",
       "kind": "normal"
     },
     {

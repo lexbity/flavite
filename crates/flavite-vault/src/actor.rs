@@ -58,6 +58,12 @@ pub enum VaultActorMsg {
     },
     /// Read the indexed title/alias snapshot for editor autocomplete.
     CompletionCandidates { reply: Sender<VaultActorResp> },
+    /// Execute full-text or hybrid search through the index owner.
+    SearchNotes {
+        query: flavite_index::query::Query,
+        limit: usize,
+        reply: Sender<VaultActorResp>,
+    },
     /// Save immutable serialized bytes through the D6 path.
     Save {
         request: SaveRequest,
@@ -104,6 +110,8 @@ pub enum VaultActorResp {
     File(Option<Vec<u8>>),
     /// Indexed note completion candidates.
     CompletionCandidates(Result<Vec<flavite_index::types::CompletionCandidate>, String>),
+    /// Search results from the structural index and Tantivy.
+    SearchNotes(Result<flavite_index::SearchPage, String>),
     /// Save completion after the structural index callback.
     Saved(Result<SaveReceipt, SaveFailure>),
     /// Durable history snapshot record.
@@ -201,6 +209,27 @@ impl VaultActorHandle {
             VaultActorResp::CompletionCandidates(result) => result,
             VaultActorResp::Error(error) => Err(error),
             _ => Err("unexpected completion-candidate response".to_owned()),
+        }
+    }
+
+    /// Execute a text or hybrid search on the actor that owns Tantivy.
+    pub fn search_notes(
+        &self,
+        query: flavite_index::query::Query,
+        limit: usize,
+    ) -> Result<flavite_index::SearchPage, String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::SearchNotes {
+                query,
+                limit,
+                reply,
+            })
+            .map_err(|e| e.to_string())?;
+        match response.recv().map_err(|e| e.to_string())? {
+            VaultActorResp::SearchNotes(result) => result,
+            VaultActorResp::Error(error) => Err(error),
+            _ => Err("unexpected search response".into()),
         }
     }
 
@@ -414,16 +443,31 @@ impl VaultActor {
 
         // Main loop
         loop {
-            match self.msg_receiver.recv() {
+            match self
+                .msg_receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+            {
                 Ok(msg) => {
                     self.handle_message(msg);
+                    if let Err(error) = self.index.commit_search_if_due(false) {
+                        tracing::error!(%error,"deferred Tantivy commit failed");
+                    }
                 }
-                Err(_) => {
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    if let Err(error) = self.index.commit_search_if_due(false) {
+                        tracing::error!(%error,"deferred Tantivy commit failed");
+                    }
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
                     // Channel disconnected
                     info!("VaultActor channel disconnected, shutting down");
                     break;
                 }
             }
+        }
+
+        if let Err(error) = self.index.commit_search_if_due(true) {
+            tracing::error!(%error,"final Tantivy commit failed");
         }
 
         is_running.store(false, Ordering::SeqCst);
@@ -453,6 +497,9 @@ impl VaultActor {
                     .try_send(VaultActorResp::Identity(self.identity.clone()));
             }
             VaultActorMsg::Shutdown => {
+                if let Err(error) = self.index.commit_search_if_due(true) {
+                    tracing::error!(%error,"shutdown Tantivy commit failed");
+                }
                 let _ = self.resp_sender.try_send(VaultActorResp::Ack);
                 // Shutdown will happen when the channel is dropped
             }
@@ -467,6 +514,14 @@ impl VaultActor {
             VaultActorMsg::CompletionCandidates { reply } => {
                 let response =
                     VaultActorResp::CompletionCandidates(self.index.completion_candidates());
+                let _ = reply.try_send(response);
+            }
+            VaultActorMsg::SearchNotes {
+                query,
+                limit,
+                reply,
+            } => {
+                let response = VaultActorResp::SearchNotes(self.index.search_notes(&query, limit));
                 let _ = reply.try_send(response);
             }
             VaultActorMsg::Save { request, reply } => self.handle_save(request, reply),
@@ -623,6 +678,9 @@ impl VaultActor {
         let summary = ReconcileSummary::default();
         let version = Version::new(self.reconcile_state.epoch, self.reconcile_state.generation);
 
+        if let Err(error) = self.index.commit_search_if_due(true) {
+            tracing::error!(%error,"post-reconcile Tantivy commit failed");
+        }
         let response = VaultActorResp::ReconcileComplete { summary, version };
         if let Some(reply) = reply {
             let _ = reply.send(response);
@@ -651,8 +709,89 @@ impl VaultActor {
             self.identity.root.display()
         );
 
-        // For now, we'll just mark it as completed
-        // In production, this would call initial_scan
+        let scan_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .try_into()
+            .unwrap_or(i64::MAX);
+        let mut pending = vec![self.identity.root.clone()];
+        while let Some(dir) = pending.pop() {
+            let entries = match self.fs.read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    tracing::warn!(path=%dir.display(),%error,"initial index scan could not read directory");
+                    continue;
+                }
+            };
+            for entry in entries {
+                if entry.name == ".flavite" || entry.name == ".obsidian" {
+                    continue;
+                }
+                if entry.is_dir {
+                    pending.push(entry.path);
+                    continue;
+                }
+                if entry
+                    .path
+                    .extension()
+                    .is_none_or(|extension| !extension.eq_ignore_ascii_case("md"))
+                    || self.fs.is_placeholder(&entry.path).unwrap_or(false)
+                {
+                    continue;
+                }
+                let metadata = match self.fs.metadata(&entry.path) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(path=%entry.path.display(),%error,"initial index scan skipped unreadable note");
+                        continue;
+                    }
+                };
+                if metadata.size > flavite_index::MAX_NOTE_BYTES as u64 {
+                    continue;
+                }
+                let Ok(relative) = entry.path.strip_prefix(&self.identity.root) else {
+                    continue;
+                };
+                let key = match self.fs.encode_path_key(relative) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(path=%entry.path.display(),%error,"initial index scan rejected unsafe path");
+                        continue;
+                    }
+                };
+                if self
+                    .index
+                    .note_metadata_matches(&key, metadata.size, metadata.mtime_ns, scan_ns)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let bytes = match self
+                    .fs
+                    .read_capped(&entry.path, flavite_index::MAX_NOTE_BYTES as u64)
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(path=%entry.path.display(),%error,"initial index scan skipped note");
+                        continue;
+                    }
+                };
+                let display_path = relative.to_string_lossy().replace('\\', "/");
+                if let Err(error) = self.index.apply_saved_note(
+                    &key,
+                    &display_path,
+                    &bytes,
+                    metadata.mtime_ns,
+                    scan_ns,
+                ) {
+                    tracing::warn!(path=%display_path,%error,"initial index scan failed to index note");
+                }
+            }
+        }
+        if let Err(error) = self.index.commit_search_if_due(true) {
+            tracing::error!(%error,"initial Tantivy scan commit failed");
+        }
 
         info!("Initial scan completed");
     }
@@ -841,7 +980,7 @@ mod tests {
             VaultActorResp::Saved(Ok(receipt)) => receipt,
             other => panic!("unexpected save reply: {other:?}"),
         };
-        assert_eq!((receipt.epoch, receipt.generation), (1, 1));
+        assert_eq!((receipt.epoch, receipt.generation), (1, 2));
         assert_eq!(
             fs.read_if_exists(std::path::Path::new("/vault/notes/a.md"))
                 .unwrap()
@@ -851,7 +990,11 @@ mod tests {
         let check = flavite_index::Writer::new(&db_path).unwrap();
         let indexed: String = check
             .conn()
-            .query_row("SELECT body_text FROM search_docs", [], |row| row.get(0))
+            .query_row(
+                "SELECT body_text FROM search_docs WHERE body_text=?1",
+                ["# Saved\n\n[[Other]]"],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(indexed, "# Saved\n\n[[Other]]");
         drop(actor);

@@ -205,7 +205,13 @@ pub struct DoctorChecker {
 impl DoctorChecker {
     /// Create a new doctor checker for a vault.
     #[must_use]
-    pub fn new(vault: ApiVaultRef) -> Self {
+    pub fn new(mut vault: ApiVaultRef) -> Self {
+        // The vault file is authoritative. This also lets lightweight callers
+        // such as the CLI recover the actual cache key without opening a
+        // writing Session or acquiring the single-instance lock.
+        if let Ok(Some(uuid)) = flavite_vault::identity::read_vault_toml(&vault.root) {
+            vault.uuid = uuid;
+        }
         Self { vault }
     }
 
@@ -293,10 +299,54 @@ impl DoctorChecker {
 
     /// Check Tantivy generation matches SQLite.
     fn check_tantivy_generation(&self) -> DoctorCheck {
-        // This will check that tantivy.committed_generation matches
-        // the SQLite index.generation
-        // Placeholder for now
-        DoctorCheck::ok("tantivy_generation", "Tantivy generation matches SQLite")
+        let Some(base) = directories::ProjectDirs::from("com", "flavite", "Flavite") else {
+            return DoctorCheck::warn(
+                "tantivy_generation",
+                "Tantivy generation matches SQLite",
+                "OS cache directory is unavailable",
+            );
+        };
+        let db = base
+            .cache_dir()
+            .join("flavite")
+            .join(self.vault.uuid.to_string())
+            .join(format!("v{}", flavite_index::SCHEMA_MAJOR))
+            .join("index.sqlite3");
+        if !db.exists() {
+            return DoctorCheck::warn(
+                "tantivy_generation",
+                "Tantivy generation matches SQLite",
+                "search index has not been built yet",
+            );
+        }
+        let result = (|| -> rusqlite::Result<(String, String)> {
+            let conn = rusqlite::Connection::open_with_flags(
+                &db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let get = |key: &str| {
+                conn.query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
+                    row.get::<_, String>(0)
+                })
+            };
+            Ok((get("generation")?, get("tantivy_committed_generation")?))
+        })();
+        match result {
+            Ok((generation, committed)) if generation == committed => DoctorCheck::ok(
+                "tantivy_generation",
+                format!("Tantivy generation {committed} matches SQLite generation {generation}"),
+            ),
+            Ok((generation, committed)) => DoctorCheck::warn(
+                "tantivy_generation",
+                "Tantivy search view is behind or ahead of SQLite",
+                format!("SQLite generation={generation}, Tantivy committed_generation={committed}"),
+            ),
+            Err(error) => DoctorCheck::warn(
+                "tantivy_generation",
+                "Could not read Tantivy generation metadata",
+                error.to_string(),
+            ),
+        }
     }
 
     /// Check sample-N hash verification against disk.

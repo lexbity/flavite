@@ -291,15 +291,15 @@ impl CliDriver {
     #[allow(clippy::ptr_arg)]
     fn run_query(&self, _vault_path: &PathBuf, query: &str, limit: usize) -> Result<()> {
         info!("Running query: {}", query);
-
-        // For now, this is a placeholder
-        // In a full implementation, we would parse the query and execute it
-        // through the Flavite facade
-
-        println!("Query: {}", query);
-        println!("Limit: {}", limit);
-        println!("Note: Query execution through API will be implemented in a future slice");
-
+        let flavite = self
+            .flavite
+            .as_ref()
+            .context("query requires an opened vault")?;
+        let result =
+            flavite.query_with_limit(&flavite_api::Query::Text(query.to_owned()), limit)?;
+        for note in &result.notes {
+            println!("{}\t{}", note.path, note.title);
+        }
         Ok(())
     }
 
@@ -308,13 +308,14 @@ impl CliDriver {
     fn run_search(&self, _vault_path: &PathBuf, term: &str, limit: usize) -> Result<()> {
         info!("Running search: {}", term);
 
-        // For now, this is a placeholder
-        // In a full implementation, we would execute the search through the API
-
-        println!("Search: {}", term);
-        println!("Limit: {}", limit);
-        println!("Note: Search execution through API will be implemented in a future slice");
-
+        let flavite = self
+            .flavite
+            .as_ref()
+            .context("search requires an opened vault")?;
+        let result = flavite.query_with_limit(&flavite_api::Query::Text(term.to_owned()), limit)?;
+        for note in &result.notes {
+            println!("{}\t{}", note.path, note.title);
+        }
         Ok(())
     }
 

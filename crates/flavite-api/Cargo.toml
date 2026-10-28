@@ -31,6 +31,8 @@ hex = "0.4"
 
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { workspace = true, features = ["bundled"] }
+directories = { workspace = true }
 
 # Filesystem (re-exported for CLI)
 flavite-fs = { path = "../flavite-fs" }

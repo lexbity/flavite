@@ -1217,12 +1217,14 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "crossbeam",
+ "directories",
  "flavite-buffer",
  "flavite-fs",
  "flavite-index",
  "flavite-syntax",
  "flavite-vault",
  "hex",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -1303,6 +1305,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tantivy",
  "tempfile",
  "thiserror 2.0.21",
 ]
