@@ -32,7 +32,10 @@
 //! frame [`LayoutState::Panicked`] **without touching its positions** (the
 //! last good frame is the only trustworthy one), stops stepping ("poisoned"),
 //! and keeps its command loop alive so the process survives and a fresh
-//! [`LayoutCommand::Replace`] can recover it. Nothing a caller can send — a
+//! topology — [`LayoutCommand::Replace`], or an [`LayoutCommand::Apply`]
+//! batch — can recover it. An incoming snapshot is validated at the same
+//! boundary (`GraphSnapshot::validate`), so a malformed CSR is rejected
+//! before it can reach the simulation. Nothing a caller can send — a
 //! malformed [`GraphSnapshot`], a `NaN` parameter — unwinds into the UI.
 //!
 //! # Freeze and wake (D15)
@@ -560,8 +563,9 @@ struct Engine {
     scratch: Vec<[f64; 2]>,
     /// Whether steps should run at all.
     running: bool,
-    /// Whether the last command or step panicked. Cleared only by a
-    /// successful install.
+    /// Whether the last command or step panicked. Cleared by a successful
+    /// install, or by an apply that rebuilt the layout from scratch (the
+    /// only two ways to obtain positions that can be trusted again).
     poisoned: bool,
 }
 
@@ -663,14 +667,32 @@ impl Engine {
     /// Install a whole topology, committing only when every step of the
     /// rebuild has succeeded.
     ///
-    /// The commit-at-the-end rule is what keeps §4.14 true across a panic: if
+    /// The snapshot is validated first (§4.2): a malformed CSR panics here,
+    /// inside the command boundary, before any state is touched. The
+    /// commit-at-the-end rule is what keeps §4.14 true across a panic: if
     /// anything below throws, `model`, `current`, and `layout` are left
     /// exactly as they were, so the frame the render thread is holding still
     /// pairs positions with the topology they index.
+    ///
+    /// A healthy install keeps every surviving node's position (D15: a
+    /// topology change is not a restart). An install that recovers from a
+    /// caught panic instead starts from a fresh disc: the positions the
+    /// panicked step left behind cannot be trusted.
     fn install(&mut self, snapshot: Arc<GraphSnapshot>) {
+        if let Err(reason) = snapshot.validate() {
+            panic!("malformed topology rejected: {reason}");
+        }
         let model = model_from_snapshot(&snapshot);
         let fresh = Arc::new(model.snapshot());
-        let mut layout = Layout::new(self.layout.params());
+        // Capture the params first: below this line, `self.layout` may be
+        // the taken-out default until the commit at the end, and a panic in
+        // between must not cost a recovery install its configured params.
+        let params = self.layout.params();
+        let mut layout = if self.poisoned {
+            Layout::new(params)
+        } else {
+            std::mem::take(&mut self.layout)
+        };
         let retarget = layout.retarget(&fresh);
 
         self.model = model;
@@ -696,20 +718,33 @@ impl Engine {
     }
 
     /// Apply a delta batch. The model is B1's, and its `apply` is defined on
-    /// plain data, so only the re-target below can fail — and it runs before
-    /// anything is committed (see [`Engine::install`]).
+    /// plain data, so only the re-target below could fail — and it runs
+    /// before anything is committed (see [`Engine::install`]).
+    ///
+    /// A poisoned worker recovers here too: the model absorbs the deltas
+    /// (dropping them would desync it from the index feed), and the layout
+    /// is rebuilt from scratch because the panicked positions cannot be
+    /// trusted. On a healthy worker the survivors keep their positions
+    /// (D15), and `retarget` itself resets the adaptive state — the wake
+    /// half of the freeze/wake cycle.
     fn apply(&mut self, deltas: Vec<Delta>) {
-        let stats = self.model.apply(&deltas);
+        let mut model = std::mem::take(&mut self.model);
+        let stats = model.apply(&deltas);
         if !stats.changed {
+            self.model = model;
             return;
         }
 
-        let fresh = Arc::new(self.model.snapshot());
-        let mut layout = Layout::new(self.layout.params());
-        // `retarget` keeps the survivors, warm-starts the newcomers, and
-        // resets the adaptive state — the wake half of D15's freeze/wake.
+        let fresh = Arc::new(model.snapshot());
+        let params = self.layout.params();
+        let mut layout = if self.poisoned {
+            Layout::new(params)
+        } else {
+            std::mem::take(&mut self.layout)
+        };
         let retarget = layout.retarget(&fresh);
 
+        self.model = model;
         self.layout = layout;
         self.current = fresh;
         self.poisoned = false;
@@ -1020,9 +1055,13 @@ mod tests {
         let buffer = worker.positions();
 
         // D15: a settled layout publishes `Frozen` and then stops stepping.
+        // `generation() > 0` keeps the initial empty frame (which is born
+        // `Frozen` at generation 0) from satisfying this vacuously — the
+        // freeze must be one the simulation itself published.
         assert!(
-            wait_until(Duration::from_secs(30), || {
-                buffer.load().state() == LayoutState::Frozen
+            wait_until(Duration::from_secs(10), || {
+                let frame = buffer.load();
+                frame.generation() > 0 && frame.state() == LayoutState::Frozen
             }),
             "the layout must freeze once it settles: {:?}",
             buffer.load().state()
@@ -1039,10 +1078,10 @@ mod tests {
             buffer.load().generation() >= frozen_generation,
             "no further publishes once frozen"
         );
-        // The freeze is counted in telemetry, but there may be a delay in visibility
-        // We already verified the layout is frozen via state() == Frozen
 
         // A topology change wakes it: it steps again and leaves `Frozen`.
+        // The worker retargets the *existing* layout, so the survivors keep
+        // their positions and only the newcomer is placed (D15).
         worker.send(LayoutCommand::Apply(vec![
             Delta::Node(NodeDelta::Added { id: note(99) }),
             Delta::Edge(EdgeDelta::Added {
@@ -1059,21 +1098,22 @@ mod tests {
             "a topology change must wake the layout: {:?}",
             buffer.load()
         );
-        let telemetry = worker.telemetry().snapshot();
-        assert!(telemetry.wakes >= 1, "the wake is counted");
-        assert!(
-            wait_until(Duration::from_secs(30), || {
-                buffer.load().state() == LayoutState::Frozen
-            }),
-            "and it settles again"
-        );
-
         let events = drain(&worker);
         assert!(
             events
                 .iter()
                 .any(|event| matches!(event, LayoutEvent::TopologyChanged { .. })),
             "the topology change is reported: {events:?}"
+        );
+        let telemetry = worker.telemetry().snapshot();
+        assert!(telemetry.wakes >= 1, "the wake is counted");
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                let frame = buffer.load();
+                frame.generation() > 0 && frame.state() == LayoutState::Frozen
+            }),
+            "and it settles again: {:?}",
+            buffer.load().state()
         );
         assert!(worker.shutdown());
     }
@@ -1091,6 +1131,8 @@ mod tests {
             buffer.load().state() == LayoutState::Paused
         }));
         let paused = worker.telemetry().snapshot();
+        // The pause published its own frame; nothing may publish after it.
+        let paused_generation = buffer.load().generation();
         assert!(
             wait_until(Duration::from_secs(2), || {
                 worker.telemetry().snapshot().steps == paused.steps
@@ -1099,7 +1141,7 @@ mod tests {
         );
         assert_eq!(
             buffer.load().generation(),
-            buffer.load().generation(),
+            paused_generation,
             "and publishes nothing new"
         );
 
@@ -1132,9 +1174,9 @@ mod tests {
     #[test]
     fn a_malformed_topology_is_caught_and_the_worker_recovers() {
         // §4.2: nothing a caller sends may unwind into the owner of the
-        // worker. A snapshot whose adjacency CSR is truncated makes the
-        // re-target index out of bounds — a genuine panic, not a simulation
-        // of one.
+        // worker. A snapshot whose adjacency CSR is truncated fails the
+        // boundary validation — a genuine panic, not a simulation of one —
+        // and the worker contains it.
         let worker = LayoutWorker::spawn_running(config(2), path(6)).expect("worker starts");
         let buffer = worker.positions();
         assert!(wait_until(Duration::from_secs(10), || {
@@ -1174,12 +1216,14 @@ mod tests {
         assert_eq!(frame.positions().len(), frame.snapshot().node_count());
         assert_eq!(frame.state(), LayoutState::Panicked);
 
-        // Recovery: a good topology clears the poison and runs again.
+        // Recovery: a good topology clears the poison and runs again. The
+        // panicked positions cannot be trusted, so this install cold-starts.
+        let panicked_generation = buffer.load().generation();
         worker.send(LayoutCommand::Replace(path(6)));
         assert!(
             wait_until(Duration::from_secs(5), || {
                 let frame = buffer.load();
-                frame.state() == LayoutState::Active && frame.generation() > frame.generation() - 1
+                frame.state() == LayoutState::Active && frame.generation() > panicked_generation
             }),
             "a fresh topology must recover the worker"
         );
@@ -1194,40 +1238,71 @@ mod tests {
 
     #[test]
     fn a_panic_during_a_step_is_isolated_too() {
-        // The same isolation for the hot path: a snapshot with a truncated
-        // degree array installs cleanly (the re-target only reads ids and
-        // adjacency) and then panics on the first force evaluation.
-        let worker = LayoutWorker::spawn_running(config(2), path(8)).expect("worker starts");
-        let buffer = worker.positions();
-        assert!(wait_until(Duration::from_secs(10), || {
-            buffer.load().generation() >= 2
-        }));
+        // The same isolation for the hot path. A malformed snapshot can no
+        // longer reach the simulation — the boundary validation catches it
+        // at install (see the test above) — so the step-time catch is
+        // driven at the engine level: the layout state is corrupted between
+        // steps, which is the class of internal failure the step boundary
+        // exists to contain. Degrees shorter than the position array makes
+        // the next force evaluation index out of bounds — a genuine panic,
+        // not a simulation of one.
+        let (_commands, commands) = unbounded::<LayoutCommand>();
+        let (event_tx, event_rx) = unbounded::<LayoutEvent>();
+        let positions = Arc::new(PositionBuffer::new());
+        let telemetry = Arc::new(LayoutTelemetry::default());
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("a small rayon pool builds");
+        let mut engine = Engine::new(
+            config(1),
+            pool,
+            commands,
+            event_tx,
+            Arc::clone(&positions),
+            Arc::clone(&telemetry),
+        );
 
-        let mut malformed = (*path(8)).clone();
-        malformed.degrees = Vec::new();
-        worker.send(LayoutCommand::Replace(Arc::new(malformed)));
-
+        engine.handle(LayoutCommand::Replace(path(8)));
+        engine.handle(LayoutCommand::Start);
         assert!(
             wait_until(Duration::from_secs(5), || {
-                buffer.load().state() == LayoutState::Panicked
+                positions.load().state() == LayoutState::Active
             }),
-            "the step panic must be caught: {:?}",
-            buffer.load().state()
+            "the engine publishes an active frame before the corruption"
         );
-        let events = drain(&worker);
+
+        engine.layout.simulate_internal_corruption();
+        engine.step();
+
+        assert!(engine.poisoned, "the step panic must poison the engine");
+        assert_eq!(telemetry.snapshot().panics, 1);
+        let events: Vec<LayoutEvent> = event_rx.try_iter().collect();
         assert!(events.iter().any(|event| matches!(
             event,
             LayoutEvent::Panicked {
-                context: "step" | "install",
+                context: "step",
                 ..
             }
         )));
-        assert!(worker.is_alive());
         // Nothing was published with mangled positions: the frame still
-        // matches its own snapshot (§4.14).
-        let frame = buffer.load();
+        // matches its own snapshot (§4.14), re-marked `Panicked`.
+        let frame = positions.load();
+        assert_eq!(frame.state(), LayoutState::Panicked);
         assert_eq!(frame.positions().len(), frame.snapshot().node_count());
-        assert!(worker.shutdown());
+        assert!(
+            !engine.should_step(),
+            "a poisoned engine must not step again"
+        );
+
+        // Recovery: a fresh topology clears the poison and steps again.
+        engine.handle(LayoutCommand::Replace(path(8)));
+        assert!(!engine.poisoned, "a clean install clears the poison");
+        engine.step();
+        let frame = positions.load();
+        assert_eq!(frame.state(), LayoutState::Active);
+        assert_eq!(frame.node_count(), 8);
+        assert!(frame.generation() > 0);
     }
 
     #[test]

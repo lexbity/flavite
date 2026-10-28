@@ -35,7 +35,8 @@ pub use delta::{Delta, EdgeDelta, EdgeKind, NodeDelta, NodeId, NodeKind};
 pub use feed::{FeedBatch, FeedError, GraphFeed, IndexCursor};
 pub use layout::{
     CONVERGENCE_STEPS, DEFAULT_THETA, Layout, LayoutParams, MAX_TREE_DEPTH, MIN_SEPARATION,
-    POSITION_LIMIT, RetargetStats, Step, StepStats,
+    POSITION_LIMIT, PROGRESS_MIN_IMPROVEMENT, PROGRESS_STALL_FRACTION, PROGRESS_STALL_WINDOW,
+    RetargetStats, Step, StepStats,
 };
 pub use model::{ApplyStats, GraphModel, GraphSnapshot};
 pub use position::{LayoutState, PositionBuffer, PositionFrame};

@@ -426,25 +426,30 @@ mod tests {
 
     #[test]
     fn geometry_from_snapshot_caps_nodes_and_edges() {
+        // Batched deltas — the feed's shape. One `apply` per delta would
+        // rebuild the CSR cache per call (O(n) each), turning this fixture
+        // into a quadratic debug-build hang.
         let mut model = flavite_graph::GraphModel::new();
-        for i in 0..FALLBACK_NODE_CAP + 100 {
-            model.apply(&[flavite_graph::Delta::Node(
-                flavite_graph::NodeDelta::Added {
+        let nodes: Vec<flavite_graph::Delta> = (0..FALLBACK_NODE_CAP + 100)
+            .map(|i| {
+                flavite_graph::Delta::Node(flavite_graph::NodeDelta::Added {
                     id: flavite_graph::NodeId::note(i as u64),
-                },
-            )]);
-        }
-        for i in 0..FALLBACK_NODE_CAP + 50 {
-            for j in i + 1..(i + 2).min(FALLBACK_NODE_CAP + 100) {
-                model.apply(&[flavite_graph::Delta::Edge(
-                    flavite_graph::EdgeDelta::Added {
+                })
+            })
+            .collect();
+        model.apply(&nodes);
+        let edges: Vec<flavite_graph::Delta> = (0..FALLBACK_NODE_CAP + 50)
+            .flat_map(|i| {
+                ((i + 1)..(i + 2).min(FALLBACK_NODE_CAP + 100)).map(move |j| {
+                    flavite_graph::Delta::Edge(flavite_graph::EdgeDelta::Added {
                         from: flavite_graph::NodeId::note(i as u64),
                         to: flavite_graph::NodeId::note(j as u64),
                         kind: flavite_graph::EdgeKind::Link,
-                    },
-                )]);
-            }
-        }
+                    })
+                })
+            })
+            .collect();
+        model.apply(&edges);
         let snapshot = model.snapshot();
         let positions: Vec<[f32; 2]> = (0..snapshot.node_count() as usize)
             .map(|i| [i as f32 * 10.0, 0.0])

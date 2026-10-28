@@ -7,9 +7,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use flavite_fs::OsFs;
 use flavite_vault::{
-    open::{vault_exists, Vault},
-    types::VaultConfig,
     ChannelSet, Notice, Pulse,
+    open::{Vault, vault_exists},
+    types::VaultConfig,
 };
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
@@ -225,33 +225,31 @@ impl CliDriver {
     fn drain_notices(&self) {
         loop {
             match self.channels.notice.try_recv() {
-                Ok(notice) => {
-                    match notice {
-                        Notice::Conflict { note } => {
-                            warn!("Conflict detected for: {}", note.path.display());
-                        }
-                        Notice::RenameSuggested {
-                            from,
-                            to,
-                            tier,
-                            inbound,
-                        } => {
-                            info!(
-                                "Rename suggested: {} -> {} (tier: {}, inbound: {})",
-                                from.display(),
-                                to.display(),
-                                tier.as_str(),
-                                inbound
-                            );
-                        }
-                        Notice::RecoveryOffer { note } => {
-                            info!("Recovery offer available for: {}", note.path.display());
-                        }
-                        Notice::ActionRequired { code, note } => {
-                            warn!("Action required: {} (note: {:?})", code, note);
-                        }
+                Ok(notice) => match notice {
+                    Notice::Conflict { note } => {
+                        warn!("Conflict detected for: {}", note.path.display());
                     }
-                }
+                    Notice::RenameSuggested {
+                        from,
+                        to,
+                        tier,
+                        inbound,
+                    } => {
+                        info!(
+                            "Rename suggested: {} -> {} (tier: {}, inbound: {})",
+                            from.display(),
+                            to.display(),
+                            tier.as_str(),
+                            inbound
+                        );
+                    }
+                    Notice::RecoveryOffer { note } => {
+                        info!("Recovery offer available for: {}", note.path.display());
+                    }
+                    Notice::ActionRequired { code, note } => {
+                        warn!("Action required: {} (note: {:?})", code, note);
+                    }
+                },
                 Err(_) => break,
             }
         }
@@ -283,9 +281,10 @@ fn main() -> Result<()> {
     init_tracing(cli.verbose);
 
     // Determine vault path
-    let vault_path = cli.vault.clone().unwrap_or_else(|| {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    });
+    let vault_path = cli
+        .vault
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     match cli.command {
         Commands::Open { path } => {
@@ -296,19 +295,11 @@ fn main() -> Result<()> {
             let vault_path = path.unwrap_or(vault_path);
             cmd_doctor(vault_path, json, quick)?;
         }
-        Commands::Query {
-            path,
-            query,
-            limit,
-        } => {
+        Commands::Query { path, query, limit } => {
             let vault_path = path.unwrap_or(vault_path);
             cmd_query(vault_path, query, limit, cli.no_watch)?;
         }
-        Commands::Search {
-            path,
-            term,
-            limit,
-        } => {
+        Commands::Search { path, term, limit } => {
             let vault_path = path.unwrap_or(vault_path);
             cmd_search(vault_path, term, limit, cli.no_watch)?;
         }
@@ -400,7 +391,10 @@ fn cmd_doctor(vault_path: PathBuf, json: bool, quick: bool) -> Result<()> {
     // Build summary
     let passed = checks.iter().filter(|c| c.passed).count();
     let failed = checks.iter().filter(|c| !c.passed).count();
-    let warnings = checks.iter().filter(|c| c.details.as_ref().map_or(false, |d| d.contains("warning"))).count();
+    let warnings = checks
+        .iter()
+        .filter(|c| c.details.as_ref().map_or(false, |d| d.contains("warning")))
+        .count();
 
     let summary = DoctorSummary {
         total_checks: checks.len(),
@@ -436,7 +430,10 @@ fn cmd_doctor(vault_path: PathBuf, json: bool, quick: bool) -> Result<()> {
         }
 
         println!("===========================================");
-        println!("Summary: {} passed, {} failed, {} warnings", summary.passed, summary.failed, summary.warnings);
+        println!(
+            "Summary: {} passed, {} failed, {} warnings",
+            summary.passed, summary.failed, summary.warnings
+        );
 
         if failed > 0 {
             std::process::exit(1);
@@ -465,7 +462,9 @@ fn run_generation_check(_driver: &CliDriver) -> DoctorCheck {
         name: "Generation consistency".to_string(),
         passed: true,
         message: "Generation check not yet implemented (stub)".to_string(),
-        details: Some("Todo: compare SQLite generation with tantivy committed_generation".to_string()),
+        details: Some(
+            "Todo: compare SQLite generation with tantivy committed_generation".to_string(),
+        ),
     }
 }
 
@@ -632,7 +631,7 @@ fn run_instance_socket_check(_driver: &CliDriver) -> DoctorCheck {
                 passed: true,
                 message: "Cannot determine OS data directory".to_string(),
                 details: None,
-            }
+            };
         }
     };
 
@@ -735,7 +734,10 @@ fn cmd_info(vault_path: PathBuf) -> Result<()> {
     println!("Vault UUID: {}", driver.vault.uuid());
     println!("Vault root: {}", driver.vault.root().display());
     println!("Watcher enabled: {}", driver.config.watcher_enabled);
-    println!("Verification interval: {:?}", driver.config.verification_interval);
+    println!(
+        "Verification interval: {:?}",
+        driver.config.verification_interval
+    );
 
     Ok(())
 }
@@ -757,6 +759,7 @@ fn cmd_test(command: String) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flavite_vault::{RenameTier, VaultRef};
 
     #[test]
     fn test_cli_parsing() {

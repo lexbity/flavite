@@ -94,6 +94,22 @@
 //! nudge, non-finite intermediates are discarded, and a runaway coordinate is
 //! projected back onto [`POSITION_LIMIT`].
 //!
+//! The epsilon criterion alone is not enough, because the adaptive speed
+//! cannot damp every geometry. A hub-and-spoke ring, for example, settles
+//! into a two-step limit cycle: on alternating steps the swinging measure
+//! collapses and traction spikes (so the speed target jumps and re-energizes
+//! the global speed), then swinging spikes and traction collapses (so the
+//! target collapses). The global speed ping-pongs forever and the mean
+//! displacement never reaches the epsilon — yet the map is *visually* static,
+//! each step moving a node a fraction of a percent of the layout's radius.
+//! [`Layout`] therefore also freezes on **stalled progress**: once the
+//! per-step motion stays below [`PROGRESS_STALL_FRACTION`] of the mean radius
+//! and the mean displacement has not improved by
+//! [`PROGRESS_MIN_IMPROVEMENT`] over the last [`PROGRESS_STALL_WINDOW`]
+//! steps, the layout is as settled as this force scheme will get, and the
+//! freeze fires ([`Layout::is_converged`]). The stall latch clears on
+//! [`Layout::wake`], so a topology change still re-energizes the map (D15).
+//!
 //! [`LayoutState::Frozen`]: crate::position::LayoutState
 
 use std::collections::HashMap;
@@ -145,6 +161,26 @@ pub const MAX_TREE_DEPTH: u32 = 64;
 /// frozen. One step can be small by coincidence (a node crossing its
 /// equilibrium); three in a row cannot.
 pub const CONVERGENCE_STEPS: u32 = 3;
+
+/// Length of the recent-displacement window the stall detector compares
+/// against (see the module `Termination` section). Long enough that a
+/// steadily converging layout — even a slow one — shows real improvement
+/// across it, short enough that a limit cycle freezes within a few hundred
+/// steps of settling.
+pub const PROGRESS_STALL_WINDOW: usize = 200;
+
+/// Largest per-step motion, as a fraction of the layout's mean radius, below
+/// which a layout counts as visually stationary for stall detection. A step
+/// that moves every node by a small fraction of a percent of the map's
+/// radius cannot be seen at any zoom the UI supports.
+pub const PROGRESS_STALL_FRACTION: f64 = 1.0e-2;
+
+/// Smallest improvement of the mean displacement over
+/// [`PROGRESS_STALL_WINDOW`] steps that counts as progress. A layout whose
+/// displacement ratchets down more slowly than this while already visually
+/// static is a limit cycle, and freezing it is the honest reading of "cool"
+/// (D15).
+pub const PROGRESS_MIN_IMPROVEMENT: f64 = 0.1;
 
 /// Rotation between successive phyllotaxis placements of a cold start — the
 /// golden angle, `π(3 − √5)`. Shared with the B2 fixture generator so a probe
@@ -821,6 +857,13 @@ pub struct Layout {
     cooling_age: f64,
     /// Consecutive stationary steps.
     converged_steps: u32,
+    /// Mean displacement of the last [`PROGRESS_STALL_WINDOW`] steps — the
+    /// stall detector's memory (see the module `Termination` section).
+    recent_displacement: std::collections::VecDeque<f64>,
+    /// Whether the stall detector has fired against the current topology.
+    /// Latched until [`Layout::wake`] so a frozen layout cannot flicker back
+    /// to stepping between two oscillating steps.
+    stalled: bool,
     /// Sanitized tunables.
     params: LayoutParams,
 }
@@ -851,6 +894,8 @@ impl Layout {
             iteration: 0,
             cooling_age: 0.0,
             converged_steps: 0,
+            recent_displacement: std::collections::VecDeque::with_capacity(PROGRESS_STALL_WINDOW),
+            stalled: false,
             params,
         }
     }
@@ -894,12 +939,14 @@ impl Layout {
         self.iteration
     }
 
-    /// Whether the layout has stopped moving ([`LayoutParams::convergence_steps`]
-    /// consecutive stationary steps). A frozen layout still accepts a
+    /// Whether the layout has stopped moving: either
+    /// [`LayoutParams::convergence_steps`] consecutive stationary steps, or
+    /// the stall detector fired on a visually static limit cycle (see the
+    /// module `Termination` section). A frozen layout still accepts a
     /// topology change, which wakes it.
     #[must_use]
     pub fn is_converged(&self) -> bool {
-        self.converged_steps >= self.params.convergence_steps
+        self.converged_steps >= self.params.convergence_steps || self.stalled
     }
 
     /// Write the current positions as `f32` into `out` (the renderer's world
@@ -965,6 +1012,8 @@ impl Layout {
             swinging,
             iteration,
             converged_steps,
+            recent_displacement,
+            stalled,
             params,
             cooling_age,
             ..
@@ -1155,6 +1204,33 @@ impl Layout {
             0
         };
 
+        // Stall detection — see the module `Termination` section. The
+        // adaptive speed cannot damp every geometry: a hub ring settles
+        // into a two-step limit cycle whose displacement never reaches the
+        // convergence epsilon, because the speed target alternates with the
+        // oscillation itself. Once the motion is visually static (a small
+        // fraction of the layout's radius per step) and has not improved
+        // over the recent window, the layout is as settled as this force
+        // scheme will get and the freeze fires. The latch holds until
+        // `wake`, so a frozen layout cannot flicker back to stepping
+        // between two oscillating steps.
+        let window_oldest = if recent_displacement.len() >= PROGRESS_STALL_WINDOW {
+            recent_displacement.pop_front()
+        } else {
+            None
+        };
+        recent_displacement.push_back(mean_displacement);
+        if mean_radius > 0.0
+            && mean_displacement <= PROGRESS_STALL_FRACTION * mean_radius
+            && window_oldest
+                .is_some_and(|oldest| mean_displacement > oldest * (1.0 - PROGRESS_MIN_IMPROVEMENT))
+        {
+            *stalled = true;
+        }
+        if *stalled {
+            *converged_steps = (*converged_steps).max(params.convergence_steps);
+        }
+
         StepStats {
             iteration: *iteration,
             global_speed: self.global_speed,
@@ -1302,7 +1378,19 @@ impl Layout {
         self.iteration = 0;
         self.cooling_age = 0.0;
         self.converged_steps = 0;
+        self.stalled = false;
+        self.recent_displacement.clear();
         self.displacement.fill([0.0; 2]);
+    }
+
+    /// Test-only: damage the internal degree array to simulate layout state
+    /// corrupted between steps — the failure class the worker's step
+    /// boundary contains (§4.2). Production code cannot produce this state
+    /// (a snapshot must pass `GraphSnapshot::validate` to reach a layout),
+    /// which is exactly why the step-panic test has to fabricate it.
+    #[cfg(test)]
+    pub(crate) fn simulate_internal_corruption(&mut self) {
+        self.degrees = Vec::new();
     }
 }
 
@@ -1781,7 +1869,7 @@ mod tests {
         // A simple 2-node layout is more predictable and settles quickly
         let snapshot = path(2);
         let params = LayoutParams {
-            gravity: 0.0,  // Disable gravity for simpler dynamics
+            gravity: 0.0, // Disable gravity for simpler dynamics
             cooling_rate: 0.5,
             convergence_epsilon: 0.001,
             ..LayoutParams::default()
@@ -1823,7 +1911,121 @@ mod tests {
         assert_ne!(layout.positions(), settled);
     }
 
-    // --- termination and numerical hygiene --------------------------------
+    // --- termination and numerical ------------------------------------------
+
+    #[test]
+    fn a_limit_cycle_stalls_into_a_freeze() {
+        // A hub ring cannot reach the convergence epsilon: the adaptive
+        // speed settles into a two-step oscillation whose target alternates
+        // with the swinging measure (see the module `Termination` section).
+        // The stall detector is what turns that into a freeze — without it
+        // this loop never terminates (D15: freeze on cool).
+        let snapshot = star(12);
+        let params = LayoutParams {
+            convergence_epsilon: 1.0e-3,
+            convergence_steps: 2,
+            ..LayoutParams::default()
+        };
+        let pool = pool(2);
+        let mut layout = Layout::from_snapshot(&snapshot, params);
+        let mut frozen_at = None;
+        let mut frozen_stats = None;
+        for step in 0..5_000u64 {
+            let stats = layout.step(&pool).stats;
+            if stats.frozen {
+                frozen_at = Some(step);
+                frozen_stats = Some(stats);
+                break;
+            }
+        }
+        assert!(
+            frozen_at.is_some(),
+            "a limit-cycling ring must stall-freeze, last stats {:?}",
+            frozen_stats
+        );
+        assert!(layout.is_converged());
+        // The freeze is honest: the map really is visually static — the
+        // mean applied displacement is below the stall fraction of the
+        // layout's own radius.
+        let stats = frozen_stats.expect("frozen above");
+        let centroid = [
+            layout.positions().iter().map(|p| p[0]).sum::<f64>() / layout.node_count() as f64,
+            layout.positions().iter().map(|p| p[1]).sum::<f64>() / layout.node_count() as f64,
+        ];
+        let radius = layout
+            .positions()
+            .iter()
+            .map(|p| (p[0] - centroid[0]).hypot(p[1] - centroid[1]))
+            .sum::<f64>()
+            / layout.node_count() as f64;
+        assert!(
+            stats.mean_displacement <= PROGRESS_STALL_FRACTION * radius,
+            "frozen at mean_disp {:.3e} with radius {:.3e}",
+            stats.mean_displacement,
+            radius
+        );
+    }
+
+    #[test]
+    fn waking_clears_the_stall_latch() {
+        // A stall-frozen layout must step again after a topology change
+        // (D15: wake on topology change) — the latch clears with the rest
+        // of the adaptive state.
+        let params = LayoutParams {
+            convergence_epsilon: 1.0e-3,
+            convergence_steps: 2,
+            ..LayoutParams::default()
+        };
+        let pool = pool(2);
+        let mut model = GraphModel::new();
+        model.apply(
+            &(0..12)
+                .map(|i| Delta::Node(NodeDelta::Added { id: note(i) }))
+                .collect::<Vec<_>>(),
+        );
+        model.apply(
+            &(1..12)
+                .map(|i| {
+                    Delta::Edge(EdgeDelta::Added {
+                        from: note(0),
+                        to: note(i),
+                        kind: EdgeKind::Link,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut layout = Layout::from_snapshot(&model.snapshot(), params);
+        let mut froze = false;
+        for _ in 0..5_000u64 {
+            if layout.step(&pool).stats.frozen {
+                froze = true;
+                break;
+            }
+        }
+        assert!(froze, "the ring must stall-freeze first");
+
+        model.apply(&[
+            Delta::Node(NodeDelta::Added { id: note(99) }),
+            Delta::Edge(EdgeDelta::Added {
+                from: note(0),
+                to: note(99),
+                kind: EdgeKind::Link,
+            }),
+        ]);
+        layout.retarget(&model.snapshot());
+        assert!(!layout.is_converged(), "a wake must clear the stall latch");
+        let moved = run(&mut layout, &pool, 5);
+        assert!(moved.max_displacement > 0.0, "the woken layout moves");
+        // And it settles again: the stall detector still works after a wake.
+        let mut refroze = false;
+        for _ in 0..5_000u64 {
+            if layout.step(&pool).stats.frozen {
+                refroze = true;
+                break;
+            }
+        }
+        assert!(refroze, "the woken ring must stall-freeze again");
+    }
 
     #[test]
     fn a_layout_terminates_and_stays_bounded_on_a_hub_heavy_graph() {
@@ -1852,7 +2054,7 @@ mod tests {
             // Faster convergence for large graphs
             cooling_rate: 0.1,
             convergence_epsilon: 0.01,
-            convergence_steps: 2,  // Freeze faster
+            convergence_steps: 2, // Freeze faster
             ..LayoutParams::default()
         };
         let mut layout = Layout::from_snapshot(&model.snapshot(), params);

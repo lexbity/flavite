@@ -208,6 +208,12 @@ impl PositionBuffer {
     /// The positions must be dense-indexed by `snapshot` — the debug assert
     /// in [`PositionFrame::new`] checks it, so a mismatched pair cannot be
     /// published even by mistake.
+    ///
+    /// The frame is swapped into place *before* the generation counter
+    /// moves: a reader that observes `generation() == n` therefore knows
+    /// frame `n` is already loadable, and never a change that is not yet
+    /// visible. The buffer is single-writer (the layout thread), so
+    /// load-increment-store keeps the generations unique and monotone.
     #[must_use]
     pub fn store(
         &self,
@@ -215,10 +221,11 @@ impl PositionBuffer {
         positions: Vec<[f32; 2]>,
         state: LayoutState,
     ) -> u64 {
-        let generation = self.published.fetch_add(1, Ordering::AcqRel) + 1;
+        let generation = self.published.load(Ordering::Relaxed) + 1;
         let topology_version = snapshot.topology_version;
         let frame = PositionFrame::new(positions, snapshot, topology_version, generation, state);
         self.frame.store(Arc::new(frame));
+        self.published.store(generation, Ordering::Release);
         generation
     }
 
@@ -227,10 +234,11 @@ impl PositionBuffer {
     ///
     /// Used on a pause or a caught panic: the state must change but the
     /// positions must not — and re-publishing the *same* `Arc` rather than a
-    /// copy keeps the reader's frame identity stable.
+    /// copy keeps the reader's frame identity stable. See [`Self::store`]
+    /// for the frame-then-counter publication order.
     #[must_use]
     pub fn mark(&self, state: LayoutState) -> u64 {
-        let generation = self.published.fetch_add(1, Ordering::AcqRel) + 1;
+        let generation = self.published.load(Ordering::Relaxed) + 1;
         let current = self.frame.load_full();
         let frame = PositionFrame::new(
             current.positions.clone(),
@@ -240,6 +248,7 @@ impl PositionBuffer {
             state,
         );
         self.frame.store(Arc::new(frame));
+        self.published.store(generation, Ordering::Release);
         generation
     }
 

@@ -242,32 +242,103 @@ impl GraphModel {
     /// positions in `node_ids` (sorted by [`NodeId`]). Position/node-id
     /// mappings from different topology versions may never be combined
     /// (§4.14 — discard stale layout results on a version change).
+    ///
+    /// The CSR arrays are built in flat `O(n + m)` passes: the in-rows by
+    /// counting sort (sources iterate in dense order, so every in-row comes
+    /// out sorted with no per-node sort), and the symmetrized union by a
+    /// merge of the two sorted rows. The earlier per-node `Vec` buckets
+    /// allocated one `Vec` per node — 50 000 allocations on the AC-16 path.
     #[must_use]
     pub fn snapshot(&self) -> GraphSnapshot {
         let n = self.node_ids.len();
-        // In-neighbor buckets (dense), built from the out-CSR.
-        let mut in_lists: Vec<Vec<u32>> = vec![Vec::new(); n];
-        for (src, w) in self.offsets.windows(2).enumerate() {
-            let (start, end) = (w[0] as usize, w[1] as usize);
-            for &dst in &self.indices[start..end] {
-                in_lists[dst as usize].push(count_u32(src));
+        let edge_rows = self.indices.len();
+
+        // In-rows by counting sort: for a fixed target, sources land in
+        // ascending dense order because sources iterate in dense order.
+        let mut in_offsets = vec![0_u32; n + 1];
+        for &dst in &self.indices {
+            in_offsets[dst as usize + 1] += 1;
+        }
+        for i in 0..n {
+            in_offsets[i + 1] += in_offsets[i];
+        }
+        let mut in_indices = vec![0_u32; edge_rows];
+        {
+            let mut cursor: Vec<u32> = in_offsets[..n].to_vec();
+            for (source, window) in self.offsets.windows(2).enumerate() {
+                let (start, end) = (window[0] as usize, window[1] as usize);
+                for &dst in &self.indices[start..end] {
+                    let row = cursor[dst as usize] as usize;
+                    in_indices[row] = count_u32(source);
+                    cursor[dst as usize] += 1;
+                }
             }
         }
-        let mut degrees = Vec::with_capacity(n);
+
+        // Row size of the symmetrized union (out ∪ in, deduped) — a stamp
+        // walk over both rows, so a self-loop (present in both) counts once.
+        let mut row_len = vec![0_u32; n];
+        {
+            let mut seen = vec![u32::MAX; n];
+            for i in 0..n {
+                let stamp = count_u32(i);
+                let out_row = &self.indices[self.offsets[i] as usize..self.offsets[i + 1] as usize];
+                let in_row = &in_indices[in_offsets[i] as usize..in_offsets[i + 1] as usize];
+                let mut len = 0_u32;
+                for &neighbor in out_row.iter().chain(in_row.iter()) {
+                    let slot = neighbor as usize;
+                    if seen[slot] != stamp {
+                        seen[slot] = stamp;
+                        len += 1;
+                    }
+                }
+                row_len[i] = len;
+            }
+        }
         let mut adj_offsets = Vec::with_capacity(n + 1);
-        let mut adj_indices = Vec::with_capacity(self.indices.len().saturating_mul(2));
+        let mut total = 0_usize;
         adj_offsets.push(0);
-        for (src, w) in self.offsets.windows(2).enumerate() {
-            let (start, end) = (w[0] as usize, w[1] as usize);
-            degrees.push(self.in_degree[src] + (w[1] - w[0]));
-            // Symmetrized adjacency: out-targets ∪ in-sources, sorted and
-            // deduped — the layout worker's neighbor lists (D15).
-            let mut neighbors = self.indices[start..end].to_vec();
-            neighbors.extend_from_slice(&in_lists[src]);
-            neighbors.sort_unstable();
-            neighbors.dedup();
-            adj_indices.append(&mut neighbors);
-            adj_offsets.push(count_u32(adj_indices.len()));
+        for &len in &row_len {
+            total += len as usize;
+            adj_offsets.push(count_u32(total));
+        }
+
+        // Fill by merging the two sorted rows, dropping duplicates: a
+        // self-loop sits in both rows, and parallel kinds (`Link` + `Embed`
+        // on one pair) duplicate a target within the out-row. Both rows are
+        // sorted, so the merge is the dedup — no per-node sort.
+        let mut adj_indices = vec![0_u32; total];
+        {
+            let mut write = 0_usize;
+            for i in 0..n {
+                let out_row = &self.indices[self.offsets[i] as usize..self.offsets[i + 1] as usize];
+                let in_row = &in_indices[in_offsets[i] as usize..in_offsets[i + 1] as usize];
+                let (mut a, mut b) = (0, 0);
+                let mut last: Option<u32> = None;
+                while a < out_row.len() || b < in_row.len() {
+                    let next =
+                        if b >= in_row.len() || (a < out_row.len() && out_row[a] <= in_row[b]) {
+                            let value = out_row[a];
+                            a += 1;
+                            value
+                        } else {
+                            let value = in_row[b];
+                            b += 1;
+                            value
+                        };
+                    if last != Some(next) {
+                        adj_indices[write] = next;
+                        write += 1;
+                        last = Some(next);
+                    }
+                }
+            }
+            debug_assert_eq!(write, total, "union merge wrote every row");
+        }
+
+        let mut degrees = Vec::with_capacity(n);
+        for (i, window) in self.offsets.windows(2).enumerate() {
+            degrees.push(self.in_degree[i] + (window[1] - window[0]));
         }
         GraphSnapshot {
             topology_version: self.topology_version,
@@ -387,6 +458,78 @@ impl GraphSnapshot {
     #[must_use]
     pub fn node_index(&self, id: NodeId) -> Option<u32> {
         self.node_ids.binary_search(&id).ok().map(count_u32)
+    }
+
+    /// Check the CSR invariants every consumer relies on.
+    ///
+    /// A snapshot is plain data and can arrive malformed — hand-built, or
+    /// produced by anything other than [`GraphModel::snapshot`]. This
+    /// checks the structural contract: parallel arrays have one entry per
+    /// node, both CSR offset arrays are monotone with length `n + 1` and
+    /// end exactly at their target arrays' length, and every dense index
+    /// is in range. The layout worker runs this at its boundary (§4.2:
+    /// nothing a caller can send unwinds into the UI); a snapshot produced
+    /// by the model always passes.
+    ///
+    /// [`GraphModel::snapshot`]: GraphModel::snapshot
+    pub fn validate(&self) -> Result<(), String> {
+        let n = self.node_count();
+        if self.node_kinds.len() != n {
+            return Err(format!(
+                "node_kinds has {} entries for {n} nodes",
+                self.node_kinds.len()
+            ));
+        }
+        if self.degrees.len() != n {
+            return Err(format!(
+                "degrees has {} entries for {n} nodes",
+                self.degrees.len()
+            ));
+        }
+        for (name, offsets, targets) in [
+            ("out_offsets", &self.out_offsets, self.out_indices.len()),
+            ("adj_offsets", &self.adj_offsets, self.adj_indices.len()),
+        ] {
+            if offsets.len() != n + 1 {
+                return Err(format!(
+                    "{name} has {} entries, expected {n} + 1",
+                    offsets.len()
+                ));
+            }
+            if offsets.first() != Some(&0) {
+                return Err(format!("{name} must start at 0"));
+            }
+            if let Some(bad) = offsets.windows(2).position(|window| window[1] < window[0]) {
+                return Err(format!("{name} is not monotone at row {bad}"));
+            }
+            let last = offsets.last().copied().unwrap_or(0) as usize;
+            if last != targets {
+                return Err(format!(
+                    "{name} ends at {last}, but its target array holds {targets} entries"
+                ));
+            }
+        }
+        if let Some(bad) = self
+            .out_indices
+            .iter()
+            .position(|&index| index as usize >= n)
+        {
+            return Err(format!(
+                "out_indices[{bad}] = {} is out of range",
+                self.out_indices[bad]
+            ));
+        }
+        if let Some(bad) = self
+            .adj_indices
+            .iter()
+            .position(|&index| index as usize >= n)
+        {
+            return Err(format!(
+                "adj_indices[{bad}] = {} is out of range",
+                self.adj_indices[bad]
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -728,6 +871,61 @@ mod tests {
         assert_send_sync::<GraphModel>();
         assert_send_sync::<GraphSnapshot>();
         assert_send_sync::<SpatialGrid>();
+    }
+
+    #[test]
+    fn validate_accepts_model_snapshots_and_rejects_corruption() {
+        // Every snapshot the model produces is valid by construction.
+        let mut model = GraphModel::new();
+        model.apply(&[
+            add(note(1)),
+            add(note(2)),
+            add(note(3)),
+            link(note(1), note(2)),
+            link(note(2), note(3)),
+            link(note(3), note(3)),
+        ]);
+        let snap = model.snapshot();
+        assert_eq!(snap.validate(), Ok(()));
+        let empty = GraphModel::new().snapshot();
+        assert_eq!(empty.validate(), Ok(()));
+
+        // degrees truncated.
+        let mut corrupt = snap.clone();
+        corrupt.degrees = Vec::new();
+        assert!(corrupt.validate().is_err(), "truncated degrees rejected");
+
+        // adjacency offsets truncated (the §4.2 test's malformed shape).
+        let mut corrupt = snap.clone();
+        corrupt.adj_offsets = vec![0];
+        assert!(
+            corrupt.validate().is_err(),
+            "truncated adj_offsets rejected"
+        );
+
+        // offsets that do not end at their target array.
+        let mut corrupt = snap.clone();
+        corrupt.out_offsets.push(99);
+        assert!(corrupt.validate().is_err(), "bad out_offsets rejected");
+
+        // non-monotone offsets.
+        let mut corrupt = snap.clone();
+        corrupt.adj_offsets[2] = 0;
+        assert!(corrupt.validate().is_err(), "non-monotone offsets rejected");
+
+        // out-of-range dense indices.
+        let mut corrupt = snap.clone();
+        corrupt.adj_indices[0] = 99;
+        assert!(
+            corrupt.validate().is_err(),
+            "out-of-range adj index rejected"
+        );
+        let mut corrupt = snap;
+        corrupt.out_indices[0] = 99;
+        assert!(
+            corrupt.validate().is_err(),
+            "out-of-range out index rejected"
+        );
     }
 
     #[test]
