@@ -535,6 +535,15 @@ impl Session {
         self.actor.completion_candidates()
     }
 
+    /// Execute a text or hybrid query on the index actor.
+    pub fn search_notes(
+        &self,
+        query: flavite_index::query::Query,
+        limit: usize,
+    ) -> Result<flavite_index::SearchPage, String> {
+        self.actor.search_notes(query, limit)
+    }
+
     /// Process ready worker replies and return every terminal result that has
     /// not yet been presented to the host. This is lossless: completions stay
     /// queued until the host drains them.
@@ -2201,7 +2210,7 @@ mod tests {
 
     #[test]
     fn session_rejects_invalid_lifecycle_operations_and_reports_unavailable_recovery() {
-        let (session, _fs, _temp) = test_session();
+        let (mut session, _fs, _temp) = test_session();
         let path = PathBuf::from("/test/vault/note.md");
         let missing = PathBuf::from("/test/vault/missing.md");
         let never_opened = PathBuf::from("/test/vault/never-opened.md");
@@ -2306,6 +2315,13 @@ mod tests {
             session.execute(SessionCommand::DiscardRecovery { path }),
             SessionResult::Error { .. }
         ));
+        session.recovery_stop.store(true, Ordering::Release);
+        if let Some(worker) = session.recovery_worker.take() {
+            worker.join().unwrap();
+        }
+        session.recovery_writer = None;
+        assert!(session.recovery_tick().is_empty());
+        assert!(session.flush_recovery().is_err());
         assert!(matches!(
             session.wait_for_operation(u64::MAX),
             SessionResult::Error { .. }

@@ -73,6 +73,12 @@ pub enum VaultActorMsg {
     },
     /// Read the indexed title/alias snapshot for editor autocomplete.
     CompletionCandidates { reply: Sender<VaultActorResp> },
+    /// Execute full-text or hybrid search through the index owner.
+    SearchNotes {
+        query: flavite_index::query::Query,
+        limit: usize,
+        reply: Sender<VaultActorResp>,
+    },
     /// Save immutable serialized bytes through the D6 path.
     Save {
         request: SaveRequest,
@@ -119,6 +125,8 @@ pub enum VaultActorResp {
     File(Option<Vec<u8>>),
     /// Indexed note completion candidates.
     CompletionCandidates(Result<Vec<flavite_index::types::CompletionCandidate>, String>),
+    /// Search results from the structural index and Tantivy.
+    SearchNotes(Result<flavite_index::SearchPage, String>),
     /// Save completion after the structural index callback.
     Saved(Result<SaveReceipt, SaveFailure>),
     /// Durable history snapshot record.
@@ -235,6 +243,27 @@ impl VaultActorHandle {
             VaultActorResp::CompletionCandidates(result) => result,
             VaultActorResp::Error(error) => Err(error),
             _ => Err("unexpected completion-candidate response".to_owned()),
+        }
+    }
+
+    /// Execute a text or hybrid search on the actor that owns Tantivy.
+    pub fn search_notes(
+        &self,
+        query: flavite_index::query::Query,
+        limit: usize,
+    ) -> Result<flavite_index::SearchPage, String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::SearchNotes {
+                query,
+                limit,
+                reply,
+            })
+            .map_err(|error| error.to_string())?;
+        match response.recv().map_err(|error| error.to_string())? {
+            VaultActorResp::SearchNotes(result) => result,
+            VaultActorResp::Error(error) => Err(error),
+            _ => Err("unexpected search response".to_owned()),
         }
     }
 
@@ -500,7 +529,12 @@ impl VaultActor {
                             last_focus = Some(std::time::Instant::now());
                         }
                     }
-                    Ok(msg) => self.handle_message(msg),
+                    Ok(msg) => {
+                        self.handle_message(msg);
+                        if let Err(error) = self.index.commit_search_if_due(false) {
+                            tracing::error!(%error, "deferred Tantivy commit failed");
+                        }
+                    }
                     Err(_) => { info!("VaultActor channel disconnected, shutting down"); break; }
                 },
                 recv(event_receiver) -> event => if let Ok(event) = event { watcher.notify(event); },
@@ -513,6 +547,9 @@ impl VaultActor {
                             self.publish_reconcile(summary, None);
                         }
                     }
+                    if let Err(error) = self.index.commit_search_if_due(false) {
+                        tracing::error!(%error, "deferred Tantivy commit failed");
+                    }
                     if last_verification.elapsed() >= self.verification_interval {
                         self.handle_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent, None);
                         last_verification = std::time::Instant::now();
@@ -523,6 +560,9 @@ impl VaultActor {
 
         if let Some(watcher) = fs_watcher.as_mut() {
             watcher.shutdown();
+        }
+        if let Err(error) = self.index.commit_search_if_due(true) {
+            tracing::error!(%error, "final Tantivy commit failed");
         }
 
         is_running.store(false, Ordering::SeqCst);
@@ -552,6 +592,9 @@ impl VaultActor {
                     .try_send(VaultActorResp::Identity(self.identity.clone()));
             }
             VaultActorMsg::Shutdown => {
+                if let Err(error) = self.index.commit_search_if_due(true) {
+                    tracing::error!(%error, "shutdown Tantivy commit failed");
+                }
                 let _ = self.resp_sender.try_send(VaultActorResp::Ack);
                 // Shutdown will happen when the channel is dropped
             }
@@ -566,6 +609,14 @@ impl VaultActor {
             VaultActorMsg::CompletionCandidates { reply } => {
                 let response =
                     VaultActorResp::CompletionCandidates(self.index.completion_candidates());
+                let _ = reply.try_send(response);
+            }
+            VaultActorMsg::SearchNotes {
+                query,
+                limit,
+                reply,
+            } => {
+                let response = VaultActorResp::SearchNotes(self.index.search_notes(&query, limit));
                 let _ = reply.try_send(response);
             }
             VaultActorMsg::Save { request, reply } => self.handle_save(request, reply),
@@ -731,7 +782,11 @@ impl VaultActor {
         self.publish_reconcile(summary, reply);
     }
 
-    fn publish_reconcile(&self, summary: ReconcileSummary, reply: Option<Sender<VaultActorResp>>) {
+    fn publish_reconcile(
+        &mut self,
+        summary: ReconcileSummary,
+        reply: Option<Sender<VaultActorResp>>,
+    ) {
         let version = Version::new(self.epoch, self.generation);
         if let Some(pulse) = &self.pulse_sender {
             let _ = pulse.try_send(Pulse::VaultChanged {
@@ -741,6 +796,9 @@ impl VaultActor {
             });
         }
 
+        if let Err(error) = self.index.commit_search_if_due(true) {
+            tracing::error!(%error, "post-reconcile Tantivy commit failed");
+        }
         let response = VaultActorResp::ReconcileComplete { summary, version };
         if let Some(reply) = reply {
             let _ = reply.send(response);

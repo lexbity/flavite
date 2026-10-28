@@ -856,9 +856,35 @@ impl Flavite {
 
     /// Query the index.
     ///
-    /// Note: This will be fully implemented when flavite-index is available.
-    pub fn query(&self, _query: &crate::Query) -> Result<QueryResult, FlaviteError> {
-        Err(FlaviteError::NotImplemented("query".to_string()))
+    /// Query the structural index and Tantivy search view.
+    pub fn query(&self, query: &crate::Query) -> Result<QueryResult, FlaviteError> {
+        self.query_with_limit(query, 100)
+    }
+
+    /// Query the index with an explicit result limit.
+    pub fn query_with_limit(
+        &self,
+        query: &crate::Query,
+        limit: usize,
+    ) -> Result<QueryResult, FlaviteError> {
+        let page = self
+            .session
+            .search_notes(query.clone(), limit.saturating_add(1))
+            .map_err(FlaviteError::IndexError)?;
+        let has_more = page.items.len() > limit;
+        let rows = page.items.into_iter().take(limit);
+        Ok(QueryResult {
+            notes: rows
+                .map(|(note_id, path, title)| NoteResult {
+                    note_id,
+                    path,
+                    title,
+                })
+                .collect(),
+            epoch: page.epoch,
+            generation: page.generation,
+            has_more,
+        })
     }
 }
 
@@ -1131,6 +1157,18 @@ mod tests {
 
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("Test Note"));
+    }
+
+    #[test]
+    fn query_facade_searches_notes_indexed_during_vault_open() {
+        let (flavite, _root, _temp) = test_flavite();
+        let page = flavite
+            .query_with_limit(&crate::Query::Text("hello".into()), 10)
+            .unwrap();
+        assert_eq!(page.notes.len(), 1);
+        assert_eq!(page.notes[0].path, "note.md");
+        assert_eq!(page.generation, 1);
+        assert!(!page.has_more);
     }
 
     #[test]

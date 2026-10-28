@@ -199,7 +199,13 @@ pub struct DoctorChecker {
 
 impl DoctorChecker {
     #[must_use]
-    pub fn new(vault: ApiVaultRef) -> Self {
+    pub fn new(mut vault: ApiVaultRef) -> Self {
+        // The vault file is authoritative. This also lets lightweight callers
+        // such as the CLI recover the actual cache key without opening a
+        // writing Session or acquiring the single-instance lock.
+        if let Ok(Some(uuid)) = flavite_vault::identity::read_vault_toml(&vault.root) {
+            vault.uuid = uuid;
+        }
         let db = cache_db_path(vault.uuid);
         Self { vault, db }
     }
@@ -209,11 +215,51 @@ impl DoctorChecker {
         Self { vault, db }
     }
 
+    /// Check Tantivy generation matches SQLite.
+    fn check_tantivy_generation(&self) -> DoctorCheck {
+        if !self.db.exists() {
+            return DoctorCheck::warn(
+                "tantivy_generation",
+                "Tantivy generation matches SQLite",
+                "search index has not been built yet",
+            );
+        }
+        let result = (|| -> rusqlite::Result<(String, String)> {
+            let conn = rusqlite::Connection::open_with_flags(
+                &self.db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let get = |key: &str| {
+                conn.query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
+                    row.get::<_, String>(0)
+                })
+            };
+            Ok((get("generation")?, get("tantivy_committed_generation")?))
+        })();
+        match result {
+            Ok((generation, committed)) if generation == committed => DoctorCheck::ok(
+                "tantivy_generation",
+                format!("Tantivy generation {committed} matches SQLite generation {generation}"),
+            ),
+            Ok((generation, committed)) => DoctorCheck::warn(
+                "tantivy_generation",
+                "Tantivy search view is behind or ahead of SQLite",
+                format!("SQLite generation={generation}, Tantivy committed_generation={committed}"),
+            ),
+            Err(error) => DoctorCheck::warn(
+                "tantivy_generation",
+                "Could not read Tantivy generation metadata",
+                error.to_string(),
+            ),
+        }
+    }
+
     /// Run checks against the opened vault and its read-only cache.
     pub fn run(&self) -> DoctorReport {
         let mut report = DoctorReport::new(self.vault.clone());
         let conn = Connection::open_with_flags(&self.db, OpenFlags::SQLITE_OPEN_READ_ONLY).ok();
         report.add_check(sqlite_check(conn.as_ref(), &self.db));
+        report.add_check(self.check_tantivy_generation());
         if !self.db.exists() {
             report.add_check(DoctorCheck::ok(
                 "broken_links",
