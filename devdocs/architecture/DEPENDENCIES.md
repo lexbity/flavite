@@ -49,7 +49,13 @@ Normal/build:
 
 ### `flavite-editor`
 
-No dependencies.
+Normal/build:
+
+- `cosmic-text` (normal)
+- `flavite-api` (normal)
+- `flavite-buffer` (normal)
+- `flavite-syntax` (normal)
+- `iced` (normal)
 
 ### `flavite-fs`
 
@@ -125,8 +131,8 @@ Normal/build:
 ## First-party external dependencies
 
 - `blake3` ← flavite-buffer, flavite-fs, flavite-index, flavite-vault, xtask
-- `cosmic-text` ← xtask
-- `iced` ← flavite-ui, xtask
+- `cosmic-text` ← flavite-editor, xtask
+- `iced` ← flavite-editor, flavite-ui, xtask
 - `notify` ← flavite-fs, flavite-fs, xtask
 - `pulldown-cmark` ← flavite-index, flavite-syntax
 - `ropey` ← flavite-buffer

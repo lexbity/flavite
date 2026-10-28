@@ -26,19 +26,14 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 
 # Serialization (for doctor --json)
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # UUID
 uuid = { version = "1", features = ["v4"] }
 
 # Filesystem
-walkdir = "2"
-directories = "5"
 
 # Time handling (for doctor timestamps)
-chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 # Testing utilities
-tempfile = "3"

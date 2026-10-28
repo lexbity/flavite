@@ -17,7 +17,6 @@ flavite-buffer = { path = "../flavite-buffer" }
 # error type (`graph::instance::GeometryError`).
 thiserror = { workspace = true }
 # serde for serialization in card content
-serde = { workspace = true }
 
 [dev-dependencies]
 # Headless wgpu validation tests drive wgpu's async device/adapter futures.

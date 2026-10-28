@@ -682,7 +682,7 @@ mod tests {
         for id in 1..=2 {
             conn.execute(
                 "INSERT INTO notes (note_id, path, path_native, path_key, stem_key, title, content_hash, size, mtime_ns, scan_ns, generation) VALUES (?1, '', ?2, '', '', '', X'00', 0, 0, 0, 0)",
-                rusqlite::params![id, vec![u8::try_from(id).unwrap()]],
+                rusqlite::params![id, vec![u8::try_from(id).expect("fixture IDs fit in a byte")]],
             ).unwrap();
         }
         let query = Query::Not(Box::new(Query::Unresolved));

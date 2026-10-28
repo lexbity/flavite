@@ -38,4 +38,3 @@ flavite-fs = { path = "../flavite-fs" }
 [dev-dependencies]
 # For tests
 tempfile = "3"
-proptest = "1"

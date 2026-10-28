@@ -1223,7 +1223,6 @@ dependencies = [
  "flavite-syntax",
  "flavite-vault",
  "hex",
- "proptest",
  "serde",
  "serde_json",
  "tempfile",
@@ -1248,22 +1247,25 @@ name = "flavite-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
  "clap",
- "directories",
  "flavite-api",
- "serde",
  "serde_json",
- "tempfile",
  "tracing",
  "tracing-subscriber",
  "uuid",
- "walkdir",
 ]
 
 [[package]]
 name = "flavite-editor"
 version = "0.1.0"
+dependencies = [
+ "cosmic-text",
+ "flavite-api",
+ "flavite-buffer",
+ "flavite-syntax",
+ "iced",
+ "unicode-segmentation",
+]
 
 [[package]]
 name = "flavite-fs"
@@ -1325,7 +1327,6 @@ dependencies = [
  "futures",
  "iced",
  "naga",
- "serde",
  "thiserror 2.0.21",
 ]
 
@@ -1878,6 +1879,7 @@ dependencies = [
  "iced_core",
  "log",
  "rustc-hash 2.1.3",
+ "tokio",
  "wasm-bindgen-futures",
  "wasmtimer",
 ]

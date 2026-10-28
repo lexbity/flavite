@@ -13,7 +13,7 @@
 //!   [`CARD_ZOOM_THRESHOLD`] (2.0× by default — D15's "zoomed in" regime).
 //! - **Card cap**: at most 64 real widgets (D15).
 //! - **Text re-layout**: text is re-laid-out at the scaled font size,
-//!   quantized to [`SCALE_STEP_BASE`] increments, cached per step.
+//!   quantized to [`super::zoomable::SCALE_STEP_BASE`] increments, cached per step.
 //! - **Edit flow**: card edits route through `Lattice` → Session commands
 //!   with buffer identity/revision guards. Indexed task spans carry source
 //!   content hash; Session validates before applying (§4.5.2, D7).

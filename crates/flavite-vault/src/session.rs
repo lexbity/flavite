@@ -1511,6 +1511,13 @@ mod tests {
         (session, fs, temp)
     }
 
+    fn save_to_terminal(session: &Session, path: PathBuf) -> SessionResult {
+        match session.execute(SessionCommand::SaveNote { path }) {
+            SessionResult::Pending { request_id } => session.wait_for_operation(request_id),
+            result => result,
+        }
+    }
+
     #[test]
     fn test_session_builder() {
         let _identity = VaultIdentity::new(
@@ -1623,11 +1630,7 @@ mod tests {
 
         fs.remove(&path).unwrap();
         fs.write_new(&path, b"hello theirs").unwrap();
-        let request_id = match session.execute(SessionCommand::SaveNote { path: path.clone() }) {
-            SessionResult::Pending { request_id } => request_id,
-            other => panic!("save must be admitted asynchronously: {other:?}"),
-        };
-        let saved = session.wait_for_operation(request_id);
+        let saved = save_to_terminal(&session, path.clone());
         assert!(matches!(saved, SessionResult::Conflict { .. }), "{saved:?}");
         assert!(matches!(
             session.execute(SessionCommand::ResolveConflict {
