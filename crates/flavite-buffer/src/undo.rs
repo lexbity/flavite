@@ -286,18 +286,35 @@ impl UndoTree {
     ///
     /// Returns the new revision.
     pub fn apply(&mut self, edit: EditOp, snapshot: TextSnapshot) -> Revision {
+        self.apply_with_coalescing(edit, snapshot, true)
+    }
+
+    /// Apply a distinct operation that must start a new undo-tree node.
+    /// Destructive conflict resolutions use this so a merge cannot coalesce
+    /// into nearby typing and lose its independent undo boundary.
+    pub fn apply_boundary(&mut self, edit: EditOp, snapshot: TextSnapshot) -> Revision {
+        self.apply_with_coalescing(edit, snapshot, false)
+    }
+
+    fn apply_with_coalescing(
+        &mut self,
+        edit: EditOp,
+        snapshot: TextSnapshot,
+        allow_coalescing: bool,
+    ) -> Revision {
         let current_id = self.current_id;
         // First, check if we should coalesce
-        let should_coalesce = if let Some(current) = self.nodes.get(current_id as usize) {
-            if let Some(current_edit) = &current.edit {
-                current_edit.can_coalesce(&edit)
-                    && current.timestamp.elapsed() < self.coalesce_window
+        let should_coalesce = allow_coalescing
+            && if let Some(current) = self.nodes.get(current_id as usize) {
+                if let Some(current_edit) = &current.edit {
+                    current_edit.can_coalesce(&edit)
+                        && current.timestamp.elapsed() < self.coalesce_window
+                } else {
+                    false
+                }
             } else {
                 false
-            }
-        } else {
-            false
-        };
+            };
         if should_coalesce {
             // Coalesce with current node - update the snapshot
             if let Some(node) = self.nodes.get_mut(current_id as usize)

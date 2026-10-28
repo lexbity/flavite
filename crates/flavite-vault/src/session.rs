@@ -20,14 +20,32 @@ use flavite_buffer::manager::{BufferManager, BufferStateChanged};
 use flavite_buffer::recovery::{RecoveryConfig, RecoveryWriter};
 use flavite_buffer::revision::{BufferId, Revision};
 use flavite_buffer::undo::EditOp;
-use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
+
+const MAX_PENDING_SAVE_OPERATIONS: usize = 4096;
+
+#[derive(Debug)]
+struct SaveFlight {
+    request: SaveRequest,
+    response: crossbeam::channel::Receiver<crate::actor::VaultActorResp>,
+    queued: Option<SaveRequest>,
+}
+
+/// Terminal result for an admitted asynchronous Session operation.
+#[derive(Debug, Clone)]
+pub struct OperationCompletion {
+    /// Request ID returned by the initial Pending result.
+    pub request_id: u64,
+    /// The operation's terminal result.
+    pub result: SessionResult,
+}
 
 /// Commands that can be executed by the Session.
 #[derive(Debug, Clone)]
@@ -41,6 +59,15 @@ pub enum SessionCommand {
         buffer_id: BufferId,
         revision: Revision,
         ops: Vec<EditOp>,
+    },
+    /// Apply a user-reviewed three-way merge to the exact buffer and disk
+    /// versions represented by its preview.
+    ApplyMerge {
+        path: PathBuf,
+        buffer_id: BufferId,
+        revision: Revision,
+        disk_hash: [u8; 32],
+        merged_bytes: Vec<u8>,
     },
     /// Save a note.
     SaveNote { path: PathBuf },
@@ -84,6 +111,8 @@ pub enum SessionResult {
     Success(CommandResult),
     /// Command is pending.
     Pending { request_id: u64 },
+    /// An admitted save was replaced by a later request for the same buffer.
+    Superseded { request_id: u64, by_request: u64 },
     /// Command failed.
     Error { message: String },
     /// Buffer is in conflict state.
@@ -92,6 +121,9 @@ pub enum SessionResult {
     /// are inserted into note content.
     MergeReady {
         path: PathBuf,
+        buffer_id: BufferId,
+        revision: Revision,
+        disk_hash: [u8; 32],
         result: crate::merge::MergeResult,
     },
     /// Action required from user.
@@ -205,6 +237,10 @@ pub struct Session {
     request_counter: AtomicU64,
     /// Pending operations.
     pending: Arc<Mutex<HashMap<u64, SessionResult>>>,
+    /// One active save and at most one coalesced successor per buffer.
+    save_flights: Mutex<HashMap<u64, SaveFlight>>,
+    /// Lossless terminal results. Admission is bounded by the pending-save cap.
+    completions: Mutex<VecDeque<OperationCompletion>>,
     /// Write token manager.
     token_manager: WriteTokenManager,
     /// Pulse channel.
@@ -288,6 +324,8 @@ impl Session {
             recovery_stop,
             request_counter: AtomicU64::new(0),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            save_flights: Mutex::new(HashMap::new()),
+            completions: Mutex::new(VecDeque::new()),
             token_manager: WriteTokenManager::new(),
             pulse,
             notice,
@@ -311,6 +349,13 @@ impl Session {
                 revision,
                 ops,
             } => self.apply_edits(buffer_id, revision, ops),
+            SessionCommand::ApplyMerge {
+                path,
+                buffer_id,
+                revision,
+                disk_hash,
+                merged_bytes,
+            } => self.apply_merge(path, buffer_id, revision, disk_hash, merged_bytes),
             SessionCommand::SaveNote { path } => self.save_note(path),
             SessionCommand::Reconcile { scope, mode } => self.reconcile(scope, mode),
             SessionCommand::Undo { buffer_id } => self.undo(buffer_id),
@@ -320,6 +365,231 @@ impl Session {
             }
             SessionCommand::RestoreRecovery { path } => self.restore_recovery(path),
             SessionCommand::DiscardRecovery { path } => self.discard_recovery(path),
+        }
+    }
+
+    /// Process ready worker replies and return every terminal result that has
+    /// not yet been presented to the host. This is lossless: completions stay
+    /// queued until the host drains them.
+    pub fn drain_operation_completions(&self) -> Vec<OperationCompletion> {
+        self.pump_save_completions();
+        self.completions.lock().unwrap().drain(..).collect()
+    }
+
+    /// CLI/headless convenience for commands that promise a disk mutation.
+    /// GUI hosts use `drain_operation_completions` from their normal pump.
+    pub fn wait_for_operation(&self, request_id: u64) -> SessionResult {
+        loop {
+            self.pump_save_completions();
+            let completed = {
+                let mut completions = self.completions.lock().unwrap();
+                completions
+                    .iter()
+                    .position(|completion| completion.request_id == request_id)
+                    .map(|position| completions.remove(position).unwrap().result)
+            };
+            if let Some(result) = completed {
+                return result;
+            }
+            let active = self.save_flights.lock().unwrap().values().any(|flight| {
+                flight.request.request_id == request_id
+                    || flight
+                        .queued
+                        .as_ref()
+                        .is_some_and(|request| request.request_id == request_id)
+            });
+            if !active {
+                return SessionResult::Error {
+                    message: format!("unknown or already-drained operation {request_id}"),
+                };
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn pump_save_completions(&self) {
+        let ready = {
+            let mut flights = self.save_flights.lock().unwrap();
+            let ready_ids = flights
+                .iter()
+                .filter_map(|(buffer, flight)| match flight.response.try_recv() {
+                    Ok(response) => Some((*buffer, response)),
+                    Err(crossbeam::channel::TryRecvError::Empty) => None,
+                    Err(crossbeam::channel::TryRecvError::Disconnected) => Some((
+                        *buffer,
+                        crate::actor::VaultActorResp::Error(
+                            "save worker disconnected before returning a terminal result".into(),
+                        ),
+                    )),
+                })
+                .collect::<Vec<_>>();
+            ready_ids
+                .into_iter()
+                .filter_map(|(buffer_id, response)| {
+                    flights
+                        .remove(&buffer_id)
+                        .map(|flight| (buffer_id, flight, response))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (buffer_id, flight, response) in ready {
+            let operation_result = self.finish_save(&flight.request, &response);
+            self.completions
+                .lock()
+                .unwrap()
+                .push_back(OperationCompletion {
+                    request_id: flight.request.request_id,
+                    result: operation_result,
+                });
+
+            let Some(mut queued) = flight.queued else {
+                continue;
+            };
+            match response {
+                crate::actor::VaultActorResp::Saved(Ok(receipt)) => {
+                    // The first save established a new disk base. Bind the
+                    // queued immutable snapshot to those exact bytes before
+                    // admitting its worker request.
+                    queued.precondition = DiskPrecondition::Existing(receipt.hash);
+                    queued.merge_base = flight.request.bytes.clone();
+                    let buffer_is_live = self
+                        .buffer_manager
+                        .lock()
+                        .unwrap()
+                        .get_buffer_by_id(BufferId::from(buffer_id))
+                        .is_some();
+                    if !buffer_is_live {
+                        self.completions
+                            .lock()
+                            .unwrap()
+                            .push_back(OperationCompletion {
+                                request_id: queued.request_id,
+                                result: SessionResult::Error {
+                                    message: "queued save's buffer was closed before admission"
+                                        .into(),
+                                },
+                            });
+                        continue;
+                    }
+                    match self.actor.submit_save(queued.clone()) {
+                        Ok(response) => {
+                            self.save_flights.lock().unwrap().insert(
+                                buffer_id,
+                                SaveFlight {
+                                    request: queued,
+                                    response,
+                                    queued: None,
+                                },
+                            );
+                        }
+                        Err(error) => {
+                            self.completions
+                                .lock()
+                                .unwrap()
+                                .push_back(OperationCompletion {
+                                    request_id: queued.request_id,
+                                    result: SessionResult::Error {
+                                        message: error.to_string(),
+                                    },
+                                })
+                        }
+                    }
+                }
+                _ => self
+                    .completions
+                    .lock()
+                    .unwrap()
+                    .push_back(OperationCompletion {
+                        request_id: queued.request_id,
+                        result: SessionResult::Error {
+                            message: format!(
+                                "queued save was not admitted because save {} did not complete",
+                                flight.request.request_id
+                            ),
+                        },
+                    }),
+            }
+        }
+    }
+
+    fn finish_save(
+        &self,
+        request: &SaveRequest,
+        response: &crate::actor::VaultActorResp,
+    ) -> SessionResult {
+        let path = request.path.clone();
+        let buffer_id = BufferId::from(request.buffer_id);
+        match response {
+            crate::actor::VaultActorResp::Saved(Ok(receipt)) => {
+                let revision = Revision::new(request.revision);
+                let mut manager = self.buffer_manager.lock().unwrap();
+                if let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) {
+                    buffer.handle_save_completed_revision(revision, &request.bytes);
+                }
+                drop(manager);
+                if let Some(writer) = &self.recovery_writer {
+                    let mut writer = writer.lock().unwrap();
+                    writer.retire_covered(buffer_id, revision);
+                }
+                self.absent_on_open.lock().unwrap().remove(&path);
+                SessionResult::Success(CommandResult::NoteSaved {
+                    path,
+                    hash: receipt.hash.to_vec(),
+                    epoch: Epoch::new(receipt.epoch),
+                    generation: Generation::new(receipt.generation),
+                })
+            }
+            crate::actor::VaultActorResp::Saved(Err(failure)) => {
+                if failure.stage == SaveFailureStage::Compare {
+                    if let Some(buffer) = self
+                        .buffer_manager
+                        .lock()
+                        .unwrap()
+                        .get_buffer_by_id_mut(buffer_id)
+                        && let Some(hash) = failure.current_hash
+                    {
+                        buffer.mark_conflicted_disk_hash(hash);
+                    }
+                    self.notice.send(crate::channels::Notice::Conflict {
+                        note: flavite_buffer::manager::NoteRef::new(path.clone()),
+                    });
+                }
+                if matches!(
+                    failure.outcome,
+                    DurabilityOutcome::ReplacedIndexPending
+                        | DurabilityOutcome::ReplacedDurabilityUncertain
+                        | DurabilityOutcome::OutcomeUnknown
+                ) {
+                    let mut manager = self.buffer_manager.lock().unwrap();
+                    if let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) {
+                        let saved_hash = *blake3::hash(&request.bytes).as_bytes();
+                        if failure.current_hash == Some(saved_hash) {
+                            buffer.record_replaced_disk_snapshot(&request.bytes);
+                        } else if let Some(hash) = failure.current_hash {
+                            buffer.mark_conflicted_disk_hash(hash);
+                        } else {
+                            // No observed hash means replacement outcome
+                            // remains unknown. The old precondition is kept,
+                            // so another save cannot pass compare without a
+                            // fresh worker observation.
+                        }
+                    }
+                    drop(manager);
+                    if failure.current_hash.is_some() {
+                        self.absent_on_open.lock().unwrap().remove(&path);
+                    }
+                }
+                SessionResult::Error {
+                    message: failure.to_string(),
+                }
+            }
+            crate::actor::VaultActorResp::Error(message) => SessionResult::Error {
+                message: message.clone(),
+            },
+            _ => SessionResult::Error {
+                message: "save worker returned an invalid response".into(),
+            },
         }
     }
 
@@ -393,6 +663,29 @@ impl Session {
         };
 
         if let Some(_buffer_id) = buffer_id {
+            if self
+                .save_flights
+                .lock()
+                .unwrap()
+                .contains_key(&_buffer_id.as_u64())
+            {
+                return SessionResult::ActionRequired {
+                    code: "save-pending",
+                    data: Some(path.display().to_string()),
+                };
+            }
+            let dirty = self
+                .buffer_manager
+                .lock()
+                .unwrap()
+                .get_buffer_by_id(_buffer_id)
+                .is_some_and(|buffer| buffer.is_dirty());
+            if dirty {
+                return SessionResult::ActionRequired {
+                    code: "dirty-buffer-close",
+                    data: Some(path.display().to_string()),
+                };
+            }
             // Close the buffer
             let mut buffer_manager = self.buffer_manager.lock().unwrap();
             buffer_manager.close_note(&path);
@@ -434,11 +727,13 @@ impl Session {
                 };
             }
 
-            // Apply all edit ops
-            let mut new_revision = revision;
-            for op in ops {
-                new_revision = buffer.model_mut().apply_edit_op(op);
-            }
+            // Validate the command once and apply all positions as one
+            // authoritative Buffer transition/undo unit.
+            let Some((new_revision, _)) = buffer.apply_local_edits(&ops) else {
+                return SessionResult::Error {
+                    message: "edit ranges overlap, are out of bounds, or split UTF-8".into(),
+                };
+            };
 
             SessionResult::Success(CommandResult::EditsApplied {
                 buffer_id,
@@ -453,161 +748,96 @@ impl Session {
 
     /// Save a note.
     fn save_note(&self, path: PathBuf) -> SessionResult {
-        // Check if buffer is open
         let buffer_id = {
             let open_buffers = self.open_buffers.lock().unwrap();
             open_buffers.get(&path).copied()
         };
-
-        if let Some(buffer_id) = buffer_id {
-            let (bytes, revision, base_hash, base_bytes, state) = {
-                let manager = self.buffer_manager.lock().unwrap();
-                if let Some(buffer) = manager.get_buffer_by_id(buffer_id) {
-                    (
-                        buffer.model().to_source_bytes(),
-                        buffer.revision(),
-                        buffer.base_hash(),
-                        buffer.base_bytes().to_vec(),
-                        buffer.state(),
-                    )
-                } else {
-                    return SessionResult::Error {
-                        message: "Buffer not found".into(),
-                    };
-                }
+        let Some(buffer_id) = buffer_id else {
+            return SessionResult::Error {
+                message: "Buffer not found".to_string(),
             };
-            if !state.allows_manual_save() {
-                return SessionResult::Conflict { path };
-            }
-            let precondition = if self.absent_on_open.lock().unwrap().contains(&path) {
-                DiskPrecondition::Absent
-            } else if let Some(hash) = base_hash {
-                DiskPrecondition::Existing(hash.as_bytes())
-            } else {
+        };
+        let (bytes, revision, base_hash, base_bytes, state) = {
+            let manager = self.buffer_manager.lock().unwrap();
+            let Some(buffer) = manager.get_buffer_by_id(buffer_id) else {
                 return SessionResult::Error {
-                    message: "buffer has no disk base; explicit create resolution is required"
-                        .into(),
+                    message: "Buffer not found".into(),
                 };
             };
-            let request_id = self.next_request_id();
-            let request = SaveRequest {
-                request_id,
-                path: path.clone(),
-                note_key: native_note_key(&path, &self.identity.root),
-                bytes: bytes.clone(),
-                precondition,
-                buffer_id: buffer_id.as_u64(),
-                revision: revision.as_u64(),
-            };
-            let note_key = native_note_key(&path, &self.identity.root);
-            if let Err(error) = self
-                .actor
-                .pin_merge_base(note_key.clone(), base_bytes.clone())
-            {
-                return SessionResult::Error {
-                    message: format!("could not persist merge base before save: {error}"),
-                };
-            }
-            match self.actor.save(request) {
-                Ok(Ok(receipt)) => {
-                    let mut manager = self.buffer_manager.lock().unwrap();
-                    let caught_up = if let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) {
-                        let caught_up = buffer.revision() == revision;
-                        buffer.handle_save_completed_revision(revision, &bytes);
-                        caught_up
-                    } else {
-                        false
-                    };
-                    drop(manager);
-                    if let Some(writer) = &self.recovery_writer {
-                        let writer = writer.lock().unwrap();
-                        writer.retire_covered(buffer_id, revision);
-                        if caught_up {
-                            // A recovery produced by a prior process has a
-                            // different BufferId; the note-keyed record is
-                            // still covered by this exact saved revision.
-                            writer.delete_for_note_key(&note_key);
-                        }
-                    }
-                    if self
-                        .actor
-                        .pin_merge_base(note_key.clone(), bytes.clone())
-                        .is_ok()
-                    {
-                        let previous_base_hash = blake3::hash(&base_bytes).to_hex().to_string();
-                        let saved_base_hash = blake3::hash(&bytes).to_hex().to_string();
-                        if previous_base_hash != saved_base_hash {
-                            let _ = self.actor.unpin_merge_base(note_key, previous_base_hash);
-                        }
-                    }
-                    self.absent_on_open.lock().unwrap().remove(&path);
-                    return SessionResult::Success(CommandResult::NoteSaved {
-                        path,
-                        hash: receipt.hash.to_vec(),
-                        epoch: Epoch::new(receipt.epoch),
-                        generation: Generation::new(receipt.generation),
-                    });
-                }
-                Ok(Err(failure)) => {
-                    if failure.stage == SaveFailureStage::Compare
-                        && let Ok(Some(theirs)) = self.actor.read_file(path.clone())
-                    {
-                        if let Some(buffer) = self
-                            .buffer_manager
-                            .lock()
-                            .unwrap()
-                            .get_buffer_by_id_mut(buffer_id)
-                        {
-                            buffer.check_external_change(&theirs);
-                        }
-                        self.notice.send(crate::channels::Notice::Conflict {
-                            note: flavite_buffer::manager::NoteRef::new(path.clone()),
-                        });
-                    }
-                    if matches!(
-                        failure.outcome,
-                        DurabilityOutcome::ReplacedIndexPending
-                            | DurabilityOutcome::ReplacedDurabilityUncertain
-                            | DurabilityOutcome::OutcomeUnknown
-                    ) {
-                        // A post-replace failure has no successful save
-                        // receipt. Re-read the destination before allowing a
-                        // retry so its disk precondition describes the actual
-                        // observed bytes, not the pre-save base. If the read
-                        // itself is unavailable, retain the old precondition;
-                        // the save path will refuse a stale retry by comparing
-                        // against disk again.
-                        if let Ok(Some(observed)) = self.actor.read_file(path.clone()) {
-                            let mut manager = self.buffer_manager.lock().unwrap();
-                            if let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) {
-                                if observed == bytes {
-                                    buffer.record_replaced_disk_snapshot(&observed);
-                                } else {
-                                    // The observed destination no longer
-                                    // contains our staged bytes. Preserve the
-                                    // conflict protocol instead of treating an
-                                    // intervening external write as a new base.
-                                    buffer.check_external_change(&observed);
-                                }
-                            }
-                            drop(manager);
-                            self.absent_on_open.lock().unwrap().remove(&path);
-                        }
-                    }
-                    return SessionResult::Error {
-                        message: failure.to_string(),
-                    };
-                }
-                Err(error) => {
-                    return SessionResult::Error {
-                        message: error.to_string(),
-                    };
-                }
-            }
+            (
+                buffer.model().to_source_bytes(),
+                buffer.revision(),
+                buffer.base_hash(),
+                buffer.base_bytes().to_vec(),
+                buffer.state(),
+            )
+        };
+        if !state.allows_manual_save() {
+            return SessionResult::Conflict { path };
         }
+        let precondition = if self.absent_on_open.lock().unwrap().contains(&path) {
+            DiskPrecondition::Absent
+        } else if let Some(hash) = base_hash {
+            DiskPrecondition::Existing(hash.as_bytes())
+        } else {
+            return SessionResult::Error {
+                message: "buffer has no disk base; explicit create resolution is required".into(),
+            };
+        };
+        let request_id = self.next_request_id();
+        let note_key = native_note_key(&path, &self.identity.root);
+        let request = SaveRequest {
+            request_id,
+            path,
+            note_key,
+            bytes,
+            merge_base: base_bytes,
+            precondition,
+            buffer_id: buffer_id.as_u64(),
+            revision: revision.as_u64(),
+        };
 
-        SessionResult::Error {
-            message: "Buffer not found".to_string(),
+        let mut flights = self.save_flights.lock().unwrap();
+        let outstanding = self.completions.lock().unwrap().len()
+            + flights
+                .values()
+                .map(|flight| 1 + usize::from(flight.queued.is_some()))
+                .sum::<usize>();
+        if outstanding >= MAX_PENDING_SAVE_OPERATIONS {
+            return SessionResult::Error {
+                message: "Busy: save completion queue is at capacity".into(),
+            };
+        }
+        if let Some(flight) = flights.get_mut(&buffer_id.as_u64()) {
+            if let Some(superseded) = flight.queued.replace(request) {
+                self.completions
+                    .lock()
+                    .unwrap()
+                    .push_back(OperationCompletion {
+                        request_id: superseded.request_id,
+                        result: SessionResult::Superseded {
+                            request_id: superseded.request_id,
+                            by_request: request_id,
+                        },
+                    });
+            }
+            return SessionResult::Pending { request_id };
+        }
+        match self.actor.submit_save(request.clone()) {
+            Ok(response) => {
+                flights.insert(
+                    buffer_id.as_u64(),
+                    SaveFlight {
+                        request,
+                        response,
+                        queued: None,
+                    },
+                );
+                SessionResult::Pending { request_id }
+            }
+            Err(error) => SessionResult::Error {
+                message: error.to_string(),
+            },
         }
     }
 
@@ -786,12 +1016,13 @@ impl Session {
                 data: Some(path.display().to_string()),
             };
         };
-        let (base, mine) = {
+        let (base, mine, revision) = {
             let manager = self.buffer_manager.lock().unwrap();
             match manager.get_buffer_by_id(buffer_id) {
                 Some(buffer) => (
                     buffer.base_bytes().to_vec(),
                     buffer.model().to_source_bytes(),
+                    buffer.revision(),
                 ),
                 None => {
                     return SessionResult::Error {
@@ -821,7 +1052,89 @@ impl Session {
         };
         SessionResult::MergeReady {
             path,
+            buffer_id,
+            revision,
+            disk_hash: *blake3::hash(theirs.as_bytes()).as_bytes(),
             result: crate::merge::three_way_merge(base, mine, theirs),
+        }
+    }
+
+    fn apply_merge(
+        &self,
+        path: PathBuf,
+        buffer_id: BufferId,
+        revision: Revision,
+        expected_disk_hash: [u8; 32],
+        merged_bytes: Vec<u8>,
+    ) -> SessionResult {
+        let Some(theirs) = self.actor.read_file(path.clone()).ok().flatten() else {
+            return SessionResult::ActionRequired {
+                code: "file-deleted",
+                data: Some(path.display().to_string()),
+            };
+        };
+        if blake3::hash(&theirs).as_bytes() != &expected_disk_hash {
+            if let Some(buffer) = self
+                .buffer_manager
+                .lock()
+                .unwrap()
+                .get_buffer_by_id_mut(buffer_id)
+            {
+                buffer.mark_conflicted_disk_hash(*blake3::hash(&theirs).as_bytes());
+            }
+            return SessionResult::Conflict { path };
+        }
+        if let Err(error) = self.actor.snapshot_history(
+            native_note_key(&path, &self.identity.root),
+            theirs.clone(),
+            crate::history::HistoryReason::Merge,
+        ) {
+            return SessionResult::Error {
+                message: format!("could not snapshot merge disk input: {error}"),
+            };
+        }
+        let mine = {
+            let manager = self.buffer_manager.lock().unwrap();
+            let Some(buffer) = manager.get_buffer_by_id(buffer_id) else {
+                return SessionResult::Error {
+                    message: "merge preview buffer was closed".into(),
+                };
+            };
+            if buffer.revision() != revision {
+                return SessionResult::Error {
+                    message: "merge preview is stale; prepare a new merge".into(),
+                };
+            }
+            buffer.model().to_source_bytes()
+        };
+        if let Err(error) = self.actor.snapshot_history(
+            native_note_key(&path, &self.identity.root),
+            mine,
+            crate::history::HistoryReason::ConflictResolution,
+        ) {
+            return SessionResult::Error {
+                message: format!("could not snapshot merge buffer: {error}"),
+            };
+        }
+        let mut manager = self.buffer_manager.lock().unwrap();
+        let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
+            return SessionResult::Error {
+                message: "merge preview buffer was closed".into(),
+            };
+        };
+        if buffer.revision() != revision {
+            return SessionResult::Error {
+                message: "merge preview became stale; prepare a new merge".into(),
+            };
+        }
+        match buffer.apply_resolved_merge(&merged_bytes, &theirs) {
+            Some(new_revision) => SessionResult::Success(CommandResult::EditsApplied {
+                buffer_id,
+                new_revision,
+            }),
+            None => SessionResult::Error {
+                message: "merge output is invalid UTF-8 or exceeds the note size limit".into(),
+            },
         }
     }
 
@@ -960,6 +1273,47 @@ impl Session {
         written
     }
 
+    /// Force a durable checkpoint for every dirty buffer before a host exits.
+    /// Returns failures rather than claiming that the timer interval alone
+    /// protects edits made shortly before shutdown.
+    pub fn flush_recovery(&self) -> Result<Vec<PathBuf>, String> {
+        let snapshots = {
+            let manager = self.buffer_manager.lock().unwrap();
+            manager
+                .dirty_buffers()
+                .into_iter()
+                .map(|(path, buffer)| {
+                    (
+                        native_note_key(path, &self.identity.root),
+                        buffer.base_bytes().to_vec(),
+                        flavite_buffer::recovery::RecoveryFile::from_buffer(buffer, 0, false),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        if snapshots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(writer) = &self.recovery_writer else {
+            return Err("local recovery storage is unavailable".into());
+        };
+        let mut written = Vec::with_capacity(snapshots.len());
+        for (key, base, snapshot) in snapshots {
+            self.actor
+                .pin_merge_base(key.clone(), base)
+                .map_err(|error| format!("could not persist recovery merge base: {error}"))?;
+            writer
+                .lock()
+                .unwrap()
+                .write_snapshot_now(&key, snapshot)
+                .ok_or_else(|| {
+                    "could not durably write a dirty-buffer recovery snapshot".to_owned()
+                })
+                .map(|path| written.push(path))?;
+        }
+        Ok(written)
+    }
+
     /// Get the vault identity.
     #[must_use]
     pub fn identity(&self) -> &VaultIdentity {
@@ -1007,6 +1361,9 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if let Err(error) = self.flush_recovery() {
+            tracing::error!(error = %error, "failed to flush dirty buffers during session shutdown");
+        }
         self.recovery_stop.store(true, Ordering::Release);
         if let Some(worker) = self.recovery_worker.take() {
             let _ = worker.join();
@@ -1468,5 +1825,145 @@ mod tests {
                 .state(),
             BufferState::Dirty
         );
+    }
+
+    #[test]
+    fn save_command_is_pending_until_disk_and_index_complete() {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/vault/notes")).unwrap();
+        fs.write_new(Path::new("/vault/notes/a.md"), b"# Base")
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("index.sqlite3");
+        drop(flavite_index::open_or_init(&db_path).unwrap());
+        let index = IndexActor::new(&db_path, 1).unwrap();
+        let identity =
+            VaultIdentity::new(Uuid::now_v7(), PathBuf::from("/vault"), vec![1, 2, 3, 4]);
+        let actor = crate::actor::VaultActorBuilder::new()
+            .with_fs(Box::new(fs.clone()) as Box<dyn Fs + Send + Sync>)
+            .with_identity(identity.clone())
+            .with_index(index)
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        let session = Session::new(
+            identity,
+            actor.clone(),
+            BufferManager::default(),
+            PulseChannel::new(8),
+            NoticeChannel::new(Duration::from_millis(10)),
+            VaultConfig::default(),
+        );
+        let path = PathBuf::from("/vault/notes/a.md");
+        let (buffer_id, revision) =
+            match session.execute(SessionCommand::OpenNote { path: path.clone() }) {
+                SessionResult::Success(CommandResult::NoteOpened {
+                    buffer_id,
+                    revision,
+                }) => (buffer_id, revision),
+                other => panic!("unexpected open result: {other:?}"),
+            };
+        let applied = session.execute(SessionCommand::ApplyEdits {
+            buffer_id,
+            revision,
+            ops: vec![EditOp::new(
+                Span::new(TextByte(6), TextByte(6)),
+                " edited".into(),
+            )],
+        });
+        let new_revision = match applied {
+            SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
+                new_revision
+            }
+            other => panic!("unexpected edit result: {other:?}"),
+        };
+        assert!(new_revision > revision);
+        assert!(matches!(
+            session.execute(SessionCommand::CloseNote { path: path.clone() }),
+            SessionResult::ActionRequired {
+                code: "dirty-buffer-close",
+                ..
+            }
+        ));
+        let request_id = match session.execute(SessionCommand::SaveNote { path: path.clone() }) {
+            SessionResult::Pending { request_id } => request_id,
+            other => panic!("save must be admitted asynchronously: {other:?}"),
+        };
+        assert!(matches!(
+            session.wait_for_operation(request_id),
+            SessionResult::Success(CommandResult::NoteSaved { .. })
+        ));
+        assert_eq!(
+            actor.read_file(path.clone()).unwrap().unwrap(),
+            b"# Base edited"
+        );
+        let current_revision = session
+            .buffer_manager
+            .lock()
+            .unwrap()
+            .get_buffer_by_id(buffer_id)
+            .unwrap()
+            .revision();
+        assert!(matches!(
+            session.execute(SessionCommand::ApplyEdits {
+                buffer_id,
+                revision: current_revision,
+                ops: vec![EditOp::new(
+                    Span::new(TextByte(13), TextByte(13)),
+                    " mine".into(),
+                )],
+            }),
+            SessionResult::Success(CommandResult::EditsApplied { .. })
+        ));
+        fs.remove(&path).unwrap();
+        fs.write_new(&path, b"# External").unwrap();
+        let (merge_revision, merge_disk_hash) = match session.prepare_merge(path.clone()) {
+            SessionResult::MergeReady {
+                buffer_id: preview_buffer,
+                revision,
+                disk_hash,
+                result,
+                ..
+            } => {
+                assert_eq!(preview_buffer, buffer_id);
+                assert!(result.merged.is_none());
+                (revision, disk_hash)
+            }
+            other => panic!("unexpected merge preview: {other:?}"),
+        };
+        assert!(matches!(
+            session.execute(SessionCommand::ApplyMerge {
+                path: path.clone(),
+                buffer_id,
+                revision: merge_revision,
+                disk_hash: merge_disk_hash,
+                merged_bytes: b"# Merged".to_vec(),
+            }),
+            SessionResult::Success(CommandResult::EditsApplied { .. })
+        ));
+        let merged_base = session
+            .buffer_manager
+            .lock()
+            .unwrap()
+            .get_buffer_by_id(buffer_id)
+            .unwrap()
+            .base_bytes()
+            .to_vec();
+        assert_eq!(merged_base, b"# External");
+        let merge_save_id = match session.execute(SessionCommand::SaveNote { path: path.clone() }) {
+            SessionResult::Pending { request_id } => request_id,
+            other => panic!("merged buffer save must be pending: {other:?}"),
+        };
+        assert!(matches!(
+            session.wait_for_operation(merge_save_id),
+            SessionResult::Success(CommandResult::NoteSaved { .. })
+        ));
+        assert_eq!(actor.read_file(path.clone()).unwrap().unwrap(), b"# Merged");
+        assert!(matches!(
+            session.execute(SessionCommand::CloseNote { path }),
+            SessionResult::Success(CommandResult::NoteClosed)
+        ));
+        assert!(session.drain_operation_completions().is_empty());
     }
 }

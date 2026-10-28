@@ -309,6 +309,27 @@ impl Buffer {
         (new_revision, transition)
     }
 
+    /// Apply a validated multi-selection command as one edit and one undo
+    /// unit, then update the D7 state in the same transition.
+    pub fn apply_local_edits(
+        &mut self,
+        edits: &[crate::undo::EditOp],
+    ) -> Option<(Revision, Option<StateTransition>)> {
+        if edits.is_empty() {
+            return Some((self.revision(), None));
+        }
+        if !self.model.edit_ops_valid(edits) {
+            return None;
+        }
+        let old_state = self.state;
+        let revision = self.model.apply_edit_ops(edits);
+        let new_state = BufferState::Dirty;
+        self.state = new_state;
+        let transition = (old_state != new_state)
+            .then(|| StateTransition::new(old_state, new_state, TransitionReason::LocalEdit));
+        Some((revision, transition))
+    }
+
     /// Check for external changes.
     ///
     /// This is called when the watcher detects a change on disk.
@@ -523,6 +544,31 @@ impl Buffer {
         ))
     }
 
+    /// Install an explicitly resolved merge against the exact disk snapshot
+    /// that was reviewed. The caller must durably snapshot the displaced
+    /// buffer and verify the disk hash before invoking this transition.
+    pub fn apply_resolved_merge(
+        &mut self,
+        merged_bytes: &[u8],
+        disk_bytes: &[u8],
+    ) -> Option<Revision> {
+        if merged_bytes.len() > 32 * 1024 * 1024 {
+            return None;
+        }
+        let merged = TextSnapshot::new(merged_bytes).ok()?;
+        let disk = TextSnapshot::new(disk_bytes).ok()?;
+        self.base_hash = Some(BaseHash::from_snapshot(&disk));
+        self.disk_hash = self.base_hash;
+        self.base_bytes = disk_bytes.to_vec();
+        let revision = self.model.apply_snapshot_boundary(merged);
+        self.state = if self.model.to_source_bytes() == disk_bytes {
+            BufferState::Clean
+        } else {
+            BufferState::Dirty
+        };
+        Some(revision)
+    }
+
     /// User chose to discard local changes.
     ///
     /// Discards local changes and reloads from disk (if available).
@@ -616,6 +662,18 @@ impl Buffer {
         self.base_bytes = bytes.to_vec();
     }
 
+    /// Mark a dirty buffer conflicted from a verified disk hash when the
+    /// worker can report identity but cannot return the current bytes in the
+    /// save completion. Reload/merge obtains bytes through a separate worker
+    /// read before making a destructive choice.
+    pub fn mark_conflicted_disk_hash(&mut self, hash: [u8; 32]) {
+        self.disk_hash = Some(BaseHash::from_bytes(hash));
+        if self.state != BufferState::Orphaned && self.base_hash != Some(BaseHash::from_bytes(hash))
+        {
+            self.state = BufferState::Conflicted;
+        }
+    }
+
     /// Handle file rename.
     ///
     /// For T0–T2 renames (in-app or detected OS rename), this is silent.
@@ -690,6 +748,21 @@ mod tests {
         assert_eq!(buffer.state(), BufferState::Clean);
         assert_eq!(buffer.text(), "hello");
         assert!(!buffer.is_dirty());
+    }
+
+    #[test]
+    fn resolved_merge_preserves_exact_snapshot_eols_and_disk_base() {
+        let mine = b"mine\r\nkeep\n";
+        let theirs = b"base\r\nkeep\nexternal\r\n";
+        let merged = b"mine\r\nkeep\nexternal\r\n";
+        let mut buffer = Buffer::from_snapshot(TextSnapshot::new(mine).unwrap());
+
+        let revision = buffer.apply_resolved_merge(merged, theirs).unwrap();
+
+        assert!(revision > Revision::INITIAL);
+        assert_eq!(buffer.model().to_source_bytes(), merged);
+        assert_eq!(buffer.base_bytes(), theirs);
+        assert_eq!(buffer.state(), BufferState::Dirty);
     }
 
     #[test]

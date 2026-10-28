@@ -109,6 +109,8 @@ pub enum VaultActorError {
     AlreadyRunning,
     #[error("Actor not running")]
     NotRunning,
+    #[error("Actor is at operation capacity")]
+    Busy,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -163,22 +165,21 @@ impl VaultActorHandle {
         }
     }
 
-    /// Send a correlated save request and receive its terminal result.
-    pub fn save(
+    /// Admit a save without waiting for disk, history, or index work.
+    pub fn submit_save(
         &self,
         request: SaveRequest,
-    ) -> Result<Result<SaveReceipt, SaveFailure>, VaultActorError> {
+    ) -> Result<Receiver<VaultActorResp>, VaultActorError> {
         let (reply, response) = crossbeam::channel::bounded(1);
         self.sender
-            .send(VaultActorMsg::Save { request, reply })
-            .map_err(|_| VaultActorError::ChannelDisconnected)?;
-        match response
-            .recv()
-            .map_err(|_| VaultActorError::ChannelDisconnected)?
-        {
-            VaultActorResp::Saved(result) => Ok(result),
-            _ => Err(VaultActorError::NotRunning),
-        }
+            .try_send(VaultActorMsg::Save { request, reply })
+            .map_err(|error| match error {
+                crossbeam::channel::TrySendError::Full(_) => VaultActorError::Busy,
+                crossbeam::channel::TrySendError::Disconnected(_) => {
+                    VaultActorError::ChannelDisconnected
+                }
+            })?;
+        Ok(response)
     }
 
     /// Snapshot observed bytes to local safety history before a destructive
@@ -475,7 +476,7 @@ impl VaultActor {
 
     fn handle_save(&mut self, request: SaveRequest, reply: Sender<VaultActorResp>) {
         let failure_context = request.clone();
-        let result = (|| {
+        let result: Result<SaveReceipt, SaveFailure> = (|| {
             if self.history.is_none() {
                 let data = crate::identity::get_data_dir()
                     .ok_or_else(|| SaveFailure::from_message("OS data directory is unavailable"))?;
@@ -488,6 +489,14 @@ impl VaultActor {
                     Some(HistoryStore::open(self.fs.clone(), root).map_err(SaveFailure::from)?);
             }
             let history = self.history.as_mut().expect("history initialized");
+            let old_base_hash = blake3::hash(&request.merge_base).to_hex().to_string();
+            history
+                .pin_merge_base(
+                    &request.note_key,
+                    &request.merge_base,
+                    crate::history::now_secs(),
+                )
+                .map_err(SaveFailure::from)?;
             let index = &mut self.index;
             let display_path = request
                 .path
@@ -500,7 +509,7 @@ impl VaultActor {
                 .unwrap_or_default()
                 .as_nanos()
                 .min(i64::MAX as u128) as i64;
-            crate::save::save(
+            let result = crate::save::save(
                 &*self.fs,
                 history,
                 request.clone(),
@@ -513,9 +522,30 @@ impl VaultActor {
                         scan_ns,
                     )
                 },
-            )
+            )?;
+            let new_base_hash = blake3::hash(&request.bytes).to_hex().to_string();
+            // The durable replacement and structural index application are
+            // the save milestone. A failure to rotate the merge-base pin after
+            // that point must not turn a completed save into a retryable
+            // failure (which could overwrite newer external bytes). Keep the
+            // prior base pinned unless the successor pin is durable.
+            if history
+                .pin_merge_base(
+                    &request.note_key,
+                    &request.bytes,
+                    crate::history::now_secs(),
+                )
+                .is_ok()
+                && old_base_hash != new_base_hash
+            {
+                // A failed unpin is safe: it leaks a pin until maintenance,
+                // whereas reporting save failure here could trigger a
+                // destructive retry after the replacement already succeeded.
+                let _ = history.unpin_merge_base(&request.note_key, &old_base_hash);
+            }
+            Ok(result)
         })()
-        .map_err(|failure| failure.for_request(&failure_context));
+        .map_err(|failure: SaveFailure| failure.for_request(&failure_context));
         let _ = reply.try_send(VaultActorResp::Saved(result));
     }
 
@@ -746,11 +776,16 @@ mod tests {
             path: std::path::PathBuf::from("/vault/notes/a.md"),
             note_key: b"notes/a.md".to_vec(),
             bytes: b"# Saved\n\n[[Other]]".to_vec(),
+            merge_base: b"# Base".to_vec(),
             precondition: crate::save::DiskPrecondition::Existing(prior_hash),
             buffer_id: 5,
             revision: 8,
         };
-        let receipt = actor.save(request).unwrap().unwrap();
+        let response = actor.submit_save(request).unwrap();
+        let receipt = match response.recv().unwrap() {
+            VaultActorResp::Saved(Ok(receipt)) => receipt,
+            other => panic!("unexpected save reply: {other:?}"),
+        };
         assert_eq!((receipt.epoch, receipt.generation), (1, 1));
         assert_eq!(
             fs.read_if_exists(std::path::Path::new("/vault/notes/a.md"))

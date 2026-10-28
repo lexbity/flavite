@@ -142,55 +142,29 @@ fn overlaps(a: &Hunk, b: &Hunk) -> bool {
 /// LCS-based line diff. The caller's note-size budget bounds this O(n*m)
 /// implementation; for very large inputs we return one whole-document hunk.
 fn diff_hunks(base: &[&str], changed: &[&str]) -> Vec<Hunk> {
-    if base.len().saturating_mul(changed.len()) > 4_000_000 {
-        if base == changed {
-            return vec![];
-        }
-        return vec![Hunk {
-            start: 0,
-            end: base.len(),
-            replacement: changed.iter().map(|s| (*s).to_owned()).collect(),
-        }];
-    }
-    let mut dp = vec![vec![0u32; changed.len() + 1]; base.len() + 1];
-    for i in (0..base.len()).rev() {
-        for j in (0..changed.len()).rev() {
-            dp[i][j] = if base[i] == changed[j] {
-                1 + dp[i + 1][j + 1]
-            } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
-        }
-    }
-    let (mut i, mut j) = (0, 0);
+    let diff = similar::TextDiff::from_slices(base, changed);
     let mut result = Vec::new();
     let mut active: Option<Hunk> = None;
-    while i < base.len() || j < changed.len() {
-        if i < base.len() && j < changed.len() && base[i] == changed[j] {
-            if let Some(h) = active.take() {
-                result.push(h);
+    for op in diff.ops() {
+        let old = op.old_range();
+        let new = op.new_range();
+        if matches!(op.tag(), similar::DiffTag::Equal) {
+            if let Some(hunk) = active.take() {
+                result.push(hunk);
             }
-            i += 1;
-            j += 1;
-        } else if j < changed.len() && (i == base.len() || dp[i][j + 1] >= dp[i + 1][j]) {
-            let h = active.get_or_insert_with(|| Hunk {
-                start: i,
-                end: i,
-                replacement: vec![],
-            });
-            h.replacement.push(changed[j].to_owned());
-            j += 1;
-        } else {
-            let h = active.get_or_insert_with(|| Hunk {
-                start: i,
-                end: i,
-                replacement: vec![],
-            });
-            h.end += 1;
-            i += 1;
+            continue;
         }
+        let hunk = active.get_or_insert_with(|| Hunk {
+            start: old.start,
+            end: old.end,
+            replacement: Vec::new(),
+        });
+        hunk.start = hunk.start.min(old.start);
+        hunk.end = hunk.end.max(old.end);
+        hunk.replacement
+            .extend(changed[new].iter().map(|line| (*line).to_owned()));
     }
-    if let Some(h) = active {
+    if let Some(h) = active.take() {
         result.push(h);
     }
     result
@@ -217,5 +191,24 @@ mod tests {
             three_way_merge("a\nb", "a\nx", "a\nx").merged.as_deref(),
             Some("a\nx")
         );
+    }
+
+    #[test]
+    fn disjoint_edits_merge_in_large_documents_without_whole_file_conflict() {
+        let base = (0..400)
+            .map(|line| format!("line-{line}\n"))
+            .collect::<String>();
+        let mut mine = base.lines().map(str::to_owned).collect::<Vec<_>>();
+        let mut theirs = mine.clone();
+        mine[20] = "mine".into();
+        theirs[370] = "theirs".into();
+        let mine = format!("{}\n", mine.join("\n"));
+        let theirs = format!("{}\n", theirs.join("\n"));
+
+        let merged = three_way_merge(&base, &mine, &theirs);
+        let merged = merged.merged.expect("disjoint edits must merge");
+        assert!(merged.contains("mine\n"));
+        assert!(merged.contains("theirs\n"));
+        assert_eq!(merged.lines().count(), 400);
     }
 }

@@ -108,4 +108,5 @@ names = [
     "nucleo",
     "image",
     "tracing",
+    "similar",
 ]
