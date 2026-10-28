@@ -190,6 +190,11 @@ gpu-setup:
 ui-visual-smoke:
     xvfb-run -a -s "-screen 0 1280x900x24" bash scripts/ui-visual-smoke-linux.sh
 
+# Linux-only rendered custom-editor smoke: interact with the widget, wait for
+# its Session autosave, and capture the resulting iced window.
+ui-editor-visual-smoke:
+    bash scripts/ui-editor-visual-smoke-linux.sh
+
 # Linux-only dependencies for the rendered UI smoke. Kept separate from
 # gpu-setup so shader validation and visual window capture remain distinct.
 ui-visual-setup:

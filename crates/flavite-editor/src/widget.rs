@@ -250,6 +250,14 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
     ) {
         let state = tree.state.downcast_ref::<EditorState>();
         let bounds = layout.bounds();
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds,
+                border: Border::default(),
+                ..renderer::Quad::default()
+            },
+            Background::Color(Color::from_rgb(0.10, 0.11, 0.13)),
+        );
         let clip = bounds
             .intersection(viewport)
             .unwrap_or(Rectangle::with_size(Size::ZERO));
@@ -296,7 +304,10 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         renderer.fill_text(
             text::Text {
                 content: displayed,
-                bounds: Size::new(bounds.width - PAD_X * 2.0, f32::INFINITY),
+                bounds: Size::new(
+                    (bounds.width - PAD_X * 2.0).max(1.0),
+                    (bounds.height - PAD_Y * 2.0).max(1.0),
+                ),
                 size: iced::Pixels(FONT_SIZE),
                 line_height: text::LineHeight::Absolute(iced::Pixels(LINE_HEIGHT)),
                 font: iced::Font::MONOSPACE,
@@ -515,18 +526,18 @@ fn caret_position(runs: &[cosmic_text::LayoutRun<'_>], text: &str, byte: usize) 
             let glyph_start = line_start + glyph.start;
             let glyph_end = line_start + glyph.end;
             if byte <= glyph_start {
-                return (glyph.x, run.line_y - run.line_top);
+                return (glyph.x, run.line_top);
             }
             if byte < glyph_end {
-                return (glyph.x, run.line_y - run.line_top);
+                return (glyph.x, run.line_top);
             }
         }
         if byte <= line_end {
             let x = run.glyphs.last().map_or(0.0, |glyph| glyph.x + glyph.w);
-            return (x, run.line_y - run.line_top);
+            return (x, run.line_top);
         }
     }
-    (0.0, runs.last().map_or(0.0, |run| run.line_y))
+    (0.0, runs.last().map_or(0.0, |run| run.line_top))
 }
 
 #[cfg(test)]
@@ -554,6 +565,17 @@ mod tests {
         let text = "a🧑🏽‍💻e\u{301}";
         let byte = hit_test(text, 45.0, 4.0, 200.0);
         assert!(text.is_char_boundary(byte));
+    }
+
+    #[test]
+    fn cosmic_text_layout_contains_the_editor_text() {
+        let text = "Heading\n\nbody\n\n- item\n- final visual editor input";
+        let shaped = shape_text(text, 400.0);
+        let runs = shaped.layout_runs().collect::<Vec<_>>();
+        assert!(!runs.is_empty());
+        assert!(runs.iter().any(|run| run.text == "Heading"));
+        let (_, y) = caret_position(&runs, text, text.len());
+        assert_eq!(y, runs.last().expect("non-empty layout").line_top);
     }
 
     #[test]
