@@ -17,6 +17,11 @@ for tool in xdotool import identify; do
     fi
 done
 
+if [[ -n "${DISPLAY:-}" ]] && ! xdotool getdisplaygeometry >/dev/null 2>&1; then
+    echo "DISPLAY=${DISPLAY} is not reachable; retrying with Xvfb if available." >&2
+    unset DISPLAY
+fi
+
 if [[ -z "${DISPLAY:-}" ]]; then
     if ! command -v xvfb-run >/dev/null 2>&1; then
         echo "DISPLAY is unset and xvfb-run is unavailable" >&2
@@ -72,7 +77,7 @@ fi
 
 xdotool windowactivate --sync "$window_id"
 sleep 1
-xdotool mousemove --sync --window "$window_id" 180 160
+xdotool mousemove --sync --window "$window_id" 80 205
 xdotool click --clearmodifiers 1
 xdotool key --clearmodifiers ctrl+a
 xdotool type --clearmodifiers --delay 100 "Visual editor input confirmed"
@@ -84,6 +89,8 @@ for _ in $(seq 1 60); do
 done
 if ! grep -Fq "Visual editor input confirmed" "$vault_dir/demo.md"; then
     cat "$visual_dir/editor-app.log" >&2
+    cat "$vault_dir/demo.md" >&2
+    import -window "$window_id" "$visual_dir/editor-failure.png" 2>/dev/null || true
     echo "editor input did not reach the Session autosave" >&2
     exit 1
 fi

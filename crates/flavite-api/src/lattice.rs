@@ -315,22 +315,26 @@ impl Lattice {
                 #[derive(Deserialize)]
                 struct UndoArgs {
                     buffer_id: u64,
+                    revision: u64,
                 }
                 let args: UndoArgs = serde_json::from_value(invocation.args.clone())
                     .map_err(|e| LatticeError::InvalidArgs(e.to_string()))?;
                 Ok(self.session.execute(SessionCommand::Undo {
                     buffer_id: BufferId::from(args.buffer_id),
+                    revision: Revision::new(args.revision),
                 }))
             }
             "redo" => {
                 #[derive(Deserialize)]
                 struct RedoArgs {
                     buffer_id: u64,
+                    revision: u64,
                 }
                 let args: RedoArgs = serde_json::from_value(invocation.args.clone())
                     .map_err(|e| LatticeError::InvalidArgs(e.to_string()))?;
                 Ok(self.session.execute(SessionCommand::Redo {
                     buffer_id: BufferId::from(args.buffer_id),
+                    revision: Revision::new(args.revision),
                 }))
             }
             "reconcile" => {

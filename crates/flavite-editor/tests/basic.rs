@@ -55,6 +55,10 @@ fn edits_become_revision_guarded_session_commands() {
 fn history_actions_remain_typed_session_commands() {
     let undo = EditorAction::history(&view(), false).into_session_command();
     let redo = EditorAction::history(&view(), true).into_session_command();
-    assert!(matches!(undo, SessionCommand::Undo { buffer_id } if buffer_id.as_u64() == 42));
-    assert!(matches!(redo, SessionCommand::Redo { buffer_id } if buffer_id.as_u64() == 42));
+    assert!(
+        matches!(undo, SessionCommand::Undo { buffer_id, revision } if buffer_id.as_u64() == 42 && revision.as_u64() == 7)
+    );
+    assert!(
+        matches!(redo, SessionCommand::Redo { buffer_id, revision } if buffer_id.as_u64() == 42 && revision.as_u64() == 7)
+    );
 }

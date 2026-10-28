@@ -641,19 +641,6 @@ mod tests {
             .entry(stable_id.clone())
             .or_default()
             .push(&vanished_note);
-        notes_by_stable_id
-            .entry(stable_id.clone())
-            .or_default()
-            .push(&changed_note);
-
-        // Wait, this creates a duplicate stable_id situation
-        // For T2, we need exactly one note per stable_id
-        // Let's fix this
-        notes_by_stable_id.clear();
-        notes_by_stable_id
-            .entry(stable_id.clone())
-            .or_default()
-            .push(&vanished_note);
 
         let mut notes_by_path: HashMap<PathBuf, &Note> = HashMap::new();
         notes_by_path.insert(PathBuf::from("old.md"), &vanished_note);
@@ -666,7 +653,7 @@ mod tests {
         let attachments_by_path: HashMap<PathBuf, &Attachment> = HashMap::new();
 
         let inference = RenameInference::new();
-        let _result = inference.infer_renames(
+        let result = inference.infer_renames(
             &vanished,
             &changed,
             &watcher_pairs,
@@ -677,14 +664,11 @@ mod tests {
             &notice_channel,
         );
 
-        // For T2, we should have detected the rename
-        // But in our current implementation, we skip duplicates
-        // Let's check if the T2 detection logic works when we don't have duplicates
-        // Actually, in this test we have a duplicate (both notes have the same stable_id)
-        // So T2 won't fire. Let's adjust the test.
-
-        // For now, let's just verify the structure works
-        // This test is incomplete and should be rewritten properly
+        assert!(
+            result
+                .t2_renames
+                .contains(&(PathBuf::from("old.md"), PathBuf::from("new.md")))
+        );
     }
 
     #[test]

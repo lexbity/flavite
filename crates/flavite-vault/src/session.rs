@@ -77,9 +77,15 @@ pub enum SessionCommand {
         mode: ReconcileMode,
     },
     /// Undo an edit.
-    Undo { buffer_id: BufferId },
+    Undo {
+        buffer_id: BufferId,
+        revision: Revision,
+    },
     /// Redo an edit.
-    Redo { buffer_id: BufferId },
+    Redo {
+        buffer_id: BufferId,
+        revision: Revision,
+    },
     /// Resolve a conflict.
     ResolveConflict {
         path: PathBuf,
@@ -358,8 +364,14 @@ impl Session {
             } => self.apply_merge(path, buffer_id, revision, disk_hash, merged_bytes),
             SessionCommand::SaveNote { path } => self.save_note(path),
             SessionCommand::Reconcile { scope, mode } => self.reconcile(scope, mode),
-            SessionCommand::Undo { buffer_id } => self.undo(buffer_id),
-            SessionCommand::Redo { buffer_id } => self.redo(buffer_id),
+            SessionCommand::Undo {
+                buffer_id,
+                revision,
+            } => self.undo(buffer_id, revision),
+            SessionCommand::Redo {
+                buffer_id,
+                revision,
+            } => self.redo(buffer_id, revision),
             SessionCommand::ResolveConflict { path, resolution } => {
                 self.resolve_conflict(path, resolution)
             }
@@ -870,11 +882,20 @@ impl Session {
     }
 
     /// Undo an edit.
-    fn undo(&self, buffer_id: BufferId) -> SessionResult {
+    fn undo(&self, buffer_id: BufferId, revision: Revision) -> SessionResult {
         let mut buffer_manager = self.buffer_manager.lock().unwrap();
 
         // Get the buffer and call undo on its model
         if let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) {
+            if buffer.revision() != revision {
+                return SessionResult::Error {
+                    message: format!(
+                        "Stale revision: expected {:?}, got {:?}",
+                        revision,
+                        buffer.revision()
+                    ),
+                };
+            }
             if let Some(new_revision) = buffer.model_mut().undo() {
                 SessionResult::Success(CommandResult::UndoPerformed {
                     buffer_id,
@@ -893,11 +914,20 @@ impl Session {
     }
 
     /// Redo an edit.
-    fn redo(&self, buffer_id: BufferId) -> SessionResult {
+    fn redo(&self, buffer_id: BufferId, revision: Revision) -> SessionResult {
         let mut buffer_manager = self.buffer_manager.lock().unwrap();
 
         // Get the buffer and call redo on its model
         if let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) {
+            if buffer.revision() != revision {
+                return SessionResult::Error {
+                    message: format!(
+                        "Stale revision: expected {:?}, got {:?}",
+                        revision,
+                        buffer.revision()
+                    ),
+                };
+            }
             if let Some(new_revision) = buffer.model_mut().redo() {
                 SessionResult::Success(CommandResult::RedoPerformed {
                     buffer_id,
@@ -1573,12 +1603,46 @@ mod tests {
             }),
             SessionResult::Error { .. }
         ));
+        let edited_revision = session
+            .buffer_manager()
+            .lock()
+            .unwrap()
+            .get_buffer_by_id(buffer_id)
+            .unwrap()
+            .revision();
         assert!(matches!(
-            session.execute(SessionCommand::Undo { buffer_id }),
-            SessionResult::Success(CommandResult::UndoPerformed { .. })
+            session.execute(SessionCommand::Undo {
+                buffer_id,
+                revision,
+            }),
+            SessionResult::Error { message } if message.contains("Stale revision")
         ));
         assert!(matches!(
-            session.execute(SessionCommand::Redo { buffer_id }),
+            session.execute(SessionCommand::Undo {
+                buffer_id,
+                revision: edited_revision,
+            }),
+            SessionResult::Success(CommandResult::UndoPerformed { .. })
+        ));
+        let undone_revision = session
+            .buffer_manager()
+            .lock()
+            .unwrap()
+            .get_buffer_by_id(buffer_id)
+            .unwrap()
+            .revision();
+        assert!(matches!(
+            session.execute(SessionCommand::Redo {
+                buffer_id,
+                revision: edited_revision,
+            }),
+            SessionResult::Error { message } if message.contains("Stale revision")
+        ));
+        assert!(matches!(
+            session.execute(SessionCommand::Redo {
+                buffer_id,
+                revision: undone_revision,
+            }),
             SessionResult::Success(CommandResult::RedoPerformed { .. })
         ));
         let request_id = match session.execute(SessionCommand::SaveNote { path: path.clone() }) {
@@ -1746,11 +1810,17 @@ mod tests {
             .unwrap()
             .revision();
         assert!(matches!(
-            session.execute(SessionCommand::Undo { buffer_id }),
+            session.execute(SessionCommand::Undo {
+                buffer_id,
+                revision
+            }),
             SessionResult::Error { .. }
         ));
         assert!(matches!(
-            session.execute(SessionCommand::Redo { buffer_id }),
+            session.execute(SessionCommand::Redo {
+                buffer_id,
+                revision
+            }),
             SessionResult::Error { .. }
         ));
         assert!(matches!(
