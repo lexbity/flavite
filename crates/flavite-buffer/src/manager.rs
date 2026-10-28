@@ -115,10 +115,7 @@ impl BufferManager {
 
     /// Create a new BufferManager with custom settings.
     #[must_use]
-    pub fn with_settings(
-        coalesce_window: std::time::Duration,
-        recovery_interval: u64,
-    ) -> Self {
+    pub fn with_settings(coalesce_window: std::time::Duration, recovery_interval: u64) -> Self {
         Self {
             buffers: HashMap::new(),
             buffer_ids: HashMap::new(),
@@ -183,7 +180,7 @@ impl BufferManager {
     ) -> (&Buffer, Option<StateTransition>) {
         // Use entry API to avoid borrow issues
         let entry = self.buffers.entry(note_path.clone());
-        
+
         match entry {
             std::collections::hash_map::Entry::Occupied(occupied) => {
                 // Buffer already exists, return it
@@ -200,11 +197,13 @@ impl BufferManager {
                 };
 
                 // Configure the buffer
-                buffer.model_mut().set_coalesce_window(self.default_coalesce_window);
-                
+                buffer
+                    .model_mut()
+                    .set_coalesce_window(self.default_coalesce_window);
+
                 // Get buffer_id
                 let buffer_id = buffer.buffer_id();
-                
+
                 // Insert into both maps
                 self.buffer_ids.insert(buffer_id, vacant.key().clone());
                 let buffer_ref = vacant.insert(buffer);
@@ -266,10 +265,10 @@ impl BufferManager {
     ) -> Vec<StateTransition> {
         let mut transitions = Vec::new();
 
-        if let Some(buffer) = self.buffers.get_mut(note_path) {
-            if let Some(transition) = buffer.check_external_change(new_content) {
-                transitions.push(transition);
-            }
+        if let Some(buffer) = self.buffers.get_mut(note_path)
+            && let Some(transition) = buffer.check_external_change(new_content)
+        {
+            transitions.push(transition);
         }
 
         transitions
@@ -295,10 +294,10 @@ impl BufferManager {
     ) -> Vec<StateTransition> {
         let mut transitions = Vec::new();
 
-        if let Some(buffer) = self.buffers.get_mut(note_path) {
-            if let Some(transition) = buffer.handle_file_recreated(new_content) {
-                transitions.push(transition);
-            }
+        if let Some(buffer) = self.buffers.get_mut(note_path)
+            && let Some(transition) = buffer.handle_file_recreated(new_content)
+        {
+            transitions.push(transition);
         }
 
         transitions
@@ -397,8 +396,8 @@ impl std::fmt::Display for BufferManager {
 
 #[cfg(test)]
 mod tests {
-    use flavite_syntax::text::{Span, TextByte};
     use super::*;
+    use flavite_syntax::text::{Span, TextByte};
     use std::path::PathBuf;
 
     #[test]
@@ -406,13 +405,13 @@ mod tests {
         let mut manager = BufferManager::new();
 
         let path = PathBuf::from("test.md");
-        
+
         // Open the note
         let (buffer, _) = manager.open_note(path.clone(), b"hello");
-        
+
         // Check buffer text immediately
         assert_eq!(buffer.text(), "hello");
-        
+
         // Now check if buffer exists (separate statement to avoid borrow issues)
         assert!(manager.has_buffer(&path));
 
@@ -428,14 +427,11 @@ mod tests {
         let path = PathBuf::from("test.md");
         manager.open_note(path.clone(), b"hello");
 
-        let edit = EditOp::new(
-            Span::new(TextByte(5), TextByte(5)),
-            " world".to_string(),
-        );
+        let edit = EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
 
         let result = manager.apply_edit(&path, edit);
         assert!(result.is_some());
-        
+
         let (rev, state, _) = result.unwrap();
         assert_eq!(state, BufferState::Dirty);
     }
@@ -461,10 +457,7 @@ mod tests {
         manager.open_note(path.clone(), b"hello");
 
         // Make it dirty
-        let edit = EditOp::new(
-            Span::new(TextByte(5), TextByte(5)),
-            " world".to_string(),
-        );
+        let edit = EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         manager.apply_edit(&path, edit);
 
         // Save completed
@@ -509,10 +502,7 @@ mod tests {
         manager.open_note(path2.clone(), b"world");
 
         // Make one dirty
-        let edit = EditOp::new(
-            Span::new(TextByte(5), TextByte(5)),
-            " world".to_string(),
-        );
+        let edit = EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         manager.apply_edit(&path1, edit);
 
         let dirty = manager.dirty_buffers();
@@ -535,10 +525,7 @@ mod tests {
 
     #[test]
     fn recovery_interval() {
-        let manager = BufferManager::with_settings(
-            std::time::Duration::from_millis(500),
-            5,
-        );
+        let manager = BufferManager::with_settings(std::time::Duration::from_millis(500), 5);
         assert_eq!(manager.recovery_interval(), 5);
     }
 

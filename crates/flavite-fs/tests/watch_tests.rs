@@ -2,7 +2,6 @@
 
 use flavite_fs::watch::{FsEvent, FsWatcher, WatcherConfig};
 use std::path::Path;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -38,7 +37,7 @@ fn watcher_watch_and_start() {
         recursive_default: false,
     };
 
-    let mut watcher = FsWatcher::new(config).unwrap();
+    let watcher = FsWatcher::new(config).unwrap();
     let temp_dir = tempdir().unwrap();
 
     // Watch the temp directory
@@ -59,7 +58,7 @@ fn watcher_watch_and_start() {
 
     // Check for events
     let receiver_guard = receiver.lock().unwrap();
-    let events: Vec<FsEvent> = receiver_guard.try_iter().collect();
+    let _events: Vec<FsEvent> = receiver_guard.try_iter().collect();
 
     // We should have at least one event
     // Note: This test may be flaky depending on the filesystem and platform
@@ -91,7 +90,7 @@ fn watcher_multiple_watches() {
     watcher.watch(&temp_dir1).unwrap();
     watcher.watch(&temp_dir2).unwrap();
 
-    let receiver = watcher.start();
+    let _receiver = watcher.start();
 
     thread::sleep(Duration::from_millis(50));
 

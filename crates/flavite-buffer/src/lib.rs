@@ -17,7 +17,11 @@ pub mod undo;
 pub use eol::{EolTable, LineEnding};
 pub use manager::{BufferManager, BufferStateChanged, NoteRef};
 pub use model::{EditorModel, EditorModelBuilder, Selection};
-pub use recovery::{RecoveryConfig, RecoveryFile, RecoveryHeader, RecoveryWriter, RecoveryWriterBuilder};
-pub use revision::{BaseHash, BufferId, ContentHash, EditPrecondition, PreconditionResult, Revision};
+pub use recovery::{
+    RecoveryConfig, RecoveryFile, RecoveryHeader, RecoveryWriter, RecoveryWriterBuilder,
+};
+pub use revision::{
+    BaseHash, BufferId, ContentHash, EditPrecondition, PreconditionResult, Revision,
+};
 pub use state::{Buffer, BufferState, StateTransition, TransitionReason};
 pub use undo::{EditGroup, EditOp, EolMetadata, LinearUndoStack, UndoNode, UndoTree};

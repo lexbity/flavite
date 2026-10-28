@@ -7,10 +7,10 @@
 //!
 //! Every edit, undo, redo, reload, and journal patch advances the revision
 //! even if text returns to previous bytes (§4.5.2).
+use crate::revision::Revision;
 use flavite_syntax::text::{Span, TextByte, TextSnapshot};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
-use crate::revision::Revision;
 /// Default time window for coalescing consecutive edits into a single undo group.
 ///
 /// Edits within this window of the previous edit are coalesced.
@@ -58,7 +58,10 @@ impl EditOp {
         if self.range.start.0 == self.range.end.0 {
             // Insert operation: inverse is to delete the replacement
             EditOp::new(
-                Span::new(self.range.start, TextByte(self.range.start.0 + self.replacement.len())),
+                Span::new(
+                    self.range.start,
+                    TextByte(self.range.start.0 + self.replacement.len()),
+                ),
                 String::new(),
             )
         } else {
@@ -67,7 +70,10 @@ impl EditOp {
                 .get(self.range.start.0..self.range.end.0)
                 .unwrap_or_default();
             EditOp::new(
-                Span::new(self.range.start, TextByte(self.range.start.0 + self.replacement.len())),
+                Span::new(
+                    self.range.start,
+                    TextByte(self.range.start.0 + self.replacement.len()),
+                ),
                 original.to_string(),
             )
         }
@@ -75,9 +81,8 @@ impl EditOp {
     /// Apply this edit to a text buffer and return the new text.
     #[must_use]
     pub fn apply(&self, text: &str) -> String {
-        let mut result = String::with_capacity(
-            text.len() + self.replacement.len() - self.range.len(),
-        );
+        let mut result =
+            String::with_capacity(text.len() + self.replacement.len() - self.range.len());
         result.push_str(&text[..self.range.start.0]);
         result.push_str(&self.replacement);
         result.push_str(&text[self.range.end.0..]);
@@ -125,10 +130,7 @@ impl EditOp {
             }
             replacement.push_str(&self.replacement);
         }
-        EditOp::new(
-            Span::new(TextByte(start), TextByte(end)),
-            replacement,
-        )
+        EditOp::new(Span::new(TextByte(start), TextByte(end)), replacement)
     }
 }
 /// Metadata about line endings for an edit operation.
@@ -179,7 +181,13 @@ impl UndoNode {
     }
     /// Create a new node from an edit with a snapshot.
     #[must_use]
-    pub fn new(id: u64, revision: Revision, edit: EditOp, parent_id: u64, snapshot: TextSnapshot) -> Self {
+    pub fn new(
+        id: u64,
+        revision: Revision,
+        edit: EditOp,
+        parent_id: u64,
+        snapshot: TextSnapshot,
+    ) -> Self {
         Self {
             id,
             revision,
@@ -190,7 +198,7 @@ impl UndoNode {
             children: Vec::new(),
         }
     }
-    
+
     /// Create a new node from an edit without a snapshot.
     #[must_use]
     pub fn new_no_snapshot(id: u64, revision: Revision, edit: EditOp, parent_id: u64) -> Self {
@@ -282,7 +290,8 @@ impl UndoTree {
         // First, check if we should coalesce
         let should_coalesce = if let Some(current) = self.nodes.get(current_id as usize) {
             if let Some(current_edit) = &current.edit {
-                current_edit.can_coalesce(&edit) && current.timestamp.elapsed() < self.coalesce_window
+                current_edit.can_coalesce(&edit)
+                    && current.timestamp.elapsed() < self.coalesce_window
             } else {
                 false
             }
@@ -304,8 +313,11 @@ impl UndoTree {
         }
         // Get current again for creating new node
         // Create a new node
-        let current_node = self.nodes.get(current_id as usize).expect("current node must exist");
-        let parent_id = current_node.id;  // Clone the id to avoid borrow issues
+        let current_node = self
+            .nodes
+            .get(current_id as usize)
+            .expect("current node must exist");
+        let parent_id = current_node.id; // Clone the id to avoid borrow issues
         let new_id = self.next_id;
         self.next_id += 1;
         let new_revision = current_node.revision.next();
@@ -349,7 +361,7 @@ impl UndoTree {
             self.position_id = target.id;
             return Some((target.revision, target.snapshot.clone()));
         }
-        
+
         // Check if current node has children (we've undone past a branch)
         let current = self.current()?;
         if !current.children.is_empty() {
@@ -360,7 +372,7 @@ impl UndoTree {
             self.current_id = child.id;
             return Some((child.revision, child.snapshot.clone()));
         }
-        
+
         None
     }
     /// Move to a specific node.
@@ -530,7 +542,7 @@ impl LinearUndoStack {
     /// it is merged instead of pushed.
     ///
     /// Returns the new revision.
-    pub fn push(&mut self, edit: EditOp, text: &str) -> Revision {
+    pub fn push(&mut self, edit: EditOp, _text: &str) -> Revision {
         let now = Instant::now();
         // Check if we can coalesce
         if let Some(last_time) = self.last_edit_time {

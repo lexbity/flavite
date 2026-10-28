@@ -14,8 +14,8 @@
 //! The path is supplied by the vault using native PathKey.
 
 use flavite_syntax::text::TextByte;
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -109,20 +109,16 @@ impl RecoveryHeader {
 
         let version = bytes[4];
         let buffer_id = u64::from_le_bytes([
-            bytes[5], bytes[6], bytes[7], bytes[8],
-            bytes[9], bytes[10], bytes[11], bytes[12],
+            bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
         ]);
         let revision = u64::from_le_bytes([
-            bytes[13], bytes[14], bytes[15], bytes[16],
-            bytes[17], bytes[18], bytes[19], bytes[20],
+            bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19], bytes[20],
         ]);
         let timestamp = u64::from_le_bytes([
-            bytes[21], bytes[22], bytes[23], bytes[24],
-            bytes[25], bytes[26], bytes[27], bytes[28],
+            bytes[21], bytes[22], bytes[23], bytes[24], bytes[25], bytes[26], bytes[27], bytes[28],
         ]);
         let checkpoint_seq = u64::from_le_bytes([
-            bytes[29], bytes[30], bytes[31], bytes[32],
-            bytes[33], bytes[34], bytes[35], bytes[36],
+            bytes[29], bytes[30], bytes[31], bytes[32], bytes[33], bytes[34], bytes[35], bytes[36],
         ]);
         let is_checkpoint = bytes.get(37).copied() == Some(1);
 
@@ -244,7 +240,7 @@ impl RecoveryFile {
             return None;
         }
         let header = RecoveryHeader::from_bytes(&bytes[..38])?;
-        
+
         let mut offset = 38;
 
         // Read EOL table length
@@ -252,7 +248,10 @@ impl RecoveryFile {
             return None;
         }
         let eol_len = u32::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
         ]) as usize;
         offset += 4;
 
@@ -269,7 +268,10 @@ impl RecoveryFile {
             return None;
         }
         let text_len = u32::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
         ]) as usize;
         offset += 4;
 
@@ -285,8 +287,14 @@ impl RecoveryFile {
             return None;
         }
         let source_len = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]) as usize;
         offset += 8;
 
@@ -492,7 +500,7 @@ impl RecoveryWriter {
 
         // Write atomically
         let temp_path = path.with_extension("tmp");
-        
+
         let mut file = match File::create(&temp_path) {
             Ok(f) => f,
             Err(e) => {
@@ -555,7 +563,7 @@ impl RecoveryWriter {
 
         // Write atomically (same as write_buffer)
         let temp_path = path.with_extension("tmp");
-        
+
         let mut file = match File::create(&temp_path) {
             Ok(f) => f,
             Err(e) => {
@@ -712,11 +720,7 @@ impl RecoveryWriterBuilder {
     /// Build the RecoveryWriter.
     #[must_use]
     pub fn build(self) -> RecoveryWriter {
-        let config = RecoveryConfig::new(
-            self.vault_uuid,
-            self.recovery_dir,
-            self.interval_secs,
-        );
+        let config = RecoveryConfig::new(self.vault_uuid, self.recovery_dir, self.interval_secs);
         RecoveryWriter::new(config)
     }
 }
@@ -735,12 +739,7 @@ mod tests {
 
     #[test]
     fn recovery_header_round_trip() {
-        let header = RecoveryHeader::new(
-            BufferId::new(),
-            Revision::new(5),
-            10,
-            false,
-        );
+        let header = RecoveryHeader::new(BufferId::new(), Revision::new(5), 10, false);
 
         let bytes = header.to_bytes();
         let decoded = RecoveryHeader::from_bytes(&bytes);
@@ -777,11 +776,7 @@ mod tests {
     #[test]
     fn recovery_writer_write_read() {
         let dir = tempdir().unwrap();
-        let config = RecoveryConfig::new(
-            "test-vault".to_string(),
-            dir.path().to_path_buf(),
-            2,
-        );
+        let config = RecoveryConfig::new("test-vault".to_string(), dir.path().to_path_buf(), 2);
         let mut writer = RecoveryWriter::new(config);
 
         let buffer = Buffer::from_str("hello world");
@@ -799,11 +794,7 @@ mod tests {
     #[test]
     fn recovery_writer_atomic_write() {
         let dir = tempdir().unwrap();
-        let config = RecoveryConfig::new(
-            "test-vault".to_string(),
-            dir.path().to_path_buf(),
-            2,
-        );
+        let config = RecoveryConfig::new("test-vault".to_string(), dir.path().to_path_buf(), 2);
         let mut writer = RecoveryWriter::new(config);
 
         let buffer = Buffer::from_str("hello world");
@@ -822,18 +813,15 @@ mod tests {
     #[test]
     fn recovery_writer_should_write() {
         use flavite_syntax::text::{Span, TextByte};
-        
+
         let dir = tempdir().unwrap();
-        let config = RecoveryConfig::new(
-            "test-vault".to_string(),
-            dir.path().to_path_buf(),
-            2,
-        );
+        let config = RecoveryConfig::new("test-vault".to_string(), dir.path().to_path_buf(), 2);
         let mut writer = RecoveryWriter::new(config);
 
         let mut buffer = Buffer::from_str("hello world");
         // Make the buffer dirty so it should be written
-        let edit = crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " test".to_string());
+        let edit =
+            crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " test".to_string());
         buffer.apply_local_edit(edit);
 
         // First write should happen (buffer is dirty and never written before)
@@ -849,11 +837,7 @@ mod tests {
     #[test]
     fn recovery_writer_checkpoint() {
         let dir = tempdir().unwrap();
-        let config = RecoveryConfig::new(
-            "test-vault".to_string(),
-            dir.path().to_path_buf(),
-            2,
-        );
+        let config = RecoveryConfig::new("test-vault".to_string(), dir.path().to_path_buf(), 2);
         let mut writer = RecoveryWriter::new(config);
 
         let buffer = Buffer::from_str("hello world");
@@ -869,11 +853,7 @@ mod tests {
     #[test]
     fn recovery_writer_list_delete() {
         let dir = tempdir().unwrap();
-        let config = RecoveryConfig::new(
-            "test-vault".to_string(),
-            dir.path().to_path_buf(),
-            2,
-        );
+        let config = RecoveryConfig::new("test-vault".to_string(), dir.path().to_path_buf(), 2);
         let mut writer = RecoveryWriter::new(config);
 
         // Write some buffers

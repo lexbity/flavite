@@ -513,7 +513,7 @@ impl QuadTree {
     fn subdivide(&mut self, index: usize, cx: f64, cy: f64, half: f64) -> [u32; 4] {
         let child_half = half * 0.5;
         let mut children = [NO_CHILD; 4];
-        for quadrant in 0..4 {
+        for (quadrant, child_slot) in children.iter_mut().enumerate() {
             let offset_x = if quadrant % 2 == 0 {
                 -child_half
             } else {
@@ -527,7 +527,7 @@ impl QuadTree {
             let child = self.regions.len() as u32;
             self.regions
                 .push(Region::empty(cx + offset_x, cy + offset_y, child_half));
-            children[quadrant] = child;
+            *child_slot = child;
         }
         self.regions[index].children = children;
         children
@@ -552,6 +552,10 @@ impl QuadTree {
     /// The recursion is depth-capped by the tree itself, so the stack can
     /// never exceed `max_tree_depth` frames — no explicit traversal stack,
     /// and therefore no allocation on the force path.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Barnes-Hut visitor: one per traversal dimension"
+    )]
     fn visit_repulsion(
         &self,
         region: u32,
@@ -1032,7 +1036,6 @@ impl Layout {
         {
             let swinging = &*swinging;
             let displacements = &mut *displacements;
-            let raw = raw;
             pool.install(|| {
                 displacements
                     .par_iter_mut()
@@ -1270,9 +1273,7 @@ impl Layout {
         self.iteration = 0;
         self.cooling_age = 0.0;
         self.converged_steps = 0;
-        for displacement in &mut self.displacement {
-            *displacement = [0.0; 2];
-        }
+        self.displacement.fill([0.0; 2]);
     }
 }
 
@@ -1361,8 +1362,8 @@ fn forces_on(
     let start = adj_offsets[i] as usize;
     let end = adj_offsets[i + 1] as usize;
     let hub_dissuasion = params.attraction / (1.0 + f64::from(degrees[i]));
-    for row in start..end {
-        let neighbour = adj_indices[row] as usize;
+    for row in adj_indices.iter().take(end).skip(start) {
+        let neighbour = *row as usize;
         let dx = positions[neighbour][0] - x;
         let dy = positions[neighbour][1] - y;
         // Magnitude = hub_dissuasion · d, direction = toward the neighbour.
@@ -1817,9 +1818,7 @@ mod tests {
         let params = LayoutParams::default();
         let pool = pool(4);
         let mut layout = Layout::from_snapshot(&snapshot, params);
-        for position in &mut layout.positions {
-            *position = [0.0; 2];
-        }
+        layout.positions.fill([0.0; 2]);
         for step in 0..200 {
             let stats = layout.step(&pool).stats;
             assert!(all_finite(&layout), "finite at step {step}: {stats:?}");
@@ -2000,9 +1999,7 @@ mod tests {
             ..LayoutParams::default()
         };
         let mut layout = Layout::from_snapshot(&snapshot, params);
-        for position in &mut layout.positions {
-            *position = [1.0, 1.0];
-        }
+        layout.positions.fill([1.0, 1.0]);
         for step in 0..20 {
             let stats = layout.step(&pool).stats;
             assert!(all_finite(&layout), "finite at step {step}: {stats:?}");
@@ -2038,7 +2035,6 @@ mod tests {
                         walk(tree, child, seen);
                     }
                 }
-                return;
             }
             // A bucket reports nothing individually; count it.
         }

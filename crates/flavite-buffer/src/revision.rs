@@ -136,7 +136,6 @@ impl BaseHash {
     /// Create a base hash from a TextSnapshot's content hash.
     #[must_use]
     pub fn from_snapshot(snapshot: &TextSnapshot) -> Self {
-        use blake3::Hash;
         let hash = blake3::hash(snapshot.source());
         Self::from_bytes(hash.into())
     }
@@ -230,7 +229,6 @@ impl ContentHash for TextSnapshot {
 
 impl ContentHash for str {
     fn content_hash(&self) -> BaseHash {
-        use blake3::Hash;
         let mut hasher = blake3::Hasher::new();
         hasher.update(self.as_bytes());
         let hash = hasher.finalize();
@@ -240,7 +238,6 @@ impl ContentHash for str {
 
 impl ContentHash for [u8] {
     fn content_hash(&self) -> BaseHash {
-        use blake3::Hash;
         let mut hasher = blake3::Hasher::new();
         hasher.update(self);
         let hash = hasher.finalize();
