@@ -6,7 +6,7 @@
 ## Question
 
 What does iced's markdown widget (`iced::widget::Markdown`) support, and
-does it cover the features required for Lattice's read mode (§4.6)? The
+does it cover the features required for Flavite's read mode (§4.6)? The
 Renderer trait (§4.6) sits behind read mode, and the decision is whether to
 extend iced's widget or replace it.
 
@@ -89,24 +89,24 @@ Embed: ![[image.png]]
 ### F2 — pulldown-cmark under the hood
 
 `iced::widget::Markdown` uses `pulldown-cmark` internally (the same parser
-Lattice uses for indexing, per §4.3). pulldown-cmark supports CommonMark
+Flavite uses for indexing, per §4.3). pulldown-cmark supports CommonMark
 plus extensions (tables, footnotes, task lists are behind cargo features that
 iced may or may not enable). Even if pulldown-cmark can parse tables, iced's
 widget does not render them.
 
-### F3 — Missing features for Lattice
+### F3 — Missing features for Flavite
 
-The following CommonMark / extension features that Lattice needs in read mode
+The following CommonMark / extension features that Flavite needs in read mode
 are **not rendered** by iced's markdown widget:
 
 1. **Tables** — the spec does not require table support explicitly, but they
    are part of the interoperability posture (§0: "inspired by Obsidian").
    Obsidian renders tables.
-2. **Task lists** — checkboxes are part of Lattice's feature set (D7: conflict
+2. **Task lists** — checkboxes are part of Flavite's feature set (D7: conflict
    state includes checkboxes; §4.6: read mode must render them).
-3. **Wikilinks** — `[[note]]` is core to Lattice (D8, D10). The widget renders
+3. **Wikilinks** — `[[note]]` is core to Flavite (D8, D10). The widget renders
    it as literal text, not as a link.
-4. **Embeds** — `![[image.png]]` is core to Lattice (D8, R3). The widget renders
+4. **Embeds** — `![[image.png]]` is core to Flavite (D8, R3). The widget renders
    it as literal text.
 5. **Math** — not a v1 requirement (§4.10: "Math spans MUST be parsed, excluded
    from link and tag extraction, and shown as styled source").
@@ -118,7 +118,7 @@ are **not rendered** by iced's markdown widget:
 iced's markdown widget may not cover tables, footnotes, or images well enough."
 
 This finding confirms that decision: **iced's markdown widget is insufficient**
-for Lattice's read mode because it does not render:
+for Flavite's read mode because it does not render:
 - Wikilinks (the "wikilink" event from pulldown-cmark with a `wiki:` URL
   scheme is not recognized)
 - Embeds (the image embed syntax)
@@ -126,7 +126,7 @@ for Lattice's read mode because it does not render:
 
 ## Decision
 
-**Decision:** Lattice implements a custom `Renderer` trait and a custom read-mode
+**Decision:** Flavite implements a custom `Renderer` trait and a custom read-mode
 renderer that:
 
 1. Uses pulldown-cmark for parsing (already a dependency, §4.3).
@@ -160,7 +160,7 @@ custom widget with:
 
 The custom renderer:
 - Is **CPU-only** (no GPU required for read mode).
-- Reuses pulldown-cmark's event stream (Lattice already depends on it for
+- Reuses pulldown-cmark's event stream (Flavite already depends on it for
   indexing).
 - Shapes text with cosmic-text (already a transitive dependency via iced).
 - Renders inline images via the `image` crate (already a dependency).

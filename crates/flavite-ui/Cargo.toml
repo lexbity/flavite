@@ -15,11 +15,11 @@ nucleo = { workspace = true }
 flavite-graph = { path = "../flavite-graph" }
 flavite-api = { path = "../flavite-api" }
 flavite-buffer = { path = "../flavite-buffer" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 # §10.4 convention: thiserror for libraries. Used for the CPU-side geometry
 # error type (`graph::instance::GeometryError`).
 thiserror = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]

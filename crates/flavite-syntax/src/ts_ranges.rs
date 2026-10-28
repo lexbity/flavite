@@ -38,7 +38,7 @@ pub struct TsParsedNote {
     pub mask: TextMask,
 }
 
-/// Parse a note's bytes with tree-sitter and extract all Lattice-specific syntax.
+/// Parse a note's bytes with tree-sitter and extract all Flavite-specific syntax.
 ///
 /// This is the editor parse path: tree-sitter for structure, our scanner
 /// for inline extensions (D10).

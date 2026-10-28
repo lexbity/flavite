@@ -1,7 +1,7 @@
 //! Minimal end-to-end host for the custom editor and Session save path.
 
-use flavite_api::lattice::session::{CommandResult, SessionCommand, SessionResult};
-use flavite_api::{BufferView, ExecutionResult, Lattice, LocalResult, VaultConfig};
+use flavite_api::session::{CommandResult, SessionCommand, SessionResult};
+use flavite_api::{BufferView, ExecutionResult, Flavite, LocalResult, VaultConfig};
 use flavite_editor::{EditorAction, EditorWidget, NoteCandidate};
 use iced::widget::{button, column, container, text};
 use iced::{Element, Length, Subscription, time};
@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
-        .title("Lattice editor demo")
+        .title("Flavite editor demo")
         .subscription(App::subscription)
         .window_size(iced::Size::new(900.0, 650.0))
         .run()
@@ -24,7 +24,7 @@ enum Message {
 }
 
 struct App {
-    lattice: Option<Lattice>,
+    flavite: Option<Flavite>,
     view: Option<BufferView>,
     candidates: Vec<NoteCandidate>,
     status: String,
@@ -37,7 +37,7 @@ impl App {
         match Self::open() {
             Ok(app) => app,
             Err(error) => Self {
-                lattice: None,
+                flavite: None,
                 view: None,
                 candidates: Vec::new(),
                 status: format!("Could not open demo vault: {error}"),
@@ -58,7 +58,7 @@ impl App {
         if !note.exists() {
             std::fs::write(
                 &note,
-                "# Lattice editor demo\n\nType here. Changes autosave after one idle second.\n",
+                "# Flavite editor demo\n\nType here. Changes autosave after one idle second.\n",
             )
             .map_err(|error| error.to_string())?;
         }
@@ -66,15 +66,15 @@ impl App {
             watcher_enabled: false,
             ..VaultConfig::default()
         };
-        let lattice =
-            Lattice::open_root(root.clone(), config).map_err(|error| error.to_string())?;
+        let flavite =
+            Flavite::open_root(root.clone(), config).map_err(|error| error.to_string())?;
         let path = root.join("demo.md");
-        match lattice.execute_session(SessionCommand::OpenNote { path }) {
+        match flavite.execute_session(SessionCommand::OpenNote { path }) {
             SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => {
-                let view = lattice
+                let view = flavite
                     .get_buffer_view(buffer_id, None)
                     .map_err(|error| error.to_string())?;
-                let candidates = lattice
+                let candidates = flavite
                     .completion_candidates()
                     .unwrap_or_default()
                     .into_iter()
@@ -86,7 +86,7 @@ impl App {
                     })
                     .collect();
                 Ok(Self {
-                    lattice: Some(lattice),
+                    flavite: Some(flavite),
                     view: Some(view),
                     candidates,
                     status: "Ready".into(),
@@ -105,24 +105,24 @@ impl App {
     fn update(&mut self, message: Message) {
         match message {
             Message::Edit(action) => {
-                let Some(lattice) = &self.lattice else { return };
+                let Some(flavite) = &self.flavite else { return };
                 if let Some(navigation) = &action.navigation {
                     let Some(path) =
-                        safe_note_target(&lattice.vault_ref().root, &navigation.target)
+                        safe_note_target(&flavite.vault_ref().root, &navigation.target)
                     else {
                         self.status = "Link target is not a safe vault-relative note path".into();
                         return;
                     };
                     let target = navigation.target.clone();
                     let invocation = action.into_link_invocation(
-                        lattice.command_registry().next_request_id(),
+                        flavite.command_registry().next_request_id(),
                         path.clone(),
                     );
                     let Some(invocation) = invocation else { return };
-                    match lattice.execute(invocation) {
+                    match flavite.execute(invocation) {
                         ExecutionResult::Local(LocalResult::Success(_)) => {
                             self.status = format!("Opened link: {target}");
-                            if let Some(buffer_id) = lattice.session().get_buffer_id(&path) {
+                            if let Some(buffer_id) = flavite.session().get_buffer_id(&path) {
                                 self.refresh(buffer_id.as_u64());
                             }
                         }
@@ -133,9 +133,9 @@ impl App {
                 let buffer_id = action.buffer_id;
                 if action.command_id == "link.insert" {
                     let invocation =
-                        action.into_invocation(lattice.command_registry().next_request_id());
+                        action.into_invocation(flavite.command_registry().next_request_id());
                     let Some(invocation) = invocation else { return };
-                    match lattice.execute(invocation) {
+                    match flavite.execute(invocation) {
                         ExecutionResult::Local(LocalResult::Success(_)) => {
                             self.status = "Link inserted".into();
                             self.refresh(buffer_id);
@@ -145,7 +145,7 @@ impl App {
                     self.last_edit = Instant::now();
                     return;
                 }
-                let result = lattice.execute_session(action.into_session_command());
+                let result = flavite.execute_session(action.into_session_command());
                 self.status = match result {
                     SessionResult::Success(_) => "Editing".into(),
                     other => format!("Edit failed: {other:?}"),
@@ -159,8 +159,8 @@ impl App {
     }
 
     fn refresh(&mut self, buffer_id: u64) {
-        if let Some(lattice) = &self.lattice {
-            match lattice.get_buffer_view(buffer_id.into(), None) {
+        if let Some(flavite) = &self.flavite {
+            match flavite.get_buffer_view(buffer_id.into(), None) {
                 Ok(view) => self.view = Some(view),
                 Err(error) => self.status = format!("Could not refresh buffer: {error}"),
             }
@@ -168,10 +168,10 @@ impl App {
     }
 
     fn save(&mut self) {
-        let (Some(lattice), Some(view)) = (&self.lattice, &self.view) else {
+        let (Some(flavite), Some(view)) = (&self.flavite, &self.view) else {
             return;
         };
-        match lattice.execute_session(SessionCommand::SaveNote {
+        match flavite.execute_session(SessionCommand::SaveNote {
             path: view.path.clone(),
         }) {
             SessionResult::Pending { request_id } => {
@@ -186,8 +186,8 @@ impl App {
     }
 
     fn pump(&mut self) {
-        let Some(lattice) = &self.lattice else { return };
-        let completions = lattice.session().drain_operation_completions();
+        let Some(flavite) = &self.flavite else { return };
+        let completions = flavite.session().drain_operation_completions();
         for completion in completions {
             if self.pending_save == Some(completion.request_id) {
                 self.pending_save = None;
@@ -208,7 +208,7 @@ impl App {
 
     fn view(&self) -> Element<'_, Message> {
         let header = column![
-            text("Lattice • custom iced editor"),
+            text("Flavite • custom iced editor"),
             text(&self.status).size(14),
             button("Save now").on_press(Message::Save),
         ]

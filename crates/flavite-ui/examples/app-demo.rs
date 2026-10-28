@@ -1,4 +1,4 @@
-//! Visual demonstration of the D1 Lattice application shell.
+//! Visual demonstration of the D1 Flavite application shell.
 
 use flavite_ui::app::App;
 use flavite_ui::style;
@@ -8,7 +8,7 @@ use std::path::PathBuf;
 fn main() -> iced::Result {
     prepare_demo_vault();
     application(App::boot, App::update, App::view)
-        .title("Lattice")
+        .title("Flavite")
         .theme(style::THEME)
         .subscription(App::subscription)
         .window_size(Size::new(1180.0, 760.0))
@@ -33,7 +33,7 @@ fn prepare_demo_vault() {
     if !note.exists()
         && let Err(error) = std::fs::write(
             note,
-            "# Welcome to Lattice\n\nA local-first vault of plain Markdown notes.\n\nUse the sidebar to explore the application shell.\n\n## Links\n\n- [[Ideas]]\n- [[Projects/Alpha]]\n\n#tag demo\n",
+            "# Welcome to Flavite\n\nA local-first vault of plain Markdown notes.\n\nUse the sidebar to explore the application shell.\n\n## Links\n\n- [[Ideas]]\n- [[Projects/Alpha]]\n\n#tag demo\n",
         )
     {
         eprintln!("could not create demo note: {error}");

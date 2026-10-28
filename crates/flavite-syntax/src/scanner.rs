@@ -1,4 +1,4 @@
-//! Inline scanner for Lattice syntax extensions (§4.3, D10).
+//! Inline scanner for Flavite syntax extensions (§4.3, D10).
 //!
 //! The scanner is **pure and IO-free**. It is the single source of link/tag
 //! semantics for both the indexer (pulldown-cmark parse path) and the editor
@@ -60,7 +60,7 @@ pub struct ScannedSpan {
 /// Run the inline scanner over `text` within `range`, returning all spans found.
 ///
 /// This is the **single semantics source** for what counts as a link/tag in
-/// Lattice. Tree-sitter never decides this (D10).
+/// Flavite. Tree-sitter never decides this (D10).
 ///
 /// # Arguments
 ///

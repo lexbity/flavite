@@ -68,5 +68,17 @@ mod tests {
             JournalRecoveryOutcome::from_state(TransactionState::Committed),
             JournalRecoveryOutcome::Committed
         );
+        assert_eq!(
+            JournalRecoveryOutcome::from_state(TransactionState::Partial),
+            JournalRecoveryOutcome::Partial
+        );
+        assert_eq!(
+            JournalRecoveryOutcome::from_state(TransactionState::Complete),
+            JournalRecoveryOutcome::Complete
+        );
+        assert_eq!(
+            JournalRecoveryOutcome::from_state(TransactionState::Abandoned),
+            JournalRecoveryOutcome::Abandoned
+        );
     }
 }

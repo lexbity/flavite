@@ -3,7 +3,7 @@
 //! Matching is in-memory nucleo fuzzy scoring (§4.7): the registry list is
 //! small, so filtering happens on the UI thread without touching the database.
 
-use flavite_api::{CommandSpec, Lattice};
+use flavite_api::{CommandSpec, Flavite};
 use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo::{Config, Matcher};
 use std::sync::{LazyLock, Mutex};
@@ -16,8 +16,8 @@ static MATCHER: LazyLock<Mutex<Matcher>> =
 /// Filter registered commands by title, id, or declared keybinding, ranked by
 /// nucleo fuzzy score. An empty or whitespace query preserves registry order.
 #[must_use]
-pub fn matching_commands(lattice: &Lattice, query: &str) -> Vec<CommandSpec> {
-    matching_specs(lattice.command_registry().specs(), query)
+pub fn matching_commands(flavite: &Flavite, query: &str) -> Vec<CommandSpec> {
+    matching_specs(flavite.command_registry().specs(), query)
 }
 
 /// Match and rank a stable command-spec snapshot, which also keeps palette
@@ -92,16 +92,28 @@ mod tests {
                 )]
             });
         vec![
-            CommandSpec::new("note.open", "Open note", flavite_api::ArgSchema),
-            CommandSpec::new("note.close", "Close note", flavite_api::ArgSchema),
+            CommandSpec::new(
+                "note.open",
+                "Open note",
+                flavite_api::ArgSchema::typed::<std::path::PathBuf>(),
+            ),
+            CommandSpec::new(
+                "note.close",
+                "Close note",
+                flavite_api::ArgSchema::typed::<std::path::PathBuf>(),
+            ),
             CommandSpec::with_availability(
                 "note.save",
                 "Save note",
-                flavite_api::ArgSchema,
+                flavite_api::ArgSchema::typed::<std::path::PathBuf>(),
                 None,
                 &SAVE[..],
             ),
-            CommandSpec::new("vault.reconcile", "Refresh vault", flavite_api::ArgSchema),
+            CommandSpec::new(
+                "vault.reconcile",
+                "Refresh vault",
+                flavite_api::ArgSchema::typed::<serde_json::Value>(),
+            ),
         ]
     }
 

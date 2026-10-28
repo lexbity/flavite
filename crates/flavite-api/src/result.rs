@@ -10,6 +10,20 @@ pub enum ExecutionResult {
     Local(LocalResult),
     /// Pending completion.
     Pending { request_id: RequestId },
+    /// Accepted command needs an explicit user decision before it can proceed.
+    ActionRequired {
+        /// The invocation that needs a decision.
+        request_id: RequestId,
+        /// Stable action code for a host to present.
+        code: String,
+        /// Structured details for the decision UI.
+        data: Option<serde_json::Value>,
+    },
+    /// An admitted operation was replaced by a newer coalesced request.
+    Superseded {
+        request_id: RequestId,
+        by_request: RequestId,
+    },
     /// Rejected without effects.
     Rejected(RejectedResult),
 }
@@ -38,6 +52,8 @@ impl ExecutionResult {
     pub fn request_id(&self) -> Option<RequestId> {
         match self {
             Self::Pending { request_id } => Some(*request_id),
+            Self::ActionRequired { request_id, .. } => Some(*request_id),
+            Self::Superseded { request_id, .. } => Some(*request_id),
             _ => None,
         }
     }
@@ -49,7 +65,9 @@ impl ExecutionResult {
             Self::Local(LocalResult::Success(s)) => Some(s.request_id),
             Self::Local(LocalResult::Void) => None,
             Self::Local(LocalResult::Error(e)) => e.request_id,
-            Self::Pending { request_id } => Some(*request_id),
+            Self::Pending { request_id }
+            | Self::ActionRequired { request_id, .. }
+            | Self::Superseded { request_id, .. } => Some(*request_id),
             Self::Rejected(_) => None,
         }
     }
@@ -289,6 +307,46 @@ mod tests {
         });
         assert!(!rejected.is_success());
         assert!(!rejected.is_pending());
+        assert!(rejected.is_rejected());
+    }
+
+    #[test]
+    fn result_accessors_cover_all_variants() {
+        let success = ExecutionResult::Local(LocalResult::Success(
+            LocalSuccess::with_command(7, "save", serde_json::json!({"ok": true}))
+                .with_version(2, 9),
+        ));
+        assert_eq!(success.request_id(), None);
+        assert_eq!(success.any_request_id(), Some(7));
+        assert_eq!(success.clone().into_success().unwrap().generation, Some(9));
+        assert!(success.clone().into_error().is_none());
+
+        let void = ExecutionResult::Local(LocalResult::Void);
+        assert_eq!(void.any_request_id(), None);
+        assert!(void.clone().into_success().is_none());
+        assert!(!void.is_success());
+
+        let error = ExecutionResult::Local(LocalResult::Error(
+            LocalError::with_request("conflict", "changed", 8).with_note_path("a.md"),
+        ));
+        assert_eq!(error.any_request_id(), Some(8));
+        assert_eq!(
+            error.clone().into_error().unwrap().note_path.as_deref(),
+            Some("a.md")
+        );
+        assert!(LocalResult::Error(LocalError::new("x", "y")).is_error());
+
+        let pending = ExecutionResult::Pending { request_id: 9 };
+        assert_eq!(pending.request_id(), Some(9));
+        assert_eq!(pending.any_request_id(), Some(9));
+        assert!(pending.clone().into_success().is_none());
+        assert!(pending.into_error().is_none());
+
+        let rejected = ExecutionResult::Rejected(
+            RejectedResult::with_request(RejectionReason::Busy, 10).with_message("busy"),
+        );
+        assert_eq!(rejected.any_request_id(), None);
+        assert!(rejected.clone().into_error().is_none());
         assert!(rejected.is_rejected());
     }
 }

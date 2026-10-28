@@ -1,6 +1,6 @@
 //! GUI-side tracking for correlated worker operations.
 
-use flavite_api::{Lattice, session::SessionResult};
+use flavite_api::{Flavite, session::SessionResult};
 use std::collections::BTreeMap;
 
 /// A correlated worker operation accepted by the Session.
@@ -40,8 +40,8 @@ impl OperationPump {
     }
 
     /// Track every terminal completion currently available from the Session.
-    pub fn drain(&mut self, lattice: &Lattice) -> Vec<TerminalOperation> {
-        lattice
+    pub fn drain(&mut self, flavite: &Flavite) -> Vec<TerminalOperation> {
+        flavite
             .session()
             .drain_operation_completions()
             .into_iter()
@@ -73,6 +73,18 @@ fn describe_result(result: &SessionResult) -> String {
             format!("Action required: {code} {}", data.as_deref().unwrap_or(""))
         }
         SessionResult::MergeReady { .. } => "Merge requires review".into(),
+        SessionResult::Busy => "Busy — retry shortly".into(),
+        SessionResult::StaleRevision {
+            buffer_id: _,
+            expected,
+            actual,
+        } => {
+            format!(
+                "Stale revision: expected {}, current {}",
+                expected.as_u64(),
+                actual.as_u64()
+            )
+        }
         SessionResult::Error { message } => format!("Failed: {message}"),
     }
 }

@@ -21,7 +21,7 @@ evidence, and no ADR-0001 escalation trigger is met.
   access is out of scope. Accept plain text only. Verdict: **decision
   recorded** (no sanitization library required).
 - **Markdown widget coverage:** iced's widget does **not** render tables, task
-  lists, wikilinks, or embeds. Lattice implements a custom `Renderer` trait
+  lists, wikilinks, or embeds. Flavite implements a custom `Renderer` trait
   and custom read-mode renderer. Verdict: **decision recorded** (custom
   renderer required).
 - **AccessKit:** iced has no AccessKit integration at 0.14; screen-reader
@@ -142,7 +142,7 @@ ADR-0001 defines the escalation path for the custom editor decision:
 - **Paste-from-HTML:** iced's text-only abstraction satisfies the spec.
 - **Markdown coverage:** The custom `Renderer` trait is the planned
   architecture; iced's limitations were anticipated.
-- **AccessKit:** The gap is in iced, not in Lattice. The waiver is honest
+- **AccessKit:** The gap is in iced, not in Flavite. The waiver is honest
   and tracked.
 
 **Escalation status: not triggered.** Proceed with A7–A11 (P6 editor

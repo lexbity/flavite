@@ -14,22 +14,23 @@
 //! - **Card cap**: at most 64 real widgets (D15).
 //! - **Text re-layout**: text is re-laid-out at the scaled font size,
 //!   quantized to [`super::zoomable::SCALE_STEP_BASE`] increments, cached per step.
-//! - **Edit flow**: card edits route through `Lattice` → Session commands
+//! - **Edit flow**: card edits route through `Flavite` → Session commands
 //!   with buffer identity/revision guards. Indexed task spans carry source
 //!   content hash; Session validates before applying (§4.5.2, D7).
 //!
 //! # Production note
 //!
 //! B7 productionizes the card layer: the B4 prototype's `CardEditSink` trait
-//! is removed; edits now dispatch through `flavite-api::Lattice`.
+//! is removed; edits now dispatch through `flavite-api::Flavite`.
 
 use std::collections::HashMap;
 
 use iced::widget::{Column, text};
 use iced::{Color, Element, Rectangle};
 
+use super::nodes::attachment_filename;
 use super::zoomable::{CARD_CAP, Card, CardIdentity, LayoutCache, ZoomableCamera};
-use flavite_api::Lattice;
+use flavite_api::Flavite;
 use flavite_buffer::revision::{BufferId, Revision};
 use flavite_graph::{NodeId, NodeKind};
 
@@ -214,8 +215,12 @@ pub fn cards_from_snapshot(
         .zip(positions.iter())
         .take(node_count)
     {
-        let title = format!("{} #{}", node_title(kind), id.id);
-        let _preview = preview_map.get(&id).cloned().unwrap_or_default();
+        let indexed_name = preview_map.get(&id).cloned().unwrap_or_default();
+        let title = match kind {
+            NodeKind::Note => format!("{} #{}", node_title(kind), id.id),
+            NodeKind::Attachment if indexed_name.is_empty() => format!("File #{}", id.id),
+            NodeKind::Attachment => attachment_filename(&indexed_name),
+        };
         let content = content_map.get(&id).cloned().unwrap_or_default();
         let task_lines = task_map.get(&id).cloned().unwrap_or_default();
 
@@ -280,6 +285,16 @@ pub fn build_card(
 
     let mut col = Column::new().spacing(8).padding(12);
 
+    // Attachment cards use a square marker and the indexed filename. The
+    // graph node itself uses the same square shape/color in `nodes`.
+    if card.kind == NodeKind::Attachment {
+        col = col.push(
+            text::Text::new("■")
+                .size(18.0 * scale)
+                .color(Color::from_rgb8(0xff, 0xc7, 0x59)),
+        );
+    }
+
     // Title
     let title = text::Text::new(card.title.clone())
         .size(16.0 * scale)
@@ -319,13 +334,13 @@ pub fn build_card(
 pub fn build_card_with_content(
     card: &Card<CardLayerMessage>,
     scale: f32,
-    lattice: &Lattice,
+    flavite: &Flavite,
     node_id: NodeId,
 ) -> Element<'static, CardLayerMessage> {
-    // For B7: fetch content from Lattice API
+    // For B7: fetch content from Flavite API
     // This is a placeholder - actual implementation will query the index
     // and buffer manager through the API
-    let content = fetch_card_content(lattice, node_id);
+    let content = fetch_card_content(flavite, node_id);
     build_card(card, scale, content)
 }
 
@@ -333,9 +348,9 @@ pub fn build_card_with_content(
 ///
 /// In production, this will query the index for previews and task lines,
 /// and check BufferManager for open buffer state.
-fn fetch_card_content(_lattice: &Lattice, _node_id: NodeId) -> CardContent {
+fn fetch_card_content(_flavite: &Flavite, _node_id: NodeId) -> CardContent {
     // Placeholder implementation - returns synthetic content
-    // Real implementation will use Lattice API to query index and buffers
+    // Real implementation will use Flavite API to query index and buffers
     CardContent::from_preview(
         "This is a preview of the note content...\n\n- [ ] Task one\n- [x] Task two",
     )
@@ -604,7 +619,7 @@ Some more content."#;
 
     #[test]
     fn fetch_card_content_placeholder() {
-        // For now, skip this test as it requires a full Lattice setup
+        // For now, skip this test as it requires a full Flavite setup
         // In production, this will query the index and buffers through the API
     }
 }

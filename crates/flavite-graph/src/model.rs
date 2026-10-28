@@ -959,9 +959,17 @@ mod tests {
         // Ring structure: every node has 4 out-edges and 4 in-edges.
         assert_eq!(model.degree(note(0)), Some(8));
         assert_eq!(model.degree(note(12_345)), Some(8));
+        // LLVM source instrumentation adds substantial per-line overhead, so
+        // keep the 1 s performance gate for normal runs and allow the measured
+        // operation to complete under the coverage runner's slower profile.
+        let budget = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(1)
+        };
         assert!(
-            elapsed < Duration::from_secs(1),
-            "50k-node build took {elapsed:?} (budget: 1 s)"
+            elapsed < budget,
+            "50k-node build took {elapsed:?} (budget: {budget:?})"
         );
     }
 }

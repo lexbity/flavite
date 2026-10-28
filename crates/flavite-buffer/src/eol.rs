@@ -1,6 +1,6 @@
 //! Per-line EOL side table and serialization (§4.8, R12, §4.16.1).
 //!
-//! Lattice MUST preserve byte-exact round-trips for unedited files and maintain
+//! Flavite MUST preserve byte-exact round-trips for unedited files and maintain
 //! mixed-EOL files without normalization. This is achieved via:
 //!
 //! 1. A bitmap recording LF/CRLF/None per line

@@ -400,7 +400,7 @@ custom widget with text runs, link runs, embed runs, code runs, etc.
 **Decision:** Waive screen-reader support pending iced upstream integration
 
 **Rationale:**
-- Gap is in iced, not in Lattice
+- Gap is in iced, not in Flavite
 - Tracked as SHOULD (D18), not MUST
 - Upstream issue to be filed
 - Custom widget tree can accommodate AccessKit later

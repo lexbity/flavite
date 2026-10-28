@@ -3,9 +3,14 @@
 //! This module provides the typed command system for the API surface.
 
 use crate::types::{Origin, Preconditions, RequestId};
+use flavite_vault::session::{Session, SessionResult};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
+
+/// An erased, statically typed command handler registered with its schema.
+pub type CommandHandler = fn(&Session, &Invocation) -> Result<SessionResult, String>;
 
 /// A command specification defining what a command does.
 #[derive(Debug, Clone)]
@@ -20,6 +25,8 @@ pub struct CommandSpec {
     pub when: Option<CommandAvailability>,
     /// Optional keybindings.
     pub keys: &'static [Chord],
+    /// Whether this command mutates vault or user data.
+    pub requires_write: bool,
 }
 
 impl CommandSpec {
@@ -32,6 +39,7 @@ impl CommandSpec {
             args,
             when: None,
             keys: &[],
+            requires_write: false,
         }
     }
 
@@ -50,13 +58,49 @@ impl CommandSpec {
             args,
             when,
             keys,
+            requires_write: false,
         }
+    }
+
+    /// Mark the command as mutating so read-only state is enforced by the
+    /// registered contract rather than by a caller supplied prefix.
+    #[must_use]
+    pub const fn write(mut self) -> Self {
+        self.requires_write = true;
+        self
     }
 }
 
 /// Argument schema for a command.
-#[derive(Debug, Clone)]
-pub struct ArgSchema;
+#[derive(Clone)]
+pub struct ArgSchema {
+    validate: fn(&serde_json::Value) -> Result<(), String>,
+}
+
+impl std::fmt::Debug for ArgSchema {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ArgSchema(..)")
+    }
+}
+
+impl ArgSchema {
+    /// Schema that validates arguments by deserializing them into a typed DTO.
+    #[must_use]
+    pub fn typed<T: DeserializeOwned>() -> Self {
+        Self {
+            validate: |value| {
+                serde_json::from_value::<T>(value.clone())
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            },
+        }
+    }
+
+    /// Validate an invocation's JSON arguments at the API boundary.
+    pub fn validate(&self, value: &serde_json::Value) -> Result<(), String> {
+        (self.validate)(value)
+    }
+}
 
 /// A keyboard chord (combination of modifier and key).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -162,10 +206,16 @@ impl Invocation {
 /// The command registry.
 #[derive(Debug, Default)]
 pub struct CommandRegistry {
-    /// Map from command ID to specification.
-    specs: RwLock<HashMap<&'static str, CommandSpec>>,
+    /// Specifications and handlers are one registration unit.
+    commands: RwLock<HashMap<&'static str, RegisteredCommand>>,
     /// Next request ID counter.
     next_request_id: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug)]
+struct RegisteredCommand {
+    spec: CommandSpec,
+    handler: CommandHandler,
 }
 
 impl CommandRegistry {
@@ -173,7 +223,7 @@ impl CommandRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            specs: RwLock::new(HashMap::new()),
+            commands: RwLock::new(HashMap::new()),
             next_request_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -186,36 +236,68 @@ impl CommandRegistry {
     }
 
     /// Register a command.
-    pub fn register(&self, spec: CommandSpec) -> Result<(), CommandRegistrationError> {
+    pub fn register(
+        &self,
+        spec: CommandSpec,
+        handler: CommandHandler,
+    ) -> Result<(), CommandRegistrationError> {
         let id = spec.id;
-
-        {
-            let specs = self.specs.read().unwrap();
-            if specs.contains_key(id) {
-                return Err(CommandRegistrationError::DuplicateId(id));
-            }
+        let mut commands = self.commands.write().unwrap();
+        if commands.contains_key(id) {
+            return Err(CommandRegistrationError::DuplicateId(id));
         }
-
-        {
-            let mut specs = self.specs.write().unwrap();
-            specs.insert(id, spec);
-        }
-
+        commands.insert(id, RegisteredCommand { spec, handler });
         Ok(())
     }
 
     /// Get a command specification.
     #[must_use]
     pub fn get_spec(&self, id: &str) -> Option<CommandSpec> {
-        let specs = self.specs.read().unwrap();
-        specs.get(id).cloned()
+        let commands = self.commands.read().unwrap();
+        commands.get(id).map(|registered| registered.spec.clone())
+    }
+
+    /// Validate arguments against the registered command schema.
+    pub fn validate(
+        &self,
+        id: &str,
+        args: &serde_json::Value,
+    ) -> Result<(), CommandValidationError> {
+        let commands = self.commands.read().unwrap();
+        let registered = commands
+            .get(id)
+            .ok_or_else(|| CommandValidationError::Unavailable(id.to_owned()))?;
+        registered
+            .spec
+            .args
+            .validate(args)
+            .map_err(CommandValidationError::InvalidArgs)
+    }
+
+    /// Validate arguments and dispatch through the handler registered with the
+    /// command specification. Validation finishes before the handler can run.
+    pub fn dispatch(
+        &self,
+        session: &Session,
+        invocation: &Invocation,
+    ) -> Result<SessionResult, CommandDispatchError> {
+        let commands = self.commands.read().unwrap();
+        let registered = commands
+            .get(invocation.command_id)
+            .ok_or_else(|| CommandDispatchError::Unavailable(invocation.command_id.to_owned()))?;
+        registered
+            .spec
+            .args
+            .validate(&invocation.args)
+            .map_err(CommandDispatchError::InvalidArgs)?;
+        (registered.handler)(session, invocation).map_err(CommandDispatchError::Handler)
     }
 
     /// List all command IDs.
     #[must_use]
     pub fn command_ids(&self) -> Vec<&'static str> {
-        let specs = self.specs.read().unwrap();
-        let mut ids = specs.keys().copied().collect::<Vec<_>>();
+        let commands = self.commands.read().unwrap();
+        let mut ids = commands.keys().copied().collect::<Vec<_>>();
         ids.sort_unstable();
         ids
     }
@@ -223,11 +305,34 @@ impl CommandRegistry {
     /// Return the registered command specifications in stable display order.
     #[must_use]
     pub fn specs(&self) -> Vec<CommandSpec> {
-        let specs = self.specs.read().unwrap();
-        let mut values = specs.values().cloned().collect::<Vec<_>>();
+        let commands = self.commands.read().unwrap();
+        let mut values = commands
+            .values()
+            .map(|registered| registered.spec.clone())
+            .collect::<Vec<_>>();
         values.sort_by_key(|spec| spec.id);
         values
     }
+}
+
+/// A command rejected before its handler can produce effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandValidationError {
+    /// No handler/specification is registered for this ID.
+    Unavailable(String),
+    /// Arguments do not match the registered typed schema.
+    InvalidArgs(String),
+}
+
+/// Failure to dispatch a registered command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandDispatchError {
+    /// No command/handler was registered.
+    Unavailable(String),
+    /// Typed argument validation failed.
+    InvalidArgs(String),
+    /// Handler refused an otherwise valid request before side effects.
+    Handler(String),
 }
 
 /// Error for command registration.
@@ -285,22 +390,32 @@ mod tests {
     #[test]
     fn registry_basic() {
         let registry = CommandRegistry::new();
-        let spec = CommandSpec::new("test.cmd", "Test", ArgSchema);
+        let spec = CommandSpec::new("test.cmd", "Test", ArgSchema::typed::<serde_json::Value>());
 
-        registry.register(spec).unwrap();
+        registry.register(spec, test_handler).unwrap();
         assert!(registry.command_ids().contains(&"test.cmd"));
     }
 
     #[test]
     fn duplicate_id_fails() {
         let registry = CommandRegistry::new();
-        let spec = CommandSpec::new("test.cmd", "Test", ArgSchema);
+        let spec = CommandSpec::new("test.cmd", "Test", ArgSchema::typed::<serde_json::Value>());
 
-        registry.register(spec).unwrap();
-        let result = registry.register(CommandSpec::new("test.cmd", "Test2", ArgSchema));
+        registry.register(spec, test_handler).unwrap();
+        let result = registry.register(
+            CommandSpec::new("test.cmd", "Test2", ArgSchema::typed::<serde_json::Value>()),
+            test_handler,
+        );
         assert!(matches!(
             result,
             Err(CommandRegistrationError::DuplicateId(_))
         ));
+    }
+
+    fn test_handler(
+        _session: &flavite_vault::session::Session,
+        _invocation: &Invocation,
+    ) -> Result<SessionResult, String> {
+        Err("test handler".into())
     }
 }

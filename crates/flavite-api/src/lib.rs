@@ -1,17 +1,17 @@
 #![forbid(unsafe_code)]
 
-//! Tier 2. `Lattice` facade owning the `Session` and command registry;
+//! Tier 2. `Flavite` facade owning the `Session` and command registry;
 //! typed commands/results, revisioned read views, versioned event bus,
 //! `Query` AST, capability declarations (§4.1, §4.5, D16).
 //!
-//! This crate provides the public API for interacting with Lattice vaults.
+//! This crate provides the public API for interacting with Flavite vaults.
 //! It is the single point through which all external consumers (GUI, CLI, future
 //! plugins) interact with the core system.
 //!
 //! # Architecture
 //!
 //! The API consists of:
-//! - **Lattice**: Main facade owning Session and command registry
+//! - **Flavite**: Main facade owning Session and command registry
 //! - **Command System**: Typed command specification and dispatch
 //! - **Event System**: Versioned events for plugin compatibility
 //! - **Query AST**: Re-exported from flavite-index
@@ -28,7 +28,7 @@ pub mod channel;
 pub mod command;
 pub mod doctor;
 pub mod event;
-pub mod lattice;
+pub mod flavite;
 pub mod open;
 pub mod result;
 pub mod types;
@@ -39,7 +39,7 @@ pub use channel::*;
 pub use command::*;
 pub use doctor::*;
 pub use event::*;
-pub use lattice::*;
+pub use flavite::*;
 pub use result::*;
 pub use types::*;
 

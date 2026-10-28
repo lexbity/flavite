@@ -64,7 +64,7 @@ impl Link {
     }
 }
 
-/// Parse a note's bytes and extract all Lattice-specific syntax.
+/// Parse a note's bytes and extract all Flavite-specific syntax.
 ///
 /// This is the indexer parse path: pulldown-cmark for structure, our scanner
 /// for inline extensions (D10).

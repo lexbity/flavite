@@ -111,7 +111,7 @@ fn main() -> iced::Result {
         |state: &mut ProbeState, message: ProbeMessage| state.update(message),
         view_probe,
     )
-    .title("Lattice Graph Visual Fixture")
+    .title("Flavite Graph Visual Fixture")
     .window_size(iced::Size::new(1024.0, 768.0))
     .run()
 }

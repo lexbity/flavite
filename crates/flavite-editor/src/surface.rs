@@ -20,6 +20,15 @@ pub struct EditorView {
     pub state: String,
 }
 
+/// A note candidate offered while completing a wikilink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkTarget {
+    /// Plain-text link target (vault-relative path or unique stem).
+    pub target: String,
+    /// Human-readable note title.
+    pub title: String,
+}
+
 impl From<&BufferView> for EditorView {
     fn from(view: &BufferView) -> Self {
         Self {
@@ -71,21 +80,21 @@ pub struct LinkNavigation {
 impl EditorAction {
     /// Convert to the Session's authoritative mutation command.
     #[must_use]
-    pub fn into_session_command(self) -> flavite_api::lattice::session::SessionCommand {
+    pub fn into_session_command(self) -> flavite_api::session::SessionCommand {
         if let Some(redo) = self.history {
             return if redo {
-                flavite_api::lattice::session::SessionCommand::Redo {
+                flavite_api::session::SessionCommand::Redo {
                     buffer_id: self.buffer_id.into(),
                     revision: flavite_buffer::revision::Revision::new(self.expected_revision),
                 }
             } else {
-                flavite_api::lattice::session::SessionCommand::Undo {
+                flavite_api::session::SessionCommand::Undo {
                     buffer_id: self.buffer_id.into(),
                     revision: flavite_buffer::revision::Revision::new(self.expected_revision),
                 }
             };
         }
-        flavite_api::lattice::session::SessionCommand::ApplyEdits {
+        flavite_api::session::SessionCommand::ApplyEdits {
             buffer_id: self.buffer_id.into(),
             revision: flavite_buffer::revision::Revision::new(self.expected_revision),
             ops: self.edits,

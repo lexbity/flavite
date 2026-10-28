@@ -34,3 +34,35 @@ impl RenameBufferPatcher {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::manifest::{TransactionItem, TransactionItemState, TransactionPhase};
+    use std::path::PathBuf;
+
+    fn item() -> TransactionItem {
+        TransactionItem {
+            id: 1,
+            from_path: PathBuf::from("old.md"),
+            to_path: PathBuf::from("new.md"),
+            phase: TransactionPhase::WaitBuffers,
+            state: TransactionItemState::Committed,
+            expected_base_hash: None,
+            expected_new_hash: None,
+            observed_base_hash: None,
+            observed_new_hash: None,
+            buffer_id: None,
+            buffer_revision: None,
+            checkpoint_seq: None,
+            operation_markers: Vec::new(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn checkpoint_stub_accepts_buffer_context() {
+        let manager = Arc::new(Mutex::new(BufferManager::new()));
+        assert!(RenameBufferPatcher::persist_checkpoint(&manager, &item(), "txn-1", 1).is_ok());
+    }
+}

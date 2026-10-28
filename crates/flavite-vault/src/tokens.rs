@@ -293,6 +293,52 @@ mod tests {
     }
 
     #[test]
+    fn manager_replacement_clone_guards_and_cleanup_cover_all_lifecycles() {
+        let manager = Arc::new(WriteTokenManager::with_timeout(Duration::from_secs(2)));
+        assert_eq!(manager.default_timeout(), Duration::from_secs(2));
+        let path = PathBuf::from("/test/lifecycle.md");
+        let first = manager.acquire(path.clone(), [1; 32]);
+        let replacement =
+            manager.acquire_with_timeout(path.clone(), [2; 32], Duration::from_secs(1));
+        assert!(first.matches(&[1; 32]));
+        assert!(!manager.matches_expected(&path, &[1; 32]));
+        assert!(manager.matches_expected(&path, &[2; 32]));
+        assert!(manager.get_token_ref(&path).is_some());
+        assert_eq!(manager.paths(), vec![path.clone()]);
+        assert_eq!(manager.len(), 1);
+        assert!(!manager.is_empty());
+        assert!(!replacement.is_expired());
+        assert!(replacement.remaining() <= Duration::from_secs(1));
+        assert!(manager.has_active_token(&path));
+        assert_eq!(manager.cleanup_expired(), 0);
+        assert!(manager.has_token(&path));
+        assert!(manager.get_token_ref(&path).is_some());
+
+        manager.release(&replacement);
+        assert!(!manager.has_token(&path));
+
+        let token = manager.acquire(path.clone(), [3; 32]);
+        let guard = TokenGuard::new(manager.clone(), token.clone());
+        assert!(manager.has_token(&path));
+        drop(guard);
+        assert!(!manager.has_token(&path));
+
+        let token = manager.acquire(path.clone(), [4; 32]);
+        TokenGuard::new(manager.clone(), token).release();
+        assert!(manager.is_empty());
+        let token = manager.acquire(path.clone(), [5; 32]);
+        manager.release(&token);
+        assert!(manager.is_empty());
+        manager.acquire(PathBuf::from("/test/clear.md"), [0; 32]);
+        manager.clear();
+        assert!(manager.is_empty());
+
+        let cloned = manager.as_ref().clone();
+        assert_eq!(cloned.default_timeout(), manager.default_timeout());
+        assert!(cloned.is_empty());
+    }
+
+    #[test]
     fn test_token_expiration() {
         let manager = WriteTokenManager::new();
         let hash = [0u8; 32];

@@ -1,4 +1,4 @@
-//! Iced application shell and host adapter for Lattice.
+//! Iced application shell and host adapter for Flavite.
 //!
 //! The shell renders persistent window chrome (sidebar, pane header, status
 //! bar) plus a keyboard-driven command palette overlay. Styles come from
@@ -11,7 +11,7 @@ use crate::settings::{RenameBehavior, Settings};
 use crate::style::{self, Tone};
 use crate::subscription;
 use flavite_api::{
-    BufferView, ExecutionResult, Invocation, Lattice, LocalResult, Origin, VaultConfig,
+    BufferView, ExecutionResult, Flavite, Invocation, LocalResult, Origin, VaultConfig,
     channels::{Notice, Pulse},
 };
 use iced::widget::{
@@ -23,9 +23,9 @@ use std::path::PathBuf;
 /// Widget id of the palette query input, used to focus it when the overlay opens.
 const PALETTE_INPUT_ID: &str = "palette-query-input";
 
-/// Run-ready application state. `Lattice` owns the only Session and buffer authority.
+/// Run-ready application state. `Flavite` owns the only Session and buffer authority.
 pub struct App {
-    lattice: Option<Lattice>,
+    flavite: Option<Flavite>,
     root: PathBuf,
     pane: Pane,
     palette_open: bool,
@@ -69,7 +69,7 @@ impl App {
             .or_else(|| std::env::var_os("LATTICE_VAULT").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("target/ui-visual/app-vault"));
         let mut app = Self {
-            lattice: None,
+            flavite: None,
             root: root.clone(),
             pane: Pane::Workspace,
             palette_open: false,
@@ -83,10 +83,10 @@ impl App {
             operations: OperationPump::default(),
             active_buffer: None,
         };
-        match Lattice::open_root(root, VaultConfig::default()) {
-            Ok(lattice) => {
-                app.root = lattice.vault_ref().root.clone();
-                app.settings = match lattice.read_settings() {
+        match Flavite::open_root(root, VaultConfig::default()) {
+            Ok(flavite) => {
+                app.root = flavite.vault_ref().root.clone();
+                app.settings = match flavite.read_settings() {
                     Ok(contents) => Settings::parse(contents.as_deref()).unwrap_or_else(|error| {
                         app.settings_valid = false;
                         app.status =
@@ -99,7 +99,7 @@ impl App {
                         Settings::default()
                     }
                 };
-                app.lattice = Some(lattice);
+                app.flavite = Some(flavite);
                 if app.settings_valid {
                     app.status = "Vault ready".into();
                 }
@@ -249,7 +249,7 @@ impl App {
                     .on_press(Message::Navigate(*pane)),
             );
         }
-        let (dot_tone, hint) = if self.lattice.is_some() {
+        let (dot_tone, hint) = if self.flavite.is_some() {
             (Tone::Success, "Vault connected")
         } else {
             (Tone::Danger, "Vault unavailable")
@@ -456,7 +456,7 @@ impl App {
     }
 
     fn document_view(&self, read_mode: bool) -> Element<'_, Message> {
-        let Some(lattice) = &self.lattice else {
+        let Some(flavite) = &self.flavite else {
             return self.placeholder_view("Document", "The vault is unavailable.");
         };
         let Some(buffer_id) = self.active_buffer else {
@@ -465,7 +465,7 @@ impl App {
                 "Open demo.md through the command palette to attach a revisioned buffer view.",
             );
         };
-        match lattice.get_buffer_view(buffer_id.into(), None) {
+        match flavite.get_buffer_view(buffer_id.into(), None) {
             Ok(view) => {
                 let title = if read_mode { "Read" } else { "Editor" };
                 let meta = row![
@@ -675,8 +675,8 @@ impl App {
     }
 
     fn palette_matches(&self) -> Vec<flavite_api::CommandSpec> {
-        self.lattice.as_ref().map_or_else(Vec::new, |lattice| {
-            matching_commands(lattice, &self.palette_query)
+        self.flavite.as_ref().map_or_else(Vec::new, |flavite| {
+            matching_commands(flavite, &self.palette_query)
         })
     }
 
@@ -708,14 +708,14 @@ impl App {
     /// Current revisioned view of the active buffer, if any.
     fn active_view(&self) -> Option<BufferView> {
         let buffer_id = self.active_buffer?;
-        self.lattice
+        self.flavite
             .as_ref()?
             .get_buffer_view(buffer_id.into(), None)
             .ok()
     }
 
     fn run_command(&mut self, command_id: &'static str) {
-        let Some(lattice) = &self.lattice else {
+        let Some(flavite) = &self.flavite else {
             self.status = "Open a vault before running commands".into();
             return;
         };
@@ -728,7 +728,7 @@ impl App {
                     self.status = format!("{command_id} requires an open note");
                     return;
                 };
-                let Ok(view) = lattice.get_buffer_view(buffer_id.into(), None) else {
+                let Ok(view) = flavite.get_buffer_view(buffer_id.into(), None) else {
                     self.status =
                         format!("{command_id} could not read the current buffer revision");
                     return;
@@ -737,9 +737,9 @@ impl App {
             }
             _ => serde_json::Value::Null,
         };
-        let request_id = lattice.command_registry().next_request_id();
+        let request_id = flavite.command_registry().next_request_id();
         let invocation = Invocation::new(request_id, command_id, args, Origin::Gui);
-        match lattice.execute(invocation) {
+        match flavite.execute(invocation) {
             ExecutionResult::Local(result) => match result {
                 LocalResult::Success(success) => {
                     self.status = match command_id {
@@ -767,6 +767,15 @@ impl App {
                 self.operations.accept(request_id, command_id);
                 self.status = format!("{command_id} pending · request {request_id}");
             }
+            ExecutionResult::ActionRequired {
+                request_id, code, ..
+            } => {
+                self.operations.accept(request_id, command_id);
+                self.status = format!("{command_id} needs a decision: {code}");
+            }
+            ExecutionResult::Superseded { by_request, .. } => {
+                self.status = format!("{command_id} superseded by request {by_request}");
+            }
             ExecutionResult::Rejected(rejected) => {
                 self.status = format!("{command_id} rejected: {:?}", rejected.reason);
             }
@@ -778,11 +787,11 @@ impl App {
             self.status = "Settings were not loaded safely; repair settings.toml first".into();
             return;
         }
-        let Some(lattice) = &self.lattice else { return };
+        let Some(flavite) = &self.flavite else { return };
         match self
             .settings
             .to_toml()
-            .and_then(|text| lattice.write_settings(&text).map_err(|e| e.to_string()))
+            .and_then(|text| flavite.write_settings(&text).map_err(|e| e.to_string()))
         {
             Ok(()) => {
                 self.settings_dirty = false;
@@ -793,17 +802,17 @@ impl App {
     }
 
     fn pump(&mut self) {
-        let Some(lattice) = &self.lattice else { return };
-        for pulse in lattice.drain_pulses() {
+        let Some(flavite) = &self.flavite else { return };
+        for pulse in flavite.drain_pulses() {
             self.recent_events.push(describe_pulse(&pulse));
         }
-        let notices = lattice.drain_notices();
+        let notices = flavite.drain_notices();
         for notice in notices {
             self.recent_events.push(describe_notice(&notice));
             // Presentation delivery is acknowledged only after adding the notice to visible state.
-            lattice.acknowledge_notice(&notice);
+            flavite.acknowledge_notice(&notice);
         }
-        for terminal in self.operations.drain(lattice) {
+        for terminal in self.operations.drain(flavite) {
             self.status = format!("Request {} · {}", terminal.request_id, terminal.result);
         }
         self.recent_events.truncate(100);
@@ -949,7 +958,7 @@ mod tests {
 
     fn empty_app() -> App {
         App {
-            lattice: None,
+            flavite: None,
             root: PathBuf::from("fixture-vault"),
             pane: Pane::Workspace,
             palette_open: false,
@@ -1023,22 +1032,22 @@ mod tests {
     #[test]
     fn pump_presents_pulses_and_notices_once_and_acks_presentation() {
         let vault = tempfile::tempdir().expect("fixture vault directory");
-        let lattice = Lattice::open_root(vault.path().to_path_buf(), VaultConfig::default())
+        let flavite = Flavite::open_root(vault.path().to_path_buf(), VaultConfig::default())
             .expect("fixture vault opens");
         let mut app = empty_app();
-        app.lattice = Some(lattice);
+        app.flavite = Some(flavite);
         app.root = vault.path().to_path_buf();
-        let lattice = app.lattice.as_ref().expect("lattice attached");
-        let _ = lattice.session().pulse_channel().send(Pulse::Invalidate {
+        let flavite = app.flavite.as_ref().expect("flavite attached");
+        let _ = flavite.session().pulse_channel().send(Pulse::Invalidate {
             note: flavite_api::channels::NoteRef::new(vault.path().join("demo.md")),
         });
-        lattice
+        flavite
             .session()
             .notice_channel()
             .send(Notice::RecoveryOffer {
                 note: flavite_api::channels::NoteRef::new(vault.path().join("demo.md")),
             });
-        lattice.session().notice_channel().send(Notice::Conflict {
+        flavite.session().notice_channel().send(Notice::Conflict {
             note: flavite_api::channels::NoteRef::new(vault.path().join("other.md")),
         });
         app.pump();

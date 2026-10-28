@@ -35,7 +35,7 @@ trap cleanup EXIT
 
 window_id=""
 for _ in $(seq 1 100); do
-    window_id="$(xdotool search --onlyvisible --name '^Lattice Graph Visual Fixture$' 2>/dev/null | head -n 1 || true)"
+    window_id="$(xdotool search --onlyvisible --name '^Flavite Graph Visual Fixture$' 2>/dev/null | head -n 1 || true)"
     if [[ -n "$window_id" ]]; then
         break
     fi

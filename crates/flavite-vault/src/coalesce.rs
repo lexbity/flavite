@@ -451,26 +451,34 @@ mod tests {
         assert!(batch.is_none());
     }
 
-    // TODO: This test requires a running coalescer with background processing
-    // #[test]
-    // fn test_coalescer_max_window() {
-    //     let config = CoalescerConfig {
-    //         quiet_window: Duration::from_secs(10),  // Long quiet window
-    //         max_window: Duration::from_millis(100), // Short max window
-    //         bulk_threshold: 500,
-    //     };
-    //     let coalescer = EventCoalescer::new(config);
-    //
-    //     // Send an event
-    //     coalescer.send(CoalescerEvent::PathNominated(PathBuf::from(
-    //         "/test/file.md",
-    //     )));
-    //
-    //     // Wait for max window to expire
-    //     std::thread::sleep(Duration::from_millis(150));
-    //
-    //     // Should get a batch due to max window
-    //     let batch = coalescer.try_recv_batch();
-    //     assert!(batch.is_some());
-    // }
+    #[test]
+    fn watcher_nominations_and_overflow_produce_batches() {
+        use flavite_fs::MemFs;
+
+        let coalescer = EventCoalescer::new(CoalescerConfig {
+            quiet_window: Duration::ZERO,
+            max_window: Duration::from_secs(5),
+            bulk_threshold: 500,
+        });
+        let watcher = VaultWatcher::new(Box::new(MemFs::new()), &coalescer);
+        watcher.notify(WatcherEvent::Created(PathBuf::from("created.md")));
+        watcher.notify(WatcherEvent::Modified(PathBuf::from("modified.md")));
+        watcher.notify(WatcherEvent::Deleted(PathBuf::from("deleted.md")));
+        watcher.notify(WatcherEvent::Renamed {
+            from: PathBuf::from("old.md"),
+            to: PathBuf::from("new.md"),
+        });
+        let batch = coalescer.try_recv_batch().unwrap();
+        assert_eq!(batch.len(), 5);
+
+        watcher.notify(WatcherEvent::Overflow);
+        let overflow = coalescer.try_recv_batch().unwrap();
+        assert_eq!(overflow.scope, ReconcileScope::Full);
+        assert_eq!(overflow.mode, ReconcileMode::VerifyContent);
+        assert!(overflow.is_empty());
+
+        coalescer.reset();
+        assert!(coalescer.try_recv_batch().is_none());
+        assert!(coalescer.pending().lock().unwrap().is_empty());
+    }
 }

@@ -138,7 +138,7 @@ Scale 2.00x: max_error=0.0000px, passes=✓
 
 **Decision:** Waive screen-reader support pending iced upstream integration  
 **Rationale:** 
-- Gap is in iced, not in Lattice
+- Gap is in iced, not in Flavite
 - Tracked as SHOULD (D18), not MUST
 - Upstream issue to be filed
 - Custom widget tree can accommodate AccessKit later with non-invasive changes

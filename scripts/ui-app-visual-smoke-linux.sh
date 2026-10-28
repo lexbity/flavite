@@ -52,7 +52,7 @@ cleanup() {
 trap cleanup EXIT
 
 for _ in $(seq 1 100); do
-    window_id="$(xdotool search --onlyvisible --name '^Lattice$' 2>/dev/null | head -n 1 || true)"
+    window_id="$(xdotool search --onlyvisible --name '^Flavite$' 2>/dev/null | head -n 1 || true)"
     if [[ -n "$window_id" ]]; then break; fi
     if ! kill -0 "$app_pid" 2>/dev/null; then
         cat "$visual_dir/app-shell.log" >&2

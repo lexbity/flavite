@@ -1,7 +1,7 @@
 //! Attachment rename handling (D8, §4.3, R3).
 //!
 //! This module handles rename detection and processing for attachments.
-//! Attachments are first-class entities in Lattice, and their renames
+//! Attachments are first-class entities in Flavite, and their renames
 //! need special handling.
 
 use crate::channels::{Notice, NoticeChannel, RenameTier};

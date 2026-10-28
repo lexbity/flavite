@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Lattice directory name in OS data.
-const LATTICE_DIR: &str = "flavite";
+/// Flavite directory name in OS data.
+const FLAVITE_DIR: &str = "flavite";
 
 /// Vaults subdirectory.
 const VAULTS_DIR: &str = "vaults";
@@ -351,7 +351,7 @@ impl InstanceManager {
 
 /// Get the path to the data directory.
 fn get_data_dir() -> InstanceResult<PathBuf> {
-    ProjectDirs::from("com", "flavite", "Lattice")
+    ProjectDirs::from("com", "flavite", "Flavite")
         .map(|p| p.data_dir().to_path_buf())
         .ok_or(InstanceError::NoProjectDirs)
 }
@@ -360,7 +360,7 @@ fn get_data_dir() -> InstanceResult<PathBuf> {
 fn get_ipc_path(uuid: Uuid) -> InstanceResult<PathBuf> {
     let data_dir = get_data_dir()?;
     Ok(data_dir
-        .join(LATTICE_DIR)
+        .join(FLAVITE_DIR)
         .join(VAULTS_DIR)
         .join(uuid.to_string())
         .join(INSTANCE_IPC))
@@ -387,7 +387,7 @@ pub fn is_instance_running(identity: &VaultIdentity) -> bool {
 fn get_root_guard_path(root_key: &[u8]) -> PathBuf {
     get_data_dir()
         .unwrap_or_else(|_| PathBuf::from("/tmp/flavite"))
-        .join(LATTICE_DIR)
+        .join(FLAVITE_DIR)
         .join(ROOTS_DIR)
         .join(format!("{}.lock", hex::encode(root_key)))
 }

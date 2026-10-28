@@ -600,4 +600,88 @@ mod tests {
             _ => panic!("Expected RenameSuggested event"),
         }
     }
+
+    #[test]
+    fn bridge_maps_remaining_pulse_and_notice_variants() {
+        use flavite_buffer::manager::NoteRef;
+        let vault = ApiVaultRef::new(Uuid::new_v4(), PathBuf::from("/vault"));
+
+        let progress =
+            ChannelBridge::pulse_to_event(&vault, Pulse::ReconcileProgress { done: 2, total: 5 });
+        assert!(matches!(
+            progress,
+            Event::VaultChanged {
+                epoch: 0,
+                generation: 0,
+                ..
+            }
+        ));
+        let invalidation = ChannelBridge::pulse_to_event(
+            &vault,
+            Pulse::Invalidate {
+                note: NoteRef {
+                    path: PathBuf::from("a.md"),
+                    stable_id: None,
+                },
+            },
+        );
+        assert!(
+            matches!(invalidation, Event::BufferStateChanged { buffer_id: 0, revision: 0, state, .. } if state == "invalidated")
+        );
+
+        let note = NoteRef {
+            path: PathBuf::from("notes/a.md"),
+            stable_id: None,
+        };
+        assert!(
+            matches!(ChannelBridge::notice_to_event(&vault, Notice::Conflict { note: note.clone() }), Event::Conflict { note_path, .. } if note_path == "notes/a.md")
+        );
+        assert!(
+            matches!(ChannelBridge::notice_to_event(&vault, Notice::RecoveryOffer { note: note.clone() }), Event::RecoveryOffer { note_path, .. } if note_path == "notes/a.md")
+        );
+        assert!(
+            matches!(ChannelBridge::notice_to_event(&vault, Notice::ActionRequired { code: "repair", note: Some(note.clone()) }), Event::ActionRequired { code, note_path: Some(path), .. } if code == "repair" && path == "notes/a.md")
+        );
+        assert!(matches!(
+            ChannelBridge::notice_to_event(
+                &vault,
+                Notice::ActionRequired {
+                    code: "global",
+                    note: None
+                }
+            ),
+            Event::ActionRequired {
+                note_path: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn coalescer_replaces_same_notice_key_and_flushes_pending_items() {
+        use flavite_buffer::manager::NoteRef;
+        let state = Arc::new(Mutex::new(HashMap::new()));
+        let mut coalescer = Coalescer::new(state.clone());
+        let first = Notice::Conflict {
+            note: NoteRef {
+                path: PathBuf::from("same.md"),
+                stable_id: None,
+            },
+        };
+        let replacement = Notice::RecoveryOffer {
+            note: NoteRef {
+                path: PathBuf::from("same.md"),
+                stable_id: None,
+            },
+        };
+        assert_eq!(coalescer.process(first).unwrap().len(), 1);
+        assert_eq!(coalescer.process(replacement).unwrap().len(), 1);
+        let flushed = coalescer.flush();
+        assert_eq!(
+            flushed.len(),
+            2,
+            "notice kinds have distinct coalescing keys"
+        );
+        assert_eq!(state.lock().unwrap().len(), 2);
+    }
 }

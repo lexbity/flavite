@@ -1,4 +1,4 @@
-use flavite_api::lattice::session::SessionCommand;
+use flavite_api::session::SessionCommand;
 use flavite_editor::{EditorAction, EditorSurface, EditorView, LinkNavigation};
 use flavite_syntax::text::{Span, TextByte};
 use std::path::PathBuf;

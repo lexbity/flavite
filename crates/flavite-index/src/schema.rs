@@ -1,4 +1,4 @@
-//! SQLite schema for the Lattice index (§4.3, D12).
+//! SQLite schema for the Flavite index (§4.3, D12).
 //!
 //! This module contains the complete schema from the specification, including
 //! all tables, indexes, and constraints. The schema is versioned and migrations

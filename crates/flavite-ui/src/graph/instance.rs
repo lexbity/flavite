@@ -433,16 +433,14 @@ impl ProbeGeometry {
         }
 
         let node_ids: Vec<NodeId> = snapshot.node_ids.clone();
-        let nodes = (0..node_count)
-            .map(|i| {
-                let kind = snapshot.node_kinds[i];
-                let degree = snapshot.degrees.get(i).copied().unwrap_or(0);
-                NodeInstance {
-                    center: positions[i],
-                    size: node_radius(degree),
-                    shape: NodeShape::from(kind),
-                    color: color_of(kind),
-                }
+        let nodes = super::nodes::node_visuals(snapshot)
+            .into_iter()
+            .zip(positions.iter().copied())
+            .map(|(visual, center)| NodeInstance {
+                center,
+                size: visual.size,
+                shape: visual.shape,
+                color: visual.color,
             })
             .collect();
 

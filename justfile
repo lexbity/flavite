@@ -1,4 +1,4 @@
-# Lattice justfile — single entry point for every gate recipe (§10.3).
+# Flavite justfile — single entry point for every gate recipe (§10.3).
 # A4: full G0 (fmt + clippy + test + arch check, ends with gc) + G1 (ci-gate).
 
 # Run rustfmt in check mode.

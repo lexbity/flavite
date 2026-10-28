@@ -9,20 +9,20 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use flavite_api::open::vault_exists;
 use flavite_api::{
-    ApiVaultRef, DoctorReport, Lattice, Origin, OsFs, Vault, VaultConfig, command::Invocation,
+    ApiVaultRef, DoctorReport, ExecutionResult, Flavite, LocalResult, Origin, OsFs, VaultConfig,
+    command::Invocation,
 };
 use std::path::PathBuf;
 use tracing::{debug, info};
 
-/// Lattice — a local-first plain-text knowledge vault in pure Rust.
+/// Flavite — a local-first plain-text knowledge vault in pure Rust.
 ///
 /// The CLI is headless and drives the vault's Session through flavite-api.
 /// All commands work without a GPU or display.
 #[derive(Parser, Debug)]
 #[command(name = "flavite")]
-#[command(author = "Lattice Contributors")]
+#[command(author = "Flavite Contributors")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "Local-first plain-text knowledge vault", long_about = None)]
 struct Cli {
@@ -114,21 +114,18 @@ enum Commands {
 /// CLI driver that uses flavite-api for all operations.
 #[allow(dead_code)]
 struct CliDriver {
-    /// Lattice facade from flavite-api
-    lattice: Option<Lattice>,
+    /// Flavite facade from flavite-api
+    flavite: Option<Flavite>,
     /// Vault reference
     vault_ref: Option<ApiVaultRef>,
-    /// Vault (temporary, for CLI integration)
-    vault: Option<Vault>,
 }
 
 impl CliDriver {
     /// Create a new CLI driver.
     fn new() -> Self {
         Self {
-            lattice: None,
+            flavite: None,
             vault_ref: None,
-            vault: None,
         }
     }
 
@@ -140,9 +137,7 @@ impl CliDriver {
         let vault_path = std::fs::canonicalize(&vault_path)
             .with_context(|| format!("Cannot canonicalize vault path: {}", vault_path.display()))?;
 
-        // Check if vault exists
-        let fs = Box::new(OsFs::new());
-        if !vault_exists(&*fs, &vault_path)? {
+        if !vault_path.is_dir() {
             anyhow::bail!(
                 "Vault does not exist at {}. Run 'flavite init' to create one.",
                 vault_path.display()
@@ -155,26 +150,24 @@ impl CliDriver {
             ..Default::default()
         };
 
-        // Open the vault through flavite-api (which re-exports from flavite-vault)
-        let vault = Vault::open(vault_path.clone(), fs, config.clone())
-            .with_context(|| format!("Failed to open vault at {}", vault_path.display()))?;
-
-        let identity = vault.identity().clone();
-
-        // Create API vault reference
-        self.vault_ref = Some(ApiVaultRef::new(identity.uuid, vault_path));
-
-        // Store the vault for later use
-        self.vault = Some(vault);
-
-        // Create a Lattice facade that works with the vault's Session
-        // Note: In a fully migrated implementation, Lattice would create and own
-        // the Session directly, and Vault would be constructed through the API
-        let session_arc = self.vault.as_ref().unwrap().session_arc();
-        self.lattice = Some(
-            Lattice::with_vault(identity, session_arc, config)
-                .map_err(|e| anyhow::anyhow!("Failed to create Lattice facade: {}", e))?,
-        );
+        let flavite = Flavite::open_root(vault_path, config)
+            .with_context(|| "Failed to open vault through Flavite API")?;
+        let request_id = flavite.command_registry().next_request_id();
+        let result = flavite.execute(Invocation::new(
+            request_id,
+            "reconcile",
+            serde_json::json!({ "scope": "full", "mode": "verify" }),
+            Origin::Cli,
+        ));
+        let result = match result {
+            ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
+            completed => completed,
+        };
+        if !matches!(result, ExecutionResult::Local(LocalResult::Success(_))) {
+            anyhow::bail!("vault reconcile did not complete successfully: {result:?}");
+        }
+        self.vault_ref = Some(flavite.vault_ref().clone());
+        self.flavite = Some(flavite);
 
         Ok(())
     }
@@ -301,7 +294,7 @@ impl CliDriver {
 
         // For now, this is a placeholder
         // In a full implementation, we would parse the query and execute it
-        // through the Lattice facade
+        // through the Flavite facade
 
         println!("Query: {}", query);
         println!("Limit: {}", limit);
@@ -330,8 +323,8 @@ impl CliDriver {
     fn show_info(&self, vault_path: &PathBuf) -> Result<()> {
         info!("Showing vault info: {}", vault_path.display());
 
-        if let Some(ref lattice) = self.lattice {
-            let vault_ref = lattice.vault_ref();
+        if let Some(ref flavite) = self.flavite {
+            let vault_ref = flavite.vault_ref();
             println!("Vault: {}", vault_ref.root.display());
             println!("UUID: {}", vault_ref.uuid);
             println!("API Version: {}", flavite_api::API_VERSION);
@@ -438,8 +431,8 @@ fn main() -> Result<()> {
         }
         Commands::Info { path } => {
             let vault_path = get_vault_path(path, cli.vault);
-            if let Some(ref lattice) = driver.lattice {
-                let vault_ref = lattice.vault_ref();
+            if let Some(ref flavite) = driver.flavite {
+                let vault_ref = flavite.vault_ref();
                 driver.vault_ref = Some(vault_ref.clone());
             }
             driver.show_info(&vault_path)?;
@@ -470,7 +463,7 @@ mod tests {
     #[test]
     fn test_cli_driver_creation() {
         let driver = CliDriver::new();
-        assert!(driver.lattice.is_none());
+        assert!(driver.flavite.is_none());
         assert!(driver.vault_ref.is_none());
     }
 }

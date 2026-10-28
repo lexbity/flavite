@@ -43,6 +43,11 @@ Click into this note. The smoke harness replaces it with a visible input check.
 - Selection and keyboard input
 - Session-owned edits and autosave
 NOTE
+cat >"$vault_dir/Concepts.md" <<'NOTE'
+# Concepts
+
+Opened through ctrl/cmd-click on a wikilink.
+NOTE
 
 cargo build -p flavite-editor --example editor-demo
 env -u WAYLAND_DISPLAY WINIT_UNIX_BACKEND=x11 \
@@ -64,7 +69,7 @@ cleanup() {
 trap cleanup EXIT
 
 for _ in $(seq 1 100); do
-    window_id="$(xdotool search --onlyvisible --name '^Lattice editor demo$' 2>/dev/null | head -n 1 || true)"
+    window_id="$(xdotool search --onlyvisible --name '^Flavite editor demo$' 2>/dev/null | head -n 1 || true)"
     if [[ -n "$window_id" ]]; then
         break
     fi
@@ -96,18 +101,39 @@ xdotool key --clearmodifiers ctrl+a
 sleep 0.2
 xdotool key --clearmodifiers BackSpace
 sleep 0.2
-xdotool type --clearmodifiers --delay 100 "Visual editor input confirmed"
+xdotool type --clearmodifiers --delay 100 "Visual editor input confirmed [[Con"
+xdotool key --clearmodifiers Return
 for _ in $(seq 1 60); do
-    if [[ "$(cat "$vault_dir/demo.md")" == "Visual editor input confirmed" ]]; then
+    if grep -Fq "Visual editor input confirmed [[Concepts]]" "$vault_dir/demo.md"; then
         break
     fi
     sleep 0.1
 done
-if [[ "$(cat "$vault_dir/demo.md")" != "Visual editor input confirmed" ]]; then
+if ! grep -Fq "Visual editor input confirmed [[Concepts]]" "$vault_dir/demo.md"; then
     cat "$visual_dir/editor-app.log" >&2
     cat "$vault_dir/demo.md" >&2
     import -window "$window_id" "$visual_dir/editor-failure.png" 2>/dev/null || true
-    echo "editor input did not reach the Session autosave" >&2
+    echo "editor input or wikilink completion did not reach the Flavite save path" >&2
+    exit 1
+fi
+
+# The completed span must still be a semantic scanner link: ctrl/cmd-click
+# opens the target through the facade, and the new buffer keeps editor focus.
+xdotool mousemove --sync --window "$window_id" 300 205
+xdotool keydown ctrl click 1 keyup ctrl
+sleep 0.5
+xdotool type --clearmodifiers --delay 40 "Wikilink navigation confirmed"
+for _ in $(seq 1 60); do
+    if grep -Fq "Wikilink navigation confirmed" "$vault_dir/Concepts.md"; then
+        break
+    fi
+    sleep 0.1
+done
+if ! grep -Fq "Wikilink navigation confirmed" "$vault_dir/Concepts.md"; then
+    cat "$visual_dir/editor-app.log" >&2
+    cat "$vault_dir/Concepts.md" >&2
+    import -window "$window_id" "$visual_dir/editor-link-failure.png" 2>/dev/null || true
+    echo "ctrl-click did not open and edit the wikilink target" >&2
     exit 1
 fi
 
