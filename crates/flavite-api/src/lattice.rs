@@ -473,14 +473,6 @@ impl Lattice {
             SessionResult::Pending { request_id: req_id } => {
                 ExecutionResult::Pending { request_id: req_id }
             }
-            SessionResult::Superseded {
-                request_id: req_id,
-                by_request,
-            } => ExecutionResult::Local(LocalResult::Error(LocalError::with_request(
-                "superseded",
-                format!("Save request {req_id} was superseded by request {by_request}"),
-                req_id,
-            ))),
             SessionResult::Error { message } => ExecutionResult::Local(LocalResult::Error(
                 LocalError::new("session_error", message),
             )),
