@@ -27,6 +27,8 @@ image = { version = "0.25", default-features = false, features = [
 # path_safety, parity).
 flavite-fs = { path = "../crates/flavite-fs" }
 flavite-syntax = { path = "../crates/flavite-syntax" }
+flavite-buffer = { path = "../crates/flavite-buffer" }
+flavite-vault = { path = "../crates/flavite-vault" }
 
 [[bin]]
 name = "parser"
@@ -51,3 +53,7 @@ path = "fuzz_targets/frontmatter_patcher.rs"
 [[bin]]
 name = "parity"
 path = "fuzz_targets/parity.rs"
+
+[[bin]]
+name = "rename_planner"
+path = "fuzz_targets/rename_planner.rs"

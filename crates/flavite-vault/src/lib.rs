@@ -12,9 +12,11 @@ pub mod coalesce;
 pub mod history;
 pub mod identity;
 pub mod instance;
+pub mod journal;
 pub mod merge;
 pub mod open;
 pub mod reconcile;
+pub mod rename;
 pub mod save;
 pub mod session;
 pub mod tokens;
@@ -38,9 +40,20 @@ pub use identity::{
 pub use instance::{
     AdvisoryLock, FocusIpc, InstanceError, InstanceManager, InstanceResult, is_instance_running,
 };
+pub use journal::manifest::{
+    JournalManifest, MANIFEST_VERSION, TransactionItem, TransactionItemState, TransactionPhase,
+    TransactionState,
+};
+pub use journal::recover::{
+    JournalRecovery, JournalRecoveryError, JournalRecoveryOutcome, JournalRecoveryResult,
+};
 pub use merge::{MergeConflict, MergeResult, three_way_merge};
 pub use open::{OpenVaultError, OpenVaultResult, Vault, vault_exists};
 pub use reconcile::{ReconcileConfig, ReconcileContext, ReconcileResult, verify_content_full};
+pub use rename::{
+    RenameBufferPatcher, RenamePlan, RenamePlanItem, RenamePlanResult, RenamePlanner, RenameUndo,
+    RenameUndoResult, RenameValidationError,
+};
 pub use save::{
     DiskPrecondition, DurabilityOutcome, SaveFailure, SaveFailureStage, SaveReceipt, SaveRequest,
     save,

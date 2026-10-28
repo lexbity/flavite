@@ -417,7 +417,7 @@ mod tests {
         for id in 1..=105 {
             conn.execute(
                 "INSERT INTO notes (note_id,path,path_native,path_key,stem_key,title,content_hash,size,mtime_ns,scan_ns,generation,parse_ok) VALUES (?1,'',?2,'','','',X'00',0,0,0,0,?3)",
-                params![id, vec![id as u8], i64::from(id != 2)],
+                params![id, vec![u8::try_from(id).unwrap()], i64::from(id != 2)],
             ).unwrap();
         }
         let mut cache = SearchDocCache::new(conn);

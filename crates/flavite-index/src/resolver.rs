@@ -642,6 +642,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn resolver_handles_paths_ids_embeds_ambiguity_and_invalidation() {
         let temp = NamedTempFile::new().unwrap();
         let mut conn = Connection::open(temp.path()).unwrap();

@@ -466,9 +466,18 @@ impl Lattice {
                     format!("Conflict detected: {}", path.to_string_lossy()),
                 )))
             }
-            SessionResult::MergeReady { path, result } => {
+            SessionResult::MergeReady {
+                path,
+                buffer_id,
+                revision,
+                disk_hash,
+                result,
+            } => {
                 let data = serde_json::json!({
                     "path": path.to_string_lossy(),
+                    "buffer_id": buffer_id,
+                    "revision": revision,
+                    "disk_hash": hex::encode(disk_hash),
                     "merged": result.merged,
                     "conflicts": result.conflicts.iter().map(|conflict| {
                         serde_json::json!({
@@ -484,6 +493,13 @@ impl Lattice {
             SessionResult::ActionRequired { code, data } => ExecutionResult::Local(
                 LocalResult::Error(LocalError::new(code, data.unwrap_or_default())),
             ),
+            SessionResult::Superseded {
+                request_id,
+                by_request,
+            } => ExecutionResult::Local(LocalResult::Success(LocalSuccess::new(
+                request_id,
+                serde_json::json!({ "superseded_by": by_request }),
+            ))),
         }
     }
 

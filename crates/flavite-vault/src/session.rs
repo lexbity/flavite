@@ -580,8 +580,12 @@ impl Session {
                         self.absent_on_open.lock().unwrap().remove(&path);
                     }
                 }
-                SessionResult::Error {
-                    message: failure.to_string(),
+                if failure.stage == SaveFailureStage::Compare {
+                    SessionResult::Conflict { path }
+                } else {
+                    SessionResult::Error {
+                        message: failure.to_string(),
+                    }
                 }
             }
             crate::actor::VaultActorResp::Error(message) => SessionResult::Error {
@@ -1570,8 +1574,12 @@ mod tests {
             session.execute(SessionCommand::Redo { buffer_id }),
             SessionResult::Success(CommandResult::RedoPerformed { .. })
         ));
+        let request_id = match session.execute(SessionCommand::SaveNote { path: path.clone() }) {
+            SessionResult::Pending { request_id } => request_id,
+            other => panic!("save must be admitted asynchronously: {other:?}"),
+        };
         assert!(matches!(
-            session.execute(SessionCommand::SaveNote { path: path.clone() }),
+            session.wait_for_operation(request_id),
             SessionResult::Success(CommandResult::NoteSaved { .. })
         ));
         assert_eq!(_fs.read_if_exists(&path).unwrap().unwrap(), b"hello world");
@@ -1615,8 +1623,12 @@ mod tests {
 
         fs.remove(&path).unwrap();
         fs.write_new(&path, b"hello theirs").unwrap();
-        let saved = session.execute(SessionCommand::SaveNote { path: path.clone() });
-        assert!(matches!(saved, SessionResult::Error { .. }), "{saved:?}");
+        let request_id = match session.execute(SessionCommand::SaveNote { path: path.clone() }) {
+            SessionResult::Pending { request_id } => request_id,
+            other => panic!("save must be admitted asynchronously: {other:?}"),
+        };
+        let saved = session.wait_for_operation(request_id);
+        assert!(matches!(saved, SessionResult::Conflict { .. }), "{saved:?}");
         assert!(matches!(
             session.execute(SessionCommand::ResolveConflict {
                 path: path.clone(),
@@ -1746,8 +1758,12 @@ mod tests {
             }),
             SessionResult::Error { .. }
         ));
+        let request_id = match session.execute(SessionCommand::SaveNote { path: path.clone() }) {
+            SessionResult::Pending { request_id } => request_id,
+            other => panic!("save must be admitted asynchronously: {other:?}"),
+        };
         assert!(matches!(
-            session.execute(SessionCommand::SaveNote { path: path.clone() }),
+            session.wait_for_operation(request_id),
             SessionResult::Success(CommandResult::NoteSaved { .. })
         ));
         assert_eq!(fs.read_if_exists(&path).unwrap().unwrap(), b"");
