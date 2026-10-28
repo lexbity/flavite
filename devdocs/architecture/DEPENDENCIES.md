@@ -48,6 +48,7 @@ Normal/build:
 - `flavite-buffer` (normal)
 - `flavite-fs` (normal)
 - `flavite-index` (normal)
+- `flavite-syntax` (normal)
 - `flavite-vault` (normal)
 - `tracing` (normal)
 

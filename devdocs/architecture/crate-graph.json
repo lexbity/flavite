@@ -152,6 +152,11 @@
     },
     {
       "from": "flavite-cli",
+      "to": "flavite-syntax",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-cli",
       "to": "flavite-vault",
       "kind": "normal"
     },

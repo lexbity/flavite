@@ -30,8 +30,10 @@
 
 pub mod card_layer;
 pub mod fallback;
+pub mod gpu;
 pub mod instance;
 pub mod shader_probe;
+pub mod shader_view;
 pub mod stats;
 pub mod synthetic;
 pub mod zoomable;
@@ -45,6 +47,7 @@ pub use fallback::{
     FALLBACK_NODE_CAP, FallbackCamera, FallbackGeometry, FallbackGeometryError, FallbackPrimitive,
     reduced_mode_notice,
 };
+pub use gpu::{GpuError, RecreatablePipeline, ShaderViewState};
 pub use instance::{
     ATTACHMENT_COLOR, Camera, CameraUniform, EDGE_ALPHA_MIN, EDGE_ALPHA_PER_OCTAVE,
     EDGE_ALPHA_SATURATE, EDGE_ALPHA_ZOOM_FLOOR, EDGE_CAP_AT_REFERENCE_ZOOM, EDGE_CAP_ZOOM_MAX,
@@ -56,6 +59,7 @@ pub use instance::{
 pub use shader_probe::{
     ProbeMessage, ProbePrimitive, ProbeProgram, ProbeState, ProbeTimings, TimingsSnapshot,
 };
+pub use shader_view::{HitNode, LOD_ZOOM_THRESHOLD, ShaderViewMessage, ShaderViewProgram};
 pub use stats::{FrameStats, StatsSnapshot, percentile, report_header};
 pub use synthetic::{Rng, SyntheticGraph, SyntheticOptions, generate};
 pub use zoomable::{
