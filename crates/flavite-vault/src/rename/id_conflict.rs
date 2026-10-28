@@ -107,19 +107,17 @@ impl DuplicateIdManager {
     /// byte order. This rule is rebuild-stable.
     #[must_use]
     pub fn get_winner(&self, stable_id: &str) -> Option<IndexNoteRef> {
-        self.stable_id_notes
-            .get(stable_id)
-            .and_then(|notes| {
-                if notes.len() > 1 {
-                    // Find the note with the lowest path_native in byte order
-                    notes
-                        .iter()
-                        .min_by(|a, b| a.path_native.cmp(&b.path_native))
-                        .cloned()
-                } else {
-                    notes.first().cloned()
-                }
-            })
+        self.stable_id_notes.get(stable_id).and_then(|notes| {
+            if notes.len() > 1 {
+                // Find the note with the lowest path_native in byte order
+                notes
+                    .iter()
+                    .min_by(|a, b| a.path_native.cmp(&b.path_native))
+                    .cloned()
+            } else {
+                notes.first().cloned()
+            }
+        })
     }
 
     /// Check if a stable ID is currently in conflict.
@@ -240,7 +238,10 @@ impl DuplicateIdManager {
 /// Only unconflicted IDs qualify for T2 identity transfer or stable-ID pin keys.
 /// Conflicted notes use native path pins.
 #[must_use]
-pub fn can_use_t2_identity(note: &flavite_index::types::Note, duplicate_manager: &DuplicateIdManager) -> bool {
+pub fn can_use_t2_identity(
+    note: &flavite_index::types::Note,
+    duplicate_manager: &DuplicateIdManager,
+) -> bool {
     note.stable_id
         .as_ref()
         .map(|id| !duplicate_manager.is_conflicted(id))
@@ -253,7 +254,12 @@ pub fn can_use_t2_identity(note: &flavite_index::types::Note, duplicate_manager:
 /// T3 and T4 require user confirmation and do NOT carry identity state.
 #[must_use]
 pub fn should_carry_identity(tier: crate::channels::RenameTier) -> bool {
-    matches!(tier, crate::channels::RenameTier::T0 | crate::channels::RenameTier::T1 | crate::channels::RenameTier::T2)
+    matches!(
+        tier,
+        crate::channels::RenameTier::T0
+            | crate::channels::RenameTier::T1
+            | crate::channels::RenameTier::T2
+    )
 }
 
 /// Check if a rename should auto-rewrite links.

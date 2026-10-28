@@ -16,9 +16,7 @@
 //! rather than guessed.
 
 use crate::channels::{Notice, NoticeChannel, RenameTier};
-use flavite_index::types::{
-    Attachment, Note, ATTACHMENT_HASH_MAX, MAX_NOTE_BYTES,
-};
+use flavite_index::types::{ATTACHMENT_HASH_MAX, Attachment, MAX_NOTE_BYTES, Note};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -226,9 +224,7 @@ impl RenameInference {
             let inbound = inbound_link_counts.get(from).copied().unwrap_or(0);
 
             // Store in result
-            result
-                .t1_renames
-                .insert((from.clone(), to.clone()));
+            result.t1_renames.insert((from.clone(), to.clone()));
 
             // Emit notice
             notice_channel.send(Notice::RenameSuggested {
@@ -239,12 +235,7 @@ impl RenameInference {
             });
 
             // Check for duplicate stable IDs that might affect this
-            self.check_stable_id_duplicates_for_pair(
-                from,
-                to,
-                notes_by_stable_id,
-                result,
-            );
+            self.check_stable_id_duplicates_for_pair(from, to, notes_by_stable_id, result);
         }
     }
 
@@ -289,10 +280,7 @@ impl RenameInference {
                         && changed_note.stable_id.as_deref() == Some(stable_id)
                     {
                         // Found T2 rename
-                        let inbound = inbound_link_counts
-                            .get(&note_path)
-                            .copied()
-                            .unwrap_or(0);
+                        let inbound = inbound_link_counts.get(&note_path).copied().unwrap_or(0);
 
                         result
                             .t2_renames
@@ -390,10 +378,7 @@ impl RenameInference {
 
                     // Prefer same-directory candidates
                     if Self::same_directory(from, to) {
-                        let inbound = inbound_link_counts
-                            .get(from)
-                            .copied()
-                            .unwrap_or(0);
+                        let inbound = inbound_link_counts.get(from).copied().unwrap_or(0);
 
                         let candidate = RenameCandidate {
                             from: from.clone(),
@@ -464,10 +449,7 @@ impl RenameInference {
                             // This is a simplified check - in practice we'd need to
                             // verify uniqueness across all pairs
 
-                            let inbound = inbound_link_counts
-                                .get(from_path)
-                                .copied()
-                                .unwrap_or(0);
+                            let inbound = inbound_link_counts.get(from_path).copied().unwrap_or(0);
 
                             let candidate = RenameCandidate {
                                 from: from_path.clone(),
@@ -695,14 +677,11 @@ mod tests {
             &notice_channel,
         );
 
-        // For T2, we should have detected the rename
-        // But in our current implementation, we skip duplicates
-        // Let's check if the T2 detection logic works when we don't have duplicates
-        // Actually, in this test we have a duplicate (both notes have the same stable_id)
-        // So T2 won't fire. Let's adjust the test.
-
-        // For now, let's just verify the structure works
-        assert!(result.candidates.len() == 0 || result.candidates.len() > 0);
+        assert!(
+            result
+                .t2_renames
+                .contains(&(PathBuf::from("old.md"), PathBuf::from("new.md")))
+        );
     }
 
     #[test]
@@ -740,18 +719,9 @@ mod tests {
 
     #[test]
     fn test_path_to_stem() {
-        assert_eq!(
-            RenameInference::path_to_stem("My Note.md"),
-            "my note"
-        );
-        assert_eq!(
-            RenameInference::path_to_stem("note.txt"),
-            "note"
-        );
-        assert_eq!(
-            RenameInference::path_to_stem("just-name"),
-            "just-name"
-        );
+        assert_eq!(RenameInference::path_to_stem("My Note.md"), "my note");
+        assert_eq!(RenameInference::path_to_stem("note.txt"), "note");
+        assert_eq!(RenameInference::path_to_stem("just-name"), "just-name");
     }
 
     #[test]
@@ -764,7 +734,7 @@ mod tests {
         let sim = RenameInference::compute_similarity("hello", "world");
         // With our simple char-based similarity, this will have some overlap
         // (both have 'l' and 'o'), so we just check it's <= 1.0
-        assert!(sim <= 1.0 && sim >= 0.0);
+        assert!((0.0..=1.0).contains(&sim));
 
         // Test partial match
         let sim = RenameInference::compute_similarity("hello world", "hello");

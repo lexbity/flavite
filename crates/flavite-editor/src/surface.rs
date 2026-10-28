@@ -53,10 +53,12 @@ impl EditorAction {
             return if redo {
                 flavite_api::lattice::session::SessionCommand::Redo {
                     buffer_id: self.buffer_id.into(),
+                    revision: flavite_buffer::revision::Revision::new(self.expected_revision),
                 }
             } else {
                 flavite_api::lattice::session::SessionCommand::Undo {
                     buffer_id: self.buffer_id.into(),
+                    revision: flavite_buffer::revision::Revision::new(self.expected_revision),
                 }
             };
         }

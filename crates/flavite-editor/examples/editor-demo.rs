@@ -127,10 +127,7 @@ impl App {
                 self.status = format!("Save pending (request {request_id})");
             }
             result => {
-                self.status = match result {
-                    SessionResult::Success(CommandResult::NoteSaved { .. }) => "Saved".into(),
-                    other => format!("Save failed: {other:?}"),
-                };
+                self.status = terminal_save_status(&result);
                 self.refresh(view.buffer_id);
             }
         }
@@ -142,10 +139,7 @@ impl App {
         for completion in completions {
             if self.pending_save == Some(completion.request_id) {
                 self.pending_save = None;
-                self.status = match completion.result {
-                    SessionResult::Success(CommandResult::NoteSaved { .. }) => "Saved".into(),
-                    other => format!("Save failed: {other:?}"),
-                };
+                self.status = terminal_save_status(&completion.result);
                 if let Some(view) = &self.view {
                     let id = view.buffer_id;
                     self.refresh(id);
@@ -182,5 +176,24 @@ impl App {
         } else {
             container(header).padding(18).into()
         }
+    }
+}
+
+fn terminal_save_status(result: &SessionResult) -> String {
+    match result {
+        SessionResult::Success(CommandResult::NoteSaved {
+            hash,
+            epoch,
+            generation,
+            ..
+        }) => {
+            let short_hash = hash
+                .iter()
+                .take(4)
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("Saved · {epoch} · {generation} · {short_hash}")
+        }
+        other => format!("Save failed: {other:?}"),
     }
 }

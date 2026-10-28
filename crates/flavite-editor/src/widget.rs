@@ -110,8 +110,8 @@ impl<'a, Message> EditorWidget<'a, Message> {
                     KeyAction::Next if selected && !modifiers.shift() => end,
                     KeyAction::Previous => previous_grapheme_boundary(&self.view.text, state.caret),
                     KeyAction::Next => next_grapheme_boundary(&self.view.text, state.caret),
-                    KeyAction::Home => 0,
-                    KeyAction::End => self.view.text.len(),
+                    KeyAction::Home => line_bounds(&self.view.text, state.caret).0,
+                    KeyAction::End => line_bounds(&self.view.text, state.caret).1,
                     _ => state.caret,
                 };
                 state.move_to(target, modifiers.shift());
@@ -189,6 +189,9 @@ impl<'a, Message> EditorWidget<'a, Message> {
             }
             KeyAction::Ignore => {}
         }
+        if emitted {
+            state.ensure_caret_visible(&self.view.text);
+        }
         emitted
     }
 }
@@ -196,6 +199,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
 /// Widget-local interaction state. Text and mutations remain Session-owned.
 #[derive(Debug, Default)]
 pub struct EditorState {
+    buffer_id: Option<u64>,
     caret: usize,
     anchor: usize,
     focused: bool,
@@ -221,6 +225,44 @@ impl EditorState {
         if !extend {
             self.anchor = byte;
         }
+    }
+
+    fn reconcile(&mut self, view: &EditorView) {
+        if self
+            .buffer_id
+            .is_some_and(|buffer_id| buffer_id != view.buffer_id)
+        {
+            *self = Self::default();
+        }
+        self.buffer_id = Some(view.buffer_id);
+        self.caret = clamp_char_boundary(&view.text, self.caret);
+        self.anchor = clamp_char_boundary(&view.text, self.anchor);
+        self.viewport.line_height = LINE_HEIGHT;
+        self.viewport.first_line = self
+            .viewport
+            .first_line
+            .min(logical_line_count(&view.text).saturating_sub(1));
+        self.ensure_caret_visible(&view.text);
+    }
+
+    fn ensure_caret_visible(&mut self, text: &str) {
+        let caret = self.caret.min(text.len());
+        let line = text[..caret].bytes().filter(|byte| *byte == b'\n').count();
+        if line < self.viewport.first_line {
+            self.viewport.first_line = line;
+        } else if line
+            >= self
+                .viewport
+                .first_line
+                .saturating_add(self.viewport.visible_lines.max(1))
+        {
+            self.viewport.first_line = line + 1 - self.viewport.visible_lines.max(1);
+        }
+    }
+
+    fn place_caret_from_point(&mut self, text: &str, x: f32, y: f32, width: f32, extend: bool) {
+        let byte = hit_test_visible(text, self.viewport, x, y, width);
+        self.move_to(byte, extend);
     }
 }
 
@@ -261,17 +303,13 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         let clip = bounds
             .intersection(viewport)
             .unwrap_or(Rectangle::with_size(Size::ZERO));
-        let text_layout = shape_text(&self.view.text, (bounds.width - PAD_X * 2.0).max(1.0));
+        let (visible_text, source_start) = visible_text(&self.view.text, state.viewport);
+        let text_layout = shape_text(&visible_text, (bounds.width - PAD_X * 2.0).max(1.0));
         let runs = text_layout.layout_runs().collect::<Vec<_>>();
-        let line_count = runs.len();
-        let mut viewport_state = state.viewport;
-        viewport_state.line_height = LINE_HEIGHT;
-        viewport_state.set_height(bounds.height - PAD_Y * 2.0);
-        let visible = viewport_state.visible_range(line_count);
         let (selection_start, selection_end) = state.selection();
         if selection_start < selection_end {
-            for run in runs.iter().skip(visible.start).take(visible.len()) {
-                let line_start = line_start_byte(&self.view.text, run.line_i);
+            for run in &runs {
+                let line_start = source_start + line_start_byte(&visible_text, run.line_i);
                 for glyph in run.glyphs {
                     let glyph_start = line_start + glyph.start;
                     let glyph_end = line_start + glyph.end;
@@ -281,7 +319,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                                 bounds: Rectangle::new(
                                     Point::new(
                                         bounds.x + PAD_X + glyph.x,
-                                        bounds.y + PAD_Y + run.line_y - run.line_top,
+                                        bounds.y + PAD_Y + run.line_top,
                                     ),
                                     Size::new(glyph.w.max(1.0), LINE_HEIGHT),
                                 ),
@@ -294,16 +332,9 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 }
             }
         }
-        let displayed = runs
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| visible.contains(index))
-            .map(|(_, run)| run.text.to_owned())
-            .collect::<Vec<_>>()
-            .join("\n");
         renderer.fill_text(
             text::Text {
-                content: displayed,
+                content: visible_text.clone(),
                 bounds: Size::new(
                     (bounds.width - PAD_X * 2.0).max(1.0),
                     (bounds.height - PAD_Y * 2.0).max(1.0),
@@ -320,15 +351,16 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             Color::from_rgb(0.88, 0.90, 0.93),
             clip,
         );
-        if state.focused {
-            let (x, y) = caret_position(&runs, &self.view.text, state.caret);
+        if state.focused
+            && state.caret >= source_start
+            && state.caret <= source_start + visible_text.len()
+        {
+            let local_caret = state.caret.saturating_sub(source_start);
+            let (x, y) = caret_position(&runs, &visible_text, local_caret);
             renderer.fill_quad(
                 renderer::Quad {
                     bounds: Rectangle::new(
-                        Point::new(
-                            bounds.x + PAD_X + x,
-                            bounds.y + PAD_Y + y - state.viewport.first_line as f32 * LINE_HEIGHT,
-                        ),
+                        Point::new(bounds.x + PAD_X + x, bounds.y + PAD_Y + y),
                         Size::new(1.5, LINE_HEIGHT),
                     ),
                     border: Border::default(),
@@ -345,6 +377,12 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
 
     fn state(&self) -> iced::advanced::widget::tree::State {
         iced::advanced::widget::tree::State::new(EditorState::default())
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.state
+            .downcast_mut::<EditorState>()
+            .reconcile(&self.view);
     }
 
     fn update(
@@ -364,36 +402,45 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 if let Some(position) = cursor.position_in(layout.bounds()) {
                     state.focused = true;
                     state.selecting = true;
-                    state.caret = hit_test(
+                    state.place_caret_from_point(
                         &self.view.text,
                         position.x - PAD_X,
-                        position.y - PAD_Y + state.viewport.first_line as f32 * LINE_HEIGHT,
+                        position.y - PAD_Y,
                         (layout.bounds().width - PAD_X * 2.0).max(1.0),
+                        false,
                     );
-                    state.anchor = state.caret;
                     shell.capture_event();
+                } else {
+                    state.focused = false;
+                    state.selecting = false;
                 }
             }
             iced::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.selecting => {
                 if let Some(position) = cursor.position_in(layout.bounds()) {
-                    state.caret = hit_test(
+                    state.place_caret_from_point(
                         &self.view.text,
                         position.x - PAD_X,
-                        position.y - PAD_Y + state.viewport.first_line as f32 * LINE_HEIGHT,
+                        position.y - PAD_Y,
                         (layout.bounds().width - PAD_X * 2.0).max(1.0),
+                        true,
                     );
                     shell.capture_event();
                 }
             }
             iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if state.selecting {
+                    shell.capture_event();
+                }
                 state.selecting = false;
             }
-            iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+            iced::Event::Mouse(mouse::Event::WheelScrolled { delta })
+                if cursor.position_in(layout.bounds()).is_some() =>
+            {
                 let lines = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => *y,
                     mouse::ScrollDelta::Pixels { y, .. } => *y / LINE_HEIGHT,
                 };
-                let last_line = self.view.text.lines().count().saturating_sub(1);
+                let last_line = logical_line_count(&self.view.text).saturating_sub(1);
                 if lines > 0.0 {
                     state.viewport.first_line = state
                         .viewport
@@ -511,6 +558,40 @@ fn hit_test(text: &str, x: f32, y: f32, width: f32) -> usize {
     clamp_char_boundary(text, line_start + cursor.index).min(text.len())
 }
 
+/// Shape and hit-test only the logical lines currently in the viewport.
+fn hit_test_visible(text: &str, viewport: Viewport, x: f32, y: f32, width: f32) -> usize {
+    let (visible, source_start) = visible_text(text, viewport);
+    source_start + hit_test(&visible, x, y, width)
+}
+
+fn visible_text(text: &str, viewport: Viewport) -> (String, usize) {
+    let line_count = logical_line_count(text);
+    let start_line = viewport.first_line.min(line_count.saturating_sub(1));
+    let end_line = start_line
+        .saturating_add(viewport.visible_lines.max(1))
+        .min(line_count);
+    let start = line_start_byte(text, start_line);
+    let end = if end_line == line_count {
+        text.len()
+    } else {
+        line_start_byte(text, end_line)
+    };
+    (text[start..end].to_owned(), start)
+}
+
+fn logical_line_count(text: &str) -> usize {
+    text.split('\n').count().max(1)
+}
+
+fn line_bounds(text: &str, byte: usize) -> (usize, usize) {
+    let byte = clamp_char_boundary(text, byte);
+    let start = text[..byte].rfind('\n').map_or(0, |newline| newline + 1);
+    let end = text[byte..]
+        .find('\n')
+        .map_or(text.len(), |newline| byte + newline);
+    (start, end)
+}
+
 fn line_start_byte(text: &str, line: usize) -> usize {
     text.split_inclusive('\n').take(line).map(str::len).sum()
 }
@@ -543,6 +624,7 @@ fn caret_position(runs: &[cosmic_text::LayoutRun<'_>], text: &str, byte: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flavite_syntax::text::{Span, TextByte};
 
     #[test]
     fn keymap_respects_platform_command_modifiers_and_text() {
@@ -579,10 +661,237 @@ mod tests {
     }
 
     #[test]
+    fn cosmic_text_layout_wraps_long_lines() {
+        let shaped = shape_text("abcdefghij", 24.0);
+        assert!(shaped.layout_runs().count() > 1);
+    }
+
+    #[test]
     fn caret_moves_by_grapheme_clusters() {
         let text = "a🧑🏽‍💻e\u{301}";
         let end = text.len();
         assert_eq!(previous_grapheme_boundary(text, end), "a🧑🏽‍💻".len());
         assert_eq!(next_grapheme_boundary(text, 1), "a🧑🏽‍💻".len());
+    }
+
+    fn test_view(text: &str, buffer_id: u64) -> BufferView {
+        BufferView {
+            buffer_id,
+            revision: 11,
+            text: text.to_owned(),
+            base_hash: Vec::new(),
+            state: "Clean".into(),
+            path: std::path::PathBuf::from("note.md"),
+        }
+    }
+
+    #[test]
+    fn headless_key_dispatch_emits_one_revision_guarded_edit() {
+        let view = test_view("hello", 91);
+        let widget = EditorWidget::new(&view, |action| action);
+        let mut state = EditorWidget::<EditorAction>::state_for_test();
+        state.focused = true;
+        state.caret = 2;
+        state.anchor = 2;
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+
+        assert!(widget.execute_key(
+            &mut state,
+            &Key::Character("x".into()),
+            Modifiers::empty(),
+            Some("é"),
+            &mut clipboard,
+            &mut shell,
+        ));
+        drop(shell);
+
+        assert_eq!(state.caret(), 4);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].buffer_id, 91);
+        assert_eq!(messages[0].expected_revision, 11);
+        assert_eq!(
+            messages[0].edits[0].range,
+            Span::new(TextByte(2), TextByte(2))
+        );
+        assert_eq!(messages[0].edits[0].replacement, "é");
+    }
+
+    #[test]
+    fn consecutive_input_before_view_refresh_keeps_optimistic_caret() {
+        let view = test_view("x", 92);
+        let widget = EditorWidget::new(&view, |action| action);
+        let mut state = EditorWidget::<EditorAction>::state_for_test();
+        state.focused = true;
+        state.caret = 1;
+        state.anchor = 1;
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+
+        for (key, text) in [("a", "a"), ("b", "b")] {
+            widget.execute_key(
+                &mut state,
+                &Key::Character(key.into()),
+                Modifiers::empty(),
+                Some(text),
+                &mut clipboard,
+                &mut shell,
+            );
+        }
+        drop(shell);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].edits[0].range,
+            Span::new(TextByte(1), TextByte(1))
+        );
+        assert_eq!(
+            messages[1].edits[0].range,
+            Span::new(TextByte(2), TextByte(2))
+        );
+        assert_eq!(state.caret(), 3);
+        assert_eq!(state.selection(), (3, 3));
+    }
+
+    #[test]
+    fn headless_selection_and_history_use_session_actions() {
+        let view = test_view("one\ntwo", 18);
+        let widget = EditorWidget::new(&view, |action| action);
+        let mut state = EditorWidget::<EditorAction>::state_for_test();
+        state.focused = true;
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+
+        widget.execute_key(
+            &mut state,
+            &Key::Character("a".into()),
+            Modifiers::CTRL,
+            None,
+            &mut clipboard,
+            &mut shell,
+        );
+        drop(shell);
+        assert_eq!(state.selection(), (0, view.text.len()));
+
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        widget.execute_key(
+            &mut state,
+            &Key::Character("z".into()),
+            Modifiers::CTRL,
+            None,
+            &mut clipboard,
+            &mut shell,
+        );
+        drop(shell);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].history, Some(false));
+        assert_eq!(messages[0].buffer_id, 18);
+    }
+
+    #[test]
+    fn viewport_shapes_only_requested_source_lines_and_maps_offsets() {
+        let source = "zero\none\ntwo\nthree\nfour";
+        let viewport = Viewport {
+            first_line: 2,
+            visible_lines: 2,
+            ..Viewport::default()
+        };
+        let (visible, source_start) = visible_text(source, viewport);
+        assert_eq!(visible, "two\nthree\n");
+        assert_eq!(source_start, "zero\none\n".len());
+        assert_eq!(
+            hit_test_visible(source, viewport, 0.0, 1.0, 300.0),
+            source_start
+        );
+    }
+
+    #[test]
+    fn pointer_hit_test_places_and_extends_selection_at_glyph_boundary() {
+        let text = "abcdef";
+        let shaped = shape_text(text, 300.0);
+        let first_run = shaped.layout_runs().next().expect("one shaped line");
+        let target = &first_run.glyphs[3];
+        let expected_byte = target.start;
+        let mut state = EditorState {
+            viewport: Viewport {
+                visible_lines: 1,
+                ..Viewport::default()
+            },
+            ..EditorState::default()
+        };
+
+        state.place_caret_from_point(text, target.x + 0.1, 1.0, 300.0, false);
+        assert_eq!(state.caret(), expected_byte);
+        assert_eq!(state.selection(), (expected_byte, expected_byte));
+        state.place_caret_from_point(text, first_run.glyphs[1].x + 0.1, 1.0, 300.0, true);
+        assert_eq!(
+            state.selection(),
+            (first_run.glyphs[1].start, expected_byte)
+        );
+    }
+
+    #[test]
+    fn widget_state_resets_on_reopen_and_clamps_after_reload() {
+        let old = EditorView {
+            buffer_id: 1,
+            revision: 2,
+            text: "long text".into(),
+            path: std::path::PathBuf::from("one.md"),
+            state: "Dirty".into(),
+        };
+        let mut state = EditorState {
+            buffer_id: Some(old.buffer_id),
+            caret: 8,
+            anchor: 4,
+            ..EditorState::default()
+        };
+
+        let shorter_same_buffer = EditorView {
+            revision: 3,
+            text: "x".into(),
+            ..old.clone()
+        };
+        state.reconcile(&shorter_same_buffer);
+        assert_eq!(state.selection(), (1, 1));
+
+        let reopened = EditorView {
+            buffer_id: 2,
+            text: "new".into(),
+            ..shorter_same_buffer
+        };
+        state.focused = true;
+        state.reconcile(&reopened);
+        assert_eq!(state.caret(), 0);
+        assert_eq!(state.selection(), (0, 0));
+        assert!(!state.focused);
+    }
+
+    #[test]
+    fn home_and_end_are_line_local() {
+        let text = "first\nsecond\nthird";
+        assert_eq!(line_bounds(text, 8), (6, 12));
+    }
+
+    #[test]
+    fn caret_motion_scrolls_the_viewport_to_keep_the_caret_visible() {
+        let mut state = EditorState {
+            caret: 0,
+            viewport: Viewport {
+                visible_lines: 3,
+                ..Viewport::default()
+            },
+            ..EditorState::default()
+        };
+        state.caret = "one\ntwo\nthree\nfour\nfive".len();
+        state.ensure_caret_visible("one\ntwo\nthree\nfour\nfive");
+        assert_eq!(state.viewport.first_line, 2);
+
+        state.caret = 0;
+        state.ensure_caret_visible("one\ntwo\nthree\nfour\nfive");
+        assert_eq!(state.viewport.first_line, 0);
     }
 }

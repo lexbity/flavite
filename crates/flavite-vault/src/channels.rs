@@ -19,7 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// A tier for rename inference (D8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum RenameTier {
     /// In-app rename command.
     T0,
