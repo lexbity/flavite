@@ -146,7 +146,7 @@ impl EditorModel {
 
     /// Create a new editor model with plain text (no EOL info, defaults to LF).
     #[must_use]
-    pub fn from_str(text: &str) -> Self {
+    pub fn from_text(text: &str) -> Self {
         let snapshot = TextSnapshot::new(text.as_bytes()).unwrap();
         Self::from_snapshot(snapshot)
     }
@@ -236,12 +236,11 @@ impl EditorModel {
     /// Get the byte offset just past the end of a line.
     #[must_use]
     pub fn line_end(&self, line: usize) -> TextByte {
-        let next_start = if line + 1 < self.line_count() {
+        if line + 1 < self.line_count() {
             self.line_start(line + 1)
         } else {
             TextByte(self.rope.len_bytes())
-        };
-        next_start
+        }
     }
 
     /// Get the line at a byte offset.
@@ -683,7 +682,7 @@ impl EditorModelBuilder {
     /// Build the EditorModel.
     #[must_use]
     pub fn build(self) -> EditorModel {
-        let mut model = EditorModel::from_str(&self.text);
+        let mut model = EditorModel::from_text(&self.text);
         model.set_coalesce_window(self.coalesce_window);
         model
     }
@@ -709,7 +708,7 @@ mod tests {
 
     #[test]
     fn from_str() {
-        let model = EditorModel::from_str("hello\nworld");
+        let model = EditorModel::from_text("hello\nworld");
         assert_eq!(model.text(), "hello\nworld");
         assert_eq!(model.len(), 11);
         assert_eq!(model.line_count(), 2);
@@ -717,7 +716,7 @@ mod tests {
 
     #[test]
     fn insert_text() {
-        let mut model = EditorModel::from_str("hello");
+        let mut model = EditorModel::from_text("hello");
         let rev1 = model.insert(TextByte(5), " world");
         assert_eq!(model.text(), "hello world");
         assert_eq!(rev1, Revision::new(1));
@@ -726,7 +725,7 @@ mod tests {
 
     #[test]
     fn delete_text() {
-        let mut model = EditorModel::from_str("hello world");
+        let mut model = EditorModel::from_text("hello world");
         let rev1 = model.delete(Span::new(TextByte(5), TextByte(11)));
         assert_eq!(model.text(), "hello");
         assert_eq!(rev1, Revision::new(1));
@@ -734,7 +733,7 @@ mod tests {
 
     #[test]
     fn replace_text() {
-        let mut model = EditorModel::from_str("hello world");
+        let mut model = EditorModel::from_text("hello world");
         let rev1 = model.replace(Span::new(TextByte(6), TextByte(11)), "there");
         assert_eq!(model.text(), "hello there");
         assert_eq!(rev1, Revision::new(1));
@@ -742,7 +741,7 @@ mod tests {
 
     #[test]
     fn undo_redo() {
-        let mut model = EditorModel::from_str("hello");
+        let mut model = EditorModel::from_text("hello");
 
         // Insert
         model.insert(TextByte(5), " world");
@@ -759,7 +758,7 @@ mod tests {
 
     #[test]
     fn line_operations() {
-        let model = EditorModel::from_str("line1\nline2\nline3");
+        let model = EditorModel::from_text("line1\nline2\nline3");
         assert_eq!(model.line_count(), 3);
         assert_eq!(model.line_at(TextByte(0)), 0);
         assert_eq!(model.line_at(TextByte(6)), 1);
@@ -772,7 +771,7 @@ mod tests {
 
     #[test]
     fn selection_operations() {
-        let mut model = EditorModel::from_str("hello world");
+        let mut model = EditorModel::from_text("hello world");
 
         // Set primary selection
         model.set_primary_selection(Selection::new(TextByte(0), TextByte(5)));
@@ -791,7 +790,7 @@ mod tests {
 
     #[test]
     fn select_all() {
-        let mut model = EditorModel::from_str("hello");
+        let mut model = EditorModel::from_text("hello");
         model.select_all();
         let sel = model.primary_selection();
         assert_eq!(sel.start(), TextByte(0));
@@ -800,7 +799,7 @@ mod tests {
 
     #[test]
     fn snapshot_round_trip() {
-        let mut model = EditorModel::from_str("hello\nworld");
+        let mut model = EditorModel::from_text("hello\nworld");
         let snapshot = model.snapshot();
         assert_eq!(snapshot.text(), "hello\nworld");
 
@@ -813,7 +812,7 @@ mod tests {
 
     #[test]
     fn to_source_bytes() {
-        let model = EditorModel::from_str("hello");
+        let model = EditorModel::from_text("hello");
         let bytes = model.to_source_bytes();
         assert_eq!(bytes, b"hello");
     }

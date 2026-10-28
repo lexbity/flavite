@@ -134,7 +134,6 @@ impl PulseChannel {
     }
 
     /// Try to send a pulse event. Returns the pulse if full.
-    #[must_use]
     pub fn try_send(&self, pulse: Pulse) -> Result<(), crossbeam::channel::TrySendError<Pulse>> {
         self.sender.try_send(pulse)
     }
@@ -145,7 +144,6 @@ impl PulseChannel {
     }
 
     /// Try to receive a pulse event.
-    #[must_use]
     pub fn try_recv(&self) -> Result<Pulse, crossbeam::channel::TryRecvError> {
         self.receiver.try_recv()
     }
@@ -233,7 +231,6 @@ impl NoticeChannel {
     }
 
     /// Try to receive a notice.
-    #[must_use]
     pub fn try_recv(&self) -> Result<Notice, crossbeam::channel::TryRecvError> {
         self.receiver.try_recv()
     }
@@ -263,12 +260,7 @@ impl NoticeChannel {
     /// Generate a key for a notice (for coalescing).
     fn key_for_notice(notice: &Notice) -> NoticeKey {
         match notice {
-            Notice::RenameSuggested {
-                from,
-                to: _,
-                tier: _,
-                ..
-            } => {
+            Notice::RenameSuggested { from, .. } => {
                 // For rename, we use the "from" path as the key
                 NoticeKey {
                     note: NoteRef::new(from.clone()),
@@ -298,6 +290,12 @@ impl NoticeChannel {
 pub struct ChannelSet {
     pub pulse: PulseChannel,
     pub notice: NoticeChannel,
+}
+
+impl Default for ChannelSet {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ChannelSet {
@@ -338,7 +336,7 @@ mod tests {
     // #[test]
     // fn pulse_channel_drop_oldest() {
     //     let channel = PulseChannel::new(3);
-//
+    //
     //     // Fill the channel
     //     channel
     //         .send(Pulse::VaultChanged {
@@ -361,7 +359,7 @@ mod tests {
     //             summary: ReconcileSummary::default(),
     //         })
     //         .unwrap();
-//
+    //
     //     // This should drop the oldest
     //     channel
     //         .send(Pulse::VaultChanged {
@@ -370,7 +368,7 @@ mod tests {
     //             summary: ReconcileSummary::default(),
     //         })
     //         .unwrap();
-//
+    //
     //     // Should receive the second, third, and fourth (oldest was dropped)
     //     let first = channel.recv().unwrap();
     //     assert_eq!(

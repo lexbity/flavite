@@ -460,15 +460,15 @@ mod tests {
     //         bulk_threshold: 500,
     //     };
     //     let coalescer = EventCoalescer::new(config);
-//
+    //
     //     // Send an event
     //     coalescer.send(CoalescerEvent::PathNominated(PathBuf::from(
     //         "/test/file.md",
     //     )));
-//
+    //
     //     // Wait for max window to expire
     //     std::thread::sleep(Duration::from_millis(150));
-//
+    //
     //     // Should get a batch due to max window
     //     let batch = coalescer.try_recv_batch();
     //     assert!(batch.is_some());

@@ -207,50 +207,47 @@ impl CliDriver {
 
     /// Drain pulses from the channel (for CLI synchronization).
     fn drain_pulses(&self) {
-        loop {
-            match self.channels.pulse.try_recv() {
-                Ok(pulse) => {
-                    debug!("Pulse received: {:?}", pulse);
-                    // Check for reconcile completion
-                    if let Pulse::ReconcileProgress { done, total } = pulse {
-                        info!("Reconcile progress: {}/{}", done, total);
-                    }
-                }
-                Err(_) => break,
+        while let Ok(pulse) = self.channels.pulse.try_recv() {
+            debug!("Pulse received: {pulse:?}");
+            // Check for reconcile completion
+            if let Pulse::ReconcileProgress { done, total } = pulse {
+                info!("Reconcile progress: {done}/{total}");
             }
         }
     }
 
     /// Drain notices from the channel.
     fn drain_notices(&self) {
-        loop {
-            match self.channels.notice.try_recv() {
-                Ok(notice) => match notice {
-                    Notice::Conflict { note } => {
-                        warn!("Conflict detected for: {}", note.path.display());
-                    }
-                    Notice::RenameSuggested {
-                        from,
-                        to,
-                        tier,
-                        inbound,
-                    } => {
-                        info!(
-                            "Rename suggested: {} -> {} (tier: {}, inbound: {})",
-                            from.display(),
-                            to.display(),
-                            tier.as_str(),
-                            inbound
-                        );
-                    }
-                    Notice::RecoveryOffer { note } => {
-                        info!("Recovery offer available for: {}", note.path.display());
-                    }
-                    Notice::ActionRequired { code, note } => {
-                        warn!("Action required: {} (note: {:?})", code, note);
-                    }
-                },
-                Err(_) => break,
+        while let Ok(notice) = self.channels.notice.try_recv() {
+            match notice {
+                Notice::Conflict { note } => {
+                    warn!("Conflict detected for: {}", note.path.display());
+                }
+                Notice::RenameSuggested {
+                    from,
+                    to,
+                    tier,
+                    inbound,
+                } => {
+                    info!(
+                        "Rename suggested: {} -> {} (tier: {}, inbound: {})",
+                        from.display(),
+                        to.display(),
+                        tier.as_str(),
+                        inbound
+                    );
+                }
+                Notice::RecoveryOffer { note } => {
+                    info!("Recovery offer available for: {}", note.path.display());
+                }
+                Notice::ActionRequired { code, note } => {
+                    let note = note.as_ref().map(|n| n.path.display().to_string());
+                    warn!(
+                        "Action required: {} (note: {})",
+                        code,
+                        note.unwrap_or_default()
+                    );
+                }
             }
         }
     }
@@ -393,7 +390,7 @@ fn cmd_doctor(vault_path: PathBuf, json: bool, quick: bool) -> Result<()> {
     let failed = checks.iter().filter(|c| !c.passed).count();
     let warnings = checks
         .iter()
-        .filter(|c| c.details.as_ref().map_or(false, |d| d.contains("warning")))
+        .filter(|c| c.details.as_ref().is_some_and(|d| d.contains("warning")))
         .count();
 
     let summary = DoctorSummary {
@@ -490,10 +487,10 @@ fn run_orphan_temp_check(driver: &CliDriver) -> DoctorCheck {
     if let Ok(entries) = fs::read_dir(vault_root) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with(".flavite-tmp.") {
-                    orphaned.push(path.display().to_string());
-                }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.starts_with(".flavite-tmp.")
+            {
+                orphaned.push(path.display().to_string());
             }
         }
     }
@@ -526,11 +523,11 @@ fn run_pending_journals_check(driver: &CliDriver) -> DoctorCheck {
     if let Ok(entries) = fs::read_dir(&journal_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".json") {
-                    // Check if this is a pending journal
-                    pending.push(path.display().to_string());
-                }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.ends_with(".json")
+            {
+                // Check if this is a pending journal
+                pending.push(path.display().to_string());
             }
         }
     }
@@ -642,12 +639,12 @@ fn run_instance_socket_check(_driver: &CliDriver) -> DoctorCheck {
     if let Ok(entries) = fs::read_dir(&vaults_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".ipc") || name.ends_with(".lock") {
-                    // Check if there's a corresponding running instance
-                    // For now, just flag all as potential orphans
-                    orphaned.push(path.display().to_string());
-                }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && (name.ends_with(".ipc") || name.ends_with(".lock"))
+            {
+                // Check if there's a corresponding running instance
+                // For now, just flag all as potential orphans
+                orphaned.push(path.display().to_string());
             }
         }
     }
@@ -767,10 +764,10 @@ mod tests {
         use clap::Parser;
 
         let cli = Cli::parse_from(["flavite", "--help"]);
-        assert!(cli.verbose == false);
+        assert!(!cli.verbose);
 
         let cli = Cli::parse_from(["flavite", "-v", "doctor"]);
-        assert!(cli.verbose == true);
+        assert!(cli.verbose);
         match cli.command {
             Commands::Doctor { .. } => {}
             _ => panic!("Expected Doctor command"),

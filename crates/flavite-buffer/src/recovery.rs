@@ -427,8 +427,8 @@ impl RecoveryWriter {
         // Hash the buffer ID and EOL table to create a unique filename
         let mut hasher = blake3::Hasher::new();
         hasher.update(&buffer_id.as_u64().to_le_bytes());
-        hasher.update(&eol_table.has_bom().to_string().as_bytes());
-        hasher.update(&eol_table.has_trailing_newline().to_string().as_bytes());
+        hasher.update(eol_table.has_bom().to_string().as_bytes());
+        hasher.update(eol_table.has_trailing_newline().to_string().as_bytes());
         for eol in &eol_table.line_endings {
             hasher.update(&[*eol as u8]);
         }
@@ -463,10 +463,10 @@ impl RecoveryWriter {
         let mut written = Vec::new();
 
         for buffer in buffers {
-            if self.should_write(buffer) {
-                if let Some(path) = self.write_buffer(buffer) {
-                    written.push(path);
-                }
+            if self.should_write(buffer)
+                && let Some(path) = self.write_buffer(buffer)
+            {
+                written.push(path);
             }
         }
 
@@ -491,11 +491,11 @@ impl RecoveryWriter {
         let bytes = recovery_file.to_bytes();
 
         // Ensure directory exists
-        if let Some(parent) = path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!("WARN: Failed to create recovery directory: {}", e);
-                return None;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            eprintln!("WARN: Failed to create recovery directory: {}", e);
+            return None;
         }
 
         // Write atomically
@@ -554,11 +554,11 @@ impl RecoveryWriter {
         let bytes = recovery_file.to_bytes();
 
         // Ensure directory exists
-        if let Some(parent) = path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!("WARN: Failed to create recovery directory: {}", e);
-                return None;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            eprintln!("WARN: Failed to create recovery directory: {}", e);
+            return None;
         }
 
         // Write atomically (same as write_buffer)
@@ -612,12 +612,10 @@ impl RecoveryWriter {
         let mut files = Vec::new();
 
         if let Ok(entries) = fs::read_dir(&self.config.recovery_dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    if path.extension().map_or(false, |ext| ext == "bin") {
-                        files.push(path);
-                    }
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "bin") {
+                    files.push(path);
                 }
             }
         }
@@ -637,14 +635,11 @@ impl RecoveryWriter {
 
         let mut deleted = 0usize;
         if let Ok(entries) = fs::read_dir(&self.config.recovery_dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let entry_path = entry.path();
-                    if entry_path.file_name() == Some(pattern) {
-                        if self.delete_recovery_file(&entry_path) {
-                            deleted += 1;
-                        }
-                    }
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
+                if entry_path.file_name() == Some(pattern) && self.delete_recovery_file(&entry_path)
+                {
+                    deleted += 1;
                 }
             }
         }
@@ -734,7 +729,6 @@ impl Default for RecoveryWriterBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use tempfile::tempdir;
 
     #[test]
@@ -753,7 +747,7 @@ mod tests {
 
     #[test]
     fn recovery_file_round_trip() {
-        let buffer = Buffer::from_str("hello\nworld");
+        let buffer = Buffer::from_text("hello\nworld");
         let recovery_file = RecoveryFile::from_buffer(&buffer, 1, false);
 
         let bytes = recovery_file.to_bytes();
@@ -766,7 +760,7 @@ mod tests {
 
     #[test]
     fn recovery_file_to_source_bytes() {
-        let buffer = Buffer::from_str("hello\nworld");
+        let buffer = Buffer::from_text("hello\nworld");
         let recovery_file = RecoveryFile::from_buffer(&buffer, 1, false);
 
         let source_bytes = recovery_file.to_source_bytes();
@@ -779,7 +773,7 @@ mod tests {
         let config = RecoveryConfig::new("test-vault".to_string(), dir.path().to_path_buf(), 2);
         let mut writer = RecoveryWriter::new(config);
 
-        let buffer = Buffer::from_str("hello world");
+        let buffer = Buffer::from_text("hello world");
         let path = writer.write_buffer(&buffer);
 
         assert!(path.is_some());
@@ -797,7 +791,7 @@ mod tests {
         let config = RecoveryConfig::new("test-vault".to_string(), dir.path().to_path_buf(), 2);
         let mut writer = RecoveryWriter::new(config);
 
-        let buffer = Buffer::from_str("hello world");
+        let buffer = Buffer::from_text("hello world");
         let path = writer.write_buffer(&buffer);
 
         assert!(path.is_some());
@@ -818,7 +812,7 @@ mod tests {
         let config = RecoveryConfig::new("test-vault".to_string(), dir.path().to_path_buf(), 2);
         let mut writer = RecoveryWriter::new(config);
 
-        let mut buffer = Buffer::from_str("hello world");
+        let mut buffer = Buffer::from_text("hello world");
         // Make the buffer dirty so it should be written
         let edit =
             crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " test".to_string());
@@ -840,7 +834,7 @@ mod tests {
         let config = RecoveryConfig::new("test-vault".to_string(), dir.path().to_path_buf(), 2);
         let mut writer = RecoveryWriter::new(config);
 
-        let buffer = Buffer::from_str("hello world");
+        let buffer = Buffer::from_text("hello world");
         let path = writer.write_checkpoint(&buffer);
 
         assert!(path.is_some());
@@ -857,8 +851,8 @@ mod tests {
         let mut writer = RecoveryWriter::new(config);
 
         // Write some buffers
-        let buffer1 = Buffer::from_str("hello");
-        let buffer2 = Buffer::from_str("world");
+        let buffer1 = Buffer::from_text("hello");
+        let buffer2 = Buffer::from_text("world");
         writer.write_buffer(&buffer1);
         writer.write_buffer(&buffer2);
 

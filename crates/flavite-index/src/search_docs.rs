@@ -30,6 +30,11 @@ impl SearchDocCache {
     }
 
     /// Get a search document by note ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error when the query cannot be prepared or the row
+    /// cannot be read; a missing document is `Ok(None)`.
     pub fn get(&self, note_id: i64) -> Result<Option<SearchDoc>> {
         let mut stmt = self.conn.prepare(
             "SELECT note_id, content_hash, body_text FROM search_docs WHERE note_id = ?",
@@ -53,6 +58,11 @@ impl SearchDocCache {
     }
 
     /// Get multiple search documents by note IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error when any lookup cannot be prepared or read;
+    /// missing documents are simply absent from the map.
     pub fn get_many(&self, note_ids: &[i64]) -> Result<HashMap<i64, SearchDoc>> {
         let mut result = HashMap::new();
 
@@ -64,11 +74,10 @@ impl SearchDocCache {
         if note_ids.len() <= 100 {
             let placeholders = vec!["?"; note_ids.len()].join(",");
             let sql = format!(
-                "SELECT note_id, content_hash, body_text FROM search_docs WHERE note_id IN ({})",
-                placeholders
+                "SELECT note_id, content_hash, body_text FROM search_docs WHERE note_id IN ({placeholders})"
             );
 
-            let params: Vec<i64> = note_ids.iter().map(|&id| id as i64).collect();
+            let params: Vec<i64> = note_ids.to_vec();
             let mut stmt = self.conn.prepare(&sql)?;
 
             // Convert to &dyn ToSql references as a slice
@@ -119,6 +128,10 @@ impl SearchDocCache {
     }
 
     /// Set or update a search document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error when the upsert cannot be executed.
     pub fn set(&mut self, note_id: i64, content_hash: &[u8], body_text: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO search_docs (note_id, content_hash, body_text) 
@@ -130,6 +143,10 @@ impl SearchDocCache {
     }
 
     /// Delete a search document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error when the delete cannot be executed.
     pub fn delete(&mut self, note_id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM search_docs WHERE note_id = ?", [note_id])?;
@@ -138,23 +155,25 @@ impl SearchDocCache {
     }
 
     /// Delete multiple search documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error when any delete cannot be executed.
     pub fn delete_many(&mut self, note_ids: &[i64]) -> Result<()> {
         if note_ids.is_empty() {
             return Ok(());
         }
 
         let placeholders = vec!["?"; note_ids.len()].join(",");
-        let sql = format!(
-            "DELETE FROM search_docs WHERE note_id IN ({})",
-            placeholders
-        );
+        let sql = format!("DELETE FROM search_docs WHERE note_id IN ({placeholders})");
 
         // Build params vector for execute
         let params: Vec<Box<dyn rusqlite::ToSql>> = note_ids
             .iter()
             .map(|&id| Box::new(id) as Box<dyn rusqlite::ToSql>)
             .collect();
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(std::convert::AsRef::as_ref).collect();
         self.conn
             .execute(&sql, &param_refs as &[&dyn rusqlite::ToSql])?;
 
@@ -162,12 +181,21 @@ impl SearchDocCache {
     }
 
     /// Clear all search documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error when the table cannot be truncated.
     pub fn clear(&mut self) -> Result<()> {
         self.conn.execute("DELETE FROM search_docs", [])?;
         Ok(())
     }
 
     /// Apply a batch of search document updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error when the transaction cannot start or commit
+    /// or any upsert/delete inside it fails.
     pub fn apply_batch(&mut self, updates: &[SearchDocUpdate]) -> Result<()> {
         for update in updates {
             match update {
@@ -195,6 +223,11 @@ impl SearchDocCache {
     /// Rebuild the entire search docs table from the current state.
     ///
     /// This is used during index rebuild or after detecting corruption.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error when the source rows cannot be read or the
+    /// rebuilt documents cannot be written.
     pub fn rebuild(&mut self) -> Result<()> {
         // Clear existing
         self.clear()?;
@@ -230,6 +263,7 @@ pub enum SearchDocUpdate {
 }
 
 impl SearchDocUpdate {
+    #[must_use]
     pub fn upsert(note_id: i64, content_hash: Vec<u8>, body_text: String) -> Self {
         Self::Upsert {
             note_id,
@@ -238,6 +272,7 @@ impl SearchDocUpdate {
         }
     }
 
+    #[must_use]
     pub fn delete(note_id: i64) -> Self {
         Self::Delete { note_id }
     }
@@ -250,6 +285,7 @@ pub struct SearchDocBatch {
 }
 
 impl SearchDocBatch {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -263,6 +299,11 @@ impl SearchDocBatch {
         self.updates.push(SearchDocUpdate::delete(note_id));
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error under the same conditions as the
+    /// [`SearchDocCache`] operations it forwards to.
     pub fn apply(&self, cache: &mut SearchDocCache) -> Result<()> {
         cache.apply_batch(&self.updates)
     }
@@ -271,6 +312,7 @@ impl SearchDocBatch {
         self.updates.clear();
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.updates.is_empty()
     }

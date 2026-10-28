@@ -16,7 +16,7 @@
 //! - File operations (rename, delete)
 //! - User resolution actions
 
-use flavite_syntax::text::{Span, TextByte, TextSnapshot};
+use flavite_syntax::text::TextSnapshot;
 use std::fmt;
 
 use crate::model::EditorModel;
@@ -162,7 +162,7 @@ impl Buffer {
 
     /// Create a new buffer with plain text.
     #[must_use]
-    pub fn from_str(text: &str) -> Self {
+    pub fn from_text(text: &str) -> Self {
         let snapshot = TextSnapshot::new(text.as_bytes()).unwrap();
         Self::from_snapshot(snapshot)
     }
@@ -233,6 +233,12 @@ impl Buffer {
         self.model.len()
     }
 
+    /// Whether the buffer holds no bytes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.model.len() == 0
+    }
+
     /// Get the line count.
     #[must_use]
     pub fn line_count(&self) -> usize {
@@ -297,12 +303,12 @@ impl Buffer {
             self.disk_hash = Some(new_disk_hash);
 
             // Check if the disk content matches our base hash
-            if let Some(base_hash) = self.base_hash {
-                if base_hash == new_disk_hash {
-                    // Disk content is the same as what we loaded
-                    // This can happen with metadata-only changes
-                    return None;
-                }
+            if let Some(base_hash) = self.base_hash
+                && base_hash == new_disk_hash
+            {
+                // Disk content is the same as what we loaded
+                // This can happen with metadata-only changes
+                return None;
             }
 
             // Disk content has changed
@@ -457,21 +463,17 @@ impl Buffer {
     pub fn discard(&mut self, disk_bytes: Option<&[u8]>) -> StateTransition {
         let old_state = self.state;
 
-        if let Some(bytes) = disk_bytes {
-            if let Ok(snapshot) = TextSnapshot::new(bytes) {
-                let new_hash = BaseHash::from_snapshot(&snapshot);
+        if let Some(bytes) = disk_bytes
+            && let Ok(snapshot) = TextSnapshot::new(bytes)
+        {
+            let new_hash = BaseHash::from_snapshot(&snapshot);
 
-                self.model = EditorModel::from_snapshot(snapshot);
-                self.base_hash = Some(new_hash);
-                self.disk_hash = Some(new_hash);
-                self.state = BufferState::Clean;
+            self.model = EditorModel::from_snapshot(snapshot);
+            self.base_hash = Some(new_hash);
+            self.disk_hash = Some(new_hash);
+            self.state = BufferState::Clean;
 
-                return StateTransition::new(
-                    old_state,
-                    BufferState::Clean,
-                    TransitionReason::Discard,
-                );
-            }
+            return StateTransition::new(old_state, BufferState::Clean, TransitionReason::Discard);
         }
 
         // No disk content available, just reset to empty
@@ -583,10 +585,11 @@ impl fmt::Display for Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flavite_syntax::text::{Span, TextByte};
 
     #[test]
     fn new_buffer() {
-        let buffer = Buffer::from_str("hello");
+        let buffer = Buffer::from_text("hello");
         assert_eq!(buffer.state(), BufferState::Clean);
         assert_eq!(buffer.text(), "hello");
         assert!(!buffer.is_dirty());
@@ -594,12 +597,12 @@ mod tests {
 
     #[test]
     fn local_edit_transition() {
-        let mut buffer = Buffer::from_str("hello");
+        let mut buffer = Buffer::from_text("hello");
 
         let edit =
             crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
 
-        let (rev, transition) = buffer.apply_local_edit(edit);
+        let (_rev, transition) = buffer.apply_local_edit(edit);
         assert_eq!(buffer.state(), BufferState::Dirty);
         assert!(buffer.is_dirty());
         assert_eq!(
@@ -614,7 +617,7 @@ mod tests {
 
     #[test]
     fn external_change_to_identical() {
-        let mut buffer = Buffer::from_str("hello");
+        let mut buffer = Buffer::from_text("hello");
 
         // Apply a local edit
         let edit =
@@ -639,7 +642,7 @@ mod tests {
 
     #[test]
     fn external_change_conflict() {
-        let mut buffer = Buffer::from_str("hello");
+        let mut buffer = Buffer::from_text("hello");
 
         // External change to different content
         let new_content = b"goodbye";
@@ -658,7 +661,7 @@ mod tests {
 
     #[test]
     fn file_deleted() {
-        let mut buffer = Buffer::from_str("hello");
+        let mut buffer = Buffer::from_text("hello");
         let transition = buffer.handle_file_deleted();
 
         assert_eq!(buffer.state(), BufferState::Orphaned);
@@ -669,7 +672,7 @@ mod tests {
 
     #[test]
     fn file_recreated() {
-        let mut buffer = Buffer::from_str("hello");
+        let mut buffer = Buffer::from_text("hello");
         buffer.handle_file_deleted();
 
         let transition = buffer.handle_file_recreated(b"hello");
@@ -679,7 +682,7 @@ mod tests {
 
     #[test]
     fn reload_from_disk() {
-        let mut buffer = Buffer::from_str("hello");
+        let mut buffer = Buffer::from_text("hello");
 
         // Make it dirty
         let edit =
@@ -687,14 +690,14 @@ mod tests {
         buffer.apply_local_edit(edit);
 
         // Reload from disk
-        let transition = buffer.reload_from_disk(b"hello");
+        let _transition = buffer.reload_from_disk(b"hello");
         assert_eq!(buffer.state(), BufferState::Clean);
         assert_eq!(buffer.text(), "hello");
     }
 
     #[test]
     fn keep_local() {
-        let mut buffer = Buffer::from_str("hello");
+        let mut buffer = Buffer::from_text("hello");
 
         // Make it dirty
         let edit =
@@ -714,7 +717,7 @@ mod tests {
 
     #[test]
     fn discard() {
-        let mut buffer = Buffer::from_str("hello");
+        let mut buffer = Buffer::from_text("hello");
 
         // Make it dirty
         let edit =
@@ -722,14 +725,14 @@ mod tests {
         buffer.apply_local_edit(edit);
 
         // Discard
-        let transition = buffer.discard(Some(b"hello"));
+        let _transition = buffer.discard(Some(b"hello"));
         assert_eq!(buffer.state(), BufferState::Clean);
         assert_eq!(buffer.text(), "hello");
     }
 
     #[test]
     fn save_completed() {
-        let mut buffer = Buffer::from_str("hello");
+        let mut buffer = Buffer::from_text("hello");
 
         // Make it dirty
         let edit =
@@ -737,14 +740,14 @@ mod tests {
         buffer.apply_local_edit(edit);
 
         // Save completed
-        let transition = buffer.handle_save_completed();
+        let _transition = buffer.handle_save_completed();
         assert_eq!(buffer.state(), BufferState::Clean);
         assert!(!buffer.is_dirty());
     }
 
     #[test]
     fn autosave_disabled_in_conflicted() {
-        let mut buffer = Buffer::from_str("hello");
+        let mut buffer = Buffer::from_text("hello");
         buffer.check_external_change(b"goodbye");
         assert_eq!(buffer.state(), BufferState::Conflicted);
         assert!(!buffer.allows_autosave());
@@ -752,14 +755,14 @@ mod tests {
 
     #[test]
     fn manual_save_disabled_in_conflicted_and_orphaned() {
-        let mut buffer = Buffer::from_str("hello");
+        let mut buffer = Buffer::from_text("hello");
 
         // Conflicted
         buffer.check_external_change(b"goodbye");
         assert!(!buffer.allows_manual_save());
 
         // Orphaned
-        let mut buffer2 = Buffer::from_str("hello");
+        let mut buffer2 = Buffer::from_text("hello");
         buffer2.handle_file_deleted();
         assert!(!buffer2.allows_manual_save());
     }
@@ -767,8 +770,8 @@ mod tests {
     #[test]
     fn d7_table_clean_changed() {
         // Clean | changed → Silent reload. Map cursor and scroll through the diff
-        let mut buffer = Buffer::from_str("hello");
-        let transition = buffer.check_external_change(b"hello world");
+        let mut buffer = Buffer::from_text("hello");
+        let _transition = buffer.check_external_change(b"hello world");
 
         assert_eq!(buffer.state(), BufferState::Conflicted);
         // This would normally trigger a silent reload in the UI
@@ -777,8 +780,8 @@ mod tests {
     #[test]
     fn d7_table_clean_deleted() {
         // Clean | deleted → Keep pane open as *Orphaned*, banner "file deleted"
-        let mut buffer = Buffer::from_str("hello");
-        let transition = buffer.handle_file_deleted();
+        let mut buffer = Buffer::from_text("hello");
+        let _transition = buffer.handle_file_deleted();
 
         assert_eq!(buffer.state(), BufferState::Orphaned);
     }
@@ -786,43 +789,43 @@ mod tests {
     #[test]
     fn d7_table_dirty_changed() {
         // Dirty | changed → Conflict banner
-        let mut buffer = Buffer::from_str("hello");
+        let mut buffer = Buffer::from_text("hello");
         let edit =
             crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         buffer.apply_local_edit(edit);
 
-        let transition = buffer.check_external_change(b"goodbye");
+        let _transition = buffer.check_external_change(b"goodbye");
         assert_eq!(buffer.state(), BufferState::Conflicted);
     }
 
     #[test]
     fn d7_table_dirty_changed_to_identical() {
         // Dirty | changed to *identical* content as buffer → Auto-resolve → Clean
-        let mut buffer = Buffer::from_str("hello");
+        let mut buffer = Buffer::from_text("hello");
         let edit =
             crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         buffer.apply_local_edit(edit);
 
-        let transition = buffer.check_external_change(b"hello world");
+        let _transition = buffer.check_external_change(b"hello world");
         assert_eq!(buffer.state(), BufferState::Clean);
     }
 
     #[test]
     fn d7_table_dirty_deleted() {
         // Dirty | deleted → Recreate · Save as · Discard
-        let mut buffer = Buffer::from_str("hello");
+        let mut buffer = Buffer::from_text("hello");
         let edit =
             crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         buffer.apply_local_edit(edit);
 
-        let transition = buffer.handle_file_deleted();
+        let _transition = buffer.handle_file_deleted();
         assert_eq!(buffer.state(), BufferState::Orphaned);
     }
 
     #[test]
     fn d7_table_conflicted() {
         // Conflicted state blocks autosave and manual save
-        let mut buffer = Buffer::from_str("hello");
+        let mut buffer = Buffer::from_text("hello");
         buffer.check_external_change(b"goodbye");
 
         assert!(buffer.is_conflicted());

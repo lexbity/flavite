@@ -282,8 +282,6 @@ impl EolTable {
     }
 }
 
-
-
 /// Statistics about line endings for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EolStats {

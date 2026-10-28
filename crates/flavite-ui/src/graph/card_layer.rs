@@ -188,11 +188,13 @@ pub fn cards_from_snapshot(
     let mut cards = Vec::new();
     let node_count = snapshot.node_count().min(positions.len());
 
-    for i in 0..node_count {
-        let id = snapshot.node_ids[i];
-        let kind = snapshot.node_kinds[i];
-        let position = positions[i];
-
+    for ((&id, &kind), position) in snapshot
+        .node_ids
+        .iter()
+        .zip(&snapshot.node_kinds)
+        .zip(positions.iter().copied())
+        .take(node_count)
+    {
         let title = format!("{} #{}", node_title(kind), id.id);
         let _preview = preview_map.get(&id).cloned().unwrap_or_default();
         let content = content_map.get(&id).cloned().unwrap_or_default();

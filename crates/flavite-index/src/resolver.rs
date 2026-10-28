@@ -16,7 +16,7 @@
 //!    application.
 //!
 //! Duplicate IDs: retain every raw frontmatter ID, flag every member of a
-//! duplicate group, and choose the lowest native PathKey in deterministic
+//! duplicate group, and choose the lowest native `PathKey` in deterministic
 //! byte order for lookup while reporting ambiguity. This rule is
 //! rebuild-stable.
 
@@ -29,22 +29,22 @@ use std::path::Path;
 /// Cached resolution state.
 #[derive(Debug, Default)]
 pub struct ResolverCache {
-    /// Map from target_key to resolved note/attachment IDs.
+    /// Map from `target_key` to resolved note/attachment IDs.
     #[allow(dead_code)]
     target_to_note: HashMap<String, i64>,
     #[allow(dead_code)]
     target_to_att: HashMap<String, i64>,
-    /// Map from stable_id to note_id (for id: links).
+    /// Map from `stable_id` to `note_id` (for id: links).
     stable_id_to_note: HashMap<String, i64>,
-    /// Map from stem_key to list of note_ids (for step 3).
+    /// Map from `stem_key` to list of `note_ids` (for step 3).
     stem_to_notes: HashMap<String, Vec<i64>>,
-    /// Map from stem_key to list of attachment_ids (for step 3).
+    /// Map from `stem_key` to list of `attachment_ids` (for step 3).
     stem_to_atts: HashMap<String, Vec<i64>>,
-    /// Map from alias_key to note_id.
+    /// Map from `alias_key` to `note_id`.
     alias_to_note: HashMap<String, i64>,
-    /// Set of duplicate stable_ids.
+    /// Set of duplicate `stable_ids`.
     duplicate_stable_ids: HashSet<String>,
-    /// Set of ambiguous target_keys.
+    /// Set of ambiguous `target_keys`.
     #[allow(dead_code)]
     ambiguous_targets: HashSet<String>,
 }
@@ -65,6 +65,7 @@ pub struct Resolution {
 }
 
 impl Resolution {
+    #[must_use]
     pub fn resolved_note(note: NoteRef) -> Self {
         Self {
             note: Some(note),
@@ -75,6 +76,7 @@ impl Resolution {
         }
     }
 
+    #[must_use]
     pub fn resolved_attachment(attachment: AttRef) -> Self {
         Self {
             note: None,
@@ -85,6 +87,7 @@ impl Resolution {
         }
     }
 
+    #[must_use]
     pub fn ambiguous() -> Self {
         Self {
             note: None,
@@ -95,6 +98,7 @@ impl Resolution {
         }
     }
 
+    #[must_use]
     pub fn unresolved() -> Self {
         Self {
             note: None,
@@ -121,6 +125,11 @@ impl Resolver {
     }
 
     /// Initialize or refresh the cache from the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error when the backing queries cannot be prepared
+    /// or their rows cannot be read.
     pub fn refresh_cache(&mut self) -> Result<()> {
         self.cache = ResolverCache::default();
 
@@ -208,7 +217,7 @@ impl Resolver {
     /// Resolve a link target to a note or attachment.
     ///
     /// This implements the 5-step D8 algorithm:
-    /// 1. `id:` prefix → stable_id lookup (with duplicate handling)
+    /// 1. `id:` prefix → `stable_id` lookup (with duplicate handling)
     /// 2. Path-suffix match if target contains `/`
     /// 3. Stem match over notes/aliases/attachments
     /// 4. Multiple candidates → rank and mark ambiguous
@@ -222,9 +231,7 @@ impl Resolver {
     ) -> Resolution {
         // Step 1: Check for id: prefix
         let raw_lower = raw_target.to_lowercase();
-        if raw_lower.starts_with("id:") {
-            let stable_id = &raw_lower[3..];
-
+        if let Some(stable_id) = raw_lower.strip_prefix("id:") {
             // Check for duplicate IDs
             if self.cache.duplicate_stable_ids.contains(stable_id) {
                 // Choose the deterministic native PathKey winner
@@ -244,37 +251,33 @@ impl Resolver {
         // Step 2: Path-suffix match if target contains `/`
         if raw_target.contains('/') {
             // Try exact path match in notes
-            let mut stmt = match self
+            let Ok(mut stmt) = self
                 .conn
                 .prepare("SELECT note_id, path_native FROM notes WHERE path_key = ?")
-            {
-                Ok(s) => s,
-                Err(_) => return Resolution::unresolved(),
+            else {
+                return Resolution::unresolved();
             };
 
             if let Ok(mut rows) = stmt.query_map([raw_target], |row| {
                 Ok(NoteRef::new(row.get(0)?, row.get(1)?))
-            }) {
-                if let Some(Ok(note_ref)) = rows.next() {
-                    return Resolution::resolved_note(note_ref);
-                }
+            }) && let Some(Ok(note_ref)) = rows.next()
+            {
+                return Resolution::resolved_note(note_ref);
             }
 
             // Try exact path match in attachments
-            let mut stmt = match self
+            let Ok(mut stmt) = self
                 .conn
                 .prepare("SELECT att_id, path_native FROM attachments WHERE path_key = ?")
-            {
-                Ok(s) => s,
-                Err(_) => return Resolution::unresolved(),
+            else {
+                return Resolution::unresolved();
             };
 
             if let Ok(mut rows) = stmt.query_map([raw_target], |row| {
                 Ok(AttRef::new(row.get(0)?, row.get(1)?))
-            }) {
-                if let Some(Ok(att_ref)) = rows.next() {
-                    return Resolution::resolved_attachment(att_ref);
-                }
+            }) && let Some(Ok(att_ref)) = rows.next()
+            {
+                return Resolution::resolved_attachment(att_ref);
             }
         }
 
@@ -293,10 +296,8 @@ impl Resolver {
         }
 
         // Check attachments by stem_key (only for embeds per D8)
-        if is_embed {
-            if let Some(ids) = self.cache.stem_to_atts.get(target_key) {
-                att_candidates.extend(ids);
-            }
+        if is_embed && let Some(ids) = self.cache.stem_to_atts.get(target_key) {
+            att_candidates.extend(ids);
         }
 
         // Step 4: Rank candidates
@@ -307,7 +308,7 @@ impl Resolver {
             return Resolution::unresolved();
         }
 
-        if total_candidates > 1 || (note_candidates.len() > 0 && att_candidates.len() > 0) {
+        if total_candidates > 1 || (!note_candidates.is_empty() && !att_candidates.is_empty()) {
             // Multiple candidates or cross-type candidates → rank and mark ambiguous
             let (best_note, best_att) =
                 self.rank_candidates(&note_candidates, &att_candidates, source_note_id);
@@ -355,7 +356,15 @@ impl Resolver {
 
     /// Rank candidates by: same directory as source, then shallowest, then lexicographic.
     ///
-    /// Returns (best_note_id, best_att_id).
+    /// Returns (`best_note_id`, `best_att_id`).
+    ///
+    /// The current implementation picks the first candidate; a proper
+    /// ranking would query paths from the database. `self` is not consulted
+    /// yet.
+    #[allow(
+        clippy::unused_self,
+        reason = "ranking will consult the resolver's cache and connection"
+    )]
     fn rank_candidates(
         &self,
         note_candidates: &[i64],
@@ -376,6 +385,11 @@ impl Resolver {
     ///
     /// This is called when notes are created, renamed, or deleted to invalidate
     /// cached resolutions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error when the cache-refresh queries cannot be
+    /// prepared; unreadable rows are skipped.
     pub fn invalidate_for_note(&mut self, note_id: i64) -> Result<()> {
         // Remove from cache
         let mut stmt = self
@@ -419,6 +433,11 @@ impl Resolver {
     }
 
     /// Re-resolve all links affected by an attachment change.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error when the cache-refresh query cannot be
+    /// prepared; unreadable rows are skipped.
     pub fn invalidate_for_attachment(&mut self, att_id: i64) -> Result<()> {
         // Remove from cache
         let mut stmt = self
@@ -436,6 +455,10 @@ impl Resolver {
     }
 
     /// Update the resolution state for a link in the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error when the update cannot be executed.
     pub fn update_link_resolution(
         &self,
         src: i64,
@@ -467,6 +490,11 @@ impl Resolver {
     /// Re-resolve all links in the database.
     ///
     /// This should be called during index initialization or after bulk changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error when the cache refresh or any link re-resolution
+    /// query fails.
     pub fn re_resolve_all(&mut self) -> Result<()> {
         self.refresh_cache()?;
 
@@ -496,25 +524,27 @@ impl Resolver {
 }
 
 /// Normalize a target key for resolution (NFC + default casefold).
+#[must_use]
 pub fn normalize_target_key(target: &str) -> String {
     // For now, just lowercase. Proper implementation would use Unicode casefolding.
     target.to_lowercase()
 }
 
 /// Extract the stem from a path (filename without extension).
+#[must_use]
 pub fn extract_stem(path: &str) -> String {
     Path::new(path)
         .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string())
+        .map_or_else(|| path.to_string(), |s| s.to_string_lossy().to_string())
 }
 
 /// Check if a file extension is an attachment-like extension.
+#[must_use]
 pub fn is_attachment_extension(path: &str) -> bool {
     let ext = Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase());
+        .map(str::to_lowercase);
 
     matches!(
         ext.as_deref(),

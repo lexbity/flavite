@@ -26,30 +26,66 @@ pub const DEFAULT_COMMIT_INTERVAL_SECS: u64 = 5;
 /// without changing the rest of the index.
 pub trait SearchBackend: Send + Sync {
     /// Apply a document to the index (add or update).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when the backend cannot record the change
+    /// (a failed write or an inaccessible index).
     fn apply_document(&self, note_id: i64, title: &str, body: &str) -> Result<(), SearchError>;
 
     /// Delete a document from the index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when the backend cannot record the deletion.
     fn delete_document(&self, note_id: i64) -> Result<(), SearchError>;
 
     /// Commit pending changes to the search index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when the commit or its checkpoint
+    /// publication fails.
     fn commit(&self) -> Result<(), SearchError>;
 
     /// Get the current committed generation.
     fn committed_generation(&self) -> u64;
 
     /// Set the committed generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when the generation cannot be persisted.
     fn set_committed_generation(&self, generation: u64) -> Result<(), SearchError>;
 
     /// Get the checkpoint metadata (epoch, generation, payload).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when the metadata or the checkpoint payload
+    /// cannot be read.
     fn checkpoint(&self) -> Result<SearchCheckpoint, SearchError>;
 
     /// Load the checkpoint from durable storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when the durable checkpoint cannot be read.
     fn load_checkpoint(&mut self) -> Result<SearchCheckpoint, SearchError>;
 
     /// Publish a new checkpoint atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when the checkpoint file cannot be written,
+    /// synced, or renamed into place.
     fn publish_checkpoint(&self, epoch: u64, generation: u64) -> Result<(), SearchError>;
 
     /// Search using a query with optional note ID filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when the backend cannot evaluate the query.
     fn search(
         &self,
         query: &QueryAst,
@@ -58,6 +94,11 @@ pub trait SearchBackend: Send + Sync {
     ) -> Result<Vec<i64>, SearchError>;
 
     /// Get a searcher for reading the index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when no searcher can be acquired (for
+    /// example, [`SearchError::NotInitialized`]).
     fn searcher(&self) -> Result<Box<dyn SearcherTrait>, SearchError>;
 }
 
@@ -72,6 +113,11 @@ pub struct SearchCheckpoint {
 
 /// Trait for searcher to allow mocking.
 pub trait SearcherTrait: Send + Sync {
+    /// Search using a query with optional note ID filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when the query cannot be evaluated.
     fn search(
         &self,
         query: &QueryAst,
@@ -111,6 +157,12 @@ pub struct StubSearchBackend {
 }
 
 impl StubSearchBackend {
+    /// Build a stub backend over `conn`, recovering the committed
+    /// generation from the index metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::Sqlite`] when the metadata row cannot be read.
     pub fn new(conn: Connection, cache_dir: &Path) -> Result<Self, SearchError> {
         let committed_gen = get_meta_u64(&conn, MetaKey::TantivyCommittedGeneration)?.unwrap_or(0);
 
@@ -125,7 +177,7 @@ impl StubSearchBackend {
     fn checkpoint_path(&self, epoch: u64, generation: u64) -> PathBuf {
         self.cache_dir
             .join("checkpoints")
-            .join(format!("checkpoint-{}-{}", epoch, generation))
+            .join(format!("checkpoint-{epoch}-{generation}"))
     }
 }
 
@@ -231,7 +283,7 @@ impl SearchBackend for StubSearchBackend {
         let checkpoint_dir = self.cache_dir.join("checkpoints");
         fs::create_dir_all(&checkpoint_dir)?;
 
-        let temp_path = checkpoint_dir.join(format!(".checkpoint-{}-{}.tmp", epoch, generation));
+        let temp_path = checkpoint_dir.join(format!(".checkpoint-{epoch}-{generation}.tmp"));
         let final_path = self.checkpoint_path(epoch, generation);
 
         let mut file = File::create(&temp_path)?;
@@ -295,6 +347,11 @@ impl CommitManager {
     }
 
     /// Commit if there are pending changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when the generation metadata cannot be read
+    /// or the backend commit fails.
     pub fn commit_if_dirty(&self) -> Result<(), SearchError> {
         let backend = self
             .backend
@@ -311,6 +368,11 @@ impl CommitManager {
     }
 
     /// Ensure commit-before-search: commit if there are pending changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same conditions as
+    /// [`CommitManager::commit_if_dirty`].
     pub fn ensure_committed(&self) -> Result<(), SearchError> {
         self.commit_if_dirty()
     }

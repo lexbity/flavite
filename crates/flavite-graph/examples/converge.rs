@@ -77,10 +77,10 @@ fn main() {
         ("ba-5k", 5_000, 3),
         ("ba-20k", 20_000, 3),
     ] {
-        if let Some(want) = &trace {
-            if want != label {
-                continue;
-            }
+        if let Some(want) = &trace
+            && want != label
+        {
+            continue;
         }
         let snapshot = build(nodes, m);
         let mut layout = Layout::from_snapshot(&snapshot, LayoutParams::default());
@@ -90,7 +90,7 @@ fn main() {
         while steps < 100_000 {
             let s = layout.step(&pool).stats;
             steps += 1;
-            if steps <= 12 || steps % 50 == 0 {
+            if steps <= 12 || steps.is_multiple_of(50) {
                 let positions = layout.positions();
                 let extent = positions
                     .iter()

@@ -146,14 +146,13 @@ pub fn reconcile(
         if should_skip(&new_file.path) {
             continue;
         }
-        if let Ok(snapshot) = read_and_parse(ctx.fs, &new_file.path, ctx.config) {
-            if ctx
+        if let Ok(snapshot) = read_and_parse(ctx.fs, &new_file.path, ctx.config)
+            && ctx
                 .index
                 .apply_note(&new_file.path, &snapshot, scan_start)
                 .is_ok()
-            {
-                summary.added += 1;
-            }
+        {
+            summary.added += 1;
         }
     }
 
@@ -161,14 +160,13 @@ pub fn reconcile(
         if should_skip(&changed_file.path) {
             continue;
         }
-        if let Ok(snapshot) = read_and_parse(ctx.fs, &changed_file.path, ctx.config) {
-            if ctx
+        if let Ok(snapshot) = read_and_parse(ctx.fs, &changed_file.path, ctx.config)
+            && ctx
                 .index
                 .update_note(&changed_file.path, &snapshot, scan_start)
                 .is_ok()
-            {
-                summary.changed += 1;
-            }
+        {
+            summary.changed += 1;
         }
     }
 
@@ -189,7 +187,7 @@ pub fn reconcile(
         .send(Pulse::VaultChanged {
             epoch: ctx.state.epoch,
             generation: ctx.state.generation,
-            summary: summary.clone(),
+            summary,
         })
         .ok();
 
@@ -213,24 +211,24 @@ fn scan_disk(
 
     match scope {
         ReconcileScope::Single(path) => {
-            if let Ok(metadata) = fs.metadata(path) {
-                if !metadata.is_dir {
-                    let entry = FileEntry {
-                        path: path.to_path_buf(),
-                        size: metadata.size,
-                        mtime_ns: metadata.mtime_ns,
-                        is_dir: false,
-                        is_placeholder: fs.is_placeholder(path).unwrap_or(false),
-                    };
-                    files.insert(path.to_path_buf(), entry);
-                }
+            if let Ok(metadata) = fs.metadata(path)
+                && !metadata.is_dir
+            {
+                let entry = FileEntry {
+                    path: path.to_path_buf(),
+                    size: metadata.size,
+                    mtime_ns: metadata.mtime_ns,
+                    is_dir: false,
+                    is_placeholder: fs.is_placeholder(path).unwrap_or(false),
+                };
+                files.insert(path.to_path_buf(), entry);
             }
         }
         ReconcileScope::Directory(dir) => {
-            scan_dir_recursive(fs, vault_root, dir, &mut files);
+            scan_dir_recursive(fs, dir, &mut files);
         }
         ReconcileScope::Full => {
-            scan_dir_recursive(fs, vault_root, vault_root, &mut files);
+            scan_dir_recursive(fs, vault_root, &mut files);
         }
     }
 
@@ -238,12 +236,7 @@ fn scan_disk(
 }
 
 /// Recursively scan a directory.
-fn scan_dir_recursive(
-    fs: &dyn Fs,
-    vault_root: &Path,
-    dir: &Path,
-    files: &mut HashMap<PathBuf, FileEntry>,
-) {
+fn scan_dir_recursive(fs: &dyn Fs, dir: &Path, files: &mut HashMap<PathBuf, FileEntry>) {
     if let Ok(entries) = fs.read_dir(dir) {
         for entry in entries {
             let full_path = entry.path;
@@ -254,7 +247,7 @@ fn scan_dir_recursive(
             }
 
             if entry.is_dir {
-                scan_dir_recursive(fs, vault_root, &full_path, files);
+                scan_dir_recursive(fs, &full_path, files);
             } else {
                 if let Ok(metadata) = fs.metadata(&full_path) {
                     let entry = FileEntry {
@@ -479,7 +472,7 @@ mod tests {
         let disk_files = scan_disk(&fs, vault_root, &ReconcileScope::Full);
         let index_files = HashMap::new();
 
-        let mut index = IndexPlaceholder::default();
+        let mut index = IndexPlaceholder;
         let (changed, vanished, new_files) = identify_changes(
             &ReconcileContext {
                 fs: &fs,

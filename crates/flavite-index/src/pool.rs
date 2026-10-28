@@ -2,7 +2,7 @@
 //!
 //! This module provides:
 //! - A single writer connection (owns the SQLite writer connection and
-//!   tantivy IndexWriter)
+//!   tantivy `IndexWriter`)
 //! - A pool of read-only WAL connections for concurrent reads
 //!
 //! The pool size is based on S4-2's recommendations: default 4 connections,
@@ -69,6 +69,11 @@ pub enum PoolError {
 
 impl ReadPool {
     /// Create a new read pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error if any of the pooled connections cannot be
+    /// opened or configured (the database must exist and be readable).
     pub fn new(db_path: &Path, size: usize) -> Result<Self> {
         let size = size.clamp(1, MAX_POOL_SIZE);
         let db_path = db_path.to_string_lossy().to_string();
@@ -109,6 +114,14 @@ impl ReadPool {
     /// Get a connection from the pool.
     ///
     /// This blocks until a connection is available or the timeout is reached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError::Timeout`] when `timeout` elapses first,
+    /// [`PoolError::Exhausted`] when the pool is at its cap with no timeout
+    /// (or a single wait timed out), [`PoolError::Poisoned`] when an internal
+    /// mutex is poisoned, and [`PoolError::Sqlite`] when growing the pool
+    /// fails to open a new connection.
     pub fn get(&self, timeout: Option<Duration>) -> Result<PooledConnection<'_>, PoolError> {
         let start = Instant::now();
 
@@ -182,6 +195,11 @@ impl ReadPool {
     }
 
     /// Return a connection to the pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError::Poisoned`] when an internal mutex is poisoned;
+    /// the connection is still enqueued in that case.
     pub fn return_conn(&self, conn: Connection) -> Result<(), PoolError> {
         let mut available = self.available.lock().map_err(|_| PoolError::Poisoned)?;
 
@@ -195,6 +213,10 @@ impl ReadPool {
     }
 
     /// Get pool statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError::Poisoned`] when an internal mutex is poisoned.
     pub fn stats(&self) -> Result<PoolStats, PoolError> {
         let available = self.available.lock().map_err(|_| PoolError::Poisoned)?;
         let in_use = self.in_use.lock().map_err(|_| PoolError::Poisoned)?;
@@ -217,7 +239,7 @@ pub struct PooledConnection<'a> {
     pool: &'a ReadPool,
 }
 
-impl<'a> std::ops::Deref for PooledConnection<'a> {
+impl std::ops::Deref for PooledConnection<'_> {
     type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
@@ -227,7 +249,7 @@ impl<'a> std::ops::Deref for PooledConnection<'a> {
     }
 }
 
-impl<'a> Drop for PooledConnection<'a> {
+impl Drop for PooledConnection<'_> {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
             let _ = self.pool.return_conn(conn);
@@ -257,6 +279,12 @@ impl Default for PoolStats {
 
 impl Writer {
     /// Create a new writer connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error if the database cannot be opened read-write
+    /// (it is created when missing) or if the WAL/foreign-keys/synchronous
+    /// pragmas cannot be applied.
     pub fn new(db_path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(
             db_path,
@@ -285,6 +313,11 @@ impl Writer {
 
 impl IndexActor {
     /// Create a new index actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error if the writer connection or any pooled read
+    /// connection cannot be opened or configured.
     pub fn new(db_path: &Path, pool_size: usize) -> Result<Self> {
         let writer = Writer::new(db_path)?;
         let read_pool = ReadPool::new(db_path, pool_size)?;
@@ -303,6 +336,10 @@ impl IndexActor {
     }
 
     /// Get pool statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError::Poisoned`] when an internal mutex is poisoned.
     pub fn pool_stats(&self) -> Result<PoolStats, PoolError> {
         self.read_pool.stats()
     }
