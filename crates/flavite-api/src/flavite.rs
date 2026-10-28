@@ -1,4 +1,4 @@
-//! Lattice facade — owns Session and command registry (§4.5, D16).
+//! Flavite facade — owns Session and command registry (§4.5, D16).
 //!
 //! This module provides the main public API facade that owns:
 //! - The headless Session (from flavite-vault)
@@ -9,7 +9,9 @@
 //! All external consumers (GUI, CLI, future plugins) interact with the core
 //! system through this facade.
 
-use crate::command::{CommandRegistry, Invocation};
+use crate::command::{
+    ArgSchema, CommandDispatchError, CommandHandler, CommandRegistry, CommandSpec, Invocation,
+};
 use crate::event::Event;
 use crate::result::{
     ExecutionResult, LocalError, LocalResult, LocalSuccess, RejectedResult, RejectionReason,
@@ -21,12 +23,127 @@ use flavite_vault::open::Vault;
 use flavite_vault::session::{Session, SessionCommand, SessionError, SessionResult};
 use flavite_vault::types::{Epoch, Generation, VaultConfig, VaultIdentity};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 /// Re-export vault types for API consumers.
 pub use flavite_vault::types::{ReconcileMode, ReconcileScope};
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditOpArgs {
+    range: (usize, usize),
+    replacement: String,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyEditsArgs {
+    buffer_id: u64,
+    revision: u64,
+    ops: Vec<EditOpArgs>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BufferRevisionArgs {
+    buffer_id: u64,
+    revision: u64,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReconcileArgs {
+    scope: String,
+    mode: String,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveArgs {
+    path: PathBuf,
+    resolution: String,
+    new_path: Option<PathBuf>,
+}
+
+fn decode<T: serde::de::DeserializeOwned>(invocation: &Invocation) -> Result<T, String> {
+    serde_json::from_value(invocation.args.clone()).map_err(|error| error.to_string())
+}
+fn handle_open(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
+    let path = decode(invocation)?;
+    Ok(session.execute(SessionCommand::OpenNote { path }))
+}
+fn handle_close(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
+    let path = decode(invocation)?;
+    Ok(session.execute(SessionCommand::CloseNote { path }))
+}
+fn handle_save(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
+    let path = decode(invocation)?;
+    Ok(session.execute(SessionCommand::SaveNote { path }))
+}
+fn handle_edits(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
+    let args: ApplyEditsArgs = decode(invocation)?;
+    use flavite_buffer::undo::EditOp;
+    use flavite_syntax::text::{Span, TextByte};
+    let ops = args
+        .ops
+        .into_iter()
+        .map(|op| {
+            EditOp::new(
+                Span::new(TextByte(op.range.0), TextByte(op.range.1)),
+                op.replacement,
+            )
+        })
+        .collect();
+    Ok(session.execute(SessionCommand::ApplyEdits {
+        buffer_id: BufferId::from(args.buffer_id),
+        revision: Revision::new(args.revision),
+        ops,
+    }))
+}
+fn handle_undo(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
+    let args: BufferRevisionArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::Undo {
+        buffer_id: BufferId::from(args.buffer_id),
+        revision: Revision::new(args.revision),
+    }))
+}
+fn handle_redo(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
+    let args: BufferRevisionArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::Redo {
+        buffer_id: BufferId::from(args.buffer_id),
+        revision: Revision::new(args.revision),
+    }))
+}
+fn handle_reconcile(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
+    let args: ReconcileArgs = decode(invocation)?;
+    let scope = match args.scope.as_str() {
+        "full" => ReconcileScope::Full,
+        _ => return Err("scope must be `full`".into()),
+    };
+    let mode = match args.mode.as_str() {
+        "fast" => ReconcileMode::FastMetadata,
+        "verify" => ReconcileMode::VerifyContent,
+        _ => return Err("mode must be `fast` or `verify`".into()),
+    };
+    Ok(session.execute(SessionCommand::Reconcile { scope, mode }))
+}
+fn handle_resolve(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
+    let args: ResolveArgs = decode(invocation)?;
+    let resolution = match args.resolution.as_str() {
+        "keep_mine" => crate::session::ConflictResolution::KeepMine,
+        "reload" => crate::session::ConflictResolution::Reload,
+        "save_as" => crate::session::ConflictResolution::SaveAs {
+            new_path: args.new_path.ok_or("save_as requires new_path")?,
+        },
+        "merge" => crate::session::ConflictResolution::Merge,
+        _ => return Err("resolution must be keep_mine, reload, save_as, or merge".into()),
+    };
+    Ok(session.execute(SessionCommand::ResolveConflict {
+        path: args.path,
+        resolution,
+    }))
+}
+
+type HandlerRegistration = (&'static str, &'static str, ArgSchema, CommandHandler);
 
 /// Result of opening a vault.
 #[derive(Debug)]
@@ -39,20 +156,28 @@ pub struct OpenVaultResult {
     pub generation: Generation,
 }
 
-/// A handle to the Lattice API.
+/// A handle to the Flavite API.
 ///
 /// This is the main entry point for interacting with a vault through the
 /// public API. It owns the Session and provides typed command dispatch,
 /// revisioned read views, and event subscriptions.
 #[derive(Debug)]
 #[allow(dead_code)]
-pub struct Lattice {
+pub struct Flavite {
     /// Vault identity.
     identity: VaultIdentity,
     /// The underlying Session.
     session: Arc<Session>,
     /// Command registry.
     command_registry: CommandRegistry,
+    /// Serializes commands and worker completion processing on the host turn.
+    ingress: Mutex<()>,
+    /// Public request IDs corresponding to Session worker IDs.
+    operation_ids: Mutex<HashMap<RequestId, RequestId>>,
+    /// Public operations still awaiting a terminal result.
+    pending_requests: Mutex<HashSet<RequestId>>,
+    /// Completions collected while waiting for another operation.
+    terminal_backlog: Mutex<HashMap<RequestId, ExecutionResult>>,
     /// Event sender for subscribers.
     event_sender: Sender<Event>,
     /// Event receiver (kept for drop behavior).
@@ -67,8 +192,8 @@ pub struct Lattice {
     owned_vault: Option<Vault>,
 }
 
-impl Lattice {
-    /// Open a vault and create a Lattice facade.
+impl Flavite {
+    /// Open a vault and create a Flavite facade.
     ///
     /// # Arguments
     /// * `identity` - The vault identity
@@ -76,20 +201,24 @@ impl Lattice {
     /// * `config` - Vault configuration
     ///
     /// # Returns
-    /// A new Lattice facade, or an error if the vault cannot be opened.
+    /// A new Flavite facade, or an error if the vault cannot be opened.
     pub fn open(
         identity: VaultIdentity,
         session: Session,
         _config: VaultConfig,
-    ) -> Result<Self, LatticeError> {
+    ) -> Result<Self, FlaviteError> {
         let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
 
         let (event_sender, event_receiver) = unbounded();
 
-        let lattice = Self {
+        let flavite = Self {
             identity,
             session: Arc::new(session),
             command_registry: CommandRegistry::new(),
+            ingress: Mutex::new(()),
+            operation_ids: Mutex::new(HashMap::new()),
+            pending_requests: Mutex::new(HashSet::new()),
+            terminal_backlog: Mutex::new(HashMap::new()),
             event_sender,
             _event_receiver: event_receiver,
             subscribers: Arc::new(Mutex::new(Vec::new())),
@@ -99,22 +228,22 @@ impl Lattice {
         };
 
         // Register built-in commands
-        lattice.register_builtin_commands()?;
+        flavite.register_builtin_commands()?;
 
-        Ok(lattice)
+        Ok(flavite)
     }
 
-    /// Create a new Lattice with a custom session builder.
+    /// Create a new Flavite with a custom session builder.
     ///
     /// This is useful for testing or when you need to customize the session.
     pub fn with_session(
         session: Session,
         vault_ref: ApiVaultRef,
         _config: VaultConfig,
-    ) -> Result<Self, LatticeError> {
+    ) -> Result<Self, FlaviteError> {
         let (event_sender, event_receiver) = unbounded();
 
-        let lattice = Self {
+        let flavite = Self {
             identity: VaultIdentity {
                 uuid: vault_ref.uuid,
                 root: vault_ref.root.clone(),
@@ -122,6 +251,10 @@ impl Lattice {
             },
             session: Arc::new(session),
             command_registry: CommandRegistry::new(),
+            ingress: Mutex::new(()),
+            operation_ids: Mutex::new(HashMap::new()),
+            pending_requests: Mutex::new(HashSet::new()),
+            terminal_backlog: Mutex::new(HashMap::new()),
             event_sender,
             _event_receiver: event_receiver,
             subscribers: Arc::new(Mutex::new(Vec::new())),
@@ -130,12 +263,12 @@ impl Lattice {
             owned_vault: None,
         };
 
-        lattice.register_builtin_commands()?;
+        flavite.register_builtin_commands()?;
 
-        Ok(lattice)
+        Ok(flavite)
     }
 
-    /// Create a new Lattice with a shared Session reference.
+    /// Create a new Flavite with a shared Session reference.
     ///
     /// This is useful when the Session is owned by another component
     /// (e.g., the Vault in the CLI integration).
@@ -143,14 +276,18 @@ impl Lattice {
         identity: VaultIdentity,
         session: Arc<Session>,
         _config: VaultConfig,
-    ) -> Result<Self, LatticeError> {
+    ) -> Result<Self, FlaviteError> {
         let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
         let (event_sender, event_receiver) = unbounded();
 
-        let lattice = Self {
+        let flavite = Self {
             identity,
             session,
             command_registry: CommandRegistry::new(),
+            ingress: Mutex::new(()),
+            operation_ids: Mutex::new(HashMap::new()),
+            pending_requests: Mutex::new(HashSet::new()),
+            terminal_backlog: Mutex::new(HashMap::new()),
             event_sender,
             _event_receiver: event_receiver,
             subscribers: Arc::new(Mutex::new(Vec::new())),
@@ -159,25 +296,83 @@ impl Lattice {
             owned_vault: None,
         };
 
-        lattice.register_builtin_commands()?;
+        flavite.register_builtin_commands()?;
 
-        Ok(lattice)
+        Ok(flavite)
     }
 
     /// Open a vault and construct the public facade while retaining ownership
     /// guards for the lifetime of the facade.
-    pub fn open_root(root: PathBuf, config: VaultConfig) -> Result<Self, LatticeError> {
+    pub fn open_root(root: PathBuf, config: VaultConfig) -> Result<Self, FlaviteError> {
         let vault = Vault::open(root, Box::new(flavite_fs::OsFs::new()), config.clone())
-            .map_err(|error| LatticeError::VaultOpenError(error.to_string()))?;
-        let mut lattice = Self::with_vault(vault.identity().clone(), vault.session_arc(), config)?;
-        lattice.owned_vault = Some(vault);
-        Ok(lattice)
+            .map_err(|error| FlaviteError::VaultOpenError(error.to_string()))?;
+        let mut flavite = Self::with_vault(vault.identity().clone(), vault.session_arc(), config)?;
+        flavite.owned_vault = Some(vault);
+        Ok(flavite)
     }
 
     /// Register built-in commands.
-    fn register_builtin_commands(&self) -> Result<(), LatticeError> {
-        // Register core commands
-        // Note: Full command implementations will be added as other slices land
+    fn register_builtin_commands(&self) -> Result<(), FlaviteError> {
+        let registrations: [HandlerRegistration; 8] = [
+            (
+                "open_note",
+                "Open note",
+                ArgSchema::typed::<PathBuf>(),
+                handle_open,
+            ),
+            (
+                "close_note",
+                "Close note",
+                ArgSchema::typed::<PathBuf>(),
+                handle_close,
+            ),
+            (
+                "save_note",
+                "Save note",
+                ArgSchema::typed::<PathBuf>(),
+                handle_save,
+            ),
+            (
+                "apply_edits",
+                "Apply edits",
+                ArgSchema::typed::<ApplyEditsArgs>(),
+                handle_edits,
+            ),
+            (
+                "undo",
+                "Undo",
+                ArgSchema::typed::<BufferRevisionArgs>(),
+                handle_undo,
+            ),
+            (
+                "redo",
+                "Redo",
+                ArgSchema::typed::<BufferRevisionArgs>(),
+                handle_redo,
+            ),
+            (
+                "reconcile",
+                "Reconcile vault",
+                ArgSchema::typed::<ReconcileArgs>(),
+                handle_reconcile,
+            ),
+            (
+                "resolve_conflict",
+                "Resolve conflict",
+                ArgSchema::typed::<ResolveArgs>(),
+                handle_resolve,
+            ),
+        ];
+        for (id, title, args, handler) in registrations {
+            let spec = if id == "open_note" {
+                CommandSpec::new(id, title, args)
+            } else {
+                CommandSpec::new(id, title, args).write()
+            };
+            self.command_registry
+                .register(spec, handler)
+                .map_err(|error| FlaviteError::Registration(format!("{error:?}")))?;
+        }
         Ok(())
     }
 
@@ -216,29 +411,64 @@ impl Lattice {
         receiver
     }
 
-    /// Get the underlying Session (for advanced use cases).
-    #[must_use]
-    pub fn session(&self) -> &Arc<Session> {
-        &self.session
-    }
-
-    /// Execute a Session command directly.
-    pub fn execute_session(&self, command: SessionCommand) -> SessionResult {
-        self.session.execute(command)
-    }
-
     /// Execute a typed command through the registry.
     pub fn execute(&self, invocation: Invocation) -> ExecutionResult {
-        // Check if read-only and command requires write access
-        if self.read_only && invocation.command_id.starts_with("write:") {
-            return ExecutionResult::Rejected(RejectedResult {
-                reason: RejectionReason::ReadOnly,
-                request_id: None,
-                message: None,
-            });
+        let _turn = self.ingress.lock().unwrap();
+        if let Err(error) = self
+            .command_registry
+            .validate(invocation.command_id, &invocation.args)
+        {
+            let (reason, message) = match error {
+                crate::command::CommandValidationError::Unavailable(id) => (
+                    RejectionReason::Unavailable,
+                    format!("command unavailable: {id}"),
+                ),
+                crate::command::CommandValidationError::InvalidArgs(message) => {
+                    (RejectionReason::InvalidArgs, message)
+                }
+            };
+            return ExecutionResult::Rejected(
+                RejectedResult::with_request(reason, invocation.request_id).with_message(message),
+            );
         }
-
-        // Dispatch to the appropriate handler
+        if let Some(buffer_id) = invocation.preconditions.buffer_id {
+            let revision = invocation.preconditions.expected_revision;
+            match self.get_buffer_view(BufferId::from(buffer_id), revision.map(Revision::new)) {
+                Ok(_) => {}
+                Err(FlaviteError::BufferNotFound(_)) => {
+                    return ExecutionResult::Rejected(RejectedResult::with_request(
+                        RejectionReason::BufferNotFound,
+                        invocation.request_id,
+                    ));
+                }
+                Err(FlaviteError::StaleBufferView { .. }) => {
+                    return ExecutionResult::Rejected(RejectedResult::with_request(
+                        RejectionReason::StaleRevision,
+                        invocation.request_id,
+                    ));
+                }
+                Err(error) => {
+                    return ExecutionResult::Rejected(
+                        RejectedResult::with_request(
+                            RejectionReason::Unsupported,
+                            invocation.request_id,
+                        )
+                        .with_message(error.to_string()),
+                    );
+                }
+            }
+        }
+        let requires_write = self
+            .command_registry
+            .get_spec(invocation.command_id)
+            .is_some_and(|spec| spec.requires_write)
+            || invocation.preconditions.requires_write;
+        if self.read_only && requires_write && !invocation.preconditions.allow_read_only {
+            return ExecutionResult::Rejected(RejectedResult::with_request(
+                RejectionReason::ReadOnly,
+                invocation.request_id,
+            ));
+        }
         let result = self.dispatch_command(&invocation);
 
         // Convert SessionResult to ExecutionResult
@@ -246,155 +476,30 @@ impl Lattice {
             Ok(session_result) => {
                 self.convert_session_result(session_result, invocation.request_id)
             }
-            Err(e) => ExecutionResult::Local(LocalResult::Error(LocalError::new(
-                "dispatch_error",
-                e.to_string(),
-            ))),
+            Err(error) => {
+                let (reason, message) = match error {
+                    CommandDispatchError::Unavailable(message) => {
+                        (RejectionReason::Unavailable, message)
+                    }
+                    CommandDispatchError::InvalidArgs(message)
+                    | CommandDispatchError::Handler(message) => {
+                        (RejectionReason::InvalidArgs, message)
+                    }
+                };
+                ExecutionResult::Rejected(
+                    RejectedResult::with_request(reason, invocation.request_id)
+                        .with_message(message),
+                )
+            }
         }
     }
 
     /// Dispatch a command to the appropriate handler.
-    fn dispatch_command(&self, invocation: &Invocation) -> Result<SessionResult, LatticeError> {
-        // For now, directly map known command IDs to Session commands
-        // In the future, this will use a proper handler registry
-        match invocation.command_id {
-            "open_note" => {
-                let path: PathBuf = serde_json::from_value(invocation.args.clone())
-                    .map_err(|e| LatticeError::InvalidArgs(e.to_string()))?;
-                Ok(self.session.execute(SessionCommand::OpenNote { path }))
-            }
-            "close_note" => {
-                let path: PathBuf = serde_json::from_value(invocation.args.clone())
-                    .map_err(|e| LatticeError::InvalidArgs(e.to_string()))?;
-                Ok(self.session.execute(SessionCommand::CloseNote { path }))
-            }
-            "save_note" => {
-                let path: PathBuf = serde_json::from_value(invocation.args.clone())
-                    .map_err(|e| LatticeError::InvalidArgs(e.to_string()))?;
-                Ok(self.session.execute(SessionCommand::SaveNote { path }))
-            }
-            "apply_edits" => {
-                // Deserialize edit operations
-                #[derive(Deserialize)]
-                struct ApplyEditsArgs {
-                    buffer_id: u64,
-                    revision: u64,
-                    ops: Vec<EditOpArgs>,
-                }
-
-                #[derive(Deserialize)]
-                struct EditOpArgs {
-                    range: (usize, usize),
-                    replacement: String,
-                }
-
-                let args: ApplyEditsArgs = serde_json::from_value(invocation.args.clone())
-                    .map_err(|e| LatticeError::InvalidArgs(e.to_string()))?;
-
-                // Convert to EditOps
-                use flavite_buffer::undo::EditOp;
-                use flavite_syntax::text::{Span, TextByte};
-                let ops: Vec<EditOp> = args
-                    .ops
-                    .into_iter()
-                    .map(|op| {
-                        EditOp::new(
-                            Span::new(TextByte(op.range.0), TextByte(op.range.1)),
-                            op.replacement,
-                        )
-                    })
-                    .collect();
-
-                Ok(self.session.execute(SessionCommand::ApplyEdits {
-                    buffer_id: BufferId::from(args.buffer_id),
-                    revision: Revision::new(args.revision),
-                    ops,
-                }))
-            }
-            "undo" => {
-                #[derive(Deserialize)]
-                struct UndoArgs {
-                    buffer_id: u64,
-                    revision: u64,
-                }
-                let args: UndoArgs = serde_json::from_value(invocation.args.clone())
-                    .map_err(|e| LatticeError::InvalidArgs(e.to_string()))?;
-                Ok(self.session.execute(SessionCommand::Undo {
-                    buffer_id: BufferId::from(args.buffer_id),
-                    revision: Revision::new(args.revision),
-                }))
-            }
-            "redo" => {
-                #[derive(Deserialize)]
-                struct RedoArgs {
-                    buffer_id: u64,
-                    revision: u64,
-                }
-                let args: RedoArgs = serde_json::from_value(invocation.args.clone())
-                    .map_err(|e| LatticeError::InvalidArgs(e.to_string()))?;
-                Ok(self.session.execute(SessionCommand::Redo {
-                    buffer_id: BufferId::from(args.buffer_id),
-                    revision: Revision::new(args.revision),
-                }))
-            }
-            "reconcile" => {
-                #[derive(Deserialize)]
-                struct ReconcileArgs {
-                    scope: String,
-                    mode: String,
-                }
-                let args: ReconcileArgs = serde_json::from_value(invocation.args.clone())
-                    .map_err(|e| LatticeError::InvalidArgs(e.to_string()))?;
-
-                // Convert string to ReconcileScope
-                let scope = match args.scope.as_str() {
-                    "full" => ReconcileScope::Full,
-                    _ => ReconcileScope::Full, // Default to Full for now
-                };
-
-                // Convert string to ReconcileMode
-                let mode = match args.mode.as_str() {
-                    "fast" => ReconcileMode::FastMetadata,
-                    "verify" => ReconcileMode::VerifyContent,
-                    _ => ReconcileMode::FastMetadata, // Default to FastMetadata
-                };
-
-                Ok(self
-                    .session
-                    .execute(SessionCommand::Reconcile { scope, mode }))
-            }
-            "resolve_conflict" => {
-                #[derive(Deserialize)]
-                struct ResolveArgs {
-                    path: PathBuf,
-                    resolution: String,
-                }
-                let args: ResolveArgs = serde_json::from_value(invocation.args.clone())
-                    .map_err(|e| LatticeError::InvalidArgs(e.to_string()))?;
-
-                let resolution = match args.resolution.as_str() {
-                    "keep_mine" => crate::session::ConflictResolution::KeepMine,
-                    "reload" => crate::session::ConflictResolution::Reload,
-                    "save_as" => crate::session::ConflictResolution::SaveAs {
-                        new_path: PathBuf::new(),
-                    },
-                    "merge" => crate::session::ConflictResolution::Merge,
-                    _ => {
-                        return Err(LatticeError::InvalidArgs(
-                            "Invalid resolution strategy".to_string(),
-                        ));
-                    }
-                };
-
-                Ok(self.session.execute(SessionCommand::ResolveConflict {
-                    path: args.path,
-                    resolution,
-                }))
-            }
-            _ => Err(LatticeError::UnknownCommand(
-                invocation.command_id.to_string(),
-            )),
-        }
+    fn dispatch_command(
+        &self,
+        invocation: &Invocation,
+    ) -> Result<SessionResult, CommandDispatchError> {
+        self.command_registry.dispatch(&self.session, invocation)
     }
 
     /// Convert a SessionResult to an ExecutionResult.
@@ -403,6 +508,33 @@ impl Lattice {
         result: SessionResult,
         request_id: RequestId,
     ) -> ExecutionResult {
+        let command_id = match &result {
+            SessionResult::Success(crate::session::CommandResult::NoteOpened { .. }) => "open_note",
+            SessionResult::Success(crate::session::CommandResult::NoteClosed) => "close_note",
+            SessionResult::Success(crate::session::CommandResult::EditsApplied { .. }) => {
+                "apply_edits"
+            }
+            SessionResult::Success(crate::session::CommandResult::NoteSaved { .. }) => "save_note",
+            SessionResult::Success(crate::session::CommandResult::ReconcileComplete { .. }) => {
+                "reconcile"
+            }
+            SessionResult::Success(crate::session::CommandResult::UndoPerformed { .. }) => "undo",
+            SessionResult::Success(crate::session::CommandResult::RedoPerformed { .. }) => "redo",
+            SessionResult::Success(crate::session::CommandResult::ConflictResolved) => {
+                "resolve_conflict"
+            }
+            SessionResult::Success(crate::session::CommandResult::RecoveryRestored { .. }) => {
+                "restore_recovery"
+            }
+            SessionResult::MergeReady { .. }
+            | SessionResult::Conflict { .. }
+            | SessionResult::ActionRequired { .. } => "resolve_conflict",
+            SessionResult::Pending { .. }
+            | SessionResult::Busy
+            | SessionResult::StaleRevision { .. }
+            | SessionResult::Superseded { .. }
+            | SessionResult::Error { .. } => "",
+        };
         match result {
             SessionResult::Success(cmd_result) => {
                 let data = match cmd_result {
@@ -426,6 +558,8 @@ impl Lattice {
                         })
                     }
                     crate::session::CommandResult::NoteSaved {
+                        buffer_id,
+                        saved_revision,
                         path,
                         hash,
                         epoch,
@@ -433,6 +567,8 @@ impl Lattice {
                     } => {
                         serde_json::json!({
                             "path": path.to_string_lossy(),
+                            "buffer_id": buffer_id.as_u64(),
+                            "saved_revision": saved_revision.as_u64(),
                             "hash": hex::encode(hash),
                             "epoch": epoch,
                             "generation": generation,
@@ -472,18 +608,45 @@ impl Lattice {
                         "revision": revision.as_u64(),
                     }),
                 };
-                ExecutionResult::Local(LocalResult::Success(LocalSuccess::new(request_id, data)))
+                ExecutionResult::Local(LocalResult::Success(LocalSuccess::with_command(
+                    request_id, command_id, data,
+                )))
             }
-            SessionResult::Pending { request_id: req_id } => {
-                ExecutionResult::Pending { request_id: req_id }
+            SessionResult::Pending {
+                request_id: session_id,
+            } => {
+                self.operation_ids
+                    .lock()
+                    .unwrap()
+                    .insert(session_id, request_id);
+                self.pending_requests.lock().unwrap().insert(request_id);
+                ExecutionResult::Pending { request_id }
             }
+            SessionResult::Busy => ExecutionResult::Rejected(
+                RejectedResult::with_request(RejectionReason::Busy, request_id)
+                    .with_message("operation queue is at capacity"),
+            ),
+            SessionResult::StaleRevision {
+                buffer_id,
+                expected,
+                actual,
+            } => ExecutionResult::Rejected(
+                RejectedResult::with_request(RejectionReason::StaleRevision, request_id)
+                    .with_message(format!(
+                        "buffer {} has revision {}; command expected {}",
+                        buffer_id.as_u64(),
+                        actual.as_u64(),
+                        expected.as_u64()
+                    )),
+            ),
             SessionResult::Error { message } => ExecutionResult::Local(LocalResult::Error(
-                LocalError::new("session_error", message),
+                LocalError::with_request("session_error", message, request_id),
             )),
             SessionResult::Conflict { path } => {
-                ExecutionResult::Local(LocalResult::Error(LocalError::new(
+                ExecutionResult::Local(LocalResult::Error(LocalError::with_request(
                     "conflict",
                     format!("Conflict detected: {}", path.to_string_lossy()),
+                    request_id,
                 )))
             }
             SessionResult::MergeReady {
@@ -508,18 +671,74 @@ impl Lattice {
                         })
                     }).collect::<Vec<_>>(),
                 });
-                ExecutionResult::Local(LocalResult::Success(LocalSuccess::new(request_id, data)))
+                ExecutionResult::Local(LocalResult::Success(LocalSuccess::with_command(
+                    request_id, command_id, data,
+                )))
             }
-            SessionResult::ActionRequired { code, data } => ExecutionResult::Local(
-                LocalResult::Error(LocalError::new(code, data.unwrap_or_default())),
-            ),
-            SessionResult::Superseded {
+            SessionResult::ActionRequired { code, data } => ExecutionResult::ActionRequired {
                 request_id,
-                by_request,
-            } => ExecutionResult::Local(LocalResult::Success(LocalSuccess::new(
-                request_id,
-                serde_json::json!({ "superseded_by": by_request }),
-            ))),
+                code: code.to_string(),
+                data: data.map(serde_json::Value::String),
+            },
+            SessionResult::Superseded { by_request, .. } => {
+                let by_request = self
+                    .operation_ids
+                    .lock()
+                    .unwrap()
+                    .get(&by_request)
+                    .copied()
+                    .unwrap_or(by_request);
+                ExecutionResult::Superseded {
+                    request_id,
+                    by_request,
+                }
+            }
+        }
+    }
+
+    /// Drain lossless terminal results for admitted asynchronous operations.
+    /// Results are correlated to the original public invocation ID.
+    pub fn drain_operation_completions(&self) -> Vec<OperationCompletion> {
+        let _turn = self.ingress.lock().unwrap();
+        self.session
+            .drain_operation_completions()
+            .into_iter()
+            .map(|completion| {
+                let request_id = self
+                    .operation_ids
+                    .lock()
+                    .unwrap()
+                    .remove(&completion.request_id)
+                    .unwrap_or(completion.request_id);
+                self.pending_requests.lock().unwrap().remove(&request_id);
+                let result = self.convert_session_result(completion.result, request_id);
+                OperationCompletion { request_id, result }
+            })
+            .collect()
+    }
+
+    /// Wait for one admitted operation to reach a terminal result.
+    pub fn wait_for_operation(&self, request_id: RequestId) -> ExecutionResult {
+        loop {
+            if let Some(result) = self.terminal_backlog.lock().unwrap().remove(&request_id) {
+                return result;
+            }
+            if !self.pending_requests.lock().unwrap().contains(&request_id) {
+                return ExecutionResult::Rejected(
+                    RejectedResult::with_request(RejectionReason::Unavailable, request_id)
+                        .with_message("operation is not pending or has already been drained"),
+                );
+            }
+            for completion in self.drain_operation_completions() {
+                if completion.request_id == request_id {
+                    return completion.result;
+                }
+                self.terminal_backlog
+                    .lock()
+                    .unwrap()
+                    .insert(completion.request_id, completion.result);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
@@ -530,43 +749,35 @@ impl Lattice {
         &self,
         buffer_id: BufferId,
         revision: Option<Revision>,
-    ) -> Result<BufferView, LatticeError> {
-        let manager = self.session.buffer_manager();
-        let manager = manager
-            .lock()
-            .map_err(|_| LatticeError::BufferManagerPoisoned)?;
-        let buffer = manager
-            .get_buffer_by_id(buffer_id)
-            .ok_or_else(|| LatticeError::BufferNotFound(buffer_id.as_u64()))?;
-        if let Some(expected) = revision
-            && buffer.revision() != expected
-        {
-            return Err(LatticeError::StaleBufferView {
-                expected: expected.as_u64(),
-                actual: buffer.revision().as_u64(),
-            });
-        }
-        let path = manager
-            .path_for_id(buffer_id)
-            .cloned()
-            .ok_or_else(|| LatticeError::BufferNotFound(buffer_id.as_u64()))?;
+    ) -> Result<BufferView, FlaviteError> {
+        let snapshot = self
+            .session
+            .buffer_snapshot(buffer_id, revision)
+            .map_err(|error| match error {
+                flavite_vault::session::BufferSnapshotError::NotFound(id) => {
+                    FlaviteError::BufferNotFound(id)
+                }
+                flavite_vault::session::BufferSnapshotError::Stale { expected, actual } => {
+                    FlaviteError::StaleBufferView { expected, actual }
+                }
+            })?;
         Ok(BufferView {
-            buffer_id: buffer_id.as_u64(),
-            revision: buffer.revision().as_u64(),
-            text: buffer.text().to_owned(),
-            base_hash: buffer
-                .base_hash()
-                .map_or_else(Vec::new, |hash| hash.as_slice().to_vec()),
-            state: buffer.state().to_string(),
-            path,
+            buffer_id: snapshot.buffer_id.as_u64(),
+            revision: snapshot.revision.as_u64(),
+            text: snapshot.text,
+            base_hash: snapshot
+                .base_hash
+                .map_or_else(Vec::new, |hash| hash.to_vec()),
+            state: snapshot.state,
+            path: snapshot.path,
         })
     }
 
     /// Query the index.
     ///
     /// Note: This will be fully implemented when flavite-index is available.
-    pub fn query(&self, _query: &crate::Query) -> Result<QueryResult, LatticeError> {
-        Err(LatticeError::NotImplemented("query".to_string()))
+    pub fn query(&self, _query: &crate::Query) -> Result<QueryResult, FlaviteError> {
+        Err(FlaviteError::NotImplemented("query".to_string()))
     }
 }
 
@@ -611,9 +822,9 @@ pub struct NoteResult {
     pub title: String,
 }
 
-/// Errors for Lattice operations.
+/// Errors for Flavite operations.
 #[derive(Debug, Error)]
-pub enum LatticeError {
+pub enum FlaviteError {
     /// The vault is already open.
     #[error("Vault already open")]
     AlreadyOpen,
@@ -621,6 +832,10 @@ pub enum LatticeError {
     /// Invalid command arguments.
     #[error("Invalid arguments: {0}")]
     InvalidArgs(String),
+
+    /// Command registration failed.
+    #[error("command registration failed: {0}")]
+    Registration(String),
 
     /// Unknown command.
     #[error("Unknown command: {0}")]
@@ -662,11 +877,20 @@ pub mod session {
     };
 }
 
+/// Terminal completion for an asynchronous public command.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OperationCompletion {
+    /// Public invocation ID returned by `execute` when the command was pending.
+    pub request_id: RequestId,
+    /// Structured terminal result.
+    pub result: ExecutionResult,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn test_lattice() -> (Lattice, PathBuf, tempfile::TempDir) {
+    fn test_flavite() -> (Flavite, PathBuf, tempfile::TempDir) {
         use flavite_buffer::manager::BufferManager;
         use flavite_fs::{Fs, MemFs};
         use flavite_index::IndexActor;
@@ -674,7 +898,7 @@ mod tests {
         use flavite_vault::channels::ChannelSet;
 
         let fs = MemFs::new();
-        let root = PathBuf::from("/test/lattice-api-vault");
+        let root = PathBuf::from("/test/flavite-api-vault");
         fs.create_dir_all(&root).unwrap();
         fs.write_new(&root.join("note.md"), b"hello").unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -698,17 +922,17 @@ mod tests {
             channels.notice,
             VaultConfig::default(),
         );
-        let lattice = Lattice::with_session(
+        let flavite = Flavite::with_session(
             session,
             ApiVaultRef::new(identity.uuid, identity.root),
             VaultConfig::default(),
         )
         .unwrap();
-        (lattice, root, temp)
+        (flavite, root, temp)
     }
 
     #[test]
-    fn lattice_creation() {
+    fn flavite_creation() {
         // This test will be expanded once Session can be properly constructed
         // For now, we just verify the types compile
     }
@@ -763,13 +987,13 @@ mod tests {
             channels.notice,
             VaultConfig::default(),
         );
-        let lattice = Lattice::with_session(
+        let flavite = Flavite::with_session(
             session,
             ApiVaultRef::new(identity.uuid, identity.root),
             VaultConfig::default(),
         )
         .unwrap();
-        let opened = lattice.execute_session(SessionCommand::OpenNote {
+        let opened = flavite.session.execute(SessionCommand::OpenNote {
             path: root.join("note.md"),
         });
         let buffer_id = match opened {
@@ -778,12 +1002,12 @@ mod tests {
             }) => buffer_id,
             other => panic!("unexpected open result: {other:?}"),
         };
-        let initial = lattice.get_buffer_view(buffer_id, None).unwrap();
+        let initial = flavite.get_buffer_view(buffer_id, None).unwrap();
         assert_eq!(initial.text, "hello");
         assert_eq!(initial.path, root.join("note.md"));
         assert_eq!(initial.state, "Clean");
 
-        lattice.execute_session(SessionCommand::ApplyEdits {
+        flavite.session.execute(SessionCommand::ApplyEdits {
             buffer_id,
             revision: Revision::new(initial.revision),
             ops: vec![flavite_buffer::undo::EditOp::new(
@@ -795,10 +1019,10 @@ mod tests {
             )],
         });
         assert!(matches!(
-            lattice.get_buffer_view(buffer_id, Some(Revision::new(initial.revision))),
-            Err(LatticeError::StaleBufferView { .. })
+            flavite.get_buffer_view(buffer_id, Some(Revision::new(initial.revision))),
+            Err(FlaviteError::StaleBufferView { .. })
         ));
-        let current = lattice.get_buffer_view(buffer_id, None).unwrap();
+        let current = flavite.get_buffer_view(buffer_id, None).unwrap();
         assert_eq!(current.text, "hello!");
         assert_eq!(current.state, "Dirty");
     }
@@ -825,8 +1049,8 @@ mod tests {
         use crate::command::Invocation;
         use crate::types::Origin;
 
-        let (mut lattice, root, _temp) = test_lattice();
-        let rejected = lattice.execute(Invocation::new(
+        let (mut flavite, root, _temp) = test_flavite();
+        let rejected = flavite.execute(Invocation::new(
             1,
             "write:save_note",
             serde_json::Value::Null,
@@ -834,13 +1058,17 @@ mod tests {
         ));
         assert!(matches!(
             rejected,
-            ExecutionResult::Local(LocalResult::Error(LocalError { code, .. })) if code == "dispatch_error"
+            ExecutionResult::Rejected(RejectedResult {
+                reason: RejectionReason::Unavailable,
+                request_id: Some(1),
+                ..
+            })
         ));
-        lattice.set_read_only(true);
-        let rejected = lattice.execute(Invocation::new(
+        flavite.set_read_only(true);
+        let rejected = flavite.execute(Invocation::new(
             2,
-            "write:save_note",
-            serde_json::Value::Null,
+            "save_note",
+            serde_json::to_value(root.join("note.md")).unwrap(),
             Origin::Gui,
         ));
         assert!(matches!(
@@ -850,29 +1078,39 @@ mod tests {
                 ..
             })
         ));
-        lattice.set_read_only(false);
+        flavite.set_read_only(false);
 
-        let invalid = lattice.execute(Invocation::new(
+        let invalid = flavite.execute(Invocation::new(
             3,
             "open_note",
             serde_json::json!({"bad": true}),
             Origin::Cli,
         ));
-        assert!(
-            matches!(invalid, ExecutionResult::Local(LocalResult::Error(LocalError { code, .. })) if code == "dispatch_error")
-        );
+        assert!(matches!(
+            invalid,
+            ExecutionResult::Rejected(RejectedResult {
+                reason: RejectionReason::InvalidArgs,
+                request_id: Some(3),
+                ..
+            })
+        ));
 
-        let unknown = lattice.execute(Invocation::new(
+        let unknown = flavite.execute(Invocation::new(
             4,
             "does_not_exist",
             serde_json::Value::Null,
             Origin::Plugin,
         ));
-        assert!(
-            matches!(unknown, ExecutionResult::Local(LocalResult::Error(LocalError { code, .. })) if code == "dispatch_error")
-        );
+        assert!(matches!(
+            unknown,
+            ExecutionResult::Rejected(RejectedResult {
+                reason: RejectionReason::Unavailable,
+                request_id: Some(4),
+                ..
+            })
+        ));
 
-        let opened = lattice.execute(Invocation::new(
+        let opened = flavite.execute(Invocation::new(
             5,
             "open_note",
             serde_json::to_value(root.join("note.md")).unwrap(),
@@ -880,7 +1118,7 @@ mod tests {
         ));
         let data = opened.into_success().unwrap().data;
         let buffer_id = data["buffer_id"].as_u64().unwrap();
-        let closed = lattice.execute(Invocation::new(
+        let closed = flavite.execute(Invocation::new(
             6,
             "close_note",
             serde_json::to_value(root.join("note.md")).unwrap(),
@@ -888,8 +1126,8 @@ mod tests {
         ));
         assert!(closed.is_success());
         assert!(matches!(
-            lattice.get_buffer_view(BufferId::from(buffer_id), None),
-            Err(LatticeError::BufferNotFound(_))
+            flavite.get_buffer_view(BufferId::from(buffer_id), None),
+            Err(FlaviteError::BufferNotFound(_))
         ));
     }
 
@@ -898,8 +1136,8 @@ mod tests {
         use crate::command::Invocation;
         use crate::types::Origin;
 
-        let (lattice, root, _temp) = test_lattice();
-        let opened = lattice.execute(Invocation::new(
+        let (flavite, root, _temp) = test_flavite();
+        let opened = flavite.execute(Invocation::new(
             10,
             "open_note",
             serde_json::to_value(root.join("note.md")).unwrap(),
@@ -909,7 +1147,7 @@ mod tests {
         let id = opened["buffer_id"].as_u64().unwrap();
         let revision = opened["revision"].as_u64().unwrap();
 
-        let applied = lattice.execute(Invocation::new(
+        let applied = flavite.execute(Invocation::new(
             11,
             "apply_edits",
             serde_json::json!({
@@ -922,7 +1160,7 @@ mod tests {
         let applied = applied.into_success().unwrap().data;
         assert_eq!(applied["revision"].as_u64().unwrap(), revision + 1);
 
-        let undone = lattice.execute(Invocation::new(
+        let undone = flavite.execute(Invocation::new(
             12,
             "undo",
             serde_json::json!({ "buffer_id": id, "revision": applied["revision"] }),
@@ -930,14 +1168,14 @@ mod tests {
         ));
         let undone = undone.into_success().expect("undo succeeds").data;
         assert_eq!(
-            lattice
+            flavite
                 .get_buffer_view(BufferId::from(id), None)
                 .unwrap()
                 .text,
             "hello"
         );
 
-        let redone = lattice.execute(Invocation::new(
+        let redone = flavite.execute(Invocation::new(
             13,
             "redo",
             serde_json::json!({ "buffer_id": id, "revision": undone["revision"] }),
@@ -945,24 +1183,27 @@ mod tests {
         ));
         assert!(redone.is_success(), "redo failed: {redone:?}");
         assert_eq!(
-            lattice
+            flavite
                 .get_buffer_view(BufferId::from(id), None)
                 .unwrap()
                 .text,
             "hello!"
         );
 
-        let reconciled = lattice.execute(Invocation::new(
+        let reconciled = flavite.execute(Invocation::new(
             14,
             "reconcile",
-            serde_json::json!({"scope": "unknown", "mode": "unknown"}),
+            serde_json::json!({"scope": "full", "mode": "verify"}),
             Origin::Cli,
         ));
-        assert!(!matches!(
+        assert!(matches!(
             reconciled,
-            ExecutionResult::Local(LocalResult::Error(LocalError { code, .. }))
-                if code == "dispatch_error"
+            ExecutionResult::Pending { request_id: 14 }
         ));
+        let terminal = flavite.wait_for_operation(14);
+        assert!(
+            matches!(terminal, ExecutionResult::Local(LocalResult::Success(LocalSuccess { request_id: 14, command_id, .. })) if command_id == "reconcile")
+        );
     }
 
     #[test]
@@ -971,7 +1212,7 @@ mod tests {
         use flavite_buffer::revision::{BufferId, Revision};
         use flavite_vault::types::{Epoch, Generation, ReconcileSummary};
 
-        let (lattice, _root, _temp) = test_lattice();
+        let (flavite, _root, _temp) = test_flavite();
         let buffer = BufferId::from(17);
         let revision = Revision::new(3);
         let successes = [
@@ -985,6 +1226,8 @@ mod tests {
                 new_revision: revision,
             },
             CommandResult::NoteSaved {
+                buffer_id: buffer,
+                saved_revision: revision,
                 path: PathBuf::from("a.md"),
                 hash: vec![1, 2],
                 epoch: Epoch::new(4),
@@ -1009,37 +1252,40 @@ mod tests {
         ];
         for result in successes {
             assert!(
-                lattice
+                flavite
                     .convert_session_result(SessionResult::Success(result), 20)
                     .is_success()
             );
         }
 
         assert!(matches!(
-            lattice.convert_session_result(SessionResult::Pending { request_id: 21 }, 20),
-            ExecutionResult::Pending { request_id: 21 }
+            flavite.convert_session_result(SessionResult::Pending { request_id: 21 }, 20),
+            ExecutionResult::Pending { request_id: 20 }
         ));
         assert!(
-            matches!(lattice.convert_session_result(SessionResult::Error { message: "failure".into() }, 20), ExecutionResult::Local(LocalResult::Error(LocalError { code, .. })) if code == "session_error")
+            matches!(flavite.convert_session_result(SessionResult::Error { message: "failure".into() }, 20), ExecutionResult::Local(LocalResult::Error(LocalError { code, .. })) if code == "session_error")
         );
         assert!(
-            matches!(lattice.convert_session_result(SessionResult::Conflict { path: PathBuf::from("a.md") }, 20), ExecutionResult::Local(LocalResult::Error(LocalError { code, .. })) if code == "conflict")
+            matches!(flavite.convert_session_result(SessionResult::Conflict { path: PathBuf::from("a.md") }, 20), ExecutionResult::Local(LocalResult::Error(LocalError { code, .. })) if code == "conflict")
         );
         assert!(
-            matches!(lattice.convert_session_result(SessionResult::ActionRequired { code: "confirm", data: Some("details".into()) }, 20), ExecutionResult::Local(LocalResult::Error(LocalError { code, message, .. })) if code == "confirm" && message == "details")
+            matches!(flavite.convert_session_result(SessionResult::ActionRequired { code: "confirm", data: Some("details".into()) }, 20), ExecutionResult::ActionRequired { request_id: 20, code, data: Some(serde_json::Value::String(message)) } if code == "confirm" && message == "details")
         );
         assert!(
-            matches!(lattice.convert_session_result(SessionResult::ActionRequired { code: "confirm", data: None }, 20), ExecutionResult::Local(LocalResult::Error(LocalError { message, .. })) if message.is_empty())
+            matches!(flavite.convert_session_result(SessionResult::ActionRequired { code: "confirm", data: None }, 20), ExecutionResult::ActionRequired { request_id: 20, code, data: None } if code == "confirm")
         );
         assert!(matches!(
-            lattice.convert_session_result(
+            flavite.convert_session_result(
                 SessionResult::Superseded {
                     request_id: 22,
                     by_request: 23
                 },
                 20
             ),
-            ExecutionResult::Local(LocalResult::Success(LocalSuccess { request_id: 22, .. }))
+            ExecutionResult::Superseded {
+                request_id: 20,
+                by_request: 23
+            }
         ));
         let merge = SessionResult::MergeReady {
             path: PathBuf::from("a.md"),
@@ -1056,7 +1302,7 @@ mod tests {
                 }],
             },
         };
-        let converted = lattice
+        let converted = flavite
             .convert_session_result(merge, 24)
             .into_success()
             .unwrap();

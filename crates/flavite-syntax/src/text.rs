@@ -1,6 +1,6 @@
 //! Text snapshots and coordinate types (§4.16.1).
 //!
-//! Lattice normalizes CRLF to LF at input and strips a UTF-8 BOM, while
+//! Flavite normalizes CRLF to LF at input and strips a UTF-8 BOM, while
 //! *remembering* exactly what the source bytes were, so that an unedited note
 //! round-trips byte-exactly and a mixed-EOL note is never normalized (§4.8,
 //! R12). Everything downstream — the scanner, both parse glues, the buffer —

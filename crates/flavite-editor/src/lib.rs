@@ -9,5 +9,5 @@ pub mod surface;
 pub mod viewport;
 pub mod widget;
 
-pub use surface::{EditorAction, EditorSurface, EditorView};
+pub use surface::{EditorAction, EditorSurface, EditorView, LinkTarget};
 pub use widget::EditorWidget;

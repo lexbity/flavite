@@ -23,7 +23,7 @@
 //!
 //! B7 productionizes the zoomable container: cards now carry
 //! `CardLayerMessage` for toggle and open actions, and card content is
-//! fetched through `flavite-api::Lattice`.
+//! fetched through `flavite-api::Flavite`.
 
 use std::collections::HashMap;
 
@@ -387,7 +387,7 @@ where
 ///
 /// For B7, this returns a simple text element. The actual styled card
 /// with content will be built by card_layer::build_card when integrated
-/// with the Lattice API.
+/// with the Flavite API.
 pub fn build_card<Message>(card: &Card<Message>, step: f32) -> Element<'static, Message>
 where
     Message: 'static + Clone + std::fmt::Debug,

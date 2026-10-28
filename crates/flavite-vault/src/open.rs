@@ -199,7 +199,7 @@ impl Vault {
     fn get_cache_dir(uuid: Uuid) -> Result<PathBuf, OpenVaultError> {
         use directories::ProjectDirs;
 
-        let cache_dir = ProjectDirs::from("com", "flavite", "Lattice")
+        let cache_dir = ProjectDirs::from("com", "flavite", "Flavite")
             .ok_or(OpenVaultError::Index(
                 "No cache directory available".to_string(),
             ))?

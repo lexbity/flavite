@@ -10,6 +10,20 @@ pub enum ExecutionResult {
     Local(LocalResult),
     /// Pending completion.
     Pending { request_id: RequestId },
+    /// Accepted command needs an explicit user decision before it can proceed.
+    ActionRequired {
+        /// The invocation that needs a decision.
+        request_id: RequestId,
+        /// Stable action code for a host to present.
+        code: String,
+        /// Structured details for the decision UI.
+        data: Option<serde_json::Value>,
+    },
+    /// An admitted operation was replaced by a newer coalesced request.
+    Superseded {
+        request_id: RequestId,
+        by_request: RequestId,
+    },
     /// Rejected without effects.
     Rejected(RejectedResult),
 }
@@ -38,6 +52,8 @@ impl ExecutionResult {
     pub fn request_id(&self) -> Option<RequestId> {
         match self {
             Self::Pending { request_id } => Some(*request_id),
+            Self::ActionRequired { request_id, .. } => Some(*request_id),
+            Self::Superseded { request_id, .. } => Some(*request_id),
             _ => None,
         }
     }
@@ -49,7 +65,9 @@ impl ExecutionResult {
             Self::Local(LocalResult::Success(s)) => Some(s.request_id),
             Self::Local(LocalResult::Void) => None,
             Self::Local(LocalResult::Error(e)) => e.request_id,
-            Self::Pending { request_id } => Some(*request_id),
+            Self::Pending { request_id }
+            | Self::ActionRequired { request_id, .. }
+            | Self::Superseded { request_id, .. } => Some(*request_id),
             Self::Rejected(_) => None,
         }
     }

@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Directory name for Lattice's configuration.
-const LATTICE_DIR: &str = "flavite";
+/// Directory name for Flavite's configuration.
+const FLAVITE_DIR: &str = "flavite";
 
 /// Subdirectory for vault registries.
 const VAULTS_DIR: &str = "vaults";
@@ -105,20 +105,20 @@ pub enum IdentityError {
 /// Type alias for identity results.
 pub type IdentityResult<T> = Result<T, IdentityError>;
 
-/// Get the OS data directory for Lattice.
+/// Get the OS data directory for Flavite.
 pub fn get_data_dir() -> Option<PathBuf> {
-    ProjectDirs::from("com", "flavite", "Lattice").map(|p| p.data_dir().to_path_buf())
+    ProjectDirs::from("com", "flavite", "Flavite").map(|p| p.data_dir().to_path_buf())
 }
 
-/// Get the OS cache directory for Lattice.
+/// Get the OS cache directory for Flavite.
 #[allow(dead_code)]
 fn get_cache_dir() -> Option<PathBuf> {
-    ProjectDirs::from("com", "flavite", "Lattice").map(|p| p.cache_dir().to_path_buf())
+    ProjectDirs::from("com", "flavite", "Flavite").map(|p| p.cache_dir().to_path_buf())
 }
 
 fn registry_path_in(data_dir: &Path, root_key: &[u8]) -> PathBuf {
     data_dir
-        .join(LATTICE_DIR)
+        .join(FLAVITE_DIR)
         .join(VAULTS_DIR)
         .join(format!("{}.toml", hex::encode(root_key)))
 }
@@ -130,7 +130,7 @@ pub fn root_guard_path(root_key: &[u8]) -> Option<PathBuf> {
 
 fn root_guard_path_in(data_dir: &Path, root_key: &[u8]) -> PathBuf {
     data_dir
-        .join(LATTICE_DIR)
+        .join(FLAVITE_DIR)
         .join(ROOTS_DIR)
         .join(format!("{}.lock", hex::encode(root_key)))
 }
@@ -142,7 +142,7 @@ pub fn uuid_lock_path(uuid: Uuid) -> Option<PathBuf> {
 
 fn uuid_lock_path_in(data_dir: &Path, uuid: Uuid) -> PathBuf {
     data_dir
-        .join(LATTICE_DIR)
+        .join(FLAVITE_DIR)
         .join(VAULTS_DIR)
         .join(uuid.to_string())
         .join(UUID_LOCK)

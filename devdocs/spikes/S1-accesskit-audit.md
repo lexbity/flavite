@@ -58,7 +58,7 @@ To integrate AccessKit with iced, we would need to:
 4. Send the tree to `accesskit-winit` for platform delivery.
 
 This is **not a widget-level change** — it is a runtime-level change to iced
-itself. A downstream crate (like Lattice) cannot add AccessKit support to a
+itself. A downstream crate (like Flavite) cannot add AccessKit support to a
 custom widget without upstream changes.
 
 ### F5 — iced's roadmap
@@ -81,7 +81,7 @@ text editor widget.
 ## Decision
 
 **Decision:** Document the gap and track it as a SHOULD (D18: screen-reader
-support is a SHOULD gated on S1). The gap is **not in Lattice** — it is in
+support is a SHOULD gated on S1). The gap is **not in Flavite** — it is in
 iced itself, which lacks any AccessKit integration at the pinned version.
 
 ### Concrete actions
@@ -103,7 +103,7 @@ iced itself, which lacks any AccessKit integration at the pinned version.
    later is a **non-invasive change** — we control the widget tree and can
    build the AccessKit tree in parallel.
 
-### What Lattice can do today
+### What Flavite can do today
 
 - **Keyboard navigation** works: the custom widget handles arrow keys,
   Home/End, selection, etc. Screen reader users can navigate with the
@@ -127,8 +127,8 @@ caret position changes because there are no accessibility nodes.
 Revisit if:
 1. iced adds AccessKit integration (or a different accessibility abstraction).
 2. A real screen-reader user reports that the lack of support blocks them
-   from using Lattice.
+   from using Flavite.
 3. A funded initiative exists to implement accessibility upstream in iced.
 
 At that point, the cost of integrating AccessKit is **low** because the
-widget tree is already controlled by Lattice.
+widget tree is already controlled by Flavite.

@@ -20,6 +20,15 @@ pub struct EditorView {
     pub state: String,
 }
 
+/// A note candidate offered while completing a wikilink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkTarget {
+    /// Plain-text link target (vault-relative path or unique stem).
+    pub target: String,
+    /// Human-readable note title.
+    pub title: String,
+}
+
 impl From<&BufferView> for EditorView {
     fn from(view: &BufferView) -> Self {
         Self {
@@ -46,27 +55,53 @@ pub struct EditorAction {
 }
 
 impl EditorAction {
-    /// Convert to the Session's authoritative mutation command.
+    /// Convert to a public Flavite invocation with revision preconditions.
     #[must_use]
-    pub fn into_session_command(self) -> flavite_api::lattice::session::SessionCommand {
+    pub fn into_invocation(self, request_id: flavite_api::RequestId) -> flavite_api::Invocation {
+        use flavite_api::{Origin, Preconditions};
         if let Some(redo) = self.history {
-            return if redo {
-                flavite_api::lattice::session::SessionCommand::Redo {
-                    buffer_id: self.buffer_id.into(),
-                    revision: flavite_buffer::revision::Revision::new(self.expected_revision),
-                }
+            let (command, args) = if redo {
+                (
+                    "redo",
+                    serde_json::json!({"buffer_id": self.buffer_id, "revision": self.expected_revision}),
+                )
             } else {
-                flavite_api::lattice::session::SessionCommand::Undo {
-                    buffer_id: self.buffer_id.into(),
-                    revision: flavite_buffer::revision::Revision::new(self.expected_revision),
-                }
+                (
+                    "undo",
+                    serde_json::json!({"buffer_id": self.buffer_id, "revision": self.expected_revision}),
+                )
             };
+            return flavite_api::Invocation::with_preconditions(
+                request_id,
+                command,
+                args,
+                Origin::Gui,
+                Preconditions::new()
+                    .with_buffer_id(self.buffer_id)
+                    .with_revision(self.expected_revision)
+                    .requires_write(),
+            );
         }
-        flavite_api::lattice::session::SessionCommand::ApplyEdits {
-            buffer_id: self.buffer_id.into(),
-            revision: flavite_buffer::revision::Revision::new(self.expected_revision),
-            ops: self.edits,
-        }
+        let ops = self
+            .edits
+            .iter()
+            .map(|edit| {
+                serde_json::json!({
+                    "range": [edit.range.start.0, edit.range.end.0],
+                    "replacement": edit.replacement,
+                })
+            })
+            .collect::<Vec<_>>();
+        flavite_api::Invocation::with_preconditions(
+            request_id,
+            "apply_edits",
+            serde_json::json!({"buffer_id": self.buffer_id, "revision": self.expected_revision, "ops": ops}),
+            Origin::Gui,
+            Preconditions::new()
+                .with_buffer_id(self.buffer_id)
+                .with_revision(self.expected_revision)
+                .requires_write(),
+        )
     }
 
     /// Build a single insertion/replacement edit.

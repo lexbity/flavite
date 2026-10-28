@@ -9,7 +9,7 @@
 //! All document mutations execute as session commands and apply EditOps
 //! through its BufferManager. Widgets receive read-only views.
 
-use crate::actor::{VaultActorHandle, VaultActorMsg};
+use crate::actor::VaultActorHandle;
 use crate::channels::{NoticeChannel, PulseChannel};
 use crate::save::{DiskPrecondition, DurabilityOutcome, SaveFailureStage, SaveRequest};
 use crate::tokens::WriteTokenManager;
@@ -45,6 +45,26 @@ pub struct OperationCompletion {
     pub request_id: u64,
     /// The operation's terminal result.
     pub result: SessionResult,
+}
+
+/// Immutable revisioned buffer data exposed by Session to API hosts.
+#[derive(Debug, Clone)]
+pub struct BufferSnapshot {
+    pub buffer_id: BufferId,
+    pub revision: Revision,
+    pub text: String,
+    pub base_hash: Option<[u8; 32]>,
+    pub state: String,
+    pub path: PathBuf,
+}
+
+/// Failure while acquiring an immutable buffer snapshot.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum BufferSnapshotError {
+    #[error("buffer {0} is not open")]
+    NotFound(u64),
+    #[error("stale revision: expected {expected}, current {actual}")]
+    Stale { expected: u64, actual: u64 },
 }
 
 /// Commands that can be executed by the Session.
@@ -117,6 +137,14 @@ pub enum SessionResult {
     Success(CommandResult),
     /// Command is pending.
     Pending { request_id: u64 },
+    /// Operation was not admitted because the lossless completion ledger is full.
+    Busy,
+    /// Revision precondition did not match the current authoritative buffer.
+    StaleRevision {
+        buffer_id: BufferId,
+        expected: Revision,
+        actual: Revision,
+    },
     /// An admitted save was replaced by a later request for the same buffer.
     Superseded { request_id: u64, by_request: u64 },
     /// Command failed.
@@ -156,6 +184,10 @@ pub enum CommandResult {
     },
     /// Note was saved.
     NoteSaved {
+        /// Buffer instance whose immutable snapshot was saved.
+        buffer_id: BufferId,
+        /// Revision represented by the saved bytes.
+        saved_revision: Revision,
         path: PathBuf,
         hash: Vec<u8>,
         epoch: Epoch,
@@ -223,6 +255,8 @@ pub enum SessionEvent {
 /// all document operations.
 #[derive(Debug)]
 pub struct Session {
+    /// Serializes every command transition and worker reply application.
+    driving_turn: Mutex<()>,
     /// Vault identity.
     identity: VaultIdentity,
     /// Vault actor handle.
@@ -245,6 +279,9 @@ pub struct Session {
     pending: Arc<Mutex<HashMap<u64, SessionResult>>>,
     /// One active save and at most one coalesced successor per buffer.
     save_flights: Mutex<HashMap<u64, SaveFlight>>,
+    /// Correlated reconcile workers.
+    reconcile_flights:
+        Mutex<HashMap<u64, crossbeam::channel::Receiver<crate::actor::VaultActorResp>>>,
     /// Lossless terminal results. Admission is bounded by the pending-save cap.
     completions: Mutex<VecDeque<OperationCompletion>>,
     /// Write token manager.
@@ -320,6 +357,7 @@ impl Session {
                 .expect("recovery worker thread creation failed")
         });
         Self {
+            driving_turn: Mutex::new(()),
             identity,
             actor,
             buffer_manager: manager,
@@ -331,6 +369,7 @@ impl Session {
             request_counter: AtomicU64::new(0),
             pending: Arc::new(Mutex::new(HashMap::new())),
             save_flights: Mutex::new(HashMap::new()),
+            reconcile_flights: Mutex::new(HashMap::new()),
             completions: Mutex::new(VecDeque::new()),
             token_manager: WriteTokenManager::new(),
             pulse,
@@ -347,6 +386,11 @@ impl Session {
 
     /// Execute a command.
     pub fn execute(&self, command: SessionCommand) -> SessionResult {
+        let _turn = self.driving_turn.lock().unwrap();
+        self.execute_inner(command)
+    }
+
+    fn execute_inner(&self, command: SessionCommand) -> SessionResult {
         match command {
             SessionCommand::OpenNote { path } => self.open_note(path),
             SessionCommand::CloseNote { path } => self.close_note(path),
@@ -384,7 +428,9 @@ impl Session {
     /// not yet been presented to the host. This is lossless: completions stay
     /// queued until the host drains them.
     pub fn drain_operation_completions(&self) -> Vec<OperationCompletion> {
+        let _turn = self.driving_turn.lock().unwrap();
         self.pump_save_completions();
+        self.pump_reconcile_completions();
         self.completions.lock().unwrap().drain(..).collect()
     }
 
@@ -392,7 +438,9 @@ impl Session {
     /// GUI hosts use `drain_operation_completions` from their normal pump.
     pub fn wait_for_operation(&self, request_id: u64) -> SessionResult {
         loop {
+            let _turn = self.driving_turn.lock().unwrap();
             self.pump_save_completions();
+            self.pump_reconcile_completions();
             let completed = {
                 let mut completions = self.completions.lock().unwrap();
                 completions
@@ -409,12 +457,17 @@ impl Session {
                         .queued
                         .as_ref()
                         .is_some_and(|request| request.request_id == request_id)
-            });
+            }) || self
+                .reconcile_flights
+                .lock()
+                .unwrap()
+                .contains_key(&request_id);
             if !active {
                 return SessionResult::Error {
                     message: format!("unknown or already-drained operation {request_id}"),
                 };
             }
+            drop(_turn);
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -525,6 +578,44 @@ impl Session {
         }
     }
 
+    fn pump_reconcile_completions(&self) {
+        let ready = {
+            let mut flights = self.reconcile_flights.lock().unwrap();
+            let ids = flights
+                .iter()
+                .filter_map(|(id, receiver)| match receiver.try_recv() {
+                    Ok(response) => Some((*id, response)),
+                    Err(crossbeam::channel::TryRecvError::Empty) => None,
+                    Err(crossbeam::channel::TryRecvError::Disconnected) => Some((
+                        *id,
+                        crate::actor::VaultActorResp::Error(
+                            "reconcile worker disconnected before returning a terminal result"
+                                .into(),
+                        ),
+                    )),
+                })
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|(id, response)| flights.remove(&id).map(|_| (id, response)))
+                .collect::<Vec<_>>()
+        };
+        for (request_id, response) in ready {
+            let result = match response {
+                crate::actor::VaultActorResp::ReconcileComplete { summary, .. } => {
+                    SessionResult::Success(CommandResult::ReconcileComplete { summary })
+                }
+                crate::actor::VaultActorResp::Error(message) => SessionResult::Error { message },
+                _ => SessionResult::Error {
+                    message: "reconcile worker returned an invalid response".into(),
+                },
+            };
+            self.completions
+                .lock()
+                .unwrap()
+                .push_back(OperationCompletion { request_id, result });
+        }
+    }
+
     fn finish_save(
         &self,
         request: &SaveRequest,
@@ -546,6 +637,8 @@ impl Session {
                 }
                 self.absent_on_open.lock().unwrap().remove(&path);
                 SessionResult::Success(CommandResult::NoteSaved {
+                    buffer_id,
+                    saved_revision: revision,
                     path,
                     hash: receipt.hash.to_vec(),
                     epoch: Epoch::new(receipt.epoch),
@@ -734,12 +827,10 @@ impl Session {
         if let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) {
             // Check revision first
             if buffer.revision() != revision {
-                return SessionResult::Error {
-                    message: format!(
-                        "Stale revision: expected {:?}, got {:?}",
-                        revision,
-                        buffer.revision()
-                    ),
+                return SessionResult::StaleRevision {
+                    buffer_id,
+                    expected: revision,
+                    actual: buffer.revision(),
                 };
             }
 
@@ -819,10 +910,9 @@ impl Session {
                 .values()
                 .map(|flight| 1 + usize::from(flight.queued.is_some()))
                 .sum::<usize>();
-        if outstanding >= MAX_PENDING_SAVE_OPERATIONS {
-            return SessionResult::Error {
-                message: "Busy: save completion queue is at capacity".into(),
-            };
+        if outstanding + self.reconcile_flights.lock().unwrap().len() >= MAX_PENDING_SAVE_OPERATIONS
+        {
+            return SessionResult::Busy;
         }
         if let Some(flight) = flights.get_mut(&buffer_id.as_u64()) {
             if let Some(superseded) = flight.queued.replace(request) {
@@ -860,23 +950,28 @@ impl Session {
     /// Trigger a reconcile.
     fn reconcile(&self, scope: ReconcileScope, mode: ReconcileMode) -> SessionResult {
         let request_id = self.next_request_id();
-
-        // Send to actor
-        match self
-            .actor
-            .try_send(VaultActorMsg::Reconcile { scope, mode })
-        {
-            Ok(()) => {
-                // Store as pending
-                let pending = SessionResult::Pending { request_id };
-                {
-                    let mut pending_ops = self.pending.lock().unwrap();
-                    pending_ops.insert(request_id, pending.clone());
-                }
-                pending
+        let flights = self.save_flights.lock().unwrap();
+        let outstanding = self.completions.lock().unwrap().len()
+            + flights
+                .values()
+                .map(|flight| 1 + usize::from(flight.queued.is_some()))
+                .sum::<usize>()
+            + self.reconcile_flights.lock().unwrap().len();
+        drop(flights);
+        if outstanding >= MAX_PENDING_SAVE_OPERATIONS {
+            return SessionResult::Busy;
+        }
+        match self.actor.submit_reconcile(scope, mode) {
+            Ok(response) => {
+                self.reconcile_flights
+                    .lock()
+                    .unwrap()
+                    .insert(request_id, response);
+                SessionResult::Pending { request_id }
             }
-            Err(_) => SessionResult::Error {
-                message: "Actor not responding".to_string(),
+            Err(crate::actor::VaultActorError::Busy) => SessionResult::Busy,
+            Err(error) => SessionResult::Error {
+                message: error.to_string(),
             },
         }
     }
@@ -888,12 +983,10 @@ impl Session {
         // Get the buffer and call undo on its model
         if let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) {
             if buffer.revision() != revision {
-                return SessionResult::Error {
-                    message: format!(
-                        "Stale revision: expected {:?}, got {:?}",
-                        revision,
-                        buffer.revision()
-                    ),
+                return SessionResult::StaleRevision {
+                    buffer_id,
+                    expected: revision,
+                    actual: buffer.revision(),
                 };
             }
             if let Some(new_revision) = buffer.model_mut().undo() {
@@ -920,12 +1013,10 @@ impl Session {
         // Get the buffer and call redo on its model
         if let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) {
             if buffer.revision() != revision {
-                return SessionResult::Error {
-                    message: format!(
-                        "Stale revision: expected {:?}, got {:?}",
-                        revision,
-                        buffer.revision()
-                    ),
+                return SessionResult::StaleRevision {
+                    buffer_id,
+                    expected: revision,
+                    actual: buffer.revision(),
                 };
             }
             if let Some(new_revision) = buffer.model_mut().redo() {
@@ -1135,8 +1226,10 @@ impl Session {
                 };
             };
             if buffer.revision() != revision {
-                return SessionResult::Error {
-                    message: "merge preview is stale; prepare a new merge".into(),
+                return SessionResult::StaleRevision {
+                    buffer_id,
+                    expected: revision,
+                    actual: buffer.revision(),
                 };
             }
             buffer.model().to_source_bytes()
@@ -1157,8 +1250,10 @@ impl Session {
             };
         };
         if buffer.revision() != revision {
-            return SessionResult::Error {
-                message: "merge preview became stale; prepare a new merge".into(),
+            return SessionResult::StaleRevision {
+                buffer_id,
+                expected: revision,
+                actual: buffer.revision(),
             };
         }
         match buffer.apply_resolved_merge(&merged_bytes, &theirs) {
@@ -1268,9 +1363,42 @@ impl Session {
         self.open_note(path)
     }
 
-    /// Get the BufferManager.
+    /// Get an immutable snapshot of an open buffer.
+    pub fn buffer_snapshot(
+        &self,
+        buffer_id: BufferId,
+        revision: Option<Revision>,
+    ) -> Result<BufferSnapshot, BufferSnapshotError> {
+        let _turn = self.driving_turn.lock().unwrap();
+        let manager = self.buffer_manager.lock().unwrap();
+        let buffer = manager
+            .get_buffer_by_id(buffer_id)
+            .ok_or(BufferSnapshotError::NotFound(buffer_id.as_u64()))?;
+        if let Some(expected) = revision
+            && buffer.revision() != expected
+        {
+            return Err(BufferSnapshotError::Stale {
+                expected: expected.as_u64(),
+                actual: buffer.revision().as_u64(),
+            });
+        }
+        let path = manager
+            .path_for_id(buffer_id)
+            .cloned()
+            .ok_or(BufferSnapshotError::NotFound(buffer_id.as_u64()))?;
+        Ok(BufferSnapshot {
+            buffer_id,
+            revision: buffer.revision(),
+            text: buffer.text().to_owned(),
+            base_hash: buffer.base_hash().map(|hash| hash.as_bytes()),
+            state: buffer.state().to_string(),
+            path,
+        })
+    }
+
+    /// Internal access for Session-owned integrations and in-crate tests.
     #[must_use]
-    pub fn buffer_manager(&self) -> Arc<Mutex<BufferManager>> {
+    pub(crate) fn buffer_manager(&self) -> Arc<Mutex<BufferManager>> {
         self.buffer_manager.clone()
     }
 
@@ -1550,20 +1678,153 @@ mod tests {
 
     #[test]
     fn test_session_builder() {
-        let _identity = VaultIdentity::new(
+        let identity = VaultIdentity::new(
             uuid::Uuid::now_v7(),
             PathBuf::from("/test/vault"),
             vec![1, 2, 3, 4],
         );
-
-        // We need a real actor, so we'll skip this for now
-        // The builder structure is tested by compilation
+        let fs = MemFs::new();
+        fs.create_dir_all(&identity.root).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("builder.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs) as Box<dyn Fs + Send + Sync>)
+            .with_identity(identity.clone())
+            .with_index(IndexActor::new(&db, 1).unwrap())
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        let channels = ChannelSet::new();
+        let session = SessionBuilder::new()
+            .with_identity(identity)
+            .with_actor(actor)
+            .with_buffer_manager(BufferManager::new())
+            .with_pulse(channels.pulse)
+            .with_notice(channels.notice)
+            .with_config(VaultConfig::default())
+            .build()
+            .unwrap();
+        assert!(
+            session
+                .buffer_manager()
+                .lock()
+                .unwrap()
+                .all_buffers()
+                .is_empty()
+        );
     }
 
     #[test]
     fn test_request_counter() {
-        // This is a basic test of the counter
-        // A full test would require a Session
+        let (session, _, _) = test_session();
+        assert_eq!(session.next_request_id(), 0);
+        assert_eq!(session.next_request_id(), 1);
+    }
+
+    #[test]
+    fn reconcile_and_save_completions_keep_request_identity_and_revision() {
+        let (session, fs, _temp) = test_session();
+        let path = PathBuf::from("/test/vault/note.md");
+        let (buffer_id, revision) =
+            match session.execute(SessionCommand::OpenNote { path: path.clone() }) {
+                SessionResult::Success(CommandResult::NoteOpened {
+                    buffer_id,
+                    revision,
+                }) => (buffer_id, revision),
+                other => panic!("expected opened note, got {other:?}"),
+            };
+        let first_revision = match session.execute(SessionCommand::ApplyEdits {
+            buffer_id,
+            revision,
+            ops: vec![EditOp::new(
+                Span::new(TextByte(5), TextByte(5)),
+                " one".into(),
+            )],
+        }) {
+            SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
+                new_revision
+            }
+            other => panic!("expected first edit, got {other:?}"),
+        };
+
+        let first_save = match session.execute(SessionCommand::SaveNote { path: path.clone() }) {
+            SessionResult::Pending { request_id } => request_id,
+            other => panic!("expected first save to be admitted, got {other:?}"),
+        };
+        let second_revision = match session.execute(SessionCommand::ApplyEdits {
+            buffer_id,
+            revision: first_revision,
+            ops: vec![EditOp::new(
+                Span::new(TextByte(9), TextByte(9)),
+                " two".into(),
+            )],
+        }) {
+            SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
+                new_revision
+            }
+            other => panic!("expected second edit, got {other:?}"),
+        };
+        let superseded = match session.execute(SessionCommand::SaveNote { path: path.clone() }) {
+            SessionResult::Pending { request_id } => request_id,
+            other => panic!("expected queued save to be admitted, got {other:?}"),
+        };
+        let final_revision = match session.execute(SessionCommand::ApplyEdits {
+            buffer_id,
+            revision: second_revision,
+            ops: vec![EditOp::new(
+                Span::new(TextByte(13), TextByte(13)),
+                " three".into(),
+            )],
+        }) {
+            SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
+                new_revision
+            }
+            other => panic!("expected third edit, got {other:?}"),
+        };
+        let final_save = match session.execute(SessionCommand::SaveNote { path: path.clone() }) {
+            SessionResult::Pending { request_id } => request_id,
+            other => panic!("expected coalesced save to be admitted, got {other:?}"),
+        };
+
+        assert!(matches!(
+            session.wait_for_operation(first_save),
+            SessionResult::Success(CommandResult::NoteSaved { .. })
+        ));
+        assert!(matches!(
+            session.wait_for_operation(superseded),
+            SessionResult::Superseded {
+                request_id,
+                by_request
+            } if request_id == superseded && by_request == final_save
+        ));
+        assert!(matches!(
+            session.wait_for_operation(final_save),
+            SessionResult::Success(CommandResult::NoteSaved { saved_revision, .. })
+                if saved_revision == final_revision
+        ));
+        assert_eq!(
+            fs.read_if_exists(&path).unwrap().unwrap(),
+            b"hello one two three"
+        );
+
+        let reconcile = match session.execute(SessionCommand::Reconcile {
+            scope: ReconcileScope::Full,
+            mode: ReconcileMode::VerifyContent,
+        }) {
+            SessionResult::Pending { request_id } => request_id,
+            other => panic!("expected reconcile to be admitted, got {other:?}"),
+        };
+        assert!(matches!(
+            session.wait_for_operation(reconcile),
+            SessionResult::Success(CommandResult::ReconcileComplete { .. })
+        ));
+        assert!(session.drain_operation_completions().is_empty());
+        assert!(matches!(
+            session.wait_for_operation(reconcile),
+            SessionResult::Error { .. }
+        ));
     }
 
     #[test]
@@ -1601,7 +1862,7 @@ mod tests {
                 revision,
                 ops: vec![],
             }),
-            SessionResult::Error { .. }
+            SessionResult::StaleRevision { .. }
         ));
         let edited_revision = session
             .buffer_manager()
@@ -1615,7 +1876,7 @@ mod tests {
                 buffer_id,
                 revision,
             }),
-            SessionResult::Error { message } if message.contains("Stale revision")
+            SessionResult::StaleRevision { .. }
         ));
         assert!(matches!(
             session.execute(SessionCommand::Undo {
@@ -1636,7 +1897,7 @@ mod tests {
                 buffer_id,
                 revision: edited_revision,
             }),
-            SessionResult::Error { message } if message.contains("Stale revision")
+            SessionResult::StaleRevision { .. }
         ));
         assert!(matches!(
             session.execute(SessionCommand::Redo {
@@ -1750,7 +2011,7 @@ mod tests {
                 revision,
                 ops: vec![],
             }),
-            SessionResult::Error { .. }
+            SessionResult::StaleRevision { .. }
         ));
         assert!(matches!(
             session.execute(SessionCommand::ResolveConflict {
@@ -1945,7 +2206,7 @@ mod tests {
                 revision: Revision::new(revision.as_u64() + 1),
                 ops: vec![],
             }),
-            SessionResult::Error { .. }
+            SessionResult::StaleRevision { .. }
         ));
         let request_id = match session.execute(SessionCommand::SaveNote { path: path.clone() }) {
             SessionResult::Pending { request_id } => request_id,

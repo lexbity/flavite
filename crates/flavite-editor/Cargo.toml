@@ -12,4 +12,5 @@ cosmic-text = { workspace = true }
 flavite-api = { path = "../flavite-api" }
 flavite-buffer = { path = "../flavite-buffer" }
 flavite-syntax = { path = "../flavite-syntax" }
+serde_json = { workspace = true }
 unicode-segmentation = { workspace = true }

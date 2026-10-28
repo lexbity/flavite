@@ -1,8 +1,9 @@
 //! Minimal end-to-end host for the custom editor and Session save path.
 
-use flavite_api::lattice::session::{CommandResult, SessionCommand, SessionResult};
-use flavite_api::{BufferView, Lattice, VaultConfig};
-use flavite_editor::{EditorAction, EditorWidget};
+use flavite_api::{
+    BufferView, ExecutionResult, Flavite, Invocation, LocalResult, Origin, VaultConfig,
+};
+use flavite_editor::{EditorAction, EditorWidget, LinkTarget};
 use iced::widget::{button, column, container, text};
 use iced::{Element, Length, Subscription, time};
 use std::path::PathBuf;
@@ -10,7 +11,7 @@ use std::time::{Duration, Instant};
 
 fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
-        .title("Lattice editor demo")
+        .title("Flavite editor demo")
         .subscription(App::subscription)
         .window_size(iced::Size::new(900.0, 650.0))
         .run()
@@ -20,11 +21,12 @@ fn main() -> iced::Result {
 enum Message {
     Edit(EditorAction),
     Save,
+    OpenLink(String),
     Pump,
 }
 
 struct App {
-    lattice: Option<Lattice>,
+    flavite: Option<Flavite>,
     view: Option<BufferView>,
     status: String,
     last_edit: Instant,
@@ -36,7 +38,7 @@ impl App {
         match Self::open() {
             Ok(app) => app,
             Err(error) => Self {
-                lattice: None,
+                flavite: None,
                 view: None,
                 status: format!("Could not open demo vault: {error}"),
                 last_edit: Instant::now(),
@@ -56,24 +58,39 @@ impl App {
         if !note.exists() {
             std::fs::write(
                 &note,
-                "# Lattice editor demo\n\nType here. Changes autosave after one idle second.\n",
+                "# Flavite editor demo\n\nType here. Changes autosave after one idle second.\n",
             )
             .map_err(|error| error.to_string())?;
+        }
+        let concepts = root.join("Concepts.md");
+        if !concepts.exists() {
+            std::fs::write(&concepts, "# Concepts\n\nA note opened from a wikilink.\n")
+                .map_err(|error| error.to_string())?;
         }
         let config = VaultConfig {
             watcher_enabled: false,
             ..VaultConfig::default()
         };
-        let lattice =
-            Lattice::open_root(root.clone(), config).map_err(|error| error.to_string())?;
+        let flavite =
+            Flavite::open_root(root.clone(), config).map_err(|error| error.to_string())?;
         let path = root.join("demo.md");
-        match lattice.execute_session(SessionCommand::OpenNote { path }) {
-            SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => {
-                let view = lattice
-                    .get_buffer_view(buffer_id, None)
+        let request_id = flavite.command_registry().next_request_id();
+        let opened = flavite.execute(Invocation::new(
+            request_id,
+            "open_note",
+            serde_json::json!(path),
+            Origin::Internal,
+        ));
+        match opened {
+            ExecutionResult::Local(LocalResult::Success(success)) => {
+                let buffer_id = success.data["buffer_id"]
+                    .as_u64()
+                    .ok_or("open response omitted buffer_id")?;
+                let view = flavite
+                    .get_buffer_view(buffer_id.into(), None)
                     .map_err(|error| error.to_string())?;
                 Ok(Self {
-                    lattice: Some(lattice),
+                    flavite: Some(flavite),
                     view: Some(view),
                     status: "Ready".into(),
                     last_edit: Instant::now(),
@@ -91,24 +108,26 @@ impl App {
     fn update(&mut self, message: Message) {
         match message {
             Message::Edit(action) => {
-                let Some(lattice) = &self.lattice else { return };
+                let Some(flavite) = &self.flavite else { return };
                 let buffer_id = action.buffer_id;
-                let result = lattice.execute_session(action.into_session_command());
+                let request_id = flavite.command_registry().next_request_id();
+                let result = flavite.execute(action.into_invocation(request_id));
                 self.status = match result {
-                    SessionResult::Success(_) => "Editing".into(),
+                    ExecutionResult::Local(LocalResult::Success(_)) => "Editing".into(),
                     other => format!("Edit failed: {other:?}"),
                 };
                 self.refresh(buffer_id);
                 self.last_edit = Instant::now();
             }
+            Message::OpenLink(target) => self.open_link(&target),
             Message::Save => self.save(),
             Message::Pump => self.pump(),
         }
     }
 
     fn refresh(&mut self, buffer_id: u64) {
-        if let Some(lattice) = &self.lattice {
-            match lattice.get_buffer_view(buffer_id.into(), None) {
+        if let Some(flavite) = &self.flavite {
+            match flavite.get_buffer_view(buffer_id.into(), None) {
                 Ok(view) => self.view = Some(view),
                 Err(error) => self.status = format!("Could not refresh buffer: {error}"),
             }
@@ -116,13 +135,17 @@ impl App {
     }
 
     fn save(&mut self) {
-        let (Some(lattice), Some(view)) = (&self.lattice, &self.view) else {
+        let (Some(flavite), Some(view)) = (&self.flavite, &self.view) else {
             return;
         };
-        match lattice.execute_session(SessionCommand::SaveNote {
-            path: view.path.clone(),
-        }) {
-            SessionResult::Pending { request_id } => {
+        let request_id = flavite.command_registry().next_request_id();
+        match flavite.execute(Invocation::new(
+            request_id,
+            "save_note",
+            serde_json::json!(view.path),
+            Origin::Gui,
+        )) {
+            ExecutionResult::Pending { request_id } => {
                 self.pending_save = Some(request_id);
                 self.status = format!("Save pending (request {request_id})");
             }
@@ -134,8 +157,8 @@ impl App {
     }
 
     fn pump(&mut self) {
-        let Some(lattice) = &self.lattice else { return };
-        let completions = lattice.session().drain_operation_completions();
+        let Some(flavite) = &self.flavite else { return };
+        let completions = flavite.drain_operation_completions();
         for completion in completions {
             if self.pending_save == Some(completion.request_id) {
                 self.pending_save = None;
@@ -154,9 +177,34 @@ impl App {
         }
     }
 
+    fn open_link(&mut self, target: &str) {
+        let Some(flavite) = &self.flavite else { return };
+        let mut path = PathBuf::from(target);
+        if path.extension().is_none() {
+            path.set_extension("md");
+        }
+        let path = flavite.vault_ref().root.join(path);
+        let id = flavite.command_registry().next_request_id();
+        let result = flavite.execute(Invocation::new(
+            id,
+            "open_note",
+            serde_json::json!(path),
+            Origin::Gui,
+        ));
+        match result {
+            ExecutionResult::Local(LocalResult::Success(success)) => {
+                if let Some(buffer_id) = success.data["buffer_id"].as_u64() {
+                    self.refresh(buffer_id);
+                }
+                self.status = format!("Opened {target}");
+            }
+            other => self.status = format!("Could not open {target}: {other:?}"),
+        }
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let header = column![
-            text("Lattice • custom iced editor"),
+            text("Flavite • custom iced editor"),
             text(&self.status).size(14),
             button("Save now").on_press(Message::Save),
         ]
@@ -166,6 +214,11 @@ impl App {
                 column![
                     header,
                     EditorWidget::new(view, Message::Edit)
+                        .on_open_link(Message::OpenLink)
+                        .with_link_targets(vec![LinkTarget {
+                            target: "Concepts".into(),
+                            title: "Concepts".into()
+                        }])
                         .width(Length::Fill)
                         .height(Length::Fill),
                 ]
@@ -179,20 +232,14 @@ impl App {
     }
 }
 
-fn terminal_save_status(result: &SessionResult) -> String {
+fn terminal_save_status(result: &ExecutionResult) -> String {
     match result {
-        SessionResult::Success(CommandResult::NoteSaved {
-            hash,
-            epoch,
-            generation,
-            ..
-        }) => {
-            let short_hash = hash
-                .iter()
-                .take(4)
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            format!("Saved · {epoch} · {generation} · {short_hash}")
+        ExecutionResult::Local(LocalResult::Success(success))
+            if success.command_id == "save_note" =>
+        {
+            let hash = success.data["hash"].as_str().unwrap_or("");
+            let short_hash = hash.chars().take(8).collect::<String>();
+            format!("Saved · {} · {}", success.data["generation"], short_hash)
         }
         other => format!("Save failed: {other:?}"),
     }

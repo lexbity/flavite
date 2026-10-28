@@ -1264,6 +1264,7 @@ dependencies = [
  "flavite-buffer",
  "flavite-syntax",
  "iced",
+ "serde_json",
  "unicode-segmentation",
 ]
 

@@ -1,12 +1,15 @@
 //! Custom iced editor widget over a revisioned, immutable API view.
 
 use crate::keymap::KeyAction;
-use crate::surface::{EditorAction, EditorSurface, EditorView};
+use crate::surface::{EditorAction, EditorSurface, EditorView, LinkTarget};
 use crate::viewport::{
     Viewport, clamp_char_boundary, next_grapheme_boundary, previous_grapheme_boundary,
 };
 use cosmic_text::{Attrs, Buffer as ShapingBuffer, FontSystem, Metrics, Shaping};
 use flavite_api::BufferView;
+use flavite_syntax::TextByte;
+use flavite_syntax::pulldown_glue::Link;
+use flavite_syntax::text::Span;
 use iced::advanced::{
     Clipboard, Layout, Renderer as AdvancedRenderer, Shell, Widget,
     layout::{Limits, Node},
@@ -33,6 +36,8 @@ thread_local! {
 pub struct EditorWidget<'a, Message> {
     view: EditorView,
     on_action: Box<dyn Fn(EditorAction) -> Message + 'a>,
+    on_open_link: Option<Box<dyn Fn(String) -> Message + 'a>>,
+    link_targets: Vec<LinkTarget>,
     width: Length,
     height: Length,
     _message: PhantomData<Message>,
@@ -44,10 +49,26 @@ impl<'a, Message> EditorWidget<'a, Message> {
         Self {
             view: EditorView::from(view),
             on_action: Box::new(on_action),
+            on_open_link: None,
+            link_targets: Vec::new(),
             width: Length::Fill,
             height: Length::Fill,
             _message: PhantomData,
         }
+    }
+
+    /// Route ctrl/cmd-click on a recognized wikilink to the host's note-open command.
+    #[must_use]
+    pub fn on_open_link(mut self, callback: impl Fn(String) -> Message + 'a) -> Self {
+        self.on_open_link = Some(Box::new(callback));
+        self
+    }
+
+    /// Provide indexed note candidates for wikilink autocomplete.
+    #[must_use]
+    pub fn with_link_targets(mut self, targets: Vec<LinkTarget>) -> Self {
+        self.link_targets = targets;
+        self
     }
 
     /// Set the requested widget width.
@@ -203,8 +224,14 @@ pub struct EditorState {
     caret: usize,
     anchor: usize,
     focused: bool,
+    preserve_focus_on_reconcile: bool,
     selecting: bool,
     viewport: Viewport,
+    links: Vec<Link>,
+    tags: Vec<Span<TextByte>>,
+    modifiers: Modifiers,
+    selected_completion: usize,
+    parsed_revision: Option<u64>,
 }
 
 impl EditorState {
@@ -232,9 +259,22 @@ impl EditorState {
             .buffer_id
             .is_some_and(|buffer_id| buffer_id != view.buffer_id)
         {
+            let focused = self.preserve_focus_on_reconcile && self.focused;
             *self = Self::default();
+            self.focused = focused;
         }
         self.buffer_id = Some(view.buffer_id);
+        if self.parsed_revision != Some(view.revision) {
+            if let Ok(parsed) = flavite_syntax::ts_ranges::parse_note_ts(view.text.as_bytes()) {
+                self.links = parsed.links;
+                self.tags = parsed.tags;
+            } else {
+                self.links.clear();
+                self.tags.clear();
+            }
+            self.parsed_revision = Some(view.revision);
+            self.selected_completion = 0;
+        }
         self.caret = clamp_char_boundary(&view.text, self.caret);
         self.anchor = clamp_char_boundary(&view.text, self.anchor);
         self.viewport.line_height = LINE_HEIGHT;
@@ -351,6 +391,36 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             Color::from_rgb(0.88, 0.90, 0.93),
             clip,
         );
+        // Scanner spans are the same semantic links/tags consumed by the
+        // indexer. Their visible underline is drawn from glyph geometry, so
+        // wrapped and Unicode text remains aligned with the shaped buffer.
+        for link in &state.links {
+            let color = if link.is_embed {
+                Color::from_rgb(0.78, 0.62, 1.0)
+            } else {
+                Color::from_rgb(0.40, 0.72, 1.0)
+            };
+            draw_span_underline(
+                renderer,
+                &runs,
+                &visible_text,
+                source_start,
+                link.span,
+                bounds,
+                color,
+            );
+        }
+        for span in &state.tags {
+            draw_span_underline(
+                renderer,
+                &runs,
+                &visible_text,
+                source_start,
+                *span,
+                bounds,
+                Color::from_rgb(0.45, 0.82, 0.62),
+            );
+        }
         if state.focused
             && state.caret >= source_start
             && state.caret <= source_start + visible_text.len()
@@ -368,6 +438,52 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 },
                 Background::Color(Color::from_rgb(0.45, 0.72, 1.0)),
             );
+        }
+        if state.focused {
+            let completions = link_completions(&self.view.text, state.caret, &self.link_targets);
+            if !completions.is_empty() {
+                let local_caret = state.caret.saturating_sub(source_start);
+                let (caret_x, caret_y) = caret_position(&runs, &visible_text, local_caret);
+                let popup_x = (bounds.x + PAD_X + caret_x).min(bounds.x + bounds.width - 260.0);
+                let popup_y =
+                    (bounds.y + PAD_Y + caret_y + LINE_HEIGHT).min(bounds.y + bounds.height - 24.0);
+                let visible = completions.iter().take(5).enumerate();
+                for (index, candidate) in visible {
+                    let row_y = popup_y + index as f32 * 24.0;
+                    let selected = index == state.selected_completion;
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: Rectangle::new(
+                                Point::new(popup_x, row_y),
+                                Size::new(250.0, 24.0),
+                            ),
+                            border: Border::default(),
+                            ..renderer::Quad::default()
+                        },
+                        Background::Color(if selected {
+                            Color::from_rgb(0.20, 0.31, 0.45)
+                        } else {
+                            Color::from_rgb(0.16, 0.18, 0.21)
+                        }),
+                    );
+                    renderer.fill_text(
+                        text::Text {
+                            content: candidate.title.clone(),
+                            bounds: Size::new(242.0, 22.0),
+                            size: iced::Pixels(13.0),
+                            line_height: text::LineHeight::Absolute(iced::Pixels(18.0)),
+                            font: iced::Font::MONOSPACE,
+                            align_x: text::Alignment::Left,
+                            align_y: iced::alignment::Vertical::Center,
+                            shaping: text::Shaping::Advanced,
+                            wrapping: text::Wrapping::None,
+                        },
+                        Point::new(popup_x + 5.0, row_y + 2.0),
+                        Color::WHITE,
+                        clip,
+                    );
+                }
+            }
         }
     }
 
@@ -398,8 +514,31 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
     ) {
         let state = tree.state.downcast_mut::<EditorState>();
         match event {
+            iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                state.modifiers = *modifiers;
+            }
             iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(position) = cursor.position_in(layout.bounds()) {
+                    let clicked = hit_test_visible(
+                        &self.view.text,
+                        state.viewport,
+                        position.x - layout.bounds().x - PAD_X,
+                        position.y - layout.bounds().y - PAD_Y,
+                        (layout.bounds().width - PAD_X * 2.0).max(1.0),
+                    );
+                    if (state.modifiers.command() || state.modifiers.control())
+                        && let Some(link) = state
+                            .links
+                            .iter()
+                            .find(|link| link.span.start.0 <= clicked && clicked < link.span.end.0)
+                        && let Some(callback) = &self.on_open_link
+                    {
+                        state.focused = true;
+                        state.preserve_focus_on_reconcile = true;
+                        shell.publish(callback(link.target_raw.clone()));
+                        shell.capture_event();
+                        return;
+                    }
                     state.focused = true;
                     state.selecting = true;
                     state.place_caret_from_point(
@@ -461,10 +600,52 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 modifiers,
                 text,
                 ..
-            }) if state.focused
-                && self.execute_key(state, key, *modifiers, text.as_deref(), clipboard, shell) =>
-            {
-                shell.capture_event();
+            }) if state.focused => {
+                let completions =
+                    link_completions(&self.view.text, state.caret, &self.link_targets);
+                if !completions.is_empty()
+                    && matches!(
+                        key,
+                        Key::Named(Named::ArrowDown) | Key::Named(Named::ArrowUp)
+                    )
+                {
+                    let len = completions.len();
+                    state.selected_completion = if matches!(key, Key::Named(Named::ArrowUp)) {
+                        state.selected_completion.checked_sub(1).unwrap_or(len - 1)
+                    } else {
+                        (state.selected_completion + 1) % len
+                    };
+                    shell.capture_event();
+                } else if !completions.is_empty()
+                    && matches!(key, Key::Named(Named::Enter) | Key::Named(Named::Tab))
+                {
+                    if let Some(target) =
+                        completions.get(state.selected_completion.min(completions.len() - 1))
+                    {
+                        let (start, end) = link_completion_range(&self.view.text, state.caret);
+                        self.emit(
+                            shell,
+                            EditorAction::replace(
+                                &self.view,
+                                start,
+                                end,
+                                format!("{}]]", target.target),
+                            ),
+                        );
+                        state.caret = start + target.target.len() + 2;
+                        state.anchor = state.caret;
+                    }
+                    shell.capture_event();
+                } else if self.execute_key(
+                    state,
+                    key,
+                    *modifiers,
+                    text.as_deref(),
+                    clipboard,
+                    shell,
+                ) {
+                    shell.capture_event();
+                }
             }
             _ => {}
         }
@@ -619,6 +800,120 @@ fn caret_position(runs: &[cosmic_text::LayoutRun<'_>], text: &str, byte: usize) 
         }
     }
     (0.0, runs.last().map_or(0.0, |run| run.line_top))
+}
+
+fn link_completion_range(text: &str, caret: usize) -> (usize, usize) {
+    let caret = clamp_char_boundary(text, caret.min(text.len()));
+    let before = &text[..caret];
+    let Some(open) = before.rfind("[[") else {
+        return (caret, caret);
+    };
+    if before[open + 2..].contains("]]") {
+        return (caret, caret);
+    }
+    let end = text[caret..]
+        .find("]]")
+        .map_or(caret, |offset| caret + offset + 2);
+    (open + 2, end)
+}
+
+fn link_completions(text: &str, caret: usize, targets: &[LinkTarget]) -> Vec<LinkTarget> {
+    let (start, end) = link_completion_range(text, caret);
+    if start >= end || start == caret {
+        return Vec::new();
+    }
+    let query = text[start..caret.min(end)].trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = targets
+        .iter()
+        .filter(|target| {
+            target.target.to_lowercase().contains(&query)
+                || target.title.to_lowercase().contains(&query)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|target| {
+        (
+            !target.target.to_lowercase().starts_with(&query),
+            target.title.to_lowercase(),
+        )
+    });
+    matches.truncate(5);
+    matches
+}
+
+fn draw_span_underline(
+    renderer: &mut iced::Renderer,
+    runs: &[cosmic_text::LayoutRun<'_>],
+    visible_text: &str,
+    source_start: usize,
+    span: Span<TextByte>,
+    bounds: Rectangle,
+    color: Color,
+) {
+    let start = span.start.0.max(source_start);
+    let end = span.end.0.min(source_start + visible_text.len());
+    if start >= end {
+        return;
+    }
+    for run in runs {
+        let line_start = source_start + line_start_byte(visible_text, run.line_i);
+        for glyph in run.glyphs {
+            let glyph_start = line_start + glyph.start;
+            let glyph_end = line_start + glyph.end;
+            if glyph_end > start && glyph_start < end {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: Rectangle::new(
+                            Point::new(
+                                bounds.x + PAD_X + glyph.x,
+                                bounds.y + PAD_Y + run.line_top + LINE_HEIGHT - 2.0,
+                            ),
+                            Size::new(glyph.w.max(1.0), 1.0),
+                        ),
+                        border: Border::default(),
+                        ..renderer::Quad::default()
+                    },
+                    Background::Color(color),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod link_aware_tests {
+    use super::*;
+
+    #[test]
+    fn autocomplete_matches_open_wikilink_prefix_and_completes_existing_closer() {
+        let targets = vec![
+            LinkTarget {
+                target: "Concepts.md".into(),
+                title: "Concepts".into(),
+            },
+            LinkTarget {
+                target: "Inbox.md".into(),
+                title: "Inbox".into(),
+            },
+        ];
+        let text = "See [[Con]] now";
+        let matches = link_completions(text, 9, &targets);
+        assert_eq!(matches[0].title, "Concepts");
+        assert_eq!(link_completion_range(text, 9), (6, 11));
+    }
+
+    #[test]
+    fn autocomplete_is_inactive_outside_an_open_wikilink() {
+        let targets = vec![LinkTarget {
+            target: "Concepts.md".into(),
+            title: "Concepts".into(),
+        }];
+        assert!(link_completions("ordinary Con text", 10, &targets).is_empty());
+        assert!(link_completions("[[Concepts]]", 12, &targets).is_empty());
+    }
 }
 
 #[cfg(test)]

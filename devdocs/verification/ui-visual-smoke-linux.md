@@ -1,10 +1,9 @@
 # Linux UI visual smoke
 
-The pre-D1 visual fixture is `flavite-ui/examples/graph_shader_probe.rs`. It
-uses the existing deterministic synthetic graph generator and a fixed 1024 ×
-768 iced window. The probe is a rendered-widget fixture, not the Lattice
-application shell; D1's `app-demo` should replace or extend it with a fixture
-vault and representative shell states.
+The Linux visual checks cover two actual iced windows:
+`flavite-ui/examples/graph_shader_probe.rs` renders the deterministic graph
+fixture, while `flavite-editor/examples/editor-demo.rs` opens a fixture vault
+through the Flavite facade and exercises the custom editor.
 
 ## Run locally
 
@@ -13,21 +12,26 @@ Install Linux dependencies once, then capture the fixture:
 ```sh
 just ui-visual-setup
 just ui-visual-smoke
+just ui-editor-visual-smoke
 ```
 
-The PNG and application log are written under `target/ui-visual/`. The smoke
-launches a real X11 window under Xvfb, waits for its title, captures the window
-with ImageMagick, and checks that the output image decodes and contains more
-than one color. CI uploads the PNG as the `lattice-ui-visual-smoke` artifact.
+The PNG and application logs are written under `target/ui-visual/`. Both smokes
+launch real X11 windows under Xvfb and capture them with ImageMagick. The graph
+smoke checks that its image decodes and contains multiple colors. The editor
+smoke types into a fixture note, accepts `[[Concepts]]` autocomplete, ctrl-clicks
+the link, types into the opened target, and verifies both files were saved. CI
+uploads the screenshots as visual-smoke artifacts.
 
 ## What this proves
 
-- The deterministic iced example launches and creates a visible Linux window.
+- The deterministic graph fixture launches and creates a visible Linux window.
 - The graph widget produces a capturable frame through X11/Xvfb and the
   software GPU configured by `just gpu-setup`.
+- The custom editor accepts text and link completion through real X11 input,
+  routes ctrl-click through the public command facade, preserves focus on the
+  opened buffer, and reaches the Session save path for both notes.
 - A screenshot is retained for human or agent visual inspection.
 
-This smoke is distinct from `shader_validation.rs`: that test validates WGSL
-and wgpu pipeline creation without creating a window. Neither check asserts
-pixel-perfect appearance, input flows, the future editor, or shell behavior.
-Those checks belong to the D1+ app fixture and phase-slice UI tests.
+These checks are distinct from `shader_validation.rs`: that test validates WGSL
+and wgpu pipeline creation without creating a window. The screenshots are
+smoke evidence, not pixel-perfect assertions or cross-platform IME/a11y tests.

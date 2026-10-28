@@ -37,6 +37,12 @@ pub enum VaultActorMsg {
         scope: ReconcileScope,
         mode: ReconcileMode,
     },
+    /// Reconcile with a correlated terminal reply for Session operation tracking.
+    ReconcileRequest {
+        scope: ReconcileScope,
+        mode: ReconcileMode,
+        reply: Sender<VaultActorResp>,
+    },
     /// Notify of a filesystem event.
     FsEvent(WatcherEvent),
     /// Get the current version.
@@ -135,9 +141,23 @@ impl VaultActorHandle {
 
     /// Try to send a message without waiting.
     pub fn try_send(&self, msg: VaultActorMsg) -> Result<(), VaultActorError> {
-        self.sender
-            .try_send(msg)
-            .map_err(|_| VaultActorError::ChannelDisconnected)
+        self.sender.try_send(msg).map_err(|error| match error {
+            crossbeam::channel::TrySendError::Full(_) => VaultActorError::Busy,
+            crossbeam::channel::TrySendError::Disconnected(_) => {
+                VaultActorError::ChannelDisconnected
+            }
+        })
+    }
+
+    /// Admit a reconcile and return its lossless one-shot completion receiver.
+    pub fn submit_reconcile(
+        &self,
+        scope: ReconcileScope,
+        mode: ReconcileMode,
+    ) -> Result<Receiver<VaultActorResp>, VaultActorError> {
+        let (reply, receiver) = crossbeam::channel::bounded(1);
+        self.try_send(VaultActorMsg::ReconcileRequest { scope, mode, reply })?;
+        Ok(receiver)
     }
 
     /// Get the current version.
@@ -395,7 +415,10 @@ impl VaultActor {
     fn handle_message(&mut self, msg: VaultActorMsg) {
         match msg {
             VaultActorMsg::Reconcile { scope, mode } => {
-                self.handle_reconcile(scope, mode);
+                self.handle_reconcile(scope, mode, None);
+            }
+            VaultActorMsg::ReconcileRequest { scope, mode, reply } => {
+                self.handle_reconcile(scope, mode, Some(reply));
             }
             VaultActorMsg::FsEvent(event) => {
                 self.handle_fs_event(event);
@@ -565,15 +588,23 @@ impl VaultActor {
     }
 
     /// Handle a reconcile request.
-    fn handle_reconcile(&mut self, _scope: ReconcileScope, _mode: ReconcileMode) {
+    fn handle_reconcile(
+        &mut self,
+        _scope: ReconcileScope,
+        _mode: ReconcileMode,
+        reply: Option<Sender<VaultActorResp>>,
+    ) {
         // For now, just return a dummy result
         // In production, this would call the actual reconcile logic
         let summary = ReconcileSummary::default();
         let version = Version::new(self.reconcile_state.epoch, self.reconcile_state.generation);
 
-        let _ = self
-            .resp_sender
-            .try_send(VaultActorResp::ReconcileComplete { summary, version });
+        let response = VaultActorResp::ReconcileComplete { summary, version };
+        if let Some(reply) = reply {
+            let _ = reply.send(response);
+        } else {
+            let _ = self.resp_sender.try_send(response);
+        }
     }
 
     /// Handle a filesystem event.

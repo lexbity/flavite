@@ -1,4 +1,4 @@
-//! Core types for the Lattice index (§4.3).
+//! Core types for the Flavite index (§4.3).
 //!
 //! This module contains the type definitions for notes, attachments, links, tags,
 //! and other index entities.
