@@ -389,6 +389,11 @@ pub struct VaultActor {
 }
 
 impl VaultActor {
+    fn record_drift(&self) {
+        let total = self.drift_found_total.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::info!(drift_found_total = total, "reconcile drift found");
+    }
+
     /// Create a new VaultActor.
     pub fn new(fs: Box<dyn Fs + Send + Sync>, identity: VaultIdentity, index: IndexActor) -> Self {
         let fs: Arc<dyn Fs + Send + Sync> = Arc::from(fs);
@@ -720,6 +725,7 @@ impl VaultActor {
                     )
                 },
             )?;
+            tracing::info!(path = %display_path, revision = ?request.revision, "save completed");
             let new_base_hash = blake3::hash(&request.bytes).to_hex().to_string();
             // The durable replacement and structural index application are
             // the save milestone. A failure to rotate the merge-base pin after
@@ -889,7 +895,7 @@ impl VaultActor {
                         if changed {
                             if was_indexed {
                                 summary.changed = summary.changed.saturating_add(1);
-                                self.drift_found_total.fetch_add(1, Ordering::Relaxed);
+                                self.record_drift();
                             } else {
                                 summary.added = summary.added.saturating_add(1);
                             }
@@ -907,7 +913,7 @@ impl VaultActor {
             match self.index.remove_note_path(&vanished) {
                 Ok(true) => {
                     summary.removed = summary.removed.saturating_add(1);
-                    self.drift_found_total.fetch_add(1, Ordering::Relaxed);
+                    self.record_drift();
                     if let Ok(relative) = self.fs.decode_path_key(&vanished) {
                         let _ = self.event_sender.send(VaultActorEvent::Deleted {
                             path: self.identity.root.join(relative),
@@ -964,7 +970,7 @@ impl VaultActor {
             if !exists {
                 if self.index.remove_note_path(&path_key).unwrap_or(false) {
                     summary.removed = summary.removed.saturating_add(1);
-                    self.drift_found_total.fetch_add(1, Ordering::Relaxed);
+                    self.record_drift();
                     let _ = self
                         .event_sender
                         .send(VaultActorEvent::Deleted { path: path.clone() });
@@ -1019,7 +1025,7 @@ impl VaultActor {
                     if generation > before {
                         if was_indexed {
                             summary.changed = summary.changed.saturating_add(1);
-                            self.drift_found_total.fetch_add(1, Ordering::Relaxed);
+                            self.record_drift();
                         } else {
                             summary.added = summary.added.saturating_add(1);
                         }

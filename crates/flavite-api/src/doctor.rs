@@ -92,6 +92,13 @@ impl DoctorCheck {
     pub fn has_issues(&self) -> bool {
         !self.is_ok()
     }
+
+    /// Attach diagnostic details to a check, including successful checks.
+    #[must_use]
+    pub fn with_details(mut self, details: impl Into<String>) -> Self {
+        self.details = Some(details.into());
+        self
+    }
 }
 
 /// Check status.
@@ -273,6 +280,10 @@ impl DoctorChecker {
                 "duplicate_ids",
                 "Index cache is not present; stable ID counts unavailable",
             ));
+            report.add_check(DoctorCheck::ok(
+                "attachments",
+                "Index cache is not present; attachment hydration and orphan counts unavailable",
+            ));
         } else {
             report.add_check(db_count_check(
                 conn.as_ref(),
@@ -287,16 +298,90 @@ impl DoctorChecker {
                 "Ambiguous links",
             ));
             report.add_check(duplicate_ids_check(conn.as_ref()));
+            report.add_check(attachment_check(conn.as_ref()));
         }
         report.add_check(temp_check(&self.vault.root));
         report.add_check(journal_check(&self.vault.root));
         report.add_check(collision_check(&self.vault.root));
         report.add_check(history_check(self.vault.uuid));
+        report.add_check(observability_check());
+        report.add_check(runtime_counters_check());
+        report.add_check(DoctorCheck::warn(
+            "watcher_health",
+            "Filesystem watcher health",
+            "Doctor runs without starting the vault actor; use `flavite info` for the live watcher status",
+        ));
         report.add_check(sample_hash_check(conn.as_ref(), &self.vault.root));
         report.add_check(registry_check());
         report.add_check(orphan_socket_check());
         report.summary.calculate_total();
         report
+    }
+}
+
+/// Local diagnostics directory used by the rotating log and crash report.
+#[must_use]
+pub fn diagnostics_log_dir() -> Option<PathBuf> {
+    ProjectDirs::from("com", "flavite", "Flavite")
+        .map(|dirs| dirs.data_local_dir().join("flavite").join("logs"))
+}
+
+fn observability_check() -> DoctorCheck {
+    let Some(dir) = diagnostics_log_dir() else {
+        return DoctorCheck::warn(
+            "observability",
+            "Local logs and crash reports",
+            "OS data directory unavailable",
+        );
+    };
+    let log = dir.join("flavite.log");
+    let crash = dir.join("crash-report.txt");
+    if log.exists() {
+        DoctorCheck::ok("observability", "Local rotating log is available").with_details(format!(
+            "Log: {}; last crash report: {}",
+            log.display(),
+            if crash.exists() { "present" } else { "none" }
+        ))
+    } else {
+        DoctorCheck::warn(
+            "observability",
+            "Local rotating log has not been created",
+            format!("Expected {}", log.display()),
+        )
+    }
+}
+
+fn attachment_check(conn: Option<&Connection>) -> DoctorCheck {
+    let Some(conn) = conn else {
+        return DoctorCheck::warn(
+            "attachments",
+            "Attachment health",
+            "Index database is unavailable",
+        );
+    };
+    let result = conn.query_row(
+        "SELECT count(*), sum(CASE WHEN hydrated = 0 THEN 1 ELSE 0 END), sum(CASE WHEN att_id NOT IN (SELECT dst_att FROM links WHERE dst_att IS NOT NULL) THEN 1 ELSE 0 END) FROM attachments",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?.unwrap_or(0), row.get::<_, Option<i64>>(2)?.unwrap_or(0))),
+    );
+    match result {
+        Ok((total, unhydrated, orphans)) if unhydrated == 0 && orphans == 0 => DoctorCheck::ok(
+            "attachments",
+            "No orphaned attachments or unhydrated placeholders",
+        )
+        .with_details(format!(
+            "{total} indexed attachment(s); 0 orphaned; 0 unhydrated"
+        )),
+        Ok((total, unhydrated, orphans)) => DoctorCheck::warn(
+            "attachments",
+            "Attachment health needs attention",
+            format!("{total} indexed; {orphans} orphaned; {unhydrated} unhydrated placeholder(s)"),
+        ),
+        Err(error) => DoctorCheck::warn(
+            "attachments",
+            "Attachment health unavailable",
+            error.to_string(),
+        ),
     }
 }
 
@@ -684,11 +769,14 @@ fn history_check(uuid: uuid::Uuid) -> DoctorCheck {
         .join(uuid.to_string())
         .join("history");
     let bytes = tree_size(&path);
+    let snapshots = tree_file_count(&path);
     const LIMIT: u64 = 1024 * 1024 * 1024;
     if bytes <= LIMIT {
         DoctorCheck::ok(
             "history_size",
-            format!("History store is {bytes} bytes (1 GiB cap)"),
+            format!(
+                "History store is {bytes} bytes across {snapshots} snapshot file(s) (1 GiB cap)"
+            ),
         )
     } else {
         DoctorCheck::error(
@@ -699,6 +787,59 @@ fn history_check(uuid: uuid::Uuid) -> DoctorCheck {
                 .to_string(),
         )
     }
+}
+
+fn tree_file_count(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let child = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                tree_file_count(&child)
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+fn runtime_counters_check() -> DoctorCheck {
+    let Some(path) = diagnostics_log_dir().map(|dir| dir.join("flavite.log")) else {
+        return DoctorCheck::warn(
+            "runtime_counters",
+            "Save and drift counters",
+            "OS data directory unavailable",
+        );
+    };
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return DoctorCheck::warn(
+            "runtime_counters",
+            "Save and drift counters unavailable",
+            "No local log file yet",
+        );
+    };
+    let save_total = contents
+        .lines()
+        .filter(|line| line.contains("save completed"))
+        .count();
+    let drift_total = contents
+        .lines()
+        .filter_map(|line| {
+            let (_, suffix) = line.split_once("drift_found_total=")?;
+            suffix
+                .split(|ch: char| !ch.is_ascii_digit())
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0);
+    DoctorCheck::ok("runtime_counters", "Local save and reconcile counters").with_details(format!(
+        "save.completed_total={save_total}; reconcile.drift_found_total={drift_total}"
+    ))
 }
 fn tree_size(path: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(path) else {

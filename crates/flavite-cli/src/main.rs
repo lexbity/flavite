@@ -13,8 +13,16 @@ use flavite_api::{
     ApiVaultRef, DoctorReport, ExecutionResult, Flavite, LocalResult, Origin, OsFs, VaultConfig,
     command::Invocation,
 };
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
+use tracing_subscriber::fmt::MakeWriter;
+
+fn flavite_vault_identity(fs: &OsFs, root: PathBuf) -> Result<flavite_api::open::IdentityManager> {
+    flavite_api::open::IdentityManager::open(fs, root).map_err(|error| {
+        anyhow::anyhow!("Failed to initialize vault identity and registry: {error}")
+    })
+}
 
 /// Flavite — a local-first plain-text knowledge vault in pure Rust.
 ///
@@ -37,6 +45,10 @@ struct Cli {
     /// Disable the filesystem watcher.
     #[arg(long, global = true)]
     no_watch: bool,
+
+    /// Emit machine-readable JSON output and JSON Lines for pending events.
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -112,12 +124,12 @@ enum Commands {
 }
 
 /// CLI driver that uses flavite-api for all operations.
-#[allow(dead_code)]
 struct CliDriver {
     /// Flavite facade from flavite-api
     flavite: Option<Flavite>,
     /// Vault reference
     vault_ref: Option<ApiVaultRef>,
+    json: bool,
 }
 
 impl CliDriver {
@@ -126,6 +138,7 @@ impl CliDriver {
         Self {
             flavite: None,
             vault_ref: None,
+            json: false,
         }
     }
 
@@ -178,29 +191,20 @@ impl CliDriver {
         info!("Initializing new vault at: {}", vault_path.display());
 
         // Ensure the vault path is absolute
-        let vault_path = std::fs::canonicalize(vault_path)
-            .with_context(|| format!("Cannot canonicalize vault path: {}", vault_path.display()))?;
-
         // Create the directory if it doesn't exist
         if !vault_path.exists() {
             std::fs::create_dir_all(&vault_path).with_context(|| {
                 format!("Failed to create vault directory: {}", vault_path.display())
             })?;
         }
+        let vault_path = std::fs::canonicalize(vault_path)
+            .with_context(|| format!("Cannot canonicalize vault path: {}", vault_path.display()))?;
 
-        // Initialize the vault
-        let _fs = Box::new(OsFs::new());
-        let _config = VaultConfig::default();
-
-        // Create .flavite directory
-        let flavite_dir = vault_path.join(".flavite");
-        if !flavite_dir.exists() {
-            std::fs::create_dir_all(&flavite_dir)
-                .with_context(|| "Failed to create .flavite directory".to_string())?;
-        }
-
-        // For now, just create the basic structure
-        // A full implementation would initialize the registry, UUID, etc.
+        // Opening through IdentityManager writes vault.toml and the matching
+        // OS-data registry record. The actor/index setup also verifies this is
+        // an openable vault; dropping closes the host resources.
+        let fs = OsFs::new();
+        drop(flavite_vault_identity(&fs, vault_path.clone())?);
         info!("Vault initialized at: {}", vault_path.display());
 
         Ok(())
@@ -295,16 +299,24 @@ impl CliDriver {
 
     /// Run a query.
     #[allow(clippy::ptr_arg)]
-    fn run_query(&self, _vault_path: &Path, query: &str, limit: usize) -> Result<()> {
-        info!("Running query: {}", query);
+    fn run_query(
+        &self,
+        _vault_path: &Path,
+        query: &flavite_api::Query,
+        limit: usize,
+    ) -> Result<()> {
+        info!("Running query");
         let flavite = self
             .flavite
             .as_ref()
             .context("query requires an opened vault")?;
-        let result =
-            flavite.query_with_limit(&flavite_api::Query::Text(query.to_owned()), limit)?;
-        for note in &result.notes {
-            println!("{}\t{}", note.path, note.title);
+        let result = flavite.query_with_limit(query, limit)?;
+        if self.json {
+            println!("{}", serde_json::to_string(&result.notes)?);
+        } else {
+            for note in &result.notes {
+                println!("{}\t{}", note.path, note.title);
+            }
         }
         Ok(())
     }
@@ -319,25 +331,54 @@ impl CliDriver {
             .as_ref()
             .context("search requires an opened vault")?;
         let result = flavite.query_with_limit(&flavite_api::Query::Text(term.to_owned()), limit)?;
-        for note in &result.notes {
-            println!("{}\t{}", note.path, note.title);
+        if self.json {
+            println!("{}", serde_json::to_string(&result.notes)?);
+        } else {
+            for note in &result.notes {
+                println!("{}\t{}", note.path, note.title);
+            }
         }
         Ok(())
     }
 
     /// Show vault info.
     #[allow(clippy::ptr_arg)]
-    fn show_info(&self, vault_path: &Path) -> Result<()> {
-        info!("Showing vault info: {}", vault_path.display());
+    fn show_info(&self, _vault_path: &Path) -> Result<()> {
+        info!("Showing opened vault info");
 
-        if let Some(ref flavite) = self.flavite {
+        let flavite = self
+            .flavite
+            .as_ref()
+            .context("info requires an opened vault")?;
+        let info = flavite.vault_info()?;
+        if self.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "vault": flavite.vault_ref(), "api_version": flavite_api::API_VERSION,
+                    "note_count": info.note_count, "epoch": info.epoch,
+                    "generation": info.generation, "tantivy_generation": info.tantivy_generation,
+                    "watcher": if info.watcher_enabled { "enabled" } else { "disabled" },
+                    "drift_found_total": info.drift_found_total,
+                }))?
+            );
+        } else {
             let vault_ref = flavite.vault_ref();
             println!("Vault: {}", vault_ref.root.display());
             println!("UUID: {}", vault_ref.uuid);
             println!("API Version: {}", flavite_api::API_VERSION);
-        } else {
-            println!("Vault: {}", vault_path.display());
-            println!("API Version: {}", flavite_api::API_VERSION);
+            println!("Notes: {}", info.note_count);
+            println!("Generation: {}", info.generation);
+            println!("Tantivy generation: {}", info.tantivy_generation);
+            println!(
+                "Watcher: {}",
+                if info.watcher_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            println!("Drift found: {}", info.drift_found_total);
         }
 
         Ok(())
@@ -377,6 +418,34 @@ impl CliDriver {
 }
 
 /// Initialize tracing with the appropriate level.
+#[derive(Clone)]
+struct RotatingLogWriter {
+    path: PathBuf,
+    max_bytes: u64,
+}
+
+impl<'a> MakeWriter<'a> for RotatingLogWriter {
+    type Writer = fs::File;
+    fn make_writer(&'a self) -> Self::Writer {
+        if fs::metadata(&self.path).is_ok_and(|metadata| metadata.len() >= self.max_bytes) {
+            let backup = self.path.with_extension("log.1");
+            let _ = fs::remove_file(&backup);
+            let _ = fs::rename(&self.path, backup);
+        }
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .unwrap_or_else(|_| {
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(std::env::temp_dir().join("flavite.log"))
+                    .unwrap()
+            })
+    }
+}
+
 fn init_tracing(verbose: bool) {
     let level = if verbose {
         tracing::Level::DEBUG
@@ -384,10 +453,42 @@ fn init_tracing(verbose: bool) {
         tracing::Level::INFO
     };
 
+    let log_path = flavite_api::doctor::diagnostics_log_dir().map(|dir| {
+        let _ = fs::create_dir_all(&dir);
+        dir.join("flavite.log")
+    });
+    if let Some(path) = &log_path {
+        let crash_path = path.parent().unwrap().join("crash-report.txt");
+        let log_for_hook = path.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            let tail = fs::read_to_string(&log_for_hook).unwrap_or_default();
+            let last = tail
+                .lines()
+                .rev()
+                .take(200)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            let report = format!("Flavite crash report\n{info}\n\nLast log lines:\n{last}\n");
+            let _ = fs::write(&crash_path, report);
+        }));
+    }
+    let writer = log_path.map_or_else(
+        || RotatingLogWriter {
+            path: std::env::temp_dir().join("flavite.log"),
+            max_bytes: 5 * 1024 * 1024,
+        },
+        |path| RotatingLogWriter {
+            path,
+            max_bytes: 5 * 1024 * 1024,
+        },
+    );
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_target(false)
-        .with_writer(std::io::stderr)
+        .with_writer(writer)
         .init();
 
     debug!("Tracing initialized at level: {}", level);
@@ -411,6 +512,7 @@ fn main() -> Result<()> {
 
     // Create CLI driver
     let mut driver = CliDriver::new();
+    driver.json = cli.json;
 
     // Process command
     match cli.command {
@@ -424,6 +526,7 @@ fn main() -> Result<()> {
             driver.run_doctor(&vault_path, json)?;
         }
         Commands::Query { path, query, limit } => {
+            let query = flavite_api::Query::parse(&query).map_err(anyhow::Error::msg)?;
             let vault_path = get_vault_path(path, cli.vault);
             driver.open_vault(vault_path.clone(), cli.no_watch)?;
             driver.run_query(&vault_path, &query, limit)?;
@@ -435,10 +538,7 @@ fn main() -> Result<()> {
         }
         Commands::Info { path } => {
             let vault_path = get_vault_path(path, cli.vault);
-            if let Some(ref flavite) = driver.flavite {
-                let vault_ref = flavite.vault_ref();
-                driver.vault_ref = Some(vault_ref.clone());
-            }
+            driver.open_vault(vault_path.clone(), cli.no_watch)?;
             driver.show_info(&vault_path)?;
         }
         Commands::ApiTest => {
@@ -448,6 +548,23 @@ fn main() -> Result<()> {
             let vault_path = get_vault_path(path, cli.vault);
             driver.init_vault(&vault_path)?;
             info!("Vault initialized at: {}", vault_path.display());
+        }
+    }
+
+    if let Some(flavite) = driver.flavite.as_ref() {
+        let events = flavite.drain_events();
+        if !events.is_empty() {
+            if driver.json {
+                for event in events {
+                    println!("{}", serde_json::to_string(&event)?);
+                    flavite.acknowledge_event(&event);
+                }
+            } else {
+                for event in events {
+                    eprintln!("event {}: {event:?}", event.event_type());
+                    flavite.acknowledge_event(&event);
+                }
+            }
         }
     }
 

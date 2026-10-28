@@ -46,6 +46,39 @@ pub enum Query {
 }
 
 impl Query {
+    /// Parse the small, intentionally limited textual query surface accepted
+    /// by the CLI. Unsupported syntax is rejected instead of being treated as
+    /// a literal search, avoiding surprising results.
+    pub fn parse(source: &str) -> Result<Self, String> {
+        let source = source.trim();
+        if source.is_empty() {
+            return Err("query is empty".into());
+        }
+        if let Some((left, right)) = source.split_once(" AND ") {
+            return Ok(Self::And(vec![Self::parse(left)?, Self::parse(right)?]));
+        }
+        if let Some(value) = source.strip_prefix("tag:") {
+            let value = unquote(value.trim())?;
+            if value.is_empty() {
+                return Err("tag query needs a name".into());
+            }
+            return Ok(Self::Tag {
+                name: value,
+                hierarchical: false,
+            });
+        }
+        if let Some(value) = source.strip_prefix("text:") {
+            return Ok(Self::Text(unquote(value.trim())?));
+        }
+        if source == "unresolved" {
+            return Ok(Self::Unresolved);
+        }
+        if source.starts_with(['!', '(', ')']) || source.contains(':') || source.contains(" OR ") {
+            return Err(format!("unsupported query syntax: {source}"));
+        }
+        Ok(Self::Text(unquote(source)?))
+    }
+
     /// Execute this query against the SQLite index.
     ///
     /// Returns a page of note IDs matching the query, along with the index version.
@@ -235,6 +268,22 @@ impl Query {
                 (format!("NOT ({sql})"), params)
             }
         }
+    }
+}
+
+fn unquote(value: &str) -> Result<String, String> {
+    if let Some(inner) = value
+        .strip_prefix('\'')
+        .and_then(|v| v.strip_suffix('\''))
+        .or_else(|| value.strip_prefix('"').and_then(|v| v.strip_suffix('"')))
+    {
+        Ok(inner.to_owned())
+    } else if value.starts_with(['\'', '"']) || value.ends_with(['\'', '"']) {
+        Err("unmatched query quote".into())
+    } else if value.is_empty() {
+        Err("query value is empty".into())
+    } else {
+        Ok(value.to_owned())
     }
 }
 

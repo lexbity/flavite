@@ -246,6 +246,8 @@ pub enum SessionEvent {
     ConflictDetected { path: PathBuf },
     /// Recovery available.
     RecoveryAvailable { path: PathBuf },
+    /// An external writer changed or deleted a note on disk.
+    ExternalChangeDetected { path: PathBuf, deleted: bool },
 }
 
 /// The Session itself.
@@ -263,6 +265,8 @@ pub struct Session {
     /// Lossless watcher observations from VaultActor, applied on Session's
     /// driving thread so buffers remain single-owner state.
     actor_events: crossbeam::channel::Receiver<crate::actor::VaultActorEvent>,
+    /// Session-level observations retained until the host drains them.
+    session_events: Mutex<VecDeque<SessionEvent>>,
     /// Idle-save deadline state, keyed by the authoritative buffer path.
     last_edit: Mutex<HashMap<PathBuf, std::time::Instant>>,
     /// Prevent repeated autosave admission for an unchanged failed revision.
@@ -361,6 +365,7 @@ impl Session {
             identity,
             actor,
             actor_events,
+            session_events: Mutex::new(VecDeque::new()),
             last_edit: Mutex::new(HashMap::new()),
             autosave_attempted: Mutex::new(HashMap::new()),
             autosave_idle_interval: config.autosave_idle_interval,
@@ -467,6 +472,12 @@ impl Session {
         while let Ok(event) = self.actor_events.try_recv() {
             match event {
                 crate::actor::VaultActorEvent::ExternalChange { path, bytes } => {
+                    self.session_events.lock().unwrap().push_back(
+                        SessionEvent::ExternalChangeDetected {
+                            path: path.clone(),
+                            deleted: false,
+                        },
+                    );
                     let mut manager = self.buffer_manager.lock().unwrap();
                     manager.notify_external_change(&path, &bytes);
                     if manager.get_buffer(&path).is_some_and(|buffer| {
@@ -481,6 +492,12 @@ impl Session {
                     });
                 }
                 crate::actor::VaultActorEvent::Deleted { path } => {
+                    self.session_events.lock().unwrap().push_back(
+                        SessionEvent::ExternalChangeDetected {
+                            path: path.clone(),
+                            deleted: true,
+                        },
+                    );
                     let mut manager = self.buffer_manager.lock().unwrap();
                     if !manager.notify_file_deleted(&path).is_empty() {
                         self.notice.send(crate::channels::Notice::ActionRequired {
@@ -570,6 +587,28 @@ impl Session {
             events.push(event);
         }
         events
+    }
+
+    /// Drain session observations, including external disk changes.
+    pub fn drain_events(&self) -> Vec<SessionEvent> {
+        let _turn = self.driving_turn.lock().unwrap();
+        self.pump_external_changes_inner();
+        self.session_events.lock().unwrap().drain(..).collect()
+    }
+
+    /// Request a throttled verification after the host window gains focus.
+    pub fn focus(&self) -> Result<(), String> {
+        self.actor.focus().map_err(|error| error.to_string())
+    }
+
+    /// Return the cumulative number of disk drifts found by reconciliation.
+    pub fn drift_found_total(&self) -> u64 {
+        self.actor.drift_found_total()
+    }
+
+    /// Current index version from the single-writer actor.
+    pub fn version(&self) -> Result<crate::types::Version, String> {
+        self.actor.get_version().map_err(|error| error.to_string())
     }
 
     /// Acknowledge notice presentation. This never changes operation state.

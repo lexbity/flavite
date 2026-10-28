@@ -27,6 +27,10 @@ toml = { workspace = true }
 futures = "0.3"
 # Fixture vaults for app-state and pump tests.
 tempfile = { workspace = true }
+flavite-fs = { path = "../flavite-fs" }
+flavite-index = { path = "../flavite-index" }
+flavite-vault = { path = "../flavite-vault" }
+uuid = { version = "1", features = ["v4"] }
 # Headless WGSL validation: parses/validates the probe's shader and asserts
 # the Rust ↔ WGSL uniform layout contract without needing a GPU adapter, so
 # the shader gate runs on every CI platform (PLAN-B §5 B2).

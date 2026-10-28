@@ -105,6 +105,12 @@ Normal/build:
 - `iced` (normal)
 - `nucleo` (normal)
 
+Dev-only:
+
+- `flavite-fs`
+- `flavite-index`
+- `flavite-vault`
+
 ### `flavite-vault`
 
 Normal/build:
@@ -165,3 +171,11 @@ UI crates (may depend on forbidden): flavite-editor, flavite-ui
 | 1 — durability-critical | flavite-fs, flavite-syntax, flavite-buffer, flavite-vault, flavite-index | ≥ 90% line |
 | 2 | flavite-api, flavite-graph | ≥ 80% line |
 | 3 — measured, not gating | flavite-cli, flavite-editor, flavite-ui | reported only |
+
+Temporary floor waivers (must have a valid expiry and reason):
+
+| Crate | Temporary floor | Expires | Reason |
+|---|---:|---|---|
+| flavite-fs | 86.8% | 2026-11-30 | Platform-specific filesystem failure branches remain uncovered in the Linux report; add portable FaultFs cases before expiry. |
+| flavite-index | 87.5% | 2026-11-30 | Index actor error and cache-recovery branches remain uncovered; raise the floor after the next index fault-path test slice. |
+| flavite-vault | 84.4% | 2026-11-30 | Actor shutdown and uncommon journal-recovery branches remain uncovered; add deterministic fault cases before expiry. |

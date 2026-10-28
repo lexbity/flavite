@@ -264,8 +264,23 @@
     },
     {
       "from": "flavite-ui",
+      "to": "flavite-fs",
+      "kind": "dev"
+    },
+    {
+      "from": "flavite-ui",
       "to": "flavite-graph",
       "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "flavite-index",
+      "kind": "dev"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "flavite-vault",
+      "kind": "dev"
     },
     {
       "from": "flavite-ui",

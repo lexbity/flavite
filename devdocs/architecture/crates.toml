@@ -74,6 +74,10 @@ active = [
     # B7 - Card layer uses API and buffer for production wiring
     { from = "flavite-ui", to = "flavite-api" },
     { from = "flavite-ui", to = "flavite-buffer" },
+    # Headless-only dev dependencies for the app pump event adapter test.
+    { from = "flavite-ui", to = "flavite-fs" },
+    { from = "flavite-ui", to = "flavite-index" },
+    { from = "flavite-ui", to = "flavite-vault" },
     # A7 - custom editor widget consumes API views and EditorModel types
     { from = "flavite-editor", to = "flavite-api" },
     { from = "flavite-editor", to = "flavite-buffer" },

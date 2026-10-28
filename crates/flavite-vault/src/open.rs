@@ -219,6 +219,12 @@ impl Vault {
         self.identity.uuid
     }
 
+    /// Whether the actor's filesystem watcher is running.
+    #[must_use]
+    pub fn watcher_enabled(&self) -> bool {
+        self.config.watcher_enabled
+    }
+
     /// Get the root path.
     #[must_use]
     pub fn root(&self) -> &PathBuf {

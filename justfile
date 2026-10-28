@@ -113,14 +113,14 @@ cov-check lcov="target/llvm-cov/lcov.info":
     cargo xtask cov-check --lcov {{lcov}}
 
 # Run maintained fuzz targets over generated input (§10.6).
-# The parity, frontmatter_patcher, and rename_planner harnesses are prototypes
-# and are intentionally excluded until they exercise their named behavior.
+# Frontmatter patching and rename planning remain excluded while their fuzz
+# targets are prototypes; parity now compares the editor/indexer scanner paths.
 # 30 s per target locally; G1 uses fuzz-smoke-ci (60 s).
 fuzz-smoke:
     #!/usr/bin/env bash
     set -euo pipefail
     cd fuzz
-    targets="image_limits parser path_safety scanner"
+    targets="image_limits parser path_safety scanner parity"
     failed=0
     for target in $targets; do
         echo "=== fuzz-smoke: $target (30s) ==="
@@ -136,7 +136,7 @@ fuzz-smoke-ci:
     #!/usr/bin/env bash
     set -euo pipefail
     cd fuzz
-    targets="image_limits parser path_safety scanner"
+    targets="image_limits parser path_safety scanner parity"
     failed=0
     for target in $targets; do
         echo "=== fuzz-smoke-ci: $target (60s) ==="

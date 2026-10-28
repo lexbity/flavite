@@ -22,6 +22,19 @@ pub enum Event {
         changed: u32,
         removed: u32,
     },
+    /// Reconcile progress (lossy pulse; consumers should re-query on completion).
+    ReconcileProgress { done: u32, total: u32 },
+    /// A specific note's indexed view is stale.
+    Invalidate {
+        vault: ApiVaultRef,
+        note_path: String,
+    },
+    /// A note changed outside the current Session.
+    ExternalChangeDetected {
+        vault: ApiVaultRef,
+        note_path: String,
+        deleted: bool,
+    },
     /// Buffer state changed.
     BufferStateChanged {
         vault: ApiVaultRef,
@@ -61,6 +74,9 @@ impl Event {
     pub fn event_type(&self) -> &'static str {
         match self {
             Self::VaultChanged { .. } => "vault_changed",
+            Self::ReconcileProgress { .. } => "reconcile_progress",
+            Self::Invalidate { .. } => "invalidate",
+            Self::ExternalChangeDetected { .. } => "external_change_detected",
             Self::BufferStateChanged { .. } => "buffer_state_changed",
             Self::RenameSuggested { .. } => "rename_suggested",
             Self::Conflict { .. } => "conflict",
