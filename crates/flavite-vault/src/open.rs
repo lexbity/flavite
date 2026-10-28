@@ -312,6 +312,17 @@ mod tests {
     }
 
     #[test]
+    fn opening_nonexistent_root_propagates_identity_failure() {
+        let fs = MemFs::new();
+        let result = Vault::open(
+            PathBuf::from("/missing/vault"),
+            Box::new(fs),
+            VaultConfig::default(),
+        );
+        assert!(matches!(result, Err(OpenVaultError::Identity(_))));
+    }
+
+    #[test]
     fn test_vault_exists_with_structure() {
         let fs = MemFs::new();
         let root = PathBuf::from("/vault");
@@ -334,5 +345,24 @@ mod tests {
         let result = Vault::get_cache_dir(uuid);
         // Should not panic, result may vary
         assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn get_vault_uuid_handles_missing_and_malformed_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let fs = MemFs::new();
+        assert_eq!(get_vault_uuid(&fs, temp.path()).unwrap(), None);
+
+        let metadata = temp.path().join(".flavite").join("vault.toml");
+        std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        let uuid = Uuid::now_v7();
+        std::fs::write(&metadata, format!("[vault]\nuuid = \"{uuid}\"\n")).unwrap();
+        assert_eq!(get_vault_uuid(&fs, temp.path()).unwrap(), Some(uuid));
+
+        std::fs::write(&metadata, "[vault]\nuuid = 'broken'").unwrap();
+        assert!(matches!(
+            get_vault_uuid(&fs, temp.path()),
+            Err(OpenVaultError::Identity(_))
+        ));
     }
 }

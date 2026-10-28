@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use iced::widget::{Column, text};
 use iced::{Color, Element, Rectangle};
 
+use super::nodes::attachment_filename;
 use super::zoomable::{CARD_CAP, Card, CardIdentity, LayoutCache, ZoomableCamera};
 use flavite_api::Lattice;
 use flavite_buffer::revision::{BufferId, Revision};
@@ -214,8 +215,12 @@ pub fn cards_from_snapshot(
         .zip(positions.iter())
         .take(node_count)
     {
-        let title = format!("{} #{}", node_title(kind), id.id);
-        let _preview = preview_map.get(&id).cloned().unwrap_or_default();
+        let indexed_name = preview_map.get(&id).cloned().unwrap_or_default();
+        let title = match kind {
+            NodeKind::Note => format!("{} #{}", node_title(kind), id.id),
+            NodeKind::Attachment if indexed_name.is_empty() => format!("File #{}", id.id),
+            NodeKind::Attachment => attachment_filename(&indexed_name),
+        };
         let content = content_map.get(&id).cloned().unwrap_or_default();
         let task_lines = task_map.get(&id).cloned().unwrap_or_default();
 
@@ -279,6 +284,16 @@ pub fn build_card(
     // We clone strings to satisfy 'static lifetime requirements
 
     let mut col = Column::new().spacing(8).padding(12);
+
+    // Attachment cards use a square marker and the indexed filename. The
+    // graph node itself uses the same square shape/color in `nodes`.
+    if card.kind == NodeKind::Attachment {
+        col = col.push(
+            text::Text::new("■")
+                .size(18.0 * scale)
+                .color(Color::from_rgb8(0xff, 0xc7, 0x59)),
+        );
+    }
 
     // Title
     let title = text::Text::new(card.title.clone())

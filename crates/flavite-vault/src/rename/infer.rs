@@ -693,6 +693,82 @@ mod tests {
     }
 
     #[test]
+    fn inference_covers_watcher_hash_attachment_and_fuzzy_candidates() {
+        let inference = RenameInference::new();
+        let notices = NoticeChannel::new(std::time::Duration::from_secs(1));
+        let vanished_note = mock_note("dir/old.md", None, vec![7; 32], 64);
+        let changed_note = mock_note("dir/newname.md", None, vec![7; 32], 64);
+        let fuzzy_from = mock_note("dir/alpha.md", None, vec![1], 20);
+        let fuzzy_to = mock_note("dir/alpah.md", None, vec![2], 20);
+        let duplicate_a = mock_note("dup/a.md", Some("duplicate"), vec![3], 80);
+        let duplicate_b = mock_note("dup/b.md", Some("duplicate"), vec![4], 80);
+        let old_attachment = mock_attachment("dir/old.png", Some(vec![9; 32]), 64);
+        let new_attachment = mock_attachment("dir/new.png", Some(vec![9; 32]), 64);
+
+        let stable_id_notes =
+            HashMap::from([("duplicate".into(), vec![&duplicate_a, &duplicate_b])]);
+        let path_notes = HashMap::from([
+            (PathBuf::from("dir/old.md"), &vanished_note),
+            (PathBuf::from("dir/newname.md"), &changed_note),
+            (PathBuf::from("dir/alpha.md"), &fuzzy_from),
+            (PathBuf::from("dir/alpah.md"), &fuzzy_to),
+        ]);
+        let attachments = HashMap::from([
+            (PathBuf::from("dir/old.png"), &old_attachment),
+            (PathBuf::from("dir/new.png"), &new_attachment),
+        ]);
+        let vanished = vec![
+            PathBuf::from("dir/old.md"),
+            PathBuf::from("dir/old.png"),
+            PathBuf::from("dir/alpha.md"),
+            PathBuf::from("dir/too-small.md"),
+        ];
+        let changed = vec![
+            PathBuf::from("dir/newname.md"),
+            PathBuf::from("dir/new.png"),
+            PathBuf::from("dir/alpah.md"),
+        ];
+        let inbound = HashMap::from([(PathBuf::from("dir/old.md"), 3)]);
+        let watcher = vec![(
+            PathBuf::from("dir/watched-old.md"),
+            PathBuf::from("dir/watched-new.md"),
+        )];
+        let result = inference.infer_renames(
+            &vanished,
+            &changed,
+            &watcher,
+            &stable_id_notes,
+            &path_notes,
+            &attachments,
+            &inbound,
+            &notices,
+        );
+
+        assert!(result.t1_renames.contains(&watcher[0]));
+        assert!(result.duplicate_stable_ids.contains("duplicate"));
+        assert!(result.candidates.iter().any(
+            |candidate| candidate.tier == RenameTier::T3 && candidate.from.ends_with("old.md")
+        ));
+        assert!(result.candidates.iter().any(
+            |candidate| candidate.tier == RenameTier::T3 && candidate.from.ends_with("old.png")
+        ));
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.tier == RenameTier::T4
+                    && candidate.from.ends_with("alpha.md"))
+        );
+        assert!(matches!(
+            notices.try_recv().unwrap(),
+            Notice::RenameSuggested {
+                tier: RenameTier::T1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn test_same_directory() {
         assert!(RenameInference::same_directory(
             &PathBuf::from("/vault/notes/old.md"),

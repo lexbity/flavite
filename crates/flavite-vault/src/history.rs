@@ -609,4 +609,48 @@ mod tests {
         assert!(hashes.len() >= 50);
         assert!(hashes.len() <= 65);
     }
+
+    #[test]
+    fn malformed_missing_and_corrupt_history_blobs_are_rejected() {
+        let fs = Arc::new(MemFs::new());
+        let root = PathBuf::from("/data/history-invalid");
+        let mut history = HistoryStore::open(fs.clone(), root.clone()).unwrap();
+        assert!(matches!(
+            history.get("bad-hash"),
+            Err(HistoryError::Metadata(_))
+        ));
+        assert!(history.pin(&"0".repeat(64)).is_err());
+        let record = history
+            .snapshot(b"note", b"valid", HistoryReason::Save, false, 1)
+            .unwrap();
+        let blob = history.blob_path(&record.hash);
+        fs.remove(&blob).unwrap();
+        fs.write_new(&blob, b"not a compressed blob").unwrap();
+        assert!(matches!(
+            history.get(&record.hash),
+            Err(HistoryError::Compression(_))
+        ));
+
+        fs.remove(&root.join(META_FILE)).unwrap();
+        fs.write_new(&root.join(META_FILE), b"invalid json")
+            .unwrap();
+        assert!(matches!(
+            HistoryStore::open(fs.clone(), root.clone()),
+            Err(HistoryError::Metadata(_))
+        ));
+
+        let clean_root = PathBuf::from("/data/history-hash-mismatch");
+        let mut clean = HistoryStore::open(fs.clone(), clean_root.clone()).unwrap();
+        let saved = clean
+            .snapshot(b"note", b"expected", HistoryReason::Save, false, 2)
+            .unwrap();
+        let corrupt_blob = clean.blob_path(&saved.hash);
+        let wrong = zstd::stream::encode_all(&b"other"[..], 3).unwrap();
+        fs.remove(&corrupt_blob).unwrap();
+        fs.write_new(&corrupt_blob, &wrong).unwrap();
+        assert!(matches!(
+            clean.get(&saved.hash),
+            Err(HistoryError::HashMismatch)
+        ));
+    }
 }

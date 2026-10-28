@@ -122,4 +122,23 @@ mod tests {
         // Stub test - planner should be creatable
         assert_eq!(planner.vault_root, PathBuf::from("/vault"));
     }
+
+    #[test]
+    fn unfinished_planner_reports_unsupported_directory_move() {
+        let planner = RenamePlanner::new(
+            Arc::new(flavite_fs::MemFs::new()),
+            PathBuf::from("/vault"),
+            1024,
+        );
+        let result = planner.plan_rename(
+            PathBuf::from("old.md"),
+            PathBuf::from("new.md"),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(matches!(
+            result,
+            RenamePlanResult::DirectoryMoveNotSupported
+        ));
+    }
 }

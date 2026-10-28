@@ -111,3 +111,24 @@ impl IndexPlaceholder {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn index_placeholder_stubs_are_safe_noops() {
+        let mut index = IndexPlaceholder;
+        let scope = ReconcileScope::Single("note.md".into());
+        assert!(index.get_notes_in_scope(&scope).is_empty());
+        let snapshot = flavite_syntax::text::TextSnapshot::new(b"hello").unwrap();
+        assert!(index.apply_note(Path::new("note.md"), &snapshot, 1).is_ok());
+        assert!(
+            index
+                .update_note(Path::new("note.md"), &snapshot, 2)
+                .is_ok()
+        );
+        assert!(index.remove_note(Path::new("note.md")).is_ok());
+    }
+}

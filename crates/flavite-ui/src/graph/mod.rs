@@ -32,6 +32,8 @@ pub mod card_layer;
 pub mod fallback;
 pub mod gpu;
 pub mod instance;
+pub mod nodes;
+pub mod pins;
 pub mod shader_probe;
 pub mod shader_view;
 pub mod stats;
@@ -56,6 +58,8 @@ pub use instance::{
     NodeShape, ProbeGeometry, edge_alpha_factor, edge_base_alpha, edge_cap, edge_importance,
     needs_upload, node_radius,
 };
+pub use nodes::{GraphNodeVisual, node_visuals};
+pub use pins::{PinCommand, PinKey, PinRecord, PinStore, PinStoreError, carry_pin_for_tier};
 pub use shader_probe::{
     ProbeMessage, ProbePrimitive, ProbeProgram, ProbeState, ProbeTimings, TimingsSnapshot,
 };

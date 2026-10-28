@@ -116,35 +116,36 @@ fn get_cache_dir() -> Option<PathBuf> {
     ProjectDirs::from("com", "flavite", "Lattice").map(|p| p.cache_dir().to_path_buf())
 }
 
-/// Get the path to the vault registry file for a given root key.
-fn registry_path(root_key: &[u8]) -> Option<PathBuf> {
-    get_data_dir().map(|data_dir| {
-        data_dir
-            .join(LATTICE_DIR)
-            .join(VAULTS_DIR)
-            .join(format!("{}.toml", hex::encode(root_key)))
-    })
+fn registry_path_in(data_dir: &Path, root_key: &[u8]) -> PathBuf {
+    data_dir
+        .join(LATTICE_DIR)
+        .join(VAULTS_DIR)
+        .join(format!("{}.toml", hex::encode(root_key)))
 }
 
 /// Get the path to the root ownership guard.
 pub fn root_guard_path(root_key: &[u8]) -> Option<PathBuf> {
-    get_data_dir().map(|data_dir| {
-        data_dir
-            .join(LATTICE_DIR)
-            .join(ROOTS_DIR)
-            .join(format!("{}.lock", hex::encode(root_key)))
-    })
+    get_data_dir().map(|data_dir| root_guard_path_in(&data_dir, root_key))
+}
+
+fn root_guard_path_in(data_dir: &Path, root_key: &[u8]) -> PathBuf {
+    data_dir
+        .join(LATTICE_DIR)
+        .join(ROOTS_DIR)
+        .join(format!("{}.lock", hex::encode(root_key)))
 }
 
 /// Get the path to the UUID instance lock.
 pub fn uuid_lock_path(uuid: Uuid) -> Option<PathBuf> {
-    get_data_dir().map(|data_dir| {
-        data_dir
-            .join(LATTICE_DIR)
-            .join(VAULTS_DIR)
-            .join(uuid.to_string())
-            .join(UUID_LOCK)
-    })
+    get_data_dir().map(|data_dir| uuid_lock_path_in(&data_dir, uuid))
+}
+
+fn uuid_lock_path_in(data_dir: &Path, uuid: Uuid) -> PathBuf {
+    data_dir
+        .join(LATTICE_DIR)
+        .join(VAULTS_DIR)
+        .join(uuid.to_string())
+        .join(UUID_LOCK)
 }
 
 /// Get the path to the vault.toml in a vault directory.
@@ -206,15 +207,19 @@ fn write_vault_toml(vault_root: &Path, uuid: Uuid) -> IdentityResult<()> {
     Ok(())
 }
 
-/// Read the registry entry for a given root key.
-fn read_registry_entry(root_key: &[u8]) -> IdentityResult<Option<RegistryEntry>> {
-    let path = registry_path(root_key).ok_or(IdentityError::NoProjectDirs)?;
+fn read_registry_entry_in(
+    data_dir: &Path,
+    root_key: &[u8],
+) -> IdentityResult<Option<RegistryEntry>> {
+    read_registry_entry_path(&registry_path_in(data_dir, root_key))
+}
 
+fn read_registry_entry_path(path: &Path) -> IdentityResult<Option<RegistryEntry>> {
     if !path.exists() {
         return Ok(None);
     }
 
-    let contents = fs::read_to_string(&path).map_err(IdentityError::Io)?;
+    let contents = fs::read_to_string(path).map_err(IdentityError::Io)?;
 
     let entry: RegistryEntry =
         toml::from_str(&contents).map_err(|e| IdentityError::TomlParseError(e.to_string()))?;
@@ -222,10 +227,15 @@ fn read_registry_entry(root_key: &[u8]) -> IdentityResult<Option<RegistryEntry>>
     Ok(Some(entry))
 }
 
-/// Write a registry entry.
-fn write_registry_entry(root_key: &[u8], entry: &RegistryEntry) -> IdentityResult<()> {
-    let path = registry_path(root_key).ok_or(IdentityError::NoProjectDirs)?;
+fn write_registry_entry_in(
+    data_dir: &Path,
+    root_key: &[u8],
+    entry: &RegistryEntry,
+) -> IdentityResult<()> {
+    write_registry_entry_path(&registry_path_in(data_dir, root_key), entry)
+}
 
+fn write_registry_entry_path(path: &Path, entry: &RegistryEntry) -> IdentityResult<()> {
     // Create parent directories if needed
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(IdentityError::Io)?;
@@ -234,7 +244,7 @@ fn write_registry_entry(root_key: &[u8], entry: &RegistryEntry) -> IdentityResul
     let contents = toml::to_string(entry)
         .map_err(|e| IdentityError::Io(std::io::Error::other(e.to_string())))?;
 
-    fs::write(&path, contents).map_err(IdentityError::Io)?;
+    fs::write(path, contents).map_err(IdentityError::Io)?;
 
     Ok(())
 }
@@ -255,7 +265,10 @@ impl RootGuard {
     pub fn acquire(fs: &dyn Fs, root: &Path) -> IdentityResult<Self> {
         let root_key = compute_root_key(fs, root)?;
         let path = root_guard_path(&root_key).ok_or(IdentityError::NoProjectDirs)?;
+        Self::acquire_at(root_key, path)
+    }
 
+    fn acquire_at(root_key: Vec<u8>, path: PathBuf) -> IdentityResult<Self> {
         // Create parent directories if needed
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(IdentityError::Io)?;
@@ -310,7 +323,10 @@ impl UuidGuard {
     /// Acquire a UUID guard for the given UUID.
     pub fn acquire(uuid: Uuid) -> IdentityResult<Self> {
         let path = uuid_lock_path(uuid).ok_or(IdentityError::NoProjectDirs)?;
+        Self::acquire_at(uuid, path)
+    }
 
+    fn acquire_at(uuid: Uuid, path: PathBuf) -> IdentityResult<Self> {
         // Create parent directories if needed
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(IdentityError::Io)?;
@@ -376,16 +392,23 @@ impl IdentityManager {
     /// 5. Acquire the UUID lock
     /// 6. Verify and persist identity/binding
     pub fn open(fs: &dyn Fs, root: PathBuf) -> IdentityResult<Self> {
+        let data_dir = get_data_dir().ok_or(IdentityError::NoProjectDirs)?;
+        Self::open_in_data_dir(fs, root, &data_dir)
+    }
+
+    fn open_in_data_dir(fs: &dyn Fs, root: PathBuf, data_dir: &Path) -> IdentityResult<Self> {
         // Step 1: Resolve the root
         let canonical_root = fs.canonicalize(&root)?;
 
         // Step 2: Acquire root guard
-        let root_guard = RootGuard::acquire(fs, &canonical_root)?;
+        let root_key = compute_root_key(fs, &canonical_root)?;
+        let root_guard =
+            RootGuard::acquire_at(root_key.clone(), root_guard_path_in(data_dir, &root_key))?;
 
         // Step 3: Read vault.toml and registry
         let root_key = root_guard.root_key().to_vec();
         let toml_uuid = read_vault_toml(&canonical_root)?;
-        let registry_entry = read_registry_entry(&root_key)?;
+        let registry_entry = read_registry_entry_in(data_dir, &root_key)?;
 
         // Step 4: Select identity in memory
         let uuid = match (toml_uuid, registry_entry) {
@@ -408,7 +431,7 @@ impl IdentityManager {
 
         // Step 5: Acquire UUID lock
         // First, check if another process has the lock
-        let uuid_lock_path = uuid_lock_path(uuid).ok_or(IdentityError::NoProjectDirs)?;
+        let uuid_lock_path = uuid_lock_path_in(data_dir, uuid);
 
         if uuid_lock_path.exists() {
             // Another process has the lock
@@ -417,7 +440,7 @@ impl IdentityManager {
             ));
         }
 
-        let uuid_guard = UuidGuard::acquire(uuid)?;
+        let uuid_guard = UuidGuard::acquire_at(uuid, uuid_lock_path)?;
 
         // Step 6: Persist identity/binding
         // Write vault.toml
@@ -426,7 +449,7 @@ impl IdentityManager {
         // Write/update registry
         let entry =
             RegistryEntry::new(uuid, root_key.clone(), canonical_root.display().to_string());
-        write_registry_entry(&root_key, &entry)?;
+        write_registry_entry_in(data_dir, &root_key, &entry)?;
 
         let identity = VaultIdentity::new(uuid, canonical_root, root_key);
 
@@ -571,5 +594,107 @@ mod tests {
 
         let empty = ReconcileSummary::default();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn atomic_version_load_store_increment_and_epoch_reset() {
+        use std::sync::atomic::Ordering;
+
+        let version = crate::types::AtomicVersion::default();
+        assert_eq!(version.load(Ordering::SeqCst), Version::from_values(0, 0));
+        version.store(Version::from_values(4, 9), Ordering::SeqCst);
+        assert_eq!(
+            version.increment_generation(Ordering::SeqCst),
+            Version::from_values(4, 9)
+        );
+        assert_eq!(version.load(Ordering::SeqCst), Version::from_values(4, 10));
+        assert_eq!(
+            version.new_epoch(Ordering::SeqCst),
+            Version::from_values(5, 0)
+        );
+        assert_eq!(version.load(Ordering::SeqCst), Version::from_values(5, 0));
+    }
+
+    #[test]
+    fn identity_selection_persists_and_rejects_conflicting_bindings() {
+        let vault = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let root = vault.path().to_path_buf();
+        let fs = flavite_fs::OsFs::new();
+
+        let first = IdentityManager::open_in_data_dir(&fs, root.clone(), data.path()).unwrap();
+        let uuid = first.uuid();
+        let root_key = first.root_key().to_vec();
+        drop(first);
+
+        let reopened = IdentityManager::open_in_data_dir(&fs, root.clone(), data.path()).unwrap();
+        assert_eq!(reopened.uuid(), uuid);
+        assert_eq!(reopened.root(), &root);
+        drop(reopened);
+
+        let registry = registry_path_in(data.path(), &root_key);
+        let conflicting = RegistryEntry::new(Uuid::now_v7(), root_key, root.display().to_string());
+        write_registry_entry_path(&registry, &conflicting).unwrap();
+        assert!(matches!(
+            IdentityManager::open_in_data_dir(&fs, root, data.path()),
+            Err(IdentityError::ConflictingBinding)
+        ));
+    }
+
+    #[test]
+    fn identity_selection_uses_single_source_and_rejects_existing_uuid_lock() {
+        let fs = flavite_fs::OsFs::new();
+
+        let toml_vault = tempfile::tempdir().unwrap();
+        let toml_data = tempfile::tempdir().unwrap();
+        let toml_uuid = Uuid::now_v7();
+        ensure_flavite_dir(toml_vault.path()).unwrap();
+        write_vault_toml(toml_vault.path(), toml_uuid).unwrap();
+        let opened = IdentityManager::open_in_data_dir(
+            &fs,
+            toml_vault.path().to_path_buf(),
+            toml_data.path(),
+        )
+        .unwrap();
+        assert_eq!(opened.uuid(), toml_uuid);
+        drop(opened);
+
+        let registry_vault = tempfile::tempdir().unwrap();
+        let registry_data = tempfile::tempdir().unwrap();
+        let root_key = compute_root_key(&fs, registry_vault.path()).unwrap();
+        let registry_uuid = Uuid::now_v7();
+        let entry = RegistryEntry::new(
+            registry_uuid,
+            root_key.clone(),
+            registry_vault.path().display().to_string(),
+        );
+        write_registry_entry_in(registry_data.path(), &root_key, &entry).unwrap();
+        let opened = IdentityManager::open_in_data_dir(
+            &fs,
+            registry_vault.path().to_path_buf(),
+            registry_data.path(),
+        )
+        .unwrap();
+        assert_eq!(opened.uuid(), registry_uuid);
+        drop(opened);
+
+        let locked_vault = tempfile::tempdir().unwrap();
+        let locked_data = tempfile::tempdir().unwrap();
+        let locked_uuid = Uuid::now_v7();
+        ensure_flavite_dir(locked_vault.path()).unwrap();
+        write_vault_toml(locked_vault.path(), locked_uuid).unwrap();
+        let root_key = compute_root_key(&fs, locked_vault.path()).unwrap();
+        let lock = uuid_lock_path_in(locked_data.path(), locked_uuid);
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        std::fs::write(&lock, b"held").unwrap();
+        assert!(matches!(
+            IdentityManager::open_in_data_dir(
+                &fs,
+                locked_vault.path().to_path_buf(),
+                locked_data.path()
+            ),
+            Err(IdentityError::UuidLockFailed(_))
+        ));
+        assert!(!root_guard_path_in(locked_data.path(), &root_key).exists());
     }
 }

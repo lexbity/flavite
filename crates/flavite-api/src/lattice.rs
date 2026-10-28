@@ -666,6 +666,47 @@ pub mod session {
 mod tests {
     use super::*;
 
+    fn test_lattice() -> (Lattice, PathBuf, tempfile::TempDir) {
+        use flavite_buffer::manager::BufferManager;
+        use flavite_fs::{Fs, MemFs};
+        use flavite_index::IndexActor;
+        use flavite_vault::actor::VaultActorBuilder;
+        use flavite_vault::channels::ChannelSet;
+
+        let fs = MemFs::new();
+        let root = PathBuf::from("/test/lattice-api-vault");
+        fs.create_dir_all(&root).unwrap();
+        fs.write_new(&root.join("note.md"), b"hello").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("index.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let identity = VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![1, 2, 3]);
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs) as Box<dyn Fs + Send + Sync>)
+            .with_identity(identity.clone())
+            .with_index(IndexActor::new(&db, 1).unwrap())
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        let channels = ChannelSet::new();
+        let session = Session::new(
+            identity.clone(),
+            actor,
+            BufferManager::new(),
+            channels.pulse,
+            channels.notice,
+            VaultConfig::default(),
+        );
+        let lattice = Lattice::with_session(
+            session,
+            ApiVaultRef::new(identity.uuid, identity.root),
+            VaultConfig::default(),
+        )
+        .unwrap();
+        (lattice, root, temp)
+    }
+
     #[test]
     fn lattice_creation() {
         // This test will be expanded once Session can be properly constructed
@@ -777,5 +818,249 @@ mod tests {
 
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("Test Note"));
+    }
+
+    #[test]
+    fn typed_dispatch_covers_validation_read_only_and_unknown_commands() {
+        use crate::command::Invocation;
+        use crate::types::Origin;
+
+        let (mut lattice, root, _temp) = test_lattice();
+        let rejected = lattice.execute(Invocation::new(
+            1,
+            "write:save_note",
+            serde_json::Value::Null,
+            Origin::Gui,
+        ));
+        assert!(matches!(
+            rejected,
+            ExecutionResult::Local(LocalResult::Error(LocalError { code, .. })) if code == "dispatch_error"
+        ));
+        lattice.set_read_only(true);
+        let rejected = lattice.execute(Invocation::new(
+            2,
+            "write:save_note",
+            serde_json::Value::Null,
+            Origin::Gui,
+        ));
+        assert!(matches!(
+            rejected,
+            ExecutionResult::Rejected(RejectedResult {
+                reason: RejectionReason::ReadOnly,
+                ..
+            })
+        ));
+        lattice.set_read_only(false);
+
+        let invalid = lattice.execute(Invocation::new(
+            3,
+            "open_note",
+            serde_json::json!({"bad": true}),
+            Origin::Cli,
+        ));
+        assert!(
+            matches!(invalid, ExecutionResult::Local(LocalResult::Error(LocalError { code, .. })) if code == "dispatch_error")
+        );
+
+        let unknown = lattice.execute(Invocation::new(
+            4,
+            "does_not_exist",
+            serde_json::Value::Null,
+            Origin::Plugin,
+        ));
+        assert!(
+            matches!(unknown, ExecutionResult::Local(LocalResult::Error(LocalError { code, .. })) if code == "dispatch_error")
+        );
+
+        let opened = lattice.execute(Invocation::new(
+            5,
+            "open_note",
+            serde_json::to_value(root.join("note.md")).unwrap(),
+            Origin::Gui,
+        ));
+        let data = opened.into_success().unwrap().data;
+        let buffer_id = data["buffer_id"].as_u64().unwrap();
+        let closed = lattice.execute(Invocation::new(
+            6,
+            "close_note",
+            serde_json::to_value(root.join("note.md")).unwrap(),
+            Origin::Gui,
+        ));
+        assert!(closed.is_success());
+        assert!(matches!(
+            lattice.get_buffer_view(BufferId::from(buffer_id), None),
+            Err(LatticeError::BufferNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn typed_dispatch_applies_edits_and_supports_undo_redo_and_reconcile() {
+        use crate::command::Invocation;
+        use crate::types::Origin;
+
+        let (lattice, root, _temp) = test_lattice();
+        let opened = lattice.execute(Invocation::new(
+            10,
+            "open_note",
+            serde_json::to_value(root.join("note.md")).unwrap(),
+            Origin::Gui,
+        ));
+        let opened = opened.into_success().unwrap().data;
+        let id = opened["buffer_id"].as_u64().unwrap();
+        let revision = opened["revision"].as_u64().unwrap();
+
+        let applied = lattice.execute(Invocation::new(
+            11,
+            "apply_edits",
+            serde_json::json!({
+                "buffer_id": id,
+                "revision": revision,
+                "ops": [{"range": [5, 5], "replacement": "!"}]
+            }),
+            Origin::Gui,
+        ));
+        let applied = applied.into_success().unwrap().data;
+        assert_eq!(applied["revision"].as_u64().unwrap(), revision + 1);
+
+        let undone = lattice.execute(Invocation::new(
+            12,
+            "undo",
+            serde_json::json!({ "buffer_id": id, "revision": applied["revision"] }),
+            Origin::Gui,
+        ));
+        let undone = undone.into_success().expect("undo succeeds").data;
+        assert_eq!(
+            lattice
+                .get_buffer_view(BufferId::from(id), None)
+                .unwrap()
+                .text,
+            "hello"
+        );
+
+        let redone = lattice.execute(Invocation::new(
+            13,
+            "redo",
+            serde_json::json!({ "buffer_id": id, "revision": undone["revision"] }),
+            Origin::Gui,
+        ));
+        assert!(redone.is_success(), "redo failed: {redone:?}");
+        assert_eq!(
+            lattice
+                .get_buffer_view(BufferId::from(id), None)
+                .unwrap()
+                .text,
+            "hello!"
+        );
+
+        let reconciled = lattice.execute(Invocation::new(
+            14,
+            "reconcile",
+            serde_json::json!({"scope": "unknown", "mode": "unknown"}),
+            Origin::Cli,
+        ));
+        assert!(!matches!(
+            reconciled,
+            ExecutionResult::Local(LocalResult::Error(LocalError { code, .. }))
+                if code == "dispatch_error"
+        ));
+    }
+
+    #[test]
+    fn session_result_conversion_serializes_every_outcome_shape() {
+        use crate::session::{CommandResult, SessionResult};
+        use flavite_buffer::revision::{BufferId, Revision};
+        use flavite_vault::types::{Epoch, Generation, ReconcileSummary};
+
+        let (lattice, _root, _temp) = test_lattice();
+        let buffer = BufferId::from(17);
+        let revision = Revision::new(3);
+        let successes = [
+            CommandResult::NoteOpened {
+                buffer_id: buffer,
+                revision,
+            },
+            CommandResult::NoteClosed,
+            CommandResult::EditsApplied {
+                buffer_id: buffer,
+                new_revision: revision,
+            },
+            CommandResult::NoteSaved {
+                path: PathBuf::from("a.md"),
+                hash: vec![1, 2],
+                epoch: Epoch::new(4),
+                generation: Generation::new(5),
+            },
+            CommandResult::ReconcileComplete {
+                summary: ReconcileSummary::new(1, 2, 3),
+            },
+            CommandResult::UndoPerformed {
+                buffer_id: buffer,
+                new_revision: revision,
+            },
+            CommandResult::RedoPerformed {
+                buffer_id: buffer,
+                new_revision: revision,
+            },
+            CommandResult::ConflictResolved,
+            CommandResult::RecoveryRestored {
+                buffer_id: buffer,
+                revision,
+            },
+        ];
+        for result in successes {
+            assert!(
+                lattice
+                    .convert_session_result(SessionResult::Success(result), 20)
+                    .is_success()
+            );
+        }
+
+        assert!(matches!(
+            lattice.convert_session_result(SessionResult::Pending { request_id: 21 }, 20),
+            ExecutionResult::Pending { request_id: 21 }
+        ));
+        assert!(
+            matches!(lattice.convert_session_result(SessionResult::Error { message: "failure".into() }, 20), ExecutionResult::Local(LocalResult::Error(LocalError { code, .. })) if code == "session_error")
+        );
+        assert!(
+            matches!(lattice.convert_session_result(SessionResult::Conflict { path: PathBuf::from("a.md") }, 20), ExecutionResult::Local(LocalResult::Error(LocalError { code, .. })) if code == "conflict")
+        );
+        assert!(
+            matches!(lattice.convert_session_result(SessionResult::ActionRequired { code: "confirm", data: Some("details".into()) }, 20), ExecutionResult::Local(LocalResult::Error(LocalError { code, message, .. })) if code == "confirm" && message == "details")
+        );
+        assert!(
+            matches!(lattice.convert_session_result(SessionResult::ActionRequired { code: "confirm", data: None }, 20), ExecutionResult::Local(LocalResult::Error(LocalError { message, .. })) if message.is_empty())
+        );
+        assert!(matches!(
+            lattice.convert_session_result(
+                SessionResult::Superseded {
+                    request_id: 22,
+                    by_request: 23
+                },
+                20
+            ),
+            ExecutionResult::Local(LocalResult::Success(LocalSuccess { request_id: 22, .. }))
+        ));
+        let merge = SessionResult::MergeReady {
+            path: PathBuf::from("a.md"),
+            buffer_id: buffer,
+            revision,
+            disk_hash: [9; 32],
+            result: flavite_vault::merge::MergeResult {
+                merged: None,
+                conflicts: vec![flavite_vault::merge::MergeConflict {
+                    base_start_line: 1,
+                    base_end_line: 2,
+                    mine: vec!["mine".into()],
+                    theirs: vec!["theirs".into()],
+                }],
+            },
+        };
+        let converted = lattice
+            .convert_session_result(merge, 24)
+            .into_success()
+            .unwrap();
+        assert_eq!(converted.data["conflicts"][0]["mine"][0], "mine");
+        assert_eq!(converted.data["disk_hash"].as_str().unwrap().len(), 64);
     }
 }

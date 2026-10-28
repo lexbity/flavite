@@ -321,6 +321,55 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_resolution_updates_indexes_and_reports_edge_cases() {
+        use crate::channels::ChannelSet;
+
+        let mut manager = DuplicateIdManager::new();
+        let one = mock_note("a.md", Some("duplicate"), 1);
+        let two = mock_note("b.md", Some("duplicate"), 2);
+        let unique = mock_note("c.md", Some("unique"), 3);
+        let missing_id = mock_note("d.md", None, 4);
+        manager.update_from_notes(&[one.clone(), two.clone(), unique.clone(), missing_id.clone()]);
+        assert!(manager.note_has_conflicted_id(&one));
+        assert!(!manager.note_has_conflicted_id(&unique));
+        assert!(!manager.note_has_conflicted_id(&missing_id));
+        assert_eq!(manager.get_duplicate_info().len(), 1);
+        assert!(manager.get_winner("unique").is_some());
+        assert!(manager.get_winner("absent").is_none());
+
+        let channels = ChannelSet::new();
+        assert!(
+            manager
+                .resolve_duplicate("absent", &one_ref(1), &channels.notice)
+                .is_none()
+        );
+        assert!(
+            manager
+                .resolve_duplicate("duplicate", &one_ref(99), &channels.notice)
+                .is_none()
+        );
+        let resolved = manager
+            .resolve_duplicate("duplicate", &one_ref(2), &channels.notice)
+            .unwrap();
+        assert_eq!(resolved.old_notes.len(), 2);
+        assert_ne!(resolved.new_stable_id, "duplicate");
+        assert!(!manager.is_conflicted("duplicate"));
+        assert_eq!(manager.detect_duplicates().len(), 0);
+        assert_eq!(manager.get_duplicate_info().len(), 0);
+        assert!(matches!(
+            channels.notice.try_recv().unwrap(),
+            crate::channels::Notice::ActionRequired {
+                code: "duplicate_id_resolved",
+                ..
+            }
+        ));
+    }
+
+    fn one_ref(note_id: i64) -> IndexNoteRef {
+        IndexNoteRef::new(note_id, format!("{note_id}.md").into_bytes())
+    }
+
+    #[test]
     fn test_winner_selection() {
         let mut manager = DuplicateIdManager::new();
 

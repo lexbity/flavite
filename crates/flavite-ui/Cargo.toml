@@ -13,6 +13,8 @@ iced = { workspace = true }
 flavite-graph = { path = "../flavite-graph" }
 flavite-api = { path = "../flavite-api" }
 flavite-buffer = { path = "../flavite-buffer" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 # §10.4 convention: thiserror for libraries. Used for the CPU-side geometry
 # error type (`graph::instance::GeometryError`).
 thiserror = { workspace = true }
@@ -21,6 +23,7 @@ thiserror = { workspace = true }
 [dev-dependencies]
 # Headless wgpu validation tests drive wgpu's async device/adapter futures.
 futures = "0.3"
+tempfile = { workspace = true }
 # Headless WGSL validation: parses/validates the probe's shader and asserts
 # the Rust ↔ WGSL uniform layout contract without needing a GPU adapter, so
 # the shader gate runs on every CI platform (PLAN-B §5 B2).

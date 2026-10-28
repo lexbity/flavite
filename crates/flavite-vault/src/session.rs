@@ -1666,6 +1666,122 @@ mod tests {
     }
 
     #[test]
+    fn session_rejects_invalid_lifecycle_operations_and_reports_unavailable_recovery() {
+        let (session, _fs, _temp) = test_session();
+        let path = PathBuf::from("/test/vault/note.md");
+        let missing = PathBuf::from("/test/vault/missing.md");
+        let never_opened = PathBuf::from("/test/vault/never-opened.md");
+
+        assert!(matches!(
+            session.execute(SessionCommand::OpenNote {
+                path: missing.clone()
+            }),
+            SessionResult::Success(CommandResult::NoteOpened { .. })
+        ));
+        assert!(matches!(
+            session.execute(SessionCommand::CloseNote {
+                path: never_opened.clone()
+            }),
+            SessionResult::Error { .. }
+        ));
+        assert!(matches!(
+            session.execute(SessionCommand::SaveNote { path: never_opened }),
+            SessionResult::Error { .. }
+        ));
+
+        let (buffer_id, revision) =
+            match session.execute(SessionCommand::OpenNote { path: path.clone() }) {
+                SessionResult::Success(CommandResult::NoteOpened {
+                    buffer_id,
+                    revision,
+                }) => (buffer_id, revision),
+                other => panic!("unexpected open result: {other:?}"),
+            };
+        assert!(matches!(
+            session.execute(SessionCommand::OpenNote { path: path.clone() }),
+            SessionResult::Success(CommandResult::NoteOpened { buffer_id: existing, .. }) if existing == buffer_id
+        ));
+
+        let bad_edit = session.execute(SessionCommand::ApplyEdits {
+            buffer_id,
+            revision,
+            ops: vec![EditOp::new(
+                Span::new(TextByte(99), TextByte(99)),
+                "x".into(),
+            )],
+        });
+        assert!(matches!(bad_edit, SessionResult::Error { .. }));
+        assert!(matches!(
+            session.execute(SessionCommand::Undo {
+                buffer_id,
+                revision
+            }),
+            SessionResult::Error { .. }
+        ));
+        assert!(matches!(
+            session.execute(SessionCommand::Redo {
+                buffer_id,
+                revision
+            }),
+            SessionResult::Error { .. }
+        ));
+
+        let changed = session.execute(SessionCommand::ApplyEdits {
+            buffer_id,
+            revision,
+            ops: vec![EditOp::new(Span::new(TextByte(5), TextByte(5)), "!".into())],
+        });
+        let dirty_revision = match changed {
+            SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
+                new_revision
+            }
+            other => panic!("unexpected edit result: {other:?}"),
+        };
+        assert!(matches!(
+            session.execute(SessionCommand::CloseNote { path: path.clone() }),
+            SessionResult::ActionRequired {
+                code: "dirty-buffer-close",
+                ..
+            }
+        ));
+        assert!(matches!(
+            session.execute(SessionCommand::ApplyEdits {
+                buffer_id,
+                revision,
+                ops: vec![],
+            }),
+            SessionResult::Error { .. }
+        ));
+        assert!(matches!(
+            session.execute(SessionCommand::ResolveConflict {
+                path: path.clone(),
+                resolution: ConflictResolution::SaveAs {
+                    new_path: PathBuf::from("copy.md")
+                }
+            }),
+            SessionResult::ActionRequired {
+                code: "save-as-confirm",
+                ..
+            }
+        ));
+        assert!(matches!(
+            session.execute(SessionCommand::RestoreRecovery { path: path.clone() }),
+            SessionResult::Error { .. }
+        ));
+        assert!(matches!(
+            session.execute(SessionCommand::DiscardRecovery { path }),
+            SessionResult::Error { .. }
+        ));
+        assert!(session.recovery_tick().is_empty());
+        assert!(session.flush_recovery().is_err());
+        assert!(matches!(
+            session.wait_for_operation(u64::MAX),
+            SessionResult::Error { .. }
+        ));
+        assert!(dirty_revision > revision);
+    }
+
+    #[test]
     fn session_detects_external_save_conflict_and_supports_merge_reload_and_save_as() {
         let (session, fs, _temp) = test_session();
         let path = PathBuf::from("/test/vault/note.md");

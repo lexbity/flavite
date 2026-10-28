@@ -230,4 +230,40 @@ mod tests {
             Path::new("/test/vault/.flavite/journal/txn-001.data")
         );
     }
+
+    #[test]
+    fn terminal_state_and_pending_items_track_partial_progress() {
+        let mut manifest = JournalManifest::new("txn-status".into(), 2);
+        let item = |id, state| TransactionItem {
+            id,
+            from_path: PathBuf::from(format!("{id}-old.md")),
+            to_path: PathBuf::from(format!("{id}-new.md")),
+            phase: TransactionPhase::Apply,
+            state,
+            expected_base_hash: None,
+            expected_new_hash: None,
+            observed_base_hash: None,
+            observed_new_hash: None,
+            buffer_id: None,
+            buffer_revision: None,
+            checkpoint_seq: None,
+            operation_markers: Vec::new(),
+            error: None,
+        };
+        manifest.items = vec![
+            item(1, TransactionItemState::Committed),
+            item(2, TransactionItemState::Saved),
+            item(3, TransactionItemState::Skipped),
+            item(4, TransactionItemState::Cancelled),
+        ];
+        assert!(!manifest.is_terminal());
+        assert!(!manifest.all_items_terminal());
+        assert_eq!(manifest.pending_items().len(), 1);
+        manifest.items[0].state = TransactionItemState::Saved;
+        assert!(manifest.all_items_terminal());
+        manifest.state = TransactionState::Complete;
+        assert!(manifest.is_terminal());
+        manifest.state = TransactionState::Abandoned;
+        assert!(manifest.is_terminal());
+    }
 }
