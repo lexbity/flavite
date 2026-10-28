@@ -94,7 +94,10 @@ pub fn parse_frontmatter(snapshot: &TextSnapshot) -> Result<Option<Frontmatter>,
     // Find closing `---` or `...` on its own line.
     let mut closing_offset = None;
     let mut line_start = 0usize;
-    for line in rest.lines() {
+    // Split only on LF so byte offsets remain exact. `str::lines()` also strips
+    // a preceding CR, but standalone CR bytes are preserved by TextSnapshot and
+    // may sit immediately before an LF after CRLF normalization.
+    for line in rest.split('\n') {
         let trimmed = line.trim();
         if trimmed == "---" || trimmed == "..." {
             // Close at the start of this line (exclude the closing delimiter line)
@@ -304,6 +307,15 @@ mod tests {
                 .title
                 .is_none()
         );
+    }
+
+    #[test]
+    fn parse_frontmatter_keeps_offsets_after_standalone_cr_before_crlf() {
+        let snapshot = snap("---\nx\r\r\n\u{FEFF}\n---\nbody");
+        let frontmatter = parse_frontmatter(&snapshot)
+            .expect("frontmatter parser should not panic on mixed line endings")
+            .expect("frontmatter block is present");
+        assert!(frontmatter.yaml_text.contains('\u{FEFF}'));
     }
 
     #[test]
