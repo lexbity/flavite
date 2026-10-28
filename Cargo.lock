@@ -1165,8 +1165,10 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "crossbeam",
+ "flavite-index",
  "proptest",
  "rayon",
+ "rusqlite",
  "thiserror 2.0.21",
 ]
 

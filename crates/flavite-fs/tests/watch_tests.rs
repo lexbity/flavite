@@ -2,7 +2,6 @@
 
 use flavite_fs::watch::{FsEvent, FsWatcher, WatcherConfig};
 use std::path::Path;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -45,7 +44,7 @@ fn watcher_watch_and_start() {
     watcher.watch(&temp_dir).unwrap();
 
     // Start the watcher
-    let receiver = watcher.start();
+    let _receiver = watcher.start();
 
     // Give the watcher time to initialize
     thread::sleep(Duration::from_millis(100));
@@ -57,15 +56,9 @@ fn watcher_watch_and_start() {
     // Wait for the event to be processed
     thread::sleep(Duration::from_millis(200));
 
-    // Check for events
-    let receiver_guard = receiver.lock().unwrap();
-    let events: Vec<FsEvent> = receiver_guard.try_iter().collect();
-
     // We should have at least one event
     // Note: This test may be flaky depending on the filesystem and platform
     // The important thing is that it doesn't panic
-
-    drop(watcher);
 }
 
 #[test]
@@ -76,7 +69,7 @@ fn watcher_config_custom() {
         recursive_default: false,
     };
 
-    let mut watcher = FsWatcher::new(config).unwrap();
+    let watcher = FsWatcher::new(config).unwrap();
     drop(watcher);
 }
 
@@ -91,7 +84,7 @@ fn watcher_multiple_watches() {
     watcher.watch(&temp_dir1).unwrap();
     watcher.watch(&temp_dir2).unwrap();
 
-    let receiver = watcher.start();
+    let _receiver = watcher.start();
 
     thread::sleep(Duration::from_millis(50));
 
@@ -108,6 +101,19 @@ fn watcher_watch_same_path_twice() {
     // Watch the same path twice - should not fail
     watcher.watch(&temp_dir).unwrap();
     watcher.watch(&temp_dir).unwrap();
+
+    drop(watcher);
+}
+
+#[test]
+fn watcher_start() {
+    let config = WatcherConfig::default();
+    let mut watcher = FsWatcher::new(config).unwrap();
+
+    let temp_dir = tempdir().unwrap();
+    watcher.watch(&temp_dir).unwrap();
+
+    let _receiver = watcher.start();
 
     drop(watcher);
 }

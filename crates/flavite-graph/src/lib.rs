@@ -21,6 +21,7 @@
 //!   coordinates.
 
 pub mod delta;
+pub mod feed;
 pub mod layout;
 pub mod model;
 pub mod position;
@@ -31,6 +32,7 @@ pub mod worker;
 mod proptests;
 
 pub use delta::{Delta, EdgeDelta, EdgeKind, NodeDelta, NodeId, NodeKind};
+pub use feed::{FeedBatch, FeedError, GraphFeed, IndexCursor};
 pub use layout::{
     CONVERGENCE_STEPS, DEFAULT_THETA, Layout, LayoutParams, MAX_TREE_DEPTH, MIN_SEPARATION,
     POSITION_LIMIT, RetargetStats, Step, StepStats,

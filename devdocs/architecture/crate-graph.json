@@ -61,6 +61,10 @@
       "kind": "external"
     },
     {
+      "id": "ropey",
+      "kind": "external"
+    },
+    {
       "id": "rusqlite",
       "kind": "external"
     },
@@ -79,9 +83,33 @@
     {
       "id": "xtask",
       "kind": "workspace"
+    },
+    {
+      "id": "zstd",
+      "kind": "external"
     }
   ],
   "edges": [
+    {
+      "from": "flavite-buffer",
+      "to": "blake3",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-buffer",
+      "to": "flavite-syntax",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-buffer",
+      "to": "ropey",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-buffer",
+      "to": "zstd",
+      "kind": "normal"
+    },
     {
       "from": "flavite-fs",
       "to": "blake3",
@@ -95,6 +123,16 @@
     {
       "from": "flavite-fs",
       "to": "notify",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-graph",
+      "to": "flavite-index",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-graph",
+      "to": "rusqlite",
       "kind": "normal"
     },
     {

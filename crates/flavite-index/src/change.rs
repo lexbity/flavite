@@ -5,7 +5,7 @@
 //! - Monotonic generation numbers
 //! - Complete structural transactions with atomic generation bumps
 //! - Epoch-based cache ID allocation
-//! - Log pruning with log_floor advancement
+//! - Log pruning with `log_floor` advancement
 //!
 //! The invalidation feed is an atomic sequence of invalidations that allows
 //! consumers to catch up with the index state without re-reading the entire
@@ -19,13 +19,13 @@ use rusqlite::{Connection, Result, params};
 pub const DEFAULT_LOG_BUDGET: usize = 64 * 1024 * 1024;
 
 /// Minimum invalidation log budget (1 MiB).
-pub const MIN_LOG_BUDGET: usize = 1 * 1024 * 1024;
+pub const MIN_LOG_BUDGET: usize = 1024 * 1024;
 
 /// Invalidation feed.
 pub struct InvalidationFeed {
-    conn: Connection,
+    pub conn: Connection,
     #[allow(dead_code)]
-    budget: usize,
+    pub budget: usize,
 }
 
 impl InvalidationFeed {
@@ -46,16 +46,25 @@ impl InvalidationFeed {
     }
 
     /// Get the current log floor.
+    ///
+    /// # Errors
+    /// Returns an error if the metadata cannot be read from the database.
     pub fn log_floor(&self) -> Result<u64> {
         get_meta_u64(&self.conn, MetaKey::LogFloor).map(|v| v.unwrap_or(0))
     }
 
     /// Get the current generation.
+    ///
+    /// # Errors
+    /// Returns an error if the metadata cannot be read from the database.
     pub fn generation(&self) -> Result<u64> {
         get_meta_u64(&self.conn, MetaKey::Generation).map(|v| v.unwrap_or(0))
     }
 
     /// Get the current epoch.
+    ///
+    /// # Errors
+    /// Returns an error if the metadata cannot be read from the database.
     pub fn epoch(&self) -> Result<u64> {
         get_meta_u64(&self.conn, MetaKey::Epoch).map(|v| v.unwrap_or(1))
     }
@@ -64,13 +73,16 @@ impl InvalidationFeed {
     ///
     /// This is called during a structural transaction to record what was
     /// invalidated by the current batch of changes.
+    ///
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub fn record_invalidation(&mut self, kind: ChangeKind, entity_id: i64) -> Result<()> {
         let generation = self.generation()?;
         let tx = self.conn.transaction()?;
 
         tx.execute(
             "INSERT INTO changes (generation, kind, entity_id) VALUES (?1, ?2, ?3)",
-            params![generation as i64, kind.as_str(), entity_id],
+            params![generation.cast_signed(), kind.as_str(), entity_id],
         )?;
 
         tx.commit()?;
@@ -79,6 +91,9 @@ impl InvalidationFeed {
     }
 
     /// Record multiple invalidations in one transaction.
+    ///
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub fn record_invalidations(&mut self, invalidations: &[(ChangeKind, i64)]) -> Result<()> {
         let generation = self.generation()?;
         let tx = self.conn.transaction()?;
@@ -86,7 +101,7 @@ impl InvalidationFeed {
         for (kind, entity_id) in invalidations {
             tx.execute(
                 "INSERT INTO changes (generation, kind, entity_id) VALUES (?1, ?2, ?3)",
-                params![generation as i64, kind.as_str(), entity_id],
+                params![generation.cast_signed(), kind.as_str(), entity_id],
             )?;
         }
 
@@ -97,8 +112,11 @@ impl InvalidationFeed {
 
     /// Get all invalidations since a given cursor.
     ///
-    /// Returns a vector of change records in order, or ResetRequired if the
+    /// Returns a vector of change records in order, or `ResetRequired` if the
     /// cursor is invalid.
+    ///
+    /// # Errors
+    /// Returns an error if the database operation fails or if the cursor is stale.
     pub fn get_invalidations_since(
         &self,
         cursor: IndexVersion,
@@ -128,17 +146,19 @@ impl InvalidationFeed {
         )?;
 
         let rows = stmt.query_map(
-            params![cursor.generation as i64, current_generation as i64],
+            params![
+                cursor.generation.cast_signed(),
+                current_generation.cast_signed()
+            ],
             |row| {
                 let generation_val: i64 = row.get(0)?;
                 let kind_str: String = row.get(1)?;
                 let entity_id: i64 = row.get(2)?;
 
                 let kind = match kind_str.as_str() {
-                    "note" => ChangeKind::Note,
                     "attachment" => ChangeKind::Attachment,
                     "outgoing" => ChangeKind::Outgoing,
-                    _ => ChangeKind::Note, // default
+                    _ => ChangeKind::Note,
                 };
 
                 Ok(ChangeRecord {
@@ -160,17 +180,16 @@ impl InvalidationFeed {
     /// Prune the log and advance the floor.
     ///
     /// This removes old invalidation records that are no longer needed by any
-    /// active consumer and advances the log_floor.
+    /// active consumer and advances the `log_floor`.
+    ///
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub fn prune(&mut self, max_retention: u64) -> Result<()> {
         let current_generation = self.generation()?;
         let log_floor = self.log_floor()?;
 
         // Calculate new floor
-        let new_floor = if current_generation > max_retention {
-            current_generation - max_retention
-        } else {
-            0
-        };
+        let new_floor = current_generation.saturating_sub(max_retention);
 
         // Ensure floor doesn't go backwards
         let new_floor = new_floor.max(log_floor);
@@ -180,7 +199,7 @@ impl InvalidationFeed {
         // Delete old records
         tx.execute(
             "DELETE FROM changes WHERE generation < ?",
-            [new_floor as i64],
+            [new_floor.cast_signed()],
         )?;
 
         // Update log floor
@@ -194,6 +213,9 @@ impl InvalidationFeed {
     /// Advance to a new epoch.
     ///
     /// This is called when the SQLite database is recreated.
+    ///
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub fn new_epoch(&mut self) -> Result<u64> {
         let new_epoch = self.epoch()? + 1;
         let tx = self.conn.transaction()?;
@@ -219,6 +241,9 @@ impl InvalidationFeed {
     /// 4. Writes all invalidations
     ///
     /// This must be done in a single SQLite transaction.
+    ///
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub fn apply_batch(&mut self, invalidations: &[(ChangeKind, i64)]) -> Result<u64> {
         // Bump generation
         let new_gen = self.generation()? + 1;
@@ -229,7 +254,7 @@ impl InvalidationFeed {
         for (kind, entity_id) in invalidations {
             tx.execute(
                 "INSERT INTO changes (generation, kind, entity_id) VALUES (?1, ?2, ?3)",
-                params![new_gen as i64, kind.as_str(), entity_id],
+                params![new_gen.cast_signed(), kind.as_str(), entity_id],
             )?;
         }
 
@@ -239,6 +264,9 @@ impl InvalidationFeed {
     }
 
     /// Check if the log needs pruning.
+    ///
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub fn needs_prune(&self, max_size: usize) -> Result<bool> {
         // Count total log size
         let count: i64 = self
@@ -246,12 +274,15 @@ impl InvalidationFeed {
             .query_row("SELECT COUNT(*) FROM changes", [], |row| row.get(0))?;
 
         // Estimate size per record (conservative: 32 bytes per record)
-        let estimated_size = count as usize * 32;
+        let estimated_size = count.cast_unsigned() * 32;
 
-        Ok(estimated_size > max_size)
+        Ok(estimated_size > max_size as u64)
     }
 
     /// Get a cursor for the current state.
+    ///
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub fn current_cursor(&self) -> Result<IndexVersion> {
         Ok(IndexVersion {
             epoch: self.epoch()?,
@@ -261,6 +292,7 @@ impl InvalidationFeed {
 }
 
 /// Change batch for atomic application.
+#[derive(Default)]
 pub struct ChangeBatch {
     /// Added notes.
     pub added_notes: Vec<(i64, String, Vec<u8>, String)>,
@@ -279,18 +311,13 @@ pub struct ChangeBatch {
 }
 
 impl ChangeBatch {
+    /// Create a new, empty change batch.
+    #[must_use]
     pub fn new() -> Self {
-        Self {
-            added_notes: Vec::new(),
-            changed_notes: Vec::new(),
-            deleted_notes: Vec::new(),
-            added_atts: Vec::new(),
-            changed_atts: Vec::new(),
-            deleted_atts: Vec::new(),
-            invalidations: Vec::new(),
-        }
+        Self::default()
     }
 
+    /// Add a note to the batch.
     pub fn add_note(
         &mut self,
         note_id: i64,
@@ -302,6 +329,7 @@ impl ChangeBatch {
             .push((note_id, stem_key, path_native, path_key));
     }
 
+    /// Change a note in the batch.
     pub fn change_note(
         &mut self,
         note_id: i64,
@@ -313,10 +341,12 @@ impl ChangeBatch {
             .push((note_id, stem_key, path_native, path_key));
     }
 
+    /// Delete a note from the batch.
     pub fn delete_note(&mut self, note_id: i64) {
         self.deleted_notes.push(note_id);
     }
 
+    /// Add an invalidation to the batch.
     pub fn add_invalidation(&mut self, kind: ChangeKind, entity_id: i64) {
         self.invalidations.push((kind, entity_id));
     }
@@ -438,8 +468,8 @@ mod tests {
 
         // Add invalidations across multiple generations using apply_batch
         // This creates invalidations at generation 1, 2, ..., 100
-        for i in 0..100 {
-            let invalidations = vec![(ChangeKind::Note, i as i64)];
+        for i in 0i32..100 {
+            let invalidations = vec![(ChangeKind::Note, i64::from(i))];
             feed.apply_batch(&invalidations).unwrap();
         }
 

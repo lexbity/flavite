@@ -37,20 +37,25 @@ flavite-ui = "iced application (§4.1)"
 # (`cargo xtask arch gen`) in the same PR — an architecture change is a
 # spec change.
 #
-# Current state (B2): flavite-fs has no internal deps. xtask depends on
+# Current state (B5): flavite-fs has no internal deps. xtask depends on
 # workspace crates but is tooling (not gated). All other crates are empty
 # skeletons with no internal edges yet, except:
 #
 #   flavite-ui → flavite-graph   (PLAN-B slice B2)
 #   flavite-index → flavite-syntax (C7 - index uses syntax for attachment extensions)
+#   flavite-graph → flavite-index (B5 - graph feed polls index.generation)
+#   flavite-buffer → flavite-syntax (PLAN-A - text snapshot/coordinate types)
 #
 # `flavite-ui::graph` consumes `flavite_graph::GraphSnapshot` as the
 # CPU-authoritative model behind an `Arc` (D15); `flavite-graph` stays
 # cpu-only, so the edge points one way only and `cargo xtask arch check`'s
-# layering rule still holds.
+# layering rule still holds. The graph → index edge is for the GraphFeed
+# which polls the index's generation and consumes the invalidation feed (§4.14).
 active = [
     { from = "flavite-ui", to = "flavite-graph" },
     { from = "flavite-index", to = "flavite-syntax" },
+    { from = "flavite-graph", to = "flavite-index" },
+    { from = "flavite-buffer", to = "flavite-syntax" },
 ]
 
 [layering]
