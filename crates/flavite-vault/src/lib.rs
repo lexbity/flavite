@@ -51,8 +51,12 @@ pub use merge::{MergeConflict, MergeResult, three_way_merge};
 pub use open::{OpenVaultError, OpenVaultResult, Vault, vault_exists};
 pub use reconcile::{ReconcileConfig, ReconcileContext, ReconcileResult, verify_content_full};
 pub use rename::{
-    RenameBufferPatcher, RenamePlan, RenamePlanItem, RenamePlanResult, RenamePlanner, RenameUndo,
-    RenameUndoResult, RenameValidationError,
+    AttachmentRename, AttachmentRenameConfig, AttachmentRenameManager, AttachmentRenameResult,
+    DuplicateIdInfo, DuplicateIdManager, DuplicateIdResolution, EmbedCountProvider, InboundLinkProvider,
+    RenameBufferPatcher, RenameCandidate, RenameInference, RenameInferenceConfig,
+    RenameInferenceResult, RenamePlan, RenamePlanItem, RenamePlanResult, RenamePlanner,
+    RenameUndo, RenameUndoResult, RenameValidationError, can_use_t2_identity, should_auto_rewrite_links,
+    should_carry_identity, should_rewrite_embeds,
 };
 pub use save::{
     DiskPrecondition, DurabilityOutcome, SaveFailure, SaveFailureStage, SaveReceipt, SaveRequest,

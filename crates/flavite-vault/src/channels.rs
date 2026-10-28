@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// A tier for rename inference (D8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub enum RenameTier {
     /// In-app rename command.
     T0,
@@ -30,6 +30,7 @@ pub enum RenameTier {
     /// Same content hash, size ≥ 64 B, exactly one candidate on each side.
     T3,
     /// Fuzzy similarity ≥ 0.9, exactly one candidate.
+    #[default]
     T4,
 }
 
