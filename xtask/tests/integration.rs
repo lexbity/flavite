@@ -136,9 +136,23 @@ fn arch_check_fails_on_layering_violation() {
     // AC-28: adding iced to a core-tier crate must fail the layering check.
     let tmp = fixture_workspace();
     // Add iced to alpha (a core-tier crate in the fixture).
+    // Resolve a local package with the real external crate name so this test
+    // stays deterministic and works in network-isolated builds.
+    let iced_dir = tmp.join("external/iced");
+    fs::create_dir_all(&iced_dir).unwrap();
+    fs::write(
+        iced_dir.join("Cargo.toml"),
+        "[package]\nname = \"iced\"\nversion = \"0.14.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(iced_dir.join("src")).unwrap();
+    fs::write(iced_dir.join("src/lib.rs"), "#![no_std]\n").unwrap();
     let alpha_manifest = tmp.join("crates/alpha/Cargo.toml");
     let content = fs::read_to_string(&alpha_manifest).unwrap();
-    let content = content.replace("[dependencies]", "[dependencies]\niced = \"0.14\"");
+    let content = content.replace(
+        "[dependencies]",
+        "[dependencies]\niced = { version = \"0.14\", path = \"../../external/iced\" }",
+    );
     fs::write(&alpha_manifest, content).unwrap();
 
     xtask::arch::generate(&tmp).expect("arch gen failed");

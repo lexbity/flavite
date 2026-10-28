@@ -369,10 +369,10 @@ fn get_ipc_path(uuid: Uuid) -> InstanceResult<PathBuf> {
 /// Check if an instance is already running for a vault.
 pub fn is_instance_running(identity: &VaultIdentity) -> bool {
     // Check UUID lock
-    if let Some(path) = uuid_lock_path(identity.uuid) {
-        if AdvisoryLock::exists(&path) {
-            return true;
-        }
+    if let Some(path) = uuid_lock_path(identity.uuid)
+        && AdvisoryLock::exists(&path)
+    {
+        return true;
     }
 
     // Check root guard

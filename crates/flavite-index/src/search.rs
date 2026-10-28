@@ -26,30 +26,54 @@ pub const DEFAULT_COMMIT_INTERVAL_SECS: u64 = 5;
 /// without changing the rest of the index.
 pub trait SearchBackend: Send + Sync {
     /// Apply a document to the index (add or update).
+    ///
+    /// # Errors
+    /// Returns an error if the document cannot be applied.
     fn apply_document(&self, note_id: i64, title: &str, body: &str) -> Result<(), SearchError>;
 
     /// Delete a document from the index.
+    ///
+    /// # Errors
+    /// Returns an error if the document cannot be deleted.
     fn delete_document(&self, note_id: i64) -> Result<(), SearchError>;
 
     /// Commit pending changes to the search index.
+    ///
+    /// # Errors
+    /// Returns an error if the commit or checkpoint publication fails.
     fn commit(&self) -> Result<(), SearchError>;
 
     /// Get the current committed generation.
     fn committed_generation(&self) -> u64;
 
     /// Set the committed generation.
+    ///
+    /// # Errors
+    /// Returns an error if the generation cannot be persisted.
     fn set_committed_generation(&self, generation: u64) -> Result<(), SearchError>;
 
     /// Get the checkpoint metadata (epoch, generation, payload).
+    ///
+    /// # Errors
+    /// Returns an error if checkpoint metadata cannot be read.
     fn checkpoint(&self) -> Result<SearchCheckpoint, SearchError>;
 
     /// Load the checkpoint from durable storage.
+    ///
+    /// # Errors
+    /// Returns an error if the checkpoint cannot be read or validated.
     fn load_checkpoint(&mut self) -> Result<SearchCheckpoint, SearchError>;
 
     /// Publish a new checkpoint atomically.
+    ///
+    /// # Errors
+    /// Returns an error if checkpoint publication fails.
     fn publish_checkpoint(&self, epoch: u64, generation: u64) -> Result<(), SearchError>;
 
     /// Search using a query with optional note ID filter.
+    ///
+    /// # Errors
+    /// Returns an error if the search view cannot be committed or queried.
     fn search(
         &self,
         query: &QueryAst,
@@ -58,6 +82,9 @@ pub trait SearchBackend: Send + Sync {
     ) -> Result<Vec<i64>, SearchError>;
 
     /// Get a searcher for reading the index.
+    ///
+    /// # Errors
+    /// Returns an error if a read handle cannot be created.
     fn searcher(&self) -> Result<Box<dyn SearcherTrait>, SearchError>;
 }
 
@@ -72,6 +99,10 @@ pub struct SearchCheckpoint {
 
 /// Trait for searcher to allow mocking.
 pub trait SearcherTrait: Send + Sync {
+    /// Search a stable reader snapshot.
+    ///
+    /// # Errors
+    /// Returns an error if the snapshot cannot execute the query.
     fn search(
         &self,
         query: &QueryAst,
@@ -111,6 +142,10 @@ pub struct StubSearchBackend {
 }
 
 impl StubSearchBackend {
+    /// Create a test backend using the SQLite metadata connection.
+    ///
+    /// # Errors
+    /// Returns an error if the stored generation cannot be read.
     pub fn new(conn: Connection, cache_dir: &Path) -> Result<Self, SearchError> {
         let committed_gen = get_meta_u64(&conn, MetaKey::TantivyCommittedGeneration)?.unwrap_or(0);
 
@@ -125,7 +160,7 @@ impl StubSearchBackend {
     fn checkpoint_path(&self, epoch: u64, generation: u64) -> PathBuf {
         self.cache_dir
             .join("checkpoints")
-            .join(format!("checkpoint-{}-{}", epoch, generation))
+            .join(format!("checkpoint-{epoch}-{generation}"))
     }
 }
 
@@ -231,7 +266,7 @@ impl SearchBackend for StubSearchBackend {
         let checkpoint_dir = self.cache_dir.join("checkpoints");
         fs::create_dir_all(&checkpoint_dir)?;
 
-        let temp_path = checkpoint_dir.join(format!(".checkpoint-{}-{}.tmp", epoch, generation));
+        let temp_path = checkpoint_dir.join(format!(".checkpoint-{epoch}-{generation}.tmp"));
         let final_path = self.checkpoint_path(epoch, generation);
 
         let mut file = File::create(&temp_path)?;
@@ -290,11 +325,15 @@ pub struct CommitManager {
 }
 
 impl CommitManager {
+    /// Create a deferred-commit manager.
     pub fn new(backend: Arc<Mutex<Box<dyn SearchBackend>>>, conn: Connection) -> Self {
         Self { backend, conn }
     }
 
     /// Commit if there are pending changes.
+    ///
+    /// # Errors
+    /// Returns an error if the backend lock, generation query, or commit fails.
     pub fn commit_if_dirty(&self) -> Result<(), SearchError> {
         let backend = self
             .backend
@@ -311,6 +350,9 @@ impl CommitManager {
     }
 
     /// Ensure commit-before-search: commit if there are pending changes.
+    ///
+    /// # Errors
+    /// Returns an error if pending changes cannot be committed.
     pub fn ensure_committed(&self) -> Result<(), SearchError> {
         self.commit_if_dirty()
     }

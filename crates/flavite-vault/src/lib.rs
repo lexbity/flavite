@@ -9,10 +9,13 @@
 pub mod actor;
 pub mod channels;
 pub mod coalesce;
+pub mod history;
 pub mod identity;
 pub mod instance;
+pub mod merge;
 pub mod open;
 pub mod reconcile;
+pub mod save;
 pub mod session;
 pub mod tokens;
 pub mod types;
@@ -27,6 +30,7 @@ pub use channels::{
 pub use coalesce::{
     CoalescerConfig, CoalescerEvent, EventBatch, EventCoalescer, VaultWatcher, WatcherEvent,
 };
+pub use history::{HistoryError, HistoryReason, HistoryStore, SnapshotRef};
 pub use identity::{
     IdentityError, IdentityManager, IdentityResult, RegistryEntry, compute_root_key,
     ensure_flavite_dir,
@@ -34,8 +38,13 @@ pub use identity::{
 pub use instance::{
     AdvisoryLock, FocusIpc, InstanceError, InstanceManager, InstanceResult, is_instance_running,
 };
+pub use merge::{MergeConflict, MergeResult, three_way_merge};
 pub use open::{OpenVaultError, OpenVaultResult, Vault, vault_exists};
 pub use reconcile::{ReconcileConfig, ReconcileContext, ReconcileResult, verify_content_full};
+pub use save::{
+    DiskPrecondition, DurabilityOutcome, SaveFailure, SaveFailureStage, SaveReceipt, SaveRequest,
+    save,
+};
 pub use session::{
     CommandResult, ConflictResolution, Session, SessionBuilder, SessionCommand, SessionError,
     SessionEvent, SessionResult,

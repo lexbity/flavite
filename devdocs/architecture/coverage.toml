@@ -14,13 +14,12 @@ tier3 = 0.0
 # and is inactive for floors; the first executable implementation
 # activates its floor in the same slice (§10.5).
 flavite-fs = "tier1"
+flavite-syntax = "tier1"
+flavite-buffer = "tier1"
+flavite-vault = "tier1"
+flavite-index = "tier1"
+flavite-api = "tier2"
 flavite-graph = "tier2"
-# Stub crates (doc-only lib.rs, no executable code yet) - moved to tier3
-flavite-syntax = "tier3"
-flavite-buffer = "tier3"
-flavite-vault = "tier3"
-flavite-index = "tier3"
-flavite-api = "tier3"
 flavite-cli = "tier3"
 flavite-editor = "tier3"
 flavite-ui = "tier3"

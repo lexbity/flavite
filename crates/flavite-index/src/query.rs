@@ -49,11 +49,15 @@ impl Query {
     /// Execute this query against the SQLite index.
     ///
     /// Returns a page of note IDs matching the query, along with the index version.
+    ///
+    /// # Errors
+    /// Returns an index error if SQLite fails, the cursor is stale, or its
+    /// values cannot be represented by SQLite's integer types.
     pub fn execute(
         &self,
         conn: &Connection,
         page_size: usize,
-        cursor: Option<Cursor>,
+        cursor: Option<&Cursor>,
     ) -> Result<Page<NoteRef>, IndexError> {
         let epoch = get_meta_u64(conn, MetaKey::Epoch)?.unwrap_or(1);
         let generation = get_meta_u64(conn, MetaKey::Generation)?.unwrap_or(0);
@@ -78,24 +82,30 @@ impl Query {
         let (where_clause, base_params) = self.to_sql();
 
         // Build the full query with cursor support
-        let mut final_sql = format!(
-            "SELECT note_id, path_native FROM notes WHERE {}",
-            where_clause
-        );
+        let mut final_sql = format!("SELECT note_id, path_native FROM notes WHERE {where_clause}");
         let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = base_params;
 
         if let Some(cursor) = &cursor {
             final_sql.push_str(" AND (note_id > ? OR (note_id = ? AND generation > ?))");
             all_params.push(Box::new(cursor.note_id.unwrap_or(0)));
             all_params.push(Box::new(cursor.note_id.unwrap_or(0)));
-            all_params.push(Box::new(cursor.generation as i64));
+            all_params.push(Box::new(i64::try_from(cursor.generation).map_err(
+                |_| {
+                    IndexError::InvalidQuery(
+                        "cursor generation exceeds SQLite integer range".into(),
+                    )
+                },
+            )?));
         }
 
         final_sql.push_str(" ORDER BY note_id ASC, generation ASC LIMIT ?");
-        all_params.push(Box::new(page_size as i64));
+        all_params.push(Box::new(i64::try_from(page_size).map_err(|_| {
+            IndexError::InvalidQuery("page size exceeds SQLite integer range".into())
+        })?));
 
         // Create a parameter list for the query
-        let param_refs: Vec<&dyn rusqlite::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            all_params.iter().map(std::convert::AsRef::as_ref).collect();
 
         let mut stmt = conn.prepare(&final_sql)?;
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
@@ -127,7 +137,8 @@ impl Query {
     }
 
     /// Convert the query to SQL fragments.
-    /// Returns (WHERE_clause, params) where WHERE_clause is the condition without the WHERE keyword
+    /// Returns (`WHERE_clause`, params) where `WHERE_clause` is the condition without the WHERE keyword
+    #[allow(clippy::too_many_lines)] // Each AST variant has one explicit, parameterized SQL mapping.
     fn to_sql(&self) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
         match self {
             Self::Tag { name, hierarchical } => {
@@ -135,13 +146,14 @@ impl Query {
                     // For hierarchical: `a/b` matches `a/b` and `a/b/c`
                     // Use range scan: [ 'a/', 'a0' )
                     let prefix = if name.ends_with('/') {
-                        name.to_string()
+                        name.clone()
                     } else {
-                        format!("{}/", name)
+                        format!("{name}/")
                     };
                     let next_prefix = next_hierarchical_key(name);
                     (
-                        format!("note_id IN (SELECT note_id FROM tags WHERE tag >= ? AND tag < ?)",),
+                        "note_id IN (SELECT note_id FROM tags WHERE tag >= ? AND tag < ?)"
+                            .to_string(),
                         vec![
                             Box::new(prefix) as Box<dyn rusqlite::ToSql>,
                             Box::new(next_prefix) as Box<dyn rusqlite::ToSql>,
@@ -176,11 +188,9 @@ impl Query {
                     (CmpOp::Lte, PropertyValue::Number(n)) => ("<=", Some(n.to_string())),
                     (CmpOp::Gt, PropertyValue::Number(n)) => (">", Some(n.to_string())),
                     (CmpOp::Gte, PropertyValue::Number(n)) => (">=", Some(n.to_string())),
-                    (CmpOp::Contains, PropertyValue::Text(t)) => ("LIKE", Some(format!("%{}%", t))),
-                    (CmpOp::StartsWith, PropertyValue::Text(t)) => {
-                        ("LIKE", Some(format!("{}%", t)))
-                    }
-                    (CmpOp::EndsWith, PropertyValue::Text(t)) => ("LIKE", Some(format!("%{}", t))),
+                    (CmpOp::Contains, PropertyValue::Text(t)) => ("LIKE", Some(format!("%{t}%"))),
+                    (CmpOp::StartsWith, PropertyValue::Text(t)) => ("LIKE", Some(format!("{t}%"))),
+                    (CmpOp::EndsWith, PropertyValue::Text(t)) => ("LIKE", Some(format!("%{t}"))),
                     _ => ("=", Some("NULL".to_string())), // fallback
                 };
 
@@ -209,37 +219,34 @@ impl Query {
                 };
 
                 // Handle NULL cases differently
-                if val_param.is_none() {
-                    (
+                match val_param {
+                    None => (
                         format!(
-                            "note_id IN (SELECT note_id FROM properties WHERE key = ? AND vtype = ? AND v_text {})",
-                            op_sql
+                            "note_id IN (SELECT note_id FROM properties WHERE key = ? AND vtype = ? AND v_text {op_sql})"
                         ),
                         vec![
                             Box::new(key.clone()) as Box<dyn rusqlite::ToSql>,
                             Box::new("text".to_string()) as Box<dyn rusqlite::ToSql>,
                         ],
-                    )
-                } else {
-                    (
+                    ),
+                    Some(value) => (
                         format!(
-                            "note_id IN (SELECT note_id FROM properties WHERE key = ? AND vtype = ? AND v_text {} ?)",
-                            op_sql
+                            "note_id IN (SELECT note_id FROM properties WHERE key = ? AND vtype = ? AND v_text {op_sql} ?)"
                         ),
                         vec![
                             Box::new(key.clone()) as Box<dyn rusqlite::ToSql>,
                             Box::new("text".to_string()) as Box<dyn rusqlite::ToSql>,
-                            Box::new(val_param.unwrap()) as Box<dyn rusqlite::ToSql>,
+                            Box::new(value) as Box<dyn rusqlite::ToSql>,
                         ],
-                    )
+                    ),
                 }
             }
             Self::LinksTo(note_ref) => (
-                format!("note_id IN (SELECT dst_note FROM links WHERE dst_note = ?)",),
+                "note_id IN (SELECT dst_note FROM links WHERE dst_note = ?)".to_string(),
                 vec![Box::new(note_ref.note_id) as Box<dyn rusqlite::ToSql>],
             ),
             Self::LinkedFrom(note_ref) => (
-                format!("note_id IN (SELECT src FROM links WHERE src = ?)",),
+                "note_id IN (SELECT src FROM links WHERE src = ?)".to_string(),
                 vec![Box::new(note_ref.note_id) as Box<dyn rusqlite::ToSql>],
             ),
             Self::Unresolved => (
@@ -257,12 +264,12 @@ impl Query {
                 let mut params = Vec::new();
 
                 if let Some(k) = kind {
-                    conditions.push(format!("kind = ?"));
+                    conditions.push("kind = ?".to_string());
                     params.push(Box::new(k.as_str().to_string()) as Box<dyn rusqlite::ToSql>);
                 }
 
                 if let Some(n) = name {
-                    conditions.push(format!("stem_key = ?"));
+                    conditions.push("stem_key = ?".to_string());
                     params.push(Box::new(n.clone()) as Box<dyn rusqlite::ToSql>);
                 }
 
@@ -274,8 +281,7 @@ impl Query {
 
                 (
                     format!(
-                        "note_id IN (SELECT note_id FROM links WHERE dst_att IN (SELECT att_id FROM attachments WHERE {}))",
-                        where_clause
+                        "note_id IN (SELECT note_id FROM links WHERE dst_att IN (SELECT att_id FROM attachments WHERE {where_clause}))"
                     ),
                     params,
                 )
@@ -286,7 +292,7 @@ impl Query {
 
                 for query in queries {
                     let (sql, p) = query.to_sql();
-                    conditions.push(format!("({})", sql));
+                    conditions.push(format!("({sql})"));
                     params.extend(p);
                 }
 
@@ -298,7 +304,7 @@ impl Query {
 
                 for query in queries {
                     let (sql, p) = query.to_sql();
-                    conditions.push(format!("({})", sql));
+                    conditions.push(format!("({sql})"));
                     params.extend(p);
                 }
 
@@ -306,7 +312,7 @@ impl Query {
             }
             Self::Not(query) => {
                 let (sql, params) = query.to_sql();
-                (format!("NOT ({})", sql), params)
+                (format!("NOT ({sql})"), params)
             }
         }
     }
@@ -327,7 +333,7 @@ fn next_hierarchical_key(key: &str) -> String {
     if let Some(pos) = key.rfind('/') {
         format!("{}/{}0", &key[..pos], &key[pos + 1..])
     } else {
-        format!("{}0", key)
+        format!("{key}0")
     }
 }
 
@@ -336,28 +342,28 @@ impl fmt::Display for Query {
         match self {
             Self::Tag { name, hierarchical } => {
                 if *hierarchical {
-                    write!(f, "tag:{}/...", name)
+                    write!(f, "tag:{name}/...")
                 } else {
-                    write!(f, "tag:{}", name)
+                    write!(f, "tag:{name}")
                 }
             }
             Self::Prop { key, op, value } => {
-                write!(f, "{}:{:?}{:?}", key, op, value)
+                write!(f, "{key}:{op:?}{value:?}")
             }
             Self::LinksTo(note_ref) => {
-                write!(f, "links-to:{}", note_ref)
+                write!(f, "links-to:{note_ref}")
             }
             Self::LinkedFrom(note_ref) => {
-                write!(f, "linked-from:{}", note_ref)
+                write!(f, "linked-from:{note_ref}")
             }
             Self::Unresolved => {
                 write!(f, "unresolved")
             }
             Self::Text(query) => {
-                write!(f, "text:\"{}\"", query)
+                write!(f, "text:\"{query}\"")
             }
             Self::Attachment { kind, name } => {
-                write!(f, "attachment:{:?}/{:?}", kind, name)
+                write!(f, "attachment:{kind:?}/{name:?}")
             }
             Self::And(queries) => {
                 write!(f, "AND(")?;
@@ -365,7 +371,7 @@ impl fmt::Display for Query {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", q)?;
+                    write!(f, "{q}")?;
                 }
                 write!(f, ")")
             }
@@ -375,12 +381,12 @@ impl fmt::Display for Query {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", q)?;
+                    write!(f, "{q}")?;
                 }
                 write!(f, ")")
             }
             Self::Not(query) => {
-                write!(f, "NOT({})", query)
+                write!(f, "NOT({query})")
             }
         }
     }
@@ -395,10 +401,12 @@ pub struct QueryBuilder {
 }
 
 impl QueryBuilder {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[must_use]
     pub fn tag(mut self, name: &str) -> Self {
         self.conditions.push(Query::Tag {
             name: name.to_string(),
@@ -407,6 +415,7 @@ impl QueryBuilder {
         self
     }
 
+    #[must_use]
     pub fn tag_hierarchical(mut self, name: &str) -> Self {
         self.conditions.push(Query::Tag {
             name: name.to_string(),
@@ -415,6 +424,7 @@ impl QueryBuilder {
         self
     }
 
+    #[must_use]
     pub fn prop(mut self, key: &str, op: CmpOp, value: PropertyValue) -> Self {
         self.conditions.push(Query::Prop {
             key: key.to_string(),
@@ -424,26 +434,31 @@ impl QueryBuilder {
         self
     }
 
+    #[must_use]
     pub fn links_to(mut self, note_ref: NoteRef) -> Self {
         self.conditions.push(Query::LinksTo(note_ref));
         self
     }
 
+    #[must_use]
     pub fn linked_from(mut self, note_ref: NoteRef) -> Self {
         self.conditions.push(Query::LinkedFrom(note_ref));
         self
     }
 
+    #[must_use]
     pub fn unresolved(mut self) -> Self {
         self.conditions.push(Query::Unresolved);
         self
     }
 
+    #[must_use]
     pub fn text(mut self, query: &str) -> Self {
         self.conditions.push(Query::Text(query.to_string()));
         self
     }
 
+    #[must_use]
     pub fn attachment(
         mut self,
         kind: Option<crate::schema::AttachmentKind>,
@@ -451,11 +466,12 @@ impl QueryBuilder {
     ) -> Self {
         self.conditions.push(Query::Attachment {
             kind,
-            name: name.map(|s| s.to_string()),
+            name: name.map(std::string::ToString::to_string),
         });
         self
     }
 
+    #[must_use]
     pub fn and(mut self) -> Self {
         let mut new = Self::new();
         let current_and = std::mem::take(&mut self.conditions);
@@ -465,22 +481,29 @@ impl QueryBuilder {
         new
     }
 
+    #[must_use]
     pub fn or(mut self, query: Query) -> Self {
         let last = self.conditions.pop().unwrap_or(Query::Unresolved);
         self.conditions.push(Query::Or(vec![last, query]));
         self
     }
 
+    #[must_use]
     pub fn not(mut self, query: Query) -> Self {
         self.conditions.push(Query::Not(Box::new(query)));
         self
     }
 
+    /// Build the query represented by this builder.
+    #[must_use]
     pub fn build(self) -> Query {
         if self.conditions.is_empty() {
             Query::Unresolved
         } else if self.conditions.len() == 1 {
-            self.conditions.into_iter().next().unwrap()
+            self.conditions
+                .into_iter()
+                .next()
+                .unwrap_or(Query::Unresolved)
         } else {
             Query::And(self.conditions)
         }
@@ -499,7 +522,7 @@ mod tests {
             name: "rust".to_string(),
             hierarchical: false,
         };
-        assert_eq!(format!("{}", query), "tag:rust");
+        assert_eq!(format!("{query}"), "tag:rust");
 
         let query = Query::And(vec![
             Query::Tag {
@@ -513,7 +536,7 @@ mod tests {
             },
         ]);
         assert_eq!(
-            format!("{}", query),
+            format!("{query}"),
             "AND(tag:rust, language:EqText(\"rust\"))"
         );
     }

@@ -16,17 +16,16 @@
 //!   Instance buffers are (re)uploaded only when the geometry generation
 //!   moves ([`instance::needs_upload`]); a steady-state frame is one
 //!   [`Queue::write_buffer`] of 48 bytes plus two instanced draws.
-//! - [`ProbePrimitive`] — the per-frame value handed back by
-//!   [`Program::draw`]. It borrows the geometry through an `Arc` (D15: the
+//! - [`ProbePrimitive`] — the per-frame value handed back by the shader
+//!   program's `draw` method. It borrows the geometry through an `Arc` (D15: the
 //!   render thread swaps a pointer and never waits on layout) and carries the
 //!   pan/zoom [`Camera`] for that frame.
-//! - [`ProbeProgram`] — the [`Program`] implementation: input handling and
+//! - [`ProbeProgram`] — the shader program implementation: input handling and
 //!   redraw sustainment. It never mutates its own camera; it publishes
 //!   [`ProbeMessage`]s and lets the application own the single camera
 //!   authority, which is rebuilt into the widget on every `view`.
 //!
 //! [`Queue::write_buffer`]: wgpu::Queue::write_buffer
-//! [`Program::draw`]: shader::Program::draw
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -292,13 +291,11 @@ impl ProbeState {
 
 /// Per-frame CPU cost of the widget, in nanoseconds.
 ///
-/// [`Primitive::prepare`] and [`Primitive::draw`] take `&self`, so these are
+/// The shader primitive's `prepare` and `draw` methods take `&self`, so these are
 /// the *only* mutation points available on the frame path. Atomics (not a
 /// mutex) keep the "no locks on the frame path" rule literally true — the
 /// increment itself is the whole cost.
 ///
-/// [`Primitive::prepare`]: shader::Primitive::prepare
-/// [`Primitive::draw`]: shader::Primitive::draw
 #[derive(Debug, Default)]
 pub struct ProbeTimings {
     prepare_ns: AtomicU64,
@@ -308,18 +305,14 @@ pub struct ProbeTimings {
 }
 
 impl ProbeTimings {
-    /// Record the duration of one [`Primitive::prepare`] call.
-    ///
-    /// [`Primitive::prepare`]: shader::Primitive::prepare
+    /// Record the duration of one shader primitive `prepare` call.
     pub fn record_prepare(&self, elapsed: Duration) {
         self.prepare_ns
             .fetch_add(elapsed.as_nanos() as u64, AtomicOrdering::Relaxed);
         self.prepare_calls.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
-    /// Record the duration of one [`Primitive::draw`] call.
-    ///
-    /// [`Primitive::draw`]: shader::Primitive::draw
+    /// Record the duration of one shader primitive `draw` call.
     pub fn record_draw(&self, elapsed: Duration) {
         self.draw_ns
             .fetch_add(elapsed.as_nanos() as u64, AtomicOrdering::Relaxed);

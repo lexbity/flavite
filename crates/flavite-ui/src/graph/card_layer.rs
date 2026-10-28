@@ -13,7 +13,8 @@
 //!   [`CARD_ZOOM_THRESHOLD`] (2.0× by default — D15's "zoomed in" regime).
 //! - **Card cap**: at most 64 real widgets (D15).
 //! - **Text re-layout**: text is re-laid-out at the scaled font size,
-//!   quantized to [`SCALE_STEP_BASE`] increments, cached per step.
+//!   quantized to `super::zoomable::SCALE_STEP_BASE` increments, cached per
+//!   step.
 //! - **Edit sink**: card edits (checkbox toggles) route through
 //!   [`CardEditSink`] → Session commands. For the B4 prototype this is a
 //!   trait with a working in-memory implementation; B7 replaces it with
@@ -188,10 +189,10 @@ pub fn cards_from_snapshot(
     let mut cards = Vec::new();
     let node_count = snapshot.node_count().min(positions.len());
 
-    for i in 0..node_count {
+    for (i, position) in positions.iter().take(node_count).enumerate() {
         let id = snapshot.node_ids[i];
         let kind = snapshot.node_kinds[i];
-        let position = positions[i];
+        let position = *position;
 
         let title = format!("{} #{}", node_title(kind), id.id);
         let _preview = preview_map.get(&id).cloned().unwrap_or_default();

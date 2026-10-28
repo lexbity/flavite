@@ -432,7 +432,7 @@ mod tests {
         let result = manager.apply_edit(&path, edit);
         assert!(result.is_some());
 
-        let (rev, state, _) = result.unwrap();
+        let (_rev, state, _) = result.unwrap();
         assert_eq!(state, BufferState::Dirty);
     }
 

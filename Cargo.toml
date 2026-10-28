@@ -23,19 +23,10 @@ tantivy = "0.27"
 pulldown-cmark = "0.13"
 notify = "8"
 tree-sitter = "0.27"
-# Markdown grammar for tree-sitter (D10's editor-side structure source).
-# Published as `tree-sitter-md` (the tree-sitter-grammars/tree-sitter-markdown
-# grammar); the `tree-sitter-markdown` crate name on crates.io is a stale 2021
-# release pinned to a pre-0.20 tree-sitter.
 tree-sitter-md = "0.5"
-# YAML 1.2 core-schema parser (D11: `no` must stay text — the Norway problem).
-saphyr = "0.3"
-saphyr-parser = "0.3"
 unicode-segmentation = "1"
 blake3 = "1"
 zstd = "0.14"
-nucleo = "0.5"
-image = "0.25"
 tracing = "0.1"
 crossbeam = "0.8"
 # Layout worker (PLAN-B B3, D15): rayon for the Barnes-Hut force pass,

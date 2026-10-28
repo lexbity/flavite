@@ -300,15 +300,15 @@ impl UndoTree {
         };
         if should_coalesce {
             // Coalesce with current node - update the snapshot
-            if let Some(node) = self.nodes.get_mut(current_id as usize) {
-                if let Some(current_edit) = &node.edit {
-                    let coalesced = current_edit.coalesce(&edit);
-                    node.edit = Some(coalesced);
-                    node.snapshot = Some(snapshot);
-                    node.timestamp = Instant::now();
-                    // Revision stays the same for coalesced edits
-                    return node.revision;
-                }
+            if let Some(node) = self.nodes.get_mut(current_id as usize)
+                && let Some(current_edit) = &node.edit
+            {
+                let coalesced = current_edit.coalesce(&edit);
+                node.edit = Some(coalesced);
+                node.snapshot = Some(snapshot);
+                node.timestamp = Instant::now();
+                // Revision stays the same for coalesced edits
+                return node.revision;
             }
         }
         // Get current again for creating new node
@@ -545,15 +545,13 @@ impl LinearUndoStack {
     pub fn push(&mut self, edit: EditOp, _text: &str) -> Revision {
         let now = Instant::now();
         // Check if we can coalesce
-        if let Some(last_time) = self.last_edit_time {
-            if now.duration_since(last_time) < self.coalesce_window {
-                if let Some(last_edit) = self.undo_stack.back_mut() {
-                    if last_edit.can_coalesce(&edit) {
-                        *last_edit = last_edit.coalesce(&edit);
-                        return self.current_revision;
-                    }
-                }
-            }
+        if let Some(last_time) = self.last_edit_time
+            && now.duration_since(last_time) < self.coalesce_window
+            && let Some(last_edit) = self.undo_stack.back_mut()
+            && last_edit.can_coalesce(&edit)
+        {
+            *last_edit = last_edit.coalesce(&edit);
+            return self.current_revision;
         }
         // Push as new edit
         self.undo_stack.push_back(edit);

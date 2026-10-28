@@ -106,8 +106,18 @@
       "kind": "normal"
     },
     {
-      "from": "flavite-buffer",
-      "to": "zstd",
+      "from": "flavite-cli",
+      "to": "flavite-fs",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-cli",
+      "to": "flavite-vault",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-cli",
+      "to": "tracing",
       "kind": "normal"
     },
     {
@@ -147,17 +157,12 @@
     },
     {
       "from": "flavite-index",
+      "to": "pulldown-cmark",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-index",
       "to": "rusqlite",
-      "kind": "normal"
-    },
-    {
-      "from": "flavite-index",
-      "to": "tantivy",
-      "kind": "normal"
-    },
-    {
-      "from": "flavite-index",
-      "to": "tracing",
       "kind": "normal"
     },
     {
@@ -178,6 +183,46 @@
     {
       "from": "flavite-ui",
       "to": "iced",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-vault",
+      "to": "blake3",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-vault",
+      "to": "flavite-buffer",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-vault",
+      "to": "flavite-fs",
+      "kind": "dev"
+    },
+    {
+      "from": "flavite-vault",
+      "to": "flavite-fs",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-vault",
+      "to": "flavite-index",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-vault",
+      "to": "flavite-syntax",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-vault",
+      "to": "tracing",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-vault",
+      "to": "zstd",
       "kind": "normal"
     },
     {

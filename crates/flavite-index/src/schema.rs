@@ -30,6 +30,7 @@ pub struct SchemaVersion {
 }
 
 impl SchemaVersion {
+    #[must_use]
     pub const fn new(major: u32, minor: u32) -> Self {
         Self { major, minor }
     }
@@ -55,6 +56,7 @@ pub enum MetaKey {
 }
 
 impl MetaKey {
+    #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::SchemaVersion => "schema_version",
@@ -81,6 +83,7 @@ pub enum AttachmentKind {
 }
 
 impl AttachmentKind {
+    #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Image => "image",
@@ -92,7 +95,8 @@ impl AttachmentKind {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    #[must_use]
+    pub fn parse_kind(s: &str) -> Option<Self> {
         match s {
             "image" => Some(Self::Image),
             "pdf" => Some(Self::Pdf),
@@ -114,6 +118,7 @@ pub enum ResState {
 }
 
 impl ResState {
+    #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Resolved => "resolved",
@@ -135,6 +140,7 @@ pub enum ValueType {
 }
 
 impl ValueType {
+    #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Text => "text",
@@ -150,11 +156,15 @@ impl ValueType {
 /// Create the complete schema in a new SQLite database.
 ///
 /// This initializes:
-/// - PRAGMA journal_mode=WAL
-/// - PRAGMA foreign_keys=ON
+/// - PRAGMA `journal_mode=WAL`
+/// - PRAGMA `foreign_keys=ON`
 /// - All tables from §4.3
 /// - All indexes from §4.3
 /// - Initial meta values
+///
+/// # Errors
+/// Returns a SQLite error if any schema statement, PRAGMA, or transaction fails.
+#[allow(clippy::too_many_lines)] // Keeping the schema in one transaction preserves its definition and atomicity.
 pub fn create_schema(conn: &mut Connection) -> Result<()> {
     // PRAGMAs - must be set before creating tables and before starting transaction
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -367,6 +377,9 @@ pub fn create_schema(conn: &mut Connection) -> Result<()> {
 }
 
 /// Open or initialize a database at the given path.
+///
+/// # Errors
+/// Returns a SQLite error if the database cannot be opened or initialized.
 pub fn open_or_init(path: &Path) -> Result<Connection> {
     let mut conn = Connection::open_with_flags(
         path,
@@ -399,6 +412,9 @@ pub fn open_or_init(path: &Path) -> Result<Connection> {
 }
 
 /// Get a meta value as a string.
+///
+/// # Errors
+/// Returns a SQLite error if the metadata query fails.
 pub fn get_meta(conn: &Connection, key: MetaKey) -> Result<Option<String>> {
     conn.query_row(
         "SELECT value FROM meta WHERE key = ?1",
@@ -416,16 +432,25 @@ pub fn get_meta(conn: &Connection, key: MetaKey) -> Result<Option<String>> {
 }
 
 /// Get a meta value as a u64.
+///
+/// # Errors
+/// Returns a SQLite error if the metadata query fails.
 pub fn get_meta_u64(conn: &Connection, key: MetaKey) -> Result<Option<u64>> {
     get_meta(conn, key).map(|v| v.map(|s| s.parse().unwrap_or(0)))
 }
 
 /// Get a meta value as a u32.
+///
+/// # Errors
+/// Returns a SQLite error if the metadata query fails.
 pub fn get_meta_u32(conn: &Connection, key: MetaKey) -> Result<Option<u32>> {
     get_meta(conn, key).map(|v| v.map(|s| s.parse().unwrap_or(0)))
 }
 
 /// Set a meta value.
+///
+/// # Errors
+/// Returns a SQLite error if the metadata row cannot be written.
 pub fn set_meta(conn: &Connection, key: MetaKey, value: &str) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
@@ -435,6 +460,9 @@ pub fn set_meta(conn: &Connection, key: MetaKey, value: &str) -> Result<()> {
 }
 
 /// Increment the generation and return the new value.
+///
+/// # Errors
+/// Returns a SQLite error if the generation cannot be read or updated.
 pub fn next_generation(conn: &mut Connection) -> Result<u64> {
     let tx = conn.transaction()?;
     let current: u64 = tx.query_row(
@@ -461,6 +489,9 @@ pub fn next_generation(conn: &mut Connection) -> Result<u64> {
 }
 
 /// Get the current epoch.
+///
+/// # Errors
+/// Returns a SQLite error if the epoch cannot be read.
 pub fn get_epoch(conn: &Connection) -> Result<u64> {
     conn.query_row("SELECT value FROM meta WHERE key = 'epoch'", [], |row| {
         let s: String = row.get(0)?;
@@ -475,6 +506,9 @@ pub fn get_epoch(conn: &Connection) -> Result<u64> {
 }
 
 /// Get the current generation.
+///
+/// # Errors
+/// Returns a SQLite error if the generation cannot be read.
 pub fn get_generation(conn: &Connection) -> Result<u64> {
     conn.query_row(
         "SELECT value FROM meta WHERE key = 'generation'",
@@ -503,13 +537,16 @@ pub struct DbVersion {
 }
 
 impl DbVersion {
+    /// Read schema, parser, epoch, and generation metadata.
+    ///
+    /// # Errors
+    /// Returns a SQLite error if required metadata cannot be read.
     pub fn get(conn: &Connection) -> Result<Self> {
         let schema_ver = get_meta(conn, MetaKey::SchemaVersion)?
-            .unwrap_or_else(|| format!("{}.{}", SCHEMA_MAJOR, SCHEMA_MINOR));
-        let (major, minor) = schema_ver
-            .split_once('.')
-            .map(|(m, n)| (m.parse().unwrap_or(0), n.parse().unwrap_or(0)))
-            .unwrap_or((0, 0));
+            .unwrap_or_else(|| format!("{SCHEMA_MAJOR}.{SCHEMA_MINOR}"));
+        let (major, minor) = schema_ver.split_once('.').map_or((0, 0), |(m, n)| {
+            (m.parse().unwrap_or(0), n.parse().unwrap_or(0))
+        });
 
         Ok(Self {
             epoch: get_epoch(conn)?,
@@ -545,7 +582,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, format!("{}.{}", SCHEMA_MAJOR, SCHEMA_MINOR));
+        assert_eq!(version, format!("{SCHEMA_MAJOR}.{SCHEMA_MINOR}"));
 
         // Verify tables exist
         let table_count: i64 = conn

@@ -18,7 +18,6 @@
 //! }
 //! ```
 
-use crate::IndexPlaceholder;
 use crate::actor::{VaultActorBuilder, VaultActorHandle};
 use crate::channels::ChannelSet;
 use crate::identity::{IdentityManager, ensure_flavite_dir};
@@ -27,6 +26,7 @@ use crate::session::{Session, SessionBuilder};
 use crate::types::{VaultConfig, VaultIdentity};
 use flavite_buffer::manager::BufferManager;
 use flavite_fs::Fs;
+use flavite_index::IndexActor;
 use std::path::PathBuf;
 use thiserror::Error;
 use tracing::{debug, info};
@@ -180,19 +180,18 @@ impl Vault {
     fn open_or_rebuild_index(
         identity: &VaultIdentity,
         _config: &VaultConfig,
-    ) -> Result<IndexPlaceholder, OpenVaultError> {
-        // For now, create a new placeholder index
-        // In production, this would check for existing index files
-        // and potentially rebuild
-
-        // Check cache directory
-        if let Ok(_cache_dir) = Self::get_cache_dir(identity.uuid) {
-            // Try to open existing index
-            // For now, we'll just create a new placeholder
-            Ok(IndexPlaceholder::default())
-        } else {
-            Ok(IndexPlaceholder::default())
-        }
+    ) -> Result<IndexActor, OpenVaultError> {
+        let cache_dir =
+            Self::get_cache_dir(identity.uuid)?.join(format!("v{}", flavite_index::SCHEMA_MAJOR));
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|error| OpenVaultError::Index(error.to_string()))?;
+        let db_path = cache_dir.join("index.sqlite3");
+        drop(
+            flavite_index::open_or_init(&db_path)
+                .map_err(|error| OpenVaultError::Index(error.to_string()))?,
+        );
+        IndexActor::new(&db_path, flavite_index::pool::DEFAULT_POOL_SIZE)
+            .map_err(|error| OpenVaultError::Index(error.to_string()))
     }
 
     /// Get the cache directory for a vault UUID.
@@ -271,8 +270,7 @@ impl Drop for Vault {
 }
 
 /// Check if a vault exists at the given path.
-#[must_use]
-pub fn vault_exists(fs: &dyn Fs, root: &PathBuf) -> Result<bool, OpenVaultError> {
+pub fn vault_exists(fs: &dyn Fs, root: &std::path::Path) -> Result<bool, OpenVaultError> {
     let toml_path = root.join(".flavite").join("vault.toml");
 
     match fs.exists(&toml_path) {
@@ -282,12 +280,13 @@ pub fn vault_exists(fs: &dyn Fs, root: &PathBuf) -> Result<bool, OpenVaultError>
 }
 
 /// Get the vault UUID without opening the vault.
-#[must_use]
-pub fn get_vault_uuid(_fs: &dyn Fs, root: &PathBuf) -> Result<Option<Uuid>, OpenVaultError> {
+pub fn get_vault_uuid(
+    _fs: &dyn Fs,
+    root: &std::path::Path,
+) -> Result<Option<Uuid>, OpenVaultError> {
     use crate::identity::read_vault_toml;
 
-    read_vault_toml(root)
-        .map_err(|e| OpenVaultError::Identity(crate::identity::IdentityError::from(e)))
+    read_vault_toml(root).map_err(OpenVaultError::Identity)
 }
 
 #[cfg(test)]

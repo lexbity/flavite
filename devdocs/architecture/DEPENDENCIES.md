@@ -33,11 +33,14 @@ Normal/build:
 - `blake3` (normal)
 - `flavite-syntax` (normal)
 - `ropey` (normal)
-- `zstd` (normal)
 
 ### `flavite-cli`
 
-No dependencies.
+Normal/build:
+
+- `flavite-fs` (normal)
+- `flavite-vault` (normal)
+- `tracing` (normal)
 
 ### `flavite-editor`
 
@@ -67,9 +70,8 @@ Normal/build:
 
 - `blake3` (normal)
 - `flavite-syntax` (normal)
+- `pulldown-cmark` (normal)
 - `rusqlite` (normal)
-- `tantivy` (normal)
-- `tracing` (normal)
 
 ### `flavite-syntax`
 
@@ -87,7 +89,19 @@ Normal/build:
 
 ### `flavite-vault`
 
-No dependencies.
+Normal/build:
+
+- `blake3` (normal)
+- `flavite-buffer` (normal)
+- `flavite-fs` (normal)
+- `flavite-index` (normal)
+- `flavite-syntax` (normal)
+- `tracing` (normal)
+- `zstd` (normal)
+
+Dev-only:
+
+- `flavite-fs`
 
 ### `xtask`
 
@@ -102,17 +116,17 @@ Normal/build:
 
 ## First-party external dependencies
 
-- `blake3` ← flavite-buffer, flavite-fs, flavite-index, xtask
+- `blake3` ← flavite-buffer, flavite-fs, flavite-index, flavite-vault, xtask
 - `cosmic-text` ← xtask
 - `iced` ← flavite-ui, xtask
 - `notify` ← flavite-fs, flavite-fs, xtask
-- `pulldown-cmark` ← flavite-syntax
+- `pulldown-cmark` ← flavite-index, flavite-syntax
 - `ropey` ← flavite-buffer
 - `rusqlite` ← flavite-graph, flavite-index, xtask
-- `tantivy` ← flavite-index, xtask
-- `tracing` ← flavite-index
+- `tantivy` ← xtask
+- `tracing` ← flavite-cli, flavite-vault
 - `tree-sitter` ← flavite-syntax
-- `zstd` ← flavite-buffer
+- `zstd` ← flavite-vault
 
 ## Layering rules (§10.2)
 

@@ -10,13 +10,6 @@ description = "Scanner, frontmatter patcher, pulldown glue — pure, IO-free (§
 pulldown-cmark = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-md = { workspace = true }
-saphyr = { workspace = true }
-saphyr-parser = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-normalization = "0.1"
-serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
-proptest = { workspace = true }

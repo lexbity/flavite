@@ -15,6 +15,7 @@ pub struct NoteRef {
 }
 
 impl NoteRef {
+    #[must_use]
     pub fn new(note_id: i64, path_native: Vec<u8>) -> Self {
         Self {
             note_id,
@@ -42,6 +43,7 @@ pub struct AttRef {
 }
 
 impl AttRef {
+    #[must_use]
     pub fn new(att_id: i64, path_native: Vec<u8>) -> Self {
         Self {
             att_id,
@@ -72,6 +74,7 @@ pub struct Note {
 }
 
 impl Note {
+    #[must_use]
     pub fn note_ref(&self) -> NoteRef {
         NoteRef::new(self.note_id, self.path_native.clone())
     }
@@ -98,6 +101,7 @@ pub struct Attachment {
 }
 
 impl Attachment {
+    #[must_use]
     pub fn att_ref(&self) -> AttRef {
         AttRef::new(self.att_id, self.path_native.clone())
     }
@@ -129,6 +133,7 @@ pub enum LinkKind {
 }
 
 impl LinkKind {
+    #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Link => "link",
@@ -153,6 +158,7 @@ pub enum TagSource {
 }
 
 impl TagSource {
+    #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Inline => "inline",
@@ -206,6 +212,7 @@ pub enum ChangeKind {
 }
 
 impl ChangeKind {
+    #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Note => "note",
@@ -223,6 +230,7 @@ pub struct IndexVersion {
 }
 
 impl IndexVersion {
+    #[must_use]
     pub const fn new(epoch: u64, generation: u64) -> Self {
         Self { epoch, generation }
     }
@@ -247,6 +255,7 @@ pub struct Page<T> {
 }
 
 impl<T> Page<T> {
+    #[must_use]
     pub fn new(items: Vec<T>, epoch: u64, generation: u64, next: Option<Cursor>) -> Self {
         Self {
             items,

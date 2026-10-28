@@ -88,7 +88,7 @@ impl FallbackGeometry {
         let mut edges = Vec::new();
 
         // First pass: cap the nodes.
-        for i in 0..cap {
+        for (i, position) in positions.iter().take(cap).enumerate() {
             let kind = snapshot
                 .node_kinds
                 .get(i)
@@ -96,7 +96,7 @@ impl FallbackGeometry {
                 .unwrap_or(NodeKind::Note);
             let degree = snapshot.degrees.get(i).copied().unwrap_or(0);
             nodes.push(FallbackNode {
-                position: positions[i],
+                position: *position,
                 size: node_radius(degree),
                 shape: NodeShape::from(kind),
                 color: color_of(kind),
@@ -239,8 +239,8 @@ impl FallbackCamera {
     pub fn fit_extent(&mut self, extent: f32, bounds: Rectangle) {
         self.center = [0.0, 0.0];
         let safe_extent = extent.max(1.0);
-        let zx = bounds.width as f32 / safe_extent;
-        let zy = bounds.height as f32 / safe_extent;
+        let zx = bounds.width / safe_extent;
+        let zy = bounds.height / safe_extent;
         self.zoom = zx.min(zy).clamp(Self::ZOOM_MIN, Self::ZOOM_MAX);
     }
 
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn fallback_node_cap_is_below_the_ac16_target() {
-        assert!(FALLBACK_NODE_CAP < 50_000);
+        const { assert!(FALLBACK_NODE_CAP < 50_000) };
     }
 
     #[test]
@@ -451,7 +451,7 @@ mod tests {
             .collect();
         model.apply(&edges);
         let snapshot = model.snapshot();
-        let positions: Vec<[f32; 2]> = (0..snapshot.node_count() as usize)
+        let positions: Vec<[f32; 2]> = (0..snapshot.node_count())
             .map(|i| [i as f32 * 10.0, 0.0])
             .collect();
         let geometry = FallbackGeometry::from_snapshot(&snapshot, &positions, 1).unwrap();

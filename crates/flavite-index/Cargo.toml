@@ -9,20 +9,16 @@ description = "SQLite, tantivy, resolver, query exec (§4.1)"
 [dependencies]
 # Core deps
 rusqlite = { workspace = true, features = ["bundled"] }
-tantivy = { workspace = true, features = ["zstd-compression", "mmap"] }
 blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
-crossbeam = { workspace = true }
+pulldown-cmark = { workspace = true }
 
 # Internal deps
 flavite-syntax = { path = "../flavite-syntax" }
 
 [dev-dependencies]
-# For tests
-proptest = { workspace = true }
 tempfile = "3"
 
 [lints.clippy]

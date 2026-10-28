@@ -56,6 +56,12 @@ active = [
     { from = "flavite-index", to = "flavite-syntax" },
     { from = "flavite-graph", to = "flavite-index" },
     { from = "flavite-buffer", to = "flavite-syntax" },
+    { from = "flavite-vault", to = "flavite-buffer" },
+    { from = "flavite-vault", to = "flavite-fs" },
+    { from = "flavite-vault", to = "flavite-index" },
+    { from = "flavite-vault", to = "flavite-syntax" },
+    { from = "flavite-cli", to = "flavite-fs" },
+    { from = "flavite-cli", to = "flavite-vault" },
 ]
 
 [layering]

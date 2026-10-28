@@ -113,7 +113,7 @@ pub struct SyntheticGraph {
     /// The CPU-authoritative snapshot the renderer consumes (D15).
     pub snapshot: GraphSnapshot,
     /// World position per dense node index — exactly what
-    /// [`ProbeGeometry::from_snapshot`] wants.
+    /// the renderer's `ProbeGeometry::from_snapshot` constructor accepts.
     ///
     /// [`ProbeGeometry`]: crate::graph::instance::ProbeGeometry
     pub positions: Vec<[f32; 2]>,

@@ -39,20 +39,10 @@ pub const CARD_CAP: usize = 64;
 /// Scale step quantization base: √2. Text laid out at 1.0×, 1.414×,
 /// 2.0×, 2.828×, etc. The human eye cannot distinguish smaller
 /// increments, and caching at every possible float would exhaust memory.
-pub const SCALE_STEP_BASE: f32 = 1.41421356237;
+pub const SCALE_STEP_BASE: f32 = std::f32::consts::SQRT_2;
 
 /// Minimum legible font scale (below this, text collapses to a dot).
 pub const SCALE_MIN: f32 = 0.25;
-
-/// Size of a card's shadow/outline in logical pixels.
-const CARD_PADDING: f32 = 8.0;
-
-/// Corner radius for note cards.
-const NOTE_CORNER_RADIUS: f32 = 6.0;
-
-/// Size of attachment card thumbnails (default: colored square when
-/// thumbnails are MAY-off per D15).
-const ATTACHMENT_THUMB_SIZE: f32 = 40.0;
 
 /// Width of a card in logical pixels at scale 1.0.
 const CARD_WIDTH: f32 = 240.0;
@@ -257,14 +247,6 @@ impl std::fmt::Debug for CardLayout {
 /// version would use an LRU with a bounded size.
 pub type LayoutCache = HashMap<(CardIdentity, i32), CardLayout>;
 
-/// Per-step geometry: cards laid out for that step.
-struct StepGeometry {
-    /// Cards in this step, in world-order (front to back).
-    cards: Vec<Element<'static, ()>>,
-    /// Screen positions for each card.
-    positions: Vec<Point>,
-}
-
 /// Message emitted by the zoomable container.
 #[derive(Debug, Clone)]
 pub enum ZoomableMessage<M> {
@@ -335,14 +317,14 @@ pub fn compute_zoomable_state(
         let cache_key = (identity, step_index);
 
         // Ensure the layout is cached (B4: we build it but don't use it for rendering).
-        if !cache.contains_key(&cache_key) {
+        cache.entry(cache_key).or_insert_with(|| {
             let element = build_card(card, scale.step);
             let size = Size::new(
                 Length::Fixed(CARD_WIDTH * scale.step),
                 Length::Fixed(CARD_HEIGHT * scale.step),
             );
-            cache.insert(cache_key, CardLayout { element, size });
-        }
+            CardLayout { element, size }
+        });
 
         // Compute screen position.
         let screen = camera.world_to_screen(card.world_position, bounds);

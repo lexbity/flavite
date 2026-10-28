@@ -2,13 +2,16 @@
 //!
 //! This module provides:
 //! - A single writer connection (owns the SQLite writer connection and
-//!   tantivy IndexWriter)
+//!   tantivy `IndexWriter`)
 //! - A pool of read-only WAL connections for concurrent reads
 //!
 //! The pool size is based on S4-2's recommendations: default 4 connections,
 //! hard cap 8.
 
-use rusqlite::{Connection, OpenFlags, Result};
+use crate::schema::{MetaKey, get_meta_u64};
+use blake3::Hash;
+use flavite_syntax::{pulldown_glue::parse_note, text::TextSnapshot};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Result};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Condvar, Mutex};
@@ -69,6 +72,9 @@ pub enum PoolError {
 
 impl ReadPool {
     /// Create a new read pool.
+    ///
+    /// # Errors
+    /// Returns a SQLite error if any read-only connection cannot be opened.
     pub fn new(db_path: &Path, size: usize) -> Result<Self> {
         let size = size.clamp(1, MAX_POOL_SIZE);
         let db_path = db_path.to_string_lossy().to_string();
@@ -109,6 +115,9 @@ impl ReadPool {
     /// Get a connection from the pool.
     ///
     /// This blocks until a connection is available or the timeout is reached.
+    ///
+    /// # Errors
+    /// Returns a pool error if the pool is poisoned, exhausted, or times out.
     pub fn get(&self, timeout: Option<Duration>) -> Result<PooledConnection<'_>, PoolError> {
         let start = Instant::now();
 
@@ -182,6 +191,9 @@ impl ReadPool {
     }
 
     /// Return a connection to the pool.
+    ///
+    /// # Errors
+    /// Returns [`PoolError::Poisoned`] if pool bookkeeping is poisoned.
     pub fn return_conn(&self, conn: Connection) -> Result<(), PoolError> {
         let mut available = self.available.lock().map_err(|_| PoolError::Poisoned)?;
 
@@ -195,6 +207,9 @@ impl ReadPool {
     }
 
     /// Get pool statistics.
+    ///
+    /// # Errors
+    /// Returns [`PoolError::Poisoned`] if pool bookkeeping is poisoned.
     pub fn stats(&self) -> Result<PoolStats, PoolError> {
         let available = self.available.lock().map_err(|_| PoolError::Poisoned)?;
         let in_use = self.in_use.lock().map_err(|_| PoolError::Poisoned)?;
@@ -217,7 +232,7 @@ pub struct PooledConnection<'a> {
     pool: &'a ReadPool,
 }
 
-impl<'a> std::ops::Deref for PooledConnection<'a> {
+impl std::ops::Deref for PooledConnection<'_> {
     type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
@@ -227,7 +242,7 @@ impl<'a> std::ops::Deref for PooledConnection<'a> {
     }
 }
 
-impl<'a> Drop for PooledConnection<'a> {
+impl Drop for PooledConnection<'_> {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
             let _ = self.pool.return_conn(conn);
@@ -257,6 +272,9 @@ impl Default for PoolStats {
 
 impl Writer {
     /// Create a new writer connection.
+    ///
+    /// # Errors
+    /// Returns a SQLite error if the database cannot be opened or configured.
     pub fn new(db_path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(
             db_path,
@@ -285,6 +303,9 @@ impl Writer {
 
 impl IndexActor {
     /// Create a new index actor.
+    ///
+    /// # Errors
+    /// Returns a SQLite error if the writer or read pool cannot be initialized.
     pub fn new(db_path: &Path, pool_size: usize) -> Result<Self> {
         let writer = Writer::new(db_path)?;
         let read_pool = ReadPool::new(db_path, pool_size)?;
@@ -303,8 +324,243 @@ impl IndexActor {
     }
 
     /// Get pool statistics.
+    ///
+    /// # Errors
+    /// Returns a pool error if the read-pool statistics cannot be read.
     pub fn pool_stats(&self) -> Result<PoolStats, PoolError> {
         self.read_pool.stats()
+    }
+
+    /// Apply the exact bytes installed by a save to SQLite in one structural
+    /// transaction. The caller owns this actor on the sole index-writer thread.
+    ///
+    /// # Errors
+    /// Returns an error if parsing, coordinate conversion, or any SQLite step
+    /// fails. A failed transaction leaves the prior structural state intact.
+    #[allow(clippy::too_many_lines)] // One transaction keeps note/search/change state atomic.
+    pub fn apply_saved_note(
+        &mut self,
+        path_native: &[u8],
+        display_path: &str,
+        bytes: &[u8],
+        mtime_ns: i64,
+        scan_ns: i64,
+    ) -> Result<(u64, u64), String> {
+        let parsed = parse_note(bytes).map_err(|error| format!("parse saved note: {error}"))?;
+        let snapshot = TextSnapshot::new(bytes).map_err(|error| error.to_string())?;
+        let content_hash = Hash::from_bytes(*blake3::hash(bytes).as_bytes());
+        let conn = &mut self.writer.conn;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let current_generation: u64 = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [MetaKey::Generation.as_str()],
+                |row| {
+                    let value: String = row.get(0)?;
+                    value.parse().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        let existing_hash: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT content_hash FROM notes WHERE path_native = ?1",
+                [path_native],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if existing_hash.as_deref() == Some(content_hash.as_bytes().as_slice()) {
+            let epoch = tx
+                .query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    [MetaKey::Epoch.as_str()],
+                    |row| {
+                        let value: String = row.get(0)?;
+                        value.parse().map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            tx.rollback().map_err(|error| error.to_string())?;
+            return Ok((epoch, current_generation));
+        }
+        let generation = current_generation
+            .checked_add(1)
+            .ok_or("index generation overflow")?;
+        let epoch = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [MetaKey::Epoch.as_str()],
+                |row| {
+                    let value: String = row.get(0)?;
+                    value.parse().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        let stem = std::path::Path::new(display_path)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or(display_path);
+        let path_key = display_path.to_lowercase();
+        let stem_key = stem.to_lowercase();
+        let frontmatter = flavite_syntax::frontmatter::parse_frontmatter(&parsed.snapshot)
+            .map_err(|error| format!("parse frontmatter: {error}"))?;
+        let title = flavite_syntax::wellknown::derive_title(
+            frontmatter
+                .as_ref()
+                .and_then(|value| value.title.as_deref()),
+            parsed
+                .headings
+                .iter()
+                .find(|(level, _)| *level == pulldown_cmark::HeadingLevel::H1)
+                .map(|(_, text)| text.as_str()),
+            stem,
+        );
+        let aliases = frontmatter
+            .as_ref()
+            .and_then(|value| {
+                value
+                    .well_known
+                    .get(&flavite_syntax::wellknown::WellKnownKey::Aliases)
+            })
+            .cloned()
+            .unwrap_or_default();
+        let frontmatter_tags = frontmatter.as_ref().map_or_else(Vec::new, |value| {
+            value
+                .well_known
+                .iter()
+                .filter(|(key, _)| {
+                    matches!(
+                        key,
+                        flavite_syntax::wellknown::WellKnownKey::Tags
+                            | flavite_syntax::wellknown::WellKnownKey::Tag
+                    )
+                })
+                .flat_map(|(_, values)| values.iter().cloned())
+                .collect()
+        });
+        let frontmatter_json = frontmatter
+            .as_ref()
+            .map(|value| serde_json::json!({ "yaml": value.yaml_text }))
+            .map(|value| value.to_string());
+        let size = i64::try_from(bytes.len()).map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO notes(path,path_native,path_key,stem_key,title,stable_id,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation)
+             VALUES(?1,?2,?3,?4,?5,NULL,0,?6,?7,?8,?9,?10,?11,1,?12)
+             ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,title=excluded.title,content_hash=excluded.content_hash,size=excluded.size,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,frontmatter=excluded.frontmatter,preview=excluded.preview,parse_ok=1,generation=excluded.generation",
+            rusqlite::params![display_path, path_native, path_key, stem_key, title, content_hash.as_bytes(), size, mtime_ns, scan_ns, frontmatter_json, &parsed.snapshot.text()[..parsed.snapshot.text().len().min(1024)], i64::try_from(generation).map_err(|e| e.to_string())?],
+        ).map_err(|e| e.to_string())?;
+        let note_id: i64 = tx
+            .query_row(
+                "SELECT note_id FROM notes WHERE path_native = ?1",
+                [path_native],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM links WHERE src = ?1", [note_id])
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM tags WHERE note_id = ?1", [note_id])
+            .map_err(|e| e.to_string())?;
+        for (ord, link) in parsed.links.iter().enumerate() {
+            let source_span = snapshot
+                .span_to_source(link.span)
+                .ok_or("link span cannot be mapped to source bytes")?;
+            let target_key = link.target_raw.to_lowercase();
+            tx.execute(
+                "INSERT INTO links(src,ord,kind,dst_raw,target_key,anchor,alias,by_id,span_start,span_end,dst_note,dst_att,res_state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL,NULL,'unresolved')",
+                rusqlite::params![note_id, i64::try_from(ord).map_err(|e| e.to_string())?, if link.is_embed { "embed" } else { "link" }, link.target_raw, target_key, link.anchor, link.alias, i64::from(link.by_id), i64::try_from(source_span.start.0).map_err(|e| e.to_string())?, i64::try_from(source_span.end.0).map_err(|e| e.to_string())?],
+            ).map_err(|e| e.to_string())?;
+        }
+        for tag in &parsed.tags {
+            let value = parsed
+                .snapshot
+                .text()
+                .get(tag.start.0..tag.end.0)
+                .ok_or("tag span is invalid")?;
+            tx.execute(
+                "INSERT OR IGNORE INTO tags(note_id,tag,source) VALUES(?1,?2,'inline')",
+                rusqlite::params![note_id, value.trim_start_matches('#')],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        for tag in frontmatter_tags {
+            tx.execute(
+                "INSERT OR IGNORE INTO tags(note_id,tag,source) VALUES(?1,?2,'frontmatter')",
+                rusqlite::params![note_id, flavite_syntax::wellknown::normalize_tag(&tag)],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        for alias in aliases {
+            tx.execute(
+                "INSERT OR IGNORE INTO aliases(note_id,alias,alias_key) VALUES(?1,?2,?3)",
+                rusqlite::params![
+                    note_id,
+                    alias,
+                    flavite_syntax::wellknown::normalize_tag(&alias)
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.execute(
+            "INSERT INTO search_docs(note_id,content_hash,body_text) VALUES(?1,?2,?3) ON CONFLICT(note_id) DO UPDATE SET content_hash=excluded.content_hash,body_text=excluded.body_text",
+            rusqlite::params![note_id, content_hash.as_bytes(), parsed.snapshot.text()],
+        ).map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE meta SET value=?1 WHERE key=?2",
+            rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO changes(generation,kind,entity_id) VALUES(?1,'note',?2)",
+            rusqlite::params![
+                i64::try_from(generation).map_err(|e| e.to_string())?,
+                note_id
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO changes(generation,kind,entity_id) VALUES(?1,'outgoing',?2)",
+            rusqlite::params![
+                i64::try_from(generation).map_err(|e| e.to_string())?,
+                note_id
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok((epoch, generation))
+    }
+
+    /// Current structural index version.
+    ///
+    /// # Errors
+    /// Returns an error if either version counter cannot be read from SQLite.
+    pub fn version(&self) -> Result<(u64, u64), String> {
+        let conn = self.writer.conn();
+        Ok((
+            get_meta_u64(conn, MetaKey::Epoch)
+                .map_err(|e| e.to_string())?
+                .unwrap_or(1),
+            get_meta_u64(conn, MetaKey::Generation)
+                .map_err(|e| e.to_string())?
+                .unwrap_or(0),
+        ))
     }
 }
 
@@ -312,6 +568,7 @@ impl IndexActor {
 mod tests {
     use super::*;
     use crate::schema::create_schema;
+    use rusqlite::params;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -409,5 +666,76 @@ mod tests {
             .unwrap();
 
         assert_eq!(wal_mode, "wal");
+    }
+
+    #[test]
+    fn saved_note_updates_structure_search_cache_and_generation_atomically() {
+        let temp = NamedTempFile::new().unwrap();
+        drop(crate::schema::open_or_init(temp.path()).unwrap());
+        let mut index = IndexActor::new(temp.path(), 1).unwrap();
+        let (epoch, generation) = index
+            .apply_saved_note(
+                b"notes/a.md",
+                "notes/a.md",
+                b"# Alpha\n\n[[Beta]] #project",
+                98,
+                99,
+            )
+            .unwrap();
+        assert_eq!((epoch, generation), (1, 1));
+
+        {
+            let conn = index.writer().conn();
+            let note: (String, Vec<u8>, i64) = conn
+                .query_row(
+                    "SELECT title, content_hash, generation FROM notes WHERE path_native=?1",
+                    [b"notes/a.md"],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(note.0, "Alpha");
+            assert_eq!(
+                note.1,
+                blake3::hash(b"# Alpha\n\n[[Beta]] #project").as_bytes()
+            );
+            assert_eq!(note.2, 1);
+            let (search_body, link_count, tag_count, changes): (String, i64, i64, i64) = conn
+                .query_row(
+                    "SELECT s.body_text,
+                    (SELECT COUNT(*) FROM links l WHERE l.src=s.note_id),
+                    (SELECT COUNT(*) FROM tags t WHERE t.note_id=s.note_id),
+                    (SELECT COUNT(*) FROM changes c WHERE c.generation=1)
+                 FROM search_docs s",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(search_body, "# Alpha\n\n[[Beta]] #project");
+            assert_eq!((link_count, tag_count, changes), (1, 1, 2));
+        }
+        assert_eq!(index.version().unwrap(), (1, 1));
+
+        let (_, next_generation) = index
+            .apply_saved_note(b"notes/a.md", "notes/a.md", b"# Updated", 100, 101)
+            .unwrap();
+        assert_eq!(next_generation, 2);
+        let conn = index.writer().conn();
+        let note_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(note_count, 1);
+        let updated_search_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM search_docs WHERE body_text=?1",
+                params!["# Updated"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_search_count, 1);
+        let (_, unchanged_generation) = index
+            .apply_saved_note(b"notes/a.md", "notes/a.md", b"# Updated", 102, 103)
+            .unwrap();
+        assert_eq!(unchanged_generation, 2);
+        assert_eq!(index.version().unwrap(), (1, 2));
     }
 }

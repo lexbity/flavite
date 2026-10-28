@@ -108,6 +108,9 @@ impl RecoveryHeader {
         }
 
         let version = bytes[4];
+        if version != RECOVERY_VERSION {
+            return None;
+        }
         let buffer_id = u64::from_le_bytes([
             bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
         ]);
@@ -120,7 +123,11 @@ impl RecoveryHeader {
         let checkpoint_seq = u64::from_le_bytes([
             bytes[29], bytes[30], bytes[31], bytes[32], bytes[33], bytes[34], bytes[35], bytes[36],
         ]);
-        let is_checkpoint = bytes.get(37).copied() == Some(1);
+        let is_checkpoint = match bytes.get(37).copied()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
 
         Some(Self {
             magic,
@@ -233,8 +240,6 @@ impl RecoveryFile {
 
     /// Deserialize a recovery file from bytes.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let _offset = 0usize;
-
         // Read header (38 bytes with magic + version + fields)
         if bytes.len() < 38 {
             return None;
@@ -279,7 +284,9 @@ impl RecoveryFile {
         if offset + text_len > bytes.len() {
             return None;
         }
-        let text = String::from_utf8_lossy(&bytes[offset..offset + text_len]).to_string();
+        let text = std::str::from_utf8(&bytes[offset..offset + text_len])
+            .ok()?
+            .to_owned();
         offset += text_len;
 
         // Read source_len
@@ -296,6 +303,9 @@ impl RecoveryFile {
             bytes[offset + 6],
             bytes[offset + 7],
         ]) as usize;
+        if source_len > 64 * 1024 * 1024 {
+            return None;
+        }
         offset += 8;
 
         // Read content_hash
@@ -306,11 +316,17 @@ impl RecoveryFile {
         offset += 32;
 
         // Read base_hash
-        let has_base_hash = bytes.get(offset).copied() == Some(1);
+        let has_base_hash = match bytes.get(offset).copied()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
         offset += 1;
         let base_hash = if has_base_hash {
             if offset + 32 <= bytes.len() {
-                Some(BaseHash::from_slice(&bytes[offset..offset + 32]))
+                let hash = BaseHash::from_slice(&bytes[offset..offset + 32]);
+                offset += 32;
+                Some(hash)
             } else {
                 None
             }
@@ -318,14 +334,27 @@ impl RecoveryFile {
             None
         };
 
-        Some(Self {
+        if offset != bytes.len() {
+            return None;
+        }
+        let recovery = Self {
             header,
             eol_table,
             text,
             source_len,
             content_hash,
             base_hash,
-        })
+        };
+        if recovery.eol_table.line_count() != recovery.text.split('\n').count() {
+            return None;
+        }
+        let source = recovery.to_source_bytes();
+        if source.len() != recovery.source_len
+            || BaseHash::from_bytes(*blake3::hash(&source).as_bytes()) != recovery.content_hash
+        {
+            return None;
+        }
+        Some(recovery)
     }
 
     /// Reconstruct the source bytes from the recovery file.
@@ -415,27 +444,11 @@ impl RecoveryWriter {
         self.config.interval_secs = secs;
     }
 
-    /// Generate the recovery file path for a buffer.
+    /// Generate the recovery file path from the note's reversible native key.
     #[must_use]
-    pub fn recovery_path(&self, buffer: &Buffer) -> PathBuf {
-        self.recovery_path_for(buffer.buffer_id(), buffer.model().eol_table())
-    }
-
-    /// Generate the recovery file path for a buffer with a specific EOL table.
-    #[must_use]
-    pub fn recovery_path_for(&self, buffer_id: BufferId, eol_table: &EolTable) -> PathBuf {
-        // Hash the buffer ID and EOL table to create a unique filename
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&buffer_id.as_u64().to_le_bytes());
-        hasher.update(&eol_table.has_bom().to_string().as_bytes());
-        hasher.update(&eol_table.has_trailing_newline().to_string().as_bytes());
-        for eol in &eol_table.line_endings {
-            hasher.update(&[*eol as u8]);
-        }
-        let hash = hasher.finalize();
-        let hash_hex = hash.to_hex();
-
-        self.config.recovery_dir.join(format!("{}.bin", hash_hex))
+    pub fn recovery_path_for_note_key(&self, note_key: &[u8]) -> PathBuf {
+        let hash = blake3::hash(note_key).to_hex();
+        self.config.recovery_dir.join(format!("{hash}.bin"))
     }
 
     /// Check if a buffer should be written to recovery.
@@ -456,17 +469,25 @@ impl RecoveryWriter {
         }
     }
 
+    /// Whether an immutable snapshot is due for a recovery write.
+    #[must_use]
+    pub fn should_write_snapshot(&self, recovery: &RecoveryFile) -> bool {
+        self.last_write
+            .get(&recovery.header.buffer_id)
+            .is_none_or(|last| last.elapsed() >= self.interval())
+    }
+
     /// Write recovery files for all dirty buffers.
     ///
     /// Returns the paths that were written.
-    pub fn write_all(&mut self, buffers: &[&Buffer]) -> Vec<PathBuf> {
+    pub fn write_all(&mut self, buffers: &[(Vec<u8>, &Buffer)]) -> Vec<PathBuf> {
         let mut written = Vec::new();
 
-        for buffer in buffers {
-            if self.should_write(buffer) {
-                if let Some(path) = self.write_buffer(buffer) {
-                    written.push(path);
-                }
+        for (note_key, buffer) in buffers {
+            if self.should_write(buffer)
+                && let Some(path) = self.write_buffer(note_key, buffer)
+            {
+                written.push(path);
             }
         }
 
@@ -477,8 +498,8 @@ impl RecoveryWriter {
     ///
     /// The write is atomic: write to a temp file, fsync, rename.
     /// Returns the path if successful.
-    pub fn write_buffer(&mut self, buffer: &Buffer) -> Option<PathBuf> {
-        let path = self.recovery_path(buffer);
+    pub fn write_buffer(&mut self, note_key: &[u8], buffer: &Buffer) -> Option<PathBuf> {
+        let path = self.recovery_path_for_note_key(note_key);
         let buffer_id = buffer.buffer_id();
 
         // Get or create checkpoint sequence
@@ -491,15 +512,19 @@ impl RecoveryWriter {
         let bytes = recovery_file.to_bytes();
 
         // Ensure directory exists
-        if let Some(parent) = path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!("WARN: Failed to create recovery directory: {}", e);
-                return None;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            eprintln!("WARN: Failed to create recovery directory: {}", e);
+            return None;
         }
 
         // Write atomically
-        let temp_path = path.with_extension("tmp");
+        let temp_path = path.with_extension(format!(
+            "{}.{}.tmp",
+            buffer_id.as_u64(),
+            buffer.revision().as_u64()
+        ));
 
         let mut file = match File::create(&temp_path) {
             Ok(f) => f,
@@ -530,9 +555,41 @@ impl RecoveryWriter {
             return None;
         }
 
+        #[cfg(unix)]
+        if let Some(parent) = path.parent()
+            && let Err(e) = File::open(parent).and_then(|directory| directory.sync_all())
+        {
+            eprintln!("WARN: Failed to sync recovery directory: {}", e);
+            return None;
+        }
+
         // Update last write time
         self.last_write.insert(buffer_id, Instant::now());
 
+        Some(path)
+    }
+
+    /// Write an immutable recovery snapshot after the caller has released the
+    /// BufferManager lock and durably pinned its merge base.
+    pub fn write_snapshot(
+        &mut self,
+        note_key: &[u8],
+        mut recovery_file: RecoveryFile,
+    ) -> Option<PathBuf> {
+        let buffer_id = recovery_file.header.buffer_id;
+        if !self.should_write_snapshot(&recovery_file) {
+            return None;
+        }
+        let seq = *self.checkpoint_seq.entry(buffer_id).or_insert(0);
+        self.checkpoint_seq.insert(buffer_id, seq.saturating_add(1));
+        recovery_file.header.checkpoint_seq = seq;
+        recovery_file.header.timestamp = RecoveryHeader::current_timestamp();
+        recovery_file.header.is_checkpoint = false;
+        let path = self.recovery_path_for_note_key(note_key);
+        if write_recovery_atomically(&path, &recovery_file.to_bytes()).is_err() {
+            return None;
+        }
+        self.last_write.insert(buffer_id, Instant::now());
         Some(path)
     }
 
@@ -540,7 +597,7 @@ impl RecoveryWriter {
     ///
     /// Checkpoints are durable recovery points that are written before
     /// operations like save or undo.
-    pub fn write_checkpoint(&mut self, buffer: &Buffer) -> Option<PathBuf> {
+    pub fn write_checkpoint(&mut self, note_key: &[u8], buffer: &Buffer) -> Option<PathBuf> {
         let buffer_id = buffer.buffer_id();
 
         // Get or create checkpoint sequence
@@ -550,15 +607,15 @@ impl RecoveryWriter {
 
         // Create recovery file with checkpoint flag
         let recovery_file = RecoveryFile::from_buffer(buffer, seq, true);
-        let path = self.recovery_path(buffer);
+        let path = self.recovery_path_for_note_key(note_key);
         let bytes = recovery_file.to_bytes();
 
         // Ensure directory exists
-        if let Some(parent) = path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!("WARN: Failed to create recovery directory: {}", e);
-                return None;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            eprintln!("WARN: Failed to create recovery directory: {}", e);
+            return None;
         }
 
         // Write atomically (same as write_buffer)
@@ -602,8 +659,18 @@ impl RecoveryWriter {
     ///
     /// Returns the recovery file if successful and valid.
     pub fn read_recovery_file(&self, path: &Path) -> Option<RecoveryFile> {
+        const MAX_RECOVERY_FILE_BYTES: u64 = 128 * 1024 * 1024;
+        if fs::metadata(path).ok()?.len() > MAX_RECOVERY_FILE_BYTES {
+            return None;
+        }
         let bytes = fs::read(path).ok()?;
         RecoveryFile::from_bytes(&bytes)
+    }
+
+    /// Read the latest recovery checkpoint associated with a native note key.
+    #[must_use]
+    pub fn read_for_note_key(&self, note_key: &[u8]) -> Option<RecoveryFile> {
+        self.read_recovery_file(&self.recovery_path_for_note_key(note_key))
     }
 
     /// List all recovery files for this vault.
@@ -612,12 +679,10 @@ impl RecoveryWriter {
         let mut files = Vec::new();
 
         if let Ok(entries) = fs::read_dir(&self.config.recovery_dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    if path.extension().map_or(false, |ext| ext == "bin") {
-                        files.push(path);
-                    }
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "bin") {
+                    files.push(path);
                 }
             }
         }
@@ -632,24 +697,35 @@ impl RecoveryWriter {
 
     /// Delete all recovery files for a specific buffer.
     pub fn delete_for_buffer(&self, buffer_id: BufferId) -> usize {
-        let path = self.recovery_path_for(buffer_id, &EolTable::default());
-        let pattern = path.file_name().unwrap_or_default();
+        self.remove_matching(|file| file.header.buffer_id == buffer_id)
+    }
 
-        let mut deleted = 0usize;
-        if let Ok(entries) = fs::read_dir(&self.config.recovery_dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let entry_path = entry.path();
-                    if entry_path.file_name() == Some(pattern) {
-                        if self.delete_recovery_file(&entry_path) {
-                            deleted += 1;
-                        }
-                    }
-                }
+    /// Retire only recovery records for this buffer whose revision is covered
+    /// by an acknowledged save. Newer revisions remain reachable.
+    pub fn retire_covered(&self, buffer_id: BufferId, saved_revision: Revision) -> usize {
+        self.remove_matching(|file| {
+            file.header.buffer_id == buffer_id && file.header.revision <= saved_revision
+        })
+    }
+
+    /// Delete recovery for a note only after the caller has completed its
+    /// explicit discard decision.
+    pub fn delete_for_note_key(&self, note_key: &[u8]) -> bool {
+        self.delete_recovery_file(&self.recovery_path_for_note_key(note_key))
+    }
+
+    fn remove_matching(&self, predicate: impl Fn(&RecoveryFile) -> bool) -> usize {
+        let mut removed = 0;
+        for path in self.list_recovery_files() {
+            if self
+                .read_recovery_file(&path)
+                .is_some_and(|file| predicate(&file))
+                && self.delete_recovery_file(&path)
+            {
+                removed += 1;
             }
         }
-
-        deleted
+        removed
     }
 
     /// Delete all recovery files.
@@ -675,6 +751,40 @@ impl Default for RecoveryWriter {
             2,
         ))
     }
+}
+
+fn write_recovery_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("recovery path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = parent.join(format!(
+        ".recovery-{}-{timestamp}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, path)?;
+        #[cfg(unix)]
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp);
+    }
+    result
 }
 
 /// Builder for creating RecoveryWriter with custom settings.
@@ -734,7 +844,6 @@ impl Default for RecoveryWriterBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use tempfile::tempdir;
 
     #[test]
@@ -753,7 +862,7 @@ mod tests {
 
     #[test]
     fn recovery_file_round_trip() {
-        let buffer = Buffer::from_str("hello\nworld");
+        let buffer = Buffer::from_text("hello\nworld");
         let recovery_file = RecoveryFile::from_buffer(&buffer, 1, false);
 
         let bytes = recovery_file.to_bytes();
@@ -766,7 +875,7 @@ mod tests {
 
     #[test]
     fn recovery_file_to_source_bytes() {
-        let buffer = Buffer::from_str("hello\nworld");
+        let buffer = Buffer::from_text("hello\nworld");
         let recovery_file = RecoveryFile::from_buffer(&buffer, 1, false);
 
         let source_bytes = recovery_file.to_source_bytes();
@@ -779,8 +888,8 @@ mod tests {
         let config = RecoveryConfig::new("test-vault".to_string(), dir.path().to_path_buf(), 2);
         let mut writer = RecoveryWriter::new(config);
 
-        let buffer = Buffer::from_str("hello world");
-        let path = writer.write_buffer(&buffer);
+        let buffer = Buffer::from_text("hello world");
+        let path = writer.write_buffer(b"notes/hello.md", &buffer);
 
         assert!(path.is_some());
         let path = path.unwrap();
@@ -792,13 +901,50 @@ mod tests {
     }
 
     #[test]
+    fn recovery_lookup_survives_buffer_identity_change_after_restart() {
+        let dir = tempdir().unwrap();
+        let config = RecoveryConfig::new("test-vault".to_string(), dir.path().to_path_buf(), 2);
+        let note_key = b"notes/identity.md";
+        let first_process = Buffer::from_text("recovered");
+        let mut writer = RecoveryWriter::new(config.clone());
+        writer.write_buffer(note_key, &first_process).unwrap();
+        drop(writer);
+
+        let second_process = Buffer::from_text("disk");
+        assert_ne!(first_process.buffer_id(), second_process.buffer_id());
+        let restarted_writer = RecoveryWriter::new(config);
+        let recovered = restarted_writer.read_for_note_key(note_key).unwrap();
+        assert_eq!(recovered.to_source_bytes(), b"recovered");
+    }
+
+    #[test]
+    fn recovery_parser_rejects_tampered_or_invalid_utf8_payloads() {
+        let buffer = Buffer::from_text("payload");
+        let recovery = RecoveryFile::from_buffer(&buffer, 0, false);
+        let mut tampered = recovery.to_bytes();
+        let text_start = 38 + 4 + serde_json::to_vec(&recovery.eol_table).unwrap().len() + 4;
+        tampered[text_start] ^= 1;
+        assert!(RecoveryFile::from_bytes(&tampered).is_none());
+
+        let invalid = RecoveryFile {
+            text: "\u{fffd}".into(),
+            ..recovery
+        };
+        // Serializer writes valid UTF-8, but a recovery file with arbitrary
+        // bytes in its text section must be rejected rather than lossy-decoded.
+        let mut bytes = invalid.to_bytes();
+        bytes[text_start] = 0xff;
+        assert!(RecoveryFile::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
     fn recovery_writer_atomic_write() {
         let dir = tempdir().unwrap();
         let config = RecoveryConfig::new("test-vault".to_string(), dir.path().to_path_buf(), 2);
         let mut writer = RecoveryWriter::new(config);
 
-        let buffer = Buffer::from_str("hello world");
-        let path = writer.write_buffer(&buffer);
+        let buffer = Buffer::from_text("hello world");
+        let path = writer.write_buffer(b"notes/hello.md", &buffer);
 
         assert!(path.is_some());
 
@@ -818,7 +964,7 @@ mod tests {
         let config = RecoveryConfig::new("test-vault".to_string(), dir.path().to_path_buf(), 2);
         let mut writer = RecoveryWriter::new(config);
 
-        let mut buffer = Buffer::from_str("hello world");
+        let mut buffer = Buffer::from_text("hello world");
         // Make the buffer dirty so it should be written
         let edit =
             crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " test".to_string());
@@ -828,7 +974,7 @@ mod tests {
         assert!(writer.should_write(&buffer));
 
         // Write it
-        writer.write_buffer(&buffer);
+        writer.write_buffer(b"notes/hello.md", &buffer);
 
         // Second write within interval should not happen
         assert!(!writer.should_write(&buffer));
@@ -840,8 +986,8 @@ mod tests {
         let config = RecoveryConfig::new("test-vault".to_string(), dir.path().to_path_buf(), 2);
         let mut writer = RecoveryWriter::new(config);
 
-        let buffer = Buffer::from_str("hello world");
-        let path = writer.write_checkpoint(&buffer);
+        let buffer = Buffer::from_text("hello world");
+        let path = writer.write_checkpoint(b"notes/hello.md", &buffer);
 
         assert!(path.is_some());
 
@@ -857,10 +1003,10 @@ mod tests {
         let mut writer = RecoveryWriter::new(config);
 
         // Write some buffers
-        let buffer1 = Buffer::from_str("hello");
-        let buffer2 = Buffer::from_str("world");
-        writer.write_buffer(&buffer1);
-        writer.write_buffer(&buffer2);
+        let buffer1 = Buffer::from_text("hello");
+        let buffer2 = Buffer::from_text("world");
+        writer.write_buffer(b"notes/one.md", &buffer1);
+        writer.write_buffer(b"notes/two.md", &buffer2);
 
         // List files
         let files = writer.list_recovery_files();
@@ -874,6 +1020,32 @@ mod tests {
         // Check count
         let files = writer.list_recovery_files();
         assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn save_retirement_preserves_recovery_for_newer_revision() {
+        use flavite_syntax::text::{Span, TextByte};
+        let dir = tempdir().unwrap();
+        let config = RecoveryConfig::new("vault".into(), dir.path().to_path_buf(), 2);
+        let writer = RecoveryWriter::new(config);
+        let mut buffer = Buffer::from_text("before");
+        let old = RecoveryFile::from_buffer(&buffer, 1, false);
+        buffer.apply_local_edit(crate::undo::EditOp::new(
+            Span::new(TextByte(6), TextByte(6)),
+            " after".into(),
+        ));
+        let newer = RecoveryFile::from_buffer(&buffer, 2, false);
+        let old_path = dir.path().join("old.bin");
+        let new_path = dir.path().join("new.bin");
+        fs::write(&old_path, old.to_bytes()).unwrap();
+        fs::write(&new_path, newer.to_bytes()).unwrap();
+
+        assert_eq!(
+            writer.retire_covered(buffer.buffer_id(), Revision::new(0)),
+            1
+        );
+        assert!(!old_path.exists());
+        assert!(new_path.exists());
     }
 
     #[test]

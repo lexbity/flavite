@@ -175,7 +175,7 @@ pub fn read_vault_toml(vault_root: &Path) -> IdentityResult<Option<Uuid>> {
         return Ok(None);
     }
 
-    let contents = fs::read_to_string(&toml_path).map_err(|e| IdentityError::Io(e))?;
+    let contents = fs::read_to_string(&toml_path).map_err(IdentityError::Io)?;
 
     let value: toml::Value =
         toml::from_str(&contents).map_err(|e| IdentityError::TomlParseError(e.to_string()))?;
@@ -197,24 +197,24 @@ fn write_vault_toml(vault_root: &Path, uuid: Uuid) -> IdentityResult<()> {
 
     // Create .flavite directory if it doesn't exist
     if let Some(parent) = toml_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| IdentityError::Io(e))?;
+        fs::create_dir_all(parent).map_err(IdentityError::Io)?;
     }
 
     let contents = format!("[vault]\nuuid = \"{uuid}\"\n");
-    fs::write(&toml_path, contents).map_err(|e| IdentityError::Io(e))?;
+    fs::write(&toml_path, contents).map_err(IdentityError::Io)?;
 
     Ok(())
 }
 
 /// Read the registry entry for a given root key.
 fn read_registry_entry(root_key: &[u8]) -> IdentityResult<Option<RegistryEntry>> {
-    let path = registry_path(root_key).ok_or_else(|| IdentityError::NoProjectDirs)?;
+    let path = registry_path(root_key).ok_or(IdentityError::NoProjectDirs)?;
 
     if !path.exists() {
         return Ok(None);
     }
 
-    let contents = fs::read_to_string(&path).map_err(|e| IdentityError::Io(e))?;
+    let contents = fs::read_to_string(&path).map_err(IdentityError::Io)?;
 
     let entry: RegistryEntry =
         toml::from_str(&contents).map_err(|e| IdentityError::TomlParseError(e.to_string()))?;
@@ -224,21 +224,17 @@ fn read_registry_entry(root_key: &[u8]) -> IdentityResult<Option<RegistryEntry>>
 
 /// Write a registry entry.
 fn write_registry_entry(root_key: &[u8], entry: &RegistryEntry) -> IdentityResult<()> {
-    let path = registry_path(root_key).ok_or_else(|| IdentityError::NoProjectDirs)?;
+    let path = registry_path(root_key).ok_or(IdentityError::NoProjectDirs)?;
 
     // Create parent directories if needed
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| IdentityError::Io(e))?;
+        fs::create_dir_all(parent).map_err(IdentityError::Io)?;
     }
 
-    let contents = toml::to_string(entry).map_err(|e| {
-        IdentityError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
-    })?;
+    let contents = toml::to_string(entry)
+        .map_err(|e| IdentityError::Io(std::io::Error::other(e.to_string())))?;
 
-    fs::write(&path, contents).map_err(|e| IdentityError::Io(e))?;
+    fs::write(&path, contents).map_err(IdentityError::Io)?;
 
     Ok(())
 }
@@ -258,11 +254,11 @@ impl RootGuard {
     /// Acquire a root guard for the given root path.
     pub fn acquire(fs: &dyn Fs, root: &Path) -> IdentityResult<Self> {
         let root_key = compute_root_key(fs, root)?;
-        let path = root_guard_path(&root_key).ok_or_else(|| IdentityError::NoProjectDirs)?;
+        let path = root_guard_path(&root_key).ok_or(IdentityError::NoProjectDirs)?;
 
         // Create parent directories if needed
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| IdentityError::Io(e))?;
+            fs::create_dir_all(parent).map_err(IdentityError::Io)?;
         }
 
         // Try to create the lock file with exclusive access
@@ -313,11 +309,11 @@ pub struct UuidGuard {
 impl UuidGuard {
     /// Acquire a UUID guard for the given UUID.
     pub fn acquire(uuid: Uuid) -> IdentityResult<Self> {
-        let path = uuid_lock_path(uuid).ok_or_else(|| IdentityError::NoProjectDirs)?;
+        let path = uuid_lock_path(uuid).ok_or(IdentityError::NoProjectDirs)?;
 
         // Create parent directories if needed
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| IdentityError::Io(e))?;
+            fs::create_dir_all(parent).map_err(IdentityError::Io)?;
         }
 
         // Try to create the lock file with exclusive access
@@ -412,7 +408,7 @@ impl IdentityManager {
 
         // Step 5: Acquire UUID lock
         // First, check if another process has the lock
-        let uuid_lock_path = uuid_lock_path(uuid).ok_or_else(|| IdentityError::NoProjectDirs)?;
+        let uuid_lock_path = uuid_lock_path(uuid).ok_or(IdentityError::NoProjectDirs)?;
 
         if uuid_lock_path.exists() {
             // Another process has the lock
@@ -477,8 +473,8 @@ pub fn ensure_flavite_dir(vault_root: &Path) -> IdentityResult<()> {
     let flavite_dir = vault_root.join(".flavite");
     let journal_dir = flavite_dir.join("journal");
 
-    fs::create_dir_all(&flavite_dir).map_err(|e| IdentityError::Io(e))?;
-    fs::create_dir_all(&journal_dir).map_err(|e| IdentityError::Io(e))?;
+    fs::create_dir_all(&flavite_dir).map_err(IdentityError::Io)?;
+    fs::create_dir_all(&journal_dir).map_err(IdentityError::Io)?;
 
     Ok(())
 }
@@ -487,7 +483,6 @@ pub fn ensure_flavite_dir(vault_root: &Path) -> IdentityResult<()> {
 mod tests {
     use super::*;
     use crate::types::{ReconcileSummary, Version};
-
 
     #[test]
     fn test_compute_root_key() {

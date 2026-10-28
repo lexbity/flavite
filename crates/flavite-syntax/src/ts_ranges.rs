@@ -12,22 +12,15 @@
 //! Note: tree-sitter's markdown grammar is not fully CommonMark-compliant,
 //! so we use it primarily for block structure and code fence detection.
 
-use crate::mask::{math_ranges, TextMask};
-use crate::scanner::{scan_inline, ScannedSpan, SpanKind};
+use crate::mask::{TextMask, math_ranges};
+use crate::scanner::{ScannedSpan, SpanKind, scan_inline};
 use crate::text::{Span, TextByte, TextSnapshot};
 use std::ops::Range;
-use tree_sitter::{Language, Node, Parser, Tree};
-
-/// External language for tree-sitter-markdown.
-///
-/// This is loaded via the tree-sitter-md crate's language function.
-extern "C" {
-    fn tree_sitter_markdown() -> Language;
-}
+use tree_sitter::{Language, Parser};
 
 /// Get the tree-sitter language for markdown.
 fn markdown_language() -> Language {
-    unsafe { tree_sitter_markdown() }
+    tree_sitter_md::LANGUAGE.into()
 }
 
 /// A parsed note with all extracted structure from tree-sitter.
@@ -77,7 +70,7 @@ pub fn parse_note_ts(bytes: &[u8]) -> Result<TsParsedNote, String> {
     // Parse with tree-sitter.
     let mut parser = Parser::new();
     parser
-        .set_language(markdown_language())
+        .set_language(&markdown_language())
         .map_err(|e| format!("failed to set language: {e}"))?;
 
     let tree = parser
@@ -89,7 +82,14 @@ pub fn parse_note_ts(bytes: &[u8]) -> Result<TsParsedNote, String> {
     // Recursively collect text ranges that are not in code/HTML/math contexts.
     // We track whether we're in an excluded context (code block, inline code, HTML).
     let mut cursor = root.walk();
-    collect_inline_spans(&mut cursor, text, &mask, &mut links, &mut tags, &mut block_ids);
+    collect_inline_spans(
+        &mut cursor,
+        text,
+        &mask,
+        &mut links,
+        &mut tags,
+        &mut block_ids,
+    );
 
     Ok(TsParsedNote {
         snapshot,
@@ -106,7 +106,7 @@ fn build_mask_ts(text: &str) -> TextMask {
 
     let mut parser = Parser::new();
     // SAFETY: We know markdown_language() is valid for this text.
-    if let Err(e) = parser.set_language(markdown_language()) {
+    if parser.set_language(&markdown_language()).is_err() {
         // If we can't set the language, return an empty mask.
         return TextMask::empty(text.len());
     }
@@ -120,7 +120,18 @@ fn build_mask_ts(text: &str) -> TextMask {
     let mut cursor = root.walk();
 
     // Recursively collect excluded ranges.
-    collect_excluded_ranges(&mut cursor, text, &mut excluded);
+    collect_excluded_ranges(&mut cursor, &mut excluded);
+
+    // The block grammar leaves inline content opaque. Parse the same snapshot
+    // with tree-sitter-md's inline grammar so code spans are excluded too.
+    let mut inline_parser = Parser::new();
+    let inline_language: Language = tree_sitter_md::INLINE_LANGUAGE.into();
+    if inline_parser.set_language(&inline_language).is_ok()
+        && let Some(inline_tree) = inline_parser.parse(text, None)
+    {
+        let mut inline_cursor = inline_tree.root_node().walk();
+        collect_excluded_ranges(&mut inline_cursor, &mut excluded);
+    }
 
     // Add math ranges (tree-sitter doesn't natively handle math).
     let math_ranges = math_ranges(text, &excluded);
@@ -135,6 +146,7 @@ fn is_excluded_kind(kind: &str) -> bool {
         kind,
         "code_block"
             | "inline_code"
+            | "code_span"
             | "fenced_code_block"
             | "html_block"
             | "html_inline"
@@ -144,7 +156,10 @@ fn is_excluded_kind(kind: &str) -> bool {
 }
 
 /// Recursively collect excluded byte ranges from tree-sitter nodes.
-fn collect_excluded_ranges(cursor: &mut tree_sitter::TreeCursor<'_>, text: &str, excluded: &mut Vec<Range<usize>>) {
+fn collect_excluded_ranges(
+    cursor: &mut tree_sitter::TreeCursor<'_>,
+    excluded: &mut Vec<Range<usize>>,
+) {
     let node = cursor.node();
     let kind = node.kind();
 
@@ -165,7 +180,7 @@ fn collect_excluded_ranges(cursor: &mut tree_sitter::TreeCursor<'_>, text: &str,
     // Descend into children.
     if cursor.goto_first_child() {
         loop {
-            collect_excluded_ranges(cursor, text, excluded);
+            collect_excluded_ranges(cursor, excluded);
             if !cursor.goto_next_sibling() {
                 break;
             }
@@ -210,7 +225,11 @@ fn collect_inline_spans(
                     }
                     if scan_end > scan_start {
                         // Scan this unmasked region.
-                        let spans = scan_inline(&TextSnapshot::new(&text.as_bytes()[scan_start..scan_end]).expect("utf-8"), 0..(scan_end - scan_start));
+                        let spans = scan_inline(
+                            &TextSnapshot::new(&text.as_bytes()[scan_start..scan_end])
+                                .expect("utf-8"),
+                            0..(scan_end - scan_start),
+                        );
                         // Map spans back to the full text coordinates.
                         for span in spans {
                             let mapped_span = Span::new(
@@ -219,20 +238,24 @@ fn collect_inline_spans(
                             );
                             match span.kind {
                                 SpanKind::Link => {
-                                    if let Some(link) = super::pulldown_glue::Link::from_scanned(ScannedSpan {
-                                        span: mapped_span,
-                                        kind: span.kind,
-                                        payload: span.payload,
-                                    }) {
+                                    if let Some(link) =
+                                        super::pulldown_glue::Link::from_scanned(ScannedSpan {
+                                            span: mapped_span,
+                                            kind: span.kind,
+                                            payload: span.payload,
+                                        })
+                                    {
                                         links.push(link);
                                     }
                                 }
                                 SpanKind::Embed => {
-                                    if let Some(link) = super::pulldown_glue::Link::from_scanned(ScannedSpan {
-                                        span: mapped_span,
-                                        kind: span.kind,
-                                        payload: span.payload,
-                                    }) {
+                                    if let Some(link) =
+                                        super::pulldown_glue::Link::from_scanned(ScannedSpan {
+                                            span: mapped_span,
+                                            kind: span.kind,
+                                            payload: span.payload,
+                                        })
+                                    {
                                         links.push(link);
                                     }
                                 }
@@ -271,20 +294,18 @@ mod tests {
 
     #[test]
     fn parses_basic_note() {
-        // Note: tree-sitter parsing may differ from pulldown-cmark.
-        // This test just verifies basic functionality.
         let src = "# Hello\n\nThis is a [[link]].\n";
         let result = parse_note_ts(src.as_bytes()).expect("parse");
-        // We expect at least some links to be found.
-        // The exact count may vary based on tree-sitter's parse.
-        println!("Found {} links", result.links.len());
+        assert_eq!(result.links.len(), 1);
+        assert_eq!(result.links[0].target_raw, "link");
     }
 
     #[test]
     fn mask_excludes_code() {
         let src = "`[[not a link]]`";
         let mask = build_mask_ts(src);
-        // The code span should be excluded.
-        // This test depends on tree-sitter correctly identifying the code span.
+        assert!(mask.is_masked(2));
+        let result = parse_note_ts(src.as_bytes()).expect("parse");
+        assert!(result.links.is_empty());
     }
 }

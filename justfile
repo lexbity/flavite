@@ -64,14 +64,21 @@ gate: fmt clippy test arch-check
 # G1 — CI gate (§10.3): G0 + coverage floors + FaultFs/integration suites +
 # doc build + deny/audit/shear + fuzz smoke 60 s + network-denied + MSRV.
 ci-gate: gate
+    @echo "=== G1: coverage ==="
+    cargo llvm-cov --workspace --lcov --output-path target/llvm-cov/lcov.info
+    cargo xtask cov-check --lcov target/llvm-cov/lcov.info
     @echo "=== G1: doc build ==="
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
     @echo "=== G1: cargo-deny ==="
     cargo deny check
     @echo "=== G1: cargo-audit ==="
     cargo audit
+    @echo "=== G1: cargo-shear ==="
+    cargo shear
     @echo "=== G1: fuzz smoke (60 s/target) ==="
     just fuzz-smoke-ci
+    @echo "=== G1: network-denied ==="
+    just network-denied
     @echo "=== G1: MSRV build ==="
     just msrv
     @echo "G1 passed."
