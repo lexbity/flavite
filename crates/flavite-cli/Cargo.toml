@@ -11,3 +11,31 @@ name = "flavite"
 path = "src/main.rs"
 
 [dependencies]
+# Workspace crates
+flavite-fs = { path = "../flavite-fs" }
+flavite-vault = { path = "../flavite-vault" }
+flavite-index = { path = "../flavite-index" }
+flavite-buffer = { path = "../flavite-buffer" }
+flavite-syntax = { path = "../flavite-syntax" }
+
+# CLI parsing
+clap = { version = "4", features = ["derive", "cargo"] }
+
+# Error handling (binary — anyhow)
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Serialization (for doctor --json)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Filesystem
+walkdir = "2"
+directories = "5"
+
+[dev-dependencies]
+# Testing utilities
+tempfile = "3"
