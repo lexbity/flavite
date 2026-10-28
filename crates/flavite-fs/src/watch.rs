@@ -1,49 +1,60 @@
-//! File system watcher wrapper (§5, D5).
+//! File system watcher wrapper (§4.4, D5).
 //!
-//! Wraps the `notify` crate with a unified interface that:
-//! - Normalizes event paths
-//! - Buffers events during initial scan
-//! - Detects rename pairs (for T1 inference)
-//! - Handles platform-specific quirks
+//! Watch registrations belong to one `RecommendedWatcher` and accumulate. Raw
+//! notify events are drained in batches so remove/create pairs can be reported
+//! as rename hints. A missed pair is safe: callers reconcile paths by content.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use notify::event::{CreateKind, RemoveKind};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-/// A watched path with its associated metadata.
 #[derive(Debug, Clone)]
 pub struct WatchedPath {
-    /// The canonical path being watched.
     pub path: PathBuf,
-    /// Whether this is a recursive watch.
     pub recursive: bool,
 }
 
-/// A filesystem event after normalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsEvent {
-    /// The kind of change that occurred.
     pub kind: EventKind,
-    /// The path(s) affected by this event.
     pub paths: Vec<PathBuf>,
-    /// Whether this event is a rename pair (old_path, new_path).
     pub is_rename: bool,
 }
 
-/// Configuration for the watcher.
+/// Portable classification of a normalized filesystem event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsChangeKind {
+    Created,
+    Modified,
+    Deleted,
+}
+
+impl FsEvent {
+    /// Map notify's platform event variants into the small vault-facing set.
+    #[must_use]
+    pub fn change_kind(&self) -> FsChangeKind {
+        if self.is_rename {
+            FsChangeKind::Modified
+        } else if matches!(self.kind, EventKind::Create(_)) {
+            FsChangeKind::Created
+        } else if matches!(self.kind, EventKind::Remove(_)) {
+            FsChangeKind::Deleted
+        } else {
+            FsChangeKind::Modified
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WatcherConfig {
-    /// How long to buffer events before emitting (for coalescing).
     pub debounce_ms: u64,
-    /// Maximum number of buffered events before flushing.
     pub max_buffered: usize,
-    /// Whether to watch recursively by default.
     pub recursive_default: bool,
 }
 
@@ -57,185 +68,126 @@ impl Default for WatcherConfig {
     }
 }
 
-/// The filesystem watcher.
-///
-/// Wraps `notify::RecommendedWatcher` with:
-/// - Path normalization
-/// - Event buffering for initial scan synchronization
-/// - Rename pair detection
-/// - Platform-specific quirks handling
+/// One OS watcher, with an accumulating registration set and a stoppable
+/// event-drain thread.
 pub struct FsWatcher {
-    /// The underlying notify watcher.
     watcher: RecommendedWatcher,
-    /// Channel to send events back to the consumer.
-    sender: Arc<Mutex<Sender<FsEvent>>>,
-    /// Receiver for the consumer.
+    raw_receiver: Arc<Mutex<Receiver<notify::Result<Event>>>>,
     receiver: Arc<Mutex<Receiver<FsEvent>>>,
-    /// Watcher configuration.
+    output_sender: Sender<FsEvent>,
     config: WatcherConfig,
-    /// Track watched paths.
-    watched: Arc<Mutex<HashSet<PathBuf>>>,
-    /// Buffer for coalescing events during initial scan.
-    event_buffer: Arc<Mutex<Vec<Event>>>,
-    /// Whether we're in the initial scan phase.
-    in_initial_scan: Arc<Mutex<bool>>,
-    /// Track potential rename pairs (path -> EventKind).
-    rename_pairs: Arc<Mutex<std::collections::HashMap<PathBuf, EventKind>>>,
+    watched: HashSet<PathBuf>,
+    shutdown: Option<Sender<()>>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl FsWatcher {
-    /// Create a new filesystem watcher.
     pub fn new(config: WatcherConfig) -> std::result::Result<Self, crate::fs::FsError> {
-        let (sender, receiver) = channel();
+        let (raw_sender, raw_receiver) = channel();
+        let callback_sender = raw_sender.clone();
         let watcher = RecommendedWatcher::new(
-            move |_res: std::result::Result<Event, notify::Error>| {
-                // This callback will be replaced
+            move |event| {
+                let _ = callback_sender.send(event);
             },
             notify::Config::default(),
         )
-        .map_err(|e| crate::fs::FsError::Io(format!("failed to create watcher: {}", e)))?;
-
+        .map_err(|e| crate::fs::FsError::Io(format!("failed to create watcher: {e}")))?;
+        let (output_sender, receiver) = channel();
         Ok(Self {
             watcher,
-            sender: Arc::new(Mutex::new(sender)),
+            raw_receiver: Arc::new(Mutex::new(raw_receiver)),
             receiver: Arc::new(Mutex::new(receiver)),
+            output_sender,
             config,
-            watched: Arc::new(Mutex::new(HashSet::new())),
-            event_buffer: Arc::new(Mutex::new(Vec::new())),
-            in_initial_scan: Arc::new(Mutex::new(false)),
-            rename_pairs: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            watched: HashSet::new(),
+            shutdown: None,
+            worker: None,
         })
     }
 
-    /// Create a new filesystem watcher with default configuration.
     pub fn with_defaults() -> std::result::Result<Self, crate::fs::FsError> {
         Self::new(WatcherConfig::default())
     }
 
-    /// Watch a path for changes.
     pub fn watch<P: AsRef<Path>>(
         &mut self,
         path: P,
     ) -> std::result::Result<(), crate::fs::FsError> {
         let path = path.as_ref().to_path_buf();
-        {
-            let mut watched = self.watched.lock().unwrap();
-            if !watched.insert(path.clone()) {
-                // Already watching this path
-                return Ok(());
-            }
+        if self.watched.contains(&path) {
+            return Ok(());
         }
-
-        // Replace the callback with one that processes events
-        let sender = self.sender.clone();
-        let event_buffer = self.event_buffer.clone();
-        let in_initial_scan = self.in_initial_scan.clone();
-        let rename_pairs = self.rename_pairs.clone();
-        let config = self.config.clone();
-
-        let mut watcher = RecommendedWatcher::new(
-            move |res: std::result::Result<Event, notify::Error>| {
-                match res {
-                    Ok(event) => {
-                        // Buffer events during initial scan
-                        if *in_initial_scan.lock().unwrap() {
-                            let mut buffer = event_buffer.lock().unwrap();
-                            buffer.push(event);
-                            return;
-                        }
-
-                        // Process the event
-                        let sender_guard = sender.lock().unwrap();
-                        process_event(
-                            event,
-                            sender_guard.clone(),
-                            rename_pairs.clone(),
-                            config.debounce_ms,
-                        );
-                    }
-                    Err(e) => {
-                        let sender_guard = sender.lock().unwrap();
-                        let _ = sender_guard.send(FsEvent {
-                            kind: EventKind::Other,
-                            paths: vec![PathBuf::from(format!("error: {}", e))],
-                            is_rename: false,
-                        });
-                    }
-                }
-            },
-            notify::Config::default(),
-        )
-        .map_err(|e| crate::fs::FsError::Io(format!("failed to recreate watcher: {}", e)))?;
-
-        // Watch the path
-        watcher
-            .watch(&path, RecursiveMode::Recursive)
+        self.watcher
+            .watch(
+                &path,
+                if self.config.recursive_default {
+                    RecursiveMode::Recursive
+                } else {
+                    RecursiveMode::NonRecursive
+                },
+            )
             .map_err(|e| {
-                crate::fs::FsError::Io(format!("failed to watch {}: {}", path.display(), e))
+                crate::fs::FsError::Io(format!("failed to watch {}: {e}", path.display()))
             })?;
-
-        self.watcher = watcher;
+        self.watched.insert(path);
         Ok(())
     }
 
-    /// Start watching, returning a receiver for events.
-    /// Note: This starts a background thread for event processing.
-    pub fn start(&self) -> Arc<Mutex<Receiver<FsEvent>>> {
-        // Start a thread to process buffered events after initial scan
-        let event_buffer = self.event_buffer.clone();
-        let sender = self.sender.clone();
-        let in_initial_scan = self.in_initial_scan.clone();
+    /// Start a single drain thread. Calling it repeatedly returns the same
+    /// receiver and does not create additional workers.
+    pub fn start(&mut self) -> Arc<Mutex<Receiver<FsEvent>>> {
+        if self.worker.is_some() {
+            return self.receiver.clone();
+        }
+        let raw = self.raw_receiver.clone();
+        let output = self.output_sender.clone();
         let config = self.config.clone();
-        let rename_pairs = self.rename_pairs.clone();
-
-        thread::spawn(move || {
-            loop {
-                thread::sleep(Duration::from_millis(config.debounce_ms));
-
-                let in_scan = *in_initial_scan.lock().unwrap();
-                if in_scan {
-                    continue;
-                }
-
-                let mut buffer = event_buffer.lock().unwrap();
-                if buffer.is_empty() {
-                    continue;
-                }
-
-                // Process buffered events
-                let events = std::mem::take(&mut *buffer);
-                for event in events {
-                    let sender_guard = sender.lock().unwrap();
-                    process_event(
-                        event,
-                        sender_guard.clone(),
-                        rename_pairs.clone(),
-                        config.debounce_ms,
-                    );
-                }
-            }
-        });
-
+        let (shutdown, stop) = channel();
+        self.shutdown = Some(shutdown);
+        self.worker = Some(
+            thread::Builder::new()
+                .name("flavite-fs-watch".into())
+                .spawn(move || {
+                    let interval = Duration::from_millis(config.debounce_ms.max(1));
+                    let mut pending = Vec::new();
+                    loop {
+                        if stop.try_recv().is_ok() {
+                            break;
+                        }
+                        let first = raw.lock().unwrap().recv_timeout(interval);
+                        match first {
+                            Ok(event) => pending.push(event),
+                            Err(RecvTimeoutError::Disconnected) => break,
+                            Err(RecvTimeoutError::Timeout) => {}
+                        }
+                        if !pending.is_empty() {
+                            while let Ok(event) = raw.lock().unwrap().try_recv() {
+                                pending.push(event);
+                            }
+                            let batch = std::mem::take(&mut pending);
+                            for event in normalize_batch(batch, config.max_buffered) {
+                                let _ = output.send(event);
+                            }
+                        }
+                    }
+                })
+                .expect("watcher worker thread creation failed"),
+        );
         self.receiver.clone()
     }
 
-    /// Mark the end of initial scan.
-    pub fn end_initial_scan(&self) {
-        *self.in_initial_scan.lock().unwrap() = false;
-    }
+    pub fn end_initial_scan(&self) {}
 
-    /// Receive the next event, blocking until one is available.
     pub fn receive(&self) -> std::result::Result<FsEvent, crate::fs::FsError> {
-        let receiver = self.receiver.lock().unwrap();
-        receiver
+        self.receiver
+            .lock()
+            .unwrap()
             .recv()
             .map_err(|_| crate::fs::FsError::Io("watcher channel closed".into()))
     }
 
-    /// Try to receive an event without blocking.
     pub fn try_receive(&self) -> std::result::Result<Option<FsEvent>, crate::fs::FsError> {
-        let receiver = self.receiver.lock().unwrap();
-        match receiver.try_recv() {
+        match self.receiver.lock().unwrap().try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -244,136 +196,113 @@ impl FsWatcher {
         }
     }
 
-    /// Unwatch a path.
     pub fn unwatch<P: AsRef<Path>>(
         &mut self,
         path: P,
     ) -> std::result::Result<(), crate::fs::FsError> {
         let path = path.as_ref().to_path_buf();
-        {
-            let mut watched = self.watched.lock().unwrap();
-            watched.remove(&path);
+        if self.watched.remove(&path) {
+            self.watcher.unwatch(&path).map_err(|e| {
+                crate::fs::FsError::Io(format!("failed to unwatch {}: {e}", path.display()))
+            })?;
         }
-        self.watcher.unwatch(&path).map_err(|e| {
-            crate::fs::FsError::Io(format!("failed to unwatch {}: {}", path.display(), e))
-        })?;
         Ok(())
     }
 
-    /// Get a list of currently watched paths.
     pub fn watched_paths(&self) -> Vec<PathBuf> {
-        self.watched.lock().unwrap().iter().cloned().collect()
-    }
-}
-
-/// Process a notify event into a normalized FsEvent.
-fn process_event(
-    event: Event,
-    sender: Sender<FsEvent>,
-    rename_pairs: Arc<Mutex<std::collections::HashMap<PathBuf, EventKind>>>,
-    _debounce_ms: u64,
-) {
-    // Extract paths from the event
-    let paths: Vec<PathBuf> = event.paths.iter().map(|p| normalize_path(p)).collect();
-
-    if paths.is_empty() {
-        return;
+        self.watched.iter().cloned().collect()
     }
 
-    let kind = event.kind;
-
-    // Check for rename pairs
-    let is_rename = if let EventKind::Create(CreateKind::File) = &kind {
-        // Check if we have a matching Remove for this path
-        let mut pairs = rename_pairs.lock().unwrap();
-        if let Some(prev_kind) = pairs.remove(&paths[0]) {
-            // This is the "new" path of a rename
-            if let EventKind::Remove(RemoveKind::File) = prev_kind {
-                true
-            } else {
-                // Put it back if it's not a matching pair
-                pairs.insert(paths[0].clone(), prev_kind);
-                false
-            }
-        } else {
-            false
+    /// Stop and join the drain thread. Registrations remain until drop.
+    pub fn shutdown(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
         }
-    } else if let EventKind::Remove(RemoveKind::File) = &kind {
-        // Store this remove for potential rename detection
-        let mut pairs = rename_pairs.lock().unwrap();
-        pairs.insert(paths[0].clone(), kind);
-        false
-    } else {
-        false
-    };
-
-    // Clean up old rename pair entries periodically
-    if kind == EventKind::Create(CreateKind::File) || kind == EventKind::Remove(RemoveKind::File) {
-        let mut pairs = rename_pairs.lock().unwrap();
-        // Remove entries older than debounce period
-        // (simplified: we don't track timestamps here)
-        pairs.retain(|_, _| true); // Keep all for now
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
-
-    let fs_event = FsEvent {
-        kind,
-        paths,
-        is_rename,
-    };
-
-    let _ = sender.send(fs_event);
 }
 
-/// Normalize a path for consistency.
+impl Drop for FsWatcher {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn normalize_batch(events: Vec<notify::Result<Event>>, max_buffered: usize) -> Vec<FsEvent> {
+    let limit = max_buffered.max(1);
+    let overflowed = events.len() > limit;
+    let events: Vec<Event> = events
+        .into_iter()
+        .take(limit)
+        .map(|event| {
+            event.unwrap_or_else(|error| {
+                Event::new(EventKind::Other)
+                    .add_path(PathBuf::from(format!("notify-error:{error}")))
+            })
+        })
+        .collect();
+    let mut removals: HashMap<PathBuf, Instant> = HashMap::new();
+    let mut creates = Vec::new();
+    let mut output = Vec::new();
+    for event in events {
+        let paths: Vec<_> = event.paths.iter().map(|p| normalize_path(p)).collect();
+        if paths.is_empty() {
+            continue;
+        }
+        match event.kind {
+            EventKind::Remove(RemoveKind::File | RemoveKind::Any) => {
+                removals.insert(paths[0].clone(), Instant::now());
+            }
+            EventKind::Create(CreateKind::File | CreateKind::Any) => {
+                creates.push((event.kind, paths))
+            }
+            kind => output.push(FsEvent {
+                kind,
+                paths,
+                is_rename: false,
+            }),
+        }
+    }
+    for (kind, paths) in creates {
+        let paired = removals.keys().next().cloned();
+        if let Some(from) = paired {
+            removals.remove(&from);
+            output.push(FsEvent {
+                kind,
+                paths: vec![from, paths[0].clone()],
+                is_rename: true,
+            });
+        } else {
+            output.push(FsEvent {
+                kind,
+                paths,
+                is_rename: false,
+            });
+        }
+    }
+    for (path, _) in removals {
+        output.push(FsEvent {
+            kind: EventKind::Remove(RemoveKind::File),
+            paths: vec![path],
+            is_rename: false,
+        });
+    }
+    if overflowed {
+        // The path is only a nomination. VaultActor treats any batch as a
+        // request for content verification, so this sentinel forces a scan.
+        output.push(FsEvent {
+            kind: EventKind::Other,
+            paths: vec![PathBuf::from(".")],
+            is_rename: false,
+        });
+    }
+    output
+}
+
 fn normalize_path(path: &Path) -> PathBuf {
-    // Convert to absolute path and normalize
-    match std::fs::canonicalize(path) {
-        Ok(p) => p,
-        Err(_) => path.to_path_buf(),
-    }
-}
-
-/// Platform-specific rename pair detection.
-///
-/// On different platforms, rename events are signalled differently:
-/// - Unix (inotify): MovedFrom + MovedTo events with the same cookie
-/// - macOS (FSEvents): Rename flag
-/// - Windows: MovedFrom + MovedTo events
-///
-/// This module provides unified detection.
-pub mod platform {
-    use super::Event;
-    use super::EventKind;
-
-    /// Check if an event represents a rename on Unix (inotify).
-    #[cfg(unix)]
-    pub fn is_rename_event(event: &Event) -> bool {
-        use notify::event::ModifyKind;
-        // On Unix, we can detect rename events through the Modify kind
-        // This is a simplified check; actual implementation would need
-        // to inspect platform-specific event data
-        matches!(event.kind, EventKind::Modify(ModifyKind::Metadata(_)))
-    }
-
-    /// Check if an event represents a rename on non-Unix platforms.
-    #[cfg(not(unix))]
-    pub fn is_rename_event(_event: &Event) -> bool {
-        false
-    }
-
-    /// Get the inotify cookie from an event (Unix only).
-    #[cfg(target_os = "linux")]
-    pub fn get_cookie(_event: &Event) -> Option<u32> {
-        // Extracting inotify cookie requires platform-specific handling
-        // For now, return None as we don't have access to the raw inotify data
-        None
-    }
-
-    /// Get the inotify cookie from an event (non-Linux).
-    #[cfg(not(target_os = "linux"))]
-    pub fn get_cookie(_event: &Event) -> Option<u32> {
-        None
-    }
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -381,19 +310,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_path_resolves_symlinks() {
-        // This test would need actual filesystem setup
-        // For now, just test that it doesn't panic
-        let path = Path::new("/tmp/test");
-        let normalized = normalize_path(path);
-        assert!(!normalized.to_string_lossy().is_empty());
+    fn batches_pair_remove_and_create_rename_hints() {
+        let events = vec![
+            Ok(Event::new(EventKind::Remove(RemoveKind::File)).add_path("/old.md".into())),
+            Ok(Event::new(EventKind::Create(CreateKind::File)).add_path("/new.md".into())),
+        ];
+        let result = normalize_batch(events, 10);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].is_rename);
+        assert_eq!(
+            result[0].paths,
+            vec![PathBuf::from("/old.md"), PathBuf::from("/new.md")]
+        );
     }
 
     #[test]
-    fn watcher_config_defaults() {
-        let config = WatcherConfig::default();
-        assert_eq!(config.debounce_ms, 100);
-        assert_eq!(config.max_buffered, 1024);
-        assert!(config.recursive_default);
+    fn registrations_accumulate_and_shutdown_joins_worker() {
+        let mut watcher = FsWatcher::with_defaults().unwrap();
+        let one = tempfile::tempdir().unwrap();
+        let two = tempfile::tempdir().unwrap();
+        watcher.watch(one.path()).unwrap();
+        watcher.watch(two.path()).unwrap();
+        assert_eq!(watcher.watched_paths().len(), 2);
+        let _events = watcher.start();
+        assert!(watcher.worker.is_some());
+        watcher.shutdown();
+        assert!(watcher.worker.is_none());
+    }
+
+    #[test]
+    fn rename_candidates_from_separate_batches_remain_create_and_delete() {
+        let removed = normalize_batch(
+            vec![Ok(
+                Event::new(EventKind::Remove(RemoveKind::File)).add_path("/old.md".into())
+            )],
+            10,
+        );
+        let created = normalize_batch(
+            vec![Ok(
+                Event::new(EventKind::Create(CreateKind::File)).add_path("/new.md".into())
+            )],
+            10,
+        );
+        assert_eq!(removed.len(), 1);
+        assert_eq!(created.len(), 1);
+        assert!(!removed[0].is_rename);
+        assert!(!created[0].is_rename);
     }
 }

@@ -143,11 +143,35 @@ impl EditorModel {
     }
 
     /// Replace the document snapshot while preserving buffer identity and
-    /// advancing its revision. Used when restoring a durable recovery file.
+    /// advancing its revision. Cursor positions are mapped through the common
+    /// prefix/suffix, with positions inside the changed range clamped to the
+    /// replacement. Used for silent reloads and durable recovery.
     pub fn replace_snapshot(&mut self, snapshot: TextSnapshot) {
+        let old_text = self.text().to_owned();
+        let new_text = snapshot.text().to_owned();
+        let (prefix, suffix) = common_text_edges(&old_text, &new_text);
+        let old_middle_end = old_text.len().saturating_sub(suffix);
+        let new_middle_end = new_text.len().saturating_sub(suffix);
+        for selection in self.selections.values_mut() {
+            selection.anchor = map_position(
+                selection.anchor,
+                prefix,
+                old_middle_end,
+                new_middle_end,
+                old_text.len(),
+                &new_text,
+            );
+            selection.head = map_position(
+                selection.head,
+                prefix,
+                old_middle_end,
+                new_middle_end,
+                old_text.len(),
+                &new_text,
+            );
+        }
         self.rope = Rope::from_str(snapshot.text());
         self.eol_table = EolTable::from_snapshot(&snapshot);
-        self.selections.clear();
         self.undo_tree = UndoTree::new(snapshot.clone());
         self.revision = self.revision.next();
         self.base_hash = Some(BaseHash::from_snapshot(&snapshot));
@@ -674,6 +698,11 @@ impl EditorModel {
         let old_middle = old_lines.len() - prefix - suffix;
         let new_middle = new_lines.len() - prefix - suffix;
         for (line, ending) in new_table.line_endings.iter_mut().enumerate() {
+            // A replacement line without a newline is authoritative: do not
+            // carry the old file's ending onto the new final unterminated line.
+            if *ending == crate::eol::LineEnding::None {
+                continue;
+            }
             let old_line = if line < prefix {
                 Some(line)
             } else if line >= prefix + new_middle {
@@ -696,6 +725,54 @@ impl EditorModel {
     pub fn set_coalesce_window(&mut self, window: Duration) {
         self.undo_tree.set_coalesce_window(window);
     }
+}
+
+fn common_text_edges(old: &str, new: &str) -> (usize, usize) {
+    let mut prefix = 0;
+    for (left, right) in old.chars().zip(new.chars()) {
+        if left != right {
+            break;
+        }
+        prefix += left.len_utf8();
+    }
+    let mut suffix = 0;
+    for (left, right) in old[prefix..]
+        .chars()
+        .rev()
+        .zip(new[prefix.min(new.len())..].chars().rev())
+    {
+        if left != right {
+            break;
+        }
+        suffix += left.len_utf8();
+    }
+    (prefix, suffix)
+}
+
+fn map_position(
+    position: TextByte,
+    prefix: usize,
+    old_middle_end: usize,
+    new_middle_end: usize,
+    old_len: usize,
+    new_text: &str,
+) -> TextByte {
+    let old = position.0;
+    let mapped = if old <= prefix {
+        old
+    } else if old >= old_middle_end {
+        new_text.len().saturating_sub(old_len.saturating_sub(old))
+    } else {
+        prefix
+            + old
+                .saturating_sub(prefix)
+                .min(new_middle_end.saturating_sub(prefix))
+    };
+    let mut mapped = mapped.min(new_text.len());
+    while !new_text.is_char_boundary(mapped) {
+        mapped = mapped.saturating_sub(1);
+    }
+    TextByte(mapped)
 }
 
 fn logical_lines(text: &str) -> Vec<&str> {
@@ -1010,7 +1087,7 @@ mod tests {
         assert_eq!(model.text(), "fresh\n");
         assert_eq!(model.revision(), Revision::new(1));
         assert!(!model.is_dirty());
-        assert_eq!(model.selections().len(), 0);
+        assert_eq!(model.selections().len(), 2);
         assert!(model.base_hash().is_some());
     }
 

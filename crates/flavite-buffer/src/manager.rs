@@ -449,6 +449,10 @@ mod tests {
 
         let path = PathBuf::from("test.md");
         manager.open_note(path.clone(), b"hello");
+        manager.apply_edit(
+            &path,
+            crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " mine".into()),
+        );
 
         // External change
         let transitions = manager.notify_external_change(&path, b"goodbye");
@@ -559,6 +563,10 @@ mod tests {
         assert!(!manager.has_buffers_needing_resolution());
 
         // Create a conflict
+        manager.apply_edit(
+            &path,
+            crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " mine".into()),
+        );
         manager.notify_external_change(&path, b"goodbye");
         assert!(manager.has_buffers_needing_resolution());
     }

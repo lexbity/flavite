@@ -123,6 +123,8 @@ impl Vault {
             .with_fs(fs)
             .with_identity(identity.clone())
             .with_index(index)
+            .with_pulse_sender(channels.pulse.sender())
+            .with_runtime_config(config.clone())
             .build()?
             .start()?;
 

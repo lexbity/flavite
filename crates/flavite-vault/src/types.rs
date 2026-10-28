@@ -275,6 +275,8 @@ pub struct VaultConfig {
     pub watcher_enabled: bool,
     /// Interval for periodic verification (default: 10 minutes).
     pub verification_interval: Duration,
+    /// Idle time before a dirty buffer becomes eligible for autosave (default: 1s).
+    pub autosave_idle_interval: Duration,
     /// Quiet window for event coalescing (default: 300ms).
     pub coalesce_quiet_window: Duration,
     /// Maximum coalescing window (default: 2s).
@@ -290,6 +292,7 @@ impl Default for VaultConfig {
         Self {
             watcher_enabled: true,
             verification_interval: Duration::from_secs(600), // 10 minutes
+            autosave_idle_interval: Duration::from_secs(1),
             coalesce_quiet_window: Duration::from_millis(300),
             coalesce_max_window: Duration::from_secs(2),
             bulk_threshold: 500,

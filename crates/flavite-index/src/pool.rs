@@ -331,6 +331,17 @@ impl IndexActor {
         self.read_pool.stats()
     }
 
+    /// Read the structural index's authoritative epoch and generation.
+    pub fn current_version(&self) -> Result<(u64, u64), String> {
+        let epoch = get_meta_u64(self.writer.conn(), MetaKey::Epoch)
+            .map_err(|error| error.to_string())?
+            .unwrap_or(0);
+        let generation = get_meta_u64(self.writer.conn(), MetaKey::Generation)
+            .map_err(|error| error.to_string())?
+            .unwrap_or(0);
+        Ok((epoch, generation))
+    }
+
     /// Read the indexed note title/alias snapshot for editor autocomplete.
     ///
     /// # Errors
@@ -384,6 +395,73 @@ impl IndexActor {
             });
         }
         Ok(candidates)
+    }
+
+    /// List native path keys currently represented in the structural index.
+    pub fn indexed_note_paths(&self) -> Result<Vec<Vec<u8>>, String> {
+        let mut statement = self
+            .writer
+            .conn()
+            .prepare("SELECT path_native FROM notes")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|e| e.to_string())?;
+        rows.map(|row| row.map_err(|e| e.to_string())).collect()
+    }
+
+    /// Check whether one native path key is already indexed.
+    pub fn contains_note_path(&self, path_native: &[u8]) -> Result<bool, String> {
+        self.writer
+            .conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM notes WHERE path_native=?1)",
+                [path_native],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    /// Remove a vanished note and its dependent structural/search rows in one
+    /// transaction. Returns whether an indexed note was removed.
+    pub fn remove_note_path(&mut self, path_native: &[u8]) -> Result<bool, String> {
+        let tx = self.writer.conn.transaction().map_err(|e| e.to_string())?;
+        let note_id: Option<i64> = tx
+            .query_row(
+                "SELECT note_id FROM notes WHERE path_native=?1",
+                [path_native],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(note_id) = note_id else {
+            tx.rollback().map_err(|e| e.to_string())?;
+            return Ok(false);
+        };
+        let generation = get_meta_u64(&tx, MetaKey::Generation)
+            .map_err(|error| error.to_string())?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or("index generation overflow")?;
+        tx.execute("DELETE FROM notes WHERE note_id=?1", [note_id])
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM search_docs WHERE note_id=?1", [note_id])
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE meta SET value=?1 WHERE key=?2",
+            rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO changes(generation,kind,entity_id) VALUES(?1,'note_deleted',?2)",
+            rusqlite::params![
+                i64::try_from(generation).map_err(|e| e.to_string())?,
+                note_id
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
     }
 
     /// Apply the exact bytes installed by a save to SQLite in one structural

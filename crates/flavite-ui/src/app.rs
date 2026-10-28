@@ -803,6 +803,7 @@ impl App {
 
     fn pump(&mut self) {
         let Some(flavite) = &self.flavite else { return };
+        flavite.session().pump();
         for pulse in flavite.drain_pulses() {
             self.recent_events.push(describe_pulse(&pulse));
         }

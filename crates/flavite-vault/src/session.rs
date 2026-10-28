@@ -260,6 +260,14 @@ pub struct Session {
     identity: VaultIdentity,
     /// Vault actor handle.
     actor: VaultActorHandle,
+    /// Lossless watcher observations from VaultActor, applied on Session's
+    /// driving thread so buffers remain single-owner state.
+    actor_events: crossbeam::channel::Receiver<crate::actor::VaultActorEvent>,
+    /// Idle-save deadline state, keyed by the authoritative buffer path.
+    last_edit: Mutex<HashMap<PathBuf, std::time::Instant>>,
+    /// Prevent repeated autosave admission for an unchanged failed revision.
+    autosave_attempted: Mutex<HashMap<PathBuf, Revision>>,
+    autosave_idle_interval: Duration,
     /// Buffer manager.
     buffer_manager: Arc<Mutex<BufferManager>>,
     /// Open buffers by path.
@@ -295,8 +303,9 @@ impl Session {
         buffer_manager: BufferManager,
         pulse: PulseChannel,
         notice: NoticeChannel,
-        _config: VaultConfig,
+        config: VaultConfig,
     ) -> Self {
+        let actor_events = actor.events();
         let manager = Arc::new(Mutex::new(buffer_manager));
         let recovery_writer = crate::identity::get_data_dir().map(|data| {
             let dir = data
@@ -351,6 +360,10 @@ impl Session {
             driving_turn: Mutex::new(()),
             identity,
             actor,
+            actor_events,
+            last_edit: Mutex::new(HashMap::new()),
+            autosave_attempted: Mutex::new(HashMap::new()),
+            autosave_idle_interval: config.autosave_idle_interval,
             buffer_manager: manager,
             open_buffers: Arc::new(Mutex::new(HashMap::new())),
             absent_on_open: Arc::new(Mutex::new(HashSet::new())),
@@ -374,7 +387,110 @@ impl Session {
     /// Execute a command.
     pub fn execute(&self, command: SessionCommand) -> SessionResult {
         let _turn = self.driving_turn.lock().unwrap();
-        self.execute_inner(command)
+        self.pump_external_changes_inner();
+        let edited_path = match &command {
+            SessionCommand::ApplyEdits { buffer_id, .. }
+            | SessionCommand::Undo { buffer_id, .. }
+            | SessionCommand::Redo { buffer_id, .. } => self
+                .buffer_manager
+                .lock()
+                .unwrap()
+                .path_for_id(*buffer_id)
+                .cloned(),
+            SessionCommand::ApplyMerge { path, .. }
+            | SessionCommand::ResolveConflict { path, .. }
+            | SessionCommand::RestoreRecovery { path } => Some(path.clone()),
+            _ => None,
+        };
+        let result = self.execute_inner(command);
+        if let Some(path) = edited_path
+            && matches!(
+                &result,
+                SessionResult::Success(_) | SessionResult::Pending { .. }
+            )
+        {
+            self.last_edit
+                .lock()
+                .unwrap()
+                .insert(path.clone(), std::time::Instant::now());
+            self.autosave_attempted.lock().unwrap().remove(&path);
+        }
+        result
+    }
+
+    /// Apply queued disk observations on the host pump. GUI hosts call this
+    /// from their regular timer; command execution also drains before running.
+    pub fn pump(&self) {
+        let _turn = self.driving_turn.lock().unwrap();
+        self.pump_external_changes_inner();
+        self.pump_save_completions();
+        self.pump_reconcile_completions();
+        self.pump_autosave();
+        let _ = self.recovery_tick();
+    }
+
+    fn pump_autosave(&self) {
+        let now = std::time::Instant::now();
+        let dirty = self
+            .buffer_manager
+            .lock()
+            .unwrap()
+            .dirty_buffers()
+            .into_iter()
+            .filter(|(_, buffer)| buffer.allows_autosave())
+            .map(|(path, buffer)| (path.clone(), buffer.buffer_id(), buffer.revision()))
+            .collect::<Vec<_>>();
+        for (path, buffer_id, revision) in dirty {
+            let last_edit = {
+                let mut deadlines = self.last_edit.lock().unwrap();
+                *deadlines.entry(path.clone()).or_insert(now)
+            };
+            if now.duration_since(last_edit) < self.autosave_idle_interval
+                || self.autosave_attempted.lock().unwrap().get(&path) == Some(&revision)
+                || self
+                    .save_flights
+                    .lock()
+                    .unwrap()
+                    .contains_key(&buffer_id.as_u64())
+            {
+                continue;
+            }
+            self.autosave_attempted
+                .lock()
+                .unwrap()
+                .insert(path.clone(), revision);
+            let _ = self.save_note(path);
+        }
+    }
+
+    fn pump_external_changes_inner(&self) {
+        while let Ok(event) = self.actor_events.try_recv() {
+            match event {
+                crate::actor::VaultActorEvent::ExternalChange { path, bytes } => {
+                    let mut manager = self.buffer_manager.lock().unwrap();
+                    manager.notify_external_change(&path, &bytes);
+                    if manager.get_buffer(&path).is_some_and(|buffer| {
+                        buffer.state() == flavite_buffer::state::BufferState::Conflicted
+                    }) {
+                        self.notice.send(crate::channels::Notice::Conflict {
+                            note: flavite_buffer::manager::NoteRef::new(path.clone()),
+                        });
+                    }
+                    let _ = self.pulse.send(crate::channels::Pulse::Invalidate {
+                        note: flavite_buffer::manager::NoteRef::new(path),
+                    });
+                }
+                crate::actor::VaultActorEvent::Deleted { path } => {
+                    let mut manager = self.buffer_manager.lock().unwrap();
+                    if !manager.notify_file_deleted(&path).is_empty() {
+                        self.notice.send(crate::channels::Notice::ActionRequired {
+                            code: "external_delete",
+                            note: Some(flavite_buffer::manager::NoteRef::new(path)),
+                        });
+                    }
+                }
+            }
+        }
     }
 
     fn execute_inner(&self, command: SessionCommand) -> SessionResult {
@@ -1637,6 +1753,7 @@ mod tests {
     use super::*;
     use crate::actor::VaultActorBuilder;
     use crate::channels::ChannelSet;
+    use crate::coalesce::WatcherEvent;
     use flavite_buffer::state::BufferState;
     use flavite_fs::{Fs, MemFs};
     use flavite_index::IndexActor;
@@ -1927,6 +2044,159 @@ mod tests {
             session.execute(SessionCommand::CloseNote { path }),
             SessionResult::Error { .. }
         ));
+    }
+
+    #[test]
+    fn watcher_change_conflicts_with_dirty_buffer_through_session_pump() {
+        let fs = MemFs::new();
+        let root = PathBuf::from("/watch/vault");
+        fs.create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        fs.write_new(&path, b"hello").unwrap();
+        let clean_path = root.join("clean.md");
+        fs.write_new(&clean_path, b"clean before").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("session-watch.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let identity = VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![1, 2, 3]);
+        let (event_tx, event_rx) = crate::actor::event_source_channel();
+        let channels = ChannelSet::new();
+        let pulse_rx = channels.pulse.receiver();
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs.clone()))
+            .with_identity(identity.clone())
+            .with_index(IndexActor::new(&db, 1).unwrap())
+            .with_event_source(event_rx)
+            .with_pulse_sender(channels.pulse.sender())
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        let mut session = Session::new(
+            identity,
+            actor,
+            BufferManager::new(),
+            channels.pulse,
+            channels.notice,
+            VaultConfig::default(),
+        );
+        session.autosave_idle_interval = Duration::from_secs(60);
+        let (buffer_id, revision) =
+            match session.execute(SessionCommand::OpenNote { path: path.clone() }) {
+                SessionResult::Success(CommandResult::NoteOpened {
+                    buffer_id,
+                    revision,
+                }) => (buffer_id, revision),
+                other => panic!("expected open, got {other:?}"),
+            };
+        let _ = session.drain_pulses();
+        assert!(matches!(
+            session.execute(SessionCommand::ApplyEdits {
+                buffer_id,
+                revision,
+                ops: vec![EditOp::new(
+                    Span::new(TextByte(5), TextByte(5)),
+                    " mine".into()
+                )],
+            }),
+            SessionResult::Success(CommandResult::EditsApplied { .. })
+        ));
+        let clean_id = match session.execute(SessionCommand::OpenNote {
+            path: clean_path.clone(),
+        }) {
+            SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => buffer_id,
+            other => panic!("expected clean note open, got {other:?}"),
+        };
+        fs.write_new(&root.join(".external"), b"theirs").unwrap();
+        fs.rename_replace(&root.join(".external"), &path).unwrap();
+        // Bulk event pressure must still produce the conflict notice through
+        // the lossless Session event path.
+        for _ in 0..500 {
+            event_tx.send(WatcherEvent::Modified(path.clone())).unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut conflicted = false;
+        while std::time::Instant::now() < deadline {
+            while pulse_rx.try_recv().is_ok() {}
+            session.pump();
+            conflicted = session
+                .buffer_manager
+                .lock()
+                .unwrap()
+                .get_buffer(&path)
+                .unwrap()
+                .state()
+                == BufferState::Conflicted;
+            if conflicted {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            conflicted,
+            "watcher change did not conflict the dirty buffer"
+        );
+        assert!(session.drain_notices().iter().any(|notice| matches!(notice, crate::channels::Notice::Conflict { note } if note.path == path)));
+        fs.write_new(&root.join(".external-clean"), b"clean after")
+            .unwrap();
+        fs.rename_replace(&root.join(".external-clean"), &clean_path)
+            .unwrap();
+        event_tx
+            .send(WatcherEvent::Modified(clean_path.clone()))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            session.pump();
+            if session
+                .buffer_manager
+                .lock()
+                .unwrap()
+                .get_buffer_by_id(clean_id)
+                .unwrap()
+                .text()
+                == "clean after"
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let manager = session.buffer_manager.lock().unwrap();
+        let clean = manager.get_buffer_by_id(clean_id).unwrap();
+        assert_eq!(clean.state(), BufferState::Clean);
+        assert_eq!(clean.text(), "clean after");
+    }
+
+    #[test]
+    fn host_clock_pump_autosaves_an_idle_dirty_revision() {
+        let (mut session, fs, _temp) = test_session();
+        let path = PathBuf::from("/test/vault/note.md");
+        session.autosave_idle_interval = Duration::from_millis(5);
+        let (buffer_id, revision) =
+            match session.execute(SessionCommand::OpenNote { path: path.clone() }) {
+                SessionResult::Success(CommandResult::NoteOpened {
+                    buffer_id,
+                    revision,
+                }) => (buffer_id, revision),
+                other => panic!("expected opened note, got {other:?}"),
+            };
+        assert!(matches!(
+            session.execute(SessionCommand::ApplyEdits {
+                buffer_id,
+                revision,
+                ops: vec![EditOp::new(Span::new(TextByte(5), TextByte(5)), "!".into())],
+            }),
+            SessionResult::Success(CommandResult::EditsApplied { .. })
+        ));
+        std::thread::sleep(Duration::from_millis(10));
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            session.pump();
+            if fs.read_if_exists(&path).unwrap().as_deref() == Some(b"hello!") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("idle dirty revision was not autosaved by the Session clock pump");
     }
 
     #[test]

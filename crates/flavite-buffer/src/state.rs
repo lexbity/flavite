@@ -354,17 +354,12 @@ impl Buffer {
             // Disk content has changed
             let new_state = match old_state {
                 BufferState::Clean => {
-                    // We were clean, but disk changed under us
-                    // Check if our buffer content matches the new disk content
-                    if self.model.matches_hash(new_disk_hash) {
-                        // Our buffer matches the new disk content
-                        // This means we auto-resolved to Clean
-                        // (D7: "Dirty | changed to *identical* content as buffer → Auto-resolve → Clean")
-                        BufferState::Clean
-                    } else {
-                        // External change detected
-                        BufferState::Conflicted
-                    }
+                    // A clean buffer has no local edits to protect. Reload the
+                    // changed bytes silently and advance its disk base (D7).
+                    self.model.replace_snapshot(new_snapshot.clone());
+                    self.base_hash = Some(new_disk_hash);
+                    self.base_bytes = self.model.to_source_bytes();
+                    BufferState::Clean
                 }
                 BufferState::Dirty => {
                     // We were dirty, disk changed
@@ -464,7 +459,7 @@ impl Buffer {
             let new_hash = BaseHash::from_snapshot(&snapshot);
 
             // Replace the model
-            self.model = EditorModel::from_snapshot(snapshot);
+            self.model.replace_snapshot(snapshot);
             self.disk_hash = Some(new_hash);
             self.base_hash = Some(new_hash);
             self.base_bytes = self.model.to_source_bytes();
@@ -813,6 +808,10 @@ mod tests {
     #[test]
     fn external_change_conflict() {
         let mut buffer = Buffer::from_text("hello");
+        buffer.apply_local_edit(crate::undo::EditOp::new(
+            Span::new(TextByte(5), TextByte(5)),
+            " mine".into(),
+        ));
 
         // External change to different content
         let new_content = b"goodbye";
@@ -822,7 +821,7 @@ mod tests {
         assert_eq!(
             transition,
             Some(StateTransition::new(
-                BufferState::Clean,
+                BufferState::Dirty,
                 BufferState::Conflicted,
                 TransitionReason::ExternalChange
             ))
@@ -977,6 +976,10 @@ mod tests {
     #[test]
     fn autosave_disabled_in_conflicted() {
         let mut buffer = Buffer::from_text("hello");
+        buffer.apply_local_edit(crate::undo::EditOp::new(
+            Span::new(TextByte(5), TextByte(5)),
+            " mine".into(),
+        ));
         buffer.check_external_change(b"goodbye");
         assert_eq!(buffer.state(), BufferState::Conflicted);
         assert!(!buffer.allows_autosave());
@@ -987,6 +990,10 @@ mod tests {
         let mut buffer = Buffer::from_text("hello");
 
         // Conflicted
+        buffer.apply_local_edit(crate::undo::EditOp::new(
+            Span::new(TextByte(5), TextByte(5)),
+            " mine".into(),
+        ));
         buffer.check_external_change(b"goodbye");
         assert!(!buffer.allows_manual_save());
 
@@ -1052,12 +1059,21 @@ mod tests {
 
     #[test]
     fn d7_table_clean_changed() {
-        // Clean | changed → Silent reload. Map cursor and scroll through the diff
+        // Clean | changed → silent reload.
         let mut buffer = Buffer::from_text("hello");
+        let buffer_id = buffer.buffer_id();
+        let revision = buffer.revision();
+        buffer
+            .model_mut()
+            .set_primary_selection(crate::model::Selection::caret(TextByte(3)));
         let _transition = buffer.check_external_change(b"hello world");
 
-        assert_eq!(buffer.state(), BufferState::Conflicted);
-        // This would normally trigger a silent reload in the UI
+        assert_eq!(buffer.state(), BufferState::Clean);
+        assert_eq!(buffer.model().text(), "hello world");
+        assert_eq!(buffer.base_bytes(), b"hello world");
+        assert_eq!(buffer.buffer_id(), buffer_id);
+        assert!(buffer.revision() > revision);
+        assert_eq!(buffer.model().primary_selection().head, TextByte(3));
     }
 
     #[test]
@@ -1109,6 +1125,10 @@ mod tests {
     fn d7_table_conflicted() {
         // Conflicted state blocks autosave and manual save
         let mut buffer = Buffer::from_text("hello");
+        buffer.apply_local_edit(crate::undo::EditOp::new(
+            Span::new(TextByte(5), TextByte(5)),
+            " mine".into(),
+        ));
         buffer.check_external_change(b"goodbye");
 
         assert!(buffer.is_conflicted());

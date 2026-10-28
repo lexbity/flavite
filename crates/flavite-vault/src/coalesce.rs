@@ -11,6 +11,29 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Monotonic time seam used to make batching deadlines deterministic in tests.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> Duration;
+}
+
+#[derive(Debug)]
+struct SystemClock(Instant);
+impl Clock for SystemClock {
+    fn now(&self) -> Duration {
+        self.0.elapsed()
+    }
+}
+
+#[derive(Default)]
+struct CoalescerState {
+    pending: EventBatch,
+    first_event: Option<Duration>,
+    last_event: Option<Duration>,
+    arrivals: Vec<Duration>,
+    bulk_pending: bool,
+    manual: Option<(ReconcileScope, ReconcileMode)>,
+}
+
 /// A coalesced event batch.
 #[derive(Debug, Clone)]
 pub struct EventBatch {
@@ -115,32 +138,30 @@ pub struct EventCoalescer {
     /// Event receiver.
     event_receiver: Receiver<CoalescerEvent>,
     /// Pending batch.
-    pending: Arc<Mutex<EventBatch>>,
-    /// Last event time.
-    last_event_time: Arc<Mutex<Instant>>,
-    /// Event count for bulk detection.
-    event_count: Arc<Mutex<u32>>,
-    /// Last bulk detection time.
-    last_bulk_time: Arc<Mutex<Instant>>,
-    /// Whether we're in bulk mode.
-    in_bulk_mode: Arc<Mutex<bool>>,
+    state: Arc<Mutex<CoalescerState>>,
+    clock: Arc<dyn Clock>,
 }
 
 impl EventCoalescer {
     /// Create a new event coalescer.
     #[must_use]
     pub fn new(config: CoalescerConfig) -> Self {
-        let (event_sender, event_receiver) = crossbeam::channel::unbounded();
+        Self::with_clock(config, Arc::new(SystemClock(Instant::now())))
+    }
 
+    /// Construct with a deterministic clock (primarily for tests).
+    #[must_use]
+    pub fn with_clock(config: CoalescerConfig, clock: Arc<dyn Clock>) -> Self {
+        let (event_sender, event_receiver) = crossbeam::channel::unbounded();
         Self {
             config,
             event_sender,
             event_receiver,
-            pending: Arc::new(Mutex::new(EventBatch::default())),
-            last_event_time: Arc::new(Mutex::new(Instant::now())),
-            event_count: Arc::new(Mutex::new(0)),
-            last_bulk_time: Arc::new(Mutex::new(Instant::now())),
-            in_bulk_mode: Arc::new(Mutex::new(false)),
+            state: Arc::new(Mutex::new(CoalescerState {
+                pending: EventBatch::default(),
+                ..CoalescerState::default()
+            })),
+            clock,
         }
     }
 
@@ -152,26 +173,7 @@ impl EventCoalescer {
 
     /// Send an event to the coalescer.
     pub fn send(&self, event: CoalescerEvent) {
-        let _ = self.event_sender.try_send(event);
-        *self.last_event_time.lock().unwrap() = Instant::now();
-
-        // Increment event count for bulk detection
-        let mut count = self.event_count.lock().unwrap();
-        *count += 1;
-
-        // Check for bulk mode
-        let now = Instant::now();
-        let mut last_bulk = self.last_bulk_time.lock().unwrap();
-
-        if *count >= self.config.bulk_threshold {
-            // Check if we've exceeded the threshold in the last second
-            let mut in_bulk = self.in_bulk_mode.lock().unwrap();
-            if !*in_bulk && now.duration_since(*last_bulk) < Duration::from_secs(1) {
-                *in_bulk = true;
-                *last_bulk = now;
-                *count = 0; // Reset count
-            }
-        }
+        self.ingest(event);
     }
 
     /// Try to receive a coalesced batch.
@@ -180,81 +182,66 @@ impl EventCoalescer {
     /// quiet window hasn't expired or there are no events.
     #[must_use]
     pub fn try_recv_batch(&self) -> Option<EventBatch> {
-        // Check if quiet window has expired
-        let last_time = *self.last_event_time.lock().unwrap();
-        let now = Instant::now();
-
-        if now.duration_since(last_time) < self.config.quiet_window {
-            // Quiet window hasn't expired
-            return None;
-        }
-
-        // Also check max window
-        if now.duration_since(last_time) > self.config.max_window {
-            // Max window expired, force a batch
-            let mut pending = self.pending.lock().unwrap();
-            if pending.is_empty() {
-                return None;
-            }
-            return Some(std::mem::take(&mut *pending));
-        }
-
-        // Check if we're in bulk mode
-        let in_bulk = *self.in_bulk_mode.lock().unwrap();
-        if in_bulk {
-            // In bulk mode, we should have already triggered
-            // For now, we'll just take the pending batch
-            let mut pending = self.pending.lock().unwrap();
-            if pending.is_empty() {
-                return None;
-            }
-            let batch = std::mem::take(&mut *pending);
-
-            // Reset bulk mode if we've processed the batch
-            *self.in_bulk_mode.lock().unwrap() = false;
-            *self.event_count.lock().unwrap() = 0;
-
-            return Some(batch);
-        }
-
-        // Try to receive and process events
-        let mut has_events = false;
-        let mut temp_paths = HashSet::new();
-
         loop {
             match self.event_receiver.try_recv() {
-                Ok(CoalescerEvent::PathNominated(path)) => {
-                    temp_paths.insert(path);
-                    has_events = true;
-                }
-                Ok(CoalescerEvent::BulkTrigger(paths)) => {
-                    temp_paths.extend(paths);
-                    has_events = true;
-                    // Enter bulk mode
-                    *self.in_bulk_mode.lock().unwrap() = true;
-                }
-                Ok(CoalescerEvent::ManualReconcile(scope, mode)) => {
-                    // For manual reconcile, we need to handle it differently
-                    // For now, just return an empty batch with the scope/mode
-                    let mut pending = self.pending.lock().unwrap();
-                    pending.scope = scope;
-                    pending.mode = mode;
-                    return Some(std::mem::take(&mut *pending));
-                }
+                Ok(event) => self.ingest(event),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
         }
-
-        if has_events {
-            let mut pending = self.pending.lock().unwrap();
-            for path in temp_paths {
-                pending.add_path(path);
-            }
-            return Some(std::mem::take(&mut *pending));
+        let now = self.clock.now();
+        let mut state = self.state.lock().unwrap();
+        if let Some((scope, mode)) = state.manual.take() {
+            let mut batch = std::mem::take(&mut state.pending);
+            batch.scope = scope;
+            batch.mode = mode;
+            state.reset_window();
+            return Some(batch);
         }
+        let last = state.last_event?;
+        let first = state.first_event.unwrap_or(last);
+        let forced = now.saturating_sub(first) >= self.config.max_window;
+        let quiet = now.saturating_sub(last) >= self.config.quiet_window;
+        if !forced && !quiet {
+            return None;
+        }
+        if state.pending.is_empty() && !state.bulk_pending {
+            state.reset_window();
+            return None;
+        }
+        let mut batch = std::mem::take(&mut state.pending);
+        if state.bulk_pending {
+            batch.scope = ReconcileScope::Full;
+            batch.mode = ReconcileMode::VerifyContent;
+            batch.is_bulk = true;
+        }
+        state.bulk_pending = false;
+        state.reset_window();
+        Some(batch)
+    }
 
-        None
+    fn ingest(&self, event: CoalescerEvent) {
+        let now = self.clock.now();
+        let mut state = self.state.lock().unwrap();
+        match event {
+            CoalescerEvent::PathNominated(path) => state.pending.add_path(path),
+            CoalescerEvent::BulkTrigger(paths) => {
+                state.pending.paths.extend(paths);
+                state.bulk_pending = true;
+            }
+            CoalescerEvent::ManualReconcile(scope, mode) => {
+                state.manual = Some((scope, mode));
+            }
+        }
+        state.first_event.get_or_insert(now);
+        state.last_event = Some(now);
+        state
+            .arrivals
+            .retain(|at| now.saturating_sub(*at) <= Duration::from_secs(1));
+        state.arrivals.push(now);
+        if state.arrivals.len() >= self.config.bulk_threshold as usize {
+            state.bulk_pending = true;
+        }
     }
 
     /// Receive a coalesced batch, waiting if necessary.
@@ -263,33 +250,9 @@ impl EventCoalescer {
             if let Some(batch) = self.try_recv_batch() {
                 return batch;
             }
-
-            // Wait for events or timeout
-            match self.event_receiver.recv_timeout(self.config.quiet_window) {
-                Ok(CoalescerEvent::PathNominated(path)) => {
-                    self.send(CoalescerEvent::PathNominated(path));
-                }
-                Ok(CoalescerEvent::BulkTrigger(paths)) => {
-                    let mut batch = EventBatch::bulk(ReconcileScope::Full, paths);
-                    // Add any pending paths
-                    let mut pending = self.pending.lock().unwrap();
-                    for path in std::mem::take(&mut pending.paths) {
-                        batch.add_path(path);
-                    }
-                    *self.in_bulk_mode.lock().unwrap() = false;
-                    *self.event_count.lock().unwrap() = 0;
-                    return batch;
-                }
-                Ok(CoalescerEvent::ManualReconcile(scope, mode)) => {
-                    let mut pending = self.pending.lock().unwrap();
-                    pending.scope = scope;
-                    pending.mode = mode;
-                    return std::mem::take(&mut *pending);
-                }
-                Err(_) => {
-                    // Timeout, try again
-                    continue;
-                }
+            match self.event_receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(event) => self.ingest(event),
+                Err(_) => {}
             }
         }
     }
@@ -303,19 +266,28 @@ impl EventCoalescer {
     /// Get a reference to the pending batch (for testing).
     #[must_use]
     pub fn pending(&self) -> Arc<Mutex<EventBatch>> {
-        self.pending.clone()
+        // Compatibility accessor; returns a snapshot that is intentionally
+        // detached so callers cannot violate the coalescer's timing state.
+        Arc::new(Mutex::new(self.state.lock().unwrap().pending.clone()))
     }
 
     /// Reset the coalescer (for testing).
     pub fn reset(&self) {
-        *self.pending.lock().unwrap() = EventBatch::default();
-        *self.last_event_time.lock().unwrap() = Instant::now();
-        *self.event_count.lock().unwrap() = 0;
-        *self.last_bulk_time.lock().unwrap() = Instant::now();
-        *self.in_bulk_mode.lock().unwrap() = false;
+        *self.state.lock().unwrap() = CoalescerState {
+            pending: EventBatch::default(),
+            ..CoalescerState::default()
+        };
 
         // Clear the channel
         while self.event_receiver.try_recv().is_ok() {}
+    }
+}
+
+impl CoalescerState {
+    fn reset_window(&mut self) {
+        self.first_event = None;
+        self.last_event = None;
+        self.arrivals.clear();
     }
 }
 
@@ -376,12 +348,9 @@ impl VaultWatcher {
                     .try_send(CoalescerEvent::PathNominated(to));
             }
             WatcherEvent::Overflow => {
-                // Trigger bulk mode
-                // For now, we'll just trigger a full reconcile
-                let _ = self.event_sender.try_send(CoalescerEvent::ManualReconcile(
-                    ReconcileScope::Full,
-                    ReconcileMode::VerifyContent,
-                ));
+                let _ = self
+                    .event_sender
+                    .try_send(CoalescerEvent::BulkTrigger(HashSet::new()));
             }
         }
     }
@@ -390,6 +359,21 @@ impl VaultWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Default)]
+    struct FakeClock(AtomicU64);
+    impl FakeClock {
+        fn advance(&self, amount: Duration) {
+            self.0
+                .fetch_add(amount.as_millis() as u64, Ordering::SeqCst);
+        }
+    }
+    impl Clock for FakeClock {
+        fn now(&self) -> Duration {
+            Duration::from_millis(self.0.load(Ordering::SeqCst))
+        }
+    }
 
     #[test]
     fn test_event_batch() {
@@ -471,5 +455,71 @@ mod tests {
         coalescer.reset();
         assert!(coalescer.try_recv_batch().is_none());
         assert!(coalescer.pending().lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn quiet_expiry_emits_without_a_followup_event_and_deduplicates_paths() {
+        let clock = Arc::new(FakeClock::default());
+        let coalescer = EventCoalescer::with_clock(
+            CoalescerConfig {
+                quiet_window: Duration::from_millis(300),
+                max_window: Duration::from_secs(2),
+                bulk_threshold: 500,
+            },
+            clock.clone(),
+        );
+        let path = PathBuf::from("note.md");
+        coalescer.send(CoalescerEvent::PathNominated(path.clone()));
+        coalescer.send(CoalescerEvent::PathNominated(path));
+        assert!(coalescer.try_recv_batch().is_none());
+        clock.advance(Duration::from_millis(300));
+        let batch = coalescer.try_recv_batch().unwrap();
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn max_window_forces_batch_during_continuous_arrival() {
+        let clock = Arc::new(FakeClock::default());
+        let coalescer = EventCoalescer::with_clock(
+            CoalescerConfig {
+                quiet_window: Duration::from_millis(300),
+                max_window: Duration::from_secs(2),
+                bulk_threshold: 500,
+            },
+            clock.clone(),
+        );
+        coalescer.send(CoalescerEvent::PathNominated("a.md".into()));
+        for n in 1..=20 {
+            clock.advance(Duration::from_millis(100));
+            coalescer.send(CoalescerEvent::PathNominated(format!("{n}.md").into()));
+            if n < 20 {
+                assert!(coalescer.try_recv_batch().is_none());
+            }
+        }
+        let batch = coalescer.try_recv_batch().unwrap();
+        assert_eq!(batch.len(), 21);
+    }
+
+    #[test]
+    fn bulk_threshold_emits_one_full_verification_batch() {
+        let clock = Arc::new(FakeClock::default());
+        let coalescer = EventCoalescer::with_clock(
+            CoalescerConfig {
+                quiet_window: Duration::from_millis(1),
+                max_window: Duration::from_secs(2),
+                bulk_threshold: 3,
+            },
+            clock.clone(),
+        );
+        for name in ["a.md", "b.md", "c.md"] {
+            coalescer.send(CoalescerEvent::PathNominated(name.into()));
+            clock.advance(Duration::from_millis(2));
+        }
+        let batch = coalescer.try_recv_batch().unwrap();
+        assert!(batch.is_bulk);
+        assert_eq!(batch.scope, ReconcileScope::Full);
+        assert_eq!(batch.mode, ReconcileMode::VerifyContent);
+        assert_eq!(batch.len(), 3);
+        assert!(coalescer.try_recv_batch().is_none());
     }
 }

@@ -22,13 +22,14 @@ pub mod types;
 
 // Re-export key types for convenience.
 pub use actor::{
-    VaultActor, VaultActorBuilder, VaultActorError, VaultActorHandle, VaultActorMsg, VaultActorResp,
+    EventSource, VaultActor, VaultActorBuilder, VaultActorError, VaultActorEvent, VaultActorHandle,
+    VaultActorMsg, VaultActorResp, event_source_channel,
 };
 pub use channels::{
     ChannelSet, Notice, NoticeChannel, NoticeKey, NoticeKind, Pulse, PulseChannel, RenameTier,
 };
 pub use coalesce::{
-    CoalescerConfig, CoalescerEvent, EventBatch, EventCoalescer, VaultWatcher, WatcherEvent,
+    Clock, CoalescerConfig, CoalescerEvent, EventBatch, EventCoalescer, VaultWatcher, WatcherEvent,
 };
 pub use history::{HistoryError, HistoryReason, HistoryStore, SnapshotRef};
 pub use identity::{
