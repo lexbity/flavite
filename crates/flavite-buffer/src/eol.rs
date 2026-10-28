@@ -53,7 +53,7 @@ impl From<LineEnding> for SyntaxEol {
 ///
 /// Tracks the line ending style for each line, the BOM presence, and whether
 /// the file has a trailing newline.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EolTable {
     /// EOL for each line. The length matches the number of lines in the buffer.
     pub line_endings: Vec<LineEnding>,
@@ -201,7 +201,7 @@ impl EolTable {
                 .line_endings
                 .last()
                 .copied()
-                .map_or(false, |e| e != LineEnding::None);
+                .is_some_and(|e| e != LineEnding::None);
         }
         result
     }
@@ -282,15 +282,7 @@ impl EolTable {
     }
 }
 
-impl Default for EolTable {
-    fn default() -> Self {
-        Self {
-            line_endings: Vec::new(),
-            has_bom: false,
-            has_trailing_newline: false,
-        }
-    }
-}
+
 
 /// Statistics about line endings for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

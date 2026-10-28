@@ -16,13 +16,11 @@
 //! - File operations (rename, delete)
 //! - User resolution actions
 
-use flavite_syntax::text::{SourceByte, Span, TextByte, TextSnapshot};
+use flavite_syntax::text::{Span, TextByte, TextSnapshot};
 use std::fmt;
 
-use crate::eol::EolTable;
 use crate::model::EditorModel;
 use crate::revision::{BaseHash, BufferId, Revision};
-use crate::undo::UndoTree;
 
 /// The buffer state as defined by D7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -262,7 +260,6 @@ impl Buffer {
         edit: crate::undo::EditOp,
     ) -> (Revision, Option<StateTransition>) {
         let old_state = self.state;
-        let old_revision = self.revision();
 
         // Apply the edit
         let new_revision = self.model.apply_edit_op(edit);

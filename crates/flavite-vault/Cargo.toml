@@ -7,3 +7,45 @@ repository.workspace = true
 description = "Session/BufferManager ownership + actors, journal, history, recovery (§4.1)"
 
 [dependencies]
+flavite-fs = { path = "../flavite-fs" }
+flavite-syntax = { path = "../flavite-syntax" }
+flavite-index = { path = "../flavite-index" }
+flavite-buffer = { path = "../flavite-buffer" }
+
+# Threading and synchronization (D3: named threads + bounded channels)
+crossbeam = { workspace = true }
+
+# Watcher
+notify = { workspace = true }
+directories = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+hex = { workspace = true }
+
+# Hashing
+blake3 = { workspace = true }
+
+# UUIDs
+uuid = { version = "1", features = ["v7", "serde"] }
+
+# Time utilities
+chrono = { version = "0.4", features = ["serde"] }
+
+# Tracing
+ tracing = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# For tests
+tempfile = { workspace = true }
+proptest = { workspace = true }
+
+[features]
+default = []
+fault = ["flavite-fs/fault"]

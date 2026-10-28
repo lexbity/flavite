@@ -265,10 +265,10 @@ impl BufferManager {
     ) -> Vec<StateTransition> {
         let mut transitions = Vec::new();
 
-        if let Some(buffer) = self.buffers.get_mut(note_path) {
-            if let Some(transition) = buffer.check_external_change(new_content) {
-                transitions.push(transition);
-            }
+        if let Some(buffer) = self.buffers.get_mut(note_path)
+            && let Some(transition) = buffer.check_external_change(new_content)
+        {
+            transitions.push(transition);
         }
 
         transitions
@@ -294,10 +294,10 @@ impl BufferManager {
     ) -> Vec<StateTransition> {
         let mut transitions = Vec::new();
 
-        if let Some(buffer) = self.buffers.get_mut(note_path) {
-            if let Some(transition) = buffer.handle_file_recreated(new_content) {
-                transitions.push(transition);
-            }
+        if let Some(buffer) = self.buffers.get_mut(note_path)
+            && let Some(transition) = buffer.handle_file_recreated(new_content)
+        {
+            transitions.push(transition);
         }
 
         transitions

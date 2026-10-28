@@ -542,7 +542,7 @@ impl LinearUndoStack {
     /// it is merged instead of pushed.
     ///
     /// Returns the new revision.
-    pub fn push(&mut self, edit: EditOp, text: &str) -> Revision {
+    pub fn push(&mut self, edit: EditOp, _text: &str) -> Revision {
         let now = Instant::now();
         // Check if we can coalesce
         if let Some(last_time) = self.last_edit_time {

@@ -46,7 +46,7 @@ fn atomic_write_in_subdirectory() {
     // Create parent directories
     fs.create_dir_all(Path::new("/vault/notes")).unwrap();
 
-    atomic_write(&fs, path, b"content").unwrap();
+    let _hash = atomic_write(&fs, path, b"content").unwrap();
 
     let content = fs.read_if_exists(path).unwrap();
     assert_eq!(content, Some(b"content".to_vec()));

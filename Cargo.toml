@@ -52,3 +52,8 @@ proptest = "1"
 tempfile = "3"
 # Dev tooling (xtask)
 walkdir = "2"
+# Project directories
+directories = "5"
+# Serialization
+hex = "0.4"
+toml = "0.8"
