@@ -14,6 +14,13 @@ use thiserror::Error;
 pub const DEFAULT_HISTORY_CAP: u64 = 1024 * 1024 * 1024;
 const META_FILE: &str = "history.json";
 
+pub(crate) fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryReason {

@@ -65,6 +65,7 @@ gate: fmt clippy test arch-check
 # doc build + deny/audit/shear + fuzz smoke 60 s + network-denied + MSRV.
 ci-gate: gate
     @echo "=== G1: coverage ==="
+    mkdir -p target/llvm-cov
     cargo llvm-cov --workspace --lcov --output-path target/llvm-cov/lcov.info
     cargo xtask cov-check --lcov target/llvm-cov/lcov.info
     @echo "=== G1: doc build ==="

@@ -414,6 +414,9 @@ pub struct RecoveryWriter {
     last_write: HashMap<BufferId, Instant>,
     /// The checkpoint sequence for each buffer.
     checkpoint_seq: HashMap<BufferId, u64>,
+    /// Highest revision durably covered by a successful save. A stale recovery
+    /// worker snapshot arriving after save retirement must not recreate it.
+    covered_revision: HashMap<BufferId, Revision>,
 }
 
 impl RecoveryWriter {
@@ -424,6 +427,7 @@ impl RecoveryWriter {
             config,
             last_write: HashMap::new(),
             checkpoint_seq: HashMap::new(),
+            covered_revision: HashMap::new(),
         }
     }
 
@@ -574,10 +578,36 @@ impl RecoveryWriter {
     pub fn write_snapshot(
         &mut self,
         note_key: &[u8],
+        recovery_file: RecoveryFile,
+    ) -> Option<PathBuf> {
+        if !self.should_write_snapshot(&recovery_file) {
+            return None;
+        }
+        self.persist_snapshot(note_key, recovery_file)
+    }
+
+    /// Durably write a recovery snapshot regardless of the periodic interval.
+    /// Session shutdown uses this for dirty buffers that have not reached their
+    /// next timer deadline.
+    pub fn write_snapshot_now(
+        &mut self,
+        note_key: &[u8],
+        recovery_file: RecoveryFile,
+    ) -> Option<PathBuf> {
+        self.persist_snapshot(note_key, recovery_file)
+    }
+
+    fn persist_snapshot(
+        &mut self,
+        note_key: &[u8],
         mut recovery_file: RecoveryFile,
     ) -> Option<PathBuf> {
         let buffer_id = recovery_file.header.buffer_id;
-        if !self.should_write_snapshot(&recovery_file) {
+        if self
+            .covered_revision
+            .get(&buffer_id)
+            .is_some_and(|covered| recovery_file.header.revision <= *covered)
+        {
             return None;
         }
         let seq = *self.checkpoint_seq.entry(buffer_id).or_insert(0);
@@ -586,6 +616,12 @@ impl RecoveryWriter {
         recovery_file.header.timestamp = RecoveryHeader::current_timestamp();
         recovery_file.header.is_checkpoint = false;
         let path = self.recovery_path_for_note_key(note_key);
+        if self.read_recovery_file(&path).is_some_and(|existing| {
+            existing.header.buffer_id == buffer_id
+                && existing.header.revision > recovery_file.header.revision
+        }) {
+            return None;
+        }
         if write_recovery_atomically(&path, &recovery_file.to_bytes()).is_err() {
             return None;
         }
@@ -702,7 +738,11 @@ impl RecoveryWriter {
 
     /// Retire only recovery records for this buffer whose revision is covered
     /// by an acknowledged save. Newer revisions remain reachable.
-    pub fn retire_covered(&self, buffer_id: BufferId, saved_revision: Revision) -> usize {
+    pub fn retire_covered(&mut self, buffer_id: BufferId, saved_revision: Revision) -> usize {
+        self.covered_revision
+            .entry(buffer_id)
+            .and_modify(|covered| *covered = (*covered).max(saved_revision))
+            .or_insert(saved_revision);
         self.remove_matching(|file| {
             file.header.buffer_id == buffer_id && file.header.revision <= saved_revision
         })
@@ -1027,7 +1067,7 @@ mod tests {
         use flavite_syntax::text::{Span, TextByte};
         let dir = tempdir().unwrap();
         let config = RecoveryConfig::new("vault".into(), dir.path().to_path_buf(), 2);
-        let writer = RecoveryWriter::new(config);
+        let mut writer = RecoveryWriter::new(config);
         let mut buffer = Buffer::from_text("before");
         let old = RecoveryFile::from_buffer(&buffer, 1, false);
         buffer.apply_local_edit(crate::undo::EditOp::new(
@@ -1046,6 +1086,66 @@ mod tests {
         );
         assert!(!old_path.exists());
         assert!(new_path.exists());
+    }
+
+    #[test]
+    fn stale_checkpoint_cannot_resurrect_after_save_retirement() {
+        use crate::state::Buffer;
+        use flavite_syntax::text::{Span, TextByte};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = RecoveryWriter::new(RecoveryConfig::new(
+            "test-vault".into(),
+            dir.path().to_path_buf(),
+            0,
+        ));
+        let mut buffer = Buffer::from_text("base");
+        buffer.apply_local_edit(crate::undo::EditOp::new(
+            Span::new(TextByte(4), TextByte(4)),
+            " edit".into(),
+        ));
+        let mut stale = RecoveryFile::from_buffer(&buffer, 1, false);
+        stale.header.revision = Revision::new(1);
+        let mut newer = RecoveryFile::from_buffer(&buffer, 2, false);
+        newer.header.revision = Revision::new(2);
+
+        writer.retire_covered(buffer.buffer_id(), Revision::new(1));
+        assert!(writer.write_snapshot(b"note.md", stale).is_none());
+        assert!(writer.write_snapshot(b"note.md", newer).is_some());
+        let recovered = writer.read_for_note_key(b"note.md").unwrap();
+        assert_eq!(recovered.header.revision, Revision::new(2));
+    }
+
+    #[test]
+    fn forced_shutdown_checkpoint_is_durable_and_revision_tagged() {
+        use crate::state::Buffer;
+        use flavite_syntax::text::{Span, TextByte};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = RecoveryWriter::new(RecoveryConfig::new(
+            "test-vault".into(),
+            dir.path().to_path_buf(),
+            3600,
+        ));
+        let mut buffer = Buffer::from_text("base");
+        buffer.apply_local_edit(crate::undo::EditOp::new(
+            Span::new(TextByte(4), TextByte(4)),
+            " edit".into(),
+        ));
+        let recovery = RecoveryFile::from_buffer(&buffer, 7, false);
+
+        // This must bypass the normal interval: shutdown cannot rely on when
+        // the periodic recovery timer last happened to run.
+        let path = writer
+            .write_snapshot_now(b"notes/base.md", recovery)
+            .expect("forced checkpoint must be written");
+        let restored = writer
+            .read_for_note_key(b"notes/base.md")
+            .expect("forced checkpoint must be readable");
+        assert_eq!(restored.header.revision, buffer.revision());
+        assert_eq!(restored.header.checkpoint_seq, 0);
+        assert_eq!(restored.to_source_bytes(), b"base edit");
+        assert_eq!(path, writer.recovery_path_for_note_key(b"notes/base.md"));
     }
 
     #[test]

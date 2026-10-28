@@ -371,6 +371,28 @@ impl EditorModel {
         new_revision
     }
 
+    /// Apply a complete serialized snapshot as one non-coalescing undo step.
+    /// The snapshot carries the authoritative BOM, per-line EOL, and trailing
+    /// newline metadata; preserving it here is essential for conflict merges.
+    pub fn apply_snapshot_boundary(&mut self, snapshot: TextSnapshot) -> Revision {
+        let old_text = self.text().to_string();
+        let new_text = snapshot.text().to_string();
+        if old_text.len() > MAX_NOTE_BYTES || new_text.len() > MAX_NOTE_BYTES {
+            return self.revision;
+        }
+        let edit = EditOp::new(
+            Span::new(TextByte(0), TextByte(old_text.len())),
+            new_text.clone(),
+        );
+        self.rope = Rope::from_str(&new_text);
+        self.eol_table = EolTable::from_snapshot(&snapshot);
+        let revision = self.undo_tree.apply_boundary(edit, snapshot.clone());
+        self.revision = revision;
+        self.base_hash = Some(BaseHash::from_snapshot(&snapshot));
+        self.is_dirty = true;
+        revision
+    }
+
     /// Apply multiple edit operations as a single atomic edit.
     ///
     /// All edits are applied in order, but they share a single undo entry
@@ -379,31 +401,67 @@ impl EditorModel {
         if edits.is_empty() {
             return self.revision;
         }
-
         let old_text = self.text().to_string();
-        let mut new_text = old_text.clone();
-
-        for edit in edits {
-            new_text = edit.apply(&new_text);
+        let mut ordered = edits.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|edit| (edit.range.start.0, edit.range.end.0));
+        if ordered.iter().any(|edit| {
+            edit.range.start.0 > edit.range.end.0
+                || edit.range.end.0 > old_text.len()
+                || !old_text.is_char_boundary(edit.range.start.0)
+                || !old_text.is_char_boundary(edit.range.end.0)
+        }) {
+            return self.revision;
+        }
+        for pair in ordered.windows(2) {
+            if pair[1].range.start.0 < pair[0].range.end.0
+                || (pair[1].range.start.0 == pair[0].range.start.0
+                    && pair[0].range.is_empty()
+                    && pair[1].range.is_empty())
+            {
+                return self.revision;
+            }
         }
 
-        // Create a coalesced edit
-        let first = &edits[0];
-        let last = &edits[edits.len() - 1];
-        let coalesced_range = Span::new(first.range.start, last.range.end);
-        let coalesced_replacement = new_text
-            .get(coalesced_range.start.0..coalesced_range.end.0)
-            .unwrap_or_default()
-            .to_string();
+        let start = ordered[0].range.start.0;
+        let end = ordered.last().unwrap().range.end.0;
+        let mut replacement = String::new();
+        let mut cursor = start;
+        for edit in ordered {
+            replacement.push_str(&old_text[cursor..edit.range.start.0]);
+            replacement.push_str(&edit.replacement);
+            cursor = edit.range.end.0;
+        }
+        replacement.push_str(&old_text[cursor..end]);
+        self.apply_edit_op(EditOp::new(
+            Span::new(TextByte(start), TextByte(end)),
+            replacement,
+        ))
+    }
 
-        // For the replacement, we need to extract from old text
-        let _original_text = old_text
-            .get(coalesced_range.start.0..coalesced_range.end.0)
-            .unwrap_or_default();
-
-        let coalesced_edit = EditOp::new(coalesced_range, coalesced_replacement);
-
-        self.apply_edit_op(coalesced_edit)
+    /// Whether edits are non-overlapping ranges against this exact text
+    /// snapshot and land on valid UTF-8 boundaries.
+    #[must_use]
+    pub fn edit_ops_valid(&self, edits: &[EditOp]) -> bool {
+        if edits.is_empty() {
+            return true;
+        }
+        let text = self.text();
+        let mut ordered = edits.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|edit| (edit.range.start.0, edit.range.end.0));
+        if ordered.iter().any(|edit| {
+            edit.range.start.0 > edit.range.end.0
+                || edit.range.end.0 > text.len()
+                || !text.is_char_boundary(edit.range.start.0)
+                || !text.is_char_boundary(edit.range.end.0)
+        }) {
+            return false;
+        }
+        !ordered.windows(2).any(|pair| {
+            pair[1].range.start.0 < pair[0].range.end.0
+                || (pair[1].range.start.0 == pair[0].range.start.0
+                    && pair[0].range.is_empty()
+                    && pair[1].range.is_empty())
+        })
     }
 
     /// Undo the last edit.
@@ -413,16 +471,17 @@ impl EditorModel {
     pub fn undo(&mut self) -> Option<Revision> {
         let result = self.undo_tree.undo();
 
-        if let Some((node_rev, Some(snapshot))) = result {
+        if let Some((_node_rev, Some(snapshot))) = result {
             let new_text = snapshot.text().to_string();
             self.rope = Rope::from_str(&new_text);
-            self.revision = node_rev.next(); // Advance revision for undo operation
+            self.eol_table = EolTable::from_snapshot(&snapshot);
+            self.revision = self.revision.next();
             self.is_dirty = true;
             Some(self.revision)
-        } else if let Some((node_rev, None)) = result {
+        } else if let Some((_node_rev, None)) = result {
             // We have a revision but no snapshot - this shouldn't happen
             // in normal operation
-            self.revision = node_rev.next(); // Advance revision for undo operation
+            self.revision = self.revision.next();
             Some(self.revision)
         } else {
             None
@@ -436,14 +495,15 @@ impl EditorModel {
     pub fn redo(&mut self) -> Option<Revision> {
         let result = self.undo_tree.redo();
 
-        if let Some((node_rev, Some(snapshot))) = result {
+        if let Some((_node_rev, Some(snapshot))) = result {
             let new_text = snapshot.text().to_string();
             self.rope = Rope::from_str(&new_text);
-            self.revision = node_rev.next(); // Advance revision for redo operation
+            self.eol_table = EolTable::from_snapshot(&snapshot);
+            self.revision = self.revision.next();
             self.is_dirty = true;
             Some(self.revision)
-        } else if let Some((node_rev, None)) = result {
-            self.revision = node_rev.next(); // Advance revision for redo operation
+        } else if let Some((_node_rev, None)) = result {
+            self.revision = self.revision.next();
             Some(self.revision)
         } else {
             None
@@ -518,7 +578,10 @@ impl EditorModel {
 
         // Build line_breaks as the end of each line (excluding the newline)
         let mut line_breaks = Vec::new();
-        for line in 0..self.line_count() {
+        // The side table follows source lines, while Ropey's `len_lines`
+        // includes a synthetic empty line after a final LF. That synthetic
+        // line has no source EOL entry and must not be serialized separately.
+        for line in 0..self.eol_table.line_count() {
             let _line_start = self.line_start(line);
             let line_end = self.line_end(line);
 
@@ -766,6 +829,38 @@ mod tests {
         // Redo
         let _ = model.redo();
         assert_eq!(model.text(), "hello world");
+    }
+
+    #[test]
+    fn multi_range_edit_applies_simultaneously_as_one_undo_step() {
+        let mut model = EditorModel::from_text("abcdefgh");
+        let before = model.revision();
+        let edits = [
+            EditOp::new(Span::new(TextByte(1), TextByte(2)), "X".into()),
+            EditOp::new(Span::new(TextByte(5), TextByte(6)), "Y".into()),
+        ];
+
+        assert!(model.edit_ops_valid(&edits));
+        let after = model.apply_edit_ops(&edits);
+        assert_eq!(model.text(), "aXcdeYgh");
+        assert_eq!(after.as_u64(), before.as_u64() + 1);
+        assert_eq!(model.undo(), Some(after.next()));
+        assert_eq!(model.text(), "abcdefgh");
+    }
+
+    #[test]
+    fn invalid_multi_range_edit_is_rejected_without_partial_change() {
+        let mut model = EditorModel::from_text("abcdef");
+        let before = model.revision();
+        let edits = [
+            EditOp::new(Span::new(TextByte(1), TextByte(4)), "X".into()),
+            EditOp::new(Span::new(TextByte(3), TextByte(5)), "Y".into()),
+        ];
+
+        assert!(!model.edit_ops_valid(&edits));
+        assert_eq!(model.apply_edit_ops(&edits), before);
+        assert_eq!(model.text(), "abcdef");
+        assert_eq!(model.revision(), before);
     }
 
     #[test]

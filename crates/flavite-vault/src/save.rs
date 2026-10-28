@@ -18,6 +18,9 @@ pub struct SaveRequest {
     pub path: PathBuf,
     pub note_key: Vec<u8>,
     pub bytes: Vec<u8>,
+    /// Exact base bytes from the loaded/saved snapshot. The actor durably pins
+    /// this merge base before it begins a destructive save.
+    pub merge_base: Vec<u8>,
     pub precondition: DiskPrecondition,
     pub buffer_id: u64,
     pub revision: u64,
@@ -322,6 +325,7 @@ mod tests {
             path,
             note_key: b"a.md".to_vec(),
             bytes: b"replacement".to_vec(),
+            merge_base: expected.to_vec(),
             precondition: DiskPrecondition::Existing(*blake3::hash(expected).as_bytes()),
             buffer_id: 11,
             revision: 3,
