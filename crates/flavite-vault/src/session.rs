@@ -1507,6 +1507,13 @@ mod tests {
         (session, fs, temp)
     }
 
+    fn save_to_terminal(session: &Session, path: PathBuf) -> SessionResult {
+        match session.execute(SessionCommand::SaveNote { path }) {
+            SessionResult::Pending { request_id } => session.wait_for_operation(request_id),
+            result => result,
+        }
+    }
+
     #[test]
     fn test_session_builder() {
         let _identity = VaultIdentity::new(
@@ -1571,7 +1578,7 @@ mod tests {
             SessionResult::Success(CommandResult::RedoPerformed { .. })
         ));
         assert!(matches!(
-            session.execute(SessionCommand::SaveNote { path: path.clone() }),
+            save_to_terminal(&session, path.clone()),
             SessionResult::Success(CommandResult::NoteSaved { .. })
         ));
         assert_eq!(_fs.read_if_exists(&path).unwrap().unwrap(), b"hello world");
@@ -1615,7 +1622,7 @@ mod tests {
 
         fs.remove(&path).unwrap();
         fs.write_new(&path, b"hello theirs").unwrap();
-        let saved = session.execute(SessionCommand::SaveNote { path: path.clone() });
+        let saved = save_to_terminal(&session, path.clone());
         assert!(matches!(saved, SessionResult::Error { .. }), "{saved:?}");
         assert!(matches!(
             session.execute(SessionCommand::ResolveConflict {
@@ -1747,7 +1754,7 @@ mod tests {
             SessionResult::Error { .. }
         ));
         assert!(matches!(
-            session.execute(SessionCommand::SaveNote { path: path.clone() }),
+            save_to_terminal(&session, path.clone()),
             SessionResult::Success(CommandResult::NoteSaved { .. })
         ));
         assert_eq!(fs.read_if_exists(&path).unwrap().unwrap(), b"");

@@ -161,6 +161,12 @@ impl BufferManager {
         self.buffers.get(path)
     }
 
+    /// Return the vault-relative note path associated with a live buffer.
+    #[must_use]
+    pub fn path_for_id(&self, buffer_id: BufferId) -> Option<&PathBuf> {
+        self.buffer_ids.get(&buffer_id)
+    }
+
     /// Get a buffer by buffer ID mutably.
     #[must_use]
     pub fn get_buffer_by_id_mut(&mut self, buffer_id: BufferId) -> Option<&mut Buffer> {

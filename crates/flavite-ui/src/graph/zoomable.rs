@@ -282,7 +282,7 @@ pub struct CardIdentity {
 ///
 /// The cache is keyed by `(identity, step_index)`. For B7, we use a
 /// generic cache that can store elements with different message types
-/// by using Box<dyn Any> or by making the cache per-card-type. For now,
+/// by using `Box<dyn Any>` or by making the cache per-card-type. For now,
 /// we use a simpler approach: just cache the size, not the full element.
 pub struct CardLayout {
     /// The logical size of the widget at this scale.

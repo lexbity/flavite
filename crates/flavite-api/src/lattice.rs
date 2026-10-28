@@ -17,6 +17,7 @@ use crate::result::{
 use crate::types::{ApiVaultRef, RequestId};
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use flavite_buffer::revision::{BufferId, Revision};
+use flavite_vault::open::Vault;
 use flavite_vault::session::{Session, SessionCommand, SessionError, SessionResult};
 use flavite_vault::types::{Epoch, Generation, VaultConfig, VaultIdentity};
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,8 @@ pub struct Lattice {
     vault_ref: ApiVaultRef,
     /// Whether the vault is read-only.
     read_only: bool,
+    /// Keeps root ownership and actor resources alive for `open_root` callers.
+    owned_vault: Option<Vault>,
 }
 
 impl Lattice {
@@ -92,6 +95,7 @@ impl Lattice {
             subscribers: Arc::new(Mutex::new(Vec::new())),
             vault_ref,
             read_only: false,
+            owned_vault: None,
         };
 
         // Register built-in commands
@@ -123,6 +127,7 @@ impl Lattice {
             subscribers: Arc::new(Mutex::new(Vec::new())),
             vault_ref,
             read_only: false,
+            owned_vault: None,
         };
 
         lattice.register_builtin_commands()?;
@@ -151,10 +156,21 @@ impl Lattice {
             subscribers: Arc::new(Mutex::new(Vec::new())),
             vault_ref,
             read_only: false,
+            owned_vault: None,
         };
 
         lattice.register_builtin_commands()?;
 
+        Ok(lattice)
+    }
+
+    /// Open a vault and construct the public facade while retaining ownership
+    /// guards for the lifetime of the facade.
+    pub fn open_root(root: PathBuf, config: VaultConfig) -> Result<Self, LatticeError> {
+        let vault = Vault::open(root, Box::new(flavite_fs::OsFs::new()), config.clone())
+            .map_err(|error| LatticeError::VaultOpenError(error.to_string()))?;
+        let mut lattice = Self::with_vault(vault.identity().clone(), vault.session_arc(), config)?;
+        lattice.owned_vault = Some(vault);
         Ok(lattice)
     }
 
@@ -457,6 +473,13 @@ impl Lattice {
             SessionResult::Pending { request_id: req_id } => {
                 ExecutionResult::Pending { request_id: req_id }
             }
+            SessionResult::Superseded {
+                request_id: req_id,
+                by_request,
+            } => ExecutionResult::Local(LocalResult::Error(LocalError::new(
+                "superseded",
+                format!("save request {req_id} was superseded by {by_request}"),
+            ))),
             SessionResult::Error { message } => ExecutionResult::Local(LocalResult::Error(
                 LocalError::new("session_error", message),
             )),
@@ -466,7 +489,7 @@ impl Lattice {
                     format!("Conflict detected: {}", path.to_string_lossy()),
                 )))
             }
-            SessionResult::MergeReady { path, result } => {
+            SessionResult::MergeReady { path, result, .. } => {
                 let data = serde_json::json!({
                     "path": path.to_string_lossy(),
                     "merged": result.merged,
@@ -492,11 +515,38 @@ impl Lattice {
     /// Returns the current text and metadata for a buffer at a specific revision.
     pub fn get_buffer_view(
         &self,
-        _buffer_id: BufferId,
-        _revision: Option<Revision>,
+        buffer_id: BufferId,
+        revision: Option<Revision>,
     ) -> Result<BufferView, LatticeError> {
-        // For now, this is a stub - full implementation requires BufferManager access
-        Err(LatticeError::NotImplemented("get_buffer_view".to_string()))
+        let manager = self.session.buffer_manager();
+        let manager = manager
+            .lock()
+            .map_err(|_| LatticeError::BufferManagerPoisoned)?;
+        let buffer = manager
+            .get_buffer_by_id(buffer_id)
+            .ok_or_else(|| LatticeError::BufferNotFound(buffer_id.as_u64()))?;
+        if let Some(expected) = revision
+            && buffer.revision() != expected
+        {
+            return Err(LatticeError::StaleBufferView {
+                expected: expected.as_u64(),
+                actual: buffer.revision().as_u64(),
+            });
+        }
+        let path = manager
+            .path_for_id(buffer_id)
+            .cloned()
+            .ok_or_else(|| LatticeError::BufferNotFound(buffer_id.as_u64()))?;
+        Ok(BufferView {
+            buffer_id: buffer_id.as_u64(),
+            revision: buffer.revision().as_u64(),
+            text: buffer.text().to_owned(),
+            base_hash: buffer
+                .base_hash()
+                .map_or_else(Vec::new, |hash| hash.as_slice().to_vec()),
+            state: buffer.state().to_string(),
+            path,
+        })
     }
 
     /// Query the index.
@@ -520,6 +570,8 @@ pub struct BufferView {
     pub base_hash: Vec<u8>,
     /// Current state.
     pub state: String,
+    /// Vault-relative path used by save and close commands.
+    pub path: PathBuf,
 }
 
 /// Result of a query.
@@ -565,6 +617,18 @@ pub enum LatticeError {
     #[error("Not implemented: {0}")]
     NotImplemented(String),
 
+    /// The requested revision is no longer current.
+    #[error("stale buffer view: expected revision {expected}, current revision is {actual}")]
+    StaleBufferView { expected: u64, actual: u64 },
+
+    /// The buffer identity is no longer open in this Session.
+    #[error("buffer {0} is not open")]
+    BufferNotFound(u64),
+
+    /// The Session buffer manager lock was poisoned.
+    #[error("buffer manager lock is poisoned")]
+    BufferManagerPoisoned,
+
     /// Session error.
     #[error("Session error: {0}")]
     SessionError(#[from] SessionError),
@@ -581,7 +645,7 @@ pub enum LatticeError {
 /// Session module re-export for convenience.
 pub mod session {
     pub use flavite_vault::session::{
-        CommandResult, ConflictResolution, SessionCommand, SessionError,
+        CommandResult, ConflictResolution, SessionCommand, SessionError, SessionResult,
     };
 }
 
@@ -603,10 +667,86 @@ mod tests {
             text: "test content".to_string(),
             base_hash: vec![1, 2, 3],
             state: "clean".to_string(),
+            path: PathBuf::from("note.md"),
         };
 
         let json = serde_json::to_string(&view).unwrap();
         assert!(json.contains("test content"));
+    }
+
+    #[test]
+    fn revisioned_buffer_view_reads_session_owned_buffer_and_rejects_old_revision() {
+        use flavite_buffer::manager::BufferManager;
+        use flavite_fs::{Fs, MemFs};
+        use flavite_index::IndexActor;
+        use flavite_vault::actor::VaultActorBuilder;
+        use flavite_vault::channels::ChannelSet;
+        use flavite_vault::session::Session;
+        use flavite_vault::types::VaultIdentity;
+
+        let fs = MemFs::new();
+        let root = PathBuf::from("/test/buffer-view-vault");
+        fs.create_dir_all(&root).unwrap();
+        fs.write_new(&root.join("note.md"), b"hello").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("index.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let identity = VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![1, 2, 3]);
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs) as Box<dyn Fs + Send + Sync>)
+            .with_identity(identity.clone())
+            .with_index(IndexActor::new(&db, 1).unwrap())
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        let channels = ChannelSet::new();
+        let session = Session::new(
+            identity.clone(),
+            actor,
+            BufferManager::new(),
+            channels.pulse,
+            channels.notice,
+            VaultConfig::default(),
+        );
+        let lattice = Lattice::with_session(
+            session,
+            ApiVaultRef::new(identity.uuid, identity.root),
+            VaultConfig::default(),
+        )
+        .unwrap();
+        let opened = lattice.execute_session(SessionCommand::OpenNote {
+            path: root.join("note.md"),
+        });
+        let buffer_id = match opened {
+            SessionResult::Success(crate::session::CommandResult::NoteOpened {
+                buffer_id, ..
+            }) => buffer_id,
+            other => panic!("unexpected open result: {other:?}"),
+        };
+        let initial = lattice.get_buffer_view(buffer_id, None).unwrap();
+        assert_eq!(initial.text, "hello");
+        assert_eq!(initial.path, root.join("note.md"));
+        assert_eq!(initial.state, "Clean");
+
+        lattice.execute_session(SessionCommand::ApplyEdits {
+            buffer_id,
+            revision: Revision::new(initial.revision),
+            ops: vec![flavite_buffer::undo::EditOp::new(
+                flavite_syntax::text::Span::new(
+                    flavite_syntax::text::TextByte(5),
+                    flavite_syntax::text::TextByte(5),
+                ),
+                "!".into(),
+            )],
+        });
+        assert!(matches!(
+            lattice.get_buffer_view(buffer_id, Some(Revision::new(initial.revision))),
+            Err(LatticeError::StaleBufferView { .. })
+        ));
+        let current = lattice.get_buffer_view(buffer_id, None).unwrap();
+        assert_eq!(current.text, "hello!");
+        assert_eq!(current.state, "Dirty");
     }
 
     #[test]

@@ -7,3 +7,9 @@ repository.workspace = true
 description = "iced widget over EditorModel (iced permitted here and in flavite-ui only) (§4.1)"
 
 [dependencies]
+iced = { workspace = true, features = ["advanced"] }
+cosmic-text = { workspace = true }
+flavite-api = { path = "../flavite-api" }
+flavite-buffer = { path = "../flavite-buffer" }
+flavite-syntax = { path = "../flavite-syntax" }
+unicode-segmentation = { workspace = true }

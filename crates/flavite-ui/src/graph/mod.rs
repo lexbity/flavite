@@ -20,7 +20,7 @@
 //! - [`zoomable`] — `Zoomable` container: world→screen transform, cached
 //!   text layout at quantized scale steps (D15; S2-3).
 //! - [`card_layer`] — `CardLayer`: real widgets at world positions, ≤ 64
-//!   cards, checkbox toggles via [`CardEditSink`] seam (D15; S2-3).
+//!   cards, with checkbox toggles routed through the API (D15; S2-3).
 //!
 //! §4.1: `flavite-ui` is one of only two crates permitted to depend on
 //! `iced`/`wgpu`; `cargo xtask arch check` enforces that `flavite-graph`

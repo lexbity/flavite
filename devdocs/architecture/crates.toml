@@ -45,6 +45,8 @@ flavite-ui = "iced application (§4.1)"
 #   flavite-index → flavite-syntax (C7 - index uses syntax for attachment extensions)
 #   flavite-graph → flavite-index (B5 - graph feed polls index.generation)
 #   flavite-buffer → flavite-syntax (PLAN-A - text snapshot/coordinate types)
+#   flavite-editor → flavite-api, flavite-buffer, flavite-syntax (A7 - custom
+#   iced editor consumes revisioned views and emits typed Session commands)
 #
 # `flavite-ui::graph` consumes `flavite_graph::GraphSnapshot` as the
 # CPU-authoritative model behind an `Arc` (D15); `flavite-graph` stays
@@ -72,6 +74,10 @@ active = [
     # B7 - Card layer uses API and buffer for production wiring
     { from = "flavite-ui", to = "flavite-api" },
     { from = "flavite-ui", to = "flavite-buffer" },
+    # A7 - custom editor widget consumes API views and EditorModel types
+    { from = "flavite-editor", to = "flavite-api" },
+    { from = "flavite-editor", to = "flavite-buffer" },
+    { from = "flavite-editor", to = "flavite-syntax" },
 ]
 
 [layering]
