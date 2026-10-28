@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-//! Tier 1 — durability-critical. SQLite (WAL) structural store, tantivy
-//! derived search view with deferred commits, link resolver, typed query
+//! Tier 1 — durability-critical. SQLite (WAL) structural store, persisted
+//! searchable document cache, link resolver, typed query
 //! execution (§4.1, D12, D13, §4.3, §4.14).
 //!
 //! # Architecture
@@ -9,7 +9,7 @@
 //! The index consists of:
 //! - **SQLite (WAL)**: The authoritative structural record (notes, attachments,
 //!   links, tags, properties, etc.)
-//! - **Tantivy**: A derived search view with full-text search capabilities
+//! - **Search document cache**: Source text cached for a future search backend
 //! - **Resolver**: Implements the D8 5-step link resolution algorithm
 //! - **Query AST**: Typed query language (not SQL strings) for safe querying
 //!
@@ -31,7 +31,6 @@ pub mod pool;
 pub mod query;
 pub mod resolver;
 pub mod schema;
-pub mod search;
 pub mod search_docs;
 pub mod types;
 
@@ -53,10 +52,7 @@ pub use change::{ChangeBatch, InvalidationFeed};
 // Re-export pool items
 pub use pool::*;
 
-// Re-export search items
-pub use search::*;
-
-// Re-export search_docs items (but not SearchDoc which conflicts with types)
+// Re-export persisted search document cache operations.
 pub use search_docs::{SearchDocBatch, SearchDocCache, SearchDocUpdate};
 
 #[cfg(test)]

@@ -43,8 +43,7 @@ impl WellKnownKey {
 /// Normalize a tag string for storage and lookup.
 #[must_use]
 pub fn normalize_tag(tag: &str) -> String {
-    use unicode_normalization::UnicodeNormalization;
-    tag.to_lowercase().nfc().collect::<String>()
+    crate::text::fold_key(tag)
 }
 
 /// Derive the title from available sources.

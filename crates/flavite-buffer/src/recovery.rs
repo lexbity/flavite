@@ -517,9 +517,8 @@ impl RecoveryWriter {
 
         // Ensure directory exists
         if let Some(parent) = path.parent()
-            && let Err(e) = fs::create_dir_all(parent)
+            && let Err(_) = fs::create_dir_all(parent)
         {
-            eprintln!("WARN: Failed to create recovery directory: {}", e);
             return None;
         }
 
@@ -532,20 +531,17 @@ impl RecoveryWriter {
 
         let mut file = match File::create(&temp_path) {
             Ok(f) => f,
-            Err(e) => {
-                eprintln!("WARN: Failed to create temp recovery file: {}", e);
+            Err(_) => {
                 return None;
             }
         };
 
-        if let Err(e) = file.write_all(&bytes) {
-            eprintln!("WARN: Failed to write recovery file: {}", e);
+        if let Err(_) = file.write_all(&bytes) {
             fs::remove_file(&temp_path).ok();
             return None;
         }
 
-        if let Err(e) = file.sync_all() {
-            eprintln!("WARN: Failed to sync recovery file: {}", e);
+        if let Err(_) = file.sync_all() {
             fs::remove_file(&temp_path).ok();
             return None;
         }
@@ -553,17 +549,15 @@ impl RecoveryWriter {
         drop(file);
 
         // Rename atomically
-        if let Err(e) = fs::rename(&temp_path, &path) {
-            eprintln!("WARN: Failed to rename recovery file: {}", e);
+        if let Err(_) = fs::rename(&temp_path, &path) {
             fs::remove_file(&temp_path).ok();
             return None;
         }
 
         #[cfg(unix)]
         if let Some(parent) = path.parent()
-            && let Err(e) = File::open(parent).and_then(|directory| directory.sync_all())
+            && let Err(_) = File::open(parent).and_then(|directory| directory.sync_all())
         {
-            eprintln!("WARN: Failed to sync recovery directory: {}", e);
             return None;
         }
 
@@ -648,9 +642,8 @@ impl RecoveryWriter {
 
         // Ensure directory exists
         if let Some(parent) = path.parent()
-            && let Err(e) = fs::create_dir_all(parent)
+            && let Err(_) = fs::create_dir_all(parent)
         {
-            eprintln!("WARN: Failed to create recovery directory: {}", e);
             return None;
         }
 
@@ -659,28 +652,24 @@ impl RecoveryWriter {
 
         let mut file = match File::create(&temp_path) {
             Ok(f) => f,
-            Err(e) => {
-                eprintln!("WARN: Failed to create temp checkpoint file: {}", e);
+            Err(_) => {
                 return None;
             }
         };
 
-        if let Err(e) = file.write_all(&bytes) {
-            eprintln!("WARN: Failed to write checkpoint file: {}", e);
+        if let Err(_) = file.write_all(&bytes) {
             fs::remove_file(&temp_path).ok();
             return None;
         }
 
-        if let Err(e) = file.sync_all() {
-            eprintln!("WARN: Failed to sync checkpoint file: {}", e);
+        if let Err(_) = file.sync_all() {
             fs::remove_file(&temp_path).ok();
             return None;
         }
 
         drop(file);
 
-        if let Err(e) = fs::rename(&temp_path, &path) {
-            eprintln!("WARN: Failed to rename checkpoint file: {}", e);
+        if let Err(_) = fs::rename(&temp_path, &path) {
             fs::remove_file(&temp_path).ok();
             return None;
         }

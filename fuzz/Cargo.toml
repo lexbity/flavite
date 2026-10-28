@@ -22,9 +22,8 @@ image = { version = "0.25", default-features = false, features = [
     "webp",
     "bmp",
 ] }
-# flavite-syntax / flavite-fs path deps are added by PLAN-C slices as their
-# fuzz targets appear (scanner, frontmatter_patcher, rename_planner,
-# path_safety, parity).
+# These path dependencies support both maintained smoke targets and prototype
+# targets. Smoke membership is intentionally listed in the root justfile.
 flavite-fs = { path = "../crates/flavite-fs" }
 flavite-syntax = { path = "../crates/flavite-syntax" }
 flavite-buffer = { path = "../crates/flavite-buffer" }

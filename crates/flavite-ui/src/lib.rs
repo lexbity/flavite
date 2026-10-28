@@ -1,9 +1,7 @@
-//! Tier 3. iced application shell: panes, palette, quick switcher,
-//! backlinks, search panel, diagnostics, conflict banners, read mode,
-//! settings. Hosts `Flavite` through `flavite-api` (D16, §4.1, §4.5).
+//! Tier 3 iced application shell. The current modules provide the app shell,
+//! graph view, operations, palette, panes, settings, styling, and subscriptions.
 //!
-//! This crate owns the graph *view* (PLAN-B): the wgpu `shader` widget, the
-//! `Zoomable` container, and the `CardLayer` live in [`graph`]. The CPU-side
+//! The graph view uses the wgpu shader widget in [`graph`]. The CPU-side
 //! model, layout, and spatial index live in `flavite-graph` (§4.1).
 
 pub mod app;

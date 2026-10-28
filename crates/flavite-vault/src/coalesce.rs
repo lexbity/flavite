@@ -6,7 +6,6 @@
 
 use crate::types::{ReconcileMode, ReconcileScope};
 use crossbeam::channel::{Receiver, Sender, TryRecvError};
-use flavite_fs::Fs;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -337,20 +336,14 @@ pub enum WatcherEvent {
 
 /// Watcher wrapper that integrates with the coalescer.
 pub struct VaultWatcher {
-    /// The underlying filesystem.
-    fs: Box<dyn Fs + Send + Sync>,
-    /// The coalescer to send events to.
-    coalescer: EventCoalescer,
     /// Event sender for coalescer events.
     event_sender: Sender<CoalescerEvent>,
 }
 
 impl VaultWatcher {
     /// Create a new vault watcher.
-    pub fn new(fs: Box<dyn Fs + Send + Sync>, coalescer: &EventCoalescer) -> Self {
+    pub fn new(coalescer: &EventCoalescer) -> Self {
         Self {
-            fs,
-            coalescer: coalescer.clone(),
             event_sender: coalescer.event_sender(),
         }
     }
@@ -453,14 +446,12 @@ mod tests {
 
     #[test]
     fn watcher_nominations_and_overflow_produce_batches() {
-        use flavite_fs::MemFs;
-
         let coalescer = EventCoalescer::new(CoalescerConfig {
             quiet_window: Duration::ZERO,
             max_window: Duration::from_secs(5),
             bulk_threshold: 500,
         });
-        let watcher = VaultWatcher::new(Box::new(MemFs::new()), &coalescer);
+        let watcher = VaultWatcher::new(&coalescer);
         watcher.notify(WatcherEvent::Created(PathBuf::from("created.md")));
         watcher.notify(WatcherEvent::Modified(PathBuf::from("modified.md")));
         watcher.notify(WatcherEvent::Deleted(PathBuf::from("deleted.md")));

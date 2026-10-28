@@ -275,10 +275,6 @@ pub fn should_auto_rewrite_links(tier: crate::channels::RenameTier) -> bool {
 mod tests {
     use super::*;
 
-    fn mock_index_note_ref(path: &str, note_id: i64) -> IndexNoteRef {
-        IndexNoteRef::new(note_id, path.as_bytes().to_vec())
-    }
-
     fn mock_note(path: &str, stable_id: Option<&str>, note_id: i64) -> flavite_index::types::Note {
         flavite_index::types::Note {
             note_id,

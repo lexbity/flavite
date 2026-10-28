@@ -13,7 +13,7 @@ pub mod ts_ranges;
 pub mod wellknown;
 
 // Re-export key types for convenience.
-pub use frontmatter::{Frontmatter, FrontmatterError, PropertyValue};
+pub use frontmatter::{Frontmatter, PropertyValue};
 pub use mask::TextMask;
 pub use pulldown_glue::{Link, ParsedNote};
 pub use scanner::{LinkPayload, ScannedSpan, SpanKind};

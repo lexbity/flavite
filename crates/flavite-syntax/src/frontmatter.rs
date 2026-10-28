@@ -3,8 +3,7 @@
 //! Frontmatter is the YAML block between `---` delimiters at the start of a
 //! note. This module:
 //!
-//! 1. Parses frontmatter with a YAML 1.2 core-schema parser with alias/depth/limit
-//!    guards (D11, §4.10).
+//! 1. Extracts common frontmatter values with a bounded line-based parser.
 //! 2. Writes changes via **textual patches** that preserve comments, quoting style,
 //!    key order, and anchors — **never** by parse-and-reserialize (D11).
 //!
@@ -20,7 +19,6 @@ use crate::text::TextSnapshot;
 use crate::wellknown::WellKnownKey;
 use std::collections::BTreeMap;
 use std::ops::Range;
-use thiserror::Error;
 
 /// A property value, either typed or a raw string.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,26 +41,6 @@ pub enum PropertyValue {
     Raw(String),
 }
 
-/// Errors from frontmatter operations.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum FrontmatterError {
-    /// No frontmatter block present.
-    #[error("no frontmatter block found")]
-    NoFrontmatter,
-    /// YAML parsing failed.
-    #[error("YAML parse error: {0}")]
-    ParseError(String),
-    /// Limits exceeded.
-    #[error("YAML feature exceeds limits: {0}")]
-    LimitsExceeded(String),
-    /// The key to patch was not found.
-    #[error("key not found: {0}")]
-    KeyNotFound(String),
-    /// Cannot safely patch.
-    #[error("cannot safely patch: {0}")]
-    PatchRefused(String),
-}
-
 /// A parsed frontmatter document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frontmatter {
@@ -79,13 +57,13 @@ pub struct Frontmatter {
 }
 
 /// Extract frontmatter from a snapshot, if present.
-pub fn parse_frontmatter(snapshot: &TextSnapshot) -> Result<Option<Frontmatter>, FrontmatterError> {
+pub fn parse_frontmatter(snapshot: &TextSnapshot) -> Option<Frontmatter> {
     let text = snapshot.text();
     // Look for `---` at the start.
     // TextSnapshot removes the BOM from normalized text, so all parser
     // offsets here are already in TextByte coordinates.
     if !text.starts_with("---") {
-        return Ok(None);
+        return None;
     }
 
     let after_open = 3;
@@ -108,7 +86,7 @@ pub fn parse_frontmatter(snapshot: &TextSnapshot) -> Result<Option<Frontmatter>,
     }
 
     let Some(close) = closing_offset else {
-        return Ok(None);
+        return None;
     };
 
     let yaml_text = text[after_open..close].to_string();
@@ -216,13 +194,13 @@ pub fn parse_frontmatter(snapshot: &TextSnapshot) -> Result<Option<Frontmatter>,
         vec.dedup();
     }
 
-    Ok(Some(Frontmatter {
+    Some(Frontmatter {
         yaml_text,
         range: 0..close,
         well_known,
         properties,
         title,
-    }))
+    })
 }
 
 /// Parse a simple YAML value (string or list).
@@ -259,9 +237,7 @@ mod tests {
     fn parse_frontmatter_basic() {
         let s = "---\ntitle: My Note\naliases:\n  - a\n  - b\n---\nBody";
         let snapshot = snap(s);
-        let fm = parse_frontmatter(&snapshot)
-            .expect("parse")
-            .expect("has frontmatter");
+        let fm = parse_frontmatter(&snapshot).expect("has frontmatter");
         assert_eq!(fm.title, Some("My Note".to_string()));
         assert_eq!(
             fm.well_known.get(&WellKnownKey::Aliases),
@@ -273,9 +249,9 @@ mod tests {
     fn parse_frontmatter_no_frontmatter() {
         let s = "Just body text";
         let snapshot = snap(s);
-        let fm = parse_frontmatter(&snapshot).expect("parse");
+        let fm = parse_frontmatter(&snapshot);
         assert!(fm.is_none());
-        assert!(parse_frontmatter(&snap("")).unwrap().is_none());
+        assert!(parse_frontmatter(&snap("")).is_none());
     }
 
     #[test]
@@ -283,26 +259,17 @@ mod tests {
         let snapshot = snap(
             "\u{FEFF}---\ntitle: A title\naliases: [z, a, z]\ntags: one\ntags: two\ncustom: value\ncustom: next\n...\nbody",
         );
-        let fm = parse_frontmatter(&snapshot).unwrap().unwrap();
+        let fm = parse_frontmatter(&snapshot).unwrap();
         assert_eq!(fm.range.start, 0);
         assert_eq!(fm.title.as_deref(), Some("A title"));
         assert_eq!(fm.well_known[&WellKnownKey::Aliases], ["a", "z"]);
         assert_eq!(fm.well_known[&WellKnownKey::Tags], ["one", "two"]);
         assert_eq!(fm.properties["custom"].len(), 2);
 
-        assert!(
-            parse_frontmatter(&snap("prefix\n---\nx\n---"))
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            parse_frontmatter(&snap("---\nno closing delimiter"))
-                .unwrap()
-                .is_none()
-        );
+        assert!(parse_frontmatter(&snap("prefix\n---\nx\n---")).is_none());
+        assert!(parse_frontmatter(&snap("---\nno closing delimiter")).is_none());
         assert!(
             parse_frontmatter(&snap("---\n\n---\nbody"))
-                .unwrap()
                 .unwrap()
                 .title
                 .is_none()
@@ -312,9 +279,7 @@ mod tests {
     #[test]
     fn parse_frontmatter_keeps_offsets_after_standalone_cr_before_crlf() {
         let snapshot = snap("---\nx\r\r\n\u{FEFF}\n---\nbody");
-        let frontmatter = parse_frontmatter(&snapshot)
-            .expect("frontmatter parser should not panic on mixed line endings")
-            .expect("frontmatter block is present");
+        let frontmatter = parse_frontmatter(&snapshot).expect("frontmatter block is present");
         assert!(frontmatter.yaml_text.contains('\u{FEFF}'));
     }
 

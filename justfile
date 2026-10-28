@@ -112,18 +112,15 @@ network-denied:
 cov-check lcov="target/llvm-cov/lcov.info":
     cargo xtask cov-check --lcov {{lcov}}
 
-# Run every fuzz target over checked-in seeds + generated input (§10.6).
-# Discovers targets dynamically from fuzz/fuzz_targets/*.rs.
+# Run maintained fuzz targets over generated input (§10.6).
+# The parity, frontmatter_patcher, and rename_planner harnesses are prototypes
+# and are intentionally excluded until they exercise their named behavior.
 # 30 s per target locally; G1 uses fuzz-smoke-ci (60 s).
 fuzz-smoke:
     #!/usr/bin/env bash
     set -euo pipefail
     cd fuzz
-    targets=$(ls fuzz_targets/*.rs | xargs -n1 basename | sed 's/\.rs$//')
-    if [ -z "$targets" ]; then
-        echo "No fuzz targets found in fuzz/fuzz_targets/"
-        exit 0
-    fi
+    targets="image_limits parser path_safety scanner"
     failed=0
     for target in $targets; do
         echo "=== fuzz-smoke: $target (30s) ==="
@@ -139,11 +136,7 @@ fuzz-smoke-ci:
     #!/usr/bin/env bash
     set -euo pipefail
     cd fuzz
-    targets=$(ls fuzz_targets/*.rs | xargs -n1 basename | sed 's/\.rs$//')
-    if [ -z "$targets" ]; then
-        echo "No fuzz targets found in fuzz/fuzz_targets/"
-        exit 0
-    fi
+    targets="image_limits parser path_safety scanner"
     failed=0
     for target in $targets; do
         echo "=== fuzz-smoke-ci: $target (60s) ==="

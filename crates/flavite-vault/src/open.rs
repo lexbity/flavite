@@ -1,22 +1,7 @@
 //! Vault open sequence implementation (§4.4).
 //!
-//! This module implements the vault opening process as specified in §4.4:
-//!
-//! ```text
-//! open_vault(fs, root) {
-//!     root_guard = acquire_root_guard(fs, root)?;
-//!     candidate = select_identity_read_only(fs, root)?;
-//!     lock = acquire_uuid_lock_or_focus(candidate)?;
-//!     persist_identity_and_binding(fs, root, candidate)?;
-//!     watcher = start_watcher_and_buffer(root)?;
-//!     recover_journals(fs, root)?;
-//!     index = open_or_rebuild_index(candidate)?;
-//!     reconcile(Full, FastMetadata);
-//!     replay_buffered_paths(VerifyContent);
-//!     schedule_full_verification();
-//!     Vault { root_guard, lock, watcher, index }
-//! }
-//! ```
+//! Opening resolves vault identity, takes the per-vault instance lock,
+//! initializes the cache index, starts the vault actor, and builds a session.
 
 use crate::actor::{VaultActorBuilder, VaultActorHandle};
 use crate::channels::ChannelSet;
@@ -78,9 +63,9 @@ pub struct Vault {
     /// Vault identity.
     identity: VaultIdentity,
     /// Identity manager.
-    identity_manager: IdentityManager,
+    _identity_manager: IdentityManager,
     /// Instance manager.
-    instance_manager: InstanceManager,
+    _instance_manager: InstanceManager,
     /// Vault actor handle.
     actor: VaultActorHandle,
     /// Session.
@@ -94,17 +79,8 @@ pub struct Vault {
 impl Vault {
     /// Open a vault at the given root path.
     ///
-    /// This implements the full sequence from §4.4:
-    /// 1. Acquire root ownership guard
-    /// 2. Select identity (vault.toml or registry)
-    /// 3. Acquire UUID lock
-    /// 4. Persist identity/binding
-    /// 5. Start watcher and event buffer
-    /// 6. Recover journals
-    /// 7. Open or rebuild index
-    /// 8. Run initial reconcile
-    /// 9. Replay buffered paths
-    /// 10. Schedule full verification
+    /// Resolves identity, acquires the instance lock, initializes the index,
+    /// starts the vault actor, and creates a session.
     pub fn open(
         root: PathBuf,
         fs: Box<dyn Fs + Send + Sync>,
@@ -142,19 +118,15 @@ impl Vault {
         // Step 7: Create buffer manager
         let buffer_manager = BufferManager::new();
 
-        // Step 8: Create coalescer and watcher
-        // These are created inside VaultActor for now
-
-        // Step 9: Create vault actor
+        // Start the vault actor.
         let actor = VaultActorBuilder::new()
             .with_fs(fs)
             .with_identity(identity.clone())
             .with_index(index)
-            .with_config(config.clone())
             .build()?
             .start()?;
 
-        // Step 10: Create session
+        // Build the session around the actor and channels.
         let session = SessionBuilder::new()
             .with_identity(identity.clone())
             .with_actor(actor.clone())
@@ -168,8 +140,8 @@ impl Vault {
 
         Ok(Self {
             identity,
-            identity_manager,
-            instance_manager,
+            _identity_manager: identity_manager,
+            _instance_manager: instance_manager,
             actor,
             session: Arc::new(session),
             channels,

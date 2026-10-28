@@ -13,7 +13,7 @@ use flavite_api::{
     ApiVaultRef, DoctorReport, ExecutionResult, Flavite, LocalResult, Origin, OsFs, VaultConfig,
     command::Invocation,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
 /// Flavite — a local-first plain-text knowledge vault in pure Rust.
@@ -174,7 +174,7 @@ impl CliDriver {
 
     /// Initialize a new vault.
     #[allow(clippy::ptr_arg)]
-    fn init_vault(&mut self, vault_path: &PathBuf) -> Result<()> {
+    fn init_vault(&mut self, vault_path: &Path) -> Result<()> {
         info!("Initializing new vault at: {}", vault_path.display());
 
         // Ensure the vault path is absolute
@@ -208,12 +208,12 @@ impl CliDriver {
 
     /// Run the doctor command.
     #[allow(clippy::ptr_arg)]
-    fn run_doctor(&self, vault_path: &PathBuf, json: bool) -> Result<()> {
+    fn run_doctor(&self, vault_path: &Path, json: bool) -> Result<()> {
         info!("Running doctor on vault: {}", vault_path.display());
 
         // Create a vault reference
         let uuid = uuid::Uuid::new_v4(); // In real impl, we'd read this from the vault
-        let vault_ref = ApiVaultRef::new(uuid, vault_path.clone());
+        let vault_ref = ApiVaultRef::new(uuid, vault_path.to_path_buf());
 
         // Run doctor checks through the API
         let report = flavite_api::doctor::run_doctor(vault_ref);
@@ -289,7 +289,7 @@ impl CliDriver {
 
     /// Run a query.
     #[allow(clippy::ptr_arg)]
-    fn run_query(&self, _vault_path: &PathBuf, query: &str, limit: usize) -> Result<()> {
+    fn run_query(&self, _vault_path: &Path, query: &str, limit: usize) -> Result<()> {
         info!("Running query: {}", query);
 
         // For now, this is a placeholder
@@ -305,7 +305,7 @@ impl CliDriver {
 
     /// Run a search.
     #[allow(clippy::ptr_arg)]
-    fn run_search(&self, _vault_path: &PathBuf, term: &str, limit: usize) -> Result<()> {
+    fn run_search(&self, _vault_path: &Path, term: &str, limit: usize) -> Result<()> {
         info!("Running search: {}", term);
 
         // For now, this is a placeholder
@@ -320,7 +320,7 @@ impl CliDriver {
 
     /// Show vault info.
     #[allow(clippy::ptr_arg)]
-    fn show_info(&self, vault_path: &PathBuf) -> Result<()> {
+    fn show_info(&self, vault_path: &Path) -> Result<()> {
         info!("Showing vault info: {}", vault_path.display());
 
         if let Some(ref flavite) = self.flavite {

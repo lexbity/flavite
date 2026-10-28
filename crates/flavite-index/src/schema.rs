@@ -51,8 +51,6 @@ pub enum MetaKey {
     Generation,
     /// Log floor - the oldest generation retained in the changes table
     LogFloor,
-    /// Tantivy committed generation (advisory; search commit checkpoint is authority)
-    TantivyCommittedGeneration,
 }
 
 impl MetaKey {
@@ -65,7 +63,6 @@ impl MetaKey {
             Self::Epoch => "epoch",
             Self::Generation => "generation",
             Self::LogFloor => "log_floor",
-            Self::TantivyCommittedGeneration => "tantivy_committed_generation",
         }
     }
 }
@@ -375,11 +372,6 @@ pub fn create_schema(conn: &mut Connection) -> Result<()> {
         params![MetaKey::LogFloor.as_str(), "0"],
     )?;
 
-    tx.execute(
-        "INSERT INTO meta (key, value) VALUES (?1, ?2)",
-        params![MetaKey::TantivyCommittedGeneration.as_str(), "0"],
-    )?;
-
     tx.commit()?;
 
     Ok(())
@@ -669,10 +661,6 @@ mod tests {
         );
         assert_eq!(
             get_meta(&conn, MetaKey::LogFloor).unwrap(),
-            Some("0".into())
-        );
-        assert_eq!(
-            get_meta(&conn, MetaKey::TantivyCommittedGeneration).unwrap(),
             Some("0".into())
         );
         assert_eq!(

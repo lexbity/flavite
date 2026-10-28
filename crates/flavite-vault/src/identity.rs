@@ -376,9 +376,9 @@ pub struct IdentityManager {
     /// The vault identity.
     identity: VaultIdentity,
     /// Root ownership guard.
-    root_guard: RootGuard,
+    _root_guard: RootGuard,
     /// UUID instance lock.
-    uuid_guard: UuidGuard,
+    _uuid_guard: UuidGuard,
 }
 
 impl IdentityManager {
@@ -455,8 +455,8 @@ impl IdentityManager {
 
         Ok(Self {
             identity,
-            root_guard,
-            uuid_guard,
+            _root_guard: root_guard,
+            _uuid_guard: uuid_guard,
         })
     }
 

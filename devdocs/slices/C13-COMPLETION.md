@@ -1,5 +1,8 @@
 # Slice C13 - Tiered Rename Inference Implementation
 
+> Historical implementation record; completion here does not imply that every
+> rename workflow is currently wired into vault/session operations.
+
 ## Summary
 
 This document records the completion of **Slice C13** — Phase 3, Slice 2 of 2: tiered rename inference (T0–T4) + rename notices + attachment renames + duplicate-ID handling.

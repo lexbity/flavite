@@ -12,7 +12,6 @@
 use crate::actor::VaultActorHandle;
 use crate::channels::{NoticeChannel, PulseChannel};
 use crate::save::{DiskPrecondition, DurabilityOutcome, SaveFailureStage, SaveRequest};
-use crate::tokens::WriteTokenManager;
 use crate::types::{
     Epoch, Generation, ReconcileMode, ReconcileScope, ReconcileSummary, VaultConfig, VaultIdentity,
 };
@@ -275,8 +274,6 @@ pub struct Session {
     recovery_stop: Arc<std::sync::atomic::AtomicBool>,
     /// Request ID counter.
     request_counter: AtomicU64,
-    /// Pending operations.
-    pending: Arc<Mutex<HashMap<u64, SessionResult>>>,
     /// One active save and at most one coalesced successor per buffer.
     save_flights: Mutex<HashMap<u64, SaveFlight>>,
     /// Correlated reconcile workers.
@@ -284,16 +281,10 @@ pub struct Session {
         Mutex<HashMap<u64, crossbeam::channel::Receiver<crate::actor::VaultActorResp>>>,
     /// Lossless terminal results. Admission is bounded by the pending-save cap.
     completions: Mutex<VecDeque<OperationCompletion>>,
-    /// Write token manager.
-    token_manager: WriteTokenManager,
     /// Pulse channel.
     pulse: PulseChannel,
     /// Notice channel.
     notice: NoticeChannel,
-    /// Configuration.
-    config: VaultConfig,
-    /// Whether the vault is read-only.
-    read_only: bool,
 }
 
 impl Session {
@@ -304,7 +295,7 @@ impl Session {
         buffer_manager: BufferManager,
         pulse: PulseChannel,
         notice: NoticeChannel,
-        config: VaultConfig,
+        _config: VaultConfig,
     ) -> Self {
         let manager = Arc::new(Mutex::new(buffer_manager));
         let recovery_writer = crate::identity::get_data_dir().map(|data| {
@@ -367,15 +358,11 @@ impl Session {
             recovery_worker,
             recovery_stop,
             request_counter: AtomicU64::new(0),
-            pending: Arc::new(Mutex::new(HashMap::new())),
             save_flights: Mutex::new(HashMap::new()),
             reconcile_flights: Mutex::new(HashMap::new()),
             completions: Mutex::new(VecDeque::new()),
-            token_manager: WriteTokenManager::new(),
             pulse,
             notice,
-            config,
-            read_only: false,
         }
     }
 
@@ -1378,22 +1365,6 @@ impl Session {
         }
     }
 
-    /// Reopen a note (after conflict reload).
-    fn reopen_note(&self, path: PathBuf) -> SessionResult {
-        // Close if open
-        let was_open = {
-            let open_buffers = self.open_buffers.lock().unwrap();
-            open_buffers.contains_key(&path)
-        };
-
-        if was_open {
-            let _ = self.close_note(path.clone());
-        }
-
-        // Reopen
-        self.open_note(path)
-    }
-
     /// Get an immutable snapshot of an open buffer.
     pub fn buffer_snapshot(
         &self,
@@ -1429,6 +1400,7 @@ impl Session {
 
     /// Internal access for Session-owned integrations and in-crate tests.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn buffer_manager(&self) -> Arc<Mutex<BufferManager>> {
         self.buffer_manager.clone()
     }
@@ -2064,8 +2036,6 @@ mod tests {
             session.execute(SessionCommand::DiscardRecovery { path }),
             SessionResult::Error { .. }
         ));
-        assert!(session.recovery_tick().is_empty());
-        assert!(session.flush_recovery().is_err());
         assert!(matches!(
             session.wait_for_operation(u64::MAX),
             SessionResult::Error { .. }

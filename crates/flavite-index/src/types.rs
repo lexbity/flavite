@@ -200,14 +200,6 @@ pub struct ExtFact {
     pub value_json: String,
 }
 
-/// Cached searchable document body.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SearchDoc {
-    pub note_id: i64,
-    pub content_hash: Vec<u8>,
-    pub body_text: String,
-}
-
 /// A change record in the invalidation log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChangeRecord {
@@ -284,24 +276,6 @@ impl<T> Page<T> {
 pub enum IndexError {
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
-
-    #[error("Tantivy error: {0}")]
-    Tantivy(String),
-
-    #[error("Note not found: {0}")]
-    NoteNotFound(i64),
-
-    #[error("Attachment not found: {0}")]
-    AttachmentNotFound(i64),
-
-    #[error("Invalid query: {0}")]
-    InvalidQuery(String),
-
-    #[error("Generation mismatch: expected {0}, got {1}")]
-    GenerationMismatch(u64, u64),
-
-    #[error("Epoch mismatch: expected {0}, got {1}")]
-    EpochMismatch(u64, u64),
 
     #[error("Stale cursor: cursor is ahead of current generation")]
     StaleCursor,

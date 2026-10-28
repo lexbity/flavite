@@ -47,9 +47,7 @@ use super::shader_probe::{
 };
 use flavite_graph::{NodeId, NodeKind};
 
-/// Zoom level at which the view switches from instanced dots+lines to the
-/// card layer. D15: "zoom/visible-count threshold → CardLayer (≤ 64 real
-/// widgets)".
+/// Zoom level reserved for the planned detail transition.
 pub const LOD_ZOOM_THRESHOLD: f32 = 8.0;
 
 /// Hit-test radius for a node at `zoom`.

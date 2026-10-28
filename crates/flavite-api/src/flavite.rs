@@ -4,7 +4,6 @@
 //! - The headless Session (from flavite-vault)
 //! - The command registry
 //! - Revisioned read views
-//! - Event bus
 //!
 //! All external consumers (GUI, CLI, future plugins) interact with the core
 //! system through this facade.
@@ -12,12 +11,10 @@
 use crate::command::{
     ArgSchema, CommandDispatchError, CommandHandler, CommandRegistry, CommandSpec, Invocation,
 };
-use crate::event::Event;
 use crate::result::{
     ExecutionResult, LocalError, LocalResult, LocalSuccess, RejectedResult, RejectionReason,
 };
 use crate::types::{ApiVaultRef, RequestId};
-use crossbeam::channel::{Receiver, Sender, unbounded};
 use flavite_buffer::revision::{BufferId, Revision};
 use flavite_vault::open::Vault;
 use flavite_vault::session::{Session, SessionCommand, SessionError, SessionResult};
@@ -173,12 +170,9 @@ pub struct OpenVaultResult {
 ///
 /// This is the main entry point for interacting with a vault through the
 /// public API. It owns the Session and provides typed command dispatch,
-/// revisioned read views, and event subscriptions.
+/// revisioned read views, and typed command dispatch.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct Flavite {
-    /// Vault identity.
-    identity: VaultIdentity,
     /// The underlying Session.
     session: Arc<Session>,
     /// Command registry.
@@ -191,12 +185,6 @@ pub struct Flavite {
     pending_requests: Mutex<HashSet<RequestId>>,
     /// Completions collected while waiting for another operation.
     terminal_backlog: Mutex<HashMap<RequestId, ExecutionResult>>,
-    /// Event sender for subscribers.
-    event_sender: Sender<Event>,
-    /// Event receiver (kept for drop behavior).
-    _event_receiver: Receiver<Event>,
-    /// Subscribers to events.
-    subscribers: Arc<Mutex<Vec<Sender<Event>>>>,
     /// The API vault reference.
     vault_ref: ApiVaultRef,
     /// Whether the vault is read-only.
@@ -222,19 +210,13 @@ impl Flavite {
     ) -> Result<Self, FlaviteError> {
         let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
 
-        let (event_sender, event_receiver) = unbounded();
-
         let flavite = Self {
-            identity,
             session: Arc::new(session),
             command_registry: CommandRegistry::new(),
             ingress: Mutex::new(()),
             operation_ids: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashSet::new()),
             terminal_backlog: Mutex::new(HashMap::new()),
-            event_sender,
-            _event_receiver: event_receiver,
-            subscribers: Arc::new(Mutex::new(Vec::new())),
             vault_ref,
             read_only: false,
             owned_vault: None,
@@ -254,23 +236,13 @@ impl Flavite {
         vault_ref: ApiVaultRef,
         _config: VaultConfig,
     ) -> Result<Self, FlaviteError> {
-        let (event_sender, event_receiver) = unbounded();
-
         let flavite = Self {
-            identity: VaultIdentity {
-                uuid: vault_ref.uuid,
-                root: vault_ref.root.clone(),
-                root_key: Vec::new(),
-            },
             session: Arc::new(session),
             command_registry: CommandRegistry::new(),
             ingress: Mutex::new(()),
             operation_ids: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashSet::new()),
             terminal_backlog: Mutex::new(HashMap::new()),
-            event_sender,
-            _event_receiver: event_receiver,
-            subscribers: Arc::new(Mutex::new(Vec::new())),
             vault_ref,
             read_only: false,
             owned_vault: None,
@@ -291,19 +263,13 @@ impl Flavite {
         _config: VaultConfig,
     ) -> Result<Self, FlaviteError> {
         let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
-        let (event_sender, event_receiver) = unbounded();
-
         let flavite = Self {
-            identity,
             session,
             command_registry: CommandRegistry::new(),
             ingress: Mutex::new(()),
             operation_ids: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashSet::new()),
             terminal_backlog: Mutex::new(HashMap::new()),
-            event_sender,
-            _event_receiver: event_receiver,
-            subscribers: Arc::new(Mutex::new(Vec::new())),
             vault_ref,
             read_only: false,
             owned_vault: None,
@@ -457,18 +423,6 @@ impl Flavite {
     /// Set the vault to read-only mode.
     pub fn set_read_only(&mut self, read_only: bool) {
         self.read_only = read_only;
-    }
-
-    /// Subscribe to events.
-    ///
-    /// Returns a receiver for events from this vault.
-    pub fn subscribe(&self) -> Receiver<Event> {
-        let (sender, receiver) = unbounded();
-        {
-            let mut subscribers = self.subscribers.lock().unwrap();
-            subscribers.push(sender);
-        }
-        receiver
     }
 
     /// Get the underlying Session (for advanced use cases).
@@ -1070,12 +1024,6 @@ mod tests {
         )
         .unwrap();
         (flavite, root, temp)
-    }
-
-    #[test]
-    fn flavite_creation() {
-        // This test will be expanded once Session can be properly constructed
-        // For now, we just verify the types compile
     }
 
     #[test]

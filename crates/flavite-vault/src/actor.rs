@@ -1,24 +1,17 @@
 //! VaultActor — the main filesystem actor (§4.2, D3).
 //!
-//! The VaultActor owns:
-//! - The filesystem implementation
-//! - The file watcher
-//! - Write tokens for atomic operations
-//! - Journal and history handles
-//! - The IndexActor connection
+//! The VaultActor owns the filesystem implementation, structural index,
+//! identity, and content-addressed history store.
 //!
-//! It runs the reconcile algorithm on a worker thread and coordinates
-//! with the Session via bounded channels.
+//! It serializes vault commands and coordinates with the Session via bounded
+//! channels.
 
-use crate::channels::{NoticeChannel, PulseChannel};
-use crate::coalesce::{CoalescerConfig, EventCoalescer, VaultWatcher, WatcherEvent};
+use crate::coalesce::WatcherEvent;
 use crate::history::HistoryStore;
 use crate::history::{HistoryReason, SnapshotRef};
-use crate::reconcile::{ReconcileConfig, ReconcileState};
 use crate::save::{SaveFailure, SaveReceipt, SaveRequest};
-use crate::tokens::WriteTokenManager;
 use crate::types::{
-    ReconcileMode, ReconcileScope, ReconcileSummary, VaultConfig, VaultIdentity, Version,
+    Epoch, Generation, ReconcileMode, ReconcileScope, ReconcileSummary, VaultIdentity, Version,
 };
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use flavite_fs::Fs;
@@ -304,24 +297,11 @@ pub struct VaultActor {
     identity: VaultIdentity,
     /// The index.
     index: IndexActor,
-    /// Vault configuration.
-    config: VaultConfig,
-    /// Event coalescer.
-    coalescer: EventCoalescer,
-    /// Vault watcher.
-    _watcher: Option<VaultWatcher>,
-    /// Pulse channel.
-    pulse: PulseChannel,
-    /// Notice channel.
-    notice: NoticeChannel,
-    /// Write token manager.
-    token_manager: WriteTokenManager,
     /// Content-addressed local safety history.
     history: Option<HistoryStore>,
-    /// Reconcile state.
-    reconcile_state: ReconcileState,
-    /// Reconcile config.
-    reconcile_config: ReconcileConfig,
+    /// Current index version reported to session clients.
+    epoch: Epoch,
+    generation: Generation,
     /// Whether the actor is running.
     is_running: AtomicBool,
     /// Message receiver.
@@ -332,38 +312,15 @@ pub struct VaultActor {
 
 impl VaultActor {
     /// Create a new VaultActor.
-    pub fn new(
-        fs: Box<dyn Fs + Send + Sync>,
-        identity: VaultIdentity,
-        index: IndexActor,
-        config: VaultConfig,
-        pulse: PulseChannel,
-        notice: NoticeChannel,
-    ) -> Self {
-        let coalescer = EventCoalescer::new(CoalescerConfig {
-            quiet_window: config.coalesce_quiet_window,
-            max_window: config.coalesce_max_window,
-            bulk_threshold: config.bulk_threshold,
-        });
-
-        // Create watcher - for stub, we skip it due to Box<dyn Fs> not implementing Clone
-        // TODO: Implement proper Fs cloning when flavite-fs supports it
-        let _watcher = None; // VaultWatcher::new(fs, &coalescer);
-
+    pub fn new(fs: Box<dyn Fs + Send + Sync>, identity: VaultIdentity, index: IndexActor) -> Self {
         let fs: Arc<dyn Fs + Send + Sync> = Arc::from(fs);
         Self {
             fs,
             identity,
             index,
-            config,
-            coalescer,
-            _watcher,
-            pulse,
-            notice,
-            token_manager: WriteTokenManager::new(),
             history: None,
-            reconcile_state: ReconcileState::default(),
-            reconcile_config: ReconcileConfig::default(),
+            epoch: Epoch::new(0),
+            generation: Generation::new(0),
             is_running: AtomicBool::new(false),
             msg_receiver: unbounded().1, // Will be replaced
             resp_sender: unbounded().0,  // Will be replaced
@@ -410,8 +367,6 @@ impl VaultActor {
         );
 
         // Perform initial scan
-        self.perform_initial_scan();
-
         // Main loop
         loop {
             match self.msg_receiver.recv() {
@@ -443,8 +398,7 @@ impl VaultActor {
                 self.handle_fs_event(event);
             }
             VaultActorMsg::GetVersion => {
-                let version =
-                    Version::new(self.reconcile_state.epoch, self.reconcile_state.generation);
+                let version = Version::new(self.epoch, self.generation);
                 let _ = self.resp_sender.try_send(VaultActorResp::Version(version));
             }
             VaultActorMsg::GetIdentity => {
@@ -621,7 +575,7 @@ impl VaultActor {
         // For now, just return a dummy result
         // In production, this would call the actual reconcile logic
         let summary = ReconcileSummary::default();
-        let version = Version::new(self.reconcile_state.epoch, self.reconcile_state.generation);
+        let version = Version::new(self.epoch, self.generation);
 
         let response = VaultActorResp::ReconcileComplete { summary, version };
         if let Some(reply) = reply {
@@ -643,19 +597,6 @@ impl VaultActor {
         // For now, just send a pulse that something changed
         // The actual reconcile will be triggered by the next message loop
     }
-
-    /// Perform the initial scan on startup.
-    fn perform_initial_scan(&mut self) {
-        info!(
-            "Performing initial scan for vault: {}",
-            self.identity.root.display()
-        );
-
-        // For now, we'll just mark it as completed
-        // In production, this would call initial_scan
-
-        info!("Initial scan completed");
-    }
 }
 
 /// Extension trait for Fs to create boxed clones.
@@ -675,7 +616,6 @@ pub struct VaultActorBuilder {
     fs: Option<Box<dyn Fs + Send + Sync>>,
     identity: Option<VaultIdentity>,
     index: Option<IndexActor>,
-    config: Option<VaultConfig>,
 }
 
 impl VaultActorBuilder {
@@ -706,22 +646,12 @@ impl VaultActorBuilder {
         self
     }
 
-    /// Set the configuration.
-    #[must_use]
-    pub fn with_config(mut self, config: VaultConfig) -> Self {
-        self.config = Some(config);
-        self
-    }
-
     /// Build the VaultActor.
     pub fn build(self) -> Result<VaultActor, String> {
         Ok(VaultActor::new(
             self.fs.ok_or("Missing filesystem")?,
             self.identity.ok_or("Missing identity")?,
             self.index.ok_or("Missing structural index")?,
-            self.config.unwrap_or_default(),
-            PulseChannel::new(1024),
-            NoticeChannel::new(std::time::Duration::from_millis(300)),
         ))
     }
 }
@@ -729,6 +659,7 @@ impl VaultActorBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokens::WriteTokenManager;
     use flavite_fs::{Fs, MemFs};
 
     #[test]

@@ -144,12 +144,11 @@ PLAN-A **slices A4, A5, and A6** — Phase 0.0 infrastructure (gates, RAG, clean
 - `fuzz/corpus/image_limits/` — seed corpus
 - `fuzz/.gitignore`
 
-**Features:**
-- ✅ Excluded from root workspace default-members
-- ✅ Two targets: parser, image_limits
-- ✅ Enforces input budgets (MAX_NOTE_BYTES, ATTACHMENT_HASH_MAX)
-- ✅ Curated, checked-in seed corpora
-- ✅ Ready for PLAN-C to add more targets
+**Current smoke scope:**
+- Maintained smoke targets: `image_limits`, `parser`, `path_safety`, and `scanner`
+- `frontmatter_patcher`, `parity`, and `rename_planner` remain prototype harnesses
+  and are excluded from the smoke loop until they test their advertised behavior.
+- Seed corpora are checked in; `just fuzz-smoke` and CI run the maintained list.
 
 ### Verification
 
@@ -667,7 +666,7 @@ The critical path is now: **A7 → A8 → A9 → A10 → A11** (Phase 6 editor)
 cargo test -p xtask                          # 29 tests
 cargo clippy -p xtask --all-targets -- -D warnings  # All pass
 cargo xtask arch check                      # Pass
-just fuzz-smoke                             # All targets pass
+just fuzz-smoke                             # Maintained smoke targets pass
 just clean --dry-run                        # Reports without deleting
 just gc                                    # No-op under budget
 

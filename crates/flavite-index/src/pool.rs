@@ -475,8 +475,7 @@ impl IndexActor {
             .unwrap_or(display_path);
         let path_key = display_path.to_lowercase();
         let stem_key = stem.to_lowercase();
-        let frontmatter = flavite_syntax::frontmatter::parse_frontmatter(&parsed.snapshot)
-            .map_err(|error| format!("parse frontmatter: {error}"))?;
+        let frontmatter = flavite_syntax::frontmatter::parse_frontmatter(&parsed.snapshot);
         let title = flavite_syntax::wellknown::derive_title(
             frontmatter
                 .as_ref()

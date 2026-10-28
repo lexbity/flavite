@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 //! Tier 2. `Flavite` facade owning the `Session` and command registry;
-//! typed commands/results, revisioned read views, versioned event bus,
+//! typed commands/results, revisioned read views, event types,
 //! `Query` AST, capability declarations (§4.1, §4.5, D16).
 //!
 //! This crate provides the public API for interacting with Flavite vaults.
@@ -13,7 +13,7 @@
 //! The API consists of:
 //! - **Flavite**: Main facade owning Session and command registry
 //! - **Command System**: Typed command specification and dispatch
-//! - **Event System**: Versioned events for plugin compatibility
+//! - **Event Types**: Versioned event records
 //! - **Query AST**: Re-exported from flavite-index
 //! - **Capabilities**: Declared capability system
 //! - **Doctor**: Vault diagnostics
@@ -24,7 +24,6 @@
 //! is migrated to use this API as the dogfooding proof.
 
 pub mod capability;
-pub mod channel;
 pub mod command;
 pub mod doctor;
 pub mod event;
@@ -35,7 +34,6 @@ pub mod types;
 
 // Re-export key types for convenience
 pub use capability::*;
-pub use channel::*;
 pub use command::*;
 pub use doctor::*;
 pub use event::*;

@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-#![allow(dead_code)] // Stub implementation for C8
 
 //! Tier 1 — durability-critical. Headless `Session` owning `BufferManager`
 //! and pending operations; `VaultActor` (watcher, write tokens, journal,
@@ -15,7 +14,6 @@ pub mod instance;
 pub mod journal;
 pub mod merge;
 pub mod open;
-pub mod reconcile;
 pub mod rename;
 pub mod save;
 pub mod session;
@@ -49,7 +47,6 @@ pub use journal::recover::{
 };
 pub use merge::{MergeConflict, MergeResult, three_way_merge};
 pub use open::{OpenVaultError, OpenVaultResult, Vault, vault_exists};
-pub use reconcile::{ReconcileConfig, ReconcileContext, ReconcileResult, verify_content_full};
 pub use rename::{
     AttachmentRename, AttachmentRenameConfig, AttachmentRenameManager, AttachmentRenameResult,
     DuplicateIdInfo, DuplicateIdManager, DuplicateIdResolution, EmbedCountProvider,
@@ -71,64 +68,3 @@ pub use types::{
     AtomicVersion, ChangeKind, Epoch, Generation, ReconcileMode, ReconcileScope, ReconcileSummary,
     VaultConfig, VaultRef, Version,
 };
-
-/// Placeholder for Index - will be implemented in flavite-index
-/// This is just to allow compilation of vault code
-#[derive(Debug, Clone, Default)]
-pub struct IndexPlaceholder;
-
-impl IndexPlaceholder {
-    /// Get notes in scope - stub
-    pub fn get_notes_in_scope(
-        &self,
-        _scope: &crate::types::ReconcileScope,
-    ) -> std::collections::HashMap<std::path::PathBuf, crate::reconcile::FileEntry> {
-        std::collections::HashMap::new()
-    }
-
-    /// Apply a note to the index - stub
-    pub fn apply_note(
-        &mut self,
-        _path: &std::path::Path,
-        _snapshot: &flavite_syntax::text::TextSnapshot,
-        _scan_time_ns: i64,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// Update a note in the index - stub
-    pub fn update_note(
-        &mut self,
-        _path: &std::path::Path,
-        _snapshot: &flavite_syntax::text::TextSnapshot,
-        _scan_time_ns: i64,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// Remove a note from the index - stub
-    pub fn remove_note(&mut self, _path: &std::path::Path) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn index_placeholder_stubs_are_safe_noops() {
-        let mut index = IndexPlaceholder;
-        let scope = ReconcileScope::Single("note.md".into());
-        assert!(index.get_notes_in_scope(&scope).is_empty());
-        let snapshot = flavite_syntax::text::TextSnapshot::new(b"hello").unwrap();
-        assert!(index.apply_note(Path::new("note.md"), &snapshot, 1).is_ok());
-        assert!(
-            index
-                .update_note(Path::new("note.md"), &snapshot, 2)
-                .is_ok()
-        );
-        assert!(index.remove_note(Path::new("note.md")).is_ok());
-    }
-}

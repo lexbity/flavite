@@ -1,4 +1,8 @@
-# Slice C8 Completion Summary
+# Slice C8 Historical Completion Summary
+
+> Historical snapshot only. Several integration claims below were not carried
+> into the current implementation; see the source and current architecture docs
+> for the actual behavior.
 
 ## Overview
 Slice C8 (Phase 1 slice 4 of 5) implements the `flavite-vault` crate with:
@@ -11,7 +15,7 @@ Slice C8 (Phase 1 slice 4 of 5) implements the `flavite-vault` crate with:
 - Pulse/Notice channels (hint vs lossless event delivery)
 - Open vault sequence per §4.4 and §4.13
 
-## Status: COMPLETE ✓
+## Status: Historical snapshot
 
 ### What's Implemented
 
