@@ -28,7 +28,12 @@ No dependencies.
 
 ### `flavite-buffer`
 
-No dependencies.
+Normal/build:
+
+- `blake3` (normal)
+- `flavite-syntax` (normal)
+- `ropey` (normal)
+- `zstd` (normal)
 
 ### `flavite-cli`
 
@@ -94,15 +99,17 @@ Normal/build:
 
 ## First-party external dependencies
 
-- `blake3` ← flavite-fs, flavite-index, xtask
+- `blake3` ← flavite-buffer, flavite-fs, flavite-index, xtask
 - `cosmic-text` ← xtask
 - `iced` ← flavite-ui, xtask
 - `notify` ← flavite-fs, flavite-fs, xtask
 - `pulldown-cmark` ← flavite-syntax
+- `ropey` ← flavite-buffer
 - `rusqlite` ← flavite-index, xtask
 - `tantivy` ← flavite-index, xtask
 - `tracing` ← flavite-index
 - `tree-sitter` ← flavite-syntax
+- `zstd` ← flavite-buffer
 
 ## Layering rules (§10.2)
 

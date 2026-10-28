@@ -7,7 +7,7 @@ use tempfile::tempdir;
 
 #[test]
 fn os_fs_new() {
-    let fs = OsFs::new();
+    let _fs = OsFs::new();
     // Just verify it creates without panic
 }
 

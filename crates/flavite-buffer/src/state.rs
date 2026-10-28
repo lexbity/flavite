@@ -257,7 +257,10 @@ impl Buffer {
     ///
     /// This applies an edit operation and transitions the state appropriately.
     /// Returns the new revision and any state transition that occurred.
-    pub fn apply_local_edit(&mut self, edit: crate::undo::EditOp) -> (Revision, Option<StateTransition>) {
+    pub fn apply_local_edit(
+        &mut self,
+        edit: crate::undo::EditOp,
+    ) -> (Revision, Option<StateTransition>) {
         let old_state = self.state;
         let old_revision = self.revision();
 
@@ -271,7 +274,11 @@ impl Buffer {
         };
 
         let transition = if old_state != new_state {
-            Some(StateTransition::new(old_state, new_state, TransitionReason::LocalEdit))
+            Some(StateTransition::new(
+                old_state,
+                new_state,
+                TransitionReason::LocalEdit,
+            ))
         } else {
             None
         };
@@ -334,11 +341,8 @@ impl Buffer {
             };
 
             if new_state != old_state {
-                let transition = StateTransition::new(
-                    old_state,
-                    new_state,
-                    TransitionReason::ExternalChange,
-                );
+                let transition =
+                    StateTransition::new(old_state, new_state, TransitionReason::ExternalChange);
                 self.state = new_state;
                 Some(transition)
             } else {
@@ -393,11 +397,8 @@ impl Buffer {
             };
 
             if new_state != old_state {
-                let transition = StateTransition::new(
-                    old_state,
-                    new_state,
-                    TransitionReason::FileRecreated,
-                );
+                let transition =
+                    StateTransition::new(old_state, new_state, TransitionReason::FileRecreated);
                 self.state = new_state;
                 Some(transition)
             } else {
@@ -598,19 +599,20 @@ mod tests {
     fn local_edit_transition() {
         let mut buffer = Buffer::from_str("hello");
 
-        let edit = crate::undo::EditOp::new(
-            Span::new(TextByte(5), TextByte(5)),
-            " world".to_string(),
-        );
+        let edit =
+            crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
 
         let (rev, transition) = buffer.apply_local_edit(edit);
         assert_eq!(buffer.state(), BufferState::Dirty);
         assert!(buffer.is_dirty());
-        assert_eq!(transition, Some(StateTransition::new(
-            BufferState::Clean,
-            BufferState::Dirty,
-            TransitionReason::LocalEdit
-        )));
+        assert_eq!(
+            transition,
+            Some(StateTransition::new(
+                BufferState::Clean,
+                BufferState::Dirty,
+                TransitionReason::LocalEdit
+            ))
+        );
     }
 
     #[test]
@@ -618,10 +620,8 @@ mod tests {
         let mut buffer = Buffer::from_str("hello");
 
         // Apply a local edit
-        let edit = crate::undo::EditOp::new(
-            Span::new(TextByte(5), TextByte(5)),
-            " world".to_string(),
-        );
+        let edit =
+            crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         buffer.apply_local_edit(edit);
 
         // External change to identical content
@@ -630,11 +630,14 @@ mod tests {
 
         // Should auto-resolve to Clean
         assert_eq!(buffer.state(), BufferState::Clean);
-        assert_eq!(transition, Some(StateTransition::new(
-            BufferState::Dirty,
-            BufferState::Clean,
-            TransitionReason::ExternalChange
-        )));
+        assert_eq!(
+            transition,
+            Some(StateTransition::new(
+                BufferState::Dirty,
+                BufferState::Clean,
+                TransitionReason::ExternalChange
+            ))
+        );
     }
 
     #[test]
@@ -646,11 +649,14 @@ mod tests {
         let transition = buffer.check_external_change(new_content);
 
         assert_eq!(buffer.state(), BufferState::Conflicted);
-        assert_eq!(transition, Some(StateTransition::new(
-            BufferState::Clean,
-            BufferState::Conflicted,
-            TransitionReason::ExternalChange
-        )));
+        assert_eq!(
+            transition,
+            Some(StateTransition::new(
+                BufferState::Clean,
+                BufferState::Conflicted,
+                TransitionReason::ExternalChange
+            ))
+        );
     }
 
     #[test]
@@ -679,10 +685,8 @@ mod tests {
         let mut buffer = Buffer::from_str("hello");
 
         // Make it dirty
-        let edit = crate::undo::EditOp::new(
-            Span::new(TextByte(5), TextByte(5)),
-            " world".to_string(),
-        );
+        let edit =
+            crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         buffer.apply_local_edit(edit);
 
         // Reload from disk
@@ -696,10 +700,8 @@ mod tests {
         let mut buffer = Buffer::from_str("hello");
 
         // Make it dirty
-        let edit = crate::undo::EditOp::new(
-            Span::new(TextByte(5), TextByte(5)),
-            " world".to_string(),
-        );
+        let edit =
+            crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         buffer.apply_local_edit(edit);
 
         // External change
@@ -718,10 +720,8 @@ mod tests {
         let mut buffer = Buffer::from_str("hello");
 
         // Make it dirty
-        let edit = crate::undo::EditOp::new(
-            Span::new(TextByte(5), TextByte(5)),
-            " world".to_string(),
-        );
+        let edit =
+            crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         buffer.apply_local_edit(edit);
 
         // Discard
@@ -735,10 +735,8 @@ mod tests {
         let mut buffer = Buffer::from_str("hello");
 
         // Make it dirty
-        let edit = crate::undo::EditOp::new(
-            Span::new(TextByte(5), TextByte(5)),
-            " world".to_string(),
-        );
+        let edit =
+            crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         buffer.apply_local_edit(edit);
 
         // Save completed
@@ -774,7 +772,7 @@ mod tests {
         // Clean | changed → Silent reload. Map cursor and scroll through the diff
         let mut buffer = Buffer::from_str("hello");
         let transition = buffer.check_external_change(b"hello world");
-        
+
         assert_eq!(buffer.state(), BufferState::Conflicted);
         // This would normally trigger a silent reload in the UI
     }
@@ -784,7 +782,7 @@ mod tests {
         // Clean | deleted → Keep pane open as *Orphaned*, banner "file deleted"
         let mut buffer = Buffer::from_str("hello");
         let transition = buffer.handle_file_deleted();
-        
+
         assert_eq!(buffer.state(), BufferState::Orphaned);
     }
 
@@ -792,12 +790,10 @@ mod tests {
     fn d7_table_dirty_changed() {
         // Dirty | changed → Conflict banner
         let mut buffer = Buffer::from_str("hello");
-        let edit = crate::undo::EditOp::new(
-            Span::new(TextByte(5), TextByte(5)),
-            " world".to_string(),
-        );
+        let edit =
+            crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         buffer.apply_local_edit(edit);
-        
+
         let transition = buffer.check_external_change(b"goodbye");
         assert_eq!(buffer.state(), BufferState::Conflicted);
     }
@@ -806,12 +802,10 @@ mod tests {
     fn d7_table_dirty_changed_to_identical() {
         // Dirty | changed to *identical* content as buffer → Auto-resolve → Clean
         let mut buffer = Buffer::from_str("hello");
-        let edit = crate::undo::EditOp::new(
-            Span::new(TextByte(5), TextByte(5)),
-            " world".to_string(),
-        );
+        let edit =
+            crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         buffer.apply_local_edit(edit);
-        
+
         let transition = buffer.check_external_change(b"hello world");
         assert_eq!(buffer.state(), BufferState::Clean);
     }
@@ -820,12 +814,10 @@ mod tests {
     fn d7_table_dirty_deleted() {
         // Dirty | deleted → Recreate · Save as · Discard
         let mut buffer = Buffer::from_str("hello");
-        let edit = crate::undo::EditOp::new(
-            Span::new(TextByte(5), TextByte(5)),
-            " world".to_string(),
-        );
+        let edit =
+            crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         buffer.apply_local_edit(edit);
-        
+
         let transition = buffer.handle_file_deleted();
         assert_eq!(buffer.state(), BufferState::Orphaned);
     }
@@ -835,7 +827,7 @@ mod tests {
         // Conflicted state blocks autosave and manual save
         let mut buffer = Buffer::from_str("hello");
         buffer.check_external_change(b"goodbye");
-        
+
         assert!(buffer.is_conflicted());
         assert!(!buffer.allows_autosave());
         assert!(!buffer.allows_manual_save());

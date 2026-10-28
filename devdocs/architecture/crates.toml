@@ -51,6 +51,7 @@ flavite-ui = "iced application (§4.1)"
 active = [
     { from = "flavite-ui", to = "flavite-graph" },
     { from = "flavite-index", to = "flavite-syntax" },
+    { from = "flavite-buffer", to = "flavite-syntax" },
 ]
 
 [layering]

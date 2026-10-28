@@ -1,13 +1,13 @@
 //! Basic tests for flavite-cli
 
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 #[test]
 fn cli_runs() {
     // Just verify the CLI binary can be invoked
     // It will print an error message but that's expected
-    let output = Command::new("cargo")
-        .args(&["run", "-p", "flavite-cli", "--", "--help"])
+    let _output = Command::new("cargo")
+        .args(["run", "-p", "flavite-cli", "--", "--help"])
         .current_dir("../../..")
         .output()
         .expect("Failed to execute cargo");
@@ -19,8 +19,8 @@ fn cli_runs() {
 #[test]
 fn cli_runs_with_cargo() {
     // Test that the CLI binary compiles and runs
-    let output = Command::new("cargo")
-        .args(&["run", "-p", "flavite-cli", "--quiet"])
+    let _output = Command::new("cargo")
+        .args(["run", "-p", "flavite-cli", "--quiet"])
         .current_dir("../../..")
         .output()
         .expect("Failed to execute cargo");
