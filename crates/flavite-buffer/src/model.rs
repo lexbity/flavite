@@ -342,18 +342,10 @@ impl EditorModel {
             return self.revision;
         }
 
-        // Count newlines
-        let start_line = self.line_at(range.start);
-        let end_line = self.line_at(range.end);
-        let newlines_deleted = end_line.saturating_sub(start_line);
-        let newlines_inserted = replacement.chars().filter(|&c| c == '\n').count();
-
         let edit = EditOp::new(range, replacement.to_string());
-
-        // Update EOL metadata
-        self.update_eol_for_replace(range, newlines_deleted, newlines_inserted);
-
-        self.apply_edit_op(edit)
+        let revision = self.apply_edit_op(edit);
+        self.rebuild_eol_table();
+        revision
     }
 
     /// Apply an edit operation.
@@ -440,10 +432,12 @@ impl EditorModel {
             cursor = edit.range.end.0;
         }
         replacement.push_str(&old_text[cursor..end]);
-        self.apply_edit_op(EditOp::new(
+        let revision = self.apply_edit_op(EditOp::new(
             Span::new(TextByte(start), TextByte(end)),
             replacement,
-        ))
+        ));
+        self.rebuild_eol_table();
+        revision
     }
 
     /// Whether edits are non-overlapping ranges against this exact text
@@ -664,40 +658,21 @@ impl EditorModel {
         }
     }
 
-    /// Update EOL metadata for a replace operation.
-    fn update_eol_for_replace(
-        &mut self,
-        range: Span<TextByte>,
-        newlines_deleted: usize,
-        _newlines_inserted: usize,
-    ) {
-        // First, handle deletions
-        self.update_eol_for_delete(range, newlines_deleted);
-
-        // Then handle insertions
-        // We need to figure out where the insertion happened
-        // For simplicity, we'll just rebuild the EOL table from the rope
-        self.rebuild_eol_table();
-    }
-
     /// Rebuild the EOL table from the current rope state.
     ///
     /// This is called when we can't easily update the EOL table incrementally.
     fn rebuild_eol_table(&mut self) {
-        let line_count = self.line_count();
-        let mut new_table = EolTable::default();
-
-        // Start with the dominant EOL from the old table
         let dominant = self.eol_table.dominant_eol();
-
-        // For now, just set all lines to the dominant EOL
-        // A full implementation would track the actual EOL of each line
-        for _ in 0..line_count {
-            new_table.push(dominant);
+        let has_bom = self.eol_table.has_bom();
+        let snapshot =
+            TextSnapshot::new(self.text().as_bytes()).expect("EditorModel text is valid UTF-8");
+        let mut new_table = EolTable::from_snapshot(&snapshot);
+        for ending in &mut new_table.line_endings {
+            if *ending == crate::eol::LineEnding::Lf {
+                *ending = dominant;
+            }
         }
-
-        new_table.has_bom = self.eol_table.has_bom();
-        new_table.has_trailing_newline = self.eol_table.has_trailing_newline();
+        new_table.has_bom = has_bom;
 
         self.eol_table = new_table;
     }
@@ -820,6 +795,24 @@ mod tests {
         let rev1 = model.replace(Span::new(TextByte(6), TextByte(11)), "there");
         assert_eq!(model.text(), "hello there");
         assert_eq!(rev1, Revision::new(1));
+    }
+
+    #[test]
+    fn replacing_multiline_text_rebuilds_eol_metadata_after_the_rope_edit() {
+        let snapshot = TextSnapshot::new("\u{FEFF}one\r\ntwo\r\nthree\n".as_bytes()).unwrap();
+        let mut model = EditorModel::from_snapshot(snapshot);
+
+        model.apply_edit_ops(&[EditOp::new(
+            Span::new(TextByte(0), TextByte(model.len())),
+            "single line".into(),
+        )]);
+
+        assert_eq!(model.text(), "single line");
+        assert_eq!(model.eol_table().line_count(), 1);
+        assert!(model.eol_table().has_bom());
+        assert!(!model.eol_table().has_trailing_newline());
+        assert_eq!(model.to_source_bytes(), "\u{FEFF}single line".as_bytes());
+        let _ = model.content_hash();
     }
 
     #[test]

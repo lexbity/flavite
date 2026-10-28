@@ -51,6 +51,7 @@ impl App {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("flavite-demo-vault"));
         std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let root = std::fs::canonicalize(root).map_err(|error| error.to_string())?;
         let note = root.join("demo.md");
         if !note.exists() {
             std::fs::write(
@@ -63,8 +64,9 @@ impl App {
             watcher_enabled: false,
             ..VaultConfig::default()
         };
-        let lattice = Lattice::open_root(root, config).map_err(|error| error.to_string())?;
-        let path = PathBuf::from("demo.md");
+        let lattice =
+            Lattice::open_root(root.clone(), config).map_err(|error| error.to_string())?;
+        let path = root.join("demo.md");
         match lattice.execute_session(SessionCommand::OpenNote { path }) {
             SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => {
                 let view = lattice
@@ -92,7 +94,10 @@ impl App {
                 let Some(lattice) = &self.lattice else { return };
                 let buffer_id = action.buffer_id;
                 let result = lattice.execute_session(action.into_session_command());
-                self.status = format!("Edit: {result:?}");
+                self.status = match result {
+                    SessionResult::Success(_) => "Editing".into(),
+                    other => format!("Edit failed: {other:?}"),
+                };
                 self.refresh(buffer_id);
                 self.last_edit = Instant::now();
             }
@@ -122,7 +127,10 @@ impl App {
                 self.status = format!("Save pending (request {request_id})");
             }
             result => {
-                self.status = format!("Save: {result:?}");
+                self.status = match result {
+                    SessionResult::Success(CommandResult::NoteSaved { .. }) => "Saved".into(),
+                    other => format!("Save failed: {other:?}"),
+                };
                 self.refresh(view.buffer_id);
             }
         }
@@ -134,7 +142,10 @@ impl App {
         for completion in completions {
             if self.pending_save == Some(completion.request_id) {
                 self.pending_save = None;
-                self.status = format!("Save complete: {:?}", completion.result);
+                self.status = match completion.result {
+                    SessionResult::Success(CommandResult::NoteSaved { .. }) => "Saved".into(),
+                    other => format!("Save failed: {other:?}"),
+                };
                 if let Some(view) = &self.view {
                     let id = view.buffer_id;
                     self.refresh(id);
