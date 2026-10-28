@@ -106,31 +106,21 @@ impl EditOp {
     }
     /// Coalesce this edit with another.
     #[must_use]
-    pub fn coalesce(&self, other: &EditOp) -> EditOp {
+    pub fn coalesce(&self, other: &EditOp) -> Option<EditOp> {
+        if !self.can_coalesce(other) {
+            return None;
+        }
         let start = std::cmp::min(self.range.start.0, other.range.start.0);
         let end = std::cmp::max(self.range.end.0, other.range.end.0);
-        let mut replacement = String::new();
-        // Handle the overlap/adjacency
-        if self.range.start.0 <= other.range.start.0 {
-            replacement.push_str(&self.replacement);
-            // If there's a gap or overlap
-            let self_end_pos = self.range.start.0 + self.replacement.len();
-            let gap_start = other.range.start.0;
-            if self_end_pos < gap_start {
-                // There's a gap, fill it
-                replacement.push_str(&" ".repeat(gap_start - self_end_pos));
-            }
-            replacement.push_str(&other.replacement);
+        let replacement = if self.range.start.0 <= other.range.start.0 {
+            format!("{}{}", self.replacement, other.replacement)
         } else {
-            replacement.push_str(&other.replacement);
-            let other_end_pos = other.range.start.0 + other.replacement.len();
-            let gap_start = self.range.start.0;
-            if other_end_pos < gap_start {
-                replacement.push_str(&" ".repeat(gap_start - other_end_pos));
-            }
-            replacement.push_str(&self.replacement);
-        }
-        EditOp::new(Span::new(TextByte(start), TextByte(end)), replacement)
+            format!("{}{}", other.replacement, self.replacement)
+        };
+        Some(EditOp::new(
+            Span::new(TextByte(start), TextByte(end)),
+            replacement,
+        ))
     }
 }
 /// Metadata about line endings for an edit operation.
@@ -320,7 +310,9 @@ impl UndoTree {
             if let Some(node) = self.nodes.get_mut(current_id as usize)
                 && let Some(current_edit) = &node.edit
             {
-                let coalesced = current_edit.coalesce(&edit);
+                let coalesced = current_edit
+                    .coalesce(&edit)
+                    .expect("coalescible edits must produce a combined edit");
                 node.edit = Some(coalesced);
                 node.snapshot = Some(snapshot);
                 node.timestamp = Instant::now();
@@ -567,7 +559,9 @@ impl LinearUndoStack {
             && let Some(last_edit) = self.undo_stack.back_mut()
             && last_edit.can_coalesce(&edit)
         {
-            *last_edit = last_edit.coalesce(&edit);
+            *last_edit = last_edit
+                .coalesce(&edit)
+                .expect("coalescible edits must produce a combined edit");
             return self.current_revision;
         }
         // Push as new edit
@@ -760,9 +754,9 @@ mod tests {
         assert!(!first.can_coalesce(&next));
         let adjacent = EditOp::new(Span::new(TextByte(0), TextByte(1)), "x".into());
         assert!(first.can_coalesce(&adjacent));
-        assert_eq!(first.coalesce(&adjacent).replacement, "ax");
+        assert_eq!(first.coalesce(&adjacent).unwrap().replacement, "ax");
         let gapped = EditOp::new(Span::new(TextByte(2), TextByte(2)), "z".into());
-        assert_eq!(first.coalesce(&gapped).replacement, "a z");
+        assert_eq!(first.coalesce(&gapped), None);
 
         let now = Instant::now();
         let mut group = EditGroup::new(vec![first.clone()], now, Revision::INITIAL);

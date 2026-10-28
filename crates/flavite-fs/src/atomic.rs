@@ -9,6 +9,7 @@
 //! 6. fsync the directory
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::fs::{Fs, Result};
 
@@ -29,7 +30,15 @@ fn temp_path<F: Fs>(fs: &F, target: &Path) -> Result<PathBuf> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
 
-    let temp_name = format!("{}{}", TEMP_PREFIX, timestamp);
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let temp_name = format!(
+        "{}{}-{}-{}",
+        TEMP_PREFIX,
+        std::process::id(),
+        timestamp,
+        sequence
+    );
     Ok(canonical_dir.join(temp_name))
 }
 
@@ -55,8 +64,9 @@ pub fn atomic_write<F: Fs>(fs: &F, path: &Path, bytes: &[u8]) -> Result<[u8; 32]
     fs.write_new(&temp_path, bytes)?;
 
     // Step 4: Copy permissions (if source exists)
-    // Note: OsFs::copy_mode is a no-op for now; real implementation would copy mode bits
-    let _ = fs.copy_mode(&target, &temp_path);
+    if fs.exists(&target)? {
+        fs.copy_mode(&target, &temp_path)?;
+    }
 
     // Step 5: fsync the temp file
     fs.fsync_file(&temp_path)?;
@@ -66,7 +76,7 @@ pub fn atomic_write<F: Fs>(fs: &F, path: &Path, bytes: &[u8]) -> Result<[u8; 32]
 
     // Step 7: fsync the directory
     if let Some(dir) = target.parent() {
-        let _ = fs.fsync_dir(dir);
+        fs.fsync_dir(dir)?;
     }
 
     // Step 8: Hash the written file

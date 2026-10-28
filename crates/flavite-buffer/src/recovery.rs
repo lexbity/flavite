@@ -345,7 +345,11 @@ impl RecoveryFile {
             content_hash,
             base_hash,
         };
-        if recovery.eol_table.line_count() != recovery.text.split('\n').count() {
+        // `str::split('\n')` counts an extra empty field after a trailing LF,
+        // while TextSnapshot stores that LF on the preceding line. Empty text
+        // still has one logical line in the EOL table.
+        let expected_lines = recovery.text.lines().count().max(1);
+        if recovery.eol_table.line_count() != expected_lines {
             return None;
         }
         let source = recovery.to_source_bytes();

@@ -57,7 +57,26 @@ impl Fs for OsFs {
     }
 
     fn resolve_symlink(&self, path: &Path) -> Result<PathBuf> {
-        self.canonicalize(path)
+        match std::fs::canonicalize(path) {
+            Ok(target) => Ok(target),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let parent = path.parent().unwrap_or(Path::new("."));
+                let name = path.file_name().ok_or_else(|| {
+                    FsError::InvalidPath(format!("path has no file name: {}", path.display()))
+                })?;
+                let parent = std::fs::canonicalize(parent).map_err(|e| {
+                    FsError::Io(format!(
+                        "failed to canonicalize parent {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+                Ok(parent.join(name))
+            }
+            Err(e) => Err(FsError::Io(format!(
+                "failed to resolve {}: {e}",
+                path.display()
+            ))),
+        }
     }
 
     fn encode_path_key(&self, path: &Path) -> Result<Vec<u8>> {
@@ -174,17 +193,44 @@ impl Fs for OsFs {
             std::fs::create_dir_all(parent)
                 .map_err(|e| FsError::Io(format!("failed to create parent: {}", e)))?;
         }
-        std::fs::write(path, bytes).map_err(|e| {
-            if e.kind() == io::ErrorKind::AlreadyExists {
-                FsError::AlreadyExists(path.to_path_buf())
-            } else {
-                FsError::Io(format!("failed to write: {}", e))
-            }
-        })?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    FsError::AlreadyExists(path.to_path_buf())
+                } else {
+                    FsError::Io(format!("failed to create {}: {e}", path.display()))
+                }
+            })?;
+        use std::io::Write;
+        file.write_all(bytes)
+            .map_err(|e| FsError::Io(format!("failed to write {}: {e}", path.display())))?;
         Ok(())
     }
 
-    fn copy_mode(&self, _from: &Path, _to: &Path) -> Result<()> {
+    fn copy_mode(&self, from: &Path, to: &Path) -> Result<()> {
+        let permissions = std::fs::metadata(from)
+            .map_err(|e| FsError::Io(format!("failed to read permissions: {e}")))?
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = permissions.mode() & 0o7777;
+            std::fs::set_permissions(to, std::fs::Permissions::from_mode(mode))
+                .map_err(|e| FsError::Io(format!("failed to copy mode: {e}")))?;
+        }
+        #[cfg(windows)]
+        {
+            let readonly = permissions.readonly();
+            let mut destination = std::fs::metadata(to)
+                .map_err(|e| FsError::Io(format!("failed to read destination permissions: {e}")))?
+                .permissions();
+            destination.set_readonly(readonly);
+            std::fs::set_permissions(to, destination)
+                .map_err(|e| FsError::Io(format!("failed to copy read-only flag: {e}")))?;
+        }
         Ok(())
     }
 
@@ -227,10 +273,23 @@ impl Fs for OsFs {
     }
 
     fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        if to.exists() {
-            return Err(FsError::AlreadyExists(to.to_path_buf()));
+        // Creating a hard link is an atomic no-replace operation: the
+        // destination is either created in full or left untouched. Both paths
+        // are in the same directory for our staging callers.
+        std::fs::hard_link(from, to).map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                FsError::AlreadyExists(to.to_path_buf())
+            } else if e.kind() == io::ErrorKind::NotFound {
+                FsError::NotFound(from.to_path_buf())
+            } else {
+                FsError::Io(format!("failed to link without replacement: {e}"))
+            }
+        })?;
+        if let Err(e) = std::fs::remove_file(from) {
+            let _ = std::fs::remove_file(to);
+            return Err(FsError::Io(format!("failed to remove rename source: {e}")));
         }
-        self.rename_replace(from, to)
+        Ok(())
     }
 
     fn fsync_file(&self, path: &Path) -> Result<()> {
