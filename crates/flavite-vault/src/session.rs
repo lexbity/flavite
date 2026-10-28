@@ -95,6 +95,8 @@ pub enum SessionCommand {
         scope: ReconcileScope,
         mode: ReconcileMode,
     },
+    /// Rename a note and journal inbound-link rewrites.
+    RenameNote { from: PathBuf, to: PathBuf },
     /// Undo an edit.
     Undo {
         buffer_id: BufferId,
@@ -194,6 +196,12 @@ pub enum CommandResult {
     },
     /// Reconcile completed.
     ReconcileComplete { summary: ReconcileSummary },
+    /// A journaled rename and its indexed link patches completed.
+    NoteRenamed {
+        txn_id: String,
+        from: PathBuf,
+        to: PathBuf,
+    },
     /// Undo was performed.
     UndoPerformed {
         buffer_id: BufferId,
@@ -291,6 +299,17 @@ pub struct Session {
     /// Correlated reconcile workers.
     reconcile_flights:
         Mutex<HashMap<u64, crossbeam::channel::Receiver<crate::actor::VaultActorResp>>>,
+    /// Correlated D9 rename operations.
+    rename_flights: Mutex<
+        HashMap<
+            u64,
+            (
+                PathBuf,
+                PathBuf,
+                crossbeam::channel::Receiver<crate::actor::VaultActorResp>,
+            ),
+        >,
+    >,
     /// Lossless terminal results. Admission is bounded by the pending-save cap.
     completions: Mutex<VecDeque<OperationCompletion>>,
     /// Pulse channel.
@@ -378,6 +397,7 @@ impl Session {
             request_counter: AtomicU64::new(0),
             save_flights: Mutex::new(HashMap::new()),
             reconcile_flights: Mutex::new(HashMap::new()),
+            rename_flights: Mutex::new(HashMap::new()),
             completions: Mutex::new(VecDeque::new()),
             pulse,
             notice,
@@ -430,6 +450,7 @@ impl Session {
         self.pump_external_changes_inner();
         self.pump_save_completions();
         self.pump_reconcile_completions();
+        self.pump_rename_completions();
         self.pump_autosave();
         let _ = self.recovery_tick();
     }
@@ -479,7 +500,13 @@ impl Session {
                         },
                     );
                     let mut manager = self.buffer_manager.lock().unwrap();
-                    manager.notify_external_change(&path, &bytes);
+                    if manager.get_buffer(&path).is_some_and(|buffer| {
+                        buffer.state() == flavite_buffer::state::BufferState::Orphaned
+                    }) {
+                        manager.notify_file_recreated(&path, &bytes);
+                    } else {
+                        manager.notify_external_change(&path, &bytes);
+                    }
                     if manager.get_buffer(&path).is_some_and(|buffer| {
                         buffer.state() == flavite_buffer::state::BufferState::Conflicted
                     }) {
@@ -506,6 +533,33 @@ impl Session {
                         });
                     }
                 }
+                crate::actor::VaultActorEvent::Renamed { from, to, .. } => {
+                    let mut manager = self.buffer_manager.lock().unwrap();
+                    if manager.rename_buffer(&from, to.clone()) {
+                        let _ = self.pulse.send(crate::channels::Pulse::Invalidate {
+                            note: flavite_buffer::manager::NoteRef::new(to),
+                        });
+                    }
+                }
+                crate::actor::VaultActorEvent::WatcherLost => {
+                    self.notice.send(crate::channels::Notice::ActionRequired {
+                        code: "watcher_lost",
+                        note: None,
+                    });
+                }
+                crate::actor::VaultActorEvent::RenameSuggested {
+                    from,
+                    to,
+                    tier,
+                    inbound,
+                } => {
+                    self.notice.send(crate::channels::Notice::RenameSuggested {
+                        from,
+                        to,
+                        tier,
+                        inbound,
+                    });
+                }
             }
         }
     }
@@ -528,6 +582,7 @@ impl Session {
             } => self.apply_merge(path, buffer_id, revision, disk_hash, merged_bytes),
             SessionCommand::SaveNote { path } => self.save_note(path),
             SessionCommand::Reconcile { scope, mode } => self.reconcile(scope, mode),
+            SessionCommand::RenameNote { from, to } => self.rename_note(from, to),
             SessionCommand::Undo {
                 buffer_id,
                 revision,
@@ -568,6 +623,7 @@ impl Session {
         let _turn = self.driving_turn.lock().unwrap();
         self.pump_save_completions();
         self.pump_reconcile_completions();
+        self.pump_rename_completions();
         self.completions.lock().unwrap().drain(..).collect()
     }
 
@@ -623,6 +679,7 @@ impl Session {
             let _turn = self.driving_turn.lock().unwrap();
             self.pump_save_completions();
             self.pump_reconcile_completions();
+            self.pump_rename_completions();
             let completed = {
                 let mut completions = self.completions.lock().unwrap();
                 completions
@@ -643,7 +700,12 @@ impl Session {
                 .reconcile_flights
                 .lock()
                 .unwrap()
-                .contains_key(&request_id);
+                .contains_key(&request_id)
+                || self
+                    .rename_flights
+                    .lock()
+                    .unwrap()
+                    .contains_key(&request_id);
             if !active {
                 return SessionResult::Error {
                     message: format!("unknown or already-drained operation {request_id}"),
@@ -789,6 +851,48 @@ impl Session {
                 crate::actor::VaultActorResp::Error(message) => SessionResult::Error { message },
                 _ => SessionResult::Error {
                     message: "reconcile worker returned an invalid response".into(),
+                },
+            };
+            self.completions
+                .lock()
+                .unwrap()
+                .push_back(OperationCompletion { request_id, result });
+        }
+    }
+
+    fn pump_rename_completions(&self) {
+        let ready = {
+            let mut flights = self.rename_flights.lock().unwrap();
+            let ids = flights
+                .iter()
+                .filter_map(|(id, (_, _, receiver))| match receiver.try_recv() {
+                    Ok(response) => Some((*id, response)),
+                    Err(crossbeam::channel::TryRecvError::Empty) => None,
+                    Err(crossbeam::channel::TryRecvError::Disconnected) => Some((
+                        *id,
+                        crate::actor::VaultActorResp::Error(
+                            "rename worker disconnected before returning a terminal result".into(),
+                        ),
+                    )),
+                })
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|(id, response)| {
+                    flights
+                        .remove(&id)
+                        .map(|(from, to, _)| (id, from, to, response))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (request_id, from, to, response) in ready {
+            let result = match response {
+                crate::actor::VaultActorResp::Renamed(Ok(txn_id)) => {
+                    SessionResult::Success(CommandResult::NoteRenamed { txn_id, from, to })
+                }
+                crate::actor::VaultActorResp::Renamed(Err(message))
+                | crate::actor::VaultActorResp::Error(message) => SessionResult::Error { message },
+                _ => SessionResult::Error {
+                    message: "rename worker returned an invalid response".into(),
                 },
             };
             self.completions
@@ -1149,6 +1253,57 @@ impl Session {
                     .lock()
                     .unwrap()
                     .insert(request_id, response);
+                SessionResult::Pending { request_id }
+            }
+            Err(crate::actor::VaultActorError::Busy) => SessionResult::Busy,
+            Err(error) => SessionResult::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn rename_note(&self, from: PathBuf, to: PathBuf) -> SessionResult {
+        let from = if from.is_absolute() {
+            from
+        } else {
+            self.identity.root.join(from)
+        };
+        let to = if to.is_absolute() {
+            to
+        } else {
+            self.identity.root.join(to)
+        };
+        let protected_paths = {
+            let manager = self.buffer_manager.lock().unwrap();
+            if let Some(buffer) = manager.get_buffer(&from)
+                && buffer.is_dirty()
+            {
+                return SessionResult::Conflict { path: from };
+            }
+            manager
+                .open_notes()
+                .into_iter()
+                .filter(|path| **path != from)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let outstanding = self.completions.lock().unwrap().len()
+            + self.save_flights.lock().unwrap().len()
+            + self.reconcile_flights.lock().unwrap().len()
+            + self.rename_flights.lock().unwrap().len();
+        if outstanding >= MAX_PENDING_SAVE_OPERATIONS {
+            return SessionResult::Busy;
+        }
+        let request_id = self.next_request_id();
+        match self
+            .actor
+            .submit_rename(from.clone(), to.clone(), protected_paths)
+        {
+            Ok(response) => {
+                self.rename_flights
+                    .lock()
+                    .unwrap()
+                    .insert(request_id, (from, to, response));
                 SessionResult::Pending { request_id }
             }
             Err(crate::actor::VaultActorError::Busy) => SessionResult::Busy,

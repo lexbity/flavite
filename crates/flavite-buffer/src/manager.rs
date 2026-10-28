@@ -310,6 +310,21 @@ impl BufferManager {
         transitions
     }
 
+    /// Re-key an open buffer after an authoritative T0–T2 rename while
+    /// preserving its buffer identity, revision, and undo history.
+    pub fn rename_buffer(&mut self, from: &PathBuf, to: PathBuf) -> bool {
+        if self.buffers.contains_key(&to) {
+            return false;
+        }
+        let Some(buffer) = self.buffers.remove(from) else {
+            return false;
+        };
+        let id = buffer.buffer_id();
+        self.buffer_ids.insert(id, to.clone());
+        self.buffers.insert(to, buffer);
+        true
+    }
+
     /// Handle a save completion for a buffer.
     pub fn notify_save_completed(&mut self, note_path: &PathBuf) -> Vec<StateTransition> {
         let mut transitions = Vec::new();
@@ -425,6 +440,19 @@ mod tests {
         let closed = manager.close_note(&path);
         assert!(closed.is_some());
         assert!(!manager.has_buffer(&path));
+    }
+
+    #[test]
+    fn rename_buffer_preserves_identity_and_updates_reverse_lookup() {
+        let mut manager = BufferManager::new();
+        let from = PathBuf::from("old.md");
+        let to = PathBuf::from("new.md");
+        let (buffer, _) = manager.open_note(from.clone(), b"content");
+        let id = buffer.buffer_id();
+        assert!(manager.rename_buffer(&from, to.clone()));
+        assert!(!manager.has_buffer(&from));
+        assert_eq!(manager.path_for_id(id), Some(&to));
+        assert_eq!(manager.get_buffer(&to).unwrap().buffer_id(), id);
     }
 
     #[test]
