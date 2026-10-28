@@ -143,7 +143,7 @@ impl TantivyBackend {
         writer
             .delete_all_documents()
             .map_err(|e| SearchError::Tantivy(e.to_string()))?;
-        let mut stmt = conn.prepare("SELECT n.note_id,n.title,s.body_text FROM notes n JOIN search_docs s USING(note_id) WHERE n.parse_ok=1")?;
+        let mut stmt = conn.prepare("SELECT n.note_id,n.title,COALESCE(s.body_text,'') FROM notes n LEFT JOIN search_docs s USING(note_id)")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -212,7 +212,7 @@ impl TantivyBackend {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         for id in ids {
-            let current: Option<(String,String)> = conn.query_row("SELECT n.title,s.body_text FROM notes n JOIN search_docs s USING(note_id) WHERE n.note_id=?1 AND n.parse_ok=1", [id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let current: Option<(String,String)> = conn.query_row("SELECT n.title,COALESCE(s.body_text,'') FROM notes n LEFT JOIN search_docs s USING(note_id) WHERE n.note_id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
             if let Some((title, body)) = current {
                 let aliases = conn
                     .prepare("SELECT alias FROM aliases WHERE note_id=?1 ORDER BY alias_key")?
@@ -509,20 +509,20 @@ fn search_fields(schema: &Schema) -> Result<SearchFields, SearchError> {
 fn register_search_tokenizers(index: &Index) {
     index.tokenizers().register(
         "flavite",
-        TextAnalyzer::builder(CjkBigramTokenizer)
+        TextAnalyzer::builder(CjkUnigramTokenizer)
             .filter(LowerCaser)
             .filter(AsciiFoldingFilter)
             .build(),
     );
 }
 #[derive(Clone, Default)]
-struct CjkBigramTokenizer;
+struct CjkUnigramTokenizer;
 struct CjkStream {
     tokens: Vec<Token>,
     position: usize,
     current: Token,
 }
-impl Tokenizer for CjkBigramTokenizer {
+impl Tokenizer for CjkUnigramTokenizer {
     type TokenStream<'a> = CjkStream;
     fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
         let mut tokens = Vec::new();
@@ -539,8 +539,9 @@ impl Tokenizer for CjkBigramTokenizer {
                         break;
                     }
                 }
-                if run.len() == 1 {
-                    let (off, ch) = run[0];
+                // Unigrams keep single-character CJK searches useful while
+                // matching multi-character queries through their components.
+                for (off, ch) in run {
                     tokens.push(Token {
                         offset_from: off,
                         offset_to: off + ch.len_utf8(),
@@ -549,19 +550,6 @@ impl Tokenizer for CjkBigramTokenizer {
                         position_length: 1,
                     });
                     position += 1;
-                } else {
-                    for i in 0..run.len() - 1 {
-                        let (off, _) = run[i];
-                        let (end, last) = run[i + 1];
-                        tokens.push(Token {
-                            offset_from: off,
-                            offset_to: end + last.len_utf8(),
-                            position,
-                            text: text[off..end + last.len_utf8()].to_owned(),
-                            position_length: 1,
-                        });
-                        position += 1;
-                    }
                 }
             } else if c.is_alphanumeric() {
                 let mut end = start + c.len_utf8();
@@ -607,7 +595,7 @@ impl TokenStream for CjkStream {
     }
 }
 fn is_cjk(c: char) -> bool {
-    matches!(c as u32,0x3040..=0x30ff|0x3400..=0x4dbf|0x4e00..=0x9fff|0xf900..=0xfaff|0xac00..=0xd7af|0x1100..=0x11ff|0x3130..=0x318f|0xff66..=0xff9f)
+    matches!(c as u32,0x3040..=0x30ff|0x3400..=0x4dbf|0x4e00..=0x9fff|0xf900..=0xfaff|0x20000..=0x2fa1f|0xac00..=0xd7af|0x1100..=0x11ff|0x3130..=0x318f|0xff66..=0xff9f)
 }
 
 /// Search backend trait.

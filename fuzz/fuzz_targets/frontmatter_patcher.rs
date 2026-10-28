@@ -7,7 +7,7 @@
 
 #![no_main]
 
-use flavite_syntax::frontmatter::parse_frontmatter;
+use flavite_syntax::frontmatter::{parse_frontmatter, patch_frontmatter_key};
 use flavite_syntax::text::TextSnapshot;
 use libfuzzer_sys::fuzz_target;
 
@@ -17,14 +17,24 @@ fuzz_target!(|data: &[u8]| {
         // Build a frontmatter-like input
         let yaml_content = text;
         let frontmatter_text = format!("---\n{}\n---\n", yaml_content);
-        
+
         if let Ok(snapshot) = TextSnapshot::new(frontmatter_text.as_bytes()) {
-            // Try to parse it
-            let _ = parse_frontmatter(&snapshot);
-            
-            // The parser should either succeed or fail gracefully
-            // We can't easily test the patcher here without more context,
-            // but we can at least ensure parsing doesn't panic
+            if parse_frontmatter(&snapshot).is_some() {
+                let value = "fuzz \"value\"".to_owned();
+                if let Ok(patched) =
+                    patch_frontmatter_key(frontmatter_text.as_bytes(), "aliases", &[value.clone()])
+                {
+                    let text = std::str::from_utf8(&patched).expect("patcher emits UTF-8");
+                    for comment in frontmatter_text
+                        .lines()
+                        .filter(|line| line.trim_start().starts_with('#'))
+                    {
+                        assert!(text.contains(comment), "unrelated comment was removed");
+                    }
+                    let again = patch_frontmatter_key(&patched, "aliases", &[value]).unwrap();
+                    assert_eq!(again, patched, "setting an identical key is idempotent");
+                }
+            }
         }
     }
 });

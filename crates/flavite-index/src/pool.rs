@@ -8,7 +8,8 @@
 //! The pool size is based on S4-2's recommendations: default 4 connections,
 //! hard cap 8.
 
-use crate::schema::{MetaKey, get_meta_u64};
+use crate::resolver::Resolver;
+use crate::schema::{AttachmentKind, MetaKey, get_meta_u64};
 use crate::search::SearchBackend;
 use blake3::Hash;
 use flavite_syntax::{pulldown_glue::parse_note, text::TextSnapshot};
@@ -518,6 +519,8 @@ impl IndexActor {
             .ok_or("index generation overflow")?;
         tx.execute("DELETE FROM notes WHERE note_id=?1", [note_id])
             .map_err(|e| e.to_string())?;
+        tx.execute("UPDATE notes SET id_conflict=CASE WHEN stable_id IS NOT NULL AND note_id<>(SELECT MIN(n2.note_id) FROM notes n2 WHERE n2.stable_id=notes.stable_id) THEN 1 ELSE 0 END", [])
+            .map_err(|error| error.to_string())?;
         tx.execute("DELETE FROM search_docs WHERE note_id=?1", [note_id])
             .map_err(|e| e.to_string())?;
         tx.execute(
@@ -526,7 +529,7 @@ impl IndexActor {
         )
         .map_err(|e| e.to_string())?;
         tx.execute(
-            "INSERT INTO changes(generation,kind,entity_id) VALUES(?1,'note_deleted',?2)",
+            "INSERT INTO changes(generation,kind,entity_id) VALUES(?1,'note',?2)",
             rusqlite::params![
                 i64::try_from(generation).map_err(|e| e.to_string())?,
                 note_id
@@ -534,6 +537,10 @@ impl IndexActor {
         )
         .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
+        self.search
+            .delete_document(note_id)
+            .map_err(|error| error.to_string())?;
+        self.reresolve_links()?;
         Ok(true)
     }
 
@@ -549,22 +556,22 @@ impl IndexActor {
         mtime_ns: i64,
         scan_ns: i64,
     ) -> Result<bool, String> {
-        let indexed: Option<(i64, i64, i64, bool)> = self
+        let indexed: Option<(i64, i64, i64)> = self
             .writer
             .conn()
             .query_row(
-                "SELECT size,mtime_ns,scan_ns,parse_ok FROM notes WHERE path_native=?1",
+                "SELECT size,mtime_ns,scan_ns FROM notes WHERE path_native=?1",
                 [path_native],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        let Some((indexed_size, indexed_mtime, _indexed_scan, parse_ok)) = indexed else {
+        let Some((indexed_size, indexed_mtime, _indexed_scan)) = indexed else {
             return Ok(false);
         };
         let size_matches = u64::try_from(indexed_size).ok() == Some(size);
         let not_racy = mtime_ns < scan_ns.saturating_sub(2_000_000_000);
-        Ok(parse_ok && size_matches && indexed_mtime == mtime_ns && not_racy)
+        Ok(size_matches && indexed_mtime == mtime_ns && not_racy)
     }
 
     /// Apply the exact bytes installed by a save to SQLite in one structural
@@ -582,7 +589,12 @@ impl IndexActor {
         mtime_ns: i64,
         scan_ns: i64,
     ) -> Result<(u64, u64), String> {
-        let parsed = parse_note(bytes).map_err(|error| format!("parse saved note: {error}"))?;
+        if bytes.len() > crate::types::MAX_NOTE_BYTES {
+            return self.apply_degraded_note(path_native, display_path, bytes, mtime_ns, scan_ns);
+        }
+        let Ok(parsed) = parse_note(bytes) else {
+            return self.apply_degraded_note(path_native, display_path, bytes, mtime_ns, scan_ns);
+        };
         let snapshot = TextSnapshot::new(bytes).map_err(|error| error.to_string())?;
         let content_hash = Hash::from_bytes(*blake3::hash(bytes).as_bytes());
         let conn = &mut self.writer.conn;
@@ -659,9 +671,17 @@ impl IndexActor {
             .file_stem()
             .and_then(|value| value.to_str())
             .unwrap_or(display_path);
-        let path_key = display_path.to_lowercase();
-        let stem_key = stem.to_lowercase();
+        let path_key = flavite_syntax::text::fold_key(display_path);
+        let stem_key = flavite_syntax::text::fold_key(stem);
         let frontmatter = flavite_syntax::frontmatter::parse_frontmatter(&parsed.snapshot);
+        let stable_id = frontmatter.as_ref().and_then(|value| {
+            value
+                .well_known
+                .get(&flavite_syntax::wellknown::WellKnownKey::Id)
+                .and_then(|values| values.first())
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        });
         let title = flavite_syntax::wellknown::derive_title(
             frontmatter
                 .as_ref()
@@ -703,9 +723,9 @@ impl IndexActor {
         let size = i64::try_from(bytes.len()).map_err(|e| e.to_string())?;
         tx.execute(
             "INSERT INTO notes(path,path_native,path_key,stem_key,title,stable_id,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation)
-             VALUES(?1,?2,?3,?4,?5,NULL,0,?6,?7,?8,?9,?10,?11,1,?12)
-             ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,title=excluded.title,content_hash=excluded.content_hash,size=excluded.size,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,frontmatter=excluded.frontmatter,preview=excluded.preview,parse_ok=1,generation=excluded.generation",
-            rusqlite::params![display_path, path_native, path_key, stem_key, title, content_hash.as_bytes(), size, mtime_ns, scan_ns, frontmatter_json, &parsed.snapshot.text()[..parsed.snapshot.text().len().min(1024)], i64::try_from(generation).map_err(|e| e.to_string())?],
+             VALUES(?1,?2,?3,?4,?5,?6,0,?7,?8,?9,?10,?11,?12,1,?13)
+             ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,title=excluded.title,stable_id=excluded.stable_id,content_hash=excluded.content_hash,size=excluded.size,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,frontmatter=excluded.frontmatter,preview=excluded.preview,parse_ok=1,generation=excluded.generation",
+            rusqlite::params![display_path, path_native, path_key, stem_key, title, stable_id, content_hash.as_bytes(), size, mtime_ns, scan_ns, frontmatter_json, &parsed.snapshot.text()[..parsed.snapshot.text().len().min(1024)], i64::try_from(generation).map_err(|e| e.to_string())?],
         ).map_err(|e| e.to_string())?;
         let note_id: i64 = tx
             .query_row(
@@ -714,6 +734,8 @@ impl IndexActor {
                 |row| row.get(0),
             )
             .map_err(|e| e.to_string())?;
+        tx.execute("UPDATE notes SET id_conflict=CASE WHEN stable_id IS NOT NULL AND note_id<>(SELECT MIN(n2.note_id) FROM notes n2 WHERE n2.stable_id=notes.stable_id) THEN 1 ELSE 0 END", [])
+            .map_err(|error| error.to_string())?;
         tx.execute("DELETE FROM links WHERE src = ?1", [note_id])
             .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM tags WHERE note_id = ?1", [note_id])
@@ -724,7 +746,7 @@ impl IndexActor {
             let source_span = snapshot
                 .span_to_source(link.span)
                 .ok_or("link span cannot be mapped to source bytes")?;
-            let target_key = link.target_raw.to_lowercase();
+            let target_key = flavite_syntax::text::fold_key(&link.target_raw);
             tx.execute(
                 "INSERT INTO links(src,ord,kind,dst_raw,target_key,anchor,alias,by_id,span_start,span_end,dst_note,dst_att,res_state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL,NULL,'unresolved')",
                 rusqlite::params![note_id, i64::try_from(ord).map_err(|e| e.to_string())?, if link.is_embed { "embed" } else { "link" }, link.target_raw, target_key, link.anchor, link.alias, i64::from(link.by_id), i64::try_from(source_span.start.0).map_err(|e| e.to_string())?, i64::try_from(source_span.end.0).map_err(|e| e.to_string())?],
@@ -802,10 +824,217 @@ impl IndexActor {
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
+        drop(alias_stmt);
+        drop(tag_stmt);
         self.search
             .apply_document_full(note_id, &title, &aliases, &tags, parsed.snapshot.text())
             .map_err(|e| e.to_string())?;
+        self.reresolve_links()?;
         Ok((epoch, generation))
+    }
+
+    fn apply_degraded_note(
+        &mut self,
+        path_native: &[u8],
+        display_path: &str,
+        bytes: &[u8],
+        mtime_ns: i64,
+        scan_ns: i64,
+    ) -> Result<(u64, u64), String> {
+        let path = Path::new(display_path);
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or(display_path);
+        let hash = blake3::hash(bytes);
+        let size = i64::try_from(bytes.len()).map_err(|error| error.to_string())?;
+        let tx = self
+            .writer
+            .conn
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let generation = get_meta_u64(&tx, MetaKey::Generation)
+            .map_err(|error| error.to_string())?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or("index generation overflow")?;
+        let epoch = get_meta_u64(&tx, MetaKey::Epoch)
+            .map_err(|error| error.to_string())?
+            .unwrap_or(1);
+        tx.execute("INSERT INTO notes(path,path_native,path_key,stem_key,title,stable_id,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation) VALUES(?1,?2,?3,?4,?5,NULL,0,?6,?7,?8,?9,NULL,NULL,0,?10) ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,title=excluded.title,stable_id=NULL,content_hash=excluded.content_hash,size=excluded.size,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,frontmatter=NULL,preview=NULL,parse_ok=0,generation=excluded.generation", rusqlite::params![display_path,path_native,flavite_syntax::text::fold_key(display_path),flavite_syntax::text::fold_key(stem),stem,hash.as_bytes(),size,mtime_ns,scan_ns,i64::try_from(generation).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
+        let note_id: i64 = tx
+            .query_row(
+                "SELECT note_id FROM notes WHERE path_native=?1",
+                [path_native],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM links WHERE src=?1", [note_id])
+            .map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM tags WHERE note_id=?1", [note_id])
+            .map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM aliases WHERE note_id=?1", [note_id])
+            .map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM search_docs WHERE note_id=?1", [note_id])
+            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE meta SET value=?1 WHERE key=?2",
+            rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO changes(generation,kind,entity_id) VALUES(?1,'note',?2)",
+            rusqlite::params![
+                i64::try_from(generation).map_err(|error| error.to_string())?,
+                note_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        self.search
+            .delete_document(note_id)
+            .map_err(|error| error.to_string())?;
+        self.reresolve_links()?;
+        Ok((epoch, generation))
+    }
+
+    fn reresolve_links(&self) -> Result<(), String> {
+        let conn = Connection::open(&self.read_pool.db_path).map_err(|e| e.to_string())?;
+        Resolver::new(conn)
+            .re_resolve_all()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Insert or refresh one attachment record. Bytes are hashed only when
+    /// hydrated and at or below [`crate::types::ATTACHMENT_HASH_MAX`].
+    ///
+    /// # Errors
+    /// Returns an error if SQLite, metadata conversion, or link resolution fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_saved_attachment(
+        &mut self,
+        path_native: &[u8],
+        display_path: &str,
+        bytes: Option<&[u8]>,
+        size: u64,
+        mtime_ns: i64,
+        scan_ns: i64,
+        hydrated: bool,
+    ) -> Result<(u64, u64), String> {
+        let path = Path::new(display_path);
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or(display_path);
+        let path_key = flavite_syntax::text::fold_key(display_path);
+        let stem_key = flavite_syntax::text::fold_key(stem);
+        let ext = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let kind = match ext.as_str() {
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "avif" | "bmp" | "ico" => {
+                AttachmentKind::Image
+            }
+            "pdf" => AttachmentKind::Pdf,
+            "mp3" | "wav" | "ogg" | "flac" | "m4a" => AttachmentKind::Audio,
+            "mp4" | "webm" | "mov" | "mkv" => AttachmentKind::Video,
+            "zip" | "tar" | "gz" | "tgz" => AttachmentKind::Archive,
+            _ => AttachmentKind::Other,
+        };
+        let content_hash = if hydrated && size <= crate::types::ATTACHMENT_HASH_MAX as u64 {
+            bytes
+                .filter(|bytes| bytes.len() <= crate::types::ATTACHMENT_HASH_MAX)
+                .map(|bytes| blake3::hash(bytes).as_bytes().to_vec())
+        } else {
+            None
+        };
+        let size = i64::try_from(size).map_err(|error| error.to_string())?;
+        let tx = self
+            .writer
+            .conn
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let generation = get_meta_u64(&tx, MetaKey::Generation)
+            .map_err(|error| error.to_string())?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or("index generation overflow")?;
+        tx.execute(
+            "INSERT INTO attachments(path,path_native,path_key,stem_key,kind,mime,size,content_hash,width,height,mtime_ns,scan_ns,hydrated,generation) VALUES(?1,?2,?3,?4,?5,NULL,?6,?7,NULL,NULL,?8,?9,?10,?11) ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,kind=excluded.kind,size=excluded.size,content_hash=excluded.content_hash,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,hydrated=excluded.hydrated,generation=excluded.generation",
+            rusqlite::params![display_path,path_native,path_key,stem_key,kind.as_str(),size,content_hash,mtime_ns,scan_ns,i64::from(hydrated),i64::try_from(generation).map_err(|error| error.to_string())?],
+        ).map_err(|error| error.to_string())?;
+        let att_id: i64 = tx
+            .query_row(
+                "SELECT att_id FROM attachments WHERE path_native=?1",
+                [path_native],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE meta SET value=?1 WHERE key=?2",
+            rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO changes(generation,kind,entity_id) VALUES(?1,'attachment',?2)",
+            rusqlite::params![
+                i64::try_from(generation).map_err(|error| error.to_string())?,
+                att_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        let epoch = get_meta_u64(self.writer.conn(), MetaKey::Epoch)
+            .map_err(|error| error.to_string())?
+            .unwrap_or(1);
+        self.reresolve_links()?;
+        Ok((epoch, generation))
+    }
+
+    /// Remove an attachment and re-resolve embeds that may have targeted it.
+    ///
+    /// # Errors
+    /// Returns an error if SQLite or link resolution fails.
+    pub fn remove_attachment_path(&mut self, path_native: &[u8]) -> Result<bool, String> {
+        let tx = self
+            .writer
+            .conn
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let id: Option<i64> = tx
+            .query_row(
+                "SELECT att_id FROM attachments WHERE path_native=?1",
+                [path_native],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(id) = id else { return Ok(false) };
+        let generation = get_meta_u64(&tx, MetaKey::Generation)
+            .map_err(|error| error.to_string())?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or("index generation overflow")?;
+        tx.execute("DELETE FROM attachments WHERE att_id=?1", [id])
+            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE meta SET value=?1 WHERE key=?2",
+            rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO changes(generation,kind,entity_id) VALUES(?1,'attachment',?2)",
+            rusqlite::params![
+                i64::try_from(generation).map_err(|error| error.to_string())?,
+                id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        self.reresolve_links()?;
+        Ok(true)
     }
 
     /// Search the derived Tantivy view. Dirty documents are committed before
@@ -1167,12 +1396,20 @@ mod tests {
             .unwrap();
         assert_eq!(unchanged_generation, 2);
         assert_eq!(index.version().unwrap(), (1, 2));
-        assert!(
-            index
-                .apply_saved_note(b"notes/b.md", "notes/b.md", &[0xff], 104, 105)
-                .is_err()
-        );
-        assert_eq!(index.version().unwrap(), (1, 2));
+        index
+            .apply_saved_note(b"notes/b.md", "notes/b.md", &[0xff], 104, 105)
+            .unwrap();
+        assert_eq!(index.version().unwrap(), (1, 3));
+        let parse_ok: bool = index
+            .writer()
+            .conn()
+            .query_row(
+                "SELECT parse_ok FROM notes WHERE path_native=?1",
+                [b"notes/b.md".as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!parse_ok);
     }
 
     fn searchable_index() -> (tempfile::TempDir, IndexActor) {
@@ -1315,7 +1552,7 @@ mod tests {
     fn cjk_bigram_and_diacritic_folding_find_notes() {
         let (_dir, mut index) = searchable_index();
         for (path, body) in [
-            ("ja.md", "東京の地図"),
+            ("ja.md", "東京の地図 𠀀文字"),
             ("zh.md", "北京数据中心"),
             ("ko.md", "서울시 한국어"),
             ("accent.md", "un café noir"),
@@ -1324,7 +1561,7 @@ mod tests {
                 .apply_saved_note(path.as_bytes(), path, body.as_bytes(), 1, 1)
                 .unwrap();
         }
-        for query in ["東京", "数据", "서울", "cafe"] {
+        for query in ["東京", "京", "数据", "서울", "𠀀", "cafe"] {
             assert!(
                 !index
                     .search_notes(&crate::query::Query::Text(query.into()), 10)
@@ -1334,6 +1571,130 @@ mod tests {
                 "query {query:?}"
             );
         }
+    }
+
+    #[test]
+    fn saved_note_ids_and_attachment_ingest_resolve_live_links() {
+        let (_dir, mut index) = searchable_index();
+        index
+            .apply_saved_note(
+                b"notes/source.md",
+                "notes/source.md",
+                b"---\nid: stable-1\n---\n![[diagram.png]] [[id:stable-1]]",
+                1,
+                1,
+            )
+            .unwrap();
+        index
+            .apply_saved_attachment(
+                b"images/diagram.png",
+                "images/diagram.png",
+                Some(b"png-bytes"),
+                9,
+                1,
+                1,
+                true,
+            )
+            .unwrap();
+        let connection = Connection::open(&index.read_pool.db_path).unwrap();
+        let id: Option<String> = connection
+            .query_row(
+                "SELECT stable_id FROM notes WHERE path='notes/source.md'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("stable-1"));
+        let resolved: i64 = connection.query_row("SELECT count(*) FROM links WHERE res_state='resolved' AND ((dst_att IS NOT NULL) OR (dst_note IS NOT NULL))", [], |row| row.get(0)).unwrap();
+        assert_eq!(resolved, 2);
+        let hash: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT content_hash FROM attachments WHERE path='images/diagram.png'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hash.unwrap().len(), 32);
+        assert!(index.remove_attachment_path(b"images/diagram.png").unwrap());
+        let unresolved: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM links WHERE res_state='unresolved'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved, 1);
+    }
+
+    #[test]
+    fn oversized_attachment_is_indexed_without_a_content_hash() {
+        let (_dir, mut index) = searchable_index();
+        let size = crate::types::ATTACHMENT_HASH_MAX as u64 + 1;
+        index
+            .apply_saved_attachment(
+                b"video/movie.mp4",
+                "video/movie.mp4",
+                None,
+                size,
+                1,
+                1,
+                true,
+            )
+            .unwrap();
+        let hash: Option<Vec<u8>> = index
+            .writer()
+            .conn()
+            .query_row("SELECT content_hash FROM attachments", [], |row| row.get(0))
+            .unwrap();
+        assert!(hash.is_none());
+    }
+
+    #[test]
+    #[allow(clippy::items_after_statements)]
+    fn incremental_index_matches_full_rebuild_after_random_mutations() {
+        use proptest::prelude::*;
+        proptest!(|(ops in prop::collection::vec((0u8..4, 0u8..6, 0u8..6), 1..40))| {
+            let (_dir, mut incremental) = searchable_index();
+            let mut files = std::collections::BTreeMap::<String, Vec<u8>>::new();
+            for (action, source, target) in ops {
+                let source_path = format!("n{source}.md");
+                match action {
+                    0 | 1 => {
+                        let text = format!("# Note {source}\n\nvalue-{target} [[n{target}]]");
+                        let bytes = text.into_bytes();
+                        incremental.apply_saved_note(source_path.as_bytes(), &source_path, &bytes, 1, 1).unwrap();
+                        files.insert(source_path, bytes);
+                    }
+                    2 => {
+                        if files.remove(&source_path).is_some() {
+                            incremental.remove_note_path(source_path.as_bytes()).unwrap();
+                        }
+                    }
+                    _ => {
+                        let renamed_path = format!("renamed{source}.md");
+                        if let Some(bytes) = files.remove(&source_path) {
+                            incremental.remove_note_path(source_path.as_bytes()).unwrap();
+                            incremental.apply_saved_note(renamed_path.as_bytes(), &renamed_path, &bytes, 1, 1).unwrap();
+                            files.insert(renamed_path, bytes);
+                        }
+                    }
+                }
+            }
+            let (_rebuild_dir, mut rebuilt) = searchable_index();
+            for (path, bytes) in &files {
+                rebuilt.apply_saved_note(path.as_bytes(), path, bytes, 1, 1).unwrap();
+            }
+            fn logical_dump(index: &IndexActor) -> Vec<(String, Vec<u8>, bool)> {
+                let mut stmt = index.writer().conn().prepare("SELECT path,content_hash,parse_ok FROM notes ORDER BY path").unwrap();
+                stmt.query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap()
+            }
+            prop_assert_eq!(logical_dump(&incremental), logical_dump(&rebuilt));
+            let links = |index: &IndexActor| {
+                let mut stmt = index.writer().conn().prepare("SELECT n.path,l.dst_raw,l.res_state,COALESCE(d.path,a.path,'') FROM links l JOIN notes n ON n.note_id=l.src LEFT JOIN notes d ON d.note_id=l.dst_note LEFT JOIN attachments a ON a.att_id=l.dst_att ORDER BY n.path,l.ord").unwrap();
+                stmt.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap()
+            };
+            prop_assert_eq!(links(&incremental), links(&rebuilt));
+        });
     }
 
     #[test]

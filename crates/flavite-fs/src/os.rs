@@ -7,7 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::fs::{DirEntry, Fs, FsError, Metadata, Result};
-use crate::path::has_non_normal_components;
+use crate::path::validate_vault_relative;
 
 /// The real filesystem implementation.
 #[derive(Debug, Default)]
@@ -80,14 +80,9 @@ impl Fs for OsFs {
     }
 
     fn encode_path_key(&self, path: &Path) -> Result<Vec<u8>> {
-        if path.is_absolute() || has_non_normal_components(path) {
-            return Err(FsError::InvalidPath(format!(
-                "path must be relative: {}",
-                path.display()
-            )));
-        }
-        // Simple encoding: just the path bytes
-        Ok(path.to_string_lossy().as_bytes().to_vec())
+        validate_vault_relative(path)
+            .map(String::into_bytes)
+            .map_err(FsError::InvalidPath)
     }
 
     fn decode_path_key(&self, key: &[u8]) -> Result<PathBuf> {

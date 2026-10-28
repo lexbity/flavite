@@ -46,6 +46,16 @@ pub enum Query {
 }
 
 impl Query {
+    /// Parse the small user-facing query syntax into the typed query AST.
+    /// Supports `tag:`, `text:`, `unresolved`, parentheses, and boolean
+    /// `AND`/`OR`/`NOT` operators (`AND` binds tighter than `OR`).
+    ///
+    /// # Errors
+    /// Returns an error for malformed or unsupported query syntax.
+    pub fn parse(input: &str) -> Result<Self, String> {
+        QueryParser::new(input)?.parse()
+    }
+
     /// Execute this query against the SQLite index.
     ///
     /// Returns a page of note IDs matching the query, along with the index version.
@@ -234,6 +244,141 @@ impl Query {
                 let (sql, params) = query.to_sql();
                 (format!("NOT ({sql})"), params)
             }
+        }
+    }
+}
+
+struct QueryParser {
+    tokens: Vec<String>,
+    cursor: usize,
+}
+
+impl QueryParser {
+    fn new(input: &str) -> Result<Self, String> {
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+        let mut quote = None;
+        for ch in input.chars() {
+            match (quote, ch) {
+                (Some(q), c) if q == c => {
+                    quote = None;
+                }
+                (None, '\'' | '"') => quote = Some(ch),
+                (None, '(' | ')') => {
+                    if !current.trim().is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                    tokens.push(ch.to_string());
+                }
+                (None, c) if c.is_whitespace() => {
+                    if !current.trim().is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                }
+                (Some(_) | None, c) => current.push(c),
+            }
+        }
+        if quote.is_some() {
+            return Err("unterminated quoted query value".into());
+        }
+        if !current.trim().is_empty() {
+            tokens.push(current);
+        }
+        if tokens.is_empty() {
+            return Err("query is empty".into());
+        }
+        Ok(Self { tokens, cursor: 0 })
+    }
+
+    fn parse(mut self) -> Result<Query, String> {
+        let query = self.parse_or()?;
+        if self.cursor != self.tokens.len() {
+            return Err(format!("unexpected token {:?}", self.tokens[self.cursor]));
+        }
+        Ok(query)
+    }
+
+    fn parse_or(&mut self) -> Result<Query, String> {
+        let mut parts = vec![self.parse_and()?];
+        while self.take_word("OR") {
+            parts.push(self.parse_and()?);
+        }
+        Ok(if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            Query::Or(parts)
+        })
+    }
+
+    fn parse_and(&mut self) -> Result<Query, String> {
+        let mut parts = vec![self.parse_unary()?];
+        while self.take_word("AND") {
+            parts.push(self.parse_unary()?);
+        }
+        Ok(if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            Query::And(parts)
+        })
+    }
+
+    fn parse_unary(&mut self) -> Result<Query, String> {
+        if self.take_word("NOT") {
+            return Ok(Query::Not(Box::new(self.parse_unary()?)));
+        }
+        if self
+            .tokens
+            .get(self.cursor)
+            .is_some_and(|token| token == "(")
+        {
+            self.cursor += 1;
+            let query = self.parse_or()?;
+            if self
+                .tokens
+                .get(self.cursor)
+                .is_none_or(|token| token != ")")
+            {
+                return Err("missing closing parenthesis".into());
+            }
+            self.cursor += 1;
+            return Ok(query);
+        }
+        let token = self
+            .tokens
+            .get(self.cursor)
+            .ok_or("expected query term")?
+            .clone();
+        self.cursor += 1;
+        if token.eq_ignore_ascii_case("unresolved") {
+            return Ok(Query::Unresolved);
+        }
+        if let Some(value) = token.strip_prefix("tag:").filter(|value| !value.is_empty()) {
+            return Ok(Query::Tag {
+                name: flavite_syntax::wellknown::normalize_tag(value),
+                hierarchical: false,
+            });
+        }
+        if let Some(value) = token
+            .strip_prefix("text:")
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(Query::Text(value.to_owned()));
+        }
+        Err(format!(
+            "unsupported query term {token:?}; expected tag:, text:, or unresolved"
+        ))
+    }
+
+    fn take_word(&mut self, word: &str) -> bool {
+        if self
+            .tokens
+            .get(self.cursor)
+            .is_some_and(|token| token.eq_ignore_ascii_case(word))
+        {
+            self.cursor += 1;
+            true
+        } else {
+            false
         }
     }
 }
@@ -511,6 +656,22 @@ mod tests {
     use super::*;
     use crate::schema::create_schema;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn parses_cli_boolean_tag_and_text_query() {
+        assert_eq!(
+            Query::parse("tag:foo AND text:'y'").unwrap(),
+            Query::And(vec![
+                Query::Tag {
+                    name: "foo".into(),
+                    hierarchical: false
+                },
+                Query::Text("y".into()),
+            ])
+        );
+        assert!(Query::parse("tag:foo AND text:'unterminated").is_err());
+        assert!(Query::parse("tag:").is_err());
+    }
 
     #[test]
     fn test_query_display() {

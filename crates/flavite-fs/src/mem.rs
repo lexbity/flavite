@@ -436,28 +436,15 @@ impl Fs for MemFs {
     }
 
     fn encode_path_key(&self, path: &Path) -> Result<Vec<u8>> {
-        // Reject absolute paths and non-normal components (§4.16.2).
-        for component in path.components() {
-            match component {
-                Component::Normal(_) => {}
-                _ => {
-                    return Err(FsError::InvalidPath(format!(
-                        "path key must be relative with normal components: {}",
-                        path.display()
-                    )));
-                }
-            }
-        }
-        // Portable UTF-8 encoding: each component as length-prefixed UTF-8.
+        let normalized =
+            crate::path::validate_vault_relative(path).map_err(FsError::InvalidPath)?;
+        // Portable, reversible UTF-8 encoding: each normalized component is
+        // length-prefixed, preserving the historical MemFs PathKey format.
         let mut out = Vec::new();
-        for component in path.components() {
-            let os = component.as_os_str();
-            let s = os.to_str().ok_or_else(|| {
-                FsError::InvalidPath(format!(
-                    "non-UTF-8 path component in MemFs: {}",
-                    os.to_string_lossy()
-                ))
-            })?;
+        for s in normalized
+            .split('/')
+            .filter(|component| !component.is_empty())
+        {
             let bytes = s.as_bytes();
             out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             out.extend_from_slice(bytes);

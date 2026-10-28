@@ -80,6 +80,9 @@ impl Link {
 pub fn parse_note(bytes: &[u8]) -> Result<ParsedNote, String> {
     let snapshot = TextSnapshot::new(bytes).map_err(|e| e.to_string())?;
     let text = snapshot.text();
+    if text.contains('\0') {
+        return Err("markdown contains an embedded NUL byte".into());
+    }
 
     // Build the exclusion mask from code spans/blocks, raw HTML, and math.
     let (mask, _body_start) = build_mask(text);
@@ -369,6 +372,11 @@ mod tests {
         assert_eq!(result.links.len(), 1);
         assert_eq!(result.links[0].target_raw, "link");
         assert!(!result.links[0].is_embed);
+    }
+
+    #[test]
+    fn rejects_embedded_nul_before_markdown_parsing() {
+        assert!(parse_note(b"[[m[]]\0").is_err());
     }
 
     #[test]

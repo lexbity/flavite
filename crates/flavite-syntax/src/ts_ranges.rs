@@ -58,6 +58,11 @@ pub struct TsParsedNote {
 pub fn parse_note_ts(bytes: &[u8]) -> Result<TsParsedNote, String> {
     let snapshot = TextSnapshot::new(bytes).map_err(|e| e.to_string())?;
     let text = snapshot.text();
+    // tree-sitter's C parser treats embedded NUL as an input terminator and
+    // can crash on malformed trailing bytes. Reject it before crossing FFI.
+    if text.contains('\0') {
+        return Err("markdown contains an embedded NUL byte".into());
+    }
 
     // Build the exclusion mask from tree-sitter nodes.
     let mask = build_mask_ts(text);
@@ -312,6 +317,7 @@ mod tests {
     #[test]
     fn parse_rejects_invalid_utf8_and_collects_all_inline_span_kinds() {
         assert!(parse_note_ts(&[0xff]).is_err());
+        assert!(parse_note_ts(b"[[m[]]\0").is_err());
 
         let result = parse_note_ts(b"See ![[image.png]] and [[note]] #topic ^block").unwrap();
         assert_eq!(result.links.len(), 2);

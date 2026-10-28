@@ -2,7 +2,7 @@
 
 use flavite_fs::fs::{Fs, FsError};
 use flavite_fs::os::OsFs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
 #[test]
@@ -247,4 +247,37 @@ fn os_fs_encode_path_key_invalid() {
     // Try to encode a path with parent traversal
     let result = fs.encode_path_key(Path::new("../escape"));
     assert!(matches!(result, Err(FsError::InvalidPath(_))));
+}
+
+#[test]
+fn os_fs_encode_path_key_rejects_portable_path_hazards_and_normalizes_nfc() {
+    let fs = OsFs::new();
+    for path in [
+        "notes/a.md:stream",
+        "\\\\?\\C:\\vault\\note.md",
+        "notes~1.md",
+        "CON.txt",
+        "NUL",
+        "COM1.log",
+        "LPT9.log",
+        "trailing.",
+        "trailing ",
+        "../escape.md",
+    ] {
+        assert!(fs.encode_path_key(Path::new(path)).is_err(), "{path:?}");
+    }
+    let key = fs
+        .encode_path_key(Path::new("cafe\u{301}/note.md"))
+        .unwrap();
+    assert_eq!(fs.decode_path_key(&key).unwrap(), Path::new("café/note.md"));
+}
+
+#[cfg(unix)]
+#[test]
+fn os_fs_path_key_never_collapses_non_utf8_bytes() {
+    use std::os::unix::ffi::OsStringExt;
+    let path = PathBuf::from(std::ffi::OsString::from_vec(vec![
+        b'n', b'o', b't', b'e', 0xff,
+    ]));
+    assert!(OsFs::new().encode_path_key(&path).is_err());
 }

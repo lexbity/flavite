@@ -222,6 +222,132 @@ fn parse_yaml_value(value: &str) -> Vec<String> {
     }
 }
 
+/// Set one top-level frontmatter string key without reserializing the YAML
+/// document. Unrelated bytes, comments, quoting, and key order are preserved.
+/// The generated value is always safely double-quoted.
+pub fn patch_frontmatter_key(
+    bytes: &[u8],
+    key: &str,
+    values: &[String],
+) -> Result<Vec<u8>, String> {
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err("frontmatter key must be a simple ASCII identifier".into());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| "frontmatter is not UTF-8")?;
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let rendered = if values.len() <= 1 {
+        format!(
+            "{key}: {}",
+            yaml_quote(values.first().map_or("", String::as_str))
+        )
+    } else {
+        format!(
+            "{key}:{}{}",
+            newline,
+            values
+                .iter()
+                .map(|value| format!("  - {}", yaml_quote(value)))
+                .collect::<Vec<_>>()
+                .join(newline)
+        )
+    };
+    let bom_len = usize::from(text.starts_with('\u{feff}')) * '\u{feff}'.len_utf8();
+    let after_bom = &text[bom_len..];
+    if !after_bom.starts_with("---") {
+        let mut output = Vec::with_capacity(bytes.len() + rendered.len() + 12);
+        output.extend_from_slice(&bytes[..bom_len]);
+        output.extend_from_slice(format!("---{newline}{rendered}{newline}---{newline}").as_bytes());
+        output.extend_from_slice(&bytes[bom_len..]);
+        return Ok(output);
+    }
+    let open_end = after_bom
+        .find('\n')
+        .map_or(text.len(), |offset| bom_len + offset + 1);
+    let close = text[open_end..]
+        .split_inclusive('\n')
+        .scan(open_end, |offset, line| {
+            let start = *offset;
+            *offset += line.len();
+            Some((start, *offset, line.trim()))
+        })
+        .find(|(_, _, line)| *line == "---" || *line == "...")
+        .map(|(start, end, _)| (start, end))
+        .ok_or("frontmatter has no closing delimiter")?;
+    let mut lines = Vec::new();
+    let mut offset = open_end;
+    while offset < close.0 {
+        let end = text[offset..close.0]
+            .find('\n')
+            .map_or(close.0, |relative| offset + relative + 1);
+        lines.push((offset, end, &text[offset..end]));
+        offset = end;
+    }
+    let matched = lines.iter().position(|(_, _, line)| {
+        line.trim_start() == *line
+            && line
+                .split_once(':')
+                .is_some_and(|(candidate, _)| candidate == key)
+    });
+    if let Some(index) = matched {
+        let matching_keys = lines
+            .iter()
+            .filter(|(_, _, line)| {
+                line.trim_start() == *line
+                    && line
+                        .split_once(':')
+                        .is_some_and(|(candidate, _)| candidate == key)
+            })
+            .count();
+        if matching_keys > 1 {
+            return Err("refusing to patch a duplicated frontmatter key".into());
+        }
+        let start = lines[index].0;
+        let mut end_index = index + 1;
+        while end_index < lines.len() {
+            let line = lines[end_index].2.trim_end_matches(['\r', '\n']);
+            if !line.trim().is_empty() && !line.starts_with([' ', '\t']) {
+                break;
+            }
+            end_index += 1;
+        }
+        let end = lines.get(end_index).map_or(close.0, |line| line.0);
+        if text[start..end].lines().any(|line| line.contains('#')) {
+            return Err("refusing to replace a frontmatter value containing comments".into());
+        }
+        let mut output = Vec::with_capacity(bytes.len() + rendered.len());
+        output.extend_from_slice(&bytes[..start]);
+        output.extend_from_slice(rendered.as_bytes());
+        output.extend_from_slice(newline.as_bytes());
+        output.extend_from_slice(&bytes[end..]);
+        Ok(output)
+    } else {
+        let mut output = Vec::with_capacity(bytes.len() + rendered.len() + 4);
+        output.extend_from_slice(&bytes[..close.0]);
+        if close.0 > open_end && !text[..close.0].ends_with('\n') {
+            output.extend_from_slice(newline.as_bytes());
+        }
+        output.extend_from_slice(rendered.as_bytes());
+        output.extend_from_slice(newline.as_bytes());
+        output.extend_from_slice(&bytes[close.0..]);
+        Ok(output)
+    }
+}
+
+fn yaml_quote(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +355,22 @@ mod tests {
 
     fn snap(s: &str) -> TextSnapshot {
         TextSnapshot::new(s.as_bytes()).expect("utf-8")
+    }
+
+    #[test]
+    fn patcher_preserves_unrelated_frontmatter_and_handles_insertion() {
+        let original = b"---\r\ntitle: 'Keep quote' # comment\r\naliases: old\r\ncustom: value\r\n---\r\nbody\r\n";
+        let changed = patch_frontmatter_key(original, "aliases", &["new\" alias".into()]).unwrap();
+        let text = std::str::from_utf8(&changed).unwrap();
+        assert!(text.contains("title: 'Keep quote' # comment\r\n"));
+        assert!(text.contains("custom: value\r\n"));
+        assert!(text.contains("aliases: \"new\\\" alias\"\r\n"));
+        let body = "\u{feff}# body\n";
+        let inserted =
+            patch_frontmatter_key(body.as_bytes(), "aliases", &["a".into(), "b".into()]).unwrap();
+        let inserted = std::str::from_utf8(&inserted).unwrap();
+        assert!(inserted.starts_with("\u{feff}---\n"));
+        assert!(inserted.contains("  - \"a\"\n  - \"b\""));
     }
 
     #[test]

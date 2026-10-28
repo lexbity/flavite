@@ -7,8 +7,13 @@ scratch-devdocs/
 /fuzz/corpus
 !/fuzz/corpus/
 /fuzz/corpus/**
-!/fuzz/corpus/scanner/
-!/fuzz/corpus/scanner/03be744b6b0d16f09bdae0c4bb5286e3adacea73
+/fuzz/corpus/scanner/
+/fuzz/corpus/frontmatter_patcher/
+/fuzz/corpus/frontmatter_patcher/*
+!/fuzz/corpus/frontmatter_patcher/seed-commented-frontmatter
+/fuzz/corpus/parity/
+/fuzz/corpus/parity/*
+!/fuzz/corpus/parity/seed-mixed-markdown
 /fuzz/target
 /fuzz/artifacts
 *.profraw

@@ -1305,6 +1305,7 @@ dependencies = [
  "proptest",
  "tempfile",
  "thiserror 2.0.21",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -1326,6 +1327,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "flavite-syntax",
+ "proptest",
  "pulldown-cmark",
  "rusqlite",
  "serde",

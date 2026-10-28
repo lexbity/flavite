@@ -15,6 +15,7 @@ blake3 = { workspace = true }
 thiserror = { workspace = true }
 # File system notification library for the watcher wrapper
 notify = { workspace = true }
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 proptest = { workspace = true }

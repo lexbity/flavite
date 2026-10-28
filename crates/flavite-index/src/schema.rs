@@ -11,7 +11,7 @@ use std::path::Path;
 /// Current schema major version.
 /// This is used in the cache path: `<os-cache>/flavite/<vault-uuid>/v<schema-major>/`
 /// When this changes, old caches are not mutated and can coexist.
-pub const SCHEMA_MAJOR: u32 = 1;
+pub const SCHEMA_MAJOR: u32 = 2;
 
 /// Current schema minor version for in-place migrations within the same major.
 pub const SCHEMA_MINOR: u32 = 0;

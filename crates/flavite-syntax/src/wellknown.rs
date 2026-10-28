@@ -17,6 +17,8 @@ pub enum WellKnownKey {
     Tag,
     /// `title` — string, overrides derived title.
     Title,
+    /// `id` — stable note identity used by `[[id:...]]` links.
+    Id,
 }
 
 impl WellKnownKey {
@@ -29,6 +31,7 @@ impl WellKnownKey {
             "tags" => Some(Self::Tags),
             "tag" => Some(Self::Tag),
             "title" => Some(Self::Title),
+            "id" => Some(Self::Id),
             _ => None,
         }
     }
@@ -36,7 +39,7 @@ impl WellKnownKey {
     /// All well-known key names.
     #[must_use]
     pub fn all() -> &'static [&'static str] {
-        &["aliases", "tags", "tag", "title"]
+        &["aliases", "tags", "tag", "title", "id"]
     }
 }
 
@@ -68,6 +71,7 @@ mod tests {
         assert_eq!(WellKnownKey::from_str("tags"), Some(WellKnownKey::Tags));
         assert_eq!(WellKnownKey::from_str("tag"), Some(WellKnownKey::Tag));
         assert_eq!(WellKnownKey::from_str("title"), Some(WellKnownKey::Title));
+        assert_eq!(WellKnownKey::from_str("id"), Some(WellKnownKey::Id));
         assert_eq!(WellKnownKey::from_str("unknown"), None);
     }
 

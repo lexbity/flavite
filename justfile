@@ -113,18 +113,25 @@ cov-check lcov="target/llvm-cov/lcov.info":
     cargo xtask cov-check --lcov {{lcov}}
 
 # Run maintained fuzz targets over generated input (§10.6).
-# The parity, frontmatter_patcher, and rename_planner harnesses are prototypes
-# and are intentionally excluded until they exercise their named behavior.
 # 30 s per target locally; G1 uses fuzz-smoke-ci (60 s).
 fuzz-smoke:
     #!/usr/bin/env bash
     set -euo pipefail
     cd fuzz
-    targets="image_limits parser path_safety scanner"
+    smoke_root="$(mktemp -d)"
+    trap 'rm -rf "$smoke_root"' EXIT
+    targets="image_limits parser path_safety scanner frontmatter_patcher parity"
     failed=0
     for target in $targets; do
+        corpus_dir="$smoke_root/$target"
+        mkdir -p "$corpus_dir"
+        while IFS= read -r -d '' seed; do
+            if ! git check-ignore -q "$seed"; then
+                cp "$seed" "$corpus_dir/$(basename "$seed")"
+            fi
+        done < <(find "corpus/$target" -type f -print0)
         echo "=== fuzz-smoke: $target (30s) ==="
-        if ! cargo +nightly fuzz run "$target" -- -max_total_time=30 -rss_limit_mb=4096; then
+        if ! cargo +nightly fuzz run "$target" "$corpus_dir" -- -max_total_time=30 -rss_limit_mb=4096; then
             echo "FUZZ SMOKE FAILED: $target"
             failed=1
         fi
@@ -136,11 +143,20 @@ fuzz-smoke-ci:
     #!/usr/bin/env bash
     set -euo pipefail
     cd fuzz
-    targets="image_limits parser path_safety scanner"
+    smoke_root="$(mktemp -d)"
+    trap 'rm -rf "$smoke_root"' EXIT
+    targets="image_limits parser path_safety scanner frontmatter_patcher parity"
     failed=0
     for target in $targets; do
+        corpus_dir="$smoke_root/$target"
+        mkdir -p "$corpus_dir"
+        while IFS= read -r -d '' seed; do
+            if ! git check-ignore -q "$seed"; then
+                cp "$seed" "$corpus_dir/$(basename "$seed")"
+            fi
+        done < <(find "corpus/$target" -type f -print0)
         echo "=== fuzz-smoke-ci: $target (60s) ==="
-        if ! cargo +nightly fuzz run "$target" -- -max_total_time=60 -rss_limit_mb=4096; then
+        if ! cargo +nightly fuzz run "$target" "$corpus_dir" -- -max_total_time=60 -rss_limit_mb=4096; then
             echo "FUZZ SMOKE FAILED: $target"
             failed=1
         fi
