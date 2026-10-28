@@ -384,11 +384,7 @@ mod tests {
         let table = EolTable::from_snapshot(&snapshot);
 
         // Build line breaks
-        let line_breaks: Vec<TextByte> = snapshot
-            .lines()
-            .iter()
-            .map(|l| l.text_end)
-            .collect();
+        let line_breaks: Vec<TextByte> = snapshot.lines().iter().map(|l| l.text_end).collect();
 
         let serialized = table.serialize(snapshot.text(), &line_breaks);
         assert_eq!(serialized, src.as_bytes());
@@ -400,11 +396,7 @@ mod tests {
         let snapshot = snap(src);
         let table = EolTable::from_snapshot(&snapshot);
 
-        let line_breaks: Vec<TextByte> = snapshot
-            .lines()
-            .iter()
-            .map(|l| l.text_end)
-            .collect();
+        let line_breaks: Vec<TextByte> = snapshot.lines().iter().map(|l| l.text_end).collect();
 
         let serialized = table.serialize(snapshot.text(), &line_breaks);
         assert_eq!(serialized, src.as_bytes());

@@ -215,7 +215,10 @@ impl EditorModel {
     /// Get a slice of text as a string.
     #[must_use]
     pub fn slice_str(&self, range: Span<TextByte>) -> &str {
-        self.rope.byte_slice(range.start.0..range.end.0).as_str().unwrap_or("")
+        self.rope
+            .byte_slice(range.start.0..range.end.0)
+            .as_str()
+            .unwrap_or("")
     }
 
     /// Get the line count.
@@ -260,10 +263,7 @@ impl EditorModel {
     /// Clear the buffer.
     pub fn clear(&mut self) {
         let old_len = self.len();
-        let edit = EditOp::new(
-            Span::new(TextByte(0), TextByte(old_len)),
-            String::new(),
-        );
+        let edit = EditOp::new(Span::new(TextByte(0), TextByte(old_len)), String::new());
         self.apply_edit_op(edit);
         self.eol_table = EolTable::default();
     }
@@ -286,10 +286,7 @@ impl EditorModel {
         // Count newlines in the inserted text
         let newlines = text.chars().filter(|&c| c == '\n').count();
 
-        let edit = EditOp::new(
-            Span::new(pos, pos),
-            text.to_string(),
-        );
+        let edit = EditOp::new(Span::new(pos, pos), text.to_string());
 
         // Update EOL metadata
         self.update_eol_for_insert(pos, newlines);
@@ -507,13 +504,13 @@ impl EditorModel {
     pub fn to_source_bytes(&self) -> Vec<u8> {
         // Get the normalized text
         let text = self.text();
-        
+
         // Build line_breaks as the end of each line (excluding the newline)
         let mut line_breaks = Vec::new();
         for line in 0..self.line_count() {
             let _line_start = self.line_start(line);
             let line_end = self.line_end(line);
-            
+
             // line_end is the start of the next line (after the newline)
             // If this line has an EOL (not None), subtract 1 to exclude the newline
             let eol = self.eol_table.get(line);
