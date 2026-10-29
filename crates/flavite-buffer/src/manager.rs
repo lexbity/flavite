@@ -343,6 +343,15 @@ impl BufferManager {
         self.buffers.keys().collect()
     }
 
+    /// Return every open path and its stable buffer identity.
+    #[must_use]
+    pub fn open_paths(&self) -> Vec<(PathBuf, BufferId)> {
+        self.buffers
+            .iter()
+            .map(|(path, buffer)| (path.clone(), buffer.buffer_id()))
+            .collect()
+    }
+
     /// Get all buffers.
     #[must_use]
     pub fn all_buffers(&self) -> Vec<&Buffer> {
@@ -625,6 +634,15 @@ mod tests {
 
         let paths = manager.open_notes();
         assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn open_paths_returns_path_and_buffer_identity() {
+        let mut manager = BufferManager::new();
+        let path = PathBuf::from("note.md");
+        let (buffer, _) = manager.open_note(path.clone(), b"hello");
+        let id = buffer.buffer_id();
+        assert_eq!(manager.open_paths(), vec![(path, id)]);
     }
 
     #[test]
