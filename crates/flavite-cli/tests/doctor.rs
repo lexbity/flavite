@@ -32,7 +32,7 @@ fn doctor_uses_vault_identity_and_reports_corrupt_cache() {
         .path()
         .join("flavite/flavite")
         .join(uuid)
-        .join("v2/index.sqlite3");
+        .join("v3/index.sqlite3");
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
     std::fs::write(db, b"damaged cache").unwrap();
 

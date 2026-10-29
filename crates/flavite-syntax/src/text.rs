@@ -24,6 +24,20 @@
 
 use unicode_segmentation::UnicodeSegmentation;
 
+/// Return the longest prefix of `text` whose UTF-8 byte length is at most
+/// `max_bytes`.
+///
+/// This is intended for byte-capped previews. The returned slice always ends
+/// at a character boundary and never allocates.
+#[must_use]
+pub fn safe_prefix(text: &str, max_bytes: usize) -> &str {
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// Offset into the original source bytes of a note (§4.16.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct SourceByte(pub usize);
@@ -756,5 +770,30 @@ mod tests {
             span.as_source_span(),
             Span::new(SourceByte(2), SourceByte(5))
         );
+    }
+
+    #[test]
+    fn safe_prefix_respects_char_boundaries() {
+        for (text, limit, expected) in [
+            ("abc", 0, ""),
+            ("abc", 2, "ab"),
+            ("abc", 9, "abc"),
+            ("a界b", 2, "a"),
+            ("a界b", 4, "a界"),
+            ("😀x", 3, ""),
+            ("😀x", 4, "😀"),
+        ] {
+            let prefix = safe_prefix(text, limit);
+            assert_eq!(prefix, expected);
+            assert!(prefix.is_char_boundary(prefix.len()));
+            assert!(prefix.len() <= limit);
+        }
+
+        for limit in [1023, 1024, 1025] {
+            let text = format!("{}tail", "界".repeat(400));
+            let prefix = safe_prefix(&text, limit);
+            assert!(prefix.is_char_boundary(prefix.len()));
+            assert!(prefix.len() <= limit);
+        }
     }
 }

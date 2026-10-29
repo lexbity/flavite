@@ -11,7 +11,7 @@ use std::path::Path;
 /// Current schema major version.
 /// This is used in the cache path: `<os-cache>/flavite/<vault-uuid>/v<schema-major>/`
 /// When this changes, old caches are not mutated and can coexist.
-pub const SCHEMA_MAJOR: u32 = 2;
+pub const SCHEMA_MAJOR: u32 = 3;
 
 /// Current schema minor version for in-place migrations within the same major.
 pub const SCHEMA_MINOR: u32 = 0;
@@ -201,8 +201,9 @@ pub fn create_schema(conn: &mut Connection) -> Result<()> {
             stem_key     TEXT NOT NULL,
             title        TEXT NOT NULL,
             stable_id    TEXT,
+            stable_id_key TEXT,
             id_conflict  INTEGER NOT NULL DEFAULT 0,
-            content_hash BLOB NOT NULL,
+            content_hash BLOB,
             size         INTEGER NOT NULL,
             mtime_ns     INTEGER NOT NULL,
             scan_ns      INTEGER NOT NULL,
@@ -217,7 +218,11 @@ pub fn create_schema(conn: &mut Connection) -> Result<()> {
     tx.execute_batch(
         "CREATE INDEX notes_stem ON notes(stem_key);
          CREATE INDEX notes_path_key ON notes(path_key);
-         CREATE INDEX notes_stable_id ON notes(stable_id)",
+         CREATE INDEX notes_stable_id ON notes(stable_id);
+         -- Duplicate IDs remain representable so the resolver can flag and
+         -- rank conflicts; uniqueness here would make that required state
+         -- impossible to ingest.
+         CREATE INDEX notes_sid ON notes(stable_id_key) WHERE stable_id_key IS NOT NULL",
     )?;
 
     // attachments table
@@ -414,6 +419,75 @@ pub fn open_or_init(path: &Path) -> Result<Connection> {
             },
         )
         .unwrap_or(false);
+    let has_user_tables: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    let schema_matches = if schema_exists {
+        let major_matches = get_meta(&conn, MetaKey::SchemaVersion)
+            .ok()
+            .flatten()
+            .and_then(|value| value.split('.').next()?.parse::<u32>().ok())
+            == Some(SCHEMA_MAJOR);
+        let table_count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('meta','notes','attachments','aliases','links','tags','properties','ext_facts','search_docs','changes')",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .unwrap_or(0);
+        let notes_columns = conn
+            .prepare("PRAGMA table_info(notes)")
+            .and_then(|mut statement| {
+                let rows = statement.query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, bool>(3)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        let has_schema_three_columns = notes_columns
+            .iter()
+            .any(|(name, _)| name == "stable_id_key")
+            && notes_columns
+                .iter()
+                .any(|(name, not_null)| name == "content_hash" && !not_null);
+        major_matches && table_count == 10 && has_schema_three_columns
+    } else {
+        false
+    };
+
+    if has_user_tables && !schema_matches {
+        tracing::info!(reason = "schema", "rebuilding incompatible index cache");
+        // The index is a disposable cache. Close SQLite before removing its
+        // database and WAL sidecars so no connection can retain old pages.
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.as_os_str().to_os_string();
+            file.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(file));
+        }
+        let mut conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        create_schema(&mut conn)?;
+        // Force the Tantivy owner to rebuild its disposable index from the
+        // fresh structural cache, without coupling this layer to its path.
+        set_meta(
+            &conn,
+            MetaKey::TantivyCommittedGeneration,
+            &u64::MAX.to_string(),
+        )?;
+        return Ok(conn);
+    }
 
     if !schema_exists {
         create_schema(&mut conn)?;

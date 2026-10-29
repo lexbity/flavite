@@ -243,6 +243,11 @@
       "kind": "normal"
     },
     {
+      "from": "flavite-index",
+      "to": "tracing",
+      "kind": "normal"
+    },
+    {
       "from": "flavite-syntax",
       "to": "pulldown-cmark",
       "kind": "normal"

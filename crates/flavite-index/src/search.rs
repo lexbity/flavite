@@ -130,6 +130,34 @@ impl TantivyBackend {
         Ok(())
     }
 
+    /// Add or replace a degraded note's title-only search document.
+    ///
+    /// Degraded rows intentionally have no body, aliases, or tags in the
+    /// search index, both incrementally and after a rebuild.
+    ///
+    /// # Errors
+    /// Returns an error when Tantivy cannot apply the document.
+    pub fn apply_title_only_document(&self, note_id: i64, title: &str) -> Result<(), SearchError> {
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| SearchError::Tantivy("writer lock poisoned".into()))?;
+        writer.delete_term(tantivy::Term::from_field_u64(
+            self.fields.id,
+            note_id.cast_unsigned(),
+        ));
+        writer
+            .add_document(
+                doc!(self.fields.id => note_id.cast_unsigned(), self.fields.title => title),
+            )
+            .map_err(|error| SearchError::Tantivy(error.to_string()))?;
+        *self
+            .dirty
+            .lock()
+            .map_err(|_| SearchError::Tantivy("dirty lock poisoned".into()))? = true;
+        Ok(())
+    }
+
     /// Rebuild the search index from the authoritative current search-doc cache.
     ///
     /// # Errors
@@ -143,20 +171,27 @@ impl TantivyBackend {
         writer
             .delete_all_documents()
             .map_err(|e| SearchError::Tantivy(e.to_string()))?;
-        let mut stmt = conn.prepare("SELECT n.note_id,n.title,COALESCE(s.body_text,'') FROM notes n LEFT JOIN search_docs s USING(note_id)")?;
+        let mut stmt = conn.prepare("SELECT n.note_id,n.title,COALESCE(s.body_text,''),n.parse_ok FROM notes n LEFT JOIN search_docs s USING(note_id)")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, bool>(3)?,
             ))
         })?;
         let mut documents = Vec::new();
         for row in rows {
-            let (id, title, body) = row?;
-            documents.push((id, title, body));
+            let (id, title, body, parse_ok) = row?;
+            documents.push((id, title, body, parse_ok));
         }
-        for (id, title, body) in documents {
+        for (id, title, body, parse_ok) in documents {
+            if !parse_ok {
+                writer
+                    .add_document(doc!(self.fields.id=>id.cast_unsigned(),self.fields.title=>title))
+                    .map_err(|error| SearchError::Tantivy(error.to_string()))?;
+                continue;
+            }
             let aliases = conn
                 .prepare("SELECT alias FROM aliases WHERE note_id=?1 ORDER BY alias_key")?
                 .query_map([id], |r| r.get::<_, String>(0))?

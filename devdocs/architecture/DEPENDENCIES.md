@@ -87,6 +87,7 @@ Normal/build:
 - `pulldown-cmark` (normal)
 - `rusqlite` (normal)
 - `tantivy` (normal)
+- `tracing` (normal)
 
 ### `flavite-syntax`
 
@@ -152,7 +153,7 @@ Normal/build:
 - `rusqlite` ← flavite-api, flavite-graph, flavite-index, xtask
 - `similar` ← flavite-vault
 - `tantivy` ← flavite-index, xtask
-- `tracing` ← flavite-cli, flavite-vault
+- `tracing` ← flavite-cli, flavite-index, flavite-vault
 - `tree-sitter` ← flavite-syntax
 - `zstd` ← flavite-vault
 

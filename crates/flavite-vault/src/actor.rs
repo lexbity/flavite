@@ -16,7 +16,7 @@ use crate::types::{
 };
 use crossbeam::channel::{Receiver, Sender, bounded, select, tick, unbounded};
 use flavite_fs::Fs;
-use flavite_index::IndexActor;
+use flavite_index::{IndexActor, MAX_NOTE_BYTES};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -1105,6 +1105,11 @@ impl VaultActor {
 
     fn perform_initial_scan(&mut self) {
         self.handle_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent, None);
+        if self.index.needs_reparse()
+            && let Err(error) = self.index.mark_parser_current()
+        {
+            tracing::warn!(%error, "could not persist current parser version after verification");
+        }
         self.initial_scan_complete = true;
     }
 
@@ -1182,10 +1187,38 @@ impl VaultActor {
                     indexed.remove(&path_key);
                     continue;
                 }
-                let Ok(bytes) = self.fs.read_capped(&entry.path, 32 * 1024 * 1024) else {
+                let display_path = relative.to_string_lossy().replace('\\', "/");
+                if metadata.size > MAX_NOTE_BYTES as u64 {
+                    match self.index.apply_unparsed_note(
+                        &path_key,
+                        &display_path,
+                        metadata.size,
+                        metadata.mtime_ns,
+                        scan_ns,
+                    ) {
+                        Ok((epoch, generation)) => {
+                            let was_indexed = indexed.remove(&path_key);
+                            let changed = generation > self.generation.0;
+                            self.epoch = Epoch::new(epoch);
+                            self.generation = Generation::new(generation);
+                            if changed {
+                                if was_indexed {
+                                    summary.changed = summary.changed.saturating_add(1);
+                                    self.record_drift();
+                                } else {
+                                    summary.added = summary.added.saturating_add(1);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(path = %entry.path.display(), %error, "oversize note reconcile failed")
+                        }
+                    }
+                    continue;
+                }
+                let Ok(bytes) = self.fs.read_capped(&entry.path, MAX_NOTE_BYTES as u64) else {
                     continue;
                 };
-                let display_path = relative.to_string_lossy().replace('\\', "/");
                 match self.index.apply_saved_note(
                     &path_key,
                     &display_path,
@@ -1451,9 +1484,6 @@ impl VaultActor {
             if metadata.is_symlink {
                 continue;
             }
-            let Ok(bytes) = self.fs.read_capped(&path, 32 * 1024 * 1024) else {
-                continue;
-            };
             let was_indexed = self.index.contains_note_path(&path_key).unwrap_or(false);
             let before = self
                 .index
@@ -1466,6 +1496,35 @@ impl VaultActor {
                 .as_nanos()
                 .min(i64::MAX as u128) as i64;
             let display_path = relative.to_string_lossy().replace('\\', "/");
+            if metadata.size > MAX_NOTE_BYTES as u64 {
+                match self.index.apply_unparsed_note(
+                    &path_key,
+                    &display_path,
+                    metadata.size,
+                    metadata.mtime_ns,
+                    scan_ns,
+                ) {
+                    Ok((epoch, generation)) => {
+                        self.epoch = Epoch::new(epoch);
+                        self.generation = Generation::new(generation);
+                        if generation > before {
+                            if was_indexed {
+                                summary.changed = summary.changed.saturating_add(1);
+                                self.record_drift();
+                            } else {
+                                summary.added = summary.added.saturating_add(1);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), %error, "oversize note reconcile failed")
+                    }
+                }
+                continue;
+            }
+            let Ok(bytes) = self.fs.read_capped(&path, MAX_NOTE_BYTES as u64) else {
+                continue;
+            };
             match self.index.apply_saved_note(
                 &path_key,
                 &display_path,
@@ -1953,6 +2012,48 @@ mod tests {
         assert!(dst_att.is_some());
         assert_eq!(state, "resolved");
         drop(event_tx);
+        let _ = actor.send(VaultActorMsg::Shutdown);
+    }
+
+    #[test]
+    fn initial_scan_lists_oversize_notes_as_unparsed_rows() {
+        let fs = MemFs::new();
+        fs.create_dir_all(std::path::Path::new("/vault")).unwrap();
+        let bytes = vec![b'x'; MAX_NOTE_BYTES + 1];
+        fs.write_new(std::path::Path::new("/vault/large.md"), &bytes)
+            .unwrap();
+        assert_eq!(
+            fs.metadata(std::path::Path::new("/vault/large.md"))
+                .unwrap()
+                .size,
+            (MAX_NOTE_BYTES + 1) as u64
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("oversize-index.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let identity = VaultIdentity::new(uuid::Uuid::now_v7(), "/vault".into(), vec![1, 2, 3, 4]);
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs))
+            .with_identity(identity)
+            .with_index(IndexActor::new(&db, 1).unwrap())
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        actor.get_version().unwrap();
+        let writer = flavite_index::Writer::new(&db).unwrap();
+        let row: (bool, Option<Vec<u8>>, i64) = writer
+            .conn()
+            .query_row(
+                "SELECT parse_ok,content_hash,size FROM notes WHERE path='large.md'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (false, None, i64::try_from(MAX_NOTE_BYTES + 1).unwrap())
+        );
         let _ = actor.send(VaultActorMsg::Shutdown);
     }
 

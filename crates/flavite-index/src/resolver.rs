@@ -111,13 +111,13 @@ impl Resolution {
 }
 
 /// The link resolver.
-pub struct Resolver {
-    conn: Connection,
+pub struct Resolver<'a> {
+    conn: &'a Connection,
     cache: ResolverCache,
 }
 
-impl Resolver {
-    pub fn new(conn: Connection) -> Self {
+impl<'a> Resolver<'a> {
+    pub fn new(conn: &'a Connection) -> Self {
         Self {
             conn,
             cache: ResolverCache::default(),
@@ -726,7 +726,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut resolver = Resolver::new(conn);
+        let mut resolver = Resolver::new(&conn);
         resolver.refresh_cache().unwrap();
 
         // Test stem resolution
@@ -751,7 +751,7 @@ mod tests {
 
         create_schema(&mut conn).unwrap();
 
-        let mut resolver = Resolver::new(conn);
+        let mut resolver = Resolver::new(&conn);
         resolver.refresh_cache().unwrap();
 
         let res = resolver.resolve("nonexistent", "nonexistent", false, None);
@@ -808,7 +808,7 @@ mod tests {
             [],
         ).unwrap();
 
-        let mut resolver = Resolver::new(conn);
+        let mut resolver = Resolver::new(&conn);
         resolver.refresh_cache().unwrap();
         assert_eq!(
             resolver
