@@ -55,6 +55,21 @@ struct ReconcileArgs {
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RenameArgs {
+    from: PathBuf,
+    to: PathBuf,
+    strategy: Option<RenameStrategyArg>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RenameStrategyArg {
+    Rewrite,
+    Alias,
+    #[serde(rename = "none")]
+    NoRewrite,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResolveArgs {
     path: PathBuf,
     resolution: String,
@@ -136,6 +151,19 @@ fn handle_reconcile(session: &Session, invocation: &Invocation) -> Result<Sessio
     };
     Ok(session.execute(SessionCommand::Reconcile { scope, mode }))
 }
+fn handle_rename(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
+    let args: RenameArgs = decode(invocation)?;
+    let strategy = args.strategy.map(|strategy| match strategy {
+        RenameStrategyArg::Rewrite => flavite_vault::types::RenameStrategy::Rewrite,
+        RenameStrategyArg::Alias => flavite_vault::types::RenameStrategy::Alias,
+        RenameStrategyArg::NoRewrite => flavite_vault::types::RenameStrategy::None,
+    });
+    Ok(session.execute(SessionCommand::RenameNote {
+        from: args.from,
+        to: args.to,
+        strategy,
+    }))
+}
 fn handle_resolve(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
     let args: ResolveArgs = decode(invocation)?;
     let resolution = match args.resolution.as_str() {
@@ -154,6 +182,7 @@ fn handle_resolve(session: &Session, invocation: &Invocation) -> Result<SessionR
 }
 
 type HandlerRegistration = (&'static str, &'static str, ArgSchema, CommandHandler);
+const MAX_NOTICE_ACKS: usize = 256;
 
 /// Result of opening a vault.
 #[derive(Debug)]
@@ -302,7 +331,7 @@ impl Flavite {
     /// the legacy dotted alias as well. Both ids resolve to the same handler
     /// and schema.
     fn register_builtin_commands(&self) -> Result<(), FlaviteError> {
-        let registrations: [HandlerRegistration; 15] = [
+        let registrations: [HandlerRegistration; 16] = [
             (
                 "open_note",
                 "Open note",
@@ -386,6 +415,12 @@ impl Flavite {
                 "Refresh vault",
                 ArgSchema::typed::<ReconcileArgs>(),
                 handle_reconcile,
+            ),
+            (
+                "note.rename",
+                "Rename note",
+                ArgSchema::typed::<RenameArgs>(),
+                handle_rename,
             ),
             (
                 "resolve_conflict",
@@ -536,10 +571,19 @@ impl Flavite {
                 }),
             }
             if let Some(event) = events.last() {
-                self.notice_acks
-                    .lock()
-                    .unwrap()
-                    .push((event.clone(), notice));
+                let evicted = {
+                    let mut pending = self.notice_acks.lock().unwrap();
+                    let evicted = (pending.len() == MAX_NOTICE_ACKS).then(|| pending.remove(0).1);
+                    pending.push((event.clone(), notice));
+                    evicted
+                };
+                if let Some(evicted) = evicted {
+                    tracing::warn!(
+                        capacity = MAX_NOTICE_ACKS,
+                        "evicting oldest unacknowledged notice"
+                    );
+                    self.session.acknowledge_notice(&evicted);
+                }
             }
         }
         events
@@ -1083,6 +1127,7 @@ impl Flavite {
                 .is_some_and(Vault::watcher_enabled),
             drift_found_total: self.drift_found_total(),
             autosave_failures_total: self.session.autosave_failures_total(),
+            rename_items_skipped_total: self.session.rename_items_skipped_total(),
         })
     }
 
@@ -1276,6 +1321,8 @@ pub struct VaultInfo {
     pub drift_found_total: u64,
     /// Cumulative autosave failures observed by the Session host pump.
     pub autosave_failures_total: u64,
+    /// Cumulative rename journal items skipped by the actor.
+    pub rename_items_skipped_total: u64,
 }
 
 #[cfg(test)]
@@ -1349,6 +1396,68 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn note_rename_is_registered_typed_and_requires_write_capability() {
+        let (flavite, _root, _temp) = test_flavite();
+        let spec = flavite.command_registry().get_spec("note.rename").unwrap();
+        assert!(spec.requires_write);
+        assert_eq!(
+            spec.required_capability,
+            Some(crate::Capability::WriteNotes {
+                scope: crate::WriteScope::Vault
+            })
+        );
+        let valid = serde_json::json!({
+            "from": "note.md",
+            "to": "renamed.md",
+            "strategy": "alias"
+        });
+        spec.args.validate(&valid).unwrap();
+        assert!(
+            spec.args
+                .validate(&serde_json::json!({
+                    "from": "note.md",
+                    "to": "renamed.md",
+                    "strategy": "invalid"
+                }))
+                .is_err()
+        );
+
+        let result = flavite.execute(Invocation::new(
+            71,
+            "note.rename",
+            valid,
+            crate::Origin::Plugin,
+        ));
+        assert!(matches!(
+            result,
+            ExecutionResult::Rejected(crate::RejectedResult {
+                reason: crate::RejectionReason::CapabilityDenied,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn notice_acknowledgement_ledger_is_bounded_and_ackable() {
+        let (flavite, _root, _temp) = test_flavite();
+        for _ in 0..(MAX_NOTICE_ACKS + 5) {
+            flavite.session.notice_channel().send(
+                flavite_vault::channels::Notice::ActionRequired {
+                    code: "ledger-test",
+                    note: None,
+                },
+            );
+        }
+        let events = flavite.drain_events();
+        assert_eq!(events.len(), MAX_NOTICE_ACKS + 5);
+        assert_eq!(flavite.notice_acks.lock().unwrap().len(), MAX_NOTICE_ACKS);
+        for event in events {
+            flavite.acknowledge_event(&event);
+        }
+        assert!(flavite.notice_acks.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1521,6 +1630,9 @@ mod tests {
             .unwrap()
             .start()
             .unwrap();
+        actor
+            .wait_until_ready(Duration::from_secs(10))
+            .expect("initial reconcile completes before external-change assertions");
         let channels = ChannelSet::new();
         let session = Session::new(
             identity.clone(),
@@ -1558,7 +1670,9 @@ mod tests {
         watch_tx
             .send(WatcherEvent::Modified(root.join("note.md")))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // The initial scan is complete above, so this waits only for the
+        // post-open watcher event being tested.
+        let deadline = Instant::now() + Duration::from_secs(5);
         let mut events = Vec::new();
         while Instant::now() < deadline {
             flavite.session().pump();
@@ -1566,9 +1680,6 @@ mod tests {
             if events
                 .iter()
                 .any(|event| matches!(event, crate::Event::ExternalChangeDetected { .. }))
-                && events
-                    .iter()
-                    .any(|event| matches!(event, crate::Event::Conflict { .. }))
             {
                 break;
             }

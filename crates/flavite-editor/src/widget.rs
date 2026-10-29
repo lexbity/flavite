@@ -499,7 +499,9 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 if link_resolution.is_some() || other_decoration {
                     let color = match link_resolution {
                         Some(LinkResolution::Unresolved) => Color::from_rgb(0.95, 0.48, 0.43),
-                        Some(LinkResolution::Ambiguous) => Color::from_rgb(0.96, 0.73, 0.32),
+                        Some(LinkResolution::MultipleCandidates) => {
+                            Color::from_rgb(0.96, 0.73, 0.32)
+                        }
                         _ => Color::from_rgb(0.35, 0.67, 0.98),
                     };
                     renderer.fill_quad(

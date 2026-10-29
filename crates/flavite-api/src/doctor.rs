@@ -4,10 +4,9 @@
 //!
 //! # Doctor Checks
 //!
-//! The current checks inspect SQLite quick_check, indexed note hashes, links,
-//! stable IDs, orphan temps, journals, path collisions, history size, stale
-//! registry records, and orphan IPC sockets. Checks owned by unfinished slices
-//! are omitted until they can report real results.
+//! Checks inspect SQLite integrity, indexed note hashes, link and ID state,
+//! runtime metadata, watcher connectivity, orphan temps, journals, path
+//! collisions, history size, registry records, and orphan IPC sockets.
 //!
 //! Doctor never cleans files referenced by a live journal.
 
@@ -300,12 +299,8 @@ impl DoctorChecker {
         report.add_check(collision_check(&self.vault.root));
         report.add_check(history_check(self.vault.uuid));
         report.add_check(observability_check());
-        report.add_check(runtime_counters_check());
-        report.add_check(DoctorCheck::warn(
-            "watcher_health",
-            "Filesystem watcher health",
-            "Doctor runs without starting the vault actor; use `flavite info` for the live watcher status",
-        ));
+        report.add_check(runtime_counters_check(conn.as_ref()));
+        report.add_check(watcher_health_check(conn.as_ref()));
         report.add_check(sample_hash_check(conn.as_ref(), &self.vault.root));
         report.add_check(registry_check());
         report.add_check(orphan_socket_check());
@@ -828,40 +823,82 @@ fn tree_file_count(path: &Path) -> u64 {
         .sum()
 }
 
-fn runtime_counters_check() -> DoctorCheck {
-    let Some(path) = diagnostics_log_dir().map(|dir| dir.join("flavite.log")) else {
+fn runtime_counters_check(conn: Option<&Connection>) -> DoctorCheck {
+    let Some(conn) = conn else {
         return DoctorCheck::warn(
             "runtime_counters",
-            "Save and drift counters",
-            "OS data directory unavailable",
+            "Persisted runtime counters",
+            "Index cache is unavailable",
         );
     };
-    let Ok(contents) = fs::read_to_string(&path) else {
-        return DoctorCheck::warn(
-            "runtime_counters",
-            "Save and drift counters unavailable",
-            "No local log file yet",
-        );
-    };
-    let save_total = contents
-        .lines()
-        .filter(|line| line.contains("save completed"))
-        .count();
-    let drift_total = contents
-        .lines()
-        .filter_map(|line| {
-            let (_, suffix) = line.split_once("drift_found_total=")?;
-            suffix
-                .split(|ch: char| !ch.is_ascii_digit())
-                .next()?
+    let counters = [
+        flavite_index::schema::MetaKey::AutosaveFailuresTotal,
+        flavite_index::schema::MetaKey::DriftFoundTotal,
+        flavite_index::schema::MetaKey::RenameItemsSkippedTotal,
+    ];
+    let values = counters
+        .iter()
+        .map(|key| {
+            let value = flavite_index::schema::get_meta(conn, *key)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("{} is missing from index metadata", key.as_str()))?;
+            let parsed = value
                 .parse::<u64>()
-                .ok()
+                .map_err(|error| format!("{} is invalid: {error}", key.as_str()))?;
+            Ok(format!("{}={parsed}", key.as_str()))
         })
-        .max()
-        .unwrap_or(0);
-    DoctorCheck::ok("runtime_counters", "Local save and reconcile counters").with_details(format!(
-        "save.completed_total={save_total}; reconcile.drift_found_total={drift_total}"
-    ))
+        .collect::<Result<Vec<_>, String>>();
+    match values {
+        Ok(values) => DoctorCheck::ok(
+            "runtime_counters",
+            "Persisted autosave, reconcile, and rename counters",
+        )
+        .with_details(values.join("; ")),
+        Err(error) => DoctorCheck::warn(
+            "runtime_counters",
+            "Persisted runtime counters unavailable",
+            error,
+        ),
+    }
+}
+
+fn watcher_health_check(conn: Option<&Connection>) -> DoctorCheck {
+    let Some(conn) = conn else {
+        return DoctorCheck::warn(
+            "watcher_health",
+            "Filesystem watcher health",
+            "Index cache is unavailable",
+        );
+    };
+    match flavite_index::schema::get_meta(conn, flavite_index::schema::MetaKey::WatcherConnected) {
+        Ok(Some(value)) if value == "true" => {
+            DoctorCheck::ok("watcher_health", "Filesystem watcher is connected")
+        }
+        Ok(Some(value)) if value == "disabled" => DoctorCheck::ok(
+            "watcher_health",
+            "Filesystem watcher is disabled by configuration",
+        ),
+        Ok(Some(value)) if value == "false" => DoctorCheck::warn(
+            "watcher_health",
+            "Filesystem watcher is disconnected",
+            "A full verification is scheduled; inspect watcher availability",
+        ),
+        Ok(Some(value)) => DoctorCheck::warn(
+            "watcher_health",
+            "Filesystem watcher status is unknown",
+            format!("Unexpected watcher_connected value: {value}"),
+        ),
+        Ok(None) => DoctorCheck::warn(
+            "watcher_health",
+            "Filesystem watcher status unavailable",
+            "watcher_connected is missing from index metadata",
+        ),
+        Err(error) => DoctorCheck::warn(
+            "watcher_health",
+            "Filesystem watcher status unavailable",
+            error.to_string(),
+        ),
+    }
 }
 fn tree_size(path: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(path) else {
@@ -997,6 +1034,32 @@ mod tests {
         let c = DoctorChecker::with_db_path(vault, db);
         assert!(check(&c, "broken_links").is_ok());
         assert!(check(&c, "ambiguous_links").has_issues());
+    }
+
+    #[test]
+    fn runtime_counters_and_watcher_health_read_persisted_meta() {
+        let (_root, db, vault) = fixture();
+        let conn = Connection::open(&db).unwrap();
+        for (key, value) in [
+            (flavite_index::schema::MetaKey::AutosaveFailuresTotal, "4"),
+            (flavite_index::schema::MetaKey::DriftFoundTotal, "7"),
+            (flavite_index::schema::MetaKey::RenameItemsSkippedTotal, "2"),
+            (flavite_index::schema::MetaKey::WatcherConnected, "true"),
+        ] {
+            flavite_index::schema::set_meta(&conn, key, value).unwrap();
+        }
+        drop(conn);
+        let checker = DoctorChecker::with_db_path(vault, db);
+        let counters = check(&checker, "runtime_counters");
+        assert!(counters.is_ok());
+        let details = counters.details.unwrap();
+        assert!(details.contains("autosave.failures_total=4"));
+        assert!(details.contains(&format!(
+            "{}=7",
+            flavite_index::schema::MetaKey::DriftFoundTotal.as_str()
+        )));
+        assert!(details.contains("rename.items_skipped_total=2"));
+        assert!(check(&checker, "watcher_health").is_ok());
     }
 
     #[test]

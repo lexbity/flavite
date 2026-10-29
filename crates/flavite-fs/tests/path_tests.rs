@@ -1,6 +1,6 @@
 //! Tests for path safety utilities
 
-use flavite_fs::path::{has_non_normal_components, lexical_canonicalize};
+use flavite_fs::path::{has_non_normal_components, lexical_canonicalize, validate_vault_relative};
 use std::path::Path;
 
 #[test]
@@ -83,4 +83,22 @@ fn lexical_canonicalize_complex() {
 #[test]
 fn lexical_canonicalize_empty() {
     assert_eq!(lexical_canonicalize(Path::new("")), Path::new(""));
+}
+
+#[test]
+fn vault_relative_path_validation_rejects_portable_hazards() {
+    for hazardous in [
+        "CON",
+        "a:b",
+        "x~1.md",
+        "trailing.",
+        "trailing ",
+        "..",
+        "/absolute",
+    ] {
+        assert!(
+            validate_vault_relative(Path::new(hazardous)).is_err(),
+            "hazardous path was accepted: {hazardous:?}"
+        );
+    }
 }

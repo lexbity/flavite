@@ -138,6 +138,11 @@
       "kind": "normal"
     },
     {
+      "from": "flavite-api",
+      "to": "tracing",
+      "kind": "normal"
+    },
+    {
       "from": "flavite-buffer",
       "to": "blake3",
       "kind": "normal"

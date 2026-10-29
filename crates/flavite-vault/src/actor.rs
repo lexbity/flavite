@@ -116,6 +116,8 @@ pub enum VaultActorMsg {
     FsEvent(WatcherEvent),
     /// The owning window gained focus; verify disk state after throttling.
     Focus,
+    /// Increment the persisted autosave failure counter.
+    AutosaveFailure,
     /// Get the current version.
     GetVersion,
     /// Get vault identity.
@@ -228,6 +230,8 @@ pub struct VaultActorHandle {
     events: Receiver<VaultActorEvent>,
     buffer_patches: Receiver<ApplyBufferPatchRequest>,
     drift_found_total: Arc<std::sync::atomic::AtomicU64>,
+    autosave_failures_total: Arc<std::sync::atomic::AtomicU64>,
+    rename_items_skipped_total: Arc<std::sync::atomic::AtomicU64>,
     startup_ready: Receiver<()>,
 }
 
@@ -261,10 +265,27 @@ impl VaultActorHandle {
         self.try_send(VaultActorMsg::Focus)
     }
 
+    /// Record an autosave failure for persisted doctor diagnostics.
+    pub fn record_autosave_failure(&self) -> Result<(), VaultActorError> {
+        self.try_send(VaultActorMsg::AutosaveFailure)
+    }
+
     /// Number of indexed disk drifts found by reconciliation.
     #[must_use]
     pub fn drift_found_total(&self) -> u64 {
         self.drift_found_total.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative journal items skipped during rename execution.
+    #[must_use]
+    pub fn rename_items_skipped_total(&self) -> u64 {
+        self.rename_items_skipped_total.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative autosave failures persisted by the actor.
+    #[must_use]
+    pub fn autosave_failures_total(&self) -> u64 {
+        self.autosave_failures_total.load(Ordering::Relaxed)
     }
 
     /// Send a message and wait for a response.
@@ -538,10 +559,13 @@ pub struct VaultActor {
     /// Session-owned buffer patches required to complete committed journal items.
     buffer_patch_sender: Sender<ApplyBufferPatchRequest>,
     drift_found_total: Arc<std::sync::atomic::AtomicU64>,
+    autosave_failures_total: Arc<std::sync::atomic::AtomicU64>,
+    rename_items_skipped_total: Arc<std::sync::atomic::AtomicU64>,
     event_source: Option<EventSource>,
     pulse_sender: Option<Sender<Pulse>>,
     coalescer: EventCoalescer,
     watcher_enabled: bool,
+    watcher_connected: bool,
     initial_scan_complete: bool,
     verification_interval: std::time::Duration,
     recent_watcher_rename_pairs:
@@ -575,6 +599,43 @@ impl VaultActor {
         tracing::info!(drift_found_total = total, "reconcile drift found");
     }
 
+    fn persist_runtime_meta(&mut self) {
+        let watcher = if !self.watcher_enabled {
+            "disabled"
+        } else if self.watcher_connected {
+            "true"
+        } else {
+            "false"
+        };
+        let values = [
+            (
+                flavite_index::schema::MetaKey::WatcherConnected,
+                watcher.to_owned(),
+            ),
+            (
+                flavite_index::schema::MetaKey::DriftFoundTotal,
+                self.drift_found_total.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                flavite_index::schema::MetaKey::AutosaveFailuresTotal,
+                self.autosave_failures_total
+                    .load(Ordering::Relaxed)
+                    .to_string(),
+            ),
+            (
+                flavite_index::schema::MetaKey::RenameItemsSkippedTotal,
+                self.rename_items_skipped_total
+                    .load(Ordering::Relaxed)
+                    .to_string(),
+            ),
+        ];
+        for (key, value) in values {
+            if let Err(error) = self.index.set_runtime_meta(key, &value) {
+                tracing::warn!(key = key.as_str(), %error, "failed to persist runtime meta");
+            }
+        }
+    }
+
     /// Create a new VaultActor.
     pub fn new(fs: Box<dyn Fs + Send + Sync>, identity: VaultIdentity, index: IndexActor) -> Self {
         let fs: Arc<dyn Fs + Send + Sync> = Arc::from(fs);
@@ -591,10 +652,13 @@ impl VaultActor {
             event_sender: unbounded().0,
             buffer_patch_sender: bounded(1).0,
             drift_found_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            autosave_failures_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rename_items_skipped_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             event_source: None,
             pulse_sender: None,
             coalescer: EventCoalescer::with_defaults(),
             watcher_enabled: true,
+            watcher_connected: false,
             initial_scan_complete: false,
             verification_interval: std::time::Duration::from_secs(600),
             recent_watcher_rename_pairs: std::collections::HashSet::new(),
@@ -624,6 +688,8 @@ impl VaultActor {
         let (buffer_patch_sender, buffer_patch_receiver) = bounded(64);
         let (startup_ready_sender, startup_ready) = bounded(1);
         let drift_found_total = Arc::clone(&self.drift_found_total);
+        let autosave_failures_total = Arc::clone(&self.autosave_failures_total);
+        let rename_items_skipped_total = Arc::clone(&self.rename_items_skipped_total);
 
         self.msg_receiver = msg_receiver;
         self.resp_sender = resp_sender;
@@ -648,6 +714,8 @@ impl VaultActor {
             events: event_receiver,
             buffer_patches: buffer_patch_receiver,
             drift_found_total,
+            autosave_failures_total,
+            rename_items_skipped_total,
             startup_ready,
         })
     }
@@ -655,6 +723,28 @@ impl VaultActor {
     /// The main actor loop.
     fn run(&mut self, is_running: Arc<AtomicBool>) {
         is_running.store(true, Ordering::SeqCst);
+        for (key, counter) in [
+            (
+                flavite_index::schema::MetaKey::DriftFoundTotal,
+                &self.drift_found_total,
+            ),
+            (
+                flavite_index::schema::MetaKey::AutosaveFailuresTotal,
+                &self.autosave_failures_total,
+            ),
+            (
+                flavite_index::schema::MetaKey::RenameItemsSkippedTotal,
+                &self.rename_items_skipped_total,
+            ),
+        ] {
+            match flavite_index::schema::get_meta_u64(self.index.writer().conn(), key) {
+                Ok(Some(value)) => counter.store(value, Ordering::Relaxed),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(key = key.as_str(), %error, "failed to load runtime counter")
+                }
+            }
+        }
 
         let (jobs_tx, jobs_rx) = bounded::<Option<crate::reconcile_worker::ReconcileJob>>(1);
         let worker_jobs_rx = jobs_rx.clone();
@@ -703,6 +793,7 @@ impl VaultActor {
             self.watcher_lost(&reason);
             crossbeam::channel::never()
         } else if let Some(receiver) = self.event_source.take() {
+            self.watcher_connected = true;
             receiver
         } else if self.watcher_enabled && self.identity.root.is_dir() {
             match flavite_fs::watch::FsWatcher::with_defaults() {
@@ -714,7 +805,7 @@ impl VaultActor {
                         let std_receiver = watcher.start();
                         let (sender, receiver) = bounded(1024);
                         let bridge = sender.clone();
-                        thread::Builder::new()
+                        let bridge_result = thread::Builder::new()
                             .name("vault-watch-bridge".into())
                             .spawn(move || {
                                 loop {
@@ -744,10 +835,19 @@ impl VaultActor {
                                     };
                                     let _ = bridge.send(translated);
                                 }
-                            })
-                            .ok();
-                        fs_watcher = Some(watcher);
-                        receiver
+                            });
+                        match bridge_result {
+                            Ok(_) => {
+                                fs_watcher = Some(watcher);
+                                self.watcher_connected = true;
+                                receiver
+                            }
+                            Err(error) => {
+                                watcher.shutdown();
+                                self.watcher_lost(&error.to_string());
+                                crossbeam::channel::never()
+                            }
+                        }
                     }
                 }
                 Err(error) => {
@@ -756,8 +856,10 @@ impl VaultActor {
                 }
             }
         } else {
+            self.watcher_connected = false;
             crossbeam::channel::never()
         };
+        self.persist_runtime_meta();
         let watcher = VaultWatcher::new(&self.coalescer);
         self.perform_initial_scan();
         let timer = tick(std::time::Duration::from_millis(50));
@@ -884,6 +986,14 @@ impl VaultActor {
                 self.handle_fs_event(event);
             }
             VaultActorMsg::Focus => {}
+            VaultActorMsg::AutosaveFailure => {
+                let total = self
+                    .autosave_failures_total
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                tracing::warn!(autosave_failures_total = total, "autosave failure recorded");
+                self.persist_runtime_meta();
+            }
             VaultActorMsg::GetVersion => {
                 let version = Version::new(self.epoch, self.generation);
                 let _ = self.resp_sender.try_send(VaultActorResp::Version(version));
@@ -1222,6 +1332,7 @@ impl VaultActor {
                         tracing::warn!(%error, "could not persist current parser version after verification");
                     }
                 }
+                self.persist_runtime_meta();
                 self.publish_reconcile(summary, context.job.reply);
                 self.prune_save_watermarks();
             }
@@ -1508,9 +1619,11 @@ impl VaultActor {
     }
 
     fn watcher_lost(&mut self, reason: &str) {
+        self.watcher_connected = false;
         self.record_drift();
         tracing::warn!(%reason, "vault watcher unavailable; scheduling full verification");
         let _ = self.event_sender.send(VaultActorEvent::WatcherLost);
+        self.persist_runtime_meta();
         self.handle_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent, None);
     }
 
@@ -1815,7 +1928,8 @@ impl VaultActor {
             .strip_prefix(&self.identity.root)
             .map_err(|_| "destination escapes vault")?;
         let patch_sender = self.buffer_patch_sender.clone();
-        let txn = crate::journal::JournalExecutor::new(&*self.fs, &self.identity.root)
+        let mut skipped_items = 0u64;
+        let txn_result = crate::journal::JournalExecutor::new(&*self.fs, &self.identity.root)
             .rename_with_patches_and_buffers(
                 relative_from,
                 relative_to,
@@ -1854,12 +1968,29 @@ impl VaultActor {
                     patch_sender
                         .send_timeout(request, std::time::Duration::from_secs(10))
                         .map_err(|error| format!("buffer patch transport failed: {error}"))?;
-                    response
+                    let result = response
                         .recv_timeout(std::time::Duration::from_secs(10))
-                        .map_err(|error| format!("buffer patch reply failed: {error}"))??;
-                    Ok(())
+                        .map_err(|error| format!("buffer patch reply failed: {error}"))?;
+                    match result {
+                        Ok(_) => Ok(()),
+                        Err(error) => {
+                            if error == "conflicted"
+                                || error == "link-absent"
+                                || error.starts_with("StaleRevision")
+                            {
+                                skipped_items = skipped_items.saturating_add(1);
+                            }
+                            Err(error)
+                        }
+                    }
                 },
-            )?;
+            );
+        if skipped_items > 0 {
+            self.rename_items_skipped_total
+                .fetch_add(skipped_items, Ordering::Relaxed);
+            self.persist_runtime_meta();
+        }
+        let txn = txn_result?;
         // Reindex exact committed bytes before acknowledging the command.
         let mut changed = patches
             .iter()

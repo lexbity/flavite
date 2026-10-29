@@ -63,8 +63,8 @@ pub struct LinkSpan {
 pub enum LinkResolution {
     /// The target has one indexed note candidate.
     Resolved,
-    /// More than one indexed note candidate matches.
-    Ambiguous,
+    /// The resolver returned more than one indexed candidate.
+    MultipleCandidates,
     /// No indexed note candidate matches.
     #[default]
     Unresolved,
@@ -219,8 +219,11 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_link(&make_span("ideas", false), Some(LinkResolution::Ambiguous)),
-            LinkResolution::Ambiguous
+            resolve_link(
+                &make_span("ideas", false),
+                Some(LinkResolution::MultipleCandidates)
+            ),
+            LinkResolution::MultipleCandidates
         );
         assert_eq!(
             resolve_link(

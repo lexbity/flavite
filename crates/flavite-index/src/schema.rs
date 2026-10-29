@@ -53,6 +53,14 @@ pub enum MetaKey {
     LogFloor,
     /// Tantivy committed generation (advisory; search commit checkpoint is authority)
     TantivyCommittedGeneration,
+    /// Whether the watcher is connected, or `disabled` by configuration.
+    WatcherConnected,
+    /// Cumulative drift observations persisted at reconcile boundaries.
+    DriftFoundTotal,
+    /// Cumulative autosave failures reported by Session.
+    AutosaveFailuresTotal,
+    /// Cumulative rename journal items skipped by the actor.
+    RenameItemsSkippedTotal,
 }
 
 impl MetaKey {
@@ -66,6 +74,10 @@ impl MetaKey {
             Self::Generation => "generation",
             Self::LogFloor => "log_floor",
             Self::TantivyCommittedGeneration => "tantivy_committed_generation",
+            Self::WatcherConnected => "watcher_connected",
+            Self::DriftFoundTotal => "drift_found_total",
+            Self::AutosaveFailuresTotal => "autosave.failures_total",
+            Self::RenameItemsSkippedTotal => "rename.items_skipped_total",
         }
     }
 }
@@ -384,6 +396,18 @@ pub fn create_schema(conn: &mut Connection) -> Result<()> {
         "INSERT INTO meta (key, value) VALUES (?1, ?2)",
         params![MetaKey::TantivyCommittedGeneration.as_str(), "0"],
     )?;
+
+    for (key, value) in [
+        (MetaKey::WatcherConnected, "unknown"),
+        (MetaKey::DriftFoundTotal, "0"),
+        (MetaKey::AutosaveFailuresTotal, "0"),
+        (MetaKey::RenameItemsSkippedTotal, "0"),
+    ] {
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+            params![key.as_str(), value],
+        )?;
+    }
 
     tx.commit()?;
 

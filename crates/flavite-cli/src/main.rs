@@ -8,7 +8,7 @@
 //! imports is tracked separately (Phase 4 exit gate).
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use flavite_api::{
     ApiVaultRef, DoctorReport, ExecutionResult, Flavite, LocalResult, Origin, OsFs, VaultConfig,
     command::Invocation,
@@ -105,6 +105,19 @@ enum Commands {
         limit: usize,
     },
 
+    /// Rename a note through the durable vault rename transaction.
+    Rename {
+        /// Vault-relative source path.
+        from: PathBuf,
+
+        /// Vault-relative destination path.
+        to: PathBuf,
+
+        /// How inbound links are handled.
+        #[arg(long, value_enum, default_value_t = CliRenameStrategy::Rewrite)]
+        strategy: CliRenameStrategy,
+    },
+
     /// Show information about the vault.
     Info {
         /// Path to the vault (overrides global --vault).
@@ -121,6 +134,23 @@ enum Commands {
         #[arg(short, long, value_name = "PATH")]
         path: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliRenameStrategy {
+    Rewrite,
+    Alias,
+    None,
+}
+
+impl CliRenameStrategy {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rewrite => "rewrite",
+            Self::Alias => "alias",
+            Self::None => "none",
+        }
+    }
 }
 
 /// CLI driver that uses flavite-api for all operations.
@@ -330,13 +360,55 @@ impl CliDriver {
             .flavite
             .as_ref()
             .context("search requires an opened vault")?;
-        let result = flavite.query_with_limit(&flavite_api::Query::Text(term.to_owned()), limit)?;
+        let query = flavite_api::Query::parse(term).map_err(anyhow::Error::msg)?;
+        let result = flavite.query_with_limit(&query, limit)?;
         if self.json {
             println!("{}", serde_json::to_string(&result.notes)?);
         } else {
             for note in &result.notes {
                 println!("{}\t{}", note.path, note.title);
             }
+        }
+        Ok(())
+    }
+
+    fn run_rename(&self, from: PathBuf, to: PathBuf, strategy: CliRenameStrategy) -> Result<()> {
+        let flavite = self
+            .flavite
+            .as_ref()
+            .context("rename requires an opened vault")?;
+        let request_id = flavite.command_registry().next_request_id();
+        let result = flavite.execute(Invocation::new(
+            request_id,
+            "note.rename",
+            serde_json::json!({
+                "from": from,
+                "to": to,
+                "strategy": strategy.as_str(),
+            }),
+            Origin::Cli,
+        ));
+        let result = match result {
+            ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
+            result => result,
+        };
+        anyhow::ensure!(
+            result.is_success(),
+            "rename did not complete successfully: {result:?}"
+        );
+        if self.json {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "strategy": strategy.as_str(),
+                    "result": result,
+                }))?
+            );
+        } else {
+            println!(
+                "Rename completed with {} strategy: {result:?}",
+                strategy.as_str()
+            );
         }
         Ok(())
     }
@@ -360,6 +432,8 @@ impl CliDriver {
                     "generation": info.generation, "tantivy_generation": info.tantivy_generation,
                     "watcher": if info.watcher_enabled { "enabled" } else { "disabled" },
                     "drift_found_total": info.drift_found_total,
+                    "autosave.failures_total": info.autosave_failures_total,
+                    "rename.items_skipped_total": info.rename_items_skipped_total,
                 }))?
             );
         } else {
@@ -379,6 +453,8 @@ impl CliDriver {
                 }
             );
             println!("Drift found: {}", info.drift_found_total);
+            println!("Autosave failures: {}", info.autosave_failures_total);
+            println!("Rename items skipped: {}", info.rename_items_skipped_total);
         }
 
         Ok(())
@@ -457,11 +533,14 @@ fn init_tracing(verbose: bool) {
         let _ = fs::create_dir_all(&dir);
         dir.join("flavite.log")
     });
-    if let Some(path) = &log_path {
-        let crash_path = path.parent().unwrap().join("crash-report.txt");
-        let log_for_hook = path.clone();
-        std::panic::set_hook(Box::new(move |info| {
-            let tail = fs::read_to_string(&log_for_hook).unwrap_or_default();
+    let prior_hook = std::panic::take_hook();
+    let hook_log_path = log_path.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(path) = &hook_log_path
+            && let Some(parent) = path.parent()
+        {
+            let crash_path = parent.join("crash-report.txt");
+            let tail = fs::read_to_string(path).unwrap_or_default();
             let last = tail
                 .lines()
                 .rev()
@@ -472,9 +551,10 @@ fn init_tracing(verbose: bool) {
                 .collect::<Vec<_>>()
                 .join("\n");
             let report = format!("Flavite crash report\n{info}\n\nLast log lines:\n{last}\n");
-            let _ = fs::write(&crash_path, report);
-        }));
-    }
+            let _ = fs::write(crash_path, report);
+        }
+        prior_hook(info);
+    }));
     let writer = log_path.map_or_else(
         || RotatingLogWriter {
             path: std::env::temp_dir().join("flavite.log"),
@@ -535,6 +615,11 @@ fn main() -> Result<()> {
             let vault_path = get_vault_path(path, cli.vault);
             driver.open_vault(vault_path.clone(), cli.no_watch)?;
             driver.run_search(&vault_path, &term, limit)?;
+        }
+        Commands::Rename { from, to, strategy } => {
+            let vault_path = get_vault_path(None, cli.vault);
+            driver.open_vault(vault_path, cli.no_watch)?;
+            driver.run_rename(from, to, strategy)?;
         }
         Commands::Info { path } => {
             let vault_path = get_vault_path(path, cli.vault);

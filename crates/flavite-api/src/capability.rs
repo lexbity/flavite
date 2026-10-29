@@ -1,6 +1,6 @@
 //! Capability declarations (D16).
 //!
-//! Capabilities are declared now even though nothing enforces them yet.
+//! Dispatch checks each invocation's grants against its registered capability.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;

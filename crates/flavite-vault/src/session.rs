@@ -587,6 +587,9 @@ impl Session {
     fn record_autosave_failure(&self, path: &Path, result: &SessionResult) {
         self.autosave_failures_total.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(path = %path.display(), result = ?result, "autosave failed");
+        if let Err(error) = self.actor.record_autosave_failure() {
+            tracing::error!(path = %path.display(), %error, "failed to persist autosave counter");
+        }
     }
 
     fn pump_external_changes_inner(&self) {
@@ -2152,7 +2155,15 @@ impl Session {
     /// Return the number of autosave attempts that failed.
     #[must_use]
     pub fn autosave_failures_total(&self) -> u64 {
-        self.autosave_failures_total.load(Ordering::Relaxed)
+        self.autosave_failures_total
+            .load(Ordering::Relaxed)
+            .max(self.actor.autosave_failures_total())
+    }
+
+    /// Cumulative rename items skipped by the journal executor.
+    #[must_use]
+    pub fn rename_items_skipped_total(&self) -> u64 {
+        self.actor.rename_items_skipped_total()
     }
 }
 
@@ -2942,6 +2953,59 @@ mod tests {
             session.notice.try_recv(),
             Ok(crate::channels::Notice::LinksBroken { count: 1, .. })
         ));
+    }
+
+    #[test]
+    fn skipped_rename_patch_increments_persisted_counter() {
+        let (session, fs, temp) = test_session();
+        let source = PathBuf::from("/test/vault/links.md");
+        fs.write_new(&source, b"See [[note]]").unwrap();
+        session
+            .actor
+            .submit_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let (buffer_id, revision) = match session.execute(SessionCommand::OpenNote {
+            path: source.clone(),
+        }) {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            }) => (buffer_id, revision),
+            result => panic!("expected inbound note to open: {result:?}"),
+        };
+        assert!(matches!(
+            session.execute(SessionCommand::ApplyEdits {
+                buffer_id,
+                revision,
+                ops: vec![flavite_buffer::undo::EditOp::new(
+                    Span::new(TextByte(0), TextByte("See [[note]]".len())),
+                    "No link".into(),
+                )],
+            }),
+            SessionResult::Success(CommandResult::EditsApplied { .. })
+        ));
+        let rename = session.execute(SessionCommand::RenameNote {
+            from: PathBuf::from("/test/vault/note.md"),
+            to: PathBuf::from("/test/vault/renamed.md"),
+            strategy: Some(RenameStrategy::Rewrite),
+        });
+        let result = match rename {
+            SessionResult::Pending { request_id } => session.wait_for_operation(request_id),
+            result => result,
+        };
+        assert!(matches!(result, SessionResult::Error { .. }));
+        assert_eq!(session.rename_items_skipped_total(), 1);
+        let conn = flavite_index::open_or_init(&temp.path().join("index.sqlite3")).unwrap();
+        let persisted: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='rename.items_skipped_total'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, "1");
     }
 
     #[test]

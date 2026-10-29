@@ -411,6 +411,18 @@ impl IndexActor {
         Ok(())
     }
 
+    /// Persist actor-owned runtime counters and connectivity state.
+    ///
+    /// # Errors
+    /// Returns the SQLite error when the meta row cannot be written.
+    pub fn set_runtime_meta(
+        &mut self,
+        key: crate::schema::MetaKey,
+        value: &str,
+    ) -> Result<(), String> {
+        crate::schema::set_meta(self.writer.conn(), key, value).map_err(|error| error.to_string())
+    }
+
     /// Get the writer connection.
     pub fn writer(&self) -> &Writer {
         &self.writer
@@ -1456,13 +1468,20 @@ impl IndexActor {
                         filters.push(part.clone());
                     }
                 }
-                (text.join(" "), Some(Query::And(filters)))
+                (
+                    text.join(" "),
+                    (!filters.is_empty()).then_some(Query::And(filters)),
+                )
             }
-            _ => return Err("query does not contain a text clause".into()),
+            structural => (String::new(), Some(structural.clone())),
         };
         if text.trim().is_empty() {
-            return Err("text query must contain at least one searchable token".into());
+            let Some(structural) = structural else {
+                return Err("text query must contain at least one searchable token".into());
+            };
+            return self.search_structural_only(&structural, limit);
         }
+        let has_structural = structural.is_some();
         let structural_ids = if let Some(structural) = structural {
             if matches!(&structural, Query::And(parts) if parts.is_empty()) {
                 Vec::new()
@@ -1482,7 +1501,6 @@ impl IndexActor {
         } else {
             Vec::new()
         };
-        let has_structural = matches!(query, Query::And(_));
         if has_structural && structural_ids.is_empty() {
             // Even an empty hybrid result is still a search operation: preserve
             // D12's commit-before-search ordering for every admitted query.
@@ -1516,30 +1534,62 @@ impl IndexActor {
         }
         hits.truncate(limit.saturating_add(1));
         hits.truncate(limit);
-        let conn = self
-            .read_pool
-            .get(Some(Duration::from_secs(2)))
-            .map_err(|e| e.to_string())?;
-        let mut rows = Vec::new();
-        for id in hits {
-            if let Some(row) = conn
-                .query_row(
-                    "SELECT note_id,path,title FROM notes WHERE note_id=?1",
-                    [id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?
-            {
-                rows.push(row);
-            }
-        }
+        let rows = self.search_note_rows(hits)?;
         let (epoch, generation) = self.version()?;
         Ok(SearchPage {
             epoch,
             generation,
             items: rows,
         })
+    }
+
+    fn search_structural_only(
+        &self,
+        query: &crate::query::Query,
+        limit: usize,
+    ) -> Result<SearchPage, String> {
+        let conn = self
+            .read_pool
+            .get(Some(Duration::from_secs(2)))
+            .map_err(|error| error.to_string())?;
+        let page = query
+            .execute(&conn, limit.saturating_add(1), None)
+            .map_err(|error| error.to_string())?;
+        drop(conn);
+        let note_ids = page
+            .items
+            .into_iter()
+            .take(limit)
+            .map(|note| note.note_id)
+            .collect();
+        let rows = self.search_note_rows(note_ids)?;
+        Ok(SearchPage {
+            epoch: page.epoch,
+            generation: page.generation,
+            items: rows,
+        })
+    }
+
+    fn search_note_rows(&self, note_ids: Vec<i64>) -> Result<Vec<(i64, String, String)>, String> {
+        let conn = self
+            .read_pool
+            .get(Some(Duration::from_secs(2)))
+            .map_err(|error| error.to_string())?;
+        let mut rows = Vec::with_capacity(note_ids.len());
+        for note_id in note_ids {
+            if let Some(row) = conn
+                .query_row(
+                    "SELECT note_id,path,title FROM notes WHERE note_id=?1",
+                    [note_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+            {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
     }
 
     /// Current structural index version.

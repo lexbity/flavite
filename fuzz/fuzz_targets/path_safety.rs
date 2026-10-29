@@ -13,9 +13,21 @@ use std::path::Path;
 use libfuzzer_sys::fuzz_target;
 
 // Import from flavite-fs
-use flavite_fs::{has_non_normal_components, path::lexical_canonicalize};
+use flavite_fs::{
+    has_non_normal_components,
+    path::{lexical_canonicalize, validate_vault_relative},
+};
 
 fuzz_target!(|data: &[u8]| {
+    // These cross-platform Windows and traversal spellings are invalid even
+    // when fuzzing on a host whose native Path parser treats them as relative.
+    for hazardous in ["CON", "a:b", "x~1.md", "trailing.", "trailing ", "..", "/absolute"] {
+        assert!(
+            validate_vault_relative(Path::new(hazardous)).is_err(),
+            "hazardous vault path was accepted: {hazardous:?}"
+        );
+    }
+
     // Try to interpret the data as a UTF-8 path string
     if let Ok(path_str) = std::str::from_utf8(data) {
         let path = Path::new(path_str);

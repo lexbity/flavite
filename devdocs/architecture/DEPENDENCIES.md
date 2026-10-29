@@ -33,6 +33,7 @@ Normal/build:
 - `flavite-syntax` (normal)
 - `flavite-vault` (normal)
 - `rusqlite` (normal)
+- `tracing` (normal)
 
 ### `flavite-buffer`
 
@@ -153,7 +154,7 @@ Normal/build:
 - `rusqlite` ← flavite-api, flavite-graph, flavite-index, xtask
 - `similar` ← flavite-vault
 - `tantivy` ← flavite-index, xtask
-- `tracing` ← flavite-cli, flavite-index, flavite-vault
+- `tracing` ← flavite-api, flavite-cli, flavite-index, flavite-vault
 - `tree-sitter` ← flavite-syntax
 - `zstd` ← flavite-vault
 

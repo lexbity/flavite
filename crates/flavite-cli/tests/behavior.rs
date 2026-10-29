@@ -105,6 +105,31 @@ fn init_open_info_query_and_external_rename_are_real() {
             .iter()
             .any(|check| check["name"] == "attachments")
     );
+    let counters = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "runtime_counters")
+        .unwrap();
+    assert!(
+        counters["details"]
+            .as_str()
+            .unwrap()
+            .contains("autosave.failures_total=")
+    );
+    assert!(
+        counters["details"]
+            .as_str()
+            .unwrap()
+            .contains("rename.items_skipped_total=")
+    );
+    assert!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["name"] == "watcher_health")
+    );
 }
 
 #[test]
@@ -119,4 +144,131 @@ fn query_rejects_unsupported_expression_instead_of_searching_literal_text() {
     ]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported query syntax"));
+}
+
+#[test]
+fn rename_via_cli_rewrites_links_and_reports_strategy() {
+    let env = CliEnv::new();
+    let vault = tempfile::tempdir().unwrap();
+    let init = env.run(&["init", "--path", vault.path().to_str().unwrap()]);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    std::fs::write(vault.path().join("A.md"), "# A\n").unwrap();
+    std::fs::write(vault.path().join("Links.md"), "See [[A]]\n").unwrap();
+
+    let output = env.run(&[
+        "rename",
+        "--vault",
+        vault.path().to_str().unwrap(),
+        "A.md",
+        "B.md",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("rewrite"));
+    assert!(!vault.path().join("A.md").exists());
+    assert_eq!(std::fs::read(vault.path().join("B.md")).unwrap(), b"# A\n");
+    assert_eq!(
+        std::fs::read(vault.path().join("Links.md")).unwrap(),
+        b"See [[B]]\n"
+    );
+}
+
+#[test]
+fn alias_strategy_and_typed_search_are_reachable_from_cli() {
+    let env = CliEnv::new();
+    let vault = tempfile::tempdir().unwrap();
+    let init = env.run(&["init", "--path", vault.path().to_str().unwrap()]);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    std::fs::write(vault.path().join("A.md"), "---\ntags: [x]\n---\n# A\n").unwrap();
+    std::fs::write(vault.path().join("Links.md"), "See [[A]]\n").unwrap();
+
+    let alias = env.run(&[
+        "rename",
+        "--vault",
+        vault.path().to_str().unwrap(),
+        "A.md",
+        "B.md",
+        "--strategy",
+        "alias",
+    ]);
+    assert!(
+        alias.status.success(),
+        "{}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    let renamed = std::fs::read_to_string(vault.path().join("B.md")).unwrap();
+    assert!(renamed.contains("aliases: \"A\""), "{renamed:?}");
+    assert_eq!(
+        std::fs::read(vault.path().join("Links.md")).unwrap(),
+        b"See [[A]]\n"
+    );
+
+    let search = env.run(&["search", "--vault", vault.path().to_str().unwrap(), "tag:x"]);
+    assert!(
+        search.status.success(),
+        "{}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    assert!(String::from_utf8_lossy(&search.stdout).contains("B.md"));
+    let invalid = env.run(&[
+        "search",
+        "--vault",
+        vault.path().to_str().unwrap(),
+        "bogus:x",
+    ]);
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("unsupported query syntax"));
+}
+
+#[test]
+fn json_stdout_is_one_value_and_json_events_use_stderr() {
+    let env = CliEnv::new();
+    let vault = tempfile::tempdir().unwrap();
+    let init = env.run(&["init", "--path", vault.path().to_str().unwrap()]);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    std::fs::write(vault.path().join("A.md"), "# A\n").unwrap();
+    std::fs::write(vault.path().join("Links.md"), "See [[A]]\n").unwrap();
+
+    let output = env.run(&[
+        "--json",
+        "rename",
+        "--vault",
+        vault.path().to_str().unwrap(),
+        "A.md",
+        "B.md",
+        "--strategy",
+        "none",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["strategy"], "none");
+    let event_lines = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        event_lines
+            .iter()
+            .any(|event| event["type"] == "links_broken")
+    );
 }

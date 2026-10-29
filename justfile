@@ -33,6 +33,36 @@ arch-gen:
 reconcile-bench:
     cargo bench -p flavite-vault --bench reconcile_concurrency
 
+# Architecture debt gates from RFC-0002 §7; zero matches are required.
+lint-arch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    check_absent() {
+        local pattern="$1"
+        shift
+        local status=0
+        rg -n --no-messages "$pattern" "$@" || status=$?
+        if [ "$status" -eq 0 ]; then
+            echo "lint-arch: forbidden match for $pattern" >&2
+            exit 1
+        elif [ "$status" -ne 1 ]; then
+            echo "lint-arch: search failed for $pattern (status $status)" >&2
+            exit "$status"
+        fi
+    }
+    check_absent 'fn apply_attachment\b' crates
+    check_absent 'open_buffers' crates/flavite-vault/src/session.rs
+    check_absent 'not yet implemented' crates/flavite-vault/src/rename
+    check_absent 'JournalRecovery\b' crates
+    check_absent 'normalize_target_key' crates
+    check_absent 'DirectoryMoveNotSupported' crates/flavite-vault/src/actor.rs
+    check_absent 'Ambiguous' crates/flavite-editor/src/links.rs
+    check_absent 'drift_found_total=' crates/flavite-api/src/doctor.rs
+    check_absent '\[\.\.?[^]]*1024\]' crates/flavite-index/src
+    check_absent 'nothing enforces' crates/flavite-api/src/capability.rs
+    check_absent 'expected_identities' crates
+    echo "lint-arch passed (RFC-0002 debt gates)."
+
 # S3 watcher-truth probe (PLAN-C C1, §9 S3-1): per-OS watcher evidence with a
 # D5 nomination-property self-check. CI runs scenarios 1–3 on Linux headless.
 spike-s3 *args:
@@ -61,7 +91,7 @@ spike-s4-db *args:
     cargo run -p xtask --bin s4_db_probe -- {{args}}
 
 # G0 — local fast gate (§10.3): fmt + clippy + test + arch check. ≤ 5 min budget.
-gate: fmt clippy test fault-tests arch-check
+gate: fmt clippy test fault-tests lint-arch arch-check
     @just gc
     @echo "G0 passed (fmt + clippy + test + arch check)."
 

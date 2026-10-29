@@ -31,6 +31,7 @@ hex = "0.4"
 
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
+tracing = { workspace = true }
 directories = "6"
 rusqlite = { workspace = true, features = ["bundled"] }
 unicode-normalization = "0.1"
