@@ -290,8 +290,10 @@ pub struct Session {
     autosave_idle_interval: Duration,
     /// Buffer manager.
     buffer_manager: Arc<Mutex<BufferManager>>,
-    /// Open buffers by path.
-    open_buffers: Arc<Mutex<HashMap<PathBuf, BufferId>>>,
+    /// Autosave failures observed by the host pump.
+    autosave_failures_total: AtomicU64,
+    /// Save requests admitted by autosave, so asynchronous failures are counted too.
+    autosave_requests: Mutex<HashSet<u64>>,
     /// Paths that were absent when opened; creation uses an absent-file guard.
     absent_on_open: Arc<Mutex<HashSet<PathBuf>>>,
     /// Dirty-buffer recovery checkpoints. The host schedules `recovery_tick`
@@ -390,7 +392,8 @@ impl Session {
             autosave_attempted: Mutex::new(HashMap::new()),
             autosave_idle_interval: config.autosave_idle_interval,
             buffer_manager: manager,
-            open_buffers: Arc::new(Mutex::new(HashMap::new())),
+            autosave_failures_total: AtomicU64::new(0),
+            autosave_requests: Mutex::new(HashSet::new()),
             absent_on_open: Arc::new(Mutex::new(HashSet::new())),
             recovery_writer,
             recovery_worker,
@@ -501,8 +504,20 @@ impl Session {
                 .lock()
                 .unwrap()
                 .insert(path.clone(), revision);
-            let _ = self.save_note(path);
+            let result = self.save_note(path.clone());
+            match result {
+                SessionResult::Pending { request_id } => {
+                    self.autosave_requests.lock().unwrap().insert(request_id);
+                }
+                SessionResult::Success(_) => {}
+                failure => self.record_autosave_failure(&path, &failure),
+            }
         }
+    }
+
+    fn record_autosave_failure(&self, path: &Path, result: &SessionResult) {
+        self.autosave_failures_total.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(path = %path.display(), result = ?result, "autosave failed");
     }
 
     fn pump_external_changes_inner(&self) {
@@ -552,6 +567,25 @@ impl Session {
                 crate::actor::VaultActorEvent::Renamed { from, to, .. } => {
                     let mut manager = self.buffer_manager.lock().unwrap();
                     if manager.rename_buffer(&from, to.clone()) {
+                        drop(manager);
+                        {
+                            let mut last_edit = self.last_edit.lock().unwrap();
+                            if let Some(edit_time) = last_edit.remove(&from) {
+                                last_edit.insert(to.clone(), edit_time);
+                            }
+                        }
+                        {
+                            let mut attempted = self.autosave_attempted.lock().unwrap();
+                            if let Some(revision) = attempted.remove(&from) {
+                                attempted.insert(to.clone(), revision);
+                            }
+                        }
+                        {
+                            let mut absent = self.absent_on_open.lock().unwrap();
+                            if absent.remove(&from) {
+                                absent.insert(to.clone());
+                            }
+                        }
                         let _ = self.pulse.send(crate::channels::Pulse::Invalidate {
                             note: flavite_buffer::manager::NoteRef::new(to),
                         });
@@ -760,6 +794,15 @@ impl Session {
 
         for (buffer_id, flight, response) in ready {
             let operation_result = self.finish_save(&flight.request, &response);
+            if self
+                .autosave_requests
+                .lock()
+                .unwrap()
+                .remove(&flight.request.request_id)
+                && !matches!(&operation_result, SessionResult::Success(_))
+            {
+                self.record_autosave_failure(&flight.request.path, &operation_result);
+            }
             self.completions
                 .lock()
                 .unwrap()
@@ -1008,16 +1051,12 @@ impl Session {
     fn open_note(&self, path: PathBuf) -> SessionResult {
         // Check if already open
         {
-            let open_buffers = self.open_buffers.lock().unwrap();
-            if open_buffers.contains_key(&path) {
-                let buffer_id = *open_buffers.get(&path).unwrap();
-                let buffer_manager = self.buffer_manager.lock().unwrap();
-                if let Some(buffer) = buffer_manager.get_buffer_by_id(buffer_id) {
-                    return SessionResult::Success(CommandResult::NoteOpened {
-                        buffer_id,
-                        revision: buffer.revision(),
-                    });
-                }
+            let buffer_manager = self.buffer_manager.lock().unwrap();
+            if let Some(buffer) = buffer_manager.get_buffer(&path) {
+                return SessionResult::Success(CommandResult::NoteOpened {
+                    buffer_id: buffer.buffer_id(),
+                    revision: buffer.revision(),
+                });
             }
         }
 
@@ -1050,11 +1089,6 @@ impl Session {
             }
         }
 
-        // Track the open buffer
-        {
-            let mut open_buffers = self.open_buffers.lock().unwrap();
-            open_buffers.insert(path.clone(), buffer_id);
-        }
         if absent {
             self.absent_on_open.lock().unwrap().insert(path.clone());
         }
@@ -1069,8 +1103,11 @@ impl Session {
     fn close_note(&self, path: PathBuf) -> SessionResult {
         // Get buffer ID
         let buffer_id = {
-            let open_buffers = self.open_buffers.lock().unwrap();
-            open_buffers.get(&path).copied()
+            self.buffer_manager
+                .lock()
+                .unwrap()
+                .get_buffer(&path)
+                .map(|buffer| buffer.buffer_id())
         };
 
         if let Some(_buffer_id) = buffer_id {
@@ -1101,11 +1138,6 @@ impl Session {
             let mut buffer_manager = self.buffer_manager.lock().unwrap();
             buffer_manager.close_note(&path);
 
-            // Remove from open buffers
-            {
-                let mut open_buffers = self.open_buffers.lock().unwrap();
-                open_buffers.remove(&path);
-            }
             self.absent_on_open.lock().unwrap().remove(&path);
 
             SessionResult::Success(CommandResult::NoteClosed)
@@ -1158,8 +1190,11 @@ impl Session {
     /// Save a note.
     fn save_note(&self, path: PathBuf) -> SessionResult {
         let buffer_id = {
-            let open_buffers = self.open_buffers.lock().unwrap();
-            open_buffers.get(&path).copied()
+            self.buffer_manager
+                .lock()
+                .unwrap()
+                .get_buffer(&path)
+                .map(|buffer| buffer.buffer_id())
         };
         let Some(buffer_id) = buffer_id else {
             return SessionResult::Error {
@@ -1289,13 +1324,13 @@ impl Session {
         } else {
             self.identity.root.join(to)
         };
+        if self.buffer_manager.lock().unwrap().has_buffer(&to) {
+            return SessionResult::Error {
+                message: format!("destination-open: {}", to.display()),
+            };
+        }
         let protected_paths = {
             let manager = self.buffer_manager.lock().unwrap();
-            if let Some(buffer) = manager.get_buffer(&from)
-                && buffer.is_dirty()
-            {
-                return SessionResult::Conflict { path: from };
-            }
             manager
                 .open_notes()
                 .into_iter()
@@ -1847,15 +1882,26 @@ impl Session {
     /// Check if a buffer is open for a path.
     #[must_use]
     pub fn is_open(&self, path: &Path) -> bool {
-        let open_buffers = self.open_buffers.lock().unwrap();
-        open_buffers.contains_key(path)
+        self.buffer_manager
+            .lock()
+            .unwrap()
+            .has_buffer(&path.to_path_buf())
     }
 
     /// Get the buffer ID for an open path.
     #[must_use]
     pub fn get_buffer_id(&self, path: &Path) -> Option<BufferId> {
-        let open_buffers = self.open_buffers.lock().unwrap();
-        open_buffers.get(path).copied()
+        self.buffer_manager
+            .lock()
+            .unwrap()
+            .get_buffer(&path.to_path_buf())
+            .map(|buffer| buffer.buffer_id())
+    }
+
+    /// Return the number of autosave attempts that failed.
+    #[must_use]
+    pub fn autosave_failures_total(&self) -> u64 {
+        self.autosave_failures_total.load(Ordering::Relaxed)
     }
 }
 
@@ -2454,6 +2500,139 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         panic!("idle dirty revision was not autosaved by the Session clock pump");
+    }
+
+    fn rename_to_terminal(session: &Session, from: PathBuf, to: PathBuf) -> SessionResult {
+        match session.execute(SessionCommand::RenameNote { from, to }) {
+            SessionResult::Pending { request_id } => session.wait_for_operation(request_id),
+            result => result,
+        }
+    }
+
+    fn edit_append(session: &Session, buffer_id: BufferId, revision: Revision, suffix: &str) {
+        assert!(matches!(
+            session.execute(SessionCommand::ApplyEdits {
+                buffer_id,
+                revision,
+                ops: vec![EditOp::new(
+                    Span::new(TextByte(5), TextByte(5)),
+                    suffix.into()
+                )],
+            }),
+            SessionResult::Success(CommandResult::EditsApplied { .. })
+        ));
+    }
+
+    #[test]
+    fn renamed_open_note_remains_savable() {
+        let (session, fs, _temp) = test_session();
+        let from = PathBuf::from("/test/vault/note.md");
+        let to = PathBuf::from("/test/vault/renamed.md");
+        let (buffer_id, revision) =
+            match session.execute(SessionCommand::OpenNote { path: from.clone() }) {
+                SessionResult::Success(CommandResult::NoteOpened {
+                    buffer_id,
+                    revision,
+                }) => (buffer_id, revision),
+                other => panic!("expected open, got {other:?}"),
+            };
+        edit_append(&session, buffer_id, revision, "!");
+
+        assert!(matches!(
+            rename_to_terminal(&session, from.clone(), to.clone()),
+            SessionResult::Success(CommandResult::NoteRenamed { .. })
+        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && !session.is_open(&to) {
+            session.pump();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(session.is_open(&to));
+        assert_eq!(session.get_buffer_id(&to), Some(buffer_id));
+        let save_result = save_to_terminal(&session, to.clone());
+        assert!(
+            matches!(&save_result, SessionResult::Success(CommandResult::NoteSaved { path, .. }) if *path == to),
+            "renamed note save failed: {save_result:?}"
+        );
+        assert_eq!(
+            fs.read_if_exists(&to).unwrap().as_deref(),
+            Some(&b"hello!"[..])
+        );
+    }
+
+    #[test]
+    fn renamed_open_note_autosaves_after_idle_tick() {
+        let (mut session, fs, _temp) = test_session();
+        let from = PathBuf::from("/test/vault/note.md");
+        let to = PathBuf::from("/test/vault/autosaved.md");
+        session.autosave_idle_interval = Duration::from_millis(5);
+        let (buffer_id, revision) =
+            match session.execute(SessionCommand::OpenNote { path: from.clone() }) {
+                SessionResult::Success(CommandResult::NoteOpened {
+                    buffer_id,
+                    revision,
+                }) => (buffer_id, revision),
+                other => panic!("expected open, got {other:?}"),
+            };
+        edit_append(&session, buffer_id, revision, "!");
+        assert!(matches!(
+            rename_to_terminal(&session, from, to.clone()),
+            SessionResult::Success(CommandResult::NoteRenamed { .. })
+        ));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            session.pump();
+            if fs.read_if_exists(&to).unwrap().as_deref() == Some(&b"hello!"[..]) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("renamed open note was not autosaved under its new path");
+    }
+
+    #[test]
+    fn autosave_failure_is_counted() {
+        let (mut session, fs, _temp) = test_session();
+        session.autosave_idle_interval = Duration::ZERO;
+        let path = PathBuf::from("/test/vault/note.md");
+        let (buffer_id, revision) =
+            match session.execute(SessionCommand::OpenNote { path: path.clone() }) {
+                SessionResult::Success(CommandResult::NoteOpened {
+                    buffer_id,
+                    revision,
+                }) => (buffer_id, revision),
+                other => panic!("expected open, got {other:?}"),
+            };
+        edit_append(&session, buffer_id, revision, "!");
+        let external = PathBuf::from("/test/vault/.external-save.md");
+        fs.write_new(&external, b"external bytes").unwrap();
+        fs.rename_replace(&external, &path).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && session.autosave_failures_total() == 0 {
+            session.pump();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(session.autosave_failures_total(), 1);
+    }
+
+    #[test]
+    fn rename_onto_open_destination_is_refused_preflight() {
+        let (session, _fs, _temp) = test_session();
+        let from = PathBuf::from("/test/vault/note.md");
+        let to = PathBuf::from("/test/vault/destination.md");
+        assert!(matches!(
+            session.execute(SessionCommand::OpenNote { path: to.clone() }),
+            SessionResult::Success(CommandResult::NoteOpened { .. })
+        ));
+
+        let result = session.execute(SessionCommand::RenameNote { from, to });
+
+        assert!(
+            matches!(result, SessionResult::Error { message } if message.starts_with("destination-open:"))
+        );
     }
 
     #[test]

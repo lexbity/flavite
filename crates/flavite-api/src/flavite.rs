@@ -1059,6 +1059,7 @@ impl Flavite {
                 .as_ref()
                 .is_some_and(Vault::watcher_enabled),
             drift_found_total: self.drift_found_total(),
+            autosave_failures_total: self.session.autosave_failures_total(),
         })
     }
 
@@ -1250,6 +1251,8 @@ pub struct VaultInfo {
     pub watcher_enabled: bool,
     /// Cumulative drift count observed by reconciliation.
     pub drift_found_total: u64,
+    /// Cumulative autosave failures observed by the Session host pump.
+    pub autosave_failures_total: u64,
 }
 
 #[cfg(test)]

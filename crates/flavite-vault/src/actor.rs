@@ -1090,12 +1090,16 @@ impl VaultActor {
             .collect::<std::collections::HashSet<_>>();
         changed.insert(from.clone());
         changed.insert(to.clone());
-        let _ = self.scan_paths(&changed);
+        // Re-key an open Session buffer before the scan reports the old path
+        // as deleted. Both observations are lossless and ordered on the
+        // Session event channel; emitting the rename first prevents its own
+        // follow-up removal from orphaning the renamed buffer.
         let _ = self.event_sender.send(VaultActorEvent::Renamed {
             from: from.clone(),
             to: to.clone(),
             tier: RenameTier::T0,
         });
+        let _ = self.scan_paths(&changed);
         Ok(txn)
     }
 
