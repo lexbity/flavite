@@ -1,15 +1,37 @@
 //! Durable roll-forward executor for single-file D9 renames.
 
 use crate::journal::manifest::{
-    JournalManifest, TransactionItem, TransactionItemState, TransactionPhase, TransactionState,
+    JournalManifest, TransactionItem, TransactionItemKind, TransactionItemState, TransactionPhase,
+    TransactionState,
 };
 use flavite_fs::Fs;
 use std::path::{Component, Path, PathBuf};
+use tracing::warn;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
-    pub recovered: Vec<String>,
+    /// Transactions rolled forward during this recovery pass.
+    pub rolled_forward: Vec<String>,
+    /// Transactions already terminal when recovery began.
+    pub done: Vec<String>,
+    /// Divergent transactions preserved for user action.
     pub skipped: Vec<(String, String)>,
+    /// Invalid manifests moved to quarantine.
+    pub quarantined: Vec<String>,
+}
+
+impl RecoveryReport {
+    /// Codes to surface through the Session's ackable notice channel.
+    pub fn notice_codes(&self) -> Vec<&'static str> {
+        let mut codes = Vec::new();
+        if !self.skipped.is_empty() {
+            codes.push("rename-diverged");
+        }
+        if !self.quarantined.is_empty() {
+            codes.push("journal-quarantined");
+        }
+        codes
+    }
 }
 
 /// A byte-preserving replacement planned from an indexed link span set.
@@ -66,8 +88,10 @@ impl<'a> JournalExecutor<'a> {
         self.fs.create_dir_all(&data_dir).map_err(display)?;
         let mut manifest = JournalManifest::new(txn_id.clone(), 1);
         manifest.state = TransactionState::Preparing;
+        manifest.native_paths = vec![from.clone(), to.clone()];
         manifest.items.push(TransactionItem {
             id: 1,
+            kind: TransactionItemKind::Rename,
             from_path: from.strip_prefix(&self.root).unwrap().to_path_buf(),
             to_path: to.strip_prefix(&self.root).unwrap().to_path_buf(),
             phase: TransactionPhase::Stage,
@@ -98,8 +122,10 @@ impl<'a> JournalExecutor<'a> {
             }
             let id = manifest.items.len() as u64 + 1;
             let new_hash = *blake3::hash(&patch.bytes).as_bytes();
+            manifest.native_paths.push(path.clone());
             manifest.items.push(TransactionItem {
                 id,
+                kind: TransactionItemKind::Patch,
                 from_path: path.strip_prefix(&self.root).unwrap().to_path_buf(),
                 to_path: path.strip_prefix(&self.root).unwrap().to_path_buf(),
                 phase: TransactionPhase::Stage,
@@ -163,7 +189,8 @@ impl<'a> JournalExecutor<'a> {
         Ok(txn_id)
     }
 
-    /// Replay committed journals. A mismatch is preserved and reported, never guessed over.
+    /// Replay committed journals. Invalid manifests are quarantined and
+    /// divergent items become durable Partial transactions.
     pub fn recover(&self) -> Result<RecoveryReport, String> {
         self.fs.create_dir_all(&self.journal_dir).map_err(display)?;
         let mut report = RecoveryReport::default();
@@ -171,26 +198,58 @@ impl<'a> JournalExecutor<'a> {
             if entry.is_dir || entry.path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
-            let Some(bytes) = self.fs.read_if_exists(&entry.path).map_err(display)? else {
+            let bytes = self.fs.read_if_exists(&entry.path).map_err(display)?;
+            let parsed = bytes
+                .as_deref()
+                .map(serde_json::from_slice::<JournalManifest>);
+            let parse_error = parsed
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .map(ToString::to_string);
+            let manifest = parsed.and_then(Result::ok);
+            let supported = manifest.as_ref().is_some_and(|m| {
+                m.version == crate::journal::manifest::MANIFEST_VERSION
+                    && valid_txn_id(&m.txn_id)
+                    && entry.path.file_stem().and_then(|stem| stem.to_str())
+                        == Some(m.txn_id.as_str())
+            });
+            let Some(mut manifest) = manifest.filter(|_| supported) else {
+                let quarantined = entry.path.with_extension("json.quarantined");
+                self.fs
+                    .rename_replace(&entry.path, &quarantined)
+                    .map_err(display)?;
+                self.fs.fsync_dir(&self.journal_dir).map_err(display)?;
+                let name = quarantined
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                warn!(counter = "journal.recoveries_total", manifest = %entry.path.display(), quarantined = %quarantined.display(), ?parse_error, outcome = "quarantined", "journal manifest quarantined");
+                report.quarantined.push(name);
                 continue;
             };
-            let mut manifest: JournalManifest = serde_json::from_slice(&bytes)
-                .map_err(|e| format!("{}: {e}", entry.path.display()))?;
-            if manifest.version != crate::journal::manifest::MANIFEST_VERSION {
-                return Err(format!(
-                    "unsupported journal version in {}",
-                    entry.path.display()
-                ));
-            }
-            if manifest.state == TransactionState::Preparing {
-                self.cleanup(&manifest)?;
-                let _ = self.fs.remove(&entry.path);
-                self.fs.fsync_dir(&self.journal_dir).map_err(display)?;
-                continue;
-            }
             if manifest.state == TransactionState::Complete
                 || manifest.state == TransactionState::Abandoned
             {
+                report.done.push(manifest.txn_id.clone());
+                tracing::info!(counter = "journal.recoveries_total", txn = %manifest.txn_id, outcome = "done", "journal already terminal");
+                continue;
+            }
+            if manifest.state == TransactionState::Partial {
+                let reasons = skipped_item_summaries(&manifest);
+                report.skipped.push((manifest.txn_id.clone(), reasons));
+                tracing::warn!(counter = "journal.recoveries_total", txn = %manifest.txn_id, outcome = "skipped", "partial journal awaits user action");
+                continue;
+            }
+            if manifest.state == TransactionState::Preparing {
+                // Preparing has not crossed the commit point, so its payloads
+                // are disposable. Do not let a missing/corrupt data directory
+                // prevent the vault from opening; leaving its unreferenced
+                // files is safer than traversing a path from this manifest.
+                let _ = self.fs.remove(&entry.path);
+                self.fs.fsync_dir(&self.journal_dir).map_err(display)?;
+                report.done.push(manifest.txn_id.clone());
+                tracing::info!(counter = "journal.recoveries_total", txn = %manifest.txn_id, outcome = "done", "discarded uncommitted journal");
                 continue;
             }
             for index in 0..manifest.items.len() {
@@ -201,13 +260,11 @@ impl<'a> JournalExecutor<'a> {
                 .iter()
                 .any(|item| item.state == TransactionItemState::Skipped)
             {
-                let reasons = manifest
-                    .items
-                    .iter()
-                    .filter_map(|item| item.error.as_deref())
-                    .collect::<Vec<_>>()
-                    .join("; ");
+                let reasons = skipped_item_summaries(&manifest);
+                manifest.state = TransactionState::Partial;
+                self.persist(&manifest)?;
                 report.skipped.push((manifest.txn_id.clone(), reasons));
+                warn!(counter = "journal.recoveries_total", txn = %manifest.txn_id, outcome = "skipped", "rename journal diverged");
             } else if manifest.items.iter().all(|item| {
                 matches!(
                     item.state,
@@ -218,9 +275,22 @@ impl<'a> JournalExecutor<'a> {
             }) {
                 manifest.state = TransactionState::Complete;
                 self.persist(&manifest)?;
-                report.recovered.push(manifest.txn_id.clone());
+                report.rolled_forward.push(manifest.txn_id.clone());
                 self.cleanup(&manifest)?;
+                tracing::info!(counter = "journal.recoveries_total", txn = %manifest.txn_id, outcome = "rolled_forward", "rename journal recovered");
             } else {
+                manifest.state = TransactionState::Partial;
+                for item in &mut manifest.items {
+                    if !matches!(
+                        item.state,
+                        TransactionItemState::Saved | TransactionItemState::Cancelled
+                    ) {
+                        item.state = TransactionItemState::Skipped;
+                        item.error
+                            .get_or_insert_with(|| "recovery left item pending".into());
+                    }
+                }
+                self.persist(&manifest)?;
                 report.skipped.push((
                     manifest.txn_id.clone(),
                     "one or more items remain pending".into(),
@@ -232,11 +302,7 @@ impl<'a> JournalExecutor<'a> {
 
     /// Durably cancel an unapplied patch after its correlated buffer undo.
     pub fn cancel_item(&self, txn_id: &str, item_id: u64) -> Result<(), String> {
-        if txn_id.is_empty()
-            || !txn_id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        {
+        if !valid_txn_id(txn_id) {
             return Err("invalid transaction id".into());
         }
         let path = self.journal_dir.join(format!("{txn_id}.json"));
@@ -247,6 +313,9 @@ impl<'a> JournalExecutor<'a> {
             .ok_or("journal manifest not found")?;
         let mut manifest: JournalManifest =
             serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if manifest.txn_id != txn_id {
+            return Err("journal transaction id does not match its manifest path".into());
+        }
         let item = manifest
             .items
             .iter_mut()
@@ -257,9 +326,7 @@ impl<'a> JournalExecutor<'a> {
         }
         item.state = TransactionItemState::Cancelled;
         item.error = None;
-        let staged = manifest
-            .data_dir(&self.journal_dir)
-            .join(format!("{item_id}.bin"));
+        let staged = self.staged_payload_path(txn_id, item_id)?;
         if self.fs.exists(&staged).map_err(display)? {
             self.fs.remove(&staged).map_err(display)?;
         }
@@ -270,7 +337,6 @@ impl<'a> JournalExecutor<'a> {
     }
 
     fn apply_item(&self, manifest: &mut JournalManifest, item_index: usize) -> Result<(), String> {
-        let staged_dir = manifest.data_dir(&self.journal_dir);
         let item_id = manifest.items[item_index].id;
         let item = &mut manifest.items[item_index];
         if matches!(
@@ -299,7 +365,7 @@ impl<'a> JournalExecutor<'a> {
         let disk_from = self.hash_if_exists(&from)?;
         if disk_from == Some(base) && (from == to || disk_to.is_none()) {
             if from == to {
-                let staged = staged_dir.join(format!("{item_id}.bin"));
+                let staged = self.staged_payload_path(&manifest.txn_id, item_id)?;
                 let payload = self
                     .fs
                     .read_if_exists(&staged)
@@ -314,13 +380,32 @@ impl<'a> JournalExecutor<'a> {
                     .ok_or("patch path has no filename")?
                     .to_string_lossy();
                 let temp = parent.join(format!(
-                    ".{name}.flavite-tmp.{}.{}",
-                    manifest.txn_id, item.id
+                    ".flavite-tmp.{}.{}.{}",
+                    manifest.txn_id, item.id, name
                 ));
-                self.fs.write_new(&temp, &payload).map_err(display)?;
-                self.fs.copy_mode(&from, &temp).map_err(display)?;
-                self.fs.fsync_file(&temp).map_err(display)?;
+                self.validate_staged_temp(&temp)?;
+                // A staged replacement is disposable. Recreate and verify it
+                // from the journal payload; a short or partial write gets one
+                // fresh attempt before it can affect the target.
+                let mut staged = false;
+                for _ in 0..2 {
+                    if self.fs.exists(&temp).unwrap_or(false) {
+                        let _ = self.fs.remove(&temp);
+                    }
+                    self.fs.write_new(&temp, &payload).map_err(display)?;
+                    self.fs.copy_mode(&from, &temp).map_err(display)?;
+                    self.fs.fsync_file(&temp).map_err(display)?;
+                    if self.hash_if_exists(&temp)? == Some(new) {
+                        staged = true;
+                        break;
+                    }
+                    let _ = self.fs.remove(&temp);
+                }
+                if !staged {
+                    return Err("journal temp failed hash verification after re-stage".into());
+                }
                 self.fs.rename_replace(&temp, &from).map_err(display)?;
+                self.fs.fsync_file(&from).map_err(display)?;
                 self.fs.fsync_dir(parent).map_err(display)?;
                 if self.hash_if_exists(&from)? != Some(new) {
                     return Err("patched payload failed hash verification".into());
@@ -331,6 +416,7 @@ impl<'a> JournalExecutor<'a> {
                 return Ok(());
             }
             self.fs.rename_no_replace(&from, &to).map_err(display)?;
+            self.fs.fsync_file(&to).map_err(display)?;
             if let Some(parent) = from.parent() {
                 self.fs.fsync_dir(parent).map_err(display)?;
             }
@@ -362,6 +448,7 @@ impl<'a> JournalExecutor<'a> {
         self.fs.write_new(&temp, &bytes).map_err(display)?;
         self.fs.fsync_file(&temp).map_err(display)?;
         self.fs.rename_replace(&temp, &path).map_err(display)?;
+        self.fs.fsync_file(&path).map_err(display)?;
         self.fs.fsync_dir(&self.journal_dir).map_err(display)
     }
 
@@ -403,6 +490,41 @@ impl<'a> JournalExecutor<'a> {
         Ok(full)
     }
 
+    /// Validate that a deterministic replacement temp is a vault-local
+    /// sibling in the reserved `.flavite-tmp` filename namespace.
+    fn validate_staged_temp(&self, path: &Path) -> Result<(), String> {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("invalid journal temp filename")?;
+        if !name.starts_with(".flavite-tmp.") {
+            return Err("journal temp is outside the .flavite-tmp namespace".into());
+        }
+        let relative = path
+            .strip_prefix(&self.root)
+            .map_err(|_| "journal temp escapes vault")?;
+        self.safe_vault_path(relative).map(|_| ())
+    }
+
+    /// Resolve and validate a journal-owned payload path before reading or
+    /// removing it. The transaction id must remain a single safe component.
+    fn staged_payload_path(&self, txn_id: &str, item_id: u64) -> Result<PathBuf, String> {
+        if !valid_txn_id(txn_id) {
+            return Err("invalid transaction id in journal payload path".into());
+        }
+        let path = self
+            .journal_dir
+            .join(format!("{txn_id}.data"))
+            .join(format!("{item_id}.bin"));
+        self.fs
+            .validate_in_root(&self.root, &path)
+            .map_err(display)?;
+        if !path.starts_with(&self.journal_dir) {
+            return Err("journal payload path escapes journal directory".into());
+        }
+        Ok(path)
+    }
+
     fn hash_if_exists(&self, path: &Path) -> Result<Option<[u8; 32]>, String> {
         Ok(self
             .fs
@@ -414,6 +536,29 @@ impl<'a> JournalExecutor<'a> {
 
 fn display(error: flavite_fs::FsError) -> String {
     error.to_string()
+}
+fn valid_txn_id(txn_id: &str) -> bool {
+    !txn_id.is_empty()
+        && txn_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+fn skipped_item_summaries(manifest: &JournalManifest) -> String {
+    manifest
+        .items
+        .iter()
+        .filter(|item| item.state == TransactionItemState::Skipped)
+        .map(|item| {
+            format!(
+                "item {} ({} -> {}): {}",
+                item.id,
+                item.from_path.display(),
+                item.to_path.display(),
+                item.error.as_deref().unwrap_or("diverged")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -491,6 +636,7 @@ mod tests {
             m.state = TransactionState::Committed;
             m.items.push(TransactionItem {
                 id: 1,
+                kind: TransactionItemKind::Rename,
                 from_path: from.into(),
                 to_path: to.into(),
                 phase: TransactionPhase::Apply,
@@ -524,8 +670,8 @@ mod tests {
         fs.write_new(Path::new("/vault/new.md"), b"next").unwrap();
         // Make the diverged source differ from the recorded base.
         let report = executor.recover().unwrap();
-        assert!(report.recovered.contains(&"tx-base".to_owned()));
-        assert!(report.recovered.contains(&"tx-new".to_owned()));
+        assert!(report.rolled_forward.contains(&"tx-base".to_owned()));
+        assert!(report.rolled_forward.contains(&"tx-new".to_owned()));
         assert!(report.skipped.iter().any(|(txn, _)| txn == "tx-diverged"));
         assert_eq!(
             fs.read_if_exists(Path::new("/vault/base-to.md")).unwrap(),
@@ -551,6 +697,7 @@ mod tests {
         manifest.state = TransactionState::Committed;
         manifest.items.push(TransactionItem {
             id: 4,
+            kind: TransactionItemKind::Patch,
             from_path: "note.md".into(),
             to_path: "note.md".into(),
             phase: TransactionPhase::WaitBuffers,
@@ -570,10 +717,119 @@ mod tests {
         executor.cancel_item("undo-tx", 4).unwrap();
         assert!(!fs.exists(&journal.join("undo-tx.data/4.bin")).unwrap());
         let report = executor.recover().unwrap();
-        assert!(report.recovered.contains(&"undo-tx".to_owned()));
+        assert!(report.rolled_forward.contains(&"undo-tx".to_owned()));
         assert_eq!(
             fs.read_if_exists(Path::new("/vault/note.md")).unwrap(),
             Some(b"undone".to_vec())
+        );
+    }
+
+    fn pending_patch_manifest(txn: &str) -> JournalManifest {
+        let mut manifest = JournalManifest::new(txn.into(), 1);
+        manifest.state = TransactionState::Committed;
+        manifest.items.push(TransactionItem {
+            id: 1,
+            kind: TransactionItemKind::Patch,
+            from_path: "note.md".into(),
+            to_path: "note.md".into(),
+            phase: TransactionPhase::Apply,
+            state: TransactionItemState::Committed,
+            expected_base_hash: Some(*blake3::hash(b"base").as_bytes()),
+            expected_new_hash: Some(*blake3::hash(b"patched").as_bytes()),
+            observed_base_hash: None,
+            observed_new_hash: None,
+            buffer_id: None,
+            buffer_revision: None,
+            checkpoint_seq: None,
+            operation_markers: Vec::new(),
+            error: None,
+        });
+        manifest
+    }
+
+    #[test]
+    fn recovery_replaces_missing_partial_and_preexisting_temp_files() {
+        for with_partial_temp in [false, true] {
+            let fs = MemFs::new();
+            let journal = Path::new("/vault/.flavite/journal");
+            fs.create_dir_all(journal).unwrap();
+            fs.create_dir_all(&journal.join("patch-tx.data")).unwrap();
+            fs.fsync_dir(Path::new("/vault")).unwrap();
+            fs.fsync_dir(Path::new("/vault/.flavite")).unwrap();
+            fs.fsync_dir(journal).unwrap();
+            fs.write_new(Path::new("/vault/note.md"), b"base").unwrap();
+            fs.write_new(&journal.join("patch-tx.data/1.bin"), b"patched")
+                .unwrap();
+            let executor = JournalExecutor::new(&fs, Path::new("/vault"));
+            executor
+                .persist(&pending_patch_manifest("patch-tx"))
+                .unwrap();
+
+            let temp = Path::new("/vault/.flavite-tmp.patch-tx.1.note.md");
+            if with_partial_temp {
+                fs.write_new(temp, b"partial garbage").unwrap();
+            }
+            let report = executor.recover().unwrap();
+
+            assert_eq!(
+                fs.read_if_exists(Path::new("/vault/note.md")).unwrap(),
+                Some(b"patched".to_vec())
+            );
+            assert!(!fs.exists(temp).unwrap());
+            assert_eq!(report.rolled_forward, vec!["patch-tx"]);
+        }
+    }
+
+    #[test]
+    fn diverged_manifest_becomes_partial_and_is_reported() {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/vault/.flavite/journal"))
+            .unwrap();
+        fs.create_dir_all(Path::new("/vault/.flavite/journal/diverged.data"))
+            .unwrap();
+        fs.write_new(Path::new("/vault/note.md"), b"user edit")
+            .unwrap();
+        let executor = JournalExecutor::new(&fs, Path::new("/vault"));
+        executor
+            .persist(&pending_patch_manifest("diverged"))
+            .unwrap();
+
+        let report = executor.recover().unwrap();
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.notice_codes(), vec!["rename-diverged"]);
+        let bytes = fs
+            .read_if_exists(Path::new("/vault/.flavite/journal/diverged.json"))
+            .unwrap()
+            .unwrap();
+        let persisted: JournalManifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(persisted.state, TransactionState::Partial);
+        assert_eq!(persisted.items[0].state, TransactionItemState::Skipped);
+    }
+
+    #[test]
+    fn corrupt_and_v1_manifests_are_quarantined_and_recovery_continues() {
+        let fs = MemFs::new();
+        let journal = Path::new("/vault/.flavite/journal");
+        fs.create_dir_all(journal).unwrap();
+        fs.write_new(&journal.join("broken.json"), b"not json")
+            .unwrap();
+        let mut old = JournalManifest::new("old-version".into(), 1);
+        old.version = 1;
+        fs.write_new(
+            &journal.join("old-version.json"),
+            &serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+
+        let report = JournalExecutor::new(&fs, Path::new("/vault"))
+            .recover()
+            .unwrap();
+        assert_eq!(report.quarantined.len(), 2);
+        assert!(report.notice_codes().contains(&"journal-quarantined"));
+        assert!(fs.exists(&journal.join("broken.json.quarantined")).unwrap());
+        assert!(
+            fs.exists(&journal.join("old-version.json.quarantined"))
+                .unwrap()
         );
     }
 
@@ -587,11 +843,17 @@ mod tests {
             let fs = MemFs::new();
             fs.create_dir_all(Path::new("/vault/.flavite/journal"))
                 .unwrap();
+            fs.fsync_dir(Path::new("/vault")).unwrap();
+            fs.fsync_dir(Path::new("/vault/.flavite")).unwrap();
+            fs.fsync_dir(Path::new("/vault/.flavite/journal")).unwrap();
             fs.write_new(Path::new("/vault/a.md"), b"# A").unwrap();
+            fs.fsync_file(Path::new("/vault/a.md")).unwrap();
             for n in 0..14 {
-                fs.write_new(&PathBuf::from(format!("/vault/in-{n}.md")), b"[[a]]")
-                    .unwrap();
+                let path = PathBuf::from(format!("/vault/in-{n}.md"));
+                fs.write_new(&path, b"[[a]]").unwrap();
+                fs.fsync_file(&path).unwrap();
             }
+            fs.fsync_dir(Path::new("/vault")).unwrap();
             fs
         }
         let make_patches = || {
@@ -611,7 +873,9 @@ mod tests {
         let calls = baseline
             .trace()
             .into_iter()
-            .filter(|entry| entry.boundary == FaultBoundary::Before)
+            .filter(|entry| {
+                entry.boundary == FaultBoundary::After || entry.boundary == FaultBoundary::Progress
+            })
             .map(|entry| (entry.method, entry.occurrence))
             .collect::<HashSet<_>>();
 
@@ -633,9 +897,11 @@ mod tests {
                         &make_patches(),
                     );
                     let revived = fs.revive();
-                    JournalExecutor::new(&revived, Path::new("/vault"))
+                    let recovery = JournalExecutor::new(&revived, Path::new("/vault"))
                         .recover()
-                        .unwrap();
+                        .unwrap_or_else(|error| {
+                            panic!("{method}[{occurrence}] {boundary:?} {mode:?}: {error}")
+                        });
                     let renamed = revived.exists(Path::new("/vault/b.md")).unwrap();
                     assert_eq!(
                         revived.exists(Path::new("/vault/a.md")).unwrap(),
@@ -654,9 +920,109 @@ mod tests {
                             } else {
                                 b"[[a]]".to_vec()
                             },
-                            "{method}[{occurrence}] {boundary:?} {mode:?}"
+                            "patch {n}: {method}[{occurrence}] {boundary:?} {mode:?}; recovery={recovery:?}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "fault")]
+    #[test]
+    fn recovery_crash_schedule_converges_with_a_preexisting_temp() {
+        use flavite_fs::{CrashMode, FaultBoundary, FaultFs, FaultKind, FaultScript};
+        use std::collections::HashSet;
+
+        fn seed() -> MemFs {
+            let fs = MemFs::new();
+            let journal = Path::new("/vault/.flavite/journal");
+            fs.create_dir_all(journal).unwrap();
+            fs.create_dir_all(&journal.join("patch-tx.data")).unwrap();
+            fs.fsync_dir(Path::new("/vault")).unwrap();
+            fs.fsync_dir(Path::new("/vault/.flavite")).unwrap();
+            fs.fsync_dir(journal).unwrap();
+            fs.write_new(Path::new("/vault/note.md"), b"base").unwrap();
+            fs.write_new(&journal.join("patch-tx.data/1.bin"), b"patched")
+                .unwrap();
+            fs.fsync_file(&journal.join("patch-tx.data/1.bin")).unwrap();
+            fs.fsync_dir(&journal.join("patch-tx.data")).unwrap();
+            fs.write_new(
+                Path::new("/vault/.flavite-tmp.patch-tx.1.note.md"),
+                b"stale temp",
+            )
+            .unwrap();
+            fs.fsync_file(Path::new("/vault/note.md")).unwrap();
+            fs.fsync_file(Path::new("/vault/.flavite-tmp.patch-tx.1.note.md"))
+                .unwrap();
+            fs.fsync_dir(Path::new("/vault")).unwrap();
+            JournalExecutor::new(&fs, Path::new("/vault"))
+                .persist(&pending_patch_manifest("patch-tx"))
+                .unwrap();
+            fs
+        }
+
+        let baseline = FaultFs::new_mem(seed(), FaultScript::new());
+        JournalExecutor::new(&baseline, Path::new("/vault"))
+            .recover()
+            .unwrap();
+        let calls = baseline
+            .trace()
+            .into_iter()
+            .filter(|entry| {
+                entry.boundary == FaultBoundary::After || entry.boundary == FaultBoundary::Progress
+            })
+            .map(|entry| (entry.method, entry.occurrence))
+            .collect::<HashSet<_>>();
+        assert!(
+            calls.iter().any(|(method, _)| *method == "remove"),
+            "calls: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|(method, _)| *method == "write_new"),
+            "calls: {calls:?}"
+        );
+
+        let short_write = FaultFs::new_mem(
+            seed(),
+            FaultScript::new().fault_at(
+                "write_new",
+                1,
+                FaultBoundary::Progress,
+                FaultKind::ShortWrite,
+            ),
+        );
+        JournalExecutor::new(&short_write, Path::new("/vault"))
+            .recover()
+            .unwrap();
+        assert_eq!(
+            short_write
+                .read_if_exists(Path::new("/vault/note.md"))
+                .unwrap(),
+            Some(b"patched".to_vec())
+        );
+
+        for (method, occurrence) in calls {
+            for boundary in [FaultBoundary::Before, FaultBoundary::After] {
+                for mode in [CrashMode::ProcessCrash, CrashMode::PowerLoss] {
+                    let kind = match mode {
+                        CrashMode::ProcessCrash => FaultKind::ProcessCrash,
+                        CrashMode::PowerLoss => FaultKind::PowerLoss,
+                    };
+                    let fs = FaultFs::new_mem(
+                        seed(),
+                        FaultScript::new().fault_at(method, occurrence, boundary, kind),
+                    );
+                    let _ = JournalExecutor::new(&fs, Path::new("/vault")).recover();
+                    let revived = fs.revive();
+                    JournalExecutor::new(&revived, Path::new("/vault"))
+                        .recover()
+                        .unwrap();
+                    assert_eq!(
+                        revived.read_if_exists(Path::new("/vault/note.md")).unwrap(),
+                        Some(b"patched".to_vec()),
+                        "recovery {method}[{occurrence}] {boundary:?} {mode:?}"
+                    );
                 }
             }
         }

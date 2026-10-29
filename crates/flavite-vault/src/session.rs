@@ -315,6 +315,8 @@ pub struct Session {
     pulse: PulseChannel,
     /// Notice channel.
     notice: NoticeChannel,
+    /// Journal recovery findings waiting for the first host pump.
+    recovery_notices: Mutex<VecDeque<&'static str>>,
 }
 
 impl Session {
@@ -400,6 +402,7 @@ impl Session {
             completions: Mutex::new(VecDeque::new()),
             pulse,
             notice,
+            recovery_notices: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -447,11 +450,25 @@ impl Session {
     pub fn pump(&self) {
         let _turn = self.driving_turn.lock().unwrap();
         self.pump_external_changes_inner();
+        self.pump_recovery_notices();
         self.pump_save_completions();
         self.pump_reconcile_completions();
         self.pump_rename_completions();
         self.pump_autosave();
         let _ = self.recovery_tick();
+    }
+
+    fn pump_recovery_notices(&self) {
+        let codes = self
+            .recovery_notices
+            .lock()
+            .unwrap()
+            .drain(..)
+            .collect::<Vec<_>>();
+        for code in codes {
+            self.notice
+                .send(crate::channels::Notice::ActionRequired { code, note: None });
+        }
     }
 
     fn pump_autosave(&self) {
@@ -1885,6 +1902,7 @@ pub struct SessionBuilder {
     pulse: Option<PulseChannel>,
     notice: Option<NoticeChannel>,
     config: Option<VaultConfig>,
+    recovery_notices: Vec<&'static str>,
 }
 
 impl SessionBuilder {
@@ -1936,9 +1954,16 @@ impl SessionBuilder {
         self
     }
 
+    /// Queue recovery findings for delivery on the first host pump.
+    #[must_use]
+    pub fn with_recovery_notices(mut self, notices: Vec<&'static str>) -> Self {
+        self.recovery_notices = notices;
+        self
+    }
+
     /// Build the Session.
     pub fn build(self) -> Result<Session, String> {
-        Ok(Session::new(
+        let session = Session::new(
             self.identity.ok_or("Missing identity")?,
             self.actor.ok_or("Missing actor")?,
             self.buffer_manager.unwrap_or_default(),
@@ -1946,7 +1971,9 @@ impl SessionBuilder {
             self.notice
                 .unwrap_or_else(|| NoticeChannel::new(Duration::from_millis(300))),
             self.config.unwrap_or_default(),
-        ))
+        );
+        *session.recovery_notices.lock().unwrap() = self.recovery_notices.into();
+        Ok(session)
     }
 }
 
@@ -2036,6 +2063,34 @@ mod tests {
                 .all_buffers()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn open_recovery_notices_are_emitted_once_and_ackable() {
+        let (session, _fs, _temp) = test_session();
+        *session.recovery_notices.lock().unwrap() =
+            vec!["rename-diverged", "journal-quarantined"].into();
+        session.pump();
+        let first = session.notice.try_recv().unwrap();
+        let second = session.notice.try_recv().unwrap();
+        assert!(matches!(
+            first,
+            crate::channels::Notice::ActionRequired {
+                code: "rename-diverged",
+                ..
+            }
+        ));
+        assert!(matches!(
+            second,
+            crate::channels::Notice::ActionRequired {
+                code: "journal-quarantined",
+                ..
+            }
+        ));
+        session.notice.ack(&first);
+        session.notice.ack(&second);
+        session.pump();
+        assert!(session.notice.try_recv().is_err());
     }
 
     #[test]

@@ -41,11 +41,8 @@ pub use instance::{
 };
 pub use journal::executor::{FilePatch, JournalExecutor, RecoveryReport};
 pub use journal::manifest::{
-    JournalManifest, MANIFEST_VERSION, TransactionItem, TransactionItemState, TransactionPhase,
-    TransactionState,
-};
-pub use journal::recover::{
-    JournalRecovery, JournalRecoveryError, JournalRecoveryOutcome, JournalRecoveryResult,
+    JournalManifest, MANIFEST_VERSION, TransactionItem, TransactionItemKind, TransactionItemState,
+    TransactionPhase, TransactionState,
 };
 pub use merge::{MergeConflict, MergeResult, three_way_merge};
 pub use open::{OpenVaultError, OpenVaultResult, Vault, vault_exists};

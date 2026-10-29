@@ -113,7 +113,7 @@ impl Vault {
         let recovery = crate::journal::JournalExecutor::new(&*fs, &root)
             .recover()
             .map_err(OpenVaultError::Reconcile)?;
-        for (txn, reason) in recovery.skipped {
+        for (txn, reason) in &recovery.skipped {
             tracing::warn!(%txn, %reason, "rename journal item diverged and was preserved");
         }
 
@@ -145,6 +145,7 @@ impl Vault {
             .with_pulse(channels.pulse.clone())
             .with_notice(channels.notice.clone())
             .with_config(config.clone())
+            .with_recovery_notices(recovery.notice_codes())
             .build()?;
 
         info!("Vault opened successfully");

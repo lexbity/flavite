@@ -6,7 +6,19 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Current journal manifest version.
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
+
+/// Kind of work represented by a journal item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionItemKind {
+    /// Rename or move a file.
+    Rename,
+    /// Replace bytes in an existing file.
+    Patch,
+    /// Add an alias to a renamed note.
+    Alias,
+}
 
 /// Transaction phase (§4.15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +87,8 @@ pub enum TransactionState {
 pub struct TransactionItem {
     /// Unique item ID within the transaction.
     pub id: u64,
+    /// Kind of transaction item.
+    pub kind: TransactionItemKind,
     /// Source path (for rename/move).
     pub from_path: PathBuf,
     /// Destination path (for rename/move).
@@ -116,8 +130,6 @@ pub struct JournalManifest {
     pub state: TransactionState,
     /// Native path endpoints (for validation).
     pub native_paths: Vec<PathBuf>,
-    /// Expected identities/hashes (for validation).
-    pub expected_identities: HashMap<String, [u8; 32]>,
     /// Items in this transaction.
     pub items: Vec<TransactionItem>,
     /// Timestamp when the manifest was created.
@@ -137,7 +149,6 @@ impl JournalManifest {
             txn_id,
             state: TransactionState::Preparing,
             native_paths: Vec::new(),
-            expected_identities: HashMap::new(),
             items: Vec::new(),
             created_timestamp: now_secs(),
             committed_timestamp: None,
@@ -159,7 +170,7 @@ impl JournalManifest {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.state,
-            TransactionState::Complete | TransactionState::Abandoned
+            TransactionState::Partial | TransactionState::Complete | TransactionState::Abandoned
         )
     }
 
@@ -236,6 +247,7 @@ mod tests {
         let mut manifest = JournalManifest::new("txn-status".into(), 2);
         let item = |id, state| TransactionItem {
             id,
+            kind: TransactionItemKind::Rename,
             from_path: PathBuf::from(format!("{id}-old.md")),
             to_path: PathBuf::from(format!("{id}-new.md")),
             phase: TransactionPhase::Apply,

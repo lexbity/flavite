@@ -97,6 +97,8 @@ pub enum Notice {
 pub struct NoticeKey {
     pub note: NoteRef,
     pub kind: NoticeKind,
+    /// Action-required notices with different recovery codes are distinct.
+    pub action_code: Option<&'static str>,
 }
 
 /// The kind of notice (for coalescing).
@@ -286,21 +288,25 @@ impl NoticeChannel {
                 NoticeKey {
                     note: NoteRef::new(from.clone()),
                     kind: NoticeKind::RenameSuggested,
+                    action_code: None,
                 }
             }
             Notice::Conflict { note } => NoticeKey {
                 note: note.clone(),
                 kind: NoticeKind::Conflict,
+                action_code: None,
             },
             Notice::RecoveryOffer { note } => NoticeKey {
                 note: note.clone(),
                 kind: NoticeKind::RecoveryOffer,
+                action_code: None,
             },
-            Notice::ActionRequired { note, .. } => NoticeKey {
+            Notice::ActionRequired { code, note } => NoticeKey {
                 note: note
                     .clone()
                     .unwrap_or_else(|| NoteRef::new(PathBuf::from("unknown"))),
                 kind: NoticeKind::ActionRequired,
+                action_code: Some(*code),
             },
         }
     }

@@ -57,9 +57,13 @@ spike-s4-db *args:
     cargo run -p xtask --bin s4_db_probe -- {{args}}
 
 # G0 — local fast gate (§10.3): fmt + clippy + test + arch check. ≤ 5 min budget.
-gate: fmt clippy test arch-check
+gate: fmt clippy test fault-tests arch-check
     @just gc
     @echo "G0 passed (fmt + clippy + test + arch check)."
+
+# Journal crash schedules are part of G0 so durability regressions fail locally.
+fault-tests:
+    cargo test -p flavite-vault --features fault journal::executor
 
 # G1 — CI gate (§10.3): G0 + coverage floors + FaultFs/integration suites +
 # doc build + deny/audit/shear + fuzz smoke 60 s + network-denied + MSRV.
