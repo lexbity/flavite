@@ -3,7 +3,9 @@
 //! Tier 1 — durability-critical. Headless `Session` owning `BufferManager`
 //! and pending operations; `VaultActor` (watcher, write tokens, journal,
 //! history); `IndexActor` (sole SQLite + tantivy writer, read pool);
-//! `ParsePool` (§4.1, §4.2, §4.5, D3, D6, D9).
+//! `ParsePool` (§4.1, §4.2, §4.5, D3, D6, D9). Reconcile filesystem
+//! observations run on one joined worker; only the actor applies them to the
+//! index, with per-path save watermarks guarding against stale scan results.
 
 pub mod actor;
 pub mod channels;
@@ -14,6 +16,7 @@ pub mod instance;
 pub mod journal;
 pub mod merge;
 pub mod open;
+mod reconcile_worker;
 pub mod rename;
 pub mod save;
 pub mod session;

@@ -1323,6 +1323,34 @@ mod tests {
         (flavite, root, temp)
     }
 
+    fn await_initial_reconcile(flavite: &Flavite) {
+        let request_id = match flavite.execute_session(SessionCommand::Reconcile {
+            scope: flavite_vault::ReconcileScope::Full,
+            mode: flavite_vault::ReconcileMode::VerifyContent,
+        }) {
+            SessionResult::Pending { request_id } => request_id,
+            result => panic!("reconcile was not admitted: {result:?}"),
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            flavite.session().pump();
+            if let Some(result) = flavite
+                .session()
+                .drain_operation_completions()
+                .into_iter()
+                .find(|completion| completion.request_id == request_id)
+            {
+                assert!(matches!(result.result, SessionResult::Success(_)));
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "initial reconcile timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn buffer_view_serialization() {
         let view = BufferView {
@@ -1433,6 +1461,7 @@ mod tests {
     #[test]
     fn query_facade_searches_notes_indexed_during_vault_open() {
         let (flavite, _root, _temp) = test_flavite();
+        await_initial_reconcile(&flavite);
         let page = flavite
             .query_with_limit(&crate::Query::Text("hello".into()), 10)
             .unwrap();
@@ -1445,6 +1474,7 @@ mod tests {
     #[test]
     fn query_as_enforces_read_notes_capability() {
         let (flavite, _root, _temp) = test_flavite();
+        await_initial_reconcile(&flavite);
         assert!(matches!(
             flavite.query_as(&[], &crate::Query::Text("hello".into()), 10),
             Err(FlaviteError::CapabilityDenied("ReadNotes"))

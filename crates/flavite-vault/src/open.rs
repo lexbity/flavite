@@ -154,6 +154,7 @@ impl Vault {
             .with_runtime_config(config.clone())
             .build()?
             .start()?;
+        actor.wait_until_ready(std::time::Duration::from_secs(120))?;
 
         // Build the session around the actor and channels.
         let session = SessionBuilder::new()

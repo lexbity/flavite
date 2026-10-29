@@ -29,6 +29,10 @@ arch-check:
 arch-gen:
     cargo xtask arch gen
 
+# Nightly D14 latency probe (20k notes; Save p99 during VerifyContent).
+reconcile-bench:
+    cargo bench -p flavite-vault --bench reconcile_concurrency
+
 # S3 watcher-truth probe (PLAN-C C1, §9 S3-1): per-OS watcher evidence with a
 # D5 nomination-property self-check. CI runs scenarios 1–3 on Linux headless.
 spike-s3 *args:

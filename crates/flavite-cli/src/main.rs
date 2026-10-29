@@ -556,7 +556,7 @@ fn main() -> Result<()> {
         if !events.is_empty() {
             if driver.json {
                 for event in events {
-                    println!("{}", serde_json::to_string(&event)?);
+                    eprintln!("{}", serde_json::to_string(&event)?);
                     flavite.acknowledge_event(&event);
                 }
             } else {

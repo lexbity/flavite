@@ -37,6 +37,7 @@ pub struct App {
     recent_events: Vec<String>,
     operations: OperationPump,
     active_buffer: Option<u64>,
+    reconcile_progress: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +83,7 @@ impl App {
             recent_events: Vec::new(),
             operations: OperationPump::default(),
             active_buffer: None,
+            reconcile_progress: None,
         };
         match Flavite::open_root(root, VaultConfig::default()) {
             Ok(flavite) => {
@@ -406,6 +408,13 @@ impl App {
         if pending > 0 {
             right = right.push(
                 container(text(format!("{pending} in flight")).size(style::TEXT_SM))
+                    .style(|theme| style::chip(theme, Tone::Warning))
+                    .padding(chip_padding()),
+            );
+        }
+        if let Some((done, total)) = self.reconcile_progress {
+            right = right.push(
+                container(text(format!("Indexing {done}/{total}")).size(style::TEXT_SM))
                     .style(|theme| style::chip(theme, Tone::Warning))
                     .padding(chip_padding()),
             );
@@ -814,6 +823,9 @@ impl App {
         let Some(flavite) = &self.flavite else { return };
         flavite.session().pump();
         for event in flavite.drain_events() {
+            if let flavite_api::Event::ReconcileProgress { done, total } = event {
+                self.reconcile_progress = (done < total).then_some((done, total));
+            }
             self.recent_events
                 .push(format!("{}: {event:?}", event.event_type()));
             flavite.acknowledge_event(&event);
@@ -937,6 +949,7 @@ mod tests {
             recent_events: Vec::new(),
             operations: OperationPump::default(),
             active_buffer: None,
+            reconcile_progress: None,
         }
     }
 

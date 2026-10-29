@@ -814,9 +814,8 @@ impl IndexActor {
     /// transaction. The caller owns this actor on the sole index-writer thread.
     ///
     /// # Errors
-    /// Returns an error if parsing, coordinate conversion, or any SQLite step
-    /// fails. A failed transaction leaves the prior structural state intact.
-    #[allow(clippy::too_many_lines)] // One transaction keeps note/search/change state atomic.
+    /// Returns an error if coordinate conversion or any SQLite step fails. A
+    /// failed transaction leaves the prior structural state intact.
     pub fn apply_saved_note(
         &mut self,
         path_native: &[u8],
@@ -835,8 +834,34 @@ impl IndexActor {
             );
         }
         let Ok(parsed) = parse_note(bytes) else {
-            return self.apply_degraded_note(path_native, display_path, bytes, mtime_ns, scan_ns);
+            return self.apply_degraded_saved_note(
+                path_native,
+                display_path,
+                bytes,
+                mtime_ns,
+                scan_ns,
+            );
         };
+        self.apply_parsed_note(path_native, display_path, bytes, &parsed, mtime_ns, scan_ns)
+    }
+
+    /// Apply a note after the reconcile worker has parsed its immutable bytes.
+    /// This keeps markdown parsing off the actor command loop while retaining
+    /// the same writer transaction as `apply_saved_note`.
+    ///
+    /// # Errors
+    /// Returns an error if coordinate conversion or any SQLite step fails.
+    /// A failed transaction leaves the prior structural state intact.
+    #[allow(clippy::too_many_lines)] // One transaction keeps note/search/change state atomic.
+    pub fn apply_parsed_note(
+        &mut self,
+        path_native: &[u8],
+        display_path: &str,
+        bytes: &[u8],
+        parsed: &flavite_syntax::pulldown_glue::ParsedNote,
+        mtime_ns: i64,
+        scan_ns: i64,
+    ) -> Result<(u64, u64), String> {
         let snapshot = TextSnapshot::new(bytes).map_err(|error| error.to_string())?;
         let content_hash = Hash::from_bytes(*blake3::hash(bytes).as_bytes());
         let conn = &mut self.writer.conn;
@@ -1080,7 +1105,13 @@ impl IndexActor {
         Ok((epoch, generation))
     }
 
-    fn apply_degraded_note(
+    /// Apply parse-failed note bytes using the same title-only degraded row
+    /// semantics as `apply_saved_note`.
+    ///
+    /// # Errors
+    /// Returns an error if any SQLite step fails. A failed transaction leaves
+    /// the prior structural state intact.
+    pub fn apply_degraded_saved_note(
         &mut self,
         path_native: &[u8],
         display_path: &str,

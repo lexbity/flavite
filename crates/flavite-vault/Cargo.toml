@@ -39,8 +39,13 @@ similar = "2.7"
 [dev-dependencies]
 # For tests
 tempfile = { workspace = true }
+proptest = { workspace = true }
 flavite-fs = { path = "../flavite-fs", features = ["fault"] }
 
 [features]
 default = []
 fault = ["flavite-fs/fault"]
+
+[[bench]]
+name = "reconcile_concurrency"
+harness = false

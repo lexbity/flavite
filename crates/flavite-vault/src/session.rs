@@ -1110,6 +1110,12 @@ impl Session {
                 crate::actor::VaultActorResp::ReconcileComplete { summary, .. } => {
                     SessionResult::Success(CommandResult::ReconcileComplete { summary })
                 }
+                crate::actor::VaultActorResp::ReconcileSuperseded { by_request } => {
+                    SessionResult::Superseded {
+                        request_id,
+                        by_request,
+                    }
+                }
                 crate::actor::VaultActorResp::Error(message) => SessionResult::Error { message },
                 _ => SessionResult::Error {
                     message: "reconcile worker returned an invalid response".into(),

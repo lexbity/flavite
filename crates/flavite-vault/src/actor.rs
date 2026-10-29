@@ -177,6 +177,8 @@ pub enum VaultActorResp {
         summary: ReconcileSummary,
         version: Version,
     },
+    /// A queued reconcile was replaced by a newer request.
+    ReconcileSuperseded { by_request: u64 },
     /// Durable journal rename and link patches completed.
     Renamed(Result<String, String>),
     /// Current version.
@@ -212,6 +214,8 @@ pub enum VaultActorError {
     NotRunning,
     #[error("Actor is at operation capacity")]
     Busy,
+    #[error("Initial reconcile did not finish before the startup deadline")]
+    StartupTimeout,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -224,9 +228,22 @@ pub struct VaultActorHandle {
     events: Receiver<VaultActorEvent>,
     buffer_patches: Receiver<ApplyBufferPatchRequest>,
     drift_found_total: Arc<std::sync::atomic::AtomicU64>,
+    startup_ready: Receiver<()>,
 }
 
 impl VaultActorHandle {
+    /// Wait until the initial worker scan has been applied by the actor.
+    pub fn wait_until_ready(&self, timeout: std::time::Duration) -> Result<(), VaultActorError> {
+        self.startup_ready
+            .recv_timeout(timeout)
+            .map_err(|error| match error {
+                crossbeam::channel::RecvTimeoutError::Timeout => VaultActorError::StartupTimeout,
+                crossbeam::channel::RecvTimeoutError::Disconnected => {
+                    VaultActorError::ChannelDisconnected
+                }
+            })
+    }
+
     /// Get the lossless external-change stream for Session processing.
     #[must_use]
     pub fn events(&self) -> Receiver<VaultActorEvent> {
@@ -529,6 +546,27 @@ pub struct VaultActor {
     verification_interval: std::time::Duration,
     recent_watcher_rename_pairs:
         std::collections::HashSet<(std::path::PathBuf, std::path::PathBuf)>,
+    reconcile_jobs: Option<Sender<Option<crate::reconcile_worker::ReconcileJob>>>,
+    reconcile_queue: Option<Receiver<Option<crate::reconcile_worker::ReconcileJob>>>,
+    reconcile_messages: Option<Receiver<crate::reconcile_worker::WorkerMessage>>,
+    reconcile_contexts: HashMap<u64, ReconcileContext>,
+    next_reconcile_id: u64,
+    save_seq: u64,
+    save_paths: HashMap<PathBuf, u64>,
+    reconcile_result_delay: std::time::Duration,
+    reconcile_scan_signal: Option<Sender<()>>,
+    watcher_start_failure: Option<String>,
+    startup_ready_sender: Option<Sender<()>>,
+}
+
+struct ReconcileContext {
+    job: crate::reconcile_worker::ReconcileJob,
+    initial_paths: std::collections::HashSet<Vec<u8>>,
+    initial_attachments: std::collections::HashSet<Vec<u8>>,
+    old_notes: Vec<flavite_index::types::Note>,
+    inbound_counts: HashMap<PathBuf, u32>,
+    summary: ReconcileSummary,
+    deleted_events: Vec<PathBuf>,
 }
 
 impl VaultActor {
@@ -560,6 +598,17 @@ impl VaultActor {
             initial_scan_complete: false,
             verification_interval: std::time::Duration::from_secs(600),
             recent_watcher_rename_pairs: std::collections::HashSet::new(),
+            reconcile_jobs: None,
+            reconcile_queue: None,
+            reconcile_messages: None,
+            reconcile_contexts: HashMap::new(),
+            next_reconcile_id: 0,
+            save_seq: 0,
+            save_paths: HashMap::new(),
+            reconcile_result_delay: std::time::Duration::ZERO,
+            reconcile_scan_signal: None,
+            watcher_start_failure: None,
+            startup_ready_sender: None,
         }
     }
 
@@ -573,12 +622,14 @@ impl VaultActor {
         let (resp_sender, resp_receiver) = unbounded();
         let (event_sender, event_receiver) = unbounded();
         let (buffer_patch_sender, buffer_patch_receiver) = bounded(64);
+        let (startup_ready_sender, startup_ready) = bounded(1);
         let drift_found_total = Arc::clone(&self.drift_found_total);
 
         self.msg_receiver = msg_receiver;
         self.resp_sender = resp_sender;
         self.event_sender = event_sender;
         self.buffer_patch_sender = buffer_patch_sender;
+        self.startup_ready_sender = Some(startup_ready_sender);
 
         let is_running = Arc::new(AtomicBool::new(false));
 
@@ -597,12 +648,48 @@ impl VaultActor {
             events: event_receiver,
             buffer_patches: buffer_patch_receiver,
             drift_found_total,
+            startup_ready,
         })
     }
 
     /// The main actor loop.
     fn run(&mut self, is_running: Arc<AtomicBool>) {
         is_running.store(true, Ordering::SeqCst);
+
+        let (jobs_tx, jobs_rx) = bounded::<Option<crate::reconcile_worker::ReconcileJob>>(1);
+        let worker_jobs_rx = jobs_rx.clone();
+        let (worker_tx, worker_rx) = bounded::<crate::reconcile_worker::WorkerMessage>(4);
+        let worker_fs = Arc::clone(&self.fs);
+        let worker_root = self.identity.root.clone();
+        let result_delay = self.reconcile_result_delay;
+        let scan_signal = self.reconcile_scan_signal.clone();
+        let worker = thread::Builder::new()
+            .name("vault-reconcile".into())
+            .spawn(move || {
+                while let Ok(Some(job)) = worker_jobs_rx.recv() {
+                    let result =
+                        crate::reconcile_worker::scan(&*worker_fs, &worker_root, &job, &worker_tx);
+                    if let Some(signal) = &scan_signal {
+                        let _ = signal.send(());
+                    }
+                    if !result_delay.is_zero() {
+                        thread::sleep(result_delay);
+                    }
+                    if worker_tx
+                        .send(crate::reconcile_worker::WorkerMessage::Complete {
+                            job_id: job.id,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("reconcile worker thread should start");
+        self.reconcile_jobs = Some(jobs_tx);
+        self.reconcile_queue = Some(jobs_rx);
+        self.reconcile_messages = Some(worker_rx);
 
         info!(
             "VaultActor started for vault: {}",
@@ -612,12 +699,16 @@ impl VaultActor {
         // Start the watcher before scanning, then reconcile once. Events which
         // arrive during the scan remain queued and are replayed afterwards.
         let mut fs_watcher = None;
-        let mut event_receiver = if let Some(receiver) = self.event_source.take() {
+        let mut event_receiver = if let Some(reason) = self.watcher_start_failure.take() {
+            self.watcher_lost(&reason);
+            crossbeam::channel::never()
+        } else if let Some(receiver) = self.event_source.take() {
             receiver
         } else if self.watcher_enabled && self.identity.root.is_dir() {
             match flavite_fs::watch::FsWatcher::with_defaults() {
                 Ok(mut watcher) => {
-                    if watcher.watch(&self.identity.root).is_err() {
+                    if let Err(error) = watcher.watch(&self.identity.root) {
+                        self.watcher_lost(&error.to_string());
                         crossbeam::channel::never()
                     } else {
                         let std_receiver = watcher.start();
@@ -659,7 +750,10 @@ impl VaultActor {
                         receiver
                     }
                 }
-                _ => crossbeam::channel::never(),
+                Err(error) => {
+                    self.watcher_lost(&error.to_string());
+                    crossbeam::channel::never()
+                }
             }
         } else {
             crossbeam::channel::never()
@@ -696,9 +790,7 @@ impl VaultActor {
                     Err(_) => {
                         // A disconnected watcher must not remain permanently selectable.
                         event_receiver = crossbeam::channel::never();
-                        self.drift_found_total.fetch_add(1, Ordering::Relaxed);
-                        let _ = self.event_sender.send(VaultActorEvent::WatcherLost);
-                        self.handle_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent, None);
+                        self.watcher_lost("watcher event stream disconnected");
                     }
                 },
                 recv(timer) -> _ => {
@@ -707,17 +799,14 @@ impl VaultActor {
                             self.handle_external_rename_pair(from, to);
                         }
                         if batch.is_bulk || batch.paths.is_empty() {
-                            if let Some(pulse) = &self.pulse_sender {
-                                let _ = pulse.try_send(Pulse::ReconcileProgress { done: 0, total: batch.paths.len() as u32 });
-                            }
                             self.handle_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent, None);
-                            if let Some(pulse) = &self.pulse_sender {
-                                let total = batch.paths.len() as u32;
-                                let _ = pulse.try_send(Pulse::ReconcileProgress { done: total, total });
-                            }
                         } else {
-                            let summary = self.scan_paths(&batch.paths);
-                            self.publish_reconcile(summary, None);
+                            self.enqueue_reconcile(
+                                ReconcileScope::Full,
+                                ReconcileMode::VerifyContent,
+                                None,
+                                batch.paths,
+                            );
                         }
                     }
                     if let Err(error) = self.index.commit_search_if_due(false) {
@@ -728,7 +817,18 @@ impl VaultActor {
                         last_verification = std::time::Instant::now();
                     }
                 }
+                recv(self.reconcile_messages.as_ref().expect("worker initialized")) -> message => {
+                    if let Ok(message) = message { self.handle_worker_message(message); }
+                }
             }
+        }
+
+        drop(self.reconcile_messages.take());
+        if let Some(sender) = self.reconcile_jobs.take() {
+            let _ = sender.send(None);
+        }
+        if let Err(error) = worker.join() {
+            tracing::error!(?error, "reconcile worker panicked during shutdown");
         }
 
         if let Some(watcher) = fs_watcher.as_mut() {
@@ -836,7 +936,11 @@ impl VaultActor {
                 let response = VaultActorResp::SearchNotes(self.index.search_notes(&query, limit));
                 let _ = reply.try_send(response);
             }
-            VaultActorMsg::Save { request, reply } => self.handle_save(request, reply),
+            VaultActorMsg::Save { request, reply } => {
+                self.save_seq = self.save_seq.saturating_add(1);
+                self.save_paths.insert(request.path.clone(), self.save_seq);
+                self.handle_save(request, reply);
+            }
             VaultActorMsg::SnapshotHistory {
                 note_key,
                 bytes,
@@ -982,22 +1086,432 @@ impl VaultActor {
     /// Handle a reconcile request.
     fn handle_reconcile(
         &mut self,
-        _scope: ReconcileScope,
+        scope: ReconcileScope,
         mode: ReconcileMode,
         reply: Option<Sender<VaultActorResp>>,
     ) {
-        let summary = match &_scope {
-            ReconcileScope::Single(path) => {
-                self.scan_paths(&std::iter::once(path.clone()).collect())
-            }
-            ReconcileScope::Directory(path) if path.is_dir() => {
-                // Directory reconciles use a full walk today so vanished paths
-                // in that subtree are discovered safely.
-                self.scan_notes_mode(mode)
-            }
-            ReconcileScope::Directory(_) | ReconcileScope::Full => self.scan_notes_mode(mode),
+        self.enqueue_reconcile(scope, mode, reply, Default::default());
+    }
+
+    fn enqueue_reconcile(
+        &mut self,
+        scope: ReconcileScope,
+        mode: ReconcileMode,
+        reply: Option<Sender<VaultActorResp>>,
+        nominated: std::collections::HashSet<PathBuf>,
+    ) {
+        self.next_reconcile_id = self.next_reconcile_id.saturating_add(1);
+        let id = self.next_reconcile_id;
+        let job = crate::reconcile_worker::ReconcileJob {
+            id,
+            scope,
+            mode,
+            watermark: self.save_seq,
+            nominated,
+            reply,
         };
-        self.publish_reconcile(summary, reply);
+        let initial_paths = self.index.indexed_note_paths().unwrap_or_default();
+        let initial_attachments = self.index.indexed_attachment_paths().unwrap_or_default();
+        let old_notes = self.index.rename_note_snapshot().unwrap_or_default();
+        let inbound_counts = old_notes
+            .iter()
+            .map(|note| {
+                let count = self
+                    .index
+                    .writer()
+                    .conn()
+                    .query_row(
+                        "SELECT COUNT(*) FROM links WHERE dst_note=?1",
+                        [note.note_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    .max(0) as u32;
+                (PathBuf::from(&note.path), count)
+            })
+            .collect();
+        let context = ReconcileContext {
+            job: job.clone(),
+            initial_paths: initial_paths.into_iter().collect(),
+            initial_attachments: initial_attachments.into_iter().collect(),
+            old_notes,
+            inbound_counts,
+            summary: ReconcileSummary::default(),
+            deleted_events: Vec::new(),
+        };
+        self.reconcile_contexts.insert(id, context);
+        let Some(sender) = self.reconcile_jobs.as_ref() else {
+            self.reconcile_contexts.remove(&id);
+            if let Some(reply) = job.reply {
+                let _ = reply.send(VaultActorResp::Error(
+                    "reconcile worker is unavailable".into(),
+                ));
+            }
+            return;
+        };
+        match sender.try_send(Some(job)) {
+            Ok(()) => {}
+            Err(crossbeam::channel::TrySendError::Full(Some(job))) => {
+                if let Some(queue) = self.reconcile_queue.as_ref()
+                    && let Ok(Some(superseded)) = queue.try_recv()
+                {
+                    self.reconcile_contexts.remove(&superseded.id);
+                    if let Some(reply) = superseded.reply {
+                        let _ = reply.send(VaultActorResp::ReconcileSuperseded { by_request: id });
+                    }
+                }
+                if let Err(error) =
+                    sender.send_timeout(Some(job), std::time::Duration::from_millis(1))
+                {
+                    let job = error.into_inner().expect("reconcile job retained");
+                    self.reconcile_contexts.remove(&id);
+                    if let Some(reply) = job.reply {
+                        let _ = reply.send(VaultActorResp::Error(
+                            "reconcile worker queue is busy".into(),
+                        ));
+                    }
+                }
+            }
+            Err(crossbeam::channel::TrySendError::Disconnected(Some(job))) => {
+                self.reconcile_contexts.remove(&id);
+                if let Some(reply) = job.reply {
+                    let _ = reply.send(VaultActorResp::Error(
+                        "reconcile worker disconnected".into(),
+                    ));
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn handle_worker_message(&mut self, message: crate::reconcile_worker::WorkerMessage) {
+        match message {
+            crate::reconcile_worker::WorkerMessage::Batch { job_id, outcomes } => {
+                if let Some(mut context) = self.reconcile_contexts.remove(&job_id) {
+                    let result = crate::reconcile_worker::ScanResult {
+                        outcomes,
+                        ..crate::reconcile_worker::ScanResult::default()
+                    };
+                    let _ = self.apply_scan_result(&mut context, result);
+                    self.reconcile_contexts.insert(job_id, context);
+                }
+            }
+            crate::reconcile_worker::WorkerMessage::Progress(progress) => {
+                if self.reconcile_contexts.contains_key(&progress.job_id)
+                    && let Some(pulse) = &self.pulse_sender
+                {
+                    let _ = pulse.try_send(Pulse::ReconcileProgress {
+                        done: progress.done,
+                        total: progress.total,
+                    });
+                }
+            }
+            crate::reconcile_worker::WorkerMessage::Complete { job_id, result } => {
+                let Some(mut context) = self.reconcile_contexts.remove(&job_id) else {
+                    return;
+                };
+                let summary = self.apply_scan_result(&mut context, result);
+                if !self.initial_scan_complete && context.job.scope == ReconcileScope::Full {
+                    self.initial_scan_complete = true;
+                    if let Some(ready) = self.startup_ready_sender.take() {
+                        let _ = ready.send(());
+                    }
+                    if self.index.needs_reparse()
+                        && let Err(error) = self.index.mark_parser_current()
+                    {
+                        tracing::warn!(%error, "could not persist current parser version after verification");
+                    }
+                }
+                self.publish_reconcile(summary, context.job.reply);
+                self.prune_save_watermarks();
+            }
+        }
+    }
+
+    fn apply_scan_result(
+        &mut self,
+        context: &mut ReconcileContext,
+        result: crate::reconcile_worker::ScanResult,
+    ) -> ReconcileSummary {
+        let scan_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(i64::MAX as u128) as i64;
+        let mut summary = ReconcileSummary::default();
+        let mut present_notes = std::collections::HashSet::new();
+        let mut present_attachments = std::collections::HashSet::new();
+        let scanned_notes = result.present_notes.clone();
+        let scanned_attachments = result.present_attachments.clone();
+        let full_scan = result.full_scan;
+        let complete_scan = result.complete && !result.incomplete;
+        for outcome in result.outcomes {
+            let path = match &outcome {
+                crate::reconcile_worker::ScanOutcome::Note { path, .. }
+                | crate::reconcile_worker::ScanOutcome::Attachment { path, .. }
+                | crate::reconcile_worker::ScanOutcome::Missing(path) => path.clone(),
+            };
+            if path_observation_is_stale(
+                self.save_paths.get(&path).copied().unwrap_or(0),
+                context.job.watermark,
+            ) {
+                continue;
+            }
+            match outcome {
+                crate::reconcile_worker::ScanOutcome::Missing(path) => {
+                    let Ok(relative) = path.strip_prefix(&self.identity.root) else {
+                        continue;
+                    };
+                    let Ok(key) = self.fs.encode_path_key(relative) else {
+                        continue;
+                    };
+                    if self.index.remove_note_path(&key).unwrap_or(false) {
+                        summary.removed = summary.removed.saturating_add(1);
+                        self.record_drift();
+                        context.deleted_events.push(path.clone());
+                    }
+                    if self.index.remove_attachment_path(&key).unwrap_or(false) {
+                        summary.removed = summary.removed.saturating_add(1);
+                        self.record_drift();
+                    }
+                }
+                crate::reconcile_worker::ScanOutcome::Note {
+                    path,
+                    path_key,
+                    display_path,
+                    size,
+                    mtime_ns,
+                    bytes,
+                    parsed,
+                } => {
+                    present_notes.insert(path_key.clone());
+                    let prior = context.initial_paths.contains(&path_key);
+                    let previous_generation = self.generation.0;
+                    let changed = if size > MAX_NOTE_BYTES as u64 {
+                        self.index
+                            .apply_unparsed_note(&path_key, &display_path, size, mtime_ns, scan_ns)
+                            .map(|(epoch, generation)| {
+                                self.epoch = Epoch::new(epoch);
+                                self.generation = Generation::new(generation);
+                                generation > previous_generation
+                            })
+                            .map_err(|error| error.to_string())
+                    } else if let Some(bytes) = bytes {
+                        if context.job.mode == ReconcileMode::FastMetadata
+                            && self
+                                .index
+                                .note_metadata_matches(&path_key, size, mtime_ns, scan_ns)
+                                .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let applied = if let Some(parsed) = parsed {
+                            self.index.apply_parsed_note(
+                                &path_key,
+                                &display_path,
+                                &bytes,
+                                &parsed,
+                                mtime_ns,
+                                scan_ns,
+                            )
+                        } else {
+                            self.index.apply_degraded_saved_note(
+                                &path_key,
+                                &display_path,
+                                &bytes,
+                                mtime_ns,
+                                scan_ns,
+                            )
+                        };
+                        match applied {
+                            Ok((epoch, generation)) => {
+                                let changed = generation > previous_generation;
+                                if changed && (prior || self.initial_scan_complete) {
+                                    let _ =
+                                        self.event_sender.send(VaultActorEvent::ExternalChange {
+                                            path: path.clone(),
+                                            bytes,
+                                        });
+                                }
+                                self.epoch = Epoch::new(epoch);
+                                self.generation = Generation::new(generation);
+                                Ok(changed)
+                            }
+                            Err(error) => Err(error.to_string()),
+                        }
+                    } else {
+                        continue;
+                    };
+                    match changed {
+                        Ok(true) if prior => {
+                            summary.changed = summary.changed.saturating_add(1);
+                            self.record_drift();
+                        }
+                        Ok(true) => {
+                            summary.added = summary.added.saturating_add(1);
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(path=%path.display(), %error, "note reconcile failed")
+                        }
+                    }
+                }
+                crate::reconcile_worker::ScanOutcome::Attachment {
+                    path,
+                    path_key,
+                    display_path,
+                    size,
+                    mtime_ns,
+                    placeholder,
+                    hash,
+                    bytes,
+                } => {
+                    present_attachments.insert(path_key.clone());
+                    if context.job.mode == ReconcileMode::FastMetadata
+                        && self
+                            .index
+                            .attachment_matches(
+                                &path_key,
+                                size,
+                                mtime_ns,
+                                None,
+                                !placeholder,
+                                scan_ns,
+                            )
+                            .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let hydrated = !placeholder
+                        && (size > flavite_index::types::ATTACHMENT_HASH_MAX as u64
+                            || hash.is_some());
+                    if self
+                        .index
+                        .attachment_matches(&path_key, size, mtime_ns, hash, hydrated, scan_ns)
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    match self.index.apply_saved_attachment(
+                        &path_key,
+                        &display_path,
+                        bytes.as_deref(),
+                        size,
+                        mtime_ns,
+                        scan_ns,
+                        hydrated,
+                    ) {
+                        Ok((_, generation)) => {
+                            let prior = context.initial_attachments.contains(&path_key);
+                            self.generation = Generation::new(generation);
+                            if prior {
+                                summary.changed = summary.changed.saturating_add(1);
+                                self.record_drift();
+                            } else {
+                                summary.added = summary.added.saturating_add(1);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(path=%path.display(), %error, "attachment reconcile failed")
+                        }
+                    }
+                }
+            }
+        }
+        if full_scan && complete_scan {
+            for key in context
+                .initial_paths
+                .iter()
+                .filter(|key| !scanned_notes.contains(*key) && !present_notes.contains(*key))
+            {
+                if self.saved_after_watermark(key, context.job.watermark) {
+                    continue;
+                }
+                if let Some(path) = self.remove_note_and_path_event(key, &mut summary) {
+                    context.deleted_events.push(path);
+                }
+            }
+            for key in context.initial_attachments.iter().filter(|key| {
+                !scanned_attachments.contains(*key) && !present_attachments.contains(*key)
+            }) {
+                if self.saved_after_watermark(key, context.job.watermark) {
+                    continue;
+                }
+                if self.index.remove_attachment_path(key).unwrap_or(false) {
+                    summary.removed = summary.removed.saturating_add(1);
+                    self.record_drift();
+                }
+            }
+            let t2 = self.infer_note_renames(
+                &context.old_notes,
+                &context.initial_paths,
+                &scanned_notes,
+                &context.inbound_counts,
+            );
+            for path in std::mem::take(&mut context.deleted_events) {
+                if !t2.contains(&path) {
+                    let _ = self.event_sender.send(VaultActorEvent::Deleted { path });
+                }
+            }
+        }
+        if result.complete && !full_scan {
+            for path in std::mem::take(&mut context.deleted_events) {
+                let _ = self.event_sender.send(VaultActorEvent::Deleted { path });
+            }
+        }
+        context.summary.added = context.summary.added.saturating_add(summary.added);
+        context.summary.changed = context.summary.changed.saturating_add(summary.changed);
+        context.summary.removed = context.summary.removed.saturating_add(summary.removed);
+        if result.complete {
+            std::mem::take(&mut context.summary)
+        } else {
+            ReconcileSummary::default()
+        }
+    }
+
+    fn remove_note_and_path_event(
+        &mut self,
+        key: &[u8],
+        summary: &mut ReconcileSummary,
+    ) -> Option<PathBuf> {
+        if !self.index.remove_note_path(key).unwrap_or(false) {
+            return None;
+        }
+        summary.removed = summary.removed.saturating_add(1);
+        self.record_drift();
+        self.fs
+            .decode_path_key(key)
+            .ok()
+            .map(|relative| self.identity.root.join(relative))
+    }
+
+    fn saved_after_watermark(&self, key: &[u8], watermark: u64) -> bool {
+        self.fs.decode_path_key(key).ok().is_some_and(|relative| {
+            self.save_paths
+                .get(&self.identity.root.join(relative))
+                .is_some_and(|seq| path_observation_is_stale(*seq, watermark))
+        })
+    }
+
+    fn prune_save_watermarks(&mut self) {
+        if self.reconcile_contexts.is_empty() {
+            self.save_paths.clear();
+            return;
+        }
+        let oldest = self
+            .reconcile_contexts
+            .values()
+            .map(|context| context.job.watermark)
+            .min()
+            .unwrap_or(self.save_seq);
+        self.save_paths.retain(|_, seq| *seq > oldest);
+    }
+
+    fn watcher_lost(&mut self, reason: &str) {
+        self.record_drift();
+        tracing::warn!(%reason, "vault watcher unavailable; scheduling full verification");
+        let _ = self.event_sender.send(VaultActorEvent::WatcherLost);
+        self.handle_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent, None);
     }
 
     fn publish_reconcile(
@@ -1382,220 +1896,17 @@ impl VaultActor {
                 count: inbound,
             });
         }
-        let _ = self.scan_paths(&changed);
+        self.enqueue_reconcile(
+            ReconcileScope::Full,
+            ReconcileMode::VerifyContent,
+            None,
+            changed,
+        );
         Ok(txn)
     }
 
     fn perform_initial_scan(&mut self) {
         self.handle_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent, None);
-        if self.index.needs_reparse()
-            && let Err(error) = self.index.mark_parser_current()
-        {
-            tracing::warn!(%error, "could not persist current parser version after verification");
-        }
-        self.initial_scan_complete = true;
-    }
-
-    fn scan_notes(&mut self) -> ReconcileSummary {
-        self.scan_notes_mode(ReconcileMode::VerifyContent)
-    }
-
-    fn scan_notes_mode(&mut self, mode: ReconcileMode) -> ReconcileSummary {
-        if let Ok((epoch, generation)) = self.index.current_version() {
-            self.epoch = Epoch::new(epoch);
-            self.generation = Generation::new(generation);
-        }
-        let total_notes = count_markdown_notes(&*self.fs, &self.identity.root);
-        let mut processed_notes = 0u32;
-        let mut stack = vec![self.identity.root.clone()];
-        let mut summary = ReconcileSummary::default();
-        let initial_paths = self.index.indexed_note_paths().unwrap_or_default();
-        let initial_path_set = initial_paths
-            .iter()
-            .cloned()
-            .collect::<std::collections::HashSet<_>>();
-        let old_note_snapshot = match self.index.rename_note_snapshot() {
-            Ok(notes) => notes,
-            Err(error) => {
-                tracing::warn!(%error, "could not snapshot notes for rename inference");
-                Vec::new()
-            }
-        };
-        let old_inbound_counts = old_note_snapshot
-            .iter()
-            .map(|note| {
-                let count = self
-                    .index
-                    .writer()
-                    .conn()
-                    .query_row(
-                        "SELECT COUNT(*) FROM links WHERE dst_note=?1",
-                        [note.note_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0)
-                    .max(0) as u32;
-                (PathBuf::from(&note.path), count)
-            })
-            .collect::<HashMap<_, _>>();
-        let mut indexed: std::collections::HashSet<Vec<u8>> = initial_paths.into_iter().collect();
-        let mut present = std::collections::HashSet::new();
-        let mut deleted_events = Vec::new();
-        while let Some(directory) = stack.pop() {
-            let Ok(entries) = self.fs.read_dir(&directory) else {
-                continue;
-            };
-            for entry in entries {
-                if entry.is_dir {
-                    if !entry.is_symlink && entry.name != ".flavite" {
-                        stack.push(entry.path);
-                    }
-                    continue;
-                }
-                if entry.is_symlink {
-                    continue;
-                }
-                if !entry
-                    .path
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
-                {
-                    continue;
-                }
-                processed_notes = processed_notes.saturating_add(1);
-                if (processed_notes.is_multiple_of(128) || processed_notes == total_notes)
-                    && let Some(pulse) = &self.pulse_sender
-                {
-                    let _ = pulse.try_send(Pulse::ReconcileProgress {
-                        done: processed_notes,
-                        total: total_notes,
-                    });
-                }
-                let Ok(relative) = entry.path.strip_prefix(&self.identity.root) else {
-                    continue;
-                };
-                let Ok(path_key) = self.fs.encode_path_key(relative) else {
-                    continue;
-                };
-                present.insert(path_key.clone());
-                let Ok(metadata) = self.fs.metadata(&entry.path) else {
-                    continue;
-                };
-                let scan_ns = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-                    .min(i64::MAX as u128) as i64;
-                if mode == ReconcileMode::FastMetadata
-                    && self
-                        .index
-                        .note_metadata_matches(&path_key, metadata.size, metadata.mtime_ns, scan_ns)
-                        .unwrap_or(false)
-                {
-                    indexed.remove(&path_key);
-                    continue;
-                }
-                let display_path = relative.to_string_lossy().replace('\\', "/");
-                if metadata.size > MAX_NOTE_BYTES as u64 {
-                    match self.index.apply_unparsed_note(
-                        &path_key,
-                        &display_path,
-                        metadata.size,
-                        metadata.mtime_ns,
-                        scan_ns,
-                    ) {
-                        Ok((epoch, generation)) => {
-                            let was_indexed = indexed.remove(&path_key);
-                            let changed = generation > self.generation.0;
-                            self.epoch = Epoch::new(epoch);
-                            self.generation = Generation::new(generation);
-                            if changed {
-                                if was_indexed {
-                                    summary.changed = summary.changed.saturating_add(1);
-                                    self.record_drift();
-                                } else {
-                                    summary.added = summary.added.saturating_add(1);
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(path = %entry.path.display(), %error, "oversize note reconcile failed")
-                        }
-                    }
-                    continue;
-                }
-                let Ok(bytes) = self.fs.read_capped(&entry.path, MAX_NOTE_BYTES as u64) else {
-                    continue;
-                };
-                match self.index.apply_saved_note(
-                    &path_key,
-                    &display_path,
-                    &bytes,
-                    metadata.mtime_ns,
-                    scan_ns,
-                ) {
-                    Ok((epoch, generation)) => {
-                        let changed = generation > self.generation.0;
-                        let was_indexed = indexed.remove(&path_key);
-                        if changed && (was_indexed || self.initial_scan_complete) {
-                            let _ = self.event_sender.send(VaultActorEvent::ExternalChange {
-                                path: entry.path.clone(),
-                                bytes: bytes.clone(),
-                            });
-                        }
-                        self.epoch = Epoch::new(epoch);
-                        self.generation = Generation::new(generation);
-                        if changed {
-                            if was_indexed {
-                                summary.changed = summary.changed.saturating_add(1);
-                                self.record_drift();
-                            } else {
-                                summary.added = summary.added.saturating_add(1);
-                                if self.initial_scan_complete {
-                                    self.drift_found_total.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(path = %entry.path.display(), %error, "note reconcile failed")
-                    }
-                }
-            }
-        }
-        // A present but unreadable/oversized note is not a deletion.
-        indexed.retain(|path| !present.contains(path));
-        for vanished in indexed {
-            match self.index.remove_note_path(&vanished) {
-                Ok(true) => {
-                    summary.removed = summary.removed.saturating_add(1);
-                    self.record_drift();
-                    if let Ok(relative) = self.fs.decode_path_key(&vanished) {
-                        deleted_events.push(self.identity.root.join(relative));
-                    }
-                    // Keep actor-visible generation monotonic after removal.
-                    self.generation = Generation::new(self.generation.0.saturating_add(1));
-                }
-                Ok(false) => {}
-                Err(error) => tracing::warn!(%error, "note removal reconcile failed"),
-            }
-        }
-        let attachments = self.scan_attachments(mode);
-        summary.added = summary.added.saturating_add(attachments.added);
-        summary.changed = summary.changed.saturating_add(attachments.changed);
-        summary.removed = summary.removed.saturating_add(attachments.removed);
-        let t2_rekey_sources = self.infer_note_renames(
-            &old_note_snapshot,
-            &initial_path_set,
-            &present,
-            &old_inbound_counts,
-        );
-        for path in deleted_events {
-            if !t2_rekey_sources.contains(&path) {
-                let _ = self.event_sender.send(VaultActorEvent::Deleted { path });
-            }
-        }
-        summary
     }
 
     fn infer_note_renames(
@@ -1676,321 +1987,6 @@ impl VaultActor {
         }
         t2_sources
     }
-
-    fn scan_attachments(&mut self, mode: ReconcileMode) -> ReconcileSummary {
-        let indexed: std::collections::HashSet<Vec<u8>> = self
-            .index
-            .indexed_attachment_paths()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        let mut still_present = std::collections::HashSet::new();
-        let mut stack = vec![self.identity.root.clone()];
-        let mut summary = ReconcileSummary::default();
-        while let Some(directory) = stack.pop() {
-            let Ok(entries) = self.fs.read_dir(&directory) else {
-                continue;
-            };
-            for entry in entries {
-                if entry.is_dir {
-                    if !entry.is_symlink && entry.name != ".flavite" {
-                        stack.push(entry.path);
-                    }
-                    continue;
-                }
-                if entry.is_symlink {
-                    continue;
-                }
-                let Some(_kind) = attachment_kind(&entry.path) else {
-                    continue;
-                };
-                let Ok(relative) = entry.path.strip_prefix(&self.identity.root) else {
-                    continue;
-                };
-                let Ok(key) = self.fs.encode_path_key(relative) else {
-                    continue;
-                };
-                still_present.insert(key.clone());
-                let Ok(metadata) = self.fs.metadata(&entry.path) else {
-                    continue;
-                };
-                let placeholder = self.fs.is_placeholder(&entry.path).unwrap_or(false);
-                let scan_ns = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-                    .min(i64::MAX as u128) as i64;
-                if mode == ReconcileMode::FastMetadata
-                    && self
-                        .index
-                        .attachment_matches(
-                            &key,
-                            metadata.size,
-                            metadata.mtime_ns,
-                            None,
-                            !placeholder,
-                            scan_ns,
-                        )
-                        .unwrap_or(false)
-                {
-                    continue;
-                }
-                let hash_cap = flavite_index::types::ATTACHMENT_HASH_MAX as u64;
-                let hash = if !placeholder && metadata.size <= hash_cap {
-                    self.fs
-                        .read_capped(&entry.path, hash_cap)
-                        .ok()
-                        .map(|bytes| *blake3::hash(&bytes).as_bytes())
-                } else {
-                    None
-                };
-                let hydrated = !placeholder && (metadata.size > hash_cap || hash.is_some());
-                if self
-                    .index
-                    .attachment_matches(
-                        &key,
-                        metadata.size,
-                        metadata.mtime_ns,
-                        hash,
-                        hydrated,
-                        scan_ns,
-                    )
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                let display = relative.to_string_lossy().replace('\\', "/");
-                let bytes = if hydrated && metadata.size <= hash_cap {
-                    self.fs.read_capped(&entry.path, hash_cap).ok()
-                } else {
-                    None
-                };
-                match self.index.apply_saved_attachment(
-                    &key,
-                    &display,
-                    bytes.as_deref(),
-                    metadata.size,
-                    metadata.mtime_ns,
-                    scan_ns,
-                    hydrated,
-                ) {
-                    Ok((_, generation)) => {
-                        self.generation = Generation::new(generation);
-                        if indexed.contains(&key) {
-                            summary.changed = summary.changed.saturating_add(1);
-                            self.drift_found_total.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            summary.added = summary.added.saturating_add(1);
-                            if self.initial_scan_complete {
-                                self.drift_found_total.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(path = %entry.path.display(), %error, "attachment reconcile failed")
-                    }
-                }
-            }
-        }
-        for key in indexed
-            .into_iter()
-            .filter(|key| !still_present.contains(key))
-        {
-            if self.index.remove_attachment_path(&key).unwrap_or(false) {
-                summary.removed = summary.removed.saturating_add(1);
-                self.drift_found_total.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        summary
-    }
-
-    /// Verify just the paths nominated by watcher events. A directory or an
-    /// unusable path falls back to a full scan so hints can never hide drift.
-    fn scan_paths(
-        &mut self,
-        paths: &std::collections::HashSet<std::path::PathBuf>,
-    ) -> ReconcileSummary {
-        if paths.is_empty() || paths.iter().any(|path| path == std::path::Path::new(".")) {
-            return self.scan_notes();
-        }
-        let mut summary = ReconcileSummary::default();
-        let initial_paths = self.index.indexed_note_paths().unwrap_or_default();
-        let initial_path_set = initial_paths
-            .iter()
-            .cloned()
-            .collect::<std::collections::HashSet<_>>();
-        let old_notes = match self.index.rename_note_snapshot() {
-            Ok(notes) => notes,
-            Err(error) => {
-                tracing::warn!(%error, "could not snapshot notes for rename inference");
-                Vec::new()
-            }
-        };
-        let inbound_counts = old_notes
-            .iter()
-            .map(|note| {
-                let count = self
-                    .index
-                    .writer()
-                    .conn()
-                    .query_row(
-                        "SELECT COUNT(*) FROM links WHERE dst_note=?1",
-                        [note.note_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0)
-                    .max(0) as u32;
-                (std::path::PathBuf::from(&note.path), count)
-            })
-            .collect::<HashMap<_, _>>();
-        let mut present_paths = initial_path_set.clone();
-        let mut deleted_events = Vec::new();
-        for nominated in paths {
-            let path = if nominated.is_absolute() {
-                nominated.clone()
-            } else {
-                self.identity.root.join(nominated)
-            };
-            if !path.starts_with(&self.identity.root) {
-                continue;
-            }
-            if !path
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
-            {
-                if attachment_kind(&path).is_some() {
-                    // Attachment changes participate in the same resolver/index transaction.
-                    return self.scan_notes_mode(ReconcileMode::VerifyContent);
-                }
-                continue;
-            }
-            let Ok(relative) = path.strip_prefix(&self.identity.root) else {
-                continue;
-            };
-            let Ok(path_key) = self.fs.encode_path_key(relative) else {
-                continue;
-            };
-            let exists = match self.fs.exists(&path) {
-                Ok(exists) => exists,
-                Err(error) => {
-                    tracing::warn!(path = %path.display(), %error, "cannot verify nominated path");
-                    continue;
-                }
-            };
-            if !exists {
-                present_paths.remove(&path_key);
-                if self.index.remove_note_path(&path_key).unwrap_or(false) {
-                    summary.removed = summary.removed.saturating_add(1);
-                    self.record_drift();
-                    deleted_events.push(path.clone());
-                    if let Ok((epoch, generation)) = self.index.current_version() {
-                        self.epoch = Epoch::new(epoch);
-                        self.generation = Generation::new(generation);
-                    }
-                }
-                continue;
-            }
-            present_paths.insert(path_key.clone());
-            if self
-                .fs
-                .validate_in_root(&self.identity.root, &path)
-                .is_err()
-            {
-                continue;
-            }
-            let Ok(metadata) = self.fs.metadata(&path) else {
-                continue;
-            };
-            if metadata.is_dir {
-                return self.scan_notes();
-            }
-            if metadata.is_symlink {
-                continue;
-            }
-            let was_indexed = self.index.contains_note_path(&path_key).unwrap_or(false);
-            let before = self
-                .index
-                .current_version()
-                .map(|(_, generation)| generation)
-                .unwrap_or(self.generation.0);
-            let scan_ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-                .min(i64::MAX as u128) as i64;
-            let display_path = relative.to_string_lossy().replace('\\', "/");
-            if metadata.size > MAX_NOTE_BYTES as u64 {
-                match self.index.apply_unparsed_note(
-                    &path_key,
-                    &display_path,
-                    metadata.size,
-                    metadata.mtime_ns,
-                    scan_ns,
-                ) {
-                    Ok((epoch, generation)) => {
-                        self.epoch = Epoch::new(epoch);
-                        self.generation = Generation::new(generation);
-                        if generation > before {
-                            if was_indexed {
-                                summary.changed = summary.changed.saturating_add(1);
-                                self.record_drift();
-                            } else {
-                                summary.added = summary.added.saturating_add(1);
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(path = %path.display(), %error, "oversize note reconcile failed")
-                    }
-                }
-                continue;
-            }
-            let Ok(bytes) = self.fs.read_capped(&path, MAX_NOTE_BYTES as u64) else {
-                continue;
-            };
-            match self.index.apply_saved_note(
-                &path_key,
-                &display_path,
-                &bytes,
-                metadata.mtime_ns,
-                scan_ns,
-            ) {
-                Ok((epoch, generation)) => {
-                    self.epoch = Epoch::new(epoch);
-                    self.generation = Generation::new(generation);
-                    if generation > before {
-                        if was_indexed {
-                            summary.changed = summary.changed.saturating_add(1);
-                            self.record_drift();
-                        } else {
-                            summary.added = summary.added.saturating_add(1);
-                        }
-                        if was_indexed || self.initial_scan_complete {
-                            let _ = self.event_sender.send(VaultActorEvent::ExternalChange {
-                                path: path.clone(),
-                                bytes,
-                            });
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(path = %path.display(), %error, "nominated note reconcile failed")
-                }
-            }
-        }
-        let t2_rekey_sources = self.infer_note_renames(
-            &old_notes,
-            &initial_path_set,
-            &present_paths,
-            &inbound_counts,
-        );
-        for path in deleted_events {
-            if !t2_rekey_sources.contains(&path) {
-                let _ = self.event_sender.send(VaultActorEvent::Deleted { path });
-            }
-        }
-        summary
-    }
 }
 
 fn attachment_kind(path: &std::path::Path) -> Option<flavite_index::schema::AttachmentKind> {
@@ -2006,29 +2002,8 @@ fn attachment_kind(path: &std::path::Path) -> Option<flavite_index::schema::Atta
     })
 }
 
-fn count_markdown_notes(fs: &dyn Fs, root: &std::path::Path) -> u32 {
-    let mut count = 0u32;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(directory) = stack.pop() {
-        let Ok(entries) = fs.read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries {
-            if entry.is_dir {
-                if !entry.is_symlink && entry.name != ".flavite" {
-                    stack.push(entry.path);
-                }
-            } else if !entry.is_symlink
-                && entry
-                    .path
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-            {
-                count = count.saturating_add(1);
-            }
-        }
-    }
-    count
+fn path_observation_is_stale(last_saved_seq: u64, watermark: u64) -> bool {
+    last_saved_seq > watermark
 }
 
 /// Extension trait for Fs to create boxed clones.
@@ -2051,6 +2026,9 @@ pub struct VaultActorBuilder {
     event_source: Option<EventSource>,
     pulse_sender: Option<Sender<Pulse>>,
     runtime_config: Option<crate::types::VaultConfig>,
+    reconcile_result_delay: std::time::Duration,
+    reconcile_scan_signal: Option<Sender<()>>,
+    watcher_start_failure: Option<String>,
 }
 
 impl VaultActorBuilder {
@@ -2088,6 +2066,24 @@ impl VaultActorBuilder {
         self
     }
 
+    #[cfg(test)]
+    fn with_reconcile_result_delay(mut self, delay: std::time::Duration) -> Self {
+        self.reconcile_result_delay = delay;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_reconcile_scan_signal(mut self, signal: Sender<()>) -> Self {
+        self.reconcile_scan_signal = Some(signal);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_watcher_start_failure(mut self, message: &str) -> Self {
+        self.watcher_start_failure = Some(message.to_owned());
+        self
+    }
+
     /// Send lossy reconcile pulses to the Session's shared channel.
     #[must_use]
     pub fn with_pulse_sender(mut self, sender: Sender<Pulse>) -> Self {
@@ -2120,6 +2116,9 @@ impl VaultActorBuilder {
                 bulk_threshold: config.bulk_threshold,
             });
         }
+        actor.reconcile_result_delay = self.reconcile_result_delay;
+        actor.reconcile_scan_signal = self.reconcile_scan_signal;
+        actor.watcher_start_failure = self.watcher_start_failure;
         Ok(actor)
     }
 }
@@ -2146,7 +2145,7 @@ mod tests {
             .unwrap()
             .start()
             .unwrap();
-        actor.get_version().unwrap();
+        reconcile_test_actor(&actor);
         (actor, temp)
     }
 
@@ -2229,6 +2228,7 @@ mod tests {
             .unwrap()
             .start()
             .unwrap();
+        reconcile_test_actor(&actor);
         assert!(actor.get_version().is_ok());
         assert_eq!(
             actor
@@ -2325,7 +2325,7 @@ mod tests {
             .unwrap()
             .start()
             .unwrap();
-        actor.get_version().unwrap();
+        reconcile_test_actor(&actor);
 
         let response = actor
             .submit_rename(
@@ -2502,6 +2502,7 @@ mod tests {
             .unwrap()
             .start()
             .unwrap();
+        reconcile_test_actor(&actor);
         assert_eq!(actor.get_version().unwrap().generation.0, 1);
         let _ = actor.events().try_iter().count();
         fs.write_new(std::path::Path::new("/vault/.next"), b"after")
@@ -2559,6 +2560,150 @@ mod tests {
     }
 
     #[test]
+    fn save_reply_completes_while_initial_reconcile_is_in_flight() {
+        let fs = MemFs::new();
+        fs.create_dir_all(std::path::Path::new("/vault")).unwrap();
+        fs.write_new(std::path::Path::new("/vault/a.md"), b"before")
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("slow-reconcile.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let note_key = fs.encode_path_key(std::path::Path::new("a.md")).unwrap();
+        let (scan_signal, scan_finished) = bounded(1);
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs.clone()))
+            .with_identity(VaultIdentity::new(
+                uuid::Uuid::now_v7(),
+                "/vault".into(),
+                vec![1],
+            ))
+            .with_index(IndexActor::new(&db, 1).unwrap())
+            .with_reconcile_result_delay(std::time::Duration::from_millis(500))
+            .with_reconcile_scan_signal(scan_signal)
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        scan_finished
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let response = actor
+            .submit_save(SaveRequest {
+                request_id: 71,
+                path: PathBuf::from("/vault/a.md"),
+                note_key,
+                bytes: b"saved while scan waits".to_vec(),
+                merge_base: b"before".to_vec(),
+                precondition: crate::save::DiskPrecondition::Existing(
+                    *blake3::hash(b"before").as_bytes(),
+                ),
+                buffer_id: 4,
+                revision: 2,
+            })
+            .unwrap();
+        assert!(matches!(
+            response
+                .recv_timeout(std::time::Duration::from_millis(350))
+                .unwrap(),
+            VaultActorResp::Saved(Ok(_))
+        ));
+        assert_eq!(
+            fs.read_if_exists(std::path::Path::new("/vault/a.md"))
+                .unwrap()
+                .unwrap(),
+            b"saved while scan waits"
+        );
+        let _ = actor.send(VaultActorMsg::Shutdown);
+    }
+
+    #[test]
+    fn queued_reconcile_gets_explicit_superseded_terminal_reply() {
+        let fs = MemFs::new();
+        fs.create_dir_all(std::path::Path::new("/vault")).unwrap();
+        fs.write_new(std::path::Path::new("/vault/a.md"), b"a")
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("superseded.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let (scan_started, scan_finished) = bounded(1);
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs))
+            .with_identity(VaultIdentity::new(
+                uuid::Uuid::now_v7(),
+                "/vault".into(),
+                vec![1],
+            ))
+            .with_index(IndexActor::new(&db, 1).unwrap())
+            .with_reconcile_result_delay(std::time::Duration::from_millis(500))
+            .with_reconcile_scan_signal(scan_started)
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        scan_finished
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let first = actor
+            .submit_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent)
+            .unwrap();
+        let second = actor
+            .submit_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent)
+            .unwrap();
+        assert!(matches!(
+            first
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            VaultActorResp::ReconcileSuperseded { by_request: 3 }
+        ));
+        assert!(matches!(
+            second
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap(),
+            VaultActorResp::ReconcileComplete { .. }
+        ));
+        let _ = actor.send(VaultActorMsg::Shutdown);
+    }
+
+    #[test]
+    fn watcher_start_failure_surfaces_watcher_lost_and_verifies() {
+        let fs = MemFs::new();
+        fs.create_dir_all(std::path::Path::new("/vault")).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("watch-start-failure.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs))
+            .with_identity(VaultIdentity::new(
+                uuid::Uuid::now_v7(),
+                "/vault".into(),
+                vec![1],
+            ))
+            .with_index(IndexActor::new(&db, 1).unwrap())
+            .with_watcher_start_failure("injected watcher construction failure")
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        assert!(matches!(
+            actor
+                .events()
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            VaultActorEvent::WatcherLost
+        ));
+        assert_eq!(actor.drift_found_total(), 1);
+        assert!(matches!(
+            actor
+                .submit_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent)
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            VaultActorResp::ReconcileComplete { .. }
+        ));
+        let _ = actor.send(VaultActorMsg::Shutdown);
+    }
+
+    #[test]
     fn initial_scan_does_not_emit_external_changes_and_indexes_attachments() {
         let fs = MemFs::new();
         fs.create_dir_all(std::path::Path::new("/vault")).unwrap();
@@ -2580,6 +2725,7 @@ mod tests {
             .unwrap()
             .start()
             .unwrap();
+        reconcile_test_actor(&actor);
         assert_eq!(actor.get_version().unwrap().generation.0, 2);
         assert!(actor.events().try_recv().is_err());
         let writer = flavite_index::Writer::new(&db).unwrap();
@@ -2627,7 +2773,7 @@ mod tests {
             .unwrap()
             .start()
             .unwrap();
-        actor.get_version().unwrap();
+        reconcile_test_actor(&actor);
         let writer = flavite_index::Writer::new(&db).unwrap();
         let row: (bool, Option<Vec<u8>>, i64) = writer
             .conn()
@@ -2668,6 +2814,7 @@ mod tests {
             .unwrap()
             .start()
             .unwrap();
+        reconcile_test_actor(&actor);
         let initial = actor.get_version().unwrap().generation.0;
         assert_eq!(actor.drift_found_total(), 0);
         let _ = actor.events().try_iter().count();
@@ -2680,14 +2827,241 @@ mod tests {
         )
         .unwrap();
         actor.focus().unwrap();
-        let _ = pulse_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while actor.get_version().unwrap().generation.0 <= initial
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(actor.get_version().unwrap().generation.0 > initial);
         assert_eq!(actor.drift_found_total(), 1);
         assert!(
             matches!(actor.events().try_recv(), Ok(VaultActorEvent::ExternalChange { bytes, .. }) if bytes == b"after")
         );
         let _ = actor.send(VaultActorMsg::Shutdown);
+    }
+
+    #[test]
+    fn startup_events_queued_during_initial_scan_are_replayed() {
+        let fs = MemFs::new();
+        fs.create_dir_all(std::path::Path::new("/vault")).unwrap();
+        fs.write_new(std::path::Path::new("/vault/a.md"), b"before")
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("startup-race.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let (events, source) = event_source_channel();
+        let (scan_signal, scan_done) = bounded(1);
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs.clone()))
+            .with_identity(VaultIdentity::new(
+                uuid::Uuid::now_v7(),
+                "/vault".into(),
+                vec![1],
+            ))
+            .with_index(IndexActor::new(&db, 1).unwrap())
+            .with_event_source(source)
+            .with_reconcile_result_delay(std::time::Duration::from_millis(300))
+            .with_reconcile_scan_signal(scan_signal)
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        scan_done
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        fs.write_new(std::path::Path::new("/vault/.next"), b"after")
+            .unwrap();
+        fs.rename_replace(
+            std::path::Path::new("/vault/.next"),
+            std::path::Path::new("/vault/a.md"),
+        )
+        .unwrap();
+        events
+            .send(WatcherEvent::Modified("/vault/a.md".into()))
+            .unwrap();
+        assert!(
+            matches!(actor.events().recv_timeout(std::time::Duration::from_secs(3)).unwrap(), VaultActorEvent::ExternalChange { bytes, .. } if bytes == b"after")
+        );
+        let _ = actor.send(VaultActorMsg::Shutdown);
+    }
+
+    #[test]
+    fn shutdown_joins_reconcile_worker_before_actor_exits() {
+        let fs = MemFs::new();
+        fs.create_dir_all(std::path::Path::new("/vault")).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("worker-shutdown.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let (signal, scan_finished) = bounded(1);
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs))
+            .with_identity(VaultIdentity::new(
+                uuid::Uuid::now_v7(),
+                "/vault".into(),
+                vec![1],
+            ))
+            .with_index(IndexActor::new(&db, 1).unwrap())
+            .with_reconcile_scan_signal(signal)
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        scan_finished
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let _ = actor.send(VaultActorMsg::Shutdown);
+        assert!(matches!(
+            scan_finished.recv_timeout(std::time::Duration::from_secs(2)),
+            Err(crossbeam::channel::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn focus_throttle_within_two_seconds_does_not_rescan() {
+        let fs = MemFs::new();
+        fs.create_dir_all(std::path::Path::new("/focus-throttle"))
+            .unwrap();
+        fs.write_new(std::path::Path::new("/focus-throttle/a.md"), b"a")
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("focus-throttle.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let channels = crate::channels::ChannelSet::new();
+        let pulses = channels.pulse.receiver();
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs))
+            .with_identity(VaultIdentity::new(
+                uuid::Uuid::now_v7(),
+                "/focus-throttle".into(),
+                vec![1],
+            ))
+            .with_index(IndexActor::new(&db, 1).unwrap())
+            .with_pulse_sender(channels.pulse.sender())
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        reconcile_test_actor(&actor);
+        while pulses.try_recv().is_ok() {}
+        actor.focus().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if matches!(pulses.try_recv(), Ok(Pulse::VaultChanged { .. })) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        while pulses.try_recv().is_ok() {}
+        actor.focus().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(pulses.try_recv().is_err());
+        let _ = actor.send(VaultActorMsg::Shutdown);
+    }
+
+    #[test]
+    fn scan_outcome_for_path_saved_after_enqueue_is_dropped() {
+        let fs = MemFs::new();
+        fs.create_dir_all(std::path::Path::new("/vault")).unwrap();
+        fs.write_new(std::path::Path::new("/vault/a.md"), b"saved bytes")
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("watermark.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let mut index = IndexActor::new(&db, 1).unwrap();
+        let key = fs.encode_path_key(std::path::Path::new("a.md")).unwrap();
+        let scan_ns = 1;
+        index
+            .apply_saved_note(&key, "a.md", b"saved bytes", 1, scan_ns)
+            .unwrap();
+        let identity = VaultIdentity::new(uuid::Uuid::now_v7(), "/vault".into(), vec![1]);
+        let mut actor = VaultActor::new(Box::new(fs.clone()), identity, index);
+        actor.save_seq = 1;
+        actor.save_paths.insert(PathBuf::from("/vault/a.md"), 1);
+        let job = crate::reconcile_worker::ReconcileJob {
+            id: 10,
+            scope: ReconcileScope::Full,
+            mode: ReconcileMode::VerifyContent,
+            watermark: 0,
+            nominated: Default::default(),
+            reply: None,
+        };
+        let mut context = ReconcileContext {
+            job,
+            initial_paths: [key.clone()].into_iter().collect(),
+            initial_attachments: Default::default(),
+            old_notes: Vec::new(),
+            inbound_counts: HashMap::new(),
+            summary: ReconcileSummary::default(),
+            deleted_events: Vec::new(),
+        };
+        let result = crate::reconcile_worker::ScanResult {
+            outcomes: vec![crate::reconcile_worker::ScanOutcome::Note {
+                path: PathBuf::from("/vault/a.md"),
+                path_key: key.clone(),
+                display_path: "a.md".into(),
+                size: 10,
+                mtime_ns: 1,
+                bytes: Some(b"stale scan".to_vec()),
+                parsed: flavite_syntax::pulldown_glue::parse_note(b"stale scan").ok(),
+            }],
+            present_notes: [key.clone()].into_iter().collect(),
+            present_attachments: Default::default(),
+            incomplete: false,
+            total: 1,
+            full_scan: false,
+            complete: true,
+        };
+        actor.apply_scan_result(&mut context, result);
+        let writer = flavite_index::Writer::new(&db).unwrap();
+        let hash: Vec<u8> = writer
+            .conn()
+            .query_row(
+                "SELECT content_hash FROM notes WHERE path='a.md'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hash, blake3::hash(b"saved bytes").as_bytes());
+    }
+
+    #[test]
+    fn save_watermark_interleavings_preserve_saved_index_bytes() {
+        use proptest::prelude::*;
+        use proptest::test_runner::TestRunner;
+        let mut runner = TestRunner::new(ProptestConfig {
+            cases: 256,
+            ..ProptestConfig::default()
+        });
+        runner
+            .run(
+                &(1u64..1_000_000, any::<bool>(), any::<bool>()),
+                |(save_seq, saved_before_enqueue, save_before_result)| {
+                    // Enqueue precedes worker read. Saves before enqueue are visible
+                    // to that read; later saves are either filtered or indexed inline.
+                    let watermark = if saved_before_enqueue { save_seq } else { 0 };
+                    let scanned = if saved_before_enqueue {
+                        b"saved".as_slice()
+                    } else {
+                        b"old".as_slice()
+                    };
+                    let indexed = if saved_before_enqueue {
+                        scanned
+                    } else if save_before_result {
+                        let saved_seq_after_enqueue = save_seq;
+                        if path_observation_is_stale(saved_seq_after_enqueue, watermark) {
+                            b"saved".as_slice()
+                        } else {
+                            scanned
+                        }
+                    } else {
+                        // The result applies first; the later save indexes inline.
+                        b"saved".as_slice()
+                    };
+                    prop_assert_eq!(indexed, b"saved".as_slice());
+                    Ok(())
+                },
+            )
+            .unwrap();
     }
 }
