@@ -15,8 +15,8 @@
 //! Otherwise it's delete + create, and links go unresolved and are reported
 //! rather than guessed.
 
-use crate::channels::{Notice, NoticeChannel, RenameTier};
-use flavite_index::types::{ATTACHMENT_HASH_MAX, Attachment, MAX_NOTE_BYTES, Note};
+use crate::channels::RenameTier;
+use flavite_index::types::{MAX_NOTE_BYTES, Note};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -64,14 +64,8 @@ pub struct RenameCandidate {
 pub struct RenameInferenceResult {
     /// List of detected rename candidates.
     pub candidates: Vec<RenameCandidate>,
-    /// Set of paths that were identified as T0 (in-app) renames.
-    pub t0_renames: HashSet<PathBuf>,
-    /// Set of paths that were identified as T1 (OS event) renames.
-    pub t1_renames: HashSet<(PathBuf, PathBuf)>,
     /// Set of paths that were identified as T2 (stable_id) renames.
     pub t2_renames: HashSet<(PathBuf, PathBuf)>,
-    /// Set of duplicate stable IDs found.
-    pub duplicate_stable_ids: HashSet<String>,
 }
 
 /// The rename inference engine.
@@ -94,92 +88,162 @@ impl RenameInference {
         Self { config }
     }
 
-    /// Infer renames from vanished and changed file sets.
-    ///
-    /// This implements the tiered inference algorithm from D8/R6:
-    /// - T0: In-app rename command (handled separately, not here)
-    /// - T1: OS rename event pair (from watcher)
-    /// - T2: Same stable_id on vanished + created pair
-    /// - T3: Same content hash, size ≥ 64 B, exactly one candidate on each side
-    /// - T4: Fuzzy similarity ≥ 0.9, exactly one candidate
-    ///
-    /// # Arguments
-    ///
-    /// * `vanished` - Files that disappeared from disk
-    /// * `changed` - Files that appeared or were modified on disk
-    /// * `watcher_pairs` - OS-level rename event pairs (T1 evidence)
-    /// * `notes_by_stable_id` - Map from stable_id to list of notes (for T2 and duplicate detection)
-    /// * `notes_by_path` - Map from path to note (for content hash comparison in T3)
-    /// * `attachments_by_path` - Map from path to attachment (for T3/T4)
-    /// * `inbound_link_counts` - Map from note path to number of inbound links
-    /// * `notice_channel` - Channel to send rename notices to
-    ///
-    /// # Returns
-    ///
-    /// A result containing all detected renames, organized by tier.
-    #[allow(clippy::too_many_arguments)]
-    pub fn infer_renames(
+    /// Infer rename pairs from one reconcile's vanished and newly-created
+    /// note sets. `old_notes` is snapshotted before removals and `new_notes`
+    /// comes from the index after ingest, so vanished rows remain available.
+    pub fn infer_reconcile(
         &self,
         vanished: &[PathBuf],
-        changed: &[PathBuf],
-        watcher_pairs: &[(PathBuf, PathBuf)],
-        notes_by_stable_id: &HashMap<String, Vec<&Note>>,
-        notes_by_path: &HashMap<PathBuf, &Note>,
-        attachments_by_path: &HashMap<PathBuf, &Attachment>,
+        created: &[PathBuf],
+        old_notes: &HashMap<PathBuf, Note>,
+        new_notes: &HashMap<PathBuf, Note>,
         inbound_link_counts: &HashMap<PathBuf, u32>,
-        notice_channel: &NoticeChannel,
     ) -> RenameInferenceResult {
         let mut result = RenameInferenceResult::default();
+        if vanished.is_empty() || created.is_empty() {
+            return result;
+        }
 
-        // T1: OS rename event pairs (highest priority for external events)
-        // These are authoritative rename events from the OS watcher
-        self.detect_t1_renames(
-            watcher_pairs,
-            notes_by_stable_id,
-            inbound_link_counts,
-            &mut result,
-            notice_channel,
-        );
+        let paths_by_id = |notes: &HashMap<PathBuf, Note>| {
+            let mut grouped = HashMap::<String, Vec<PathBuf>>::new();
+            for (path, note) in notes {
+                if let Some(id) = note.stable_id.as_deref() {
+                    grouped
+                        .entry(flavite_syntax::text::fold_key(id))
+                        .or_default()
+                        .push(path.clone());
+                }
+            }
+            grouped
+        };
+        // Uniqueness is a property of the complete index snapshot. Looking
+        // only at the changed paths would mistake one member of a duplicate
+        // stable-id group for an unambiguous rename.
+        let old_by_id = paths_by_id(old_notes);
+        let new_by_id = paths_by_id(new_notes);
+        let mut claimed_old = HashSet::new();
+        let mut claimed_new = HashSet::new();
+        for (id, old_paths) in &old_by_id {
+            let Some(new_paths) = new_by_id.get(id) else {
+                continue;
+            };
+            if old_paths.len() != 1 || new_paths.len() != 1 {
+                continue;
+            }
+            let from = old_paths[0].clone();
+            let to = new_paths[0].clone();
+            if !vanished.contains(&from)
+                || !created.contains(&to)
+                || old_notes.get(&from).is_none_or(|note| note.id_conflict)
+                || new_notes.get(&to).is_none_or(|note| note.id_conflict)
+            {
+                continue;
+            }
+            let inbound = inbound_link_counts.get(&from).copied().unwrap_or(0);
+            claimed_old.insert(from.clone());
+            claimed_new.insert(to.clone());
+            result.t2_renames.insert((from.clone(), to.clone()));
+            result.candidates.push(RenameCandidate {
+                from,
+                to,
+                tier: RenameTier::T2,
+                confidence: 1.0,
+                inbound_links: inbound,
+            });
+        }
 
-        // T2: Same stable_id on vanished + created pair
-        self.detect_t2_renames(
-            vanished,
-            changed,
-            notes_by_stable_id,
-            notes_by_path,
-            inbound_link_counts,
-            &mut result,
-            notice_channel,
-        );
-
-        // T3: Same content hash, size ≥ 64 B, exactly one candidate
         if self.config.t3_enabled {
-            self.detect_t3_renames(
-                vanished,
-                changed,
-                notes_by_path,
-                attachments_by_path,
-                inbound_link_counts,
-                &mut result,
-                notice_channel,
-            );
+            let group_hashes = |notes: &HashMap<PathBuf, Note>| {
+                let mut grouped = HashMap::<Vec<u8>, Vec<PathBuf>>::new();
+                for (path, note) in notes {
+                    if usize::try_from(note.size)
+                        .is_ok_and(|size| size >= self.config.t3_min_size && size <= MAX_NOTE_BYTES)
+                        && note.content_hash.len() == 32
+                    {
+                        grouped
+                            .entry(note.content_hash.clone())
+                            .or_default()
+                            .push(path.clone());
+                    }
+                }
+                grouped
+            };
+            // As with IDs, T3 is only evidence when the content is unique in
+            // each full snapshot, not merely unique among this reconcile's
+            // changed paths.
+            let old_hashes = group_hashes(old_notes);
+            let new_hashes = group_hashes(new_notes);
+            for (hash, old_paths) in old_hashes {
+                let Some(new_paths) = new_hashes.get(&hash) else {
+                    continue;
+                };
+                if old_paths.len() != 1 || new_paths.len() != 1 {
+                    continue;
+                }
+                let from = old_paths[0].clone();
+                let to = new_paths[0].clone();
+                if claimed_old.contains(&from)
+                    || claimed_new.contains(&to)
+                    || !vanished.contains(&from)
+                    || !created.contains(&to)
+                {
+                    continue;
+                }
+                let inbound = inbound_link_counts.get(&from).copied().unwrap_or(0);
+                claimed_old.insert(from.clone());
+                claimed_new.insert(to.clone());
+                result.candidates.push(RenameCandidate {
+                    from,
+                    to,
+                    tier: RenameTier::T3,
+                    confidence: 1.0,
+                    inbound_links: inbound,
+                });
+            }
         }
 
-        // T4: Fuzzy similarity ≥ 0.9, exactly one candidate
         if self.config.t4_enabled {
-            self.detect_t4_renames(
-                vanished,
-                changed,
-                notes_by_path,
-                inbound_link_counts,
-                &mut result,
-                notice_channel,
-            );
+            let old_remaining = vanished
+                .iter()
+                .filter(|path| !claimed_old.contains(*path) && old_notes.contains_key(*path))
+                .collect::<Vec<_>>();
+            let new_remaining = created
+                .iter()
+                .filter(|path| !claimed_new.contains(*path) && new_notes.contains_key(*path))
+                .collect::<Vec<_>>();
+            let mut old_matches = HashMap::<PathBuf, Vec<(PathBuf, f64)>>::new();
+            let mut new_match_counts = HashMap::<PathBuf, usize>::new();
+            for from in &old_remaining {
+                let old_stem = Self::path_to_stem(&old_notes[*from].path);
+                for to in &new_remaining {
+                    let new_stem = Self::path_to_stem(&new_notes[*to].path);
+                    let score = Self::compute_similarity(&old_stem, &new_stem);
+                    if score >= self.config.t4_min_similarity {
+                        old_matches
+                            .entry((*from).clone())
+                            .or_default()
+                            .push(((*to).clone(), score));
+                        *new_match_counts.entry((*to).clone()).or_default() += 1;
+                    }
+                }
+            }
+            for (from, matches) in old_matches {
+                if matches.len() != 1 {
+                    continue;
+                }
+                let (to, confidence) = &matches[0];
+                if new_match_counts.get(to) != Some(&1) {
+                    continue;
+                }
+                result.candidates.push(RenameCandidate {
+                    inbound_links: inbound_link_counts.get(&from).copied().unwrap_or(0),
+                    from,
+                    to: to.clone(),
+                    tier: RenameTier::T4,
+                    confidence: *confidence,
+                });
+            }
         }
-
-        // Detect duplicate stable IDs
-        self.detect_duplicate_stable_ids(notes_by_stable_id, &mut result);
-
         result
     }
 
@@ -203,372 +267,25 @@ impl RenameInference {
         }
     }
 
-    /// Detect T1 renames from OS watcher event pairs.
-    ///
-    /// These are rename events detected by the OS watcher (inotify cookie,
-    /// FSEvents flags, or RENAMED_OLD+NEW on Windows).
-    fn detect_t1_renames(
-        &self,
-        watcher_pairs: &[(PathBuf, PathBuf)],
-        notes_by_stable_id: &HashMap<String, Vec<&Note>>,
-        inbound_link_counts: &HashMap<PathBuf, u32>,
-        result: &mut RenameInferenceResult,
-        notice_channel: &NoticeChannel,
-    ) {
-        for (from, to) in watcher_pairs {
-            // Check if both paths are in our vanished/changed sets
-            // (they should be, but we verify)
-
-            // T1: silent buffer re-key and pin carry-over, but emit notice
-            // Never auto-rewrite (external)
-            let inbound = inbound_link_counts.get(from).copied().unwrap_or(0);
-
-            // Store in result
-            result.t1_renames.insert((from.clone(), to.clone()));
-
-            // Emit notice
-            notice_channel.send(Notice::RenameSuggested {
-                from: from.clone(),
-                to: to.clone(),
-                tier: RenameTier::T1,
-                inbound,
-            });
-
-            // Check for duplicate stable IDs that might affect this
-            self.check_stable_id_duplicates_for_pair(from, to, notes_by_stable_id, result);
-        }
-    }
-
-    /// Detect T2 renames from same stable_id on vanished + created pair.
-    ///
-    /// When a file with a stable_id vanishes and another with the same stable_id
-    /// appears, we infer it's a rename.
-    #[allow(clippy::too_many_arguments)]
-    fn detect_t2_renames(
-        &self,
-        vanished: &[PathBuf],
-        changed: &[PathBuf],
-        notes_by_stable_id: &HashMap<String, Vec<&Note>>,
-        notes_by_path: &HashMap<PathBuf, &Note>,
-        inbound_link_counts: &HashMap<PathBuf, u32>,
-        result: &mut RenameInferenceResult,
-        notice_channel: &NoticeChannel,
-    ) {
-        // Build sets for quick lookup
-        let vanished_set: HashSet<&PathBuf> = vanished.iter().collect();
-        let _changed_set: HashSet<&PathBuf> = changed.iter().collect();
-
-        // Find stable IDs that have notes in both vanished and changed sets
-        for (stable_id, notes) in notes_by_stable_id {
-            // Skip if this stable_id is a duplicate (handled separately)
-            if notes.len() != 1 {
-                continue;
-            }
-
-            let note = notes[0];
-
-            // Convert note.path (String) to PathBuf for comparison
-            let note_path = PathBuf::from(&note.path);
-
-            // Check if this note's path is in vanished
-            if vanished_set.contains(&note_path) {
-                // Look for another note with the same stable_id in changed
-                // Since we have a 1:1 mapping here (not duplicate), we need to
-                // find which changed file has the same stable_id
-                for changed_path in changed {
-                    if let Some(changed_note) = notes_by_path.get(changed_path)
-                        && changed_note.stable_id.as_deref() == Some(stable_id)
-                    {
-                        // Found T2 rename
-                        let inbound = inbound_link_counts.get(&note_path).copied().unwrap_or(0);
-
-                        result
-                            .t2_renames
-                            .insert((note_path.clone(), changed_path.clone()));
-
-                        // Emit notice - never auto-rewrite (external)
-                        notice_channel.send(Notice::RenameSuggested {
-                            from: note_path.clone(),
-                            to: changed_path.clone(),
-                            tier: RenameTier::T2,
-                            inbound,
-                        });
-
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Detect T3 renames from content hash matching.
-    ///
-    /// Same content hash, size ≥ 64 B, exactly one candidate on each side.
-    /// T3 does NOT carry identity state silently - no buffer re-key, no pin carry.
-    /// Only emits a notice that the user must confirm.
-    #[allow(clippy::too_many_arguments)]
-    fn detect_t3_renames(
-        &self,
-        vanished: &[PathBuf],
-        changed: &[PathBuf],
-        notes_by_path: &HashMap<PathBuf, &Note>,
-        attachments_by_path: &HashMap<PathBuf, &Attachment>,
-        inbound_link_counts: &HashMap<PathBuf, u32>,
-        result: &mut RenameInferenceResult,
-        notice_channel: &NoticeChannel,
-    ) {
-        // Build maps from content hash to paths
-        let mut hash_to_vanished: HashMap<Vec<u8>, Vec<PathBuf>> = HashMap::new();
-        let mut hash_to_changed: HashMap<Vec<u8>, Vec<PathBuf>> = HashMap::new();
-
-        // Index vanished files by content hash
-        for path in vanished {
-            if let Some(note) = notes_by_path.get(path) {
-                // Only consider files large enough (T3 requires size ≥ 64 B)
-                if note.size as usize >= self.config.t3_min_size
-                    && note.size as usize <= MAX_NOTE_BYTES
-                {
-                    hash_to_vanished
-                        .entry(note.content_hash.clone())
-                        .or_default()
-                        .push(path.clone());
-                }
-            } else if let Some(att) = attachments_by_path.get(path)
-                && att.size as usize >= self.config.t3_min_size
-                && att.size as usize <= ATTACHMENT_HASH_MAX
-                && att.content_hash.is_some()
-            {
-                hash_to_vanished
-                    .entry(att.content_hash.as_ref().unwrap().clone())
-                    .or_default()
-                    .push(path.clone());
-            }
-        }
-
-        // Index changed files by content hash
-        for path in changed {
-            if let Some(note) = notes_by_path.get(path) {
-                if note.size as usize >= self.config.t3_min_size
-                    && note.size as usize <= MAX_NOTE_BYTES
-                {
-                    hash_to_changed
-                        .entry(note.content_hash.clone())
-                        .or_default()
-                        .push(path.clone());
-                }
-            } else if let Some(att) = attachments_by_path.get(path)
-                && att.size as usize >= self.config.t3_min_size
-                && att.size as usize <= ATTACHMENT_HASH_MAX
-                && att.content_hash.is_some()
-            {
-                hash_to_changed
-                    .entry(att.content_hash.as_ref().unwrap().clone())
-                    .or_default()
-                    .push(path.clone());
-            }
-        }
-
-        // Find matching hashes with exactly one candidate on each side
-        for (hash, vanished_paths) in &hash_to_vanished {
-            if let Some(changed_paths) = hash_to_changed.get(hash) {
-                // Need exactly one on each side
-                if vanished_paths.len() == 1 && changed_paths.len() == 1 {
-                    let from = &vanished_paths[0];
-                    let to = &changed_paths[0];
-
-                    // Prefer same-directory candidates
-                    if Self::same_directory(from, to) {
-                        let inbound = inbound_link_counts.get(from).copied().unwrap_or(0);
-
-                        let candidate = RenameCandidate {
-                            from: from.clone(),
-                            to: to.clone(),
-                            tier: RenameTier::T3,
-                            confidence: 0.95,
-                            inbound_links: inbound,
-                        };
-
-                        result.candidates.push(candidate.clone());
-
-                        // Emit notice - no automatic action, user must confirm
-                        notice_channel.send(Notice::RenameSuggested {
-                            from: from.clone(),
-                            to: to.clone(),
-                            tier: RenameTier::T3,
-                            inbound,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    /// Detect T4 renames from fuzzy similarity.
-    ///
-    /// Fuzzy similarity ≥ 0.9, exactly one candidate.
-    /// T4 does NOT carry identity state silently - no buffer re-key, no pin carry.
-    /// Only emits a notice that the user must confirm.
-    #[allow(clippy::too_many_arguments)]
-    fn detect_t4_renames(
-        &self,
-        vanished: &[PathBuf],
-        changed: &[PathBuf],
-        notes_by_path: &HashMap<PathBuf, &Note>,
-        inbound_link_counts: &HashMap<PathBuf, u32>,
-        result: &mut RenameInferenceResult,
-        notice_channel: &NoticeChannel,
-    ) {
-        // For T4, we need to compute similarity between vanished and changed files
-        // This is expensive, so we only do it if we have a reasonable number of files
-
-        // Limit the number of comparisons to avoid O(n^2) explosion
-        const MAX_COMPARISONS: usize = 1000;
-        let mut comparison_count = 0;
-
-        for from_path in vanished {
-            if comparison_count >= MAX_COMPARISONS {
-                break;
-            }
-
-            if let Some(from_note) = notes_by_path.get(from_path) {
-                // Get the stem from the from note
-                let from_stem = Self::path_to_stem(&from_note.path);
-
-                for to_path in changed {
-                    comparison_count += 1;
-
-                    if let Some(to_note) = notes_by_path.get(to_path) {
-                        let to_stem = Self::path_to_stem(&to_note.path);
-
-                        // Compute similarity between stems
-                        let similarity = Self::compute_similarity(&from_stem, &to_stem);
-
-                        if similarity >= self.config.t4_min_similarity {
-                            // Check if this is the only candidate
-                            // For T4, we want exactly one candidate pair
-                            // This is a simplified check - in practice we'd need to
-                            // verify uniqueness across all pairs
-
-                            let inbound = inbound_link_counts.get(from_path).copied().unwrap_or(0);
-
-                            let candidate = RenameCandidate {
-                                from: from_path.clone(),
-                                to: to_path.clone(),
-                                tier: RenameTier::T4,
-                                confidence: similarity,
-                                inbound_links: inbound,
-                            };
-
-                            result.candidates.push(candidate.clone());
-
-                            // Emit notice - no automatic action, user must confirm
-                            notice_channel.send(Notice::RenameSuggested {
-                                from: from_path.clone(),
-                                to: to_path.clone(),
-                                tier: RenameTier::T4,
-                                inbound,
-                            });
-
-                            // Only process one match per vanished file for T4
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Detect duplicate stable IDs.
-    fn detect_duplicate_stable_ids(
-        &self,
-        notes_by_stable_id: &HashMap<String, Vec<&Note>>,
-        result: &mut RenameInferenceResult,
-    ) {
-        for (stable_id, notes) in notes_by_stable_id {
-            if notes.len() > 1 {
-                result.duplicate_stable_ids.insert(stable_id.clone());
-            }
-        }
-    }
-
-    /// Check for duplicate stable IDs that might affect a rename pair.
-    #[allow(dead_code)]
-    fn check_stable_id_duplicates_for_pair(
-        &self,
-        _from: &PathBuf,
-        _to: &PathBuf,
-        _notes_by_stable_id: &HashMap<String, Vec<&Note>>,
-        _result: &mut RenameInferenceResult,
-    ) {
-        // This is a helper to check if the from or to paths have duplicate stable IDs
-        // For now, we just rely on the main duplicate detection
-        // In a full implementation, we'd check if either path has a conflicting stable_id
-    }
-
-    /// Check if two paths are in the same directory.
-    fn same_directory(from: &Path, to: &Path) -> bool {
-        from.parent() == to.parent()
-    }
-
     /// Extract stem from a path.
     fn path_to_stem(path: &str) -> String {
-        // Remove extension and path components
         let path_obj = Path::new(path);
-        path_obj
+        let stem = path_obj
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or(path)
-            .to_lowercase()
+            .unwrap_or(path);
+        flavite_syntax::text::fold_key(stem)
     }
 
-    /// Compute similarity between two strings.
-    ///
-    /// Uses a simple Jaro-Winkler similarity for now.
-    /// In production, we might use a more sophisticated algorithm.
+    /// Compute normalized character-level edit similarity.
     fn compute_similarity(a: &str, b: &str) -> f64 {
-        // Simple implementation using the `strsim` crate's Jaro-Winkler
-        // For now, we use a basic ratio
         if a.is_empty() || b.is_empty() {
             return 0.0;
         }
-
-        // Simple character-based similarity as a placeholder
-        // In production, use the `similar` crate
-        let a_chars: Vec<char> = a.chars().collect();
-        let b_chars: Vec<char> = b.chars().collect();
-        let a_len = a_chars.len();
-        let b_len = b_chars.len();
-
-        // Count matching characters
-        let mut matches = 0usize;
-        for a_char in &a_chars {
-            if b_chars.contains(a_char) {
-                matches += 1;
-            }
-        }
-
-        // Simple ratio - this is a placeholder
-        // Real implementation should use proper string similarity
-        let max_len = a_len.max(b_len);
-        if max_len == 0 {
-            0.0
-        } else {
-            (matches as f64) / (max_len as f64)
-        }
+        let a = flavite_syntax::text::fold_key(a);
+        let b = flavite_syntax::text::fold_key(b);
+        similar::TextDiff::from_chars(&a, &b).ratio() as f64
     }
-}
-
-/// Inbound link information for rename inference.
-pub trait InboundLinkProvider {
-    /// Get the number of inbound links for a given note path.
-    fn get_inbound_link_count(&self, path: &Path) -> u32;
-}
-
-/// Helper to get the canonical path for comparison.
-pub fn canonical_path(path: &Path) -> PathBuf {
-    // For now, just normalize the path
-    // In a full implementation, this would use the flavite-fs path utilities
-    path.to_path_buf()
 }
 
 #[cfg(test)]
@@ -602,182 +319,123 @@ mod tests {
         }
     }
 
-    fn mock_attachment(path: &str, content_hash: Option<Vec<u8>>, size: i64) -> Attachment {
-        Attachment {
-            att_id: 0,
-            path: path.to_string(),
-            path_native: path.as_bytes().to_vec(),
-            path_key: path.to_lowercase(),
-            stem_key: Path::new(path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(path)
-                .to_lowercase(),
-            kind: flavite_index::schema::AttachmentKind::Other,
-            mime: None,
-            size,
-            content_hash,
-            width: None,
-            height: None,
-            mtime_ns: 0,
-            scan_ns: 0,
-            hydrated: true,
-            generation: 0,
+    #[test]
+    fn reconcile_inference_uses_unique_t2_t3_t4_evidence() {
+        let mut old_notes = HashMap::new();
+        let mut new_notes = HashMap::new();
+        let t2_old = mock_note("notes/old-id.md", Some("Été"), vec![1; 32], 80);
+        let t2_new = mock_note("notes/new-id.md", Some("E\u{301}TÉ"), vec![2; 32], 80);
+        let t3_old = mock_note("notes/old-copy.md", None, vec![3; 32], 80);
+        let t3_new = mock_note("archive/new-copy.md", None, vec![3; 32], 80);
+        let t4_old = mock_note("notes/proposal.md", None, vec![4; 32], 80);
+        let t4_new = mock_note("notes/proposals.md", None, vec![5; 32], 80);
+        let ambiguous_old = mock_note("notes/report.md", None, vec![6; 32], 80);
+        let ambiguous_a = mock_note("notes/reports.md", None, vec![7; 32], 80);
+        let ambiguous_b = mock_note("notes/reportx.md", None, vec![8; 32], 80);
+        for note in [t2_old, t3_old, t4_old, ambiguous_old] {
+            old_notes.insert(PathBuf::from(&note.path), note);
         }
-    }
+        for note in [t2_new, t3_new, t4_new, ambiguous_a, ambiguous_b] {
+            new_notes.insert(PathBuf::from(&note.path), note);
+        }
+        let vanished = old_notes.keys().cloned().collect::<Vec<_>>();
+        let created = new_notes.keys().cloned().collect::<Vec<_>>();
+        let inbound = HashMap::from([(PathBuf::from("notes/old-id.md"), 4)]);
+        let result = RenameInference::new()
+            .infer_reconcile(&vanished, &created, &old_notes, &new_notes, &inbound);
 
-    #[test]
-    fn test_t2_rename_detection() {
-        let _inference = RenameInference::new();
-        let notice_channel = NoticeChannel::new(std::time::Duration::from_secs(1));
-
-        // Create test data
-        let stable_id = "test-id".to_string();
-        let vanished_note = mock_note("old.md", Some(&stable_id), vec![1, 2, 3], 100);
-        let changed_note = mock_note("new.md", Some(&stable_id), vec![1, 2, 3], 100);
-
-        let mut notes_by_stable_id: HashMap<String, Vec<&Note>> = HashMap::new();
-        notes_by_stable_id
-            .entry(stable_id.clone())
-            .or_default()
-            .push(&vanished_note);
-
-        let mut notes_by_path: HashMap<PathBuf, &Note> = HashMap::new();
-        notes_by_path.insert(PathBuf::from("old.md"), &vanished_note);
-        notes_by_path.insert(PathBuf::from("new.md"), &changed_note);
-
-        let vanished = vec![PathBuf::from("old.md")];
-        let changed = vec![PathBuf::from("new.md")];
-        let watcher_pairs: Vec<(PathBuf, PathBuf)> = vec![];
-        let inbound_link_counts: HashMap<PathBuf, u32> = HashMap::new();
-        let attachments_by_path: HashMap<PathBuf, &Attachment> = HashMap::new();
-
-        let inference = RenameInference::new();
-        let result = inference.infer_renames(
-            &vanished,
-            &changed,
-            &watcher_pairs,
-            &notes_by_stable_id,
-            &notes_by_path,
-            &attachments_by_path,
-            &inbound_link_counts,
-            &notice_channel,
-        );
-
-        assert!(
-            result
-                .t2_renames
-                .contains(&(PathBuf::from("old.md"), PathBuf::from("new.md")))
-        );
-    }
-
-    #[test]
-    fn test_duplicate_stable_id_detection() {
-        let inference = RenameInference::new();
-
-        let stable_id = "duplicate-id".to_string();
-        let note1 = mock_note("note1.md", Some(&stable_id), vec![1], 100);
-        let note2 = mock_note("note2.md", Some(&stable_id), vec![2], 100);
-        let note3 = mock_note("note3.md", Some(&stable_id), vec![3], 100);
-
-        let mut notes_by_stable_id: HashMap<String, Vec<&Note>> = HashMap::new();
-        notes_by_stable_id
-            .entry(stable_id.clone())
-            .or_default()
-            .extend([&note1, &note2, &note3]);
-
-        let mut result = RenameInferenceResult::default();
-        inference.detect_duplicate_stable_ids(&notes_by_stable_id, &mut result);
-
-        assert!(result.duplicate_stable_ids.contains(&stable_id));
-    }
-
-    #[test]
-    fn inference_covers_watcher_hash_attachment_and_fuzzy_candidates() {
-        let inference = RenameInference::new();
-        let notices = NoticeChannel::new(std::time::Duration::from_secs(1));
-        let vanished_note = mock_note("dir/old.md", None, vec![7; 32], 64);
-        let changed_note = mock_note("dir/newname.md", None, vec![7; 32], 64);
-        let fuzzy_from = mock_note("dir/alpha.md", None, vec![1], 20);
-        let fuzzy_to = mock_note("dir/alpah.md", None, vec![2], 20);
-        let duplicate_a = mock_note("dup/a.md", Some("duplicate"), vec![3], 80);
-        let duplicate_b = mock_note("dup/b.md", Some("duplicate"), vec![4], 80);
-        let old_attachment = mock_attachment("dir/old.png", Some(vec![9; 32]), 64);
-        let new_attachment = mock_attachment("dir/new.png", Some(vec![9; 32]), 64);
-
-        let stable_id_notes =
-            HashMap::from([("duplicate".into(), vec![&duplicate_a, &duplicate_b])]);
-        let path_notes = HashMap::from([
-            (PathBuf::from("dir/old.md"), &vanished_note),
-            (PathBuf::from("dir/newname.md"), &changed_note),
-            (PathBuf::from("dir/alpha.md"), &fuzzy_from),
-            (PathBuf::from("dir/alpah.md"), &fuzzy_to),
-        ]);
-        let attachments = HashMap::from([
-            (PathBuf::from("dir/old.png"), &old_attachment),
-            (PathBuf::from("dir/new.png"), &new_attachment),
-        ]);
-        let vanished = vec![
-            PathBuf::from("dir/old.md"),
-            PathBuf::from("dir/old.png"),
-            PathBuf::from("dir/alpha.md"),
-            PathBuf::from("dir/too-small.md"),
-        ];
-        let changed = vec![
-            PathBuf::from("dir/newname.md"),
-            PathBuf::from("dir/new.png"),
-            PathBuf::from("dir/alpah.md"),
-        ];
-        let inbound = HashMap::from([(PathBuf::from("dir/old.md"), 3)]);
-        let watcher = vec![(
-            PathBuf::from("dir/watched-old.md"),
-            PathBuf::from("dir/watched-new.md"),
-        )];
-        let result = inference.infer_renames(
-            &vanished,
-            &changed,
-            &watcher,
-            &stable_id_notes,
-            &path_notes,
-            &attachments,
-            &inbound,
-            &notices,
-        );
-
-        assert!(result.t1_renames.contains(&watcher[0]));
-        assert!(result.duplicate_stable_ids.contains("duplicate"));
-        assert!(result.candidates.iter().any(
-            |candidate| candidate.tier == RenameTier::T3 && candidate.from.ends_with("old.md")
-        ));
-        assert!(result.candidates.iter().any(
-            |candidate| candidate.tier == RenameTier::T3 && candidate.from.ends_with("old.png")
-        ));
-        assert!(
+        assert!(result.t2_renames.contains(&(
+            PathBuf::from("notes/old-id.md"),
+            PathBuf::from("notes/new-id.md")
+        )));
+        assert_eq!(
             result
                 .candidates
                 .iter()
-                .any(|candidate| candidate.tier == RenameTier::T4
-                    && candidate.from.ends_with("alpha.md"))
+                .find(|candidate| candidate.tier == RenameTier::T2)
+                .unwrap()
+                .inbound_links,
+            4
         );
-        assert!(matches!(
-            notices.try_recv().unwrap(),
-            Notice::RenameSuggested {
-                tier: RenameTier::T1,
-                ..
-            }
-        ));
+        assert!(result.candidates.iter().any(|candidate| {
+            candidate.tier == RenameTier::T3
+                && candidate.from.as_path() == Path::new("notes/old-copy.md")
+                && candidate.to.as_path() == Path::new("archive/new-copy.md")
+        }));
+        assert!(result.candidates.iter().any(|candidate| {
+            candidate.tier == RenameTier::T4
+                && candidate.from.as_path() == Path::new("notes/proposal.md")
+                && candidate.to.as_path() == Path::new("notes/proposals.md")
+        }));
+        assert!(
+            !result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.from.as_path() == Path::new("notes/report.md"))
+        );
+
+        let empty =
+            RenameInference::new().infer_reconcile(&[], &created, &old_notes, &new_notes, &inbound);
+        assert!(empty.candidates.is_empty());
+        assert!(empty.t2_renames.is_empty());
     }
 
     #[test]
-    fn test_same_directory() {
-        assert!(RenameInference::same_directory(
-            &PathBuf::from("/vault/notes/old.md"),
-            &PathBuf::from("/vault/notes/new.md")
-        ));
-        assert!(!RenameInference::same_directory(
-            &PathBuf::from("/vault/notes/old.md"),
-            &PathBuf::from("/vault/other/new.md")
-        ));
+    fn reconcile_t2_and_t3_require_global_uniqueness() {
+        let duplicate_id = flavite_syntax::text::fold_key("Copied-ID");
+        let mut old_notes = HashMap::new();
+        let mut new_notes = HashMap::new();
+        let old_id_path = PathBuf::from("notes/old-id.md");
+        let keeper_id_path = PathBuf::from("notes/keeper-id.md");
+        let new_id_path = PathBuf::from("notes/new-id.md");
+        let old_hash_path = PathBuf::from("notes/old-copy.md");
+        let new_hash_path = PathBuf::from("notes/new-copy.md");
+        let mut old_loser = mock_note("notes/old-id.md", Some(&duplicate_id), vec![1; 32], 80);
+        old_loser.id_conflict = false;
+        let mut old_keeper = mock_note("notes/keeper-id.md", Some(&duplicate_id), vec![2; 32], 80);
+        old_keeper.id_conflict = true;
+        let mut new_keeper = mock_note("notes/keeper-id.md", Some(&duplicate_id), vec![2; 32], 80);
+        new_keeper.id_conflict = true;
+        let mut new_loser = mock_note("notes/new-id.md", Some(&duplicate_id), vec![3; 32], 80);
+        new_loser.id_conflict = true;
+        for note in [
+            old_loser,
+            old_keeper,
+            mock_note("notes/old-copy.md", None, vec![9; 32], 80),
+            mock_note("notes/keeper-copy.md", None, vec![9; 32], 80),
+        ] {
+            old_notes.insert(PathBuf::from(&note.path), note);
+        }
+        for note in [
+            new_keeper,
+            new_loser,
+            mock_note("notes/keeper-copy.md", None, vec![9; 32], 80),
+            mock_note("notes/new-copy.md", None, vec![9; 32], 80),
+        ] {
+            new_notes.insert(PathBuf::from(&note.path), note);
+        }
+
+        let result = RenameInference::new().infer_reconcile(
+            &[old_id_path.clone(), old_hash_path.clone()],
+            &[new_id_path, new_hash_path],
+            &old_notes,
+            &new_notes,
+            &HashMap::new(),
+        );
+        assert!(
+            !result
+                .t2_renames
+                .contains(&(old_id_path.clone(), PathBuf::from("notes/new-id.md")))
+        );
+        assert!(!result.candidates.iter().any(|candidate| {
+            candidate.tier == RenameTier::T2 && candidate.from == old_id_path
+        }));
+        assert!(!result.candidates.iter().any(|candidate| {
+            candidate.tier == RenameTier::T3 && candidate.from == old_hash_path
+        }));
+        assert_eq!(old_notes.len(), 4);
+        assert_eq!(new_notes.len(), 4);
+        assert!(old_notes.contains_key(&keeper_id_path));
     }
 
     #[test]

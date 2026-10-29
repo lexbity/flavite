@@ -548,6 +548,41 @@ impl IndexActor {
         rows.map(|row| row.map_err(|e| e.to_string())).collect()
     }
 
+    /// Return parsed note records used to infer rename pairs during a
+    /// reconcile. The actor snapshots vanished rows before applying removals.
+    ///
+    /// # Errors
+    /// Returns an error when the writer connection cannot read note rows.
+    pub fn rename_note_snapshot(&self) -> Result<Vec<crate::types::Note>, String> {
+        let mut statement = self.writer.conn().prepare(
+            "SELECT note_id,path,path_native,path_key,stem_key,title,stable_id,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation FROM notes WHERE parse_ok=1 AND content_hash IS NOT NULL ORDER BY path_key",
+        ).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(crate::types::Note {
+                    note_id: row.get(0)?,
+                    path: row.get(1)?,
+                    path_native: row.get(2)?,
+                    path_key: row.get(3)?,
+                    stem_key: row.get(4)?,
+                    title: row.get(5)?,
+                    stable_id: row.get(6)?,
+                    id_conflict: row.get(7)?,
+                    content_hash: row.get(8)?,
+                    size: row.get(9)?,
+                    mtime_ns: row.get(10)?,
+                    scan_ns: row.get(11)?,
+                    frontmatter: row.get(12)?,
+                    preview: row.get(13)?,
+                    parse_ok: row.get(14)?,
+                    generation: row.get(15)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| row.map_err(|error| error.to_string()))
+            .collect()
+    }
+
     /// Return indexed links targeting a note stem, including path-suffix and
     /// explicit `.md` forms. The caller MUST verify each source hash again.
     ///

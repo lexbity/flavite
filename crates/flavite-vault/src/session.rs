@@ -1342,14 +1342,25 @@ impl Session {
                 message: format!("destination-open: {}", to.display()),
             };
         }
-        let protected_paths = {
+        let (protected_paths, buffer_ids, buffer_revisions) = {
             let manager = self.buffer_manager.lock().unwrap();
-            manager
+            let protected_paths = manager
                 .open_notes()
                 .into_iter()
                 .filter(|path| **path != from)
                 .cloned()
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let mut buffer_ids = HashMap::new();
+            let mut buffer_revisions = HashMap::new();
+            for (path, buffer_id) in manager.open_paths() {
+                if let Ok(relative) = path.strip_prefix(&self.identity.root) {
+                    buffer_ids.insert(relative.to_path_buf(), buffer_id.as_u64());
+                    if let Some(buffer) = manager.get_buffer_by_id(buffer_id) {
+                        buffer_revisions.insert(buffer_id.as_u64(), buffer.revision().as_u64());
+                    }
+                }
+            }
+            (protected_paths, buffer_ids, buffer_revisions)
         };
         let outstanding = self.completions.lock().unwrap().len()
             + self.save_flights.lock().unwrap().len()
@@ -1359,10 +1370,13 @@ impl Session {
             return SessionResult::Busy;
         }
         let request_id = self.next_request_id();
-        match self
-            .actor
-            .submit_rename(from.clone(), to.clone(), protected_paths)
-        {
+        match self.actor.submit_rename(
+            from.clone(),
+            to.clone(),
+            protected_paths,
+            buffer_ids,
+            buffer_revisions,
+        ) {
             Ok(response) => {
                 self.rename_flights
                     .lock()
@@ -2602,6 +2616,72 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         panic!("renamed open note was not autosaved under its new path");
+    }
+
+    #[test]
+    fn t2_reconcile_rekeys_open_buffer_and_emits_suggestion() {
+        let fs = MemFs::new();
+        let root = PathBuf::from("/test/vault");
+        fs.create_dir_all(&root).unwrap();
+        let old_path = root.join("old-name.md");
+        let new_path = root.join("new-name.md");
+        fs.write_new(&old_path, b"---\nid: Stable-Note\n---\n# Original\n")
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("index.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let identity = VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![1, 2, 3]);
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs.clone()) as Box<dyn Fs + Send + Sync>)
+            .with_identity(identity.clone())
+            .with_index(IndexActor::new(&db, 1).unwrap())
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        actor.get_version().unwrap();
+        let channels = ChannelSet::new();
+        let session = Session::new(
+            identity,
+            actor.clone(),
+            BufferManager::new(),
+            channels.pulse,
+            channels.notice,
+            VaultConfig::default(),
+        );
+        let buffer_id = match session.execute(SessionCommand::OpenNote {
+            path: old_path.clone(),
+        }) {
+            SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => buffer_id,
+            other => panic!("expected open, got {other:?}"),
+        };
+
+        fs.remove(&old_path).unwrap();
+        fs.write_new(&new_path, b"---\nid: stable-note\n---\n# Original\n")
+            .unwrap();
+        let response = actor
+            .submit_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            response,
+            crate::actor::VaultActorResp::ReconcileComplete { .. }
+        ));
+        session.pump();
+
+        assert_eq!(session.get_buffer_id(&new_path), Some(buffer_id));
+        assert_eq!(session.get_buffer_id(&old_path), None);
+        assert!(session.drain_notices().iter().any(|notice| matches!(
+            notice,
+            crate::channels::Notice::RenameSuggested {
+                from,
+                to,
+                tier: crate::channels::RenameTier::T2,
+                ..
+            } if from == &old_path && to == &new_path
+        )));
+        let _ = actor.send(crate::actor::VaultActorMsg::Shutdown);
     }
 
     #[test]

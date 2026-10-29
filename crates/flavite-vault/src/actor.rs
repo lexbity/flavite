@@ -10,6 +10,7 @@ use crate::channels::{Pulse, RenameTier};
 use crate::coalesce::{EventCoalescer, VaultWatcher, WatcherEvent};
 use crate::history::HistoryStore;
 use crate::history::{HistoryReason, SnapshotRef};
+use crate::rename::RenamePlanner;
 use crate::save::{SaveFailure, SaveReceipt, SaveRequest};
 use crate::types::{
     Epoch, Generation, ReconcileMode, ReconcileScope, ReconcileSummary, VaultIdentity, Version,
@@ -17,6 +18,8 @@ use crate::types::{
 use crossbeam::channel::{Receiver, Sender, bounded, select, tick, unbounded};
 use flavite_fs::Fs;
 use flavite_index::{IndexActor, MAX_NOTE_BYTES};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -76,6 +79,8 @@ pub enum VaultActorMsg {
         from: std::path::PathBuf,
         to: std::path::PathBuf,
         protected_paths: Vec<std::path::PathBuf>,
+        buffer_ids: HashMap<std::path::PathBuf, u64>,
+        buffer_revisions: HashMap<u64, u64>,
         reply: Sender<VaultActorResp>,
     },
     /// Notify of a filesystem event.
@@ -246,12 +251,16 @@ impl VaultActorHandle {
         from: std::path::PathBuf,
         to: std::path::PathBuf,
         protected_paths: Vec<std::path::PathBuf>,
+        buffer_ids: HashMap<std::path::PathBuf, u64>,
+        buffer_revisions: HashMap<u64, u64>,
     ) -> Result<Receiver<VaultActorResp>, VaultActorError> {
         let (reply, receiver) = crossbeam::channel::bounded(1);
         self.try_send(VaultActorMsg::RenameNoteRequest {
             from,
             to,
             protected_paths,
+            buffer_ids,
+            buffer_revisions,
             reply,
         })?;
         Ok(receiver)
@@ -463,6 +472,8 @@ pub struct VaultActor {
     watcher_enabled: bool,
     initial_scan_complete: bool,
     verification_interval: std::time::Duration,
+    recent_watcher_rename_pairs:
+        std::collections::HashSet<(std::path::PathBuf, std::path::PathBuf)>,
 }
 
 impl VaultActor {
@@ -492,6 +503,7 @@ impl VaultActor {
             watcher_enabled: true,
             initial_scan_complete: false,
             verification_interval: std::time::Duration::from_secs(600),
+            recent_watcher_rename_pairs: std::collections::HashSet::new(),
         }
     }
 
@@ -632,6 +644,9 @@ impl VaultActor {
                 },
                 recv(timer) -> _ => {
                     if let Some(batch) = self.coalescer.try_recv_batch() {
+                        for (from, to) in batch.rename_pairs.iter().cloned() {
+                            self.handle_external_rename_pair(from, to);
+                        }
                         if batch.is_bulk || batch.paths.is_empty() {
                             if let Some(pulse) = &self.pulse_sender {
                                 let _ = pulse.try_send(Pulse::ReconcileProgress { done: 0, total: batch.paths.len() as u32 });
@@ -644,9 +659,6 @@ impl VaultActor {
                         } else {
                             let summary = self.scan_paths(&batch.paths);
                             self.publish_reconcile(summary, None);
-                        }
-                        for (from, to) in batch.rename_pairs {
-                            self.handle_external_rename_pair(from, to);
                         }
                     }
                     if let Err(error) = self.index.commit_search_if_due(false) {
@@ -684,9 +696,17 @@ impl VaultActor {
                 from,
                 to,
                 protected_paths,
+                buffer_ids,
+                buffer_revisions,
                 reply,
             } => {
-                let result = self.execute_journaled_rename(&from, &to, &protected_paths);
+                let result = self.execute_journaled_rename(
+                    &from,
+                    &to,
+                    &protected_paths,
+                    &buffer_ids,
+                    &buffer_revisions,
+                );
                 let _ = reply.try_send(VaultActorResp::Renamed(result));
             }
             VaultActorMsg::FsEvent(event) => {
@@ -965,6 +985,8 @@ impl VaultActor {
         if !note_rename && !attachment_rename {
             return;
         }
+        self.recent_watcher_rename_pairs
+            .insert((from.clone(), to.clone()));
         let stem = from
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -1004,20 +1026,27 @@ impl VaultActor {
         from: &std::path::Path,
         to: &std::path::Path,
         protected_paths: &[std::path::PathBuf],
+        buffer_ids: &HashMap<std::path::PathBuf, u64>,
+        buffer_revisions: &HashMap<u64, u64>,
     ) -> Result<String, String> {
-        let from = if from.is_absolute() {
-            from.to_path_buf()
-        } else {
-            self.identity.root.join(from)
-        };
-        let to = if to.is_absolute() {
-            to.to_path_buf()
-        } else {
-            self.identity.root.join(to)
-        };
-        if !from.starts_with(&self.identity.root) || !to.starts_with(&self.identity.root) {
-            return Err("rename paths must remain inside the vault".into());
-        }
+        let plan = RenamePlanner::new(
+            Arc::clone(&self.fs),
+            self.identity.root.clone(),
+            256 * 1024 * 1024,
+        )
+        .plan_rename(
+            from.to_path_buf(),
+            to.to_path_buf(),
+            buffer_ids,
+            buffer_revisions,
+        )
+        .into_plan()?;
+        let plan_item = plan
+            .items
+            .first()
+            .ok_or_else(|| "rename planner produced an empty plan".to_owned())?;
+        let from = self.identity.root.join(&plan_item.from_path);
+        let to = self.identity.root.join(&plan_item.to_path);
         if !from
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
@@ -1176,13 +1205,38 @@ impl VaultActor {
         let mut processed_notes = 0u32;
         let mut stack = vec![self.identity.root.clone()];
         let mut summary = ReconcileSummary::default();
-        let mut indexed: std::collections::HashSet<Vec<u8>> = self
-            .index
-            .indexed_note_paths()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        let initial_paths = self.index.indexed_note_paths().unwrap_or_default();
+        let initial_path_set = initial_paths
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let old_note_snapshot = match self.index.rename_note_snapshot() {
+            Ok(notes) => notes,
+            Err(error) => {
+                tracing::warn!(%error, "could not snapshot notes for rename inference");
+                Vec::new()
+            }
+        };
+        let old_inbound_counts = old_note_snapshot
+            .iter()
+            .map(|note| {
+                let count = self
+                    .index
+                    .writer()
+                    .conn()
+                    .query_row(
+                        "SELECT COUNT(*) FROM links WHERE dst_note=?1",
+                        [note.note_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    .max(0) as u32;
+                (PathBuf::from(&note.path), count)
+            })
+            .collect::<HashMap<_, _>>();
+        let mut indexed: std::collections::HashSet<Vec<u8>> = initial_paths.into_iter().collect();
         let mut present = std::collections::HashSet::new();
+        let mut deleted_events = Vec::new();
         while let Some(directory) = stack.pop() {
             let Ok(entries) = self.fs.read_dir(&directory) else {
                 continue;
@@ -1313,9 +1367,7 @@ impl VaultActor {
                     summary.removed = summary.removed.saturating_add(1);
                     self.record_drift();
                     if let Ok(relative) = self.fs.decode_path_key(&vanished) {
-                        let _ = self.event_sender.send(VaultActorEvent::Deleted {
-                            path: self.identity.root.join(relative),
-                        });
+                        deleted_events.push(self.identity.root.join(relative));
                     }
                     // Keep actor-visible generation monotonic after removal.
                     self.generation = Generation::new(self.generation.0.saturating_add(1));
@@ -1328,7 +1380,97 @@ impl VaultActor {
         summary.added = summary.added.saturating_add(attachments.added);
         summary.changed = summary.changed.saturating_add(attachments.changed);
         summary.removed = summary.removed.saturating_add(attachments.removed);
+        let t2_rekey_sources = self.infer_note_renames(
+            &old_note_snapshot,
+            &initial_path_set,
+            &present,
+            &old_inbound_counts,
+        );
+        for path in deleted_events {
+            if !t2_rekey_sources.contains(&path) {
+                let _ = self.event_sender.send(VaultActorEvent::Deleted { path });
+            }
+        }
         summary
+    }
+
+    fn infer_note_renames(
+        &mut self,
+        old_notes: &[flavite_index::types::Note],
+        initial_paths: &std::collections::HashSet<Vec<u8>>,
+        present_paths: &std::collections::HashSet<Vec<u8>>,
+        inbound_link_counts: &HashMap<std::path::PathBuf, u32>,
+    ) -> std::collections::HashSet<std::path::PathBuf> {
+        let watcher_pairs = std::mem::take(&mut self.recent_watcher_rename_pairs);
+        let vanished = old_notes
+            .iter()
+            .filter(|note| !present_paths.contains(&note.path_native))
+            .map(|note| std::path::PathBuf::from(&note.path))
+            .collect::<Vec<_>>();
+        if vanished.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        let Ok(indexed_paths) = self.index.indexed_note_paths() else {
+            return std::collections::HashSet::new();
+        };
+        let created_native = indexed_paths
+            .into_iter()
+            .filter(|path| !initial_paths.contains(path))
+            .collect::<std::collections::HashSet<_>>();
+        if created_native.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        let Ok(current_notes) = self.index.rename_note_snapshot() else {
+            return std::collections::HashSet::new();
+        };
+        let old_by_path = old_notes
+            .iter()
+            .cloned()
+            .map(|note| (std::path::PathBuf::from(&note.path), note))
+            .collect::<HashMap<_, _>>();
+        let current_by_path = current_notes
+            .iter()
+            .cloned()
+            .map(|note| (std::path::PathBuf::from(&note.path), note))
+            .collect::<HashMap<_, _>>();
+        let created = current_notes
+            .iter()
+            .filter(|note| created_native.contains(&note.path_native))
+            .map(|note| std::path::PathBuf::from(&note.path))
+            .collect::<Vec<_>>();
+        if vanished.is_empty() || created.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        let result = crate::rename::RenameInference::new().infer_reconcile(
+            &vanished,
+            &created,
+            &old_by_path,
+            &current_by_path,
+            inbound_link_counts,
+        );
+        let mut t2_sources = std::collections::HashSet::new();
+        for candidate in result.candidates {
+            let from = self.identity.root.join(&candidate.from);
+            let to = self.identity.root.join(&candidate.to);
+            if watcher_pairs.contains(&(from.clone(), to.clone())) {
+                continue;
+            }
+            if candidate.tier == RenameTier::T2 {
+                t2_sources.insert(from.clone());
+                let _ = self.event_sender.send(VaultActorEvent::Renamed {
+                    from: from.clone(),
+                    to: to.clone(),
+                    tier: RenameTier::T2,
+                });
+            }
+            let _ = self.event_sender.send(VaultActorEvent::RenameSuggested {
+                from,
+                to,
+                tier: candidate.tier,
+                inbound: candidate.inbound_links,
+            });
+        }
+        t2_sources
     }
 
     fn scan_attachments(&mut self, mode: ReconcileMode) -> ReconcileSummary {
@@ -1468,6 +1610,37 @@ impl VaultActor {
             return self.scan_notes();
         }
         let mut summary = ReconcileSummary::default();
+        let initial_paths = self.index.indexed_note_paths().unwrap_or_default();
+        let initial_path_set = initial_paths
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let old_notes = match self.index.rename_note_snapshot() {
+            Ok(notes) => notes,
+            Err(error) => {
+                tracing::warn!(%error, "could not snapshot notes for rename inference");
+                Vec::new()
+            }
+        };
+        let inbound_counts = old_notes
+            .iter()
+            .map(|note| {
+                let count = self
+                    .index
+                    .writer()
+                    .conn()
+                    .query_row(
+                        "SELECT COUNT(*) FROM links WHERE dst_note=?1",
+                        [note.note_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    .max(0) as u32;
+                (std::path::PathBuf::from(&note.path), count)
+            })
+            .collect::<HashMap<_, _>>();
+        let mut present_paths = initial_path_set.clone();
+        let mut deleted_events = Vec::new();
         for nominated in paths {
             let path = if nominated.is_absolute() {
                 nominated.clone()
@@ -1501,12 +1674,11 @@ impl VaultActor {
                 }
             };
             if !exists {
+                present_paths.remove(&path_key);
                 if self.index.remove_note_path(&path_key).unwrap_or(false) {
                     summary.removed = summary.removed.saturating_add(1);
                     self.record_drift();
-                    let _ = self
-                        .event_sender
-                        .send(VaultActorEvent::Deleted { path: path.clone() });
+                    deleted_events.push(path.clone());
                     if let Ok((epoch, generation)) = self.index.current_version() {
                         self.epoch = Epoch::new(epoch);
                         self.generation = Generation::new(generation);
@@ -1514,6 +1686,7 @@ impl VaultActor {
                 }
                 continue;
             }
+            present_paths.insert(path_key.clone());
             if self
                 .fs
                 .validate_in_root(&self.identity.root, &path)
@@ -1599,6 +1772,17 @@ impl VaultActor {
                 Err(error) => {
                     tracing::warn!(path = %path.display(), %error, "nominated note reconcile failed")
                 }
+            }
+        }
+        let t2_rekey_sources = self.infer_note_renames(
+            &old_notes,
+            &initial_path_set,
+            &present_paths,
+            &inbound_counts,
+        );
+        for path in deleted_events {
+            if !t2_rekey_sources.contains(&path) {
+                let _ = self.event_sender.send(VaultActorEvent::Deleted { path });
             }
         }
         summary
@@ -1741,6 +1925,39 @@ mod tests {
     use super::*;
     use crate::tokens::WriteTokenManager;
     use flavite_fs::{Fs, MemFs};
+
+    fn start_test_actor(fs: &MemFs) -> (VaultActorHandle, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("index.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs.clone()))
+            .with_identity(VaultIdentity::new(
+                uuid::Uuid::now_v7(),
+                PathBuf::from("/vault"),
+                vec![1, 2, 3, 4],
+            ))
+            .with_index(IndexActor::new(&db, 1).unwrap())
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        actor.get_version().unwrap();
+        (actor, temp)
+    }
+
+    fn reconcile_test_actor(actor: &VaultActorHandle) {
+        let response = actor
+            .submit_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent)
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(response, VaultActorResp::ReconcileComplete { .. }));
+    }
+
+    fn collect_rename_events(actor: &VaultActorHandle) -> Vec<VaultActorEvent> {
+        actor.events().try_iter().collect()
+    }
 
     #[test]
     fn test_write_token() {
@@ -1910,6 +2127,8 @@ mod tests {
                 std::path::PathBuf::from("/vault/notes/a.md"),
                 std::path::PathBuf::from("/vault/notes/b.md"),
                 Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
             )
             .unwrap()
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -1937,6 +2156,123 @@ mod tests {
                 .unwrap();
             assert_eq!(rewritten, b"[[b]]\n", "inbound file {i}");
         }
+        let _ = actor.send(VaultActorMsg::Shutdown);
+    }
+
+    #[test]
+    fn reconcile_infers_t2_t3_t4_with_tier_specific_events() {
+        let fs = MemFs::new();
+        fs.create_dir_all(std::path::Path::new("/vault/notes"))
+            .unwrap();
+        fs.write_new(
+            std::path::Path::new("/vault/notes/old-id.md"),
+            b"---\nid: Stable-X\n---\n# Same identity\n",
+        )
+        .unwrap();
+        fs.write_new(
+            std::path::Path::new("/vault/notes/old-copy.md"),
+            b"# A copied note with enough content to qualify for content hash inference.\n",
+        )
+        .unwrap();
+        fs.write_new(
+            std::path::Path::new("/vault/notes/proposal.md"),
+            b"# Different contents, similar filename.\n",
+        )
+        .unwrap();
+        let (actor, _temp) = start_test_actor(&fs);
+        let old_id = std::path::Path::new("/vault/notes/old-id.md");
+        let old_copy = std::path::Path::new("/vault/notes/old-copy.md");
+        let proposal = std::path::Path::new("/vault/notes/proposal.md");
+        fs.remove(old_id).unwrap();
+        fs.remove(old_copy).unwrap();
+        fs.remove(proposal).unwrap();
+        fs.write_new(
+            std::path::Path::new("/vault/notes/new-id.md"),
+            b"---\nid: stable-x\n---\n# Same identity, changed filename\n",
+        )
+        .unwrap();
+        fs.create_dir_all(std::path::Path::new("/vault/archive"))
+            .unwrap();
+        fs.write_new(
+            std::path::Path::new("/vault/archive/new-copy.md"),
+            b"# A copied note with enough content to qualify for content hash inference.\n",
+        )
+        .unwrap();
+        fs.write_new(
+            std::path::Path::new("/vault/notes/proposals.md"),
+            b"# Entirely different contents, similar filename.\n",
+        )
+        .unwrap();
+
+        reconcile_test_actor(&actor);
+        let events = collect_rename_events(&actor);
+        let suggestions = events
+            .iter()
+            .filter_map(|event| match event {
+                VaultActorEvent::RenameSuggested { from, to, tier, .. } => Some((from, to, *tier)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(suggestions.iter().any(|(from, to, tier)| {
+            *tier == RenameTier::T2 && from.ends_with("old-id.md") && to.ends_with("new-id.md")
+        }));
+        assert!(suggestions.iter().any(|(from, to, tier)| {
+            *tier == RenameTier::T3 && from.ends_with("old-copy.md") && to.ends_with("new-copy.md")
+        }));
+        assert!(suggestions.iter().any(|(from, to, tier)| {
+            *tier == RenameTier::T4 && from.ends_with("proposal.md") && to.ends_with("proposals.md")
+        }));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            VaultActorEvent::Renamed { from, to, tier: RenameTier::T2 }
+                if from.ends_with("old-id.md") && to.ends_with("new-id.md")
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            VaultActorEvent::Renamed {
+                tier: RenameTier::T3 | RenameTier::T4,
+                ..
+            }
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            VaultActorEvent::Deleted { path } if path.ends_with("old-id.md")
+        )));
+        let _ = actor.send(VaultActorMsg::Shutdown);
+    }
+
+    #[test]
+    fn actor_rename_rejection_comes_from_rename_planner() {
+        let fs = MemFs::new();
+        fs.create_dir_all(std::path::Path::new("/vault/notes"))
+            .unwrap();
+        fs.write_new(std::path::Path::new("/vault/notes/a.md"), b"# A")
+            .unwrap();
+        fs.write_new(std::path::Path::new("/vault/notes/b.md"), b"# B")
+            .unwrap();
+        let (actor, _temp) = start_test_actor(&fs);
+
+        let response = actor
+            .submit_rename(
+                PathBuf::from("/vault/notes/a.md"),
+                PathBuf::from("/vault/notes/b.md"),
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            response,
+            VaultActorResp::Renamed(Err(message))
+                if message == "destination is occupied: /vault/notes/b.md"
+        ));
+        assert!(
+            fs.read_if_exists(std::path::Path::new("/vault/notes/a.md"))
+                .unwrap()
+                .is_some()
+        );
         let _ = actor.send(VaultActorMsg::Shutdown);
     }
 

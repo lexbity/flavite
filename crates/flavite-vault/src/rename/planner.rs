@@ -26,6 +26,25 @@ pub enum RenamePlanResult {
     PayloadBudgetExceeded,
 }
 
+impl RenamePlanResult {
+    /// Return the plan or the planner's precise refusal reason.
+    pub fn into_plan(self) -> Result<RenamePlan, String> {
+        match self {
+            Self::Success(plan) => Ok(plan),
+            Self::ValidationFailed(error) => Err(error.to_string()),
+            Self::DestinationOccupied(path) => {
+                Err(format!("destination is occupied: {}", path.display()))
+            }
+            Self::CrossFilesystemNotSupported => {
+                Err("cross-filesystem move is not supported".into())
+            }
+            Self::DirectoryMoveNotSupported => Err("directory move is not supported".into()),
+            Self::DiskSpaceInsufficient => Err("insufficient disk space".into()),
+            Self::PayloadBudgetExceeded => Err("rename exceeds the payload budget".into()),
+        }
+    }
+}
+
 /// Error during rename validation.
 #[derive(Debug, Clone, Error)]
 pub enum RenameValidationError {
@@ -92,6 +111,8 @@ impl RenamePlanner {
 
     /// Plan a rename/move operation.
     ///
+    /// # Errors
+    /// This method returns refusals as [`RenamePlanResult`] variants.
     pub fn plan_rename(
         &self,
         from_path: PathBuf,
@@ -196,14 +217,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_planner_creation() {
-        let planner = RenamePlanner {
-            fs: Arc::new(flavite_fs::MemFs::new()),
-            vault_root: PathBuf::from("/vault"),
-            payload_budget: 256 * 1024 * 1024,
-        };
-
-        // Stub test - planner should be creatable
+    fn planner_accepts_a_constructed_vault_root() {
+        let planner = RenamePlanner::new(
+            Arc::new(flavite_fs::MemFs::new()),
+            PathBuf::from("/vault"),
+            256 * 1024 * 1024,
+        );
         assert_eq!(planner.vault_root, PathBuf::from("/vault"));
     }
 
