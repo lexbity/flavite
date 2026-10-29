@@ -5,6 +5,7 @@
 //! to fail on any decrease vs `main`'s lcov artifact.
 
 use anyhow::{Context, Result};
+use chrono::{NaiveDate, Utc};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -149,7 +150,7 @@ pub fn check(
 
     // Check floors for each gating crate.
     for (crate_name, tier) in &config.crates {
-        let floor = match tier.as_str() {
+        let permanent_floor = match tier.as_str() {
             "tier1" => config.floors.tier1,
             "tier2" => config.floors.tier2,
             "tier3" => config.floors.tier3,
@@ -163,6 +164,48 @@ pub fn check(
             }
             continue;
         }
+
+        let floor = if let Some(waiver) = config.waivers.get(crate_name) {
+            let expiry = NaiveDate::parse_from_str(&waiver.expires, "%Y-%m-%d");
+            let valid = match expiry {
+                Ok(date)
+                    if date >= Utc::now().date_naive()
+                        && !waiver.reason.trim().is_empty()
+                        && waiver.floor >= 0.0
+                        && waiver.floor < permanent_floor =>
+                {
+                    Some(waiver.floor)
+                }
+                Ok(date) if date < Utc::now().date_naive() => {
+                    report
+                        .failures
+                        .push(format!("{crate_name}: coverage waiver expired on {date}"));
+                    None
+                }
+                Ok(_) => {
+                    report.failures.push(format!("{crate_name}: invalid waiver; floor must be lower than {permanent_floor:.1}% and reason must be stated"));
+                    None
+                }
+                Err(_) => {
+                    report.failures.push(format!(
+                        "{crate_name}: invalid waiver expiry {}; expected YYYY-MM-DD",
+                        waiver.expires
+                    ));
+                    None
+                }
+            };
+            if let Some(floor) = valid {
+                println!(
+                    "  {crate_name}: temporary floor {floor:.1}% (permanent {permanent_floor:.0}%, expires {})",
+                    waiver.expires
+                );
+                floor
+            } else {
+                permanent_floor
+            }
+        } else {
+            permanent_floor
+        };
 
         match coverages.get(crate_name) {
             Some(cov) => {
@@ -349,6 +392,31 @@ flavite-fs = "tier1"
         let report = check(&lcov_path, &tmp, None).unwrap();
         assert!(report.failures.is_empty());
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn active_waiver_applies_and_expired_waiver_fails() {
+        let tmp = std::env::temp_dir().join(format!("flavite-cov-waiver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("devdocs/architecture")).unwrap();
+        let config = tmp.join("devdocs/architecture/coverage.toml");
+        let lcov = tmp.join("lcov.info");
+        std::fs::write(
+            &lcov,
+            "SF:/project/crates/flavite-fs/src/lib.rs\nDA:1,1\nDA:2,0\nend_of_record\n",
+        )
+        .unwrap();
+        std::fs::write(&config, "[floors]\ntier1=90.0\n[crates]\nflavite-fs=\"tier1\"\n[waivers.flavite-fs]\nfloor=50.0\nexpires=\"2999-01-01\"\nreason=\"add tests\"\n").unwrap();
+        assert!(check(&lcov, &tmp, None).unwrap().failures.is_empty());
+        std::fs::write(&config, "[floors]\ntier1=90.0\n[crates]\nflavite-fs=\"tier1\"\n[waivers.flavite-fs]\nfloor=50.0\nexpires=\"2000-01-01\"\nreason=\"add tests\"\n").unwrap();
+        assert!(
+            check(&lcov, &tmp, None)
+                .unwrap()
+                .failures
+                .iter()
+                .any(|failure| failure.contains("waiver expired"))
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

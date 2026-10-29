@@ -43,6 +43,8 @@ pub struct EventBatch {
     pub mode: ReconcileMode,
     /// The paths that changed.
     pub paths: HashSet<PathBuf>,
+    /// OS rename pairs retained as authoritative T1 evidence.
+    pub rename_pairs: Vec<(PathBuf, PathBuf)>,
     /// Whether this is a bulk mode batch.
     pub is_bulk: bool,
 }
@@ -55,6 +57,7 @@ impl EventBatch {
             scope,
             mode,
             paths: HashSet::new(),
+            rename_pairs: Vec::new(),
             is_bulk: false,
         }
     }
@@ -66,6 +69,7 @@ impl EventBatch {
             scope,
             mode: ReconcileMode::VerifyContent,
             paths,
+            rename_pairs: Vec::new(),
             is_bulk: true,
         }
     }
@@ -99,6 +103,8 @@ impl Default for EventBatch {
 pub enum CoalescerEvent {
     /// A path was nominated by the watcher.
     PathNominated(PathBuf),
+    /// A paired rename event; paths are also nominated for reconciliation.
+    RenamePair(PathBuf, PathBuf),
     /// A bulk mode trigger (overflow detected).
     BulkTrigger(HashSet<PathBuf>),
     /// A manual reconcile request.
@@ -225,6 +231,11 @@ impl EventCoalescer {
         let mut state = self.state.lock().unwrap();
         match event {
             CoalescerEvent::PathNominated(path) => state.pending.add_path(path),
+            CoalescerEvent::RenamePair(from, to) => {
+                state.pending.add_path(from.clone());
+                state.pending.add_path(to.clone());
+                state.pending.rename_pairs.push((from, to));
+            }
             CoalescerEvent::BulkTrigger(paths) => {
                 state.pending.paths.extend(paths);
                 state.bulk_pending = true;
@@ -338,13 +349,9 @@ impl VaultWatcher {
                     .try_send(CoalescerEvent::PathNominated(path));
             }
             WatcherEvent::Renamed { from, to } => {
-                // Both paths need to be nominated
                 let _ = self
                     .event_sender
-                    .try_send(CoalescerEvent::PathNominated(from.clone()));
-                let _ = self
-                    .event_sender
-                    .try_send(CoalescerEvent::PathNominated(to));
+                    .try_send(CoalescerEvent::RenamePair(from, to));
             }
             WatcherEvent::Overflow => {
                 let _ = self
@@ -444,6 +451,10 @@ mod tests {
         });
         let batch = coalescer.try_recv_batch().unwrap();
         assert_eq!(batch.len(), 5);
+        assert_eq!(
+            batch.rename_pairs,
+            vec![(PathBuf::from("old.md"), PathBuf::from("new.md"))]
+        );
 
         watcher.notify(WatcherEvent::Overflow);
         let overflow = coalescer.try_recv_batch().unwrap();

@@ -280,6 +280,8 @@ pub enum RejectionReason {
     Unsupported,
     /// Invalid arguments.
     InvalidArgs,
+    /// Caller did not declare the required capability.
+    CapabilityDenied,
     /// Conflict state.
     Conflict,
 }

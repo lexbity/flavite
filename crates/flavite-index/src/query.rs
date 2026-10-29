@@ -47,8 +47,11 @@ pub enum Query {
 
 impl Query {
     /// Parse the small user-facing query syntax into the typed query AST.
-    /// Supports `tag:`, `text:`, `unresolved`, parentheses, and boolean
-    /// `AND`/`OR`/`NOT` operators (`AND` binds tighter than `OR`).
+    /// Supports `tag:`, `text:`, `unresolved`, bare full-text terms,
+    /// parentheses, and boolean `AND`/`OR`/`NOT` operators (`AND` binds
+    /// tighter than `OR`). Unsupported `key:value` expressions are rejected
+    /// instead of being treated as a literal search, avoiding surprising
+    /// results.
     ///
     /// # Errors
     /// Returns an error for malformed or unsupported query syntax.
@@ -364,9 +367,13 @@ impl QueryParser {
         {
             return Ok(Query::Text(value.to_owned()));
         }
-        Err(format!(
-            "unsupported query term {token:?}; expected tag:, text:, or unresolved"
-        ))
+        if token.contains(':') {
+            // A `key:value` form this parser does not implement (e.g.
+            // `title:foo`): reject it rather than silently searching the
+            // literal text.
+            return Err(format!("unsupported query syntax: {token}"));
+        }
+        Ok(Query::Text(token))
     }
 
     fn take_word(&mut self, word: &str) -> bool {

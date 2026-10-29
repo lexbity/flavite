@@ -185,6 +185,8 @@ pub struct Flavite {
     pending_requests: Mutex<HashSet<RequestId>>,
     /// Completions collected while waiting for another operation.
     terminal_backlog: Mutex<HashMap<RequestId, ExecutionResult>>,
+    /// Notices delivered to consumers, retained until presentation ack.
+    notice_acks: Mutex<Vec<(crate::Event, flavite_vault::channels::Notice)>>,
     /// The API vault reference.
     vault_ref: ApiVaultRef,
     /// Whether the vault is read-only.
@@ -217,6 +219,7 @@ impl Flavite {
             operation_ids: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashSet::new()),
             terminal_backlog: Mutex::new(HashMap::new()),
+            notice_acks: Mutex::new(Vec::new()),
             vault_ref,
             read_only: false,
             owned_vault: None,
@@ -243,6 +246,7 @@ impl Flavite {
             operation_ids: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashSet::new()),
             terminal_backlog: Mutex::new(HashMap::new()),
+            notice_acks: Mutex::new(Vec::new()),
             vault_ref,
             read_only: false,
             owned_vault: None,
@@ -270,6 +274,7 @@ impl Flavite {
             operation_ids: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashSet::new()),
             terminal_backlog: Mutex::new(HashMap::new()),
+            notice_acks: Mutex::new(Vec::new()),
             vault_ref,
             read_only: false,
             owned_vault: None,
@@ -391,9 +396,13 @@ impl Flavite {
         ];
         for (id, title, args, handler) in registrations {
             let spec = if matches!(id, "open_note" | "note.open") {
-                CommandSpec::new(id, title, args)
+                CommandSpec::new(id, title, args).requires(crate::Capability::ReadNotes)
             } else {
-                CommandSpec::new(id, title, args).write()
+                CommandSpec::new(id, title, args)
+                    .write()
+                    .requires(crate::Capability::WriteNotes {
+                        scope: crate::WriteScope::Vault,
+                    })
             };
             self.command_registry
                 .register(spec, handler)
@@ -449,6 +458,107 @@ impl Flavite {
     /// Acknowledge notice presentation. This does not complete commands or journal work.
     pub fn acknowledge_notice(&self, notice: &flavite_vault::channels::Notice) {
         self.session.acknowledge_notice(notice);
+    }
+
+    /// Drain the versioned public event stream assembled from Session events,
+    /// lossy pulses, and coalesced notices. Hosts should consume this instead
+    /// of depending on vault channel payloads.
+    pub fn drain_events(&self) -> Vec<crate::Event> {
+        use flavite_vault::channels::{Notice, Pulse};
+        use flavite_vault::session::SessionEvent;
+
+        let mut events = Vec::new();
+        for event in self.session.drain_events() {
+            if let SessionEvent::ExternalChangeDetected { path, deleted } = event {
+                events.push(crate::Event::ExternalChangeDetected {
+                    vault: self.vault_ref.clone(),
+                    note_path: path.to_string_lossy().into_owned(),
+                    deleted,
+                });
+            }
+        }
+        for pulse in self.session.drain_pulses() {
+            match pulse {
+                Pulse::VaultChanged {
+                    epoch,
+                    generation,
+                    summary,
+                } => events.push(crate::Event::VaultChanged {
+                    vault: self.vault_ref.clone(),
+                    epoch: epoch.value(),
+                    generation: generation.value(),
+                    added: summary.added,
+                    changed: summary.changed,
+                    removed: summary.removed,
+                }),
+                Pulse::ReconcileProgress { done, total } => {
+                    events.push(crate::Event::ReconcileProgress { done, total })
+                }
+                Pulse::Invalidate { note } => events.push(crate::Event::Invalidate {
+                    vault: self.vault_ref.clone(),
+                    note_path: note.path.to_string_lossy().into_owned(),
+                }),
+            }
+        }
+        for notice in self.session.drain_notices() {
+            match &notice {
+                Notice::RenameSuggested {
+                    from,
+                    to,
+                    tier,
+                    inbound,
+                } => events.push(crate::Event::RenameSuggested {
+                    vault: self.vault_ref.clone(),
+                    from: from.clone(),
+                    to: to.clone(),
+                    tier: tier.as_str().into(),
+                    inbound: *inbound,
+                }),
+                Notice::Conflict { note } => events.push(crate::Event::Conflict {
+                    vault: self.vault_ref.clone(),
+                    note_path: note.path.to_string_lossy().into_owned(),
+                }),
+                Notice::RecoveryOffer { note } => events.push(crate::Event::RecoveryOffer {
+                    vault: self.vault_ref.clone(),
+                    note_path: note.path.to_string_lossy().into_owned(),
+                }),
+                Notice::ActionRequired { code, note } => {
+                    events.push(crate::Event::ActionRequired {
+                        vault: self.vault_ref.clone(),
+                        code: (*code).into(),
+                        note_path: note.as_ref().map(|n| n.path.to_string_lossy().into_owned()),
+                    })
+                }
+            }
+            if let Some(event) = events.last() {
+                self.notice_acks
+                    .lock()
+                    .unwrap()
+                    .push((event.clone(), notice));
+            }
+        }
+        events
+    }
+
+    /// Acknowledge a notice event after the host has presented or reported it.
+    /// This only retires the presentation notice; it never completes an operation.
+    pub fn acknowledge_event(&self, event: &crate::Event) {
+        let mut pending = self.notice_acks.lock().unwrap();
+        if let Some(index) = pending.iter().position(|(candidate, _)| candidate == event) {
+            let (_, notice) = pending.remove(index);
+            self.session.acknowledge_notice(&notice);
+        }
+    }
+
+    /// Ask the vault actor to perform its throttled focus verification.
+    pub fn focus(&self) -> Result<(), FlaviteError> {
+        self.session.focus().map_err(FlaviteError::SessionOperation)
+    }
+
+    /// Cumulative drift observations from the vault actor.
+    #[must_use]
+    pub fn drift_found_total(&self) -> u64 {
+        self.session.drift_found_total()
     }
 
     /// Return a revision-independent snapshot of indexed note titles, aliases,
@@ -510,6 +620,22 @@ impl Flavite {
             };
             return ExecutionResult::Rejected(
                 RejectedResult::with_request(reason, invocation.request_id).with_message(message),
+            );
+        }
+        if let Some(required) = self
+            .command_registry
+            .get_spec(invocation.command_id)
+            .and_then(|spec| spec.required_capability)
+            && !invocation.capabilities.iter().any(|granted| {
+                granted.covers(&required, self.command_target(&invocation).as_deref())
+            })
+        {
+            return ExecutionResult::Rejected(
+                RejectedResult::with_request(
+                    RejectionReason::CapabilityDenied,
+                    invocation.request_id,
+                )
+                .with_message(format!("missing capability: {}", required.description())),
             );
         }
         if let Some(buffer_id) = invocation.preconditions.buffer_id {
@@ -575,6 +701,29 @@ impl Flavite {
         }
     }
 
+    fn command_target(&self, invocation: &Invocation) -> Option<PathBuf> {
+        let path = invocation.args.as_str().map(PathBuf::from).or_else(|| {
+            invocation
+                .args
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from)
+        });
+        path.or_else(|| {
+            invocation.preconditions.buffer_id.and_then(|buffer| {
+                self.get_buffer_view(
+                    BufferId::from(buffer),
+                    invocation
+                        .preconditions
+                        .expected_revision
+                        .map(Revision::new),
+                )
+                .ok()
+                .map(|view| view.path)
+            })
+        })
+    }
+
     /// Dispatch a command to the appropriate handler.
     fn dispatch_command(
         &self,
@@ -598,6 +747,9 @@ impl Flavite {
             SessionResult::Success(crate::session::CommandResult::NoteSaved { .. }) => "save_note",
             SessionResult::Success(crate::session::CommandResult::ReconcileComplete { .. }) => {
                 "reconcile"
+            }
+            SessionResult::Success(crate::session::CommandResult::NoteRenamed { .. }) => {
+                "rename_note"
             }
             SessionResult::Success(crate::session::CommandResult::UndoPerformed { .. }) => "undo",
             SessionResult::Success(crate::session::CommandResult::RedoPerformed { .. }) => "redo",
@@ -660,6 +812,13 @@ impl Flavite {
                             "added": summary.added,
                             "changed": summary.changed,
                             "removed": summary.removed,
+                        })
+                    }
+                    crate::session::CommandResult::NoteRenamed { txn_id, from, to } => {
+                        serde_json::json!({
+                            "txn_id": txn_id,
+                            "from": from.to_string_lossy(),
+                            "to": to.to_string_lossy(),
                         })
                     }
                     crate::session::CommandResult::UndoPerformed {
@@ -861,6 +1020,48 @@ impl Flavite {
         self.query_with_limit(query, 100)
     }
 
+    /// Current index and watcher summary for CLI and diagnostics.
+    pub fn vault_info(&self) -> Result<VaultInfo, FlaviteError> {
+        let version = self.session().version().map_err(FlaviteError::IndexError)?;
+        let db_path = crate::doctor::cache_db_path(self.vault_ref.uuid);
+        let (note_count, tantivy_generation) = if db_path.exists() {
+            let connection = rusqlite::Connection::open_with_flags(
+                &db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(|error| FlaviteError::IndexError(error.to_string()))?;
+            let count = u64::try_from(connection.query_row(
+                "SELECT count(*) FROM notes",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)
+            .map_err(|error| FlaviteError::IndexError(error.to_string()))?;
+            let committed = connection
+                .query_row(
+                    "SELECT value FROM meta WHERE key='tantivy_committed_generation'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            (count, committed)
+        } else {
+            (0, 0)
+        };
+        Ok(VaultInfo {
+            note_count,
+            epoch: version.epoch.value(),
+            generation: version.generation.value(),
+            tantivy_generation,
+            watcher_enabled: self
+                .owned_vault
+                .as_ref()
+                .is_some_and(Vault::watcher_enabled),
+            drift_found_total: self.drift_found_total(),
+        })
+    }
+
     /// Query the index with an explicit result limit.
     pub fn query_with_limit(
         &self,
@@ -885,6 +1086,22 @@ impl Flavite {
             generation: page.generation,
             has_more,
         })
+    }
+
+    /// Query the index on behalf of a capability-bearing API consumer.
+    pub fn query_as(
+        &self,
+        capabilities: &[crate::Capability],
+        query: &crate::Query,
+        limit: usize,
+    ) -> Result<QueryResult, FlaviteError> {
+        if !capabilities
+            .iter()
+            .any(|grant| grant.covers(&crate::Capability::ReadNotes, None))
+        {
+            return Err(FlaviteError::CapabilityDenied("ReadNotes"));
+        }
+        self.query_with_limit(query, limit)
     }
 }
 
@@ -972,6 +1189,14 @@ pub enum FlaviteError {
     #[error("Index error: {0}")]
     IndexError(String),
 
+    /// Vault operation could not be submitted.
+    #[error("Vault operation failed: {0}")]
+    SessionOperation(String),
+
+    /// A consumer attempted an API operation without its declared capability.
+    #[error("missing capability: {0}")]
+    CapabilityDenied(&'static str),
+
     /// Session error.
     #[error("Session error: {0}")]
     SessionError(#[from] SessionError),
@@ -983,6 +1208,9 @@ pub enum FlaviteError {
     /// JSON serialization error.
     #[error("JSON error: {0}")]
     JsonError(#[from] serde_json::Error),
+    /// SQLite read failed.
+    #[error("SQLite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }
 
 /// Session module re-export for convenience.
@@ -1005,6 +1233,23 @@ pub struct OperationCompletion {
     pub request_id: RequestId,
     /// Structured terminal result.
     pub result: ExecutionResult,
+}
+
+/// Read-only status reported by `flavite info` and diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultInfo {
+    /// Indexed Markdown note count.
+    pub note_count: u64,
+    /// Index epoch.
+    pub epoch: u64,
+    /// Structural index generation.
+    pub generation: u64,
+    /// Last committed full-text search generation.
+    pub tantivy_generation: u64,
+    /// Whether filesystem watching was enabled for this open.
+    pub watcher_enabled: bool,
+    /// Cumulative drift count observed by reconciliation.
+    pub drift_found_total: u64,
 }
 
 #[cfg(test)]
@@ -1172,11 +1417,155 @@ mod tests {
     }
 
     #[test]
+    fn query_as_enforces_read_notes_capability() {
+        let (flavite, _root, _temp) = test_flavite();
+        assert!(matches!(
+            flavite.query_as(&[], &crate::Query::Text("hello".into()), 10),
+            Err(FlaviteError::CapabilityDenied("ReadNotes"))
+        ));
+        assert_eq!(
+            flavite
+                .query_as(
+                    &[crate::Capability::ReadNotes],
+                    &crate::Query::Text("hello".into()),
+                    10
+                )
+                .unwrap()
+                .notes
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn public_event_drain_maps_external_change_and_conflict() {
+        use flavite_buffer::manager::BufferManager;
+        use flavite_fs::{Fs, MemFs};
+        use flavite_index::IndexActor;
+        use flavite_vault::actor::{VaultActorBuilder, event_source_channel};
+        use flavite_vault::channels::ChannelSet;
+        use flavite_vault::coalesce::WatcherEvent;
+        use flavite_vault::session::Session;
+        use std::time::{Duration, Instant};
+        let fs = MemFs::new();
+        let root = PathBuf::from("/test/event-vault");
+        fs.create_dir_all(&root).unwrap();
+        fs.write_new(&root.join("note.md"), b"before").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("event-index.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let identity = VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![7, 8, 9]);
+        let (watch_tx, watch_rx) = event_source_channel();
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs.clone()) as Box<dyn Fs + Send + Sync>)
+            .with_identity(identity.clone())
+            .with_index(IndexActor::new(&db, 1).unwrap())
+            .with_event_source(watch_rx)
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        let channels = ChannelSet::new();
+        let session = Session::new(
+            identity.clone(),
+            actor,
+            BufferManager::new(),
+            channels.pulse,
+            channels.notice,
+            VaultConfig::default(),
+        );
+        let flavite = Flavite::open(identity, session, VaultConfig::default()).unwrap();
+        let opened = flavite.execute_session(SessionCommand::OpenNote {
+            path: PathBuf::from("note.md"),
+        });
+        let buffer_id = match opened {
+            SessionResult::Success(crate::session::CommandResult::NoteOpened {
+                buffer_id, ..
+            }) => buffer_id,
+            other => panic!("unexpected open result: {other:?}"),
+        };
+        let view = flavite.get_buffer_view(buffer_id, None).unwrap();
+        flavite.execute_session(SessionCommand::ApplyEdits {
+            buffer_id,
+            revision: Revision::new(view.revision),
+            ops: vec![flavite_buffer::undo::EditOp::new(
+                flavite_syntax::text::Span::new(
+                    flavite_syntax::text::TextByte(6),
+                    flavite_syntax::text::TextByte(6),
+                ),
+                " mine".into(),
+            )],
+        });
+        fs.write_new(&root.join(".external"), b"external").unwrap();
+        fs.rename_replace(&root.join(".external"), &root.join("note.md"))
+            .unwrap();
+        watch_tx
+            .send(WatcherEvent::Modified(root.join("note.md")))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut events = Vec::new();
+        while Instant::now() < deadline {
+            flavite.session().pump();
+            events.extend(flavite.drain_events());
+            if events
+                .iter()
+                .any(|event| matches!(event, crate::Event::ExternalChangeDetected { .. }))
+                && events
+                    .iter()
+                    .any(|event| matches!(event, crate::Event::Conflict { .. }))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(events.iter().any(|event| matches!(event, crate::Event::ExternalChangeDetected { note_path, deleted: false, .. } if note_path.ends_with("note.md"))), "{events:?}");
+        flavite
+            .session()
+            .notice_channel()
+            .send(flavite_vault::channels::Notice::Conflict {
+                note: flavite_buffer::manager::NoteRef::new(root.join("note.md")),
+            });
+        events.extend(flavite.drain_events());
+        assert!(events.iter().any(|event| matches!(event, crate::Event::Conflict { note_path, .. } if note_path.ends_with("note.md"))), "{events:?}");
+    }
+
+    #[test]
     fn typed_dispatch_covers_validation_read_only_and_unknown_commands() {
         use crate::command::Invocation;
         use crate::types::Origin;
 
         let (mut flavite, root, _temp) = test_flavite();
+        let denied = flavite.execute(
+            Invocation::new(9, "note.open", serde_json::json!("note.md"), Origin::Plugin)
+                .with_capabilities(Vec::new()),
+        );
+        assert!(matches!(
+            denied,
+            ExecutionResult::Rejected(RejectedResult {
+                reason: RejectionReason::CapabilityDenied,
+                request_id: Some(9),
+                ..
+            })
+        ));
+        let scoped_denial = flavite.execute(
+            Invocation::new(
+                10,
+                "save_note",
+                serde_json::json!("outside.md"),
+                Origin::Plugin,
+            )
+            .with_capabilities(vec![crate::Capability::WriteNotes {
+                scope: crate::WriteScope::PathPrefix("notes".into()),
+            }]),
+        );
+        assert!(matches!(
+            scoped_denial,
+            ExecutionResult::Rejected(RejectedResult {
+                reason: RejectionReason::CapabilityDenied,
+                request_id: Some(10),
+                ..
+            })
+        ));
         let rejected = flavite.execute(Invocation::new(
             1,
             "write:save_note",

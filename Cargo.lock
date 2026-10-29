@@ -1355,7 +1355,10 @@ version = "0.1.0"
 dependencies = [
  "flavite-api",
  "flavite-buffer",
+ "flavite-fs",
  "flavite-graph",
+ "flavite-index",
+ "flavite-vault",
  "futures",
  "iced",
  "naga",
@@ -1365,6 +1368,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml",
+ "uuid",
 ]
 
 [[package]]
@@ -5675,6 +5679,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "chrono",
  "cosmic-text",
  "iced",
  "libc",

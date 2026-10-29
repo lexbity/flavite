@@ -333,6 +333,20 @@ fn render_dependencies_md(
             "| 3 — measured, not gating | {} | reported only |\n",
             crates_toml.tiers.tier3.join(", ")
         ));
+        if !cov.waivers.is_empty() {
+            md.push_str("\nTemporary floor waivers (must have a valid expiry and reason):\n\n");
+            md.push_str("| Crate | Temporary floor | Expires | Reason |\n|---|---:|---|---|\n");
+            let mut waivers = cov.waivers.iter().collect::<Vec<_>>();
+            waivers.sort_by_key(|(crate_name, _)| *crate_name);
+            for (crate_name, waiver) in waivers {
+                md.push_str(&format!(
+                    "| {crate_name} | {:.1}% | {} | {} |\n",
+                    waiver.floor,
+                    waiver.expires,
+                    waiver.reason.replace('|', "\\|").replace('\n', " ")
+                ));
+            }
+        }
     }
 
     md
@@ -667,6 +681,19 @@ pub struct CoverageToml {
     pub floors: CoverageFloors,
     #[serde(default)]
     pub crates: HashMap<String, String>,
+    /// Temporary, explicitly justified per-crate floor reductions.
+    #[serde(default)]
+    pub waivers: HashMap<String, CoverageWaiver>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CoverageWaiver {
+    /// Temporary coverage floor while the waiver is active.
+    pub floor: f64,
+    /// ISO date after which the waiver stops applying.
+    pub expires: String,
+    /// Why the crate is below its permanent floor and what work remains.
+    pub reason: String,
 }
 
 #[derive(Debug, Deserialize, Default)]

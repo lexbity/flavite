@@ -113,6 +113,10 @@ cov-check lcov="target/llvm-cov/lcov.info":
     cargo xtask cov-check --lcov {{lcov}}
 
 # Run maintained fuzz targets over generated input (§10.6).
+# Rename planning remains excluded while its fuzz target is a prototype; smoke
+# membership is intentionally listed here (fuzz/Cargo.toml still builds the
+# prototype target). Smoke runs copy only tracked, unignored seeds into a
+# fresh corpus so the large ignored corpora never load inside a smoke window.
 # 30 s per target locally; G1 uses fuzz-smoke-ci (60 s).
 fuzz-smoke:
     #!/usr/bin/env bash
@@ -126,10 +130,8 @@ fuzz-smoke:
         corpus_dir="$smoke_root/$target"
         mkdir -p "$corpus_dir"
         while IFS= read -r -d '' seed; do
-            if ! git check-ignore -q "$seed"; then
-                cp "$seed" "$corpus_dir/$(basename "$seed")"
-            fi
-        done < <(find "corpus/$target" -type f -print0)
+            cp "$seed" "$corpus_dir/$(basename "$seed")"
+        done < <(git ls-files -z --cached --others --exclude-standard -- "corpus/$target")
         echo "=== fuzz-smoke: $target (30s) ==="
         if ! cargo +nightly fuzz run "$target" "$corpus_dir" -- -max_total_time=30 -rss_limit_mb=4096; then
             echo "FUZZ SMOKE FAILED: $target"
@@ -151,10 +153,8 @@ fuzz-smoke-ci:
         corpus_dir="$smoke_root/$target"
         mkdir -p "$corpus_dir"
         while IFS= read -r -d '' seed; do
-            if ! git check-ignore -q "$seed"; then
-                cp "$seed" "$corpus_dir/$(basename "$seed")"
-            fi
-        done < <(find "corpus/$target" -type f -print0)
+            cp "$seed" "$corpus_dir/$(basename "$seed")"
+        done < <(git ls-files -z --cached --others --exclude-standard -- "corpus/$target")
         echo "=== fuzz-smoke-ci: $target (60s) ==="
         if ! cargo +nightly fuzz run "$target" "$corpus_dir" -- -max_total_time=60 -rss_limit_mb=4096; then
             echo "FUZZ SMOKE FAILED: $target"

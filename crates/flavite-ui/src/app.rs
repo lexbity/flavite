@@ -12,7 +12,6 @@ use crate::style::{self, Tone};
 use crate::subscription;
 use flavite_api::{
     BufferView, ExecutionResult, Flavite, Invocation, LocalResult, Origin, VaultConfig,
-    channels::{Notice, Pulse},
 };
 use iced::widget::{
     Space, button, column, container, opaque, row, rule, scrollable, stack, text, text_input,
@@ -58,6 +57,7 @@ pub enum Message {
     SetIgnoreGlobs(String),
     SaveSettings,
     Pump,
+    WindowEvent(iced::window::Event),
 }
 
 impl App {
@@ -115,6 +115,7 @@ impl App {
         Subscription::batch([
             subscription::pump().map(|_| Message::Pump),
             keyboard::listen().map(Message::Keyboard),
+            iced::window::events().map(|(_, event)| Message::WindowEvent(event)),
         ])
     }
 
@@ -126,6 +127,14 @@ impl App {
                     return self.update(message);
                 }
             }
+            Message::WindowEvent(iced::window::Event::Focused) => {
+                if let Some(flavite) = &self.flavite
+                    && let Err(error) = flavite.focus()
+                {
+                    self.status = format!("Vault focus reconcile failed: {error}");
+                }
+            }
+            Message::WindowEvent(_) => {}
             Message::Navigate(pane) => self.pane = pane,
             Message::PaletteOpen => {
                 self.palette_open = true;
@@ -804,14 +813,10 @@ impl App {
     fn pump(&mut self) {
         let Some(flavite) = &self.flavite else { return };
         flavite.session().pump();
-        for pulse in flavite.drain_pulses() {
-            self.recent_events.push(describe_pulse(&pulse));
-        }
-        let notices = flavite.drain_notices();
-        for notice in notices {
-            self.recent_events.push(describe_notice(&notice));
-            // Presentation delivery is acknowledged only after adding the notice to visible state.
-            flavite.acknowledge_notice(&notice);
+        for event in flavite.drain_events() {
+            self.recent_events
+                .push(format!("{}: {event:?}", event.event_type()));
+            flavite.acknowledge_event(&event);
         }
         for terminal in self.operations.drain(flavite) {
             self.status = format!("Request {} · {}", terminal.request_id, terminal.result);
@@ -912,50 +917,10 @@ fn adjust(value: u64, delta: i8, minimum: u64, maximum: u64) -> u64 {
     (value as i64 + i64::from(delta)).clamp(minimum as i64, maximum as i64) as u64
 }
 
-fn describe_pulse(pulse: &Pulse) -> String {
-    match pulse {
-        Pulse::VaultChanged {
-            generation,
-            summary,
-            ..
-        } => format!(
-            "Vault changed · generation {} · +{} ~{} −{}",
-            generation.value(),
-            summary.added,
-            summary.changed,
-            summary.removed
-        ),
-        Pulse::ReconcileProgress { done, total } => format!("Refresh progress · {done}/{total}"),
-        Pulse::Invalidate { note } => format!("Invalidated · {}", note.path.display()),
-    }
-}
-
-fn describe_notice(notice: &Notice) -> String {
-    match notice {
-        Notice::RenameSuggested {
-            from,
-            to,
-            tier,
-            inbound,
-        } => format!(
-            "Rename suggested · {} → {} · {} · {inbound} links",
-            from.display(),
-            to.display(),
-            tier.as_str()
-        ),
-        Notice::Conflict { note } => format!("Conflict · {}", note.path.display()),
-        Notice::RecoveryOffer { note } => format!("Recovery available · {}", note.path.display()),
-        Notice::ActionRequired { code, note } => format!(
-            "Action required · {code} · {}",
-            note.as_ref()
-                .map_or_else(|| "vault".into(), |note| note.path.display().to_string())
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flavite_api::channels::{Notice, Pulse};
 
     fn empty_app() -> App {
         App {
@@ -1031,46 +996,154 @@ mod tests {
     }
 
     #[test]
-    fn pump_presents_pulses_and_notices_once_and_acks_presentation() {
-        let vault = tempfile::tempdir().expect("fixture vault directory");
-        let flavite = Flavite::open_root(vault.path().to_path_buf(), VaultConfig::default())
-            .expect("fixture vault opens");
+    fn pump_presents_versioned_api_events_once() {
+        use flavite_buffer::manager::BufferManager;
+        use flavite_fs::{Fs, MemFs};
+        use flavite_index::IndexActor;
+        use flavite_vault::actor::VaultActorBuilder;
+        use flavite_vault::channels::ChannelSet;
+        use flavite_vault::session::Session;
+        let fs = MemFs::new();
+        let root = PathBuf::from("/test/ui-host-vault");
+        fs.create_dir_all(&root).unwrap();
+        let temp = tempfile::tempdir().expect("fixture cache directory");
+        let db = temp.path().join("ui-host.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let identity =
+            flavite_api::VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![2, 4, 6]);
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs) as Box<dyn Fs + Send + Sync>)
+            .with_identity(identity.clone())
+            .with_index(IndexActor::new(&db, 1).unwrap())
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        let channels = ChannelSet::new();
+        let session = Session::new(
+            identity.clone(),
+            actor,
+            BufferManager::new(),
+            channels.pulse,
+            channels.notice,
+            VaultConfig::default(),
+        );
+        let flavite = Flavite::open(identity, session, VaultConfig::default()).unwrap();
         let mut app = empty_app();
         app.flavite = Some(flavite);
-        app.root = vault.path().to_path_buf();
+        app.root = root.clone();
         let flavite = app.flavite.as_ref().expect("flavite attached");
         let _ = flavite.session().pulse_channel().send(Pulse::Invalidate {
-            note: flavite_api::channels::NoteRef::new(vault.path().join("demo.md")),
+            note: flavite_api::channels::NoteRef::new(root.join("demo.md")),
         });
         flavite
             .session()
             .notice_channel()
             .send(Notice::RecoveryOffer {
-                note: flavite_api::channels::NoteRef::new(vault.path().join("demo.md")),
+                note: flavite_api::channels::NoteRef::new(root.join("demo.md")),
             });
         flavite.session().notice_channel().send(Notice::Conflict {
-            note: flavite_api::channels::NoteRef::new(vault.path().join("other.md")),
+            note: flavite_api::channels::NoteRef::new(root.join("other.md")),
         });
         app.pump();
         let presented = app.recent_events.clone();
         assert!(
-            presented.iter().any(|event| event.contains("Invalidated")),
+            presented.iter().any(|event| event.contains("invalidate")),
             "pulse hint should be presented: {presented:?}"
         );
         assert!(
             presented
                 .iter()
-                .any(|event| event.contains("Recovery available")),
+                .any(|event| event.contains("recovery_offer")),
             "recovery offer should be presented: {presented:?}"
         );
         assert!(
-            presented.iter().any(|event| event.contains("Conflict")),
+            presented.iter().any(|event| event.contains("conflict")),
             "conflict notice should be presented: {presented:?}"
         );
         // Lossless policy: a second pump re-delivers nothing, and the
         // presentation acks let the channel retire the pending keys.
         app.pump();
         assert_eq!(app.recent_events.len(), presented.len());
+    }
+
+    #[test]
+    fn gui_and_cli_hosts_reach_the_same_document_state_for_note_open() {
+        use flavite_buffer::manager::BufferManager;
+        use flavite_fs::{Fs, MemFs};
+        use flavite_index::IndexActor;
+        use flavite_vault::actor::VaultActorBuilder;
+        use flavite_vault::channels::ChannelSet;
+        use flavite_vault::session::Session;
+
+        fn fixture(label: &str) -> (Flavite, PathBuf, tempfile::TempDir) {
+            let fs = MemFs::new();
+            let root = PathBuf::from(format!("/test/host-parity-{label}"));
+            fs.create_dir_all(&root).unwrap();
+            fs.write_new(&root.join("demo.md"), b"# Shared state\n\nbody\n")
+                .unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let db = temp.path().join("index.sqlite3");
+            drop(flavite_index::open_or_init(&db).unwrap());
+            let identity =
+                flavite_api::VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![8, 6, 7]);
+            let actor = VaultActorBuilder::new()
+                .with_fs(Box::new(fs) as Box<dyn Fs + Send + Sync>)
+                .with_identity(identity.clone())
+                .with_index(IndexActor::new(&db, 1).unwrap())
+                .build()
+                .unwrap()
+                .start()
+                .unwrap();
+            let channels = ChannelSet::new();
+            let session = Session::new(
+                identity.clone(),
+                actor,
+                BufferManager::new(),
+                channels.pulse,
+                channels.notice,
+                VaultConfig::default(),
+            );
+            let flavite = Flavite::open(identity, session, VaultConfig::default()).unwrap();
+            (flavite, root, temp)
+        }
+
+        let (gui_flavite, gui_root, _gui_cache) = fixture("gui");
+        let mut app = empty_app();
+        app.flavite = Some(gui_flavite);
+        app.root = gui_root.clone();
+        let _ = app.update(Message::RunCommand("note.open"));
+        let gui_buffer = app.active_buffer.expect("GUI host opens the note");
+        let gui_view = app
+            .flavite
+            .as_ref()
+            .unwrap()
+            .get_buffer_view(gui_buffer.into(), None)
+            .unwrap();
+
+        let (cli_flavite, cli_root, _cli_cache) = fixture("cli");
+        let request_id = cli_flavite.command_registry().next_request_id();
+        let result = cli_flavite.execute(Invocation::new(
+            request_id,
+            "note.open",
+            serde_json::json!(cli_root.join("demo.md")),
+            Origin::Cli,
+        ));
+        let cli_buffer = match result {
+            ExecutionResult::Local(LocalResult::Success(success)) => success
+                .data
+                .get("buffer_id")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap(),
+            other => panic!("CLI host failed to open note: {other:?}"),
+        };
+        let cli_view = cli_flavite
+            .get_buffer_view(cli_buffer.into(), None)
+            .unwrap();
+
+        assert_eq!(gui_view.text, cli_view.text);
+        assert_eq!(gui_view.state, cli_view.state);
+        assert_eq!(gui_view.path.file_name(), cli_view.path.file_name());
     }
 
     #[test]

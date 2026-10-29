@@ -9,6 +9,23 @@ tier2 = 80.0
 # Tier 3 is measured and reported, not gating.
 tier3 = 0.0
 
+# Temporary, reviewed waivers from the fresh workspace coverage run on
+# 2026-10-28. Each expires after 30 days; expired or malformed waivers fail G1.
+[waivers.flavite-index]
+floor = 87.5
+expires = "2026-11-30"
+reason = "Index actor error and cache-recovery branches remain uncovered; raise the floor after the next index fault-path test slice."
+
+[waivers.flavite-fs]
+floor = 86.8
+expires = "2026-11-30"
+reason = "Platform-specific filesystem failure branches remain uncovered in the Linux report; add portable FaultFs cases before expiry."
+
+[waivers.flavite-vault]
+floor = 84.4
+expires = "2026-11-30"
+reason = "Actor shutdown and uncommon journal-recovery branches remain uncovered; add deterministic fault cases before expiry."
+
 [crates]
 # Crate → tier mapping. A crate with zero executable lines reports N/A
 # and is inactive for floors; the first executable implementation

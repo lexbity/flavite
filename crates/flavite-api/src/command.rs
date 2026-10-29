@@ -2,6 +2,7 @@
 //!
 //! This module provides the typed command system for the API surface.
 
+use crate::capability::Capability;
 use crate::types::{Origin, Preconditions, RequestId};
 use flavite_vault::session::{Session, SessionResult};
 use serde::de::DeserializeOwned;
@@ -27,6 +28,8 @@ pub struct CommandSpec {
     pub keys: &'static [Chord],
     /// Whether this command mutates vault or user data.
     pub requires_write: bool,
+    /// Capability required before this handler may execute.
+    pub required_capability: Option<Capability>,
 }
 
 impl CommandSpec {
@@ -40,6 +43,7 @@ impl CommandSpec {
             when: None,
             keys: &[],
             requires_write: false,
+            required_capability: None,
         }
     }
 
@@ -59,6 +63,7 @@ impl CommandSpec {
             when,
             keys,
             requires_write: false,
+            required_capability: None,
         }
     }
 
@@ -67,6 +72,13 @@ impl CommandSpec {
     #[must_use]
     pub const fn write(mut self) -> Self {
         self.requires_write = true;
+        self
+    }
+
+    /// Require a declared capability at dispatch.
+    #[must_use]
+    pub fn requires(mut self, capability: Capability) -> Self {
+        self.required_capability = Some(capability);
         self
     }
 }
@@ -164,6 +176,9 @@ pub struct Invocation {
     pub origin: Origin,
     /// Preconditions.
     pub preconditions: Preconditions,
+    /// Capabilities granted to this caller. GUI/CLI/internal callers receive
+    /// the built-in host grants; plugin callers must provide explicit grants.
+    pub capabilities: Vec<Capability>,
 }
 
 impl Invocation {
@@ -175,12 +190,22 @@ impl Invocation {
         args: serde_json::Value,
         origin: Origin,
     ) -> Self {
+        let capabilities = match origin {
+            Origin::Plugin => Vec::new(),
+            _ => vec![
+                Capability::ReadNotes,
+                Capability::WriteNotes {
+                    scope: crate::capability::WriteScope::Vault,
+                },
+            ],
+        };
         Self {
             request_id,
             command_id,
             args,
             origin,
             preconditions: Preconditions::new(),
+            capabilities,
         }
     }
 
@@ -193,13 +218,30 @@ impl Invocation {
         origin: Origin,
         preconditions: Preconditions,
     ) -> Self {
+        let capabilities = match origin {
+            Origin::Plugin => Vec::new(),
+            _ => vec![
+                Capability::ReadNotes,
+                Capability::WriteNotes {
+                    scope: crate::capability::WriteScope::Vault,
+                },
+            ],
+        };
         Self {
             request_id,
             command_id,
             args,
             origin,
             preconditions,
+            capabilities,
         }
+    }
+
+    /// Set the grants explicitly, as a future plugin host will do.
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: Vec<Capability>) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 }
 

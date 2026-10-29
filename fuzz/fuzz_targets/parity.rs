@@ -1,10 +1,7 @@
 //! Fuzz target for parity between editor and indexer parse paths (AC-5, §10.6).
 //!
-//! Differential harness: grammar-generated documents through both parsers.
-//! Assert: `editor_link_spans == indexer_link_spans`
-//!
-//! For now, this just exercises the indexer parse path. The editor path
-//! (tree-sitter) will be integrated later when PLAN-B lands.
+//! Differential harness: pulldown's exclusion mask vs. editor inline ranges.
+//! Both paths invoke the shared scanner, and must produce identical link spans.
 
 #![no_main]
 

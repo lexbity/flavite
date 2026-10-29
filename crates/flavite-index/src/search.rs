@@ -908,51 +908,6 @@ impl SearcherTrait for StubSearcher {
     }
 }
 
-/// Deferred commit manager.
-///
-/// This manages the commit-before-search policy and periodic commits.
-pub struct CommitManager {
-    backend: Arc<Mutex<Box<dyn SearchBackend>>>,
-    conn: Connection,
-}
-
-impl CommitManager {
-    pub fn new(backend: Arc<Mutex<Box<dyn SearchBackend>>>, conn: Connection) -> Self {
-        Self { backend, conn }
-    }
-
-    /// Commit if there are pending changes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SearchError`] when the generation metadata cannot be read
-    /// or the backend commit fails.
-    pub fn commit_if_dirty(&self) -> Result<(), SearchError> {
-        let backend = self
-            .backend
-            .lock()
-            .map_err(|_| SearchError::Tantivy("Failed to lock backend".to_string()))?;
-
-        // Check if dirty by comparing committed generation with current generation
-        let current_gen = get_meta_u64(&self.conn, MetaKey::Generation)?.unwrap_or(0);
-        if backend.committed_generation() < current_gen {
-            backend.commit()
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Ensure commit-before-search: commit if there are pending changes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SearchError`] under the same conditions as
-    /// [`CommitManager::commit_if_dirty`].
-    pub fn ensure_committed(&self) -> Result<(), SearchError> {
-        self.commit_if_dirty()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_generation_and_commit_manager_are_idempotent() {
+    fn explicit_generation_updates_stub_generation() {
         let temp_dir = tempdir().unwrap();
         let cache_dir = temp_dir.path().join("cache");
         let temp = NamedTempFile::new().unwrap();
@@ -1067,9 +1022,6 @@ mod tests {
         let backend = StubSearchBackend::new(conn, &cache_dir).unwrap();
         backend.set_committed_generation(2).unwrap();
         assert_eq!(backend.committed_generation(), 2);
-        let db = Connection::open(temp.path()).unwrap();
-        let manager = CommitManager::new(Arc::new(Mutex::new(Box::new(backend))), db);
-        manager.ensure_committed().unwrap();
-        manager.commit_if_dirty().unwrap();
+        assert_eq!(backend.committed_generation(), 2);
     }
 }

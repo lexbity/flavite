@@ -108,6 +108,15 @@ impl Vault {
         // Step 4: Ensure .flavite directory exists
         ensure_flavite_dir(&root)?;
 
+        // Journal recovery precedes cache startup: disk is authoritative and
+        // interrupted committed renames roll forward before indexing.
+        let recovery = crate::journal::JournalExecutor::new(&*fs, &root)
+            .recover()
+            .map_err(OpenVaultError::Reconcile)?;
+        for (txn, reason) in recovery.skipped {
+            tracing::warn!(%txn, %reason, "rename journal item diverged and was preserved");
+        }
+
         // Step 5: Open the index
         let index = Self::open_or_rebuild_index(&identity, &config)?;
 
@@ -217,6 +226,12 @@ impl Vault {
     #[must_use]
     pub fn uuid(&self) -> Uuid {
         self.identity.uuid
+    }
+
+    /// Whether the actor's filesystem watcher is running.
+    #[must_use]
+    pub fn watcher_enabled(&self) -> bool {
+        self.config.watcher_enabled
     }
 
     /// Get the root path.
