@@ -529,6 +529,11 @@ impl Flavite {
                         note_path: note.as_ref().map(|n| n.path.to_string_lossy().into_owned()),
                     })
                 }
+                Notice::LinksBroken { from, count } => events.push(crate::Event::LinksBroken {
+                    vault: self.vault_ref.clone(),
+                    from: from.clone(),
+                    count: *count,
+                }),
             }
             if let Some(event) = events.last() {
                 self.notice_acks

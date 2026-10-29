@@ -120,6 +120,8 @@ pub struct EditorModel {
     base_hash: Option<BaseHash>,
     /// Whether the buffer has unsaved changes.
     is_dirty: bool,
+    /// Operation represented by the most recent undo/redo transition.
+    last_transition_ops: Vec<EditOp>,
 }
 
 impl EditorModel {
@@ -139,6 +141,7 @@ impl EditorModel {
             revision: Revision::INITIAL,
             base_hash: Some(BaseHash::from_snapshot(&snapshot)),
             is_dirty: false,
+            last_transition_ops: Vec::new(),
         }
     }
 
@@ -390,12 +393,32 @@ impl EditorModel {
     /// The snapshot carries the authoritative BOM, per-line EOL, and trailing
     /// newline metadata; preserving it here is essential for conflict merges.
     pub fn apply_snapshot_boundary(&mut self, snapshot: TextSnapshot) -> Revision {
+        self.apply_snapshot_boundary_inner(snapshot, None)
+    }
+
+    /// Apply a durable journal snapshot as one tagged undo boundary.
+    pub fn apply_journal_snapshot_boundary(
+        &mut self,
+        snapshot: TextSnapshot,
+        tag: crate::undo::JournalTag,
+    ) -> Revision {
+        self.apply_snapshot_boundary_inner(snapshot, Some(tag))
+    }
+
+    fn apply_snapshot_boundary_inner(
+        &mut self,
+        snapshot: TextSnapshot,
+        journal: Option<crate::undo::JournalTag>,
+    ) -> Revision {
         let old_text = self.text().to_string();
         let new_text = snapshot.text().to_string();
-        let edit = EditOp::new(
+        let mut edit = EditOp::new(
             Span::new(TextByte(0), TextByte(old_text.len())),
             new_text.clone(),
         );
+        if let Some(tag) = journal {
+            edit = edit.with_journal(tag);
+        }
         self.rope = Rope::from_str(&new_text);
         self.eol_table = EolTable::from_snapshot(&snapshot);
         let revision = self.undo_tree.apply_boundary(edit, snapshot.clone());
@@ -410,6 +433,23 @@ impl EditorModel {
     /// All edits are applied in order, but they share a single undo entry
     /// and revision advancement.
     pub fn apply_edit_ops(&mut self, edits: &[EditOp]) -> Revision {
+        self.apply_edit_ops_inner(edits, None)
+    }
+
+    /// Apply a set of edits as one non-coalescing, journal-tagged undo unit.
+    pub fn apply_journal_edit_ops(
+        &mut self,
+        edits: &[EditOp],
+        tag: crate::undo::JournalTag,
+    ) -> Revision {
+        self.apply_edit_ops_inner(edits, Some(tag))
+    }
+
+    fn apply_edit_ops_inner(
+        &mut self,
+        edits: &[EditOp],
+        journal: Option<crate::undo::JournalTag>,
+    ) -> Revision {
         if edits.is_empty() {
             return self.revision;
         }
@@ -444,10 +484,22 @@ impl EditorModel {
             cursor = edit.range.end.0;
         }
         replacement.push_str(&old_text[cursor..end]);
-        let revision = self.apply_edit_op(EditOp::new(
-            Span::new(TextByte(start), TextByte(end)),
-            replacement,
-        ));
+        let mut combined = EditOp::new(Span::new(TextByte(start), TextByte(end)), replacement);
+        let is_journal = journal.is_some();
+        if let Some(tag) = journal {
+            combined = combined.with_journal(tag);
+        }
+        let old_text = self.text().to_string();
+        let new_text = combined.apply(&old_text);
+        let snapshot = TextSnapshot::new(new_text.as_bytes()).unwrap();
+        self.rope = Rope::from_str(&new_text);
+        let revision = if is_journal {
+            self.undo_tree.apply_boundary(combined, snapshot)
+        } else {
+            self.undo_tree.apply(combined, snapshot)
+        };
+        self.revision = revision;
+        self.is_dirty = true;
         self.rebuild_eol_table(&old_text);
         revision
     }
@@ -483,6 +535,7 @@ impl EditorModel {
     /// Returns the new revision and whether the undo was successful.
     /// Every undo advances the revision (§4.5.2).
     pub fn undo(&mut self) -> Option<Revision> {
+        let transition = self.undo_tree.undo_edit();
         let result = self.undo_tree.undo();
 
         if let Some((_node_rev, Some(snapshot))) = result {
@@ -491,11 +544,13 @@ impl EditorModel {
             self.eol_table = EolTable::from_snapshot(&snapshot);
             self.revision = self.revision.next();
             self.is_dirty = true;
+            self.last_transition_ops = transition.into_iter().collect();
             Some(self.revision)
         } else if let Some((_node_rev, None)) = result {
             // We have a revision but no snapshot - this shouldn't happen
             // in normal operation
             self.revision = self.revision.next();
+            self.last_transition_ops = transition.into_iter().collect();
             Some(self.revision)
         } else {
             None
@@ -507,6 +562,7 @@ impl EditorModel {
     /// Returns the new revision and whether the redo was successful.
     /// Every redo advances the revision (§4.5.2).
     pub fn redo(&mut self) -> Option<Revision> {
+        let transition = self.undo_tree.redo_edit();
         let result = self.undo_tree.redo();
 
         if let Some((_node_rev, Some(snapshot))) = result {
@@ -515,13 +571,27 @@ impl EditorModel {
             self.eol_table = EolTable::from_snapshot(&snapshot);
             self.revision = self.revision.next();
             self.is_dirty = true;
+            self.last_transition_ops = transition.into_iter().collect();
             Some(self.revision)
         } else if let Some((_node_rev, None)) = result {
             self.revision = self.revision.next();
+            self.last_transition_ops = transition.into_iter().collect();
             Some(self.revision)
         } else {
             None
         }
+    }
+
+    /// Operations reverted or restored by the latest undo/redo transition.
+    #[must_use]
+    pub fn last_transition_ops(&self) -> &[EditOp] {
+        &self.last_transition_ops
+    }
+
+    /// Operations that the next redo would restore, if any.
+    #[must_use]
+    pub fn next_redo_ops(&self) -> Vec<EditOp> {
+        self.undo_tree.redo_edit().into_iter().collect()
     }
 
     /// Get the primary selection.
@@ -947,6 +1017,39 @@ mod tests {
         assert_eq!(after.as_u64(), before.as_u64() + 1);
         assert_eq!(model.undo(), Some(after.next()));
         assert_eq!(model.text(), "abcdefgh");
+    }
+
+    #[test]
+    fn journal_edit_is_one_boundary_and_transition_is_reported() {
+        let mut model = EditorModel::from_text("[[Ideas]] / [[Ideas]] / [[Other]]");
+        let edits = [
+            EditOp::new(Span::new(TextByte(2), TextByte(7)), "Plans".into()),
+            EditOp::new(Span::new(TextByte(14), TextByte(19)), "Plans".into()),
+        ];
+        let revision = model.apply_journal_edit_ops(
+            &edits,
+            crate::undo::JournalTag {
+                txn_id: "tx".into(),
+                item_id: 9,
+            },
+        );
+        assert_eq!(revision.as_u64(), 1);
+        assert_eq!(model.text(), "[[Plans]] / [[Plans]] / [[Other]]");
+        assert_eq!(model.undo(), Some(revision.next()));
+        assert_eq!(model.text(), "[[Ideas]] / [[Ideas]] / [[Other]]");
+        assert_eq!(
+            model.last_transition_ops()[0]
+                .journal
+                .as_ref()
+                .unwrap()
+                .item_id,
+            9
+        );
+        assert_eq!(
+            model.next_redo_ops()[0].journal.as_ref().unwrap().item_id,
+            9
+        );
+        assert_eq!(model.redo(), Some(revision.next().next()));
     }
 
     #[test]

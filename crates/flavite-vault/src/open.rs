@@ -110,9 +110,27 @@ impl Vault {
 
         // Journal recovery precedes cache startup: disk is authoritative and
         // interrupted committed renames roll forward before indexing.
-        let recovery = crate::journal::JournalExecutor::new(&*fs, &root)
-            .recover()
-            .map_err(OpenVaultError::Reconcile)?;
+        let recovery_writer = crate::identity::get_data_dir().map(|data| {
+            let dir = data
+                .join("flavite")
+                .join("vaults")
+                .join(identity.uuid.to_string())
+                .join("recovery");
+            flavite_buffer::recovery::RecoveryWriter::new(
+                flavite_buffer::recovery::RecoveryConfig::new(identity.uuid.to_string(), dir, 2),
+            )
+        });
+        let executor = crate::journal::JournalExecutor::new(&*fs, &root);
+        let recovery = if let Some(writer) = &recovery_writer {
+            executor.recover_with_buffer_base(|key| {
+                writer
+                    .read_for_note_key(key)
+                    .and_then(|file| file.base_hash.map(|hash| hash.as_bytes()))
+            })
+        } else {
+            executor.recover()
+        }
+        .map_err(OpenVaultError::Reconcile)?;
         for (txn, reason) in &recovery.skipped {
             tracing::warn!(%txn, %reason, "rename journal item diverged and was preserved");
         }

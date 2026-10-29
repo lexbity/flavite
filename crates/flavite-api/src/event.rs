@@ -50,6 +50,12 @@ pub enum Event {
         tier: String,
         inbound: u32,
     },
+    /// A rename left this number of inbound links targeting the old path.
+    LinksBroken {
+        vault: ApiVaultRef,
+        from: PathBuf,
+        count: u32,
+    },
     /// Conflict detected.
     Conflict {
         vault: ApiVaultRef,
@@ -79,6 +85,7 @@ impl Event {
             Self::ExternalChangeDetected { .. } => "external_change_detected",
             Self::BufferStateChanged { .. } => "buffer_state_changed",
             Self::RenameSuggested { .. } => "rename_suggested",
+            Self::LinksBroken { .. } => "links_broken",
             Self::Conflict { .. } => "conflict",
             Self::RecoveryOffer { .. } => "recovery_offer",
             Self::ActionRequired { .. } => "action_required",
@@ -94,6 +101,7 @@ impl Event {
                 | Self::Conflict { .. }
                 | Self::RecoveryOffer { .. }
                 | Self::ActionRequired { .. }
+                | Self::LinksBroken { .. }
         )
     }
 

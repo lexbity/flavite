@@ -38,8 +38,18 @@ impl RecoveryReport {
 #[derive(Debug, Clone)]
 pub struct FilePatch {
     pub path: PathBuf,
+    /// Existing source used for the precondition when `path` is created by
+    /// the rename item earlier in this transaction (Alias items).
+    pub base_path: Option<PathBuf>,
+    pub kind: TransactionItemKind,
     pub expected_base_hash: [u8; 32],
     pub bytes: Vec<u8>,
+    pub buffer_id: Option<u64>,
+    pub buffer_revision: Option<u64>,
+    pub old_stem: Option<String>,
+    pub new_stem: Option<String>,
+    pub target_key: Option<String>,
+    pub recovery_key: Option<Vec<u8>>,
 }
 
 pub struct JournalExecutor<'a> {
@@ -69,6 +79,22 @@ impl<'a> JournalExecutor<'a> {
         to: &Path,
         patches: &[FilePatch],
     ) -> Result<String, String> {
+        self.rename_with_patches_and_buffers(from, to, patches, |_, _| Ok(()))
+    }
+
+    /// Execute a rename while awaiting correlated Session replies for open
+    /// source buffers. Buffer edits are durable journal states before disk
+    /// application begins, so replay can safely roll forward after a crash.
+    pub fn rename_with_patches_and_buffers<F>(
+        &self,
+        from: &Path,
+        to: &Path,
+        patches: &[FilePatch],
+        mut apply_buffer: F,
+    ) -> Result<String, String>
+    where
+        F: FnMut(&str, &TransactionItem) -> Result<(), String>,
+    {
         let from = self.safe_vault_path(from)?;
         let to = self.safe_vault_path(to)?;
         if from == to {
@@ -104,16 +130,27 @@ impl<'a> JournalExecutor<'a> {
             buffer_revision: None,
             checkpoint_seq: None,
             operation_markers: Vec::new(),
+            old_stem: None,
+            new_stem: None,
+            target_key: None,
+            indexed_hash: None,
+            recovery_key: None,
             error: None,
         });
         let mut payloads = vec![(1u64, bytes)];
         for patch in patches {
             let path = self.safe_vault_path(&patch.path)?;
+            let base_path = patch
+                .base_path
+                .as_ref()
+                .map(|path| self.safe_vault_path(path))
+                .transpose()?
+                .unwrap_or_else(|| path.clone());
             let current = self
                 .fs
-                .read_if_exists(&path)
+                .read_if_exists(&base_path)
                 .map_err(display)?
-                .ok_or_else(|| format!("patch source disappeared: {}", path.display()))?;
+                .ok_or_else(|| format!("patch source disappeared: {}", base_path.display()))?;
             if *blake3::hash(&current).as_bytes() != patch.expected_base_hash {
                 return Err(format!(
                     "patch source changed during planning: {}",
@@ -125,7 +162,7 @@ impl<'a> JournalExecutor<'a> {
             manifest.native_paths.push(path.clone());
             manifest.items.push(TransactionItem {
                 id,
-                kind: TransactionItemKind::Patch,
+                kind: patch.kind,
                 from_path: path.strip_prefix(&self.root).unwrap().to_path_buf(),
                 to_path: path.strip_prefix(&self.root).unwrap().to_path_buf(),
                 phase: TransactionPhase::Stage,
@@ -134,10 +171,15 @@ impl<'a> JournalExecutor<'a> {
                 expected_new_hash: Some(new_hash),
                 observed_base_hash: Some(patch.expected_base_hash),
                 observed_new_hash: None,
-                buffer_id: None,
-                buffer_revision: None,
+                buffer_id: patch.buffer_id.map(Into::into),
+                buffer_revision: patch.buffer_revision,
                 checkpoint_seq: None,
                 operation_markers: Vec::new(),
+                old_stem: patch.old_stem.clone(),
+                new_stem: patch.new_stem.clone(),
+                target_key: patch.target_key.clone(),
+                indexed_hash: Some(patch.expected_base_hash),
+                recovery_key: patch.recovery_key.clone(),
                 error: None,
             });
             payloads.push((id, patch.bytes.clone()));
@@ -167,6 +209,31 @@ impl<'a> JournalExecutor<'a> {
             item.state = TransactionItemState::Committed;
         }
         self.persist(&manifest)?;
+        for index in 1..manifest.items.len() {
+            if manifest.items[index].buffer_id.is_none() {
+                continue;
+            }
+            manifest.items[index].phase = TransactionPhase::WaitBuffers;
+            self.persist(&manifest)?;
+            match apply_buffer(&txn_id, &manifest.items[index]) {
+                Ok(()) => manifest.items[index].state = TransactionItemState::BufferApplied,
+                Err(error)
+                    if error == "conflicted"
+                        || error == "link-absent"
+                        || error.starts_with("StaleRevision") =>
+                {
+                    manifest.items[index].state = TransactionItemState::Skipped;
+                    manifest.items[index].error = Some(error);
+                }
+                Err(error) => {
+                    // Transport loss is not a content decision. Leave the item
+                    // committed for R7 recovery instead of making it terminal.
+                    self.persist(&manifest)?;
+                    return Err(error);
+                }
+            }
+            self.persist(&manifest)?;
+        }
         for index in 0..manifest.items.len() {
             self.apply_item(&mut manifest, index)?;
         }
@@ -192,6 +259,17 @@ impl<'a> JournalExecutor<'a> {
     /// Replay committed journals. Invalid manifests are quarantined and
     /// divergent items become durable Partial transactions.
     pub fn recover(&self) -> Result<RecoveryReport, String> {
+        self.recover_with_buffer_base(|_| None)
+    }
+
+    /// Replay using durable buffer-base hashes for rename recovery (R7).
+    pub fn recover_with_buffer_base<F>(
+        &self,
+        mut recovery_base_hash: F,
+    ) -> Result<RecoveryReport, String>
+    where
+        F: FnMut(&[u8]) -> Option<[u8; 32]>,
+    {
         self.fs.create_dir_all(&self.journal_dir).map_err(display)?;
         let mut report = RecoveryReport::default();
         for entry in self.fs.read_dir(&self.journal_dir).map_err(display)? {
@@ -251,6 +329,24 @@ impl<'a> JournalExecutor<'a> {
                 report.done.push(manifest.txn_id.clone());
                 tracing::info!(counter = "journal.recoveries_total", txn = %manifest.txn_id, outcome = "done", "discarded uncommitted journal");
                 continue;
+            }
+            for item in &mut manifest.items {
+                if item.kind == TransactionItemKind::Patch
+                    && item.buffer_id.is_some()
+                    && (item.state == TransactionItemState::BufferApplied
+                        || item.phase == TransactionPhase::WaitBuffers)
+                {
+                    let recovered_base = item
+                        .recovery_key
+                        .as_deref()
+                        .and_then(&mut recovery_base_hash);
+                    if recovered_base == item.expected_new_hash {
+                        item.state = TransactionItemState::BufferApplied;
+                    } else if item.state == TransactionItemState::BufferApplied {
+                        item.state = TransactionItemState::Skipped;
+                        item.error = Some("buffer-authoritative divergence".into());
+                    }
+                }
             }
             for index in 0..manifest.items.len() {
                 self.apply_item(&mut manifest, index)?;
@@ -321,7 +417,9 @@ impl<'a> JournalExecutor<'a> {
             .iter_mut()
             .find(|item| item.id == item_id)
             .ok_or("journal item not found")?;
-        if item.state == TransactionItemState::Saved {
+        if item.state == TransactionItemState::Saved
+            && !(item.kind == TransactionItemKind::Patch && item.buffer_id.is_some())
+        {
             return Err("applied disk item cannot be cancelled by buffer undo".into());
         }
         item.state = TransactionItemState::Cancelled;
@@ -462,7 +560,7 @@ impl<'a> JournalExecutor<'a> {
             }
             // Fs has no remove-directory operation; empty transaction data dirs are harmless.
         }
-        if manifest.is_terminal() {
+        if manifest.is_terminal() && manifest.items.iter().all(|item| item.buffer_id.is_none()) {
             let path = manifest.manifest_path(&self.journal_dir);
             if self.fs.exists(&path).unwrap_or(false) {
                 self.fs.remove(&path).map_err(display)?;
@@ -484,9 +582,16 @@ impl<'a> JournalExecutor<'a> {
             return Err("journal path escapes vault".into());
         }
         let full = self.root.join(path);
-        self.fs
-            .validate_in_root(&self.root, &full)
-            .map_err(display)?;
+        if self.fs.exists(&full).map_err(display)? {
+            self.fs
+                .validate_in_root(&self.root, &full)
+                .map_err(display)?;
+        } else {
+            let parent = full.parent().ok_or("journal path has no parent")?;
+            self.fs
+                .validate_in_root(&self.root, parent)
+                .map_err(display)?;
+        }
         Ok(full)
     }
 
@@ -516,9 +621,10 @@ impl<'a> JournalExecutor<'a> {
             .journal_dir
             .join(format!("{txn_id}.data"))
             .join(format!("{item_id}.bin"));
-        self.fs
-            .validate_in_root(&self.root, &path)
-            .map_err(display)?;
+        let relative = path
+            .strip_prefix(&self.root)
+            .map_err(|_| "journal payload path escapes vault")?;
+        let path = self.safe_vault_path(relative)?;
         if !path.starts_with(&self.journal_dir) {
             return Err("journal payload path escapes journal directory".into());
         }
@@ -585,8 +691,16 @@ mod tests {
                     .unwrap();
                 FilePatch {
                     path,
+                    base_path: None,
+                    kind: TransactionItemKind::Patch,
                     expected_base_hash: *blake3::hash(b"See [[a]].").as_bytes(),
                     bytes: b"See [[b]].".to_vec(),
+                    buffer_id: None,
+                    buffer_revision: None,
+                    old_stem: None,
+                    new_stem: None,
+                    target_key: None,
+                    recovery_key: None,
                 }
             })
             .collect::<Vec<_>>();
@@ -608,6 +722,127 @@ mod tests {
         }
         assert!(!txn.is_empty());
         assert_eq!(executor.recover().unwrap(), RecoveryReport::default());
+    }
+
+    #[test]
+    fn wait_buffers_persists_correlated_item_before_disk_apply() {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/vault")).unwrap();
+        fs.write_new(Path::new("/vault/a.md"), b"a").unwrap();
+        fs.write_new(Path::new("/vault/in.md"), b"[[a]]").unwrap();
+        let patch = FilePatch {
+            path: PathBuf::from("in.md"),
+            base_path: None,
+            kind: TransactionItemKind::Patch,
+            expected_base_hash: *blake3::hash(b"[[a]]").as_bytes(),
+            bytes: b"[[b]]".to_vec(),
+            buffer_id: Some(47),
+            buffer_revision: Some(12),
+            old_stem: Some("a".into()),
+            new_stem: Some("b".into()),
+            target_key: Some("a".into()),
+            recovery_key: Some(b"in.md".to_vec()),
+        };
+        let executor = JournalExecutor::new(&fs, Path::new("/vault"));
+        let seen = std::cell::Cell::new(false);
+        let txn = executor
+            .rename_with_patches_and_buffers(
+                Path::new("a.md"),
+                Path::new("b.md"),
+                &[patch],
+                |txn, item| {
+                    assert!(valid_txn_id(txn));
+                    assert_eq!(item.phase, TransactionPhase::WaitBuffers);
+                    assert_eq!(item.buffer_revision, Some(12));
+                    seen.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(seen.get());
+        let bytes = fs
+            .read_if_exists(&Path::new("/vault/.flavite/journal").join(format!("{txn}.json")))
+            .unwrap()
+            .unwrap();
+        let manifest: JournalManifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(manifest.items[1].state, TransactionItemState::Saved);
+        assert_eq!(manifest.items[1].buffer_id.unwrap().as_u64(), 47);
+        assert_eq!(
+            fs.read_if_exists(Path::new("/vault/in.md"))
+                .unwrap()
+                .unwrap(),
+            b"[[b]]"
+        );
+    }
+
+    #[test]
+    fn buffer_applied_recovery_uses_the_durable_recovery_base_hash() {
+        let fs = MemFs::new();
+        let journal = Path::new("/vault/.flavite/journal");
+        fs.create_dir_all(journal).unwrap();
+        fs.create_dir_all(&journal.join("r7-match.data")).unwrap();
+        fs.create_dir_all(&journal.join("r7-mismatch.data"))
+            .unwrap();
+        fs.write_new(Path::new("/vault/match.md"), b"base").unwrap();
+        fs.write_new(Path::new("/vault/mismatch.md"), b"base")
+            .unwrap();
+        let base = *blake3::hash(b"base").as_bytes();
+        let new = *blake3::hash(b"patched").as_bytes();
+        let make_manifest = |txn: &str, path: &str| {
+            let mut manifest = JournalManifest::new(txn.into(), 1);
+            manifest.state = TransactionState::Committed;
+            manifest.items.push(TransactionItem {
+                id: 1,
+                kind: TransactionItemKind::Patch,
+                from_path: path.into(),
+                to_path: path.into(),
+                phase: TransactionPhase::WaitBuffers,
+                state: TransactionItemState::BufferApplied,
+                expected_base_hash: Some(base),
+                expected_new_hash: Some(new),
+                observed_base_hash: None,
+                observed_new_hash: None,
+                buffer_id: Some(flavite_buffer::revision::BufferId::new()),
+                buffer_revision: Some(3),
+                checkpoint_seq: None,
+                operation_markers: Vec::new(),
+                old_stem: Some("old".into()),
+                new_stem: Some("new".into()),
+                target_key: Some("old".into()),
+                indexed_hash: Some(base),
+                recovery_key: Some(path.as_bytes().to_vec()),
+                error: None,
+            });
+            manifest
+        };
+        let matched = make_manifest("r7-match", "match.md");
+        fs.write_new(&journal.join("r7-match.data/1.bin"), b"patched")
+            .unwrap();
+        JournalExecutor::new(&fs, Path::new("/vault"))
+            .persist(&matched)
+            .unwrap();
+        let mismatched = make_manifest("r7-mismatch", "mismatch.md");
+        fs.write_new(&journal.join("r7-mismatch.data/1.bin"), b"patched")
+            .unwrap();
+        JournalExecutor::new(&fs, Path::new("/vault"))
+            .persist(&mismatched)
+            .unwrap();
+
+        let report = JournalExecutor::new(&fs, Path::new("/vault"))
+            .recover_with_buffer_base(|key| (key == b"match.md").then_some(new))
+            .unwrap();
+        assert!(report.rolled_forward.contains(&"r7-match".to_owned()));
+        assert!(report.skipped.iter().any(|(txn, reason)| {
+            txn == "r7-mismatch" && reason.contains("buffer-authoritative divergence")
+        }));
+        assert_eq!(
+            fs.read_if_exists(Path::new("/vault/match.md")).unwrap(),
+            Some(b"patched".to_vec())
+        );
+        assert_eq!(
+            fs.read_if_exists(Path::new("/vault/mismatch.md")).unwrap(),
+            Some(b"base".to_vec())
+        );
     }
 
     #[test]
@@ -649,6 +884,11 @@ mod tests {
                 buffer_revision: None,
                 checkpoint_seq: None,
                 operation_markers: vec![],
+                old_stem: None,
+                new_stem: None,
+                target_key: None,
+                indexed_hash: None,
+                recovery_key: None,
                 error: None,
             });
             m
@@ -710,6 +950,11 @@ mod tests {
             buffer_revision: Some(1),
             checkpoint_seq: Some(1),
             operation_markers: Vec::new(),
+            old_stem: None,
+            new_stem: None,
+            target_key: None,
+            indexed_hash: None,
+            recovery_key: None,
             error: None,
         });
         let executor = JournalExecutor::new(&fs, Path::new("/vault"));
@@ -742,6 +987,11 @@ mod tests {
             buffer_revision: None,
             checkpoint_seq: None,
             operation_markers: Vec::new(),
+            old_stem: None,
+            new_stem: None,
+            target_key: None,
+            indexed_hash: None,
+            recovery_key: None,
             error: None,
         });
         manifest
@@ -860,8 +1110,16 @@ mod tests {
             (0..14)
                 .map(|n| FilePatch {
                     path: PathBuf::from(format!("in-{n}.md")),
+                    base_path: None,
+                    kind: TransactionItemKind::Patch,
                     expected_base_hash: *blake3::hash(b"[[a]]").as_bytes(),
                     bytes: b"[[b]]".to_vec(),
+                    buffer_id: None,
+                    buffer_revision: None,
+                    old_stem: None,
+                    new_stem: None,
+                    target_key: None,
+                    recovery_key: None,
                 })
                 .collect::<Vec<_>>()
         };
@@ -924,6 +1182,123 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[cfg(feature = "fault")]
+    #[test]
+    fn wait_buffers_crash_after_durable_reply_recovers_r7_base() {
+        use flavite_fs::{CrashMode, FaultBoundary, FaultFs, FaultKind, FaultScript};
+
+        fn seed() -> MemFs {
+            let fs = MemFs::new();
+            fs.create_dir_all(Path::new("/vault/.flavite/journal"))
+                .unwrap();
+            fs.create_dir_all(Path::new("/vault/.flavite/recovery"))
+                .unwrap();
+            fs.fsync_dir(Path::new("/vault")).unwrap();
+            fs.fsync_dir(Path::new("/vault/.flavite")).unwrap();
+            fs.fsync_dir(Path::new("/vault/.flavite/journal")).unwrap();
+            fs.fsync_dir(Path::new("/vault/.flavite/recovery")).unwrap();
+            fs.write_new(Path::new("/vault/a.md"), b"# A").unwrap();
+            fs.write_new(Path::new("/vault/in.md"), b"[[a]]").unwrap();
+            fs.fsync_file(Path::new("/vault/a.md")).unwrap();
+            fs.fsync_file(Path::new("/vault/in.md")).unwrap();
+            fs.fsync_dir(Path::new("/vault")).unwrap();
+            fs
+        }
+        let new_hash = *blake3::hash(b"[[b]]").as_bytes();
+        let make_patch = || FilePatch {
+            path: PathBuf::from("in.md"),
+            base_path: None,
+            kind: TransactionItemKind::Patch,
+            expected_base_hash: *blake3::hash(b"[[a]]").as_bytes(),
+            bytes: b"[[b]]".to_vec(),
+            buffer_id: Some(7),
+            buffer_revision: Some(3),
+            old_stem: Some("a".into()),
+            new_stem: Some("b".into()),
+            target_key: Some("a".into()),
+            recovery_key: Some(b"in.md".to_vec()),
+        };
+
+        // Session's correlated success means its recovery checkpoint is
+        // already durable before the executor persists BufferApplied.
+        let baseline = FaultFs::new_mem(seed(), FaultScript::new());
+        let next_manifest_write = std::cell::Cell::new(0);
+        JournalExecutor::new(&baseline, Path::new("/vault"))
+            .rename_with_patches_and_buffers(
+                Path::new("a.md"),
+                Path::new("b.md"),
+                &[make_patch()],
+                |_, _| {
+                    let recovery = Path::new("/vault/.flavite/recovery/in.md");
+                    baseline.write_new(recovery, &new_hash).unwrap();
+                    baseline.fsync_file(recovery).unwrap();
+                    baseline.fsync_dir(recovery.parent().unwrap()).unwrap();
+                    next_manifest_write.set(baseline.call_count("write_new") + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        for boundary in [FaultBoundary::Before, FaultBoundary::After] {
+            for mode in [CrashMode::ProcessCrash, CrashMode::PowerLoss] {
+                let kind = match mode {
+                    CrashMode::ProcessCrash => FaultKind::ProcessCrash,
+                    CrashMode::PowerLoss => FaultKind::PowerLoss,
+                };
+                let fs = FaultFs::new_mem(
+                    seed(),
+                    FaultScript::new().fault_at(
+                        "write_new",
+                        next_manifest_write.get(),
+                        boundary,
+                        kind,
+                    ),
+                );
+                let _ = JournalExecutor::new(&fs, Path::new("/vault"))
+                    .rename_with_patches_and_buffers(
+                        Path::new("a.md"),
+                        Path::new("b.md"),
+                        &[make_patch()],
+                        |_, _| {
+                            let recovery = Path::new("/vault/.flavite/recovery/in.md");
+                            fs.write_new(recovery, &new_hash).unwrap();
+                            fs.fsync_file(recovery).unwrap();
+                            fs.fsync_dir(recovery.parent().unwrap()).unwrap();
+                            Ok(())
+                        },
+                    );
+                let revived = fs.revive();
+                let recovery = JournalExecutor::new(&revived, Path::new("/vault"))
+                    .recover_with_buffer_base(|key| {
+                        if key == b"in.md" {
+                            revived
+                                .read_if_exists(Path::new("/vault/.flavite/recovery/in.md"))
+                                .ok()
+                                .flatten()
+                                .and_then(|bytes| bytes.as_slice().try_into().ok())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap();
+                assert!(
+                    recovery.skipped.is_empty(),
+                    "R7 recovery unexpectedly diverged: {recovery:?}"
+                );
+                assert_eq!(
+                    revived.read_if_exists(Path::new("/vault/b.md")).unwrap(),
+                    Some(b"# A".to_vec()),
+                    "rename recovery at {boundary:?} {mode:?}: {recovery:?}"
+                );
+                assert_eq!(
+                    revived.read_if_exists(Path::new("/vault/in.md")).unwrap(),
+                    Some(b"[[b]]".to_vec()),
+                    "buffer recovery at {boundary:?} {mode:?}: {recovery:?}"
+                );
             }
         }
     }

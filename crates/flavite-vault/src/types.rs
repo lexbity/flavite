@@ -285,6 +285,20 @@ pub struct VaultConfig {
     pub bulk_threshold: u32,
     /// Capacity for the pulse channel (default: 1024).
     pub pulse_channel_capacity: usize,
+    /// Default strategy for note and attachment rename link handling.
+    pub rename_strategy: RenameStrategy,
+}
+
+/// Durable link handling selected for rename operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenameStrategy {
+    /// Rewrite inbound links and embeds through the journal.
+    #[default]
+    Rewrite,
+    /// Add the previous stem to note aliases and leave inbound text unchanged.
+    Alias,
+    /// Rename only and report the count of links left pointing at the old target.
+    None,
 }
 
 impl Default for VaultConfig {
@@ -297,6 +311,7 @@ impl Default for VaultConfig {
             coalesce_max_window: Duration::from_secs(2),
             bulk_threshold: 500,
             pulse_channel_capacity: 1024,
+            rename_strategy: RenameStrategy::Rewrite,
         }
     }
 }

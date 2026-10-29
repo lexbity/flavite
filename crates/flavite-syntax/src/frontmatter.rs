@@ -337,6 +337,70 @@ pub fn patch_frontmatter_key(
     }
 }
 
+/// Append one value to a simple top-level YAML string/list key while preserving
+/// unrelated frontmatter bytes. Ambiguous YAML structures and comments within
+/// the value are rejected instead of being rewritten lossily.
+pub fn append_list_value(bytes: &[u8], key: &str, value: &str) -> Result<Vec<u8>, String> {
+    std::str::from_utf8(bytes).map_err(|_| "frontmatter is not UTF-8")?;
+    if value.contains(['\n', '\r']) {
+        return Err("list value cannot contain a line break".into());
+    }
+    let mut values = Vec::new();
+    let mut found = false;
+    if let Some(frontmatter) =
+        parse_frontmatter(&TextSnapshot::new(bytes).map_err(|e| e.to_string())?)
+    {
+        let body = frontmatter.yaml_text;
+        let mut lines = body.lines().peekable();
+        while let Some(line) = lines.next() {
+            if line.trim_start() != line {
+                continue;
+            }
+            let Some((candidate, raw)) = line.split_once(':') else {
+                continue;
+            };
+            if candidate != key {
+                continue;
+            }
+            if found {
+                return Err("refusing to append to duplicated frontmatter key".into());
+            }
+            found = true;
+            let raw = raw.trim();
+            if raw.contains('#') {
+                return Err("refusing to append to a commented frontmatter value".into());
+            }
+            if raw.is_empty() {
+                while lines
+                    .peek()
+                    .is_some_and(|next| next.starts_with([' ', '\t']))
+                {
+                    let item = lines.next().expect("peeked frontmatter line exists");
+                    let item = item.trim();
+                    if !item.is_empty() {
+                        let item = item
+                            .strip_prefix('-')
+                            .ok_or("unsupported nested frontmatter list")?
+                            .trim();
+                        if item.contains('#') {
+                            return Err(
+                                "refusing to append to a commented frontmatter value".into()
+                            );
+                        }
+                        values.push(item.trim_matches(['"', '\'']).to_owned());
+                    }
+                }
+            } else {
+                values = parse_yaml_value(raw);
+            }
+        }
+    }
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_owned());
+    }
+    patch_frontmatter_key(bytes, key, &values)
+}
+
 fn yaml_quote(value: &str) -> String {
     format!(
         "\"{}\"",
@@ -371,6 +435,20 @@ mod tests {
         let inserted = std::str::from_utf8(&inserted).unwrap();
         assert!(inserted.starts_with("\u{feff}---\n"));
         assert!(inserted.contains("  - \"a\"\n  - \"b\""));
+    }
+
+    #[test]
+    fn append_alias_preserves_unrelated_bytes_and_deduplicates() {
+        let original = b"\xef\xbb\xbf---\r\ntitle: 'Keep quote' # comment\r\naliases:\r\n  - old\r\ncustom: value\r\n---\r\nbody\r\n";
+        let appended = append_list_value(original, "aliases", "older").unwrap();
+        let text = std::str::from_utf8(&appended).unwrap();
+        assert!(text.starts_with("\u{feff}---\r\ntitle: 'Keep quote' # comment\r\n"));
+        assert!(text.contains("custom: value\r\n---\r\nbody\r\n"));
+        assert!(text.contains("aliases:\r\n  - \"old\"\r\n  - \"older\"\r\n"));
+        assert_eq!(
+            append_list_value(&appended, "aliases", "older").unwrap(),
+            appended
+        );
     }
 
     #[test]

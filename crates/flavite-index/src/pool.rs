@@ -621,6 +621,46 @@ impl IndexActor {
         rows.map(|row| row.map_err(|e| e.to_string())).collect()
     }
 
+    /// Return resolved inbound embeds for one indexed attachment path.
+    ///
+    /// # Errors
+    /// Returns the SQLite error text when the lookup fails or a source hash is
+    /// malformed.
+    pub fn inbound_embeds_for_attachment(
+        &self,
+        path_native: &[u8],
+    ) -> Result<Vec<InboundLinkSpan>, String> {
+        let mut statement = self
+            .writer
+            .conn()
+            .prepare(
+                "SELECT n.path_native,n.content_hash,l.span_start,l.span_end,l.dst_raw
+                 FROM links l JOIN notes n ON n.note_id=l.src
+                 JOIN attachments a ON a.att_id=l.dst_att
+                 WHERE l.kind='embed' AND a.path_native=?1
+                 ORDER BY n.path_native,l.span_start",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([path_native], |row| {
+                let hash: Vec<u8> = row.get(1)?;
+                let source_hash: [u8; 32] =
+                    hash.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let start: i64 = row.get(2)?;
+                let end: i64 = row.get(3)?;
+                Ok(InboundLinkSpan {
+                    source_path_native: row.get(0)?,
+                    source_hash,
+                    span_start: start.cast_unsigned(),
+                    span_end: end.cast_unsigned(),
+                    target_raw: row.get(4)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| row.map_err(|error| error.to_string()))
+            .collect()
+    }
+
     /// List native path keys for indexed attachments.
     ///
     /// # Errors
@@ -1519,9 +1559,10 @@ mod tests {
 
     #[test]
     fn metadata_fast_path_rehashes_recently_modified_notes() {
-        let temp = NamedTempFile::new().unwrap();
-        drop(crate::open_or_init(temp.path()).unwrap());
-        let mut index = IndexActor::new(temp.path(), 1).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("index.sqlite3");
+        drop(crate::open_or_init(&db_path).unwrap());
+        let mut index = IndexActor::new(&db_path, 1).unwrap();
         index
             .apply_saved_note(b"a.md", "a.md", b"body", 10_000_000_000, 10_000_000_000)
             .unwrap();
@@ -1614,9 +1655,10 @@ mod tests {
 
     #[test]
     fn saved_note_updates_structure_search_cache_and_generation_atomically() {
-        let temp = NamedTempFile::new().unwrap();
-        drop(crate::schema::open_or_init(temp.path()).unwrap());
-        let mut index = IndexActor::new(temp.path(), 1).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("index.sqlite3");
+        drop(crate::schema::open_or_init(&db_path).unwrap());
+        let mut index = IndexActor::new(&db_path, 1).unwrap();
         let original = b"---\ntitle: Alpha\naliases: [A, B]\ntags: [frontmatter]\n---\n# Heading\n\n[[Beta|alias]] ![[image.png]] #project";
         let (epoch, generation) = index
             .apply_saved_note(b"notes/a.md", "notes/a.md", original, 98, 99)

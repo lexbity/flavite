@@ -49,10 +49,9 @@ pub use open::{OpenVaultError, OpenVaultResult, Vault, vault_exists};
 pub use rename::{
     AttachmentRename, AttachmentRenameConfig, AttachmentRenameManager, AttachmentRenameResult,
     DuplicateIdInfo, DuplicateIdManager, DuplicateIdResolution, EmbedCountProvider,
-    RenameBufferPatcher, RenameCandidate, RenameInference, RenameInferenceConfig,
-    RenameInferenceResult, RenamePlan, RenamePlanItem, RenamePlanResult, RenamePlanner, RenameUndo,
-    RenameUndoResult, RenameValidationError, can_use_t2_identity, should_auto_rewrite_links,
-    should_carry_identity, should_rewrite_embeds,
+    RenameCandidate, RenameInference, RenameInferenceConfig, RenameInferenceResult, RenamePlan,
+    RenamePlanItem, RenamePlanResult, RenamePlanner, RenameValidationError, can_use_t2_identity,
+    should_auto_rewrite_links, should_carry_identity, should_rewrite_embeds,
 };
 pub use save::{
     DiskPrecondition, DurabilityOutcome, SaveFailure, SaveFailureStage, SaveReceipt, SaveRequest,
@@ -65,5 +64,5 @@ pub use session::{
 pub use tokens::{TokenGuard, WriteToken, WriteTokenManager};
 pub use types::{
     AtomicVersion, ChangeKind, Epoch, Generation, ReconcileMode, ReconcileScope, ReconcileSummary,
-    VaultConfig, VaultRef, Version,
+    RenameStrategy, VaultConfig, VaultRef, Version,
 };

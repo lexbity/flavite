@@ -13,7 +13,8 @@ use crate::history::{HistoryReason, SnapshotRef};
 use crate::rename::RenamePlanner;
 use crate::save::{SaveFailure, SaveReceipt, SaveRequest};
 use crate::types::{
-    Epoch, Generation, ReconcileMode, ReconcileScope, ReconcileSummary, VaultIdentity, Version,
+    Epoch, Generation, ReconcileMode, ReconcileScope, ReconcileSummary, RenameStrategy,
+    VaultIdentity, Version,
 };
 use crossbeam::channel::{Receiver, Sender, bounded, select, tick, unbounded};
 use flavite_fs::Fs;
@@ -58,6 +59,28 @@ pub enum VaultActorEvent {
         tier: RenameTier,
         inbound: u32,
     },
+    /// A rename intentionally left inbound links pointing at the previous stem.
+    LinksBroken {
+        from: std::path::PathBuf,
+        count: u32,
+    },
+}
+
+/// Correlated request for Session-owned buffer mutation during WAIT-BUFFERS.
+#[derive(Debug)]
+pub struct ApplyBufferPatchRequest {
+    pub txn_id: String,
+    pub item_id: u64,
+    pub kind: crate::journal::TransactionItemKind,
+    pub buffer_id: u64,
+    pub expected_revision: u64,
+    pub old_stem: String,
+    pub new_stem: String,
+    pub target_key: String,
+    pub indexed_hash: [u8; 32],
+    pub recovery_key: Option<Vec<u8>>,
+    pub new_base_bytes: Vec<u8>,
+    pub reply: Sender<Result<u64, String>>,
 }
 
 /// Messages for the VaultActor.
@@ -74,13 +97,19 @@ pub enum VaultActorMsg {
         mode: ReconcileMode,
         reply: Sender<VaultActorResp>,
     },
-    /// Execute a D9 rename after refusing to mutate any open inbound buffer.
+    /// Execute a journaled rename, correlating open-buffer patches through Session.
     RenameNoteRequest {
         from: std::path::PathBuf,
         to: std::path::PathBuf,
-        protected_paths: Vec<std::path::PathBuf>,
+        strategy: RenameStrategy,
         buffer_ids: HashMap<std::path::PathBuf, u64>,
         buffer_revisions: HashMap<u64, u64>,
+        reply: Sender<VaultActorResp>,
+    },
+    /// Durably cancel a journal item after a tagged buffer undo.
+    CancelJournalItem {
+        txn_id: String,
+        item_id: u64,
         reply: Sender<VaultActorResp>,
     },
     /// Notify of a filesystem event.
@@ -193,6 +222,7 @@ pub struct VaultActorHandle {
     sender: Sender<VaultActorMsg>,
     receiver: Receiver<VaultActorResp>,
     events: Receiver<VaultActorEvent>,
+    buffer_patches: Receiver<ApplyBufferPatchRequest>,
     drift_found_total: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -201,6 +231,12 @@ impl VaultActorHandle {
     #[must_use]
     pub fn events(&self) -> Receiver<VaultActorEvent> {
         self.events.clone()
+    }
+
+    /// Receive buffer-patch work that the Session must apply on its owner thread.
+    #[must_use]
+    pub fn buffer_patch_requests(&self) -> Receiver<ApplyBufferPatchRequest> {
+        self.buffer_patches.clone()
     }
 
     /// Request a throttled full verification after the host window gains focus.
@@ -250,7 +286,7 @@ impl VaultActorHandle {
         &self,
         from: std::path::PathBuf,
         to: std::path::PathBuf,
-        protected_paths: Vec<std::path::PathBuf>,
+        strategy: RenameStrategy,
         buffer_ids: HashMap<std::path::PathBuf, u64>,
         buffer_revisions: HashMap<u64, u64>,
     ) -> Result<Receiver<VaultActorResp>, VaultActorError> {
@@ -258,12 +294,29 @@ impl VaultActorHandle {
         self.try_send(VaultActorMsg::RenameNoteRequest {
             from,
             to,
-            protected_paths,
+            strategy,
             buffer_ids,
             buffer_revisions,
             reply,
         })?;
         Ok(receiver)
+    }
+
+    /// Durably cancel a committed journal item before acknowledging its undo.
+    pub fn cancel_journal_item(&self, txn_id: String, item_id: u64) -> Result<(), String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::CancelJournalItem {
+                txn_id,
+                item_id,
+                reply,
+            })
+            .map_err(|error| error.to_string())?;
+        match response.recv().map_err(|error| error.to_string())? {
+            VaultActorResp::Ack => Ok(()),
+            VaultActorResp::Error(error) => Err(error),
+            _ => Err("unexpected journal cancellation response".into()),
+        }
     }
 
     /// Get the current version.
@@ -465,6 +518,8 @@ pub struct VaultActor {
     resp_sender: Sender<VaultActorResp>,
     /// Lossless path observations for the owning Session.
     event_sender: Sender<VaultActorEvent>,
+    /// Session-owned buffer patches required to complete committed journal items.
+    buffer_patch_sender: Sender<ApplyBufferPatchRequest>,
     drift_found_total: Arc<std::sync::atomic::AtomicU64>,
     event_source: Option<EventSource>,
     pulse_sender: Option<Sender<Pulse>>,
@@ -496,6 +551,7 @@ impl VaultActor {
             msg_receiver: unbounded().1, // Will be replaced
             resp_sender: unbounded().0,  // Will be replaced
             event_sender: unbounded().0,
+            buffer_patch_sender: bounded(1).0,
             drift_found_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             event_source: None,
             pulse_sender: None,
@@ -516,11 +572,13 @@ impl VaultActor {
         let (msg_sender, msg_receiver) = unbounded();
         let (resp_sender, resp_receiver) = unbounded();
         let (event_sender, event_receiver) = unbounded();
+        let (buffer_patch_sender, buffer_patch_receiver) = bounded(64);
         let drift_found_total = Arc::clone(&self.drift_found_total);
 
         self.msg_receiver = msg_receiver;
         self.resp_sender = resp_sender;
         self.event_sender = event_sender;
+        self.buffer_patch_sender = buffer_patch_sender;
 
         let is_running = Arc::new(AtomicBool::new(false));
 
@@ -537,6 +595,7 @@ impl VaultActor {
             sender: msg_sender,
             receiver: resp_receiver,
             events: event_receiver,
+            buffer_patches: buffer_patch_receiver,
             drift_found_total,
         })
     }
@@ -695,7 +754,7 @@ impl VaultActor {
             VaultActorMsg::RenameNoteRequest {
                 from,
                 to,
-                protected_paths,
+                strategy,
                 buffer_ids,
                 buffer_revisions,
                 reply,
@@ -703,11 +762,23 @@ impl VaultActor {
                 let result = self.execute_journaled_rename(
                     &from,
                     &to,
-                    &protected_paths,
+                    strategy,
                     &buffer_ids,
                     &buffer_revisions,
                 );
                 let _ = reply.try_send(VaultActorResp::Renamed(result));
+            }
+            VaultActorMsg::CancelJournalItem {
+                txn_id,
+                item_id,
+                reply,
+            } => {
+                let result = crate::journal::JournalExecutor::new(&*self.fs, &self.identity.root)
+                    .cancel_item(&txn_id, item_id);
+                let response = result
+                    .map(|()| VaultActorResp::Ack)
+                    .unwrap_or_else(VaultActorResp::Error);
+                let _ = reply.send(response);
             }
             VaultActorMsg::FsEvent(event) => {
                 self.handle_fs_event(event);
@@ -1019,13 +1090,11 @@ impl VaultActor {
 
     /// Plan inbound-link replacements from the current index, verify their
     /// source hashes, and execute the note rename through the durable journal.
-    /// Open inbound buffers are rejected because applying disk patches without
-    /// a correlated Session EditOp would violate the single-buffer authority.
     fn execute_journaled_rename(
         &mut self,
         from: &std::path::Path,
         to: &std::path::Path,
-        protected_paths: &[std::path::PathBuf],
+        strategy: RenameStrategy,
         buffer_ids: &HashMap<std::path::PathBuf, u64>,
         buffer_revisions: &HashMap<u64, u64>,
     ) -> Result<String, String> {
@@ -1047,14 +1116,20 @@ impl VaultActor {
             .ok_or_else(|| "rename planner produced an empty plan".to_owned())?;
         let from = self.identity.root.join(&plan_item.from_path);
         let to = self.identity.root.join(&plan_item.to_path);
-        if !from
+        let note_rename = from
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-            || !to
+            && to
                 .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-        {
-            return Err("Session rename currently accepts Markdown notes only".into());
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+        let attachment_rename = attachment_kind(&from).is_some() && attachment_kind(&to).is_some();
+        if !note_rename && !attachment_rename {
+            return Err(
+                "rename source and destination must both be notes or supported attachments".into(),
+            );
+        }
+        if attachment_rename && strategy == RenameStrategy::Alias {
+            return Err("alias strategy is only valid for Markdown notes".into());
         }
         let old_stem = from
             .file_stem()
@@ -1064,7 +1139,20 @@ impl VaultActor {
             .file_stem()
             .and_then(|v| v.to_str())
             .ok_or("destination filename is not valid Unicode")?;
-        let inbound = self.index.inbound_links_for_stem(old_stem)?;
+        let inbound = if strategy == RenameStrategy::Rewrite && note_rename {
+            self.index.inbound_links_for_stem(old_stem)?
+        } else if strategy == RenameStrategy::Rewrite {
+            let relative = from
+                .strip_prefix(&self.identity.root)
+                .map_err(|_| "source escapes vault")?;
+            let path_native = self
+                .fs
+                .encode_path_key(relative)
+                .map_err(|error| error.to_string())?;
+            self.index.inbound_embeds_for_attachment(&path_native)?
+        } else {
+            Vec::new()
+        };
         let mut grouped = std::collections::BTreeMap::new();
         for link in inbound {
             let relative = self
@@ -1072,17 +1160,6 @@ impl VaultActor {
                 .decode_path_key(&link.source_path_native)
                 .map_err(|e| e.to_string())?;
             let source = self.identity.root.join(relative);
-            if source == from {
-                return Err(
-                    "rename has self-referential links; source-buffer remapping is required".into(),
-                );
-            }
-            if protected_paths.iter().any(|path| path == &source) {
-                return Err(format!(
-                    "inbound link source is open in a buffer: {}",
-                    source.display()
-                ));
-            }
             let span = (
                 usize::try_from(link.span_start).map_err(|_| "link span overflow")?,
                 usize::try_from(link.span_end).map_err(|_| "link span overflow")?,
@@ -1096,7 +1173,8 @@ impl VaultActor {
             entry.2.push(span);
         }
 
-        let mut patches = Vec::with_capacity(grouped.len());
+        let mut patches =
+            Vec::with_capacity(grouped.len() + usize::from(strategy == RenameStrategy::Alias));
         for (_path_key, (path, expected_base_hash, mut spans)) in grouped {
             let mut bytes = self
                 .fs
@@ -1143,14 +1221,76 @@ impl VaultActor {
             for (start, end) in replacements {
                 bytes.splice(start..end, new_stem.bytes());
             }
-            let relative_path = path
+            let is_renamed_source = path == from;
+            let relative_source = path
                 .strip_prefix(&self.identity.root)
                 .map_err(|_| "inbound link source escapes vault")?
                 .to_path_buf();
+            let relative_path = if is_renamed_source {
+                to.strip_prefix(&self.identity.root)
+                    .map_err(|_| "rename destination escapes vault")?
+                    .to_path_buf()
+            } else {
+                relative_source.clone()
+            };
             patches.push(crate::journal::FilePatch {
                 path: relative_path,
+                base_path: is_renamed_source.then_some(relative_source.clone()),
+                kind: crate::journal::TransactionItemKind::Patch,
                 expected_base_hash,
                 bytes,
+                buffer_id: buffer_ids.get(&relative_source).copied(),
+                buffer_revision: buffer_ids
+                    .get(&relative_source)
+                    .and_then(|id| buffer_revisions.get(id).copied()),
+                old_stem: Some(old_stem.to_owned()),
+                new_stem: Some(new_stem.to_owned()),
+                target_key: Some(flavite_syntax::text::fold_key(old_stem)),
+                recovery_key: Some(crate::session::native_note_key(
+                    if is_renamed_source { &to } else { &path },
+                    &self.identity.root,
+                )),
+            });
+        }
+
+        if strategy == RenameStrategy::Alias {
+            let source_bytes = self
+                .fs
+                .read_if_exists(&from)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("rename source disappeared: {}", from.display()))?;
+            let alias_bytes =
+                flavite_syntax::frontmatter::append_list_value(&source_bytes, "aliases", old_stem)?;
+            self.history_store()?
+                .snapshot(
+                    from.to_string_lossy().as_bytes(),
+                    &source_bytes,
+                    HistoryReason::Rename,
+                    false,
+                    crate::history::now_secs(),
+                )
+                .map_err(|error| error.to_string())?;
+            let relative_from = from
+                .strip_prefix(&self.identity.root)
+                .map_err(|_| "source escapes vault")?
+                .to_path_buf();
+            let relative_to = to
+                .strip_prefix(&self.identity.root)
+                .map_err(|_| "destination escapes vault")?
+                .to_path_buf();
+            let buffer_id = buffer_ids.get(&relative_from).copied();
+            patches.push(crate::journal::FilePatch {
+                path: relative_to,
+                base_path: Some(relative_from),
+                kind: crate::journal::TransactionItemKind::Alias,
+                expected_base_hash: *blake3::hash(&source_bytes).as_bytes(),
+                bytes: alias_bytes,
+                buffer_id,
+                buffer_revision: buffer_id.and_then(|id| buffer_revisions.get(&id).copied()),
+                old_stem: Some(old_stem.to_owned()),
+                new_stem: Some(new_stem.to_owned()),
+                target_key: Some(flavite_syntax::text::fold_key(old_stem)),
+                recovery_key: Some(crate::session::native_note_key(&to, &self.identity.root)),
             });
         }
 
@@ -1160,8 +1300,52 @@ impl VaultActor {
         let relative_to = to
             .strip_prefix(&self.identity.root)
             .map_err(|_| "destination escapes vault")?;
+        let patch_sender = self.buffer_patch_sender.clone();
         let txn = crate::journal::JournalExecutor::new(&*self.fs, &self.identity.root)
-            .rename_with_patches(relative_from, relative_to, &patches)?;
+            .rename_with_patches_and_buffers(
+                relative_from,
+                relative_to,
+                &patches,
+                |txn_id, item| {
+                    let (reply, response) = bounded(1);
+                    let request = ApplyBufferPatchRequest {
+                        txn_id: txn_id.to_owned(),
+                        item_id: item.id,
+                        kind: item.kind,
+                        buffer_id: item.buffer_id.map(|id| id.as_u64()).unwrap_or_default(),
+                        expected_revision: item.buffer_revision.unwrap_or_default(),
+                        old_stem: item
+                            .old_stem
+                            .clone()
+                            .ok_or("journal patch has no old stem")?,
+                        new_stem: item
+                            .new_stem
+                            .clone()
+                            .ok_or("journal patch has no new stem")?,
+                        target_key: item
+                            .target_key
+                            .clone()
+                            .ok_or("journal patch has no target key")?,
+                        indexed_hash: item
+                            .indexed_hash
+                            .ok_or("journal patch has no indexed hash")?,
+                        recovery_key: item.recovery_key.clone(),
+                        new_base_bytes: patches
+                            .iter()
+                            .find(|patch| patch.path == item.from_path)
+                            .map(|patch| patch.bytes.clone())
+                            .ok_or("journal patch payload is missing")?,
+                        reply,
+                    };
+                    patch_sender
+                        .send_timeout(request, std::time::Duration::from_secs(10))
+                        .map_err(|error| format!("buffer patch transport failed: {error}"))?;
+                    response
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .map_err(|error| format!("buffer patch reply failed: {error}"))??;
+                    Ok(())
+                },
+            )?;
         // Reindex exact committed bytes before acknowledging the command.
         let mut changed = patches
             .iter()
@@ -1178,6 +1362,26 @@ impl VaultActor {
             to: to.clone(),
             tier: RenameTier::T0,
         });
+        if strategy == RenameStrategy::None {
+            let inbound = if note_rename {
+                self.index.inbound_links_for_stem(old_stem)?.len()
+            } else {
+                let relative = from
+                    .strip_prefix(&self.identity.root)
+                    .map_err(|_| "source escapes vault")?;
+                let path_native = self
+                    .fs
+                    .encode_path_key(relative)
+                    .map_err(|error| error.to_string())?;
+                self.index
+                    .inbound_embeds_for_attachment(&path_native)?
+                    .len()
+            } as u32;
+            let _ = self.event_sender.send(VaultActorEvent::LinksBroken {
+                from: from.clone(),
+                count: inbound,
+            });
+        }
         let _ = self.scan_paths(&changed);
         Ok(txn)
     }
@@ -1986,9 +2190,10 @@ mod tests {
             vec![1, 2, 3, 4],
         );
 
-        let temp = tempfile::NamedTempFile::new().unwrap();
-        drop(flavite_index::open_or_init(temp.path()).unwrap());
-        let index = IndexActor::new(temp.path(), 1).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("index.sqlite3");
+        drop(flavite_index::open_or_init(&db_path).unwrap());
+        let index = IndexActor::new(&db_path, 1).unwrap();
         let actor = VaultActorBuilder::new()
             .with_fs(fs)
             .with_identity(identity)
@@ -2094,7 +2299,7 @@ mod tests {
         let fs = MemFs::new();
         fs.create_dir_all(std::path::Path::new("/vault/notes"))
             .unwrap();
-        fs.write_new(std::path::Path::new("/vault/notes/a.md"), b"# A")
+        fs.write_new(std::path::Path::new("/vault/notes/a.md"), b"# A\n[[a]]\n")
             .unwrap();
         for i in 0..14 {
             fs.write_new(
@@ -2126,7 +2331,7 @@ mod tests {
             .submit_rename(
                 std::path::PathBuf::from("/vault/notes/a.md"),
                 std::path::PathBuf::from("/vault/notes/b.md"),
-                Vec::new(),
+                RenameStrategy::Rewrite,
                 HashMap::new(),
                 HashMap::new(),
             )
@@ -2145,7 +2350,7 @@ mod tests {
         assert_eq!(
             fs.read_if_exists(std::path::Path::new("/vault/notes/b.md"))
                 .unwrap(),
-            Some(b"# A".to_vec())
+            Some(b"# A\n[[b]]\n".to_vec())
         );
         for i in 0..14 {
             let rewritten = fs
@@ -2256,7 +2461,7 @@ mod tests {
             .submit_rename(
                 PathBuf::from("/vault/notes/a.md"),
                 PathBuf::from("/vault/notes/b.md"),
-                Vec::new(),
+                RenameStrategy::Rewrite,
                 HashMap::new(),
                 HashMap::new(),
             )

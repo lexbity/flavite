@@ -113,6 +113,21 @@ pub struct TransactionItem {
     pub checkpoint_seq: Option<u64>,
     /// Operation markers for checkpoint lineage.
     pub operation_markers: Vec<u64>,
+    /// Original link/embed stem for a located buffer patch.
+    #[serde(default)]
+    pub old_stem: Option<String>,
+    /// Replacement link/embed stem for a located buffer patch.
+    #[serde(default)]
+    pub new_stem: Option<String>,
+    /// Folded target key used to locate current-buffer links.
+    #[serde(default)]
+    pub target_key: Option<String>,
+    /// Indexed source hash used to reject stale buffer patches.
+    #[serde(default)]
+    pub indexed_hash: Option<[u8; 32]>,
+    /// Native note key used to locate the recovery file for R7 comparison.
+    #[serde(default)]
+    pub recovery_key: Option<Vec<u8>>,
     /// Error message if the item failed.
     pub error: Option<String>,
 }
@@ -260,6 +275,11 @@ mod tests {
             buffer_revision: None,
             checkpoint_seq: None,
             operation_markers: Vec::new(),
+            old_stem: None,
+            new_stem: None,
+            target_key: None,
+            indexed_hash: None,
+            recovery_key: None,
             error: None,
         };
         manifest.items = vec![

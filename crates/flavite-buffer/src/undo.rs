@@ -24,6 +24,17 @@ pub struct EditOp {
     pub replacement: String,
     /// The EOL metadata for the inserted lines (if any).
     pub eol_metadata: EolMetadata,
+    /// Journal obligation associated with this edit, if it came from a rename.
+    pub journal: Option<JournalTag>,
+    /// A boundary edit is never merged into a neighboring undo group.
+    pub boundary: bool,
+}
+
+/// Durable journal item represented by an undoable buffer edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalTag {
+    pub txn_id: String,
+    pub item_id: u64,
 }
 impl EditOp {
     /// Create a new edit operation.
@@ -33,6 +44,8 @@ impl EditOp {
             range,
             replacement,
             eol_metadata: EolMetadata::default(),
+            journal: None,
+            boundary: false,
         }
     }
     /// Create a new edit with EOL metadata.
@@ -42,7 +55,16 @@ impl EditOp {
             range,
             replacement,
             eol_metadata,
+            journal: None,
+            boundary: false,
         }
+    }
+    /// Mark an operation as a durable, non-coalescing journal boundary.
+    #[must_use]
+    pub fn with_journal(mut self, tag: JournalTag) -> Self {
+        self.journal = Some(tag);
+        self.boundary = true;
+        self
     }
     /// Check if this edit is a no-op (empty range and empty replacement).
     #[must_use]
@@ -95,6 +117,9 @@ impl EditOp {
     /// - They happen within the coalesce window
     #[must_use]
     pub fn can_coalesce(&self, other: &EditOp) -> bool {
+        if self.boundary || other.boundary || self.journal.is_some() || other.journal.is_some() {
+            return false;
+        }
         // Check if ranges are adjacent or overlapping
         let self_end = self.range.end.0;
         let other_start = other.range.start.0;
@@ -268,6 +293,21 @@ impl UndoTree {
     #[must_use]
     pub fn position(&self) -> Option<&UndoNode> {
         self.nodes.get(self.position_id as usize)
+    }
+    /// Edit represented by the next undo transition.
+    #[must_use]
+    pub fn undo_edit(&self) -> Option<EditOp> {
+        self.current()?.edit.clone()
+    }
+    /// Edit represented by the next redo transition.
+    #[must_use]
+    pub fn redo_edit(&self) -> Option<EditOp> {
+        let target_id = if self.position_id != self.current_id {
+            self.current_id
+        } else {
+            self.position()?.children.first().copied()?
+        };
+        self.get(target_id)?.edit.clone()
     }
     /// Apply an edit and advance the tree.
     ///
@@ -631,6 +671,18 @@ mod tests {
         let text = "hello there";
         let result = op.apply(text);
         assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn journal_ops_never_coalesce() {
+        let tagged =
+            EditOp::new(Span::new(TextByte(0), TextByte(0)), "x".into()).with_journal(JournalTag {
+                txn_id: "txn".into(),
+                item_id: 1,
+            });
+        let adjacent = EditOp::new(Span::new(TextByte(1), TextByte(1)), "y".into());
+        assert!(!tagged.can_coalesce(&adjacent));
+        assert!(!adjacent.can_coalesce(&tagged));
     }
     #[test]
     fn edit_op_invert() {

@@ -13,7 +13,8 @@ use crate::actor::VaultActorHandle;
 use crate::channels::{NoticeChannel, PulseChannel};
 use crate::save::{DiskPrecondition, DurabilityOutcome, SaveFailureStage, SaveRequest};
 use crate::types::{
-    Epoch, Generation, ReconcileMode, ReconcileScope, ReconcileSummary, VaultConfig, VaultIdentity,
+    Epoch, Generation, ReconcileMode, ReconcileScope, ReconcileSummary, RenameStrategy,
+    VaultConfig, VaultIdentity,
 };
 use flavite_buffer::manager::{BufferManager, BufferStateChanged};
 use flavite_buffer::recovery::{RecoveryConfig, RecoveryWriter};
@@ -25,6 +26,61 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+fn located_patch(
+    text: &str,
+    target_key: &str,
+    old_stem: &str,
+    new_stem: &str,
+) -> Result<Vec<EditOp>, String> {
+    let snapshot = flavite_syntax::text::TextSnapshot::new(text.as_bytes());
+    let snapshot = snapshot.map_err(|error| error.to_string())?;
+    let mut edits = Vec::new();
+    for scanned in flavite_syntax::scanner::scan_inline(&snapshot, 0..snapshot.text().len()) {
+        let Some(payload) = scanned.payload else {
+            continue;
+        };
+        let folded_target = flavite_syntax::text::fold_key(&payload.target_raw);
+        let suffixed = folded_target.strip_prefix("id:").unwrap_or(&folded_target);
+        let basename_stem = folded_target
+            .rsplit('/')
+            .next()
+            .unwrap_or(&folded_target)
+            .rsplit_once('.')
+            .map_or_else(
+                || folded_target.rsplit('/').next().unwrap_or(&folded_target),
+                |(stem, _)| stem,
+            );
+        if folded_target != target_key
+            && folded_target != format!("{target_key}.md")
+            && !folded_target.ends_with(&format!("/{target_key}"))
+            && !folded_target.ends_with(&format!("/{target_key}.md"))
+            && basename_stem != target_key
+            && suffixed != target_key
+        {
+            continue;
+        }
+        let start = scanned.span.start.0;
+        let end = scanned.span.end.0;
+        let raw = &snapshot.text()[start..end];
+        let relative = raw
+            .find(&payload.target_raw)
+            .ok_or_else(|| "scanner target span is inconsistent".to_owned())?;
+        let target_start = start + relative;
+        let stem_offset = payload
+            .target_raw
+            .find(old_stem)
+            .ok_or_else(|| "link-absent".to_owned())?;
+        edits.push(EditOp::new(
+            flavite_syntax::text::Span::new(
+                flavite_syntax::text::TextByte(target_start + stem_offset),
+                flavite_syntax::text::TextByte(target_start + stem_offset + old_stem.len()),
+            ),
+            new_stem.to_owned(),
+        ));
+    }
+    Ok(edits)
+}
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -96,7 +152,11 @@ pub enum SessionCommand {
         mode: ReconcileMode,
     },
     /// Rename a note and journal inbound-link rewrites.
-    RenameNote { from: PathBuf, to: PathBuf },
+    RenameNote {
+        from: PathBuf,
+        to: PathBuf,
+        strategy: Option<RenameStrategy>,
+    },
     /// Undo an edit.
     Undo {
         buffer_id: BufferId,
@@ -281,6 +341,7 @@ pub struct Session {
     /// Lossless watcher observations from VaultActor, applied on Session's
     /// driving thread so buffers remain single-owner state.
     actor_events: crossbeam::channel::Receiver<crate::actor::VaultActorEvent>,
+    actor_buffer_patches: crossbeam::channel::Receiver<crate::actor::ApplyBufferPatchRequest>,
     /// Session-level observations retained until the host drains them.
     session_events: Mutex<VecDeque<SessionEvent>>,
     /// Idle-save deadline state, keyed by the authoritative buffer path.
@@ -288,6 +349,7 @@ pub struct Session {
     /// Prevent repeated autosave admission for an unchanged failed revision.
     autosave_attempted: Mutex<HashMap<PathBuf, Revision>>,
     autosave_idle_interval: Duration,
+    rename_strategy: RenameStrategy,
     /// Buffer manager.
     buffer_manager: Arc<Mutex<BufferManager>>,
     /// Autosave failures observed by the host pump.
@@ -311,6 +373,8 @@ pub struct Session {
         Mutex<HashMap<u64, crossbeam::channel::Receiver<crate::actor::VaultActorResp>>>,
     /// Correlated D9 rename operations.
     rename_flights: Mutex<HashMap<u64, RenameFlight>>,
+    journal_applied: Mutex<HashMap<(String, u64), Result<u64, String>>>,
+    cancelled_journal_items: Mutex<HashSet<(String, u64)>>,
     /// Lossless terminal results. Admission is bounded by the pending-save cap.
     completions: Mutex<VecDeque<OperationCompletion>>,
     /// Pulse channel.
@@ -332,6 +396,7 @@ impl Session {
         config: VaultConfig,
     ) -> Self {
         let actor_events = actor.events();
+        let actor_buffer_patches = actor.buffer_patch_requests();
         let manager = Arc::new(Mutex::new(buffer_manager));
         let recovery_writer = crate::identity::get_data_dir().map(|data| {
             let dir = data
@@ -387,10 +452,12 @@ impl Session {
             identity,
             actor,
             actor_events,
+            actor_buffer_patches,
             session_events: Mutex::new(VecDeque::new()),
             last_edit: Mutex::new(HashMap::new()),
             autosave_attempted: Mutex::new(HashMap::new()),
             autosave_idle_interval: config.autosave_idle_interval,
+            rename_strategy: config.rename_strategy,
             buffer_manager: manager,
             autosave_failures_total: AtomicU64::new(0),
             autosave_requests: Mutex::new(HashSet::new()),
@@ -402,6 +469,8 @@ impl Session {
             save_flights: Mutex::new(HashMap::new()),
             reconcile_flights: Mutex::new(HashMap::new()),
             rename_flights: Mutex::new(HashMap::new()),
+            journal_applied: Mutex::new(HashMap::new()),
+            cancelled_journal_items: Mutex::new(HashSet::new()),
             completions: Mutex::new(VecDeque::new()),
             pulse,
             notice,
@@ -521,6 +590,7 @@ impl Session {
     }
 
     fn pump_external_changes_inner(&self) {
+        self.pump_buffer_patch_requests();
         while let Ok(event) = self.actor_events.try_recv() {
             match event {
                 crate::actor::VaultActorEvent::ExternalChange { path, bytes } => {
@@ -610,8 +680,125 @@ impl Session {
                         inbound,
                     });
                 }
+                crate::actor::VaultActorEvent::LinksBroken { from, count } => {
+                    self.notice
+                        .send(crate::channels::Notice::LinksBroken { from, count });
+                }
             }
         }
+        self.pump_buffer_patch_requests();
+    }
+
+    fn pump_buffer_patch_requests(&self) {
+        while let Ok(request) = self.actor_buffer_patches.try_recv() {
+            let key = (request.txn_id.clone(), request.item_id);
+            if let Some(result) = self.journal_applied.lock().unwrap().get(&key).cloned() {
+                let _ = request.reply.send(result);
+                continue;
+            }
+            let result = self.apply_buffer_patch(&request);
+            if let Ok(revision) = result {
+                self.journal_applied
+                    .lock()
+                    .unwrap()
+                    .insert(key, Ok(revision));
+            } else {
+                self.journal_applied
+                    .lock()
+                    .unwrap()
+                    .insert(key, result.clone());
+            }
+            let _ = request.reply.send(result);
+        }
+    }
+
+    fn apply_buffer_patch(
+        &self,
+        request: &crate::actor::ApplyBufferPatchRequest,
+    ) -> Result<u64, String> {
+        let buffer_id = BufferId::from(request.buffer_id);
+        let mut manager = self.buffer_manager.lock().unwrap();
+        if manager
+            .get_buffer_by_id(buffer_id)
+            .is_some_and(|buffer| buffer.state() == flavite_buffer::state::BufferState::Conflicted)
+        {
+            if let Some(path) = manager.path_for_id(buffer_id).cloned() {
+                self.notice.send(crate::channels::Notice::Conflict {
+                    note: flavite_buffer::manager::NoteRef::new(path),
+                });
+            }
+            return Err("conflicted".into());
+        }
+        let buffer = manager
+            .get_buffer_by_id_mut(buffer_id)
+            .ok_or("buffer is not open")?;
+        if buffer.revision().as_u64() != request.expected_revision {
+            return Err("StaleRevision".into());
+        }
+        if *blake3::hash(buffer.base_bytes()).as_bytes() != request.indexed_hash {
+            return Err("StaleRevision: indexed base changed".into());
+        }
+        if request.kind == crate::journal::TransactionItemKind::Alias {
+            let snapshot = flavite_syntax::text::TextSnapshot::new(&request.new_base_bytes)
+                .map_err(|error| error.to_string())?;
+            let revision = buffer.model_mut().apply_journal_snapshot_boundary(
+                snapshot,
+                flavite_buffer::undo::JournalTag {
+                    txn_id: request.txn_id.clone(),
+                    item_id: request.item_id,
+                },
+            );
+            buffer.set_base_snapshot(request.new_base_bytes.clone());
+            let recovery = flavite_buffer::recovery::RecoveryFile::from_buffer(buffer, 0, false);
+            drop(manager);
+            self.persist_journal_recovery_snapshot(request, recovery)?;
+            return Ok(revision.as_u64());
+        }
+        let edits = located_patch(
+            buffer.text(),
+            &request.target_key,
+            &request.old_stem,
+            &request.new_stem,
+        )?;
+        if edits.is_empty() {
+            return Err("link-absent".into());
+        }
+        let revision = buffer.model_mut().apply_journal_edit_ops(
+            &edits,
+            flavite_buffer::undo::JournalTag {
+                txn_id: request.txn_id.clone(),
+                item_id: request.item_id,
+            },
+        );
+        if revision.as_u64() == request.expected_revision {
+            return Err("journal patch failed validation".into());
+        }
+        buffer.set_base_snapshot(request.new_base_bytes.clone());
+        let recovery = flavite_buffer::recovery::RecoveryFile::from_buffer(buffer, 0, false);
+        drop(manager);
+        self.persist_journal_recovery_snapshot(request, recovery)?;
+        Ok(revision.as_u64())
+    }
+
+    fn persist_journal_recovery_snapshot(
+        &self,
+        request: &crate::actor::ApplyBufferPatchRequest,
+        recovery: flavite_buffer::recovery::RecoveryFile,
+    ) -> Result<(), String> {
+        let key = request
+            .recovery_key
+            .as_deref()
+            .ok_or("journal buffer item has no recovery key")?;
+        let writer = self
+            .recovery_writer
+            .as_ref()
+            .ok_or("recovery writer is unavailable for journal buffer patch")?;
+        writer
+            .lock()
+            .map_err(|_| "recovery writer lock poisoned")?
+            .write_snapshot_now(key, recovery)
+            .ok_or_else(|| "could not persist journal buffer recovery snapshot".to_owned())?;
+        Ok(())
     }
 
     fn execute_inner(&self, command: SessionCommand) -> SessionResult {
@@ -632,7 +819,9 @@ impl Session {
             } => self.apply_merge(path, buffer_id, revision, disk_hash, merged_bytes),
             SessionCommand::SaveNote { path } => self.save_note(path),
             SessionCommand::Reconcile { scope, mode } => self.reconcile(scope, mode),
-            SessionCommand::RenameNote { from, to } => self.rename_note(from, to),
+            SessionCommand::RenameNote { from, to, strategy } => {
+                self.rename_note(from, to, strategy.unwrap_or(self.rename_strategy))
+            }
             SessionCommand::Undo {
                 buffer_id,
                 revision,
@@ -740,6 +929,7 @@ impl Session {
     pub fn wait_for_operation(&self, request_id: u64) -> SessionResult {
         loop {
             let _turn = self.driving_turn.lock().unwrap();
+            self.pump_external_changes_inner();
             self.pump_save_completions();
             self.pump_reconcile_completions();
             self.pump_rename_completions();
@@ -1326,7 +1516,7 @@ impl Session {
         }
     }
 
-    fn rename_note(&self, from: PathBuf, to: PathBuf) -> SessionResult {
+    fn rename_note(&self, from: PathBuf, to: PathBuf, strategy: RenameStrategy) -> SessionResult {
         let from = if from.is_absolute() {
             from
         } else {
@@ -1342,14 +1532,8 @@ impl Session {
                 message: format!("destination-open: {}", to.display()),
             };
         }
-        let (protected_paths, buffer_ids, buffer_revisions) = {
+        let (buffer_ids, buffer_revisions) = {
             let manager = self.buffer_manager.lock().unwrap();
-            let protected_paths = manager
-                .open_notes()
-                .into_iter()
-                .filter(|path| **path != from)
-                .cloned()
-                .collect::<Vec<_>>();
             let mut buffer_ids = HashMap::new();
             let mut buffer_revisions = HashMap::new();
             for (path, buffer_id) in manager.open_paths() {
@@ -1360,7 +1544,7 @@ impl Session {
                     }
                 }
             }
-            (protected_paths, buffer_ids, buffer_revisions)
+            (buffer_ids, buffer_revisions)
         };
         let outstanding = self.completions.lock().unwrap().len()
             + self.save_flights.lock().unwrap().len()
@@ -1373,7 +1557,7 @@ impl Session {
         match self.actor.submit_rename(
             from.clone(),
             to.clone(),
-            protected_paths,
+            strategy,
             buffer_ids,
             buffer_revisions,
         ) {
@@ -1405,6 +1589,24 @@ impl Session {
                 };
             }
             if let Some(new_revision) = buffer.model_mut().undo() {
+                let tags = buffer
+                    .model()
+                    .last_transition_ops()
+                    .iter()
+                    .filter_map(|op| op.journal.clone())
+                    .collect::<Vec<_>>();
+                for tag in tags {
+                    if let Err(message) = self
+                        .actor
+                        .cancel_journal_item(tag.txn_id.clone(), tag.item_id)
+                    {
+                        return SessionResult::Error { message };
+                    }
+                    self.cancelled_journal_items
+                        .lock()
+                        .unwrap()
+                        .insert((tag.txn_id, tag.item_id));
+                }
                 SessionResult::Success(CommandResult::UndoPerformed {
                     buffer_id,
                     new_revision,
@@ -1432,6 +1634,22 @@ impl Session {
                     buffer_id,
                     expected: revision,
                     actual: buffer.revision(),
+                };
+            }
+            if buffer
+                .model()
+                .next_redo_ops()
+                .iter()
+                .filter_map(|op| op.journal.as_ref())
+                .any(|tag| {
+                    self.cancelled_journal_items
+                        .lock()
+                        .unwrap()
+                        .contains(&(tag.txn_id.clone(), tag.item_id))
+                })
+            {
+                return SessionResult::Error {
+                    message: "redo-after-cancel".into(),
                 };
             }
             if let Some(new_revision) = buffer.model_mut().redo() {
@@ -1944,7 +2162,7 @@ impl Drop for Session {
     }
 }
 
-fn native_note_key(path: &Path, root: &Path) -> Vec<u8> {
+pub(crate) fn native_note_key(path: &Path, root: &Path) -> Vec<u8> {
     let relative = path.strip_prefix(root).unwrap_or(path);
     #[cfg(unix)]
     {
@@ -2530,7 +2748,11 @@ mod tests {
     }
 
     fn rename_to_terminal(session: &Session, from: PathBuf, to: PathBuf) -> SessionResult {
-        match session.execute(SessionCommand::RenameNote { from, to }) {
+        match session.execute(SessionCommand::RenameNote {
+            from,
+            to,
+            strategy: Some(RenameStrategy::Rewrite),
+        }) {
             SessionResult::Pending { request_id } => session.wait_for_operation(request_id),
             result => result,
         }
@@ -2584,6 +2806,184 @@ mod tests {
         assert_eq!(
             fs.read_if_exists(&to).unwrap().as_deref(),
             Some(&b"hello!"[..])
+        );
+    }
+
+    #[test]
+    fn open_inbound_buffer_is_patched_as_one_journal_undo_and_cancelled_durably() {
+        let (session, fs, _temp) = test_session();
+        let source = PathBuf::from("/test/vault/links.md");
+        let from = PathBuf::from("/test/vault/note.md");
+        let to = PathBuf::from("/test/vault/renamed.md");
+        fs.write_new(&source, b"See [[note]] / [[note]] / [[other]]")
+            .unwrap();
+        let scan = session
+            .actor
+            .submit_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent)
+            .unwrap();
+        scan.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (buffer_id, revision) = match session.execute(SessionCommand::OpenNote {
+            path: source.clone(),
+        }) {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            }) => (buffer_id, revision),
+            other => panic!("expected inbound buffer to open: {other:?}"),
+        };
+
+        assert!(matches!(
+            rename_to_terminal(&session, from, to),
+            SessionResult::Success(CommandResult::NoteRenamed { .. })
+        ));
+        let current = session.buffer_manager.lock().unwrap();
+        let buffer = current.get_buffer_by_id(buffer_id).unwrap();
+        assert_eq!(buffer.text(), "See [[renamed]] / [[renamed]] / [[other]]");
+        let patched_revision = buffer.revision();
+        drop(current);
+
+        let undo = session.execute(SessionCommand::Undo {
+            buffer_id,
+            revision: patched_revision,
+        });
+        assert!(
+            matches!(
+                undo,
+                SessionResult::Success(CommandResult::UndoPerformed { .. })
+            ),
+            "{undo:?}"
+        );
+        assert!(matches!(
+            session.execute(SessionCommand::Redo {
+                buffer_id,
+                revision: patched_revision.next(),
+            }),
+            SessionResult::Error { message } if message == "redo-after-cancel"
+        ));
+        let current = session.buffer_manager.lock().unwrap();
+        assert_eq!(
+            current.get_buffer_by_id(buffer_id).unwrap().text(),
+            "See [[note]] / [[note]] / [[other]]"
+        );
+        drop(current);
+        assert!(matches!(
+            save_to_terminal(&session, source.clone()),
+            SessionResult::Success(CommandResult::NoteSaved { .. })
+        ));
+        assert_eq!(
+            fs.read_if_exists(&source).unwrap().unwrap(),
+            b"See [[note]] / [[note]] / [[other]]"
+        );
+        let _ = revision;
+    }
+
+    #[test]
+    fn alias_strategy_updates_open_buffer_and_appends_frontmatter() {
+        let (session, fs, _temp) = test_session();
+        let from = PathBuf::from("/test/vault/note.md");
+        let to = PathBuf::from("/test/vault/renamed.md");
+        let (buffer_id, _) = match session.execute(SessionCommand::OpenNote { path: from.clone() })
+        {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            }) => (buffer_id, revision),
+            other => panic!("expected source buffer open: {other:?}"),
+        };
+        assert!(matches!(
+            session.execute(SessionCommand::RenameNote {
+                from,
+                to: to.clone(),
+                strategy: Some(RenameStrategy::Alias),
+            }),
+            SessionResult::Pending { request_id } if matches!(session.wait_for_operation(request_id), SessionResult::Success(CommandResult::NoteRenamed { .. }))
+        ));
+        let bytes = fs.read_if_exists(&to).unwrap().unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.starts_with("---\naliases: \"note\"\n---\nhello"));
+        let manager = session.buffer_manager.lock().unwrap();
+        assert_eq!(
+            manager.get_buffer_by_id(buffer_id).unwrap().text(),
+            text.trim_end_matches('\n')
+        );
+    }
+
+    #[test]
+    fn none_strategy_keeps_links_and_emits_counted_notice() {
+        let (session, fs, _temp) = test_session();
+        let source = PathBuf::from("/test/vault/links.md");
+        let from = PathBuf::from("/test/vault/note.md");
+        let to = PathBuf::from("/test/vault/renamed.md");
+        fs.write_new(&source, b"See [[note]]").unwrap();
+        let reconcile = session
+            .actor
+            .submit_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent)
+            .unwrap();
+        reconcile.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            session.execute(SessionCommand::RenameNote {
+                from,
+                to,
+                strategy: Some(RenameStrategy::None),
+            }),
+            SessionResult::Pending { request_id } if matches!(session.wait_for_operation(request_id), SessionResult::Success(CommandResult::NoteRenamed { .. }))
+        ));
+        assert_eq!(
+            fs.read_if_exists(&source).unwrap().unwrap(),
+            b"See [[note]]"
+        );
+        assert!(matches!(
+            session.notice.try_recv(),
+            Ok(crate::channels::Notice::LinksBroken { count: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn attachment_rename_rewrites_open_embed_buffer_through_journal() {
+        let (session, fs, _temp) = test_session();
+        let old = PathBuf::from("/test/vault/image.png");
+        let new = PathBuf::from("/test/vault/renamed-image.png");
+        let source = PathBuf::from("/test/vault/embeds.md");
+        fs.write_new(&old, b"image bytes").unwrap();
+        fs.write_new(&source, b"![[image.png]] and ![[other.png]]")
+            .unwrap();
+        let reconcile = session
+            .actor
+            .submit_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent)
+            .unwrap();
+        reconcile.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (buffer_id, _) = match session.execute(SessionCommand::OpenNote {
+            path: source.clone(),
+        }) {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            }) => (buffer_id, revision),
+            other => panic!("expected embedding note to open: {other:?}"),
+        };
+        let result = session.execute(SessionCommand::RenameNote {
+            from: old.clone(),
+            to: new.clone(),
+            strategy: Some(RenameStrategy::Rewrite),
+        });
+        assert!(
+            matches!(result, SessionResult::Pending { request_id } if matches!(session.wait_for_operation(request_id), SessionResult::Success(CommandResult::NoteRenamed { .. })))
+        );
+        assert!(!fs.exists(&old).unwrap());
+        assert!(fs.exists(&new).unwrap());
+        assert_eq!(
+            session
+                .buffer_manager
+                .lock()
+                .unwrap()
+                .get_buffer_by_id(buffer_id)
+                .unwrap()
+                .text(),
+            "![[renamed-image.png]] and ![[other.png]]"
+        );
+        assert_eq!(
+            fs.read_if_exists(&source).unwrap().unwrap(),
+            b"![[renamed-image.png]] and ![[other.png]]"
         );
     }
 
@@ -2721,7 +3121,11 @@ mod tests {
             SessionResult::Success(CommandResult::NoteOpened { .. })
         ));
 
-        let result = session.execute(SessionCommand::RenameNote { from, to });
+        let result = session.execute(SessionCommand::RenameNote {
+            from,
+            to,
+            strategy: Some(RenameStrategy::Rewrite),
+        });
 
         assert!(
             matches!(result, SessionResult::Error { message } if message.starts_with("destination-open:"))

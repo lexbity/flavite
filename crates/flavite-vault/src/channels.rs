@@ -90,6 +90,8 @@ pub enum Notice {
         code: &'static str,
         note: Option<NoteRef>,
     },
+    /// A rename used the `none` strategy and left inbound links unchanged.
+    LinksBroken { from: PathBuf, count: u32 },
 }
 
 /// Key for coalescing notices.
@@ -108,6 +110,7 @@ pub enum NoticeKind {
     Conflict,
     RecoveryOffer,
     ActionRequired,
+    LinksBroken,
 }
 
 /// The pulse channel — bounded, drop-oldest on overflow.
@@ -307,6 +310,11 @@ impl NoticeChannel {
                     .unwrap_or_else(|| NoteRef::new(PathBuf::from("unknown"))),
                 kind: NoticeKind::ActionRequired,
                 action_code: Some(*code),
+            },
+            Notice::LinksBroken { from, .. } => NoticeKey {
+                note: NoteRef::new(from.clone()),
+                kind: NoticeKind::LinksBroken,
+                action_code: None,
             },
         }
     }
