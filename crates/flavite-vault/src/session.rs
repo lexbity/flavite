@@ -657,6 +657,19 @@ impl Session {
         self.actor.completion_candidates()
     }
 
+    /// Resolve a target through the shared index resolver for editor
+    /// decorations or navigation previews.
+    pub fn resolve_target(
+        &self,
+        target_key: String,
+        raw_target: String,
+        is_embed: bool,
+        source_path_key: Option<String>,
+    ) -> Result<flavite_index::resolver::Resolution, String> {
+        self.actor
+            .resolve_target(target_key, raw_target, is_embed, source_path_key)
+    }
+
     /// Execute a text or hybrid query on the index actor.
     pub fn search_notes(
         &self,

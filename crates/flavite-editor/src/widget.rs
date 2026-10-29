@@ -22,6 +22,7 @@ use iced::advanced::{
 use iced::keyboard::{self, Key, Modifiers, key::Named};
 use iced::{Background, Border, Color, Length, Point, Rectangle, Size, Theme};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 const FONT_SIZE: f32 = 16.0;
@@ -38,6 +39,7 @@ thread_local! {
 pub struct EditorWidget<'a, Message> {
     view: EditorView,
     candidates: Vec<NoteCandidate>,
+    link_resolutions: HashMap<String, LinkResolution>,
     stable_links: bool,
     on_action: Box<dyn Fn(EditorAction) -> Message + 'a>,
     width: Length,
@@ -51,6 +53,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
         Self {
             view: EditorView::from(view),
             candidates: Vec::new(),
+            link_resolutions: HashMap::new(),
             stable_links: false,
             on_action: Box::new(on_action),
             width: Length::Fill,
@@ -63,6 +66,17 @@ impl<'a, Message> EditorWidget<'a, Message> {
     #[must_use]
     pub fn with_candidates(mut self, candidates: Vec<NoteCandidate>) -> Self {
         self.candidates = candidates;
+        self
+    }
+
+    /// Supply resolver verdicts keyed by the folded raw link target. Verdicts
+    /// come from the index snapshot API; the editor does not rank candidates.
+    #[must_use]
+    pub fn with_link_resolutions(mut self, resolutions: HashMap<String, LinkResolution>) -> Self {
+        self.link_resolutions = resolutions
+            .into_iter()
+            .map(|(target, verdict)| (flavite_syntax::text::fold_key(&target), verdict))
+            .collect();
         self
     }
 
@@ -351,7 +365,7 @@ impl EditorState {
         }
     }
 
-    fn reconcile(&mut self, view: &EditorView, candidates: &[NoteCandidate]) {
+    fn reconcile(&mut self, view: &EditorView, link_resolutions: &HashMap<String, LinkResolution>) {
         if self
             .buffer_id
             .is_some_and(|buffer_id| buffer_id != view.buffer_id)
@@ -361,11 +375,12 @@ impl EditorState {
         self.buffer_id = Some(view.buffer_id);
         if self.revision != Some(view.revision) {
             self.link_spans = scan_links(&view.text);
-            for span in &mut self.link_spans {
-                span.resolution = resolve_link(span, candidates);
-            }
             self.decorations = scan_decorations(&view.text);
             self.revision = Some(view.revision);
+        }
+        for span in &mut self.link_spans {
+            let key = flavite_syntax::text::fold_key(&span.payload.target_raw);
+            span.resolution = resolve_link(span, link_resolutions.get(&key).copied());
         }
         self.caret = clamp_char_boundary(&view.text, self.caret);
         self.anchor = clamp_char_boundary(&view.text, self.anchor);
@@ -629,7 +644,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
     fn diff(&self, tree: &mut Tree) {
         tree.state
             .downcast_mut::<EditorState>()
-            .reconcile(&self.view, &self.candidates);
+            .reconcile(&self.view, &self.link_resolutions);
     }
 
     fn update(
@@ -1273,7 +1288,7 @@ mod tests {
             text: "x".into(),
             ..old.clone()
         };
-        state.reconcile(&shorter_same_buffer, &[]);
+        state.reconcile(&shorter_same_buffer, &HashMap::new());
         assert_eq!(state.selection(), (1, 1));
 
         let reopened = EditorView {
@@ -1282,7 +1297,7 @@ mod tests {
             ..shorter_same_buffer
         };
         state.focused = true;
-        state.reconcile(&reopened, &[]);
+        state.reconcile(&reopened, &HashMap::new());
         assert_eq!(state.caret(), 0);
         assert_eq!(state.selection(), (0, 0));
         assert!(!state.focused);

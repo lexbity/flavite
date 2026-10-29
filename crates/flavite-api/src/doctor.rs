@@ -285,12 +285,7 @@ impl DoctorChecker {
                 "Index cache is not present; attachment hydration and orphan counts unavailable",
             ));
         } else {
-            report.add_check(db_count_check(
-                conn.as_ref(),
-                "broken_links",
-                "SELECT count(*) FROM links WHERE res_state = 'unresolved'",
-                "Unresolved links",
-            ));
+            report.add_check(unresolved_links_check(conn.as_ref()));
             report.add_check(db_count_check(
                 conn.as_ref(),
                 "ambiguous_links",
@@ -447,6 +442,32 @@ fn db_count_check(conn: Option<&Connection>, name: &str, sql: &str, label: &str)
         ),
     }
 }
+
+fn unresolved_links_check(conn: Option<&Connection>) -> DoctorCheck {
+    let Some(conn) = conn else {
+        return DoctorCheck::error(
+            "broken_links",
+            "Unresolved links",
+            "Index database unavailable",
+            "Open the vault once or rebuild its cache",
+        );
+    };
+    match conn.query_row(
+        "SELECT count(*) FROM links WHERE res_state='unresolved'",
+        [],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(count) => DoctorCheck::ok("broken_links", "Unresolved links are informational")
+            .with_details(format!("{count} unresolved link(s)")),
+        Err(error) => DoctorCheck::error(
+            "broken_links",
+            "Unresolved links",
+            error.to_string(),
+            "Rebuild the disposable index cache",
+        ),
+    }
+}
+
 fn duplicate_ids_check(conn: Option<&Connection>) -> DoctorCheck {
     let Some(conn) = conn else {
         return DoctorCheck::error(
@@ -471,13 +492,14 @@ fn duplicate_ids_check(conn: Option<&Connection>) -> DoctorCheck {
             ),
         );
     }
-    let result = conn.query_row("SELECT count(*) FROM (SELECT stable_id FROM notes WHERE stable_id IS NOT NULL GROUP BY stable_id HAVING count(*) > 1)", [], |r| r.get::<_, i64>(0));
+    let result = conn.query_row("SELECT count(*) FROM (SELECT stable_id_key FROM notes WHERE stable_id_key IS NOT NULL GROUP BY stable_id_key HAVING count(*) > 1)", [], |r| r.get::<_, i64>(0));
     match result {
         Ok(0) => DoctorCheck::ok("duplicate_ids", "No duplicate stable IDs"),
-        Ok(n) => DoctorCheck::warn(
+        Ok(n) => DoctorCheck::error(
             "duplicate_ids",
             "Duplicate stable IDs",
             format!("{n} duplicated IDs"),
+            "Remint IDs on the non-winning notes",
         ),
         Err(e) => DoctorCheck::error(
             "duplicate_ids",
@@ -973,7 +995,7 @@ mod tests {
         conn.execute("INSERT INTO links(src,ord,kind,dst_raw,target_key,span_start,span_end,res_state) VALUES(1,1,'link','maybe','maybe',0,0,'ambiguous')", []).unwrap();
         drop(conn);
         let c = DoctorChecker::with_db_path(vault, db);
-        assert!(check(&c, "broken_links").has_issues());
+        assert!(check(&c, "broken_links").is_ok());
         assert!(check(&c, "ambiguous_links").has_issues());
     }
 
@@ -996,7 +1018,7 @@ mod tests {
         let (root, db, vault) = fixture();
         let conn = Connection::open(&db).unwrap();
         for (id, path) in [(1, "a.md"), (2, "b.md")] {
-            conn.execute("INSERT INTO notes(note_id,path,path_native,path_key,stem_key,title,stable_id,content_hash,size,mtime_ns,scan_ns,generation) VALUES(?1,?2,?2,?2,?2,?2,'same',X'00',0,0,0,0)", (id,path)).unwrap();
+            conn.execute("INSERT INTO notes(note_id,path,path_native,path_key,stem_key,title,stable_id,stable_id_key,content_hash,size,mtime_ns,scan_ns,generation) VALUES(?1,?2,?2,?2,?2,?2,'same','same',X'00',0,0,0,0)", (id,path)).unwrap();
         }
         drop(conn);
         std::fs::write(root.path().join(".note.md.flavite-tmp.xyz"), b"tmp").unwrap();

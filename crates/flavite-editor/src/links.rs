@@ -101,53 +101,14 @@ pub fn scan_links(text: &str) -> Vec<LinkSpan> {
         .collect()
 }
 
-/// Classify a scanned note link against an indexed title/alias snapshot.
+/// Use the index's verdict for a scanned link. Candidate ranking belongs to
+/// `flavite-index`; the editor only maps a supplied snapshot onto decorations.
 #[must_use]
-pub fn resolve_link(span: &LinkSpan, candidates: &[NoteCandidate]) -> LinkResolution {
+pub fn resolve_link(span: &LinkSpan, verdict: Option<LinkResolution>) -> LinkResolution {
     if span.embed {
         return LinkResolution::NotApplicable;
     }
-    let target = span
-        .payload
-        .target_raw
-        .strip_suffix(".md")
-        .unwrap_or(&span.payload.target_raw);
-    let key = flavite_syntax::text::fold_key(target);
-    let matches = candidates
-        .iter()
-        .filter(|candidate| {
-            if span.payload.by_id {
-                return candidate.stable_id.as_deref().is_some_and(|id| {
-                    flavite_syntax::text::fold_key(id)
-                        == flavite_syntax::text::fold_key(
-                            target.strip_prefix("id:").unwrap_or(target),
-                        )
-                });
-            }
-            if target.contains('/') {
-                let path_key = flavite_syntax::text::fold_key(&candidate.target);
-                if path_key == key {
-                    return true;
-                }
-            }
-            let stem = candidate
-                .target
-                .rsplit('/')
-                .next()
-                .unwrap_or(&candidate.target);
-            let stem = stem.strip_suffix(".md").unwrap_or(stem);
-            flavite_syntax::text::fold_key(stem) == key
-                || candidate
-                    .aliases
-                    .iter()
-                    .any(|alias| flavite_syntax::text::fold_key(alias) == key)
-        })
-        .count();
-    match matches {
-        0 => LinkResolution::Unresolved,
-        1 => LinkResolution::Resolved,
-        _ => LinkResolution::Ambiguous,
-    }
+    verdict.unwrap_or(LinkResolution::Unresolved)
 }
 
 /// Shared-scanner spans for editor decorations; code/math/HTML are excluded.
@@ -244,12 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn note_link_resolution_distinguishes_resolved_ambiguous_and_unresolved() {
-        let mut first = NoteCandidate::new("notes/ideas", "Ideas");
-        first.aliases.push("Brainstorm".into());
-        first.stable_id = Some("01J9ZK".into());
-        let second = NoteCandidate::new("archive/ideas", "Ideas");
-        let candidates = [first, second];
+    fn note_link_resolution_uses_the_index_verdict() {
         let make_span = |target: &str, by_id: bool| LinkSpan {
             span: 0..target.len() + 4,
             payload: LinkPayload {
@@ -263,19 +219,18 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_link(&make_span("Brainstorm", false), &candidates),
-            LinkResolution::Resolved
-        );
-        assert_eq!(
-            resolve_link(&make_span("ideas", false), &candidates),
+            resolve_link(&make_span("ideas", false), Some(LinkResolution::Ambiguous)),
             LinkResolution::Ambiguous
         );
         assert_eq!(
-            resolve_link(&make_span("id:01J9ZK", true), &candidates),
+            resolve_link(
+                &make_span("id:01J9ZK", true),
+                Some(LinkResolution::Resolved)
+            ),
             LinkResolution::Resolved
         );
         assert_eq!(
-            resolve_link(&make_span("missing", false), &candidates),
+            resolve_link(&make_span("missing", false), None),
             LinkResolution::Unresolved
         );
     }

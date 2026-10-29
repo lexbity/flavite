@@ -15,26 +15,45 @@
 //!    *locate file*; clicking an attachment link opens it with the OS default
 //!    application.
 //!
-//! Duplicate IDs: retain every raw frontmatter ID, flag every member of a
-//! duplicate group, and choose the lowest native `PathKey` in deterministic
-//! byte order for lookup while reporting ambiguity. This rule is
-//! rebuild-stable.
+//! Duplicate IDs are co-ingested. The lowest folded path key wins `id:` lookup;
+//! remaining rows carry `id_conflict` and are reported by doctor.
 
 use crate::schema::ResState;
 use crate::types::{AttRef, NoteRef};
 use rusqlite::{Connection, Result, params};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
+
+/// Pure candidate ordering used by persisted and on-demand resolution.
+/// Candidate collection remains index-owned; this module owns the ranking
+/// rule itself.
+pub mod ranking {
+    /// Candidate attributes used by the deterministic resolver ranking.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Candidate {
+        pub same_directory: bool,
+        pub depth: usize,
+        pub path: String,
+        pub is_note: bool,
+        pub id: i64,
+    }
+
+    /// Sort same-directory candidates first, then shallowest path, then
+    /// lexicographic folded display path.
+    pub fn rank_candidates(candidates: &mut [Candidate]) {
+        candidates.sort_by(|a, b| {
+            b.same_directory
+                .cmp(&a.same_directory)
+                .then(a.depth.cmp(&b.depth))
+                .then(a.path.cmp(&b.path))
+        });
+    }
+}
 
 /// Cached resolution state.
 #[derive(Debug, Default)]
 pub struct ResolverCache {
-    /// Map from `target_key` to resolved note/attachment IDs.
-    #[allow(dead_code)]
-    target_to_note: HashMap<String, i64>,
-    #[allow(dead_code)]
-    target_to_att: HashMap<String, i64>,
-    /// Map from `stable_id` to `note_id` (for id: links).
+    /// Map from folded stable ID to its lowest-path-key winner.
     stable_id_to_note: HashMap<String, i64>,
     /// Map from `stem_key` to list of `note_ids` (for step 3).
     stem_to_notes: HashMap<String, Vec<i64>>,
@@ -42,11 +61,6 @@ pub struct ResolverCache {
     stem_to_atts: HashMap<String, Vec<i64>>,
     /// Map from `alias_key` to `note_id`.
     alias_to_note: HashMap<String, Vec<i64>>,
-    /// Set of duplicate `stable_ids`.
-    duplicate_stable_ids: HashSet<String>,
-    /// Set of ambiguous `target_keys`.
-    #[allow(dead_code)]
-    ambiguous_targets: HashSet<String>,
 }
 
 /// Link resolution result.
@@ -135,7 +149,7 @@ impl<'a> Resolver<'a> {
 
         // Load stable_id to note_id mappings
         let mut stmt = self.conn.prepare(
-            "SELECT stable_id, note_id FROM notes WHERE stable_id IS NOT NULL ORDER BY note_id",
+            "SELECT stable_id_key, note_id FROM notes WHERE stable_id_key IS NOT NULL ORDER BY path_key",
         )?;
         let rows = stmt.query_map([], |row| {
             let stable_id: String = row.get(0)?;
@@ -143,24 +157,12 @@ impl<'a> Resolver<'a> {
             Ok((stable_id, note_id))
         })?;
 
-        let mut stable_id_counts = HashMap::new();
         for row in rows {
             let (stable_id, note_id) = row?;
-            stable_id_counts
-                .entry(stable_id.clone())
-                .or_insert_with(Vec::new)
-                .push(note_id);
             self.cache
                 .stable_id_to_note
                 .entry(stable_id)
                 .or_insert(note_id);
-        }
-
-        // Track duplicates
-        for (stable_id, note_ids) in stable_id_counts {
-            if note_ids.len() > 1 {
-                self.cache.duplicate_stable_ids.insert(stable_id);
-            }
         }
 
         // Load stem_key to note_id mappings
@@ -240,66 +242,89 @@ impl<'a> Resolver<'a> {
         let normalized_target_key = flavite_syntax::text::fold_key(target_key);
         // Step 1: Check for id: prefix
         let raw_lower = flavite_syntax::text::fold_key(raw_target);
-        if let Some(stable_id) = raw_lower.strip_prefix("id:") {
-            // Check for duplicate IDs
-            if self.cache.duplicate_stable_ids.contains(stable_id) {
-                // Choose the deterministic native PathKey winner
-                // For now, we'll use the first one in the cache (not ideal but will work)
-                if let Some(&note_id) = self.cache.stable_id_to_note.get(stable_id)
-                    && let Ok(path) = self.conn.query_row(
-                        "SELECT path_native FROM notes WHERE note_id=?1",
-                        [note_id],
-                        |row| row.get(0),
-                    )
-                {
-                    let mut result = Resolution::resolved_note(NoteRef::new(note_id, path));
-                    result.is_ambiguous = true;
-                    result.state = ResState::Ambiguous;
-                    return result;
-                }
-                // Fall through to unresolved if not found
-            } else if let Some(&note_id) = self.cache.stable_id_to_note.get(stable_id)
-                && let Ok(path) = self.conn.query_row(
-                    "SELECT path_native FROM notes WHERE note_id=?1",
-                    [note_id],
-                    |row| row.get(0),
-                )
-            {
-                return Resolution::resolved_note(NoteRef::new(note_id, path));
-            }
+        if let Some(stable_id) = raw_lower.strip_prefix("id:")
+            && let Some(&note_id) = self.cache.stable_id_to_note.get(stable_id)
+            && let Ok(path) = self.conn.query_row(
+                "SELECT path_native FROM notes WHERE note_id=?1",
+                [note_id],
+                |row| row.get(0),
+            )
+        {
+            return Resolution::resolved_note(NoteRef::new(note_id, path));
             // id: not found, continue
         }
 
         // Step 2: Path-suffix match if target contains `/`
         if raw_target.contains('/') {
-            // Try exact path match in notes
+            // Match a path suffix so `[[notes/one]]` finds `notes/one.md`.
             let path_key = flavite_syntax::text::fold_key(raw_target);
             let Ok(mut stmt) = self.conn.prepare(
-                "SELECT note_id, path_native FROM notes WHERE path_key = ? ORDER BY path_native",
+                "SELECT note_id, path_native FROM notes WHERE path_key LIKE '%' || '/' || ?1 OR path_key LIKE '%' || '/' || ?1 || '.md' OR path_key = ?1 OR path_key = ?1 || '.md' ORDER BY path_key",
             ) else {
                 return Resolution::unresolved();
             };
-
-            if let Ok(mut rows) = stmt.query_map([&path_key], |row| {
-                Ok(NoteRef::new(row.get(0)?, row.get(1)?))
-            }) && let Some(Ok(note_ref)) = rows.next()
+            let note_matches = stmt
+                .query_map([&path_key], |row| {
+                    Ok(NoteRef::new(row.get(0)?, row.get(1)?))
+                })
+                .and_then(Iterator::collect::<Result<Vec<_>, _>>);
+            if let Ok(note_matches) = note_matches
+                && !note_matches.is_empty()
             {
-                return Resolution::resolved_note(note_ref);
+                let ids = note_matches
+                    .iter()
+                    .map(|note| note.note_id)
+                    .collect::<Vec<_>>();
+                let best = self
+                    .rank_candidates(&ids, &[], source_note_id)
+                    .0
+                    .unwrap_or(ids[0]);
+                let note = note_matches.into_iter().find(|note| note.note_id == best);
+                let Some(note) = note else {
+                    return Resolution::unresolved();
+                };
+                let mut result = Resolution::resolved_note(note);
+                result.is_ambiguous = ids.len() > 1;
+                if result.is_ambiguous {
+                    result.state = ResState::Ambiguous;
+                }
+                return result;
             }
 
-            // Try exact path match in attachments
+            // Notes take precedence over attachments for path targets.
             let Ok(mut stmt) = self
                 .conn
-                .prepare("SELECT att_id, path_native FROM attachments WHERE path_key = ? ORDER BY path_native")
+                .prepare("SELECT att_id, path_native FROM attachments WHERE path_key LIKE '%' || '/' || ?1 OR path_key = ?1 ORDER BY path_key")
             else {
                 return Resolution::unresolved();
             };
 
-            if let Ok(mut rows) =
-                stmt.query_map([&path_key], |row| Ok(AttRef::new(row.get(0)?, row.get(1)?)))
-                && let Some(Ok(att_ref)) = rows.next()
+            let attachment_matches = stmt
+                .query_map([&path_key], |row| Ok(AttRef::new(row.get(0)?, row.get(1)?)))
+                .and_then(Iterator::collect::<Result<Vec<_>, _>>);
+            if let Ok(attachment_matches) = attachment_matches
+                && !attachment_matches.is_empty()
             {
-                return Resolution::resolved_attachment(att_ref);
+                let ids = attachment_matches
+                    .iter()
+                    .map(|attachment| attachment.att_id)
+                    .collect::<Vec<_>>();
+                let best = self
+                    .rank_candidates(&[], &ids, source_note_id)
+                    .1
+                    .unwrap_or(ids[0]);
+                let attachment = attachment_matches
+                    .into_iter()
+                    .find(|attachment| attachment.att_id == best);
+                let Some(attachment) = attachment else {
+                    return Resolution::unresolved();
+                };
+                let mut result = Resolution::resolved_attachment(attachment);
+                result.is_ambiguous = ids.len() > 1;
+                if result.is_ambiguous {
+                    result.state = ResState::Ambiguous;
+                }
+                return result;
             }
         }
 
@@ -480,22 +505,22 @@ impl<'a> Resolver<'a> {
                     let same_directory = source_dir
                         .as_deref()
                         .is_some_and(|dir| candidate.parent() == Some(dir));
-                    candidates.push((
+                    candidates.push(ranking::Candidate {
                         same_directory,
-                        candidate.components().count(),
+                        depth: candidate.components().count(),
                         path,
                         is_note,
-                        *id,
-                    ));
+                        id: *id,
+                    });
                 }
             }
         }
-        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        ranking::rank_candidates(&mut candidates);
         candidates.first().map_or((None, None), |candidate| {
-            if candidate.3 {
-                (Some(candidate.4), None)
+            if candidate.is_note {
+                (Some(candidate.id), None)
             } else {
-                (None, Some(candidate.4))
+                (None, Some(candidate.id))
             }
         })
     }
@@ -537,13 +562,12 @@ impl<'a> Resolver<'a> {
         // Remove from stable_id cache
         let mut stmt = self
             .conn
-            .prepare("SELECT stable_id FROM notes WHERE note_id = ?")?;
+            .prepare("SELECT stable_id_key FROM notes WHERE note_id = ?")?;
 
         if let Ok(rows) = stmt.query_map([note_id], |row| row.get::<_, Option<String>>(0)) {
             for row in rows {
                 if let Ok(Some(id)) = row {
                     self.cache.stable_id_to_note.remove(&id);
-                    self.cache.duplicate_stable_ids.remove(&id);
                 }
             }
         }
@@ -594,7 +618,14 @@ impl<'a> Resolver<'a> {
                     (None, None, ResState::Unresolved)
                 }
             }
-            ResState::Ambiguous => (None, None, ResState::Ambiguous),
+            ResState::Ambiguous => (
+                resolution.note.as_ref().map(|note| note.note_id),
+                resolution
+                    .attachment
+                    .as_ref()
+                    .map(|attachment| attachment.att_id),
+                ResState::Ambiguous,
+            ),
             ResState::Unresolved => (None, None, ResState::Unresolved),
         };
 
@@ -640,13 +671,6 @@ impl<'a> Resolver<'a> {
 
         Ok(())
     }
-}
-
-/// Normalize a target key for resolution (NFC + default casefold).
-#[must_use]
-pub fn normalize_target_key(target: &str) -> String {
-    // For now, just lowercase. Proper implementation would use Unicode casefolding.
-    target.to_lowercase()
 }
 
 /// Extract the stem from a path (filename without extension).
@@ -790,7 +814,7 @@ mod tests {
             ),
         ] {
             conn.execute(
-                "INSERT INTO notes (note_id,path,path_native,path_key,stem_key,title,stable_id,content_hash,size,mtime_ns,scan_ns,generation) VALUES (?1,?2,?3,?2,?4,'',?5,X'00',0,0,0,0)",
+                "INSERT INTO notes (note_id,path,path_native,path_key,stem_key,title,stable_id,stable_id_key,content_hash,size,mtime_ns,scan_ns,generation) VALUES (?1,?2,?3,?2,?4,'',?5,?5,X'00',0,0,0,0)",
                 params![id, path, native, stem, stable],
             ).unwrap();
         }
@@ -818,6 +842,10 @@ mod tests {
                 .note_id,
             3
         );
+        let duplicate_id = resolver.resolve("shared", "id:shared", false, None);
+        assert_eq!(duplicate_id.note.unwrap().note_id, 1);
+        assert_eq!(duplicate_id.state, ResState::Resolved);
+        assert!(!duplicate_id.is_ambiguous);
         assert_eq!(
             resolver
                 .resolve("notes/one.md", "notes/one.md", false, None)

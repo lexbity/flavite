@@ -569,6 +569,24 @@ impl Flavite {
             .map_err(FlaviteError::IndexError)
     }
 
+    /// Resolve an editor link using the vault index's canonical resolver.
+    pub fn resolve_target(
+        &self,
+        target_key: impl Into<String>,
+        raw_target: impl Into<String>,
+        is_embed: bool,
+        source_path_key: Option<String>,
+    ) -> Result<flavite_index::resolver::Resolution, FlaviteError> {
+        self.session
+            .resolve_target(
+                target_key.into(),
+                raw_target.into(),
+                is_embed,
+                source_path_key,
+            )
+            .map_err(FlaviteError::IndexError)
+    }
+
     /// Read the versioned vault settings document through the API boundary.
     pub fn read_settings(&self) -> Result<Option<String>, FlaviteError> {
         let path = self.vault_ref.root.join(".flavite").join("settings.toml");

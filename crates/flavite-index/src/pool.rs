@@ -498,6 +498,39 @@ impl IndexActor {
         Ok(candidates)
     }
 
+    /// Resolve one editor link through the same resolver used by ingestion.
+    /// `source_path_key` is the folded vault-relative path of the source note.
+    ///
+    /// # Errors
+    /// Returns an error when SQLite cannot look up the source or refresh the
+    /// resolver's indexed candidate cache.
+    pub fn resolve_target(
+        &self,
+        target_key: &str,
+        raw_target: &str,
+        is_embed: bool,
+        source_path_key: Option<&str>,
+    ) -> Result<crate::resolver::Resolution, String> {
+        let conn = self.writer.conn();
+        let source_note_id = source_path_key
+            .map(|path_key| {
+                conn.query_row(
+                    "SELECT note_id FROM notes WHERE path_key=?1 ORDER BY path_key LIMIT 1",
+                    [path_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())
+            })
+            .transpose()?
+            .flatten();
+        let mut resolver = Resolver::new(conn);
+        resolver
+            .refresh_cache()
+            .map_err(|error| error.to_string())?;
+        Ok(resolver.resolve(target_key, raw_target, is_embed, source_note_id))
+    }
+
     /// List native path keys currently represented in the structural index.
     ///
     /// # Errors
@@ -603,45 +636,6 @@ impl IndexActor {
             && content_hash.is_none_or(|hash| old_hash.as_deref() == Some(hash.as_slice())))
     }
 
-    /// Insert or refresh one attachment row and advance structural generation.
-    ///
-    /// # Errors
-    /// Returns the underlying error text when a query fails, a generation or
-    /// size does not fit `i64`, or the transaction commit fails.
-    #[allow(clippy::too_many_arguments)]
-    pub fn apply_attachment(
-        &mut self,
-        path_native: &[u8],
-        path: &str,
-        path_key: &str,
-        stem_key: &str,
-        kind: crate::schema::AttachmentKind,
-        size: u64,
-        content_hash: Option<[u8; 32]>,
-        mtime_ns: i64,
-        scan_ns: i64,
-        hydrated: bool,
-    ) -> Result<u64, String> {
-        let conn = &mut self.writer.conn;
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        let generation = get_meta_u64(&tx, MetaKey::Generation)
-            .map_err(|e| e.to_string())?
-            .unwrap_or(0)
-            .saturating_add(1);
-        tx.execute("INSERT INTO attachments(path,path_native,path_key,stem_key,kind,mime,size,content_hash,width,height,mtime_ns,scan_ns,hydrated,generation) VALUES(?1,?2,?3,?4,?5,NULL,?6,?7,NULL,NULL,?8,?9,?10,?11) ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,kind=excluded.kind,size=excluded.size,content_hash=excluded.content_hash,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,hydrated=excluded.hydrated,generation=excluded.generation",
-            rusqlite::params![path, path_native, path_key, stem_key, kind.as_str(), i64::try_from(size).map_err(|e| e.to_string())?, content_hash.map(|hash| hash.to_vec()), mtime_ns, scan_ns, hydrated, i64::try_from(generation).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
-        let filename = Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(path)
-            .to_lowercase();
-        tx.execute("UPDATE links SET dst_note=NULL,dst_att=(SELECT MIN(att_id) FROM attachments WHERE stem_key=links.target_key OR lower(path)=links.target_key OR lower(path) LIKE '%/' || links.target_key),res_state=CASE WHEN (SELECT COUNT(*) FROM attachments WHERE stem_key=links.target_key OR lower(path)=links.target_key OR lower(path) LIKE '%/' || links.target_key)=1 THEN 'resolved' ELSE 'ambiguous' END WHERE kind='embed' AND (target_key=?1 OR target_key=?2 OR target_key=?3)", rusqlite::params![stem_key, filename, path_key]).map_err(|e| e.to_string())?;
-        crate::schema::set_meta(&tx, MetaKey::Generation, &generation.to_string())
-            .map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(generation)
-    }
-
     /// Check whether one native path key is already indexed.
     ///
     /// # Errors
@@ -684,7 +678,7 @@ impl IndexActor {
             .ok_or("index generation overflow")?;
         tx.execute("DELETE FROM notes WHERE note_id=?1", [note_id])
             .map_err(|e| e.to_string())?;
-        tx.execute("UPDATE notes SET id_conflict=CASE WHEN stable_id IS NOT NULL AND note_id<>(SELECT MIN(n2.note_id) FROM notes n2 WHERE n2.stable_id=notes.stable_id) THEN 1 ELSE 0 END", [])
+        tx.execute("UPDATE notes SET id_conflict=CASE WHEN stable_id_key IS NOT NULL AND path_key<>(SELECT MIN(n2.path_key) FROM notes n2 WHERE n2.stable_id_key=notes.stable_id_key) THEN 1 ELSE 0 END", [])
             .map_err(|error| error.to_string())?;
         tx.execute("DELETE FROM search_docs WHERE note_id=?1", [note_id])
             .map_err(|e| e.to_string())?;
@@ -910,7 +904,7 @@ impl IndexActor {
                 |row| row.get(0),
             )
             .map_err(|e| e.to_string())?;
-        tx.execute("UPDATE notes SET id_conflict=CASE WHEN stable_id IS NOT NULL AND note_id<>(SELECT MIN(n2.note_id) FROM notes n2 WHERE n2.stable_id=notes.stable_id) THEN 1 ELSE 0 END", [])
+        tx.execute("UPDATE notes SET id_conflict=CASE WHEN stable_id_key IS NOT NULL AND path_key<>(SELECT MIN(n2.path_key) FROM notes n2 WHERE n2.stable_id_key=notes.stable_id_key) THEN 1 ELSE 0 END", [])
             .map_err(|error| error.to_string())?;
         tx.execute("DELETE FROM links WHERE src = ?1", [note_id])
             .map_err(|e| e.to_string())?;
@@ -1960,13 +1954,13 @@ mod tests {
     }
 
     #[test]
-    fn saved_note_ids_and_attachment_ingest_resolve_live_links() {
+    fn attachment_ingest_single_path_resolves_non_ascii_embed_targets() {
         let (_dir, mut index) = searchable_index();
         index
             .apply_saved_note(
                 b"notes/source.md",
                 "notes/source.md",
-                b"---\nid: stable-1\n---\n![[diagram.png]] [[id:stable-1]]",
+                b"---\nid: stable-1\n---\n![[diagram.png]] ![[\xe5\x9b\xbe\xe8\xa1\xa8.png]] [[id:stable-1]]",
                 1,
                 1,
             )
@@ -1975,6 +1969,17 @@ mod tests {
             .apply_saved_attachment(
                 b"images/diagram.png",
                 "images/diagram.png",
+                Some(b"png-bytes"),
+                9,
+                1,
+                1,
+                true,
+            )
+            .unwrap();
+        index
+            .apply_saved_attachment(
+                "图像/图表.png".as_bytes(),
+                "图像/图表.png",
                 Some(b"png-bytes"),
                 9,
                 1,
@@ -1992,7 +1997,7 @@ mod tests {
             .unwrap();
         assert_eq!(id.as_deref(), Some("stable-1"));
         let resolved: i64 = connection.query_row("SELECT count(*) FROM links WHERE res_state='resolved' AND ((dst_att IS NOT NULL) OR (dst_note IS NOT NULL))", [], |row| row.get(0)).unwrap();
-        assert_eq!(resolved, 2);
+        assert_eq!(resolved, 3);
         let hash: Option<Vec<u8>> = connection
             .query_row(
                 "SELECT content_hash FROM attachments WHERE path='images/diagram.png'",
@@ -2010,6 +2015,96 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unresolved, 1);
+    }
+
+    #[test]
+    fn resolver_persists_ambiguous_winner_and_handles_folded_ids_and_suffixes() {
+        let (_dir, mut index) = searchable_index();
+        index
+            .apply_saved_note(
+                b"z/copy.md",
+                "z/copy.md",
+                "---\nid: Été\n---\n# Copy".as_bytes(),
+                1,
+                1,
+            )
+            .unwrap();
+        index
+            .apply_saved_note(
+                b"a/copy.md",
+                "a/copy.md",
+                "---\nid: E\u{301}té\n---\n# Copy".as_bytes(),
+                1,
+                1,
+            )
+            .unwrap();
+        index
+            .apply_saved_note(
+                b"folder/source.md",
+                "folder/source.md",
+                "[[id:ÉTÉ]] [[folder/idea]] [[idea]]".as_bytes(),
+                1,
+                1,
+            )
+            .unwrap();
+        index
+            .apply_saved_note(b"folder/idea.md", "folder/idea.md", b"# Local", 1, 1)
+            .unwrap();
+        index
+            .apply_saved_note(b"other/idea.md", "other/idea.md", b"# Other", 1, 1)
+            .unwrap();
+
+        let connection = index.writer().conn();
+        let id_target: (String, Option<i64>, bool) = connection
+            .query_row(
+                "SELECT res_state,dst_note,(SELECT id_conflict FROM notes WHERE note_id=dst_note) FROM links WHERE dst_raw='id:ÉTÉ'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, Option<bool>>(2)?.unwrap_or(false))),
+            )
+            .unwrap();
+        assert_eq!(id_target.0, "resolved");
+        let winner_path: String = connection
+            .query_row(
+                "SELECT path FROM notes WHERE note_id=?1",
+                [id_target.1.unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(winner_path, "a/copy.md");
+        assert!(!id_target.2);
+        let conflict_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM notes WHERE id_conflict=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(conflict_count, 1);
+
+        let suffix_target: String = connection
+            .query_row(
+                "SELECT n.path FROM links l JOIN notes n ON n.note_id=l.dst_note WHERE l.dst_raw='folder/idea'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(suffix_target, "folder/idea.md");
+        let ambiguous: (String, Option<i64>) = connection
+            .query_row(
+                "SELECT res_state,dst_note FROM links WHERE dst_raw='idea'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ambiguous.0, "ambiguous");
+        let picked: String = connection
+            .query_row(
+                "SELECT path FROM notes WHERE note_id=?1",
+                [ambiguous.1.unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(picked, "folder/idea.md");
     }
 
     #[test]
@@ -2080,6 +2175,18 @@ mod tests {
                 stmt.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap()
             };
             prop_assert_eq!(links(&incremental), links(&rebuilt));
+            let tantivy_docs = |index: &mut IndexActor| {
+                let mut docs = index
+                    .search_notes(&crate::query::Query::Text("value".into()), 100)
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|(_, path, title)| (path, title))
+                    .collect::<Vec<_>>();
+                docs.sort();
+                docs
+            };
+            prop_assert_eq!(tantivy_docs(&mut incremental), tantivy_docs(&mut rebuilt));
         });
     }
 

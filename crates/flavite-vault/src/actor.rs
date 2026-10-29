@@ -95,6 +95,14 @@ pub enum VaultActorMsg {
     },
     /// Read the indexed title/alias snapshot for editor autocomplete.
     CompletionCandidates { reply: Sender<VaultActorResp> },
+    /// Resolve one link through the index's canonical resolver.
+    ResolveTarget {
+        target_key: String,
+        raw_target: String,
+        is_embed: bool,
+        source_path_key: Option<String>,
+        reply: Sender<VaultActorResp>,
+    },
     /// Execute full-text or hybrid search through the index owner.
     SearchNotes {
         query: flavite_index::query::Query,
@@ -149,6 +157,8 @@ pub enum VaultActorResp {
     File(Option<Vec<u8>>),
     /// Indexed note completion candidates.
     CompletionCandidates(Result<Vec<flavite_index::types::CompletionCandidate>, String>),
+    /// Canonical link resolution verdict.
+    ResolveTarget(Result<flavite_index::resolver::Resolution, String>),
     /// Search results from the structural index and Tantivy.
     SearchNotes(Result<flavite_index::SearchPage, String>),
     /// Save completion after the structural index callback.
@@ -284,6 +294,31 @@ impl VaultActorHandle {
             VaultActorResp::CompletionCandidates(result) => result,
             VaultActorResp::Error(error) => Err(error),
             _ => Err("unexpected completion-candidate response".to_owned()),
+        }
+    }
+
+    /// Resolve one link using the index's canonical ranking and target rules.
+    pub fn resolve_target(
+        &self,
+        target_key: String,
+        raw_target: String,
+        is_embed: bool,
+        source_path_key: Option<String>,
+    ) -> Result<flavite_index::resolver::Resolution, String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::ResolveTarget {
+                target_key,
+                raw_target,
+                is_embed,
+                source_path_key,
+                reply,
+            })
+            .map_err(|error| error.to_string())?;
+        match response.recv().map_err(|error| error.to_string())? {
+            VaultActorResp::ResolveTarget(result) => result,
+            VaultActorResp::Error(error) => Err(error),
+            _ => Err("unexpected resolver response".to_owned()),
         }
     }
 
@@ -685,6 +720,21 @@ impl VaultActor {
             VaultActorMsg::CompletionCandidates { reply } => {
                 let response =
                     VaultActorResp::CompletionCandidates(self.index.completion_candidates());
+                let _ = reply.try_send(response);
+            }
+            VaultActorMsg::ResolveTarget {
+                target_key,
+                raw_target,
+                is_embed,
+                source_path_key,
+                reply,
+            } => {
+                let response = VaultActorResp::ResolveTarget(self.index.resolve_target(
+                    &target_key,
+                    &raw_target,
+                    is_embed,
+                    source_path_key.as_deref(),
+                ));
                 let _ = reply.try_send(response);
             }
             VaultActorMsg::SearchNotes {
@@ -1305,7 +1355,7 @@ impl VaultActor {
                 if entry.is_symlink {
                     continue;
                 }
-                let Some(kind) = attachment_kind(&entry.path) else {
+                let Some(_kind) = attachment_kind(&entry.path) else {
                     continue;
                 };
                 let Ok(relative) = entry.path.strip_prefix(&self.identity.root) else {
@@ -1364,25 +1414,21 @@ impl VaultActor {
                     continue;
                 }
                 let display = relative.to_string_lossy().replace('\\', "/");
-                let path_key = display.to_lowercase();
-                let stem_key = entry
-                    .path
-                    .file_stem()
-                    .map(|stem| stem.to_string_lossy().to_lowercase())
-                    .unwrap_or_default();
-                match self.index.apply_attachment(
+                let bytes = if hydrated && metadata.size <= hash_cap {
+                    self.fs.read_capped(&entry.path, hash_cap).ok()
+                } else {
+                    None
+                };
+                match self.index.apply_saved_attachment(
                     &key,
                     &display,
-                    &path_key,
-                    &stem_key,
-                    kind,
+                    bytes.as_deref(),
                     metadata.size,
-                    hash,
                     metadata.mtime_ns,
                     scan_ns,
                     hydrated,
                 ) {
-                    Ok(generation) => {
+                    Ok((_, generation)) => {
                         self.generation = Generation::new(generation);
                         if indexed.contains(&key) {
                             summary.changed = summary.changed.saturating_add(1);
