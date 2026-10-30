@@ -52,3 +52,8 @@ hex = "0.4"
 toml = "0.8"
 # Fuzzy matching (§4.7: command palette + quick switcher are in-memory nucleo)
 nucleo = "0.5"
+
+[patch.crates-io]
+iced_program = { path = "vendor/iced-accessibility/iced_program" }
+iced_runtime = { path = "vendor/iced-accessibility/iced_runtime" }
+iced_winit = { path = "vendor/iced-accessibility/iced_winit" }

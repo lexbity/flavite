@@ -4,6 +4,7 @@
 //! The graph view uses the wgpu shader widget in [`graph`]. The CPU-side
 //! model, layout, and spatial index live in `flavite-graph` (§4.1).
 
+pub mod accessibility;
 pub mod app;
 pub mod graph;
 pub mod operation;

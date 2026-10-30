@@ -12,8 +12,9 @@ use crate::viewport::{
 use cosmic_text::{Attrs, Buffer as ShapingBuffer, FontSystem, Metrics, Shaping};
 use flavite_api::BufferView;
 use flavite_syntax::SpanKind;
+use iced::advanced::input_method::InputMethod;
 use iced::advanced::{
-    Clipboard, Layout, Renderer as AdvancedRenderer, Shell, Widget,
+    Clipboard, Layout, Renderer as AdvancedRenderer, Shell, Widget, input_method,
     layout::{Limits, Node},
     mouse, renderer, text,
     text::Renderer as TextRenderer,
@@ -42,6 +43,7 @@ pub struct EditorWidget<'a, Message> {
     link_resolutions: HashMap<String, LinkResolution>,
     stable_links: bool,
     on_action: Box<dyn Fn(EditorAction) -> Message + 'a>,
+    on_interaction: Option<Box<dyn Fn(EditorInteractionSnapshot) -> Message + 'a>>,
     width: Length,
     height: Length,
     _message: PhantomData<Message>,
@@ -49,13 +51,14 @@ pub struct EditorWidget<'a, Message> {
 
 impl<'a, Message> EditorWidget<'a, Message> {
     /// Create an editor from the API's immutable revisioned view.
-    pub fn new(view: &'a BufferView, on_action: impl Fn(EditorAction) -> Message + 'a) -> Self {
+    pub fn new(view: &BufferView, on_action: impl Fn(EditorAction) -> Message + 'a) -> Self {
         Self {
             view: EditorView::from(view),
             candidates: Vec::new(),
             link_resolutions: HashMap::new(),
             stable_links: false,
             on_action: Box::new(on_action),
+            on_interaction: None,
             width: Length::Fill,
             height: Length::Fill,
             _message: PhantomData,
@@ -85,6 +88,17 @@ impl<'a, Message> EditorWidget<'a, Message> {
     #[must_use]
     pub fn with_stable_links(mut self, enabled: bool) -> Self {
         self.stable_links = enabled;
+        self
+    }
+
+    /// Publish acknowledged focus, caret, selection, and composition changes
+    /// to the host without copying document text into widget state.
+    #[must_use]
+    pub fn with_interaction(
+        mut self,
+        on_interaction: impl Fn(EditorInteractionSnapshot) -> Message + 'a,
+    ) -> Self {
+        self.on_interaction = Some(Box::new(on_interaction));
         self
     }
 
@@ -325,12 +339,219 @@ pub struct EditorState {
     caret: usize,
     anchor: usize,
     focused: bool,
+    ime_active: bool,
     selecting: bool,
     modifiers: Modifiers,
     autocomplete_start: Option<usize>,
     autocomplete_query: String,
     autocomplete_selected: usize,
     viewport: Viewport,
+    composition: Option<Composition>,
+}
+
+/// Host-visible per-view interaction state needed by accessibility and
+/// composition-aware workspace commands. The text itself remains owned by the
+/// revisioned buffer view and is not copied into widget state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditorInteractionSnapshot {
+    pub buffer_id: u64,
+    pub revision: u64,
+    pub caret: usize,
+    pub selection: (usize, usize),
+    pub focused: bool,
+    pub composing: bool,
+}
+
+/// Inspect the focused custom editor through iced's normal widget operation
+/// traversal. The result is absent when no editor currently owns focus.
+pub fn inspect_focused_editor()
+-> impl iced::advanced::widget::Operation<Option<EditorInteractionSnapshot>> {
+    struct Inspect(Option<EditorInteractionSnapshot>);
+
+    impl iced::advanced::widget::Operation<Option<EditorInteractionSnapshot>> for Inspect {
+        fn traverse(
+            &mut self,
+            operate: &mut dyn FnMut(
+                &mut dyn iced::advanced::widget::Operation<Option<EditorInteractionSnapshot>>,
+            ),
+        ) {
+            if self.0.is_none() {
+                operate(self);
+            }
+        }
+
+        fn custom(
+            &mut self,
+            _id: Option<&iced::advanced::widget::Id>,
+            _bounds: Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            let Some(state) = state.downcast_ref::<EditorState>() else {
+                return;
+            };
+            if !state.focused {
+                return;
+            }
+            let Some(buffer_id) = state.buffer_id else {
+                return;
+            };
+            let Some(revision) = state.revision else {
+                return;
+            };
+            self.0 = Some(EditorInteractionSnapshot {
+                buffer_id,
+                revision,
+                caret: state.caret,
+                selection: state.selection(),
+                focused: true,
+                composing: state.is_composing(),
+            });
+        }
+
+        fn finish(
+            &self,
+        ) -> iced::advanced::widget::operation::Outcome<Option<EditorInteractionSnapshot>> {
+            iced::advanced::widget::operation::Outcome::Some(self.0)
+        }
+    }
+
+    Inspect(None)
+}
+
+/// Set the focused editor's selection through iced's normal widget operation
+/// path. The byte offsets are validated by the host against the current text
+/// snapshot before this operation is dispatched.
+pub fn set_focused_editor_selection(
+    expected_buffer_id: u64,
+    expected_revision: u64,
+    anchor: usize,
+    focus: usize,
+) -> impl iced::advanced::widget::Operation<Option<EditorInteractionSnapshot>> {
+    struct SetSelection {
+        expected_buffer_id: u64,
+        expected_revision: u64,
+        anchor: usize,
+        focus: usize,
+        result: Option<EditorInteractionSnapshot>,
+    }
+
+    impl iced::advanced::widget::Operation<Option<EditorInteractionSnapshot>> for SetSelection {
+        fn traverse(
+            &mut self,
+            operate: &mut dyn FnMut(
+                &mut dyn iced::advanced::widget::Operation<Option<EditorInteractionSnapshot>>,
+            ),
+        ) {
+            if self.result.is_none() {
+                operate(self);
+            }
+        }
+
+        fn custom(
+            &mut self,
+            _id: Option<&iced::advanced::widget::Id>,
+            _bounds: Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            let Some(state) = state.downcast_mut::<EditorState>() else {
+                return;
+            };
+            if state.is_composing() {
+                return;
+            }
+            if state.buffer_id != Some(self.expected_buffer_id)
+                || state.revision != Some(self.expected_revision)
+            {
+                return;
+            }
+            state.anchor = self.anchor;
+            state.caret = self.focus;
+            state.focused = true;
+            state.ime_active = true;
+            self.result = state.interaction_snapshot();
+        }
+
+        fn finish(
+            &self,
+        ) -> iced::advanced::widget::operation::Outcome<Option<EditorInteractionSnapshot>> {
+            iced::advanced::widget::operation::Outcome::Some(self.result)
+        }
+    }
+
+    SetSelection {
+        expected_buffer_id,
+        expected_revision,
+        anchor,
+        focus,
+        result: None,
+    }
+}
+
+/// Focus the matching editor instance through iced's widget operation path.
+/// The host captures the buffer incarnation as a revision pair so a late
+/// native action cannot focus a replacement note in the same widget slot.
+pub fn focus_editor(
+    expected_buffer_id: u64,
+    expected_revision: u64,
+) -> impl iced::advanced::widget::Operation<Option<EditorInteractionSnapshot>> {
+    struct FocusEditor {
+        expected_buffer_id: u64,
+        expected_revision: u64,
+        result: Option<EditorInteractionSnapshot>,
+    }
+
+    impl iced::advanced::widget::Operation<Option<EditorInteractionSnapshot>> for FocusEditor {
+        fn traverse(
+            &mut self,
+            operate: &mut dyn FnMut(
+                &mut dyn iced::advanced::widget::Operation<Option<EditorInteractionSnapshot>>,
+            ),
+        ) {
+            if self.result.is_none() {
+                operate(self);
+            }
+        }
+
+        fn custom(
+            &mut self,
+            _id: Option<&iced::advanced::widget::Id>,
+            _bounds: Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            let Some(state) = state.downcast_mut::<EditorState>() else {
+                return;
+            };
+            if state.is_composing()
+                || state.buffer_id != Some(self.expected_buffer_id)
+                || state.revision != Some(self.expected_revision)
+            {
+                return;
+            }
+            state.focused = true;
+            state.ime_active = true;
+            self.result = state.interaction_snapshot();
+        }
+
+        fn finish(
+            &self,
+        ) -> iced::advanced::widget::operation::Outcome<Option<EditorInteractionSnapshot>> {
+            iced::advanced::widget::operation::Outcome::Some(self.result)
+        }
+    }
+
+    FocusEditor {
+        expected_buffer_id,
+        expected_revision,
+        result: None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Composition {
+    start: usize,
+    end: usize,
+    preedit: String,
+    selection: Option<std::ops::Range<usize>>,
 }
 
 impl EditorState {
@@ -344,6 +565,77 @@ impl EditorState {
     #[must_use]
     pub fn selection(&self) -> (usize, usize) {
         (self.caret.min(self.anchor), self.caret.max(self.anchor))
+    }
+
+    /// Whether an IME owns the current input sequence. Hosts use this to
+    /// refuse actions that would hide or replace a composing editor.
+    #[must_use]
+    pub fn is_composing(&self) -> bool {
+        self.composition.is_some()
+    }
+
+    fn interaction_snapshot(&self) -> Option<EditorInteractionSnapshot> {
+        Some(EditorInteractionSnapshot {
+            buffer_id: self.buffer_id?,
+            revision: self.revision?,
+            caret: self.caret,
+            selection: self.selection(),
+            focused: self.focused,
+            composing: self.is_composing(),
+        })
+    }
+
+    fn input_method_event(
+        &mut self,
+        view: &EditorView,
+        event: &input_method::Event,
+    ) -> Option<EditorAction> {
+        match event {
+            input_method::Event::Opened => {
+                self.ime_active = true;
+                let (start, end) = self.selection();
+                self.composition = Some(Composition {
+                    start,
+                    end,
+                    preedit: String::new(),
+                    selection: None,
+                });
+                None
+            }
+            input_method::Event::Preedit(preedit, selection) => {
+                let (start, end) = self.selection();
+                let composition = self.composition.get_or_insert_with(|| Composition {
+                    start,
+                    end,
+                    preedit: String::new(),
+                    selection: None,
+                });
+                composition.preedit.clone_from(preedit);
+                composition.selection.clone_from(selection);
+                None
+            }
+            input_method::Event::Commit(committed) => {
+                let composition = self.composition.take();
+                let (start, end) = composition
+                    .map(|composition| (composition.start, composition.end))
+                    .unwrap_or_else(|| self.selection());
+                if committed.is_empty() {
+                    return None;
+                }
+                self.caret = start + committed.len();
+                self.anchor = self.caret;
+                self.ensure_caret_visible(&view.text);
+                Some(EditorAction::replace(view, start, end, committed.clone()))
+            }
+            input_method::Event::Closed => {
+                self.composition = None;
+                // `Closed` ends this composition session, not editor focus.
+                // Keep requesting an input method while focused so switching
+                // back to an IME can open a new composition without requiring
+                // an extra click into the editor.
+                None
+            }
+        }
     }
 
     fn open_autocomplete(&mut self, start: usize) {
@@ -540,6 +832,50 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             Color::from_rgb(0.88, 0.90, 0.93),
             clip,
         );
+        if let Some(composition) = &state.composition
+            && !composition.preedit.is_empty()
+            && composition.start >= source_start
+            && composition.start <= source_start + visible_text.len()
+        {
+            let local_start = composition.start - source_start;
+            let (x, y) = caret_position(&runs, &visible_text, local_start);
+            let preedit_layout =
+                shape_text(&composition.preedit, (bounds.width - PAD_X * 2.0).max(1.0));
+            let preedit_width = preedit_layout
+                .layout_runs()
+                .map(|run| run.glyphs.iter().map(|glyph| glyph.w).sum::<f32>())
+                .fold(0.0_f32, f32::max);
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: Rectangle::new(
+                        Point::new(
+                            bounds.x + PAD_X + x,
+                            bounds.y + PAD_Y + y + LINE_HEIGHT - 2.0,
+                        ),
+                        Size::new(preedit_width.max(1.0), 1.5),
+                    ),
+                    border: Border::default(),
+                    ..renderer::Quad::default()
+                },
+                Background::Color(Color::from_rgb(0.98, 0.78, 0.35)),
+            );
+            renderer.fill_text(
+                text::Text {
+                    content: composition.preedit.clone(),
+                    bounds: Size::new((bounds.width - PAD_X * 2.0).max(1.0), LINE_HEIGHT),
+                    size: iced::Pixels(FONT_SIZE),
+                    line_height: text::LineHeight::Absolute(iced::Pixels(LINE_HEIGHT)),
+                    font: iced::Font::MONOSPACE,
+                    align_x: text::Alignment::Left,
+                    align_y: iced::alignment::Vertical::Top,
+                    shaping: text::Shaping::Advanced,
+                    wrapping: text::Wrapping::None,
+                },
+                Point::new(bounds.x + PAD_X + x, bounds.y + PAD_Y + y),
+                Color::from_rgb(1.0, 0.86, 0.55),
+                clip,
+            );
+        }
         if state.autocomplete_start.is_some() {
             let matches = match_candidates(&self.candidates, &state.autocomplete_query, 8);
             let has_create = !state.autocomplete_query.trim().is_empty();
@@ -649,6 +985,20 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             .reconcile(&self.view, &self.link_resolutions);
     }
 
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        _renderer: &iced::Renderer,
+        operation: &mut dyn iced::advanced::widget::Operation,
+    ) {
+        operation.custom(
+            None,
+            layout.bounds(),
+            tree.state.downcast_mut::<EditorState>(),
+        );
+    }
+
     fn update(
         &mut self,
         tree: &mut Tree,
@@ -662,6 +1012,19 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
     ) {
         let state = tree.state.downcast_mut::<EditorState>();
         match event {
+            iced::Event::InputMethod(input_event) if state.focused => {
+                if let Some(action) = state.input_method_event(&self.view, input_event) {
+                    self.emit(shell, action);
+                }
+                shell.capture_event();
+                shell.request_redraw();
+            }
+            iced::Event::Window(iced::window::Event::Unfocused) => {
+                state.focused = false;
+                state.ime_active = false;
+                state.composition = None;
+                shell.request_input_method::<&str>(&InputMethod::Disabled);
+            }
             iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 state.modifiers = *modifiers;
             }
@@ -682,6 +1045,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                         return;
                     }
                     state.focused = true;
+                    state.ime_active = true;
                     state.selecting = true;
                     state.place_caret_from_point(
                         &self.view.text,
@@ -693,7 +1057,9 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     shell.capture_event();
                 } else {
                     state.focused = false;
+                    state.ime_active = false;
                     state.selecting = false;
+                    state.composition = None;
                 }
             }
             iced::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.selecting => {
@@ -743,11 +1109,36 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 text,
                 ..
             }) if state.focused
+                && state.composition.is_none()
                 && self.execute_key(state, key, *modifiers, text.as_deref(), clipboard, shell) =>
             {
                 shell.capture_event();
             }
             _ => {}
+        }
+        if state.focused && state.ime_active {
+            let (visible, source_start) = visible_text(&self.view.text, state.viewport);
+            let layout_text = shape_text(&visible, (layout.bounds().width - PAD_X * 2.0).max(1.0));
+            let runs = layout_text.layout_runs().collect::<Vec<_>>();
+            let caret = state.caret.saturating_sub(source_start).min(visible.len());
+            let (x, y) = caret_position(&runs, &visible, caret);
+            shell.request_input_method(&InputMethod::Enabled {
+                cursor: Rectangle::new(
+                    Point::new(layout.bounds().x + PAD_X + x, layout.bounds().y + PAD_Y + y),
+                    Size::new(1.0, LINE_HEIGHT),
+                ),
+                purpose: input_method::Purpose::Normal,
+                // The widget paints preedit inline itself. Sending a runtime
+                // preedit as well would draw a second over-the-spot copy.
+                preedit: None::<input_method::Preedit<&str>>,
+            });
+        } else {
+            shell.request_input_method::<&str>(&InputMethod::Disabled);
+        }
+        if let Some(on_interaction) = &self.on_interaction
+            && let Some(snapshot) = state.interaction_snapshot()
+        {
+            shell.publish(on_interaction(snapshot));
         }
     }
 
@@ -942,6 +1333,189 @@ fn caret_position(runs: &[cosmic_text::LayoutRun<'_>], text: &str, byte: usize) 
 mod tests {
     use super::*;
     use flavite_syntax::text::{Span, TextByte};
+    use iced::advanced::widget::Operation as _;
+
+    #[test]
+    fn ime_preedit_is_transient_and_commit_emits_one_edit() {
+        let view = EditorView::from(&test_view("hello", 12));
+        let mut state = EditorState {
+            caret: 2,
+            anchor: 2,
+            ..EditorState::default()
+        };
+        assert_eq!(
+            state.input_method_event(&view, &input_method::Event::Opened),
+            None
+        );
+        assert_eq!(
+            state.input_method_event(
+                &view,
+                &input_method::Event::Preedit("にほん".into(), Some(0..9)),
+            ),
+            None
+        );
+        assert!(state.is_composing());
+        assert_eq!(state.composition.as_ref().unwrap().preedit, "にほん");
+        // winit clears preedit immediately before its commit event. That clear
+        // must not end the composition or lose the captured replacement span.
+        assert_eq!(
+            state.input_method_event(&view, &input_method::Event::Preedit(String::new(), None)),
+            None
+        );
+        let action = state
+            .input_method_event(&view, &input_method::Event::Commit("日本語".into()))
+            .expect("one committed edit");
+        assert_eq!(action.expected_revision, view.revision);
+        assert_eq!(action.edits.len(), 1);
+        assert_eq!(action.edits[0].range, Span::new(TextByte(2), TextByte(2)));
+        assert_eq!(action.edits[0].replacement, "日本語");
+        assert_eq!(state.caret(), 2 + "日本語".len());
+        assert!(!state.is_composing());
+    }
+
+    #[test]
+    fn cancelled_ime_composition_never_changes_the_document() {
+        let view = EditorView::from(&test_view("hello", 12));
+        let mut state = EditorState {
+            caret: 3,
+            anchor: 3,
+            focused: true,
+            ime_active: true,
+            ..EditorState::default()
+        };
+        state.input_method_event(&view, &input_method::Event::Opened);
+        state.input_method_event(
+            &view,
+            &input_method::Event::Preedit("pinyin".into(), Some(0..6)),
+        );
+        assert!(state.is_composing());
+        assert_eq!(
+            state.input_method_event(&view, &input_method::Event::Closed),
+            None
+        );
+        assert!(!state.is_composing());
+        assert!(state.ime_active);
+        assert_eq!(state.caret(), 3);
+
+        // Switching the input method back on while the editor retains focus
+        // must start a new composition without a second pointer click.
+        state.input_method_event(&view, &input_method::Event::Opened);
+        state.input_method_event(
+            &view,
+            &input_method::Event::Preedit("かな".into(), Some(0..2)),
+        );
+        assert!(state.is_composing());
+        let committed = state
+            .input_method_event(&view, &input_method::Event::Commit("仮名".into()))
+            .expect("reopened IME commits through one guarded edit");
+        assert_eq!(committed.edits.len(), 1);
+        assert_eq!(
+            committed.edits[0].range,
+            Span::new(TextByte(3), TextByte(3))
+        );
+        assert_eq!(committed.edits[0].replacement, "仮名");
+        assert_eq!(state.caret(), 3 + "仮名".len());
+        assert!(!state.is_composing());
+    }
+
+    #[test]
+    fn host_operation_observes_the_focused_editor_caret_and_composition() {
+        let view = EditorView::from(&test_view("text", 12));
+        let mut state = EditorState {
+            buffer_id: Some(view.buffer_id),
+            revision: Some(view.revision),
+            caret: 2,
+            anchor: 1,
+            focused: true,
+            composition: Some(Composition {
+                start: 2,
+                end: 2,
+                preedit: "かな".into(),
+                selection: None,
+            }),
+            ..EditorState::default()
+        };
+        let mut operation = inspect_focused_editor();
+        operation.custom(None, Rectangle::with_size(Size::ZERO), &mut state);
+        match operation.finish() {
+            iced::advanced::widget::operation::Outcome::Some(Some(snapshot)) => {
+                assert_eq!(snapshot.buffer_id, view.buffer_id);
+                assert_eq!(snapshot.revision, view.revision);
+                assert_eq!(snapshot.caret, 2);
+                assert_eq!(snapshot.selection, (1, 2));
+                assert!(snapshot.focused);
+                assert!(snapshot.composing);
+            }
+            _ => panic!("focused editor snapshot was not returned"),
+        }
+    }
+
+    #[test]
+    fn accessibility_selection_operation_updates_live_editor_and_blocks_ime() {
+        let view = EditorView::from(&test_view("text", 12));
+        let mut state = EditorState {
+            buffer_id: Some(view.buffer_id),
+            revision: Some(view.revision),
+            caret: 2,
+            anchor: 2,
+            focused: false,
+            ..EditorState::default()
+        };
+        let mut operation = set_focused_editor_selection(view.buffer_id, view.revision, 1, 4);
+        operation.custom(None, Rectangle::with_size(Size::ZERO), &mut state);
+        assert_eq!(state.selection(), (1, 4));
+        assert!(state.focused);
+        assert!(matches!(
+            operation.finish(),
+            iced::advanced::widget::operation::Outcome::Some(Some(snapshot))
+                if snapshot.caret == 4 && snapshot.selection == (1, 4)
+        ));
+
+        state.composition = Some(Composition {
+            start: 0,
+            end: 0,
+            preedit: "かな".into(),
+            selection: None,
+        });
+        let mut blocked = set_focused_editor_selection(view.buffer_id, view.revision, 0, 0);
+        blocked.custom(None, Rectangle::with_size(Size::ZERO), &mut state);
+        assert_eq!(state.selection(), (1, 4));
+        assert!(matches!(
+            blocked.finish(),
+            iced::advanced::widget::operation::Outcome::Some(None)
+        ));
+    }
+
+    #[test]
+    fn accessibility_focus_operation_is_bound_to_buffer_revision() {
+        let view = EditorView::from(&test_view("text", 12));
+        let mut state = EditorState {
+            buffer_id: Some(view.buffer_id),
+            revision: Some(view.revision),
+            caret: 3,
+            anchor: 1,
+            focused: false,
+            ..EditorState::default()
+        };
+        let mut stale = focus_editor(view.buffer_id, view.revision + 1);
+        stale.custom(None, Rectangle::with_size(Size::ZERO), &mut state);
+        assert!(!state.focused);
+        assert!(matches!(
+            stale.finish(),
+            iced::advanced::widget::operation::Outcome::Some(None)
+        ));
+
+        let mut current = focus_editor(view.buffer_id, view.revision);
+        current.custom(None, Rectangle::with_size(Size::ZERO), &mut state);
+        assert!(state.focused);
+        assert!(state.ime_active);
+        assert_eq!(state.selection(), (1, 3));
+        assert!(matches!(
+            current.finish(),
+            iced::advanced::widget::operation::Outcome::Some(Some(snapshot))
+                if snapshot.buffer_id == view.buffer_id && snapshot.revision == view.revision
+        ));
+    }
 
     #[test]
     fn keymap_respects_platform_command_modifiers_and_text() {

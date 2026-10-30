@@ -13,6 +13,7 @@ use crate::subscription;
 use flavite_api::{
     BufferView, ExecutionResult, Flavite, Invocation, LocalResult, Origin, VaultConfig,
 };
+use flavite_editor::{EditorAction, EditorInteractionSnapshot, EditorWidget};
 use iced::widget::{
     Space, button, column, container, opaque, row, rule, scrollable, stack, text, text_input,
 };
@@ -33,16 +34,27 @@ pub struct App {
     settings: Settings,
     settings_dirty: bool,
     settings_valid: bool,
+    window_size: iced::Size,
     status: String,
     recent_events: Vec<String>,
     operations: OperationPump,
     active_buffer: Option<u64>,
+    editor_interaction: Option<EditorInteractionSnapshot>,
     reconcile_progress: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Navigate(Pane),
+    Edit(EditorAction),
+    EditorInteraction(EditorInteractionSnapshot),
+    EditorFocusRequested,
+    EditorSelectionRequested {
+        revision: u64,
+        anchor: usize,
+        focus: usize,
+    },
+    EditorSelectionAcknowledged(Option<EditorInteractionSnapshot>),
     Keyboard(keyboard::Event),
     PaletteOpen,
     PaletteClose,
@@ -69,9 +81,34 @@ impl App {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("LATTICE_VAULT").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("target/ui-visual/app-vault"));
-        let mut app = Self {
+        Self::boot_from_root(root)
+    }
+
+    /// Construct the shell against an explicit vault root. Examples and
+    /// integration harnesses use this to avoid process-global path state.
+    pub fn boot_from_root(root: PathBuf) -> Self {
+        let mut app = Self::empty_at(root.clone());
+        match Flavite::open_root(root, VaultConfig::default()) {
+            Ok(flavite) => app.attach_vault(flavite),
+            Err(error) => app.status = format!("Vault unavailable: {error}"),
+        }
+        app
+    }
+
+    /// Build the shell around an already-authorized Session facade. This is
+    /// also the fixture seam used by integration tests with an isolated Fs.
+    pub fn from_flavite(flavite: Flavite) -> Self {
+        let root = flavite.vault_ref().root.clone();
+        let mut app = Self::empty_at(root);
+        app.attach_vault(flavite);
+        app
+    }
+
+    fn empty_at(root: PathBuf) -> Self {
+        let status = format!("Opening {}…", root.display());
+        Self {
             flavite: None,
-            root: root.clone(),
+            root,
             pane: Pane::Workspace,
             palette_open: false,
             palette_query: String::new(),
@@ -79,37 +116,77 @@ impl App {
             settings: Settings::default(),
             settings_dirty: false,
             settings_valid: true,
-            status: format!("Opening {}…", root.display()),
+            window_size: iced::Size::new(1180.0, 760.0),
+            status,
             recent_events: Vec::new(),
             operations: OperationPump::default(),
             active_buffer: None,
+            editor_interaction: None,
             reconcile_progress: None,
-        };
-        match Flavite::open_root(root, VaultConfig::default()) {
-            Ok(flavite) => {
-                app.root = flavite.vault_ref().root.clone();
-                app.settings = match flavite.read_settings() {
-                    Ok(contents) => Settings::parse(contents.as_deref()).unwrap_or_else(|error| {
-                        app.settings_valid = false;
-                        app.status =
-                            format!("Settings could not be parsed; saving is disabled: {error}");
-                        Settings::default()
-                    }),
-                    Err(error) => {
-                        app.settings_valid = false;
-                        app.status = format!("Settings could not be read: {error}");
-                        Settings::default()
-                    }
-                };
-                app.flavite = Some(flavite);
-                if app.settings_valid {
-                    app.status = "Vault ready".into();
-                }
-                app.run_command("note.open");
-            }
-            Err(error) => app.status = format!("Vault unavailable: {error}"),
         }
-        app
+    }
+
+    fn attach_vault(&mut self, flavite: Flavite) {
+        self.root = flavite.vault_ref().root.clone();
+        self.settings = match flavite.read_settings() {
+            Ok(contents) => Settings::parse(contents.as_deref()).unwrap_or_else(|error| {
+                self.settings_valid = false;
+                self.status = format!("Settings could not be parsed; saving is disabled: {error}");
+                Settings::default()
+            }),
+            Err(error) => {
+                self.settings_valid = false;
+                self.status = format!("Settings could not be read: {error}");
+                Settings::default()
+            }
+        };
+        self.flavite = Some(flavite);
+        if self.settings_valid {
+            self.status = "Vault ready".into();
+        }
+        self.run_command("note.open");
+    }
+
+    /// Return a fresh semantic snapshot of the current shell document. This
+    /// is deliberately derived from the Session view on each publication;
+    /// assistive technology never receives a stale copy owned by the widget.
+    pub fn accessibility_document(&self) -> (String, String, Option<EditorInteractionSnapshot>) {
+        let title = self
+            .active_buffer
+            .and_then(|buffer| {
+                self.flavite
+                    .as_ref()?
+                    .get_buffer_view(buffer.into(), None)
+                    .ok()
+                    .map(|view| view.path.display().to_string())
+            })
+            .unwrap_or_else(|| format!("{:?}", self.pane));
+        let contents = self
+            .active_buffer
+            .and_then(|buffer| {
+                self.flavite
+                    .as_ref()?
+                    .get_buffer_view(buffer.into(), None)
+                    .ok()
+                    .map(|view| view.text)
+            })
+            .unwrap_or_else(|| self.status.clone());
+        let interaction = self.editor_interaction.filter(|snapshot| {
+            self.pane == Pane::Editor && self.active_buffer == Some(snapshot.buffer_id)
+        });
+        (title, contents, interaction)
+    }
+
+    /// Current legacy shell destination, projected only for its navigation
+    /// tabs while W02 replaces this shell with the workspace model.
+    pub fn accessibility_pane(&self) -> Pane {
+        self.pane
+    }
+
+    /// Current logical window size, used to keep native accessibility bounds
+    /// aligned with the shell after resize events.
+    pub fn accessibility_window_size(&self) -> iced::Size {
+        self.window_size
     }
 
     /// Bridge vault channels and operation replies without coupling completion to presentation.
@@ -136,8 +213,81 @@ impl App {
                     self.status = format!("Vault focus reconcile failed: {error}");
                 }
             }
+            Message::WindowEvent(iced::window::Event::Unfocused) => {
+                self.editor_interaction = None;
+            }
+            Message::WindowEvent(iced::window::Event::Resized(size)) => {
+                self.window_size = size;
+            }
             Message::WindowEvent(_) => {}
-            Message::Navigate(pane) => self.pane = pane,
+            Message::Navigate(pane) => {
+                self.pane = pane;
+                self.editor_interaction = None;
+            }
+            Message::Edit(action) => self.apply_editor_action(action),
+            Message::EditorInteraction(snapshot) => {
+                if self.pane == Pane::Editor && self.active_buffer == Some(snapshot.buffer_id) {
+                    self.editor_interaction = Some(snapshot);
+                }
+            }
+            Message::EditorFocusRequested => {
+                let Some(buffer_id) = self.active_buffer else {
+                    self.status = "Open a note before focusing the editor.".into();
+                    return iced::Task::none();
+                };
+                let Some(view) = self
+                    .flavite
+                    .as_ref()
+                    .and_then(|flavite| flavite.get_buffer_view(buffer_id.into(), None).ok())
+                else {
+                    self.status = "The current editor view is unavailable.".into();
+                    return iced::Task::none();
+                };
+                return iced_runtime::task::widget(flavite_editor::focus_editor(
+                    buffer_id,
+                    view.revision,
+                ))
+                .map(Message::EditorSelectionAcknowledged);
+            }
+            Message::EditorSelectionRequested {
+                revision,
+                anchor,
+                focus,
+            } => {
+                let active_buffer = self.active_buffer;
+                let valid = active_buffer
+                    .zip(self.editor_interaction)
+                    .filter(|(buffer, interaction)| {
+                        *buffer == interaction.buffer_id && interaction.revision == revision
+                    })
+                    .and_then(|(buffer, _)| {
+                        self.flavite
+                            .as_ref()?
+                            .get_buffer_view(buffer.into(), None)
+                            .ok()
+                    })
+                    .is_some_and(|view| {
+                        anchor <= view.text.len()
+                            && focus <= view.text.len()
+                            && view.text.is_char_boundary(anchor)
+                            && view.text.is_char_boundary(focus)
+                    });
+                if valid && let Some(buffer_id) = active_buffer {
+                    return iced_runtime::task::widget(
+                        flavite_editor::set_focused_editor_selection(
+                            buffer_id, revision, anchor, focus,
+                        ),
+                    )
+                    .map(Message::EditorSelectionAcknowledged);
+                }
+            }
+            Message::EditorSelectionAcknowledged(Some(snapshot)) => {
+                self.editor_interaction = Some(snapshot);
+            }
+            Message::EditorSelectionAcknowledged(None) => {
+                self.status =
+                    "Accessibility selection could not be applied to the current editor.".into();
+            }
             Message::PaletteOpen => {
                 self.palette_open = true;
                 self.palette_selected = 0;
@@ -498,13 +648,20 @@ impl App {
                         .padding(chip_padding()),
                 ]
                 .spacing(style::SPACING_SM);
-                let body = container(scrollable(
-                    text(view.text).font(Font::MONOSPACE).size(style::TEXT),
-                ))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .padding(style::SPACING)
-                .style(style::card);
+                let body: Element<'_, Message> = if read_mode {
+                    container(scrollable(
+                        text(view.text).font(Font::MONOSPACE).size(style::TEXT),
+                    ))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .padding(style::SPACING)
+                    .style(style::card)
+                    .into()
+                } else {
+                    EditorWidget::new(&view, Message::Edit)
+                        .with_interaction(Message::EditorInteraction)
+                        .into()
+                };
                 container(column![meta, body].spacing(style::SPACING))
                     .width(Length::Fill)
                     .height(Length::Fill)
@@ -515,6 +672,29 @@ impl App {
             Err(error) => {
                 self.placeholder_view("Document", &format!("Buffer view unavailable: {error}"))
             }
+        }
+    }
+
+    fn apply_editor_action(&mut self, action: EditorAction) {
+        let Some(flavite) = &self.flavite else {
+            self.status = "The vault is unavailable".into();
+            return;
+        };
+        let buffer_id = action.buffer_id;
+        if action.navigation.is_some() {
+            self.status = "Link navigation is unavailable in this editor view".into();
+            return;
+        }
+        let result = flavite.execute_session(action.into_session_command());
+        self.status = match result {
+            flavite_api::session::SessionResult::Success(_) => "Editing".into(),
+            other => format!("Edit failed: {other:?}"),
+        };
+        if let Ok(view) = flavite.get_buffer_view(buffer_id.into(), None) {
+            if self.active_buffer != Some(view.buffer_id) {
+                self.editor_interaction = None;
+            }
+            self.active_buffer = Some(view.buffer_id);
         }
     }
 
@@ -768,12 +948,17 @@ impl App {
                         _ => format!("{command_id} completed"),
                     };
                     if command_id == "note.open" {
-                        self.active_buffer = success
+                        let opened = success
                             .data
                             .get("buffer_id")
                             .and_then(serde_json::Value::as_u64);
+                        if self.active_buffer != opened {
+                            self.editor_interaction = None;
+                        }
+                        self.active_buffer = opened;
                     } else if command_id == "note.close" {
                         self.active_buffer = None;
+                        self.editor_interaction = None;
                     }
                 }
                 LocalResult::Error(error) => {
@@ -945,10 +1130,12 @@ mod tests {
             settings: Settings::default(),
             settings_dirty: false,
             settings_valid: true,
+            window_size: iced::Size::new(1180.0, 760.0),
             status: "Ready".into(),
             recent_events: Vec::new(),
             operations: OperationPump::default(),
             active_buffer: None,
+            editor_interaction: None,
             reconcile_progress: None,
         }
     }
@@ -1133,6 +1320,57 @@ mod tests {
             .unwrap()
             .get_buffer_view(gui_buffer.into(), None)
             .unwrap();
+        app.pane = Pane::Editor;
+        app.editor_interaction = Some(EditorInteractionSnapshot {
+            buffer_id: gui_view.buffer_id,
+            revision: gui_view.revision,
+            caret: 2,
+            selection: (2, 2),
+            focused: true,
+            composing: false,
+        });
+        let action = accesskit::ActionRequest {
+            action: accesskit::Action::SetTextSelection,
+            target_tree: accesskit::TreeId::ROOT,
+            target_node: crate::accessibility::tree::EDITOR,
+            data: Some(accesskit::ActionData::SetTextSelection(
+                accesskit::TextSelection {
+                    anchor: accesskit::TextPosition {
+                        node: crate::accessibility::tree::EDITOR_TEXT,
+                        character_index: 2,
+                    },
+                    focus: accesskit::TextPosition {
+                        node: crate::accessibility::tree::EDITOR_TEXT,
+                        character_index: 8,
+                    },
+                },
+            )),
+        };
+        match crate::accessibility::route_action(&app, action).unwrap() {
+            Message::EditorSelectionRequested {
+                revision,
+                anchor,
+                focus,
+            } => {
+                assert_eq!(revision, gui_view.revision);
+                assert_eq!((anchor, focus), (2, 8));
+            }
+            _ => panic!("native selection must use the editor message path"),
+        }
+        let edit = EditorAction::replace(
+            &flavite_editor::EditorView::from(&gui_view),
+            gui_view.text.len(),
+            gui_view.text.len(),
+            " from shell editor".into(),
+        );
+        app.apply_editor_action(edit);
+        let edited_gui_view = app
+            .flavite
+            .as_ref()
+            .unwrap()
+            .get_buffer_view(gui_buffer.into(), None)
+            .unwrap();
+        assert!(edited_gui_view.text.ends_with(" from shell editor"));
 
         let (cli_flavite, cli_root, _cli_cache) = fixture("cli");
         let request_id = cli_flavite.command_registry().next_request_id();

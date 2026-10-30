@@ -74,6 +74,8 @@ active = [
     # B7 - Card layer uses API and buffer for production wiring
     { from = "flavite-ui", to = "flavite-api" },
     { from = "flavite-ui", to = "flavite-buffer" },
+    # W01 - the actual shell hosts the custom editor widget.
+    { from = "flavite-ui", to = "flavite-editor" },
     # Headless-only dev dependencies for the app pump event adapter test.
     { from = "flavite-ui", to = "flavite-fs" },
     { from = "flavite-ui", to = "flavite-index" },
@@ -107,6 +109,10 @@ ui_crates = ["flavite-editor", "flavite-ui"]
 # External deps tracked as nodes in the crate graph (§10.2).
 names = [
     "iced",
+    "iced_runtime",
+    "iced_winit",
+    "accesskit",
+    "accesskit_winit",
     "winit",
     "wgpu",
     "cosmic-text",

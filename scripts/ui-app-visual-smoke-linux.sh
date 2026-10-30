@@ -82,6 +82,7 @@ fi
 palette_opened=false
 for _ in $(seq 1 3); do
     xdotool windowactivate --sync "$window_id"
+    xdotool windowfocus --sync "$window_id"
     sleep 0.5
     xdotool key --clearmodifiers ctrl+p
     sleep 0.5

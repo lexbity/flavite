@@ -1,6 +1,10 @@
 {
   "nodes": [
     {
+      "id": "accesskit",
+      "kind": "external"
+    },
+    {
       "id": "blake3",
       "kind": "external"
     },
@@ -50,6 +54,14 @@
     },
     {
       "id": "iced",
+      "kind": "external"
+    },
+    {
+      "id": "iced_runtime",
+      "kind": "external"
+    },
+    {
+      "id": "iced_winit",
       "kind": "external"
     },
     {
@@ -264,12 +276,22 @@
     },
     {
       "from": "flavite-ui",
+      "to": "accesskit",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
       "to": "flavite-api",
       "kind": "normal"
     },
     {
       "from": "flavite-ui",
       "to": "flavite-buffer",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "flavite-editor",
       "kind": "normal"
     },
     {
@@ -295,6 +317,16 @@
     {
       "from": "flavite-ui",
       "to": "iced",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "iced_runtime",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "iced_winit",
       "kind": "normal"
     },
     {

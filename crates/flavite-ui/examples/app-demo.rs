@@ -1,23 +1,11 @@
 //! Visual demonstration of the D1 Flavite application shell.
 
-use flavite_ui::app::App;
-use flavite_ui::style;
-use iced::{Size, application, window};
+use flavite_ui::accessibility::program::FlaviteProgram;
 use std::path::PathBuf;
 
-fn main() -> iced::Result {
+fn main() -> Result<(), iced_winit::Error> {
     prepare_demo_vault();
-    application(App::boot, App::update, App::view)
-        .title("Flavite")
-        .theme(style::THEME)
-        .subscription(App::subscription)
-        .window_size(Size::new(1180.0, 760.0))
-        .window(window::Settings {
-            min_size: Some(Size::new(940.0, 620.0)),
-            ..window::Settings::default()
-        })
-        .centered()
-        .run()
+    iced_winit::run(FlaviteProgram)
 }
 
 fn prepare_demo_vault() {

@@ -101,10 +101,14 @@ Normal/build:
 
 Normal/build:
 
+- `accesskit` (normal)
 - `flavite-api` (normal)
 - `flavite-buffer` (normal)
+- `flavite-editor` (normal)
 - `flavite-graph` (normal)
 - `iced` (normal)
+- `iced_runtime` (normal)
+- `iced_winit` (normal)
 - `nucleo` (normal)
 
 Dev-only:
@@ -143,9 +147,12 @@ Normal/build:
 
 ## First-party external dependencies
 
+- `accesskit` ← flavite-ui
 - `blake3` ← flavite-api, flavite-buffer, flavite-fs, flavite-index, flavite-vault, xtask
 - `cosmic-text` ← flavite-editor, xtask
 - `iced` ← flavite-editor, flavite-ui, xtask
+- `iced_runtime` ← flavite-ui
+- `iced_winit` ← flavite-ui
 - `notify` ← flavite-fs, flavite-fs, xtask
 - `nucleo` ← flavite-ui
 - `nucleo-matcher` ← flavite-editor

@@ -58,6 +58,9 @@ rusqlite = { workspace = true, features = ["bundled"] }
 # the same way production will (§4.3), so batch-apply cost includes it.
 blake3 = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [target."cfg(unix)".dependencies]
 libc = "0.2"
 
