@@ -1043,7 +1043,15 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
     }
 
     fn state(&self) -> iced::advanced::widget::tree::State {
-        iced::advanced::widget::tree::State::new(EditorState::default())
+        let mut state = EditorState {
+            view_key: self.view_key,
+            ..EditorState::default()
+        };
+        state.reconcile(&self.view, &self.link_resolutions);
+        if let Some(interaction) = self.initial_interaction {
+            state.restore_interaction(&self.view.text, interaction);
+        }
+        iced::advanced::widget::tree::State::new(state)
     }
 
     fn diff(&self, tree: &mut Tree) {

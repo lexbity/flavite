@@ -411,6 +411,14 @@ fn solver_projection_clamps_and_previews_without_rewriting_desired_ratios() {
 fn pointer_edge_drop_moves_exact_tab_and_stale_drag_cannot_commit() {
     let Fixture { mut app, .. } = fixture();
     let (alpha, buffer) = open_note(&mut app, "alpha.md");
+    let _ = app.update(Message::AccessibleSelection {
+        tab: alpha,
+        incarnation: app.notes.incarnation(alpha).unwrap(),
+        revision: app.note_editor_view(alpha).unwrap().revision,
+        anchor: 1,
+        head: 1,
+    });
+    let target = app.workspace.writing_target().unwrap();
     open_note(&mut app, "beta.md");
     let group = app.focused_group().unwrap();
     let rect = iced::Rectangle {
@@ -436,6 +444,12 @@ fn pointer_edge_drop_moves_exact_tab_and_stale_drag_cannot_commit() {
     )));
     assert_eq!(app.workspace.groups().count(), 2);
     assert_eq!(app.notes.state(&alpha).unwrap().buffer, Some(buffer));
+    assert_eq!(app.workspace.document_anchor(), Some(alpha));
+    assert_eq!(
+        app.workspace.writing_target(),
+        Some(target),
+        "moving a source must preserve its insertion authority"
+    );
     let _ = app.update(Message::TabPressed(alpha));
     let _ = app.update(Message::Mouse(iced::mouse::Event::CursorMoved {
         position: iced::Point::new(100.0, 200.0),

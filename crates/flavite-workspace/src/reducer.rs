@@ -429,6 +429,25 @@ impl WorkspaceState {
             return Err("interaction revision is stale");
         }
         let focused = interaction.focused;
+        // Blur/scroll acknowledgements may advance the interaction sequence
+        // without changing the remembered caret. Preserve existing authority
+        // only when every text/view guard still matches; never create it here.
+        let retained_target = self
+            .writing_target
+            .filter(|target| {
+                target.tab == tab
+                    && target.incarnation == interaction.incarnation
+                    && Some(target.buffer_id) == interaction.buffer_id
+                    && target.revision == interaction.revision
+                    && target.interaction_sequence == current.interaction().sequence
+                    && interaction.composition == crate::input::CompositionState::Idle
+                    && interaction.selections
+                        == [crate::input::Selection::caret(target.caret_text_byte)]
+            })
+            .map(|mut target| {
+                target.interaction_sequence = interaction.sequence;
+                target
+            });
         let target = if focused
             && interaction.composition == crate::input::CompositionState::Idle
             && interaction.selections.len() == 1
@@ -454,6 +473,8 @@ impl WorkspaceState {
         if focused {
             self.document_anchor = Some(tab);
             self.writing_target = target;
+        } else if self.writing_target.is_some_and(|target| target.tab == tab) {
+            self.writing_target = retained_target;
         }
         Ok(())
     }
@@ -465,6 +486,12 @@ impl WorkspaceState {
             if Some(*tab) != except && view.interaction().focused {
                 let mut interaction = view.interaction().clone();
                 interaction.focused = false;
+                if let Some(target) = self.writing_target.as_mut()
+                    && target.tab == *tab
+                    && target.interaction_sequence == interaction.sequence
+                {
+                    target.interaction_sequence = interaction.sequence.saturating_add(1);
+                }
                 interaction.sequence = interaction.sequence.saturating_add(1);
                 view.set_interaction(interaction);
             }
@@ -649,16 +676,20 @@ impl WorkspaceState {
             group_state.remove(tab).is_none()
         };
         self.tabs.remove(&tab);
+        if became_empty {
+            self.remove_group_collapse(group)?;
+        }
+        Ok(group)
+    }
+
+    /// Closing destroys a source identity; moving only detaches membership.
+    fn forget_source(&mut self, tab: TabId) {
         if self.document_anchor == Some(tab) {
             self.document_anchor = None;
         }
         if self.writing_target.is_some_and(|target| target.tab == tab) {
             self.writing_target = None;
         }
-        if became_empty {
-            self.remove_group_collapse(group)?;
-        }
-        Ok(group)
     }
 
     /// Remove a group, collapsing its parent split. Returns false when no
@@ -931,6 +962,7 @@ fn apply(state: &mut WorkspaceState, action: &LayoutAction) -> Result<Vec<Effect
                 state.remember_closed(note.locator().clone());
             }
             state.detach_tab(*tab)?;
+            state.forget_source(*tab);
             Ok(vec![Effect::ViewDetached { tab: *tab, kind }])
         }
         LayoutAction::CloseGroup { group, .. } => {
@@ -951,6 +983,7 @@ fn apply(state: &mut WorkspaceState, action: &LayoutAction) -> Result<Vec<Effect
                     });
                 }
                 state.detach_tab(tab)?;
+                state.forget_source(tab);
             }
             Ok(effects)
         }

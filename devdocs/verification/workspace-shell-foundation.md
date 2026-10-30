@@ -69,7 +69,7 @@ geometry and overflow selection. Visual runs use an isolated Xvfb display when
 available, retaining screenshots, semantic observations, assertions and a
 per-run manifest under `target/workspace-evidence/`. The manifest records the
 commit, lock hash and source-worktree fingerprint; fixture-only observations
-are compiled behind `ui-test-support`. CI runs this scenario and retains its
+have their runtime call sites gated behind `ui-test-support`. CI runs this scenario and retains its
 artifacts on failure. Render backend identification remains the existing
 `gpu-or-software` value; this is not GPU/canvas parity evidence.
 

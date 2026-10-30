@@ -211,3 +211,42 @@ fn editor_link_navigation_resolves_through_the_api_catalog() {
     assert_eq!(app.workspace.tab(&opened).unwrap().title(), "target");
     assert!(app.notes.state(&opened).unwrap().buffer.is_some());
 }
+
+#[test]
+fn blur_acknowledgements_preserve_only_an_unchanged_authorized_caret() {
+    let (mut app, _fs, _cache) = fixture();
+    let group = app.focused_group().unwrap();
+    let _ = app.update(Message::OpenNote {
+        locator: flavite_workspace::NoteLocator::from_components(["note.md"]).unwrap(),
+        group: Some(group),
+    });
+    wait_for_open(&mut app);
+    let tab = app.workspace.focused_tab();
+    acknowledge_caret(&mut app, tab, 2, 1);
+    let original = app.workspace.writing_target().unwrap();
+    let mut blur = app.editor_interaction_snapshot(tab).unwrap();
+    blur.sequence += 1;
+    blur.focused = false;
+    let incarnation = app.notes.incarnation(tab).unwrap();
+    let _ = app.update(Message::EditorAction {
+        tab,
+        incarnation,
+        action: EditorAction::Interaction(blur),
+    });
+    let _ = app.update(Message::Pump);
+    let retained = app.workspace.writing_target().unwrap();
+    assert_eq!(retained.tab, original.tab);
+    assert_eq!(retained.revision, original.revision);
+    assert_eq!(retained.caret_text_byte, 2);
+    assert_eq!(retained.interaction_sequence, blur.sequence);
+    // A changed selection while unfocused does not silently reauthorize it.
+    blur.sequence += 1;
+    blur.selection = (3, 3);
+    blur.caret = 3;
+    let _ = app.update(Message::EditorAction {
+        tab,
+        incarnation,
+        action: EditorAction::Interaction(blur),
+    });
+    assert!(app.workspace.writing_target().is_none());
+}

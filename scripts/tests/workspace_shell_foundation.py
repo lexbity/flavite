@@ -48,7 +48,38 @@ def move(x, y):
 
 
 def capture(name):
-    run("import", "-window", window, str(output/name))
+    # Require two stable pixel samples. Semantic readiness precedes GPU
+    # presentation, so immediately importing once can capture the old frame.
+    previous = None
+    deadline = time.monotonic()+5
+    while time.monotonic()<deadline:
+        run("import", "-window", window, str(output/name))
+        pixels = subprocess.check_output(["convert",str(output/name),"RGB:-"])
+        if pixels == previous:
+            return
+        previous = pixels
+        time.sleep(0.1)
+    raise AssertionError(f"paint did not stabilize for {name}")
+
+
+def painted_menu(name, before, group_bounds):
+    s=snapshot()
+    geometry=dict(line.split("=",1) for line in run("xdotool","getwindowgeometry","--shell",window).splitlines())
+    sx=int(geometry["WIDTH"])/s["window_size"][0]
+    sy=int(geometry["HEIGHT"])/s["window_size"][1]
+    x,y,w,_=group_bounds
+    crop=f"{round(250*sx)}x{round(210*sy)}+{round((x+w-253)*sx)}+{round((y+36)*sy)}"
+    def pixels(path):
+        return subprocess.check_output(["convert",str(path),"-crop",crop,"+repage","RGB:-"])
+    baseline=pixels(output/before)
+    deadline=time.monotonic()+5
+    while time.monotonic()<deadline:
+        capture(name)
+        current=pixels(output/name)
+        if len(current)==len(baseline) and sum(a!=b for a,b in zip(current,baseline))>len(current)/4:
+            return
+        time.sleep(0.05)
+    raise AssertionError("menu state was published but the anchored popup did not paint")
 
 
 def open_note(name):
@@ -107,6 +138,7 @@ wait(lambda s: len(s["groups"]) == 2 and all(g["bounds"] for g in s["groups"]), 
 g, t = locate("alpha")
 assert (t["tab"],t["buffer"],t["revision"],t["selection"]) == identity
 assert sorted(t["tab"] for g in snapshot()["groups"] for t in g["tabs"]) == original_tabs
+assert snapshot()["writing_target"] and snapshot()["writing_target"]["tab"]==alpha["tab"]
 capture("03-pointer-split.png")
 checks.append("edge-drop-preserves-tab-buffer-revision-caret")
 # Live splitter previews must paint before release and leave desired ratios alone.
@@ -155,14 +187,16 @@ checks.append("center-drop-and-pointer-reorder")
 g = snapshot()["groups"][0]
 before = g["bounds"]
 x,y,w,h = before
+capture("04-before-menu.png")
 move(x+w-16,y+16)
 run("xdotool", "click", "1")
 wait(lambda s: s.get("menu_open"), "More menu")
 assert snapshot()["groups"][0]["bounds"] == before
-capture("04-anchored-menu.png")
+painted_menu("04-anchored-menu.png","04-before-menu.png",before)
 key("Escape")
 wait(lambda s: not s.get("menu_open"), "Escape dismisses menu")
-checks.append("anchored-menu-preserves-content-geometry")
+assert snapshot()["writing_target"] and snapshot()["writing_target"]["tab"]==alpha["tab"]
+checks.append("anchored-menu-preserves-content-geometry-and-writing-target")
 # Every active tab remains visible, including beyond the old eight-tab cap.
 for count in range(12):
     before_count = sum(len(g["tabs"]) for g in snapshot()["groups"])
