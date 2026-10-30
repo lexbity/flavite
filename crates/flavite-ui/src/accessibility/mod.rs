@@ -3,53 +3,109 @@
 pub mod program;
 pub mod tree;
 
-use crate::app::{App, Message};
-use crate::pane::Pane;
-use accesskit::{Action, ActionData, ActionRequest};
+pub use tree::NodeTarget;
 
-/// Convert a native text-selection action into the ordinary app message path.
-/// Invalid node IDs, stale/missing editor state, and malformed positions are
-/// rejected without changing the editor.
+use crate::app::App;
+use crate::app::Message;
+use accesskit::{Action, ActionRequest};
+use flavite_workspace::LayoutAction;
+
+/// Convert a native accessibility action into the ordinary app message
+/// path. Unknown nodes, stale state, and malformed data are rejected
+/// without changing the workspace.
+#[must_use]
 pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
     if request.target_tree != accesskit::TreeId::ROOT {
         return None;
     }
-    if request.action == Action::Focus
-        && request.target_node == tree::EDITOR
-        && app.accessibility_pane() == Pane::Editor
-    {
-        return Some(Message::EditorFocusRequested);
+    let target = app.a11y_nodes.get(&request.target_node)?.clone();
+    let revision = app.workspace.revision();
+    match request.action {
+        Action::Click => match target {
+            tree::NodeTarget::ActivateTab(tab) => {
+                Some(Message::Layout(LayoutAction::ActivateTab {
+                    expected_revision: revision,
+                    tab,
+                }))
+            }
+            tree::NodeTarget::CloseTab(tab) => Some(Message::Layout(LayoutAction::CloseTab {
+                expected_revision: revision,
+                tab,
+            })),
+            tree::NodeTarget::OpenNote(path) => {
+                let locator = flavite_workspace::NoteLocator::from_relative(&path).ok()?;
+                Some(Message::OpenNote {
+                    locator,
+                    group: None,
+                })
+            }
+            tree::NodeTarget::OpenPicker => Some(Message::PickerOpen),
+            tree::NodeTarget::OpenPalette => Some(Message::PaletteOpen),
+            tree::NodeTarget::ResizeSplit { .. } => None,
+        },
+        Action::Increment => match target {
+            tree::NodeTarget::ResizeSplit { split, .. } => resize_by(app, split, 1),
+            _ => None,
+        },
+        Action::Decrement => match target {
+            tree::NodeTarget::ResizeSplit { split, .. } => resize_by(app, split, -1),
+            _ => None,
+        },
+        Action::Focus => match target {
+            tree::NodeTarget::ActivateTab(tab) => {
+                Some(Message::Layout(LayoutAction::ActivateTab {
+                    expected_revision: revision,
+                    tab,
+                }))
+            }
+            _ => None,
+        },
+        // Text selection arrives with the editor integration (W03);
+        // source-reading text is not editable, so no other action applies.
+        _ => None,
     }
-    if request.action == Action::Click {
-        let pane = match request.target_node {
-            accesskit::NodeId(10) => Pane::Workspace,
-            accesskit::NodeId(11) => Pane::Editor,
-            accesskit::NodeId(12) => Pane::Read,
-            accesskit::NodeId(13) => Pane::Graph,
-            accesskit::NodeId(14) => Pane::Settings,
-            _ => return None,
-        };
-        return Some(Message::Navigate(pane));
-    }
-    if request.action != Action::SetTextSelection
-        || request.target_node != tree::EDITOR
-        || app.accessibility_pane() != Pane::Editor
-    {
-        return None;
-    }
-    let ActionData::SetTextSelection(selection) = request.data? else {
-        return None;
+}
+
+fn resize_by(app: &App, split: flavite_workspace::SplitId, direction: i8) -> Option<Message> {
+    let current = current_ratio(app, split)?;
+    let adjusted = if direction >= 0 {
+        (current + tree::RESIZE_STEP_PPM).min(flavite_workspace::MAX_RATIO_PPM)
+    } else {
+        current
+            .saturating_sub(tree::RESIZE_STEP_PPM)
+            .max(flavite_workspace::MIN_RATIO_PPM)
     };
-    if selection.anchor.node != tree::EDITOR_TEXT || selection.focus.node != tree::EDITOR_TEXT {
+    if adjusted == current {
         return None;
     }
-    let (_, contents, interaction) = app.accessibility_document();
-    let interaction = interaction?;
-    let anchor = tree::char_index_to_byte(&contents, selection.anchor.character_index)?;
-    let focus = tree::char_index_to_byte(&contents, selection.focus.character_index)?;
-    Some(Message::EditorSelectionRequested {
-        revision: interaction.revision,
-        anchor,
-        focus,
-    })
+    Some(Message::Layout(LayoutAction::ResizeSplit {
+        expected_revision: app.workspace.revision(),
+        split,
+        desired_ratio_ppm: adjusted,
+    }))
+}
+
+fn current_ratio(app: &App, split: flavite_workspace::SplitId) -> Option<u32> {
+    fn find(
+        node: &flavite_workspace::LayoutNode,
+        split: flavite_workspace::SplitId,
+    ) -> Option<u32> {
+        match node {
+            flavite_workspace::LayoutNode::Group(_) => None,
+            flavite_workspace::LayoutNode::Split {
+                id,
+                desired_ratio_ppm,
+                first,
+                second,
+                ..
+            } => {
+                if *id == split {
+                    Some(*desired_ratio_ppm)
+                } else {
+                    find(first, split).or_else(|| find(second, split))
+                }
+            }
+        }
+    }
+    find(app.workspace.tree(), split)
 }

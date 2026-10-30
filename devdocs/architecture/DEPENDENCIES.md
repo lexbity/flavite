@@ -18,6 +18,7 @@ Generated from `cargo metadata --format-version 1 --all-features`.
 | `flavite-syntax` | 1 | Scanner, frontmatter patcher, pulldown glue — pure, IO-free (§4.1) |
 | `flavite-ui` | 3 | iced application (§4.1) |
 | `flavite-vault` | 1 | Session/BufferManager ownership + actors, journal, history, recovery (§4.1) |
+| `flavite-workspace` | 1 | IO-free workspace model: layout tree, tab groups, typed transactions, geometry (RFC-0003 D-02) |
 | `xtask` | ? | — |
 
 ## Dependencies
@@ -106,6 +107,7 @@ Normal/build:
 - `flavite-buffer` (normal)
 - `flavite-editor` (normal)
 - `flavite-graph` (normal)
+- `flavite-workspace` (normal)
 - `iced` (normal)
 - `iced_runtime` (normal)
 - `iced_winit` (normal)
@@ -133,6 +135,10 @@ Normal/build:
 Dev-only:
 
 - `flavite-fs`
+
+### `flavite-workspace`
+
+No dependencies.
 
 ### `xtask`
 
@@ -177,7 +183,7 @@ UI crates (may depend on forbidden): flavite-editor, flavite-ui
 
 | Tier | Crates | Floor |
 |---|---|---|
-| 1 — durability-critical | flavite-fs, flavite-syntax, flavite-buffer, flavite-vault, flavite-index | ≥ 90% line |
+| 1 — durability-critical | flavite-fs, flavite-syntax, flavite-buffer, flavite-vault, flavite-index, flavite-workspace | ≥ 90% line |
 | 2 | flavite-api, flavite-graph | ≥ 80% line |
 | 3 — measured, not gating | flavite-cli, flavite-editor, flavite-ui | reported only |
 

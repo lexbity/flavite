@@ -28,6 +28,7 @@ flavite-fs = { path = "../crates/flavite-fs" }
 flavite-syntax = { path = "../crates/flavite-syntax" }
 flavite-buffer = { path = "../crates/flavite-buffer" }
 flavite-vault = { path = "../crates/flavite-vault" }
+flavite-workspace = { path = "../crates/flavite-workspace" }
 
 [[bin]]
 name = "parser"
@@ -56,3 +57,7 @@ path = "fuzz_targets/parity.rs"
 [[bin]]
 name = "rename_planner"
 path = "fuzz_targets/rename_planner.rs"
+
+[[bin]]
+name = "workspace_layout"
+path = "fuzz_targets/workspace_layout.rs"

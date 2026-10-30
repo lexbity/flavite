@@ -4,7 +4,7 @@
 use crate::{
     accessibility,
     app::{App, Message},
-    style,
+    style, workspace_shell,
 };
 use accesskit::{ActionRequest, TreeUpdate};
 use iced::{Element, Settings, Size, Theme, window};
@@ -30,7 +30,8 @@ impl program::Program for FlaviteProgram {
     fn window(&self) -> Option<window::Settings> {
         Some(window::Settings {
             size: Size::new(1180.0, 760.0),
-            min_size: Some(Size::new(940.0, 620.0)),
+            // D-13: the supported default minimum window is 640×480.
+            min_size: Some(Size::new(640.0, 480.0)),
             ..window::Settings::default()
         })
     }
@@ -48,21 +49,11 @@ impl program::Program for FlaviteProgram {
         state: &'a App,
         _window: core::window::Id,
     ) -> Element<'a, Message, Theme, iced::Renderer> {
-        state.view()
+        workspace_shell::view(state)
     }
 
     fn accessibility_tree(&self, state: &App, _window: core::window::Id) -> Option<TreeUpdate> {
-        let (title, contents, interaction) = state.accessibility_document();
-        let selection = interaction.map(|snapshot| snapshot.selection);
-        let editor_focused = interaction.is_some_and(|snapshot| snapshot.focused);
-        Some(accessibility::tree::shell_tree(
-            &title,
-            &contents,
-            selection,
-            editor_focused,
-            state.accessibility_pane(),
-            state.accessibility_window_size(),
-        ))
+        Some(accessibility::tree::shell_tree(state))
     }
 
     fn accessibility_action(

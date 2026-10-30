@@ -1,6 +1,6 @@
 //! GUI-side tracking for correlated worker operations.
 
-use flavite_api::{Flavite, session::SessionResult};
+use flavite_api::{ExecutionResult, Flavite, LocalResult};
 use std::collections::BTreeMap;
 
 /// A correlated worker operation accepted by the Session.
@@ -39,18 +39,25 @@ impl OperationPump {
         );
     }
 
-    /// Track every terminal completion currently available from the Session.
+    /// Ingest one drained batch of completions, retiring matching pending
+    /// entries. The caller drains the Session once and routes completions
+    /// to every interested surface.
+    pub fn ingest(&mut self, completions: &[flavite_api::OperationCompletion]) {
+        for completion in completions {
+            self.pending.remove(&completion.request_id);
+        }
+    }
+
+    /// Drain the Session once and ingest, returning the terminal operations
+    /// for presentation.
     pub fn drain(&mut self, flavite: &Flavite) -> Vec<TerminalOperation> {
-        flavite
-            .session()
-            .drain_operation_completions()
+        let completions = flavite.drain_operation_completions();
+        self.ingest(&completions);
+        completions
             .into_iter()
-            .map(|completion| {
-                self.pending.remove(&completion.request_id);
-                TerminalOperation {
-                    request_id: completion.request_id,
-                    result: describe_result(&completion.result),
-                }
+            .map(|completion| TerminalOperation {
+                request_id: completion.request_id,
+                result: describe_result(&completion.result),
             })
             .collect()
     }
@@ -61,31 +68,23 @@ impl OperationPump {
     }
 }
 
-fn describe_result(result: &SessionResult) -> String {
+fn describe_result(result: &ExecutionResult) -> String {
+    use flavite_api::RejectionReason;
     match result {
-        SessionResult::Success(_) => "Completed".into(),
-        SessionResult::Pending { request_id } => format!("Still pending ({request_id})"),
-        SessionResult::Superseded { by_request, .. } => {
+        ExecutionResult::Local(local) => match local {
+            LocalResult::Success(_) => "Completed".into(),
+            LocalResult::Void => "Completed".into(),
+            LocalResult::Error(error) => format!("Failed: {}", error.message),
+        },
+        ExecutionResult::Pending { request_id } => format!("Still pending ({request_id})"),
+        ExecutionResult::Superseded { by_request, .. } => {
             format!("Superseded by request {by_request}")
         }
-        SessionResult::Conflict { path } => format!("Conflict: {}", path.display()),
-        SessionResult::ActionRequired { code, data } => {
-            format!("Action required: {code} {}", data.as_deref().unwrap_or(""))
-        }
-        SessionResult::MergeReady { .. } => "Merge requires review".into(),
-        SessionResult::Busy => "Busy — retry shortly".into(),
-        SessionResult::StaleRevision {
-            buffer_id: _,
-            expected,
-            actual,
-        } => {
-            format!(
-                "Stale revision: expected {}, current {}",
-                expected.as_u64(),
-                actual.as_u64()
-            )
-        }
-        SessionResult::Error { message } => format!("Failed: {message}"),
+        ExecutionResult::ActionRequired { code, .. } => format!("Action required: {code}"),
+        ExecutionResult::Rejected(rejected) => match rejected.reason {
+            RejectionReason::Busy => "Busy — retry shortly".into(),
+            other => format!("Rejected: {other:?}"),
+        },
     }
 }
 

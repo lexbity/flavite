@@ -162,7 +162,7 @@ fuzz-smoke:
     cd fuzz
     smoke_root="$(mktemp -d)"
     trap 'rm -rf "$smoke_root"' EXIT
-    targets="image_limits parser path_safety scanner frontmatter_patcher parity"
+    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout"
     failed=0
     for target in $targets; do
         corpus_dir="$smoke_root/$target"
@@ -185,7 +185,7 @@ fuzz-smoke-ci:
     cd fuzz
     smoke_root="$(mktemp -d)"
     trap 'rm -rf "$smoke_root"' EXIT
-    targets="image_limits parser path_safety scanner frontmatter_patcher parity"
+    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout"
     failed=0
     for target in $targets; do
         corpus_dir="$smoke_root/$target"
@@ -256,6 +256,28 @@ ui-visual-setup:
 
 # Full cleanup (§10.10): removes target/, fuzz/target/, fuzz/artifacts/,
 # profiling intermediates. Pass --dry-run to preview without removing.
+# RFC-0003 §16.1: headless workspace gates. During partial implementation
+# the profile argument limits scope to capabilities not yet shipped; it can
+# never disable a completed slice's gate (W01 runs additively inside W02+).
+workspace-gate *profile="W02":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bash scripts/check-workspace-contracts.sh "{{profile}}"
+    cargo test -p flavite-workspace
+    cargo test -p flavite-ui --test workspace_layout
+    cargo test -p flavite-ui --test runtime_accessibility
+    cargo test -p flavite-api --test open_flights
+
+# RFC-0003 §31.1: real Linux window input, semantic checkpoints, screenshots,
+# and an evidence manifest.
+workspace-visual *scenario="layout":
+    bash scripts/workspace-visual-linux.sh --scenario {{scenario}}
+
+# RFC-0003 §31.1: native backend IME/a11y check runner; an absent required
+# backend returns incomplete/nonzero.
+workspace-native:
+    bash scripts/workspace-native-accessibility-linux.sh
+
 clean *args:
     cargo xtask clean {{args}}
 

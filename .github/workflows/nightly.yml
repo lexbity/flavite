@@ -1,6 +1,11 @@
 # Nightly (not blocking) (§10.3).
 # Long fuzz campaigns (≥ 1 h/target, AC-20), corpus minimization, coverage
 # and benchmark trends.
+#
+# TD-16 (RFC-0003 W02): fuzz failures are aggregated and fail the job; every
+# crash input is retained as an uploaded artifact. A crashed target can no
+# longer hide behind a green run, and a minimized corpus never overwrites a
+# reproducer silently.
 
 name: Nightly
 
@@ -21,10 +26,48 @@ jobs:
       - name: Long fuzz campaigns
         run: |
           cd fuzz
+          failed=0
           for target in $(ls fuzz_targets/*.rs | xargs -n1 basename | sed 's/\.rs$//'); do
             echo "=== long fuzz: $target (1 h) ==="
-            cargo +nightly fuzz run "$target" -- -max_total_time=3600 -rss_limit_mb=4096 || true
+            if ! cargo +nightly fuzz run "$target" -- -max_total_time=3600 -rss_limit_mb=4096; then
+              echo "fuzz target FAILED: $target" | tee -a fuzz-failures.txt
+              failed=$((failed + 1))
+            fi
           done
+          if [ "$failed" -ne 0 ]; then
+            echo "$failed fuzz target(s) failed:" >&2
+            cat fuzz-failures.txt >&2
+            exit 1
+          fi
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: long-fuzz-crashes
+          path: |
+            fuzz/artifacts/
+            fuzz-failures.txt
+          if-no-files-found: ignore
+
+  workspace-fuzz:
+    name: Workspace layout fuzz (strict)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
+      - name: Setup
+        run: just setup
+      - name: Fuzz the workspace reducer (1 h)
+        run: |
+          cd fuzz
+          cargo +nightly fuzz run workspace_layout -- -max_total_time=3600 -rss_limit_mb=4096
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-fuzz-crashes
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
 
   corpus-minimize:
     name: Corpus minimization
@@ -37,10 +80,19 @@ jobs:
       - name: cargo fuzz cmin
         run: |
           cd fuzz
+          failed=0
           for target in $(ls fuzz_targets/*.rs | xargs -n1 basename | sed 's/\.rs$//'); do
             echo "=== cmin: $target ==="
-            cargo +nightly fuzz cmin "$target" || true
+            if ! cargo +nightly fuzz cmin "$target"; then
+              echo "corpus minimization FAILED: $target" | tee -a cmin-failures.txt
+              failed=$((failed + 1))
+            fi
           done
+          if [ "$failed" -ne 0 ]; then
+            echo "$failed corpus minimization run(s) failed:" >&2
+            cat cmin-failures.txt >&2
+            exit 1
+          fi
 
   coverage-trend:
     name: Coverage trend

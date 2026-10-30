@@ -1508,6 +1508,7 @@ dependencies = [
  "flavite-graph",
  "flavite-index",
  "flavite-vault",
+ "flavite-workspace",
  "futures",
  "iced",
  "iced_runtime",
@@ -1544,6 +1545,13 @@ dependencies = [
  "tracing",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "flavite-workspace"
+version = "0.1.0"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]

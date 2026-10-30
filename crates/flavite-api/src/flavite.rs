@@ -83,18 +83,46 @@ fn decode<T: serde::de::DeserializeOwned>(invocation: &Invocation) -> Result<T, 
 /// Arguments for the note-open commands: a bare vault-relative path, or an
 /// object form (`{"path": …}`) so hosts can attach navigation metadata
 /// (target, anchor, by_id, create_if_unresolved) alongside the path.
+/// `policy` distinguishes opening existing notes from creating missing
+/// ones; the default keeps the established create-if-missing behavior.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum OpenArgs {
     Path(PathBuf),
-    Object { path: PathBuf },
+    Object {
+        path: PathBuf,
+        #[serde(default)]
+        policy: OpenPolicyArg,
+    },
+}
+
+/// Wire form of [`flavite_vault::session::OpenPolicy`].
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum OpenPolicyArg {
+    #[default]
+    CreateIfMissing,
+    ExistingOnly,
+}
+
+impl From<OpenPolicyArg> for flavite_vault::session::OpenPolicy {
+    fn from(policy: OpenPolicyArg) -> Self {
+        match policy {
+            OpenPolicyArg::CreateIfMissing => Self::CreateIfMissing,
+            OpenPolicyArg::ExistingOnly => Self::ExistingOnly,
+        }
+    }
 }
 
 fn handle_open(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
-    let path = match decode::<OpenArgs>(invocation)? {
-        OpenArgs::Path(path) | OpenArgs::Object { path } => path,
+    let (path, policy) = match decode::<OpenArgs>(invocation)? {
+        OpenArgs::Path(path) => (path, OpenPolicyArg::default()),
+        OpenArgs::Object { path, policy } => (path, policy),
     };
-    Ok(session.execute(SessionCommand::OpenNote { path }))
+    Ok(session.execute(SessionCommand::OpenNote {
+        path,
+        policy: policy.into(),
+    }))
 }
 fn handle_close(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
     let path = decode(invocation)?;
@@ -1285,7 +1313,7 @@ pub enum FlaviteError {
 /// Session module re-export for convenience.
 pub mod session {
     pub use flavite_vault::session::{
-        CommandResult, ConflictResolution, SessionCommand, SessionError, SessionResult,
+        CommandResult, ConflictResolution, OpenPolicy, SessionCommand, SessionError, SessionResult,
     };
 }
 
@@ -1516,9 +1544,13 @@ mod tests {
             VaultConfig::default(),
         )
         .unwrap();
-        let opened = flavite.session.execute(SessionCommand::OpenNote {
+        let opened = match flavite.session.execute(SessionCommand::OpenNote {
             path: root.join("note.md"),
-        });
+            policy: flavite_vault::session::OpenPolicy::CreateIfMissing,
+        }) {
+            SessionResult::Pending { request_id } => flavite.session.wait_for_operation(request_id),
+            result => result,
+        };
         let buffer_id = match opened {
             SessionResult::Success(crate::session::CommandResult::NoteOpened {
                 buffer_id, ..
@@ -1643,18 +1675,29 @@ mod tests {
             VaultConfig::default(),
         );
         let flavite = Flavite::open(identity, session, VaultConfig::default()).unwrap();
-        let opened = flavite.execute_session(SessionCommand::OpenNote {
+        let opened = match flavite.execute_session(SessionCommand::OpenNote {
             path: PathBuf::from("note.md"),
-        });
-        let buffer_id = match opened {
-            SessionResult::Success(crate::session::CommandResult::NoteOpened {
-                buffer_id, ..
-            }) => buffer_id,
+            policy: flavite_vault::session::OpenPolicy::CreateIfMissing,
+        }) {
+            SessionResult::Pending { request_id } => {
+                let completion = flavite.session.wait_for_operation(request_id);
+                match completion {
+                    SessionResult::Success(crate::session::CommandResult::NoteOpened {
+                        buffer_id,
+                        ..
+                    }) => serde_json::json!({ "buffer_id": buffer_id.as_u64() }),
+                    other => panic!("unexpected open completion: {other:?}"),
+                }
+            }
+            SessionResult::Success(_) => {
+                unreachable!("direct session opens via execute_session are async")
+            }
             other => panic!("unexpected open result: {other:?}"),
         };
-        let view = flavite.get_buffer_view(buffer_id, None).unwrap();
+        let buffer_id = opened["buffer_id"].as_u64().expect("buffer id");
+        let view = flavite.get_buffer_view(buffer_id.into(), None).unwrap();
         flavite.execute_session(SessionCommand::ApplyEdits {
-            buffer_id,
+            buffer_id: buffer_id.into(),
             revision: Revision::new(view.revision),
             ops: vec![flavite_buffer::undo::EditOp::new(
                 flavite_syntax::text::Span::new(
@@ -1793,12 +1836,16 @@ mod tests {
             })
         ));
 
-        let opened = flavite.execute(Invocation::new(
+        let opened = match flavite.execute(Invocation::new(
             5,
             "open_note",
             serde_json::to_value(root.join("note.md")).unwrap(),
             Origin::Gui,
-        ));
+        )) {
+            result @ ExecutionResult::Local(_) => result,
+            ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
+            other => panic!("unexpected open result: {other:?}"),
+        };
         let data = opened.into_success().unwrap().data;
         let buffer_id = data["buffer_id"].as_u64().unwrap();
         let closed = flavite.execute(Invocation::new(
@@ -1820,12 +1867,16 @@ mod tests {
         use crate::types::Origin;
 
         let (flavite, root, _temp) = test_flavite();
-        let opened = flavite.execute(Invocation::new(
+        let opened = match flavite.execute(Invocation::new(
             10,
             "open_note",
             serde_json::to_value(root.join("note.md")).unwrap(),
             Origin::Gui,
-        ));
+        )) {
+            result @ ExecutionResult::Local(_) => result,
+            ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
+            other => panic!("unexpected open result: {other:?}"),
+        };
         let opened = opened.into_success().unwrap().data;
         let id = opened["buffer_id"].as_u64().unwrap();
         let revision = opened["revision"].as_u64().unwrap();

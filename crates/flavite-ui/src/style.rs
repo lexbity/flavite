@@ -29,6 +29,12 @@ pub const TEXT_LG: f32 = 16.0;
 pub const HEADING: f32 = 20.0;
 /// Sidebar brand wordmark.
 pub const BRAND: f32 = 19.0;
+/// Tab strip height (§13.1: tab height 32 px).
+pub const TAB_HEIGHT: f32 = 32.0;
+/// Splitter thickness at 100% scale (§7.5).
+pub const SPLITTER_WIDTH: f32 = 4.0;
+/// Focus ring width (§7.5/NFR-15: focus ring ≥ 2 px).
+pub const FOCUS_WIDTH: f32 = 2.0;
 
 /// Corner radius shared by cards, rows, and action buttons.
 const RADIUS: f32 = 8.0;
@@ -313,5 +319,53 @@ mod tests {
         let selected = list_row(true)(&theme, button::Status::Active);
         let unselected = list_row(false)(&theme, button::Status::Active);
         assert_ne!(selected.background, unselected.background);
+    }
+}
+
+/// Container style: one tab-group pane; the focused group carries a
+/// visible non-color border.
+#[must_use]
+pub fn pane(theme: &Theme, focused: bool) -> container::Style {
+    let ext = theme.extended_palette();
+    let border = if focused {
+        Border {
+            color: ext.primary.base.color,
+            width: FOCUS_WIDTH,
+            radius: border::Radius::from(0.0),
+        }
+    } else {
+        Border {
+            color: ext.background.strong.color,
+            width: 1.0,
+            radius: border::Radius::from(0.0),
+        }
+    };
+    container::Style {
+        text_color: None,
+        background: Some(Background::Color(theme.palette().background)),
+        border,
+        shadow: Shadow::default(),
+        snap: false,
+    }
+}
+
+/// Title-bar style for the pane-grid drag handle above each group.
+#[must_use]
+pub fn pane_title_bar(theme: &Theme, focused: bool) -> container::Style {
+    let ext = theme.extended_palette();
+    container::Style {
+        text_color: None,
+        background: Some(Background::Color(if focused {
+            ext.primary.weak.color
+        } else {
+            ext.background.weaker.color
+        })),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: border::Radius::from(0.0),
+        },
+        shadow: Shadow::default(),
+        snap: false,
     }
 }

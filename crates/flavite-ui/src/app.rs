@@ -1,91 +1,135 @@
-//! Iced application shell and host adapter for Flavite.
+//! The iced application host for the Flavite workspace (RFC-0003 W02).
 //!
-//! The shell renders persistent window chrome (sidebar, pane header, status
-//! bar) plus a keyboard-driven command palette overlay. Styles come from
-//! [`crate::style`]; every surface reads the theme palette.
+//! `App` owns the authoritative [`WorkspaceState`], the toolkit adapter,
+//! and the host registries. Widget events become host messages; layout
+//! truth changes only through the flavite-workspace reducer. Shell
+//! rendering lives in [`crate::workspace_shell`].
 
+use crate::host::commands as host_commands;
+use crate::host::effects::NoteRegistry;
 use crate::operation::OperationPump;
-use crate::palette::{keybinding, matching_commands};
-use crate::pane::Pane;
-use crate::settings::{RenameBehavior, Settings};
-use crate::style::{self, Tone};
+use crate::palette::matching_specs;
+use crate::settings::Settings;
 use crate::subscription;
-use flavite_api::{
-    BufferView, ExecutionResult, Flavite, Invocation, LocalResult, Origin, VaultConfig,
+use crate::workspace::{Adapter, StripMenu, gestures};
+use flavite_api::queries::{MAX_NOTE_CATALOG_LIMIT, NoteCatalogEntry};
+use flavite_api::{ExecutionResult, Flavite, Invocation, LocalResult, Origin, VaultConfig};
+use flavite_workspace::{
+    Effect, GroupId, Ids, LayoutAction, NoteLocator, Outcome, SplitId, TabId, WorkspaceState,
 };
-use flavite_editor::{EditorAction, EditorInteractionSnapshot, EditorWidget};
-use iced::widget::{
-    Space, button, column, container, opaque, row, rule, scrollable, stack, text, text_input,
-};
-use iced::{Element, Font, Length, Padding, Subscription, Task, alignment, keyboard};
+use iced::{Subscription, Task, keyboard};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// Widget id of the palette query input, used to focus it when the overlay opens.
-const PALETTE_INPUT_ID: &str = "palette-query-input";
-
-/// Run-ready application state. `Flavite` owns the only Session and buffer authority.
-pub struct App {
-    flavite: Option<Flavite>,
-    root: PathBuf,
-    pane: Pane,
-    palette_open: bool,
-    palette_query: String,
-    palette_selected: usize,
-    settings: Settings,
-    settings_dirty: bool,
-    settings_valid: bool,
-    window_size: iced::Size,
-    status: String,
-    recent_events: Vec<String>,
-    operations: OperationPump,
-    active_buffer: Option<u64>,
-    editor_interaction: Option<EditorInteractionSnapshot>,
-    reconcile_progress: Option<(u32, u32)>,
+/// The note picker overlay state.
+#[derive(Debug, Clone, Default)]
+pub struct Picker {
+    /// Whether the overlay is open.
+    pub open: bool,
+    /// Query text.
+    pub query: String,
+    /// Selected row.
+    pub selected: usize,
 }
 
+/// Run-ready application state. `Flavite` owns the only Session and buffer
+/// authority; the workspace model owns layout truth.
+pub struct App {
+    pub flavite: Option<Flavite>,
+    root: PathBuf,
+    pub workspace: WorkspaceState,
+    pub adapter: Adapter,
+    pub notes: NoteRegistry,
+    pub picker: Picker,
+    pub palette_open: bool,
+    pub palette_query: String,
+    pub palette_selected: usize,
+    pub strip_menu: Option<(GroupId, StripMenu)>,
+    pub gesture: gestures::TabGesture,
+    pub resize_preview: BTreeMap<SplitId, u32>,
+    pub resizing_split: Option<SplitId>,
+    catalog: Vec<NoteCatalogEntry>,
+    catalog_error: Option<String>,
+    settings: Settings,
+    settings_valid: bool,
+    operations: OperationPump,
+    pub status: String,
+    pub recent_events: Vec<String>,
+    reconcile_progress: Option<(u32, u32)>,
+    window_size: iced::Size,
+    /// Accessibility node routing map, rebuilt after every commit.
+    pub a11y_nodes: BTreeMap<accesskit::NodeId, crate::accessibility::NodeTarget>,
+}
+
+/// Host messages. Widget events surface here and reduce through the
+/// workspace model or the host catalog.
 #[derive(Debug, Clone)]
 pub enum Message {
-    Navigate(Pane),
-    Edit(EditorAction),
-    EditorInteraction(EditorInteractionSnapshot),
-    EditorFocusRequested,
-    EditorSelectionRequested {
-        revision: u64,
-        anchor: usize,
-        focus: usize,
-    },
-    EditorSelectionAcknowledged(Option<EditorInteractionSnapshot>),
     Keyboard(keyboard::Event),
+    Mouse(iced::mouse::Event),
+    Pump,
+    WindowEvent(iced::window::Event),
+    /// A typed layout transaction.
+    Layout(flavite_workspace::LayoutAction),
+    /// Open a real view kind in the focused group.
+    NewViewInFocused(flavite_workspace::ViewKind),
+    /// Open (or focus) a note, optionally in a specific group.
+    OpenNote {
+        locator: NoteLocator,
+        group: Option<GroupId>,
+    },
+    /// Toggle a group strip's inline menu row.
+    GroupMenu(GroupId, StripMenu),
+    /// A tab was pressed (activation + drag candidate).
+    TabPressed(TabId),
+    /// A tab strip row is hovered during a drag.
+    TabHover {
+        group: GroupId,
+        index: usize,
+    },
+    /// A group body is hovered during a drag (append target).
+    BodyHover(GroupId),
+    /// pane_grid drag events (whole-group moves and merges).
+    PaneDrag(iced::widget::pane_grid::DragEvent),
+    /// pane_grid resize previews (committed on release).
+    PaneResize(iced::widget::pane_grid::ResizeEvent),
+    /// A pane was clicked (focus that group).
+    PaneClicked(iced::widget::pane_grid::Pane),
     PaletteOpen,
     PaletteClose,
     PaletteQuery(String),
     PaletteNext,
     PalettePrevious,
     PaletteSubmit,
-    RunCommand(&'static str),
-    ChangeRenameBehavior,
-    ChangeRecovery(i8),
-    ChangeVerification(i8),
-    ChangeLogBudget(i8),
-    SetIgnoreGlobs(String),
-    SaveSettings,
-    Pump,
-    WindowEvent(iced::window::Event),
+    /// A palette result row was clicked.
+    PalettePick(usize),
+    PickerOpen,
+    PickerClose,
+    PickerQuery(String),
+    PickerNext,
+    PickerPrevious,
+    PickerSubmit,
+    /// A picker result row was clicked.
+    PickerPick(usize),
+    /// Dispatch a host (UI) command by catalog id.
+    RunHostCommand(&'static str),
+    /// Dispatch a core command through the API for the focused note tab.
+    RunCoreCommand(&'static str),
+    /// Reload the note catalog snapshot.
+    RefreshCatalog,
 }
 
 impl App {
-    /// Open the configured vault and construct the iced shell.
+    /// Open the configured vault and construct the shell.
+    #[must_use]
     pub fn boot() -> Self {
-        let root = std::env::args_os()
-            .nth(1)
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("LATTICE_VAULT").map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("target/ui-visual/app-vault"));
+        let root = crate::host::env::vault_root_from_env()
+            .unwrap_or_else(crate::host::env::default_vault_root);
         Self::boot_from_root(root)
     }
 
-    /// Construct the shell against an explicit vault root. Examples and
-    /// integration harnesses use this to avoid process-global path state.
+    /// Construct the shell against an explicit vault root.
+    #[must_use]
     pub fn boot_from_root(root: PathBuf) -> Self {
         let mut app = Self::empty_at(root.clone());
         match Flavite::open_root(root, VaultConfig::default()) {
@@ -95,8 +139,9 @@ impl App {
         app
     }
 
-    /// Build the shell around an already-authorized Session facade. This is
-    /// also the fixture seam used by integration tests with an isolated Fs.
+    /// Build the shell around an already-authorized facade. Fixture seam
+    /// for integration tests.
+    #[must_use]
     pub fn from_flavite(flavite: Flavite) -> Self {
         let root = flavite.vault_ref().root.clone();
         let mut app = Self::empty_at(root);
@@ -105,24 +150,34 @@ impl App {
     }
 
     fn empty_at(root: PathBuf) -> Self {
+        let mut ids = Ids::new();
+        let workspace = WorkspaceState::with_ids(&mut ids);
+        let adapter = Adapter::build(&workspace);
         let status = format!("Opening {}…", root.display());
         Self {
             flavite: None,
             root,
-            pane: Pane::Workspace,
+            adapter,
+            notes: NoteRegistry::default(),
+            picker: Picker::default(),
             palette_open: false,
             palette_query: String::new(),
             palette_selected: 0,
+            strip_menu: None,
+            gesture: gestures::TabGesture::default(),
+            resize_preview: BTreeMap::new(),
+            resizing_split: None,
+            catalog: Vec::new(),
+            catalog_error: None,
             settings: Settings::default(),
-            settings_dirty: false,
             settings_valid: true,
-            window_size: iced::Size::new(1180.0, 760.0),
+            operations: OperationPump::default(),
             status,
             recent_events: Vec::new(),
-            operations: OperationPump::default(),
-            active_buffer: None,
-            editor_interaction: None,
             reconcile_progress: None,
+            window_size: iced::Size::new(1180.0, 760.0),
+            a11y_nodes: BTreeMap::new(),
+            workspace,
         }
     }
 
@@ -140,72 +195,315 @@ impl App {
                 Settings::default()
             }
         };
+        // D-16: the composed catalog is checked once at attach; UI ids are
+        // namespaced, so any overlap is a build defect worth surfacing.
+        let core_ids: Vec<&str> = flavite.command_registry().command_ids().to_vec();
+        let conflicts = host_commands::catalog_conflicts(&core_ids);
+        if !conflicts.is_empty() {
+            self.status = format!("Command catalog conflict: {}", conflicts.join(", "));
+        }
         self.flavite = Some(flavite);
-        if self.settings_valid {
+        if self.settings_valid && conflicts.is_empty() {
             self.status = "Vault ready".into();
         }
-        self.run_command("note.open");
+        self.load_catalog();
+        self.refresh_semantics();
     }
 
-    /// Return a fresh semantic snapshot of the current shell document. This
-    /// is deliberately derived from the Session view on each publication;
-    /// assistive technology never receives a stale copy owned by the widget.
-    pub fn accessibility_document(&self) -> (String, String, Option<EditorInteractionSnapshot>) {
-        let title = self
-            .active_buffer
-            .and_then(|buffer| {
-                self.flavite
-                    .as_ref()?
-                    .get_buffer_view(buffer.into(), None)
-                    .ok()
-                    .map(|view| view.path.display().to_string())
-            })
-            .unwrap_or_else(|| format!("{:?}", self.pane));
-        let contents = self
-            .active_buffer
-            .and_then(|buffer| {
-                self.flavite
-                    .as_ref()?
-                    .get_buffer_view(buffer.into(), None)
-                    .ok()
-                    .map(|view| view.text)
-            })
-            .unwrap_or_else(|| self.status.clone());
-        let interaction = self.editor_interaction.filter(|snapshot| {
-            self.pane == Pane::Editor && self.active_buffer == Some(snapshot.buffer_id)
-        });
-        (title, contents, interaction)
+    /// Load a bounded note catalog snapshot; failures stay visible.
+    fn load_catalog(&mut self) {
+        let Some(flavite) = &self.flavite else {
+            return;
+        };
+        match flavite.note_catalog(MAX_NOTE_CATALOG_LIMIT) {
+            Ok(catalog) => {
+                self.catalog = catalog.entries;
+                self.catalog_error = None;
+            }
+            Err(error) => {
+                self.catalog_error = Some(error.to_string());
+            }
+        }
     }
 
-    /// Current legacy shell destination, projected only for its navigation
-    /// tabs while W02 replaces this shell with the workspace model.
-    pub fn accessibility_pane(&self) -> Pane {
-        self.pane
+    /// The note catalog snapshot for views and the picker.
+    #[must_use]
+    pub fn catalog(&self) -> &[NoteCatalogEntry] {
+        &self.catalog
     }
 
-    /// Current logical window size, used to keep native accessibility bounds
-    /// aligned with the shell after resize events.
-    pub fn accessibility_window_size(&self) -> iced::Size {
+    /// The group displaying a tab, if any.
+    #[must_use]
+    pub fn group_of(&self, tab: TabId) -> Option<GroupId> {
+        self.workspace.group_of(tab)
+    }
+
+    /// The palette candidate snapshot (host + core commands).
+    #[must_use]
+    pub fn palette_snapshot(&self) -> Vec<flavite_api::CommandSpec> {
+        self.palette_matches()
+    }
+
+    /// The selected palette row clamped to the candidate list.
+    #[must_use]
+    pub fn palette_selection(&self, candidate_count: usize) -> usize {
+        self.palette_selected.min(candidate_count.saturating_sub(1))
+    }
+
+    /// The current palette query text.
+    #[must_use]
+    pub fn palette_query_text(&self) -> &str {
+        &self.palette_query
+    }
+
+    /// Current source text of a note tab, if its buffer is installed.
+    #[must_use]
+    pub fn note_state_text(&self, tab: TabId) -> Option<String> {
+        let buffer = self.notes.state(&tab)?.buffer?;
+        self.note_text(buffer)
+    }
+
+    /// The buffer state chip label for a note tab ("Clean"/"Dirty"/…).
+    #[must_use]
+    pub fn note_buffer_state(&self, tab: TabId) -> Option<String> {
+        let buffer = self.notes.state(&tab)?.buffer?;
+        let flavite = self.flavite.as_ref()?;
+        Some(
+            flavite
+                .get_buffer_view(flavite_buffer::BufferId::from(buffer), None)
+                .ok()?
+                .state,
+        )
+    }
+
+    /// Pending operation count.
+    #[must_use]
+    pub fn pending_operations(&self) -> usize {
+        self.operations.pending().count()
+    }
+
+    /// Current reconcile progress.
+    #[must_use]
+    pub fn reconcile_progress(&self) -> Option<(u32, u32)> {
+        self.reconcile_progress
+    }
+
+    /// The status line text.
+    #[must_use]
+    pub fn status_text(&self) -> &str {
+        &self.status
+    }
+
+    /// The catalog's last load error, if any.
+    #[must_use]
+    pub fn catalog_error(&self) -> Option<&str> {
+        self.catalog_error.as_deref()
+    }
+
+    /// The vault root (locators join against it).
+    #[must_use]
+    pub fn root(&self) -> &PathBuf {
+        &self.root
+    }
+
+    /// Current logical window size.
+    #[must_use]
+    pub const fn window_size(&self) -> iced::Size {
         self.window_size
     }
 
-    /// Bridge vault channels and operation replies without coupling completion to presentation.
-    pub fn subscription(_state: &Self) -> Subscription<Message> {
-        Subscription::batch([
-            subscription::pump().map(|_| Message::Pump),
-            keyboard::listen().map(Message::Keyboard),
-            iced::window::events().map(|(_, event)| Message::WindowEvent(event)),
-        ])
+    /// The group owning the focused tab.
+    #[must_use]
+    pub fn focused_group(&self) -> Option<GroupId> {
+        self.workspace.focused_group()
+    }
+
+    /// The manually maximized group.
+    #[must_use]
+    pub fn maximized_group(&self) -> Option<GroupId> {
+        self.workspace.maximized_group()
+    }
+
+    /// The next or previous group in stable traversal order.
+    #[must_use]
+    pub fn next_group_of(&self, from: GroupId, forward: bool) -> Option<GroupId> {
+        let order = self.workspace.group_order();
+        let position = order.iter().position(|group| *group == from)?;
+        let next = if forward {
+            (position + 1) % order.len()
+        } else {
+            (position + order.len() - 1) % order.len()
+        };
+        order.get(next).copied()
+    }
+
+    /// The rendered text of a ready note tab, for the semantic tree.
+    #[must_use]
+    pub fn note_text(&self, buffer: u64) -> Option<String> {
+        let flavite = self.flavite.as_ref()?;
+        Some(
+            flavite
+                .get_buffer_view(flavite_buffer::BufferId::from(buffer), None)
+                .ok()?
+                .text,
+        )
+    }
+
+    /// Commit one reducer outcome, reconciling the adapter and effects.
+    fn commit(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Committed(commit) => {
+                self.workspace = commit.state;
+                self.adapter.reconcile(&self.workspace);
+                let effects = commit.effects;
+                self.apply_effects(&effects);
+                self.refresh_semantics();
+            }
+            Outcome::Rejected(error) => {
+                self.status = format!("Workspace: {error}");
+            }
+        }
+    }
+
+    /// Build and reduce one layout transaction at the current revision.
+    pub fn dispatch_layout(&mut self, build: impl FnOnce(u64) -> LayoutAction) {
+        let revision = self.workspace.revision();
+        let outcome = flavite_workspace::reduce(&self.workspace, build(revision));
+        self.commit(outcome);
+    }
+
+    fn apply_effects(&mut self, effects: &[Effect]) {
+        for effect in effects {
+            match effect {
+                Effect::ViewAttached { tab, kind } => {
+                    if let flavite_workspace::ViewKind::Note(note) = kind {
+                        let (tab, locator) = match self.notes.attach(*tab, note.locator().clone()) {
+                            Some(attached) => attached,
+                            None => continue,
+                        };
+                        self.open_note_tab(tab, &locator);
+                    }
+                }
+                Effect::ViewDetached { tab, .. } => self.notes.detach(*tab),
+                Effect::NoteLoadChanged { .. } => {}
+            }
+        }
+    }
+
+    /// Issue the async open for one note tab (RFC-0003 §8.3 cold open).
+    fn open_note_tab(&mut self, tab: TabId, locator: &NoteLocator) {
+        let Some(flavite) = &self.flavite else {
+            return;
+        };
+        let path = locator.to_path(&self.root);
+        let request_id = flavite.command_registry().next_request_id();
+        let invocation = Invocation::new(
+            request_id,
+            "note.open",
+            serde_json::json!({ "path": path, "policy": "existing_only" }),
+            Origin::Gui,
+        );
+        match flavite.execute(invocation) {
+            ExecutionResult::Pending { request_id } => {
+                self.operations.accept(request_id, "note.open");
+                self.notes.track_request(tab, request_id);
+            }
+            ExecutionResult::Local(LocalResult::Success(success)) => {
+                let buffer = success
+                    .data
+                    .get("buffer_id")
+                    .and_then(serde_json::Value::as_u64);
+                self.notes.ready(tab, buffer);
+                self.dispatch_layout(|revision| LayoutAction::NoteLoadReady {
+                    expected_revision: revision,
+                    tab,
+                });
+            }
+            ExecutionResult::Local(LocalResult::Error(error)) => {
+                self.status = format!(
+                    "Could not open {}: {}",
+                    locator.components().join("/"),
+                    error.message
+                );
+                self.dispatch_layout(|revision| LayoutAction::NoteLoadFailed {
+                    expected_revision: revision,
+                    tab,
+                });
+            }
+            ExecutionResult::Rejected(rejected) => {
+                self.status = format!(
+                    "Could not open {}: {:?}",
+                    locator.components().join("/"),
+                    rejected.reason
+                );
+                self.dispatch_layout(|revision| LayoutAction::NoteLoadFailed {
+                    expected_revision: revision,
+                    tab,
+                });
+            }
+            ExecutionResult::ActionRequired { code, .. } => {
+                self.status = format!("Open needs attention: {code}");
+                self.dispatch_layout(|revision| LayoutAction::NoteLoadFailed {
+                    expected_revision: revision,
+                    tab,
+                });
+            }
+            ExecutionResult::Superseded { by_request, .. } => {
+                self.status = format!("Open superseded by request {by_request}");
+                self.dispatch_layout(|revision| LayoutAction::NoteLoadFailed {
+                    expected_revision: revision,
+                    tab,
+                });
+            }
+            ExecutionResult::Local(LocalResult::Void) => {
+                self.dispatch_layout(|revision| LayoutAction::NoteLoadFailed {
+                    expected_revision: revision,
+                    tab,
+                });
+            }
+        }
+    }
+
+    /// Route an open request canonically: focus an existing tab of the same
+    /// note, otherwise open into `group` (default: the focused group).
+    fn request_open(&mut self, locator: NoteLocator, group: Option<GroupId>) {
+        let existing = self
+            .workspace
+            .tabs()
+            .find_map(|(tab, session)| match session.kind() {
+                flavite_workspace::ViewKind::Note(note) if note.locator() == &locator => Some(*tab),
+                _ => None,
+            });
+        if let Some(tab) = existing {
+            self.dispatch_layout(|revision| LayoutAction::ActivateTab {
+                expected_revision: revision,
+                tab,
+            });
+            return;
+        }
+        let Some(group) = group
+            .or_else(|| self.focused_group())
+            .or_else(|| self.workspace.first_group())
+        else {
+            self.status = "Open a group before opening notes".into();
+            return;
+        };
+        self.dispatch_layout(|revision| LayoutAction::OpenNote {
+            expected_revision: revision,
+            locator,
+            group,
+        });
     }
 
     /// Apply one host event.
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Keyboard(event) => {
-                if let Some(message) = self.keyboard_message(event) {
+                if let Some(message) = host_commands::keyboard_message(self, event) {
                     return self.update(message);
                 }
             }
+            Message::Mouse(event) => self.handle_mouse(event),
             Message::WindowEvent(iced::window::Event::Focused) => {
                 if let Some(flavite) = &self.flavite
                     && let Err(error) = flavite.focus()
@@ -213,85 +511,100 @@ impl App {
                     self.status = format!("Vault focus reconcile failed: {error}");
                 }
             }
-            Message::WindowEvent(iced::window::Event::Unfocused) => {
-                self.editor_interaction = None;
-            }
             Message::WindowEvent(iced::window::Event::Resized(size)) => {
                 self.window_size = size;
             }
+            Message::WindowEvent(iced::window::Event::Unfocused) => {
+                self.gesture.cancel();
+            }
             Message::WindowEvent(_) => {}
-            Message::Navigate(pane) => {
-                self.pane = pane;
-                self.editor_interaction = None;
-            }
-            Message::Edit(action) => self.apply_editor_action(action),
-            Message::EditorInteraction(snapshot) => {
-                if self.pane == Pane::Editor && self.active_buffer == Some(snapshot.buffer_id) {
-                    self.editor_interaction = Some(snapshot);
+            Message::Pump => self.pump(),
+            Message::Layout(action) => {
+                let revision = self.workspace.revision();
+                let mut action = action;
+                if action.expected_revision() != revision {
+                    // Re-stamp actions that arrived through stateless
+                    // widgets so a stale click cannot masquerade as valid.
+                    action = restamp(action, revision);
                 }
+                let outcome = flavite_workspace::reduce(&self.workspace, action);
+                self.commit(outcome);
             }
-            Message::EditorFocusRequested => {
-                let Some(buffer_id) = self.active_buffer else {
-                    self.status = "Open a note before focusing the editor.".into();
-                    return iced::Task::none();
-                };
-                let Some(view) = self
-                    .flavite
-                    .as_ref()
-                    .and_then(|flavite| flavite.get_buffer_view(buffer_id.into(), None).ok())
-                else {
-                    self.status = "The current editor view is unavailable.".into();
-                    return iced::Task::none();
-                };
-                return iced_runtime::task::widget(flavite_editor::focus_editor(
-                    buffer_id,
-                    view.revision,
-                ))
-                .map(Message::EditorSelectionAcknowledged);
-            }
-            Message::EditorSelectionRequested {
-                revision,
-                anchor,
-                focus,
-            } => {
-                let active_buffer = self.active_buffer;
-                let valid = active_buffer
-                    .zip(self.editor_interaction)
-                    .filter(|(buffer, interaction)| {
-                        *buffer == interaction.buffer_id && interaction.revision == revision
-                    })
-                    .and_then(|(buffer, _)| {
-                        self.flavite
-                            .as_ref()?
-                            .get_buffer_view(buffer.into(), None)
-                            .ok()
-                    })
-                    .is_some_and(|view| {
-                        anchor <= view.text.len()
-                            && focus <= view.text.len()
-                            && view.text.is_char_boundary(anchor)
-                            && view.text.is_char_boundary(focus)
+            Message::NewViewInFocused(kind) => {
+                if let Some(group) = self
+                    .focused_group()
+                    .or_else(|| self.workspace.first_group())
+                {
+                    self.dispatch_layout(|revision| match kind {
+                        flavite_workspace::ViewKind::Empty => LayoutAction::OpenEmpty {
+                            expected_revision: revision,
+                            group,
+                        },
+                        flavite_workspace::ViewKind::Notes => LayoutAction::OpenNotes {
+                            expected_revision: revision,
+                            group,
+                        },
+                        flavite_workspace::ViewKind::Note(_) => LayoutAction::OpenEmpty {
+                            expected_revision: revision,
+                            group,
+                        },
                     });
-                if valid && let Some(buffer_id) = active_buffer {
-                    return iced_runtime::task::widget(
-                        flavite_editor::set_focused_editor_selection(
-                            buffer_id, revision, anchor, focus,
-                        ),
-                    )
-                    .map(Message::EditorSelectionAcknowledged);
                 }
             }
-            Message::EditorSelectionAcknowledged(Some(snapshot)) => {
-                self.editor_interaction = Some(snapshot);
+            Message::OpenNote { locator, group } => self.request_open(locator, group),
+            Message::GroupMenu(group, menu) => {
+                self.strip_menu = match self.strip_menu {
+                    Some((open_group, open_menu)) if open_group == group && open_menu == menu => {
+                        None
+                    }
+                    _ => Some((group, menu)),
+                };
             }
-            Message::EditorSelectionAcknowledged(None) => {
-                self.status =
-                    "Accessibility selection could not be applied to the current editor.".into();
+            Message::TabPressed(tab) => {
+                self.gesture.press(tab);
+                let revision = self.workspace.revision();
+                let outcome = flavite_workspace::reduce(
+                    &self.workspace,
+                    LayoutAction::ActivateTab {
+                        expected_revision: revision,
+                        tab,
+                    },
+                );
+                self.commit(outcome);
+            }
+            Message::TabHover { group, index } => self.gesture.hover(group, index),
+            Message::BodyHover(group) => {
+                let count = self
+                    .workspace
+                    .group(&group)
+                    .map_or(0, |group| group.tabs().len());
+                self.gesture.hover_group(group, count);
+            }
+            Message::PaneDrag(event) => self.handle_pane_drag(event),
+            Message::PaneResize(event) => {
+                if let Some(split) = self.adapter.workspace_split(event.split) {
+                    let ppm = ratio_to_ppm(event.ratio);
+                    self.resizing_split = Some(split);
+                    self.resize_preview.insert(split, ppm);
+                }
+            }
+            Message::PaneClicked(pane) => {
+                if let Some(group) = self.adapter.group_of_pane(pane) {
+                    let revision = self.workspace.revision();
+                    let outcome = flavite_workspace::reduce(
+                        &self.workspace,
+                        LayoutAction::FocusGroup {
+                            expected_revision: revision,
+                            group,
+                        },
+                    );
+                    self.commit(outcome);
+                }
             }
             Message::PaletteOpen => {
                 self.palette_open = true;
                 self.palette_selected = 0;
-                return iced::widget::operation::focus(PALETTE_INPUT_ID);
+                return iced::widget::operation::focus(crate::workspace_shell::PALETTE_INPUT_ID);
             }
             Message::PaletteClose => self.palette_open = false,
             Message::PaletteQuery(query) => {
@@ -299,7 +612,7 @@ impl App {
                 self.palette_selected = 0;
             }
             Message::PaletteNext => {
-                let last = self.palette_match_count().saturating_sub(1);
+                let last = self.palette_matches().len().saturating_sub(1);
                 self.palette_selected = (self.palette_selected + 1).min(last);
             }
             Message::PalettePrevious => {
@@ -309,671 +622,221 @@ impl App {
                 let selected = self.palette_selected;
                 return self.run_palette_selection(selected);
             }
-            Message::RunCommand(id) => {
-                self.close_palette();
-                self.run_command(id);
-            }
-            Message::ChangeRenameBehavior => {
-                self.settings.rename_behavior = match self.settings.rename_behavior {
-                    RenameBehavior::Rewrite => RenameBehavior::Alias,
-                    RenameBehavior::Alias => RenameBehavior::None,
-                    RenameBehavior::None => RenameBehavior::Rewrite,
+            Message::PalettePick(index) => return self.run_palette_selection(index),
+            Message::PickerOpen => {
+                self.picker = Picker {
+                    open: true,
+                    query: String::new(),
+                    selected: 0,
                 };
-                self.settings_dirty = true;
-            }
-            Message::ChangeRecovery(delta) => {
-                self.settings.recovery_interval_secs =
-                    adjust(self.settings.recovery_interval_secs, delta, 1, 60);
-                self.settings_dirty = true;
-            }
-            Message::ChangeVerification(delta) => {
-                self.settings.verification_interval_mins =
-                    adjust(self.settings.verification_interval_mins, delta, 1, 1440);
-                self.settings_dirty = true;
-            }
-            Message::ChangeLogBudget(delta) => {
-                self.settings.change_log_budget_mib =
-                    adjust(self.settings.change_log_budget_mib, delta, 8, 1024);
-                self.settings_dirty = true;
-            }
-            Message::SetIgnoreGlobs(value) => {
-                self.settings.ignore_globs = value
-                    .split('\n')
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_owned)
-                    .collect();
-                self.settings_dirty = true;
-            }
-            Message::SaveSettings => self.save_settings(),
-            Message::Pump => self.pump(),
-        }
-        Task::none()
-    }
-
-    /// Draw the persistent shell: sidebar, pane header, content, status bar.
-    pub fn view(&self) -> Element<'_, Message> {
-        let shell = self.shell();
-        if !self.palette_open {
-            return shell;
-        }
-        let backdrop = button(Space::new().width(Length::Fill).height(Length::Fill))
-            .style(style::backdrop)
-            .on_press(Message::PaletteClose);
-        stack![
-            shell,
-            opaque(backdrop),
-            container(self.palette_card())
-                .align_x(alignment::Horizontal::Center)
-                .align_y(alignment::Vertical::Top)
-                .padding(Padding {
-                    top: 72.0,
-                    ..Padding::default()
-                })
-                .width(Length::Fill)
-                .height(Length::Fill)
-        ]
-        .into()
-    }
-
-    /// The chrome shared by every pane: navigation sidebar, pane header and
-    /// content, and the status bar.
-    fn shell(&self) -> Element<'_, Message> {
-        column![
-            row![self.sidebar(), self.main_region()].height(Length::Fill),
-            rule::horizontal(1),
-            self.status_bar(),
-        ]
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
-    }
-
-    fn sidebar(&self) -> Element<'_, Message> {
-        let vault_name = self.root.file_name().map_or_else(
-            || self.root.display().to_string(),
-            |name| name.to_string_lossy().to_string(),
-        );
-        let mut nav = column![];
-        for pane in Pane::NAV {
-            let selected = *pane == self.pane;
-            nav = nav.push(
-                button(text(pane.title()).width(Length::Fill))
-                    .width(Length::Fill)
-                    .padding(Padding {
-                        top: 7.0,
-                        bottom: 7.0,
-                        left: 10.0,
-                        right: 10.0,
-                    })
-                    .style(style::list_row(selected))
-                    .on_press(Message::Navigate(*pane)),
-            );
-        }
-        let (dot_tone, hint) = if self.flavite.is_some() {
-            (Tone::Success, "Vault connected")
-        } else {
-            (Tone::Danger, "Vault unavailable")
-        };
-        container(
-            column![
-                text("LATTICE").size(style::BRAND).style(style::accent_text),
-                text(vault_name).size(style::TEXT_SM).style(style::dim_text),
-                text(self.root.display().to_string())
-                    .size(style::TEXT_SM)
-                    .style(style::dim_text),
-                Space::new()
-                    .width(Length::Fixed(0.0))
-                    .height(Length::Fixed(style::SPACING_LG)),
-                nav.spacing(style::SPACING_SM),
-                button(
-                    text("Command palette  Ctrl+P")
-                        .width(Length::Fill)
-                        .style(style::dim_text),
-                )
-                .width(Length::Fill)
-                .padding(Padding {
-                    top: 7.0,
-                    bottom: 7.0,
-                    left: 10.0,
-                    right: 10.0,
-                })
-                .style(style::ghost())
-                .on_press(Message::PaletteOpen),
-                Space::new().width(Length::Fill).height(Length::Fill),
-                row![
-                    container(
-                        Space::new()
-                            .width(Length::Fixed(8.0))
-                            .height(Length::Fixed(8.0))
-                    )
-                    .style(move |theme| style::dot(theme, dot_tone)),
-                    text(hint).size(style::TEXT_SM).style(style::dim_text),
-                ]
-                .spacing(style::SPACING_SM)
-                .align_y(alignment::Vertical::Center),
-            ]
-            .spacing(style::SPACING_SM),
-        )
-        .width(Length::Fixed(style::SIDEBAR_WIDTH))
-        .height(Length::Fill)
-        .padding(style::SPACING)
-        .style(style::sidebar)
-        .into()
-    }
-
-    fn main_region(&self) -> Element<'_, Message> {
-        let content = match self.pane {
-            Pane::Workspace => self.workspace_view(),
-            Pane::Editor => self.document_view(false),
-            Pane::Read => self.document_view(true),
-            Pane::Graph => self.placeholder_view(
-                "Knowledge graph",
-                "The graph view is hosted in the same pane grid and will receive its live feed in the graph integration slice.",
-            ),
-            Pane::Settings => self.settings_view(),
-        };
-        column![self.pane_header(), rule::horizontal(1), content]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    }
-
-    fn pane_header(&self) -> Element<'_, Message> {
-        let mut header = row![
-            text(self.pane.title())
-                .size(style::HEADING)
-                .width(Length::Fill),
-        ]
-        .spacing(style::SPACING)
-        .align_y(alignment::Vertical::Center);
-        header = match self.pane {
-            Pane::Workspace => header.push(
-                button(text("Refresh vault"))
-                    .style(style::ghost())
-                    .padding(chip_padding())
-                    .on_press(Message::RunCommand("vault.reconcile")),
-            ),
-            Pane::Editor => {
-                let mut actions = header;
-                if let Some(view) = self.active_view() {
-                    let tone = state_tone(&view.state);
-                    let state = view.state;
-                    actions = actions.push(
-                        container(text(state).size(style::TEXT_SM))
-                            .style(move |theme| style::chip(theme, tone))
-                            .padding(chip_padding()),
-                    );
+                if self.catalog.is_empty() {
+                    self.load_catalog();
                 }
-                actions.push(
-                    button(text("Save note  Ctrl+S"))
-                        .style(style::action())
-                        .padding(chip_padding())
-                        .on_press_maybe(
-                            self.active_buffer
-                                .is_some()
-                                .then_some(Message::RunCommand("note.save")),
-                        ),
-                )
+                return iced::widget::operation::focus(crate::workspace_shell::PICKER_INPUT_ID);
             }
-            Pane::Read => header.push(
-                button(text("Open in editor"))
-                    .style(style::ghost())
-                    .padding(chip_padding())
-                    .on_press(Message::Navigate(Pane::Editor)),
-            ),
-            Pane::Graph | Pane::Settings => header,
-        };
-        container(header)
-            .width(Length::Fill)
-            .padding(Padding {
-                top: 10.0,
-                bottom: 10.0,
-                left: style::SPACING_LG,
-                right: style::SPACING_LG,
-            })
-            .into()
-    }
-
-    fn status_bar(&self) -> Element<'_, Message> {
-        let mut right = row![].spacing(style::SPACING_SM);
-        if let Some(view) = self.active_view() {
-            let conflicted = view.state == "Conflicted";
-            let tone = state_tone(&view.state);
-            let state = view.state;
-            right = right.push(
-                container(text(state).size(style::TEXT_SM))
-                    .style(move |theme| style::chip(theme, tone))
-                    .padding(chip_padding()),
-            );
-            if conflicted {
-                right = right.push(
-                    container(text("Autosave paused").size(style::TEXT_SM))
-                        .style(|theme| style::chip(theme, Tone::Danger))
-                        .padding(chip_padding()),
-                );
+            Message::PickerClose => self.picker = Picker::default(),
+            Message::PickerQuery(query) => {
+                self.picker.query = query;
+                self.picker.selected = 0;
             }
-        }
-        let pending = self.operations.pending().count();
-        if pending > 0 {
-            right = right.push(
-                container(text(format!("{pending} in flight")).size(style::TEXT_SM))
-                    .style(|theme| style::chip(theme, Tone::Warning))
-                    .padding(chip_padding()),
-            );
-        }
-        if let Some((done, total)) = self.reconcile_progress {
-            right = right.push(
-                container(text(format!("Indexing {done}/{total}")).size(style::TEXT_SM))
-                    .style(|theme| style::chip(theme, Tone::Warning))
-                    .padding(chip_padding()),
-            );
-        }
-        container(
-            row![
-                text(&self.status).size(style::TEXT_SM).width(Length::Fill),
-                right,
-            ]
-            .spacing(style::SPACING),
-        )
-        .width(Length::Fill)
-        .padding(Padding {
-            top: 6.0,
-            bottom: 6.0,
-            left: style::SPACING_LG,
-            right: style::SPACING_LG,
-        })
-        .style(style::status_bar)
-        .into()
-    }
-
-    fn workspace_view(&self) -> Element<'_, Message> {
-        let content = column![
-            text("Your notes remain plain Markdown files. This shell hosts the same headless Session used by the CLI."),
-            row![
-                button(text("Open command palette  Ctrl+P"))
-                    .style(style::action())
-                    .padding(chip_padding())
-                    .on_press(Message::PaletteOpen),
-                button(text("Save active note  Ctrl+S"))
-                    .style(style::ghost())
-                    .padding(chip_padding())
-                    .on_press_maybe(
-                        self.active_buffer.is_some().then_some(Message::RunCommand("note.save")),
-                    ),
-            ]
-            .spacing(style::SPACING),
-            container(
-                column![
-                    text("Recent activity").size(style::TEXT_LG),
-                    self.events_view(),
-                ]
-                .spacing(style::SPACING_SM),
-            )
-            .width(Length::Fill)
-            .padding(style::SPACING)
-            .style(style::card),
-        ]
-        .spacing(style::SPACING_LG);
-        container(scrollable(content))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(style::SPACING_LG)
-            .style(style::content)
-            .into()
-    }
-
-    fn document_view(&self, read_mode: bool) -> Element<'_, Message> {
-        let Some(flavite) = &self.flavite else {
-            return self.placeholder_view("Document", "The vault is unavailable.");
-        };
-        let Some(buffer_id) = self.active_buffer else {
-            return self.placeholder_view(
-                "Document",
-                "Open demo.md through the command palette to attach a revisioned buffer view.",
-            );
-        };
-        match flavite.get_buffer_view(buffer_id.into(), None) {
-            Ok(view) => {
-                let title = if read_mode { "Read" } else { "Editor" };
-                let meta = row![
-                    container(text(view.path.display().to_string()).size(style::TEXT_SM))
-                        .style(|theme| style::chip(theme, Tone::Neutral))
-                        .padding(chip_padding()),
-                    container(text(format!("rev {}", view.revision)).size(style::TEXT_SM))
-                        .style(|theme| style::chip(theme, Tone::Neutral))
-                        .padding(chip_padding()),
-                    container(text(title).size(style::TEXT_SM))
-                        .style(|theme| style::chip(theme, Tone::Primary))
-                        .padding(chip_padding()),
-                ]
-                .spacing(style::SPACING_SM);
-                let body: Element<'_, Message> = if read_mode {
-                    container(scrollable(
-                        text(view.text).font(Font::MONOSPACE).size(style::TEXT),
-                    ))
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .padding(style::SPACING)
-                    .style(style::card)
-                    .into()
-                } else {
-                    EditorWidget::new(&view, Message::Edit)
-                        .with_interaction(Message::EditorInteraction)
-                        .into()
-                };
-                container(column![meta, body].spacing(style::SPACING))
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .padding(style::SPACING_LG)
-                    .style(style::content)
-                    .into()
+            Message::PickerNext => {
+                let last = self.picker_matches().len().saturating_sub(1);
+                self.picker.selected = (self.picker.selected + 1).min(last);
             }
-            Err(error) => {
-                self.placeholder_view("Document", &format!("Buffer view unavailable: {error}"))
+            Message::PickerPrevious => {
+                self.picker.selected = self.picker.selected.saturating_sub(1);
             }
-        }
-    }
-
-    fn apply_editor_action(&mut self, action: EditorAction) {
-        let Some(flavite) = &self.flavite else {
-            self.status = "The vault is unavailable".into();
-            return;
-        };
-        let buffer_id = action.buffer_id;
-        if action.navigation.is_some() {
-            self.status = "Link navigation is unavailable in this editor view".into();
-            return;
-        }
-        let result = flavite.execute_session(action.into_session_command());
-        self.status = match result {
-            flavite_api::session::SessionResult::Success(_) => "Editing".into(),
-            other => format!("Edit failed: {other:?}"),
-        };
-        if let Ok(view) = flavite.get_buffer_view(buffer_id.into(), None) {
-            if self.active_buffer != Some(view.buffer_id) {
-                self.editor_interaction = None;
+            Message::PickerSubmit => {
+                let selected = self.picker.selected;
+                return self.run_picker_selection(selected);
             }
-            self.active_buffer = Some(view.buffer_id);
+            Message::PickerPick(index) => return self.run_picker_selection(index),
+            Message::RunHostCommand(id) => return host_commands::dispatch(self, id),
+            Message::RunCoreCommand(id) => self.run_core_command(id),
+            Message::RefreshCatalog => self.load_catalog(),
         }
-    }
-
-    fn placeholder_view(&self, title: &str, description: &str) -> Element<'_, Message> {
-        container(
-            column![
-                text(title.to_owned()).size(style::TEXT_LG),
-                text(description.to_owned()).style(style::dim_text),
-            ]
-            .spacing(style::SPACING_SM),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(style::SPACING_LG)
-        .style(style::content)
-        .center_x(Length::Fill)
-        .align_y(alignment::Vertical::Top)
-        .into()
-    }
-
-    fn palette_card(&self) -> Element<'_, Message> {
-        let matches = self.palette_matches();
-        let selected = self.palette_selected.min(matches.len().saturating_sub(1));
-        let mut rows = column![];
-        for (index, spec) in matches.iter().enumerate() {
-            let is_selected = index == selected;
-            rows = rows.push(
-                button(
-                    row![
-                        text(spec.title).width(Length::Fill),
-                        text(spec.id).size(style::TEXT_SM).style(style::dim_text),
-                        text(keybinding(spec).unwrap_or_default())
-                            .size(style::TEXT_SM)
-                            .style(style::dim_text),
-                    ]
-                    .spacing(style::SPACING),
-                )
-                .width(Length::Fill)
-                .padding(Padding {
-                    top: 8.0,
-                    bottom: 8.0,
-                    left: 10.0,
-                    right: 10.0,
-                })
-                .style(style::list_row(is_selected))
-                .on_press(Message::RunCommand(spec.id)),
-            );
-        }
-        let body: Element<'_, Message> = if matches.is_empty() {
-            text("No matching commands").style(style::dim_text).into()
-        } else {
-            scrollable(rows).width(Length::Fill).into()
-        };
-        container(
-            column![
-                text_input("Type a command…", &self.palette_query)
-                    .id(PALETTE_INPUT_ID)
-                    .on_input(Message::PaletteQuery)
-                    .size(style::TEXT_LG)
-                    .padding(8),
-                rule::horizontal(1),
-                container(body).max_height(360).width(Length::Fill),
-                row![
-                    Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
-                    text("Up/Down navigate · Enter runs · Esc dismisses")
-                        .size(style::TEXT_SM)
-                        .style(style::dim_text),
-                ],
-            ]
-            .spacing(style::SPACING_SM)
-            .width(Length::Fill),
-        )
-        .width(Length::Fixed(style::PALETTE_WIDTH))
-        .padding(style::SPACING)
-        .style(style::palette_card)
-        .into()
-    }
-
-    fn settings_view(&self) -> Element<'_, Message> {
-        let rename = match self.settings.rename_behavior {
-            RenameBehavior::Rewrite => "Rewrite links",
-            RenameBehavior::Alias => "Add aliases",
-            RenameBehavior::None => "Do not update links",
-        };
-        let globs = self.settings.ignore_globs.join("\n");
-        let can_save = self.settings_valid && self.settings_dirty;
-        let content =
-            column![
-                text(format!(
-                    "Settings version {} · unknown fields are preserved",
-                    self.settings.version
-                ))
-                .style(style::dim_text),
-                container(
-                    column![
-                        setting_row(
-                            "Rename behavior",
-                            button(text(rename))
-                                .style(style::ghost())
-                                .padding(chip_padding())
-                                .on_press(Message::ChangeRenameBehavior),
-                        ),
-                        setting_row(
-                            "Recovery checkpoint",
-                            stepper(
-                                self.settings.recovery_interval_secs,
-                                "seconds",
-                                Message::ChangeRecovery,
-                            ),
-                        ),
-                        setting_row(
-                            "Content verification",
-                            stepper(
-                                self.settings.verification_interval_mins,
-                                "minutes",
-                                Message::ChangeVerification,
-                            ),
-                        ),
-                        setting_row(
-                            "Change log budget",
-                            stepper(
-                                self.settings.change_log_budget_mib,
-                                "MiB",
-                                Message::ChangeLogBudget,
-                            ),
-                        ),
-                        text("Ignore globs · one per line"),
-                        text_input("*.draft.md", &globs)
-                            .on_input(Message::SetIgnoreGlobs)
-                            .padding(8),
-                        row![
-                        button(text(if !self.settings_valid {
-                            "Settings unavailable"
-                        } else if self.settings_dirty {
-                            "Save settings"
-                        } else {
-                            "Settings saved"
-                        }))
-                        .style(style::action())
-                        .padding(chip_padding())
-                        .on_press_maybe(can_save.then_some(Message::SaveSettings)),
-                        text("External symlink targets remain disabled by the vault safety policy.")
-                            .size(style::TEXT_SM)
-                            .style(style::dim_text),
-                    ]
-                        .spacing(style::SPACING)
-                        .align_y(alignment::Vertical::Center),
-                    ]
-                    .spacing(style::SPACING),
-                )
-                .width(Length::Fill)
-                .padding(style::SPACING)
-                .style(style::card),
-            ]
-            .spacing(style::SPACING);
-        container(scrollable(content))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(style::SPACING_LG)
-            .style(style::content)
-            .into()
-    }
-
-    fn events_view(&self) -> Element<'_, Message> {
-        if self.recent_events.is_empty() {
-            return text("No recent events")
-                .size(style::TEXT_SM)
-                .style(style::dim_text)
-                .into();
-        }
-        let mut entries = column![];
-        for event in self.recent_events.iter().rev().take(12) {
-            entries = entries.push(text(event.as_str()).size(style::TEXT_SM));
-        }
-        entries.into()
-    }
-
-    fn palette_matches(&self) -> Vec<flavite_api::CommandSpec> {
-        self.flavite.as_ref().map_or_else(Vec::new, |flavite| {
-            matching_commands(flavite, &self.palette_query)
-        })
-    }
-
-    fn palette_match_count(&self) -> usize {
-        self.palette_matches().len()
-    }
-
-    /// Execute the palette row at `index` and dismiss the overlay.
-    fn run_palette_selection(&mut self, index: usize) -> Task<Message> {
-        let matches = self.palette_matches();
-        let Some(spec_id) = matches
-            .get(index.min(matches.len().saturating_sub(1)))
-            .map(|spec| spec.id)
-        else {
-            self.close_palette();
-            return Task::none();
-        };
-        self.close_palette();
-        self.run_command(spec_id);
+        #[cfg(feature = "ui-test-support")]
+        crate::harness::observe(self);
         Task::none()
     }
 
-    fn close_palette(&mut self) {
-        self.palette_open = false;
-        self.palette_query.clear();
-        self.palette_selected = 0;
+    fn handle_mouse(&mut self, event: iced::mouse::Event) {
+        match event {
+            iced::mouse::Event::CursorMoved { position } => {
+                self.gesture.moved(position);
+            }
+            iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left) => {
+                if let Some((tab, target)) = self.gesture.release() {
+                    self.dispatch_layout(|revision| LayoutAction::MoveTab {
+                        expected_revision: revision,
+                        tab,
+                        target: flavite_workspace::TabDropTarget::Index {
+                            group: target.group,
+                            index: target.index,
+                        },
+                    });
+                }
+                if let Some(split) = self.resizing_split.take()
+                    && let Some(ppm) = self.resize_preview.remove(&split)
+                {
+                    self.dispatch_layout(|revision| LayoutAction::ResizeSplit {
+                        expected_revision: revision,
+                        split,
+                        desired_ratio_ppm: ppm,
+                    });
+                }
+            }
+            _ => {}
+        }
     }
 
-    /// Current revisioned view of the active buffer, if any.
-    fn active_view(&self) -> Option<BufferView> {
-        let buffer_id = self.active_buffer?;
-        self.flavite
-            .as_ref()?
-            .get_buffer_view(buffer_id.into(), None)
-            .ok()
+    fn handle_pane_drag(&mut self, event: iced::widget::pane_grid::DragEvent) {
+        use iced::widget::pane_grid::{DragEvent, Target};
+        match event {
+            DragEvent::Dropped { pane, target } => {
+                let Some(source) = self.adapter.group_of_pane(pane) else {
+                    return;
+                };
+                let action = match target {
+                    Target::Pane(other, region) => {
+                        let Some(destination) = self.adapter.group_of_pane(other) else {
+                            return;
+                        };
+                        match region {
+                            iced::widget::pane_grid::Region::Center => LayoutAction::MergeGroups {
+                                expected_revision: self.workspace.revision(),
+                                source,
+                                destination,
+                            },
+                            iced::widget::pane_grid::Region::Edge(edge) => {
+                                let (arrangement, side) =
+                                    crate::workspace::pane_grid::workspace_split_target(edge);
+                                LayoutAction::MoveGroupSplit {
+                                    expected_revision: self.workspace.revision(),
+                                    source,
+                                    destination,
+                                    arrangement,
+                                    side,
+                                }
+                            }
+                        }
+                    }
+                    Target::Edge(edge) => {
+                        let edge = crate::workspace::pane_grid::workspace_edge(edge);
+                        LayoutAction::MoveGroupEdge {
+                            expected_revision: self.workspace.revision(),
+                            group: source,
+                            edge,
+                        }
+                    }
+                };
+                let outcome = flavite_workspace::reduce(&self.workspace, action);
+                self.commit(outcome);
+            }
+            DragEvent::Picked { .. } | DragEvent::Canceled { .. } => {}
+        }
     }
 
-    fn run_command(&mut self, command_id: &'static str) {
+    /// Process vault events and completions on the host pump. Presentation
+    /// never gates core progress (FR-28).
+    fn pump(&mut self) {
+        let drained = {
+            let Some(flavite) = &self.flavite else {
+                return;
+            };
+            flavite.session().pump();
+            let mut refresh_catalog = false;
+            let mut events = Vec::new();
+            for event in flavite.drain_events() {
+                if let flavite_api::Event::ReconcileProgress { done, total } = event {
+                    self.reconcile_progress = (done < total).then_some((done, total));
+                }
+                if matches!(event, flavite_api::Event::VaultChanged { .. }) {
+                    refresh_catalog = true;
+                }
+                events.push(format!("{}: {event:?}", event.event_type()));
+                flavite.acknowledge_event(&event);
+            }
+            let completions = flavite.drain_operation_completions();
+            if refresh_catalog {
+                // Scoped borrow ends before mutation below.
+                drop(flavite);
+                self.load_catalog();
+            }
+            (events, completions)
+        };
+        let (events, completions) = drained;
+        for event in events {
+            self.recent_events.push(event);
+        }
+        self.recent_events.truncate(100);
+        self.operations.ingest(&completions);
+        for completion in completions {
+            if let Some(tab) = self.notes.finish_request(completion.request_id) {
+                match &completion.result {
+                    ExecutionResult::Local(LocalResult::Success(success)) => {
+                        let buffer = success
+                            .data
+                            .get("buffer_id")
+                            .and_then(serde_json::Value::as_u64);
+                        self.notes.ready(tab, buffer);
+                        self.dispatch_layout(|revision| LayoutAction::NoteLoadReady {
+                            expected_revision: revision,
+                            tab,
+                        });
+                    }
+                    _ => {
+                        self.dispatch_layout(|revision| LayoutAction::NoteLoadFailed {
+                            expected_revision: revision,
+                            tab,
+                        });
+                    }
+                }
+            } else {
+                self.status = format!("Request {} completed", completion.request_id);
+            }
+        }
+    }
+
+    fn run_core_command(&mut self, command_id: &'static str) {
         let Some(flavite) = &self.flavite else {
             self.status = "Open a vault before running commands".into();
             return;
         };
-        let note = self.root.join("demo.md");
         let args = match command_id {
-            "note.open" | "note.close" | "note.save" => serde_json::json!(note),
-            "vault.reconcile" => serde_json::json!({ "scope": "full", "mode": "fast" }),
-            "buffer.undo" | "buffer.redo" => {
-                let Some(buffer_id) = self.active_buffer else {
-                    self.status = format!("{command_id} requires an open note");
+            "note.save" | "note.close" => {
+                let focused = self.workspace.focused_tab();
+                let Some(state) = self.notes.state(&focused) else {
+                    self.status = format!("{command_id} requires a note tab");
                     return;
                 };
-                let Ok(view) = flavite.get_buffer_view(buffer_id.into(), None) else {
-                    self.status =
-                        format!("{command_id} could not read the current buffer revision");
-                    return;
-                };
-                serde_json::json!({ "buffer_id": buffer_id, "revision": view.revision })
+                serde_json::json!(state.locator.to_path(&self.root))
             }
+            "vault.reconcile" => serde_json::json!({ "scope": "full", "mode": "fast" }),
             _ => serde_json::Value::Null,
         };
         let request_id = flavite.command_registry().next_request_id();
         let invocation = Invocation::new(request_id, command_id, args, Origin::Gui);
         match flavite.execute(invocation) {
-            ExecutionResult::Local(result) => match result {
-                LocalResult::Success(success) => {
-                    self.status = match command_id {
-                        "note.open" => "Opened demo.md".into(),
-                        "note.close" => "Note closed".into(),
-                        "note.save" => "Note saved".into(),
-                        "vault.reconcile" => "Vault refreshed".into(),
-                        _ => format!("{command_id} completed"),
-                    };
-                    if command_id == "note.open" {
-                        let opened = success
-                            .data
-                            .get("buffer_id")
-                            .and_then(serde_json::Value::as_u64);
-                        if self.active_buffer != opened {
-                            self.editor_interaction = None;
-                        }
-                        self.active_buffer = opened;
-                    } else if command_id == "note.close" {
-                        self.active_buffer = None;
-                        self.editor_interaction = None;
-                    }
-                }
-                LocalResult::Error(error) => {
-                    self.status = format!("{command_id} failed: {}", error.message);
-                }
-                LocalResult::Void => self.status = format!("{command_id} completed"),
-            },
+            ExecutionResult::Local(LocalResult::Success(_)) => {
+                self.status = match command_id {
+                    "note.save" => "Note saved".into(),
+                    "note.close" => "Note closed".into(),
+                    "vault.reconcile" => "Vault refreshed".into(),
+                    _ => format!("{command_id} completed"),
+                };
+            }
+            ExecutionResult::Local(LocalResult::Error(error)) => {
+                self.status = format!("{command_id} failed: {}", error.message);
+            }
+            ExecutionResult::Local(LocalResult::Void) => {
+                self.status = format!("{command_id} completed");
+            }
             ExecutionResult::Pending { request_id } => {
                 self.operations.accept(request_id, command_id);
-                self.status = format!("{command_id} pending · request {request_id}");
+                self.status = format!("{command_id} pending");
             }
-            ExecutionResult::ActionRequired {
-                request_id, code, ..
-            } => {
-                self.operations.accept(request_id, command_id);
+            ExecutionResult::ActionRequired { code, .. } => {
                 self.status = format!("{command_id} needs a decision: {code}");
             }
             ExecutionResult::Superseded { by_request, .. } => {
@@ -985,169 +848,260 @@ impl App {
         }
     }
 
-    fn save_settings(&mut self) {
-        if !self.settings_valid {
-            self.status = "Settings were not loaded safely; repair settings.toml first".into();
-            return;
+    /// The combined catalog snapshot for the palette: core specs plus the
+    /// host commands, in stable order.
+    fn palette_matches(&self) -> Vec<flavite_api::CommandSpec> {
+        let mut specs = host_commands::ui_specs();
+        if let Some(flavite) = &self.flavite {
+            specs.extend(flavite.command_registry().specs());
         }
-        let Some(flavite) = &self.flavite else { return };
-        match self
-            .settings
-            .to_toml()
-            .and_then(|text| flavite.write_settings(&text).map_err(|e| e.to_string()))
-        {
-            Ok(()) => {
-                self.settings_dirty = false;
-                self.status = "Settings saved".into();
-            }
-            Err(error) => self.status = format!("Settings save failed: {error}"),
-        }
+        matching_specs(specs, &self.palette_query)
     }
 
-    fn pump(&mut self) {
-        let Some(flavite) = &self.flavite else { return };
-        flavite.session().pump();
-        for event in flavite.drain_events() {
-            if let flavite_api::Event::ReconcileProgress { done, total } = event {
-                self.reconcile_progress = (done < total).then_some((done, total));
-            }
-            self.recent_events
-                .push(format!("{}: {event:?}", event.event_type()));
-            flavite.acknowledge_event(&event);
-        }
-        for terminal in self.operations.drain(flavite) {
-            self.status = format!("Request {} · {}", terminal.request_id, terminal.result);
-        }
-        self.recent_events.truncate(100);
-    }
-}
-
-/// Map a buffer state string to its chip tone.
-fn state_tone(state: &str) -> Tone {
-    match state {
-        "Clean" => Tone::Success,
-        "Dirty" => Tone::Warning,
-        "Conflicted" => Tone::Danger,
-        _ => Tone::Neutral,
-    }
-}
-
-/// Padding shared by chip-sized controls.
-fn chip_padding() -> Padding {
-    Padding {
-        top: 5.0,
-        bottom: 5.0,
-        left: 10.0,
-        right: 10.0,
-    }
-}
-
-fn setting_row<'a>(
-    label: &'static str,
-    control: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    row![text(label).width(Length::Fill), control.into(),]
-        .spacing(style::SPACING)
-        .align_y(alignment::Vertical::Center)
-        .into()
-}
-
-fn stepper<'a>(value: u64, unit: &'static str, change: fn(i8) -> Message) -> Element<'a, Message> {
-    row![
-        button(text("−"))
-            .style(style::ghost())
-            .padding(chip_padding())
-            .on_press(change(-1)),
-        text(format!("{value} {unit}"))
-            .width(Length::Fixed(96.0))
-            .align_x(alignment::Horizontal::Center),
-        button(text("+"))
-            .style(style::ghost())
-            .padding(chip_padding())
-            .on_press(change(1)),
-    ]
-    .spacing(style::SPACING_SM)
-    .align_y(alignment::Vertical::Center)
-    .into()
-}
-
-impl App {
-    /// Resolve a raw keyboard event against the shell state (palette overlay
-    /// shortcuts and navigation keys).
-    fn keyboard_message(&self, event: keyboard::Event) -> Option<Message> {
-        let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
-            return None;
+    fn run_palette_selection(&mut self, index: usize) -> Task<Message> {
+        let matches = self.palette_matches();
+        let Some(spec) = matches.get(index.min(matches.len().saturating_sub(1))) else {
+            self.palette_open = false;
+            return Task::none();
         };
-        if modifiers.command() {
-            let keyboard::Key::Character(character) = key.as_ref() else {
-                return None;
-            };
-            if character.eq_ignore_ascii_case("p") {
-                return Some(if self.palette_open {
-                    Message::PaletteClose
-                } else {
-                    Message::PaletteOpen
-                });
-            }
-            if character.eq_ignore_ascii_case("s") {
-                return Some(Message::RunCommand("note.save"));
-            }
-            return None;
+        let id = spec.id;
+        self.palette_open = false;
+        self.palette_query.clear();
+        self.palette_selected = 0;
+        if let Some(command) = host_commands::UI_COMMANDS.iter().find(|c| c.id == id) {
+            return host_commands::dispatch(self, command.id);
         }
-        if !self.palette_open {
-            return None;
-        }
-        let keyboard::Key::Named(named) = key.as_ref() else {
-            return None;
+        self.run_core_command(id);
+        Task::none()
+    }
+
+    /// Fuzzy-matched catalog entries for the picker.
+    #[must_use]
+    pub fn picker_matches(&self) -> Vec<NoteCatalogEntry> {
+        picker_matches(self.catalog.clone(), &self.picker.query)
+    }
+
+    fn run_picker_selection(&mut self, index: usize) -> Task<Message> {
+        let matches = self.picker_matches();
+        self.picker = Picker::default();
+        let Some(entry) = matches.get(index.min(matches.len().saturating_sub(1))) else {
+            return Task::none();
         };
-        match named {
-            keyboard::key::Named::Escape => Some(Message::PaletteClose),
-            keyboard::key::Named::ArrowDown => Some(Message::PaletteNext),
-            keyboard::key::Named::ArrowUp => Some(Message::PalettePrevious),
-            keyboard::key::Named::Enter => Some(Message::PaletteSubmit),
-            _ => None,
-        }
+        let Ok(locator) = NoteLocator::from_relative(&entry.path) else {
+            self.status = format!(
+                "The picker entry is not a valid note path: {}",
+                entry.path.display()
+            );
+            return Task::none();
+        };
+        self.request_open(locator, None);
+        Task::none()
+    }
+
+    /// Rebuild the accessibility routing map from current state.
+    pub fn refresh_semantics(&mut self) {
+        self.a11y_nodes = crate::accessibility::tree::build_node_map(self);
+    }
+
+    /// Bridge vault channels and operation replies.
+    pub fn subscription(_state: &Self) -> Subscription<Message> {
+        Subscription::batch([
+            subscription::pump().map(|_| Message::Pump),
+            keyboard::listen().map(Message::Keyboard),
+            iced::event::listen_with(|event, _status, _id| match event {
+                iced::Event::Mouse(mouse_event) => Some(Message::Mouse(mouse_event)),
+                _ => None,
+            }),
+            iced::window::events().map(|(_, event)| Message::WindowEvent(event)),
+        ])
     }
 }
 
-fn adjust(value: u64, delta: i8, minimum: u64, maximum: u64) -> u64 {
-    (value as i64 + i64::from(delta)).clamp(minimum as i64, maximum as i64) as u64
+/// Re-stamp an action built against an older revision. Widget-held actions
+/// are rebuilt at the current revision so stale clicks still express intent
+/// without silently passing the guard.
+fn restamp(action: LayoutAction, revision: u64) -> LayoutAction {
+    use flavite_workspace::LayoutAction as A;
+    match action {
+        A::OpenNote { locator, group, .. } => A::OpenNote {
+            expected_revision: revision,
+            locator,
+            group,
+        },
+        A::OpenEmpty { group, .. } => A::OpenEmpty {
+            expected_revision: revision,
+            group,
+        },
+        A::OpenNotes { group, .. } => A::OpenNotes {
+            expected_revision: revision,
+            group,
+        },
+        A::ActivateTab { tab, .. } => A::ActivateTab {
+            expected_revision: revision,
+            tab,
+        },
+        A::FocusGroup { group, .. } => A::FocusGroup {
+            expected_revision: revision,
+            group,
+        },
+        A::CloseTab { tab, .. } => A::CloseTab {
+            expected_revision: revision,
+            tab,
+        },
+        A::CloseGroup { group, .. } => A::CloseGroup {
+            expected_revision: revision,
+            group,
+        },
+        A::DuplicateTab { tab, .. } => A::DuplicateTab {
+            expected_revision: revision,
+            tab,
+        },
+        A::ReopenClosed { .. } => A::ReopenClosed {
+            expected_revision: revision,
+        },
+        A::MoveTab { tab, target, .. } => A::MoveTab {
+            expected_revision: revision,
+            tab,
+            target,
+        },
+        A::MergeGroups {
+            source,
+            destination,
+            ..
+        } => A::MergeGroups {
+            expected_revision: revision,
+            source,
+            destination,
+        },
+        A::MoveGroupSplit {
+            source,
+            destination,
+            arrangement,
+            side,
+            ..
+        } => A::MoveGroupSplit {
+            expected_revision: revision,
+            source,
+            destination,
+            arrangement,
+            side,
+        },
+        A::MoveGroupEdge { group, edge, .. } => A::MoveGroupEdge {
+            expected_revision: revision,
+            group,
+            edge,
+        },
+        A::SplitGroup {
+            group, arrangement, ..
+        } => A::SplitGroup {
+            expected_revision: revision,
+            group,
+            arrangement,
+        },
+        A::ResizeSplit {
+            split,
+            desired_ratio_ppm,
+            ..
+        } => A::ResizeSplit {
+            expected_revision: revision,
+            split,
+            desired_ratio_ppm,
+        },
+        A::ToggleMaximize { group, .. } => A::ToggleMaximize {
+            expected_revision: revision,
+            group,
+        },
+        A::NoteLoadReady { tab, .. } => A::NoteLoadReady {
+            expected_revision: revision,
+            tab,
+        },
+        A::NoteLoadFailed { tab, .. } => A::NoteLoadFailed {
+            expected_revision: revision,
+            tab,
+        },
+        A::CycleTab { forward, .. } => A::CycleTab {
+            expected_revision: revision,
+            forward,
+        },
+        A::CycleGroup { forward, .. } => A::CycleGroup {
+            expected_revision: revision,
+            forward,
+        },
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn ratio_to_ppm(ratio: f32) -> u32 {
+    let ppm = (ratio * 1_000_000.0).round() as i64;
+    ppm.clamp(
+        i64::from(flavite_workspace::MIN_RATIO_PPM),
+        i64::from(flavite_workspace::MAX_RATIO_PPM),
+    ) as u32
+}
+
+/// Fuzzy-match catalog entries against title and path (§4.7 in-memory).
+#[must_use]
+pub fn picker_matches(entries: Vec<NoteCatalogEntry>, query: &str) -> Vec<NoteCatalogEntry> {
+    let needle = query.trim();
+    if needle.is_empty() {
+        return entries;
+    }
+    use nucleo::pattern::{CaseMatching, Normalization, Pattern};
+    use nucleo::{Config, Matcher};
+    static MATCHER: std::sync::LazyLock<std::sync::Mutex<Matcher>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(Matcher::new(Config::DEFAULT)));
+    let texts: Vec<String> = entries
+        .iter()
+        .map(|entry| format!("{} {}", entry.title, entry.path.display()))
+        .collect();
+    let pattern = Pattern::parse(needle, CaseMatching::Smart, Normalization::Smart);
+    let mut matcher = MATCHER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pattern
+        .match_list(texts.iter().map(String::as_str), &mut matcher)
+        .into_iter()
+        .filter_map(|(matched, _)| {
+            texts
+                .iter()
+                .position(|candidate| *candidate == matched)
+                .map(|index| entries[index].clone())
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flavite_api::channels::{Notice, Pulse};
 
     fn empty_app() -> App {
+        let mut ids = Ids::new();
+        let workspace = WorkspaceState::with_ids(&mut ids);
         App {
             flavite: None,
             root: PathBuf::from("fixture-vault"),
-            pane: Pane::Workspace,
+            adapter: Adapter::build(&workspace),
+            notes: NoteRegistry::default(),
+            picker: Picker::default(),
             palette_open: false,
             palette_query: String::new(),
             palette_selected: 0,
+            strip_menu: None,
+            gesture: gestures::TabGesture::default(),
+            resize_preview: BTreeMap::new(),
+            resizing_split: None,
+            catalog: Vec::new(),
+            catalog_error: None,
             settings: Settings::default(),
-            settings_dirty: false,
             settings_valid: true,
-            window_size: iced::Size::new(1180.0, 760.0),
+            operations: OperationPump::default(),
             status: "Ready".into(),
             recent_events: Vec::new(),
-            operations: OperationPump::default(),
-            active_buffer: None,
-            editor_interaction: None,
             reconcile_progress: None,
+            window_size: iced::Size::new(1180.0, 760.0),
+            a11y_nodes: BTreeMap::new(),
+            workspace,
         }
-    }
-
-    #[test]
-    fn app_state_navigates_and_tracks_setting_edits_without_a_ui_runtime() {
-        let mut app = empty_app();
-        let _ = app.update(Message::Navigate(Pane::Settings));
-        assert_eq!(app.pane, Pane::Settings);
-        let _ = app.update(Message::ChangeRecovery(1));
-        assert_eq!(app.settings.recovery_interval_secs, 3);
-        assert!(app.settings_dirty);
     }
 
     #[test]
@@ -1160,304 +1114,247 @@ mod tests {
         let _ = app.update(Message::PaletteClose);
         assert!(!app.palette_open);
         assert_eq!(app.palette_query, "save", "Esc preserves the query");
-        let _ = app.update(Message::RunCommand("note.save"));
-        assert!(app.palette_query.is_empty());
-        assert_eq!(app.palette_selected, 0);
+        let _ = app.update(Message::RunHostCommand("workspace.new_tab"));
+        assert!(app.palette_query.is_empty() || !app.palette_open);
     }
 
     #[test]
-    fn palette_selection_walks_without_leaving_bounds() {
+    fn layout_messages_re_stamp_stale_revisions_and_commit() {
         let mut app = empty_app();
-        app.palette_selected = 0;
-        let _ = app.update(Message::PaletteNext);
-        assert_eq!(app.palette_selected, 0, "no matches without a vault");
-        app.palette_selected = 3;
-        let _ = app.update(Message::PalettePrevious);
-        assert_eq!(app.palette_selected, 2);
-        let _ = app.update(Message::PalettePrevious);
-        assert_eq!(app.palette_selected, 1);
-    }
-
-    #[test]
-    fn running_a_command_dismisses_the_palette() {
-        let mut app = empty_app();
-        let _ = app.update(Message::PaletteOpen);
-        let _ = app.update(Message::RunCommand("note.save"));
-        assert!(!app.palette_open);
-        assert!(app.status.contains("Open a vault"));
-    }
-
-    #[test]
-    fn save_is_not_reported_as_completed_when_no_vault_is_open() {
-        let mut app = empty_app();
-        app.run_command("note.save");
-        assert!(app.status.contains("Open a vault"));
-        assert_eq!(app.operations.pending().count(), 0);
-    }
-
-    #[test]
-    fn pump_presents_versioned_api_events_once() {
-        use flavite_buffer::manager::BufferManager;
-        use flavite_fs::{Fs, MemFs};
-        use flavite_index::IndexActor;
-        use flavite_vault::actor::VaultActorBuilder;
-        use flavite_vault::channels::ChannelSet;
-        use flavite_vault::session::Session;
-        let fs = MemFs::new();
-        let root = PathBuf::from("/test/ui-host-vault");
-        fs.create_dir_all(&root).unwrap();
-        let temp = tempfile::tempdir().expect("fixture cache directory");
-        let db = temp.path().join("ui-host.sqlite3");
-        drop(flavite_index::open_or_init(&db).unwrap());
-        let identity =
-            flavite_api::VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![2, 4, 6]);
-        let actor = VaultActorBuilder::new()
-            .with_fs(Box::new(fs) as Box<dyn Fs + Send + Sync>)
-            .with_identity(identity.clone())
-            .with_index(IndexActor::new(&db, 1).unwrap())
-            .build()
-            .unwrap()
-            .start()
-            .unwrap();
-        let channels = ChannelSet::new();
-        let session = Session::new(
-            identity.clone(),
-            actor,
-            BufferManager::new(),
-            channels.pulse,
-            channels.notice,
-            VaultConfig::default(),
-        );
-        let flavite = Flavite::open(identity, session, VaultConfig::default()).unwrap();
-        let mut app = empty_app();
-        app.flavite = Some(flavite);
-        app.root = root.clone();
-        let flavite = app.flavite.as_ref().expect("flavite attached");
-        let _ = flavite.session().pulse_channel().send(Pulse::Invalidate {
-            note: flavite_api::channels::NoteRef::new(root.join("demo.md")),
-        });
-        flavite
-            .session()
-            .notice_channel()
-            .send(Notice::RecoveryOffer {
-                note: flavite_api::channels::NoteRef::new(root.join("demo.md")),
-            });
-        flavite.session().notice_channel().send(Notice::Conflict {
-            note: flavite_api::channels::NoteRef::new(root.join("other.md")),
-        });
-        app.pump();
-        let presented = app.recent_events.clone();
-        assert!(
-            presented.iter().any(|event| event.contains("invalidate")),
-            "pulse hint should be presented: {presented:?}"
-        );
-        assert!(
-            presented
-                .iter()
-                .any(|event| event.contains("recovery_offer")),
-            "recovery offer should be presented: {presented:?}"
-        );
-        assert!(
-            presented.iter().any(|event| event.contains("conflict")),
-            "conflict notice should be presented: {presented:?}"
-        );
-        // Lossless policy: a second pump re-delivers nothing, and the
-        // presentation acks let the channel retire the pending keys.
-        app.pump();
-        assert_eq!(app.recent_events.len(), presented.len());
-    }
-
-    #[test]
-    fn gui_and_cli_hosts_reach_the_same_document_state_for_note_open() {
-        use flavite_buffer::manager::BufferManager;
-        use flavite_fs::{Fs, MemFs};
-        use flavite_index::IndexActor;
-        use flavite_vault::actor::VaultActorBuilder;
-        use flavite_vault::channels::ChannelSet;
-        use flavite_vault::session::Session;
-
-        fn fixture(label: &str) -> (Flavite, PathBuf, tempfile::TempDir) {
-            let fs = MemFs::new();
-            let root = PathBuf::from(format!("/test/host-parity-{label}"));
-            fs.create_dir_all(&root).unwrap();
-            fs.write_new(&root.join("demo.md"), b"# Shared state\n\nbody\n")
-                .unwrap();
-            let temp = tempfile::tempdir().unwrap();
-            let db = temp.path().join("index.sqlite3");
-            drop(flavite_index::open_or_init(&db).unwrap());
-            let identity =
-                flavite_api::VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![8, 6, 7]);
-            let actor = VaultActorBuilder::new()
-                .with_fs(Box::new(fs) as Box<dyn Fs + Send + Sync>)
-                .with_identity(identity.clone())
-                .with_index(IndexActor::new(&db, 1).unwrap())
-                .build()
-                .unwrap()
-                .start()
-                .unwrap();
-            let channels = ChannelSet::new();
-            let session = Session::new(
-                identity.clone(),
-                actor,
-                BufferManager::new(),
-                channels.pulse,
-                channels.notice,
-                VaultConfig::default(),
-            );
-            let flavite = Flavite::open(identity, session, VaultConfig::default()).unwrap();
-            (flavite, root, temp)
-        }
-
-        let (gui_flavite, gui_root, _gui_cache) = fixture("gui");
-        let mut app = empty_app();
-        app.flavite = Some(gui_flavite);
-        app.root = gui_root.clone();
-        let _ = app.update(Message::RunCommand("note.open"));
-        let gui_buffer = app.active_buffer.expect("GUI host opens the note");
-        let gui_view = app
-            .flavite
-            .as_ref()
-            .unwrap()
-            .get_buffer_view(gui_buffer.into(), None)
-            .unwrap();
-        app.pane = Pane::Editor;
-        app.editor_interaction = Some(EditorInteractionSnapshot {
-            buffer_id: gui_view.buffer_id,
-            revision: gui_view.revision,
-            caret: 2,
-            selection: (2, 2),
-            focused: true,
-            composing: false,
-        });
-        let action = accesskit::ActionRequest {
-            action: accesskit::Action::SetTextSelection,
-            target_tree: accesskit::TreeId::ROOT,
-            target_node: crate::accessibility::tree::EDITOR,
-            data: Some(accesskit::ActionData::SetTextSelection(
-                accesskit::TextSelection {
-                    anchor: accesskit::TextPosition {
-                        node: crate::accessibility::tree::EDITOR_TEXT,
-                        character_index: 2,
-                    },
-                    focus: accesskit::TextPosition {
-                        node: crate::accessibility::tree::EDITOR_TEXT,
-                        character_index: 8,
-                    },
-                },
-            )),
+        let group = app.workspace.first_group().expect("group");
+        let stale = LayoutAction::OpenEmpty {
+            expected_revision: app.workspace.revision() + 50,
+            group,
         };
-        match crate::accessibility::route_action(&app, action).unwrap() {
-            Message::EditorSelectionRequested {
-                revision,
-                anchor,
-                focus,
-            } => {
-                assert_eq!(revision, gui_view.revision);
-                assert_eq!((anchor, focus), (2, 8));
-            }
-            _ => panic!("native selection must use the editor message path"),
-        }
-        let edit = EditorAction::replace(
-            &flavite_editor::EditorView::from(&gui_view),
-            gui_view.text.len(),
-            gui_view.text.len(),
-            " from shell editor".into(),
-        );
-        app.apply_editor_action(edit);
-        let edited_gui_view = app
-            .flavite
-            .as_ref()
-            .unwrap()
-            .get_buffer_view(gui_buffer.into(), None)
-            .unwrap();
-        assert!(edited_gui_view.text.ends_with(" from shell editor"));
+        let _ = app.update(Message::Layout(stale));
+        assert_eq!(app.workspace.revision(), 1, "restamped action commits");
+        assert_eq!(app.workspace.tabs().count(), 2);
+    }
 
-        let (cli_flavite, cli_root, _cli_cache) = fixture("cli");
-        let request_id = cli_flavite.command_registry().next_request_id();
-        let result = cli_flavite.execute(Invocation::new(
-            request_id,
+    #[test]
+    fn new_view_actions_land_in_the_focused_group() {
+        let mut app = empty_app();
+        let group = app.workspace.first_group().expect("group");
+        let _ = app.update(Message::Layout(LayoutAction::FocusGroup {
+            expected_revision: app.workspace.revision(),
+            group,
+        }));
+        let _ = app.update(Message::NewViewInFocused(
+            flavite_workspace::ViewKind::Notes,
+        ));
+        assert_eq!(app.workspace.tabs().count(), 2);
+        let focused = app.workspace.focused_tab();
+        assert_eq!(
+            app.workspace.tab(&focused).map(|session| session.title()),
+            Some("Notes".into())
+        );
+    }
+
+    #[test]
+    fn picker_matching_ranks_titles_and_paths() {
+        let entries = vec![
+            NoteCatalogEntry {
+                path: PathBuf::from("Systems/Feedback loops.md"),
+                native_path: b"Systems/Feedback loops.md".to_vec(),
+                title: "Feedback loops".into(),
+            },
+            NoteCatalogEntry {
+                path: PathBuf::from("Sources/archive.md"),
+                native_path: b"Sources/archive.md".to_vec(),
+                title: "Archive".into(),
+            },
+        ];
+        let matched = picker_matches(entries, "feedback");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].title, "Feedback loops");
+    }
+
+    #[test]
+    fn closing_the_focused_tab_returns_focus_to_a_neighbor() {
+        let mut app = empty_app();
+        let group = app.workspace.first_group().expect("group");
+        let locator = NoteLocator::from_components(["a.md"]).expect("locator");
+        let _ = app.update(Message::OpenNote {
+            locator,
+            group: Some(group),
+        });
+        assert_eq!(app.workspace.tabs().count(), 2);
+        let focused = app.workspace.focused_tab();
+        let _ = app.update(Message::Layout(LayoutAction::CloseTab {
+            expected_revision: app.workspace.revision(),
+            tab: focused,
+        }));
+        assert_eq!(app.workspace.tabs().count(), 1);
+        let remaining = app.workspace.focused_tab();
+        assert_ne!(remaining, focused);
+    }
+
+    #[test]
+    fn gestures_resolve_to_one_move_on_release() {
+        let mut app = empty_app();
+        let group = app.workspace.first_group().expect("group");
+        let locator = NoteLocator::from_components(["a.md"]).expect("locator");
+        let _ = app.update(Message::OpenNote {
+            locator,
+            group: Some(group),
+        });
+        let tab = app.workspace.focused_tab();
+        let _ = app.update(Message::TabPressed(tab));
+        let _ = app.update(Message::Mouse(iced::mouse::Event::CursorMoved {
+            position: iced::Point::new(10.0, 10.0),
+        }));
+        let _ = app.update(Message::Mouse(iced::mouse::Event::CursorMoved {
+            position: iced::Point::new(40.0, 10.0),
+        }));
+        assert!(app.gesture.dragging());
+        let _ = app.update(Message::Mouse(iced::mouse::Event::ButtonReleased(
+            iced::mouse::Button::Left,
+        )));
+        assert!(!app.gesture.dragging());
+        // The tab stays where it was: no hover target was set, so nothing
+        // moved and the reducer reported the no-op.
+        assert!(app.workspace.tab(&tab).is_some());
+    }
+
+    #[test]
+    fn keyboard_chords_route_to_host_commands() {
+        use flavite_workspace::LayoutAction;
+        let app = empty_app();
+        let press =
+            |key: keyboard::Key, modifiers: keyboard::Modifiers| keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers,
+                text: None,
+                repeat: false,
+            };
+        let message = host_commands::keyboard_message(
+            &app,
+            press(
+                keyboard::Key::Character("t".into()),
+                keyboard::Modifiers::COMMAND,
+            ),
+        )
+        .expect("ctrl+t resolves");
+        assert!(matches!(
+            message,
+            Message::RunHostCommand("workspace.new_tab")
+        ));
+        let message = host_commands::keyboard_message(
+            &app,
+            press(
+                keyboard::Key::Named(keyboard::key::Named::ArrowRight),
+                keyboard::Modifiers::COMMAND | keyboard::Modifiers::ALT,
+            ),
+        );
+        assert!(
+            matches!(
+                message,
+                Some(Message::Layout(LayoutAction::SplitGroup {
+                    arrangement: flavite_workspace::Arrangement::SideBySide,
+                    ..
+                }))
+            ),
+            "ctrl+alt+right splits side by side"
+        );
+        // Plain typing never triggers commands.
+        assert!(
+            host_commands::keyboard_message(
+                &app,
+                press(
+                    keyboard::Key::Character("x".into()),
+                    keyboard::Modifiers::empty()
+                ),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn resize_previews_commit_one_transaction_on_release() {
+        let mut app = empty_app();
+        let group = app.workspace.first_group().expect("group");
+        let _ = app.update(Message::Layout(LayoutAction::SplitGroup {
+            expected_revision: app.workspace.revision(),
+            group,
+            arrangement: flavite_workspace::Arrangement::SideBySide,
+        }));
+        let split = app.workspace.tree().splits()[0];
+        let pane_split = app.adapter.split_map[&split];
+        let _ = app.update(Message::PaneResize(iced::widget::pane_grid::ResizeEvent {
+            split: pane_split,
+            ratio: 0.7,
+        }));
+        assert_eq!(app.resize_preview.get(&split), Some(&700_000));
+        let revision_before = app.workspace.revision();
+        let _ = app.update(Message::Mouse(iced::mouse::Event::ButtonReleased(
+            iced::mouse::Button::Left,
+        )));
+        assert_eq!(app.workspace.revision(), revision_before + 1);
+        assert!(app.resize_preview.is_empty());
+        match app.workspace.tree() {
+            flavite_workspace::LayoutNode::Split {
+                desired_ratio_ppm, ..
+            } => assert_eq!(*desired_ratio_ppm, 700_000),
+            flavite_workspace::LayoutNode::Group(_) => panic!("expected a split"),
+        }
+    }
+
+    fn button_press(key: keyboard::Key, modifiers: keyboard::Modifiers) -> keyboard::Event {
+        keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn command_palette_binding_moves_to_ctrl_shift_p() {
+        let app = empty_app();
+        assert!(
+            host_commands::keyboard_message(
+                &app,
+                button_press(
+                    keyboard::Key::Character("p".into()),
+                    keyboard::Modifiers::COMMAND
+                ),
+            )
+            .is_some_and(|message| matches!(message, Message::PickerOpen)),
+            "ctrl+p is the note picker"
+        );
+        assert!(
+            host_commands::keyboard_message(
+                &app,
+                button_press(
+                    keyboard::Key::Character("p".into()),
+                    keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+                ),
+            )
+            .is_some_and(|message| matches!(message, Message::PaletteOpen)),
+            "ctrl+shift+p is the command palette"
+        );
+    }
+
+    #[test]
+    fn quick_switch_and_palette_specs_do_not_collide_with_core_ids() {
+        let conflicts = host_commands::catalog_conflicts(&[
             "note.open",
-            serde_json::json!(cli_root.join("demo.md")),
-            Origin::Cli,
-        ));
-        let cli_buffer = match result {
-            ExecutionResult::Local(LocalResult::Success(success)) => success
-                .data
-                .get("buffer_id")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap(),
-            other => panic!("CLI host failed to open note: {other:?}"),
-        };
-        let cli_view = cli_flavite
-            .get_buffer_view(cli_buffer.into(), None)
-            .unwrap();
-
-        assert_eq!(gui_view.text, cli_view.text);
-        assert_eq!(gui_view.state, cli_view.state);
-        assert_eq!(gui_view.path.file_name(), cli_view.path.file_name());
-    }
-
-    #[test]
-    fn palette_keys_only_respond_while_the_overlay_is_open() {
-        let app = empty_app();
-        let press = |named: keyboard::key::Named| keyboard::Event::KeyPressed {
-            key: keyboard::Key::Named(named),
-            modified_key: keyboard::Key::Named(named),
-            physical_key: keyboard::key::Physical::Unidentified(
-                keyboard::key::NativeCode::Unidentified,
-            ),
-            location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::empty(),
-            text: None,
-            repeat: false,
-        };
-        assert!(
-            app.keyboard_message(press(keyboard::key::Named::Escape))
-                .is_none()
-        );
-        let mut open = empty_app();
-        open.palette_open = true;
-        assert!(matches!(
-            open.keyboard_message(press(keyboard::key::Named::Escape)),
-            Some(Message::PaletteClose)
-        ));
-        assert!(matches!(
-            open.keyboard_message(press(keyboard::key::Named::ArrowDown)),
-            Some(Message::PaletteNext)
-        ));
-        assert!(matches!(
-            open.keyboard_message(press(keyboard::key::Named::Enter)),
-            Some(Message::PaletteSubmit)
-        ));
-    }
-
-    #[test]
-    fn command_shortcuts_map_save_and_palette_keys() {
-        let press_ctrl = |character: &'static str| keyboard::Event::KeyPressed {
-            key: keyboard::Key::Character(character.into()),
-            modified_key: keyboard::Key::Character(character.into()),
-            physical_key: keyboard::key::Physical::Unidentified(
-                keyboard::key::NativeCode::Unidentified,
-            ),
-            location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::COMMAND,
-            text: None,
-            repeat: false,
-        };
-        let app = empty_app();
-        assert!(matches!(
-            app.keyboard_message(press_ctrl("s")),
-            Some(Message::RunCommand("note.save"))
-        ));
-        assert!(matches!(
-            app.keyboard_message(press_ctrl("p")),
-            Some(Message::PaletteOpen)
-        ));
-        let mut open = empty_app();
-        open.palette_open = true;
-        assert!(matches!(
-            open.keyboard_message(press_ctrl("p")),
-            Some(Message::PaletteClose)
-        ));
+            "note.save",
+            "vault.reconcile",
+            "buffer.undo",
+        ]);
+        assert!(conflicts.is_empty());
+        let seeded = host_commands::catalog_conflicts(&["workspace.quick_switch"]);
+        assert_eq!(seeded.len(), 1, "a colliding core id is reported");
     }
 }

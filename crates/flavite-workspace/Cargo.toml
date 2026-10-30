@@ -1,0 +1,19 @@
+[package]
+name = "flavite-workspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "IO-free workspace model: layout tree, context identities, transactions (RFC-0003 D-02)"
+
+# D-02: the workspace model is IO-free and toolkit-free. It depends on
+# nothing outside the standard library so layout fuzzers and property tests
+# never run through a GUI dependency closure.
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

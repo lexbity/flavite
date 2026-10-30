@@ -85,12 +85,56 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const MAX_PENDING_SAVE_OPERATIONS: usize = 4096;
+/// Bounded pending cold opens (RFC-0003 §12.1: pending opens ≤128).
+const MAX_PENDING_OPEN_NOTES: usize = 128;
+/// Concurrent cold-open read flights (RFC-0003 §12.1).
+const OPEN_READ_WORKERS: usize = 4;
+
+/// Whether a cold open may create the note when it is absent.
+///
+/// `ExistingOnly` renders missing notes as recoverable missing states;
+/// `CreateIfMissing` keeps the established absent-file creation guard
+/// (RFC-0003 §8.3). The policy cannot be inferred from a display title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpenPolicy {
+    /// Open only when the file exists; otherwise the open fails.
+    #[default]
+    CreateIfMissing,
+    /// Open only when the file exists; otherwise the open fails.
+    ExistingOnly,
+}
 
 #[derive(Debug)]
 struct SaveFlight {
     request: SaveRequest,
     response: crossbeam::channel::Receiver<crate::actor::VaultActorResp>,
     queued: Option<SaveRequest>,
+}
+
+/// One coalesced cold-open flight keyed by native path. Every admitted
+/// caller records its request id and receives its own terminal result.
+#[derive(Debug, Default)]
+struct OpenFlight {
+    request_ids: Vec<u64>,
+}
+
+/// A read job handed to the bounded open-worker pool. The blocking
+/// `actor.read_file` and the recovery lookup run on the worker, never
+/// under the Session driving turn.
+#[derive(Debug)]
+struct OpenJob {
+    path: PathBuf,
+    policy: OpenPolicy,
+    note_key: Vec<u8>,
+}
+
+/// A completed read, awaiting installation on a short Session turn.
+#[derive(Debug)]
+struct OpenRead {
+    path: PathBuf,
+    policy: OpenPolicy,
+    outcome: Result<Option<Vec<u8>>, String>,
+    recovery: Option<flavite_buffer::recovery::RecoveryFile>,
 }
 
 /// Terminal result for an admitted asynchronous Session operation.
@@ -126,7 +170,7 @@ pub enum BufferSnapshotError {
 #[derive(Debug, Clone)]
 pub enum SessionCommand {
     /// Open a note.
-    OpenNote { path: PathBuf },
+    OpenNote { path: PathBuf, policy: OpenPolicy },
     /// Close a note.
     CloseNote { path: PathBuf },
     /// Apply edits to a note.
@@ -373,6 +417,12 @@ pub struct Session {
         Mutex<HashMap<u64, crossbeam::channel::Receiver<crate::actor::VaultActorResp>>>,
     /// Correlated D9 rename operations.
     rename_flights: Mutex<HashMap<u64, RenameFlight>>,
+    /// Coalesced cold-open flights keyed by native path.
+    open_flights: Mutex<HashMap<PathBuf, OpenFlight>>,
+    /// Job queue for the bounded open-read worker pool.
+    open_jobs: Option<crossbeam::channel::Sender<OpenJob>>,
+    /// Completed reads awaiting installation on a Session turn.
+    open_results: crossbeam::channel::Receiver<OpenRead>,
     journal_applied: Mutex<HashMap<(String, u64), Result<u64, String>>>,
     cancelled_journal_items: Mutex<HashSet<(String, u64)>>,
     /// Lossless terminal results. Admission is bounded by the pending-save cap.
@@ -447,12 +497,46 @@ impl Session {
                 })
                 .expect("recovery worker thread creation failed")
         });
+        let (open_job_sender, open_job_receiver) = crossbeam::channel::unbounded::<OpenJob>();
+        let (open_result_sender, open_result_receiver) =
+            crossbeam::channel::unbounded::<OpenRead>();
+        for worker_index in 0..OPEN_READ_WORKERS {
+            let jobs = open_job_receiver.clone();
+            let results = open_result_sender.clone();
+            let actor = actor.clone();
+            let recovery_writer = recovery_writer.clone();
+            std::thread::Builder::new()
+                .name(format!("vault-open-{worker_index}"))
+                .spawn(move || {
+                    // Workers exit when the Session drops the job sender.
+                    while let Ok(job) = jobs.recv() {
+                        let outcome = actor
+                            .read_file(job.path.clone())
+                            .map_err(|error| error.to_string());
+                        let recovery = recovery_writer.as_ref().and_then(|writer| {
+                            writer.lock().unwrap().read_for_note_key(&job.note_key)
+                        });
+                        // Sending only fails when the Session is gone; the
+                        // read result is then unobservable by construction.
+                        let _ = results.send(OpenRead {
+                            path: job.path,
+                            policy: job.policy,
+                            outcome,
+                            recovery,
+                        });
+                    }
+                })
+                .expect("open worker thread creation failed");
+        }
         Self {
             driving_turn: Mutex::new(()),
             identity,
             actor,
             actor_events,
             actor_buffer_patches,
+            open_jobs: Some(open_job_sender),
+            open_results: open_result_receiver,
+            open_flights: Mutex::new(HashMap::new()),
             session_events: Mutex::new(VecDeque::new()),
             last_edit: Mutex::new(HashMap::new()),
             autosave_attempted: Mutex::new(HashMap::new()),
@@ -523,6 +607,7 @@ impl Session {
         let _turn = self.driving_turn.lock().unwrap();
         self.pump_external_changes_inner();
         self.pump_recovery_notices();
+        self.pump_open_completions();
         self.pump_save_completions();
         self.pump_reconcile_completions();
         self.pump_rename_completions();
@@ -806,7 +891,7 @@ impl Session {
 
     fn execute_inner(&self, command: SessionCommand) -> SessionResult {
         match command {
-            SessionCommand::OpenNote { path } => self.open_note(path),
+            SessionCommand::OpenNote { path, policy } => self.open_note(path, policy),
             SessionCommand::CloseNote { path } => self.close_note(path),
             SessionCommand::ApplyEdits {
                 buffer_id,
@@ -839,6 +924,12 @@ impl Session {
             SessionCommand::RestoreRecovery { path } => self.restore_recovery(path),
             SessionCommand::DiscardRecovery { path } => self.discard_recovery(path),
         }
+    }
+
+    /// Read a bounded native-identity note catalog snapshot for workspace
+    /// shells and pickers. Read-only; errors surface as retryable states.
+    pub fn note_catalog(&self, limit: usize) -> Result<flavite_index::NoteCatalogPage, String> {
+        self.actor.note_catalog(limit)
     }
 
     /// Return the current indexed note-title and alias snapshot for UI
@@ -876,6 +967,7 @@ impl Session {
     /// queued until the host drains them.
     pub fn drain_operation_completions(&self) -> Vec<OperationCompletion> {
         let _turn = self.driving_turn.lock().unwrap();
+        self.pump_open_completions();
         self.pump_save_completions();
         self.pump_reconcile_completions();
         self.pump_rename_completions();
@@ -933,6 +1025,7 @@ impl Session {
         loop {
             let _turn = self.driving_turn.lock().unwrap();
             self.pump_external_changes_inner();
+            self.pump_open_completions();
             self.pump_save_completions();
             self.pump_reconcile_completions();
             self.pump_rename_completions();
@@ -961,7 +1054,13 @@ impl Session {
                     .rename_flights
                     .lock()
                     .unwrap()
-                    .contains_key(&request_id);
+                    .contains_key(&request_id)
+                || self
+                    .open_flights
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|flight| flight.request_ids.contains(&request_id));
             if !active {
                 return SessionResult::Error {
                     message: format!("unknown or already-drained operation {request_id}"),
@@ -1259,56 +1358,131 @@ impl Session {
         }
     }
 
-    /// Open a note.
-    fn open_note(&self, path: PathBuf) -> SessionResult {
-        // Check if already open
+    /// Admit a cold open. An already-open note returns its existing
+    /// identity immediately; otherwise the request joins (or creates) a
+    /// coalesced open flight and the read runs on a bounded worker, never
+    /// under this driving turn (RFC-0003 §8.3).
+    fn open_note(&self, path: PathBuf, policy: OpenPolicy) -> SessionResult {
+        if let Some(buffer_id) = self
+            .buffer_manager
+            .lock()
+            .unwrap()
+            .get_buffer(&path)
+            .map(|buffer| (buffer.buffer_id(), buffer.revision()))
         {
-            let buffer_manager = self.buffer_manager.lock().unwrap();
-            if let Some(buffer) = buffer_manager.get_buffer(&path) {
-                return SessionResult::Success(CommandResult::NoteOpened {
-                    buffer_id: buffer.buffer_id(),
-                    revision: buffer.revision(),
-                });
+            return SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id: buffer_id.0,
+                revision: buffer_id.1,
+            });
+        }
+        {
+            let flights = self.open_flights.lock().unwrap();
+            if flights.len() >= MAX_PENDING_OPEN_NOTES {
+                return SessionResult::Busy;
             }
         }
-
-        // Capture exact disk bytes before establishing the buffer's base hash.
-        let content = match self.actor.read_file(path.clone()) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                return SessionResult::Error {
-                    message: error.to_string(),
-                };
+        let request_id = self.next_request_id();
+        let mut flights = self.open_flights.lock().unwrap();
+        match flights.entry(path.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut flight) => {
+                flight.get_mut().request_ids.push(request_id);
+                SessionResult::Pending { request_id }
             }
-        };
-        let absent = content.is_none();
-        let content = content.unwrap_or_default();
-
-        // Open the buffer
-        let mut buffer_manager = self.buffer_manager.lock().unwrap();
-        let (buffer, _transition) = buffer_manager.open_note(path.clone(), &content);
-        let buffer_id = buffer.buffer_id();
-
-        if let Some(writer) = &self.recovery_writer {
-            let key = native_note_key(&path, &self.identity.root);
-            if let Some(recovery) = writer.lock().unwrap().read_for_note_key(&key) {
-                let recovered = recovery.to_source_bytes();
-                if blake3::hash(&recovered).as_bytes() != blake3::hash(&content).as_bytes() {
-                    self.notice.send(crate::channels::Notice::RecoveryOffer {
-                        note: flavite_buffer::manager::NoteRef::new(path.clone()),
-                    });
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(OpenFlight {
+                    request_ids: vec![request_id],
+                });
+                let job = OpenJob {
+                    note_key: native_note_key(&path, &self.identity.root),
+                    path: path.clone(),
+                    policy,
+                };
+                let admitted = self
+                    .open_jobs
+                    .as_ref()
+                    .is_some_and(|jobs| jobs.send(job).is_ok());
+                if admitted {
+                    SessionResult::Pending { request_id }
+                } else {
+                    flights.remove(&path);
+                    SessionResult::Error {
+                        message: "vault open workers are unavailable".into(),
+                    }
                 }
             }
         }
+    }
 
-        if absent {
-            self.absent_on_open.lock().unwrap().insert(path.clone());
+    /// Install one completed read: a single Session turn turns the exact
+    /// immutable snapshot into a buffer and publishes every correlated
+    /// caller's terminal result once (RFC-0003 §8.3).
+    fn install_open_read(&self, read: OpenRead) -> SessionResult {
+        let Some(open_jobs) = &self.open_jobs else {
+            return SessionResult::Error {
+                message: "vault is shutting down".into(),
+            };
+        };
+        let content = match read.outcome {
+            Ok(content) => content,
+            Err(message) => return SessionResult::Error { message },
+        };
+        let absent = content.is_none();
+        if absent && read.policy == OpenPolicy::ExistingOnly {
+            return SessionResult::Error {
+                message: SessionError::NoteNotFound(read.path.clone()).to_string(),
+            };
         }
+        let content = content.unwrap_or_default();
+        let (buffer_id, revision) = {
+            let mut buffer_manager_guard = self.buffer_manager.lock().unwrap();
+            let (buffer, _transition) = buffer_manager_guard.open_note(read.path.clone(), &content);
+            (buffer.buffer_id(), buffer.revision())
+        };
 
+        if let Some(recovery) = read.recovery {
+            let recovered = recovery.to_source_bytes();
+            if blake3::hash(&recovered).as_bytes() != blake3::hash(&content).as_bytes() {
+                self.notice.send(crate::channels::Notice::RecoveryOffer {
+                    note: flavite_buffer::manager::NoteRef::new(read.path.clone()),
+                });
+            }
+        }
+        if absent {
+            self.absent_on_open
+                .lock()
+                .unwrap()
+                .insert(read.path.clone());
+        }
+        // The flight slot is already consumed by the pump; keep the jobs
+        // sender referenced so the field stays alive for later flights.
+        let _ = open_jobs;
         SessionResult::Success(CommandResult::NoteOpened {
             buffer_id,
-            revision: buffer.revision(),
+            revision,
         })
+    }
+
+    fn pump_open_completions(&self) {
+        let mut ready = Vec::new();
+        while let Ok(read) = self.open_results.try_recv() {
+            ready.push(read);
+        }
+        if ready.is_empty() {
+            return;
+        }
+        let mut completions = self.completions.lock().unwrap();
+        for read in ready {
+            let Some(flight) = self.open_flights.lock().unwrap().remove(&read.path) else {
+                continue;
+            };
+            let result = self.install_open_read(read);
+            for request_id in flight.request_ids {
+                completions.push_back(OperationCompletion {
+                    request_id,
+                    result: result.clone(),
+                });
+            }
+        }
     }
 
     /// Close a note.
@@ -1931,8 +2105,14 @@ impl Session {
             }
         };
         if !self.is_open(&path) {
-            match self.open_note(path.clone()) {
+            match self.open_note(path.clone(), OpenPolicy::CreateIfMissing) {
                 SessionResult::Success(_) => {}
+                SessionResult::Pending { request_id } => {
+                    match self.wait_for_operation(request_id) {
+                        SessionResult::Success(_) => {}
+                        other => return other,
+                    }
+                }
                 other => return other,
             }
         }
@@ -2326,6 +2506,18 @@ mod tests {
         (session, fs, temp)
     }
 
+    /// Open through the async flight and wait, for tests that need the
+    /// buffer identity immediately.
+    fn open_to_terminal(session: &Session, path: PathBuf) -> SessionResult {
+        match session.execute(SessionCommand::OpenNote {
+            path,
+            policy: OpenPolicy::CreateIfMissing,
+        }) {
+            SessionResult::Pending { request_id } => session.wait_for_operation(request_id),
+            result => result,
+        }
+    }
+
     fn save_to_terminal(session: &Session, path: PathBuf) -> SessionResult {
         match session.execute(SessionCommand::SaveNote { path }) {
             SessionResult::Pending { request_id } => session.wait_for_operation(request_id),
@@ -2412,14 +2604,13 @@ mod tests {
     fn reconcile_and_save_completions_keep_request_identity_and_revision() {
         let (session, fs, _temp) = test_session();
         let path = PathBuf::from("/test/vault/note.md");
-        let (buffer_id, revision) =
-            match session.execute(SessionCommand::OpenNote { path: path.clone() }) {
-                SessionResult::Success(CommandResult::NoteOpened {
-                    buffer_id,
-                    revision,
-                }) => (buffer_id, revision),
-                other => panic!("expected opened note, got {other:?}"),
-            };
+        let (buffer_id, revision) = match open_to_terminal(&session, path.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            }) => (buffer_id, revision),
+            other => panic!("expected opened note, got {other:?}"),
+        };
         let first_revision = match session.execute(SessionCommand::ApplyEdits {
             buffer_id,
             revision,
@@ -2516,7 +2707,7 @@ mod tests {
     fn session_open_edit_undo_redo_and_close_tracks_buffer_state() {
         let (session, _fs, _temp) = test_session();
         let path = PathBuf::from("/test/vault/note.md");
-        let opened = session.execute(SessionCommand::OpenNote { path: path.clone() });
+        let opened = open_to_terminal(&session, path.clone());
         let (buffer_id, revision) = match opened {
             SessionResult::Success(CommandResult::NoteOpened {
                 buffer_id,
@@ -2527,7 +2718,7 @@ mod tests {
         assert!(session.is_open(&path));
         assert_eq!(session.get_buffer_id(&path), Some(buffer_id));
         assert!(matches!(
-            session.execute(SessionCommand::OpenNote { path: path.clone() }),
+            open_to_terminal(&session, path.clone()),
             SessionResult::Success(CommandResult::NoteOpened { .. })
         ));
 
@@ -2646,14 +2837,13 @@ mod tests {
             VaultConfig::default(),
         );
         session.autosave_idle_interval = Duration::from_secs(60);
-        let (buffer_id, revision) =
-            match session.execute(SessionCommand::OpenNote { path: path.clone() }) {
-                SessionResult::Success(CommandResult::NoteOpened {
-                    buffer_id,
-                    revision,
-                }) => (buffer_id, revision),
-                other => panic!("expected open, got {other:?}"),
-            };
+        let (buffer_id, revision) = match open_to_terminal(&session, path.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            }) => (buffer_id, revision),
+            other => panic!("expected open, got {other:?}"),
+        };
         let _ = session.drain_pulses();
         assert!(matches!(
             session.execute(SessionCommand::ApplyEdits {
@@ -2666,9 +2856,7 @@ mod tests {
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
-        let clean_id = match session.execute(SessionCommand::OpenNote {
-            path: clean_path.clone(),
-        }) {
+        let clean_id = match open_to_terminal(&session, clean_path.clone()) {
             SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => buffer_id,
             other => panic!("expected clean note open, got {other:?}"),
         };
@@ -2736,14 +2924,13 @@ mod tests {
         let (mut session, fs, _temp) = test_session();
         let path = PathBuf::from("/test/vault/note.md");
         session.autosave_idle_interval = Duration::from_millis(5);
-        let (buffer_id, revision) =
-            match session.execute(SessionCommand::OpenNote { path: path.clone() }) {
-                SessionResult::Success(CommandResult::NoteOpened {
-                    buffer_id,
-                    revision,
-                }) => (buffer_id, revision),
-                other => panic!("expected opened note, got {other:?}"),
-            };
+        let (buffer_id, revision) = match open_to_terminal(&session, path.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            }) => (buffer_id, revision),
+            other => panic!("expected opened note, got {other:?}"),
+        };
         assert!(matches!(
             session.execute(SessionCommand::ApplyEdits {
                 buffer_id,
@@ -2794,14 +2981,13 @@ mod tests {
         let (session, fs, _temp) = test_session();
         let from = PathBuf::from("/test/vault/note.md");
         let to = PathBuf::from("/test/vault/renamed.md");
-        let (buffer_id, revision) =
-            match session.execute(SessionCommand::OpenNote { path: from.clone() }) {
-                SessionResult::Success(CommandResult::NoteOpened {
-                    buffer_id,
-                    revision,
-                }) => (buffer_id, revision),
-                other => panic!("expected open, got {other:?}"),
-            };
+        let (buffer_id, revision) = match open_to_terminal(&session, from.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            }) => (buffer_id, revision),
+            other => panic!("expected open, got {other:?}"),
+        };
         edit_append(&session, buffer_id, revision, "!");
 
         assert!(matches!(
@@ -2839,9 +3025,7 @@ mod tests {
             .submit_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent)
             .unwrap();
         scan.recv_timeout(Duration::from_secs(2)).unwrap();
-        let (buffer_id, revision) = match session.execute(SessionCommand::OpenNote {
-            path: source.clone(),
-        }) {
+        let (buffer_id, revision) = match open_to_terminal(&session, source.clone()) {
             SessionResult::Success(CommandResult::NoteOpened {
                 buffer_id,
                 revision,
@@ -2899,8 +3083,7 @@ mod tests {
         let (session, fs, _temp) = test_session();
         let from = PathBuf::from("/test/vault/note.md");
         let to = PathBuf::from("/test/vault/renamed.md");
-        let (buffer_id, _) = match session.execute(SessionCommand::OpenNote { path: from.clone() })
-        {
+        let (buffer_id, _) = match open_to_terminal(&session, from.clone()) {
             SessionResult::Success(CommandResult::NoteOpened {
                 buffer_id,
                 revision,
@@ -2966,9 +3149,7 @@ mod tests {
             .unwrap()
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
-        let (buffer_id, revision) = match session.execute(SessionCommand::OpenNote {
-            path: source.clone(),
-        }) {
+        let (buffer_id, revision) = match open_to_terminal(&session, source.clone()) {
             SessionResult::Success(CommandResult::NoteOpened {
                 buffer_id,
                 revision,
@@ -3022,9 +3203,7 @@ mod tests {
             .submit_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent)
             .unwrap();
         reconcile.recv_timeout(Duration::from_secs(2)).unwrap();
-        let (buffer_id, _) = match session.execute(SessionCommand::OpenNote {
-            path: source.clone(),
-        }) {
+        let (buffer_id, _) = match open_to_terminal(&session, source.clone()) {
             SessionResult::Success(CommandResult::NoteOpened {
                 buffer_id,
                 revision,
@@ -3063,14 +3242,13 @@ mod tests {
         let from = PathBuf::from("/test/vault/note.md");
         let to = PathBuf::from("/test/vault/autosaved.md");
         session.autosave_idle_interval = Duration::from_millis(5);
-        let (buffer_id, revision) =
-            match session.execute(SessionCommand::OpenNote { path: from.clone() }) {
-                SessionResult::Success(CommandResult::NoteOpened {
-                    buffer_id,
-                    revision,
-                }) => (buffer_id, revision),
-                other => panic!("expected open, got {other:?}"),
-            };
+        let (buffer_id, revision) = match open_to_terminal(&session, from.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            }) => (buffer_id, revision),
+            other => panic!("expected open, got {other:?}"),
+        };
         edit_append(&session, buffer_id, revision, "!");
         assert!(matches!(
             rename_to_terminal(&session, from, to.clone()),
@@ -3119,9 +3297,7 @@ mod tests {
             channels.notice,
             VaultConfig::default(),
         );
-        let buffer_id = match session.execute(SessionCommand::OpenNote {
-            path: old_path.clone(),
-        }) {
+        let buffer_id = match open_to_terminal(&session, old_path.clone()) {
             SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => buffer_id,
             other => panic!("expected open, got {other:?}"),
         };
@@ -3159,14 +3335,13 @@ mod tests {
         let (mut session, fs, _temp) = test_session();
         session.autosave_idle_interval = Duration::ZERO;
         let path = PathBuf::from("/test/vault/note.md");
-        let (buffer_id, revision) =
-            match session.execute(SessionCommand::OpenNote { path: path.clone() }) {
-                SessionResult::Success(CommandResult::NoteOpened {
-                    buffer_id,
-                    revision,
-                }) => (buffer_id, revision),
-                other => panic!("expected open, got {other:?}"),
-            };
+        let (buffer_id, revision) = match open_to_terminal(&session, path.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            }) => (buffer_id, revision),
+            other => panic!("expected open, got {other:?}"),
+        };
         edit_append(&session, buffer_id, revision, "!");
         let external = PathBuf::from("/test/vault/.external-save.md");
         fs.write_new(&external, b"external bytes").unwrap();
@@ -3187,7 +3362,7 @@ mod tests {
         let from = PathBuf::from("/test/vault/note.md");
         let to = PathBuf::from("/test/vault/destination.md");
         assert!(matches!(
-            session.execute(SessionCommand::OpenNote { path: to.clone() }),
+            open_to_terminal(&session, to.clone()),
             SessionResult::Success(CommandResult::NoteOpened { .. })
         ));
 
@@ -3210,9 +3385,7 @@ mod tests {
         let never_opened = PathBuf::from("/test/vault/never-opened.md");
 
         assert!(matches!(
-            session.execute(SessionCommand::OpenNote {
-                path: missing.clone()
-            }),
+            open_to_terminal(&session, missing.clone()),
             SessionResult::Success(CommandResult::NoteOpened { .. })
         ));
         assert!(matches!(
@@ -3226,16 +3399,15 @@ mod tests {
             SessionResult::Error { .. }
         ));
 
-        let (buffer_id, revision) =
-            match session.execute(SessionCommand::OpenNote { path: path.clone() }) {
-                SessionResult::Success(CommandResult::NoteOpened {
-                    buffer_id,
-                    revision,
-                }) => (buffer_id, revision),
-                other => panic!("unexpected open result: {other:?}"),
-            };
+        let (buffer_id, revision) = match open_to_terminal(&session, path.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            }) => (buffer_id, revision),
+            other => panic!("unexpected open result: {other:?}"),
+        };
         assert!(matches!(
-            session.execute(SessionCommand::OpenNote { path: path.clone() }),
+            open_to_terminal(&session, path.clone()),
             SessionResult::Success(CommandResult::NoteOpened { buffer_id: existing, .. }) if existing == buffer_id
         ));
 
@@ -3327,7 +3499,7 @@ mod tests {
     fn session_detects_external_save_conflict_and_supports_merge_reload_and_save_as() {
         let (session, fs, _temp) = test_session();
         let path = PathBuf::from("/test/vault/note.md");
-        let buffer_id = match session.execute(SessionCommand::OpenNote { path: path.clone() }) {
+        let buffer_id = match open_to_terminal(&session, path.clone()) {
             SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => buffer_id,
             other => panic!("expected opened note, got {other:?}"),
         };
@@ -3397,7 +3569,7 @@ mod tests {
     fn session_restores_then_discards_note_keyed_recovery() {
         let (mut session, _fs, temp) = test_session();
         let path = PathBuf::from("/test/vault/note.md");
-        let buffer_id = match session.execute(SessionCommand::OpenNote { path: path.clone() }) {
+        let buffer_id = match open_to_terminal(&session, path.clone()) {
             SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => buffer_id,
             other => panic!("expected opened note, got {other:?}"),
         };
@@ -3456,7 +3628,7 @@ mod tests {
     fn session_handles_absent_notes_stale_edits_and_empty_undo_redo() {
         let (session, fs, _temp) = test_session();
         let path = PathBuf::from("/test/vault/new.md");
-        let buffer_id = match session.execute(SessionCommand::OpenNote { path: path.clone() }) {
+        let buffer_id = match open_to_terminal(&session, path.clone()) {
             SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => buffer_id,
             other => panic!("expected opened absent note, got {other:?}"),
         };
@@ -3517,7 +3689,7 @@ mod tests {
             }),
             SessionResult::Error { .. }
         ));
-        let buffer_id = match session.execute(SessionCommand::OpenNote { path: path.clone() }) {
+        let buffer_id = match open_to_terminal(&session, path.clone()) {
             SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => buffer_id,
             other => panic!("expected opened note, got {other:?}"),
         };
@@ -3603,14 +3775,13 @@ mod tests {
             VaultConfig::default(),
         );
         let path = PathBuf::from("/vault/notes/a.md");
-        let (buffer_id, revision) =
-            match session.execute(SessionCommand::OpenNote { path: path.clone() }) {
-                SessionResult::Success(CommandResult::NoteOpened {
-                    buffer_id,
-                    revision,
-                }) => (buffer_id, revision),
-                other => panic!("unexpected open result: {other:?}"),
-            };
+        let (buffer_id, revision) = match open_to_terminal(&session, path.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            }) => (buffer_id, revision),
+            other => panic!("unexpected open result: {other:?}"),
+        };
         let applied = session.execute(SessionCommand::ApplyEdits {
             buffer_id,
             revision,

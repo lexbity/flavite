@@ -30,7 +30,7 @@ target_dir="${CARGO_TARGET_DIR:-target}"
 run_root="$(mktemp -d "$target_dir/workspace-native-atspi.XXXXXX")"
 vault_root="$run_root/vault"
 mkdir -p "$vault_root" "$run_root/data" "$run_root/config" "$run_root/cache"
-cp crates/flavite-ui/tests/fixtures/native-accessibility.md "$vault_root/demo.md"
+cp crates/flavite-ui/tests/fixtures/native-accessibility.md "$vault_root/alpha.md"
 cargo build -p flavite-ui --example app-demo
 
 env -u WAYLAND_DISPLAY \
@@ -39,7 +39,7 @@ env -u WAYLAND_DISPLAY \
     XDG_DATA_HOME="$run_root/data" \
     XDG_CONFIG_HOME="$run_root/config" \
     XDG_CACHE_HOME="$run_root/cache" \
-    "$target_dir/debug/examples/app-demo" "$vault_root" \
+    "$target_dir/debug/examples/app-demo" \
     >"$run_root/app.log" 2>&1 &
 app_pid=$!
 cleanup() {
@@ -64,6 +64,15 @@ if [[ -z "$window_id" ]]; then
     cat "$run_root/app.log" >&2
     exit 1
 fi
+
+xdotool windowactivate --sync "$window_id"
+xdotool windowfocus --sync "$window_id"
+xdotool key --clearmodifiers ctrl+p
+sleep 0.5
+xdotool type --delay 25 "alpha"
+sleep 0.3
+xdotool key --clearmodifiers Return
+sleep 0.5
 
 if ! python3 scripts/workspace-native-accessibility-linux.py "$vault_root"; then
     echo "native AT-SPI runner failed; app log: $run_root/app.log" >&2

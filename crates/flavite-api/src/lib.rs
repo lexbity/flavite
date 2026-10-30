@@ -29,6 +29,7 @@ pub mod doctor;
 pub mod event;
 pub mod flavite;
 pub mod open;
+pub mod queries;
 pub mod result;
 pub mod types;
 
@@ -38,6 +39,7 @@ pub use command::*;
 pub use doctor::*;
 pub use event::*;
 pub use flavite::*;
+pub use queries::*;
 pub use result::*;
 pub use types::*;
 

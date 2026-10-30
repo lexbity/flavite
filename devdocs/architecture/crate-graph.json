@@ -53,6 +53,10 @@
       "kind": "workspace"
     },
     {
+      "id": "flavite-workspace",
+      "kind": "workspace"
+    },
+    {
       "id": "iced",
       "kind": "external"
     },
@@ -313,6 +317,11 @@
       "from": "flavite-ui",
       "to": "flavite-vault",
       "kind": "dev"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "flavite-workspace",
+      "kind": "normal"
     },
     {
       "from": "flavite-ui",

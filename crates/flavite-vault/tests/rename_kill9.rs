@@ -1,6 +1,6 @@
 use flavite_fs::{Fs, OsFs};
 use flavite_vault::{
-    CommandResult, SessionCommand, SessionResult, Vault, VaultConfig,
+    CommandResult, OpenPolicy, SessionCommand, SessionResult, Vault, VaultConfig,
     journal::{JournalExecutor, TransactionItemKind, TransactionItemState},
     types::RenameStrategy,
 };
@@ -23,7 +23,17 @@ fn undo_child_process() {
     .unwrap();
     let session = vault.session();
     let links = root.join("links.md");
-    let (buffer_id, _) = match session.execute(SessionCommand::OpenNote { path: links }) {
+    let (buffer_id, _) = match session.execute(SessionCommand::OpenNote {
+        path: links,
+        policy: OpenPolicy::CreateIfMissing,
+    }) {
+        SessionResult::Pending { request_id } => match session.wait_for_operation(request_id) {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            }) => (buffer_id, revision),
+            other => panic!("open inbound buffer failed: {other:?}"),
+        },
         SessionResult::Success(CommandResult::NoteOpened {
             buffer_id,
             revision,

@@ -69,33 +69,43 @@ impl App {
         let flavite =
             Flavite::open_root(root.clone(), config).map_err(|error| error.to_string())?;
         let path = root.join("demo.md");
-        match flavite.execute_session(SessionCommand::OpenNote { path }) {
-            SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => {
-                let view = flavite
-                    .get_buffer_view(buffer_id, None)
-                    .map_err(|error| error.to_string())?;
-                let candidates = flavite
-                    .completion_candidates()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|candidate| NoteCandidate {
-                        target: candidate.target,
-                        title: candidate.title,
-                        aliases: candidate.aliases,
-                        stable_id: candidate.stable_id,
-                    })
-                    .collect();
-                Ok(Self {
-                    flavite: Some(flavite),
-                    view: Some(view),
-                    candidates,
-                    status: "Ready".into(),
-                    last_edit: Instant::now(),
-                    pending_save: None,
-                })
+        // Cold opens complete on the Session's worker pool; hosts wait
+        // through the correlated completion path.
+        let open_request = match flavite.execute_session(SessionCommand::OpenNote {
+            path,
+            policy: flavite_api::session::OpenPolicy::CreateIfMissing,
+        }) {
+            SessionResult::Pending { request_id } => {
+                let completion = flavite.wait_for_operation(request_id);
+                completion.into_success().expect("open completes").data
             }
-            other => Err(format!("open note did not complete: {other:?}")),
-        }
+            other => panic!("unexpected direct open result: {other:?}"),
+        };
+        let data = open_request;
+        let buffer_id =
+            flavite_buffer::BufferId::from(data["buffer_id"].as_u64().expect("buffer id"));
+        let view = flavite
+            .get_buffer_view(buffer_id, None)
+            .map_err(|error| error.to_string())?;
+        let candidates = flavite
+            .completion_candidates()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|candidate| NoteCandidate {
+                target: candidate.target,
+                title: candidate.title,
+                aliases: candidate.aliases,
+                stable_id: candidate.stable_id,
+            })
+            .collect();
+        Ok(Self {
+            flavite: Some(flavite),
+            view: Some(view),
+            candidates,
+            status: "Ready".into(),
+            last_edit: Instant::now(),
+            pending_save: None,
+        })
     }
 
     fn subscription(_state: &Self) -> Subscription<Message> {

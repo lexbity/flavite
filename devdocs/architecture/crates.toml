@@ -6,12 +6,16 @@
 
 [tiers]
 # Tier 1 — durability-critical (§10.5: ≥ 90% line coverage floor).
+# Tier 1 — durability-critical (§10.5: ≥ 90% line coverage floor).
+# RFC-0003 adds flavite-workspace: the IO-free layout model carries
+# durability-adjacent invariants and holds the 90% floor.
 tier1 = [
     "flavite-fs",
     "flavite-syntax",
     "flavite-buffer",
     "flavite-vault",
     "flavite-index",
+    "flavite-workspace",
 ]
 # Tier 2 (§10.5: ≥ 80% line coverage floor).
 tier2 = ["flavite-api", "flavite-graph"]
@@ -27,6 +31,7 @@ flavite-vault = "Session/BufferManager ownership + actors, journal, history, rec
 flavite-api = "Registry, typed commands/results, revisioned views, events, capabilities (§4.1)"
 flavite-graph = "Layout, spatial — CPU only (§4.1)"
 flavite-cli = "Headless CLI; consumes flavite-api (D16 dogfood) (§4.1)"
+flavite-workspace = "IO-free workspace model: layout tree, tab groups, typed transactions, geometry (RFC-0003 D-02)"
 flavite-editor = "iced widget over EditorModel (iced permitted here and in flavite-ui only) (§4.1)"
 flavite-ui = "iced application (§4.1)"
 
@@ -84,6 +89,8 @@ active = [
     { from = "flavite-editor", to = "flavite-api" },
     { from = "flavite-editor", to = "flavite-buffer" },
     { from = "flavite-editor", to = "flavite-syntax" },
+    # W02 - the shell reduces authoritative layout through the IO-free model.
+    { from = "flavite-ui", to = "flavite-workspace" },
 ]
 
 [layering]

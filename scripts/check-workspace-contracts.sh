@@ -37,6 +37,24 @@ case "$profile" in
         assert_absent 'a11y_stub|fake_accessible_text|waived.*complete' \
             "$root/crates/flavite-ui/src/accessibility"
         ;;
+    W02)
+        # W01 gates remain in force additively; W02 adds the destination-shell
+        # removal and the demo-target removal.
+        assert_nonempty "$root/crates/flavite-workspace/src/reducer.rs"
+        assert_nonempty "$root/crates/flavite-workspace/src/geometry.rs"
+        assert_nonempty "$root/crates/flavite-ui/src/workspace_shell.rs"
+        assert_nonempty "$root/crates/flavite-ui/src/workspace/pane_grid.rs"
+        assert_nonempty "$root/crates/flavite-ui/src/host/commands.rs"
+        assert_nonempty "$root/scripts/workspace-visual-linux.sh"
+        assert_absent 'enum Pane\b|Navigate\(Pane|Pane::NAV|Pane::Workspace|Pane::Editor|Pane::Read|Pane::Graph' \
+            "$root/crates/flavite-ui/src"
+        assert_absent 'demo\.md|LATTICE' \
+            "$root/crates/flavite-ui/src/app.rs" \
+            "$root/crates/flavite-ui/src/workspace_shell.rs"
+        # The workspace model stays IO-free and toolkit-free.
+        assert_absent 'iced|rusqlite|flavite-api|flavite-fs|flavite-ui|flavite-graph' \
+            "$root/crates/flavite-workspace/Cargo.toml"
+        ;;
     *)
         echo "unknown workspace contract profile: ${profile:-<empty>}" >&2
         exit 2

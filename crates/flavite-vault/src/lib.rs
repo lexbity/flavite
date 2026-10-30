@@ -61,8 +61,8 @@ pub use save::{
     save,
 };
 pub use session::{
-    CommandResult, ConflictResolution, Session, SessionBuilder, SessionCommand, SessionError,
-    SessionEvent, SessionResult,
+    CommandResult, ConflictResolution, OpenPolicy, Session, SessionBuilder, SessionCommand,
+    SessionError, SessionEvent, SessionResult,
 };
 pub use tokens::{TokenGuard, WriteToken, WriteTokenManager};
 pub use types::{

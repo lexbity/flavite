@@ -73,6 +73,31 @@ pub struct SearchPage {
 /// One matching note from a text or hybrid query.
 pub type SearchNote = (i64, String, String);
 
+/// One catalog entry: the portable path string, the raw native path bytes
+/// (authoritative identity), and the indexed title.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NoteCatalogEntry {
+    /// Portable vault-relative path (display and join purposes).
+    pub path: String,
+    /// Exact native path bytes as stored by the index.
+    pub path_native: Vec<u8>,
+    /// Indexed note title.
+    pub title: String,
+}
+
+/// A bounded catalog page with the index generation it came from.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NoteCatalogPage {
+    /// Entries in canonical path order, at most the requested limit.
+    pub items: Vec<NoteCatalogEntry>,
+    /// Index epoch.
+    pub epoch: u64,
+    /// Index generation.
+    pub generation: u64,
+    /// Total indexed notes, which may exceed the page length.
+    pub total: u64,
+}
+
 /// Indexed source span for one inbound link used by journaled note renames.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundLinkSpan {
@@ -1419,6 +1444,52 @@ impl IndexActor {
             self.last_search_commit = Instant::now();
         }
         Ok(())
+    }
+
+    /// A bounded native-identity note catalog for workspace shells and
+    /// note pickers. Ordering is the canonical path order; entries carry
+    /// the raw native path bytes so consumers never reconstruct identity
+    /// from a display string.
+    ///
+    /// # Errors
+    /// Returns the underlying error text when SQLite cannot be read.
+    pub fn note_catalog(&self, limit: usize) -> Result<NoteCatalogPage, String> {
+        let conn = self
+            .read_pool
+            .get(Some(Duration::from_secs(2)))
+            .map_err(|e| e.to_string())?;
+        let epoch = crate::schema::get_meta_u64(&conn, crate::schema::MetaKey::Epoch)
+            .map_err(|e| e.to_string())?
+            .unwrap_or(1);
+        let generation = crate::schema::get_meta_u64(&conn, crate::schema::MetaKey::Generation)
+            .map_err(|e| e.to_string())?
+            .unwrap_or(0);
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        let mut statement = conn
+            .prepare("SELECT path, path_native, title FROM notes ORDER BY path_key, path LIMIT ?1")
+            .map_err(|e| e.to_string())?;
+        let bounded_limit =
+            i64::try_from(limit).map_err(|_| "note catalog limit does not fit i64".to_owned())?;
+        let rows = statement
+            .query_map([bounded_limit], |row| {
+                Ok(NoteCatalogEntry {
+                    path: row.get(0)?,
+                    path_native: row.get(1)?,
+                    title: row.get(2)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let items = rows
+            .map(|row| row.map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(NoteCatalogPage {
+            items,
+            epoch,
+            generation,
+            total: u64::try_from(total.max(0)).unwrap_or(0),
+        })
     }
 
     /// Search generation counters used by diagnostics and tests.

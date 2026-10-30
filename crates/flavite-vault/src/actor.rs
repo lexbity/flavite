@@ -131,6 +131,11 @@ pub enum VaultActorMsg {
     },
     /// Read the indexed title/alias snapshot for editor autocomplete.
     CompletionCandidates { reply: Sender<VaultActorResp> },
+    /// Read a bounded native-identity note catalog for workspace shells.
+    NoteCatalog {
+        limit: usize,
+        reply: Sender<VaultActorResp>,
+    },
     /// Resolve one link through the index's canonical resolver.
     ResolveTarget {
         target_key: String,
@@ -180,7 +185,9 @@ pub enum VaultActorResp {
         version: Version,
     },
     /// A queued reconcile was replaced by a newer request.
-    ReconcileSuperseded { by_request: u64 },
+    ReconcileSuperseded {
+        by_request: u64,
+    },
     /// Durable journal rename and link patches completed.
     Renamed(Result<String, String>),
     /// Current version.
@@ -195,6 +202,7 @@ pub enum VaultActorResp {
     File(Option<Vec<u8>>),
     /// Indexed note completion candidates.
     CompletionCandidates(Result<Vec<flavite_index::types::CompletionCandidate>, String>),
+    NoteCatalog(Result<flavite_index::NoteCatalogPage, String>),
     /// Canonical link resolution verdict.
     ResolveTarget(Result<flavite_index::resolver::Resolution, String>),
     /// Search results from the structural index and Tantivy.
@@ -379,6 +387,19 @@ impl VaultActorHandle {
             VaultActorResp::File(bytes) => Ok(bytes),
             VaultActorResp::Error(_) => Err(VaultActorError::NotRunning),
             _ => Err(VaultActorError::NotRunning),
+        }
+    }
+
+    /// Read a bounded native-identity note catalog page.
+    pub fn note_catalog(&self, limit: usize) -> Result<flavite_index::NoteCatalogPage, String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::NoteCatalog { limit, reply })
+            .map_err(|error| error.to_string())?;
+        match response.recv().map_err(|error| error.to_string())? {
+            VaultActorResp::NoteCatalog(result) => result,
+            VaultActorResp::Error(error) => Err(error),
+            _ => Err("unexpected note-catalog response".to_owned()),
         }
     }
 
@@ -1021,6 +1042,10 @@ impl VaultActor {
             VaultActorMsg::CompletionCandidates { reply } => {
                 let response =
                     VaultActorResp::CompletionCandidates(self.index.completion_candidates());
+                let _ = reply.try_send(response);
+            }
+            VaultActorMsg::NoteCatalog { limit, reply } => {
+                let response = VaultActorResp::NoteCatalog(self.index.note_catalog(limit));
                 let _ = reply.try_send(response);
             }
             VaultActorMsg::ResolveTarget {
