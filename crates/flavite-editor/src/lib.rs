@@ -11,7 +11,7 @@ pub mod viewport;
 pub mod widget;
 
 pub use links::NoteCandidate;
-pub use surface::{EditorAction, EditorSurface, EditorView, LinkNavigation};
+pub use surface::{EditorAction, EditorSurface, EditorView, HistoryDirection, LinkNavigation};
 pub use widget::{
     EditorInteractionSnapshot, EditorWidget, focus_editor, inspect_focused_editor,
     set_focused_editor_selection,

@@ -17,13 +17,15 @@
 //! - User resolution actions
 
 use flavite_syntax::text::TextSnapshot;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use crate::model::EditorModel;
 use crate::revision::{BaseHash, BufferId, Revision};
 
 /// The buffer state as defined by D7.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BufferState {
     /// Buffer content matches what's on disk.
     Clean,

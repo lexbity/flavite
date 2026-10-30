@@ -40,6 +40,7 @@ case "$profile" in
     W02)
         # W01 gates remain in force additively; W02 adds the destination-shell
         # removal and the demo-target removal.
+        bash "$0" W01 "$root"
         assert_nonempty "$root/crates/flavite-workspace/src/reducer.rs"
         assert_nonempty "$root/crates/flavite-workspace/src/geometry.rs"
         assert_nonempty "$root/crates/flavite-ui/src/workspace_shell.rs"
@@ -54,6 +55,30 @@ case "$profile" in
         # The workspace model stays IO-free and toolkit-free.
         assert_absent 'iced|rusqlite|flavite-api|flavite-fs|flavite-ui|flavite-graph' \
             "$root/crates/flavite-workspace/Cargo.toml"
+        ;;
+    W03)
+        # Completed layout and runtime gates remain additive.
+        bash "$0" W02 "$root"
+        for file in \
+            crates/flavite-workspace/src/input.rs \
+            crates/flavite-editor/src/surface.rs \
+            crates/flavite-editor/src/widget.rs \
+            crates/flavite-api/src/flavite.rs \
+            crates/flavite-ui/src/operation.rs \
+            crates/flavite-ui/tests/shared_views.rs; do
+            assert_nonempty "$root/$file"
+        done
+        assert_absent 'active_buffer|\.session\(\)|execute_session\(' \
+            "$root/crates/flavite-ui/src/app.rs" \
+            "$root/crates/flavite-ui/src/host" \
+            "$root/crates/flavite-ui/src/operation.rs"
+        assert_absent 'pub history: Option|pub navigation: Option|pub command_id:.*str' \
+            "$root/crates/flavite-editor/src/surface.rs"
+        assert_absent 'state == "|state != "' \
+            "$root/crates/flavite-ui/src/app.rs" \
+            "$root/crates/flavite-editor/src/widget.rs"
+        assert_absent 'pub fn session\(|pub fn execute_session\(' \
+            "$root/crates/flavite-api/src/flavite.rs"
         ;;
     *)
         echo "unknown workspace contract profile: ${profile:-<empty>}" >&2

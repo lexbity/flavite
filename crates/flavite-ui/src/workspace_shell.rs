@@ -13,7 +13,7 @@ use iced::widget::{
     Space, button, column, container, mouse_area, opaque, pane_grid, row, rule, scrollable, stack,
     text, text_input,
 };
-use iced::{Element, Font, Length, Padding, alignment};
+use iced::{Element, Length, Padding, alignment};
 
 /// Widget id of the palette query input.
 pub const PALETTE_INPUT_ID: &str = "palette-query-input";
@@ -58,16 +58,66 @@ pub fn view(app: &App) -> Element<'_, Message> {
 }
 
 fn shell(app: &App) -> Element<'_, Message> {
-    column![
-        top_bar(app),
-        rule::horizontal(1),
-        workspace_region(app),
-        rule::horizontal(1),
-        status_bar(app),
+    let mut shell = column![top_bar(app), rule::horizontal(1)];
+    if let Some(notifications) = notification_surface(app) {
+        shell = shell.push(notifications);
+    }
+    shell
+        .push(workspace_region(app))
+        .push(rule::horizontal(1))
+        .push(status_bar(app))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+fn notification_surface(app: &App) -> Option<Element<'_, Message>> {
+    if app.notices.is_empty() {
+        return None;
+    }
+    let hidden = app.notices.len().saturating_sub(3);
+    let mut entries = column![
+        text(format!("Notifications ({})", app.notices.len()))
+            .size(style::TEXT_SM)
+            .style(style::dim_text)
     ]
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into()
+    .spacing(2);
+    for notice in app.notices.iter().take(3) {
+        entries = entries.push(
+            row![
+                text(format!("{}: {:?}", notice.event.event_type(), notice.event))
+                    .size(style::TEXT_SM)
+                    .width(Length::Fill),
+                button(text("Dismiss").size(style::TEXT_SM))
+                    .padding(tab_strip::chip_padding())
+                    .style(style::ghost())
+                    .on_press(Message::AcknowledgeNotice(notice.id)),
+            ]
+            .spacing(style::SPACING_SM)
+            .align_y(alignment::Vertical::Center),
+        );
+    }
+    if hidden > 0 {
+        entries = entries.push(
+            text(format!(
+                "{hidden} additional notices are waiting for presentation"
+            ))
+            .size(style::TEXT_SM)
+            .style(style::dim_text),
+        );
+    }
+    Some(
+        container(entries)
+            .width(Length::Fill)
+            .padding(Padding {
+                top: style::SPACING_SM,
+                bottom: style::SPACING_SM,
+                left: style::SPACING_LG,
+                right: style::SPACING_LG,
+            })
+            .style(style::card)
+            .into(),
+    )
 }
 
 fn top_bar(app: &App) -> Element<'_, Message> {
@@ -256,8 +306,8 @@ fn empty_state(title: &str, hint: &str) -> Element<'static, Message> {
     .into()
 }
 
-/// One source-reading note tab: an explicitly labeled Source view of the
-/// current buffer (editing integrates in W03).
+/// One editable note tab. The widget runtime is keyed by TabId and restores
+/// the host-owned logical interaction state after reparenting.
 fn note_view<'a>(
     app: &'a App,
     tab: TabId,
@@ -314,30 +364,40 @@ fn note_view<'a>(
         .style(style::content)
         .into(),
         NoteLoad::Ready => {
-            let text_body = app
-                .note_state_text(tab)
-                .unwrap_or_else(|| "The buffer view is unavailable.".into());
+            let Some(view) = app.note_editor_view(tab) else {
+                return empty_state("Buffer unavailable", "The note view needs to be reopened.");
+            };
+            let Some(incarnation) = app.notes.incarnation(tab) else {
+                return empty_state("View unavailable", "This note view is no longer active.");
+            };
+            let initial_interaction = app.editor_interaction_snapshot(tab);
+            let mut editor = flavite_editor::EditorWidget::from_view(view, move |action| {
+                Message::EditorAction {
+                    tab,
+                    incarnation,
+                    action,
+                }
+            })
+            .with_interaction(move |snapshot| Message::EditorAction {
+                tab,
+                incarnation,
+                action: flavite_editor::EditorAction::Interaction(snapshot),
+            });
+            if let Some(interaction) = initial_interaction {
+                editor = editor.with_initial_interaction(interaction);
+            }
             let meta = row![
                 container(text(path).size(style::TEXT_SM))
                     .style(|theme| style::chip(theme, style::Tone::Neutral))
                     .padding(tab_strip::chip_padding()),
-                container(text("Source").size(style::TEXT_SM))
+                container(text("Edit").size(style::TEXT_SM))
                     .style(|theme| style::chip(theme, style::Tone::Primary))
                     .padding(tab_strip::chip_padding()),
             ]
             .spacing(style::SPACING_SM);
             container(
-                column![
-                    meta,
-                    container(scrollable(
-                        text(text_body).font(Font::MONOSPACE).size(style::TEXT)
-                    ))
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .padding(style::SPACING)
-                    .style(style::card),
-                ]
-                .spacing(style::SPACING),
+                column![meta, editor.width(Length::Fill).height(Length::Fill)]
+                    .spacing(style::SPACING),
             )
             .width(Length::Fill)
             .height(Length::Fill)
@@ -437,6 +497,11 @@ fn note_row(entry: &NoteCatalogEntry, group: GroupId) -> Element<'_, Message> {
 
 fn status_bar(app: &App) -> Element<'_, Message> {
     let mut right = row![].spacing(style::SPACING_SM);
+    right = right.push(
+        container(text(app.writing_target_label()).size(style::TEXT_SM))
+            .style(|theme| style::chip(theme, style::Tone::Primary))
+            .padding(tab_strip::chip_padding()),
+    );
     if let Some(state) = focused_note_state(app) {
         right = right.push(
             container(text(state).size(style::TEXT_SM))
@@ -450,6 +515,16 @@ fn status_bar(app: &App) -> Element<'_, Message> {
             container(text(format!("{pending} in flight")).size(style::TEXT_SM))
                 .style(|theme| style::chip(theme, style::Tone::Warning))
                 .padding(tab_strip::chip_padding()),
+        );
+    }
+    let displaced = app.operation_history_overflowed();
+    if displaced > 0 {
+        right = right.push(
+            container(
+                text(format!("{displaced} older outcomes outside history")).size(style::TEXT_SM),
+            )
+            .style(|theme| style::chip(theme, style::Tone::Warning))
+            .padding(tab_strip::chip_padding()),
         );
     }
     if let Some((done, total)) = app.reconcile_progress() {

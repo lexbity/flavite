@@ -153,7 +153,18 @@ pub struct BufferSnapshot {
     pub revision: Revision,
     pub text: String,
     pub base_hash: Option<[u8; 32]>,
-    pub state: String,
+    pub state: flavite_buffer::state::BufferState,
+    pub path: PathBuf,
+}
+
+/// Immutable shared snapshot for multiple views of the same buffer revision.
+#[derive(Debug, Clone)]
+pub struct SharedBufferSnapshot {
+    pub buffer_id: BufferId,
+    pub revision: Revision,
+    pub text: std::sync::Arc<str>,
+    pub base_hash: Option<[u8; 32]>,
+    pub state: flavite_buffer::state::BufferState,
     pub path: PathBuf,
 }
 
@@ -396,6 +407,10 @@ pub struct Session {
     rename_strategy: RenameStrategy,
     /// Buffer manager.
     buffer_manager: Arc<Mutex<BufferManager>>,
+    /// Latest immutable text snapshot per open buffer. Views/workers retain
+    /// older revisions through Arc while the cache itself remains bounded to
+    /// one revision per buffer.
+    shared_snapshots: Mutex<HashMap<BufferId, (Revision, std::sync::Arc<str>)>>,
     /// Autosave failures observed by the host pump.
     autosave_failures_total: AtomicU64,
     /// Save requests admitted by autosave, so asynchronous failures are counted too.
@@ -543,6 +558,7 @@ impl Session {
             autosave_idle_interval: config.autosave_idle_interval,
             rename_strategy: config.rename_strategy,
             buffer_manager: manager,
+            shared_snapshots: Mutex::new(HashMap::new()),
             autosave_failures_total: AtomicU64::new(0),
             autosave_requests: Mutex::new(HashSet::new()),
             absent_on_open: Arc::new(Mutex::new(HashSet::new())),
@@ -612,7 +628,9 @@ impl Session {
         self.pump_reconcile_completions();
         self.pump_rename_completions();
         self.pump_autosave();
-        let _ = self.recovery_tick();
+        // Recovery checkpoints run on the dedicated worker created with the
+        // Session. Never perform recovery filesystem or actor I/O while this
+        // host pump owns the Session driving-turn lock.
     }
 
     fn pump_recovery_notices(&self) {
@@ -985,8 +1003,16 @@ impl Session {
 
     /// Drain lossless, coalesced notices for a host adapter.
     pub fn drain_notices(&self) -> Vec<crate::channels::Notice> {
+        self.drain_notices_limit(usize::MAX)
+    }
+
+    /// Drain at most `limit` lossless notices so an API host can apply
+    /// acknowledgement credits without losing the producer's backlog.
+    pub fn drain_notices_limit(&self, limit: usize) -> Vec<crate::channels::Notice> {
         let mut events = Vec::new();
-        while let Ok(event) = self.notice.try_recv() {
+        while events.len() < limit
+            && let Ok(event) = self.notice.try_recv()
+        {
             events.push(event);
         }
         events
@@ -1523,6 +1549,8 @@ impl Session {
             // Close the buffer
             let mut buffer_manager = self.buffer_manager.lock().unwrap();
             buffer_manager.close_note(&path);
+            drop(buffer_manager);
+            self.shared_snapshots.lock().unwrap().remove(&_buffer_id);
 
             self.absent_on_open.lock().unwrap().remove(&path);
 
@@ -2175,6 +2203,23 @@ impl Session {
         buffer_id: BufferId,
         revision: Option<Revision>,
     ) -> Result<BufferSnapshot, BufferSnapshotError> {
+        let snapshot = self.shared_buffer_snapshot(buffer_id, revision)?;
+        Ok(BufferSnapshot {
+            buffer_id: snapshot.buffer_id,
+            revision: snapshot.revision,
+            text: snapshot.text.to_string(),
+            base_hash: snapshot.base_hash,
+            state: snapshot.state,
+            path: snapshot.path,
+        })
+    }
+
+    /// Get a cached immutable snapshot shared by all views of this revision.
+    pub fn shared_buffer_snapshot(
+        &self,
+        buffer_id: BufferId,
+        revision: Option<Revision>,
+    ) -> Result<SharedBufferSnapshot, BufferSnapshotError> {
         let _turn = self.driving_turn.lock().unwrap();
         let manager = self.buffer_manager.lock().unwrap();
         let buffer = manager
@@ -2192,12 +2237,26 @@ impl Session {
             .path_for_id(buffer_id)
             .cloned()
             .ok_or(BufferSnapshotError::NotFound(buffer_id.as_u64()))?;
-        Ok(BufferSnapshot {
+        let current_revision = buffer.revision();
+        let text = {
+            let mut cache = self.shared_snapshots.lock().unwrap();
+            match cache.get(&buffer_id) {
+                Some((cached_revision, text)) if *cached_revision == current_revision => {
+                    text.clone()
+                }
+                _ => {
+                    let text: std::sync::Arc<str> = buffer.text().to_owned().into();
+                    cache.insert(buffer_id, (current_revision, text.clone()));
+                    text
+                }
+            }
+        };
+        Ok(SharedBufferSnapshot {
             buffer_id,
-            revision: buffer.revision(),
-            text: buffer.text().to_owned(),
+            revision: current_revision,
+            text,
             base_hash: buffer.base_hash().map(|hash| hash.as_bytes()),
-            state: buffer.state().to_string(),
+            state: buffer.state(),
             path,
         })
     }
@@ -2210,8 +2269,9 @@ impl Session {
     }
 
     /// Write recovery files for dirty buffers whose configured interval is
-    /// due. GUI and CLI hosts call this from their timer pump; errors remain
-    /// best-effort as required by D6, while the dirty buffer remains present.
+    /// due. This explicit maintenance hook is used by tests and recovery
+    /// tooling; normal host operation uses the dedicated background worker.
+    /// Errors remain best-effort while the dirty buffer remains present.
     pub fn recovery_tick(&self) -> Vec<PathBuf> {
         let Some(writer) = &self.recovery_writer else {
             return Vec::new();
@@ -2717,6 +2777,15 @@ mod tests {
         };
         assert!(session.is_open(&path));
         assert_eq!(session.get_buffer_id(&path), Some(buffer_id));
+        let shared = session.shared_buffer_snapshot(buffer_id, None).unwrap();
+        assert_eq!(shared.text.as_ref(), "hello");
+        assert!(
+            session
+                .shared_snapshots
+                .lock()
+                .unwrap()
+                .contains_key(&buffer_id)
+        );
         assert!(matches!(
             open_to_terminal(&session, path.clone()),
             SessionResult::Success(CommandResult::NoteOpened { .. })
@@ -2796,6 +2865,13 @@ mod tests {
             SessionResult::Success(CommandResult::NoteClosed)
         ));
         assert!(!session.is_open(&path));
+        assert!(
+            !session
+                .shared_snapshots
+                .lock()
+                .unwrap()
+                .contains_key(&buffer_id)
+        );
         assert!(matches!(
             session.execute(SessionCommand::CloseNote { path }),
             SessionResult::Error { .. }

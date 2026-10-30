@@ -7,6 +7,7 @@
 //! inert preserved records when the codec lands (W06).
 
 use crate::ids::TabId;
+use crate::input::EditorInteraction;
 use std::path::{Path, PathBuf};
 
 /// A validated, vault-relative note locator (§7.1). Display strings are not
@@ -164,12 +165,17 @@ impl NoteView {
 pub struct ViewSession {
     tab: TabId,
     kind: ViewKind,
+    interaction: EditorInteraction,
 }
 
 impl ViewSession {
     #[must_use]
-    pub const fn new(tab: TabId, kind: ViewKind) -> Self {
-        Self { tab, kind }
+    pub fn new(tab: TabId, kind: ViewKind) -> Self {
+        Self {
+            tab,
+            kind,
+            interaction: EditorInteraction::new(tab, 1),
+        }
     }
 
     #[must_use]
@@ -180,6 +186,16 @@ impl ViewSession {
     #[must_use]
     pub const fn kind(&self) -> &ViewKind {
         &self.kind
+    }
+
+    /// Acknowledged per-view input state, independent of widget-tree position.
+    #[must_use]
+    pub const fn interaction(&self) -> &EditorInteraction {
+        &self.interaction
+    }
+
+    pub(crate) fn set_interaction(&mut self, interaction: EditorInteraction) {
+        self.interaction = interaction;
     }
 
     pub(crate) fn kind_mut(&mut self) -> &mut ViewKind {

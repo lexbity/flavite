@@ -262,6 +262,10 @@ workspace-gate *profile="W02":
     cargo test -p flavite-ui --test workspace_layout
     cargo test -p flavite-ui --test runtime_accessibility
     cargo test -p flavite-api --test open_flights
+    if [ "{{profile}}" = "W03" ]; then
+        cargo test -p flavite-editor
+        cargo test -p flavite-ui --test shared_views
+    fi
 
 # RFC-0003 §31.1: real Linux window input, semantic checkpoints, screenshots,
 # and an evidence manifest.

@@ -637,17 +637,25 @@ fn main() -> Result<()> {
     }
 
     if let Some(flavite) = driver.flavite.as_ref() {
-        let events = flavite.drain_events();
+        let events = flavite.poll_events(256);
         if !events.is_empty() {
             if driver.json {
-                for event in events {
-                    eprintln!("{}", serde_json::to_string(&event)?);
-                    flavite.acknowledge_event(&event);
+                for delivery in events {
+                    eprintln!("{}", serde_json::to_string(&delivery.event)?);
+                    if let Some(id) = delivery.notice_id {
+                        flavite.acknowledge_notice(id);
+                    }
                 }
             } else {
-                for event in events {
-                    eprintln!("event {}: {event:?}", event.event_type());
-                    flavite.acknowledge_event(&event);
+                for delivery in events {
+                    eprintln!(
+                        "event {}: {:?}",
+                        delivery.event.event_type(),
+                        delivery.event
+                    );
+                    if let Some(id) = delivery.notice_id {
+                        flavite.acknowledge_notice(id);
+                    }
                 }
             }
         }

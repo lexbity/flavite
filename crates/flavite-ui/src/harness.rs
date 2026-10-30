@@ -95,6 +95,8 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                         flavite_workspace::ViewKind::Empty => "empty",
                         flavite_workspace::ViewKind::Notes => "notes",
                     };
+                    let interaction = session.interaction();
+                    let buffer_view = app.note_editor_view(*tab);
                     Some(serde_json::json!({
                         // JSON numbers cannot losslessly represent every
                         // u128; expose opaque identity in its stable string
@@ -103,6 +105,12 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                         "title": session.title(),
                         "load": load,
                         "active": *tab == state.active(),
+                        "buffer": buffer_view.as_ref().map(|view| view.buffer_id),
+                        "revision": buffer_view.as_ref().map(|view| view.revision),
+                        "selection": interaction.selections.first().map(|selection| [selection.anchor, selection.head]),
+                        "incarnation": interaction.incarnation,
+                        "interaction_focused": interaction.focused,
+                        "composing": interaction.composition == flavite_workspace::CompositionState::Active,
                     }))
                 })
                 .collect();
@@ -122,6 +130,15 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         .note_state_text(focused)
         .map(|text| text.chars().count())
         .unwrap_or(0);
+    let focused_text_content = app.note_state_text(focused).unwrap_or_default();
+    let writing_target = app.workspace.writing_target().map(|target| {
+        serde_json::json!({
+            "tab": target.tab.to_string(),
+            "buffer": target.buffer_id,
+            "revision": target.revision,
+            "caret": target.caret_text_byte,
+        })
+    });
     serde_json::json!({
         "event": "workspace",
         "revision": app.workspace.revision(),
@@ -129,6 +146,9 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "groups": groups,
         "focused_tab": focused.to_string(),
         "focused_text_chars": focused_text,
+        "focused_text": focused_text_content,
+        "document_anchor": app.workspace.document_anchor().map(|tab| tab.to_string()),
+        "writing_target": writing_target,
         "maximized": app.maximized_group().map(|group| group.to_string()),
         "catalog": app.catalog().len(),
     })

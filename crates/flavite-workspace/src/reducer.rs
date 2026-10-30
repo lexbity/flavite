@@ -100,6 +100,8 @@ pub struct WorkspaceState {
     groups: BTreeMap<GroupId, TabGroup>,
     tabs: BTreeMap<TabId, ViewSession>,
     focus: TabId,
+    document_anchor: Option<TabId>,
+    writing_target: Option<crate::input::WritingTarget>,
     maximized: Option<GroupId>,
     recently_closed: VecDeque<NoteLocator>,
 }
@@ -350,6 +352,8 @@ impl WorkspaceState {
             groups,
             tabs,
             focus: tab,
+            document_anchor: None,
+            writing_target: None,
             maximized: None,
             recently_closed: VecDeque::new(),
         }
@@ -393,6 +397,127 @@ impl WorkspaceState {
     #[must_use]
     pub fn tab(&self, id: &TabId) -> Option<&ViewSession> {
         self.tabs.get(id)
+    }
+
+    /// Acknowledge host-visible editor input for a note view. This updates
+    /// logical input state without changing the structural layout revision.
+    /// The widget event must match the current tab incarnation and advance
+    /// its interaction sequence.
+    ///
+    /// # Errors
+    /// Returns an error when the tab is missing, the interaction is stale or
+    /// invalid for the current text, or a focused caret has no buffer identity.
+    pub fn acknowledge_interaction(
+        &mut self,
+        interaction: crate::input::EditorInteraction,
+        text: &str,
+    ) -> Result<(), &'static str> {
+        let tab = interaction.tab;
+        let current = self.tabs.get(&tab).ok_or("interaction tab is closed")?;
+        interaction.validate(tab, current.interaction().incarnation, text.len())?;
+        if interaction.sequence <= current.interaction().sequence {
+            return Err("interaction sequence is stale");
+        }
+        if !text.is_char_boundary(interaction.viewport_anchor)
+            || interaction.selections.iter().any(|selection| {
+                !text.is_char_boundary(selection.anchor) || !text.is_char_boundary(selection.head)
+            })
+        {
+            return Err("interaction position is not a UTF-8 boundary");
+        }
+        if interaction.revision < current.interaction().revision {
+            return Err("interaction revision is stale");
+        }
+        let focused = interaction.focused;
+        let target = if focused
+            && interaction.composition == crate::input::CompositionState::Idle
+            && interaction.selections.len() == 1
+            && interaction.selections[0].is_caret()
+        {
+            Some(crate::input::WritingTarget {
+                tab,
+                incarnation: interaction.incarnation,
+                buffer_id: interaction
+                    .buffer_id
+                    .ok_or("writing target has no buffer")?,
+                revision: interaction.revision,
+                interaction_sequence: interaction.sequence,
+                caret_text_byte: interaction.selections[0].head,
+            })
+        } else {
+            None
+        };
+        self.tabs
+            .get_mut(&tab)
+            .ok_or("interaction tab closed during acknowledgement")?
+            .set_interaction(interaction);
+        if focused {
+            self.document_anchor = Some(tab);
+            self.writing_target = target;
+        }
+        Ok(())
+    }
+
+    /// Note source most recently focused in an editable or reading view.
+    #[must_use]
+    pub const fn document_anchor(&self) -> Option<TabId> {
+        self.document_anchor
+    }
+
+    /// Current explicitly acknowledged semantic insertion target.
+    #[must_use]
+    pub const fn writing_target(&self) -> Option<crate::input::WritingTarget> {
+        self.writing_target
+    }
+
+    /// Invalidate insertion authorization after any edit to the bound buffer.
+    pub fn invalidate_writing_target(&mut self, buffer_id: u64) {
+        if self
+            .writing_target
+            .is_some_and(|target| target.buffer_id == buffer_id)
+        {
+            self.writing_target = None;
+        }
+    }
+
+    /// Replace a view incarnation before its keyed runtime is released.
+    /// Existing interaction coordinates are intentionally invalidated.
+    ///
+    /// # Errors
+    /// Returns an error when the tab is missing or the resulting incarnation
+    /// cannot be installed.
+    pub fn replace_view_incarnation(&mut self, tab: TabId) -> Result<u64, &'static str> {
+        let incarnation = self
+            .tabs
+            .get(&tab)
+            .ok_or("view tab is closed")?
+            .interaction()
+            .incarnation
+            .saturating_add(1);
+        self.install_view_incarnation(tab, incarnation)?;
+        Ok(incarnation)
+    }
+
+    /// Install the host-assigned resource generation for a newly attached
+    /// view. Logical coordinates are reset because they belong to the prior
+    /// runtime incarnation.
+    ///
+    /// # Errors
+    /// Returns an error when the incarnation is zero or the tab is missing.
+    pub fn install_view_incarnation(
+        &mut self,
+        tab: TabId,
+        incarnation: u64,
+    ) -> Result<(), &'static str> {
+        if incarnation == 0 {
+            return Err("view incarnation must be nonzero");
+        }
+        let view = self.tabs.get_mut(&tab).ok_or("view tab is closed")?;
+        view.set_interaction(crate::input::EditorInteraction::new(tab, incarnation));
+        if self.writing_target.is_some_and(|target| target.tab == tab) {
+            self.writing_target = None;
+        }
+        Ok(())
     }
 
     /// The focused tab (invariant: an active tab of some group).
@@ -511,6 +636,12 @@ impl WorkspaceState {
             group_state.remove(tab).is_none()
         };
         self.tabs.remove(&tab);
+        if self.document_anchor == Some(tab) {
+            self.document_anchor = None;
+        }
+        if self.writing_target.is_some_and(|target| target.tab == tab) {
+            self.writing_target = None;
+        }
         if became_empty {
             self.remove_group_collapse(group)?;
         }

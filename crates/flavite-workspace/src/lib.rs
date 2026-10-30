@@ -12,6 +12,7 @@
 
 pub mod geometry;
 pub mod ids;
+pub mod input;
 pub mod layout;
 pub mod reducer;
 pub mod validate;
@@ -21,6 +22,7 @@ pub use geometry::{
     Rect, SPLITTER_WIDTH, Size, fits, rects, required_minimum, solve, view_minimum,
 };
 pub use ids::{GroupId, Ids, SplitId, TabId, WorkspaceId};
+pub use input::{CompositionState, EditorInteraction, Selection, WritingTarget};
 pub use layout::{
     Arrangement, Edge, LayoutNode, MAX_GROUPS, MAX_RATIO_PPM, MAX_TABS, MIN_RATIO_PPM, Side,
     TabDropTarget, TabGroup,

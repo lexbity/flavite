@@ -17,23 +17,28 @@ pub struct NoteTabState {
     pub buffer: Option<u64>,
     /// The outstanding open request, if any.
     pub request: Option<u64>,
+    /// Process-local resource generation, invalidating late editor events.
+    pub incarnation: u64,
 }
 
 /// Per-tab note state for all attached note views.
 #[derive(Debug, Clone, Default)]
 pub struct NoteRegistry {
     tabs: BTreeMap<TabId, NoteTabState>,
+    next_incarnation: u64,
 }
 
 impl NoteRegistry {
     /// Attach a note view and produce its open path.
     pub fn attach(&mut self, tab: TabId, locator: NoteLocator) -> Option<(TabId, NoteLocator)> {
+        self.next_incarnation = self.next_incarnation.saturating_add(1).max(1);
         let fresh = self.tabs.insert(
             tab,
             NoteTabState {
                 locator: locator.clone(),
                 buffer: None,
                 request: None,
+                incarnation: self.next_incarnation,
             },
         );
         debug_assert!(fresh.is_none(), "a fresh tab cannot already be attached");
@@ -74,6 +79,12 @@ impl NoteRegistry {
     #[must_use]
     pub fn state(&self, tab: &TabId) -> Option<&NoteTabState> {
         self.tabs.get(tab)
+    }
+
+    /// Current process-local incarnation for an attached note view.
+    #[must_use]
+    pub fn incarnation(&self, tab: TabId) -> Option<u64> {
+        self.tabs.get(&tab).map(|state| state.incarnation)
     }
 
     /// All attached tabs.

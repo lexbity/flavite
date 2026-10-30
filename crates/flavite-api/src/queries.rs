@@ -46,7 +46,7 @@ impl Flavite {
     pub fn note_catalog(&self, limit: usize) -> Result<NoteCatalog, FlaviteError> {
         let limit = limit.min(MAX_NOTE_CATALOG_LIMIT);
         let page = self
-            .session()
+            .session
             .note_catalog(limit)
             .map_err(FlaviteError::IndexError)?;
         Ok(NoteCatalog {

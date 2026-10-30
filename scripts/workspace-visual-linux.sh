@@ -20,8 +20,8 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
-if [[ "$scenario" != "layout" ]]; then
-    echo "unsupported scenario: $scenario (W02 implements 'layout')" >&2
+if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" ]]; then
+    echo "unsupported scenario: $scenario (implemented: layout, shared-editors)" >&2
     exit 2
 fi
 if [[ "$(uname -s)" != Linux ]]; then
@@ -37,6 +37,10 @@ for tool in xdotool import identify python3; do
 done
 if [[ -n "${DISPLAY:-}" ]] && ! xdotool getdisplaygeometry >/dev/null 2>&1; then
     echo "DISPLAY=${DISPLAY} is not reachable; retrying with Xvfb if available." >&2
+    if [[ "${FLAVITE_XVFB_ACTIVE:-0}" == 1 ]]; then
+        echo "Xvfb started by this runner is not reachable; refusing recursive relaunch." >&2
+        exit 2
+    fi
     unset DISPLAY
 fi
 if [[ -z "${DISPLAY:-}" ]]; then
@@ -44,13 +48,14 @@ if [[ -z "${DISPLAY:-}" ]]; then
         echo "DISPLAY is unset and xvfb-run is unavailable" >&2
         exit 2
     fi
-    exec xvfb-run -a -s "-screen 0 ${FLAVITE_VISUAL_SCREEN:-1440x900x24}" bash "$0" --scenario "$scenario" --backend "$backend"
+    exec xvfb-run -a -s "-screen 0 ${FLAVITE_VISUAL_SCREEN:-1440x900x24}" \
+        env FLAVITE_XVFB_ACTIVE=1 bash "$0" --scenario "$scenario" --backend "$backend"
 fi
 
 target_dir="${CARGO_TARGET_DIR:-target}"
 evidence_dir="$target_dir/workspace-evidence"
 mkdir -p "$evidence_dir"
-run_id="layout-$(date +%s)-$$"
+run_id="${scenario}-$(date +%s)-$$"
 run_dir="$evidence_dir/$run_id"
 mkdir -p "$run_dir"
 
@@ -172,6 +177,82 @@ harness_wait "boot with the catalog loaded" \
 capture "$run_dir/01-boot.png"
 record "boot-single-group-catalog" "01-boot.png"
 
+if [[ "$scenario" == "shared-editors" ]]; then
+    xdotool_key "ctrl+p"
+    xdotool type --delay 25 "alpha"
+    xdotool_key "Return"
+    harness_wait "alpha editor is ready" \
+        'any(t["load"] == "ready" and t["title"] == "alpha" for g in snapshot["groups"] for t in g["tabs"]) and snapshot["focused_text_chars"] > 0'
+    for _ in $(seq 1 8); do
+        if python3 -c '
+import json, sys
+lines=[line for line in open(sys.argv[1]) if line.strip()]
+s=json.loads(lines[-1]) if lines else {}
+active=[t for g in s.get("groups", []) for t in g["tabs"] if t["active"]]
+sys.exit(0 if len(active)==1 and active[0]["title"]=="alpha" else 1)
+' "$harness_log"; then
+            break
+        fi
+        xdotool_key "ctrl+Tab"
+    done
+    harness_wait "alpha is the active editor tab" \
+        'any(t["active"] and t["title"] == "alpha" for g in snapshot["groups"] for t in g["tabs"])'
+    xdotool windowfocus --sync "$window_id"
+    xdotool mousemove --window "$window_id" 700 300 click 1
+    harness_wait "OS pointer focuses the actual editor widget" \
+        'snapshot["writing_target"] is not None and snapshot["writing_target"]["tab"] == snapshot["focused_tab"]'
+    capture "$run_dir/02-editor-focused.png"
+    # One committed edit at a time keeps the real UI event loop's revision
+    # acknowledgements between OS key events.
+    xdotool type --clearmodifiers --delay 100 "w03-marker"
+    harness_wait "OS typing changes the real note buffer" \
+        '"w03-marker" in snapshot["focused_text"]'
+    capture "$run_dir/03-typed-note.png"
+    record "os-typed-note-buffer" "03-typed-note.png"
+
+    xdotool_key "ctrl+alt+Right"
+    harness_wait "split creates two views of the same note buffer" \
+        'len(snapshot["groups"]) == 2 and all(any(t["title"] == "alpha" for t in g["tabs"]) for g in snapshot["groups"])'
+    python3 -c '
+import json, sys, time
+path=sys.argv[1]
+deadline=time.monotonic()+10
+while time.monotonic()<deadline:
+    lines=[line for line in open(path) if line.strip()]
+    if lines:
+        s=json.loads(lines[-1])
+        tabs=[t for g in s["groups"] for t in g["tabs"] if t["title"]=="alpha"]
+        if len(tabs)==2 and all(t["buffer"] is not None for t in tabs):
+            assert tabs[0]["buffer"]==tabs[1]["buffer"], tabs
+            assert tabs[0]["revision"]==tabs[1]["revision"], tabs
+            break
+    time.sleep(.05)
+else:
+    raise SystemExit("two editor views did not converge on one buffer snapshot")
+' "$harness_log"
+    capture "$run_dir/04-split-before-carets.png"
+    # The original view retains the OS-typed caret while the deliberate
+    # duplicate starts with an independent caret. The reducer's UI test
+    # covers subsequent per-view caret updates; this OS scenario proves the
+    # actual shell reparent/split preserves both acknowledged positions.
+    python3 -c '
+import json, sys
+for line in reversed([line for line in open(sys.argv[1]) if line.strip()]):
+    try:
+        s=json.loads(line)
+        break
+    except json.JSONDecodeError:
+        continue
+else:
+    raise SystemExit("no complete semantic snapshot")
+tabs=[t for g in s["groups"] for t in g["tabs"] if t["title"]=="alpha"]
+assert len(tabs)==2 and tabs[0]["selection"] != tabs[1]["selection"], tabs
+assert s["writing_target"] and s["writing_target"]["tab"]==s["document_anchor"]
+' "$harness_log"
+    capture "$run_dir/05-independent-carets.png"
+    record "shared-buffer-independent-carets" "05-independent-carets.png"
+else
+
 # 2. Quick switch opens a real note through an async open flight.
 xdotool_key "ctrl+p"
 xdotool type --delay 25 "alpha"
@@ -242,12 +323,19 @@ for image in "$run_dir"/*.png; do
         exit 1
     fi
 done
+fi
 
 # Duplicate-id guard: tab identities inside the harness are unique.
 python3 -c "
 import json, sys
-lines = [line for line in open(sys.argv[1]) if line.strip()]
-snapshot = json.loads(lines[-1])
+for line in reversed([line for line in open(sys.argv[1]) if line.strip()]):
+    try:
+        snapshot = json.loads(line)
+        break
+    except json.JSONDecodeError:
+        continue
+else:
+    raise SystemExit('no complete semantic snapshot')
 tabs = [t['tab'] for g in snapshot['groups'] for t in g['tabs']]
 assert len(tabs) == len(set(tabs)), f'duplicate tab ids: {tabs}'
 groups = [g['group'] for g in snapshot['groups']]

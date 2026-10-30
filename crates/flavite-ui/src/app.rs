@@ -14,11 +14,12 @@ use crate::subscription;
 use crate::workspace::{Adapter, StripMenu, gestures};
 use flavite_api::queries::{MAX_NOTE_CATALOG_LIMIT, NoteCatalogEntry};
 use flavite_api::{ExecutionResult, Flavite, Invocation, LocalResult, Origin, VaultConfig};
+use flavite_editor::{EditorAction, EditorInteractionSnapshot, EditorView};
 use flavite_workspace::{
     Effect, GroupId, Ids, LayoutAction, NoteLocator, Outcome, SplitId, TabId, WorkspaceState,
 };
 use iced::{Subscription, Task, keyboard};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
 /// The note picker overlay state.
@@ -30,6 +31,15 @@ pub struct Picker {
     pub query: String,
     /// Selected row.
     pub selected: usize,
+}
+
+/// Lossless notice retained until the user dismisses its visible entry.
+#[derive(Debug, Clone)]
+pub struct NoticePresentation {
+    /// Stable core acknowledgement token.
+    pub id: flavite_api::NoticeId,
+    /// Typed notice event.
+    pub event: flavite_api::Event,
 }
 
 /// Run-ready application state. `Flavite` owns the only Session and buffer
@@ -55,6 +65,8 @@ pub struct App {
     operations: OperationPump,
     pub status: String,
     pub recent_events: Vec<String>,
+    /// Visible lossless notices awaiting explicit presentation acknowledgement.
+    pub notices: VecDeque<NoticePresentation>,
     reconcile_progress: Option<(u32, u32)>,
     window_size: iced::Size,
     /// Accessibility node routing map, rebuilt after every commit.
@@ -117,6 +129,14 @@ pub enum Message {
     RunCoreCommand(&'static str),
     /// Reload the note catalog snapshot.
     RefreshCatalog,
+    /// Dismiss a notice after its entry has been presented in the shell.
+    AcknowledgeNotice(flavite_api::NoticeId),
+    /// Apply a typed editor action from one exact view incarnation.
+    EditorAction {
+        tab: TabId,
+        incarnation: u64,
+        action: EditorAction,
+    },
 }
 
 impl App {
@@ -174,6 +194,7 @@ impl App {
             operations: OperationPump::default(),
             status,
             recent_events: Vec::new(),
+            notices: VecDeque::new(),
             reconcile_progress: None,
             window_size: iced::Size::new(1180.0, 760.0),
             a11y_nodes: BTreeMap::new(),
@@ -263,6 +284,36 @@ impl App {
         self.note_text(buffer)
     }
 
+    /// Shared immutable editor snapshot for a note tab.
+    #[must_use]
+    pub fn note_editor_view(&self, tab: TabId) -> Option<EditorView> {
+        let buffer = self.notes.state(&tab)?.buffer?;
+        let view = self
+            .flavite
+            .as_ref()?
+            .get_shared_buffer_view(flavite_buffer::BufferId::from(buffer), None)
+            .ok()?;
+        Some(EditorView::from(&view))
+    }
+
+    /// Host-acknowledged input to restore into a new widget runtime.
+    #[must_use]
+    pub fn editor_interaction_snapshot(&self, tab: TabId) -> Option<EditorInteractionSnapshot> {
+        let view = self.note_editor_view(tab)?;
+        let logical = self.workspace.tab(&tab)?.interaction();
+        let selection = logical.selections.first().copied().unwrap_or_default();
+        Some(EditorInteractionSnapshot {
+            sequence: logical.sequence,
+            buffer_id: view.buffer_id,
+            revision: view.revision,
+            caret: selection.head,
+            selection: (selection.anchor, selection.head),
+            viewport_anchor: logical.viewport_anchor,
+            focused: logical.focused,
+            composing: logical.composition == flavite_workspace::CompositionState::Active,
+        })
+    }
+
     /// The buffer state chip label for a note tab ("Clean"/"Dirty"/…).
     #[must_use]
     pub fn note_buffer_state(&self, tab: TabId) -> Option<String> {
@@ -272,14 +323,46 @@ impl App {
             flavite
                 .get_buffer_view(flavite_buffer::BufferId::from(buffer), None)
                 .ok()?
-                .state,
+                .state
+                .to_string(),
         )
+    }
+
+    /// Visible, identity-safe description of the insertion authority.
+    #[must_use]
+    pub fn writing_target_label(&self) -> String {
+        let Some(target) = self.workspace.writing_target() else {
+            return "Writing target: none — focus an editor caret".into();
+        };
+        let Some(view) = self.workspace.tab(&target.tab) else {
+            return "Writing target: invalid — editor closed".into();
+        };
+        let current = self.note_editor_view(target.tab);
+        if view.interaction().incarnation != target.incarnation
+            || current.is_none_or(|snapshot| {
+                snapshot.buffer_id != target.buffer_id || snapshot.revision != target.revision
+            })
+        {
+            return "Writing target: invalid — place the caret again".into();
+        }
+        let title = self
+            .notes
+            .state(&target.tab)
+            .map(|state| state.locator.title())
+            .unwrap_or("note");
+        format!("Writing target: {title} at byte {}", target.caret_text_byte)
     }
 
     /// Pending operation count.
     #[must_use]
     pub fn pending_operations(&self) -> usize {
         self.operations.pending().count()
+    }
+
+    /// Host-side count of terminal outcomes displaced by capacity pressure.
+    #[must_use]
+    pub fn operation_history_overflowed(&self) -> u64 {
+        self.operations.terminal_overflowed()
     }
 
     /// Current reconcile progress.
@@ -343,9 +426,10 @@ impl App {
         let flavite = self.flavite.as_ref()?;
         Some(
             flavite
-                .get_buffer_view(flavite_buffer::BufferId::from(buffer), None)
+                .get_shared_buffer_view(flavite_buffer::BufferId::from(buffer), None)
                 .ok()?
-                .text,
+                .text
+                .to_string(),
         )
     }
 
@@ -367,9 +451,19 @@ impl App {
 
     /// Build and reduce one layout transaction at the current revision.
     pub fn dispatch_layout(&mut self, build: impl FnOnce(u64) -> LayoutAction) {
+        if self.has_composing_view() {
+            self.status = "Finish or cancel text composition before changing the layout".into();
+            return;
+        }
         let revision = self.workspace.revision();
         let outcome = flavite_workspace::reduce(&self.workspace, build(revision));
         self.commit(outcome);
+    }
+
+    fn has_composing_view(&self) -> bool {
+        self.workspace.tabs().any(|(_, view)| {
+            view.interaction().composition == flavite_workspace::CompositionState::Active
+        })
     }
 
     fn apply_effects(&mut self, effects: &[Effect]) {
@@ -381,11 +475,184 @@ impl App {
                             Some(attached) => attached,
                             None => continue,
                         };
+                        let incarnation = self.notes.incarnation(tab).expect("attached note tab");
+                        if let Err(error) =
+                            self.workspace.install_view_incarnation(tab, incarnation)
+                        {
+                            self.status = format!("Could not install editor incarnation: {error}");
+                            self.notes.detach(tab);
+                            continue;
+                        }
                         self.open_note_tab(tab, &locator);
                     }
                 }
-                Effect::ViewDetached { tab, .. } => self.notes.detach(*tab),
+                Effect::ViewDetached { tab, .. } => {
+                    self.notes.detach(*tab);
+                }
                 Effect::NoteLoadChanged { .. } => {}
+            }
+        }
+    }
+
+    fn handle_editor_action(&mut self, tab: TabId, incarnation: u64, action: EditorAction) {
+        if self.notes.incarnation(tab) != Some(incarnation)
+            || self
+                .workspace
+                .tab(&tab)
+                .is_none_or(|view| view.interaction().incarnation != incarnation)
+        {
+            self.status = "Ignored input from a replaced editor view".into();
+            return;
+        }
+        match action {
+            EditorAction::Interaction(snapshot) => {
+                let Some(current) = self.note_editor_view(tab) else {
+                    return;
+                };
+                if snapshot.buffer_id != current.buffer_id || snapshot.revision != current.revision
+                {
+                    self.status =
+                        "Editor input was stale; the current caret state was restored".into();
+                    return;
+                }
+                let selection =
+                    flavite_workspace::Selection::new(snapshot.selection.0, snapshot.selection.1);
+                let mut interaction = self
+                    .workspace
+                    .tab(&tab)
+                    .expect("tab verified above")
+                    .interaction()
+                    .clone();
+                interaction.buffer_id = Some(snapshot.buffer_id);
+                interaction.revision = snapshot.revision;
+                interaction.sequence = snapshot.sequence;
+                interaction.selections = vec![selection];
+                interaction.viewport_anchor = snapshot.viewport_anchor;
+                interaction.composition = if snapshot.composing {
+                    flavite_workspace::CompositionState::Active
+                } else {
+                    flavite_workspace::CompositionState::Idle
+                };
+                interaction.focused = snapshot.focused;
+                if let Err(error) = self
+                    .workspace
+                    .acknowledge_interaction(interaction, &current.text)
+                {
+                    self.status = format!("Editor state was not accepted: {error}");
+                }
+            }
+            EditorAction::Navigate {
+                buffer_id,
+                expected_revision,
+                navigation,
+            } => {
+                let Some(source) = self.note_editor_view(tab) else {
+                    self.status = "Link source is no longer open".into();
+                    return;
+                };
+                if source.buffer_id != buffer_id || source.revision != expected_revision {
+                    self.status = "Link source changed; activate the link again".into();
+                    return;
+                }
+                let resolution = self.flavite.as_ref().and_then(|flavite| {
+                    flavite
+                        .resolve_note_target(navigation.target.clone(), None)
+                        .ok()
+                });
+                let Some(resolution) = resolution else {
+                    self.status =
+                        "Link target resolution is unavailable; retry after indexing".into();
+                    return;
+                };
+                if resolution.is_ambiguous {
+                    self.status = "Link target is ambiguous; choose a note from the picker".into();
+                    return;
+                }
+                let Some(target) = resolution.note else {
+                    self.status = if resolution.is_unresolved && navigation.create_if_unresolved {
+                        "Link target does not exist; create it explicitly from the Notes view"
+                            .into()
+                    } else {
+                        "Link target is not an indexed note".into()
+                    };
+                    return;
+                };
+                let Some(entry) = self
+                    .catalog
+                    .iter()
+                    .find(|entry| entry.native_path == target.path_native)
+                else {
+                    self.status =
+                        "Resolved note is outside the current catalog page; refresh the catalog"
+                            .into();
+                    return;
+                };
+                match NoteLocator::from_relative(&entry.path) {
+                    Ok(locator) => self.request_open(locator, self.group_of(tab)),
+                    Err(error) => {
+                        self.status = format!("Resolved note path cannot be opened here: {error}");
+                    }
+                }
+            }
+            edit_or_history => {
+                let expected_buffer = self.notes.state(&tab).and_then(|state| state.buffer);
+                let Some(expected_buffer) = expected_buffer else {
+                    self.status = "Editor buffer is not ready".into();
+                    return;
+                };
+                let buffer_matches = match &edit_or_history {
+                    EditorAction::Edit { buffer_id, .. }
+                    | EditorAction::History { buffer_id, .. } => *buffer_id == expected_buffer,
+                    EditorAction::Navigate { .. } | EditorAction::Interaction(_) => false,
+                };
+                if !buffer_matches {
+                    self.status = "Editor action targeted a different buffer".into();
+                    return;
+                }
+                // Any mutation changes the authorization revision. A later
+                // acknowledged caret event may explicitly establish a new
+                // target; the old byte position is never silently rebased.
+                self.workspace.invalidate_writing_target(expected_buffer);
+                let Some(flavite) = &self.flavite else {
+                    self.status = "Open a vault before editing".into();
+                    return;
+                };
+                let request_id = flavite.command_registry().next_request_id();
+                let Some(invocation) = edit_or_history.into_invocation(request_id) else {
+                    self.status = "Editor action could not be routed".into();
+                    return;
+                };
+                match flavite.execute(invocation) {
+                    ExecutionResult::Local(LocalResult::Success(success)) => {
+                        let revision = success
+                            .data
+                            .get("revision")
+                            .and_then(serde_json::Value::as_u64);
+                        self.status = revision.map_or_else(
+                            || "Edit applied".into(),
+                            |revision| format!("Edited revision {revision}"),
+                        );
+                    }
+                    ExecutionResult::Local(LocalResult::Error(error)) => {
+                        self.status = format!("Edit failed: {}", error.message);
+                    }
+                    ExecutionResult::Rejected(rejected) => {
+                        self.status = format!("Edit rejected: {:?}", rejected.reason);
+                    }
+                    ExecutionResult::Pending { request_id } => {
+                        self.operations.accept(request_id, "editor mutation");
+                        self.status = "Editor mutation pending".into();
+                    }
+                    ExecutionResult::ActionRequired { code, .. } => {
+                        self.status = format!("Edit needs attention: {code}");
+                    }
+                    ExecutionResult::Superseded { by_request, .. } => {
+                        self.status = format!("Edit superseded by request {by_request}");
+                    }
+                    ExecutionResult::Local(LocalResult::Void) => {
+                        self.status = "Editor command completed".into();
+                    }
+                }
             }
         }
     }
@@ -520,6 +787,11 @@ impl App {
             Message::WindowEvent(_) => {}
             Message::Pump => self.pump(),
             Message::Layout(action) => {
+                if self.has_composing_view() {
+                    self.status =
+                        "Finish or cancel text composition before changing the layout".into();
+                    return Task::none();
+                }
                 let revision = self.workspace.revision();
                 let mut action = action;
                 if action.expected_revision() != revision {
@@ -654,6 +926,19 @@ impl App {
             Message::RunHostCommand(id) => return host_commands::dispatch(self, id),
             Message::RunCoreCommand(id) => self.run_core_command(id),
             Message::RefreshCatalog => self.load_catalog(),
+            Message::AcknowledgeNotice(id) => {
+                if let Some(index) = self.notices.iter().position(|notice| notice.id == id) {
+                    self.notices.remove(index);
+                    if let Some(flavite) = &self.flavite {
+                        flavite.acknowledge_notice(id);
+                    }
+                }
+            }
+            Message::EditorAction {
+                tab,
+                incarnation,
+                action,
+            } => self.handle_editor_action(tab, incarnation, action),
         }
         #[cfg(feature = "ui-test-support")]
         crate::harness::observe(self);
@@ -744,18 +1029,22 @@ impl App {
             let Some(flavite) = &self.flavite else {
                 return;
             };
-            flavite.session().pump();
+            flavite.pump();
             let mut refresh_catalog = false;
+            let credits = 256usize.saturating_sub(self.notices.len());
             let mut events = Vec::new();
-            for event in flavite.drain_events() {
-                if let flavite_api::Event::ReconcileProgress { done, total } = event {
-                    self.reconcile_progress = (done < total).then_some((done, total));
+            for delivery in flavite.poll_events(credits) {
+                let event = delivery.event;
+                if let flavite_api::Event::ReconcileProgress { done, total } = &event {
+                    self.reconcile_progress = (*done < *total).then_some((*done, *total));
                 }
-                if matches!(event, flavite_api::Event::VaultChanged { .. }) {
+                if matches!(&event, flavite_api::Event::VaultChanged { .. }) {
                     refresh_catalog = true;
                 }
                 events.push(format!("{}: {event:?}", event.event_type()));
-                flavite.acknowledge_event(&event);
+                if let Some(id) = delivery.notice_id {
+                    self.notices.push_back(NoticePresentation { id, event });
+                }
             }
             let completions = flavite.drain_operation_completions();
             if refresh_catalog {
@@ -793,6 +1082,19 @@ impl App {
                 }
             } else {
                 self.status = format!("Request {} completed", completion.request_id);
+            }
+        }
+        if let Some(target) = self.workspace.writing_target() {
+            let remains_current = self.notes.incarnation(target.tab) == Some(target.incarnation)
+                && self.note_editor_view(target.tab).is_some_and(|view| {
+                    view.buffer_id == target.buffer_id && view.revision == target.revision
+                })
+                && self
+                    .workspace
+                    .tab(&target.tab)
+                    .is_some_and(|view| view.interaction().sequence == target.interaction_sequence);
+            if !remains_current {
+                self.workspace.invalidate_writing_target(target.buffer_id);
             }
         }
     }
@@ -1096,6 +1398,7 @@ mod tests {
             operations: OperationPump::default(),
             status: "Ready".into(),
             recent_events: Vec::new(),
+            notices: VecDeque::new(),
             reconcile_progress: None,
             window_size: iced::Size::new(1180.0, 760.0),
             a11y_nodes: BTreeMap::new(),

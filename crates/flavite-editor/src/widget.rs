@@ -44,6 +44,7 @@ pub struct EditorWidget<'a, Message> {
     stable_links: bool,
     on_action: Box<dyn Fn(EditorAction) -> Message + 'a>,
     on_interaction: Option<Box<dyn Fn(EditorInteractionSnapshot) -> Message + 'a>>,
+    initial_interaction: Option<EditorInteractionSnapshot>,
     width: Length,
     height: Length,
     _message: PhantomData<Message>,
@@ -52,13 +53,19 @@ pub struct EditorWidget<'a, Message> {
 impl<'a, Message> EditorWidget<'a, Message> {
     /// Create an editor from the API's immutable revisioned view.
     pub fn new(view: &BufferView, on_action: impl Fn(EditorAction) -> Message + 'a) -> Self {
+        Self::from_view(EditorView::from(view), on_action)
+    }
+
+    /// Create an editor from an already shared, API-owned text revision.
+    pub fn from_view(view: EditorView, on_action: impl Fn(EditorAction) -> Message + 'a) -> Self {
         Self {
-            view: EditorView::from(view),
+            view,
             candidates: Vec::new(),
             link_resolutions: HashMap::new(),
             stable_links: false,
             on_action: Box::new(on_action),
             on_interaction: None,
+            initial_interaction: None,
             width: Length::Fill,
             height: Length::Fill,
             _message: PhantomData,
@@ -99,6 +106,14 @@ impl<'a, Message> EditorWidget<'a, Message> {
         on_interaction: impl Fn(EditorInteractionSnapshot) -> Message + 'a,
     ) -> Self {
         self.on_interaction = Some(Box::new(on_interaction));
+        self
+    }
+
+    /// Restore host-acknowledged input state after a widget runtime is
+    /// recreated or reparented.
+    #[must_use]
+    pub fn with_initial_interaction(mut self, interaction: EditorInteractionSnapshot) -> Self {
+        self.initial_interaction = Some(interaction);
         self
     }
 
@@ -347,6 +362,7 @@ pub struct EditorState {
     autocomplete_selected: usize,
     viewport: Viewport,
     composition: Option<Composition>,
+    interaction_sequence: u64,
 }
 
 /// Host-visible per-view interaction state needed by accessibility and
@@ -354,10 +370,12 @@ pub struct EditorState {
 /// revisioned buffer view and is not copied into widget state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EditorInteractionSnapshot {
+    pub sequence: u64,
     pub buffer_id: u64,
     pub revision: u64,
     pub caret: usize,
     pub selection: (usize, usize),
+    pub viewport_anchor: usize,
     pub focused: bool,
     pub composing: bool,
 }
@@ -399,10 +417,12 @@ pub fn inspect_focused_editor()
                 return;
             };
             self.0 = Some(EditorInteractionSnapshot {
+                sequence: state.interaction_sequence,
                 buffer_id,
                 revision,
                 caret: state.caret,
                 selection: state.selection(),
+                viewport_anchor: 0,
                 focused: true,
                 composing: state.is_composing(),
             });
@@ -468,7 +488,7 @@ pub fn set_focused_editor_selection(
             state.caret = self.focus;
             state.focused = true;
             state.ime_active = true;
-            self.result = state.interaction_snapshot();
+            self.result = state.interaction_snapshot(None);
         }
 
         fn finish(
@@ -529,7 +549,7 @@ pub fn focus_editor(
             }
             state.focused = true;
             state.ime_active = true;
-            self.result = state.interaction_snapshot();
+            self.result = state.interaction_snapshot(None);
         }
 
         fn finish(
@@ -574,15 +594,34 @@ impl EditorState {
         self.composition.is_some()
     }
 
-    fn interaction_snapshot(&self) -> Option<EditorInteractionSnapshot> {
+    fn interaction_snapshot(&self, text: Option<&str>) -> Option<EditorInteractionSnapshot> {
         Some(EditorInteractionSnapshot {
+            sequence: self.interaction_sequence,
             buffer_id: self.buffer_id?,
             revision: self.revision?,
             caret: self.caret,
             selection: self.selection(),
+            viewport_anchor: text.map_or(0, |text| line_start_byte(text, self.viewport.first_line)),
             focused: self.focused,
             composing: self.is_composing(),
         })
+    }
+
+    fn restore_interaction(&mut self, text: &str, interaction: EditorInteractionSnapshot) {
+        if self.buffer_id != Some(interaction.buffer_id)
+            || self.revision != Some(interaction.revision)
+            || interaction.sequence <= self.interaction_sequence
+        {
+            return;
+        }
+        self.anchor = clamp_char_boundary(text, interaction.selection.0);
+        self.caret = clamp_char_boundary(text, interaction.selection.1);
+        self.viewport.first_line = text[..interaction.viewport_anchor.min(text.len())]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        self.focused = interaction.focused;
+        self.interaction_sequence = interaction.sequence;
     }
 
     fn input_method_event(
@@ -593,16 +632,20 @@ impl EditorState {
         match event {
             input_method::Event::Opened => {
                 self.ime_active = true;
-                let (start, end) = self.selection();
-                self.composition = Some(Composition {
-                    start,
-                    end,
-                    preedit: String::new(),
-                    selection: None,
-                });
                 None
             }
             input_method::Event::Preedit(preedit, selection) => {
+                if preedit.is_empty() {
+                    // winit sends an empty preedit immediately before commit.
+                    // Keep an existing transaction alive, but an opened IME
+                    // with no preedit is not itself active composition and
+                    // must not suppress ordinary key input.
+                    if let Some(composition) = &mut self.composition {
+                        composition.preedit.clear();
+                        composition.selection.clone_from(selection);
+                    }
+                    return None;
+                }
                 let (start, end) = self.selection();
                 let composition = self.composition.get_or_insert_with(|| Composition {
                     start,
@@ -980,9 +1023,11 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
     }
 
     fn diff(&self, tree: &mut Tree) {
-        tree.state
-            .downcast_mut::<EditorState>()
-            .reconcile(&self.view, &self.link_resolutions);
+        let state = tree.state.downcast_mut::<EditorState>();
+        state.reconcile(&self.view, &self.link_resolutions);
+        if let Some(interaction) = self.initial_interaction {
+            state.restore_interaction(&self.view.text, interaction);
+        }
     }
 
     fn operate(
@@ -1136,7 +1181,10 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             shell.request_input_method::<&str>(&InputMethod::Disabled);
         }
         if let Some(on_interaction) = &self.on_interaction
-            && let Some(snapshot) = state.interaction_snapshot()
+            && let Some(snapshot) = {
+                state.interaction_sequence = state.interaction_sequence.saturating_add(1);
+                state.interaction_snapshot(Some(&self.view.text))
+            }
         {
             shell.publish(on_interaction(snapshot));
         }
@@ -1347,6 +1395,7 @@ mod tests {
             state.input_method_event(&view, &input_method::Event::Opened),
             None
         );
+        assert!(!state.is_composing(), "an open IME without preedit is idle");
         assert_eq!(
             state.input_method_event(
                 &view,
@@ -1365,10 +1414,11 @@ mod tests {
         let action = state
             .input_method_event(&view, &input_method::Event::Commit("日本語".into()))
             .expect("one committed edit");
-        assert_eq!(action.expected_revision, view.revision);
-        assert_eq!(action.edits.len(), 1);
-        assert_eq!(action.edits[0].range, Span::new(TextByte(2), TextByte(2)));
-        assert_eq!(action.edits[0].replacement, "日本語");
+        let (_, revision, edits) = action.as_edit().expect("edit action");
+        assert_eq!(revision, view.revision);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].range, Span::new(TextByte(2), TextByte(2)));
+        assert_eq!(edits[0].replacement, "日本語");
         assert_eq!(state.caret(), 2 + "日本語".len());
         assert!(!state.is_composing());
     }
@@ -1408,12 +1458,10 @@ mod tests {
         let committed = state
             .input_method_event(&view, &input_method::Event::Commit("仮名".into()))
             .expect("reopened IME commits through one guarded edit");
-        assert_eq!(committed.edits.len(), 1);
-        assert_eq!(
-            committed.edits[0].range,
-            Span::new(TextByte(3), TextByte(3))
-        );
-        assert_eq!(committed.edits[0].replacement, "仮名");
+        let (_, _, edits) = committed.as_edit().expect("edit action");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].range, Span::new(TextByte(3), TextByte(3)));
+        assert_eq!(edits[0].replacement, "仮名");
         assert_eq!(state.caret(), 3 + "仮名".len());
         assert!(!state.is_composing());
     }
@@ -1560,18 +1608,21 @@ mod tests {
         ));
         drop(shell);
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].expected_revision, 11);
-        assert_eq!(messages[0].command_id, "link.insert");
-        assert_eq!(
-            messages[0].edits[0].range,
-            Span::new(TextByte(0), TextByte(4))
-        );
-        assert_eq!(messages[0].edits[0].replacement, "[[notes/inbox|Inbox]]");
+        assert!(matches!(
+            messages[0],
+            EditorAction::Edit {
+                expected_revision: 11,
+                ..
+            }
+        ));
+        let (_, _, edits) = messages[0].as_edit().expect("edit action");
+        assert_eq!(edits[0].range, Span::new(TextByte(0), TextByte(4)));
+        assert_eq!(edits[0].replacement, "[[notes/inbox|Inbox]]");
         let invocation = messages[0]
             .clone()
             .into_invocation(88)
             .expect("registry invocation");
-        assert_eq!(invocation.command_id, "link.insert");
+        assert_eq!(invocation.command_id, "apply_edits");
         assert_eq!(invocation.args["ops"][0]["range"][0], 0);
         assert_eq!(
             invocation.args["ops"][0]["replacement"],
@@ -1609,8 +1660,7 @@ mod tests {
         drop(shell);
 
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].command_id, "note.open");
-        let navigation = messages[0].navigation.as_ref().expect("create navigation");
+        let navigation = messages[0].navigation().expect("create navigation");
         assert_eq!(navigation.target, "New note");
         assert!(navigation.create_if_unresolved);
         assert_eq!(navigation.span, Span::new(TextByte(0), TextByte(5)));
@@ -1637,13 +1687,18 @@ mod tests {
             revision: 15,
             text: text.into(),
             path: std::path::PathBuf::from("source.md"),
-            state: "Clean".into(),
+            state: flavite_api::BufferStatus::Clean,
         };
         let action = link_action_at(&view, &spans, 4).expect("link activation");
-        assert_eq!(action.buffer_id, 88);
-        assert_eq!(action.expected_revision, 15);
-        assert!(action.edits.is_empty());
-        let navigation = action.navigation.expect("navigation action");
+        assert!(matches!(
+            action,
+            EditorAction::Navigate {
+                buffer_id: 88,
+                expected_revision: 15,
+                ..
+            }
+        ));
+        let navigation = action.navigation().expect("navigation action");
         assert_eq!(navigation.target, "Ideas");
         assert_eq!(navigation.alias.as_deref(), Some("Ideas"));
         assert_eq!(navigation.anchor.as_deref(), Some("Plan"));
@@ -1689,7 +1744,7 @@ mod tests {
             revision: 11,
             text: text.to_owned(),
             base_hash: Vec::new(),
-            state: "Clean".into(),
+            state: flavite_api::BufferStatus::Clean,
             path: std::path::PathBuf::from("note.md"),
         }
     }
@@ -1718,13 +1773,17 @@ mod tests {
 
         assert_eq!(state.caret(), 4);
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].buffer_id, 91);
-        assert_eq!(messages[0].expected_revision, 11);
-        assert_eq!(
-            messages[0].edits[0].range,
-            Span::new(TextByte(2), TextByte(2))
-        );
-        assert_eq!(messages[0].edits[0].replacement, "é");
+        assert!(matches!(
+            messages[0],
+            EditorAction::Edit {
+                buffer_id: 91,
+                expected_revision: 11,
+                ..
+            }
+        ));
+        let (_, _, edits) = messages[0].as_edit().expect("edit action");
+        assert_eq!(edits[0].range, Span::new(TextByte(2), TextByte(2)));
+        assert_eq!(edits[0].replacement, "é");
     }
 
     #[test]
@@ -1753,11 +1812,11 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert_eq!(
-            messages[0].edits[0].range,
+            messages[0].as_edit().unwrap().2[0].range,
             Span::new(TextByte(1), TextByte(1))
         );
         assert_eq!(
-            messages[1].edits[0].range,
+            messages[1].as_edit().unwrap().2[0].range,
             Span::new(TextByte(2), TextByte(2))
         );
         assert_eq!(state.caret(), 3);
@@ -1797,8 +1856,14 @@ mod tests {
         );
         drop(shell);
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].history, Some(false));
-        assert_eq!(messages[0].buffer_id, 18);
+        assert!(matches!(
+            messages[0],
+            EditorAction::History {
+                buffer_id: 18,
+                direction: crate::surface::HistoryDirection::Undo,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1850,7 +1915,7 @@ mod tests {
             revision: 2,
             text: "long text".into(),
             path: std::path::PathBuf::from("one.md"),
-            state: "Dirty".into(),
+            state: flavite_api::BufferStatus::Dirty,
         };
         let mut state = EditorState {
             buffer_id: Some(old.buffer_id),

@@ -230,7 +230,7 @@ fn drain_completions(
 ) -> Vec<(u64, ExecutionResult)> {
     let mut drained = Vec::new();
     while drained.len() < wanted && Instant::now() < deadline {
-        flavite.session().pump();
+        flavite.pump();
         for completion in flavite.drain_operation_completions() {
             drained.push((completion.request_id, completion.result));
         }
@@ -403,7 +403,7 @@ fn cancelled_view_isolation_and_existing_only_missing_notes() {
         missing_error.message
     );
     assert!(
-        !flavite.session().is_open(&missing),
+        !flavite.is_note_open(&missing),
         "no buffer is created for a missing ExistingOnly note"
     );
     assert!(
@@ -413,7 +413,7 @@ fn cancelled_view_isolation_and_existing_only_missing_notes() {
         "CreateIfMissing installs an empty buffer for an absent note"
     );
     assert!(
-        flavite.session().is_open(&fixture.root.join("fresh.md")),
+        flavite.is_note_open(&fixture.root.join("fresh.md")),
         "the created note is open"
     );
 }

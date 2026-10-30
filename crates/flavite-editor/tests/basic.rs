@@ -19,7 +19,7 @@ fn view() -> EditorView {
         revision: 7,
         text: "hello".into(),
         path: PathBuf::from("note.md"),
-        state: "Dirty".into(),
+        state: flavite_api::BufferStatus::Dirty,
     }
 }
 
@@ -27,10 +27,11 @@ fn view() -> EditorView {
 fn surface_trait_is_implementable_without_iced() {
     let surface = SurfaceDouble { view: view() };
     let action = surface.replace_selection(1, 4, "i".into());
-    assert_eq!(action.buffer_id, 42);
-    assert_eq!(action.expected_revision, 7);
-    assert_eq!(action.edits[0].range, Span::new(TextByte(1), TextByte(4)));
-    assert_eq!(action.edits[0].replacement, "i");
+    let (buffer_id, revision, edits) = action.as_edit().expect("edit action");
+    assert_eq!(buffer_id, 42);
+    assert_eq!(revision, 7);
+    assert_eq!(edits[0].range, Span::new(TextByte(1), TextByte(4)));
+    assert_eq!(edits[0].replacement, "i");
 }
 
 #[test]

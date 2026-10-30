@@ -22,6 +22,7 @@ use flavite_vault::types::{Epoch, Generation, VaultConfig, VaultIdentity};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -212,6 +213,20 @@ fn handle_resolve(session: &Session, invocation: &Invocation) -> Result<SessionR
 type HandlerRegistration = (&'static str, &'static str, ArgSchema, CommandHandler);
 const MAX_NOTICE_ACKS: usize = 256;
 
+/// Stable token for one notice presentation acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NoticeId(pub u64);
+
+/// Event delivered to a host. Pulses have no token; lossless notices retain
+/// theirs until the host confirms that they were presented.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventDelivery {
+    /// Stable acknowledgement token for notices, absent for pulses.
+    pub notice_id: Option<NoticeId>,
+    /// Typed event payload.
+    pub event: crate::Event,
+}
+
 /// Result of opening a vault.
 #[derive(Debug)]
 pub struct OpenVaultResult {
@@ -231,7 +246,7 @@ pub struct OpenVaultResult {
 #[derive(Debug)]
 pub struct Flavite {
     /// The underlying Session.
-    session: Arc<Session>,
+    pub(crate) session: Arc<Session>,
     /// Command registry.
     command_registry: CommandRegistry,
     /// Serializes commands and worker completion processing on the host turn.
@@ -243,7 +258,10 @@ pub struct Flavite {
     /// Completions collected while waiting for another operation.
     terminal_backlog: Mutex<HashMap<RequestId, ExecutionResult>>,
     /// Notices delivered to consumers, retained until presentation ack.
-    notice_acks: Mutex<Vec<(crate::Event, flavite_vault::channels::Notice)>>,
+    notice_acks: Mutex<
+        std::collections::BTreeMap<NoticeId, (crate::Event, flavite_vault::channels::Notice)>,
+    >,
+    next_notice_id: AtomicU64,
     /// The API vault reference.
     vault_ref: ApiVaultRef,
     /// Whether the vault is read-only.
@@ -276,7 +294,8 @@ impl Flavite {
             operation_ids: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashSet::new()),
             terminal_backlog: Mutex::new(HashMap::new()),
-            notice_acks: Mutex::new(Vec::new()),
+            notice_acks: Mutex::new(std::collections::BTreeMap::new()),
+            next_notice_id: AtomicU64::new(1),
             vault_ref,
             read_only: false,
             owned_vault: None,
@@ -303,7 +322,8 @@ impl Flavite {
             operation_ids: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashSet::new()),
             terminal_backlog: Mutex::new(HashMap::new()),
-            notice_acks: Mutex::new(Vec::new()),
+            notice_acks: Mutex::new(std::collections::BTreeMap::new()),
+            next_notice_id: AtomicU64::new(1),
             vault_ref,
             read_only: false,
             owned_vault: None,
@@ -331,7 +351,8 @@ impl Flavite {
             operation_ids: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashSet::new()),
             terminal_backlog: Mutex::new(HashMap::new()),
-            notice_acks: Mutex::new(Vec::new()),
+            notice_acks: Mutex::new(std::collections::BTreeMap::new()),
+            next_notice_id: AtomicU64::new(1),
             vault_ref,
             read_only: false,
             owned_vault: None,
@@ -497,134 +518,129 @@ impl Flavite {
         self.read_only = read_only;
     }
 
-    /// Get the underlying Session (for advanced use cases).
+    /// Advance accepted Session work and publish terminal completions. Hosts
+    /// call this regularly; notice acknowledgement never gates this pump.
+    pub fn pump(&self) {
+        self.session.pump();
+    }
+
+    /// Whether a canonical note path currently has a shared Session buffer.
     #[must_use]
-    pub fn session(&self) -> &Arc<Session> {
-        &self.session
+    pub fn is_note_open(&self, path: &std::path::Path) -> bool {
+        self.session.is_open(path)
     }
 
-    /// Execute a Session command directly.
-    pub fn execute_session(&self, command: SessionCommand) -> SessionResult {
-        self.session.execute(command)
-    }
-
-    /// Drain lossy pulse events through the public host boundary.
-    pub fn drain_pulses(&self) -> Vec<flavite_vault::channels::Pulse> {
-        self.session.drain_pulses()
-    }
-
-    /// Drain lossless notices through the public host boundary.
-    pub fn drain_notices(&self) -> Vec<flavite_vault::channels::Notice> {
-        self.session.drain_notices()
-    }
-
-    /// Acknowledge notice presentation. This does not complete commands or journal work.
-    pub fn acknowledge_notice(&self, notice: &flavite_vault::channels::Notice) {
-        self.session.acknowledge_notice(notice);
-    }
-
-    /// Drain the versioned public event stream assembled from Session events,
-    /// lossy pulses, and coalesced notices. Hosts should consume this instead
-    /// of depending on vault channel payloads.
-    pub fn drain_events(&self) -> Vec<crate::Event> {
+    /// Poll typed events with notice credits. Pulses are lossy hints and do
+    /// not consume credits. At most `min(credits, available capacity)` notices
+    /// are removed from the Session; outstanding notices are never evicted or
+    /// auto-acknowledged when the host stops presenting them.
+    pub fn poll_events(&self, notice_credits: usize) -> Vec<EventDelivery> {
         use flavite_vault::channels::{Notice, Pulse};
         use flavite_vault::session::SessionEvent;
 
+        let available = MAX_NOTICE_ACKS.saturating_sub(self.notice_acks.lock().unwrap().len());
+        let notice_limit = notice_credits.min(available);
         let mut events = Vec::new();
         for event in self.session.drain_events() {
             if let SessionEvent::ExternalChangeDetected { path, deleted } = event {
-                events.push(crate::Event::ExternalChangeDetected {
-                    vault: self.vault_ref.clone(),
-                    note_path: path.to_string_lossy().into_owned(),
-                    deleted,
+                events.push(EventDelivery {
+                    notice_id: None,
+                    event: crate::Event::ExternalChangeDetected {
+                        vault: self.vault_ref.clone(),
+                        note_path: path.to_string_lossy().into_owned(),
+                        deleted,
+                    },
                 });
             }
         }
         for pulse in self.session.drain_pulses() {
-            match pulse {
+            let event = match pulse {
                 Pulse::VaultChanged {
                     epoch,
                     generation,
                     summary,
-                } => events.push(crate::Event::VaultChanged {
+                } => crate::Event::VaultChanged {
                     vault: self.vault_ref.clone(),
                     epoch: epoch.value(),
                     generation: generation.value(),
                     added: summary.added,
                     changed: summary.changed,
                     removed: summary.removed,
-                }),
+                },
                 Pulse::ReconcileProgress { done, total } => {
-                    events.push(crate::Event::ReconcileProgress { done, total })
+                    crate::Event::ReconcileProgress { done, total }
                 }
-                Pulse::Invalidate { note } => events.push(crate::Event::Invalidate {
+                Pulse::Invalidate { note } => crate::Event::Invalidate {
                     vault: self.vault_ref.clone(),
                     note_path: note.path.to_string_lossy().into_owned(),
-                }),
-            }
+                },
+            };
+            events.push(EventDelivery {
+                notice_id: None,
+                event,
+            });
         }
-        for notice in self.session.drain_notices() {
-            match &notice {
+        for notice in self.session.drain_notices_limit(notice_limit) {
+            let event = match &notice {
                 Notice::RenameSuggested {
                     from,
                     to,
                     tier,
                     inbound,
-                } => events.push(crate::Event::RenameSuggested {
+                } => crate::Event::RenameSuggested {
                     vault: self.vault_ref.clone(),
                     from: from.clone(),
                     to: to.clone(),
                     tier: tier.as_str().into(),
                     inbound: *inbound,
-                }),
-                Notice::Conflict { note } => events.push(crate::Event::Conflict {
+                },
+                Notice::Conflict { note } => crate::Event::Conflict {
                     vault: self.vault_ref.clone(),
                     note_path: note.path.to_string_lossy().into_owned(),
-                }),
-                Notice::RecoveryOffer { note } => events.push(crate::Event::RecoveryOffer {
+                },
+                Notice::RecoveryOffer { note } => crate::Event::RecoveryOffer {
                     vault: self.vault_ref.clone(),
                     note_path: note.path.to_string_lossy().into_owned(),
-                }),
-                Notice::ActionRequired { code, note } => {
-                    events.push(crate::Event::ActionRequired {
-                        vault: self.vault_ref.clone(),
-                        code: (*code).into(),
-                        note_path: note.as_ref().map(|n| n.path.to_string_lossy().into_owned()),
-                    })
-                }
-                Notice::LinksBroken { from, count } => events.push(crate::Event::LinksBroken {
+                },
+                Notice::ActionRequired { code, note } => crate::Event::ActionRequired {
+                    vault: self.vault_ref.clone(),
+                    code: (*code).into(),
+                    note_path: note.as_ref().map(|n| n.path.to_string_lossy().into_owned()),
+                },
+                Notice::LinksBroken { from, count } => crate::Event::LinksBroken {
                     vault: self.vault_ref.clone(),
                     from: from.clone(),
                     count: *count,
-                }),
-            }
-            if let Some(event) = events.last() {
-                let evicted = {
-                    let mut pending = self.notice_acks.lock().unwrap();
-                    let evicted = (pending.len() == MAX_NOTICE_ACKS).then(|| pending.remove(0).1);
-                    pending.push((event.clone(), notice));
-                    evicted
-                };
-                if let Some(evicted) = evicted {
-                    tracing::warn!(
-                        capacity = MAX_NOTICE_ACKS,
-                        "evicting oldest unacknowledged notice"
-                    );
-                    self.session.acknowledge_notice(&evicted);
-                }
-            }
+                },
+            };
+            let id = NoticeId(self.next_notice_id.fetch_add(1, Ordering::Relaxed));
+            self.notice_acks
+                .lock()
+                .unwrap()
+                .insert(id, (event.clone(), notice));
+            events.push(EventDelivery {
+                notice_id: Some(id),
+                event,
+            });
         }
         events
     }
 
-    /// Acknowledge a notice event after the host has presented or reported it.
-    /// This only retires the presentation notice; it never completes an operation.
-    pub fn acknowledge_event(&self, event: &crate::Event) {
+    /// Acknowledge a notice only after its host presentation is visible.
+    /// This never completes a command or advances journal work.
+    pub fn acknowledge_notice(&self, id: NoticeId) -> bool {
         let mut pending = self.notice_acks.lock().unwrap();
-        if let Some(index) = pending.iter().position(|(candidate, _)| candidate == event) {
-            let (_, notice) = pending.remove(index);
+        if let Some((_, notice)) = pending.remove(&id) {
             self.session.acknowledge_notice(&notice);
+            return true;
         }
+        false
+    }
+
+    /// Current number of notice credits held by the host.
+    #[must_use]
+    pub fn outstanding_notice_count(&self) -> usize {
+        self.notice_acks.lock().unwrap().len()
     }
 
     /// Ask the vault actor to perform its throttled focus verification.
@@ -662,6 +678,23 @@ impl Flavite {
                 source_path_key,
             )
             .map_err(FlaviteError::IndexError)
+    }
+
+    /// Resolve a note-link spelling through the canonical index resolver.
+    /// The facade computes the resolver key so GUI callers never duplicate
+    /// syntax normalization policy.
+    pub fn resolve_note_target(
+        &self,
+        raw_target: impl Into<String>,
+        source_path_key: Option<String>,
+    ) -> Result<flavite_index::resolver::Resolution, FlaviteError> {
+        let raw_target = raw_target.into();
+        self.resolve_target(
+            flavite_syntax::text::fold_key(&raw_target),
+            raw_target,
+            false,
+            source_path_key,
+        )
     }
 
     /// Read the versioned vault settings document through the API boundary.
@@ -1087,7 +1120,7 @@ impl Flavite {
     ) -> Result<BufferView, FlaviteError> {
         let snapshot = self
             .session
-            .buffer_snapshot(buffer_id, revision)
+            .shared_buffer_snapshot(buffer_id, revision)
             .map_err(|error| match error {
                 flavite_vault::session::BufferSnapshotError::NotFound(id) => {
                     FlaviteError::BufferNotFound(id)
@@ -1097,6 +1130,36 @@ impl Flavite {
                 }
             })?;
         Ok(BufferView {
+            buffer_id: snapshot.buffer_id.as_u64(),
+            revision: snapshot.revision.as_u64(),
+            text: snapshot.text.to_string(),
+            base_hash: snapshot
+                .base_hash
+                .map_or_else(Vec::new, |hash| hash.to_vec()),
+            state: snapshot.state,
+            path: snapshot.path,
+        })
+    }
+
+    /// Get a shared immutable view for in-process consumers such as multiple
+    /// editor tabs. Serialized API consumers continue to use [`BufferView`].
+    pub fn get_shared_buffer_view(
+        &self,
+        buffer_id: BufferId,
+        revision: Option<Revision>,
+    ) -> Result<SharedBufferView, FlaviteError> {
+        let snapshot = self
+            .session
+            .shared_buffer_snapshot(buffer_id, revision)
+            .map_err(|error| match error {
+                flavite_vault::session::BufferSnapshotError::NotFound(id) => {
+                    FlaviteError::BufferNotFound(id)
+                }
+                flavite_vault::session::BufferSnapshotError::Stale { expected, actual } => {
+                    FlaviteError::StaleBufferView { expected, actual }
+                }
+            })?;
+        Ok(SharedBufferView {
             buffer_id: snapshot.buffer_id.as_u64(),
             revision: snapshot.revision.as_u64(),
             text: snapshot.text,
@@ -1117,7 +1180,7 @@ impl Flavite {
 
     /// Current index and watcher summary for CLI and diagnostics.
     pub fn vault_info(&self) -> Result<VaultInfo, FlaviteError> {
-        let version = self.session().version().map_err(FlaviteError::IndexError)?;
+        let version = self.session.version().map_err(FlaviteError::IndexError)?;
         let db_path = crate::doctor::cache_db_path(self.vault_ref.uuid);
         let (note_count, tantivy_generation) = if db_path.exists() {
             let connection = rusqlite::Connection::open_with_flags(
@@ -1214,8 +1277,25 @@ pub struct BufferView {
     /// The base hash.
     pub base_hash: Vec<u8>,
     /// Current state.
-    pub state: String,
+    pub state: crate::BufferStatus,
     /// Vault-relative path used by save and close commands.
+    pub path: PathBuf,
+}
+
+/// In-process immutable revision shared by all views of one Session buffer.
+#[derive(Debug, Clone)]
+pub struct SharedBufferView {
+    /// Buffer ID.
+    pub buffer_id: u64,
+    /// Buffer revision.
+    pub revision: u64,
+    /// Shared normalized text.
+    pub text: Arc<str>,
+    /// Base hash.
+    pub base_hash: Vec<u8>,
+    /// Typed canonical buffer state.
+    pub state: crate::BufferStatus,
+    /// Vault-relative path.
     pub path: PathBuf,
 }
 
@@ -1399,7 +1479,7 @@ mod tests {
     }
 
     fn await_initial_reconcile(flavite: &Flavite) {
-        let request_id = match flavite.execute_session(SessionCommand::Reconcile {
+        let request_id = match flavite.session.execute(SessionCommand::Reconcile {
             scope: flavite_vault::ReconcileScope::Full,
             mode: flavite_vault::ReconcileMode::VerifyContent,
         }) {
@@ -1408,9 +1488,9 @@ mod tests {
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
-            flavite.session().pump();
+            flavite.pump();
             if let Some(result) = flavite
-                .session()
+                .session
                 .drain_operation_completions()
                 .into_iter()
                 .find(|completion| completion.request_id == request_id)
@@ -1479,13 +1559,21 @@ mod tests {
                 },
             );
         }
-        let events = flavite.drain_events();
-        assert_eq!(events.len(), MAX_NOTICE_ACKS + 5);
-        assert_eq!(flavite.notice_acks.lock().unwrap().len(), MAX_NOTICE_ACKS);
-        for event in events {
-            flavite.acknowledge_event(&event);
+        let first = flavite.poll_events(usize::MAX);
+        assert_eq!(first.len(), MAX_NOTICE_ACKS);
+        assert_eq!(flavite.outstanding_notice_count(), MAX_NOTICE_ACKS);
+        let blocked = flavite.poll_events(usize::MAX);
+        assert!(blocked.iter().all(|delivery| delivery.notice_id.is_none()));
+        assert_eq!(flavite.outstanding_notice_count(), MAX_NOTICE_ACKS);
+        for delivery in first {
+            assert!(flavite.acknowledge_notice(delivery.notice_id.unwrap()));
         }
-        assert!(flavite.notice_acks.lock().unwrap().is_empty());
+        let remainder = flavite.poll_events(usize::MAX);
+        assert_eq!(remainder.len(), 5);
+        for delivery in remainder {
+            assert!(flavite.acknowledge_notice(delivery.notice_id.unwrap()));
+        }
+        assert_eq!(flavite.outstanding_notice_count(), 0);
     }
 
     #[test]
@@ -1495,7 +1583,7 @@ mod tests {
             revision: 1,
             text: "test content".to_string(),
             base_hash: vec![1, 2, 3],
-            state: "clean".to_string(),
+            state: crate::BufferStatus::Clean,
             path: PathBuf::from("note.md"),
         };
 
@@ -1560,7 +1648,7 @@ mod tests {
         let initial = flavite.get_buffer_view(buffer_id, None).unwrap();
         assert_eq!(initial.text, "hello");
         assert_eq!(initial.path, root.join("note.md"));
-        assert_eq!(initial.state, "Clean");
+        assert_eq!(initial.state, crate::BufferStatus::Clean);
 
         flavite.session.execute(SessionCommand::ApplyEdits {
             buffer_id,
@@ -1579,7 +1667,7 @@ mod tests {
         ));
         let current = flavite.get_buffer_view(buffer_id, None).unwrap();
         assert_eq!(current.text, "hello!");
-        assert_eq!(current.state, "Dirty");
+        assert_eq!(current.state, crate::BufferStatus::Dirty);
     }
 
     #[test]
@@ -1675,7 +1763,7 @@ mod tests {
             VaultConfig::default(),
         );
         let flavite = Flavite::open(identity, session, VaultConfig::default()).unwrap();
-        let opened = match flavite.execute_session(SessionCommand::OpenNote {
+        let opened = match flavite.session.execute(SessionCommand::OpenNote {
             path: PathBuf::from("note.md"),
             policy: flavite_vault::session::OpenPolicy::CreateIfMissing,
         }) {
@@ -1690,13 +1778,13 @@ mod tests {
                 }
             }
             SessionResult::Success(_) => {
-                unreachable!("direct session opens via execute_session are async")
+                unreachable!("direct Session opens are async")
             }
             other => panic!("unexpected open result: {other:?}"),
         };
         let buffer_id = opened["buffer_id"].as_u64().expect("buffer id");
         let view = flavite.get_buffer_view(buffer_id.into(), None).unwrap();
-        flavite.execute_session(SessionCommand::ApplyEdits {
+        flavite.session.execute(SessionCommand::ApplyEdits {
             buffer_id: buffer_id.into(),
             revision: Revision::new(view.revision),
             ops: vec![flavite_buffer::undo::EditOp::new(
@@ -1718,25 +1806,24 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut events = Vec::new();
         while Instant::now() < deadline {
-            flavite.session().pump();
-            events.extend(flavite.drain_events());
-            if events
-                .iter()
-                .any(|event| matches!(event, crate::Event::ExternalChangeDetected { .. }))
-            {
+            flavite.pump();
+            events.extend(flavite.poll_events(256));
+            if events.iter().any(|delivery| {
+                matches!(delivery.event, crate::Event::ExternalChangeDetected { .. })
+            }) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(events.iter().any(|event| matches!(event, crate::Event::ExternalChangeDetected { note_path, deleted: false, .. } if note_path.ends_with("note.md"))), "{events:?}");
+        assert!(events.iter().any(|delivery| matches!(&delivery.event, crate::Event::ExternalChangeDetected { note_path, deleted: false, .. } if note_path.ends_with("note.md"))), "{events:?}");
         flavite
-            .session()
+            .session
             .notice_channel()
             .send(flavite_vault::channels::Notice::Conflict {
                 note: flavite_buffer::manager::NoteRef::new(root.join("note.md")),
             });
-        events.extend(flavite.drain_events());
-        assert!(events.iter().any(|event| matches!(event, crate::Event::Conflict { note_path, .. } if note_path.ends_with("note.md"))), "{events:?}");
+        events.extend(flavite.poll_events(256));
+        assert!(events.iter().any(|delivery| matches!(&delivery.event, crate::Event::Conflict { note_path, .. } if note_path.ends_with("note.md"))), "{events:?}");
     }
 
     #[test]
