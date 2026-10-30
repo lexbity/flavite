@@ -5,6 +5,8 @@
 //! response to widget callbacks: widget events become host messages, the
 //! reducer commits, and [`Adapter::reconcile`] rebuilds the projection.
 
+pub mod bounds;
+pub mod chrome;
 pub mod gestures;
 pub mod pane_grid;
 pub mod tab_strip;

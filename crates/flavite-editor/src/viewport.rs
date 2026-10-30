@@ -50,6 +50,27 @@ pub fn clamp_char_boundary(text: &str, byte: usize) -> usize {
     at
 }
 
+/// Selectable characters for native text adapters. AccessKit stores each
+/// character's byte length in a u8. Extremely long combining sequences use
+/// scalar-sized segments in the projection; input admission still refuses
+/// a caret inside the original grapheme.
+#[must_use]
+pub fn accessible_characters(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    for (start, grapheme) in text.grapheme_indices(true) {
+        if grapheme.len() <= usize::from(u8::MAX) {
+            ranges.push(start..start + grapheme.len());
+        } else {
+            ranges.extend(
+                grapheme
+                    .char_indices()
+                    .map(|(i, c)| start + i..start + i + c.len_utf8()),
+            );
+        }
+    }
+    ranges
+}
+
 /// Previous extended grapheme boundary, including combining and emoji sequences.
 #[must_use]
 pub fn previous_grapheme_boundary(text: &str, byte: usize) -> usize {

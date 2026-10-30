@@ -34,6 +34,8 @@ pub struct Target {
     pub group: GroupId,
     /// Destination index (before the hovered tab, or append).
     pub index: usize,
+    /// An edge drop creates a new split.
+    pub edge: Option<flavite_workspace::Edge>,
 }
 
 impl TabGesture {
@@ -66,7 +68,11 @@ impl TabGesture {
     /// A hovered tab during a drag becomes the insertion target.
     pub fn hover(&mut self, group: GroupId, index: usize) {
         if let State::Dragging { target, .. } = &mut self.state {
-            *target = Some(Target { group, index });
+            *target = Some(Target {
+                group,
+                index,
+                edge: None,
+            });
         }
     }
 
@@ -76,7 +82,15 @@ impl TabGesture {
             *target = Some(Target {
                 group,
                 index: group_tab_count,
+                edge: None,
             });
+        }
+    }
+
+    /// Replace the candidate after a hit test using actual mounted rectangles.
+    pub fn set_target(&mut self, next: Option<Target>) {
+        if let State::Dragging { target, .. } = &mut self.state {
+            *target = next;
         }
     }
 
@@ -126,6 +140,23 @@ impl TabGesture {
     }
 }
 
+impl Target {
+    #[must_use]
+    pub fn layout_target(self) -> flavite_workspace::TabDropTarget {
+        match self.edge {
+            Some(edge) => flavite_workspace::TabDropTarget::SplitFrom {
+                group: self.group,
+                arrangement: edge.arrangement(),
+                side: edge.side(),
+            },
+            None => flavite_workspace::TabDropTarget::Index {
+                group: self.group,
+                index: self.index,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +190,7 @@ mod tests {
             Some(Target {
                 group: GroupId::from_raw(2),
                 index: 1,
+                edge: None,
             })
         );
     }
@@ -178,6 +210,7 @@ mod tests {
                 Target {
                     group: GroupId::from_raw(2),
                     index: 0,
+                    edge: None,
                 }
             ))
         );

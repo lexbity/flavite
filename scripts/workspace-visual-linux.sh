@@ -20,8 +20,8 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
-if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" ]]; then
-    echo "unsupported scenario: $scenario (implemented: layout, shared-editors)" >&2
+if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" ]]; then
+    echo "unsupported scenario: $scenario (implemented: layout, shared-editors, shell-foundation)" >&2
     exit 2
 fi
 if [[ "$(uname -s)" != Linux ]]; then
@@ -35,6 +35,12 @@ for tool in xdotool import identify python3; do
         exit 2
     fi
 done
+# Keep test pointer/keyboard ownership separate from the user's desktop.
+# Allow enough physical pixels for the default window at 2x display scale.
+if [[ "${FLAVITE_XVFB_ACTIVE:-0}" != 1 ]] && command -v xvfb-run >/dev/null 2>&1; then
+    exec xvfb-run -a -s "-screen 0 ${FLAVITE_VISUAL_SCREEN:-2560x1600x24}" \
+        env FLAVITE_XVFB_ACTIVE=1 bash "$0" --scenario "$scenario" --backend "$backend"
+fi
 if [[ -n "${DISPLAY:-}" ]] && ! xdotool getdisplaygeometry >/dev/null 2>&1; then
     echo "DISPLAY=${DISPLAY} is not reachable; retrying with Xvfb if available." >&2
     if [[ "${FLAVITE_XVFB_ACTIVE:-0}" == 1 ]]; then
@@ -48,7 +54,7 @@ if [[ -z "${DISPLAY:-}" ]]; then
         echo "DISPLAY is unset and xvfb-run is unavailable" >&2
         exit 2
     fi
-    exec xvfb-run -a -s "-screen 0 ${FLAVITE_VISUAL_SCREEN:-1440x900x24}" \
+    exec xvfb-run -a -s "-screen 0 ${FLAVITE_VISUAL_SCREEN:-2560x1600x24}" \
         env FLAVITE_XVFB_ACTIVE=1 bash "$0" --scenario "$scenario" --backend "$backend"
 fi
 
@@ -177,7 +183,10 @@ harness_wait "boot with the catalog loaded" \
 capture "$run_dir/01-boot.png"
 record "boot-single-group-catalog" "01-boot.png"
 
-if [[ "$scenario" == "shared-editors" ]]; then
+if [[ "$scenario" == "shell-foundation" ]]; then
+    python3 scripts/tests/workspace_shell_foundation.py "$window_id" "$harness_log" "$run_dir"
+    record "os-pointer-dock-reorder-menu-overflow" "foundation-checks.json"
+elif [[ "$scenario" == "shared-editors" ]]; then
     xdotool_key "ctrl+p"
     xdotool type --delay 25 "alpha"
     xdotool_key "Return"
@@ -343,14 +352,29 @@ assert len(groups) == len(set(groups)), 'duplicate group ids'
 " "$harness_log" || { echo "semantic identity check failed" >&2; exit 1; }
 record "semantic-ids-unique" "harness.jsonl"
 
+# Artifact existence is a required check, independent of image color counts.
+for entry in "${checks[@]}"; do
+    ENTRY="$entry" RUN_DIR="$run_dir" python3 -c 'import json,os,pathlib; item=json.loads(os.environ["ENTRY"]); p=pathlib.Path(os.environ["RUN_DIR"])/item["artifact"]; assert p.is_file() and p.stat().st_size>0, p'
+done
 # Evidence manifest (§31.2).
 build_hash="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 lock_hash="$(cargo xtask blake3 Cargo.lock)"
+source_hash="$(python3 -c '
+import hashlib,pathlib,subprocess
+h=hashlib.sha256()
+paths=set(subprocess.check_output(["git","ls-files","-co","--exclude-standard","-z"]).split(b"\0"))
+for raw in sorted(p for p in paths if p):
+    path=pathlib.Path(raw.decode())
+    if not path.is_file() or not (str(path).startswith(("crates/","vendor/","scripts/",".github/")) or str(path) in ("Cargo.lock","Cargo.toml","justfile")): continue
+    data=path.read_bytes(); h.update(raw+b"\0"+str(len(data)).encode()+b"\0"+data)
+print(h.hexdigest())
+')"
 {
     echo '{'
     echo "  \"schema\": 1,"
     echo "  \"build\": \"$build_hash\","
     echo "  \"lock_blake3\": \"$lock_hash\","
+    echo "  \"worktree_sha256\": \"$source_hash\","
     echo "  \"scenario\": \"$scenario\","
     echo "  \"platform\": \"linux\","
     echo "  \"display_backend\": \"$backend\","
@@ -366,5 +390,6 @@ lock_hash="$(cargo xtask blake3 Cargo.lock)"
     echo '}'
 } >"$evidence_dir/manifest.json"
 
+cp "$evidence_dir/manifest.json" "$run_dir/manifest.json"
 echo "workspace visual run complete: $run_dir"
 echo "manifest: $evidence_dir/manifest.json"

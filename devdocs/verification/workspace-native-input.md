@@ -2,7 +2,7 @@
 
 **Slice:** RFC-0003 W01. **Status:** implementation in progress; the real
 Flavite shell now uses a pinned iced AccessKit runtime bridge and exposes its
-current source text, destination tabs, and revisioned editor selection. Native
+current source text, movable workspace tabs, and revisioned editor selection. Native
 OS action and assistive-technology evidence has not yet been collected.
 
 This record replaces the earlier screen-reader waiver for the proposed
@@ -14,6 +14,19 @@ AccessKit hooks; W01 now carries a small local runtime patch under
 accepts native SetTextSelection through the ordinary app message and widget
 operation path. Headless tree tests verify the semantic projection; they do
 not establish native screen-reader exposure or OS action round trips.
+
+## Current shell correction
+
+The foundational shell changes restore per-tab editable text/caret projection
+and guarded Focus/SetTextSelection routing after the W02 migration. Menus and
+pickers now exclude background accessibility actions. The current native runner
+also checks subsequent OS typing and saved bytes at the selected caret. Its
+2026-10-29 rerun returned nonzero before launching because this desktop reports
+`AT-SPI IsEnabled=false`; no desktop setting was changed. The older native
+round trip described below is historical evidence for the earlier shell, not
+validation of the current tree. See
+[workspace-shell-foundation.md](workspace-shell-foundation.md) for current
+headless and rendered-OS-input coverage. W01 remains incomplete.
 
 ## Required evidence
 

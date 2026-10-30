@@ -458,6 +458,19 @@ impl WorkspaceState {
         Ok(())
     }
 
+    /// Release keyboard ownership without changing document or writing context.
+    /// Advancing the sequence makes controlled runtimes observe the blur.
+    pub fn release_editor_focus(&mut self, except: Option<TabId>) {
+        for (tab, view) in &mut self.tabs {
+            if Some(*tab) != except && view.interaction().focused {
+                let mut interaction = view.interaction().clone();
+                interaction.focused = false;
+                interaction.sequence = interaction.sequence.saturating_add(1);
+                view.set_interaction(interaction);
+            }
+        }
+    }
+
     /// Note source most recently focused in an editable or reading view.
     #[must_use]
     pub const fn document_anchor(&self) -> Option<TabId> {

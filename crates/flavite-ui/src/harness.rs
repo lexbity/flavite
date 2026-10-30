@@ -48,6 +48,23 @@ fn injected_hidden_tab() -> Option<String> {
         .clone()
 }
 
+fn desired_ratios(node: &flavite_workspace::LayoutNode) -> Vec<u32> {
+    match node {
+        flavite_workspace::LayoutNode::Group(_) => vec![],
+        flavite_workspace::LayoutNode::Split {
+            desired_ratio_ppm,
+            first,
+            second,
+            ..
+        } => {
+            let mut ratios = vec![*desired_ratio_ppm];
+            ratios.extend(desired_ratios(first));
+            ratios.extend(desired_ratios(second));
+            ratios
+        }
+    }
+}
+
 /// Emit one semantic snapshot of the shell after a state change.
 pub fn observe(app: &App) {
     let Some(sink) = sink() else {
@@ -81,6 +98,8 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         .into_iter()
         .filter_map(|group| {
             let state = app.workspace.group(&group)?;
+            let bounds = app.group_bounds.get(&group).copied();
+            let slots = crate::workspace::tab_strip::plan(bounds.map_or(0.0,|r|r.width),state.tabs().len(),state.tabs().iter().position(|t| *t==state.active()).unwrap_or(0));
             let tabs: Vec<serde_json::Value> = state
                 .tabs()
                 .iter()
@@ -102,12 +121,15 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                         // u128; expose opaque identity in its stable string
                         // form so the fixture protocol remains valid.
                         "tab": tab.to_string(),
+                        "visible_in_strip": state.tabs().iter().position(|t| t==tab).is_some_and(|i| i>=slots.start && i<slots.start+slots.count),
+                        "slot_index": state.tabs().iter().position(|t| t==tab).and_then(|i| i.checked_sub(slots.start)).filter(|i| *i<slots.count),
                         "title": session.title(),
                         "load": load,
                         "active": *tab == state.active(),
                         "buffer": buffer_view.as_ref().map(|view| view.buffer_id),
                         "revision": buffer_view.as_ref().map(|view| view.revision),
                         "selection": interaction.selections.first().map(|selection| [selection.anchor, selection.head]),
+                        "editor_bounds": app.editor_bounds.get(tab).map(|r| [r.x,r.y,r.width,r.height]),
                         "incarnation": interaction.incarnation,
                         "interaction_focused": interaction.focused,
                         "composing": interaction.composition == flavite_workspace::CompositionState::Active,
@@ -116,6 +138,8 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                 .collect();
             Some(serde_json::json!({
                 "group": group.to_string(),
+                "bounds": bounds.map(|r| [r.x,r.y,r.width,r.height]),
+                "tab_width": slots.tab_width,
                 "label": app
                     .workspace
                     .tab(&state.active())
@@ -144,6 +168,19 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "revision": app.workspace.revision(),
         "status": app.status_text(),
         "groups": groups,
+        "menu_open": app.strip_menu.is_some(),
+        "picker_open": app.picker.open,
+        "palette_open": app.palette_open,
+        "desired_ratios": desired_ratios(app.workspace.tree()),
+        "adaptive_maximized": !flavite_workspace::fits(&app.workspace,flavite_workspace::Size {width:app.workspace_bounds.width,height:app.workspace_bounds.height},1.0),
+        "window_size": [app.window_size().width,app.window_size().height],
+        "drag_target": app.gesture.target().map(|target|format!("{target:?}")),
+        "dragging": app.gesture.dragging(),
+        "pointer": app.pointer.map(|p|[p.x,p.y]),
+        "resizing": app.resizing_split.map(|id|id.to_string()),
+        "split_hits": app.split_hits().into_iter().map(|(_,r,_)|[r.x,r.y,r.width,r.height]).collect::<Vec<_>>(),
+        "resize_preview": app.resize_preview.values().copied().collect::<Vec<_>>(),
+        "workspace_bounds": [app.workspace_bounds.x,app.workspace_bounds.y,app.workspace_bounds.width,app.workspace_bounds.height],
         "focused_tab": focused.to_string(),
         "focused_text_chars": focused_text,
         "focused_text": focused_text_content,

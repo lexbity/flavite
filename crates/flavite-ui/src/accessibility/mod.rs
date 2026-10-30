@@ -7,7 +7,7 @@ pub use tree::NodeTarget;
 
 use crate::app::App;
 use crate::app::Message;
-use accesskit::{Action, ActionRequest};
+use accesskit::{Action, ActionData, ActionRequest};
 use flavite_workspace::LayoutAction;
 
 /// Convert a native accessibility action into the ordinary app message
@@ -19,49 +19,104 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
         return None;
     }
     let target = app.a11y_nodes.get(&request.target_node)?.clone();
-    let revision = app.workspace.revision();
-    match request.action {
-        Action::Click => match target {
-            tree::NodeTarget::ActivateTab(tab) => {
-                Some(Message::Layout(LayoutAction::ActivateTab {
-                    expected_revision: revision,
-                    tab,
-                }))
+    match target {
+        NodeTarget::Editor {
+            tab,
+            incarnation,
+            revision,
+        } => {
+            if app.picker.open
+                || app.palette_open
+                || app.strip_menu.is_some()
+                || !app.is_tab_visible(tab)
+            {
+                return None;
             }
-            tree::NodeTarget::CloseTab(tab) => Some(Message::Layout(LayoutAction::CloseTab {
-                expected_revision: revision,
+            let view = app.note_editor_view(tab)?;
+            if view.revision != revision
+                || app.notes.incarnation(tab) != Some(incarnation)
+                || app.has_composition()
+            {
+                return None;
+            }
+            let (anchor, head) = match request.action {
+                Action::Focus => {
+                    let s = app.editor_interaction_snapshot(tab)?;
+                    (s.selection.0, s.selection.1)
+                }
+                Action::SetTextSelection => {
+                    let Some(ActionData::SetTextSelection(selection)) = request.data else {
+                        return None;
+                    };
+                    (
+                        tree::position_byte(app, tab, &view.text, selection.anchor)?,
+                        tree::position_byte(app, tab, &view.text, selection.focus)?,
+                    )
+                }
+                _ => return None,
+            };
+            Some(Message::AccessibleSelection {
+                tab,
+                incarnation,
+                revision,
+                anchor,
+                head,
+            })
+        }
+        NodeTarget::ResizeSplit { split, .. } => match request.action {
+            Action::Increment => resize_by(app, split, 1),
+            Action::Decrement => resize_by(app, split, -1),
+            _ => None,
+        },
+        NodeTarget::MenuItem(index) => match request.action {
+            Action::Click => Some(Message::MenuPick(index)),
+            Action::Focus => Some(Message::MenuFocus(index)),
+            _ => None,
+        },
+        NodeTarget::OverlayQuery => match (request.action, request.data) {
+            (Action::SetValue, Some(ActionData::Value(value))) => Some(if app.picker.open {
+                Message::PickerQuery(value.into())
+            } else {
+                Message::PaletteQuery(value.into())
+            }),
+            _ => None,
+        },
+        NodeTarget::OverlayItem(index) if request.action == Action::Click => {
+            Some(if app.picker.open {
+                Message::PickerPick(index)
+            } else {
+                Message::PalettePick(index)
+            })
+        }
+        NodeTarget::DismissOverlay if request.action == Action::Click => Some(if app.picker.open {
+            Message::PickerClose
+        } else {
+            Message::PaletteClose
+        }),
+        target if matches!(request.action, Action::Click | Action::Focus) => match target {
+            NodeTarget::FocusGroup(group) => Some(Message::Layout(LayoutAction::FocusGroup {
+                expected_revision: app.workspace.revision(),
+                group,
+            })),
+            NodeTarget::ActivateTab(tab) => Some(Message::Layout(LayoutAction::ActivateTab {
+                expected_revision: app.workspace.revision(),
                 tab,
             })),
-            tree::NodeTarget::OpenNote(path) => {
-                let locator = flavite_workspace::NoteLocator::from_relative(&path).ok()?;
+            NodeTarget::CloseTab(tab) if request.action == Action::Click => {
+                Some(Message::CloseTab(tab))
+            }
+            NodeTarget::OpenNote(path) if request.action == Action::Click => {
                 Some(Message::OpenNote {
-                    locator,
+                    locator: flavite_workspace::NoteLocator::from_relative(&path).ok()?,
                     group: None,
                 })
             }
-            tree::NodeTarget::OpenPicker => Some(Message::PickerOpen),
-            tree::NodeTarget::OpenPalette => Some(Message::PaletteOpen),
-            tree::NodeTarget::ResizeSplit { .. } => None,
-        },
-        Action::Increment => match target {
-            tree::NodeTarget::ResizeSplit { split, .. } => resize_by(app, split, 1),
+            NodeTarget::OpenPicker => Some(Message::PickerOpen),
+            NodeTarget::OpenPalette => Some(Message::PaletteOpen),
+            NodeTarget::MenuClose => Some(Message::MenuClose),
+            NodeTarget::GroupMenu(group, menu) => Some(Message::GroupMenu(group, menu)),
             _ => None,
         },
-        Action::Decrement => match target {
-            tree::NodeTarget::ResizeSplit { split, .. } => resize_by(app, split, -1),
-            _ => None,
-        },
-        Action::Focus => match target {
-            tree::NodeTarget::ActivateTab(tab) => {
-                Some(Message::Layout(LayoutAction::ActivateTab {
-                    expected_revision: revision,
-                    tab,
-                }))
-            }
-            _ => None,
-        },
-        // Text selection arrives with the editor integration (W03);
-        // source-reading text is not editable, so no other action applies.
         _ => None,
     }
 }

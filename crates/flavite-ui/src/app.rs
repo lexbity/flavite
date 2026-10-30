@@ -58,6 +58,13 @@ pub struct App {
     pub gesture: gestures::TabGesture,
     pub resize_preview: BTreeMap<SplitId, u32>,
     pub resizing_split: Option<SplitId>,
+    /// Actual mounted geometry, used by both paint projection and pointer hits.
+    pub workspace_bounds: iced::Rectangle,
+    pub group_bounds: BTreeMap<GroupId, iced::Rectangle>,
+    pub editor_bounds: BTreeMap<TabId, iced::Rectangle>,
+    pub menu_selected: usize,
+    pub pointer: Option<iced::Point>,
+    pub drag_revision: Option<u64>,
     catalog: Vec<NoteCatalogEntry>,
     catalog_error: Option<String>,
     settings: Settings,
@@ -78,6 +85,25 @@ pub struct App {
 #[derive(Debug, Clone)]
 pub enum Message {
     Keyboard(keyboard::Event),
+    WorkspaceBounds(iced::Rectangle),
+    GroupBounds(GroupId, iced::Rectangle),
+    EditorBounds(TabId, iced::Rectangle),
+    MenuClose,
+    MenuNext(bool),
+    MenuPick(usize),
+    MenuFocus(usize),
+    ActivateTab(TabId),
+    CloseTab(TabId),
+    CancelGesture,
+    ResizeBegin(SplitId),
+    /// Native editor actions carry the captured view and revision guard.
+    AccessibleSelection {
+        tab: TabId,
+        incarnation: u64,
+        revision: u64,
+        anchor: usize,
+        head: usize,
+    },
     Mouse(iced::mouse::Event),
     Pump,
     WindowEvent(iced::window::Event),
@@ -94,19 +120,6 @@ pub enum Message {
     GroupMenu(GroupId, StripMenu),
     /// A tab was pressed (activation + drag candidate).
     TabPressed(TabId),
-    /// A tab strip row is hovered during a drag.
-    TabHover {
-        group: GroupId,
-        index: usize,
-    },
-    /// A group body is hovered during a drag (append target).
-    BodyHover(GroupId),
-    /// pane_grid drag events (whole-group moves and merges).
-    PaneDrag(iced::widget::pane_grid::DragEvent),
-    /// pane_grid resize previews (committed on release).
-    PaneResize(iced::widget::pane_grid::ResizeEvent),
-    /// A pane was clicked (focus that group).
-    PaneClicked(iced::widget::pane_grid::Pane),
     PaletteOpen,
     PaletteClose,
     PaletteQuery(String),
@@ -187,6 +200,15 @@ impl App {
             gesture: gestures::TabGesture::default(),
             resize_preview: BTreeMap::new(),
             resizing_split: None,
+            workspace_bounds: iced::Rectangle::new(
+                iced::Point::ORIGIN,
+                iced::Size::new(1180.0, 650.0),
+            ),
+            group_bounds: BTreeMap::new(),
+            editor_bounds: BTreeMap::new(),
+            menu_selected: 0,
+            pointer: None,
+            drag_revision: None,
             catalog: Vec::new(),
             catalog_error: None,
             settings: Settings::default(),
@@ -350,7 +372,7 @@ impl App {
             .state(&target.tab)
             .map(|state| state.locator.title())
             .unwrap_or("note");
-        format!("Writing target: {title} at byte {}", target.caret_text_byte)
+        format!("Writing target: {title}")
     }
 
     /// Pending operation count.
@@ -439,6 +461,7 @@ impl App {
             Outcome::Committed(commit) => {
                 self.workspace = commit.state;
                 self.adapter.reconcile(&self.workspace);
+                self.project_geometry();
                 let effects = commit.effects;
                 self.apply_effects(&effects);
                 self.refresh_semantics();
@@ -456,7 +479,12 @@ impl App {
             return;
         }
         let revision = self.workspace.revision();
-        let outcome = flavite_workspace::reduce(&self.workspace, build(revision));
+        let action = build(revision);
+        if !self.layout_fits(&action) {
+            self.status = "There is not enough space for that split".into();
+            return;
+        }
+        let outcome = flavite_workspace::reduce(&self.workspace, action);
         self.commit(outcome);
     }
 
@@ -495,6 +523,12 @@ impl App {
     }
 
     fn handle_editor_action(&mut self, tab: TabId, incarnation: u64, action: EditorAction) {
+        if self.picker.open || self.palette_open || self.strip_menu.is_some() {
+            return;
+        }
+        if !self.is_tab_visible(tab) {
+            return;
+        }
         if self.notes.incarnation(tab) != Some(incarnation)
             || self
                 .workspace
@@ -534,6 +568,15 @@ impl App {
                     flavite_workspace::CompositionState::Idle
                 };
                 interaction.focused = snapshot.focused;
+                if snapshot.focused {
+                    if self.workspace.focused_tab() != tab {
+                        self.dispatch_layout(|revision| LayoutAction::ActivateTab {
+                            expected_revision: revision,
+                            tab,
+                        });
+                    }
+                    self.workspace.release_editor_focus(Some(tab));
+                }
                 if let Err(error) = self
                     .workspace
                     .acknowledge_interaction(interaction, &current.text)
@@ -765,6 +808,78 @@ impl App {
     /// Apply one host event.
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::ResizeBegin(split) => {
+                if !self.has_composing_view() {
+                    self.resizing_split = Some(split);
+                }
+            }
+            Message::WorkspaceBounds(bounds) => self.workspace_bounds = bounds,
+            Message::GroupBounds(group, bounds) => {
+                if self.workspace.group(&group).is_some() {
+                    self.group_bounds.insert(group, bounds);
+                }
+            }
+            Message::EditorBounds(tab, bounds) => {
+                if self.workspace.tab(&tab).is_some() {
+                    self.editor_bounds.insert(tab, bounds);
+                }
+            }
+            Message::MenuClose => self.strip_menu = None,
+            Message::CancelGesture => {
+                self.gesture.cancel();
+                self.drag_revision = None;
+                self.resize_preview.clear();
+                self.resizing_split = None;
+                self.strip_menu = None;
+            }
+            Message::MenuNext(forward) => {
+                if let Some((group, menu)) = self.strip_menu {
+                    let entries = crate::workspace::tab_strip::menu_entries(self, group, menu);
+                    let count = entries.len();
+                    for _ in 0..count {
+                        self.menu_selected = if forward {
+                            (self.menu_selected + 1) % count
+                        } else {
+                            (self.menu_selected + count - 1) % count
+                        };
+                        if entries[self.menu_selected].action.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Message::MenuFocus(index) => {
+                self.menu_selected = index;
+            }
+            Message::MenuPick(index) => {
+                if let Some((group, menu)) = self.strip_menu {
+                    let entry = crate::workspace::tab_strip::menu_entries(self, group, menu)
+                        .get(index)
+                        .cloned();
+                    if let Some(action) = entry.and_then(|e| e.action) {
+                        self.strip_menu = None;
+                        return self.update(action);
+                    }
+                }
+            }
+            Message::ActivateTab(tab) => {
+                self.strip_menu = None;
+                self.dispatch_layout(|revision| LayoutAction::ActivateTab {
+                    expected_revision: revision,
+                    tab,
+                });
+            }
+            Message::CloseTab(tab) => self.dispatch_layout(|revision| LayoutAction::CloseTab {
+                expected_revision: revision,
+                tab,
+            }),
+            Message::AccessibleSelection {
+                tab,
+                incarnation,
+                revision,
+                anchor,
+                head,
+            } => self.accessible_selection(tab, incarnation, revision, anchor, head),
             Message::Keyboard(event) => {
                 if let Some(message) = host_commands::keyboard_message(self, event) {
                     return self.update(message);
@@ -783,24 +898,21 @@ impl App {
             }
             Message::WindowEvent(iced::window::Event::Unfocused) => {
                 self.gesture.cancel();
+                self.drag_revision = None;
+                self.resize_preview.clear();
+                self.resizing_split = None;
             }
             Message::WindowEvent(_) => {}
             Message::Pump => self.pump(),
             Message::Layout(action) => {
-                if self.has_composing_view() {
+                if !self.has_composing_view() && self.layout_fits(&action) {
+                    let outcome = flavite_workspace::reduce(&self.workspace, action);
+                    self.commit(outcome);
+                } else {
                     self.status =
-                        "Finish or cancel text composition before changing the layout".into();
-                    return Task::none();
+                        "This layout change needs more space or an unfinished composition to end"
+                            .into();
                 }
-                let revision = self.workspace.revision();
-                let mut action = action;
-                if action.expected_revision() != revision {
-                    // Re-stamp actions that arrived through stateless
-                    // widgets so a stale click cannot masquerade as valid.
-                    action = restamp(action, revision);
-                }
-                let outcome = flavite_workspace::reduce(&self.workspace, action);
-                self.commit(outcome);
             }
             Message::NewViewInFocused(kind) => {
                 if let Some(group) = self
@@ -825,6 +937,17 @@ impl App {
             }
             Message::OpenNote { locator, group } => self.request_open(locator, group),
             Message::GroupMenu(group, menu) => {
+                if self.has_composing_view() {
+                    return Task::none();
+                }
+                self.dispatch_layout(|revision| LayoutAction::FocusGroup {
+                    expected_revision: revision,
+                    group,
+                });
+                self.menu_selected = crate::workspace::tab_strip::menu_entries(self, group, menu)
+                    .iter()
+                    .position(|entry| entry.action.is_some())
+                    .unwrap_or(0);
                 self.strip_menu = match self.strip_menu {
                     Some((open_group, open_menu)) if open_group == group && open_menu == menu => {
                         None
@@ -833,7 +956,14 @@ impl App {
                 };
             }
             Message::TabPressed(tab) => {
+                if self.has_composing_view() || self.picker.open || self.palette_open {
+                    return Task::none();
+                }
+                self.strip_menu = None;
                 self.gesture.press(tab);
+                if let Some(pointer) = self.pointer {
+                    self.gesture.moved(pointer);
+                }
                 let revision = self.workspace.revision();
                 let outcome = flavite_workspace::reduce(
                     &self.workspace,
@@ -843,35 +973,7 @@ impl App {
                     },
                 );
                 self.commit(outcome);
-            }
-            Message::TabHover { group, index } => self.gesture.hover(group, index),
-            Message::BodyHover(group) => {
-                let count = self
-                    .workspace
-                    .group(&group)
-                    .map_or(0, |group| group.tabs().len());
-                self.gesture.hover_group(group, count);
-            }
-            Message::PaneDrag(event) => self.handle_pane_drag(event),
-            Message::PaneResize(event) => {
-                if let Some(split) = self.adapter.workspace_split(event.split) {
-                    let ppm = ratio_to_ppm(event.ratio);
-                    self.resizing_split = Some(split);
-                    self.resize_preview.insert(split, ppm);
-                }
-            }
-            Message::PaneClicked(pane) => {
-                if let Some(group) = self.adapter.group_of_pane(pane) {
-                    let revision = self.workspace.revision();
-                    let outcome = flavite_workspace::reduce(
-                        &self.workspace,
-                        LayoutAction::FocusGroup {
-                            expected_revision: revision,
-                            group,
-                        },
-                    );
-                    self.commit(outcome);
-                }
+                self.drag_revision = Some(self.workspace.revision());
             }
             Message::PaletteOpen => {
                 self.palette_open = true;
@@ -940,6 +1042,8 @@ impl App {
                 action,
             } => self.handle_editor_action(tab, incarnation, action),
         }
+        self.project_geometry();
+        self.refresh_semantics();
         #[cfg(feature = "ui-test-support")]
         crate::harness::observe(self);
         Task::none()
@@ -948,18 +1052,38 @@ impl App {
     fn handle_mouse(&mut self, event: iced::mouse::Event) {
         match event {
             iced::mouse::Event::CursorMoved { position } => {
+                self.pointer = Some(position);
+                if let Some(split) = self.resizing_split
+                    && let Some(ratio) = self.pointer_resize_ratio(split, position)
+                {
+                    self.resize_preview.insert(split, ratio_to_ppm(ratio));
+                }
                 self.gesture.moved(position);
+                if self.gesture.dragging() {
+                    let target = self.dock_target(position);
+                    if let Some(target) = target
+                        && self
+                            .gesture
+                            .dragged_tab()
+                            .is_some_and(|tab| !self.drop_allowed(tab, target))
+                    {
+                        self.status = "This split needs more space or another tab".into();
+                    }
+                    self.gesture.set_target(target);
+                }
             }
             iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left) => {
                 if let Some((tab, target)) = self.gesture.release() {
-                    self.dispatch_layout(|revision| LayoutAction::MoveTab {
-                        expected_revision: revision,
-                        tab,
-                        target: flavite_workspace::TabDropTarget::Index {
-                            group: target.group,
-                            index: target.index,
-                        },
-                    });
+                    if self.drag_revision == Some(self.workspace.revision())
+                        && self.drop_allowed(tab, target)
+                    {
+                        self.dispatch_layout(|revision| LayoutAction::MoveTab {
+                            expected_revision: revision,
+                            tab,
+                            target: target.layout_target(),
+                        });
+                    }
+                    self.drag_revision = None;
                 }
                 if let Some(split) = self.resizing_split.take()
                     && let Some(ppm) = self.resize_preview.remove(&split)
@@ -972,53 +1096,6 @@ impl App {
                 }
             }
             _ => {}
-        }
-    }
-
-    fn handle_pane_drag(&mut self, event: iced::widget::pane_grid::DragEvent) {
-        use iced::widget::pane_grid::{DragEvent, Target};
-        match event {
-            DragEvent::Dropped { pane, target } => {
-                let Some(source) = self.adapter.group_of_pane(pane) else {
-                    return;
-                };
-                let action = match target {
-                    Target::Pane(other, region) => {
-                        let Some(destination) = self.adapter.group_of_pane(other) else {
-                            return;
-                        };
-                        match region {
-                            iced::widget::pane_grid::Region::Center => LayoutAction::MergeGroups {
-                                expected_revision: self.workspace.revision(),
-                                source,
-                                destination,
-                            },
-                            iced::widget::pane_grid::Region::Edge(edge) => {
-                                let (arrangement, side) =
-                                    crate::workspace::pane_grid::workspace_split_target(edge);
-                                LayoutAction::MoveGroupSplit {
-                                    expected_revision: self.workspace.revision(),
-                                    source,
-                                    destination,
-                                    arrangement,
-                                    side,
-                                }
-                            }
-                        }
-                    }
-                    Target::Edge(edge) => {
-                        let edge = crate::workspace::pane_grid::workspace_edge(edge);
-                        LayoutAction::MoveGroupEdge {
-                            expected_revision: self.workspace.revision(),
-                            group: source,
-                            edge,
-                        }
-                    }
-                };
-                let outcome = flavite_workspace::reduce(&self.workspace, action);
-                self.commit(outcome);
-            }
-            DragEvent::Picked { .. } | DragEvent::Canceled { .. } => {}
         }
     }
 
@@ -1081,7 +1158,7 @@ impl App {
                     }
                 }
             } else {
-                self.status = format!("Request {} completed", completion.request_id);
+                self.status = "Operation completed".into();
             }
         }
         if let Some(target) = self.workspace.writing_target() {
@@ -1218,119 +1295,6 @@ impl App {
     }
 }
 
-/// Re-stamp an action built against an older revision. Widget-held actions
-/// are rebuilt at the current revision so stale clicks still express intent
-/// without silently passing the guard.
-fn restamp(action: LayoutAction, revision: u64) -> LayoutAction {
-    use flavite_workspace::LayoutAction as A;
-    match action {
-        A::OpenNote { locator, group, .. } => A::OpenNote {
-            expected_revision: revision,
-            locator,
-            group,
-        },
-        A::OpenEmpty { group, .. } => A::OpenEmpty {
-            expected_revision: revision,
-            group,
-        },
-        A::OpenNotes { group, .. } => A::OpenNotes {
-            expected_revision: revision,
-            group,
-        },
-        A::ActivateTab { tab, .. } => A::ActivateTab {
-            expected_revision: revision,
-            tab,
-        },
-        A::FocusGroup { group, .. } => A::FocusGroup {
-            expected_revision: revision,
-            group,
-        },
-        A::CloseTab { tab, .. } => A::CloseTab {
-            expected_revision: revision,
-            tab,
-        },
-        A::CloseGroup { group, .. } => A::CloseGroup {
-            expected_revision: revision,
-            group,
-        },
-        A::DuplicateTab { tab, .. } => A::DuplicateTab {
-            expected_revision: revision,
-            tab,
-        },
-        A::ReopenClosed { .. } => A::ReopenClosed {
-            expected_revision: revision,
-        },
-        A::MoveTab { tab, target, .. } => A::MoveTab {
-            expected_revision: revision,
-            tab,
-            target,
-        },
-        A::MergeGroups {
-            source,
-            destination,
-            ..
-        } => A::MergeGroups {
-            expected_revision: revision,
-            source,
-            destination,
-        },
-        A::MoveGroupSplit {
-            source,
-            destination,
-            arrangement,
-            side,
-            ..
-        } => A::MoveGroupSplit {
-            expected_revision: revision,
-            source,
-            destination,
-            arrangement,
-            side,
-        },
-        A::MoveGroupEdge { group, edge, .. } => A::MoveGroupEdge {
-            expected_revision: revision,
-            group,
-            edge,
-        },
-        A::SplitGroup {
-            group, arrangement, ..
-        } => A::SplitGroup {
-            expected_revision: revision,
-            group,
-            arrangement,
-        },
-        A::ResizeSplit {
-            split,
-            desired_ratio_ppm,
-            ..
-        } => A::ResizeSplit {
-            expected_revision: revision,
-            split,
-            desired_ratio_ppm,
-        },
-        A::ToggleMaximize { group, .. } => A::ToggleMaximize {
-            expected_revision: revision,
-            group,
-        },
-        A::NoteLoadReady { tab, .. } => A::NoteLoadReady {
-            expected_revision: revision,
-            tab,
-        },
-        A::NoteLoadFailed { tab, .. } => A::NoteLoadFailed {
-            expected_revision: revision,
-            tab,
-        },
-        A::CycleTab { forward, .. } => A::CycleTab {
-            expected_revision: revision,
-            forward,
-        },
-        A::CycleGroup { forward, .. } => A::CycleGroup {
-            expected_revision: revision,
-            forward,
-        },
-    }
-}
-
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn ratio_to_ppm(ratio: f32) -> u32 {
     let ppm = (ratio * 1_000_000.0).round() as i64;
@@ -1391,6 +1355,15 @@ mod tests {
             gesture: gestures::TabGesture::default(),
             resize_preview: BTreeMap::new(),
             resizing_split: None,
+            workspace_bounds: iced::Rectangle::new(
+                iced::Point::ORIGIN,
+                iced::Size::new(1180.0, 650.0),
+            ),
+            group_bounds: BTreeMap::new(),
+            editor_bounds: BTreeMap::new(),
+            menu_selected: 0,
+            pointer: None,
+            drag_revision: None,
             catalog: Vec::new(),
             catalog_error: None,
             settings: Settings::default(),
@@ -1421,16 +1394,19 @@ mod tests {
     }
 
     #[test]
-    fn layout_messages_re_stamp_stale_revisions_and_commit() {
+    fn stale_layout_messages_leave_authoritative_state_unchanged() {
         let mut app = empty_app();
         let group = app.workspace.first_group().expect("group");
         let stale = LayoutAction::OpenEmpty {
             expected_revision: app.workspace.revision() + 50,
             group,
         };
+        let before = app.workspace.clone();
         let _ = app.update(Message::Layout(stale));
-        assert_eq!(app.workspace.revision(), 1, "restamped action commits");
-        assert_eq!(app.workspace.tabs().count(), 2);
+        assert_eq!(
+            app.workspace, before,
+            "stale widget actions must not be silently reauthorized"
+        );
     }
 
     #[test]
@@ -1602,10 +1578,12 @@ mod tests {
             arrangement: flavite_workspace::Arrangement::SideBySide,
         }));
         let split = app.workspace.tree().splits()[0];
-        let pane_split = app.adapter.split_map[&split];
-        let _ = app.update(Message::PaneResize(iced::widget::pane_grid::ResizeEvent {
-            split: pane_split,
-            ratio: 0.7,
+        let _ = app.update(Message::ResizeBegin(split));
+        let _ = app.update(Message::Mouse(iced::mouse::Event::CursorMoved {
+            position: iced::Point::new(
+                app.workspace_bounds.x + 2.0 + 0.7 * (app.workspace_bounds.width - 4.0),
+                app.workspace_bounds.y + 200.0,
+            ),
         }));
         assert_eq!(app.resize_preview.get(&split), Some(&700_000));
         let revision_before = app.workspace.revision();

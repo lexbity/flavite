@@ -81,7 +81,7 @@ fn running_shell_program_publishes_the_workspace_and_routes_actions() {
     let text_node = update
         .nodes
         .iter()
-        .find(|(id, _)| *id == tree::exposed_text_node())
+        .find(|(id, _)| *id == tree::editor_node(&app, app.workspace.focused_tab()))
         .map(|(_, node)| node)
         .expect("the active note text is exposed");
     assert_eq!(text_node.value(), Some("# Native bridge note\n\nbody\n"));
@@ -116,6 +116,113 @@ fn running_shell_program_publishes_the_workspace_and_routes_actions() {
         route_action(&app, request).is_none(),
         "unknown nodes are rejected"
     );
+
+    // Actual native text-selection actions enter the same controlled editor
+    // acknowledgement path as pointer input, with exact revision/run guards.
+    let view = app.note_editor_view(tab).unwrap();
+    let caret = view.text.find("body").unwrap();
+    let selection = accesskit::TextSelection {
+        anchor: tree::text_position(&app, tab, &view.text, caret),
+        focus: tree::text_position(&app, tab, &view.text, caret),
+    };
+    let native = || accesskit::ActionRequest {
+        action: accesskit::Action::SetTextSelection,
+        target_tree: accesskit::TreeId::ROOT,
+        target_node: tree::editor_node(&app, tab),
+        data: Some(accesskit::ActionData::SetTextSelection(selection)),
+    };
+    let routed = route_action(&app, native()).expect("native selection routes");
+    let _ = app.update(routed);
+    assert_eq!(
+        app.editor_interaction_snapshot(tab).unwrap().selection,
+        (caret, caret)
+    );
+    assert_eq!(
+        app.workspace.writing_target().unwrap().caret_text_byte,
+        caret
+    );
+    let captured = Message::AccessibleSelection {
+        tab,
+        incarnation: app.notes.incarnation(tab).unwrap(),
+        revision: view.revision,
+        anchor: 0,
+        head: 0,
+    };
+
+    // Background actions are absent while a menu or picker owns input.
+    let _ = app.update(Message::GroupMenu(
+        group,
+        flavite_ui::workspace::StripMenu::Actions,
+    ));
+    assert!(
+        route_action(
+            &app,
+            accesskit::ActionRequest {
+                action: accesskit::Action::Click,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: tree::node_for_tab(tab),
+                data: None
+            }
+        )
+        .is_none()
+    );
+    let _ = app.update(Message::CancelGesture);
+    let _ = app.update(Message::PickerOpen);
+    assert!(
+        route_action(
+            &app,
+            accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: tree::editor_node(&app, tab),
+                data: None
+            }
+        )
+        .is_none()
+    );
+    let _ = app.update(Message::PickerClose);
+
+    // The edit is Session-owned; old revision text positions cannot authorize
+    // a second selection on a newer revision.
+    let incarnation = app.notes.incarnation(tab).unwrap();
+    let _ = app.update(Message::EditorAction {
+        tab,
+        incarnation,
+        action: flavite_editor::EditorAction::replace(&view, caret, caret, "native-marker".into()),
+    });
+    let before = app.editor_interaction_snapshot(tab).unwrap();
+    let _ = app.update(captured);
+    assert_eq!(app.editor_interaction_snapshot(tab).unwrap(), before);
+    assert!(
+        app.note_editor_view(tab)
+            .unwrap()
+            .text
+            .contains("native-markerbody")
+    );
+    let invalid = accesskit::TextSelection {
+        anchor: selection.anchor,
+        focus: selection.focus,
+    };
+    assert!(
+        route_action(
+            &app,
+            accesskit::ActionRequest {
+                action: accesskit::Action::SetTextSelection,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: tree::editor_node(&app, tab),
+                data: Some(accesskit::ActionData::SetTextSelection(invalid))
+            }
+        )
+        .is_none(),
+        "old revision text runs are rejected"
+    );
+    // Restore clean state so the existing final-close assertion remains valid.
+    let current = app.note_editor_view(tab).unwrap();
+    let _ = app.update(Message::EditorAction {
+        tab,
+        incarnation,
+        action: flavite_editor::EditorAction::history(&current, false),
+    });
 
     // Closing the tab through the routed action removes it from the tree.
     let _ = app.update(Message::Layout(flavite_workspace::LayoutAction::CloseTab {

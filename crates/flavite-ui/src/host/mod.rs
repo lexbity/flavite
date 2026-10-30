@@ -8,3 +8,4 @@
 pub mod commands;
 pub mod effects;
 pub mod env;
+pub mod shell;

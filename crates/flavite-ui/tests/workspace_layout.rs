@@ -360,3 +360,122 @@ fn host_catalog_and_palette_resolve_the_same_commands() {
     let _ = app.update(Message::PalettePick(index));
     assert_eq!(app.workspace.tabs().count(), tabs_before + 1);
 }
+
+#[test]
+fn solver_projection_clamps_and_previews_without_rewriting_desired_ratios() {
+    let Fixture { mut app, .. } = fixture();
+    open_note(&mut app, "alpha.md");
+    run_host(&mut app, "workspace.split_right");
+    wait_ready(&mut app);
+    let split = app.workspace.tree().splits()[0];
+    let _ = app.update(Message::WorkspaceBounds(iced::Rectangle::new(
+        iced::Point::ORIGIN,
+        iced::Size::new(800.0, 500.0),
+    )));
+    let _ = app.update(Message::Layout(LayoutAction::ResizeSplit {
+        expected_revision: app.workspace.revision(),
+        split,
+        desired_ratio_ppm: 950_000,
+    }));
+    let before = app.workspace.clone();
+    for preview in [50_000, 500_000, 950_000] {
+        app.resize_preview.insert(split, preview);
+        let _ = app.update(Message::WorkspaceBounds(app.workspace_bounds));
+        let actual = app.adapter.pane_rectangles(
+            flavite_workspace::SPLITTER_WIDTH,
+            app.workspace_bounds.size(),
+        );
+        let expected = flavite_workspace::rects(
+            &app.workspace,
+            flavite_workspace::Size {
+                width: 800.0,
+                height: 500.0,
+            },
+            1.0,
+            &app.resize_preview,
+        );
+        for (group, rect) in actual {
+            let e = expected[&group];
+            assert!((rect.x - e.x).abs() <= 1.0);
+            assert!((rect.width - e.width).abs() <= 1.0);
+            assert!(rect.width >= 319.0);
+        }
+        assert_eq!(
+            app.workspace, before,
+            "preview must not rewrite saved ratios"
+        );
+    }
+}
+
+#[test]
+fn pointer_edge_drop_moves_exact_tab_and_stale_drag_cannot_commit() {
+    let Fixture { mut app, .. } = fixture();
+    let (alpha, buffer) = open_note(&mut app, "alpha.md");
+    open_note(&mut app, "beta.md");
+    let group = app.focused_group().unwrap();
+    let rect = iced::Rectangle {
+        x: 0.0,
+        y: 40.0,
+        width: 1200.0,
+        height: 700.0,
+    };
+    let _ = app.update(Message::GroupBounds(group, rect));
+    let _ = app.update(Message::Mouse(iced::mouse::Event::CursorMoved {
+        position: iced::Point::new(100.0, 56.0),
+    }));
+    let _ = app.update(Message::TabPressed(alpha));
+    let _ = app.update(Message::Mouse(iced::mouse::Event::CursorMoved {
+        position: iced::Point::new(1190.0, 300.0),
+    }));
+    assert_eq!(
+        app.gesture.target().unwrap().edge,
+        Some(flavite_workspace::Edge::Right)
+    );
+    let _ = app.update(Message::Mouse(iced::mouse::Event::ButtonReleased(
+        iced::mouse::Button::Left,
+    )));
+    assert_eq!(app.workspace.groups().count(), 2);
+    assert_eq!(app.notes.state(&alpha).unwrap().buffer, Some(buffer));
+    let _ = app.update(Message::TabPressed(alpha));
+    let _ = app.update(Message::Mouse(iced::mouse::Event::CursorMoved {
+        position: iced::Point::new(100.0, 200.0),
+    }));
+    run_host(&mut app, "workspace.new_tab");
+    let before = app.workspace.clone();
+    let _ = app.update(Message::Mouse(iced::mouse::Event::ButtonReleased(
+        iced::mouse::Button::Left,
+    )));
+    assert_eq!(
+        app.workspace, before,
+        "a layout change invalidates an in-flight drop"
+    );
+}
+
+#[test]
+fn menus_leave_geometry_unchanged_and_escape_cancels_resize() {
+    let Fixture { mut app, .. } = fixture();
+    open_note(&mut app, "alpha.md");
+    run_host(&mut app, "workspace.split_right");
+    wait_ready(&mut app);
+    let bounds = app
+        .adapter
+        .pane_rectangles(4.0, app.workspace_bounds.size());
+    let group = app.focused_group().unwrap();
+    let _ = app.update(Message::GroupMenu(
+        group,
+        flavite_ui::workspace::StripMenu::Actions,
+    ));
+    assert!(app.strip_menu.is_some());
+    assert_eq!(
+        bounds,
+        app.adapter
+            .pane_rectangles(4.0, app.workspace_bounds.size())
+    );
+    let split = app.workspace.tree().splits()[0];
+    app.resize_preview.insert(split, 700_000);
+    app.resizing_split = Some(split);
+    let _ = app.update(Message::CancelGesture);
+    assert!(app.resize_preview.is_empty());
+    assert!(app.strip_menu.is_none());
+    assert!(app.resizing_split.is_none());
+}

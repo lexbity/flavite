@@ -5,16 +5,29 @@
 use iced::widget::{button, container, text};
 use iced::{Background, Border, Color, Shadow, Theme, Vector, border};
 
-/// The shell's theme. Catppuccin Macchiato: a calm dark base with readable
-/// accents; all component styles read from its palette instead of hard-coding.
-pub const THEME: Theme = Theme::CatppuccinMacchiato;
+/// Neutral shell surfaces with a distinct violet writing/focus accent.
+/// Full user-selectable light/System preferences remain owned by W11.
+#[must_use]
+pub fn theme() -> Theme {
+    Theme::custom(
+        "Flavite Dark",
+        iced::theme::Palette {
+            background: Color::from_rgb8(25, 29, 35),
+            text: Color::from_rgb8(226, 229, 239),
+            primary: Color::from_rgb8(180, 137, 240),
+            success: Color::from_rgb8(94, 206, 193),
+            warning: Color::from_rgb8(232, 187, 108),
+            danger: Color::from_rgb8(237, 128, 142),
+        },
+    )
+}
 
 /// Base spacing unit.
-pub const SPACING: f32 = 12.0;
+pub const SPACING: f32 = 8.0;
 /// Tight spacing (list rows, chip gaps).
-pub const SPACING_SM: f32 = 6.0;
+pub const SPACING_SM: f32 = 4.0;
 /// Loose spacing (section separation).
-pub const SPACING_LG: f32 = 18.0;
+pub const SPACING_LG: f32 = 12.0;
 /// Sidebar width.
 pub const SIDEBAR_WIDTH: f32 = 232.0;
 /// Command palette card width.
@@ -37,7 +50,72 @@ pub const SPLITTER_WIDTH: f32 = 4.0;
 pub const FOCUS_WIDTH: f32 = 2.0;
 
 /// Corner radius shared by cards, rows, and action buttons.
-const RADIUS: f32 = 8.0;
+const RADIUS: f32 = 3.0;
+
+/// A continuous toolbar surface, shared by tab strips and view headers.
+pub fn toolbar(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(theme.extended_palette().background.weaker.color.into()),
+        ..container::Style::default()
+    }
+}
+
+/// Flat tabs distinguish the active document from toolbar buttons.
+pub fn tab(theme: &Theme, active: bool) -> container::Style {
+    let ext = theme.extended_palette();
+    container::Style {
+        background: Some(
+            if active {
+                ext.background.weak.color
+            } else {
+                ext.background.weaker.color
+            }
+            .into(),
+        ),
+        border: Border {
+            color: if active {
+                ext.primary.base.color
+            } else {
+                Color::TRANSPARENT
+            },
+            width: 1.0,
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
+
+/// A compact icon button with a 32px target and visible keyboard focus.
+pub fn toolbar_button(theme: &Theme, status: button::Status) -> button::Style {
+    let mut result = button::text(theme, status);
+    result.border.radius = 2.0.into();
+    result
+}
+
+pub fn menu_backdrop(_theme: &Theme, _status: button::Status) -> button::Style {
+    button::Style {
+        background: None,
+        ..button::Style::default()
+    }
+}
+
+pub fn drop_target(theme: &Theme, allowed: bool) -> container::Style {
+    let mut color = if allowed {
+        theme.extended_palette().primary.base.color
+    } else {
+        theme.palette().danger
+    };
+    color.a = 0.28;
+    container::Style {
+        background: Some(color.into()),
+        border: Border {
+            color: theme.palette().primary,
+            width: 2.0,
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
 
 /// A surface tone used by [`card`]-like containers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,7 +251,15 @@ pub fn dot(theme: &Theme, tone: Tone) -> container::Style {
 pub fn list_row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
     move |theme, status| {
         let ext = theme.extended_palette();
-        let (background, text_color) = if selected {
+        let (background, text_color) = if status == button::Status::Disabled {
+            (
+                None,
+                Color {
+                    a: 0.45,
+                    ..theme.palette().text
+                },
+            )
+        } else if selected {
             (
                 Some(Background::Color(ext.primary.weak.color)),
                 ext.primary.strong.text,
@@ -355,7 +441,7 @@ mod tests {
 
     #[test]
     fn component_styles_derive_from_the_theme_palette() {
-        let theme = THEME;
+        let theme = theme();
         let palette = theme.palette();
         let card_style = card(&theme);
         let Some(Background::Color(card_background)) = card_style.background else {

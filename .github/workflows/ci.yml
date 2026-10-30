@@ -45,6 +45,23 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: just ui-visual-smoke
 
+      - name: Linux workspace pointer and chrome checks
+        if: matrix.os == 'ubuntu-latest'
+        run: just workspace-visual shell-foundation
+
+      - name: Upload workspace behavior evidence
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: flavite-workspace-shell
+          path: |
+            target/workspace-evidence/**/*.png
+            target/workspace-evidence/**/manifest.json
+            target/workspace-evidence/**/foundation-checks.json
+            target/workspace-evidence/**/harness.jsonl
+            target/workspace-evidence/**/app.log
+          if-no-files-found: error
+
       - name: Upload Linux UI screenshot
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4

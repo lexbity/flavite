@@ -74,6 +74,6 @@ impl program::Program for FlaviteProgram {
     }
 
     fn theme(&self, _state: &App, _window: core::window::Id) -> Option<Theme> {
-        Some(style::THEME)
+        Some(style::theme())
     }
 }

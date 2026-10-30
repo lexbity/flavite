@@ -2,7 +2,7 @@
 """Exercise the running Flavite workspace through the Linux AT-SPI bus.
 
 W02 semantics: the shell exposes tablists with tabs, splitters, and the
-active note's source text. Native actions route through the ordinary
+active note's editable text and caret. Native actions route through the ordinary
 message path. The wrapper drives real OS keyboard input (the note picker);
 this script observes the semantic tree, asserts it, and dispatches a
 native tab action.
@@ -10,6 +10,7 @@ native tab action.
 
 from __future__ import annotations
 
+from pathlib import Path
 import sys
 import time
 
@@ -114,6 +115,21 @@ def main() -> int:
     if "Native bridge note" not in exposed:
         raise RuntimeError(f"AT-SPI returned unexpected note text: {exposed!r}")
 
+    # Exercise actual OS text/selection actions, then native key input. The
+    # caret must change the real editor and the guarded save must persist it.
+    caret = exposed.index("Native bridge note")
+    if not text_node.grab_focus():
+        raise RuntimeError("AT-SPI editor focus was rejected")
+    if not text_node.set_caret_offset(caret):
+        raise RuntimeError("AT-SPI text-selection action was rejected")
+    wait_for(lambda: text_node.get_caret_offset() == caret, "native caret acknowledgement")
+    import subprocess
+    subprocess.run(["xdotool", "type", "--clearmodifiers", "--delay", "100", "native-caret-marker"], check=True)
+    subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+s"], check=True)
+    expected = exposed[:caret] + "native-caret-marker" + exposed[caret:]
+    vault = Path(sys.argv[1])
+    wait_for(lambda: (vault / "alpha.md").read_text() == expected, "native caret edit saved at the exact source position")
+
     # Dispatch a native Click action on the Empty tab; the workspace routes
     # it through the ordinary message path and the tab becomes active.
     empty_tab = wait_for(
@@ -125,7 +141,7 @@ def main() -> int:
     wait_for(
         lambda: any(
             (tab.get_name() or "") == "Empty"
-            and tab.get_state_set().contains(Atspi.StateType.ACTIVE)
+            and tab.get_state_set().contains(Atspi.StateType.SELECTED)
             for tab in find_nodes(app, "tab")
         ),
         "the clicked tab becoming active",

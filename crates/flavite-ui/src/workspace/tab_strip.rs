@@ -1,254 +1,204 @@
-//! Tab strip rendering for one group (RFC-0003 §13.1).
-//!
-//! The strip is the pane-grid title bar: active tab, overflow list, new-view
-//! row, and group actions. Every control is a real button so keyboard and
-//! assistive-technology users operate the same actions the pointer does
-//! (FR-02, FR-18).
+//! Width-aware tab strip and the items shared by pointer/keyboard menus.
+use crate::workspace::chrome::{self, Icon};
+use crate::{
+    app::{App, Message},
+    style,
+};
+use flavite_workspace::{GroupId, TabId, ViewKind};
+use iced::widget::{Space, container, mouse_area, row, text};
+use iced::{Element, Length, alignment};
 
-use crate::app::Message;
-use crate::style;
-use flavite_workspace::{GroupId, TabId, WorkspaceState};
-use iced::widget::{button, column, container, row, scrollable, text};
-use iced::{Element, Length, Padding};
-
-/// Height of the tab strip (§13.1: tab height 32 px).
 pub const TAB_HEIGHT: f32 = 32.0;
+pub const CONTROLS_WIDTH: f32 = 96.0;
 
-/// How many tabs render inline before the overflow list takes over.
-const INLINE_TAB_BUDGET: usize = 8;
-
-/// What an inline secondary row of the strip is showing, if anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StripMenu {
-    /// The new-view row (Empty tab / Notes list).
     NewView,
-    /// The group actions row (move/merge/duplicate/close/maximize).
     Actions,
+    Tabs,
 }
 
-/// Render the tab strip for one group.
-#[allow(clippy::too_many_arguments)]
-pub fn view(
-    state: &WorkspaceState,
-    group: GroupId,
-    focused: bool,
-    inline_menu: Option<StripMenu>,
-    has_notes_catalog: bool,
-) -> Element<'_, Message> {
-    let Some(group_state) = state.group(&group) else {
-        return column![].into();
+/// A contiguous window always containing the active tab. Every tab remains
+/// available in the complete Tabs menu, regardless of title length.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StripPlan {
+    pub start: usize,
+    pub count: usize,
+    pub tab_width: f32,
+}
+
+#[must_use]
+pub fn plan(width: f32, count: usize, active: usize) -> StripPlan {
+    let available = (width - CONTROLS_WIDTH).max(0.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let visible = ((available / 104.0).floor() as usize)
+        .max(1)
+        .min(count.max(1));
+    let start = active
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(count.saturating_sub(visible));
+    #[allow(clippy::cast_precision_loss)]
+    StripPlan {
+        start,
+        count: visible.min(count),
+        tab_width: (available / visible as f32).min(200.0),
+    }
+}
+
+pub fn view(app: &App, group: GroupId) -> Element<'_, Message> {
+    let Some(g) = app.workspace.group(&group) else {
+        return row![].into();
     };
-    let tabs = group_state.tabs();
-    let active = group_state.active();
-    let inline_count = tabs.len().min(INLINE_TAB_BUDGET);
-
-    let mut strip = row![].spacing(2);
-    for tab in tabs.iter().take(inline_count) {
-        strip = strip.push(tab_button(state, *tab, *tab == active));
+    let width = app.group_bounds.get(&group).map_or(400.0, |r| r.width);
+    let active_index = g.tabs().iter().position(|t| *t == g.active()).unwrap_or(0);
+    let slots = plan(width, g.tabs().len(), active_index);
+    let mut tabs = row![].spacing(0);
+    for tab in g.tabs().iter().skip(slots.start).take(slots.count) {
+        tabs = tabs.push(tab_view(app, *tab, *tab == g.active(), slots.tab_width));
     }
-    if tabs.len() > inline_count {
-        strip = strip.push(
-            button(text(format!("+{}", tabs.len() - inline_count)).size(style::TEXT_SM))
-                .padding(chip_padding())
-                .style(style::ghost())
-                .on_press_maybe(Some(Message::GroupMenu(group, StripMenu::Actions))),
-        );
-    }
-    strip = strip.push(
-        button(text("+").size(style::TEXT))
-            .padding(chip_padding())
-            .style(style::ghost())
-            .on_press(Message::GroupMenu(group, StripMenu::NewView)),
-    );
-    strip = strip.push(
-        button(text("⋯").size(style::TEXT))
-            .padding(chip_padding())
-            .style(style::ghost())
-            .on_press(Message::GroupMenu(group, StripMenu::Actions)),
-    );
-
-    let mut content = column![container(strip).height(Length::Fixed(TAB_HEIGHT))]
-        .spacing(2)
-        .width(Length::Fill);
-    if focused && inline_menu == Some(StripMenu::NewView) {
-        content = content.push(new_view_row(has_notes_catalog));
-    }
-    if focused && inline_menu == Some(StripMenu::Actions) {
-        content = content.push(actions_row(state, group));
-    }
-    content.into()
+    tabs = tabs.push(Space::new().width(Length::Fill));
+    tabs = tabs.push(chrome::icon_button(
+        Icon::Tabs,
+        "All tabs",
+        Some(Message::GroupMenu(group, StripMenu::Tabs)),
+    ));
+    tabs = tabs.push(chrome::icon_button(
+        Icon::Add,
+        "New view",
+        Some(Message::GroupMenu(group, StripMenu::NewView)),
+    ));
+    tabs = tabs.push(chrome::icon_button(
+        Icon::More,
+        "Group actions",
+        Some(Message::GroupMenu(group, StripMenu::Actions)),
+    ));
+    container(tabs.align_y(alignment::Vertical::Center))
+        .width(Length::Fill)
+        .height(TAB_HEIGHT)
+        .style(style::toolbar)
+        .into()
 }
 
-fn tab_button(state: &WorkspaceState, tab: TabId, active: bool) -> Element<'_, Message> {
-    let Some(session) = state.tab(&tab) else {
-        return column![].into();
+fn tab_view(app: &App, tab: TabId, active: bool, width: f32) -> Element<'_, Message> {
+    let Some(view) = app.workspace.tab(&tab) else {
+        return row![].into();
     };
-    let title = session.title();
-    let load_marker = match session.kind() {
-        flavite_workspace::ViewKind::Note(note) => match note.load() {
-            flavite_workspace::NoteLoad::Reserved => " …",
-            flavite_workspace::NoteLoad::Ready => "",
-            flavite_workspace::NoteLoad::Failed => " !",
-        },
-        _ => "",
+    let kind = match view.kind() {
+        ViewKind::Notes => Icon::Notes,
+        _ => Icon::Note,
     };
-    row![
-        button(text(format!("{title}{load_marker}")).size(style::TEXT_SM))
-            .padding(Padding {
-                top: 5.0,
-                bottom: 5.0,
-                left: 8.0,
-                right: 8.0,
-            })
-            .style(style::list_row(active))
-            .on_press(Message::Layout(
-                flavite_workspace::LayoutAction::ActivateTab {
-                    expected_revision: state.revision(),
-                    tab,
-                }
-            )),
-        button(text("×").size(style::TEXT_SM))
-            .padding(Padding {
-                top: 4.0,
-                bottom: 4.0,
-                left: 6.0,
-                right: 6.0,
-            })
-            .style(style::ghost())
-            .on_press(Message::Layout(flavite_workspace::LayoutAction::CloseTab {
-                expected_revision: state.revision(),
-                tab,
-            })),
-    ]
-    .spacing(0)
-    .into()
-}
-
-fn new_view_row(has_notes_catalog: bool) -> Element<'static, Message> {
-    row![
-        button(text("Empty tab").size(style::TEXT_SM))
-            .padding(chip_padding())
-            .style(style::ghost())
-            .on_press(Message::NewViewInFocused(
-                flavite_workspace::ViewKind::Empty
-            )),
-        button(text("Notes list").size(style::TEXT_SM))
-            .padding(chip_padding())
-            .style(style::ghost())
-            .on_press_maybe(has_notes_catalog.then_some(Message::NewViewInFocused(
-                flavite_workspace::ViewKind::Notes
-            ))),
-    ]
-    .spacing(style::SPACING_SM)
-    .into()
-}
-
-fn actions_row(state: &WorkspaceState, group: GroupId) -> Element<'_, Message> {
-    let revision = state.revision();
-    row![
-        button(text("Duplicate tab").size(style::TEXT_SM))
-            .padding(chip_padding())
-            .style(style::ghost())
-            .on_press_maybe(
-                state
-                    .group(&group)
-                    .map(|g| g.active())
-                    .map(
-                        |active| Message::Layout(flavite_workspace::LayoutAction::DuplicateTab {
-                            expected_revision: revision,
-                            tab: active,
-                        })
-                    ),
-            ),
-        button(text("Split right").size(style::TEXT_SM))
-            .padding(chip_padding())
-            .style(style::ghost())
-            .on_press(Message::Layout(
-                flavite_workspace::LayoutAction::SplitGroup {
-                    expected_revision: revision,
-                    group,
-                    arrangement: flavite_workspace::Arrangement::SideBySide,
-                },
-            )),
-        button(text("Split down").size(style::TEXT_SM))
-            .padding(chip_padding())
-            .style(style::ghost())
-            .on_press(Message::Layout(
-                flavite_workspace::LayoutAction::SplitGroup {
-                    expected_revision: revision,
-                    group,
-                    arrangement: flavite_workspace::Arrangement::Stacked,
-                },
-            )),
-        button(text("Maximize").size(style::TEXT_SM))
-            .padding(chip_padding())
-            .style(style::ghost())
-            .on_press(Message::Layout(
-                flavite_workspace::LayoutAction::ToggleMaximize {
-                    expected_revision: revision,
-                    group,
-                },
-            )),
-        button(text("Close group").size(style::TEXT_SM))
-            .padding(chip_padding())
-            .style(style::ghost())
-            .on_press(Message::Layout(
-                flavite_workspace::LayoutAction::CloseGroup {
-                    expected_revision: revision,
-                    group,
-                },
-            )),
-    ]
-    .spacing(style::SPACING_SM)
-    .wrap()
-    .into()
-}
-
-/// Scrollable overflow list for groups with many tabs.
-pub fn overflow_list(state: &WorkspaceState, group: GroupId) -> Option<Element<'_, Message>> {
-    let group_state = state.group(&group)?;
-    if group_state.tabs().len() <= INLINE_TAB_BUDGET {
-        return None;
-    }
-    let mut rows = column![].spacing(2);
-    for tab in group_state.tabs() {
-        let Some(session) = state.tab(tab) else {
-            continue;
-        };
-        let active = *tab == group_state.active();
-        rows = rows.push(
-            button(
-                text(session.title())
-                    .size(style::TEXT_SM)
-                    .width(Length::Fill),
-            )
-            .width(Length::Fill)
-            .padding(chip_padding())
-            .style(style::list_row(active))
-            .on_press(Message::Layout(
-                flavite_workspace::LayoutAction::ActivateTab {
-                    expected_revision: state.revision(),
-                    tab: *tab,
-                },
-            )),
-        );
-    }
-    Some(
-        container(scrollable(rows).height(Length::Fill))
-            .max_height(220)
-            .width(Length::Fill)
-            .padding(style::SPACING_SM)
-            .style(style::card)
-            .into(),
+    let label = view.title();
+    let title = container(
+        row![
+            chrome::icon(kind),
+            text(label)
+                .size(style::TEXT_SM)
+                .wrapping(iced::widget::text::Wrapping::None)
+        ]
+        .spacing(6)
+        .align_y(alignment::Vertical::Center),
     )
+    .width((width - 32.0).max(0.0))
+    .height(TAB_HEIGHT)
+    .padding([0, 8])
+    .align_y(alignment::Vertical::Center)
+    .clip(true);
+    let title = mouse_area(title)
+        .on_press(Message::TabPressed(tab))
+        .interaction(iced::mouse::Interaction::Pointer);
+    container(row![
+        title,
+        chrome::icon_button(Icon::Close, "Close tab", Some(Message::CloseTab(tab)))
+    ])
+    .width(width)
+    .height(TAB_HEIGHT)
+    .style(move |theme| style::tab(theme, active))
+    .into()
 }
 
-/// Padding shared by chip-sized strip controls.
-pub fn chip_padding() -> Padding {
-    Padding {
-        top: 4.0,
-        bottom: 4.0,
-        left: 8.0,
-        right: 8.0,
+pub fn chip_padding() -> iced::Padding {
+    iced::Padding::from([4, 8])
+}
+
+#[derive(Debug, Clone)]
+pub struct MenuEntry {
+    pub label: String,
+    pub action: Option<Message>,
+}
+
+#[must_use]
+pub fn menu_entries(app: &App, group: GroupId, menu: StripMenu) -> Vec<MenuEntry> {
+    let Some(g) = app.workspace.group(&group) else {
+        return vec![];
+    };
+    match menu {
+        StripMenu::Tabs => g
+            .tabs()
+            .iter()
+            .filter_map(|tab| {
+                app.workspace.tab(tab).map(|v| MenuEntry {
+                    label: format!(
+                        "{}{}",
+                        if *tab == g.active() { "●  " } else { "   " },
+                        v.title()
+                    ),
+                    action: Some(Message::ActivateTab(*tab)),
+                })
+            })
+            .collect(),
+        StripMenu::NewView => [
+            ("Empty tab", "workspace.new_tab"),
+            ("Notes list", "workspace.open_notes_view"),
+        ]
+        .into_iter()
+        .map(|(label, id)| MenuEntry {
+            label: label.into(),
+            action: crate::host::commands::available(app, id)
+                .then_some(Message::RunHostCommand(id)),
+        })
+        .collect(),
+        StripMenu::Actions => [
+            ("Duplicate tab", "workspace.duplicate_tab"),
+            ("Split right", "workspace.split_right"),
+            ("Split down", "workspace.split_down"),
+            (
+                if app.maximized_group().is_some() {
+                    "Restore group"
+                } else {
+                    "Maximize group"
+                },
+                "workspace.maximize_group",
+            ),
+            ("Move tab to next group", "workspace.move_tab_next_group"),
+            ("Merge next group", "workspace.merge_next_group"),
+            ("Close group", "workspace.close_group"),
+        ]
+        .into_iter()
+        .map(|(label, id)| MenuEntry {
+            label: label.into(),
+            action: crate::host::commands::available(app, id)
+                .then_some(Message::RunHostCommand(id)),
+        })
+        .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn every_active_tab_is_visible_at_narrow_and_wide_widths() {
+        for width in [200.0, 240.0, 320.0, 640.0, 1200.0] {
+            for count in 1..=128 {
+                for active in 0..count {
+                    let p = plan(width, count, active);
+                    assert!(p.start <= active && active < p.start + p.count);
+                    #[allow(clippy::cast_precision_loss)]
+                    let occupied = p.count as f32 * p.tab_width + CONTROLS_WIDTH;
+                    assert!(occupied <= width + 0.01);
+                }
+            }
+        }
     }
 }

@@ -34,6 +34,70 @@ pub struct Adapter {
 }
 
 impl Adapter {
+    /// Project effective solver rectangles into disposable toolkit ratios.
+    /// Iced measures ratios through the divider centre; the model measures
+    /// the first child's fraction of usable space (excluding the divider).
+    pub fn project(
+        &mut self,
+        state: &WorkspaceState,
+        size: iced::Size,
+        preview: &BTreeMap<SplitId, u32>,
+    ) {
+        let geometry = flavite_workspace::solve(
+            state,
+            flavite_workspace::Size {
+                width: size.width,
+                height: size.height,
+            },
+            1.0,
+            preview,
+        );
+        if geometry.adaptive_maximize {
+            return;
+        }
+        fn walk(
+            adapter: &mut Adapter,
+            node: &LayoutNode,
+            rects: &BTreeMap<GroupId, flavite_workspace::Rect>,
+        ) -> iced::Rectangle {
+            match node {
+                LayoutNode::Group(group) => {
+                    let r = rects[group];
+                    iced::Rectangle {
+                        x: r.x,
+                        y: r.y,
+                        width: r.width,
+                        height: r.height,
+                    }
+                }
+                LayoutNode::Split {
+                    id,
+                    arrangement,
+                    first,
+                    second,
+                    ..
+                } => {
+                    let a = walk(adapter, first, rects);
+                    let b = walk(adapter, second, rects);
+                    let all = a.union(&b);
+                    let ratio = match arrangement {
+                        Arrangement::SideBySide => {
+                            (a.width + flavite_workspace::SPLITTER_WIDTH / 2.0) / all.width
+                        }
+                        Arrangement::Stacked => {
+                            (a.height + flavite_workspace::SPLITTER_WIDTH / 2.0) / all.height
+                        }
+                    };
+                    if let Some(split) = adapter.split_map.get(id) {
+                        adapter.panes.resize(*split, ratio);
+                    }
+                    all
+                }
+            }
+        }
+        walk(self, state.tree(), &geometry.rects);
+    }
+
     /// Build the projection for `state`.
     #[must_use]
     pub fn build(state: &WorkspaceState) -> Self {

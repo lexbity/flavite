@@ -73,6 +73,18 @@ pub struct UiCommand {
 /// build is absent here (RFC §16.1): no placeholder rows.
 pub const UI_COMMANDS: &[UiCommand] = &[
     UiCommand {
+        id: "workspace.group_actions",
+        title: "Open group actions menu",
+    },
+    UiCommand {
+        id: "workspace.all_tabs",
+        title: "Show all tabs in this group",
+    },
+    UiCommand {
+        id: "workspace.new_view",
+        title: "Open new view menu",
+    },
+    UiCommand {
         id: "workspace.quick_switch",
         title: "Quick switch: open a note",
     },
@@ -197,6 +209,22 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
     else {
         return None;
     };
+    if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
+        && !app.palette_open
+        && !app.picker.open
+    {
+        return Some(Message::CancelGesture);
+    }
+    if app.strip_menu.is_some() {
+        return match key {
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Some(Message::MenuNext(true)),
+            keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some(Message::MenuNext(false)),
+            keyboard::Key::Named(keyboard::key::Named::Enter) => {
+                Some(Message::MenuPick(app.menu_selected))
+            }
+            _ => None,
+        };
+    }
     // Overlay-local navigation first (§13.1: IME/plain typing precedence).
     if app.palette_open || app.picker.open {
         if modifiers.is_empty()
@@ -215,6 +243,9 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
             });
         }
         return None;
+    }
+    if modifiers.shift() && matches!(&key, keyboard::Key::Named(keyboard::key::Named::F10)) {
+        return Some(Message::RunHostCommand("workspace.group_actions"));
     }
     // Layout and shell chords.
     if modifiers.command() {
@@ -332,8 +363,22 @@ fn command_chord(app: &App, key: &keyboard::Key, modifiers: Modifiers) -> Option
 /// Dispatch a host command id against current shell state. Availability
 /// failures surface as a status message, never as a silent no-op.
 pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
+    if !available(app, id) {
+        app.status = "This command is unavailable in the current view".into();
+        return iced::Task::none();
+    }
     let focused_group = app.focused_group();
     match id {
+        "workspace.group_actions" | "workspace.all_tabs" | "workspace.new_view" => {
+            if let Some(group) = focused_group {
+                let menu = match id {
+                    "workspace.all_tabs" => crate::workspace::StripMenu::Tabs,
+                    "workspace.new_view" => crate::workspace::StripMenu::NewView,
+                    _ => crate::workspace::StripMenu::Actions,
+                };
+                return app.update(Message::GroupMenu(group, menu));
+            }
+        }
         "workspace.quick_switch" => return iced::Task::done(Message::PickerOpen),
         "workspace.command_palette" => return iced::Task::done(Message::PaletteOpen),
         "workspace.new_tab" => {
@@ -439,6 +484,39 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
         other => app.status = format!("{other} is not a host command"),
     }
     iced::Task::none()
+}
+
+/// Shared availability for shell menus and host dispatch; reducer/core guards
+/// still recheck every accepted action.
+#[must_use]
+pub fn available(app: &App, id: &str) -> bool {
+    if app.has_composition() {
+        return false;
+    }
+    let Some(group) = app.focused_group() else {
+        return false;
+    };
+    match id {
+        "workspace.duplicate_tab" => app
+            .workspace
+            .tab(&app.workspace.focused_tab())
+            .is_some_and(|v| v.duplicate().is_some()),
+        "workspace.split_right" | "workspace.split_down" => {
+            app.layout_fits(&LayoutAction::SplitGroup {
+                expected_revision: app.workspace.revision(),
+                group,
+                arrangement: if id.ends_with("right") {
+                    flavite_workspace::Arrangement::SideBySide
+                } else {
+                    flavite_workspace::Arrangement::Stacked
+                },
+            })
+        }
+        "workspace.move_tab_next_group"
+        | "workspace.move_tab_previous_group"
+        | "workspace.merge_next_group" => app.workspace.groups().count() > 1,
+        _ => true,
+    }
 }
 
 fn move_tab_to_neighbor(app: &mut App, forward: bool) {

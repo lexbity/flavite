@@ -45,6 +45,8 @@ pub struct EditorWidget<'a, Message> {
     on_action: Box<dyn Fn(EditorAction) -> Message + 'a>,
     on_interaction: Option<Box<dyn Fn(EditorInteractionSnapshot) -> Message + 'a>>,
     initial_interaction: Option<EditorInteractionSnapshot>,
+    view_key: Option<(u128, u64)>,
+    input_enabled: bool,
     width: Length,
     height: Length,
     _message: PhantomData<Message>,
@@ -66,6 +68,8 @@ impl<'a, Message> EditorWidget<'a, Message> {
             on_action: Box::new(on_action),
             on_interaction: None,
             initial_interaction: None,
+            view_key: None,
+            input_enabled: true,
             width: Length::Fill,
             height: Length::Fill,
             _message: PhantomData,
@@ -114,6 +118,21 @@ impl<'a, Message> EditorWidget<'a, Message> {
     #[must_use]
     pub fn with_initial_interaction(mut self, interaction: EditorInteractionSnapshot) -> Self {
         self.initial_interaction = Some(interaction);
+        self
+    }
+
+    /// Stable host identity prevents a retained widget slot from inheriting
+    /// another view's caret when two views share a buffer.
+    #[must_use]
+    pub fn with_view_key(mut self, key: u128, incarnation: u64) -> Self {
+        self.view_key = Some((key, incarnation));
+        self
+    }
+
+    /// Modal overlays suppress background editor input without losing its caret.
+    #[must_use]
+    pub fn with_input_enabled(mut self, enabled: bool) -> Self {
+        self.input_enabled = enabled;
         self
     }
 
@@ -347,6 +366,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
 /// Widget-local interaction state. Text and mutations remain Session-owned.
 #[derive(Debug, Default)]
 pub struct EditorState {
+    view_key: Option<(u128, u64)>,
     buffer_id: Option<u64>,
     revision: Option<u64>,
     link_spans: Vec<LinkSpan>,
@@ -621,7 +641,11 @@ impl EditorState {
             .filter(|byte| *byte == b'\n')
             .count();
         self.focused = interaction.focused;
+        self.ime_active = interaction.focused;
         self.interaction_sequence = interaction.sequence;
+        if self.focused {
+            self.ensure_caret_visible(text);
+        }
     }
 
     fn input_method_event(
@@ -766,7 +790,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         &self,
         tree: &Tree,
         renderer: &mut iced::Renderer,
-        _theme: &Theme,
+        theme: &Theme,
         _style: &renderer::Style,
         layout: Layout<'_>,
         _cursor: mouse::Cursor,
@@ -780,7 +804,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 border: Border::default(),
                 ..renderer::Quad::default()
             },
-            Background::Color(Color::from_rgb(0.10, 0.11, 0.13)),
+            Background::Color(theme.palette().background),
         );
         let clip = bounds
             .intersection(viewport)
@@ -1024,6 +1048,10 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
 
     fn diff(&self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<EditorState>();
+        if state.view_key != self.view_key {
+            *state = EditorState::default();
+            state.view_key = self.view_key;
+        }
         state.reconcile(&self.view, &self.link_resolutions);
         if let Some(interaction) = self.initial_interaction {
             state.restore_interaction(&self.view.text, interaction);
@@ -1056,6 +1084,9 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         _viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<EditorState>();
+        if !self.input_enabled {
+            return;
+        }
         match event {
             iced::Event::InputMethod(input_event) if state.focused => {
                 if let Some(action) = state.input_method_event(&self.view, input_event) {
@@ -1736,6 +1767,43 @@ mod tests {
         let end = text.len();
         assert_eq!(previous_grapheme_boundary(text, end), "a🧑🏽‍💻".len());
         assert_eq!(next_grapheme_boundary(text, 1), "a🧑🏽‍💻".len());
+    }
+
+    #[test]
+    fn keyed_views_restore_lower_sequences_without_inheriting_shared_buffer_carets() {
+        let view = EditorView::from(&test_view("abcdef", 77));
+        let snapshot = |sequence, caret| EditorInteractionSnapshot {
+            sequence,
+            buffer_id: view.buffer_id,
+            revision: view.revision,
+            caret,
+            selection: (caret, caret),
+            viewport_anchor: 0,
+            focused: true,
+            composing: false,
+        };
+        let first: iced::Element<'_, EditorAction> =
+            EditorWidget::from_view(view.clone(), |action| action)
+                .with_view_key(1, 1)
+                .with_initial_interaction(snapshot(10, 1))
+                .into();
+        let mut tree = Tree::new(&first);
+        first.as_widget().diff(&mut tree);
+        assert_eq!(tree.state.downcast_ref::<EditorState>().caret(), 1);
+        let second: iced::Element<'_, EditorAction> =
+            EditorWidget::from_view(view.clone(), |action| action)
+                .with_view_key(2, 1)
+                .with_initial_interaction(snapshot(1, 5))
+                .into();
+        second.as_widget().diff(&mut tree);
+        assert_eq!(tree.state.downcast_ref::<EditorState>().caret(), 5);
+        let reopened: iced::Element<'_, EditorAction> =
+            EditorWidget::from_view(view.clone(), |action| action)
+                .with_view_key(2, 2)
+                .with_initial_interaction(snapshot(1, 3))
+                .into();
+        reopened.as_widget().diff(&mut tree);
+        assert_eq!(tree.state.downcast_ref::<EditorState>().caret(), 3);
     }
 
     fn test_view(text: &str, buffer_id: u64) -> BufferView {
