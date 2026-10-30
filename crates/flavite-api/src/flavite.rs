@@ -268,6 +268,8 @@ pub struct Flavite {
     read_only: bool,
     /// Keeps root ownership and actor resources alive for `open_root` callers.
     owned_vault: Option<Vault>,
+    /// Bounded asynchronous context query service (W04).
+    queries: crate::query_service::QueryService,
 }
 
 impl Flavite {
@@ -287,8 +289,13 @@ impl Flavite {
     ) -> Result<Self, FlaviteError> {
         let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
 
+        let session = Arc::new(session);
+        let queries = crate::query_service::QueryService::new(
+            Arc::clone(&session),
+            uuid::Uuid::now_v7().as_u128(),
+        );
         let flavite = Self {
-            session: Arc::new(session),
+            session,
             command_registry: CommandRegistry::new(),
             ingress: Mutex::new(()),
             operation_ids: Mutex::new(HashMap::new()),
@@ -299,6 +306,7 @@ impl Flavite {
             vault_ref,
             read_only: false,
             owned_vault: None,
+            queries,
         };
 
         // Register built-in commands
@@ -315,8 +323,13 @@ impl Flavite {
         vault_ref: ApiVaultRef,
         _config: VaultConfig,
     ) -> Result<Self, FlaviteError> {
+        let session = Arc::new(session);
+        let queries = crate::query_service::QueryService::new(
+            Arc::clone(&session),
+            uuid::Uuid::now_v7().as_u128(),
+        );
         let flavite = Self {
-            session: Arc::new(session),
+            session,
             command_registry: CommandRegistry::new(),
             ingress: Mutex::new(()),
             operation_ids: Mutex::new(HashMap::new()),
@@ -327,6 +340,7 @@ impl Flavite {
             vault_ref,
             read_only: false,
             owned_vault: None,
+            queries,
         };
 
         flavite.register_builtin_commands()?;
@@ -344,6 +358,10 @@ impl Flavite {
         _config: VaultConfig,
     ) -> Result<Self, FlaviteError> {
         let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
+        let queries = crate::query_service::QueryService::new(
+            Arc::clone(&session),
+            uuid::Uuid::now_v7().as_u128(),
+        );
         let flavite = Self {
             session,
             command_registry: CommandRegistry::new(),
@@ -351,6 +369,7 @@ impl Flavite {
             operation_ids: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashSet::new()),
             terminal_backlog: Mutex::new(HashMap::new()),
+            queries,
             notice_acks: Mutex::new(std::collections::BTreeMap::new()),
             next_notice_id: AtomicU64::new(1),
             vault_ref,
@@ -637,6 +656,21 @@ impl Flavite {
         false
     }
 
+    /// Inject a typed notice as if the core had raised it. Test-only seam
+    /// for host-boundary notice-ledger conformance; not part of the API.
+    #[doc(hidden)]
+    pub fn inject_notice_for_test(&self, code: &'static str) {
+        self.session
+            .notice_channel()
+            .send(flavite_vault::channels::Notice::ActionRequired { code, note: None });
+    }
+
+    /// The bounded asynchronous context query service (W04).
+    #[must_use]
+    pub const fn query_service(&self) -> &crate::query_service::QueryService {
+        &self.queries
+    }
+
     /// Current number of notice credits held by the host.
     #[must_use]
     pub fn outstanding_notice_count(&self) -> usize {
@@ -798,7 +832,10 @@ impl Flavite {
             .get_spec(invocation.command_id)
             .is_some_and(|spec| spec.requires_write)
             || invocation.preconditions.requires_write;
-        if self.read_only && requires_write && !invocation.preconditions.allow_read_only {
+        // The write policy is a property of the opened vault, never of the
+        // caller's preconditions (TD-17): a read-only vault rejects every
+        // write-requiring command regardless of requested exceptions.
+        if self.read_only && requires_write {
             return ExecutionResult::Rejected(RejectedResult::with_request(
                 RejectionReason::ReadOnly,
                 invocation.request_id,

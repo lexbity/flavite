@@ -174,12 +174,14 @@ impl Query {
                 }
             }
             Self::Prop { key, op, value } => prop_to_sql(key, *op, value),
+            // Notes that link TO the given note: the link's source row.
             Self::LinksTo(note_ref) => (
-                "note_id IN (SELECT dst_note FROM links WHERE dst_note = ?)".to_string(),
+                "note_id IN (SELECT src FROM links WHERE dst_note = ?)".to_string(),
                 vec![Box::new(note_ref.note_id) as Box<dyn rusqlite::ToSql>],
             ),
+            // Notes linked FROM the given note: the link's destination row.
             Self::LinkedFrom(note_ref) => (
-                "note_id IN (SELECT src FROM links WHERE src = ?)".to_string(),
+                "note_id IN (SELECT dst_note FROM links WHERE src = ?)".to_string(),
                 vec![Box::new(note_ref.note_id) as Box<dyn rusqlite::ToSql>],
             ),
             Self::Unresolved => (

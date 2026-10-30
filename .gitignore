@@ -29,6 +29,9 @@ scratch-devdocs/
 *.profdata
 
 # OS / editor cruft.
+.zcode
+.claude
+.codex
 .DS_Store
 Thumbs.db
 *.swp

@@ -61,24 +61,48 @@ case "$profile" in
         bash "$0" W02 "$root"
         for file in \
             crates/flavite-workspace/src/input.rs \
+            crates/flavite-buffer/src/positions.rs \
             crates/flavite-editor/src/surface.rs \
             crates/flavite-editor/src/widget.rs \
             crates/flavite-api/src/flavite.rs \
             crates/flavite-ui/src/operation.rs \
+            crates/flavite-ui/src/host/documents.rs \
+            crates/flavite-ui/src/views/note.rs \
             crates/flavite-ui/tests/shared_views.rs; do
             assert_nonempty "$root/$file"
         done
         assert_absent 'active_buffer|\.session\(\)|execute_session\(' \
             "$root/crates/flavite-ui/src/app.rs" \
             "$root/crates/flavite-ui/src/host" \
+            "$root/crates/flavite-ui/src/views" \
             "$root/crates/flavite-ui/src/operation.rs"
         assert_absent 'pub history: Option|pub navigation: Option|pub command_id:.*str' \
             "$root/crates/flavite-editor/src/surface.rs"
         assert_absent 'state == "|state != "' \
-            "$root/crates/flavite-ui/src/app.rs" \
+            "$root/crates/flavite-ui/src/views" \
             "$root/crates/flavite-editor/src/widget.rs"
         assert_absent 'pub fn session\(|pub fn execute_session\(' \
             "$root/crates/flavite-api/src/flavite.rs"
+        ;;
+    W04)
+        # W03 gates remain additive; W04 adds the context-routing contract.
+        bash "$0" W03 "$root"
+        for file in \
+            crates/flavite-workspace/src/context.rs \
+            crates/flavite-api/src/query_service.rs \
+            crates/flavite-ui/src/host/context.rs \
+            crates/flavite-ui/src/views/context_header.rs \
+            crates/flavite-ui/src/views/preview.rs \
+            crates/flavite-ui/src/views/backlinks.rs \
+            crates/flavite-workspace/tests/context_properties.rs \
+            crates/flavite-ui/tests/context_routing.rs; do
+            assert_nonempty "$root/$file"
+        done
+        assert_absent 'active_buffer|nearest_editor|last_pane' \
+            "$root/crates/flavite-ui/src/host/context.rs" \
+            "$root/crates/flavite-ui/src/views"
+        assert_absent 'rusqlite|flavite_index|flavite_vault' \
+            "$root/crates/flavite-ui/src/views"
         ;;
     *)
         echo "unknown workspace contract profile: ${profile:-<empty>}" >&2

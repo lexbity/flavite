@@ -160,7 +160,9 @@ impl<'a, Message> EditorWidget<'a, Message> {
         shell.publish((self.on_action)(action));
     }
 
-    fn execute_key(
+    /// Headless key dispatch through the real keymap; used by the runtime
+    /// event loop and by controlled-input tests.
+    pub fn execute_key(
         &self,
         state: &mut EditorState,
         key: &Key,
@@ -610,6 +612,11 @@ impl EditorState {
     /// Whether an IME owns the current input sequence. Hosts use this to
     /// refuse actions that would hide or replace a composing editor.
     #[must_use]
+    /// Whether this editor currently owns keyboard focus.
+    pub fn is_focused(&self) -> bool {
+        self.focused
+    }
+
     pub fn is_composing(&self) -> bool {
         self.composition.is_some()
     }
@@ -627,7 +634,10 @@ impl EditorState {
         })
     }
 
-    fn restore_interaction(&mut self, text: &str, interaction: EditorInteractionSnapshot) {
+    /// Install a host-controlled interaction acknowledgement. Lower or
+    /// equal sequences and mismatched buffer/revision are rejected, so a
+    /// delayed or stale acknowledgement can never move the caret back.
+    pub fn restore_interaction(&mut self, text: &str, interaction: EditorInteractionSnapshot) {
         if self.buffer_id != Some(interaction.buffer_id)
             || self.revision != Some(interaction.revision)
             || interaction.sequence <= self.interaction_sequence
@@ -648,10 +658,13 @@ impl EditorState {
         }
     }
 
-    fn input_method_event(
+    /// Feed one platform input-method event through the controlled
+    /// composition state; preedit stays transient and commits to at most
+    /// one revision-guarded edit.
+    pub fn input_method_event(
         &mut self,
         view: &EditorView,
-        event: &input_method::Event,
+        event: &iced::advanced::input_method::Event,
     ) -> Option<EditorAction> {
         match event {
             input_method::Event::Opened => {
@@ -724,7 +737,13 @@ impl EditorState {
         }
     }
 
-    fn reconcile(&mut self, view: &EditorView, link_resolutions: &HashMap<String, LinkResolution>) {
+    /// Reconcile widget state with a replacement controlled buffer view
+    /// (reload, journal patch, reopen under the same tab role).
+    pub fn reconcile(
+        &mut self,
+        view: &EditorView,
+        link_resolutions: &HashMap<String, LinkResolution>,
+    ) {
         if self
             .buffer_id
             .is_some_and(|buffer_id| buffer_id != view.buffer_id)
@@ -766,7 +785,9 @@ impl EditorState {
         }
     }
 
-    fn place_caret_from_point(&mut self, text: &str, x: f32, y: f32, width: f32, extend: bool) {
+    /// Pointer selection against shaped text: places or extends the
+    /// selection at the glyph boundary under the point.
+    pub fn place_caret_from_point(&mut self, text: &str, x: f32, y: f32, width: f32, extend: bool) {
         let byte = hit_test_visible(text, self.viewport, x, y, width);
         self.move_to(byte, extend);
     }
@@ -1325,6 +1346,14 @@ fn link_action_at(view: &EditorView, spans: &[LinkSpan], byte: usize) -> Option<
             create_if_unresolved: true,
         },
     ))
+}
+
+/// Shape text at a fixed monospace width for headless pointer-selection
+/// tests and glyph-boundary assertions.
+#[doc(hidden)]
+#[must_use]
+pub fn shape_for_test(text: &str, width: f32) -> ShapingBuffer {
+    shape_text(text, width)
 }
 
 fn shape_text(text: &str, width: f32) -> ShapingBuffer {

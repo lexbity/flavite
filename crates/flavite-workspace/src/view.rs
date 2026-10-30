@@ -6,13 +6,15 @@
 //! real kinds `Empty`, `Note`, and `Notes`; serialized unknown kinds become
 //! inert preserved records when the codec lands (W06).
 
+use crate::context::ContextBinding;
 use crate::ids::TabId;
 use crate::input::EditorInteraction;
 use std::path::{Path, PathBuf};
 
 /// A validated, vault-relative note locator (§7.1). Display strings are not
-/// identity; the components are kept exactly as constructed.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// identity; the components are kept exactly as constructed. Ordering is by
+/// path components, so registries can key documents by locator.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NoteLocator {
     components: Vec<String>,
 }
@@ -115,6 +117,10 @@ pub enum ViewKind {
     Note(NoteView),
     /// The vault note list.
     Notes,
+    /// Saved source-text preview of the bound context source (W04).
+    Preview(ContextBinding),
+    /// Inbound links of the bound context source (W04).
+    Backlinks(ContextBinding),
 }
 
 impl ViewKind {
@@ -128,6 +134,10 @@ impl ViewKind {
                 NoteLoad::Reserved,
             ))),
             ViewKind::Notes => Some(ViewKind::Notes),
+            // A duplicated context tool is an independent view with its own
+            // copy of the binding; the binding target itself is unchanged.
+            ViewKind::Preview(binding) => Some(ViewKind::Preview(binding.clone())),
+            ViewKind::Backlinks(binding) => Some(ViewKind::Backlinks(binding.clone())),
         }
     }
 }
@@ -209,6 +219,8 @@ impl ViewSession {
             ViewKind::Empty => "Empty".into(),
             ViewKind::Notes => "Notes".into(),
             ViewKind::Note(note) => note.locator().title().to_owned(),
+            ViewKind::Preview(_) => "Preview".into(),
+            ViewKind::Backlinks(_) => "Backlinks".into(),
         }
     }
 
@@ -223,6 +235,8 @@ impl ViewSession {
                 NoteLoad::Reserved,
             ))),
             ViewKind::Notes => Some(ViewKind::Notes),
+            ViewKind::Preview(binding) => Some(ViewKind::Preview(binding.clone())),
+            ViewKind::Backlinks(binding) => Some(ViewKind::Backlinks(binding.clone())),
         }
     }
 }

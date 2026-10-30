@@ -16,5 +16,6 @@ pub mod palette;
 pub mod settings;
 pub mod style;
 pub mod subscription;
+pub mod views;
 pub mod workspace;
 pub mod workspace_shell;

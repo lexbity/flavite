@@ -10,6 +10,7 @@
 //! its expected revision matches, applied to a copy, normalized, and
 //! validated before it commits. Rejected transactions leave state untouched.
 
+pub mod context;
 pub mod geometry;
 pub mod ids;
 pub mod input;
@@ -18,6 +19,10 @@ pub mod reducer;
 pub mod validate;
 pub mod view;
 
+pub use context::{
+    ContextBinding, ContextRouter, ContextSource, ContextViewKind, EntityLocator,
+    ExplorationSelection, UnboundReason, is_source_kind,
+};
 pub use geometry::{
     Rect, SPLITTER_WIDTH, Size, fits, rects, required_minimum, solve, view_minimum,
 };

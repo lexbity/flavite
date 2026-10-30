@@ -153,6 +153,22 @@ pub const UI_COMMANDS: &[UiCommand] = &[
         title: "Open notes list",
     },
     UiCommand {
+        id: "workspace.open_preview",
+        title: "Open preview of the followed note",
+    },
+    UiCommand {
+        id: "workspace.open_backlinks",
+        title: "Open backlinks of the followed note",
+    },
+    UiCommand {
+        id: "context.pin",
+        title: "Pin this context tool to its current source",
+    },
+    UiCommand {
+        id: "context.follow_document",
+        title: "Follow the document anchor again",
+    },
+    UiCommand {
         id: "workspace.close_group",
         title: "Close group",
     },
@@ -481,6 +497,37 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
                 });
             }
         }
+        "workspace.open_preview" => {
+            return iced::Task::done(Message::OpenContextView {
+                view: flavite_workspace::ContextViewKind::Preview,
+                group: focused_group,
+            });
+        }
+        "workspace.open_backlinks" => {
+            return iced::Task::done(Message::OpenContextView {
+                view: flavite_workspace::ContextViewKind::Backlinks,
+                group: focused_group,
+            });
+        }
+        "context.pin" => {
+            let tab = app.workspace.focused_tab();
+            if let Some(source) = app.contexts.observed(&tab) {
+                return iced::Task::done(Message::SetContextBinding {
+                    tab,
+                    binding: flavite_workspace::ContextBinding::Pinned(
+                        flavite_workspace::EntityLocator::new(source.locator.clone()),
+                    ),
+                });
+            }
+            app.status = "This context tool has no source to pin yet".into();
+        }
+        "context.follow_document" => {
+            let tab = app.workspace.focused_tab();
+            return iced::Task::done(Message::SetContextBinding {
+                tab,
+                binding: flavite_workspace::ContextBinding::FollowDocument,
+            });
+        }
         other => app.status = format!("{other} is not a host command"),
     }
     iced::Task::none()
@@ -497,6 +544,15 @@ pub fn available(app: &App, id: &str) -> bool {
         return false;
     };
     match id {
+        "context.pin" => {
+            app.contexts
+                .observed(&app.workspace.focused_tab())
+                .is_some()
+                && crate::views::context_header::is_context_tab(app, app.workspace.focused_tab())
+        }
+        "context.follow_document" => {
+            crate::views::context_header::is_context_tab(app, app.workspace.focused_tab())
+        }
         "workspace.duplicate_tab" => app
             .workspace
             .tab(&app.workspace.focused_tab())

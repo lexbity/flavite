@@ -303,6 +303,18 @@ fn close_reopen_round_trip_restores_the_note() {
         app.note_state_text(reopened).as_deref(),
         Some("# Alpha\n\nalpha body\n")
     );
+    // The reopened tab's load state actually resolves, not just the
+    // registry buffer behind it.
+    assert_eq!(
+        app.workspace.tab(&reopened).map(|view| view.title()),
+        Some("alpha".to_owned()),
+    );
+    let load_ready = matches!(
+        app.workspace.tab(&reopened).map(|view| view.kind().clone()),
+        Some(flavite_workspace::ViewKind::Note(note))
+            if note.load() == flavite_workspace::NoteLoad::Ready
+    );
+    assert!(load_ready, "the reopened tab must reach NoteLoad::Ready");
 }
 
 #[test]

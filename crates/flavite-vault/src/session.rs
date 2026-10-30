@@ -971,6 +971,19 @@ impl Session {
             .resolve_target(target_key, raw_target, is_embed, source_path_key)
     }
 
+    /// Read the saved bytes of one note directly from the vault actor.
+    ///
+    /// This is a read-only bounded snapshot of saved content for query
+    /// workers; it never touches open-buffer state or the driving turn.
+    ///
+    /// # Errors
+    /// Returns the actor error text when the read cannot be served.
+    pub fn read_saved_note(&self, path: &Path) -> Result<Option<Vec<u8>>, String> {
+        self.actor
+            .read_file(path.to_path_buf())
+            .map_err(|error| error.to_string())
+    }
+
     /// Execute a text or hybrid query on the index actor.
     pub fn search_notes(
         &self,

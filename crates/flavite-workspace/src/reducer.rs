@@ -11,6 +11,7 @@
 //! Rejected actions leave state byte-identical (AC-W01). The reducer never
 //! allocates operating-system resources and never inspects the toolkit.
 
+use crate::context::{ContextBinding, ContextViewKind, ExplorationSelection};
 use crate::ids::{GroupId, Ids, SplitId, TabId, WorkspaceId};
 use crate::layout::{
     Arrangement, DEFAULT_RATIO_PPM, Edge, LayoutNode, MAX_DEPTH, MAX_GROUPS, MAX_RATIO_PPM,
@@ -101,6 +102,9 @@ pub struct WorkspaceState {
     tabs: BTreeMap<TabId, ViewSession>,
     focus: TabId,
     document_anchor: Option<TabId>,
+    document_publication: u64,
+    exploration: Option<ExplorationSelection>,
+    exploration_sequence: u64,
     writing_target: Option<crate::input::WritingTarget>,
     maximized: Option<GroupId>,
     recently_closed: VecDeque<NoteLocator>,
@@ -142,6 +146,12 @@ pub enum Effect {
         /// The new load state.
         load: NoteLoad,
     },
+    /// A context tool's effective source may have changed; the host must
+    /// re-resolve its binding through [`crate::context::ContextRouter`].
+    ContextRebound {
+        /// The context tool tab to re-resolve.
+        tab: TabId,
+    },
 }
 
 /// The result of one [`reduce`] call.
@@ -175,6 +185,20 @@ pub enum LayoutAction {
     OpenNotes {
         expected_revision: u64,
         group: GroupId,
+    },
+    /// Open a context tool (Preview/Backlinks) with an explicit binding.
+    OpenContext {
+        expected_revision: u64,
+        view: ContextViewKind,
+        binding: ContextBinding,
+        group: GroupId,
+    },
+    /// Rebind an existing context tool; sinks cannot follow sinks, which
+    /// [`ContextViewKind`] construction and this arm's validation enforce.
+    SetContextBinding {
+        expected_revision: u64,
+        tab: TabId,
+        binding: ContextBinding,
     },
     /// Activate and focus a tab.
     ActivateTab { expected_revision: u64, tab: TabId },
@@ -271,6 +295,12 @@ impl LayoutAction {
             | Self::OpenNotes {
                 expected_revision, ..
             }
+            | Self::OpenContext {
+                expected_revision, ..
+            }
+            | Self::SetContextBinding {
+                expected_revision, ..
+            }
             | Self::ActivateTab {
                 expected_revision, ..
             }
@@ -353,6 +383,9 @@ impl WorkspaceState {
             tabs,
             focus: tab,
             document_anchor: None,
+            document_publication: 0,
+            exploration: None,
+            exploration_sequence: 0,
             writing_target: None,
             maximized: None,
             recently_closed: VecDeque::new(),
@@ -471,6 +504,11 @@ impl WorkspaceState {
             .ok_or("interaction tab closed during acknowledgement")?
             .set_interaction(interaction);
         if focused {
+            if self.document_anchor != Some(tab) {
+                // A new document anchor is a new publication; context tools
+                // re-resolve through the router and re-query by publication.
+                self.document_publication = self.document_publication.saturating_add(1);
+            }
             self.document_anchor = Some(tab);
             self.writing_target = target;
         } else if self.writing_target.is_some_and(|target| target.tab == tab) {
@@ -502,6 +540,98 @@ impl WorkspaceState {
     #[must_use]
     pub const fn document_anchor(&self) -> Option<TabId> {
         self.document_anchor
+    }
+
+    /// Monotonic publication counter for the document anchor. Every anchor
+    /// change or retirement increments it; context tools re-resolve when
+    /// their observed publication differs.
+    #[must_use]
+    pub const fn document_publication(&self) -> u64 {
+        self.document_publication
+    }
+
+    /// The publication sequence at which `tab` became the document anchor;
+    /// zero when the tab is not the current anchor.
+    #[must_use]
+    pub fn document_publication_of(&self, tab: TabId) -> u64 {
+        if self.document_anchor == Some(tab) {
+            self.document_publication
+        } else {
+            0
+        }
+    }
+
+    /// The current exploration selection, published by a source view.
+    #[must_use]
+    pub const fn exploration(&self) -> Option<&ExplorationSelection> {
+        self.exploration.as_ref()
+    }
+
+    /// Publish an exploration selection from a source view (graph W07,
+    /// search W10). Sinks cannot publish; the source tab must exist and be
+    /// a source kind.
+    ///
+    /// # Errors
+    /// Returns an error when the publishing tab is unknown or is a sink.
+    pub fn publish_exploration(
+        &mut self,
+        source_tab: TabId,
+        incarnation: u64,
+        target: NoteLocator,
+    ) -> Result<(), &'static str> {
+        let session = self
+            .tabs
+            .get(&source_tab)
+            .ok_or("exploration source tab is closed")?;
+        if !crate::context::is_source_kind(session.kind()) {
+            return Err("sinks cannot publish exploration selections");
+        }
+        self.exploration_sequence = self.exploration_sequence.saturating_add(1);
+        self.exploration = Some(ExplorationSelection {
+            source_tab,
+            incarnation,
+            sequence: self.exploration_sequence,
+            target,
+        });
+        self.document_publication = self.document_publication.saturating_add(1);
+        Ok(())
+    }
+
+    /// Publish an explicitly empty exploration selection for one source.
+    /// Only the publishing source can clear its own selection.
+    pub fn clear_exploration(&mut self, source_tab: TabId) {
+        if self
+            .exploration
+            .as_ref()
+            .is_some_and(|selection| selection.source_tab == source_tab)
+        {
+            self.exploration = None;
+            self.document_publication = self.document_publication.saturating_add(1);
+        }
+    }
+
+    /// The explicit binding of a context tool tab.
+    #[must_use]
+    pub fn binding_of(&self, tab: &TabId) -> Option<&ContextBinding> {
+        match self.tab(tab)?.kind() {
+            ViewKind::Preview(binding) | ViewKind::Backlinks(binding) => Some(binding),
+            _ => None,
+        }
+    }
+
+    /// One rebind signal per surviving context tool, after any change that
+    /// can alter their effective sources.
+    fn context_rebound_effects(&self) -> Vec<Effect> {
+        self.tabs
+            .iter()
+            .filter(|(_, session)| {
+                matches!(
+                    session.kind(),
+                    ViewKind::Preview(_) | ViewKind::Backlinks(_)
+                )
+            })
+            .map(|(tab, _)| Effect::ContextRebound { tab: *tab })
+            .collect()
     }
 
     /// Current explicitly acknowledged semantic insertion target.
@@ -686,6 +816,17 @@ impl WorkspaceState {
     fn forget_source(&mut self, tab: TabId) {
         if self.document_anchor == Some(tab) {
             self.document_anchor = None;
+            // Retirement of the anchor is observable: sinks re-resolve to a
+            // typed unbound state instead of silently keeping stale content.
+            self.document_publication = self.document_publication.saturating_add(1);
+        }
+        if self
+            .exploration
+            .as_ref()
+            .is_some_and(|selection| selection.source_tab == tab)
+        {
+            self.exploration = None;
+            self.document_publication = self.document_publication.saturating_add(1);
         }
         if self.writing_target.is_some_and(|target| target.tab == tab) {
             self.writing_target = None;
@@ -943,6 +1084,36 @@ fn apply(state: &mut WorkspaceState, action: &LayoutAction) -> Result<Vec<Effect
                 kind: ViewKind::Notes,
             }])
         }
+        LayoutAction::OpenContext {
+            view,
+            binding,
+            group,
+            ..
+        } => {
+            let tab = state.ids.tab_id();
+            let kind = view.view_kind(binding.clone());
+            let tab = state.append_tab(*group, ViewSession::new(tab, kind.clone()))?;
+            Ok(vec![
+                Effect::ViewAttached {
+                    tab,
+                    kind: state.tabs[&tab].kind().clone(),
+                },
+                Effect::ContextRebound { tab },
+            ])
+        }
+        LayoutAction::SetContextBinding { tab, binding, .. } => {
+            let session = state
+                .tabs
+                .get_mut(tab)
+                .ok_or(WorkspaceError::UnknownTab(*tab))?;
+            match session.kind_mut() {
+                ViewKind::Preview(binding_slot) | ViewKind::Backlinks(binding_slot) => {
+                    *binding_slot = binding.clone();
+                }
+                _ => return Err(WorkspaceError::UnknownTab(*tab)),
+            }
+            Ok(vec![Effect::ContextRebound { tab: *tab }])
+        }
         LayoutAction::ActivateTab { tab, .. } => {
             let owner = state.owner_of(*tab)?;
             state.group_mut(&owner)?.set_active(*tab);
@@ -963,7 +1134,9 @@ fn apply(state: &mut WorkspaceState, action: &LayoutAction) -> Result<Vec<Effect
             }
             state.detach_tab(*tab)?;
             state.forget_source(*tab);
-            Ok(vec![Effect::ViewDetached { tab: *tab, kind }])
+            let mut effects = vec![Effect::ViewDetached { tab: *tab, kind }];
+            effects.extend(state.context_rebound_effects());
+            Ok(effects)
         }
         LayoutAction::CloseGroup { group, .. } => {
             let members = state
@@ -985,6 +1158,7 @@ fn apply(state: &mut WorkspaceState, action: &LayoutAction) -> Result<Vec<Effect
                 state.detach_tab(tab)?;
                 state.forget_source(tab);
             }
+            effects.extend(state.context_rebound_effects());
             Ok(effects)
         }
         LayoutAction::DuplicateTab { tab, .. } => {
@@ -1315,8 +1489,10 @@ pub fn reduce(state: &WorkspaceState, action: LayoutAction) -> Outcome {
                     seen.insert(*tab)
                 }
                 // Load changes are unique per tab and state in one commit;
-                // the apply step rejects no-op transitions.
+                // the apply step rejects no-op transitions. Rebind signals
+                // are unique per context tab by construction.
                 Effect::NoteLoadChanged { .. } => true,
+                Effect::ContextRebound { tab } => seen.insert(*tab),
             });
             Outcome::Committed(Commit {
                 state: candidate,

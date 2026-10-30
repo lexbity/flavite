@@ -6,7 +6,8 @@
 //! rendering lives in [`crate::workspace_shell`].
 
 use crate::host::commands as host_commands;
-use crate::host::effects::NoteRegistry;
+use crate::host::context::ContextRegistry;
+use crate::host::documents::{AttachDecision, DocumentRegistry};
 use crate::operation::OperationPump;
 use crate::palette::matching_specs;
 use crate::settings::Settings;
@@ -20,6 +21,11 @@ use flavite_workspace::{
 };
 use iced::{Subscription, Task, keyboard};
 use std::collections::{BTreeMap, VecDeque};
+
+/// Outstanding notice credits per poll (W03: bounded credit-based polling).
+const NOTICE_CREDIT_CAPACITY: usize = 256;
+/// Completions routed per pump tick; the rest wait in the backlog (NFR-08).
+const MAX_COMPLETION_ROUTING_PER_PUMP: usize = 64;
 use std::path::PathBuf;
 
 /// The note picker overlay state.
@@ -49,7 +55,9 @@ pub struct App {
     root: PathBuf,
     pub workspace: WorkspaceState,
     pub adapter: Adapter,
-    pub notes: NoteRegistry,
+    pub notes: DocumentRegistry,
+    /// Context tool state: bindings, effective sources, and query states.
+    pub contexts: ContextRegistry,
     pub picker: Picker,
     pub palette_open: bool,
     pub palette_query: String,
@@ -70,8 +78,10 @@ pub struct App {
     settings: Settings,
     settings_valid: bool,
     operations: OperationPump,
+    /// Completions routed past the per-pump turn budget; the next pump tick
+    /// continues (NFR-08: UI event-loop work is budgeted, never lost).
+    completion_backlog: VecDeque<flavite_api::OperationCompletion>,
     pub status: String,
-    pub recent_events: Vec<String>,
     /// Visible lossless notices awaiting explicit presentation acknowledgement.
     pub notices: VecDeque<NoticePresentation>,
     reconcile_progress: Option<(u32, u32)>,
@@ -111,6 +121,24 @@ pub enum Message {
     Layout(flavite_workspace::LayoutAction),
     /// Open a real view kind in the focused group.
     NewViewInFocused(flavite_workspace::ViewKind),
+    /// Open a Preview/Backlinks tool with its D-04 default binding.
+    OpenContextView {
+        view: flavite_workspace::ContextViewKind,
+        group: Option<GroupId>,
+    },
+    /// Rebind an existing context tool (follow document, pin source, ...).
+    SetContextBinding {
+        tab: TabId,
+        binding: flavite_workspace::ContextBinding,
+    },
+    /// Force one tool to re-query its current source (retry).
+    RequeryContext {
+        tab: TabId,
+    },
+    /// Open a note chosen from a context tool row.
+    OpenNoteFromContext {
+        locator: NoteLocator,
+    },
     /// Open (or focus) a note, optionally in a specific group.
     OpenNote {
         locator: NoteLocator,
@@ -191,7 +219,8 @@ impl App {
             flavite: None,
             root,
             adapter,
-            notes: NoteRegistry::default(),
+            notes: DocumentRegistry::default(),
+            contexts: ContextRegistry::default(),
             picker: Picker::default(),
             palette_open: false,
             palette_query: String::new(),
@@ -214,8 +243,8 @@ impl App {
             settings: Settings::default(),
             settings_valid: true,
             operations: OperationPump::default(),
+            completion_backlog: VecDeque::new(),
             status,
-            recent_events: Vec::new(),
             notices: VecDeque::new(),
             reconcile_progress: None,
             window_size: iced::Size::new(1180.0, 760.0),
@@ -369,9 +398,9 @@ impl App {
         }
         let title = self
             .notes
-            .state(&target.tab)
-            .map(|state| state.locator.title())
-            .unwrap_or("note");
+            .locator_of(target.tab)
+            .map(|locator| locator.title().to_owned())
+            .unwrap_or_else(|| "note".into());
         format!("Writing target: {title}")
     }
 
@@ -499,11 +528,8 @@ impl App {
             match effect {
                 Effect::ViewAttached { tab, kind } => {
                     if let flavite_workspace::ViewKind::Note(note) = kind {
-                        let (tab, locator) = match self.notes.attach(*tab, note.locator().clone()) {
-                            Some(attached) => attached,
-                            None => continue,
-                        };
-                        let incarnation = self.notes.incarnation(tab).expect("attached note tab");
+                        let locator = note.locator().clone();
+                        let (tab, incarnation, decision) = self.notes.attach(*tab, locator.clone());
                         if let Err(error) =
                             self.workspace.install_view_incarnation(tab, incarnation)
                         {
@@ -511,13 +537,78 @@ impl App {
                             self.notes.detach(tab);
                             continue;
                         }
-                        self.open_note_tab(tab, &locator);
+                        match decision {
+                            AttachDecision::IssueOpen => self.open_note_tab(tab, &locator),
+                            // The document's buffer is already installed: the
+                            // reopened lease resolves immediately.
+                            AttachDecision::Ready => {
+                                self.dispatch_layout(|revision| LayoutAction::NoteLoadReady {
+                                    expected_revision: revision,
+                                    tab,
+                                });
+                            }
+                            // A shared flight completion installs the buffer
+                            // for every waiting lease at once.
+                            AttachDecision::FlightPending => {}
+                        }
                     }
                 }
                 Effect::ViewDetached { tab, .. } => {
                     self.notes.detach(*tab);
+                    self.contexts.detach(*tab);
                 }
                 Effect::NoteLoadChanged { .. } => {}
+                Effect::ContextRebound { .. } => {}
+            }
+        }
+        self.reconcile_contexts();
+    }
+
+    /// Re-resolve every context tool against the router and submit queries
+    /// for changed sources. Busy admission is recorded, never lost.
+    fn reconcile_contexts(&mut self) {
+        let Some(flavite) = &self.flavite else {
+            return;
+        };
+        for (tab, session) in self.workspace.tabs() {
+            let backlinks = match session.kind() {
+                flavite_workspace::ViewKind::Preview(_) => false,
+                flavite_workspace::ViewKind::Backlinks(_) => true,
+                _ => continue,
+            };
+            if self.contexts.incarnation_of(tab).is_none() {
+                self.contexts
+                    .attach(*tab, session.interaction().incarnation, backlinks);
+            }
+            let Some(binding) = self.workspace.binding_of(tab) else {
+                continue;
+            };
+            let source = flavite_workspace::ContextRouter::resolve(&self.workspace, binding);
+            if let Some(job) = self.contexts.rebind(*tab, &source) {
+                let payload = if job.backlinks {
+                    flavite_api::QueryPayload::Backlinks {
+                        path: job.path.clone(),
+                    }
+                } else {
+                    flavite_api::QueryPayload::Preview {
+                        path: job.path.clone(),
+                    }
+                };
+                match flavite.query_service().submit(
+                    job.tab.raw(),
+                    job.incarnation,
+                    job.binding_sequence,
+                    payload,
+                ) {
+                    Ok(token) => {
+                        self.contexts.submitted(
+                            job.tab,
+                            job.binding_sequence,
+                            token.request_sequence,
+                        );
+                    }
+                    Err(_) => self.contexts.busy(job.tab, job.binding_sequence),
+                }
             }
         }
     }
@@ -582,6 +673,10 @@ impl App {
                     .acknowledge_interaction(interaction, &current.text)
                 {
                     self.status = format!("Editor state was not accepted: {error}");
+                } else {
+                    // The anchor publication may have changed; context tools
+                    // re-resolve immediately.
+                    self.reconcile_contexts();
                 }
             }
             EditorAction::Navigate {
@@ -932,6 +1027,18 @@ impl App {
                             expected_revision: revision,
                             group,
                         },
+                        flavite_workspace::ViewKind::Preview(_) => LayoutAction::OpenContext {
+                            expected_revision: revision,
+                            view: flavite_workspace::ContextViewKind::Preview,
+                            binding: flavite_workspace::ContextBinding::FollowExplorationOrDocument,
+                            group,
+                        },
+                        flavite_workspace::ViewKind::Backlinks(_) => LayoutAction::OpenContext {
+                            expected_revision: revision,
+                            view: flavite_workspace::ContextViewKind::Backlinks,
+                            binding: flavite_workspace::ContextBinding::FollowDocument,
+                            group,
+                        },
                     });
                 }
             }
@@ -1041,6 +1148,41 @@ impl App {
                 incarnation,
                 action,
             } => self.handle_editor_action(tab, incarnation, action),
+            Message::OpenContextView { view, group } => {
+                let group = group
+                    .or_else(|| self.focused_group())
+                    .or_else(|| self.workspace.first_group());
+                if let Some(group) = group {
+                    let binding = match view {
+                        flavite_workspace::ContextViewKind::Preview => {
+                            flavite_workspace::ContextBinding::FollowExplorationOrDocument
+                        }
+                        flavite_workspace::ContextViewKind::Backlinks => {
+                            flavite_workspace::ContextBinding::FollowDocument
+                        }
+                    };
+                    self.dispatch_layout(|revision| LayoutAction::OpenContext {
+                        expected_revision: revision,
+                        view,
+                        binding,
+                        group,
+                    });
+                } else {
+                    self.status = "Open a group before opening context tools".into();
+                }
+            }
+            Message::SetContextBinding { tab, binding } => {
+                self.dispatch_layout(|revision| LayoutAction::SetContextBinding {
+                    expected_revision: revision,
+                    tab,
+                    binding,
+                });
+            }
+            Message::RequeryContext { tab } => {
+                self.contexts.detach(tab);
+                self.reconcile_contexts();
+            }
+            Message::OpenNoteFromContext { locator } => self.request_open(locator, None),
         }
         self.project_geometry();
         self.refresh_semantics();
@@ -1108,7 +1250,7 @@ impl App {
             };
             flavite.pump();
             let mut refresh_catalog = false;
-            let credits = 256usize.saturating_sub(self.notices.len());
+            let credits = NOTICE_CREDIT_CAPACITY.saturating_sub(self.notices.len());
             let mut events = Vec::new();
             for delivery in flavite.poll_events(credits) {
                 let event = delivery.event;
@@ -1117,6 +1259,8 @@ impl App {
                 }
                 if matches!(&event, flavite_api::Event::VaultChanged { .. }) {
                     refresh_catalog = true;
+                    // Saved content changed: previews and backlinks re-query.
+                    self.contexts.invalidate_all();
                 }
                 events.push(format!("{}: {event:?}", event.event_type()));
                 if let Some(id) = delivery.notice_id {
@@ -1130,37 +1274,35 @@ impl App {
             }
             (events, completions)
         };
-        let (events, completions) = drained;
-        for event in events {
-            self.recent_events.push(event);
-        }
-        self.recent_events.truncate(100);
-        self.operations.ingest(&completions);
-        for completion in completions {
-            if let Some(tab) = self.notes.finish_request(completion.request_id) {
-                match &completion.result {
-                    ExecutionResult::Local(LocalResult::Success(success)) => {
-                        let buffer = success
-                            .data
-                            .get("buffer_id")
-                            .and_then(serde_json::Value::as_u64);
-                        self.notes.ready(tab, buffer);
-                        self.dispatch_layout(|revision| LayoutAction::NoteLoadReady {
-                            expected_revision: revision,
-                            tab,
-                        });
-                    }
-                    _ => {
-                        self.dispatch_layout(|revision| LayoutAction::NoteLoadFailed {
-                            expected_revision: revision,
-                            tab,
-                        });
-                    }
-                }
-            } else {
-                self.status = "Operation completed".into();
+        let (_events, completions) = drained;
+        if let Some(flavite) = &self.flavite {
+            // Context query results: late or superseded tokens are dropped
+            // by the registry, so a rebind or replaced view is never
+            // repainted by an older query.
+            for outcome in flavite.query_service().drain() {
+                let _ = self.contexts.observe(
+                    TabId::from_raw(outcome.token.context_tab),
+                    outcome.token.incarnation,
+                    outcome.token.binding_sequence,
+                    outcome.token.request_sequence,
+                    &outcome.result,
+                );
             }
         }
+        self.operations.ingest(&completions);
+        // Turn budget (NFR-08): route a bounded number of completions per
+        // pump; the remainder waits in the backlog for the next tick, typed
+        // and lossless in the ledger.
+        let mut queue = std::mem::take(&mut self.completion_backlog);
+        queue.extend(completions);
+        for _ in 0..MAX_COMPLETION_ROUTING_PER_PUMP {
+            let Some(completion) = queue.pop_front() else {
+                break;
+            };
+            self.route_completion(completion);
+        }
+        self.completion_backlog = queue;
+        self.reconcile_contexts();
         if let Some(target) = self.workspace.writing_target() {
             let remains_current = self.notes.incarnation(target.tab) == Some(target.incarnation)
                 && self.note_editor_view(target.tab).is_some_and(|view| {
@@ -1173,6 +1315,44 @@ impl App {
             if !remains_current {
                 self.workspace.invalidate_writing_target(target.buffer_id);
             }
+        }
+    }
+
+    /// Route one completion to its document flight, independent of which
+    /// tab still exists (TD-09). Outcomes without a live flight stay typed
+    /// in the ledger and are presented with their real result.
+    fn route_completion(&mut self, completion: flavite_api::OperationCompletion) {
+        let flight = self.notes.finish_request(completion.request_id);
+        let locator = flight.as_ref().map(|flight| flight.locator.clone());
+        let tabs = flight.map(|flight| flight.tabs).unwrap_or_default();
+        match &completion.result {
+            ExecutionResult::Local(LocalResult::Success(success)) => {
+                let buffer = success
+                    .data
+                    .get("buffer_id")
+                    .and_then(serde_json::Value::as_u64);
+                if let Some(locator) = &locator {
+                    self.notes.install_buffer(locator, buffer);
+                }
+                // Every lease on the document shares the flight outcome.
+                for tab in tabs {
+                    self.dispatch_layout(|revision| LayoutAction::NoteLoadReady {
+                        expected_revision: revision,
+                        tab,
+                    });
+                }
+            }
+            _ => {
+                for tab in tabs {
+                    self.dispatch_layout(|revision| LayoutAction::NoteLoadFailed {
+                        expected_revision: revision,
+                        tab,
+                    });
+                }
+            }
+        }
+        if locator.is_none() {
+            self.status = crate::operation::describe_completion(&completion);
         }
     }
 
@@ -1346,7 +1526,8 @@ mod tests {
             flavite: None,
             root: PathBuf::from("fixture-vault"),
             adapter: Adapter::build(&workspace),
-            notes: NoteRegistry::default(),
+            notes: DocumentRegistry::default(),
+            contexts: ContextRegistry::default(),
             picker: Picker::default(),
             palette_open: false,
             palette_query: String::new(),
@@ -1369,8 +1550,8 @@ mod tests {
             settings: Settings::default(),
             settings_valid: true,
             operations: OperationPump::default(),
+            completion_backlog: VecDeque::new(),
             status: "Ready".into(),
-            recent_events: Vec::new(),
             notices: VecDeque::new(),
             reconcile_progress: None,
             window_size: iced::Size::new(1180.0, 760.0),

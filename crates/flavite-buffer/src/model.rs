@@ -827,22 +827,15 @@ fn map_position(
     old_len: usize,
     new_text: &str,
 ) -> TextByte {
-    let old = position.0;
-    let mapped = if old <= prefix {
-        old
-    } else if old >= old_middle_end {
-        new_text.len().saturating_sub(old_len.saturating_sub(old))
-    } else {
-        prefix
-            + old
-                .saturating_sub(prefix)
-                .min(new_middle_end.saturating_sub(prefix))
-    };
-    let mut mapped = mapped.min(new_text.len());
-    while !new_text.is_char_boundary(mapped) {
-        mapped = mapped.saturating_sub(1);
-    }
-    TextByte(mapped)
+    let mapped = crate::positions::map_through_snapshot(
+        position.0,
+        prefix,
+        old_middle_end,
+        new_middle_end,
+        old_len,
+        new_text.len(),
+    );
+    TextByte(crate::positions::snap_to_char_boundary(new_text, mapped))
 }
 
 fn logical_lines(text: &str) -> Vec<&str> {

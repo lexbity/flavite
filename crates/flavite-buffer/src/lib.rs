@@ -8,6 +8,7 @@
 pub mod eol;
 pub mod manager;
 pub mod model;
+pub mod positions;
 pub mod recovery;
 pub mod revision;
 pub mod state;
@@ -17,6 +18,7 @@ pub mod undo;
 pub use eol::{EolTable, LineEnding};
 pub use manager::{BufferManager, BufferStateChanged, NoteRef};
 pub use model::{EditorModel, EditorModelBuilder, Selection};
+pub use positions::{Affinity, TextEdit};
 pub use recovery::{
     RecoveryConfig, RecoveryFile, RecoveryHeader, RecoveryWriter, RecoveryWriterBuilder,
 };

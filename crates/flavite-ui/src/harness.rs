@@ -113,7 +113,15 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                         },
                         flavite_workspace::ViewKind::Empty => "empty",
                         flavite_workspace::ViewKind::Notes => "notes",
+                        flavite_workspace::ViewKind::Preview(_) => "preview",
+                        flavite_workspace::ViewKind::Backlinks(_) => "backlinks",
                     };
+                    let binding = app.workspace.binding_of(tab);
+                    let context_state = app
+                        .contexts
+                        .state(tab)
+                        .map(|state| format!("{state:?}"))
+                        .unwrap_or_default();
                     let interaction = session.interaction();
                     let buffer_view = app.note_editor_view(*tab);
                     Some(serde_json::json!({
@@ -133,6 +141,12 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                         "incarnation": interaction.incarnation,
                         "interaction_focused": interaction.focused,
                         "composing": interaction.composition == flavite_workspace::CompositionState::Active,
+                        "binding": binding.map(|binding| format!("{binding:?}")),
+                        "effective_source": app
+                            .contexts
+                            .observed(tab)
+                            .map(|source| source.locator.components().join("/")),
+                        "context_state": context_state,
                     }))
                 })
                 .collect();

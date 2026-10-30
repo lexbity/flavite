@@ -20,8 +20,8 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
-if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" ]]; then
-    echo "unsupported scenario: $scenario (implemented: layout, shared-editors, shell-foundation)" >&2
+if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" && "$scenario" != "context" ]]; then
+    echo "unsupported scenario: $scenario (implemented: layout, shared-editors, shell-foundation, context)" >&2
     exit 2
 fi
 if [[ "$(uname -s)" != Linux ]]; then
@@ -186,6 +186,78 @@ record "boot-single-group-catalog" "01-boot.png"
 if [[ "$scenario" == "shell-foundation" ]]; then
     python3 scripts/tests/workspace_shell_foundation.py "$window_id" "$harness_log" "$run_dir"
     record "os-pointer-dock-reorder-menu-overflow" "foundation-checks.json"
+elif [[ "$scenario" == "context" ]]; then
+    # W04: contextual tools follow explicit sources. Real palette dispatch
+    # (Ctrl+Shift+P) opens Backlinks/Preview; the harness semantic snapshot
+    # carries per-tab binding/effective_source/context_state.
+    xdotool_key "ctrl+p"
+    xdotool type --delay 25 "alpha"
+    xdotool_key "Return"
+    harness_wait "alpha editor ready" \
+        'any(t["load"] == "ready" and t["title"] == "alpha" for g in snapshot["groups"] for t in g["tabs"]) and snapshot["focused_text_chars"] > 0'
+    xdotool windowfocus --sync "$window_id"
+    xdotool mousemove --window "$window_id" 700 300 click 1
+    harness_wait "editor focused so the document anchor is established" \
+        'snapshot["writing_target"] is not None and snapshot["writing_target"]["tab"] == snapshot["focused_tab"]'
+
+    xdotool_key "ctrl+shift+p"
+    xdotool type --delay 25 "open backlinks"
+    xdotool_key "Return"
+    harness_wait "backlinks tool opened" \
+        'any(t["load"] == "backlinks" for g in snapshot["groups"] for t in g["tabs"])'
+    harness_wait "backlinks follow the document anchor" \
+        'any(t["load"] == "backlinks" and t["binding"] == "FollowDocument" and t["effective_source"] == "alpha.md" for g in snapshot["groups"] for t in g["tabs"])'
+    harness_wait "backlinks served an honest served/unbound state" \
+        'any(t["load"] == "backlinks" and ("NoBacklinks" in t["context_state"] or "Ready" in t["context_state"] or "Unbound" in t["context_state"]) for g in snapshot["groups"] for t in g["tabs"])'
+    capture "$run_dir/02-backlinks.png"
+    record "backlinks-follow-document" "02-backlinks.png"
+
+    xdotool_key "ctrl+shift+p"
+    xdotool type --delay 25 "open preview"
+    xdotool_key "Return"
+    harness_wait "preview tool opened and served saved text" \
+        'any(t["load"] == "preview" and t["effective_source"] == "alpha.md" and "Ready" in t["context_state"] for g in snapshot["groups"] for t in g["tabs"])'
+    capture "$run_dir/03-preview.png"
+    record "preview-saved-source-text" "03-preview.png"
+
+    # The just-opened preview tool owns focus; pin it through the catalog.
+    xdotool_key "ctrl+shift+p"
+    xdotool type --delay 25 "pin this context"
+    xdotool_key "Return"
+    harness_wait "preview pinned to an explicit locator" \
+        'any(t["load"] == "preview" and t["binding"] is not None and t["binding"].startswith("Pinned") for g in snapshot["groups"] for t in g["tabs"])'
+    capture "$run_dir/04-pinned.png"
+    record "context-pin-locator" "04-pinned.png"
+
+    # A tool can be moved to any group and still follow/pin correctly.
+    # Split first (duplicating the focused Preview), then focus the first
+    # group and cycle to the Backlinks tool before the documented move
+    # shortcut transfers it.
+    xdotool_key "ctrl+alt+Right"
+    harness_wait "split creates a second group" \
+        'len(snapshot["groups"]) == 2'
+    xdotool_key "shift+F6"
+    for _ in $(seq 1 8); do
+        if python3 -c '
+import json, sys
+lines=[line for line in open(sys.argv[1]) if line.strip()]
+s=json.loads(lines[-1]) if lines else {}
+focused=[t for g in s.get("groups", []) for t in g["tabs"] if t["tab"]==s.get("focused_tab")]
+sys.exit(0 if len(focused)==1 and focused[0]["title"]=="Backlinks" else 1)
+' "$harness_log"; then
+            break
+        fi
+        xdotool_key "ctrl+Tab"
+        sleep 0.2
+    done
+    xdotool_key "ctrl+alt+shift+Right"
+    harness_wait "moved tool keeps its binding and source" \
+        'len(snapshot["groups"]) == 2 and any(g["bounds"][0] > 10 and any(t["load"] == "backlinks" and t["binding"] == "FollowDocument" and t["effective_source"] == "alpha.md" for t in g["tabs"]) for g in snapshot["groups"])'
+    capture "$run_dir/05-moved-tool.png"
+    record "context-tool-move-preserves-binding" "05-moved-tool.png"
+
+    capture "$run_dir/06-final.png"
+    record "final-capture" "06-final.png"
 elif [[ "$scenario" == "shared-editors" ]]; then
     xdotool_key "ctrl+p"
     xdotool type --delay 25 "alpha"

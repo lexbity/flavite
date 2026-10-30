@@ -97,9 +97,11 @@ fn expected_delta(state: &WorkspaceState, action: &LayoutAction) -> Option<i64> 
         return None;
     }
     match action {
-        A::OpenNote { group, .. } | A::OpenEmpty { group, .. } | A::OpenNotes { group, .. } => {
-            state.group(group).is_some().then_some(1)
-        }
+        A::OpenNote { group, .. }
+        | A::OpenEmpty { group, .. }
+        | A::OpenNotes { group, .. }
+        | A::OpenContext { group, .. }
+        | A::SplitGroup { group, .. } => state.group(group).is_some().then_some(1),
         A::DuplicateTab { tab, .. } => state
             .tab(tab)
             .filter(|session| session.kind().duplicate().is_some())
@@ -126,8 +128,8 @@ fn expected_delta(state: &WorkspaceState, action: &LayoutAction) -> Option<i64> 
                 -closing
             }
         }),
-        A::SplitGroup { group, .. } => state.group(group).is_some().then_some(1),
-        A::MoveTab { .. }
+        A::SetContextBinding { .. }
+        | A::MoveTab { .. }
         | A::MergeGroups { .. }
         | A::MoveGroupSplit { .. }
         | A::MoveGroupEdge { .. }

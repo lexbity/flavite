@@ -57,6 +57,16 @@ fn wait_for_open(app: &mut App) {
 }
 
 fn acknowledge_caret(app: &mut App, tab: TabId, byte: usize, sequence: u64) {
+    acknowledge_caret_with_anchor(app, tab, byte, 0, sequence);
+}
+
+fn acknowledge_caret_with_anchor(
+    app: &mut App,
+    tab: TabId,
+    byte: usize,
+    viewport_anchor: usize,
+    sequence: u64,
+) {
     let incarnation = app.notes.incarnation(tab).unwrap();
     let view = app.note_editor_view(tab).unwrap();
     let _ = app.update(Message::EditorAction {
@@ -68,7 +78,7 @@ fn acknowledge_caret(app: &mut App, tab: TabId, byte: usize, sequence: u64) {
             revision: view.revision,
             caret: byte,
             selection: (byte, byte),
-            viewport_anchor: 0,
+            viewport_anchor,
             focused: true,
             composing: false,
         }),
@@ -95,8 +105,9 @@ fn split_views_share_revision_text_and_history_but_keep_independent_carets() {
         app.notes.state(&second).unwrap().buffer
     );
 
-    acknowledge_caret(&mut app, first, 1, 1);
-    acknowledge_caret(&mut app, second, 7, 1);
+    // Independent carets and independent scroll anchors in one shared buffer.
+    acknowledge_caret_with_anchor(&mut app, first, 1, 0, 1);
+    acknowledge_caret_with_anchor(&mut app, second, 7, 5, 1);
     assert_eq!(app.workspace.document_anchor(), Some(second));
     assert_eq!(app.workspace.writing_target().unwrap().tab, second);
     let first_view = app.note_editor_view(first).unwrap();
@@ -109,6 +120,23 @@ fn split_views_share_revision_text_and_history_but_keep_independent_carets() {
     assert_eq!(
         app.workspace.tab(&second).unwrap().interaction().selections,
         vec![Selection::caret(7)]
+    );
+    assert_eq!(
+        app.workspace
+            .tab(&first)
+            .unwrap()
+            .interaction()
+            .viewport_anchor,
+        0
+    );
+    assert_eq!(
+        app.workspace
+            .tab(&second)
+            .unwrap()
+            .interaction()
+            .viewport_anchor,
+        5,
+        "each view keeps its own scroll anchor"
     );
 
     let edit = EditorAction::replace(
@@ -144,6 +172,33 @@ fn split_views_share_revision_text_and_history_but_keep_independent_carets() {
         tab: second,
         incarnation,
         action: undo,
+    });
+    assert_eq!(
+        app.note_editor_view(first).unwrap().text.as_ref(),
+        "alpha\nbeta\n"
+    );
+    // Redo from the other view restores the same one-edit boundary.
+    let after_undo = app.note_editor_view(second).unwrap();
+    let redo = EditorAction::history(&after_undo, true);
+    let incarnation = app.notes.incarnation(second).unwrap();
+    let _ = app.update(Message::EditorAction {
+        tab: second,
+        incarnation,
+        action: redo,
+    });
+    assert_eq!(
+        app.note_editor_view(first).unwrap().text.as_ref(),
+        "alpha\nbeta\n!",
+        "redo restores the shared edit"
+    );
+    // Undo again before the final save so the disk bytes match the original.
+    let after_redo = app.note_editor_view(second).unwrap();
+    let undo_again = EditorAction::history(&after_redo, false);
+    let incarnation = app.notes.incarnation(second).unwrap();
+    let _ = app.update(Message::EditorAction {
+        tab: second,
+        incarnation,
+        action: undo_again,
     });
     assert_eq!(
         app.note_editor_view(first).unwrap().text.as_ref(),

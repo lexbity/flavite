@@ -67,6 +67,9 @@ impl ApiBufferRef {
 }
 
 /// Preconditions for command execution.
+///
+/// The write policy is enforced by the vault itself: there is no caller-side
+/// exception that can run a write command against a read-only vault (TD-17).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Preconditions {
     /// Optional buffer ID this command requires.
@@ -75,8 +78,6 @@ pub struct Preconditions {
     pub expected_revision: Option<u64>,
     /// Whether this command requires write access.
     pub requires_write: bool,
-    /// Whether this command can run in read-only mode.
-    pub allow_read_only: bool,
 }
 
 impl Preconditions {
@@ -104,13 +105,6 @@ impl Preconditions {
     #[must_use]
     pub fn requires_write(mut self) -> Self {
         self.requires_write = true;
-        self
-    }
-
-    /// Allow in read-only mode.
-    #[must_use]
-    pub fn allow_read_only(mut self) -> Self {
-        self.allow_read_only = true;
         self
     }
 }

@@ -6,11 +6,7 @@
 
 use crate::app::{App, Message};
 use crate::style;
-use crate::workspace::{
-    bounds,
-    chrome::{self, Icon},
-    tab_strip,
-};
+use crate::workspace::{bounds, tab_strip};
 use flavite_api::queries::NoteCatalogEntry;
 use flavite_workspace::{GroupId, LayoutAction, NoteLoad, TabId, ViewKind};
 use iced::widget::{
@@ -65,66 +61,32 @@ pub fn view(app: &App) -> Element<'_, Message> {
 }
 
 fn shell(app: &App) -> Element<'_, Message> {
-    let mut shell = column![top_bar(app), rule::horizontal(1)];
-    if let Some(notifications) = notification_surface(app) {
-        shell = shell.push(notifications);
-    }
-    shell
-        .push(bounds::workspace(workspace_region(app), app))
-        .push(rule::horizontal(1))
-        .push(status_bar(app))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
-}
-
-fn notification_surface(app: &App) -> Option<Element<'_, Message>> {
-    if app.notices.is_empty() {
-        return None;
-    }
-    let hidden = app.notices.len().saturating_sub(3);
-    let mut entries = column![
-        text(format!("Notifications ({})", app.notices.len()))
-            .size(style::TEXT_SM)
-            .style(style::dim_text)
+    let workspace = column![
+        top_bar(app),
+        rule::horizontal(1),
+        bounds::workspace(workspace_region(app), app),
+        rule::horizontal(1),
+        status_bar(app),
     ]
-    .spacing(2);
-    for notice in app.notices.iter().take(3) {
-        entries = entries.push(
-            row![
-                text(format!("{}: {:?}", notice.event.event_type(), notice.event))
-                    .size(style::TEXT_SM)
-                    .width(Length::Fill),
-                button(text("Dismiss").size(style::TEXT_SM))
-                    .padding(tab_strip::chip_padding())
-                    .style(style::ghost())
-                    .on_press(Message::AcknowledgeNotice(notice.id)),
-            ]
-            .spacing(style::SPACING_SM)
-            .align_y(alignment::Vertical::Center),
-        );
+    .width(Length::Fill)
+    .height(Length::Fill);
+    // Notifications are presentation, not content: they float over the
+    // workspace and never consume layout rows (RFC W04).
+    if let Some(notifications) = crate::views::notifications::overlay(app) {
+        stack![
+            Element::from(workspace),
+            container(notifications)
+                .width(Length::Fill)
+                .align_y(alignment::Vertical::Top)
+                .padding(Padding {
+                    top: 36.0,
+                    ..Padding::default()
+                })
+        ]
+        .into()
+    } else {
+        workspace.into()
     }
-    if hidden > 0 {
-        entries = entries.push(
-            text(format!(
-                "{hidden} additional notices are waiting for presentation"
-            ))
-            .size(style::TEXT_SM)
-            .style(style::dim_text),
-        );
-    }
-    Some(
-        container(entries)
-            .width(Length::Fill)
-            .padding(Padding {
-                top: style::SPACING_SM,
-                bottom: style::SPACING_SM,
-                left: style::SPACING_LG,
-                right: style::SPACING_LG,
-            })
-            .style(style::card)
-            .into(),
-    )
 }
 
 fn top_bar(app: &App) -> Element<'_, Message> {
@@ -347,160 +309,17 @@ fn menu_overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Me
 
 fn active_view(app: &App, group: GroupId, tab: TabId) -> Element<'_, Message> {
     let Some(session) = app.workspace.tab(&tab) else {
-        return empty_state("Empty", "This tab has no content.");
+        return crate::views::empty_state("Empty", "This tab has no content.");
     };
     match session.kind() {
-        ViewKind::Empty => empty_state(
+        ViewKind::Empty => crate::views::empty_state(
             "Empty",
             "Open a note with Quick switch (Ctrl+P) or add a Notes list.",
         ),
         ViewKind::Notes => notes_view(app, group),
-        ViewKind::Note(note) => note_view(app, tab, note.load(), note.locator()),
-    }
-}
-
-fn empty_state(title: &str, hint: &str) -> Element<'static, Message> {
-    container(
-        column![
-            text(title.to_owned()).size(style::HEADING),
-            text(hint.to_owned()).style(style::dim_text),
-        ]
-        .spacing(style::SPACING_SM),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .padding(style::SPACING_LG)
-    .style(style::content)
-    .center_x(Length::Fill)
-    .align_y(alignment::Vertical::Top)
-    .into()
-}
-
-/// One editable note tab. The widget runtime is keyed by TabId and restores
-/// the host-owned logical interaction state after reparenting.
-fn note_view<'a>(
-    app: &'a App,
-    tab: TabId,
-    load: NoteLoad,
-    locator: &'a flavite_workspace::NoteLocator,
-) -> Element<'a, Message> {
-    let path = locator.components().join("/");
-    match load {
-        NoteLoad::Reserved => container(
-            column![
-                text(format!("Opening {path}…")),
-                button(text("Close tab"))
-                    .padding(tab_strip::chip_padding())
-                    .style(style::ghost())
-                    .on_press(Message::Layout(LayoutAction::CloseTab {
-                        expected_revision: app.workspace.revision(),
-                        tab,
-                    })),
-            ]
-            .spacing(style::SPACING),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(style::SPACING_LG)
-        .style(style::content)
-        .into(),
-        NoteLoad::Failed => container(
-            column![
-                text("Note unavailable").size(style::HEADING),
-                text(path.clone()).style(style::dim_text),
-                row![
-                    button(text("Retry"))
-                        .padding(tab_strip::chip_padding())
-                        .style(style::action())
-                        .on_press(Message::OpenNote {
-                            locator: locator.clone(),
-                            group: app.group_of(tab),
-                        }),
-                    button(text("Close tab"))
-                        .padding(tab_strip::chip_padding())
-                        .style(style::ghost())
-                        .on_press(Message::Layout(LayoutAction::CloseTab {
-                            expected_revision: app.workspace.revision(),
-                            tab,
-                        })),
-                ]
-                .spacing(style::SPACING),
-            ]
-            .spacing(style::SPACING_SM),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(style::SPACING_LG)
-        .style(style::content)
-        .into(),
-        NoteLoad::Ready => {
-            let Some(view) = app.note_editor_view(tab) else {
-                return empty_state("Buffer unavailable", "The note view needs to be reopened.");
-            };
-            let Some(incarnation) = app.notes.incarnation(tab) else {
-                return empty_state("View unavailable", "This note view is no longer active.");
-            };
-            let initial_interaction = app.editor_interaction_snapshot(tab);
-            let mut editor = flavite_editor::EditorWidget::from_view(view, move |action| {
-                Message::EditorAction {
-                    tab,
-                    incarnation,
-                    action,
-                }
-            })
-            .with_view_key(tab.raw(), incarnation)
-            .with_input_enabled(!app.picker.open && !app.palette_open && app.strip_menu.is_none())
-            .with_interaction(move |snapshot| Message::EditorAction {
-                tab,
-                incarnation,
-                action: flavite_editor::EditorAction::Interaction(snapshot),
-            });
-            if let Some(interaction) = initial_interaction {
-                editor = editor.with_initial_interaction(interaction);
-            }
-            let meta = container(
-                row![
-                    chrome::icon(Icon::Note),
-                    text(path).size(style::TEXT_SM).width(Length::Fill),
-                    text("Source").size(style::TEXT_SM).style(style::dim_text)
-                ]
-                .spacing(8)
-                .align_y(alignment::Vertical::Center),
-            )
-            .height(32)
-            .padding([0, 12])
-            .align_y(alignment::Vertical::Center)
-            .style(style::toolbar);
-            let state = app
-                .note_buffer_state(tab)
-                .unwrap_or_else(|| "Unavailable".into());
-            let state = match state.as_str() {
-                "Clean" => "Saved",
-                "Dirty" => "Unsaved changes",
-                other => other,
-            };
-            let footer = container(
-                text(state.to_owned())
-                    .size(style::TEXT_SM)
-                    .style(style::dim_text),
-            )
-            .height(24)
-            .padding([4, 12]);
-            let editor = bounds::observe(
-                editor.width(Length::Fill).height(Length::Fill),
-                move |rect| Message::EditorBounds(tab, rect),
-            );
-            column![
-                meta,
-                rule::horizontal(1),
-                editor,
-                rule::horizontal(1),
-                footer
-            ]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-        }
+        ViewKind::Note(note) => crate::views::note::view(app, tab, note.load(), note.locator()),
+        ViewKind::Preview(_) => crate::views::preview::view(app, tab),
+        ViewKind::Backlinks(_) => crate::views::backlinks::view(app, tab),
     }
 }
 

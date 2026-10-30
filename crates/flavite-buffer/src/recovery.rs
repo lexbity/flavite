@@ -907,6 +907,53 @@ mod tests {
     }
 
     #[test]
+    fn receipt_for_revision_n_cannot_retire_recovery_for_revision_n_plus_one() {
+        let dir = tempdir().expect("recovery dir");
+        let mut writer = RecoveryWriterBuilder::new()
+            .vault_uuid("receipt-test".into())
+            .recovery_dir(dir.path().to_path_buf())
+            .interval_secs(0)
+            .build();
+        let buffer_id = BufferId::new();
+        let note_key = b"notes/receipt.md";
+
+        let mut revision = |text: &str, rev: u64| {
+            let mut file = RecoveryFile::from_buffer(&Buffer::from_text(text), 0, false);
+            file.header.buffer_id = buffer_id;
+            file.header.revision = Revision::new(rev);
+            writer
+                .write_snapshot_now(note_key, file)
+                .expect("snapshot persisted");
+        };
+        revision("stale content", 4);
+        revision("current content", 5);
+
+        // One durable file per note holds the newest snapshot: a save receipt
+        // for revision 4 retires nothing, and the revision-5 recovery file
+        // survives for the next decision.
+        let retired = writer.retire_covered(buffer_id, Revision::new(4));
+        assert_eq!(retired, 0);
+        let remaining = writer.read_for_note_key(note_key).expect("revision 5 kept");
+        assert_eq!(remaining.text, "current content");
+
+        // Retiring revision 5 does remove the file...
+        let retired = writer.retire_covered(buffer_id, Revision::new(5));
+        assert_eq!(retired, 1);
+        assert!(writer.read_for_note_key(note_key).is_none());
+
+        // ...and the retired revisions cannot be re-persisted under the
+        // receipt: a delayed writer for revision n is refused outright.
+        let mut replay = RecoveryFile::from_buffer(&Buffer::from_text("stale content"), 0, false);
+        replay.header.buffer_id = buffer_id;
+        replay.header.revision = Revision::new(4);
+        assert!(writer.write_snapshot_now(note_key, replay).is_none());
+        let mut replay = RecoveryFile::from_buffer(&Buffer::from_text("stale content"), 0, false);
+        replay.header.buffer_id = buffer_id;
+        replay.header.revision = Revision::new(4);
+        assert!(writer.write_snapshot_now(note_key, replay).is_none());
+    }
+
+    #[test]
     fn recovery_file_to_source_bytes() {
         let buffer = Buffer::from_text("hello\nworld");
         let recovery_file = RecoveryFile::from_buffer(&buffer, 1, false);

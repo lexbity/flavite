@@ -1,6 +1,6 @@
 //! GUI-side tracking for correlated worker operations.
 
-use flavite_api::{Flavite, OperationCompletion};
+use flavite_api::{ExecutionResult, Flavite, LocalResult, OperationCompletion};
 use std::collections::{BTreeMap, VecDeque};
 
 const MAX_TERMINAL_COMPLETIONS: usize = 4096;
@@ -92,6 +92,70 @@ impl OperationPump {
         };
         self.terminal.remove(index);
         true
+    }
+}
+
+/// Present one typed completion at the presentation boundary.
+///
+/// Classification reads the structured result only (TD-09): no string
+/// matching, and the typed outcome stays in the ledger regardless of what
+/// is displayed here.
+#[must_use]
+pub fn describe_completion(completion: &OperationCompletion) -> String {
+    match &completion.result {
+        ExecutionResult::Local(LocalResult::Success(success)) => format!(
+            "Operation {} completed{}",
+            completion.request_id,
+            success
+                .data
+                .get("revision")
+                .and_then(serde_json::Value::as_u64)
+                .map_or_else(String::new, |revision| format!(" at revision {revision}"))
+        ),
+        ExecutionResult::Local(LocalResult::Error(error)) => {
+            format!(
+                "Operation {} failed: {}",
+                completion.request_id, error.message
+            )
+        }
+        ExecutionResult::Rejected(rejected) => format!(
+            "Operation {} rejected: {}",
+            completion.request_id,
+            describe_rejection(&rejected.reason)
+        ),
+        ExecutionResult::Pending { .. } => {
+            format!("Operation {} is still pending", completion.request_id)
+        }
+        ExecutionResult::ActionRequired { code, .. } => {
+            format!(
+                "Operation {} needs attention: {code}",
+                completion.request_id
+            )
+        }
+        ExecutionResult::Superseded { by_request, .. } => format!(
+            "Operation {} was superseded by request {by_request}",
+            completion.request_id
+        ),
+        ExecutionResult::Local(LocalResult::Void) => {
+            format!("Operation {} completed", completion.request_id)
+        }
+    }
+}
+
+/// Human presentation for typed rejection reasons.
+#[must_use]
+pub fn describe_rejection(reason: &flavite_api::RejectionReason) -> &'static str {
+    use flavite_api::RejectionReason::*;
+    match reason {
+        Unavailable => "the core service is unavailable",
+        ReadOnly => "the vault is open read-only",
+        BufferNotFound => "the buffer no longer exists",
+        StaleRevision => "the buffer changed since the request",
+        Busy => "the core is busy; retry",
+        Unsupported => "the command is unsupported",
+        InvalidArgs => "the command arguments were invalid",
+        CapabilityDenied => "the caller lacks the required capability",
+        Conflict => "the note is in conflict and needs a decision",
     }
 }
 

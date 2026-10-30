@@ -150,6 +150,8 @@ pub fn menu_entries(app: &App, group: GroupId, menu: StripMenu) -> Vec<MenuEntry
         StripMenu::NewView => [
             ("Empty tab", "workspace.new_tab"),
             ("Notes list", "workspace.open_notes_view"),
+            ("Preview", "workspace.open_preview"),
+            ("Backlinks", "workspace.open_backlinks"),
         ]
         .into_iter()
         .map(|(label, id)| MenuEntry {
