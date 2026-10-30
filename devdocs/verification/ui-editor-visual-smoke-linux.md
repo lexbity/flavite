@@ -1,17 +1,9 @@
-# Linux custom editor visual smoke
+# Retired: standalone editor visual demo
 
-Run `bash scripts/ui-editor-visual-smoke-linux.sh` on Linux. The harness
-launches the actual `flavite-editor` iced demo under X11 (using Xvfb when
-needed), types `[[Vis`, captures the autocomplete popup, then replaces the
-buffer with a known string and waits for the Session autosave before taking the
-final editor capture.
+The standalone `flavite-editor` widget demo and its dedicated runner were
+removed during RFC-0003 W02. The widget is exercised inside the full Flavite
+shell. Use `just workspace-visual layout` for W02 shell interactions and
+`bash scripts/ui-app-visual-smoke-linux.sh` for a basic full-shell capture.
 
-Artifacts are written under `target/ui-visual/`:
-
-- `editor-autocomplete.png` shows the in-memory title/target candidates.
-- `editor.png` shows the final selected text and saved status.
-- `editor-app.log` captures the demo's standard output and errors.
-
-The script also checks that the saved note contains the typed content and that
-the final screenshot decodes and contains visible color variation. This is a
-rendered interaction smoke, not a pixel-perfect visual regression test.
+This retired record is historical only; it is not a runnable gate or current
+editor acceptance evidence.

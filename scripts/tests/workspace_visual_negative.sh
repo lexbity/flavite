@@ -11,6 +11,7 @@ set -uo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 target_dir="${CARGO_TARGET_DIR:-target}"
+mkdir -p "$target_dir/workspace-evidence"
 
 status=0
 

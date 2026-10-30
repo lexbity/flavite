@@ -1,9 +1,8 @@
 # Linux UI visual smoke
 
-The Linux visual checks cover two actual iced windows:
-`flavite-ui/examples/graph_shader_probe.rs` renders the deterministic graph
-fixture, while `flavite-editor/examples/editor-demo.rs` opens a fixture vault
-through the Flavite facade and exercises the custom editor.
+The repository has a graph renderer probe, a full-shell smoke, and the W02
+workspace interaction runner. The standalone editor widget demo was retired
+when the editor became part of the Flavite shell; it is not a product window.
 
 ## Run locally
 
@@ -12,24 +11,23 @@ Install Linux dependencies once, then capture the fixture:
 ```sh
 just ui-visual-setup
 just ui-visual-smoke
-just ui-editor-visual-smoke
+bash scripts/ui-app-visual-smoke-linux.sh
+just workspace-visual layout
 ```
 
-The PNG and application logs are written under `target/ui-visual/`. Both smokes
-launch real X11 windows under Xvfb and capture them with ImageMagick. The graph
-smoke checks that its image decodes and contains multiple colors. The editor
-smoke types into a fixture note, accepts `[[Concepts]]` autocomplete, ctrl-clicks
-the link, types into the opened target, and verifies both files were saved. CI
-uploads the screenshots as visual-smoke artifacts.
+The PNG and application logs are written under `target/ui-visual/`; workspace
+evidence is written under `target/workspace-evidence/`. The runners launch real
+X11 windows under Xvfb and capture them with ImageMagick. The workspace runner
+also sends OS keyboard input and checks semantic state transitions.
 
 ## What this proves
 
 - The deterministic graph fixture launches and creates a visible Linux window.
 - The graph widget produces a capturable frame through X11/Xvfb and the
   software GPU configured by `just gpu-setup`.
-- The custom editor accepts text and link completion through real X11 input,
-  routes ctrl-click through the public command facade, preserves focus on the
-  opened buffer, and reaches the Session save path for both notes.
+- The shell smoke opens the full Flavite window and exercises its command
+  palette. The W02 workspace scenario checks note opening and tab/group
+  operations in that shell; it does not claim editor typing coverage.
 - A screenshot is retained for human or agent visual inspection.
 
 These checks are distinct from `shader_validation.rs`: that test validates WGSL

@@ -760,7 +760,6 @@ impl App {
             let completions = flavite.drain_operation_completions();
             if refresh_catalog {
                 // Scoped borrow ends before mutation below.
-                drop(flavite);
                 self.load_catalog();
             }
             (events, completions)
@@ -1260,6 +1259,22 @@ mod tests {
                 }))
             ),
             "ctrl+alt+right splits side by side"
+        );
+        let message = host_commands::keyboard_message(
+            &app,
+            press(
+                keyboard::Key::Named(keyboard::key::Named::ArrowLeft),
+                keyboard::Modifiers::COMMAND
+                    | keyboard::Modifiers::ALT
+                    | keyboard::Modifiers::SHIFT,
+            ),
+        );
+        assert!(
+            matches!(
+                message,
+                Some(Message::RunHostCommand("workspace.move_tab_previous_group"))
+            ),
+            "ctrl+alt+shift+left moves the tab to the previous group"
         );
         // Plain typing never triggers commands.
         assert!(

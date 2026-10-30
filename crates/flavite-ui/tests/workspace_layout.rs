@@ -175,9 +175,8 @@ fn split_move_merge_preserve_identity_text_and_semantics() {
     // Every tab's buffer maps onto the pre-split buffers: layout moved a
     // tab but created no new buffer.
     for (tab, buffer) in &buffers_after {
-        assert_eq!(
+        assert!(
             buffers_before.values().any(|known| known == buffer),
-            true,
             "tab {tab:?} carries a pre-existing buffer"
         );
         let _ = tab;

@@ -30,6 +30,7 @@ pub enum StripMenu {
 #[allow(clippy::too_many_arguments)]
 pub fn view(
     state: &WorkspaceState,
+    group: GroupId,
     focused: bool,
     inline_menu: Option<StripMenu>,
     has_notes_catalog: bool,
@@ -43,7 +44,7 @@ pub fn view(
 
     let mut strip = row![].spacing(2);
     for tab in tabs.iter().take(inline_count) {
-        strip = strip.push(tab_button(state, group, *tab, *tab == active));
+        strip = strip.push(tab_button(state, *tab, *tab == active));
     }
     if tabs.len() > inline_count {
         strip = strip.push(
@@ -78,12 +79,7 @@ pub fn view(
     content.into()
 }
 
-fn tab_button(
-    state: &WorkspaceState,
-    group: GroupId,
-    tab: TabId,
-    active: bool,
-) -> Element<'_, Message> {
+fn tab_button(state: &WorkspaceState, tab: TabId, active: bool) -> Element<'_, Message> {
     let Some(session) = state.tab(&tab) else {
         return column![].into();
     };

@@ -29,6 +29,8 @@ static KEYS_NEXT_GROUP: LazyLock<[Chord; 1]> = LazyLock::new(|| [Chord::new(0, "
 static KEYS_PREVIOUS_GROUP: LazyLock<[Chord; 1]> = chords!(SHIFT; "F6");
 static KEYS_SPLIT_RIGHT: LazyLock<[Chord; 1]> = chords!(CTRL, ALT; "Right");
 static KEYS_SPLIT_DOWN: LazyLock<[Chord; 1]> = chords!(CTRL, ALT; "Down");
+static KEYS_MOVE_TAB_NEXT_GROUP: LazyLock<[Chord; 1]> = chords!(CTRL, ALT, SHIFT; "Right");
+static KEYS_MOVE_TAB_PREVIOUS_GROUP: LazyLock<[Chord; 1]> = chords!(CTRL, ALT, SHIFT; "Left");
 static KEYS_MAXIMIZE_GROUP: LazyLock<[Chord; 1]> = chords!(CTRL, SHIFT; "M");
 
 /// The `'static` default chord slice for a command id, if any.
@@ -46,6 +48,8 @@ fn keys_for(id: &str) -> Option<&'static [Chord]> {
         "workspace.previous_group" => &LazyLock::force(&KEYS_PREVIOUS_GROUP)[..],
         "workspace.split_right" => &LazyLock::force(&KEYS_SPLIT_RIGHT)[..],
         "workspace.split_down" => &LazyLock::force(&KEYS_SPLIT_DOWN)[..],
+        "workspace.move_tab_next_group" => &LazyLock::force(&KEYS_MOVE_TAB_NEXT_GROUP)[..],
+        "workspace.move_tab_previous_group" => &LazyLock::force(&KEYS_MOVE_TAB_PREVIOUS_GROUP)[..],
         "workspace.maximize_group" => &LazyLock::force(&KEYS_MAXIMIZE_GROUP)[..],
         _ => {
             let _ = mods::NONE;
@@ -195,10 +199,10 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
     };
     // Overlay-local navigation first (§13.1: IME/plain typing precedence).
     if app.palette_open || app.picker.open {
-        if modifiers.is_empty() {
-            if let keyboard::Key::Named(named) = &key {
-                return overlay_navigation(app, *named);
-            }
+        if modifiers.is_empty()
+            && let keyboard::Key::Named(named) = &key
+        {
+            return overlay_navigation(app, *named);
         }
         if modifiers.command()
             && let keyboard::Key::Character(character) = key.as_ref()
@@ -299,6 +303,12 @@ fn command_chord(app: &App, key: &keyboard::Key, modifiers: Modifiers) -> Option
                 expected_revision: revision,
                 forward: !modifiers.shift(),
             }),
+            keyboard::key::Named::ArrowLeft if modifiers.alt() && modifiers.shift() => {
+                Some(Message::RunHostCommand("workspace.move_tab_previous_group"))
+            }
+            keyboard::key::Named::ArrowRight if modifiers.alt() && modifiers.shift() => {
+                Some(Message::RunHostCommand("workspace.move_tab_next_group"))
+            }
             keyboard::key::Named::ArrowRight if modifiers.alt() => {
                 layout(LayoutAction::SplitGroup {
                     expected_revision: revision,
@@ -322,7 +332,6 @@ fn command_chord(app: &App, key: &keyboard::Key, modifiers: Modifiers) -> Option
 /// Dispatch a host command id against current shell state. Availability
 /// failures surface as a status message, never as a silent no-op.
 pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
-    let revision = app.workspace.revision();
     let focused_group = app.focused_group();
     match id {
         "workspace.quick_switch" => return iced::Task::done(Message::PickerOpen),

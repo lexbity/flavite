@@ -301,27 +301,6 @@ pub fn accent_text(theme: &Theme) -> text::Style {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn component_styles_derive_from_the_theme_palette() {
-        let theme = THEME;
-        let palette = theme.palette();
-        let card_style = card(&theme);
-        let Some(Background::Color(card_background)) = card_style.background else {
-            panic!("card style must set a solid background");
-        };
-        assert_ne!(card_background, palette.background);
-        assert!(card_style.border.width > 0.0);
-        assert!(palette_card(&theme).shadow.blur_radius > 0.0);
-        let selected = list_row(true)(&theme, button::Status::Active);
-        let unselected = list_row(false)(&theme, button::Status::Active);
-        assert_ne!(selected.background, unselected.background);
-    }
-}
-
 /// Container style: one tab-group pane; the focused group carries a
 /// visible non-color border.
 #[must_use]
@@ -367,5 +346,26 @@ pub fn pane_title_bar(theme: &Theme, focused: bool) -> container::Style {
         },
         shadow: Shadow::default(),
         snap: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn component_styles_derive_from_the_theme_palette() {
+        let theme = THEME;
+        let palette = theme.palette();
+        let card_style = card(&theme);
+        let Some(Background::Color(card_background)) = card_style.background else {
+            panic!("card style must set a solid background");
+        };
+        assert_ne!(card_background, palette.background);
+        assert!(card_style.border.width > 0.0);
+        assert!(palette_card(&theme).shadow.blur_radius > 0.0);
+        let selected = list_row(true)(&theme, button::Status::Active);
+        let unselected = list_row(false)(&theme, button::Status::Active);
+        assert_ne!(selected.background, unselected.background);
     }
 }

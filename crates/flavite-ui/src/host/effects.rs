@@ -77,7 +77,6 @@ impl NoteRegistry {
     }
 
     /// All attached tabs.
-    #[must_use]
     pub fn tabs(&self) -> impl Iterator<Item = (TabId, &NoteTabState)> {
         self.tabs.iter().map(|(tab, state)| (*tab, state))
     }

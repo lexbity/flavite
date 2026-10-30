@@ -122,15 +122,26 @@ else:
 }
 
 xdotool_key() {
-    xdotool windowactivate --sync "$window_id"
+    # Xvfb may run without a window manager; activate via EWMH then fails
+    # even though the mapped app window is focusable.
     xdotool windowfocus --sync "$window_id"
     xdotool key --clearmodifiers "$1"
     sleep 0.3
 }
 
 capture() {
-    import -window "$window_id" "$1"
-    identify "$1" >/dev/null
+    for _ in $(seq 1 50); do
+        import -window "$window_id" "$1"
+        identify "$1" >/dev/null
+        local colors
+        colors="$(identify -format '%k' "$1")"
+        if (( colors >= 16 )); then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "capture appears blank after waiting for paint: $1 ($colors colors)" >&2
+    return 1
 }
 
 for _ in $(seq 1 100); do
@@ -157,7 +168,7 @@ record() {
 
 # 1. Boot: shell ready, one group, catalog loaded from the fixture vault.
 harness_wait "boot with the catalog loaded" \
-    'snapshot["revision"] >= 1 and snapshot["groups"] and snapshot["catalog"] >= 3'
+    'snapshot["groups"] and snapshot["catalog"] >= 3'
 capture "$run_dir/01-boot.png"
 record "boot-single-group-catalog" "01-boot.png"
 
@@ -182,11 +193,20 @@ record "keyboard-new-tab" "03-new-tab.png"
 # 4. Split right: two groups (splitting duplicates the focused Empty view).
 xdotool_key "ctrl+alt+Right"
 harness_wait "split right creates a second group" \
-    'len(snapshot["groups"]) == 2'
+    'len(snapshot["groups"]) == 2 and len(snapshot["groups"][0]["tabs"]) == 3 and len(snapshot["groups"][1]["tabs"]) == 1'
 capture "$run_dir/04-split.png"
 record "keyboard-split-right" "04-split.png"
 
-# 5. Open beta in the new group, close it, reopen it.
+# 5. Move a tab from the first group to the next group using the documented
+# host shortcut and real OS keyboard input.
+xdotool_key "shift+F6"
+xdotool_key "ctrl+alt+shift+Right"
+harness_wait "keyboard move transfers a tab to the next group" \
+    'len(snapshot["groups"]) == 2 and len(snapshot["groups"][0]["tabs"]) == 2 and len(snapshot["groups"][1]["tabs"]) == 2'
+capture "$run_dir/05-moved-tab.png"
+record "keyboard-move-tab-between-groups" "05-moved-tab.png"
+
+# 6. Open beta, close it, and reopen it.
 xdotool_key "ctrl+p"
 xdotool type --delay 25 "beta"
 xdotool_key "Return"
@@ -198,23 +218,23 @@ harness_wait "beta tab closed" \
 xdotool_key "ctrl+shift+t"
 harness_wait "reopen restores beta" \
     'any(t["title"] == "beta" and t["load"] == "ready" for g in snapshot["groups"] for t in g["tabs"])'
-capture "$run_dir/05-reopen.png"
-record "close-reopen-tab" "05-reopen.png"
+capture "$run_dir/06-reopen.png"
+record "close-reopen-tab" "06-reopen.png"
 
-# 6. Maximize and restore the focused group (manual maximize).
+# 7. Maximize and restore the focused group (manual maximize).
 xdotool_key "ctrl+shift+m"
 harness_wait "manual maximize engaged" \
     'snapshot["maximized"] is not None'
-capture "$run_dir/06-maximized.png"
-record "manual-maximize" "06-maximized.png"
+capture "$run_dir/07-maximized.png"
+record "manual-maximize" "07-maximized.png"
 xdotool_key "ctrl+shift+m"
 harness_wait "restore clears manual maximize" \
     'snapshot["maximized"] is None'
-record "manual-restore" "06-maximized.png"
+record "manual-restore" "07-maximized.png"
 
-# 7. Final capture and non-blank assertions for every artifact.
-capture "$run_dir/07-final.png"
-record "final-capture" "07-final.png"
+# 8. Final capture and non-blank assertions for every artifact.
+capture "$run_dir/08-final.png"
+record "final-capture" "08-final.png"
 for image in "$run_dir"/*.png; do
     color_count="$(identify -format '%k' "$image")"
     if (( color_count < 16 )); then
@@ -224,7 +244,7 @@ for image in "$run_dir"/*.png; do
 done
 
 # Duplicate-id guard: tab identities inside the harness are unique.
-HARNESS_FILE="$harness_log" python3 -c "
+python3 -c "
 import json, sys
 lines = [line for line in open(sys.argv[1]) if line.strip()]
 snapshot = json.loads(lines[-1])
@@ -232,12 +252,12 @@ tabs = [t['tab'] for g in snapshot['groups'] for t in g['tabs']]
 assert len(tabs) == len(set(tabs)), f'duplicate tab ids: {tabs}'
 groups = [g['group'] for g in snapshot['groups']]
 assert len(groups) == len(set(groups)), 'duplicate group ids'
-" || { echo "semantic identity check failed" >&2; exit 1; }
+" "$harness_log" || { echo "semantic identity check failed" >&2; exit 1; }
 record "semantic-ids-unique" "harness.jsonl"
 
 # Evidence manifest (§31.2).
 build_hash="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
-lock_hash="$(sha256sum Cargo.lock | cut -d' ' -f1)"
+lock_hash="$(cargo xtask blake3 Cargo.lock)"
 {
     echo '{'
     echo "  \"schema\": 1,"

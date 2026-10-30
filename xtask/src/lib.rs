@@ -33,6 +33,7 @@ pub fn print_usage() {
     );
     eprintln!("  clean [--dry-run]        Full cleanup of build output (§10.10)");
     eprintln!("  gc                       Post-gate threshold-based cleanup (§10.10)");
+    eprintln!("  blake3 <file>            Print the BLAKE3 digest of a file");
     eprintln!("  setup                    Developer onboarding: tools + hook (§10.8)");
 }
 
@@ -59,6 +60,15 @@ pub fn run(args: &[String]) -> Result<()> {
             Ok(())
         }
         "setup" => setup::setup(),
+        "blake3" => {
+            let Some(path) = args.get(2) else {
+                anyhow::bail!("blake3 requires a file path");
+            };
+            let bytes =
+                std::fs::read(path).with_context(|| format!("reading file for BLAKE3: {path}"))?;
+            println!("{}", blake3::hash(&bytes).to_hex());
+            Ok(())
+        }
         "arch" => handle_arch(&args[2..]),
         "cov-check" => handle_cov_check(&args[2..]),
         other => {

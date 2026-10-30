@@ -96,7 +96,10 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                         flavite_workspace::ViewKind::Notes => "notes",
                     };
                     Some(serde_json::json!({
-                        "tab": tab.raw(),
+                        // JSON numbers cannot losslessly represent every
+                        // u128; expose opaque identity in its stable string
+                        // form so the fixture protocol remains valid.
+                        "tab": tab.to_string(),
                         "title": session.title(),
                         "load": load,
                         "active": *tab == state.active(),
@@ -104,7 +107,7 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                 })
                 .collect();
             Some(serde_json::json!({
-                "group": group.raw(),
+                "group": group.to_string(),
                 "label": app
                     .workspace
                     .tab(&state.active())
@@ -124,9 +127,9 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "revision": app.workspace.revision(),
         "status": app.status_text(),
         "groups": groups,
-        "focused_tab": focused.raw(),
+        "focused_tab": focused.to_string(),
         "focused_text_chars": focused_text,
-        "maximized": app.maximized_group().map(flavite_workspace::GroupId::raw),
+        "maximized": app.maximized_group().map(|group| group.to_string()),
         "catalog": app.catalog().len(),
     })
 }

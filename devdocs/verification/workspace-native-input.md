@@ -55,11 +55,9 @@ Korean commit and cancellation. Synthetic input must be labeled synthetic.
   the actual shell program against a temporary vault, checks the published
   Session text and routes a shell tab action. The app host test separately
   checks text-selection action routing and the editor widget operation checks
-  revision/composition guards. The existing
-  `scripts/ui-editor-visual-smoke-linux.sh` still launches
-  `flavite-editor/examples/editor-demo`, not the Flavite shell. Its run failed
-  the save-path input assertion in this environment. Do not use that capture
-  as shell evidence.
+  revision/composition guards. The standalone editor demo and its visual
+  script were retired in W02; their historical failed run is not evidence for
+  the current shell.
 - The editor now holds IME preedit transiently, renders it underlined, replaces
   the captured selection once on Commit, and clears composition on Closed or
   window focus loss. Unit tests cover preedit/commit and cancellation. Native
@@ -93,9 +91,9 @@ Korean commit and cancellation. Synthetic input must be labeled synthetic.
   under an active screen reader on a normal acceptance host. The successful
   bridge-only run used a temporary explicit bus toggle and is recorded as
   partial evidence, not a screen-reader pass.
-- Existing `scripts/ui-editor-visual-smoke-linux.sh` exercises rendered editor
-  input and screenshot capture only; it does not inspect an OS accessibility
-  tree or dispatch accessibility actions.
+- The W02 workspace visual runner exercises OS keyboard input and screenshot
+  capture; it does not inspect an OS accessibility tree or dispatch native
+  accessibility actions.
 - `devdocs/spikes/S1-accesskit-audit.md` found no AccessKit integration in
   upstream iced 0.14. The local bridge now implements the required runtime
   event-loop seam without Flavite domain logic; native verification remains
