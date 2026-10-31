@@ -49,6 +49,17 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: just workspace-visual shell-foundation
 
+      - name: Workspace contracts through W08
+        run: just workspace-contracts W08
+
+      - name: Linux graph input, projections and filtering (canvas)
+        if: matrix.os == 'ubuntu-latest'
+        run: just workspace-graph-visual canvas
+
+      - name: Linux graph input, projections and filtering (GPU)
+        if: matrix.os == 'ubuntu-latest'
+        run: just workspace-graph-visual gpu
+
       - name: Upload workspace behavior evidence
         if: always() && matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
@@ -58,8 +69,11 @@ jobs:
             target/workspace-evidence/**/*.png
             target/workspace-evidence/**/manifest.json
             target/workspace-evidence/**/foundation-checks.json
+            target/workspace-evidence/**/graph-checks.json
+            target/workspace-evidence/**/expected-fixture.json
             target/workspace-evidence/**/harness.jsonl
             target/workspace-evidence/**/app.log
+            target/workspace-evidence/w08/**
           if-no-files-found: error
 
       - name: Upload Linux UI screenshot

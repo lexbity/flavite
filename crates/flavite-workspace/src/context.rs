@@ -65,6 +65,10 @@ pub enum UnboundReason {
     SourceClosed(TabId),
     /// No exploration source has published a selection.
     NoExploration,
+    /// The exploration source explicitly published an empty selection
+    /// (D-04: this is not "no exploration source exists" — Preview shows
+    /// "No selection" until another explicit source is chosen).
+    EmptySelection,
 }
 
 /// An explicit binding of a context sink to a source (§7.2).
@@ -84,6 +88,11 @@ pub enum ContextBinding {
 
 /// The `ExplorationSelection` authority. A producer (graph in W07, search in
 /// W10) publishes selections; W04 defines the state and its routing rules.
+///
+/// `target` is `None` for a *deliberately published empty selection*: the
+/// source exists and reported "nothing selected" (e.g. a click on the empty
+/// graph background). That is distinct from no selection ever published,
+/// which leaves the authority absent (§D-04).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExplorationSelection {
     /// The source tab that published the selection.
@@ -92,8 +101,8 @@ pub struct ExplorationSelection {
     pub incarnation: u64,
     /// Monotonic publication sequence of the source.
     pub sequence: u64,
-    /// The selected note.
-    pub target: NoteLocator,
+    /// The selected note, or an explicit empty selection.
+    pub target: Option<NoteLocator>,
 }
 
 /// The effective source a sink should render, computed by [`ContextRouter`].
@@ -123,8 +132,8 @@ pub enum ContextSource {
 #[must_use]
 pub fn is_source_kind(kind: &ViewKind) -> bool {
     match kind {
-        ViewKind::Note(_) => true,
-        // Graph and Search sources arrive with their slices (W07/W10).
+        ViewKind::Note(_) | ViewKind::Graph(_) => true,
+        // Search sources arrive with their slice (W10).
         ViewKind::Empty | ViewKind::Notes | ViewKind::Preview(_) | ViewKind::Backlinks(_) => false,
     }
 }
@@ -147,10 +156,19 @@ impl ContextRouter {
             }
             ContextBinding::FollowExplorationOrDocument => {
                 if let Some(exploration) = state.exploration() {
-                    ContextSource::Exploration {
-                        source_tab: exploration.source_tab,
-                        locator: exploration.target.clone(),
-                        sequence: exploration.sequence,
+                    match &exploration.target {
+                        Some(locator) => ContextSource::Exploration {
+                            source_tab: exploration.source_tab,
+                            locator: locator.clone(),
+                            sequence: exploration.sequence,
+                        },
+                        // D-04: a deliberately published empty selection is
+                        // not absence — the sink must not fall back to the
+                        // document anchor while the selection authority is
+                        // intentionally "nothing".
+                        None => ContextSource::Unbound {
+                            reason: UnboundReason::EmptySelection,
+                        },
                     }
                 } else {
                     Self::document_source(state).unwrap_or(ContextSource::Unbound {
@@ -160,23 +178,33 @@ impl ContextRouter {
             }
             ContextBinding::FollowSource { tab } => {
                 match state.tab(tab).map(|session| session.kind().clone()) {
+                    Some(ViewKind::Note(note)) => ContextSource::Document {
+                        tab: *tab,
+                        locator: note.locator().clone(),
+                        publication: state.document_publication_of(*tab),
+                    },
                     Some(kind) if is_source_kind(&kind) => {
-                        if let ViewKind::Note(note) = kind {
-                            ContextSource::Document {
-                                tab: *tab,
-                                locator: note.locator().clone(),
-                                publication: state.document_publication_of(*tab),
+                        // Graph and later sources resolve through their own
+                        // publications; nothing published yet is a typed
+                        // unbound, never a silent substitute source.
+                        match state.exploration() {
+                            Some(selection) if selection.source_tab == *tab => {
+                                match &selection.target {
+                                    Some(locator) => ContextSource::Exploration {
+                                        source_tab: *tab,
+                                        locator: locator.clone(),
+                                        sequence: selection.sequence,
+                                    },
+                                    None => ContextSource::Unbound {
+                                        reason: UnboundReason::EmptySelection,
+                                    },
+                                }
                             }
-                        } else {
-                            // Future source kinds resolve through their own
-                            // publications once their slices land.
-                            ContextSource::Unbound {
+                            _ => ContextSource::Unbound {
                                 reason: UnboundReason::NoExploration,
-                            }
+                            },
                         }
                     }
-                    // Sinks and closed tabs are typed-unbound, never silently
-                    // replaced by a different source (D-09).
                     // Sinks and closed tabs are typed-unbound, never
                     // silently replaced by a different source (D-09).
                     Some(_) | None => ContextSource::Unbound {
@@ -356,7 +384,7 @@ mod tests {
         let mut state = commit.state;
         assert!(
             state
-                .publish_exploration(sink_tab, 1, locator("a.md"))
+                .publish_exploration(sink_tab, 1, Some(locator("a.md")))
                 .is_err()
         );
         // Rebinding through the typed action works and signals rebind.

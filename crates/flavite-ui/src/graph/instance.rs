@@ -8,10 +8,9 @@
 //! importance — are decided *here*, on the CPU, where they are unit-tested
 //! rather than re-derived (and re-implemented) in WGSL.
 
-use std::cmp::Ordering;
 use std::mem::size_of;
 
-use flavite_graph::{GraphSnapshot, NodeId, NodeKind};
+use flavite_graph::NodeKind;
 
 /// Vertex-layout stride of [`NodeInstance`], in bytes.
 ///
@@ -98,7 +97,7 @@ impl From<NodeKind> for NodeShape {
     fn from(kind: NodeKind) -> Self {
         match kind {
             NodeKind::Note => Self::Circle,
-            NodeKind::Attachment => Self::Square,
+            NodeKind::Attachment | NodeKind::Unresolved => Self::Square,
         }
     }
 }
@@ -375,188 +374,13 @@ impl CameraUniform {
 }
 
 /// A problem building instance geometry from a snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum GeometryError {
-    /// The position buffer must be indexed by the snapshot's dense order
-    /// (§4.14: position/node-id mappings from different topologies may never
-    /// be combined).
-    #[error(
-        "position count ({positions}) does not match node count ({nodes}) — \
-         positions and snapshot must come from the same topology version"
-    )]
-    PositionCountMismatch {
-        /// Nodes in the snapshot.
-        nodes: usize,
-        /// Positions supplied.
-        positions: usize,
-    },
-}
-
-/// The instanced geometry the probe uploads: nodes, then edges ordered by
-/// importance (descending) so the per-frame edge cap is a prefix draw.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProbeGeometry {
-    generation: u64,
-    nodes: Vec<NodeInstance>,
-    edges: Vec<EdgeInstance>,
-    /// Node identities, in dense order, parallel to `nodes`.
-    /// Added in B6 for hit-testing: mapping dense indices back to [`NodeId`].
-    node_ids: Vec<NodeId>,
-}
-
-impl ProbeGeometry {
-    /// Build geometry from a graph snapshot and dense-indexed positions.
-    ///
-    /// - One [`NodeInstance`] per node, sized by [`node_radius`] and shaped
-    ///   by [`NodeShape::from`].
-    /// - One [`EdgeInstance`] per directed out-edge of the snapshot (each
-    ///   edge is drawn exactly once), carrying its [`edge_base_alpha`],
-    ///   sorted **importance-descending** so that a draw of
-    ///   `edges[..edge_cap(total, zoom)]` keeps the most important edges
-    ///   first (D15: edge count capped by importance).
-    ///
-    /// `generation` identifies the position/topology generation: the
-    /// renderer only re-uploads instance buffers when it changes (see
-    /// [`needs_upload`]), which is the hand-off `PositionBuffer` makes in
-    /// B3+.
-    pub fn from_snapshot(
-        snapshot: &GraphSnapshot,
-        positions: &[[f32; 2]],
-        generation: u64,
-    ) -> Result<Self, GeometryError> {
-        let node_count = snapshot.node_count();
-        if positions.len() != node_count {
-            return Err(GeometryError::PositionCountMismatch {
-                nodes: node_count,
-                positions: positions.len(),
-            });
-        }
-
-        let node_ids: Vec<NodeId> = snapshot.node_ids.clone();
-        let nodes = super::nodes::node_visuals(snapshot)
-            .into_iter()
-            .zip(positions.iter().copied())
-            .map(|(visual, center)| NodeInstance {
-                center,
-                size: visual.size,
-                shape: visual.shape,
-                color: visual.color,
-            })
-            .collect();
-
-        let mut keyed: Vec<(f32, EdgeInstance)> = Vec::with_capacity(snapshot.edge_count());
-        let mut cursor = 0usize;
-        for src in 0..node_count {
-            let start = snapshot.out_offsets[src] as usize;
-            let end = snapshot.out_offsets[src + 1] as usize;
-            assert!(
-                start >= cursor,
-                "out_offsets must be non-decreasing (CSR invariant)"
-            );
-            cursor = end;
-            for row in start..end {
-                let dst = snapshot.out_indices[row] as usize;
-                let importance = edge_importance(snapshot.degrees[src], snapshot.degrees[dst]);
-                keyed.push((
-                    importance,
-                    EdgeInstance {
-                        from: positions[src],
-                        to: positions[dst],
-                        alpha: edge_base_alpha(importance),
-                        width: EDGE_WIDTH_BASE,
-                        pad: [0.0; 2],
-                    },
-                ));
-            }
-        }
-        assert_eq!(
-            cursor,
-            snapshot.edge_count(),
-            "CSR rows must account for every edge"
-        );
-
-        // Stable sort: ties keep snapshot order, so the result is
-        // deterministic for a given snapshot.
-        keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-        let edges = keyed.into_iter().map(|(_, edge)| edge).collect();
-
-        Ok(Self {
-            generation,
-            nodes,
-            edges,
-            node_ids,
-        })
-    }
-
-    /// Build geometry directly (used by tests that do not need a snapshot).
-    #[must_use]
-    pub fn new(
-        generation: u64,
-        nodes: Vec<NodeInstance>,
-        edges: Vec<EdgeInstance>,
-        node_ids: Vec<NodeId>,
-    ) -> Self {
-        Self {
-            generation,
-            nodes,
-            edges,
-            node_ids,
-        }
-    }
-
-    /// The position/topology generation this geometry was built at.
-    #[must_use]
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    /// Node instances, in dense order.
-    #[must_use]
-    pub fn nodes(&self) -> &[NodeInstance] {
-        &self.nodes
-    }
-
-    /// Edge instances, importance-descending.
-    #[must_use]
-    pub fn edges(&self) -> &[EdgeInstance] {
-        &self.edges
-    }
-
-    /// Node identities, in dense order (parallel to [`Self::nodes`]).
-    ///
-    /// Added in B6 for hit-testing: maps dense indices back to [`NodeId`].
-    #[must_use]
-    pub fn node_ids(&self) -> &[NodeId] {
-        &self.node_ids
-    }
-
-    /// Number of nodes.
-    #[must_use]
-    pub fn node_count(&self) -> usize {
-        self.nodes.len()
-    }
-
-    /// Total number of edge instances available (before any zoom cap).
-    #[must_use]
-    pub fn edge_count(&self) -> usize {
-        self.edges.len()
-    }
-
-    /// Edge instances to draw at `zoom`: the importance prefix (D15).
-    #[must_use]
-    pub fn visible_edge_count(&self, zoom: f32) -> usize {
-        edge_cap(self.edges.len(), zoom)
-    }
-
-    /// Get the node identity for a dense index.
-    ///
-    /// Returns `None` if the index is out of range.
-    #[must_use]
-    pub fn node_id(&self, index: usize) -> Option<NodeId> {
-        self.node_ids.get(index).copied()
-    }
-}
-
+///
+/// The concrete error enum now lives in [`super::geometry`]; this alias keeps
+/// the module graph honest — the CPU instance layer owns the primitive bytes,
+/// the geometry layer owns the snapshot-to-frame pairing.
+/// The instanced geometry the renderer uploads lives in
+/// [`super::geometry::RenderGeometry`]; the probe is a consumer of it, not
+/// its owner (TD-10 removed the inverted production→probe dependency).
 /// Whether instance buffers must be (re)uploaded.
 ///
 /// Uploads happen only when the geometry generation moved (or when the
@@ -619,7 +443,7 @@ pub fn edge_alpha_factor(zoom: f32) -> f32 {
 ///
 /// The cap scales with zoom between [`EDGE_CAP_ZOOM_MIN`] and
 /// [`EDGE_CAP_ZOOM_MAX`] and never exceeds `total`. Combined with the
-/// importance ordering of [`ProbeGeometry::edges`], truncating the instance
+/// importance ordering of [`super::geometry::RenderGeometry::edges`], truncating the instance
 /// draw to this value is exactly "cap the edge count by importance".
 #[must_use]
 pub fn edge_cap(total: usize, zoom: f32) -> usize {
@@ -641,6 +465,7 @@ pub fn color_of(kind: NodeKind) -> [f32; 4] {
     match kind {
         NodeKind::Note => NOTE_COLOR,
         NodeKind::Attachment => ATTACHMENT_COLOR,
+        NodeKind::Unresolved => [0.92, 0.67, 0.25, 1.0],
     }
 }
 
@@ -662,7 +487,9 @@ fn pack_f32x4(v: [f32; 4]) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::geometry::{GeometryError, RenderGeometry};
     use flavite_graph::{Delta, EdgeDelta, EdgeKind, GraphModel, NodeDelta, NodeId};
+    use std::cmp::Ordering;
 
     fn note(id: u64) -> NodeId {
         NodeId::note(id)
@@ -924,7 +751,7 @@ mod tests {
     fn from_snapshot_builds_one_node_instance_per_node() {
         let snapshot = fixture();
         let positions = [[0.0, 0.0], [10.0, 0.0], [20.0, 20.0]];
-        let geometry = ProbeGeometry::from_snapshot(&snapshot, &positions, 7).unwrap();
+        let geometry = RenderGeometry::from_snapshot(&snapshot, &positions, 7).unwrap();
         assert_eq!(geometry.node_count(), 3);
         assert_eq!(geometry.generation(), 7);
         assert_eq!(geometry.edge_count(), 3);
@@ -953,7 +780,7 @@ mod tests {
     #[test]
     fn from_snapshot_rejects_a_mismatched_position_buffer() {
         let snapshot = fixture();
-        let err = ProbeGeometry::from_snapshot(&snapshot, &[[0.0, 0.0]], 0).unwrap_err();
+        let err = RenderGeometry::from_snapshot(&snapshot, &[[0.0, 0.0]], 0).unwrap_err();
         assert_eq!(
             err,
             GeometryError::PositionCountMismatch {
@@ -962,9 +789,9 @@ mod tests {
             }
         );
         // Same topology, exactly one position per node → accepted.
-        assert!(ProbeGeometry::from_snapshot(&snapshot, &[[0.0, 0.0]; 3], 0).is_ok());
+        assert!(RenderGeometry::from_snapshot(&snapshot, &[[0.0, 0.0]; 3], 0).is_ok());
         // Too many positions is just as stale as too few.
-        assert!(ProbeGeometry::from_snapshot(&snapshot, &[[0.0, 0.0]; 4], 0).is_err());
+        assert!(RenderGeometry::from_snapshot(&snapshot, &[[0.0, 0.0]; 4], 0).is_err());
     }
 
     #[test]
@@ -1001,7 +828,7 @@ mod tests {
         ]);
         let snapshot = model.snapshot();
         let positions: Vec<[f32; 2]> = (0..5).map(|i| [i as f32 * 10.0, 0.0]).collect();
-        let geometry = ProbeGeometry::from_snapshot(&snapshot, &positions, 0).unwrap();
+        let geometry = RenderGeometry::from_snapshot(&snapshot, &positions, 0).unwrap();
         assert_eq!(geometry.edge_count(), 6);
 
         // Recompute every expected alpha straight from the snapshot's degree
@@ -1050,8 +877,8 @@ mod tests {
     fn geometry_is_deterministic_for_a_given_snapshot() {
         let snapshot = fixture();
         let positions = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
-        let a = ProbeGeometry::from_snapshot(&snapshot, &positions, 1).unwrap();
-        let b = ProbeGeometry::from_snapshot(&snapshot, &positions, 1).unwrap();
+        let a = RenderGeometry::from_snapshot(&snapshot, &positions, 1).unwrap();
+        let b = RenderGeometry::from_snapshot(&snapshot, &positions, 1).unwrap();
         assert_eq!(a, b);
     }
 
@@ -1059,7 +886,7 @@ mod tests {
     fn visible_edge_count_is_a_prefix_of_the_sorted_edges() {
         let snapshot = fixture();
         let positions = [[0.0, 0.0]; 3];
-        let geometry = ProbeGeometry::from_snapshot(&snapshot, &positions, 0).unwrap();
+        let geometry = RenderGeometry::from_snapshot(&snapshot, &positions, 0).unwrap();
         let cap = geometry.visible_edge_count(1.0);
         assert!(cap <= geometry.edge_count());
         // At reference zoom the cap (100k) exceeds this tiny graph, so the
@@ -1174,7 +1001,7 @@ mod tests {
     #[test]
     fn empty_snapshot_yields_empty_geometry() {
         let snapshot = flavite_graph::GraphModel::new().snapshot();
-        let geometry = ProbeGeometry::from_snapshot(&snapshot, &[], 3).unwrap();
+        let geometry = RenderGeometry::from_snapshot(&snapshot, &[], 3).unwrap();
         assert_eq!(geometry.node_count(), 0);
         assert_eq!(geometry.edge_count(), 0);
         assert_eq!(geometry.visible_edge_count(1.0), 0);

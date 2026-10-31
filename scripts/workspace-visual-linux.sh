@@ -3,7 +3,7 @@
 #
 # Starts the actual shell under a real native window, injects real OS
 # keyboard input, waits for semantic readiness of the workspace harness
-# (never sleeps), asserts structure, and captures screenshots. The fixture
+# with bounded readiness waits, asserts structure, and captures screenshots. The fixture
 # binary is built only with `ui-test-support`; the production build cannot
 # enable the harness (RFC-0003 §16.2).
 set -euo pipefail
@@ -13,14 +13,18 @@ cd "$repo_root"
 
 scenario="layout"
 backend="x11"
+render_backend="gpu"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --scenario) scenario="$2"; shift 2 ;;
-        --backend) backend="$2"; shift 2 ;;
+        --backend)
+            case "$2" in gpu|canvas) render_backend="$2" ;; x11) backend=x11 ;; *) echo "This window-input runner supports X11 with gpu or canvas rendering" >&2; exit 2 ;; esac
+            shift 2 ;;
+        --require-backend) shift ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
-if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" && "$scenario" != "context" && "$scenario" != "semantic-link" && "$scenario" != "restore" ]]; then
+if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" && "$scenario" != "context" && "$scenario" != "semantic-link" && "$scenario" != "restore" && "$scenario" != "filtered-unsaved-graph" ]]; then
     echo "unsupported scenario: $scenario (implemented: layout, shared-editors, shell-foundation, context, semantic-link, restore)" >&2
     exit 2
 fi
@@ -39,7 +43,7 @@ done
 # Allow enough physical pixels for the default window at 2x display scale.
 if [[ "${FLAVITE_XVFB_ACTIVE:-0}" != 1 ]] && command -v xvfb-run >/dev/null 2>&1; then
     exec xvfb-run -a -s "-screen 0 ${FLAVITE_VISUAL_SCREEN:-2560x1600x24}" \
-        env FLAVITE_XVFB_ACTIVE=1 bash "$0" --scenario "$scenario" --backend "$backend"
+        env FLAVITE_XVFB_ACTIVE=1 bash "$0" --scenario "$scenario" --backend "$render_backend" --require-backend
 fi
 if [[ -n "${DISPLAY:-}" ]] && ! xdotool getdisplaygeometry >/dev/null 2>&1; then
     echo "DISPLAY=${DISPLAY} is not reachable; retrying with Xvfb if available." >&2
@@ -55,7 +59,7 @@ if [[ -z "${DISPLAY:-}" ]]; then
         exit 2
     fi
     exec xvfb-run -a -s "-screen 0 ${FLAVITE_VISUAL_SCREEN:-2560x1600x24}" \
-        env FLAVITE_XVFB_ACTIVE=1 bash "$0" --scenario "$scenario" --backend "$backend"
+        env FLAVITE_XVFB_ACTIVE=1 bash "$0" --scenario "$scenario" --backend "$render_backend" --require-backend
 fi
 
 target_dir="${CARGO_TARGET_DIR:-target}"
@@ -71,6 +75,12 @@ mkdir -p "$vault_dir/Systems"
 printf '# Alpha\n\nalpha body\n' >"$vault_dir/alpha.md"
 printf '# Beta\n\nbeta body\n' >"$vault_dir/beta.md"
 printf '# Gamma\n\ngamma body\n' >"$vault_dir/Systems/gamma.md"
+python3 - "$vault_dir" "$run_dir/expected-fixture.json" <<'PY'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+files={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(root.rglob('*.md'))}
+pathlib.Path(sys.argv[2]).write_text(json.dumps({'schema':1,'fixture_seed':31008,'phase':'before_explicit_demo_boot','files_sha256':files},indent=2)+'\n')
+PY
 
 cargo build -p flavite-ui --example app-demo --features ui-test-support
 
@@ -97,8 +107,9 @@ mkdir -p "$device_dir"
 env -u WAYLAND_DISPLAY WINIT_UNIX_BACKEND=x11 \
     FLAVITE_VAULT="$vault_dir" \
     FLAVITE_DATA_DIR="$device_dir" \
+    FLAVITE_GRAPH_BACKEND="$render_backend" \
     FLAVITE_HARNESS_OUT_FD=3 \
-    "$target_dir/debug/examples/app-demo" \
+    "$target_dir/debug/examples/app-demo" "$vault_dir" \
     3>"$harness_log" >"$app_log" 2>&1 &
 app_pid=$!
 
@@ -186,7 +197,10 @@ harness_wait "boot with the catalog loaded" \
 capture "$run_dir/01-boot.png"
 record "boot-single-group-catalog" "01-boot.png"
 
-if [[ "$scenario" == "shell-foundation" ]]; then
+if [[ "$scenario" == "filtered-unsaved-graph" ]]; then
+    python3 scripts/tests/workspace_graph.py "$window_id" "$harness_log" "$run_dir" "$vault_dir" "$render_backend"
+    record "graph-os-input-filter-overlay-undo" "graph-checks.json"
+elif [[ "$scenario" == "shell-foundation" ]]; then
     python3 scripts/tests/workspace_shell_foundation.py "$window_id" "$harness_log" "$run_dir"
     record "os-pointer-dock-reorder-menu-overflow" "foundation-checks.json"
 elif [[ "$scenario" == "semantic-link" ]]; then
@@ -210,7 +224,7 @@ elif [[ "$scenario" == "semantic-link" ]]; then
     harness_wait "semantic link inserted at the caret" \
         '"[[beta]]" in snapshot["focused_text"]'
     harness_wait "the insertion targets the alpha editor" \
-        'any(t["active"] and t["title"] == "alpha" and "[[beta]]" in (t.get("effective_source") or "x") or t["active"] and t["title"] == "alpha" for g in snapshot["groups"] for t in g["tabs"]) or True'
+        'any(t["active"] and t["title"] == "alpha" and "[[beta]]" in (t.get("effective_source") or "x") or t["active"] and t["title"] == "alpha" for g in snapshot["groups"] for t in g["tabs"])'
     capture "$run_dir/02-inserted.png"
     record "semantic-link-inserted-at-caret" "02-inserted.png"
 
@@ -566,9 +580,10 @@ print(h.hexdigest())
     echo "  \"scenario\": \"$scenario\","
     echo "  \"platform\": \"linux\","
     echo "  \"display_backend\": \"$backend\","
-    echo "  \"render_backend\": \"gpu-or-software\","
+    echo "  \"render_backend\": \"$render_backend\","
     echo "  \"input_evidence\": \"rendered_os_input\","
-    echo "  \"fixture_seed\": null,"
+    echo "  \"fixture_seed\": 31008,"
+    echo "  \"fixture_manifest\": \"expected-fixture.json\","
     echo "  \"run_id\": \"$run_id\","
     echo "  \"checks\": ["
     joined="$(IFS=,; echo "${checks[*]}")"
@@ -576,8 +591,8 @@ print(h.hexdigest())
     echo "  ],"
     echo "  \"unmet\": []"
     echo '}'
-} >"$evidence_dir/manifest.json"
+} >"$run_dir/manifest.json"
 
-cp "$evidence_dir/manifest.json" "$run_dir/manifest.json"
+cp "$run_dir/manifest.json" "$evidence_dir/manifest.json"
 echo "workspace visual run complete: $run_dir"
 echo "manifest: $evidence_dir/manifest.json"

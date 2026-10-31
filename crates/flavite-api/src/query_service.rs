@@ -6,7 +6,6 @@
 //! or superseded sequences never overwrite newer ones, and no SQLite,
 //! index, or vault types cross this boundary.
 
-use flavite_index::query::Query;
 use flavite_vault::session::Session;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -42,6 +41,11 @@ pub struct RequestToken {
 /// without leaking locator types across the facade boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryPayload {
+    /// Inspect one exact current connection occurrence before a removal decision.
+    Occurrence {
+        epoch: u64,
+        occurrence: crate::LinkOccurrence,
+    },
     /// Saved source text of one note.
     Preview {
         /// Vault-relative path components.
@@ -74,11 +78,28 @@ pub struct BacklinkRow {
     /// The line of the source containing a link occurrence, when the source
     /// could be read.
     pub excerpt: Option<String>,
+    /// This source is a current unsaved replacement of its saved outgoing links.
+    pub unsaved: bool,
+    /// Number of current directed occurrences from this source.
+    pub occurrences: usize,
 }
 
 /// Typed outcome of one query slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextQueryResult {
+    /// A scanner-validated occurrence with normalized positions and exact bytes.
+    Occurrence(OccurrenceDetail),
+    /// Current open-buffer preview, clearly distinguished from saved text.
+    BufferPreview {
+        path: Vec<String>,
+        text: String,
+        buffer_id: u64,
+        revision: u64,
+        unsaved: bool,
+    },
+    /// A newer source/catalog projection is pending; stale results are not current.
+    Updating,
+
     /// Saved source text (dirty buffer content is never shown here).
     Preview {
         /// Vault-relative path components.
@@ -104,6 +125,18 @@ pub enum ContextQueryResult {
         /// Bounded, redacted failure text.
         message: String,
     },
+}
+
+/// Read-only chooser data, never a write capability. Commit still requires a
+/// revisioned semantic plan, write authority, and current target validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OccurrenceDetail {
+    pub occurrence: crate::LinkOccurrence,
+    pub epoch: u64,
+    pub start: usize,
+    pub end: usize,
+    pub exact_source: String,
+    pub excerpt: String,
 }
 
 /// A completed query slot.
@@ -134,6 +167,7 @@ pub struct QueryService {
     // Manual `Debug` below: worker handles and locks are not meaningful in
     // diagnostics and must not leak identities.
     jobs: crossbeam::channel::Sender<Job>,
+    graph: Arc<arc_swap::ArcSwap<crate::GraphService>>,
     ready: Arc<Mutex<BTreeMap<RequestToken, (QueryPayload, ContextQueryResult)>>>,
     in_flight: Arc<AtomicUsize>,
     session_nonce: u128,
@@ -154,8 +188,13 @@ impl std::fmt::Debug for QueryService {
 }
 
 impl QueryService {
-    pub(crate) fn new(session: Arc<Session>, session_nonce: u128) -> Self {
-        let (jobs, receiver) = crossbeam::channel::unbounded::<Job>();
+    pub(crate) fn new(
+        session: Arc<Session>,
+        session_nonce: u128,
+        graph: Arc<crate::GraphService>,
+    ) -> Self {
+        let graph = Arc::new(arc_swap::ArcSwap::from(graph));
+        let (jobs, receiver) = crossbeam::channel::bounded::<Job>(MAX_QUERY_SLOTS);
         let ready: Arc<Mutex<BTreeMap<RequestToken, (QueryPayload, ContextQueryResult)>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -163,6 +202,7 @@ impl QueryService {
         for worker_index in 0..2 {
             let receiver = receiver.clone();
             let session = Arc::clone(&session);
+            let graph = Arc::clone(&graph);
             let ready = Arc::clone(&ready);
             let in_flight = Arc::clone(&in_flight);
             workers.push(
@@ -170,7 +210,15 @@ impl QueryService {
                     .name(format!("flavite-query-{worker_index}"))
                     .spawn(move || {
                         while let Ok(job) = receiver.recv() {
-                            let result = execute(&session, &job.payload);
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    execute(&session, &graph.load_full(), &job.payload)
+                                }))
+                                .unwrap_or(
+                                    ContextQueryResult::Failed {
+                                        message: "Context worker failed; retry the query".into(),
+                                    },
+                                );
                             publish(&ready, &in_flight, job, result);
                         }
                     })
@@ -179,12 +227,17 @@ impl QueryService {
         }
         Self {
             jobs,
+            graph,
             ready,
             in_flight,
             session_nonce,
             request_sequence: AtomicU64::new(0),
             _workers: workers,
         }
+    }
+
+    pub(crate) fn set_graph(&self, graph: Arc<crate::GraphService>) {
+        self.graph.store(graph);
     }
 
     /// Submit a query for a context tool. The token is derived from the
@@ -200,10 +253,15 @@ impl QueryService {
         binding_sequence: u64,
         payload: QueryPayload,
     ) -> Result<RequestToken, QuerySubmitError> {
-        if self.in_flight.load(Ordering::Acquire) >= MAX_QUERY_SLOTS {
+        if self
+            .in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_QUERY_SLOTS).then_some(count + 1)
+            })
+            .is_err()
+        {
             return Err(QuerySubmitError::Busy);
         }
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
         let token = RequestToken {
             session_nonce: self.session_nonce,
             context_tab,
@@ -211,7 +269,7 @@ impl QueryService {
             binding_sequence,
             request_sequence: self.request_sequence.fetch_add(1, Ordering::AcqRel),
         };
-        if self.jobs.send(Job { token, payload }).is_err() {
+        if self.jobs.try_send(Job { token, payload }).is_err() {
             self.in_flight.fetch_sub(1, Ordering::AcqRel);
             return Err(QuerySubmitError::Busy);
         }
@@ -223,7 +281,9 @@ impl QueryService {
     /// coexist with a served `n+1` for the same requesting view.
     pub fn drain(&self) -> Vec<QueryOutcome> {
         let mut ready = self.ready.lock().expect("query slot lock");
-        std::mem::take(&mut *ready)
+        let drained = std::mem::take(&mut *ready);
+        self.in_flight.fetch_sub(drained.len(), Ordering::AcqRel);
+        drained
             .into_iter()
             .map(|(token, (payload, result))| QueryOutcome {
                 token,
@@ -270,19 +330,105 @@ fn publish(
             .copied()
             .collect();
         for token in superseded {
-            slots.remove(&token);
+            if slots.remove(&token).is_some() {
+                in_flight.fetch_sub(1, Ordering::AcqRel);
+            }
         }
         slots.insert(job.token, (job.payload, result));
+    } else {
+        in_flight.fetch_sub(1, Ordering::AcqRel);
     }
-    in_flight.fetch_sub(1, Ordering::AcqRel);
 }
 
 /// Execute one query against the Session read surface.
-fn execute(session: &Arc<Session>, payload: &QueryPayload) -> ContextQueryResult {
+fn execute(
+    session: &Arc<Session>,
+    graph: &Arc<crate::GraphService>,
+    payload: &QueryPayload,
+) -> ContextQueryResult {
     match payload {
+        QueryPayload::Occurrence { epoch, occurrence } => {
+            inspect_occurrence(session, graph, *epoch, occurrence)
+        }
         QueryPayload::Preview { path } => execute_preview(session, path),
-        QueryPayload::Backlinks { path } => execute_backlinks(session, path),
+        QueryPayload::Backlinks { path } => execute_backlinks(session, graph, path),
     }
+}
+
+fn inspect_occurrence(
+    session: &Arc<Session>,
+    graph: &Arc<crate::GraphService>,
+    epoch: u64,
+    occurrence: &crate::LinkOccurrence,
+) -> ContextQueryResult {
+    let failure = || ContextQueryResult::Failed {
+        message: "Connection changed; refresh the occurrence chooser".into(),
+    };
+    let Some(frame) = graph.frame() else {
+        return failure();
+    };
+    if frame.projection().saved.epoch != epoch
+        || frame.projection().buffer_stamp != session.graph_buffer_stamp()
+        || !frame.projection().occurrences.contains(occurrence)
+    {
+        return failure();
+    }
+    let content = match &occurrence.source {
+        crate::OccurrenceSource::Buffer {
+            buffer_id,
+            revision,
+        } => session
+            .shared_buffer_snapshot(
+                (*buffer_id).into(),
+                Some(flavite_buffer::Revision::new(*revision)),
+            )
+            .ok()
+            .map(|s| (s.text.to_string(), occurrence.start, occurrence.end)),
+        crate::OccurrenceSource::Saved { content_hash } => session
+            .read_saved_note(&session.root().join(&occurrence.source_path))
+            .ok()
+            .flatten()
+            .filter(|bytes| blake3::hash(bytes).as_bytes().as_slice() == content_hash)
+            .and_then(|bytes| {
+                let snapshot = flavite_syntax::text::TextSnapshot::new(&bytes).ok()?;
+                let start = snapshot
+                    .source_to_text(flavite_syntax::text::SourceByte(occurrence.start))?
+                    .0;
+                let end = snapshot
+                    .source_to_text(flavite_syntax::text::SourceByte(occurrence.end))?
+                    .0;
+                Some((snapshot.text().to_owned(), start, end))
+            }),
+    };
+    let Some((text, start, end)) = content else {
+        return failure();
+    };
+    let Ok(parsed) = flavite_syntax::pulldown_glue::parse_note(text.as_bytes()) else {
+        return failure();
+    };
+    if !parsed.links.iter().any(|link| {
+        link.span.start.0 == start
+            && link.span.end.0 == end
+            && link.target_raw == occurrence.target_raw
+    }) {
+        return failure();
+    }
+    let Some(exact_source) = text.get(start..end) else {
+        return failure();
+    };
+    if exact_source.len() > 8192 {
+        return ContextQueryResult::Failed {
+            message: "Connection syntax exceeds the 8 KiB edit limit; edit source".into(),
+        };
+    }
+    ContextQueryResult::Occurrence(OccurrenceDetail {
+        occurrence: occurrence.clone(),
+        epoch,
+        start,
+        end,
+        exact_source: exact_source.into(),
+        excerpt: exact_excerpt(&text, start, end).unwrap_or_default(),
+    })
 }
 
 fn root_path(session: &Arc<Session>, components: &[String]) -> PathBuf {
@@ -299,6 +445,21 @@ fn provenance(session: &Arc<Session>) -> Result<(u64, u64), String> {
 }
 
 fn execute_preview(session: &Arc<Session>, path: &[String]) -> ContextQueryResult {
+    let relative: PathBuf = path.iter().collect();
+    if let Some((id, revision, ..)) = session
+        .graph_buffer_stamp()
+        .into_iter()
+        .find(|(_, _, open, ..)| open.strip_prefix(session.root()).unwrap_or(open) == relative)
+        && let Ok(snapshot) = session.shared_buffer_snapshot(id, Some(revision))
+    {
+        return ContextQueryResult::BufferPreview {
+            path: path.to_vec(),
+            text: snapshot.text.to_string(),
+            buffer_id: id.as_u64(),
+            revision: revision.as_u64(),
+            unsaved: snapshot.state != flavite_buffer::state::BufferState::Clean,
+        };
+    }
     let full = root_path(session, path);
     let bytes = match session.read_saved_note(&full) {
         Ok(Some(bytes)) => bytes,
@@ -316,63 +477,113 @@ fn execute_preview(session: &Arc<Session>, path: &[String]) -> ContextQueryResul
     }
 }
 
-fn execute_backlinks(session: &Arc<Session>, path: &[String]) -> ContextQueryResult {
-    let (epoch, generation) = match provenance(session) {
-        Ok(values) => values,
-        Err(message) => return ContextQueryResult::Failed { message },
+fn execute_backlinks(
+    session: &Arc<Session>,
+    graph: &Arc<crate::GraphService>,
+    path: &[String],
+) -> ContextQueryResult {
+    let Some(frame) = graph.frame() else {
+        return ContextQueryResult::Updating;
     };
-    let target_raw = path.last().map(String::as_str).unwrap_or_default();
-    let stem = target_raw.strip_suffix(".md").unwrap_or(target_raw);
-    let target_key = path.join("/");
-    let resolution = session.resolve_target(target_key, stem.to_owned(), false, None);
-    let note_ref = match resolution {
-        Ok(resolution) if resolution.is_ambiguous => {
-            return ContextQueryResult::Failed {
-                message: "backlink target resolves to more than one note".to_owned(),
-            };
-        }
-        Ok(resolution) => match resolution.note {
-            Some(note) => note,
-            None => {
-                return ContextQueryResult::Failed {
-                    message: "backlink target is not a resolved note".to_owned(),
-                };
-            }
-        },
-        Err(message) => return ContextQueryResult::Failed { message },
+    let projection = frame.projection();
+    if projection.buffer_stamp != session.graph_buffer_stamp() {
+        return ContextQueryResult::Updating;
+    }
+    if projection
+        .overlays
+        .values()
+        .any(|overlay| matches!(overlay, crate::OverlayState::Failed { .. }))
+    {
+        return ContextQueryResult::Failed {
+            message: "Current backlinks unavailable: fix the source parse error".into(),
+        };
+    }
+    let relative: PathBuf = path.iter().collect();
+    let Some(target) = projection
+        .effective
+        .nodes
+        .iter()
+        .find(|n| n.native_path == relative)
+    else {
+        return ContextQueryResult::Missing;
     };
-    let page = match session.search_notes(Query::LinksTo(note_ref), MAX_BACKLINK_ROWS) {
-        Ok(page) => page,
-        Err(message) => return ContextQueryResult::Failed { message },
-    };
-    let target_stem = stem.to_owned();
-    let links = page
-        .items
-        .into_iter()
-        .map(|(_note_id, source_path, source_title)| {
-            let excerpt = session
-                .read_saved_note(&session.root().join(&source_path))
+    let mut by_source: BTreeMap<flavite_graph::NodeId, Vec<&crate::LinkOccurrence>> =
+        BTreeMap::new();
+    for occurrence in projection
+        .occurrences
+        .iter()
+        .filter(|o| o.edge.to == target.id)
+    {
+        by_source
+            .entry(occurrence.edge.from)
+            .or_default()
+            .push(occurrence);
+    }
+    let mut links = Vec::new();
+    for (source, occurrences) in by_source.into_iter().take(MAX_BACKLINK_ROWS) {
+        let Some(record) = projection.effective.nodes.iter().find(|r| r.id == source) else {
+            continue;
+        };
+        let occurrence = occurrences[0];
+        let unsaved = matches!(occurrence.source, crate::OccurrenceSource::Buffer { .. });
+        let excerpt = match &occurrence.source {
+            crate::OccurrenceSource::Buffer {
+                buffer_id,
+                revision,
+            } => session
+                .shared_buffer_snapshot(
+                    (*buffer_id).into(),
+                    Some(flavite_buffer::Revision::new(*revision)),
+                )
+                .ok()
+                .and_then(|s| exact_excerpt(&s.text, occurrence.start, occurrence.end)),
+            crate::OccurrenceSource::Saved { content_hash } => session
+                .read_saved_note(&session.root().join(&occurrence.source_path))
                 .ok()
                 .flatten()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .and_then(|text| link_excerpt(&text, &target_stem));
-            BacklinkRow {
-                source_path,
-                source_title,
-                excerpt,
-            }
-        })
-        .collect();
+                .filter(|bytes| blake3::hash(bytes).as_bytes().as_slice() == content_hash)
+                .and_then(|bytes| {
+                    let snapshot = flavite_syntax::text::TextSnapshot::new(&bytes).ok()?;
+                    let start = snapshot
+                        .source_to_text(flavite_syntax::text::SourceByte(occurrence.start))?
+                        .0;
+                    let end = snapshot
+                        .source_to_text(flavite_syntax::text::SourceByte(occurrence.end))?
+                        .0;
+                    exact_excerpt(snapshot.text(), start, end)
+                }),
+        };
+        links.push(BacklinkRow {
+            source_path: record.path.clone(),
+            source_title: record.title.clone(),
+            excerpt,
+            unsaved,
+            occurrences: occurrences.len(),
+        });
+    }
     ContextQueryResult::Backlinks {
         path: path.to_vec(),
         links,
-        provenance: Provenance { epoch, generation },
+        provenance: Provenance {
+            epoch: projection.saved.epoch,
+            generation: projection.saved.generation,
+        },
     }
+}
+
+fn exact_excerpt(text: &str, start: usize, end: usize) -> Option<String> {
+    text.get(start..end)?;
+    let line_start = text[..start].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = text[end..]
+        .find('\n')
+        .map_or(text.len(), |index| end + index);
+    Some(text[line_start..line_end].trim_end().to_owned())
 }
 
 /// The first line of `text` containing a link occurrence whose target
 /// mentions `stem`, found by the one shared scanner (never a second,
 /// weaker parser). Excerpts are presentation-only; identity is the path.
+#[cfg(test)]
 fn link_excerpt(text: &str, stem: &str) -> Option<String> {
     let parsed = flavite_syntax::pulldown_glue::parse_note(text.as_bytes()).ok()?;
     let link = parsed.links.iter().find(|link| {

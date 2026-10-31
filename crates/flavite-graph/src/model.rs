@@ -78,6 +78,11 @@ impl Default for GraphModel {
 }
 
 impl GraphModel {
+    /// Reconstructed worker mirrors retain the producer's topology identity.
+    pub(crate) fn adopt_snapshot_version(&mut self, version: u64) {
+        self.topology_version = version;
+    }
+
     /// A new, empty model.
     ///
     /// The CSR cache is built eagerly so the "cache is consistent with the

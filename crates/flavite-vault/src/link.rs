@@ -42,6 +42,15 @@ pub enum StableLinkPolicy {
     PreferStable,
 }
 
+/// Exact selected entity; cache identities never cross epochs or path reuse.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkTargetIdentity {
+    pub epoch: u64,
+    pub entity_id: u64,
+    pub native_path: Vec<u8>,
+}
+
 /// One prepare request. The target is the vault-relative note path (with or
 /// without `.md`); the core resolves it through the canonical resolver and
 /// records the exact entity identity in the plan.
@@ -57,8 +66,23 @@ pub struct LinkPrepareRequest {
     pub caret: usize,
     /// Vault-relative target path (components joined by `/`).
     pub target_path: String,
+    pub expected_target: Option<LinkTargetIdentity>,
     /// Stable-link policy.
     pub stable_link_policy: StableLinkPolicy,
+    /// Present only for a guarded occurrence-removal prepare.
+    pub removal: Option<RemovalRequest>,
+}
+
+/// Exact normalized scanner occurrence selected by the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovalRequest {
+    pub start: usize,
+    pub end: usize,
+    pub expected_source: String,
+    pub epoch: u64,
+    pub target_entity_id: u64,
+    pub target_is_attachment: bool,
+    pub target_is_unresolved: bool,
 }
 
 /// Source identity a plan is bound to.
@@ -248,11 +272,15 @@ pub(crate) struct LinkPlan {
     pub source: LinkSourceRef,
     /// Exact entity identity from the canonical resolver.
     pub target_entity_id: i64,
-    /// Target portable path components.
-    pub target_path: Vec<String>,
 
     /// The authorized edit: (start, end, replacement) in normalized bytes.
     pub edit: (usize, usize, String),
+    pub removal: bool,
+    pub target_raw: String,
+    pub target_is_attachment: bool,
+    pub target_is_unresolved: bool,
+    pub target_is_embed: bool,
+    pub source_path_key: Option<String>,
     /// Canonical catalog epoch the target was validated against.
     pub validated_epoch: u64,
     /// Canonical catalog generation at validation time.
@@ -262,12 +290,13 @@ pub(crate) struct LinkPlan {
 }
 
 /// A completed prepare request's payload fingerprint (dedup key value).
-pub(crate) type Fingerprint = u64;
+pub(crate) type Fingerprint = u128;
 
 /// Bounded plan store with gesture deduplication (§9.2).
 #[derive(Debug, Default)]
 pub struct LinkPlanStore {
     plans: HashMap<u128, LinkPlan>,
+    clients: std::collections::HashSet<ClientToken>,
     /// The one outstanding gesture per client namespace.
     outstanding: HashMap<ClientToken, u64>,
     /// Terminal results per (client, sequence).
@@ -312,7 +341,7 @@ fn fingerprint_prepare(request: &LinkPrepareRequest) -> Fingerprint {
         state ^= u64::from(*byte);
         state = state.wrapping_mul(0x1000_0000_01b3);
     }
-    state
+    u128::from(state)
 }
 
 /// The commit payload fingerprint (plan ID) used by the Session.
@@ -322,7 +351,7 @@ pub fn fingerprint_insert_public(plan_id: u128) -> Fingerprint {
 }
 
 fn fingerprint_insert(plan_id: u128) -> Fingerprint {
-    plan_id as u64 ^ (plan_id >> 64) as u64
+    plan_id
 }
 
 impl StableLinkPolicy {
@@ -335,6 +364,31 @@ impl StableLinkPolicy {
 }
 
 impl LinkPlanStore {
+    /// Register a token at trusted Session connection creation.
+    pub fn register_client(&mut self, client: ClientToken) {
+        self.clients.insert(client);
+    }
+
+    /// Actual source identity for authorization, independent of client fields.
+    pub fn source_for(&self, intent: LinkIntent, plan_id: u128) -> Option<u64> {
+        if let Some(plan) = self
+            .plans
+            .get(&plan_id)
+            .filter(|plan| plan.intent == intent)
+        {
+            return Some(plan.source.buffer_id);
+        }
+        self.results
+            .get(&(intent.client, intent.sequence))
+            .filter(|(fingerprint, _)| *fingerprint == plan_id)
+            .and_then(|(_, result)| {
+                result
+                    .as_ref()
+                    .ok()
+                    .map(|LinkOutcome::Applied { buffer_id, .. }| *buffer_id)
+            })
+    }
+
     /// Allocate a fresh opaque plan ID.
     #[must_use]
     pub fn allocate_plan_id(&mut self) -> u128 {
@@ -349,9 +403,10 @@ impl LinkPlanStore {
     ) -> Result<PrepareAdmission, LinkInsertionError> {
         let client = request.intent.client;
         let sequence = request.intent.sequence;
-        if sequence == 0 {
+        if sequence == 0 || !self.clients.contains(&client) {
             return Err(LinkInsertionError::InvalidIntent);
         }
+        self.purge_expired();
         if self.outstanding.contains_key(&client) {
             // Busy does not consume the sequence (§9.2).
             return Err(LinkInsertionError::Busy);
@@ -367,8 +422,7 @@ impl LinkPlanStore {
             let _ = self.results.get(&(client, sequence));
             return Err(LinkInsertionError::IntentExpired);
         }
-        self.purge_expired();
-        if self.plans.len() >= MAX_LIVE_LINK_PLANS {
+        if self.outstanding.len() >= MAX_LIVE_LINK_PLANS {
             self.plans_overflowed = self.plans_overflowed.saturating_add(1);
             return Err(LinkInsertionError::Busy);
         }
@@ -377,15 +431,21 @@ impl LinkPlanStore {
     }
 
     /// Install a completed plan under its allocated ID.
-    pub(crate) fn complete_prepare(&mut self, plan_id: u128, mut plan: LinkPlan) {
+    pub(crate) fn complete_prepare(&mut self, plan_id: u128, mut plan: LinkPlan) -> bool {
+        if self.outstanding.get(&plan.intent.client) != Some(&plan.intent.sequence) {
+            return false;
+        }
         plan.plan_id = plan_id;
         self.plans.insert(plan_id, plan);
+        true
     }
 
     /// Release the outstanding gesture after a failed prepare so the user
     /// can retry with a fresh sequence.
-    pub fn fail_prepare(&mut self, client: ClientToken) {
-        self.outstanding.remove(&client);
+    pub fn fail_prepare(&mut self, intent: LinkIntent) {
+        if self.outstanding.get(&intent.client) == Some(&intent.sequence) {
+            self.outstanding.remove(&intent.client);
+        }
     }
 
     /// Admit one commit request (fast checks on the session turn).
@@ -393,6 +453,7 @@ impl LinkPlanStore {
         &mut self,
         intent: &LinkIntent,
         plan_id: u128,
+        removal: bool,
     ) -> Result<CommitAdmission, LinkInsertionError> {
         let client = intent.client;
         let sequence = intent.sequence;
@@ -412,7 +473,7 @@ impl LinkPlanStore {
             return Err(LinkInsertionError::IntentExpired);
         }
         let cloned = match self.plans.get(&plan_id) {
-            Some(plan) if plan.intent == *intent => plan.clone(),
+            Some(plan) if plan.intent == *intent && plan.removal == removal => plan.clone(),
             Some(_) => return Err(LinkInsertionError::PlanNotFound),
             None => return Err(LinkInsertionError::PlanNotFound),
         };
@@ -421,8 +482,6 @@ impl LinkPlanStore {
             self.outstanding.remove(&client);
             return Err(LinkInsertionError::PlanExpired);
         }
-        self.plans.remove(&plan_id);
-        self.outstanding.remove(&client);
         Ok(CommitAdmission::Proceed(Box::new(cloned)))
     }
 
@@ -433,6 +492,8 @@ impl LinkPlanStore {
         fingerprint: Fingerprint,
         outcome: CachedOutcome,
     ) {
+        self.outstanding.remove(&intent.client);
+        self.plans.retain(|_, plan| plan.intent != *intent);
         let key = (intent.client, intent.sequence);
         if self.results.contains_key(&key) {
             return; // The first terminal outcome for a gesture is final.
@@ -441,8 +502,19 @@ impl LinkPlanStore {
         self.results_order.push(key);
         let high_water = self.high_water.entry(intent.client).or_insert(0);
         *high_water = (*high_water).max(intent.sequence);
-        while self.results_order.len() > LINK_RESULT_CACHE_LIMIT {
-            let evicted = self.results_order.remove(0);
+        while self
+            .results_order
+            .iter()
+            .filter(|(client, _)| *client == intent.client)
+            .count()
+            > LINK_RESULT_CACHE_LIMIT
+        {
+            let index = self
+                .results_order
+                .iter()
+                .position(|(client, _)| *client == intent.client)
+                .expect("client overflow");
+            let evicted = self.results_order.remove(index);
             self.results.remove(&evicted);
             self.results_overflowed = self.results_overflowed.saturating_add(1);
         }
@@ -456,8 +528,12 @@ impl LinkPlanStore {
 
     /// Cancel an outstanding gesture (host cancellation: no auto commit
     /// after cancellation, §9 worker table).
-    pub fn cancel(&mut self, client: ClientToken) {
-        if let Some(sequence) = self.outstanding.remove(&client) {
+    pub fn cancel(&mut self, intent: LinkIntent) {
+        let client = intent.client;
+        if self.outstanding.get(&client) == Some(&intent.sequence) {
+            let sequence = self.outstanding.remove(&client).expect("checked");
+            let high = self.high_water.entry(client).or_insert(0);
+            *high = (*high).max(sequence);
             self.plans.retain(|_, plan| {
                 !(plan.intent.client == client && plan.intent.sequence == sequence)
             });
@@ -495,6 +571,7 @@ impl LinkPlanStore {
 pub(crate) struct PrepareContext<'a> {
     pub manager: &'a std::sync::Mutex<flavite_buffer::manager::BufferManager>,
     pub actor: &'a crate::actor::VaultActorHandle,
+    pub root: &'a std::path::Path,
 }
 
 pub(crate) fn prepare_work(
@@ -537,70 +614,76 @@ pub(crate) fn prepare_work(
         return Err(LinkInsertionError::CaretOutOfBounds);
     }
 
-    // Canonical resolution of the target path through the shared resolver.
+    if let Some(removal) = &request.removal {
+        return prepare_removal_work(context, request, removal, &text, &source_path);
+    }
+
+    let catalog = context
+        .actor
+        .resolver_catalog()
+        .map_err(|_| LinkInsertionError::Busy)?;
+    let expected = request
+        .expected_target
+        .as_ref()
+        .ok_or(LinkInsertionError::MissingTarget)?;
+    if catalog.epoch != expected.epoch {
+        return Err(LinkInsertionError::StaleEpoch);
+    }
     let raw_target = request
         .target_path
         .strip_suffix(".md")
-        .unwrap_or(&request.target_path)
-        .to_owned();
-    let resolution = context
-        .actor
-        .resolve_target(fold_key(&raw_target), raw_target.clone(), false, None)
-        .map_err(|_| LinkInsertionError::MissingTarget)?;
-    let note = match resolution {
-        resolution if resolution.is_ambiguous => return Err(LinkInsertionError::AmbiguousTarget),
-        resolution => match resolution.note {
-            Some(note) => note,
-            None => return Err(LinkInsertionError::MissingTarget),
-        },
-    };
-
-    // Portable vault-relative path + title for the resolved entity, matched
-    // by exact native path bytes (display strings are not identity).
-    let catalog = context
-        .actor
-        .note_catalog(50_000)
-        .map_err(|_| LinkInsertionError::MissingTarget)?;
-    let entry = catalog
-        .items
-        .iter()
-        .find(|entry| entry.path_native == note.path_native)
+        .unwrap_or(&request.target_path);
+    let resolution = catalog.resolve(&fold_key(raw_target), raw_target, false, None);
+    if resolution.is_ambiguous {
+        return Err(LinkInsertionError::AmbiguousTarget);
+    }
+    let note = resolution.note.ok_or(LinkInsertionError::MissingTarget)?;
+    if u64::try_from(note.note_id).ok() != Some(expected.entity_id)
+        || note.path_native != expected.native_path
+    {
+        return Err(LinkInsertionError::TargetRetargeted);
+    }
+    let (path, title, stable_id, _) = catalog
+        .note_data(note.note_id)
         .ok_or(LinkInsertionError::MissingTarget)?;
-    if std::path::Path::new(&entry.path) == source_path {
+    let relative_source = source_path
+        .strip_prefix(context.root)
+        .unwrap_or(&source_path);
+    if std::path::Path::new(path) == relative_source {
         return Err(LinkInsertionError::SelfTarget);
     }
-    let components: Vec<String> = std::path::Path::new(&entry.path)
+    let components: Vec<String> = std::path::Path::new(path)
         .components()
-        .filter_map(|component| component.as_os_str().to_str().map(str::to_owned))
-        .collect();
-    if components.is_empty() {
-        return Err(LinkInsertionError::UnrepresentableTarget(
-            entry.path.clone(),
-        ));
-    }
-
-    // Serialization: stable-ID form only when enabled and unconflicted.
-    let serialized = match request.stable_link_policy {
-        StableLinkPolicy::Disabled => serialize_link(&components, None),
-        StableLinkPolicy::PreferStable => {
-            let target_key = entry.path.strip_suffix(".md").unwrap_or(&entry.path);
-            let stable_id = context
-                .actor
-                .completion_candidates()
-                .ok()
-                .and_then(|candidates| {
-                    candidates
-                        .into_iter()
-                        .find(|candidate| candidate.target == target_key)
-                        .and_then(|candidate| candidate.stable_id)
-                });
-            match stable_id {
-                Some(id) if !id.is_empty() => serialize_stable_link(&id, entry.title.as_str()),
-                _ => serialize_link(&components, None),
-            }
-        }
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    LinkInsertionError::UnrepresentableTarget(
+                        "Native target is not representable".into(),
+                    )
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    let serialized = match (request.stable_link_policy, stable_id) {
+        (StableLinkPolicy::PreferStable, Some(id)) => serialize_stable_link(id, title),
+        _ => serialize_link(&components, None),
     }
     .map_err(|error| LinkInsertionError::UnrepresentableTarget(error.to_string()))?;
+    let round_trip = catalog.resolve(
+        &fold_key(&serialized.payload.target_raw),
+        &serialized.payload.target_raw,
+        false,
+        None,
+    );
+    if round_trip.is_ambiguous
+        || round_trip.note.as_ref().is_none_or(|resolved| {
+            resolved.note_id != note.note_id || resolved.path_native != note.path_native
+        })
+    {
+        return Err(LinkInsertionError::TargetRetargeted);
+    }
     let proof =
         prove_insertion(&text, request.caret, &serialized).map_err(
             |rejection| match rejection {
@@ -611,19 +694,14 @@ pub(crate) fn prepare_work(
                 }
             },
         )?;
-
-    let version = context
-        .actor
-        .index_version()
-        .map_err(|_| LinkInsertionError::StaleEpoch)?;
     let prepared = PreparedLink {
-        plan_id: 0, // Assigned by the store on completion.
-        serialized_link: serialized.text.clone(),
-        target_display: entry.title.clone(),
+        plan_id: 0,
+        serialized_link: serialized.text,
+        target_display: title.into(),
         target_path: components,
-        expires_in_ms: u64::try_from(LINK_PLAN_TTL.as_millis()).unwrap_or(10_000),
-        validated_epoch: version.0,
-        validated_generation: version.1,
+        expires_in_ms: 10_000,
+        validated_epoch: catalog.epoch,
+        validated_generation: catalog.generation,
         source: LinkSourceRef {
             buffer_id,
             revision: request.revision,
@@ -636,11 +714,114 @@ pub(crate) fn prepare_work(
         intent: request.intent,
         source: prepared.source.clone(),
         target_entity_id: note.note_id,
-        target_path: prepared.target_path.clone(),
         edit: (proof.start, proof.end, proof.replacement),
+        removal: false,
+        target_raw: serialized.payload.target_raw,
+        target_is_attachment: false,
+        target_is_unresolved: false,
+        target_is_embed: false,
+        source_path_key: None,
+        validated_epoch: catalog.epoch,
+        validated_generation: catalog.generation,
+        expires_at: Instant::now() + LINK_PLAN_TTL,
+    };
+    Ok((plan, prepared))
+}
+
+fn prepare_removal_work(
+    context: &PrepareContext<'_>,
+    request: &LinkPrepareRequest,
+    removal: &RemovalRequest,
+    text: &str,
+    source_path: &std::path::Path,
+) -> Result<(LinkPlan, PreparedLink), LinkInsertionError> {
+    let parsed = flavite_syntax::pulldown_glue::parse_note(text.as_bytes())
+        .map_err(LinkInsertionError::SourceUnparsable)?;
+    let link = parsed
+        .links
+        .iter()
+        .find(|link| link.span.start.0 == removal.start && link.span.end.0 == removal.end)
+        .ok_or(LinkInsertionError::CaretNotLinkable)?;
+    if text.get(removal.start..removal.end) != Some(removal.expected_source.as_str()) {
+        return Err(LinkInsertionError::CaretNotLinkable);
+    }
+    let catalog = context
+        .actor
+        .resolver_catalog()
+        .map_err(|_| LinkInsertionError::Busy)?;
+    let source_relative = source_path.strip_prefix(context.root).ok();
+    let resolution = catalog.resolve_at_path(
+        &flavite_syntax::text::fold_key(&link.target_raw),
+        &link.target_raw,
+        link.is_embed,
+        source_relative,
+    );
+    let resolved = if removal.target_is_attachment {
+        resolution.attachment.as_ref().map(|r| r.att_id as u64)
+    } else {
+        resolution.note.as_ref().map(|r| r.note_id as u64)
+    };
+    if if removal.target_is_unresolved {
+        !resolution.is_unresolved
+    } else {
+        resolved != Some(removal.target_entity_id)
+    } {
+        return Err(LinkInsertionError::TargetRetargeted);
+    }
+    let version = (catalog.epoch, catalog.generation);
+    if version.0 != removal.epoch {
+        return Err(LinkInsertionError::StaleEpoch);
+    }
+    let source = LinkSourceRef {
+        buffer_id: request.buffer_id,
+        revision: request.revision,
+        caret: removal.start,
+    };
+    let components: Vec<String> = std::path::Path::new(&request.target_path)
+        .components()
+        .map(|c| {
+            c.as_os_str().to_str().map(str::to_owned).ok_or_else(|| {
+                LinkInsertionError::UnrepresentableTarget(
+                    "native target is not representable".into(),
+                )
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let plan = LinkPlan {
+        plan_id: 0,
+        intent: request.intent,
+        source: source.clone(),
+        target_entity_id: i64::try_from(if removal.target_is_unresolved {
+            0
+        } else {
+            removal.target_entity_id
+        })
+        .map_err(|_| LinkInsertionError::MissingTarget)?,
+        edit: (removal.start, removal.end, String::new()),
+        removal: true,
+        target_raw: link.target_raw.clone(),
+        target_is_attachment: removal.target_is_attachment,
+        target_is_unresolved: removal.target_is_unresolved,
+        target_is_embed: link.is_embed,
+        source_path_key: source_path
+            .strip_prefix(context.root)
+            .ok()
+            .and_then(std::path::Path::to_str)
+            .map(str::to_owned),
         validated_epoch: version.0,
         validated_generation: version.1,
         expires_at: Instant::now() + LINK_PLAN_TTL,
+    };
+    let prepared = PreparedLink {
+        plan_id: 0,
+        serialized_link: removal.expected_source.clone(),
+        target_display: request.target_path.clone(),
+        target_path: components,
+        expires_in_ms: 10_000,
+        validated_epoch: version.0,
+        validated_generation: version.1,
+        source,
+        requires_confirmation: true,
     };
     Ok((plan, prepared))
 }
@@ -664,12 +845,15 @@ mod tests {
             caret: 118,
             target_path: "Systems/Emergence.md".into(),
             stable_link_policy: StableLinkPolicy::Disabled,
+            expected_target: None,
+            removal: None,
         }
     }
 
     #[test]
     fn one_outstanding_prepare_per_client_and_busy_does_not_consume() {
         let mut store = LinkPlanStore::default();
+        store.register_client(ClientToken(1));
         assert!(matches!(
             store.admit_prepare(&prepare(1, 41)),
             Ok(PrepareAdmission::Proceed)
@@ -682,7 +866,7 @@ mod tests {
             "second concurrent prepare is Busy"
         );
         // A failure releases the namespace; the same sequence can then run.
-        store.fail_prepare(ClientToken(1));
+        store.fail_prepare(intent(1, 41));
         assert!(matches!(
             store.admit_prepare(&prepare(1, 41)),
             Ok(PrepareAdmission::Proceed)
@@ -692,6 +876,7 @@ mod tests {
     #[test]
     fn consumed_sequences_expire_and_zero_sequences_are_invalid() {
         let mut store = LinkPlanStore::default();
+        store.register_client(ClientToken(1));
         assert!(matches!(
             store.admit_prepare(&prepare(1, 0)),
             Err(LinkInsertionError::InvalidIntent)
@@ -717,6 +902,7 @@ mod tests {
     #[test]
     fn commit_dedup_matches_fingerprints_and_eviction_counts() {
         let mut store = LinkPlanStore::default();
+        store.register_client(ClientToken(1));
         store.record_outcome(
             &intent(1, 41),
             fingerprint_insert(9),
@@ -727,12 +913,12 @@ mod tests {
         );
         // Same plan ID: cached replay.
         assert!(matches!(
-            store.admit_commit(&intent(1, 41), 9),
+            store.admit_commit(&intent(1, 41), 9, false),
             Ok(CommitAdmission::Cached(_))
         ));
         // Different plan ID under the same gesture: mismatch.
         assert!(matches!(
-            store.admit_commit(&intent(1, 41), 10),
+            store.admit_commit(&intent(1, 41), 10, false),
             Err(LinkInsertionError::IntentMismatch)
         ));
         // Eviction is counted, never silent.
@@ -750,21 +936,69 @@ mod tests {
         // oldest (including the probe result) were displaced, never lost.
         assert_eq!(store.results_overflowed, 3);
         assert!(matches!(
-            store.admit_commit(&intent(1, 41), 9),
+            store.admit_commit(&intent(1, 41), 9, false),
             Err(LinkInsertionError::IntentExpired)
         ));
     }
 
     #[test]
-    fn cancellation_drops_the_gesture_without_consuming_the_sequence() {
+    fn cancellation_retires_the_gesture_without_allowing_late_worker_revival() {
         let mut store = LinkPlanStore::default();
+        store.register_client(ClientToken(1));
         let _ = store.admit_prepare(&prepare(1, 41));
-        store.cancel(ClientToken(1));
+        store.cancel(intent(1, 41));
         assert!(!store.is_outstanding(ClientToken(1)));
-        // The sequence was never consumed, so a fresh gesture can reuse it.
+        // A late cancelled worker cannot be confused with a new gesture.
         assert!(matches!(
-            store.admit_prepare(&prepare(1, 41)),
+            store.admit_prepare(&prepare(1, 42)),
             Ok(PrepareAdmission::Proceed)
         ));
+    }
+
+    #[test]
+    fn preparation_capacity_includes_unfinished_worker_jobs() {
+        let mut store = LinkPlanStore::default();
+        for client in 1..=MAX_LIVE_LINK_PLANS as u128 {
+            store.register_client(ClientToken(client));
+            assert!(store.admit_prepare(&prepare(client, 1)).is_ok());
+        }
+        let client = MAX_LIVE_LINK_PLANS as u128 + 1;
+        store.register_client(ClientToken(client));
+        assert!(matches!(
+            store.admit_prepare(&prepare(client, 1)),
+            Err(LinkInsertionError::Busy)
+        ));
+    }
+
+    #[test]
+    fn expired_plan_releases_capacity_before_admission_and_late_results_cannot_revive_it() {
+        let mut store = LinkPlanStore::default();
+        store.register_client(ClientToken(1));
+        store.admit_prepare(&prepare(1, 41)).unwrap();
+        let plan = LinkPlan {
+            plan_id: 0,
+            intent: intent(1, 41),
+            source: LinkSourceRef {
+                buffer_id: 7,
+                revision: 23,
+                caret: 0,
+            },
+            target_entity_id: 2,
+            edit: (0, 0, "[[b]]".into()),
+            removal: false,
+            target_raw: "b".into(),
+            target_is_attachment: false,
+            target_is_unresolved: false,
+            target_is_embed: false,
+            source_path_key: None,
+            validated_epoch: 1,
+            validated_generation: 1,
+            expires_at: Instant::now() - Duration::from_millis(1),
+        };
+        assert!(store.complete_prepare(1, plan.clone()));
+        assert!(store.admit_prepare(&prepare(1, 42)).is_ok());
+        assert!(!store.complete_prepare(2, plan));
+        assert_eq!(store.live_plans(), 0);
+        assert!(store.is_outstanding(ClientToken(1)));
     }
 }

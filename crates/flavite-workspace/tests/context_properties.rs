@@ -185,7 +185,7 @@ fn randomized_sequences_preserve_authorities_and_typed_sources() {
                     if let Some(source) = source_tabs.first() {
                         let name = notes[rng.below(3) as usize];
                         state
-                            .publish_exploration(*source, 1, locator(name))
+                            .publish_exploration(*source, 1, Some(locator(name)))
                             .expect("sources can publish");
                     }
                 }
@@ -271,7 +271,9 @@ fn randomized_sequences_preserve_authorities_and_typed_sources() {
                 let document_before = commit.state.document_publication();
                 let mut state = commit.state;
                 assert!(
-                    state.publish_exploration(sink, 1, locator("a.md")).is_err(),
+                    state
+                        .publish_exploration(sink, 1, Some(locator("a.md")))
+                        .is_err(),
                     "round {round}: sinks cannot publish"
                 );
                 assert_eq!(

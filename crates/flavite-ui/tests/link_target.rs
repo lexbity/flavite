@@ -62,7 +62,7 @@ fn open_note(app: &mut App, name: &str) -> TabId {
 }
 
 fn acknowledge(app: &mut App, tab: TabId, caret: usize, anchor: usize, focused: bool) {
-    let sequence = 1000 + u64::try_from(caret).unwrap();
+    let sequence = app.workspace.tab(&tab).unwrap().interaction().sequence + 1;
     acknowledge_sequence(app, tab, caret, anchor, focused, sequence);
 }
 
@@ -147,13 +147,45 @@ fn self_target_and_stale_acknowledgement_are_honest_refusals() {
     wait_for(&mut app, "gesture settles", |app| {
         !matches!(app.linking.state(), GestureState::Preparing { .. })
     });
-    let inserted = matches!(app.linking.state(), GestureState::Inserted { .. });
-    if inserted {
-        // The auto-commit already ran before the invalidation; skip.
-        return;
-    }
+    assert!(matches!(app.linking.state(), GestureState::Inserted { .. }));
+    let view = app.note_editor_view(tab).unwrap();
+    let api = app.flavite.as_ref().unwrap();
+    assert!(api.execute(flavite_api::Invocation::new(
+        api.command_registry().next_request_id(), "apply_edits",
+        serde_json::json!({"buffer_id":view.buffer_id,"revision":view.revision,"ops":[{"range":[0,0],"replacement":"prefix "}]}),
+        flavite_api::Origin::Gui,
+    )).is_success());
+    let _ = app.update(Message::Pump);
+    assert!(
+        app.valid_writing_target().is_none(),
+        "different-origin edit invalidates the retained target"
+    );
+    let before = app.note_editor_view(tab).unwrap().text;
+    let _ = app.update(Message::InsertLink { locator: beta });
     assert!(app.linking.pending_target_path().is_none());
-    let _ = tab;
+    assert_eq!(app.note_editor_view(tab).unwrap().text, before);
+}
+
+#[test]
+fn moving_the_caret_while_prepare_is_pending_never_commits_at_the_old_position() {
+    let (mut app, _fs, _cache) = fixture();
+    reconcile(&mut app);
+    let tab = open_note(&mut app, "source.md");
+    let _ = app.update(Message::InsertLink {
+        locator: NoteLocator::from_components(["beta.md"]).unwrap(),
+    });
+    assert!(matches!(
+        app.linking.state(),
+        GestureState::Preparing { .. }
+    ));
+    acknowledge(&mut app, tab, 1, 1, true);
+    wait_for(&mut app, "cancel stale caret", |app| {
+        !matches!(app.linking.state(), GestureState::Preparing { .. })
+    });
+    assert_eq!(
+        app.note_editor_view(tab).unwrap().text.as_ref(),
+        "Hello world.\n"
+    );
 }
 
 #[test]
@@ -173,10 +205,13 @@ fn picker_insert_places_one_link_at_the_acknowledged_caret() {
         "Hello [[beta]]world.\n",
         "exactly one link at the acknowledged caret"
     );
-    // The insertion itself invalidates the old target (different-origin
-    // edit, D-07); a fresh acknowledged caret re-authorizes at the new
-    // revision before the focus-shift assertions.
-    assert!(app.valid_writing_target().is_none());
+    // This target's own guarded edit acknowledges the exact caret transform;
+    // it remains authorized while graph or picker focus stays independent.
+    let (_, _, _, revision, caret) = app
+        .valid_writing_target()
+        .expect("own edit retained target");
+    assert_eq!(revision, app.note_editor_view(tab).unwrap().revision);
+    assert_eq!(caret, 14);
     acknowledge(&mut app, tab, 21, 21, true);
     if app.valid_writing_target().is_none() {
         panic!(

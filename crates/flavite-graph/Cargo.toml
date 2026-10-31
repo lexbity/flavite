@@ -6,20 +6,17 @@ license.workspace = true
 repository.workspace = true
 description = "Layout, spatial — CPU only (§4.1)"
 
-# Internal dependencies: the flavite-index edge lands in B5 (GraphFeed) —
-# PLAN-B §5. The crate MUST stay CPU-only — no UI framework, no GPU stack, no
-# text shaper, ever (§4.1, enforced transitively by `cargo xtask arch check`).
-# `rayon` (LayoutWorker force pass) and `arc-swap` (lock-free PositionBuffer)
-# are third-party CPU dependencies added in B3.
+# Internal dependencies: none (§4.1, TD-12/W07). The SQLite-backed index
+# feed bridge moved to `flavite-api::graph_service`; this crate consumes the
+# plain DTOs in `protocol` and applies them in `feed`. CPU-only — no
+# iced/GPU/winit/AccessKit dependencies, no database, no filesystem, ever
+# (enforced by `cargo xtask arch check`).
 [dependencies]
+flavite-graph-protocol = { path = "../flavite-graph-protocol" }
 arc-swap = { workspace = true }
 crossbeam = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
-# Internal edge: graph → index (B5, §4.14) — poll index.generation, consume
-# invalidation feed. CPU-only; no iced/GPU/winit dependencies.
-flavite-index = { path = "../flavite-index" }
-rusqlite = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

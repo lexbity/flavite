@@ -156,11 +156,57 @@ fn handle_link_prepare(
         revision: args.source.revision,
         caret: args.source.caret,
         target_path: args.target_path,
+        expected_target: Some(args.expected_target),
         stable_link_policy: policy,
+        removal: None,
     };
     Ok(session.execute(SessionCommand::LinkPrepare {
         request,
         request_id: invocation.request_id,
+    }))
+}
+
+fn handle_link_prepare_remove(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: crate::links::LinkRemovalArgs = decode(invocation)?;
+    if args.expected_source.len() > 8192 {
+        return Err("occurrence exceeds 8 KiB".into());
+    }
+    Ok(session.execute(SessionCommand::LinkPrepare {
+        request_id: invocation.request_id,
+        request: flavite_vault::link::LinkPrepareRequest {
+            intent: flavite_vault::link::LinkIntent {
+                client: flavite_vault::link::ClientToken(args.intent.client),
+                sequence: args.intent.sequence,
+            },
+            buffer_id: args.source.buffer_id,
+            revision: args.source.revision,
+            caret: args.start,
+            target_path: args.target_path,
+            expected_target: None,
+            stable_link_policy: flavite_vault::link::StableLinkPolicy::Disabled,
+            removal: Some(flavite_vault::link::RemovalRequest {
+                start: args.start,
+                end: args.end,
+                expected_source: args.expected_source,
+                epoch: args.epoch,
+                target_entity_id: args.target_entity_id,
+                target_is_attachment: args.target_is_attachment,
+                target_is_unresolved: args.target_is_unresolved,
+            }),
+        },
+    }))
+}
+fn handle_link_remove(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
+    let args: crate::links::LinkInsertArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::LinkRemove {
+        intent: flavite_vault::link::LinkIntent {
+            client: flavite_vault::link::ClientToken(args.intent.client),
+            sequence: args.intent.sequence,
+        },
+        plan_id: args.plan_id,
     }))
 }
 
@@ -314,13 +360,38 @@ pub struct Flavite {
     /// The API vault reference.
     vault_ref: ApiVaultRef,
     /// Whether the vault is read-only.
-    read_only: bool,
+    pub(crate) read_only: bool,
     /// Keeps root ownership and actor resources alive for `open_root` callers.
     owned_vault: Option<Vault>,
     /// Bounded asynchronous context query service (W04).
-    queries: crate::query_service::QueryService,
+    pub(crate) queries: crate::query_service::QueryService,
     /// Device-local user state (W06); `None` without an OS data directory.
     pub(crate) user_state: Option<flavite_vault::user_state::UserStateStore>,
+    /// Vault-relative user state (graph pins; W07/TD-11) behind the `Fs`.
+    pub(crate) vault_user_state: flavite_vault::user_state::VaultUserStateStore,
+    /// One graph base service per vault (W07/TD-12): the only graph-path
+    /// owner of an index read handle.
+    pub(crate) graph: Arc<crate::graph_service::GraphService>,
+}
+
+/// Build the per-vault attached services shared by every constructor.
+fn attach_services(
+    uuid: uuid::Uuid,
+    root: &std::path::Path,
+    session: &Arc<Session>,
+) -> (
+    flavite_vault::user_state::VaultUserStateStore,
+    Arc<crate::graph_service::GraphService>,
+) {
+    let vault_user_state = flavite_vault::user_state::VaultUserStateStore::new(
+        Box::new(flavite_fs::OsFs::new()),
+        root,
+    );
+    let graph = crate::graph_service::GraphService::start_with_session(
+        crate::doctor::cache_db_path(uuid),
+        Some(Arc::clone(session)),
+    );
+    (vault_user_state, graph)
 }
 
 impl Flavite {
@@ -342,9 +413,11 @@ impl Flavite {
         let vault_uuid = vault_ref.uuid.to_string();
 
         let session = Arc::new(session);
+        let (vault_user_state, graph) = attach_services(vault_ref.uuid, &identity.root, &session);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
             uuid::Uuid::now_v7().as_u128(),
+            Arc::clone(&graph),
         );
         let flavite = Self {
             session,
@@ -364,6 +437,8 @@ impl Flavite {
                 &vault_uuid,
             )
             .ok(),
+            vault_user_state,
+            graph,
         };
 
         // Register built-in commands
@@ -384,9 +459,11 @@ impl Flavite {
     ) -> Result<Self, FlaviteError> {
         let vault_uuid = vault_ref.uuid.to_string();
         let session = Arc::new(session);
+        let (vault_user_state, graph) = attach_services(vault_ref.uuid, &vault_ref.root, &session);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
             uuid::Uuid::now_v7().as_u128(),
+            Arc::clone(&graph),
         );
         let flavite = Self {
             session,
@@ -406,6 +483,8 @@ impl Flavite {
                 &vault_uuid,
             )
             .ok(),
+            vault_user_state,
+            graph,
         };
 
         flavite.register_builtin_commands()?;
@@ -424,9 +503,11 @@ impl Flavite {
     ) -> Result<Self, FlaviteError> {
         let vault_uuid = identity.uuid.to_string();
         let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
+        let (vault_user_state, graph) = attach_services(vault_ref.uuid, &identity.root, &session);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
             uuid::Uuid::now_v7().as_u128(),
+            Arc::clone(&graph),
         );
         let flavite = Self {
             session,
@@ -441,6 +522,8 @@ impl Flavite {
                 &vault_uuid,
             )
             .ok(),
+            vault_user_state,
+            graph,
             notice_acks: Mutex::new(std::collections::BTreeMap::new()),
             next_notice_id: AtomicU64::new(1),
             vault_ref,
@@ -470,7 +553,7 @@ impl Flavite {
     /// the legacy dotted alias as well. Both ids resolve to the same handler
     /// and schema.
     fn register_builtin_commands(&self) -> Result<(), FlaviteError> {
-        let registrations: [HandlerRegistration; 17] = [
+        let registrations: [HandlerRegistration; 19] = [
             (
                 "open_note",
                 "Open note",
@@ -518,6 +601,18 @@ impl Flavite {
                 "Prepare link insertion",
                 ArgSchema::typed::<crate::links::LinkPrepareArgs>(),
                 handle_link_prepare,
+            ),
+            (
+                "link.prepare_remove",
+                "Prepare connection removal",
+                ArgSchema::typed::<crate::links::LinkRemovalArgs>(),
+                handle_link_prepare_remove,
+            ),
+            (
+                "link.remove",
+                "Remove connection occurrence",
+                ArgSchema::typed::<crate::links::LinkInsertArgs>(),
+                handle_link_remove,
             ),
             (
                 "link.insert",
@@ -877,6 +972,22 @@ impl Flavite {
                 .with_message(format!("missing capability: {}", required.description())),
             );
         }
+        if matches!(
+            invocation.command_id,
+            "link.prepare" | "link.prepare_remove" | "link.insert" | "link.remove"
+        ) && !invocation
+            .capabilities
+            .iter()
+            .any(|cap| cap.covers(&crate::Capability::ReadNotes, None))
+        {
+            return ExecutionResult::Rejected(
+                RejectedResult::with_request(
+                    RejectionReason::CapabilityDenied,
+                    invocation.request_id,
+                )
+                .with_message("Reading the connection target requires ReadNotes"),
+            );
+        }
         if let Some(buffer_id) = invocation.preconditions.buffer_id {
             let revision = invocation.preconditions.expected_revision;
             match self.get_buffer_view(BufferId::from(buffer_id), revision.map(Revision::new)) {
@@ -944,6 +1055,46 @@ impl Flavite {
     }
 
     fn command_target(&self, invocation: &Invocation) -> Option<PathBuf> {
+        let actual_source = match invocation.command_id {
+            "link.prepare" | "link.prepare_remove" => invocation
+                .args
+                .get("source")
+                .and_then(|source| source.get("buffer_id"))
+                .and_then(serde_json::Value::as_u64)
+                .map(BufferId::from),
+            "apply_edits" | "undo" | "redo" => invocation
+                .args
+                .get("buffer_id")
+                .and_then(serde_json::Value::as_u64)
+                .map(BufferId::from),
+            "link.insert" | "link.remove" => {
+                serde_json::from_value::<crate::links::LinkInsertArgs>(invocation.args.clone())
+                    .ok()
+                    .and_then(|args| {
+                        self.session.link_plan_source(
+                            flavite_vault::link::LinkIntent {
+                                client: flavite_vault::link::ClientToken(args.intent.client),
+                                sequence: args.intent.sequence,
+                            },
+                            args.plan_id,
+                        )
+                    })
+            }
+            _ => None,
+        };
+        if matches!(
+            invocation.command_id,
+            "link.prepare"
+                | "link.prepare_remove"
+                | "link.insert"
+                | "link.remove"
+                | "apply_edits"
+                | "undo"
+                | "redo"
+        ) {
+            return actual_source.and_then(|id| self.session.buffer_path(id));
+        }
+
         let path = invocation.args.as_str().map(PathBuf::from).or_else(|| {
             invocation
                 .args

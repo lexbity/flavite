@@ -1,23 +1,27 @@
-//! Versioned graph pin state stored in `<vault>/.flavite/graph.json` (D15).
+//! Versioned graph pin state: the in-memory codec and identity rules
+//! (RFC-0003 D-11, TD-11, W07).
 //!
-//! Pins are user state, never cache state. Stable IDs are used only when the
-//! caller has established they are unconflicted; all other entities use the
-//! exact native path bytes supplied by the index. Unknown JSON fields are
-//! retained at both the document and pin-record levels when the file is
-//! updated (§4.12).
+//! Pins are user state, never cache state. Stable IDs are used only when
+//! the caller has established they are unconflicted; all other entities
+//! keep the exact native path bytes supplied by the index. Unknown JSON
+//! fields are retained at both the document and pin-record levels when the
+//! file is updated (§4.12).
+//!
+//! TD-11 moved persistence behind the API: this module no longer touches
+//! the filesystem (the W07 contract gates fail if it ever does). The UI
+//! decodes the document the API read, mutates the in-memory store through
+//! [`PinCommand`]s, and re-encodes bytes for the API's generation-checked
+//! write. The on-disk location and byte format (
+//! `<vault>/.flavite/graph.json`) are unchanged — an existing pin file
+//! keeps its identity semantics and unknown fields across the migration.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Current on-disk graph-state schema.
 pub const GRAPH_STATE_VERSION: u32 = 1;
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
 /// Stable, reversible identity for a pinned graph entity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -30,8 +34,9 @@ pub enum PinKey {
 }
 
 impl PinKey {
-    /// Use a stable ID only when it is present and has no duplicate conflict.
-    /// Otherwise preserve identity using the lossless native path bytes.
+    /// Use a stable ID only when it is present and has no duplicate
+    /// conflict. Otherwise preserve identity using the lossless native
+    /// path bytes.
     #[must_use]
     pub fn for_note(stable_id: Option<&str>, id_conflict: bool, native_path: &[u8]) -> Self {
         if !id_conflict && let Some(stable_id) = stable_id.filter(|id| !id.is_empty()) {
@@ -110,15 +115,18 @@ pub struct PinStore {
 }
 
 impl PinStore {
-    /// Load `<root>/.flavite/graph.json`; a missing file means no pins.
-    pub fn load(root: &Path) -> Result<Self, PinStoreError> {
-        let path = graph_state_path(root);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => return Err(PinStoreError::Io(error)),
-        };
-        let file: GraphStateFile = serde_json::from_slice(&bytes)?;
+    /// Decode `<vault>/.flavite/graph.json` bytes; empty bytes mean no
+    /// pins (a first-ever read returns an empty store, not an error).
+    ///
+    /// # Errors
+    /// Typed [`PinStoreError`] for a newer schema, malformed keys or
+    /// positions, or duplicate identities. A refused decode leaves the
+    /// caller's previous store untouched.
+    pub fn decode(bytes: &[u8]) -> Result<Self, PinStoreError> {
+        if bytes.is_empty() {
+            return Ok(Self::default());
+        }
+        let file: GraphStateFile = serde_json::from_slice(bytes)?;
         if file.version != GRAPH_STATE_VERSION {
             return Err(PinStoreError::UnsupportedVersion(file.version));
         }
@@ -126,12 +134,11 @@ impl PinStore {
         for entry in file.pins {
             validate_key(&entry.key)?;
             validate_position(entry.position)?;
-            let key = entry.key;
             let record = PinRecord {
                 position: entry.position,
                 extra: entry.extra,
             };
-            if pins.insert(key, record).is_some() {
+            if pins.insert(entry.key, record).is_some() {
                 return Err(PinStoreError::DuplicateKey);
             }
         }
@@ -141,11 +148,13 @@ impl PinStore {
         })
     }
 
-    /// Persist atomically, syncing the temporary file before replacement.
-    pub fn save(&self, root: &Path) -> Result<(), PinStoreError> {
-        let path = graph_state_path(root);
-        let parent = path.parent().expect("graph state path has a parent");
-        fs::create_dir_all(parent)?;
+    /// Encode to the established on-disk bytes (pretty JSON, document and
+    /// record unknown fields preserved verbatim).
+    ///
+    /// # Errors
+    /// Serialization of a validated store cannot normally fail; the typed
+    /// error is surfaced rather than swallowed.
+    pub fn encode(&self) -> Result<Vec<u8>, PinStoreError> {
         let file = GraphStateFile {
             version: GRAPH_STATE_VERSION,
             pins: self
@@ -159,25 +168,7 @@ impl PinStore {
                 .collect(),
             extra: self.extra.clone(),
         };
-        let bytes = serde_json::to_vec_pretty(&file)?;
-        let temp = temporary_sibling(&path);
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        let result = (|| {
-            output.write_all(&bytes)?;
-            output.sync_all()?;
-            drop(output);
-            replace_file(&temp, &path)?;
-            sync_directory(parent)?;
-            Ok::<(), io::Error>(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp);
-        }
-        result?;
-        Ok(())
+        Ok(serde_json::to_vec_pretty(&file)?)
     }
 
     /// Get a pin by identity.
@@ -189,6 +180,18 @@ impl PinStore {
     /// Iterate in stable deterministic key order.
     pub fn iter(&self) -> impl Iterator<Item = (&PinKey, &PinRecord)> {
         self.pins.iter()
+    }
+
+    /// Number of live pins.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.pins.len()
+    }
+
+    /// Whether nothing is pinned.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pins.is_empty()
     }
 
     /// Set or replace a world-space pin.
@@ -207,7 +210,8 @@ impl PinStore {
         self.pins.remove(key).is_some()
     }
 
-    /// Apply a user pin/unpin action. Hosts persist after a successful change.
+    /// Apply a user pin/unpin action. Hosts persist after a successful
+    /// change through the API user-state write.
     pub fn execute(&mut self, command: PinCommand) -> Result<bool, PinStoreError> {
         match command {
             PinCommand::Pin { key, position } => {
@@ -219,9 +223,10 @@ impl PinStore {
         }
     }
 
-    /// Carry a pin to a renamed path only when the rename evidence is T0–T2.
-    /// `from` and `to` must be the actual old/new pin identities; this helper
-    /// never manufactures a stable ID or infers identity from content.
+    /// Carry a pin to a renamed path only when the rename evidence is
+    /// T0–T2. `from` and `to` must be the actual old/new pin identities;
+    /// this helper never manufactures a stable ID or infers identity from
+    /// content.
     pub fn carry(&mut self, from: &PinKey, to: PinKey, tier: &str) -> bool {
         if !carry_pin_for_tier(tier) || from == &to {
             return false;
@@ -233,8 +238,8 @@ impl PinStore {
         true
     }
 
-    /// Add or replace a root-level unknown field (useful to preserve metadata
-    /// when another component updates the graph state).
+    /// Add or replace a root-level unknown field (useful to preserve
+    /// metadata when another component updates the graph state).
     pub fn set_extra(&mut self, key: String, value: Value) {
         self.extra.insert(key, value);
     }
@@ -253,12 +258,13 @@ pub fn carry_pin_for_tier(tier: &str) -> bool {
     matches!(tier, "T0" | "T1" | "T2")
 }
 
-/// Error loading or persisting graph user state.
+/// Error decoding or encoding graph user state.
+///
+/// The former `Io` variant is gone: persistence moved behind the API's
+/// vault user-state store (TD-11), whose typed errors reach the host
+/// through [`flavite_api::FlaviteError::UserState`].
 #[derive(Debug, thiserror::Error)]
 pub enum PinStoreError {
-    /// Filesystem operation failed.
-    #[error("graph state I/O failed: {0}")]
-    Io(#[from] io::Error),
     /// JSON was malformed.
     #[error("graph state JSON is invalid: {0}")]
     Json(#[from] serde_json::Error),
@@ -274,10 +280,6 @@ pub enum PinStoreError {
     /// The file contains the same native or stable identity more than once.
     #[error("graph state contains a duplicate pin key")]
     DuplicateKey,
-}
-
-fn graph_state_path(root: &Path) -> PathBuf {
-    root.join(".flavite").join("graph.json")
 }
 
 fn validate_key(key: &PinKey) -> Result<(), PinStoreError> {
@@ -298,29 +300,6 @@ fn validate_position(position: [f32; 2]) -> Result<(), PinStoreError> {
         .all(|coordinate| coordinate.is_finite())
         .then_some(())
         .ok_or(PinStoreError::InvalidPosition)
-}
-
-fn temporary_sibling(path: &Path) -> PathBuf {
-    let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    path.with_file_name(format!(".{name}.tmp.{}.{}", std::process::id(), sequence))
-}
-
-fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
-    // `rename` is a same-volume replacement operation on the supported
-    // platforms. Never unlink the prior user-state file first: that would
-    // create a crash window with no graph state at all.
-    fs::rename(from, to)
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -427,49 +406,56 @@ mod tests {
     }
 
     #[test]
-    fn atomic_round_trip_preserves_unknown_document_and_record_fields() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = graph_state_path(temp.path());
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            r#"{"version":1,"future_document":{"enabled":true},"pins":[{"key":{"kind":"stable_id","value":"one"},"position":[3.0,4.0],"future_pin":"keep"}] }"#,
-        )
-        .unwrap();
-        let mut store = PinStore::load(temp.path()).unwrap();
+    fn round_trip_preserves_unknown_document_and_record_fields() {
+        let original = r#"{"version":1,"future_document":{"enabled":true},"pins":[{"key":{"kind":"stable_id","value":"one"},"position":[3.0,4.0],"future_pin":"keep"}] }"#;
+        let mut store = PinStore::decode(original.as_bytes()).unwrap();
         store
             .set(PinKey::StableId("two".into()), [5.0, 6.0])
             .unwrap();
-        store.save(temp.path()).unwrap();
-        let json: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let bytes = store.encode().unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["future_document"]["enabled"], true);
         assert!(json.to_string().contains("future_pin"));
-        let loaded = PinStore::load(temp.path()).unwrap();
+        let reloaded = PinStore::decode(&bytes).unwrap();
         assert_eq!(
-            loaded
+            reloaded
                 .get(&PinKey::StableId("two".into()))
                 .unwrap()
                 .position,
             [5.0, 6.0]
         );
-        assert_eq!(loaded.extra()["future_document"]["enabled"], true);
+        assert_eq!(reloaded.extra()["future_document"]["enabled"], true);
+        assert_eq!(
+            reloaded.get(&PinKey::StableId("one".into())).unwrap().extra["future_pin"],
+            "keep"
+        );
     }
 
     #[test]
-    fn invalid_positions_and_future_versions_are_not_written_over() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = graph_state_path(temp.path());
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, r#"{"version":9,"pins":[]}"#).unwrap();
-        let loaded = PinStore::load(temp.path());
-        assert!(
-            matches!(loaded, Err(PinStoreError::UnsupportedVersion(9))),
-            "unexpected load result: {loaded:?}"
-        );
+    fn invalid_positions_and_future_versions_are_refused_without_writing() {
         let mut store = PinStore::default();
         assert!(matches!(
             store.set(PinKey::StableId("a".into()), [f32::NAN, 0.0]),
             Err(PinStoreError::InvalidPosition)
         ));
+        // Decode refuses a newer schema; the caller keeps its current file
+        // bytes protected (the API store never overwrote anything here).
+        assert!(matches!(
+            PinStore::decode(br#"{"version":9,"pins":[]}"#),
+            Err(PinStoreError::UnsupportedVersion(9))
+        ));
+        assert!(matches!(
+            PinStore::decode(br#"{"version":1,"pins":[{"key":{"kind":"native_path","value":"zz"},"position":[0.0,0.0]}]}"#),
+            Err(PinStoreError::InvalidPathKey)
+        ));
+        assert!(matches!(
+            PinStore::decode(br#"{"version":1,"pins":[{"key":{"kind":"stable_id","value":"x"},"position":[0.0,0.0]},{"key":{"kind":"stable_id","value":"x"},"position":[1.0,1.0]}]}"#),
+            Err(PinStoreError::DuplicateKey)
+        ));
+    }
+
+    #[test]
+    fn empty_bytes_decode_to_an_empty_store() {
+        assert_eq!(PinStore::decode(b"").unwrap(), PinStore::default());
     }
 }

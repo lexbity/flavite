@@ -12,6 +12,11 @@ flavite-vault = { path = "../flavite-vault" }
 flavite-index = { path = "../flavite-index" }
 flavite-buffer = { path = "../flavite-buffer" }
 flavite-syntax = { path = "../flavite-syntax" }
+# TD-12 (W07): the graph index bridge consumes the CPU graph crate's plain
+# DTOs and publishes its base frames. The dependency points one way only —
+# flavite-graph never sees the facade, the database, or any toolkit.
+flavite-graph = { path = "../flavite-graph" }
+arc-swap = { workspace = true }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

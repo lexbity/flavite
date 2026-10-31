@@ -53,7 +53,7 @@ case "$profile" in
             "$root/crates/flavite-ui/src/app.rs" \
             "$root/crates/flavite-ui/src/workspace_shell.rs"
         # The workspace model stays IO-free and toolkit-free.
-        assert_absent 'iced|rusqlite|flavite-api|flavite-fs|flavite-ui|flavite-graph' \
+        assert_absent 'iced|rusqlite|flavite-api|flavite-fs|flavite-ui|flavite-graph([[:space:]=]|$)' \
             "$root/crates/flavite-workspace/Cargo.toml"
         ;;
     W03)
@@ -146,6 +146,39 @@ case "$profile" in
         assert_absent 'std::fs|File::create|OpenOptions|fs::write|fs::rename' \
             "$root/crates/flavite-ui/src/host/persistence.rs" \
             "$root/crates/flavite-workspace/src"
+        ;;
+    W07)
+        # W06 gates remain additive; W07 adds the live graph + pin authority.
+        bash "$0" W06 "$root"
+        for file in \
+            crates/flavite-graph/src/protocol.rs \
+            crates/flavite-api/src/graph_service.rs \
+            crates/flavite-ui/src/graph/canvas.rs \
+            crates/flavite-ui/src/graph/events.rs \
+            crates/flavite-ui/src/graph/geometry.rs \
+            crates/flavite-ui/src/graph/renderer.rs \
+            crates/flavite-ui/src/host/graph.rs \
+            crates/flavite-ui/src/views/graph.rs \
+            crates/flavite-workspace/tests/graph_view_model.rs; do
+            assert_nonempty "$root/$file"
+        done
+        assert_absent 'shader_probe::|ProbeGeometry|ProbeProgram|InnerProgram' \
+            "$root/crates/flavite-ui/src/graph/shader_view.rs" \
+            "$root/crates/flavite-ui/src/graph/renderer.rs" \
+            "$root/crates/flavite-ui/src/views/graph.rs"
+        assert_absent 'rusqlite|flavite_index' \
+            "$root/crates/flavite-graph/src"
+        assert_absent 'std::fs|OpenOptions|fs::rename' \
+            "$root/crates/flavite-ui/src/graph/pins.rs"
+        ;;
+    W08)
+        bash "$0" W07 "$root"
+        for file in crates/flavite-graph/src/scope.rs crates/flavite-api/src/graph_projection.rs crates/flavite-ui/src/graph/filters.rs crates/flavite-ui/src/graph/provenance.rs crates/flavite-ui/src/host/occurrences.rs crates/flavite-api/tests/graph_projection.rs crates/flavite-api/tests/link_occurrences.rs crates/flavite-graph/tests/scopes.rs crates/flavite-ui/tests/graph_filter_context.rs; do
+            assert_nonempty "$root/$file"
+        done
+        assert_absent 'unwrap_or_default\(\).*edges|apply_edits.*retry' "$root/crates/flavite-api/src/graph_projection.rs" "$root/crates/flavite-ui/src/graph/filters.rs"
+        assert_absent 'std::fs|rusqlite' "$root/crates/flavite-ui/src/graph/filters.rs" "$root/crates/flavite-ui/src/graph/provenance.rs" "$root/crates/flavite-ui/src/host/occurrences.rs"
+        assert_absent 'iced|winit|wgpu|rusqlite|std::fs|flavite-api' "$root/crates/flavite-graph-protocol/src" "$root/crates/flavite-graph-protocol/Cargo.toml"
         ;;
     *)
         echo "unknown workspace contract profile: ${profile:-<empty>}" >&2

@@ -14,6 +14,7 @@ Generated from `cargo metadata --format-version 1 --all-features`.
 | `flavite-editor` | 3 | iced widget over EditorModel (iced permitted here and in flavite-ui only) (§4.1) |
 | `flavite-fs` | 1 | Fs trait, atomic_write, watcher, path safety; FaultFs behind feature "fault" (§4.1) |
 | `flavite-graph` | 2 | Layout, spatial — CPU only (§4.1) |
+| `flavite-graph-protocol` | 1 | IO-free bounded durable graph scope value types shared by core and workspace (RFC-0003 W08) |
 | `flavite-index` | 1 | SQLite, tantivy, resolver, query exec (§4.1) |
 | `flavite-syntax` | 1 | Scanner, frontmatter patcher, pulldown glue — pure, IO-free (§4.1) |
 | `flavite-ui` | 3 | iced application (§4.1) |
@@ -30,6 +31,7 @@ Normal/build:
 - `blake3` (normal)
 - `flavite-buffer` (normal)
 - `flavite-fs` (normal)
+- `flavite-graph` (normal)
 - `flavite-index` (normal)
 - `flavite-syntax` (normal)
 - `flavite-vault` (normal)
@@ -77,8 +79,11 @@ Dev-only:
 
 Normal/build:
 
-- `flavite-index` (normal)
-- `rusqlite` (normal)
+- `flavite-graph-protocol` (normal)
+
+### `flavite-graph-protocol`
+
+No dependencies.
 
 ### `flavite-index`
 
@@ -138,7 +143,10 @@ Dev-only:
 
 ### `flavite-workspace`
 
-No dependencies.
+Normal/build:
+
+- `blake3` (normal)
+- `flavite-graph-protocol` (normal)
 
 ### `xtask`
 
@@ -154,7 +162,7 @@ Normal/build:
 ## First-party external dependencies
 
 - `accesskit` ← flavite-ui
-- `blake3` ← flavite-api, flavite-buffer, flavite-fs, flavite-index, flavite-vault, xtask
+- `blake3` ← flavite-api, flavite-buffer, flavite-fs, flavite-index, flavite-vault, flavite-workspace, xtask
 - `cosmic-text` ← flavite-editor, xtask
 - `iced` ← flavite-editor, flavite-ui, xtask
 - `iced_runtime` ← flavite-ui
@@ -164,7 +172,7 @@ Normal/build:
 - `nucleo-matcher` ← flavite-editor
 - `pulldown-cmark` ← flavite-index, flavite-syntax
 - `ropey` ← flavite-buffer
-- `rusqlite` ← flavite-api, flavite-graph, flavite-index, xtask
+- `rusqlite` ← flavite-api, flavite-index, xtask
 - `similar` ← flavite-vault
 - `tantivy` ← flavite-index, xtask
 - `tracing` ← flavite-api, flavite-cli, flavite-index, flavite-vault
@@ -173,7 +181,7 @@ Normal/build:
 
 ## Layering rules (§10.2)
 
-Core-tier crates: flavite-fs, flavite-syntax, flavite-index, flavite-buffer, flavite-vault, flavite-api, flavite-graph, flavite-cli
+Core-tier crates: flavite-fs, flavite-syntax, flavite-index, flavite-buffer, flavite-vault, flavite-api, flavite-graph, flavite-graph-protocol, flavite-workspace, flavite-cli
 
 Forbidden in core-tier transitive closure (normal+build): iced, iced_*, winit, wgpu, cosmic-text
 
@@ -183,7 +191,7 @@ UI crates (may depend on forbidden): flavite-editor, flavite-ui
 
 | Tier | Crates | Floor |
 |---|---|---|
-| 1 — durability-critical | flavite-fs, flavite-syntax, flavite-buffer, flavite-vault, flavite-index, flavite-workspace | ≥ 90% line |
+| 1 — durability-critical | flavite-fs, flavite-syntax, flavite-buffer, flavite-vault, flavite-index, flavite-workspace, flavite-graph-protocol | ≥ 90% line |
 | 2 | flavite-api, flavite-graph | ≥ 80% line |
 | 3 — measured, not gating | flavite-cli, flavite-editor, flavite-ui | reported only |
 

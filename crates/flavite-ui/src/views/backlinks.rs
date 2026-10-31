@@ -40,7 +40,7 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             .into()
         }
         Some(ToolState::NoBacklinks) => {
-            empty_state("No backlinks", "No saved note links to this one yet.")
+            empty_state("No backlinks", "No current note links to this one yet.")
         }
         Some(ToolState::Unbound { .. }) => empty_state(
             "No source",
@@ -69,7 +69,7 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         Some(ToolState::Idle) | Some(ToolState::Querying) | None => {
             empty_state("Loading…", "The backlink query is in flight.")
         }
-        Some(ToolState::Ready(ToolContent::Preview { .. })) => {
+        Some(ToolState::Ready(ToolContent::Preview { .. } | ToolContent::BufferPreview { .. })) => {
             empty_state("Loading…", "The backlink query is in flight.")
         }
     };
@@ -85,7 +85,13 @@ fn backlink_row<'a>(row: &'a flavite_api::BacklinkRow) -> Element<'a, Message> {
         .map(|locator| Message::OpenNoteFromContext { locator });
     button(
         column![
-            text(row.source_title.clone()).width(Length::Fill),
+            text(format!(
+                "{} · {} occurrence(s) · {}",
+                row.source_title,
+                row.occurrences,
+                if row.unsaved { "Unsaved" } else { "Saved" }
+            ))
+            .width(Length::Fill),
             text(
                 row.excerpt
                     .clone()

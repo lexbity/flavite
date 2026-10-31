@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 mod support;
 
-use support::{GateFs, SharedFs};
+use support::{GateFs, SharedGateFs};
 
 /// `MemFs` with a per-call delay on reads of one gated note, so query
 /// workers stay busy while the test submits.
@@ -41,9 +41,7 @@ fn fixture() -> (Flavite, PathBuf, std::sync::Arc<GateFs>, tempfile::TempDir) {
     drop(flavite_index::open_or_init(&db).expect("index"));
     let identity = flavite_api::VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![9]);
     let actor = VaultActorBuilder::new()
-        .with_fs(Box::new(SharedFs {
-            inner: std::sync::Arc::clone(&mem),
-        }) as Box<dyn Fs + Send + Sync>)
+        .with_fs(Box::new(SharedGateFs { inner: fs.clone() }) as Box<dyn Fs + Send + Sync>)
         .with_identity(identity.clone())
         .with_index(IndexActor::new(&db, 1).expect("index actor"))
         .build()
@@ -59,7 +57,8 @@ fn fixture() -> (Flavite, PathBuf, std::sync::Arc<GateFs>, tempfile::TempDir) {
         channels.notice,
         VaultConfig::default(),
     );
-    let flavite = Flavite::open(identity, session, VaultConfig::default()).expect("facade");
+    let mut flavite = Flavite::open(identity, session, VaultConfig::default()).expect("facade");
+    flavite.set_graph_db_path_for_test(db);
     (flavite, root, fs, cache)
 }
 
@@ -137,7 +136,10 @@ fn saturated_slots_return_busy_and_saves_still_finish() {
         for outcome in outcomes {
             assert_eq!(outcome.token.session_nonce, tokens[0].session_nonce);
             assert!(
-                matches!(outcome.result, ContextQueryResult::Backlinks { .. }),
+                matches!(
+                    outcome.result,
+                    ContextQueryResult::Backlinks { .. } | ContextQueryResult::Updating
+                ),
                 "backlink queries serve typed results"
             );
         }
@@ -156,11 +158,14 @@ fn closed_request_tokens_are_drained_and_dropped_without_revival() {
     // no per-tab subscriptions.
     let served = |flavite: &Flavite| {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while flavite.query_service().in_flight() > 0 {
+        loop {
             assert!(Instant::now() < deadline, "query never served");
+            let outcomes = flavite.query_service().drain();
+            if !outcomes.is_empty() {
+                return outcomes;
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
-        flavite.query_service().drain()
     };
     let token = flavite
         .query_service()

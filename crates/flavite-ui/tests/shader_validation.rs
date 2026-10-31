@@ -25,14 +25,16 @@
 use iced::wgpu;
 use iced::widget::shader::{Pipeline as _, Primitive as _};
 
+use flavite_ui::graph::geometry::RenderGeometry;
 use flavite_ui::graph::instance::{
     CAMERA_UNIFORM_SIZE, Camera, CameraUniform, EdgeInstance, NODE_INSTANCE_SIZE, NOTE_COLOR,
-    NodeInstance, NodeShape, ProbeGeometry,
+    NodeInstance, NodeShape,
 };
-use flavite_ui::graph::shader_probe::{
+use flavite_ui::graph::renderer::{
     CAMERA_UNIFORM_NAME, EDGE_FRAGMENT_ENTRY, EDGE_VERTEX_ENTRY, NODE_FRAGMENT_ENTRY,
-    NODE_VERTEX_ENTRY, PROBE_WGSL, ProbePipeline, ProbePrimitive, ProbeTimings,
+    NODE_VERTEX_ENTRY,
 };
+use flavite_ui::graph::shader_probe::{PROBE_WGSL, ProbePipeline, ProbePrimitive, ProbeTimings};
 
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 
@@ -321,7 +323,7 @@ fn probe_pipelines_compile_and_link_on_a_real_device() {
     // the camera uniform and uploads the instance buffers; `draw` binds
     // both pipelines against a real render pass, which is what would
     // surface a vertex/fragment interface mismatch.
-    let geometry = std::sync::Arc::new(ProbeGeometry::new(
+    let geometry = std::sync::Arc::new(RenderGeometry::new(
         1,
         vec![
             NodeInstance {

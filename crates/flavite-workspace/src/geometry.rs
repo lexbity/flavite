@@ -13,8 +13,10 @@ use crate::view::ViewKind;
 use std::collections::BTreeMap;
 
 /// Per-view minimums at 100% interface scale (§7.5): Note 320×200,
-/// Notes/Empty 200×160. Tab and title chrome are included in these heights.
+/// Graph 320×240, Notes/Empty 200×160. Tab and title chrome are included
+/// in these heights.
 const MIN_NOTE: (f32, f32) = (320.0, 200.0);
+const MIN_GRAPH: (f32, f32) = (320.0, 240.0);
 const MIN_LIST: (f32, f32) = (200.0, 160.0);
 const MIN_CONTEXT: (f32, f32) = (240.0, 160.0);
 
@@ -49,6 +51,7 @@ pub const SPLITTER_WIDTH: f32 = 4.0;
 pub fn view_minimum(kind: &ViewKind, scale: f32) -> Size {
     let (width, height) = match kind {
         ViewKind::Note(_) => MIN_NOTE,
+        ViewKind::Graph(_) => MIN_GRAPH,
         ViewKind::Notes | ViewKind::Empty => MIN_LIST,
         ViewKind::Preview(_) | ViewKind::Backlinks(_) => MIN_CONTEXT,
     };

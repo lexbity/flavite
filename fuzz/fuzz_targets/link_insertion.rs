@@ -66,10 +66,13 @@ fuzz_target!(|data: &[u8]| {
 
     let Ok(original) = parse_note(normalized.as_bytes()) else {
         // An unparsable source must reject, never authorize.
-        assert!(matches!(
-            prove_insertion(&normalized, caret, &serialized),
-            Err(ProofRejection::SourceUnparsable(_))
-        ));
+        let rejected = prove_insertion(&normalized, caret, &serialized);
+        assert!(rejected.is_err());
+        // Coordinate validation precedes parsing; a mid-codepoint caret has
+        // two independent refusal reasons, neither may authorize an edit.
+        if normalized.is_char_boundary(caret) {
+            assert!(matches!(rejected, Err(ProofRejection::SourceUnparsable(_))));
+        }
         return;
     };
     let original_links = original.links.len();

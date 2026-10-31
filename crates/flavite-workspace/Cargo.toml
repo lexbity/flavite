@@ -11,6 +11,7 @@ description = "IO-free workspace model: layout tree, context identities, transac
 # nothing outside the standard library so layout fuzzers and property tests
 # never run through a GUI dependency closure.
 [dependencies]
+flavite-graph-protocol = { path = "../flavite-graph-protocol" }
 # Device-local workspace codec (W06): bounded JSON serialization with a
 # canonical payload checksum. Pure libraries; the model stays IO-free (D-02).
 serde = { workspace = true }

@@ -1,8 +1,8 @@
-//! Saved source-text preview (RFC-0003 §20, W04).
+//! Revisioned source-text preview (RFC-0003 §20/§24, W04/W08).
 //!
 //! This is explicitly a source-text preview, not rendered reading (W09
-//! owns the renderer). The content is the saved vault text with its index
-//! provenance; unsaved editor content is never shown here.
+//! owns the renderer). Open notes use their current buffer; otherwise the
+//! saved snapshot is shown. The source header distinguishes their provenance.
 
 use crate::app::{App, Message};
 use crate::host::context::{ToolContent, ToolState};
@@ -23,7 +23,10 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
     }
     let header = context_header::view(app, tab);
     let body: Element<'a, Message> = match app.contexts.state(&tab) {
-        Some(ToolState::Ready(ToolContent::Preview { text: saved, .. })) => {
+        Some(ToolState::Ready(
+            ToolContent::Preview { text: saved, .. }
+            | ToolContent::BufferPreview { text: saved, .. },
+        )) => {
             let open = button(text("Open note").size(style::TEXT_SM))
                 .padding(tab_strip::chip_padding())
                 .style(style::action())

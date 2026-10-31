@@ -82,6 +82,40 @@ fn golden_round_trip_preserves_every_durable_field() {
 }
 
 #[test]
+fn graph_scope_round_trips_and_invalid_filter_bounds_cannot_be_restored() {
+    use flavite_workspace::{Direction, GraphScope, Neighborhood, NotePredicate};
+    let mut workspace = sample();
+    workspace.tabs[2].kind = PersistedKind::Graph {
+        camera: None,
+        scope: GraphScope {
+            predicate: NotePredicate::And {
+                clauses: vec![
+                    NotePredicate::Tag {
+                        name: "systems".into(),
+                    },
+                    NotePredicate::SavedQuery {
+                        query: "feedback".into(),
+                    },
+                ],
+            },
+            neighborhood: Some(Neighborhood {
+                root_native: b"Systems/Root.md".to_vec(),
+                depth: 2,
+                direction: Direction::Both,
+            }),
+            ..Default::default()
+        },
+    };
+    let bytes = encode_workspace(&workspace).unwrap();
+    assert_eq!(decode_workspace(&bytes, VAULT).unwrap(), workspace);
+    if let PersistedKind::Graph { scope, .. } = &mut workspace.tabs[2].kind {
+        scope.neighborhood.as_mut().unwrap().depth = 7;
+    }
+    let bytes = encode_workspace(&workspace).unwrap();
+    assert!(decode_workspace(&bytes, VAULT).is_err());
+}
+
+#[test]
 fn tampered_payload_fails_the_checksum() {
     let workspace = sample();
     let bytes = encode_workspace(&workspace).expect("encodes");

@@ -377,8 +377,9 @@ impl EditorModel {
         self.rope = Rope::from_str(&new_text);
 
         // Apply to undo tree
-        let snapshot = TextSnapshot::new(new_text.as_bytes()).unwrap();
-        let new_revision = self.undo_tree.apply(edit, snapshot);
+        let snapshot = self.snapshot();
+        self.undo_tree.apply(edit, snapshot);
+        let new_revision = self.revision.next();
 
         // Update revision
         self.revision = new_revision;
@@ -421,7 +422,8 @@ impl EditorModel {
         }
         self.rope = Rope::from_str(&new_text);
         self.eol_table = EolTable::from_snapshot(&snapshot);
-        let revision = self.undo_tree.apply_boundary(edit, snapshot.clone());
+        self.undo_tree.apply_boundary(edit, snapshot.clone());
+        let revision = self.revision.next();
         self.revision = revision;
         self.base_hash = Some(BaseHash::from_snapshot(&snapshot));
         self.is_dirty = true;
@@ -434,6 +436,11 @@ impl EditorModel {
     /// and revision advancement.
     pub fn apply_edit_ops(&mut self, edits: &[EditOp]) -> Revision {
         self.apply_edit_ops_inner(edits, None)
+    }
+
+    /// Seal the current undo group before a durable snapshot is admitted.
+    pub fn seal_undo_group(&mut self) {
+        self.undo_tree.seal_current();
     }
 
     /// Apply a set of edits as one non-coalescing, journal-tagged undo unit.
@@ -485,22 +492,23 @@ impl EditorModel {
         }
         replacement.push_str(&old_text[cursor..end]);
         let mut combined = EditOp::new(Span::new(TextByte(start), TextByte(end)), replacement);
-        let is_journal = journal.is_some();
+        let is_journal = journal.is_some() || edits.iter().any(|edit| edit.boundary);
         if let Some(tag) = journal {
             combined = combined.with_journal(tag);
         }
         let old_text = self.text().to_string();
         let new_text = combined.apply(&old_text);
-        let snapshot = TextSnapshot::new(new_text.as_bytes()).unwrap();
         self.rope = Rope::from_str(&new_text);
-        let revision = if is_journal {
+        self.rebuild_eol_table(&old_text);
+        let snapshot = self.snapshot();
+        if is_journal {
             self.undo_tree.apply_boundary(combined, snapshot)
         } else {
             self.undo_tree.apply(combined, snapshot)
         };
+        let revision = self.revision.next();
         self.revision = revision;
         self.is_dirty = true;
-        self.rebuild_eol_table(&old_text);
         revision
     }
 

@@ -1446,6 +1446,7 @@ fn node_key(id: NodeId) -> u64 {
     let kind = match id.kind {
         NodeKind::Note => 0_u64,
         NodeKind::Attachment => 1_u64,
+        NodeKind::Unresolved => 2_u64,
     };
     mix(kind, id.id)
 }

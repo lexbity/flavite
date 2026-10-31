@@ -15,7 +15,7 @@ pedantic = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
 # UI framework (permitted only in flavite-editor and flavite-ui — §4.1/§10.2)
-iced = { version = "0.14", features = ["tokio"] }
+iced = { version = "0.14", features = ["tokio", "canvas"] }
 cosmic-text = "0.15"
 # Core
 ropey = "1.6"

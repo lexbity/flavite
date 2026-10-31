@@ -44,4 +44,10 @@ pub use layout::{
 pub use reducer::{Commit, Effect, LayoutAction, Outcome, WorkspaceError, WorkspaceState, reduce};
 pub use restore::{RestoreError, RestorePlan, RestoredTab, plan as plan_restore};
 pub use validate::validate;
-pub use view::{NoteLoad, NoteLocator, ViewKind, ViewSession};
+pub use view::{
+    GraphCamera, GraphCameraError, GraphView, NoteLoad, NoteLocator, ViewKind, ViewSession,
+};
+
+pub use flavite_graph_protocol::{
+    Direction, GraphScope, Neighborhood, NotePredicate, PropertyValue,
+};

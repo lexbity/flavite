@@ -41,9 +41,33 @@ pub enum NodeTarget {
     OverlayQuery,
     OverlayItem(usize),
     DismissOverlay,
+    /// Select one graph node (list-row primary action).
+    GraphSelect {
+        tab: flavite_workspace::TabId,
+        node: flavite_graph::NodeId,
+        key: flavite_graph::RenderKey,
+        incarnation: u64,
+    },
+    /// Open one graph node's note (list-row action).
+    GraphOpen {
+        tab: flavite_workspace::TabId,
+        node: flavite_graph::NodeId,
+        key: flavite_graph::RenderKey,
+        incarnation: u64,
+    },
+    /// Insert one graph node's link at the writing target (list-row action).
+    GraphInsert {
+        tab: flavite_workspace::TabId,
+        node: flavite_graph::NodeId,
+        key: flavite_graph::RenderKey,
+        incarnation: u64,
+    },
 }
 
 pub(crate) const RESIZE_STEP_PPM: u32 = 50_000;
+
+/// Graph list rows exposed to assistive technology per mounted graph view.
+const GRAPH_A11Y_ROW_BUDGET: usize = 50;
 
 /// Hash workspace identities into stable semantic node ids. `DefaultHasher`
 /// starts from fixed keys, so ids are deterministic across runs.
@@ -53,6 +77,18 @@ fn node_id(kind: &str, raw: u128) -> NodeId {
     kind.hash(&mut hasher);
     raw.hash(&mut hasher);
     NodeId(hasher.finish())
+}
+
+fn graph_row_node_id(
+    tab: flavite_workspace::TabId,
+    role: &str,
+    node: flavite_graph::NodeId,
+    epoch: u64,
+) -> NodeId {
+    node_id(
+        &format!("{role}-{:?}-{epoch}", node.kind),
+        tab.raw() ^ (u128::from(node.id) << 16),
+    )
 }
 
 fn tab_node_id(tab: flavite_workspace::TabId) -> NodeId {
@@ -181,7 +217,102 @@ pub fn build_node_map(app: &App) -> BTreeMap<NodeId, NodeTarget> {
     for (path, id) in visible_catalog(app) {
         map.insert(id, NodeTarget::OpenNote(path));
     }
+    for (tab, rows) in graph_rows(app) {
+        for row in rows {
+            map.insert(
+                graph_row_node_id(tab, "graph-row", row.node, row.key.epoch),
+                NodeTarget::GraphSelect {
+                    tab,
+                    node: row.node,
+                    key: row.key,
+                    incarnation: row.incarnation,
+                },
+            );
+            map.insert(
+                graph_row_node_id(tab, "graph-row-open", row.node, row.key.epoch),
+                NodeTarget::GraphOpen {
+                    tab,
+                    node: row.node,
+                    key: row.key,
+                    incarnation: row.incarnation,
+                },
+            );
+            if row.is_note {
+                map.insert(
+                    graph_row_node_id(tab, "graph-row-insert", row.node, row.key.epoch),
+                    NodeTarget::GraphInsert {
+                        tab,
+                        node: row.node,
+                        key: row.key,
+                        incarnation: row.incarnation,
+                    },
+                );
+            }
+        }
+    }
     map
+}
+
+/// One accessible graph row.
+struct GraphRow {
+    key: flavite_graph::RenderKey,
+    incarnation: u64,
+    node: flavite_graph::NodeId,
+    title: String,
+    is_note: bool,
+    selected: bool,
+}
+
+/// The accessible list rows for every mounted graph view: the same saved
+/// base nodes the visual graph shows (§13.3: pan/zoom is not the only way
+/// to select, open, or insert).
+fn graph_rows(app: &App) -> Vec<(flavite_workspace::TabId, Vec<GraphRow>)> {
+    let Some(flavite) = &app.flavite else {
+        return Vec::new();
+    };
+    let Some(frame) = flavite.graph_frame() else {
+        return Vec::new();
+    };
+    let publication = frame.publication();
+    app.workspace
+        .tabs()
+        .filter(|(tab, session)| {
+            matches!(session.kind(), flavite_workspace::ViewKind::Graph(_))
+                && app.is_tab_visible(**tab)
+        })
+        .map(|(tab, _)| {
+            let selection = app.graph.state(*tab).and_then(|state| state.selection);
+            let rows = publication
+                .records
+                .iter()
+                .filter(|record| {
+                    app.graph.state(*tab).is_some_and(|s| {
+                        s.scope_result
+                            .as_ref()
+                            .is_some_and(|scope| scope.nodes.contains(&record.id))
+                    })
+                })
+                .skip(app.graph.state(*tab).map_or(0, |s| s.list_offset))
+                .take(GRAPH_A11Y_ROW_BUDGET)
+                .map(|record| GraphRow {
+                    key: app
+                        .graph
+                        .state(*tab)
+                        .and_then(|s| s.geometry_key)
+                        .unwrap_or(frame.render_key()),
+                    incarnation: app
+                        .workspace
+                        .tab(tab)
+                        .map_or(0, |s| s.interaction().incarnation),
+                    node: record.id,
+                    title: format!("{} · {}", record.title, record.path),
+                    is_note: record.id.kind == flavite_graph::NodeKind::Note,
+                    selected: selection.is_some_and(|hit| hit.id == record.id),
+                })
+                .collect();
+            (*tab, rows)
+        })
+        .collect()
 }
 
 fn collapsed(app: &App) -> bool {
@@ -525,6 +656,53 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
             node.add_action(Action::Click);
             nodes.push((id, node));
             window_children.push(id);
+        }
+        let can_insert = app.valid_writing_target().is_some();
+        for (tab, rows) in graph_rows(app) {
+            let list_id = node_id("graph-list", tab.raw());
+            let mut children = Vec::new();
+            for row in rows {
+                let item_id = graph_row_node_id(tab, "graph-row", row.node, row.key.epoch);
+                let mut item = Node::new(Role::ListItem);
+                item.set_label(row.title.clone());
+                item.set_selected(row.selected);
+                item.add_action(Action::Click);
+                let open_id = graph_row_node_id(tab, "graph-row-open", row.node, row.key.epoch);
+                let mut open = Node::new(Role::Button);
+                open.set_label(format!("Open {} (graph)", row.title));
+                open.add_action(Action::Click);
+                let mut row_children = vec![open_id];
+                nodes.push((open_id, open));
+                if row.is_note {
+                    let insert_id =
+                        graph_row_node_id(tab, "graph-row-insert", row.node, row.key.epoch);
+                    let mut insert = Node::new(Role::Button);
+                    insert.set_label(format!(
+                        "Insert link to {} at the writing target ({})",
+                        row.title,
+                        if can_insert {
+                            "ready"
+                        } else {
+                            "no writing target — focus an editor caret"
+                        }
+                    ));
+                    if can_insert {
+                        insert.add_action(Action::Click);
+                    } else {
+                        insert.set_disabled();
+                    }
+                    nodes.push((insert_id, insert));
+                    row_children.push(insert_id);
+                }
+                item.set_children(row_children);
+                nodes.push((item_id, item));
+                children.push(item_id);
+            }
+            let mut list = Node::new(Role::List);
+            list.set_label("Graph nodes (saved index; select to drive context)");
+            list.set_children(children);
+            nodes.push((list_id, list));
+            window_children.push(list_id);
         }
     }
 

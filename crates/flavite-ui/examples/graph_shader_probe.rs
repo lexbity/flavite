@@ -14,13 +14,14 @@ use iced::widget::shader::Shader;
 use iced::{Element, Length};
 
 use flavite_ui::graph::{
-    Camera, ProbeGeometry, ProbeMessage, ProbeProgram, ProbeTimings, SyntheticOptions, generate,
+    Camera, GraphMessage, ProbeMessage, ProbeProgram, ProbeTimings, RenderGeometry,
+    SyntheticOptions, generate,
 };
 
 /// The probe state.
 pub struct ProbeState {
     /// CPU-side geometry: nodes and edges with identities.
-    geometry: Arc<ProbeGeometry>,
+    geometry: Arc<RenderGeometry>,
     /// Shared instrumentation for frame-time measurement.
     timings: Arc<ProbeTimings>,
     /// The current camera (pan/zoom in world units).
@@ -39,7 +40,7 @@ impl ProbeState {
         let synthetic = generate(&SyntheticOptions::probe_default());
         let positions = synthetic.positions.clone();
 
-        let geometry = ProbeGeometry::from_snapshot(&synthetic.snapshot, &positions, 0)
+        let geometry = RenderGeometry::from_snapshot(&synthetic.snapshot, &positions, 0)
             .expect("fixture snapshot and positions must match");
 
         let geometry = Arc::new(geometry);
@@ -80,6 +81,12 @@ impl ProbeState {
             ProbeMessage::ScaleFactor { .. } => {
                 // Scale factor changed — handled by camera in draw
             }
+            // The measurement probe ignores gesture traffic; the workspace
+            // shell (views/graph.rs) is the consumer of releases/drags.
+            GraphMessage::NodeDragged { .. }
+            | GraphMessage::Released { .. }
+            | GraphMessage::BoxPreview { .. }
+            | GraphMessage::BoxSelected { .. } => {}
         }
         iced::Task::none()
     }

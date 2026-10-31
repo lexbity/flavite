@@ -40,8 +40,27 @@ pub struct LinkPrepareArgs {
     pub source: LinkSourceArgs,
     /// Vault-relative target path.
     pub target_path: String,
+    pub expected_target: flavite_vault::link::LinkTargetIdentity,
     /// `disabled` or `prefer_stable` (D-06).
     pub stable_link_policy: String,
+}
+
+/// Prepare a removal of one exact scanner occurrence in an open source buffer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkRemovalArgs {
+    pub intent: LinkIntentArgs,
+    pub source: LinkSourceArgs,
+    pub target_path: String,
+    pub epoch: u64,
+    pub target_entity_id: u64,
+    #[serde(default)]
+    pub target_is_attachment: bool,
+    #[serde(default)]
+    pub target_is_unresolved: bool,
+    pub start: usize,
+    pub end: usize,
+    pub expected_source: String,
 }
 
 /// `link.insert` arguments. Only intent + plan ID: everything else lives in
@@ -71,6 +90,14 @@ pub fn validate_link_insert_args(value: &serde_json::Value) -> Result<(), String
 }
 
 impl Flavite {
+    /// Retire an uncommitted host gesture without replaying it on completion.
+    pub fn cancel_link_intent(&self, client: u128, sequence: u64) {
+        self.session
+            .cancel_link_intent(flavite_vault::link::LinkIntent {
+                client: flavite_vault::link::ClientToken(client),
+                sequence,
+            });
+    }
     /// Issue a core-semantic-link client namespace token for this host
     /// connection. One token per connection; gestures sequence inside it.
     #[must_use]
@@ -83,5 +110,29 @@ impl Flavite {
     #[must_use]
     pub const fn raw_link_insert_rejection() -> &'static str {
         "use apply_edits for raw replacements"
+    }
+}
+
+impl Flavite {
+    /// Capture the exact canonical entity at selection time.
+    ///
+    /// # Errors
+    /// Returns a typed error while targets are changing or unresolved.
+    pub fn link_target_identity(
+        &self,
+        path: &str,
+    ) -> Result<flavite_vault::link::LinkTargetIdentity, String> {
+        let catalog = self.session.resolver_catalog().map_err(str::to_owned)?;
+        let raw = path.strip_suffix(".md").unwrap_or(path);
+        let resolved = catalog.resolve(&flavite_syntax::text::fold_key(raw), raw, false, None);
+        if resolved.is_ambiguous {
+            return Err("ambiguous target".into());
+        }
+        let note = resolved.note.ok_or("missing target")?;
+        Ok(flavite_vault::link::LinkTargetIdentity {
+            epoch: catalog.epoch,
+            entity_id: note.note_id as u64,
+            native_path: note.path_native,
+        })
     }
 }

@@ -17,7 +17,7 @@ pub const SCHEMA_MAJOR: u32 = 3;
 pub const SCHEMA_MINOR: u32 = 0;
 
 /// Parser version - used to trigger background reindex when parser changes.
-pub const PARSER_VERSION: u32 = 1;
+pub const PARSER_VERSION: u32 = 2;
 
 /// Current epoch starts at 1 and increments when SQLite is recreated.
 pub const INITIAL_EPOCH: u64 = 1;

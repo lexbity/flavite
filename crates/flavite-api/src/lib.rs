@@ -28,6 +28,11 @@ pub mod command;
 pub mod doctor;
 pub mod event;
 pub mod flavite;
+pub mod graph_projection;
+pub mod graph_service;
+pub use graph_projection::{
+    GraphProjection, GraphViewToken, LinkOccurrence, OccurrenceSource, OverlayState, ScopeRequest,
+};
 pub mod links;
 pub mod open;
 pub mod queries;
@@ -43,6 +48,9 @@ pub use command::*;
 pub use doctor::*;
 pub use event::*;
 pub use flavite::*;
+pub use graph_service::{
+    GRAPH_POLL_INTERVAL, GraphFrame, GraphService, GraphServiceMetrics, GraphServiceStatus,
+};
 pub use queries::*;
 pub use query_service::*;
 pub use result::*;
@@ -71,3 +79,5 @@ pub const API_VERSION_MAX: &str = "0.2.0";
 
 /// Minimum API version supported.
 pub const API_VERSION_MIN: &str = "0.1.0";
+
+pub use flavite_vault::link::LinkTargetIdentity;

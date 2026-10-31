@@ -370,6 +370,7 @@ fn node_id(logical: usize, kind: NodeKind) -> NodeId {
     match kind {
         NodeKind::Note => NodeId::note(logical as u64),
         NodeKind::Attachment => NodeId::attachment(logical as u64),
+        NodeKind::Unresolved => NodeId::unresolved(logical as u64),
     }
 }
 

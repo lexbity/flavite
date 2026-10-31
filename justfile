@@ -162,7 +162,7 @@ fuzz-smoke:
     cd fuzz
     smoke_root="$(mktemp -d)"
     trap 'rm -rf "$smoke_root"' EXIT
-    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore"
+    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore graph_scope"
     failed=0
     for target in $targets; do
         corpus_dir="$smoke_root/$target"
@@ -185,7 +185,7 @@ fuzz-smoke-ci:
     cd fuzz
     smoke_root="$(mktemp -d)"
     trap 'rm -rf "$smoke_root"' EXIT
-    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore"
+    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore graph_scope"
     failed=0
     for target in $targets; do
         corpus_dir="$smoke_root/$target"
@@ -247,58 +247,60 @@ ui-visual-setup:
         exit 2
     fi
     sudo apt-get update
-    sudo apt-get install -y --no-install-recommends xvfb xdotool imagemagick
+    sudo apt-get install -y --no-install-recommends xvfb xdotool imagemagick python3-pil
 
 # Full cleanup (§10.10): removes target/, fuzz/target/, fuzz/artifacts/,
 # profiling intermediates. Pass --dry-run to preview without removing.
 # RFC-0003 §16.1: headless workspace gates. During partial implementation
 # the profile argument limits scope to capabilities not yet shipped; it can
 # never disable a completed slice's gate (W01 runs additively inside W02+).
-workspace-gate *profile="W02":
+workspace-contracts profile="W08":
+    bash scripts/check-workspace-contracts.sh {{profile}}
+
+workspace-gate profile="W08":
     #!/usr/bin/env bash
     set -euo pipefail
-    bash scripts/check-workspace-contracts.sh "{{profile}}"
-    cargo test -p flavite-workspace
-    cargo test -p flavite-ui --test workspace_layout
+    case "{{profile}}" in W0[1-8]) slice="{{profile}}"; stage="${slice#W0}" ;; *) echo "Expected W01–W08" >&2; exit 2 ;; esac
+    just workspace-contracts "{{profile}}"
+    cargo test -p xtask --test workspace_gates
     cargo test -p flavite-ui --test runtime_accessibility
-    cargo test -p flavite-api --test open_flights
-    if [ "{{profile}}" = "W03" ]; then
-        cargo test -p flavite-editor
-        cargo test -p flavite-ui --test shared_views
+    if (( stage >= 2 )); then
+        cargo test -p flavite-workspace
+        cargo test -p flavite-ui --test workspace_layout
+        cargo test -p flavite-api --test open_flights
     fi
-    if [ "{{profile}}" = "W04" ]; then
+    if (( stage >= 3 )); then
         cargo test -p flavite-editor
         cargo test -p flavite-ui --test shared_views
-        cargo test -p flavite-workspace --test context_properties
-        cargo test -p flavite-ui --test context_routing
-        cargo test -p flavite-api --test query_service
         cargo test -p flavite-api --test host_boundary
     fi
-    if [ "{{profile}}" = "W05" ]; then
-        cargo test -p flavite-editor
-        cargo test -p flavite-ui --test shared_views
-        cargo test -p flavite-workspace --test context_properties
+    if (( stage >= 4 )); then
         cargo test -p flavite-ui --test context_routing
         cargo test -p flavite-api --test query_service
-        cargo test -p flavite-api --test host_boundary
+    fi
+    if (( stage >= 5 )); then
         cargo test -p flavite-syntax --test link_insert_properties
         cargo test -p flavite-api --test semantic_links
         cargo test -p flavite-ui --test link_target
     fi
-    if [ "{{profile}}" = "W06" ]; then
-        cargo test -p flavite-editor
-        cargo test -p flavite-ui --test shared_views
-        cargo test -p flavite-workspace --test context_properties
-        cargo test -p flavite-ui --test context_routing
-        cargo test -p flavite-api --test query_service
-        cargo test -p flavite-api --test host_boundary
-        cargo test -p flavite-syntax --test link_insert_properties
-        cargo test -p flavite-api --test semantic_links
-        cargo test -p flavite-ui --test link_target
-        cargo test -p flavite-workspace --test workspace_codec
+    if (( stage >= 6 )); then
         cargo test -p flavite-api --test workspace_storage
         cargo test -p flavite-ui --test workspace_restore
     fi
+    if (( stage >= 7 )); then
+        cargo test -p flavite-graph
+        cargo test -p flavite-ui --test shader_validation
+    fi
+    if (( stage >= 8 )); then
+        cargo test -p flavite-graph-protocol
+        cargo test -p flavite-api --test graph_projection --test link_occurrences
+        cargo test -p flavite-index --test graph_identity
+        cargo test -p flavite-buffer --test revision_history
+        cargo test -p flavite-ui --test graph_filter_context
+    fi
+
+workspace-graph-visual backend="canvas":
+    bash scripts/workspace-visual-linux.sh --scenario filtered-unsaved-graph --backend {{backend}} --require-backend
 
 # RFC-0003 §31.1: real Linux window input, semantic checkpoints, screenshots,
 # and an evidence manifest.

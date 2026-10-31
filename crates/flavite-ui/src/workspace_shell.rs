@@ -318,6 +318,7 @@ fn active_view(app: &App, group: GroupId, tab: TabId) -> Element<'_, Message> {
         ),
         ViewKind::Notes => notes_view(app, group),
         ViewKind::Note(note) => crate::views::note::view(app, tab, note.load(), note.locator()),
+        ViewKind::Graph(_) => crate::views::graph::view(app, tab),
         ViewKind::Preview(_) => crate::views::preview::view(app, tab),
         ViewKind::Backlinks(_) => crate::views::backlinks::view(app, tab),
     }

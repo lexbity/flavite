@@ -8,6 +8,22 @@
 use flavite_syntax::link_format::{ProofRejection, prove_insertion, serialize_link};
 use flavite_syntax::pulldown_glue::parse_note;
 
+#[test]
+fn invalid_unicode_caret_and_unparsable_source_both_refuse_authorization() {
+    // link_insertion fuzz repro bfb0d37043b906b81ae244a9ea45ce9af1e0af3a.
+    let source = String::from_utf8_lossy(&[0xa1, 0, 0xf5, 0xcf, 0xc8]);
+    let serialized = serialize_link(&["I".into()], None).unwrap();
+    assert!(parse_note(source.as_bytes()).is_err());
+    assert!(matches!(
+        prove_insertion(&source, 2, &serialized),
+        Err(ProofRejection::CaretOutOfBounds)
+    ));
+    assert!(matches!(
+        prove_insertion(&source, 0, &serialized),
+        Err(ProofRejection::SourceUnparsable(_))
+    ));
+}
+
 fn link(name: &str) -> flavite_syntax::link_format::SerializedLink {
     serialize_link(&[name.to_owned()], None).expect("representable target")
 }

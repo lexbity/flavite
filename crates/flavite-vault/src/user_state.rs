@@ -1,14 +1,23 @@
-//! Device-local user state storage (RFC-0003 §22, W06, D-11/D-12).
+//! Device-local and vault-local user state storage (RFC-0003 §22, W06/W07,
+//! D-11/D-12).
 //!
 //! Workspace layouts and device preferences are device-local user state in
 //! the OS data directory, keyed by vault UUID: never note truth, never
 //! synced through the vault. The store owns fixed, validated locations —
 //! no arbitrary caller filenames — with atomic generations, a last-good
 //! backup, and explicit fault surfaces for tests.
+//!
+//! Graph pin coordinates keep their existing vault-relative location
+//! (`.flavite/graph.json`) and file format (D-11: "Graph pin coordinates
+//! retain their existing vault-user-state location and semantics behind a
+//! consolidated storage service"). `VaultUserStateStore` moves that storage
+//! behind the API's `Fs` while the UI keeps only the in-memory codec and
+//! identity rules (TD-11).
 
 use crate::identity::get_data_dir;
 use flavite_fs::Fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Hard byte bound for one user-state file (codec bound plus envelope).
 pub const MAX_USER_STATE_BYTES: u64 = 5 * 1024 * 1024;
@@ -62,6 +71,11 @@ pub enum UserStateError {
     NotJson(String),
     /// The underlying filesystem failed.
     Fs(String),
+    /// The operation mutates state that this vault mode must not write
+    /// (RFC-0003 §11.2: a read-only vault still allows device-local layout
+    /// writes, but graph pin storage modifies vault user state and is
+    /// disabled).
+    ReadOnly,
 }
 
 impl std::fmt::Display for UserStateError {
@@ -84,6 +98,7 @@ impl std::fmt::Display for UserStateError {
             Self::Corrupt(message) => write!(f, "user state file is corrupt: {message}"),
             Self::NotJson(message) => write!(f, "user state payload is not JSON: {message}"),
             Self::Fs(message) => write!(f, "user state filesystem error: {message}"),
+            Self::ReadOnly => write!(f, "vault is read-only: vault user state is not writable"),
         }
     }
 }
@@ -259,5 +274,235 @@ impl UserStateStore {
             });
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vault-local user state (graph pins; RFC-0003 TD-11, W07)
+// ---------------------------------------------------------------------------
+
+/// The fixed set of vault-relative user-state kinds. Like
+/// [`UserStateKind`], callers cannot invent locations: the file name is
+/// part of the kind, not an argument (§11.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultUserStateKind {
+    /// Graph position pins — `<vault>/.flavite/graph.json`, existing
+    /// format, existing semantics (D-11).
+    GraphPins,
+}
+
+impl VaultUserStateKind {
+    /// The fixed vault-relative path for this kind.
+    #[must_use]
+    pub const fn relative_path(self) -> &'static str {
+        match self {
+            Self::GraphPins => ".flavite/graph.json",
+        }
+    }
+}
+
+/// Vault-relative user state stored behind the injected `Fs`.
+///
+/// The graph-pins document keeps its established on-disk bytes — the
+/// `{"version":1,"pins":[…]}` shape with unknown-field preservation is the
+/// UI codec's contract, not this store's. The store therefore treats the
+/// file as an opaque JSON document: bounded size, symlink protection, one
+/// shared atomic-replace primitive (§4.4/D6), and a compare-and-set
+/// generation.
+///
+/// The generation counter is process-scoped by design: the vault's single
+/// writer lock already serializes across processes (§11.2), and the CAS
+/// exists to reject stale in-process writes after a re-read — never to
+/// rewrite the established file format with a new envelope.
+pub struct VaultUserStateStore {
+    fs: Box<dyn Fs + Send + Sync>,
+    vault_root: PathBuf,
+    graph_pins_generation: AtomicU64,
+}
+
+impl std::fmt::Debug for VaultUserStateStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultUserStateStore")
+            .finish_non_exhaustive()
+    }
+}
+
+impl VaultUserStateStore {
+    /// Build a store rooted at the open vault's root.
+    #[must_use]
+    pub fn new(fs: Box<dyn Fs + Send + Sync>, vault_root: &Path) -> Self {
+        Self {
+            fs,
+            vault_root: vault_root.to_path_buf(),
+            graph_pins_generation: AtomicU64::new(0),
+        }
+    }
+
+    /// The fixed path for one vault-relative kind.
+    #[must_use]
+    pub fn path_for(&self, kind: VaultUserStateKind) -> PathBuf {
+        let mut path = self.vault_root.clone();
+        for component in Path::new(kind.relative_path()) {
+            path.push(component);
+        }
+        path
+    }
+
+    /// Read the graph-pins document; `None` when nothing was ever written.
+    ///
+    /// # Errors
+    /// Typed bounds, protection, and filesystem failures.
+    pub fn read_graph_pins(&self) -> Result<Option<StoredUserState>, UserStateError> {
+        let path = self.path_for(VaultUserStateKind::GraphPins);
+        self.guard_protected(&path)?;
+        let bytes = match self.fs.read_if_exists(&path) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(UserStateError::Fs(error.to_string())),
+        };
+        if bytes.len() as u64 > MAX_USER_STATE_BYTES {
+            return Err(UserStateError::TooLarge { size: bytes.len() });
+        }
+        Ok(Some(StoredUserState {
+            generation: self.graph_pins_generation.load(Ordering::Acquire),
+            payload: bytes,
+        }))
+    }
+
+    /// Write the graph-pins document under a compare-and-set generation
+    /// receipt; returns the new generation.
+    ///
+    /// The payload must be a JSON document (the UI codec's
+    /// `{"version":1,…}` shape) and the write goes through the same
+    /// `flavite_fs::atomic::atomic_write` durability primitive as device
+    /// user state — no separate temp/replace helper survives (TD-11).
+    ///
+    /// # Errors
+    /// [`UserStateError::GenerationMismatch`] on a stale receipt,
+    /// [`UserStateError::NotJson`] for a non-document payload,
+    /// [`UserStateError::ReadOnly`] when `allow_writes` is false, and typed
+    /// protection/filesystem failures.
+    pub fn write_graph_pins(
+        &self,
+        expected_generation: u64,
+        payload: &[u8],
+        allow_writes: bool,
+    ) -> Result<u64, UserStateError> {
+        if !allow_writes {
+            return Err(UserStateError::ReadOnly);
+        }
+        if payload.len() as u64 > MAX_USER_STATE_BYTES {
+            return Err(UserStateError::TooLarge {
+                size: payload.len(),
+            });
+        }
+        let document: serde_json::Value = serde_json::from_slice(payload)
+            .map_err(|error| UserStateError::NotJson(error.to_string()))?;
+        if !document.is_object() {
+            return Err(UserStateError::NotJson(
+                "graph pins must be a JSON object".into(),
+            ));
+        }
+        let path = self.path_for(VaultUserStateKind::GraphPins);
+        let parent = path
+            .parent()
+            .ok_or_else(|| UserStateError::Fs("graph pins path has no parent".into()))?;
+        self.guard_protected(&path)?;
+        self.guard_protected(parent)?;
+        let actual = self.graph_pins_generation.load(Ordering::Acquire);
+        if actual != expected_generation {
+            return Err(UserStateError::GenerationMismatch {
+                expected: expected_generation,
+                actual,
+            });
+        }
+        if let Err(error) = self.fs.create_dir_all(parent) {
+            return Err(UserStateError::Fs(error.to_string()));
+        }
+        if let Err(error) = flavite_fs::atomic::atomic_write(self.fs.as_ref(), &path, payload) {
+            return Err(UserStateError::Fs(error.to_string()));
+        }
+        let next = expected_generation.saturating_add(1);
+        self.graph_pins_generation.store(next, Ordering::Release);
+        Ok(next)
+    }
+
+    fn guard_protected(&self, path: &Path) -> Result<(), UserStateError> {
+        if let Ok(metadata) = self.fs.metadata(path)
+            && metadata.is_symlink
+        {
+            return Err(UserStateError::Protected {
+                path: path.display().to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod vault_store_tests {
+    use super::*;
+    use flavite_fs::MemFs;
+
+    fn store() -> (VaultUserStateStore, tempfile::TempDir) {
+        // A real temp root with MemFs is the established fault-surface
+        // pattern: paths exist for metadata, contents live in memory.
+        let dir = tempfile::tempdir().expect("vault dir");
+        let fs: Box<dyn Fs + Send + Sync> = Box::new(MemFs::new());
+        (VaultUserStateStore::new(fs, dir.path()), dir)
+    }
+
+    #[test]
+    fn graph_pins_round_trip_under_generation_cas() {
+        let (store, _dir) = store();
+        assert!(store.read_graph_pins().expect("read").is_none());
+        let payload = br#"{"version":1,"pins":[]}"#;
+        let next = store
+            .write_graph_pins(0, payload, true)
+            .expect("first write");
+        assert_eq!(next, 1);
+        let stored = store.read_graph_pins().expect("read").expect("present");
+        assert_eq!(stored.generation, 1);
+        assert_eq!(stored.payload, payload);
+        // A stale receipt is a typed mismatch, never a silent overwrite.
+        let stale = store.write_graph_pins(0, br#"{"version":1,"pins":[]}"#, true);
+        assert_eq!(
+            stale,
+            Err(UserStateError::GenerationMismatch {
+                expected: 0,
+                actual: 1
+            })
+        );
+    }
+
+    #[test]
+    fn read_only_vaults_reject_graph_pin_writes() {
+        let (store, _dir) = store();
+        assert_eq!(
+            store.write_graph_pins(0, b"{}", false),
+            Err(UserStateError::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn graph_pins_payload_must_be_a_json_object() {
+        let (store, _dir) = store();
+        assert!(matches!(
+            store.write_graph_pins(0, b"not json", true),
+            Err(UserStateError::NotJson(_))
+        ));
+        assert!(matches!(
+            store.write_graph_pins(0, b"[1,2]", true),
+            Err(UserStateError::NotJson(_))
+        ));
+    }
+
+    #[test]
+    fn graph_pins_path_is_fixed_under_the_vault_root() {
+        let dir = tempfile::tempdir().expect("vault dir");
+        let fs: Box<dyn Fs + Send + Sync> = Box::new(MemFs::new());
+        let store = VaultUserStateStore::new(fs, dir.path());
+        let path = store.path_for(VaultUserStateKind::GraphPins);
+        assert_eq!(path, dir.path().join(".flavite").join("graph.json"));
     }
 }

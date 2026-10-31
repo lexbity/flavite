@@ -153,6 +153,54 @@ pub const UI_COMMANDS: &[UiCommand] = &[
         title: "Open notes list",
     },
     UiCommand {
+        id: "workspace.open_graph",
+        title: "Open graph view",
+    },
+    UiCommand {
+        id: "graph.freeze",
+        title: "Freeze graph layout",
+    },
+    UiCommand {
+        id: "graph.fit",
+        title: "Fit graph to view",
+    },
+    UiCommand {
+        id: "graph.list",
+        title: "Toggle graph list",
+    },
+    UiCommand {
+        id: "graph.filters",
+        title: "Show graph filters",
+    },
+    UiCommand {
+        id: "graph.apply_filters",
+        title: "Apply graph filters",
+    },
+    UiCommand {
+        id: "graph.clear_filters",
+        title: "Clear graph filters",
+    },
+    UiCommand {
+        id: "graph.undo_filters",
+        title: "Undo graph filters",
+    },
+    UiCommand {
+        id: "graph.explore",
+        title: "Explore selected neighborhood",
+    },
+    UiCommand {
+        id: "graph.clear_selection",
+        title: "Clear graph selection",
+    },
+    UiCommand {
+        id: "graph.open_selected",
+        title: "Open the selected graph note",
+    },
+    UiCommand {
+        id: "graph.insert_selected",
+        title: "Insert a link to the selected graph note at the caret",
+    },
+    UiCommand {
         id: "workspace.open_preview",
         title: "Open preview of the followed note",
     },
@@ -283,6 +331,23 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
     }
     if modifiers.shift() && matches!(&key, keyboard::Key::Named(keyboard::key::Named::F10)) {
         return Some(Message::RunHostCommand("workspace.group_actions"));
+    }
+    // Graph tab operations (§9.3 keyboard): Enter opens the selected
+    // note; command+Enter requests one link insertion at the retained
+    // writing target. No selection or a non-graph tab never fires.
+    if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Enter))
+        && let Some(tab) = graph_action_tab(app)
+    {
+        let command = if modifiers.is_empty() {
+            Some(crate::host::graph::GraphCommand::OpenSelected)
+        } else if modifiers.command() {
+            Some(crate::host::graph::GraphCommand::InsertSelected)
+        } else {
+            None
+        };
+        if let Some(command) = command {
+            return Some(Message::GraphCommand { tab, command });
+        }
     }
     // Layout and shell chords.
     if modifiers.command() {
@@ -518,6 +583,77 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
                 });
             }
         }
+        "workspace.open_graph" => {
+            if let Some(group) = focused_group {
+                app.dispatch_layout(|revision| LayoutAction::OpenGraph {
+                    expected_revision: revision,
+                    group,
+                });
+            }
+        }
+        "graph.freeze" => {
+            return iced::Task::done(Message::GraphCommand {
+                tab: app.workspace.focused_tab(),
+                command: crate::host::graph::GraphCommand::ToggleFreeze,
+            });
+        }
+        "graph.fit" => {
+            return iced::Task::done(Message::GraphCommand {
+                tab: app.workspace.focused_tab(),
+                command: crate::host::graph::GraphCommand::FitView,
+            });
+        }
+        "graph.list" => {
+            return iced::Task::done(Message::GraphCommand {
+                tab: app.workspace.focused_tab(),
+                command: crate::host::graph::GraphCommand::ToggleList,
+            });
+        }
+        "graph.filters" => {
+            return iced::Task::done(Message::GraphCommand {
+                tab: app.workspace.focused_tab(),
+                command: crate::host::graph::GraphCommand::ToggleFilters,
+            });
+        }
+        "graph.apply_filters" => {
+            return iced::Task::done(Message::GraphCommand {
+                tab: app.workspace.focused_tab(),
+                command: crate::host::graph::GraphCommand::ApplyFilters,
+            });
+        }
+        "graph.clear_filters" => {
+            return iced::Task::done(Message::GraphCommand {
+                tab: app.workspace.focused_tab(),
+                command: crate::host::graph::GraphCommand::ClearFilters,
+            });
+        }
+        "graph.undo_filters" => {
+            return iced::Task::done(Message::GraphCommand {
+                tab: app.workspace.focused_tab(),
+                command: crate::host::graph::GraphCommand::UndoFilters,
+            });
+        }
+        "graph.explore" => {
+            return iced::Task::done(Message::GraphCommand {
+                tab: app.workspace.focused_tab(),
+                command: crate::host::graph::GraphCommand::ExploreSelected,
+            });
+        }
+        "graph.clear_selection" => {
+            return iced::Task::done(Message::GraphCommand {
+                tab: app.workspace.focused_tab(),
+                command: crate::host::graph::GraphCommand::ClearSelection,
+            });
+        }
+        "graph.open_selected" | "graph.insert_selected" => {
+            let tab = app.workspace.focused_tab();
+            let command = if id == "graph.open_selected" {
+                crate::host::graph::GraphCommand::OpenSelected
+            } else {
+                crate::host::graph::GraphCommand::InsertSelected
+            };
+            return iced::Task::done(Message::GraphCommand { tab, command });
+        }
         "workspace.open_preview" => {
             return iced::Task::done(Message::OpenContextView {
                 view: flavite_workspace::ContextViewKind::Preview,
@@ -582,6 +718,47 @@ pub fn available(app: &App, id: &str) -> bool {
                 .is_some()
                 && crate::views::context_header::is_context_tab(app, app.workspace.focused_tab())
         }
+        "workspace.open_graph" => app.focused_group().is_some(),
+        "graph.freeze" => app
+            .workspace
+            .tab(&app.workspace.focused_tab())
+            .is_some_and(|view| matches!(view.kind(), ViewKind::Graph(_))),
+        "graph.fit" => app
+            .workspace
+            .tab(&app.workspace.focused_tab())
+            .is_some_and(|view| matches!(view.kind(), ViewKind::Graph(_))),
+        "graph.list" => app
+            .workspace
+            .tab(&app.workspace.focused_tab())
+            .is_some_and(|view| matches!(view.kind(), ViewKind::Graph(_))),
+        "graph.filters" => app
+            .workspace
+            .tab(&app.workspace.focused_tab())
+            .is_some_and(|view| matches!(view.kind(), ViewKind::Graph(_))),
+        "graph.apply_filters" => app
+            .workspace
+            .tab(&app.workspace.focused_tab())
+            .is_some_and(|view| matches!(view.kind(), ViewKind::Graph(_))),
+        "graph.clear_filters" => app
+            .workspace
+            .tab(&app.workspace.focused_tab())
+            .is_some_and(|view| matches!(view.kind(), ViewKind::Graph(_))),
+        "graph.undo_filters" => app
+            .workspace
+            .tab(&app.workspace.focused_tab())
+            .is_some_and(|view| matches!(view.kind(), ViewKind::Graph(_))),
+        "graph.explore" => app
+            .workspace
+            .tab(&app.workspace.focused_tab())
+            .is_some_and(|view| matches!(view.kind(), ViewKind::Graph(_))),
+        "graph.clear_selection" => app
+            .workspace
+            .tab(&app.workspace.focused_tab())
+            .is_some_and(|view| matches!(view.kind(), ViewKind::Graph(_))),
+        "graph.open_selected" => graph_action_tab(app).is_some(),
+        "graph.insert_selected" => {
+            graph_action_tab(app).is_some() && app.valid_writing_target().is_some()
+        }
         "context.follow_document" => {
             crate::views::context_header::is_context_tab(app, app.workspace.focused_tab())
         }
@@ -643,6 +820,21 @@ pub fn locator_for(app: &App, tab: TabId) -> Option<NoteLocator> {
         Some(ViewKind::Note(note)) => Some(note.locator().clone()),
         _ => None,
     }
+}
+
+/// The focused tab when it is a graph view holding a selection (the
+/// keyboard Enter/Cmd+Enter chord target).
+#[must_use]
+fn graph_action_tab(app: &App) -> Option<TabId> {
+    let tab = app.workspace.focused_tab();
+    let session = app.workspace.tab(&tab)?;
+    if !matches!(session.kind(), ViewKind::Graph(_)) {
+        return None;
+    }
+    app.graph
+        .state(tab)
+        .and_then(|state| state.selection)
+        .map(|_| tab)
 }
 
 /// The focused group the shell routes commands to.

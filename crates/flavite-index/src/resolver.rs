@@ -21,7 +21,6 @@
 use crate::schema::ResState;
 use crate::types::{AttRef, NoteRef};
 use rusqlite::{Connection, Result, params};
-use std::collections::HashMap;
 use std::path::Path;
 
 /// Pure candidate ordering used by persisted and on-demand resolution.
@@ -48,19 +47,6 @@ pub mod ranking {
                 .then(a.path.cmp(&b.path))
         });
     }
-}
-
-/// Cached resolution state.
-#[derive(Debug, Default)]
-pub struct ResolverCache {
-    /// Map from folded stable ID to its lowest-path-key winner.
-    stable_id_to_note: HashMap<String, i64>,
-    /// Map from `stem_key` to list of `note_ids` (for step 3).
-    stem_to_notes: HashMap<String, Vec<i64>>,
-    /// Map from `stem_key` to list of `attachment_ids` (for step 3).
-    stem_to_atts: HashMap<String, Vec<i64>>,
-    /// Map from `alias_key` to `note_id`.
-    alias_to_note: HashMap<String, Vec<i64>>,
 }
 
 /// Link resolution result.
@@ -127,14 +113,14 @@ impl Resolution {
 /// The link resolver.
 pub struct Resolver<'a> {
     conn: &'a Connection,
-    cache: ResolverCache,
+    catalog: Option<crate::catalog::ResolverCatalog>,
 }
 
 impl<'a> Resolver<'a> {
     pub fn new(conn: &'a Connection) -> Self {
         Self {
             conn,
-            cache: ResolverCache::default(),
+            catalog: None,
         }
     }
 
@@ -145,93 +131,28 @@ impl<'a> Resolver<'a> {
     /// Returns a SQLite error when the backing queries cannot be prepared
     /// or their rows cannot be read.
     pub fn refresh_cache(&mut self) -> Result<()> {
-        self.cache = ResolverCache::default();
-
-        // Load stable_id to note_id mappings
-        let mut stmt = self.conn.prepare(
-            "SELECT stable_id_key, note_id FROM notes WHERE stable_id_key IS NOT NULL ORDER BY path_key",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let stable_id: String = row.get(0)?;
-            let note_id: i64 = row.get(1)?;
-            Ok((stable_id, note_id))
-        })?;
-
-        for row in rows {
-            let (stable_id, note_id) = row?;
-            self.cache
-                .stable_id_to_note
-                .entry(stable_id)
-                .or_insert(note_id);
-        }
-
-        // Load stem_key to note_id mappings
-        let mut stmt = self.conn.prepare("SELECT stem_key, note_id FROM notes")?;
-        let rows = stmt.query_map([], |row| {
-            let stem_key: String = row.get(0)?;
-            let note_id: i64 = row.get(1)?;
-            Ok((stem_key, note_id))
-        })?;
-
-        for row in rows {
-            let (stem_key, note_id) = row?;
-            self.cache
-                .stem_to_notes
-                .entry(stem_key)
-                .or_default()
-                .push(note_id);
-        }
-
-        // Load alias_key to note_id mappings
-        let mut stmt = self
-            .conn
-            .prepare("SELECT alias_key, note_id FROM aliases")?;
-        let rows = stmt.query_map([], |row| {
-            let alias_key: String = row.get(0)?;
-            let note_id: i64 = row.get(1)?;
-            Ok((alias_key, note_id))
-        })?;
-
-        for row in rows {
-            let (alias_key, note_id) = row?;
-            self.cache
-                .alias_to_note
-                .entry(alias_key)
-                .or_default()
-                .push(note_id);
-        }
-
-        // Load stem_key to attachment_id mappings
-        let mut stmt = self
-            .conn
-            .prepare("SELECT stem_key, att_id FROM attachments")?;
-        let rows = stmt.query_map([], |row| {
-            let stem_key: String = row.get(0)?;
-            let att_id: i64 = row.get(1)?;
-            Ok((stem_key, att_id))
-        })?;
-
-        for row in rows {
-            let (stem_key, att_id) = row?;
-            self.cache
-                .stem_to_atts
-                .entry(stem_key)
-                .or_default()
-                .push(att_id);
-        }
-
+        self.catalog = Some(crate::catalog::ResolverCatalog::load(self.conn)?);
         Ok(())
     }
 
-    /// Resolve a link target to a note or attachment.
-    ///
-    /// This implements the 5-step D8 algorithm:
-    /// 1. `id:` prefix → `stable_id` lookup (with duplicate handling)
-    /// 2. Path-suffix match if target contains `/`
-    /// 3. Stem match over notes/aliases/attachments
-    /// 4. Multiple candidates → rank and mark ambiguous
-    /// 5. Zero candidates → unresolved
-    #[allow(clippy::too_many_lines)]
+    /// Resolve a new unsaved source with the same directory-ranking rule.
+    #[must_use]
+    pub fn resolve_at_path(
+        &self,
+        target_key: &str,
+        raw: &str,
+        embed: bool,
+        source: &Path,
+    ) -> Resolution {
+        self.catalog
+            .as_ref()
+            .map_or_else(Resolution::unresolved, |catalog| {
+                catalog.resolve_at_path(target_key, raw, embed, Some(source))
+            })
+    }
+
+    /// Resolve a link target using the canonical D8 precedence and ranking.
+    #[must_use]
     pub fn resolve(
         &self,
         target_key: &str,
@@ -239,290 +160,11 @@ impl<'a> Resolver<'a> {
         is_embed: bool,
         source_note_id: Option<i64>,
     ) -> Resolution {
-        let normalized_target_key = flavite_syntax::text::fold_key(target_key);
-        // Step 1: Check for id: prefix
-        let raw_lower = flavite_syntax::text::fold_key(raw_target);
-        if let Some(stable_id) = raw_lower.strip_prefix("id:")
-            && let Some(&note_id) = self.cache.stable_id_to_note.get(stable_id)
-            && let Ok(path) = self.conn.query_row(
-                "SELECT path_native FROM notes WHERE note_id=?1",
-                [note_id],
-                |row| row.get(0),
-            )
-        {
-            return Resolution::resolved_note(NoteRef::new(note_id, path));
-            // id: not found, continue
-        }
-
-        // Step 2: Path-suffix match if target contains `/`
-        if raw_target.contains('/') {
-            // Match a path suffix so `[[notes/one]]` finds `notes/one.md`.
-            let path_key = flavite_syntax::text::fold_key(raw_target);
-            let Ok(mut stmt) = self.conn.prepare(
-                "SELECT note_id, path_native FROM notes WHERE path_key LIKE '%' || '/' || ?1 OR path_key LIKE '%' || '/' || ?1 || '.md' OR path_key = ?1 OR path_key = ?1 || '.md' ORDER BY path_key",
-            ) else {
-                return Resolution::unresolved();
-            };
-            let note_matches = stmt
-                .query_map([&path_key], |row| {
-                    Ok(NoteRef::new(row.get(0)?, row.get(1)?))
-                })
-                .and_then(Iterator::collect::<Result<Vec<_>, _>>);
-            if let Ok(note_matches) = note_matches
-                && !note_matches.is_empty()
-            {
-                let ids = note_matches
-                    .iter()
-                    .map(|note| note.note_id)
-                    .collect::<Vec<_>>();
-                let best = self
-                    .rank_candidates(&ids, &[], source_note_id)
-                    .0
-                    .unwrap_or(ids[0]);
-                let note = note_matches.into_iter().find(|note| note.note_id == best);
-                let Some(note) = note else {
-                    return Resolution::unresolved();
-                };
-                let mut result = Resolution::resolved_note(note);
-                result.is_ambiguous = ids.len() > 1;
-                if result.is_ambiguous {
-                    result.state = ResState::Ambiguous;
-                }
-                return result;
-            }
-
-            // Notes take precedence over attachments for path targets.
-            let Ok(mut stmt) = self
-                .conn
-                .prepare("SELECT att_id, path_native FROM attachments WHERE path_key LIKE '%' || '/' || ?1 OR path_key = ?1 ORDER BY path_key")
-            else {
-                return Resolution::unresolved();
-            };
-
-            let attachment_matches = stmt
-                .query_map([&path_key], |row| Ok(AttRef::new(row.get(0)?, row.get(1)?)))
-                .and_then(Iterator::collect::<Result<Vec<_>, _>>);
-            if let Ok(attachment_matches) = attachment_matches
-                && !attachment_matches.is_empty()
-            {
-                let ids = attachment_matches
-                    .iter()
-                    .map(|attachment| attachment.att_id)
-                    .collect::<Vec<_>>();
-                let best = self
-                    .rank_candidates(&[], &ids, source_note_id)
-                    .1
-                    .unwrap_or(ids[0]);
-                let attachment = attachment_matches
-                    .into_iter()
-                    .find(|attachment| attachment.att_id == best);
-                let Some(attachment) = attachment else {
-                    return Resolution::unresolved();
-                };
-                let mut result = Resolution::resolved_attachment(attachment);
-                result.is_ambiguous = ids.len() > 1;
-                if result.is_ambiguous {
-                    result.state = ResState::Ambiguous;
-                }
-                return result;
-            }
-        }
-
-        // Step 3: Stem match over notes.stem_key ∪ aliases.alias_key ∪ attachments.stem_key
-        let mut note_candidates: Vec<i64> = Vec::new();
-        let mut att_candidates: Vec<i64> = Vec::new();
-        let basename = Path::new(raw_target)
-            .file_stem()
-            .and_then(|value| value.to_str());
-        let stem_target = basename.map_or_else(
-            || normalized_target_key.clone(),
-            flavite_syntax::text::fold_key,
-        );
-
-        // Check notes by stem_key
-        if let Some(ids) = self.cache.stem_to_notes.get(&normalized_target_key) {
-            note_candidates.extend(ids);
-        }
-        if stem_target != normalized_target_key
-            && let Some(ids) = self.cache.stem_to_notes.get(&stem_target)
-        {
-            note_candidates.extend(ids);
-        }
-
-        // Check aliases by alias_key
-        if let Some(ids) = self.cache.alias_to_note.get(&normalized_target_key) {
-            note_candidates.extend(ids);
-        }
-        if stem_target != normalized_target_key
-            && let Some(ids) = self.cache.alias_to_note.get(&stem_target)
-        {
-            note_candidates.extend(ids);
-        }
-
-        // Check attachments by stem_key (only for embeds per D8)
-        if is_embed && let Some(ids) = self.cache.stem_to_atts.get(&normalized_target_key) {
-            att_candidates.extend(ids);
-        }
-        if is_embed
-            && stem_target != normalized_target_key
-            && let Some(ids) = self.cache.stem_to_atts.get(&stem_target)
-        {
-            att_candidates.extend(ids);
-        }
-        note_candidates.sort_unstable();
-        note_candidates.dedup();
-        att_candidates.sort_unstable();
-        att_candidates.dedup();
-
-        // Step 4: Rank candidates
-        let total_candidates = note_candidates.len() + att_candidates.len();
-
-        if total_candidates == 0 {
-            // Step 5: No candidates → unresolved
-            return Resolution::unresolved();
-        }
-
-        if is_embed && !att_candidates.is_empty() {
-            let best_att = self.rank_candidates(&[], &att_candidates, source_note_id).1;
-            if let Some(att_id) = best_att {
-                let path = self
-                    .conn
-                    .query_row(
-                        "SELECT path_native FROM attachments WHERE att_id=?1",
-                        [att_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or_default();
-                let mut result = Resolution::resolved_attachment(AttRef::new(att_id, path));
-                result.is_ambiguous = att_candidates.len() > 1;
-                if result.is_ambiguous {
-                    result.state = ResState::Ambiguous;
-                }
-                return result;
-            }
-        }
-        if total_candidates > 1 {
-            // Multiple candidates or cross-type candidates → rank and mark ambiguous
-            let (best_note, best_att) =
-                self.rank_candidates(&note_candidates, &att_candidates, source_note_id);
-
-            // Mark as ambiguous if there are multiple candidates
-            let is_ambiguous = total_candidates > 1;
-
-            if let Some(note_id) = best_note {
-                let note_ref = NoteRef::new(note_id, Vec::new());
-                let mut result = Resolution::resolved_note(note_ref);
-                result.is_ambiguous = is_ambiguous;
-                if is_ambiguous {
-                    result.state = ResState::Ambiguous;
-                }
-                return result;
-            }
-
-            if let Some(att_id) = best_att {
-                let att_ref = AttRef::new(att_id, Vec::new());
-                let mut result = Resolution::resolved_attachment(att_ref);
-                result.is_ambiguous = is_ambiguous;
-                if is_ambiguous {
-                    result.state = ResState::Ambiguous;
-                }
-                return result;
-            }
-
-            // Should not reach here if we have candidates
-            return Resolution::ambiguous();
-        }
-
-        // Exactly one candidate
-        if !note_candidates.is_empty() {
-            let id = self
-                .rank_candidates(&note_candidates, &[], source_note_id)
-                .0
-                .unwrap_or(note_candidates[0]);
-            let path = self
-                .conn
-                .query_row(
-                    "SELECT path_native FROM notes WHERE note_id=?1",
-                    [id],
-                    |row| row.get(0),
-                )
-                .unwrap_or_default();
-            let note_ref = NoteRef::new(id, path);
-            return Resolution::resolved_note(note_ref);
-        }
-
-        if !att_candidates.is_empty() {
-            let id = self
-                .rank_candidates(&[], &att_candidates, source_note_id)
-                .1
-                .unwrap_or(att_candidates[0]);
-            let path = self
-                .conn
-                .query_row(
-                    "SELECT path_native FROM attachments WHERE att_id=?1",
-                    [id],
-                    |row| row.get(0),
-                )
-                .unwrap_or_default();
-            let att_ref = AttRef::new(id, path);
-            return Resolution::resolved_attachment(att_ref);
-        }
-
-        Resolution::unresolved()
-    }
-
-    /// Rank candidates by: same directory as source, then shallowest, then lexicographic.
-    ///
-    /// Returns (`best_note_id`, `best_att_id`).
-    ///
-    fn rank_candidates(
-        &self,
-        note_candidates: &[i64],
-        att_candidates: &[i64],
-        source_note_id: Option<i64>,
-    ) -> (Option<i64>, Option<i64>) {
-        let source_dir = source_note_id
-            .and_then(|id| {
-                self.conn
-                    .query_row("SELECT path FROM notes WHERE note_id=?1", [id], |row| {
-                        row.get::<_, String>(0)
-                    })
-                    .ok()
+        self.catalog
+            .as_ref()
+            .map_or_else(Resolution::unresolved, |catalog| {
+                catalog.resolve(target_key, raw_target, is_embed, source_note_id)
             })
-            .and_then(|path| Path::new(&path).parent().map(Path::to_path_buf));
-        let mut candidates = Vec::new();
-        for (is_note, ids, table, id_column) in [
-            (true, note_candidates, "notes", "note_id"),
-            (false, att_candidates, "attachments", "att_id"),
-        ] {
-            for id in ids {
-                if let Ok(path) = self.conn.query_row(
-                    &format!("SELECT path FROM {table} WHERE {id_column}=?1"),
-                    [id],
-                    |row| row.get::<_, String>(0),
-                ) {
-                    let candidate = Path::new(&path);
-                    let same_directory = source_dir
-                        .as_deref()
-                        .is_some_and(|dir| candidate.parent() == Some(dir));
-                    candidates.push(ranking::Candidate {
-                        same_directory,
-                        depth: candidate.components().count(),
-                        path,
-                        is_note,
-                        id: *id,
-                    });
-                }
-            }
-        }
-        ranking::rank_candidates(&mut candidates);
-        candidates.first().map_or((None, None), |candidate| {
-            if candidate.is_note {
-                (Some(candidate.id), None)
-            } else {
-                (None, Some(candidate.id))
-            }
-        })
     }
 
     /// Re-resolve all links affected by a note change.
@@ -535,65 +177,20 @@ impl<'a> Resolver<'a> {
     /// Returns a SQLite error when the cache-refresh queries cannot be
     /// prepared; unreadable rows are skipped.
     pub fn invalidate_for_note(&mut self, note_id: i64) -> Result<()> {
-        // Remove from cache
-        let mut stmt = self
-            .conn
-            .prepare("SELECT stem_key FROM notes WHERE note_id = ?")?;
-
-        if let Ok(rows) = stmt.query_map([note_id], |row| row.get::<_, String>(0)) {
-            for row in rows {
-                let stem_key: String = row?;
-                self.cache.stem_to_notes.remove(&stem_key);
-            }
+        if let Some(catalog) = &mut self.catalog {
+            catalog.invalidate_note(note_id);
         }
-
-        // Remove aliases
-        let mut stmt = self
-            .conn
-            .prepare("SELECT alias_key FROM aliases WHERE note_id = ?")?;
-
-        if let Ok(rows) = stmt.query_map([note_id], |row| row.get::<_, String>(0)) {
-            for row in rows {
-                let alias_key: String = row?;
-                self.cache.alias_to_note.remove(&alias_key);
-            }
-        }
-
-        // Remove from stable_id cache
-        let mut stmt = self
-            .conn
-            .prepare("SELECT stable_id_key FROM notes WHERE note_id = ?")?;
-
-        if let Ok(rows) = stmt.query_map([note_id], |row| row.get::<_, Option<String>>(0)) {
-            for row in rows {
-                if let Ok(Some(id)) = row {
-                    self.cache.stable_id_to_note.remove(&id);
-                }
-            }
-        }
-
         Ok(())
     }
 
-    /// Re-resolve all links affected by an attachment change.
+    /// Invalidate canonical attachment candidates after an index change.
     ///
     /// # Errors
-    ///
-    /// Returns a SQLite error when the cache-refresh query cannot be
-    /// prepared; unreadable rows are skipped.
+    /// Retains the existing fallible API; the immutable in-memory removal cannot fail.
     pub fn invalidate_for_attachment(&mut self, att_id: i64) -> Result<()> {
-        // Remove from cache
-        let mut stmt = self
-            .conn
-            .prepare("SELECT stem_key FROM attachments WHERE att_id = ?")?;
-
-        if let Ok(rows) = stmt.query_map([att_id], |row| row.get::<_, String>(0)) {
-            for row in rows {
-                let stem_key: String = row?;
-                self.cache.stem_to_atts.remove(&stem_key);
-            }
+        if let Some(catalog) = &mut self.catalog {
+            catalog.invalidate_attachment(att_id);
         }
-
         Ok(())
     }
 

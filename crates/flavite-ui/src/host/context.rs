@@ -22,6 +22,12 @@ pub struct PendingQuery {
 /// Content of a served query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolContent {
+    /// Preview from the exact current open-buffer revision.
+    BufferPreview {
+        text: String,
+        revision: u64,
+        unsaved: bool,
+    },
     /// Saved source text (never dirty buffer content).
     Preview {
         /// Saved text.
@@ -79,6 +85,7 @@ struct ContextTool {
     observed: Option<SourceIdentity>,
     /// Outstanding query, if any.
     pending: Option<PendingQuery>,
+    invalidated: bool,
     /// Observable state.
     state: ToolState,
 }
@@ -149,6 +156,7 @@ impl ContextRegistry {
                 binding_sequence: 0,
                 observed: None,
                 pending: None,
+                invalidated: false,
                 state: ToolState::Idle,
             },
         );
@@ -166,17 +174,23 @@ impl ContextRegistry {
     pub fn rebind(&mut self, tab: TabId, source: &ContextSource) -> Option<QueryJob> {
         let tool = self.tools.get_mut(&tab)?;
         let identity = SourceIdentity::from_resolved(source);
-        if tool.observed.as_ref() == identity.as_ref()
-            && !matches!(source, ContextSource::Unbound { .. })
-        {
+        let same_source = tool.observed.as_ref() == identity.as_ref()
+            && !matches!(source, ContextSource::Unbound { .. });
+        if same_source && !tool.invalidated {
             return None;
         }
+        tool.invalidated = false;
         tool.binding_sequence = tool.binding_sequence.saturating_add(1);
         tool.pending = None;
         let state = match source {
             ContextSource::Unbound { reason } => ToolState::Unbound {
                 reason: reason.clone(),
             },
+            _ if same_source
+                && matches!(tool.state, ToolState::Ready(_) | ToolState::NoBacklinks) =>
+            {
+                tool.state.clone()
+            }
             _ => ToolState::Idle,
         };
         tool.state = state;
@@ -240,6 +254,25 @@ impl ContextRegistry {
         }
         tool.pending = None;
         tool.state = match result {
+            QueryResult::Occurrence(_) => return false,
+            QueryResult::Updating => {
+                tool.invalidated = true;
+                if matches!(tool.state, ToolState::Ready(_) | ToolState::NoBacklinks) {
+                    tool.state.clone()
+                } else {
+                    ToolState::Querying
+                }
+            }
+            QueryResult::BufferPreview {
+                text,
+                revision,
+                unsaved,
+                ..
+            } => ToolState::Ready(ToolContent::BufferPreview {
+                text: text.clone(),
+                revision: *revision,
+                unsaved: *unsaved,
+            }),
             QueryResult::Preview {
                 text, provenance, ..
             } => ToolState::Ready(ToolContent::Preview {
@@ -272,6 +305,13 @@ impl ContextRegistry {
         self.tools.get(tab).map(|tool| &tool.state)
     }
 
+    /// A refresh keeps same-source content visibly marked as updating.
+    pub fn is_updating(&self, tab: &TabId) -> bool {
+        self.tools
+            .get(tab)
+            .is_some_and(|tool| tool.pending.is_some() || tool.invalidated)
+    }
+
     /// The source identity a tool currently observes.
     #[must_use]
     pub fn observed(&self, tab: &TabId) -> Option<&SourceIdentity> {
@@ -300,7 +340,7 @@ impl ContextRegistry {
     /// content changed; the publication marker alone cannot see that).
     pub fn invalidate_all(&mut self) {
         for tool in self.tools.values_mut() {
-            tool.observed = None;
+            tool.invalidated = true;
         }
     }
 }

@@ -6,6 +6,7 @@
 
 pub mod backlinks;
 pub mod context_header;
+pub mod graph;
 pub mod note;
 pub mod notifications;
 pub mod preview;

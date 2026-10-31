@@ -157,6 +157,15 @@ pub struct BufferSnapshot {
     pub path: PathBuf,
 }
 
+/// Small source identity used to reject obsolete graph publications.
+pub type GraphBufferStamp = (
+    BufferId,
+    Revision,
+    PathBuf,
+    flavite_buffer::state::BufferState,
+    Option<[u8; 32]>,
+);
+
 /// Immutable shared snapshot for multiple views of the same buffer revision.
 #[derive(Debug, Clone)]
 pub struct SharedBufferSnapshot {
@@ -236,6 +245,11 @@ pub enum SessionCommand {
     LinkPrepare {
         request: crate::link::LinkPrepareRequest,
         request_id: u64,
+    },
+    /// Consume a prepared exact occurrence-removal plan.
+    LinkRemove {
+        intent: crate::link::LinkIntent,
+        plan_id: u128,
     },
     /// Commit a prepared semantic link with one guarded edit (W05).
     LinkInsert {
@@ -481,8 +495,6 @@ pub struct Session {
     link_jobs: Option<crossbeam::channel::Sender<LinkJob>>,
     /// Completed prepare results awaiting installation on a Session turn.
     link_results: crossbeam::channel::Receiver<LinkOutcomeMessage>,
-    /// Core-issued client namespace counter.
-    link_clients: std::sync::atomic::AtomicU64,
 }
 
 /// One queued semantic-link prepare job (W05).
@@ -596,6 +608,7 @@ impl Session {
             crossbeam::channel::unbounded::<LinkOutcomeMessage>();
         {
             for worker_index in 0..2 {
+                let root = identity.root.clone();
                 let manager = manager.clone();
                 let actor = actor.clone();
                 let link_plans = link_plans.clone();
@@ -609,6 +622,7 @@ impl Session {
                             let context = crate::link::PrepareContext {
                                 manager: &manager,
                                 actor: &actor,
+                                root: &root,
                             };
                             let outcome = match crate::link::prepare_work(&context, &job.request) {
                                 Ok((plan, mut prepared)) => {
@@ -616,18 +630,25 @@ impl Session {
                                         let mut store = link_plans.lock().unwrap();
                                         let plan_id = store.allocate_plan_id();
                                         prepared.plan_id = plan_id;
-                                        store.complete_prepare(plan_id, plan);
-                                        plan_id
+                                        if store.complete_prepare(plan_id, plan) {
+                                            Some(plan_id)
+                                        } else {
+                                            None
+                                        }
                                     };
-                                    SessionResult::Success(CommandResult::LinkPrepared {
-                                        prepared: prepared.with_plan_id(plan_id),
-                                    })
+                                    match plan_id {
+                                        Some(plan_id) => {
+                                            SessionResult::Success(CommandResult::LinkPrepared {
+                                                prepared: prepared.with_plan_id(plan_id),
+                                            })
+                                        }
+                                        None => SessionResult::LinkRejected {
+                                            reason: crate::link::LinkInsertionError::IntentExpired,
+                                        },
+                                    }
                                 }
                                 Err(reason) => {
-                                    link_plans
-                                        .lock()
-                                        .unwrap()
-                                        .fail_prepare(job.request.intent.client);
+                                    link_plans.lock().unwrap().fail_prepare(job.request.intent);
                                     SessionResult::LinkRejected { reason }
                                 }
                             };
@@ -677,7 +698,6 @@ impl Session {
             link_plans,
             link_jobs: Some(link_job_sender),
             link_results: link_result_receiver,
-            link_clients: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -699,6 +719,21 @@ impl Session {
                 .unwrap()
                 .path_for_id(*buffer_id)
                 .cloned(),
+            SessionCommand::LinkInsert { intent, plan_id }
+            | SessionCommand::LinkRemove { intent, plan_id } => {
+                let source = self
+                    .link_plans
+                    .lock()
+                    .unwrap()
+                    .source_for(*intent, *plan_id);
+                source.and_then(|id| {
+                    self.buffer_manager
+                        .lock()
+                        .unwrap()
+                        .path_for_id(id.into())
+                        .cloned()
+                })
+            }
             SessionCommand::ApplyMerge { path, .. }
             | SessionCommand::ResolveConflict { path, .. }
             | SessionCommand::RestoreRecovery { path } => Some(path.clone()),
@@ -1061,7 +1096,12 @@ impl Session {
                 request,
                 request_id,
             } => self.prepare_link(request, request_id),
-            SessionCommand::LinkInsert { intent, plan_id } => self.commit_link(intent, plan_id),
+            SessionCommand::LinkRemove { intent, plan_id } => {
+                self.commit_link(intent, plan_id, true)
+            }
+            SessionCommand::LinkInsert { intent, plan_id } => {
+                self.commit_link(intent, plan_id, false)
+            }
         }
     }
 
@@ -1118,10 +1158,42 @@ impl Session {
     /// token is process-local and never persisted (FR-26).
     #[must_use]
     pub fn new_link_client(&self) -> crate::link::ClientToken {
-        let counter = self
-            .link_clients
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        crate::link::ClientToken(u128::from(counter).wrapping_add(1))
+        let token = crate::link::ClientToken(u128::from(uuid::Uuid::now_v7().as_u64_pair().1));
+        self.link_plans.lock().unwrap().register_client(token);
+        token
+    }
+
+    /// Cancel an uncommitted gesture; late worker results cannot revive it.
+    pub fn cancel_link_intent(&self, intent: crate::link::LinkIntent) {
+        self.link_plans.lock().unwrap().cancel(intent);
+    }
+
+    /// Read the immutable canonical publication without actor IO.
+    pub fn resolver_catalog(
+        &self,
+    ) -> Result<Arc<flavite_index::catalog::ResolverCatalog>, &'static str> {
+        self.actor.resolver_catalog()
+    }
+
+    /// Resolve source authority from a semantic plan, never a caller path.
+    pub fn link_plan_source(
+        &self,
+        intent: crate::link::LinkIntent,
+        plan_id: u128,
+    ) -> Option<BufferId> {
+        self.link_plans
+            .lock()
+            .unwrap()
+            .source_for(intent, plan_id)
+            .map(BufferId::from)
+    }
+    /// Native path for an open buffer without cloning note contents.
+    pub fn buffer_path(&self, buffer: BufferId) -> Option<PathBuf> {
+        self.buffer_manager
+            .lock()
+            .unwrap()
+            .path_for_id(buffer)
+            .cloned()
     }
 
     /// Admit one semantic-link prepare request under the ingress turn; the
@@ -1139,7 +1211,7 @@ impl Session {
             Err(reason) => SessionResult::LinkRejected { reason },
             Ok(crate::link::PrepareAdmission::Proceed) => match &self.link_jobs {
                 Some(jobs) => {
-                    let client = request.intent.client;
+                    let intent = request.intent;
                     if jobs
                         .send(LinkJob {
                             request_id,
@@ -1147,7 +1219,7 @@ impl Session {
                         })
                         .is_err()
                     {
-                        self.link_plans.lock().unwrap().fail_prepare(client);
+                        self.link_plans.lock().unwrap().fail_prepare(intent);
                         return SessionResult::LinkRejected {
                             reason: crate::link::LinkInsertionError::Busy,
                         };
@@ -1155,10 +1227,7 @@ impl Session {
                     SessionResult::Pending { request_id }
                 }
                 None => {
-                    self.link_plans
-                        .lock()
-                        .unwrap()
-                        .fail_prepare(request.intent.client);
+                    self.link_plans.lock().unwrap().fail_prepare(request.intent);
                     SessionResult::LinkRejected {
                         reason: crate::link::LinkInsertionError::Busy,
                     }
@@ -1171,11 +1240,16 @@ impl Session {
     /// serialized mutation authority (W05 §9.2: TTL, revision, epoch, and
     /// target identity are revalidated; the plan is consumed exactly once
     /// and the terminal outcome is recorded atomically with the edit).
-    fn commit_link(&self, intent: crate::link::LinkIntent, plan_id: u128) -> SessionResult {
+    fn commit_link(
+        &self,
+        intent: crate::link::LinkIntent,
+        plan_id: u128,
+        removal: bool,
+    ) -> SessionResult {
         use crate::link::{CommitAdmission, LinkOutcome};
         let admission = {
             let mut store = self.link_plans.lock().unwrap();
-            store.admit_commit(&intent, plan_id)
+            store.admit_commit(&intent, plan_id, removal)
         };
         let plan = match admission {
             Err(reason) => return SessionResult::LinkRejected { reason },
@@ -1184,9 +1258,16 @@ impl Session {
                     Ok(LinkOutcome::Applied {
                         buffer_id,
                         new_revision,
-                    }) => SessionResult::Success(CommandResult::LinkInserted {
-                        buffer_id: BufferId::from(buffer_id),
-                        new_revision: Revision::new(new_revision),
+                    }) => SessionResult::Success(if removal {
+                        CommandResult::EditsApplied {
+                            buffer_id: BufferId::from(buffer_id),
+                            new_revision: Revision::new(new_revision),
+                        }
+                    } else {
+                        CommandResult::LinkInserted {
+                            buffer_id: BufferId::from(buffer_id),
+                            new_revision: Revision::new(new_revision),
+                        }
                     }),
                     Err(reason) => SessionResult::LinkRejected { reason },
                 };
@@ -1253,17 +1334,15 @@ impl Session {
         }
         // Canonical catalog revalidation: same epoch, target still resolves
         // to the exact planned entity (never retarget by title).
-        let version = match self.version() {
-            Ok(version) => version,
+        let catalog = match self.actor.resolver_catalog() {
+            Ok(catalog) => catalog,
             Err(_) => {
                 return SessionResult::LinkRejected {
-                    reason: crate::link::LinkInsertionError::StaleEpoch,
+                    reason: crate::link::LinkInsertionError::Busy,
                 };
             }
         };
-        if version.epoch.value() != plan.validated_epoch
-            || version.generation.value() < plan.validated_generation
-        {
+        if catalog.epoch != plan.validated_epoch || catalog.generation < plan.validated_generation {
             self.link_plans.lock().unwrap().record_outcome(
                 &intent,
                 crate::link::fingerprint_insert_public(plan_id),
@@ -1273,44 +1352,45 @@ impl Session {
                 reason: crate::link::LinkInsertionError::StaleEpoch,
             };
         }
-        let raw_target = plan.target_path.join("/").strip_suffix(".md").map_or_else(
-            || plan.target_path.join("/"),
-            std::string::ToString::to_string,
+        let resolution = catalog.resolve_at_path(
+            &flavite_syntax::text::fold_key(&plan.target_raw),
+            &plan.target_raw,
+            plan.target_is_embed,
+            plan.source_path_key.as_deref().map(std::path::Path::new),
         );
-        let resolution = self
-            .resolve_target(
-                flavite_syntax::text::fold_key(&raw_target),
-                raw_target,
-                false,
-                None,
-            )
-            .ok()
-            .and_then(|resolution| resolution.note);
-        match resolution {
-            Some(note) if note.note_id == plan.target_entity_id => {}
-            Some(_) | None => {
-                self.link_plans.lock().unwrap().record_outcome(
-                    &intent,
-                    crate::link::fingerprint_insert_public(plan_id),
-                    Err(crate::link::LinkInsertionError::TargetRetargeted),
-                );
-                return SessionResult::LinkRejected {
-                    reason: crate::link::LinkInsertionError::TargetRetargeted,
-                };
-            }
+        let current_id = if plan.target_is_attachment {
+            resolution.attachment.as_ref().map(|a| a.att_id)
+        } else {
+            resolution.note.as_ref().map(|n| n.note_id)
+        };
+        if if plan.target_is_unresolved {
+            !resolution.is_unresolved
+        } else {
+            current_id != Some(plan.target_entity_id)
+        } {
+            self.link_plans.lock().unwrap().record_outcome(
+                &intent,
+                crate::link::fingerprint_insert_public(plan_id),
+                Err(crate::link::LinkInsertionError::TargetRetargeted),
+            );
+            return SessionResult::LinkRejected {
+                reason: crate::link::LinkInsertionError::TargetRetargeted,
+            };
         }
         // One guarded edit: a single-op batch is one undo-tree unit.
         let (start, end, replacement) = plan.edit.clone();
+        let mut edit = flavite_buffer::EditOp::new(
+            flavite_syntax::text::Span::new(
+                flavite_syntax::text::TextByte(start),
+                flavite_syntax::text::TextByte(end),
+            ),
+            replacement,
+        );
+        edit.boundary = true;
         let applied = self.apply_edits(
             BufferId::from(plan.source.buffer_id),
             Revision::new(plan.source.revision),
-            vec![flavite_buffer::EditOp::new(
-                flavite_syntax::text::Span::new(
-                    flavite_syntax::text::TextByte(start),
-                    flavite_syntax::text::TextByte(end),
-                ),
-                replacement,
-            )],
+            vec![edit],
         );
         let result = match applied {
             SessionResult::Success(CommandResult::EditsApplied {
@@ -1357,6 +1437,17 @@ impl Session {
             crate::link::fingerprint_insert_public(plan_id),
             cached,
         );
+        if removal
+            && let SessionResult::Success(CommandResult::LinkInserted {
+                buffer_id,
+                new_revision,
+            }) = result
+        {
+            return SessionResult::Success(CommandResult::EditsApplied {
+                buffer_id,
+                new_revision,
+            });
+        }
         result
     }
 
@@ -1997,12 +2088,13 @@ impl Session {
             };
         };
         let (bytes, revision, base_hash, base_bytes, state) = {
-            let manager = self.buffer_manager.lock().unwrap();
-            let Some(buffer) = manager.get_buffer_by_id(buffer_id) else {
+            let mut manager = self.buffer_manager.lock().unwrap();
+            let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
                 return SessionResult::Error {
                     message: "Buffer not found".into(),
                 };
             };
+            buffer.model_mut().seal_undo_group();
             (
                 buffer.model().to_source_bytes(),
                 buffer.revision(),
@@ -2593,6 +2685,42 @@ impl Session {
             state: snapshot.state,
             path: snapshot.path,
         })
+    }
+
+    /// Worker-only decode through the exact vault filesystem identity codec.
+    pub fn decode_graph_paths(&self, keys: Vec<Vec<u8>>) -> Result<Vec<PathBuf>, String> {
+        self.actor.decode_graph_paths(keys)
+    }
+
+    /// Lightweight current buffer stamp for rejecting obsolete graph publications.
+    /// No text copies, database access, or filesystem work.
+    pub fn graph_buffer_stamp(&self) -> Vec<GraphBufferStamp> {
+        let manager = self.buffer_manager.lock().unwrap();
+        let mut stamp: Vec<_> = manager
+            .open_paths()
+            .into_iter()
+            .filter_map(|(path, id)| {
+                manager.get_buffer_by_id(id).map(|buffer| {
+                    (
+                        id,
+                        buffer.revision(),
+                        path,
+                        buffer.state(),
+                        buffer.base_hash().map(|hash| hash.as_bytes()),
+                    )
+                })
+            })
+            .collect();
+        stamp.sort_by_key(|(id, ..)| id.as_u64());
+        stamp
+    }
+
+    /// Worker-only immutable graph inputs, shared with editor snapshots.
+    pub fn graph_buffer_snapshots(&self) -> Vec<SharedBufferSnapshot> {
+        self.graph_buffer_stamp()
+            .into_iter()
+            .filter_map(|(id, revision, ..)| self.shared_buffer_snapshot(id, Some(revision)).ok())
+            .collect()
     }
 
     /// Get a cached immutable snapshot shared by all views of this revision.

@@ -1,8 +1,9 @@
-//! Plain-data graph deltas — the interface between the index feed and the
-//! graph model (D15).
+//! Plain-data graph deltas — the interface between the index feed bridge
+//! (now in `flavite-api::graph_service`) and the graph model (D15).
 //!
-//! Deltas are pure data with no IO. The index feed (`GraphFeed`, B5) derives
-//! them from §4.14 invalidation batches; [`GraphModel::apply`] consumes them.
+//! Deltas are pure data with no IO. The [`crate::feed::GraphPublisher`]
+//! derives them from consecutive [`crate::GraphBatch`] values (§4.14);
+//! [`GraphModel::apply`] consumes them.
 //! Application is idempotent (D5, reconcile by idempotence): re-applying an
 //! `Added` for an existing node or edge, or a `Removed` for an absent one, is
 //! a no-op.
@@ -20,6 +21,8 @@ pub enum NodeKind {
     Note,
     /// An attachment (`attachments.att_id` in the index, §4.3).
     Attachment,
+    /// An unresolved target, process-local and never a note identity.
+    Unresolved,
 }
 
 /// Stable identity of a graph node.
@@ -46,6 +49,14 @@ impl NodeId {
     pub fn note(id: u64) -> Self {
         Self {
             kind: NodeKind::Note,
+            id,
+        }
+    }
+
+    #[must_use]
+    pub fn unresolved(id: u64) -> Self {
+        Self {
+            kind: NodeKind::Unresolved,
             id,
         }
     }

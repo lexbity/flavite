@@ -86,6 +86,26 @@ pub fn plan(
                         crate::view::NoteLoad::Reserved,
                     ))
                 }),
+            PersistedKind::Graph { camera, scope } => {
+                let mut view = match camera {
+                    Some(camera) => crate::view::GraphCamera::new(camera.center, camera.zoom)
+                        .map_or_else(
+                            |_| {
+                                report.push(format!(
+                                    "tab {} carried an invalid graph camera; the default was used",
+                                    tab.id
+                                ));
+                                crate::view::GraphView::new(crate::view::GraphCamera::centered())
+                            },
+                            crate::view::GraphView::new,
+                        ),
+                    None => crate::view::GraphView::new(crate::view::GraphCamera::centered()),
+                };
+                if let Err(error) = view.set_scope(scope.clone()) {
+                    report.push(error.into());
+                }
+                Some(ViewKind::Graph(view))
+            }
             PersistedKind::Preview { binding } => {
                 restore_binding(binding, &mut report).map(ViewKind::Preview)
             }

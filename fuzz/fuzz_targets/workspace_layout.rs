@@ -106,7 +106,7 @@ fn build_action(rng: &mut Rng, state: &WorkspaceState) -> LayoutAction {
             }
         };
     }
-    match rng.below(14) {
+    match rng.below(16) {
         0 => LayoutAction::OpenNote {
             expected_revision: revision,
             locator: NoteLocator::from_components([format!("n{}.md", rng.below(8))])
@@ -200,6 +200,13 @@ fn build_action(rng: &mut Rng, state: &WorkspaceState) -> LayoutAction {
                 },
             }
         }
+        14 => LayoutAction::OpenGraph { expected_revision: revision, group: pick_group!() },
+        15 => LayoutAction::SetGraphScope {
+            expected_revision: revision, tab: pick_tab!(), scope: flavite_workspace::GraphScope {
+                neighborhood: Some(flavite_workspace::Neighborhood { root_native: b"root.md".to_vec(), depth: rng.below(9) as u8, direction: flavite_workspace::Direction::Both }),
+                ..Default::default()
+            }
+        },
         _ => LayoutAction::SplitGroup {
             expected_revision: revision,
             group: pick_group!(),

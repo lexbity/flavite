@@ -4,8 +4,12 @@
 //! worker, spatial grid for hit-testing. CPU only — no GPU dependencies
 //! (§4.1, D15).
 //!
-//! - [`delta`] — the plain-data delta interface ([`NodeDelta`]/[`EdgeDelta`])
-//!   the index feed produces (wired in B5).
+//! - [`delta`] — the plain-data delta interface ([`NodeDelta`]/[`EdgeDelta`]).
+//! - [`protocol`] — the IO-free DTOs between the API's index bridge and the
+//!   CPU model ([`GraphBatch`], [`GraphNodeRecord`], [`GraphEdgeRecord`],
+//!   [`RenderKey`]) (RFC-0003 TD-12, W07).
+//! - [`feed`] — the CPU apply path: [`GraphPublisher`] diffs consecutive
+//!   batches into exact deltas and rebuilds on epoch resets (§4.14).
 //! - [`model`] — [`GraphModel`], the CPU-authoritative graph state with CSR
 //!   adjacency and topology versioning; the GPU pipeline is recreated from
 //!   its snapshots on device loss (§4.9).
@@ -25,6 +29,7 @@ pub mod feed;
 pub mod layout;
 pub mod model;
 pub mod position;
+pub mod protocol;
 pub mod spatial;
 pub mod worker;
 
@@ -32,7 +37,7 @@ pub mod worker;
 mod proptests;
 
 pub use delta::{Delta, EdgeDelta, EdgeKind, NodeDelta, NodeId, NodeKind};
-pub use feed::{FeedBatch, FeedError, GraphFeed, IndexCursor};
+pub use feed::{GraphPublication, GraphPublisher};
 pub use layout::{
     CONVERGENCE_STEPS, DEFAULT_THETA, Layout, LayoutParams, MAX_TREE_DEPTH, MIN_SEPARATION,
     POSITION_LIMIT, PROGRESS_MIN_IMPROVEMENT, PROGRESS_STALL_FRACTION, PROGRESS_STALL_WINDOW,
@@ -40,8 +45,14 @@ pub use layout::{
 };
 pub use model::{ApplyStats, GraphModel, GraphSnapshot};
 pub use position::{LayoutState, PositionBuffer, PositionFrame};
+pub use protocol::{GraphBatch, GraphEdgeRecord, GraphNodeRecord, RenderKey};
 pub use spatial::{BASE_CELL_SIZE, SpatialGrid};
 pub use worker::{
     LayoutCommand, LayoutEvent, LayoutTelemetry, LayoutWorker, LayoutWorkerConfig,
     LayoutWorkerError, TelemetrySnapshot,
+};
+
+pub mod scope;
+pub use flavite_graph_protocol::{
+    Direction, GraphScope, Neighborhood, NotePredicate, PropertyValue,
 };

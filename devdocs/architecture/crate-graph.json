@@ -37,6 +37,10 @@
       "kind": "workspace"
     },
     {
+      "id": "flavite-graph-protocol",
+      "kind": "workspace"
+    },
+    {
       "id": "flavite-index",
       "kind": "workspace"
     },
@@ -131,6 +135,11 @@
     {
       "from": "flavite-api",
       "to": "flavite-fs",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-api",
+      "to": "flavite-graph",
       "kind": "normal"
     },
     {
@@ -230,12 +239,7 @@
     },
     {
       "from": "flavite-graph",
-      "to": "flavite-index",
-      "kind": "normal"
-    },
-    {
-      "from": "flavite-graph",
-      "to": "rusqlite",
+      "to": "flavite-graph-protocol",
       "kind": "normal"
     },
     {
@@ -386,6 +390,16 @@
     {
       "from": "flavite-vault",
       "to": "zstd",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-workspace",
+      "to": "blake3",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-workspace",
+      "to": "flavite-graph-protocol",
       "kind": "normal"
     },
     {

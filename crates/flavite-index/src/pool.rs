@@ -355,6 +355,26 @@ impl Writer {
     }
 }
 
+/// Reserve an epoch-local identity even when the largest live row was deleted.
+/// SQLite's default ROWID allocator can reuse it; active graph references cannot.
+fn reserve_graph_identity(
+    conn: &rusqlite::Connection,
+    note: bool,
+    reserve: bool,
+) -> Result<(), String> {
+    let (table, column, key) = if note {
+        ("notes", "note_id", "note_identity_high_water")
+    } else {
+        ("attachments", "att_id", "attachment_identity_high_water")
+    };
+    let highest:i64=conn.query_row(&format!("SELECT MAX(COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key=?1),0),COALESCE(MAX({column}),0)) FROM {table}"),[key],|row|row.get(0)).map_err(|error|error.to_string())?;
+    let next = highest
+        .checked_add(i64::from(reserve))
+        .ok_or("graph identity space exhausted")?;
+    conn.execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",rusqlite::params![key,next.to_string()]).map_err(|error|error.to_string())?;
+    Ok(())
+}
+
 impl IndexActor {
     /// Create a new index actor.
     ///
@@ -366,6 +386,10 @@ impl IndexActor {
             != Some(crate::schema::PARSER_VERSION);
         drop(parser_version);
         let writer = Writer::new(db_path)?;
+        reserve_graph_identity(writer.conn(), true, false)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?;
+        reserve_graph_identity(writer.conn(), false, false)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?;
         let read_pool = ReadPool::new(db_path, pool_size)?;
         let cache_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
         let (search, search_recreated) =
@@ -792,6 +816,8 @@ impl IndexActor {
             .map_err(|e| e.to_string())?;
         tx.execute("UPDATE notes SET id_conflict=CASE WHEN stable_id_key IS NOT NULL AND path_key<>(SELECT MIN(n2.path_key) FROM notes n2 WHERE n2.stable_id_key=notes.stable_id_key) THEN 1 ELSE 0 END", [])
             .map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM properties WHERE note_id=?1", [note_id])
+            .map_err(|error| error.to_string())?;
         tx.execute("DELETE FROM search_docs WHERE note_id=?1", [note_id])
             .map_err(|e| e.to_string())?;
         tx.execute(
@@ -1028,9 +1054,10 @@ impl IndexActor {
             .map(|value| serde_json::json!({ "yaml": value.yaml_text }))
             .map(|value| value.to_string());
         let size = i64::try_from(bytes.len()).map_err(|e| e.to_string())?;
+        reserve_graph_identity(&tx, true, true)?;
         tx.execute(
-            "INSERT INTO notes(path,path_native,path_key,stem_key,title,stable_id,stable_id_key,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10,?11,?12,?13,1,?14)
+            "INSERT INTO notes(note_id,path,path_native,path_key,stem_key,title,stable_id,stable_id_key,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation)
+             VALUES((SELECT CAST(value AS INTEGER) FROM meta WHERE key='note_identity_high_water'),?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10,?11,?12,?13,1,?14)
              ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,title=excluded.title,stable_id=excluded.stable_id,stable_id_key=excluded.stable_id_key,content_hash=excluded.content_hash,size=excluded.size,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,frontmatter=excluded.frontmatter,preview=excluded.preview,parse_ok=1,generation=excluded.generation",
             rusqlite::params![display_path, path_native, path_key, stem_key, title, stable_id, stable_id_key, content_hash.as_bytes(), size, mtime_ns, scan_ns, frontmatter_json, flavite_syntax::text::safe_prefix(parsed.snapshot.text(), 1024), i64::try_from(generation).map_err(|e| e.to_string())?],
         ).map_err(|e| e.to_string())?;
@@ -1088,6 +1115,39 @@ impl IndexActor {
                 ],
             )
             .map_err(|e| e.to_string())?;
+        }
+        tx.execute("DELETE FROM properties WHERE note_id=?1", [note_id])
+            .map_err(|error| error.to_string())?;
+        if let Some(frontmatter) = &frontmatter {
+            for (key, values) in &frontmatter.properties {
+                let mut ordinal: i64 = 0;
+                let mut pending: Vec<_> = values.iter().rev().map(|(_, value)| value).collect();
+                while let Some(value) = pending.pop() {
+                    use flavite_syntax::frontmatter::PropertyValue as V;
+                    let (kind, text, number) = match value {
+                        V::Text(value) | V::Raw(value) => ("text", Some(value.clone()), None),
+                        V::Number(value) => (
+                            "num",
+                            None,
+                            value.parse::<f64>().ok().filter(|v| v.is_finite()),
+                        ),
+                        V::Bool(value) => (
+                            "bool",
+                            Some(value.to_string()),
+                            Some(f64::from(u8::from(*value))),
+                        ),
+                        V::Date(value) => ("date", Some(value.clone()), None),
+                        V::DateTime(value) => ("datetime", Some(value.clone()), None),
+                        V::Null => ("null", None, None),
+                        V::List(values) => {
+                            pending.extend(values.iter().rev());
+                            continue;
+                        }
+                    };
+                    tx.execute("INSERT INTO properties(note_id,key,ord,vtype,v_text,v_num) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![note_id, key, ordinal, kind, text, number]).map_err(|error| error.to_string())?;
+                    ordinal += 1;
+                }
+            }
         }
         tx.execute(
             "INSERT INTO search_docs(note_id,content_hash,body_text) VALUES(?1,?2,?3) ON CONFLICT(note_id) DO UPDATE SET content_hash=excluded.content_hash,body_text=excluded.body_text",
@@ -1236,7 +1296,8 @@ impl IndexActor {
         let epoch = get_meta_u64(&tx, MetaKey::Epoch)
             .map_err(|error| error.to_string())?
             .unwrap_or(1);
-        tx.execute("INSERT INTO notes(path,path_native,path_key,stem_key,title,stable_id,stable_id_key,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation) VALUES(?1,?2,?3,?4,?5,NULL,NULL,0,NULL,?6,?7,?8,NULL,?9,0,?10) ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,title=excluded.title,stable_id=NULL,stable_id_key=NULL,content_hash=NULL,size=excluded.size,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,frontmatter=NULL,preview=excluded.preview,parse_ok=0,generation=excluded.generation", rusqlite::params![display_path,path_native,flavite_syntax::text::fold_key(display_path),flavite_syntax::text::fold_key(stem),stem,size,mtime_ns,scan_ns,preview,i64::try_from(generation).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
+        reserve_graph_identity(&tx, true, true)?;
+        tx.execute("INSERT INTO notes(note_id,path,path_native,path_key,stem_key,title,stable_id,stable_id_key,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation) VALUES((SELECT CAST(value AS INTEGER) FROM meta WHERE key='note_identity_high_water'),?1,?2,?3,?4,?5,NULL,NULL,0,NULL,?6,?7,?8,NULL,?9,0,?10) ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,title=excluded.title,stable_id=NULL,stable_id_key=NULL,content_hash=NULL,size=excluded.size,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,frontmatter=NULL,preview=excluded.preview,parse_ok=0,generation=excluded.generation", rusqlite::params![display_path,path_native,flavite_syntax::text::fold_key(display_path),flavite_syntax::text::fold_key(stem),stem,size,mtime_ns,scan_ns,preview,i64::try_from(generation).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
         let note_id: i64 = tx
             .query_row(
                 "SELECT note_id FROM notes WHERE path_native=?1",
@@ -1249,6 +1310,8 @@ impl IndexActor {
         tx.execute("DELETE FROM tags WHERE note_id=?1", [note_id])
             .map_err(|error| error.to_string())?;
         tx.execute("DELETE FROM aliases WHERE note_id=?1", [note_id])
+            .map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM properties WHERE note_id=?1", [note_id])
             .map_err(|error| error.to_string())?;
         tx.execute("DELETE FROM search_docs WHERE note_id=?1", [note_id])
             .map_err(|error| error.to_string())?;
@@ -1331,8 +1394,9 @@ impl IndexActor {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or("index generation overflow")?;
+        reserve_graph_identity(&tx, false, true)?;
         tx.execute(
-            "INSERT INTO attachments(path,path_native,path_key,stem_key,kind,mime,size,content_hash,width,height,mtime_ns,scan_ns,hydrated,generation) VALUES(?1,?2,?3,?4,?5,NULL,?6,?7,NULL,NULL,?8,?9,?10,?11) ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,kind=excluded.kind,size=excluded.size,content_hash=excluded.content_hash,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,hydrated=excluded.hydrated,generation=excluded.generation",
+            "INSERT INTO attachments(att_id,path,path_native,path_key,stem_key,kind,mime,size,content_hash,width,height,mtime_ns,scan_ns,hydrated,generation) VALUES((SELECT CAST(value AS INTEGER) FROM meta WHERE key='attachment_identity_high_water'),?1,?2,?3,?4,?5,NULL,?6,?7,NULL,NULL,?8,?9,?10,?11) ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,kind=excluded.kind,size=excluded.size,content_hash=excluded.content_hash,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,hydrated=excluded.hydrated,generation=excluded.generation",
             rusqlite::params![display_path,path_native,path_key,stem_key,kind.as_str(),size,content_hash,mtime_ns,scan_ns,i64::from(hydrated),i64::try_from(generation).map_err(|error| error.to_string())?],
         ).map_err(|error| error.to_string())?;
         let att_id: i64 = tx

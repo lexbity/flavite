@@ -297,18 +297,25 @@ impl UndoTree {
     /// Edit represented by the next undo transition.
     #[must_use]
     pub fn undo_edit(&self) -> Option<EditOp> {
-        self.current()?.edit.clone()
+        self.position()?.edit.clone()
     }
     /// Edit represented by the next redo transition.
     #[must_use]
     pub fn redo_edit(&self) -> Option<EditOp> {
-        let target_id = if self.position_id != self.current_id {
-            self.current_id
-        } else {
-            self.position()?.children.first().copied()?
-        };
+        let target_id = self.redo_target()?;
         self.get(target_id)?.edit.clone()
     }
+    fn redo_target(&self) -> Option<u64> {
+        let mut child = self.current_id;
+        while let Some(node) = self.get(child) {
+            if node.parent_id == Some(self.position_id) {
+                return Some(child);
+            }
+            child = node.parent_id?;
+        }
+        None
+    }
+
     /// Apply an edit and advance the tree.
     ///
     /// If the edit can be coalesced with the current node's edit, it is merged.
@@ -322,7 +329,8 @@ impl UndoTree {
     /// Apply a distinct operation that must start a new undo-tree node.
     /// Destructive conflict resolutions use this so a merge cannot coalesce
     /// into nearby typing and lose its independent undo boundary.
-    pub fn apply_boundary(&mut self, edit: EditOp, snapshot: TextSnapshot) -> Revision {
+    pub fn apply_boundary(&mut self, mut edit: EditOp, snapshot: TextSnapshot) -> Revision {
+        edit.boundary = true;
         self.apply_with_coalescing(edit, snapshot, false)
     }
 
@@ -332,9 +340,11 @@ impl UndoTree {
         snapshot: TextSnapshot,
         allow_coalescing: bool,
     ) -> Revision {
-        let current_id = self.current_id;
+        let branched = self.position_id != self.current_id;
+        let current_id = self.position_id;
         // First, check if we should coalesce
         let should_coalesce = allow_coalescing
+            && !branched
             && if let Some(current) = self.nodes.get(current_id as usize) {
                 if let Some(current_edit) = &current.edit {
                     current_edit.can_coalesce(&edit)
@@ -346,18 +356,46 @@ impl UndoTree {
                 false
             };
         if should_coalesce {
-            // Coalesce with current node - update the snapshot
-            if let Some(node) = self.nodes.get_mut(current_id as usize)
-                && let Some(current_edit) = &node.edit
-            {
-                let coalesced = current_edit
-                    .coalesce(&edit)
-                    .expect("coalescible edits must produce a combined edit");
-                node.edit = Some(coalesced);
-                node.snapshot = Some(snapshot);
-                node.timestamp = Instant::now();
-                // Revision stays the same for coalesced edits
-                return node.revision;
+            let parent_text = self
+                .get(current_id)
+                .and_then(|node| node.parent_id)
+                .and_then(|id| self.get(id))
+                .and_then(|node| node.snapshot.as_ref())
+                .map(TextSnapshot::text);
+            if let Some(before) = parent_text {
+                let after = snapshot.text();
+                let mut prefix = before
+                    .bytes()
+                    .zip(after.bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                while prefix > 0
+                    && (!before.is_char_boundary(prefix) || !after.is_char_boundary(prefix))
+                {
+                    prefix -= 1;
+                }
+                let mut suffix = before.as_bytes()[prefix..]
+                    .iter()
+                    .rev()
+                    .zip(after.as_bytes()[prefix..].iter().rev())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                while suffix > 0
+                    && (!before.is_char_boundary(before.len() - suffix)
+                        || !after.is_char_boundary(after.len() - suffix))
+                {
+                    suffix -= 1;
+                }
+                let coalesced = EditOp::new(
+                    Span::new(TextByte(prefix), TextByte(before.len() - suffix)),
+                    after[prefix..after.len() - suffix].into(),
+                );
+                if let Some(node) = self.nodes.get_mut(current_id as usize) {
+                    node.edit = Some(coalesced);
+                    node.snapshot = Some(snapshot);
+                    node.timestamp = Instant::now();
+                    return node.revision;
+                }
             }
         }
         // Get current again for creating new node
@@ -381,13 +419,22 @@ impl UndoTree {
         self.position_id = new_id;
         new_revision
     }
+    /// Preserve a save/semantic boundary without adding a document edit.
+    pub fn seal_current(&mut self) {
+        if let Some(node) = self.nodes.get_mut(self.position_id as usize)
+            && let Some(edit) = &mut node.edit
+        {
+            edit.boundary = true;
+        }
+    }
+
     /// Undo the current edit.
     ///
     /// Moves the position back to the parent node.
     /// Returns the parent's revision and snapshot.
     /// The caller (model) is responsible for advancing the revision (§4.5.2).
     pub fn undo(&mut self) -> Option<(Revision, Option<TextSnapshot>)> {
-        let current = self.current()?;
+        let current = self.position()?;
         if current.is_root() {
             return None;
         }
@@ -404,25 +451,10 @@ impl UndoTree {
     /// Returns the target's revision and snapshot.
     /// The caller (model) is responsible for advancing the revision (§4.5.2).
     pub fn redo(&mut self) -> Option<(Revision, Option<TextSnapshot>)> {
-        // If position_id != current_id, we've undone and can move forward
-        if self.position_id != self.current_id {
-            let target = self.nodes.get(self.current_id as usize)?;
-            self.position_id = target.id;
-            return Some((target.revision, target.snapshot.clone()));
-        }
-
-        // Check if current node has children (we've undone past a branch)
-        let current = self.current()?;
-        if !current.children.is_empty() {
-            // For now, redo to the first child
-            let child_id = current.children[0];
-            let child = self.nodes.get(child_id as usize)?;
-            self.position_id = child.id;
-            self.current_id = child.id;
-            return Some((child.revision, child.snapshot.clone()));
-        }
-
-        None
+        let child = self.get(self.redo_target()?)?;
+        let result = (child.revision, child.snapshot.clone());
+        self.position_id = child.id;
+        Some(result)
     }
     /// Move to a specific node.
     pub fn goto(&mut self, id: u64) -> bool {

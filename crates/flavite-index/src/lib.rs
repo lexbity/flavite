@@ -69,7 +69,7 @@ mod tests {
         // This is just a sanity check that all modules compile
         assert_eq!(SCHEMA_MAJOR, 3);
         assert_eq!(SCHEMA_MINOR, 0);
-        assert_eq!(PARSER_VERSION, 1);
+        assert_eq!(PARSER_VERSION, 2);
         assert_eq!(INITIAL_EPOCH, 1);
         assert_eq!(MAX_NOTE_BYTES, 32 * 1024 * 1024);
         assert_eq!(ATTACHMENT_HASH_MAX, 64 * 1024 * 1024);
@@ -102,3 +102,5 @@ mod tests {
         assert_eq!(current, 2);
     }
 }
+
+pub mod catalog;

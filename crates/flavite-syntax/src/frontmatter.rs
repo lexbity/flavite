@@ -174,7 +174,7 @@ pub fn parse_frontmatter(snapshot: &TextSnapshot) -> Option<Frontmatter> {
                 }
             } else {
                 // Arbitrary property.
-                let prop_value = PropertyValue::Text(value.to_string());
+                let prop_value = parse_property_scalar(value);
                 properties
                     .entry(key.to_string())
                     .or_default()
@@ -199,6 +199,31 @@ pub fn parse_frontmatter(snapshot: &TextSnapshot) -> Option<Frontmatter> {
         properties,
         title,
     })
+}
+
+/// Extract supported scalar types without reserializing the YAML document.
+fn parse_property_scalar(value: &str) -> PropertyValue {
+    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        return PropertyValue::Text(value[1..value.len() - 1].replace("''", "'"));
+    }
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        let body = &value[1..value.len() - 1];
+        return if body.contains('\\') {
+            PropertyValue::Raw(value.into())
+        } else {
+            PropertyValue::Text(body.into())
+        };
+    }
+    match value {
+        "true" | "True" | "TRUE" => PropertyValue::Bool(true),
+        "false" | "False" | "FALSE" => PropertyValue::Bool(false),
+        "" | "null" | "Null" | "NULL" | "~" => PropertyValue::Null,
+        _ if value.parse::<f64>().is_ok_and(f64::is_finite) => PropertyValue::Number(value.into()),
+        _ if value.starts_with(['[', '{', '&', '*', '!', '|', '>']) => {
+            PropertyValue::Raw(value.into())
+        }
+        _ => PropertyValue::Text(value.into()),
+    }
 }
 
 /// Parse a simple YAML value (string or list).

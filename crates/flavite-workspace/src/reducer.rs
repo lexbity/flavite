@@ -46,6 +46,10 @@ pub enum WorkspaceError {
     DepthLimitReached,
     /// The desired ratio is outside the persisted range.
     InvalidRatio(u32),
+    /// A committed graph camera is outside the validated range (§10.3:
+    /// import/restore reject out-of-range cameras rather than clamping).
+    InvalidGraphCamera(crate::view::GraphCameraError),
+    InvalidGraphScope(&'static str),
     /// Reopen was requested with an empty closed-tab history.
     NothingToReopen,
     /// The view kind cannot be duplicated.
@@ -77,6 +81,10 @@ impl std::fmt::Display for WorkspaceError {
                     f,
                     "split ratio {ratio} ppm is outside {MIN_RATIO_PPM}..={MAX_RATIO_PPM}"
                 )
+            }
+            Self::InvalidGraphScope(error) => write!(f, "graph filter rejected: {error}"),
+            Self::InvalidGraphCamera(error) => {
+                write!(f, "graph camera was rejected: {error}")
             }
             Self::NothingToReopen => write!(f, "no closed tab to reopen"),
             Self::NotDuplicateable(tab) => write!(f, "an empty tab cannot be duplicated ({tab})"),
@@ -185,6 +193,24 @@ pub enum LayoutAction {
     OpenNotes {
         expected_revision: u64,
         group: GroupId,
+    },
+    /// Open a graph view of the saved knowledge network in `group` (W07).
+    OpenGraph {
+        expected_revision: u64,
+        group: GroupId,
+    },
+    /// Commit a validated durable scope, preserving selection and writing target.
+    SetGraphScope {
+        expected_revision: u64,
+        tab: TabId,
+        scope: crate::GraphScope,
+    },
+    /// Commit one released graph camera gesture for an existing graph view
+    /// (§7.4: previews are ephemeral; release commits one transaction).
+    SetGraphCamera {
+        expected_revision: u64,
+        tab: TabId,
+        camera: crate::view::GraphCamera,
     },
     /// Open a context tool (Preview/Backlinks) with an explicit binding.
     OpenContext {
@@ -306,6 +332,15 @@ impl LayoutAction {
                 expected_revision, ..
             }
             | Self::OpenNotes {
+                expected_revision, ..
+            }
+            | Self::OpenGraph {
+                expected_revision, ..
+            }
+            | Self::SetGraphScope {
+                expected_revision, ..
+            }
+            | Self::SetGraphCamera {
                 expected_revision, ..
             }
             | Self::OpenContext {
@@ -533,6 +568,54 @@ impl WorkspaceState {
         Ok(())
     }
 
+    /// Advance the retained target after its own guarded, acknowledged edit.
+    /// Other-origin edits must use invalidation, never this authorization path.
+    ///
+    /// # Errors
+    /// Rejects changed target identities, stale revisions, composition, sequence
+    /// exhaustion, and caret positions outside UTF-8 boundaries.
+    pub fn acknowledge_target_edit(
+        &mut self,
+        expected: crate::input::WritingTarget,
+        revision: u64,
+        caret: usize,
+        text: &str,
+    ) -> Result<(), &'static str> {
+        if self.writing_target != Some(expected) || revision <= expected.revision {
+            return Err("writing target changed before acknowledgement");
+        }
+        if !text.is_char_boundary(caret) {
+            return Err("acknowledged caret is not a UTF-8 boundary");
+        }
+        let view = self
+            .tabs
+            .get_mut(&expected.tab)
+            .ok_or("target view closed")?;
+        let interaction = view.interaction();
+        if interaction.incarnation != expected.incarnation
+            || interaction.sequence != expected.interaction_sequence
+            || interaction.composition != crate::input::CompositionState::Idle
+        {
+            return Err("target interaction changed before acknowledgement");
+        }
+        let mut next = interaction.clone();
+        next.revision = revision;
+        next.sequence = next
+            .sequence
+            .checked_add(1)
+            .ok_or("interaction sequence exhausted")?;
+        next.selections = vec![crate::input::Selection::caret(caret)];
+        let sequence = next.sequence;
+        view.set_interaction(next);
+        self.writing_target = Some(crate::input::WritingTarget {
+            revision,
+            caret_text_byte: caret,
+            interaction_sequence: sequence,
+            ..expected
+        });
+        Ok(())
+    }
+
     /// Release keyboard ownership without changing document or writing context.
     /// Advancing the sequence makes controlled runtimes observe the blur.
     pub fn release_editor_focus(&mut self, except: Option<TabId>) {
@@ -585,7 +668,9 @@ impl WorkspaceState {
 
     /// Publish an exploration selection from a source view (graph W07,
     /// search W10). Sinks cannot publish; the source tab must exist and be
-    /// a source kind.
+    /// a source kind. `target` is `None` for a deliberately published empty
+    /// selection (D-04: the sink then shows "No selection" rather than
+    /// falling back to an unrelated document).
     ///
     /// # Errors
     /// Returns an error when the publishing tab is unknown or is a sink.
@@ -593,7 +678,7 @@ impl WorkspaceState {
         &mut self,
         source_tab: TabId,
         incarnation: u64,
-        target: NoteLocator,
+        target: Option<NoteLocator>,
     ) -> Result<(), &'static str> {
         let session = self
             .tabs
@@ -1111,6 +1196,42 @@ fn apply(state: &mut WorkspaceState, action: &LayoutAction) -> Result<Vec<Effect
                 tab,
                 kind: ViewKind::Notes,
             }])
+        }
+        LayoutAction::OpenGraph { group, .. } => {
+            let tab = state.ids.tab_id();
+            let kind = ViewKind::Graph(crate::view::GraphView::new(
+                crate::view::GraphCamera::centered(),
+            ));
+            let tab = state.append_tab(*group, ViewSession::new(tab, kind.clone()))?;
+            Ok(vec![Effect::ViewAttached { tab, kind }])
+        }
+        LayoutAction::SetGraphScope { tab, scope, .. } => {
+            let session = state
+                .tabs
+                .get_mut(tab)
+                .ok_or(WorkspaceError::UnknownTab(*tab))?;
+            let ViewKind::Graph(view) = session.kind_mut() else {
+                return Err(WorkspaceError::InvalidGraphScope("tab is not a graph"));
+            };
+            view.set_scope(scope.clone())
+                .map_err(WorkspaceError::InvalidGraphScope)?;
+            Ok(Vec::new())
+        }
+        LayoutAction::SetGraphCamera { tab, camera, .. } => {
+            let session = state
+                .tabs
+                .get_mut(tab)
+                .ok_or(WorkspaceError::UnknownTab(*tab))?;
+            match session.kind_mut() {
+                ViewKind::Graph(view) => {
+                    // Commit through the validated setter; an out-of-range
+                    // camera is a typed rejection, never a silent clamp.
+                    view.set_camera(*camera)
+                        .map_err(WorkspaceError::InvalidGraphCamera)?;
+                }
+                _ => return Err(WorkspaceError::UnknownTab(*tab)),
+            }
+            Ok(Vec::new())
         }
         LayoutAction::OpenContext {
             view,

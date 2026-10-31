@@ -41,3 +41,5 @@ flavite-graph = "tier2"
 flavite-cli = "tier3"
 flavite-editor = "tier3"
 flavite-ui = "tier3"
+
+flavite-graph-protocol = "tier1"

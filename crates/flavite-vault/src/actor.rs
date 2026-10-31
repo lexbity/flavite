@@ -27,6 +27,47 @@ use std::thread;
 use thiserror::Error;
 use tracing::info;
 
+/// Immutable canonical targets with a sequence guard around actor mutations.
+/// Session commits clone one Arc; they never ask this actor to perform IO.
+#[derive(Debug, Default)]
+struct CatalogPublication {
+    snapshot: arc_swap::ArcSwapOption<flavite_index::catalog::ResolverCatalog>,
+    sequence: std::sync::atomic::AtomicU64,
+}
+impl CatalogPublication {
+    fn begin(&self) {
+        self.sequence.fetch_add(1, Ordering::AcqRel);
+    }
+    fn finish(&self, index: &IndexActor) {
+        let snapshot = self.snapshot.load_full();
+        if index.current_version().ok().is_none_or(|version| {
+            snapshot
+                .as_ref()
+                .is_none_or(|old| (old.epoch, old.generation) != version)
+        }) {
+            self.snapshot.store(
+                flavite_index::catalog::ResolverCatalog::load(index.writer().conn())
+                    .ok()
+                    .map(Arc::new),
+            );
+        }
+        if self.sequence.load(Ordering::Relaxed) & 1 != 0 {
+            self.sequence.fetch_add(1, Ordering::Release);
+        }
+    }
+    fn read(&self) -> Result<Arc<flavite_index::catalog::ResolverCatalog>, &'static str> {
+        let before = self.sequence.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            return Err("busy");
+        }
+        let snapshot = self.snapshot.load_full();
+        if before != self.sequence.load(Ordering::Acquire) {
+            return Err("busy");
+        }
+        snapshot.ok_or("unavailable")
+    }
+}
+
 /// Injectable watcher seam. Tests can retain the sender and feed events without
 /// relying on OS notification behavior.
 pub type EventSource = Receiver<WatcherEvent>;
@@ -136,6 +177,11 @@ pub enum VaultActorMsg {
         limit: usize,
         reply: Sender<VaultActorResp>,
     },
+    /// Decode a bounded graph catalog through this vault's exact Fs codec.
+    DecodeGraphPaths {
+        keys: Vec<Vec<u8>>,
+        reply: Sender<VaultActorResp>,
+    },
     /// Resolve one link through the index's canonical resolver.
     ResolveTarget {
         target_key: String,
@@ -179,6 +225,7 @@ pub enum VaultActorMsg {
 /// Responses from the VaultActor.
 #[derive(Debug, Clone)]
 pub enum VaultActorResp {
+    GraphPaths(Result<Vec<PathBuf>, String>),
     /// Reconcile completed.
     ReconcileComplete {
         summary: ReconcileSummary,
@@ -241,6 +288,7 @@ pub struct VaultActorHandle {
     autosave_failures_total: Arc<std::sync::atomic::AtomicU64>,
     rename_items_skipped_total: Arc<std::sync::atomic::AtomicU64>,
     startup_ready: Receiver<()>,
+    catalog: Arc<CatalogPublication>,
 }
 
 impl VaultActorHandle {
@@ -366,6 +414,30 @@ impl VaultActorHandle {
     }
 
     /// Get the current version.
+    /// Nonblocking canonical target publication used on Session ingress.
+    pub fn resolver_catalog(
+        &self,
+    ) -> Result<Arc<flavite_index::catalog::ResolverCatalog>, &'static str> {
+        self.catalog.read()
+    }
+
+    pub fn decode_graph_paths(&self, keys: Vec<Vec<u8>>) -> Result<Vec<PathBuf>, String> {
+        if keys.len() > 100_000 || keys.iter().any(|key| key.len() > 8192) {
+            return Err("graph catalog exceeds native path bounds".into());
+        }
+        let (reply, receive) = bounded(1);
+        self.sender
+            .send(VaultActorMsg::DecodeGraphPaths { keys, reply })
+            .map_err(|_| "native path service unavailable")?;
+        match receive
+            .recv()
+            .map_err(|_| "native path service unavailable")?
+        {
+            VaultActorResp::GraphPaths(result) => result,
+            _ => Err("native path service returned invalid data".into()),
+        }
+    }
+
     /// Read the current canonical catalog epoch/generation as plain values.
     ///
     /// # Errors
@@ -568,6 +640,7 @@ impl VaultActorHandle {
 
 /// The VaultActor itself.
 pub struct VaultActor {
+    catalog: Arc<CatalogPublication>,
     /// The filesystem.
     fs: Arc<dyn Fs + Send + Sync>,
     /// Vault identity.
@@ -671,6 +744,7 @@ impl VaultActor {
     pub fn new(fs: Box<dyn Fs + Send + Sync>, identity: VaultIdentity, index: IndexActor) -> Self {
         let fs: Arc<dyn Fs + Send + Sync> = Arc::from(fs);
         Self {
+            catalog: Arc::new(CatalogPublication::default()),
             fs,
             identity,
             index,
@@ -718,6 +792,7 @@ impl VaultActor {
         let (event_sender, event_receiver) = unbounded();
         let (buffer_patch_sender, buffer_patch_receiver) = bounded(64);
         let (startup_ready_sender, startup_ready) = bounded(1);
+        let catalog = Arc::clone(&self.catalog);
         let drift_found_total = Arc::clone(&self.drift_found_total);
         let autosave_failures_total = Arc::clone(&self.autosave_failures_total);
         let rename_items_skipped_total = Arc::clone(&self.rename_items_skipped_total);
@@ -748,6 +823,7 @@ impl VaultActor {
             autosave_failures_total,
             rename_items_skipped_total,
             startup_ready,
+            catalog,
         })
     }
 
@@ -892,7 +968,9 @@ impl VaultActor {
         };
         self.persist_runtime_meta();
         let watcher = VaultWatcher::new(&self.coalescer);
+        self.catalog.begin();
         self.perform_initial_scan();
+        self.catalog.finish(&self.index);
         let timer = tick(std::time::Duration::from_millis(50));
         let mut last_verification = std::time::Instant::now();
         let mut last_focus: Option<std::time::Instant> = None;
@@ -911,7 +989,10 @@ impl VaultActor {
                         }
                     }
                     Ok(msg) => {
+                        let mutating = matches!(&msg, VaultActorMsg::Save { .. } | VaultActorMsg::RenameNoteRequest { .. } | VaultActorMsg::Reconcile { .. } | VaultActorMsg::ReconcileRequest { .. } | VaultActorMsg::FsEvent(_));
+                        if mutating { self.catalog.begin(); }
                         self.handle_message(msg);
+                        if mutating { self.catalog.finish(&self.index); }
                         if let Err(error) = self.index.commit_search_if_due(false) {
                             tracing::error!(%error, "deferred Tantivy commit failed");
                         }
@@ -929,7 +1010,9 @@ impl VaultActor {
                 recv(timer) -> _ => {
                     if let Some(batch) = self.coalescer.try_recv_batch() {
                         for (from, to) in batch.rename_pairs.iter().cloned() {
+                            self.catalog.begin();
                             self.handle_external_rename_pair(from, to);
+                            self.catalog.finish(&self.index);
                         }
                         if batch.is_bulk || batch.paths.is_empty() {
                             self.handle_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent, None);
@@ -951,7 +1034,12 @@ impl VaultActor {
                     }
                 }
                 recv(self.reconcile_messages.as_ref().expect("worker initialized")) -> message => {
-                    if let Ok(message) = message { self.handle_worker_message(message); }
+                    if let Ok(message) = message {
+                        let mutating = !matches!(message, crate::reconcile_worker::WorkerMessage::Progress(_));
+                        if mutating { self.catalog.begin(); }
+                        self.handle_worker_message(message);
+                        if mutating { self.catalog.finish(&self.index); }
+                    }
                 }
             }
         }
@@ -999,6 +1087,7 @@ impl VaultActor {
                     &buffer_ids,
                     &buffer_revisions,
                 );
+                self.catalog.finish(&self.index);
                 let _ = reply.try_send(VaultActorResp::Renamed(result));
             }
             VaultActorMsg::CancelJournalItem {
@@ -1057,6 +1146,17 @@ impl VaultActor {
             VaultActorMsg::NoteCatalog { limit, reply } => {
                 let response = VaultActorResp::NoteCatalog(self.index.note_catalog(limit));
                 let _ = reply.try_send(response);
+            }
+            VaultActorMsg::DecodeGraphPaths { keys, reply } => {
+                let result = keys
+                    .iter()
+                    .map(|key| {
+                        self.fs
+                            .decode_path_key(key)
+                            .map_err(|_| "graph native path is invalid".to_owned())
+                    })
+                    .collect();
+                let _ = reply.try_send(VaultActorResp::GraphPaths(result));
             }
             VaultActorMsg::ResolveTarget {
                 target_key,
@@ -1160,6 +1260,15 @@ impl VaultActor {
                     crate::history::now_secs(),
                 )
                 .map_err(SaveFailure::from)?;
+            let index_path_key = self
+                .fs
+                .encode_path_key(
+                    request
+                        .path
+                        .strip_prefix(&self.identity.root)
+                        .map_err(SaveFailure::from_message)?,
+                )
+                .map_err(SaveFailure::from_message)?;
             let index = &mut self.index;
             let display_path = request
                 .path
@@ -1177,13 +1286,7 @@ impl VaultActor {
                 history,
                 request.clone(),
                 |_path, bytes, mtime_ns| {
-                    index.apply_saved_note(
-                        &request.note_key,
-                        &display_path,
-                        bytes,
-                        mtime_ns,
-                        scan_ns,
-                    )
+                    index.apply_saved_note(&index_path_key, &display_path, bytes, mtime_ns, scan_ns)
                 },
             )?;
             tracing::info!(path = %display_path, revision = ?request.revision, "save completed");
@@ -1210,6 +1313,7 @@ impl VaultActor {
             Ok(result)
         })()
         .map_err(|failure: SaveFailure| failure.for_request(&failure_context));
+        self.catalog.finish(&self.index);
         let _ = reply.try_send(VaultActorResp::Saved(result));
     }
 
@@ -1356,6 +1460,7 @@ impl VaultActor {
                     return;
                 };
                 let summary = self.apply_scan_result(&mut context, result);
+                self.catalog.finish(&self.index);
                 if !self.initial_scan_complete && context.job.scope == ReconcileScope::Full {
                     self.initial_scan_complete = true;
                     if let Some(ready) = self.startup_ready_sender.take() {

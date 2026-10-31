@@ -9,6 +9,8 @@ pub mod commands;
 pub mod context;
 pub mod documents;
 pub mod env;
+pub mod graph;
 pub mod linking;
+pub mod occurrences;
 pub mod persistence;
 pub mod shell;

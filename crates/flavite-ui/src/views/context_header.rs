@@ -68,15 +68,18 @@ pub fn status_label(app: &App, tab: TabId) -> String {
         ToolState::Querying => "Updating…".into(),
         ToolState::Busy => "Query queued; the service is busy".into(),
         ToolState::Ready(content) => match content {
-            crate::host::context::ToolContent::Preview { provenance, .. } => format!(
-                "Saved text · index epoch {} generation {}",
-                provenance.epoch, provenance.generation
-            ),
-            crate::host::context::ToolContent::Backlinks { rows, provenance } => format!(
-                "{} link(s) · index epoch {} generation {}",
+            crate::host::context::ToolContent::BufferPreview { unsaved, .. } => {
+                if *unsaved {
+                    "Current note · unsaved changes".into()
+                } else {
+                    "Current note · saved".into()
+                }
+            }
+            crate::host::context::ToolContent::Preview { .. } => "Saved text".into(),
+            crate::host::context::ToolContent::Backlinks { rows, .. } => format!(
+                "{} linking notes · {} unsaved",
                 rows.len(),
-                provenance.epoch,
-                provenance.generation
+                rows.iter().filter(|r| r.unsaved).count()
             ),
         },
         ToolState::Missing => "Missing note".into(),
@@ -96,6 +99,9 @@ pub fn status_label(app: &App, tab: TabId) -> String {
                 flavite_workspace::UnboundReason::NoExploration => {
                     "Unbound: no selection published".into()
                 }
+                flavite_workspace::UnboundReason::EmptySelection => {
+                    "No selection — the source published an empty selection".into()
+                }
             },
             _ => "Unbound".into(),
         },
@@ -107,6 +113,11 @@ pub fn status_label(app: &App, tab: TabId) -> String {
 pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
     let label = source_label(app, tab);
     let status = status_label(app, tab);
+    let status = if app.contexts.is_updating(&tab) {
+        format!("Updating · {status}")
+    } else {
+        status
+    };
     let is_pinned = matches!(binding_of(app, tab), Some(ContextBinding::Pinned(_)));
     let mut controls = row![].spacing(style::SPACING_SM);
     if is_pinned {

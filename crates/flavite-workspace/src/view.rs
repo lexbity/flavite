@@ -43,6 +43,11 @@ impl NoteLocator {
                     "note locator rejects `{component}` path components"
                 ));
             }
+            if component.contains(['/', '\\', ':']) {
+                return Err(
+                    "note locator component contains a path separator or drive prefix".into(),
+                );
+            }
             if component.contains('\0') {
                 return Err("note locator rejects NUL bytes".into());
             }
@@ -115,6 +120,8 @@ pub enum ViewKind {
     Empty,
     /// A source-reading view of one note (editing integrates in W03).
     Note(NoteView),
+    /// A knowledge-network graph view of the saved index (W07).
+    Graph(GraphView),
     /// The vault note list.
     Notes,
     /// Saved source-text preview of the bound context source (W04).
@@ -133,6 +140,7 @@ impl ViewKind {
                 note.locator().clone(),
                 NoteLoad::Reserved,
             ))),
+            ViewKind::Graph(graph) => Some(ViewKind::Graph(graph.clone())),
             ViewKind::Notes => Some(ViewKind::Notes),
             // A duplicated context tool is an independent view with its own
             // copy of the binding; the binding target itself is unchanged.
@@ -167,6 +175,190 @@ impl NoteView {
 
     pub(crate) fn set_load(&mut self, load: NoteLoad) {
         self.load = load;
+    }
+}
+
+/// Rejection of a graph camera value outside the supported range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphCameraError {
+    /// A component is NaN or infinite.
+    NonFinite,
+    /// A world coordinate exceeds ±1e9 (§10.3).
+    OutOfWorldRange,
+    /// The zoom is outside the interaction range 0.05–64 (§10.3).
+    ZoomOutOfRange,
+}
+
+impl std::fmt::Display for GraphCameraError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFinite => write!(f, "graph camera values must be finite"),
+            Self::OutOfWorldRange => write!(f, "graph camera coordinates exceed ±1e9 world units"),
+            Self::ZoomOutOfRange => write!(f, "graph camera zoom is outside 0.05–64"),
+        }
+    }
+}
+
+impl std::error::Error for GraphCameraError {}
+
+/// Persisted pan/zoom state of one graph view (§10.3, §11.1).
+///
+/// Validated at construction: every component finite, coordinates within
+/// ±1e9 world units, and zoom inside the interaction range 0.05–64.
+/// Imported or restored cameras outside the range are *rejected*, not
+/// clamped (§10.3: "rejected outside that range during import/restore
+/// validation").
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GraphCamera {
+    /// World point shown at the viewport centre.
+    pub center: [f32; 2],
+    /// World units → logical pixels.
+    pub zoom: f32,
+}
+
+/// Interaction and persistence bounds (§10.3).
+impl GraphCamera {
+    /// Lowest admitted zoom.
+    pub const MIN_ZOOM: f32 = 0.05;
+    /// Highest admitted zoom.
+    pub const MAX_ZOOM: f32 = 64.0;
+    /// Largest admitted absolute world coordinate.
+    pub const MAX_COORDINATE: f32 = 1.0e9;
+
+    /// The default centered camera at 1:1.
+    #[must_use]
+    pub const fn centered() -> Self {
+        Self {
+            center: [0.0, 0.0],
+            zoom: 1.0,
+        }
+    }
+
+    /// Build a validated camera.
+    ///
+    /// # Errors
+    /// Returns the first violated bound ([`GraphCameraError`]).
+    pub fn new(center: [f32; 2], zoom: f32) -> Result<Self, GraphCameraError> {
+        if !center[0].is_finite() || !center[1].is_finite() || !zoom.is_finite() {
+            return Err(GraphCameraError::NonFinite);
+        }
+        if center[0].abs() > Self::MAX_COORDINATE || center[1].abs() > Self::MAX_COORDINATE {
+            return Err(GraphCameraError::OutOfWorldRange);
+        }
+        if !(Self::MIN_ZOOM..=Self::MAX_ZOOM).contains(&zoom) {
+            return Err(GraphCameraError::ZoomOutOfRange);
+        }
+        Ok(Self { center, zoom })
+    }
+
+    /// Apply a pan and clamp the result to the world bounds (interaction,
+    /// not import: out-of-range drags stop at the edge instead of refusing).
+    #[must_use]
+    pub fn panned(self, dx: f32, dy: f32) -> Self {
+        let clamp = |value: f32| {
+            if value.is_finite() {
+                value.clamp(-Self::MAX_COORDINATE, Self::MAX_COORDINATE)
+            } else {
+                0.0
+            }
+        };
+        Self {
+            center: [clamp(self.center[0] + dx), clamp(self.center[1] + dy)],
+            zoom: self.zoom,
+        }
+    }
+
+    /// Multiply the zoom, clamped to the interaction range.
+    #[must_use]
+    pub fn zoomed(self, factor: f32) -> Self {
+        let zoom = if factor.is_finite() && factor > 0.0 {
+            (self.zoom * factor).clamp(Self::MIN_ZOOM, Self::MAX_ZOOM)
+        } else {
+            self.zoom
+        };
+        Self {
+            center: self.center,
+            zoom,
+        }
+    }
+}
+
+impl Default for GraphCamera {
+    fn default() -> Self {
+        Self::centered()
+    }
+}
+
+// A validated camera is always finite, so identity is exact-bit equality;
+// hashing the raw bits keeps `Eq`/`Hash` consistent without an `f32`
+// structural derive.
+impl Eq for GraphCamera {}
+
+impl std::hash::Hash for GraphCamera {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (if self.center[0] == 0.0 {
+            0
+        } else {
+            self.center[0].to_bits()
+        })
+        .hash(state);
+        (if self.center[1] == 0.0 {
+            0
+        } else {
+            self.center[1].to_bits()
+        })
+        .hash(state);
+        self.zoom.to_bits().hash(state);
+    }
+}
+
+/// Logical state of one graph view: the durable per-view camera.
+///
+/// Node selection, hit candidates, and in-flight drag previews are
+/// host-transient (never part of the authoritative model); the camera is
+/// durable because it survives tab moves and layout restarts (§11.1).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GraphView {
+    camera: GraphCamera,
+    scope: crate::GraphScope,
+}
+
+impl GraphView {
+    #[must_use]
+    pub fn new(camera: GraphCamera) -> Self {
+        Self {
+            camera,
+            scope: crate::GraphScope::default(),
+        }
+    }
+
+    #[must_use]
+    pub const fn camera(&self) -> GraphCamera {
+        self.camera
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> &crate::GraphScope {
+        &self.scope
+    }
+
+    /// Validate before committing a scope; rejected updates leave it intact.
+    ///
+    /// # Errors
+    /// Returns the first exceeded clause, depth, or value bound.
+    pub fn set_scope(&mut self, scope: crate::GraphScope) -> Result<(), &'static str> {
+        scope.validate()?;
+        self.scope = scope;
+        Ok(())
+    }
+
+    /// Replace the camera after the host validates a released gesture.
+    ///
+    /// # Errors
+    /// Returns the first violated bound; the view keeps its old camera.
+    pub fn set_camera(&mut self, camera: GraphCamera) -> Result<(), GraphCameraError> {
+        self.camera = GraphCamera::new(camera.center, camera.zoom)?;
+        Ok(())
     }
 }
 
@@ -219,6 +411,7 @@ impl ViewSession {
             ViewKind::Empty => "Empty".into(),
             ViewKind::Notes => "Notes".into(),
             ViewKind::Note(note) => note.locator().title().to_owned(),
+            ViewKind::Graph(_) => "Graph".into(),
             ViewKind::Preview(_) => "Preview".into(),
             ViewKind::Backlinks(_) => "Backlinks".into(),
         }
@@ -234,6 +427,7 @@ impl ViewSession {
                 note.locator().clone(),
                 NoteLoad::Reserved,
             ))),
+            ViewKind::Graph(graph) => Some(ViewKind::Graph(graph.clone())),
             ViewKind::Notes => Some(ViewKind::Notes),
             ViewKind::Preview(binding) => Some(ViewKind::Preview(binding.clone())),
             ViewKind::Backlinks(binding) => Some(ViewKind::Backlinks(binding.clone())),

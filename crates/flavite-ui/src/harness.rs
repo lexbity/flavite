@@ -111,6 +111,7 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                             flavite_workspace::NoteLoad::Ready => "ready",
                             flavite_workspace::NoteLoad::Failed => "failed",
                         },
+                        flavite_workspace::ViewKind::Graph(_) => "graph",
                         flavite_workspace::ViewKind::Empty => "empty",
                         flavite_workspace::ViewKind::Notes => "notes",
                         flavite_workspace::ViewKind::Preview(_) => "preview",
@@ -124,6 +125,76 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                         .unwrap_or_default();
                     let interaction = session.interaction();
                     let buffer_view = app.note_editor_view(*tab);
+                    let graph = if matches!(
+                        session.kind(),
+                        flavite_workspace::ViewKind::Graph(_)
+                    ) {
+                        app.graph.state(*tab).map(|state| {
+                            let publication = app
+                                .flavite
+                                .as_ref()
+                                .and_then(|flavite| flavite.graph_frame())
+                                .map(|frame| frame.publication().clone());
+                            // Screen positions for the visual runner: the
+                            // real pointer then clicks the real widget.
+                            let nodes: Vec<serde_json::Value> = state
+                                .geometry
+                                .as_ref()
+                                .map(|geometry| {
+                                    let bounds = state.bounds.unwrap_or(iced::Rectangle::new(
+                                        iced::Point::ORIGIN,
+                                        iced::Size::new(800.0, 600.0),
+                                    ));
+                                    geometry
+                                        .nodes()
+                                        .iter()
+                                        .enumerate()
+                                        .take(80)
+                                        .map(|(dense, node)| {
+                                            let title = publication
+                                                .as_ref()
+                                                .and_then(|p| geometry.node_id(dense).and_then(|id| p.node_index(id)).and_then(|index| p.record(index as usize)))
+                                                .map(|r| r.title.clone())
+                                                .unwrap_or_default();
+                                            let screen = state.camera.world_to_screen(
+                                                node.center,
+                                                [0.0, 0.0],
+                                                [bounds.width, bounds.height],
+                                            );
+                                            serde_json::json!({
+                                                "id": format!("{}", geometry.node_id(dense).map(|i| i.id).unwrap_or(0)),
+                                                "kind": format!("{:?}", geometry.node_id(dense).map(|i| i.kind)),
+                                                "title": title,
+                                                "x": bounds.x + screen[0],
+                                                "y": bounds.y + screen[1],
+                                            })
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            serde_json::json!({
+                                "backend": app.graph.backend.label(),
+                                "filter_bounds": state.filter_bounds.iter().map(|(field,r)|(format!("{field:?}"),vec![r.x,r.y,r.width,r.height])).collect::<std::collections::BTreeMap<_,_>>(),
+                                "nodes": state.geometry.as_ref().map_or(0, |g| g.node_count()),
+                                "edges": state.geometry.as_ref().map_or(0, |g| g.edge_count()),
+                                "epoch": publication.as_ref().map(|p| p.epoch),
+                                "generation": publication.as_ref().map(|p| p.generation),
+                                "topology": publication.as_ref().map(|p| p.topology_version),
+                                "selection": state.selection.map(|hit| hit.display()),
+                                "frozen": state.frozen,
+                                "list_mode": state.list_mode,
+                                "stale": state.stale,
+                                "updating": state.updating,
+                                "scope_sequence": state.scope_sequence,
+                                "overlay_sources": state.overlay_count,
+                                "outside_scope": state.selection.is_some_and(|hit| state.scope_result.as_ref().is_some_and(|scope| !scope.nodes.contains(&hit.id))),
+                                "bounds": state.bounds.map(|r| [r.x, r.y, r.width, r.height]),
+                                "screen_nodes": nodes,
+                            })
+                        })
+                    } else {
+                        None
+                    };
                     Some(serde_json::json!({
                         // JSON numbers cannot losslessly represent every
                         // u128; expose opaque identity in its stable string
@@ -136,6 +207,7 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                         "active": *tab == state.active(),
                         "buffer": buffer_view.as_ref().map(|view| view.buffer_id),
                         "revision": buffer_view.as_ref().map(|view| view.revision),
+                        "buffer_text": buffer_view.as_ref().map(|view| view.text.to_string()),
                         "selection": interaction.selections.first().map(|selection| [selection.anchor, selection.head]),
                         "editor_bounds": app.editor_bounds.get(tab).map(|r| [r.x,r.y,r.width,r.height]),
                         "incarnation": interaction.incarnation,
@@ -147,6 +219,7 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                             .observed(tab)
                             .map(|source| source.locator.components().join("/")),
                         "context_state": context_state,
+                        "graph": graph,
                     }))
                 })
                 .collect();
@@ -177,6 +250,25 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
             "caret": target.caret_text_byte,
         })
     });
+    let graph_service = serde_json::json!({
+        "backend": app.graph.backend.label(),
+        "status": app.graph.status.as_ref().map(|status| format!("{status:?}")),
+        "pins": app.graph.pins.count(),
+        "pins_dirty": app.graph.pins.is_dirty(),
+        "pins_failure": app.graph.pins.failure.clone(),
+        "pins_loaded": app.graph.pins.loaded(),
+        "stale_discards": app.graph.stale_discards_total,
+        "metrics": app.graph.metrics.map(|metrics| serde_json::json!({
+            "polls": metrics.polls_total,
+            "batches": metrics.batches_total,
+            "resets": metrics.resets_total,
+        })),
+        "publishing": app.workspace.exploration().map(|selection| serde_json::json!({
+            "source_tab": selection.source_tab.to_string(),
+            "sequence": selection.sequence,
+            "target": selection.target.as_ref().map(|target| target.components().join("/")),
+        })),
+    });
     serde_json::json!({
         "event": "workspace",
         "revision": app.workspace.revision(),
@@ -197,9 +289,11 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "workspace_bounds": [app.workspace_bounds.x,app.workspace_bounds.y,app.workspace_bounds.width,app.workspace_bounds.height],
         "focused_tab": focused.to_string(),
         "focused_text_chars": focused_text,
+        "pending_operations": app.pending_operations(),
         "focused_text": focused_text_content,
         "document_anchor": app.workspace.document_anchor().map(|tab| tab.to_string()),
         "writing_target": writing_target,
+        "graph_service": graph_service,
         "maximized": app.maximized_group().map(|group| group.to_string()),
         "catalog": app.catalog().len(),
     })

@@ -65,3 +65,20 @@ impl Flavite {
         })
     }
 }
+
+impl crate::Flavite {
+    /// Current shared buffer for an exact vault-relative source path, if open.
+    pub fn open_source_view(&self, path: &std::path::Path) -> Option<crate::SharedBufferView> {
+        let (id, revision, ..) =
+            self.session
+                .graph_buffer_stamp()
+                .into_iter()
+                .find(|(_, _, candidate, ..)| {
+                    candidate
+                        .strip_prefix(self.session.root())
+                        .unwrap_or(candidate)
+                        == path
+                })?;
+        self.get_shared_buffer_view(id, Some(revision)).ok()
+    }
+}

@@ -859,6 +859,7 @@ fn model_from_snapshot(snapshot: &GraphSnapshot) -> GraphModel {
         model.apply(batch);
     }
 
+    model.adopt_snapshot_version(snapshot.topology_version);
     model
 }
 
@@ -1389,10 +1390,8 @@ mod tests {
         assert_eq!(fresh.out_indices, snapshot.out_indices);
         assert_eq!(fresh.adj_indices, snapshot.adj_indices);
         assert_eq!(fresh.adj_offsets, snapshot.adj_offsets);
-        // The rebuilt model is a model: its version is its own, not the
-        // view's — the frame publishes the model's, so positions and
-        // topology stay one authority.
-        assert_ne!(fresh.topology_version, 0);
+        // The worker mirrors this exact authoritative publication.
+        assert_eq!(fresh.topology_version, snapshot.topology_version);
     }
 
     #[test]

@@ -107,7 +107,11 @@ impl std::error::Error for CodecError {}
 
 /// A durable view kind. Unknown later kinds are preserved inert (`Other`)
 /// and re-serialized unchanged (RFC §22: unknown kinds are retained).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `PartialEq` (not `Eq`) because the graph camera carries `f32` values;
+/// decoded payloads are bound-checked in `validate`, and JSON never
+/// encodes NaN or infinity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PersistedKind {
     /// A blank tab.
@@ -116,6 +120,15 @@ pub enum PersistedKind {
     Note {
         /// Vault-relative path components.
         locator: Vec<String>,
+    },
+    /// A graph view of the saved knowledge network (W07): the durable
+    /// per-view camera only. Selection and hit candidates are transient and
+    /// are never persisted (FR-26).
+    Graph {
+        /// The persisted camera, when the view carried a valid one.
+        camera: Option<PersistedGraphCamera>,
+        #[serde(default)]
+        scope: crate::GraphScope,
     },
     /// The vault note list.
     Notes,
@@ -136,6 +149,15 @@ pub enum PersistedKind {
         /// The unknown payload, preserved verbatim.
         data: serde_json::Value,
     },
+}
+
+/// A durable graph camera (§11.1: finite coordinates, validated range).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PersistedGraphCamera {
+    /// World point at the viewport centre.
+    pub center: [f32; 2],
+    /// World units → logical pixels.
+    pub zoom: f32,
 }
 
 /// A durable context binding (identities, never live view pointers).
@@ -159,7 +181,7 @@ pub enum PersistedBinding {
 }
 
 /// One tab: opaque persistent id plus its durable kind.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistedTab {
     /// Persistent tab identity (u128 as string).
     pub id: String,
@@ -168,7 +190,7 @@ pub struct PersistedTab {
 }
 
 /// One tab group.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistedGroup {
     /// Persistent group identity.
     pub id: String,
@@ -203,7 +225,7 @@ pub enum PersistedNode {
 }
 
 /// A named layout: an independent durable workspace snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NamedLayout {
     /// User-facing name.
     pub name: String,
@@ -212,7 +234,7 @@ pub struct NamedLayout {
 }
 
 /// The durable workspace projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistedWorkspace {
     /// Schema version.
     pub schema: u32,
@@ -283,6 +305,18 @@ fn persist_kind(kind: &crate::view::ViewKind) -> PersistedKind {
         crate::view::ViewKind::Notes => PersistedKind::Notes,
         crate::view::ViewKind::Note(note) => PersistedKind::Note {
             locator: note.locator().components().to_vec(),
+        },
+        crate::view::ViewKind::Graph(view) => PersistedKind::Graph {
+            scope: view.scope().clone(),
+            // A never-moved camera needs no persisted payload.
+            camera: if view.camera() == crate::view::GraphCamera::centered() {
+                None
+            } else {
+                Some(PersistedGraphCamera {
+                    center: view.camera().center,
+                    zoom: view.camera().zoom,
+                })
+            },
         },
         crate::view::ViewKind::Preview(binding) => PersistedKind::Preview {
             binding: persist_binding(binding),
@@ -427,6 +461,7 @@ fn preflight_depth(bytes: &[u8]) -> Result<(), CodecError> {
 ///
 /// # Errors
 /// Returns [`CodecError::InvalidStructure`] on the first violated invariant.
+#[allow(clippy::too_many_lines)]
 pub fn validate(workspace: &PersistedWorkspace) -> Result<(), CodecError> {
     if workspace.schema < MIN_SUPPORTED_SCHEMA {
         return Err(CodecError::UnsupportedSchema {
@@ -442,6 +477,38 @@ pub fn validate(workspace: &PersistedWorkspace) -> Result<(), CodecError> {
     for tab in &workspace.tabs {
         if tab.id.is_empty() {
             return Err(CodecError::InvalidStructure("empty tab id".into()));
+        }
+        if let PersistedKind::Graph {
+            camera: Some(camera),
+            ..
+        } = &tab.kind
+        {
+            // Graph cameras restore with validated bounds (§10.3): an
+            // out-of-range or non-finite import is refused, never clamped.
+            if !camera.center[0].is_finite()
+                || !camera.center[1].is_finite()
+                || !camera.zoom.is_finite()
+            {
+                return Err(CodecError::InvalidStructure(format!(
+                    "graph camera in tab {} is not finite",
+                    tab.id
+                )));
+            }
+            if camera.center[0].abs() > crate::view::GraphCamera::MAX_COORDINATE
+                || camera.center[1].abs() > crate::view::GraphCamera::MAX_COORDINATE
+                || camera.zoom < crate::view::GraphCamera::MIN_ZOOM
+                || camera.zoom > crate::view::GraphCamera::MAX_ZOOM
+            {
+                return Err(CodecError::InvalidStructure(format!(
+                    "graph camera in tab {} is outside the supported range",
+                    tab.id
+                )));
+            }
+        }
+        if let PersistedKind::Graph { scope, .. } = &tab.kind {
+            scope
+                .validate()
+                .map_err(|error| CodecError::InvalidStructure(error.into()))?;
         }
         if !tab_ids.insert(tab.id.as_str()) {
             return Err(CodecError::InvalidStructure(format!(

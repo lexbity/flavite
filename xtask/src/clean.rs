@@ -12,7 +12,7 @@ use walkdir::WalkDir;
 /// Soft budget: at or under this, `gc` is a no-op (§10.10).
 pub const SOFT_BUDGET: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 
-/// Hard budget: still over this after incremental cleanup → escalate to `clean` (§10.10).
+/// Hard budget: still over this → remove rebuildable caches, retaining evidence.
 pub const HARD_BUDGET: u64 = 20 * 1024 * 1024 * 1024; // 20 GB
 
 /// Report from a `clean` or `gc` operation.
@@ -197,12 +197,43 @@ pub fn clean(root: &Path, dry_run: bool) -> Result<CleanReport> {
     Ok(report)
 }
 
+/// Automatic cleanup may reclaim compiled caches, never crash reproducers or
+/// verification output needed by the gate that just completed. Explicit
+/// `clean` retains its documented full-clean semantics.
+fn gc_build_caches(root: &Path) -> Result<CleanReport> {
+    let mut paths = vec![root.join("fuzz/target")];
+    if let Ok(entries) = fs::read_dir(root.join("target")) {
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let cache = matches!(
+                name.to_str(),
+                Some("debug" | "release" | "doc" | "llvm-cov-target")
+            ) || entry.path().join("debug").is_dir()
+                || entry.path().join("release").is_dir();
+            if cache {
+                paths.push(entry.path());
+            }
+        }
+    }
+    let mut report = CleanReport::default();
+    for path in paths {
+        verify_in_root(root, &path)?;
+        let bytes = remove_path(&path, false);
+        if bytes > 0 {
+            report.paths_removed.push(path);
+            report.bytes_freed += bytes;
+        }
+    }
+    Ok(report)
+}
+
 /// Post-gate garbage collection (§10.10): threshold-based.
 ///
 /// - At or under the soft budget → no-op.
 /// - Over soft budget → remove incremental caches + fuzz/target/ + profiling
 ///   intermediates, then re-measure.
-/// - Still over hard budget → escalate to full `clean` with a warning.
+/// - Still over hard budget → remove compiled caches; retain evidence/crashes.
 pub fn gc(root: &Path) -> Result<CleanReport> {
     verify_in_root(root, root)?;
 
@@ -244,11 +275,11 @@ pub fn gc(root: &Path) -> Result<CleanReport> {
 
     if total > HARD_BUDGET {
         eprintln!(
-            "gc: still over hard budget ({:.2} GB), escalating to full clean",
+            "gc: still over hard budget ({:.2} GB), removing compiled caches (evidence retained)",
             total as f64 / (1024.0 * 1024.0 * 1024.0)
         );
         eprintln!("WARNING: the next gate rebuilds from scratch");
-        let clean_report = clean(root, false)?;
+        let clean_report = gc_build_caches(root)?;
         report.bytes_freed += clean_report.bytes_freed;
         report.paths_removed.extend(clean_report.paths_removed);
     } else {
@@ -284,6 +315,41 @@ mod tests {
 
     fn cleanup_tmp(tmp: &Path) {
         let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn automatic_full_reclamation_retains_gate_evidence_and_crash_inputs() {
+        let tmp = temp_workspace();
+        for path in [
+            "target/debug/deps/build",
+            "target/release/app",
+            "target/x86_64-linux/debug/cache",
+            "target/workspace-evidence/run/manifest.json",
+            "target/ui-visual/graph.png",
+            "fuzz/artifacts/graph_scope/crash",
+            "fuzz/target/cache",
+        ] {
+            let file = tmp.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, b"fixture").unwrap();
+        }
+        gc_build_caches(&tmp).unwrap();
+        for path in [
+            "target/debug",
+            "target/release",
+            "target/x86_64-linux",
+            "fuzz/target",
+        ] {
+            assert!(!tmp.join(path).exists());
+        }
+        for path in [
+            "target/workspace-evidence/run/manifest.json",
+            "target/ui-visual/graph.png",
+            "fuzz/artifacts/graph_scope/crash",
+        ] {
+            assert_eq!(fs::read(tmp.join(path)).unwrap(), b"fixture");
+        }
+        cleanup_tmp(&tmp);
     }
 
     #[test]

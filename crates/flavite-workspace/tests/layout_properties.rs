@@ -6,8 +6,8 @@
 //! reference model. Rejected actions must leave the state byte-identical.
 
 use flavite_workspace::{
-    Arrangement, Edge, GroupId, Ids, LayoutAction, NoteLocator, Outcome, Side, SplitId,
-    TabDropTarget, TabId, WorkspaceError, WorkspaceState, reduce,
+    Arrangement, Edge, GraphCamera, GroupId, Ids, LayoutAction, NoteLocator, Outcome, Side,
+    SplitId, TabDropTarget, TabId, WorkspaceError, WorkspaceState, reduce,
 };
 use std::collections::BTreeSet;
 
@@ -100,6 +100,7 @@ fn expected_delta(state: &WorkspaceState, action: &LayoutAction) -> Option<i64> 
         A::OpenNote { group, .. }
         | A::OpenEmpty { group, .. }
         | A::OpenNotes { group, .. }
+        | A::OpenGraph { group, .. }
         | A::OpenContext { group, .. }
         | A::SplitGroup { group, .. } => state.group(group).is_some().then_some(1),
         A::DuplicateTab { tab, .. } => state
@@ -129,6 +130,8 @@ fn expected_delta(state: &WorkspaceState, action: &LayoutAction) -> Option<i64> 
             }
         }),
         A::SetContextBinding { .. }
+        | A::SetGraphCamera { .. }
+        | A::SetGraphScope { .. }
         | A::MoveTab { .. }
         | A::MergeGroups { .. }
         | A::MoveGroupSplit { .. }
@@ -342,10 +345,33 @@ fn build_action(rng: &mut Rng, state: &WorkspaceState, locators: &[NoteLocator])
             expected_revision: revision,
             forward: rng.chance(50),
         },
-        _ => LayoutAction::CycleGroup {
+        19 => LayoutAction::CycleGroup {
             expected_revision: revision,
             forward: rng.chance(50),
         },
+        20 => LayoutAction::OpenGraph {
+            expected_revision: revision,
+            group: pick_group!(),
+        },
+        _ => {
+            // Graph camera commits: one valid, one deliberately outside the
+            // validated range (which must reject without mutation).
+            let tab = pick_tab!();
+            let camera = match rng.below(4) {
+                0 => GraphCamera::new([0.0, 0.0], 0.05).expect("lower bound"),
+                1 => GraphCamera::new([12.5, -7.25], 2.5).expect("interior"),
+                2 => GraphCamera::new([0.0, 0.0], 64.0).expect("upper bound"),
+                _ => GraphCamera {
+                    center: [0.0, 0.0],
+                    zoom: 100.0,
+                },
+            };
+            LayoutAction::SetGraphCamera {
+                expected_revision: revision,
+                tab,
+                camera,
+            }
+        }
     }
 }
 
@@ -371,7 +397,7 @@ fn run_campaign(seed: u64, budget: usize) {
     let mut state = WorkspaceState::with_ids(&mut ids);
     let locators: Vec<NoteLocator> = ["a.md", "b.md", "Systems/c.md"]
         .iter()
-        .map(|path| NoteLocator::from_components([*path]).expect("locator"))
+        .map(|path| NoteLocator::from_relative(std::path::Path::new(path)).expect("locator"))
         .collect();
     let mut rng = Rng::new(seed);
     let mut committed = 0u64;

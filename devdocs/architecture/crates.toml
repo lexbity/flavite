@@ -16,6 +16,7 @@ tier1 = [
     "flavite-vault",
     "flavite-index",
     "flavite-workspace",
+    "flavite-graph-protocol",
 ]
 # Tier 2 (§10.5: ≥ 80% line coverage floor).
 tier2 = ["flavite-api", "flavite-graph"]
@@ -23,6 +24,7 @@ tier2 = ["flavite-api", "flavite-graph"]
 tier3 = ["flavite-cli", "flavite-editor", "flavite-ui"]
 
 [responsibilities]
+flavite-graph-protocol = "IO-free bounded durable graph scope value types shared by core and workspace (RFC-0003 W08)"
 flavite-fs = "Fs trait, atomic_write, watcher, path safety; FaultFs behind feature \"fault\" (§4.1)"
 flavite-syntax = "Scanner, frontmatter patcher, pulldown glue — pure, IO-free (§4.1)"
 flavite-index = "SQLite, tantivy, resolver, query exec (§4.1)"
@@ -59,9 +61,11 @@ flavite-ui = "iced application (§4.1)"
 # layering rule still holds. The graph → index edge is for the GraphFeed
 # which polls the index's generation and consumes the invalidation feed (§4.14).
 active = [
+    { from = "flavite-api", to = "flavite-graph" },
+    { from = "flavite-graph", to = "flavite-graph-protocol" },
+    { from = "flavite-workspace", to = "flavite-graph-protocol" },
     { from = "flavite-ui", to = "flavite-graph" },
     { from = "flavite-index", to = "flavite-syntax" },
-    { from = "flavite-graph", to = "flavite-index" },
     { from = "flavite-buffer", to = "flavite-syntax" },
     # flavite-vault dependencies
     { from = "flavite-vault", to = "flavite-buffer" },
@@ -104,6 +108,8 @@ core_tier = [
     "flavite-vault",
     "flavite-api",
     "flavite-graph",
+    "flavite-graph-protocol",
+    "flavite-workspace",
     "flavite-cli",
 ]
 # Forbidden in core-tier transitive closure (normal+build deps only;

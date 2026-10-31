@@ -108,6 +108,17 @@ impl Fs for GateFs {
     impl_fs_delegates!(GateFs, inner);
 }
 
+/// A gate shared with the test that controls its delay.
+pub struct SharedGateFs {
+    pub inner: std::sync::Arc<GateFs>,
+}
+impl Fs for SharedGateFs {
+    fn read_if_exists(&self, path: &Path) -> Result<Option<Vec<u8>>> {
+        self.inner.read_if_exists(path)
+    }
+    impl_fs_delegates!(SharedGateFs, inner);
+}
+
 /// `Fs` view over a shared `MemFs`.
 pub struct SharedFs {
     /// The shared store.

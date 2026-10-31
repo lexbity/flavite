@@ -39,6 +39,7 @@ pub fn node_visuals(snapshot: &GraphSnapshot) -> Vec<GraphNodeVisual> {
             color: match kind {
                 NodeKind::Note => NOTE_COLOR,
                 NodeKind::Attachment => ATTACHMENT_COLOR,
+                NodeKind::Unresolved => [0.92, 0.67, 0.25, 1.0],
             },
             degree,
         })

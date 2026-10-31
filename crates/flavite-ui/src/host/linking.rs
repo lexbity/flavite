@@ -82,6 +82,7 @@ impl Default for LinkIntents {
             client: None,
             next_sequence: 0,
             pending: None,
+            cancelled: None,
             state: GestureState::Idle,
         }
     }
@@ -91,6 +92,7 @@ pub struct LinkIntents {
     pub(crate) client: Option<u128>,
     next_sequence: u64,
     pending: Option<PendingGesture>,
+    cancelled: Option<u64>,
     state: GestureState,
 }
 
@@ -209,6 +211,11 @@ impl LinkIntents {
 
     /// Record the terminal outcome and retire the gesture.
     pub fn finish(&mut self, state: GestureState) {
+        if matches!(state, GestureState::Failed { .. })
+            && let Some(pending) = &self.pending
+        {
+            self.cancelled = Some(pending.sequence);
+        }
         self.pending = None;
         self.state = state;
     }
@@ -216,10 +223,14 @@ impl LinkIntents {
     /// Cancel a held/pending gesture without consuming the sequence
     /// (§9: no auto commit after cancellation).
     pub fn cancel(&mut self) {
-        if self.pending.is_some() {
-            self.pending = None;
+        if let Some(pending) = self.pending.take() {
+            self.cancelled = Some(pending.sequence);
             self.state = GestureState::Idle;
         }
+    }
+
+    pub fn take_cancelled(&mut self) -> Option<u64> {
+        self.cancelled.take()
     }
 
     /// Invalidate the gesture when its source binding no longer matches.

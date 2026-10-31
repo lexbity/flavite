@@ -62,6 +62,8 @@ pub struct App {
     pub contexts: ContextRegistry,
     /// Semantic link insertion gestures (W05).
     pub linking: crate::host::linking::LinkIntents,
+    /// Graph view host: per-tab camera/selection/pins/geometry (W07).
+    pub graph: crate::host::graph::GraphHost,
     /// Device-local workspace persistence (W06).
     pub persistence: crate::host::persistence::PersistenceHost,
     /// Named layouts carried for the next layout save (W06).
@@ -85,7 +87,7 @@ pub struct App {
     catalog_error: Option<String>,
     settings: Settings,
     settings_valid: bool,
-    operations: OperationPump,
+    pub(crate) operations: OperationPump,
     /// Completions routed past the per-pump turn budget; the next pump tick
     /// continues (NFR-08: UI event-loop work is budgeted, never lost).
     completion_backlog: VecDeque<flavite_api::OperationCompletion>,
@@ -161,6 +163,43 @@ pub enum Message {
     OpenNote {
         locator: NoteLocator,
         group: Option<GroupId>,
+    },
+    /// One typed graph widget message for an exact view incarnation (W07).
+    GraphAction {
+        tab: TabId,
+        incarnation: u64,
+        message: crate::graph::renderer::GraphMessage,
+        key: flavite_graph::RenderKey,
+    },
+    /// One graph command from a button, keyboard, menu, or a11y row.
+    GraphNodeCommand {
+        tab: TabId,
+        incarnation: u64,
+        key: flavite_graph::RenderKey,
+        command: crate::host::graph::GraphCommand,
+    },
+    GraphCommand {
+        tab: TabId,
+        command: crate::host::graph::GraphCommand,
+    },
+    /// Observed bounds of a mounted graph surface (hit + harness mapping).
+    GraphBounds(TabId, iced::Rectangle),
+    GraphFilterBounds {
+        tab: TabId,
+        field: crate::graph::filters::FilterField,
+        bounds: iced::Rectangle,
+    },
+    InspectGraphOccurrence {
+        tab: TabId,
+        incarnation: u64,
+        key: flavite_graph::RenderKey,
+        index: usize,
+    },
+    GraphFilterInput {
+        tab: TabId,
+        incarnation: u64,
+        field: crate::graph::filters::FilterField,
+        value: String,
     },
     /// Toggle a group strip's inline menu row.
     GroupMenu(GroupId, StripMenu),
@@ -240,6 +279,11 @@ impl App {
             notes: DocumentRegistry::default(),
             contexts: ContextRegistry::default(),
             linking: crate::host::linking::LinkIntents::default(),
+            graph: {
+                let mut host = crate::host::graph::GraphHost::default();
+                host.backend = crate::host::graph::GraphBackend::from_env();
+                host
+            },
             persistence: crate::host::persistence::PersistenceHost::default(),
             named_layouts: Vec::new(),
             picker: Picker::default(),
@@ -299,8 +343,25 @@ impl App {
         if self.settings_valid && conflicts.is_empty() {
             self.status = "Vault ready".into();
         }
+        // Graph pins load once through the API at attach (TD-11): a decode
+        // or read failure is an honest report, never an overwrite.
+        if let Some(flavite) = self.flavite.as_ref() {
+            match flavite.read_graph_pins() {
+                Ok(stored) => {
+                    let observed = self.graph.pins.observe_read(stored);
+                    if let Err(error) = observed {
+                        self.status =
+                            format!("{} — graph pins could not be read: {error}", self.status);
+                    }
+                }
+                Err(error) => {
+                    self.status = format!("Vault ready (graph pins unavailable: {error})");
+                }
+            }
+        }
         self.load_catalog();
         self.restore_workspace_layout();
+        crate::host::graph::sync_hosts(self);
         self.refresh_semantics();
     }
 
@@ -706,6 +767,7 @@ impl App {
                 self.project_geometry();
                 let effects = commit.effects;
                 self.apply_effects(&effects);
+                crate::host::graph::sync_hosts(self);
                 self.refresh_semantics();
                 // Every committed layout change marks the device-local
                 // layout dirty (W06 autosave).
@@ -739,10 +801,51 @@ impl App {
         })
     }
 
+    /// Route one graph widget message through the host after stale-guard
+    /// validation (replaced views and hidden tabs never reach the model).
+    fn handle_graph_action(
+        &mut self,
+        tab: TabId,
+        incarnation: u64,
+        message: crate::graph::renderer::GraphMessage,
+        key: flavite_graph::RenderKey,
+    ) {
+        if self.picker.open || self.palette_open || self.strip_menu.is_some() {
+            return;
+        }
+        if !self.is_tab_visible(tab) {
+            return;
+        }
+        let Some(session) = self.workspace.tab(&tab) else {
+            return;
+        };
+        if !matches!(session.kind(), flavite_workspace::ViewKind::Graph(_)) {
+            return;
+        }
+        if session.interaction().incarnation != incarnation {
+            self.status = "Ignored input from a replaced graph view".into();
+            return;
+        }
+        if self.graph.state(tab).is_none_or(|s| {
+            s.filter.expanded || s.updating || s.stale || s.geometry_key != Some(key)
+        }) || self
+            .flavite
+            .as_ref()
+            .is_none_or(|api| !api.graph_is_current())
+        {
+            self.graph.stale_discards_total += 1;
+            return;
+        }
+        crate::host::graph::handle_message(self, tab, message);
+    }
+
     fn apply_effects(&mut self, effects: &[Effect]) {
         for effect in effects {
             match effect {
                 Effect::ViewAttached { tab, kind } => {
+                    if let flavite_workspace::ViewKind::Graph(view) = kind {
+                        self.graph.attach(*tab, view);
+                    }
                     if let flavite_workspace::ViewKind::Note(note) = kind {
                         let locator = note.locator().clone();
                         let (tab, incarnation, decision) = self.notes.attach(*tab, locator.clone());
@@ -772,6 +875,10 @@ impl App {
                 Effect::ViewDetached { tab, .. } => {
                     self.notes.detach(*tab);
                     self.contexts.detach(*tab);
+                    self.graph.detach(*tab);
+                    if let Some(api) = self.flavite.as_ref() {
+                        api.graph_release_scope(tab.raw());
+                    }
                 }
                 Effect::NoteLoadChanged { .. } => {}
                 Effect::ContextRebound { .. } => {}
@@ -782,7 +889,7 @@ impl App {
 
     /// Re-resolve every context tool against the router and submit queries
     /// for changed sources. Busy admission is recorded, never lost.
-    fn reconcile_contexts(&mut self) {
+    pub(crate) fn reconcile_contexts(&mut self) {
         let Some(flavite) = &self.flavite else {
             return;
         };
@@ -1090,7 +1197,7 @@ impl App {
 
     /// Route an open request canonically: focus an existing tab of the same
     /// note, otherwise open into `group` (default: the focused group).
-    fn request_open(&mut self, locator: NoteLocator, group: Option<GroupId>) {
+    pub(crate) fn request_open(&mut self, locator: NoteLocator, group: Option<GroupId>) {
         let existing = self
             .workspace
             .tabs()
@@ -1145,6 +1252,9 @@ impl App {
                 self.resize_preview.clear();
                 self.resizing_split = None;
                 self.strip_menu = None;
+                // Escape also restores an in-flight node drag to its prior
+                // position and drops click candidates (never a pin write).
+                crate::host::graph::cancel_gestures(self);
             }
             Message::MenuNext(forward) => {
                 if let Some((group, menu)) = self.strip_menu {
@@ -1246,6 +1356,10 @@ impl App {
                             expected_revision: revision,
                             group,
                         },
+                        flavite_workspace::ViewKind::Graph(_) => LayoutAction::OpenGraph {
+                            expected_revision: revision,
+                            group,
+                        },
                         flavite_workspace::ViewKind::Preview(_) => LayoutAction::OpenContext {
                             expected_revision: revision,
                             view: flavite_workspace::ContextViewKind::Preview,
@@ -1262,6 +1376,66 @@ impl App {
                 }
             }
             Message::OpenNote { locator, group } => self.request_open(locator, group),
+            Message::GraphAction {
+                tab,
+                incarnation,
+                message,
+                key,
+            } => self.handle_graph_action(tab, incarnation, message, key),
+            Message::GraphNodeCommand {
+                tab,
+                incarnation,
+                key,
+                command,
+            } => {
+                if self
+                    .workspace
+                    .tab(&tab)
+                    .is_some_and(|s| s.interaction().incarnation == incarnation)
+                    && self
+                        .graph
+                        .state(tab)
+                        .is_some_and(|s| !s.updating && !s.stale && s.geometry_key == Some(key))
+                    && self
+                        .flavite
+                        .as_ref()
+                        .is_some_and(flavite_api::Flavite::graph_is_current)
+                {
+                    crate::host::graph::command(self, tab, command);
+                } else {
+                    self.graph.stale_discards_total += 1;
+                }
+            }
+            Message::GraphCommand { tab, command } => {
+                if self.picker.open || self.palette_open || self.strip_menu.is_some() {
+                    return Task::none();
+                }
+                crate::host::graph::command(self, tab, command);
+            }
+            Message::InspectGraphOccurrence {
+                tab,
+                incarnation,
+                key,
+                index,
+            } => crate::host::occurrences::inspect(self, tab, incarnation, key, index),
+            Message::GraphFilterInput {
+                tab,
+                incarnation,
+                field,
+                value,
+            } => {
+                crate::graph::filters::input(self, tab, incarnation, field, value);
+            }
+            Message::GraphFilterBounds { tab, field, bounds } => {
+                if let Some(state) = self.graph.state_mut(tab) {
+                    state.filter_bounds.insert(field, bounds);
+                }
+            }
+            Message::GraphBounds(tab, rect) => {
+                if let Some(state) = self.graph.state_mut(tab) {
+                    state.bounds = Some(rect);
+                }
+            }
             Message::GroupMenu(group, menu) => {
                 if self.has_composing_view() {
                     return Task::none();
@@ -1438,6 +1612,12 @@ impl App {
         }
         self.project_geometry();
         self.refresh_semantics();
+        if let Some(sequence) = self.linking.take_cancelled()
+            && let Some(client) = self.linking.client
+            && let Some(api) = &self.flavite
+        {
+            api.cancel_link_intent(client, sequence);
+        }
         #[cfg(feature = "ui-test-support")]
         crate::harness::observe(self);
         Task::none()
@@ -1513,6 +1693,9 @@ impl App {
                     refresh_catalog = true;
                     // Saved content changed: previews and backlinks re-query.
                     self.contexts.invalidate_all();
+                    // The graph feed polls on a bounded cadence; the pulse
+                    // only wakes it early (§12.1 invalidation hints).
+                    flavite.graph_notify_changed();
                 }
                 events.push(format!("{}: {event:?}", event.event_type()));
                 if let Some(id) = delivery.notice_id {
@@ -1527,11 +1710,18 @@ impl App {
             (events, completions)
         };
         let (_events, completions) = drained;
-        if let Some(flavite) = &self.flavite {
+        let query_outcomes = self
+            .flavite
+            .as_ref()
+            .map_or_else(Vec::new, |api| api.query_service().drain());
+        {
             // Context query results: late or superseded tokens are dropped
             // by the registry, so a rebind or replaced view is never
             // repainted by an older query.
-            for outcome in flavite.query_service().drain() {
+            for outcome in query_outcomes {
+                if crate::host::occurrences::observe(self, &outcome) {
+                    continue;
+                }
                 let _ = self.contexts.observe(
                     TabId::from_raw(outcome.token.context_tab),
                     outcome.token.incarnation,
@@ -1566,12 +1756,18 @@ impl App {
         // never committed (§9: no auto commit after cancellation).
         self.linking
             .invalidate_if_source_changed(self.valid_writing_target());
+        // Graph frames, pins, geometry pairing, and camera commits (§W07).
+        crate::host::graph::pump(self);
+        crate::host::occurrences::pump(self);
     }
 
     /// Route one completion to its document flight, independent of which
     /// tab still exists (TD-09). Outcomes without a live flight stay typed
     /// in the ledger and are presented with their real result.
     fn route_completion(&mut self, completion: flavite_api::OperationCompletion) {
+        if crate::host::occurrences::completion(self, &completion) {
+            return;
+        }
         if self.linking.handles(completion.request_id) {
             self.route_link_completion(completion);
             return;
@@ -1668,6 +1864,22 @@ impl App {
         serialized: String,
         display: String,
     ) {
+        let expected = self.workspace.writing_target();
+        let same_source = self.linking.pending_source().is_some_and(|source| {
+            self.valid_writing_target()
+                == Some((
+                    source.tab,
+                    source.incarnation,
+                    source.buffer_id,
+                    source.revision,
+                    source.caret,
+                ))
+        });
+        if !same_source || self.has_composition() {
+            self.linking.cancel();
+            self.status = "The insertion point changed; place the cursor and try again".into();
+            return;
+        }
         let Some(flavite) = &self.flavite else {
             self.linking.cancel();
             return;
@@ -1696,7 +1908,19 @@ impl App {
             flavite_api::Preconditions::new().requires_write(),
         );
         match flavite.execute(invocation) {
-            ExecutionResult::Local(LocalResult::Success(_)) => {
+            ExecutionResult::Local(LocalResult::Success(success)) => {
+                if let Some(target) = expected
+                    && let Some(revision) = success.data["revision"].as_u64()
+                    && let Some(caret) = target.caret_text_byte.checked_add(serialized.len())
+                    && let Some(view) = self.note_editor_view(target.tab)
+                    && view.revision == revision
+                    && self
+                        .workspace
+                        .acknowledge_target_edit(target, revision, caret, &view.text)
+                        .is_err()
+                {
+                    self.workspace.invalidate_writing_target(target.buffer_id);
+                }
                 self.linking
                     .finish(crate::host::linking::GestureState::Inserted {
                         serialized_link: serialized.clone(),
@@ -1760,6 +1984,22 @@ impl App {
     /// (W05). The caret is never manufactured: an unmet precondition is an
     /// honest refusal.
     pub fn request_link_insert(&mut self, locator: NoteLocator) {
+        let expected = self.flavite.as_ref().and_then(|api| {
+            api.link_target_identity(&locator.components().join("/"))
+                .ok()
+        });
+        self.request_link_insert_expected(locator, expected);
+    }
+
+    pub(crate) fn request_link_insert_expected(
+        &mut self,
+        locator: NoteLocator,
+        expected: Option<flavite_api::LinkTargetIdentity>,
+    ) {
+        let Some(expected) = expected else {
+            self.status = "Target identities are updating or missing; choose the note again".into();
+            return;
+        };
         let Some(flavite) = &self.flavite else {
             self.status = "Open a vault before inserting links".into();
             return;
@@ -1814,6 +2054,7 @@ impl App {
                 "intent": { "client": client, "sequence": sequence },
                 "source": { "buffer_id": buffer_id, "revision": revision, "caret": caret },
                 "target_path": target_path.clone(),
+                "expected_target": expected,
                 "stable_link_policy": "disabled",
             }),
             Origin::Gui,
@@ -2030,6 +2271,11 @@ mod tests {
             notes: DocumentRegistry::default(),
             contexts: ContextRegistry::default(),
             linking: crate::host::linking::LinkIntents::default(),
+            graph: {
+                let mut host = crate::host::graph::GraphHost::default();
+                host.backend = crate::host::graph::GraphBackend::from_env();
+                host
+            },
             persistence: crate::host::persistence::PersistenceHost::default(),
             named_layouts: Vec::new(),
             picker: Picker::default(),

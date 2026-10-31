@@ -46,7 +46,7 @@ jobs:
           name: long-fuzz-crashes
           path: |
             fuzz/artifacts/
-            fuzz-failures.txt
+            fuzz/fuzz-failures.txt
           if-no-files-found: ignore
 
   workspace-fuzz:

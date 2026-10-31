@@ -14,6 +14,7 @@ flavite-buffer = { path = "../flavite-buffer" }
 
 # Threading and synchronization (D3: named threads + bounded channels)
 crossbeam = { workspace = true }
+arc-swap = { workspace = true }
 directories = { workspace = true }
 
 # Serialization
