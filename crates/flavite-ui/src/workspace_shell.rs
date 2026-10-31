@@ -598,7 +598,7 @@ fn picker_card(app: &App) -> Element<'_, Message> {
             container(body).max_height(360).width(Length::Fill),
             row![
                 Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
-                text("Enter opens · Esc dismisses")
+                text("Enter opens · Ctrl+Enter inserts a link at the caret · Esc dismisses")
                     .size(style::TEXT_SM)
                     .style(style::dim_text),
             ],

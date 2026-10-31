@@ -169,6 +169,18 @@ pub const UI_COMMANDS: &[UiCommand] = &[
         title: "Follow the document anchor again",
     },
     UiCommand {
+        id: "link.insert_target",
+        title: "Insert a link to the followed note at the caret",
+    },
+    UiCommand {
+        id: "workspace.save_layout",
+        title: "Save workspace layout now",
+    },
+    UiCommand {
+        id: "workspace.reset_layout",
+        title: "Reset workspace layout to the default",
+    },
+    UiCommand {
         id: "workspace.close_group",
         title: "Close group",
     },
@@ -247,6 +259,15 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
             && let keyboard::Key::Named(named) = &key
         {
             return overlay_navigation(app, *named);
+        }
+        if app.picker.open
+            && modifiers.command()
+            && matches!(
+                key.as_ref(),
+                keyboard::Key::Named(keyboard::key::Named::Enter)
+            )
+        {
+            return Some(Message::PickerInsert(app.picker.selected));
         }
         if modifiers.command()
             && let keyboard::Key::Character(character) = key.as_ref()
@@ -528,6 +549,17 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
                 binding: flavite_workspace::ContextBinding::FollowDocument,
             });
         }
+        "link.insert_target" => {
+            let tab = app.workspace.focused_tab();
+            if let Some(source) = app.contexts.observed(&tab) {
+                return iced::Task::done(Message::InsertLink {
+                    locator: source.locator.clone(),
+                });
+            }
+            app.status = "This context tool has no source to insert yet".into();
+        }
+        "workspace.save_layout" => app.save_layout_now(),
+        "workspace.reset_layout" => app.reset_layout(),
         other => app.status = format!("{other} is not a host command"),
     }
     iced::Task::none()
@@ -552,6 +584,12 @@ pub fn available(app: &App, id: &str) -> bool {
         }
         "context.follow_document" => {
             crate::views::context_header::is_context_tab(app, app.workspace.focused_tab())
+        }
+        "link.insert_target" => {
+            let tab = app.workspace.focused_tab();
+            crate::views::context_header::is_context_tab(app, tab)
+                && app.contexts.observed(&tab).is_some()
+                && app.valid_writing_target().is_some()
         }
         "workspace.duplicate_tab" => app
             .workspace

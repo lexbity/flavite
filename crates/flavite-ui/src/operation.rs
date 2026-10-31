@@ -142,6 +142,13 @@ pub fn describe_completion(completion: &OperationCompletion) -> String {
     }
 }
 
+/// Present one typed local (core) error honestly: stable code + message.
+#[must_use]
+pub fn describe_local_error(error: impl std::borrow::Borrow<flavite_api::LocalError>) -> String {
+    let error = error.borrow();
+    format!("Link not inserted ({}): {}", error.code, error.message)
+}
+
 /// Human presentation for typed rejection reasons.
 #[must_use]
 pub fn describe_rejection(reason: &flavite_api::RejectionReason) -> &'static str {

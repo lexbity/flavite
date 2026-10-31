@@ -96,6 +96,14 @@ impl std::fmt::Debug for ArgSchema {
 }
 
 impl ArgSchema {
+    /// Schema built from an explicit validation function, for payloads that
+    /// need pre-decoding structural rejection (e.g. the raw link.insert
+    /// shape must fail with its own pointer, not a serde field error).
+    #[must_use]
+    pub const fn custom(validate: fn(&serde_json::Value) -> Result<(), String>) -> Self {
+        Self { validate }
+    }
+
     /// Schema that validates arguments by deserializing them into a typed DTO.
     #[must_use]
     pub fn typed<T: DeserializeOwned>() -> Self {

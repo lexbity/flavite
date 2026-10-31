@@ -193,15 +193,15 @@ impl<'a, Message> EditorWidget<'a, Message> {
                     let matches = match_candidates(&self.candidates, &state.autocomplete_query, 8);
                     if let Some(candidate) = matches.get(state.autocomplete_selected) {
                         let start = state.autocomplete_start.unwrap_or(state.caret);
-                        let inserted = format_link(candidate, self.stable_links);
+                        let inserted = flavite_syntax::link_format::format_candidate_link(
+                            &candidate.target,
+                            &candidate.title,
+                            candidate.stable_id.as_deref(),
+                            self.stable_links,
+                        );
                         self.emit(
                             shell,
-                            EditorAction::insert_link(
-                                &self.view,
-                                start,
-                                state.caret,
-                                inserted.clone(),
-                            ),
+                            EditorAction::replace(&self.view, start, state.caret, inserted.clone()),
                         );
                         state.caret = start + inserted.len();
                         state.anchor = state.caret;
@@ -1317,17 +1317,6 @@ fn key_action(key: &Key, modifiers: Modifiers, text: Option<&str>) -> KeyAction 
     }
 }
 
-fn format_link(candidate: &NoteCandidate, stable_links: bool) -> String {
-    if stable_links && let Some(id) = &candidate.stable_id {
-        return format!("[[id:{id}|{}]]", candidate.title);
-    }
-    if candidate.target == candidate.title {
-        format!("[[{}]]", candidate.target)
-    } else {
-        format!("[[{}|{}]]", candidate.target, candidate.title)
-    }
-}
-
 fn link_action_at(view: &EditorView, spans: &[LinkSpan], byte: usize) -> Option<EditorAction> {
     let link = spans
         .iter()
@@ -1739,11 +1728,16 @@ mod tests {
     fn link_insert_supports_readable_aliases_and_opt_in_stable_form() {
         let mut candidate = NoteCandidate::new("notes/concepts", "Concepts");
         candidate.stable_id = Some("01J9ZK".into());
-        assert_eq!(
-            format_link(&candidate, false),
-            "[[notes/concepts|Concepts]]"
-        );
-        assert_eq!(format_link(&candidate, true), "[[id:01J9ZK|Concepts]]");
+        let format = |candidate: &NoteCandidate, stable: bool| {
+            flavite_syntax::link_format::format_candidate_link(
+                &candidate.target,
+                &candidate.title,
+                candidate.stable_id.as_deref(),
+                stable,
+            )
+        };
+        assert_eq!(format(&candidate, false), "[[notes/concepts|Concepts]]");
+        assert_eq!(format(&candidate, true), "[[id:01J9ZK|Concepts]]");
     }
 
     #[test]

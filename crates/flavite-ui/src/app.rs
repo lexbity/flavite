@@ -21,9 +21,11 @@ use flavite_workspace::{
 };
 use iced::{Subscription, Task, keyboard};
 use std::collections::{BTreeMap, VecDeque};
+use std::time::Instant;
 
-/// Outstanding notice credits per poll (W03: bounded credit-based polling).
-const NOTICE_CREDIT_CAPACITY: usize = 256;
+/// Outstanding notice credits per poll (W03: bounded credit-based polling)
+/// — the same bound as the core ledger, imported rather than duplicated.
+const NOTICE_CREDIT_CAPACITY: usize = flavite_api::MAX_NOTICE_ACKS;
 /// Completions routed per pump tick; the rest wait in the backlog (NFR-08).
 const MAX_COMPLETION_ROUTING_PER_PUMP: usize = 64;
 use std::path::PathBuf;
@@ -58,6 +60,12 @@ pub struct App {
     pub notes: DocumentRegistry,
     /// Context tool state: bindings, effective sources, and query states.
     pub contexts: ContextRegistry,
+    /// Semantic link insertion gestures (W05).
+    pub linking: crate::host::linking::LinkIntents,
+    /// Device-local workspace persistence (W06).
+    pub persistence: crate::host::persistence::PersistenceHost,
+    /// Named layouts carried for the next layout save (W06).
+    pub named_layouts: Vec<flavite_workspace::NamedLayout>,
     pub picker: Picker,
     pub palette_open: bool,
     pub palette_query: String,
@@ -139,6 +147,16 @@ pub enum Message {
     OpenNoteFromContext {
         locator: NoteLocator,
     },
+    /// Insert a link to this note at the acknowledged writing target (W05).
+    InsertLink {
+        locator: NoteLocator,
+    },
+    /// Insert a link to the picked note instead of opening it (Ctrl+Enter).
+    PickerInsert(usize),
+    /// Commit the confirmed semantic link plan.
+    ConfirmLinkInsert,
+    /// Cancel the pending/confirmed semantic link gesture.
+    CancelLinkInsert,
     /// Open (or focus) a note, optionally in a specific group.
     OpenNote {
         locator: NoteLocator,
@@ -221,6 +239,9 @@ impl App {
             adapter,
             notes: DocumentRegistry::default(),
             contexts: ContextRegistry::default(),
+            linking: crate::host::linking::LinkIntents::default(),
+            persistence: crate::host::persistence::PersistenceHost::default(),
+            named_layouts: Vec::new(),
             picker: Picker::default(),
             palette_open: false,
             palette_query: String::new(),
@@ -279,7 +300,205 @@ impl App {
             self.status = "Vault ready".into();
         }
         self.load_catalog();
+        self.restore_workspace_layout();
         self.refresh_semantics();
+    }
+
+    /// Restore the device-local workspace layout (W06): decode, plan, and
+    /// apply through one atomic reducer transaction; note tabs reopen
+    /// through their normal open flights. Every failure is an honest
+    /// report — never a default overwrite.
+    fn restore_workspace_layout(&mut self) {
+        use flavite_api::UserStateKind;
+        let Some(flavite) = &self.flavite else {
+            return;
+        };
+        let uuid = flavite.vault_ref().uuid.to_string();
+        let stored = match flavite.read_user_state(UserStateKind::WorkspaceLayouts) {
+            Ok(Some(stored)) => stored,
+            Ok(None) => {
+                self.status = "Vault ready (no saved workspace layout)".into();
+                return;
+            }
+            Err(error) => {
+                self.status = format!("Workspace layout not restored: {error}");
+                return;
+            }
+        };
+        self.persistence.observe_generation(stored.generation);
+        let decoded = match flavite_workspace::decode_workspace(&stored.payload, &uuid) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.status = format!("Workspace layout not restored: {error}");
+                return;
+            }
+        };
+        let catalog: std::collections::BTreeSet<String> = self
+            .catalog
+            .iter()
+            .filter_map(|entry| entry.path.to_str().map(str::to_owned))
+            .collect();
+        let plan = match flavite_workspace::plan_restore(&decoded, &catalog) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.status = format!("Workspace layout not restored: {error:?}");
+                return;
+            }
+        };
+        let revision = self.workspace.revision();
+        let action = LayoutAction::RestoreWorkspace {
+            expected_revision: revision,
+            tree: plan.tree.clone(),
+            tabs: plan
+                .tabs
+                .iter()
+                .map(|tab| (tab.id, tab.kind.clone()))
+                .collect(),
+            groups: decoded
+                .groups
+                .iter()
+                .filter_map(|group| {
+                    let id = group.id.parse::<u128>().ok()?;
+                    let members: Vec<TabId> = group
+                        .tabs
+                        .iter()
+                        .filter_map(|tab| tab.parse::<u128>().ok().map(TabId::from_raw))
+                        .collect();
+                    let active = group.active.parse::<u128>().ok().map(TabId::from_raw)?;
+                    Some((flavite_workspace::GroupId::from_raw(id), members, active))
+                })
+                .collect(),
+            focus: plan.focus,
+            maximized: plan.maximized,
+            closed_history: plan.closed_history.clone(),
+        };
+        // The restore is the persisted truth, not a user-initiated split:
+        // it bypasses the interactive fits gate and goes through the same
+        // atomic reduce/validate/commit path.
+        let outcome = flavite_workspace::reduce(&self.workspace, action);
+        if let flavite_workspace::Outcome::Rejected(error) = &outcome {
+            self.status = format!("Workspace layout not restored: {error}");
+            return;
+        }
+        self.commit(outcome);
+        let missing = plan
+            .missing_notes
+            .iter()
+            .map(|locator| locator.components().join("/"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let dropped = plan.report.len();
+        let mut report = String::from("Workspace layout restored");
+        if !missing.is_empty() {
+            report.push_str(&format!("; missing notes: {missing}"));
+        }
+        if dropped > 0 {
+            report.push_str(&format!("; {dropped} entries dropped"));
+        }
+        self.status = report;
+    }
+
+    /// Save the workspace layout immediately (W06: explicit flush with a
+    /// durability acknowledgement in the status line).
+    pub fn save_layout_now(&mut self) {
+        self.persistence
+            .mark_dirty(Instant::now() - crate::host::persistence::LAYOUT_SAVE_DEBOUNCE);
+        self.persist_workspace_layout();
+        match self.persistence.last_error() {
+            None => {
+                self.status = format!(
+                    "Workspace layout saved (generation {})",
+                    self.persistence.generation()
+                )
+            }
+            Some(failure) => {
+                self.status = format!("Workspace layout not saved: {failure:?}");
+            }
+        }
+    }
+
+    /// Reset the device-local layout: the next save stores the current
+    /// default shell; notes are untouched (FR-17).
+    pub fn reset_layout(&mut self) {
+        self.named_layouts.clear();
+        self.persistence
+            .mark_dirty(Instant::now() - crate::host::persistence::LAYOUT_SAVE_DEBOUNCE);
+        self.persist_workspace_layout();
+        self.status = "Workspace layout reset; notes are untouched".into();
+    }
+
+    /// Persist the device-local workspace layout when the autosave is due
+    /// (W06: debounce, receipts, retry; independent of note saves).
+    fn persist_workspace_layout(&mut self) {
+        use flavite_api::UserStateKind;
+        if self.flavite.is_none() {
+            return;
+        }
+        match self.persistence.due(Instant::now()) {
+            crate::host::persistence::SaveRequest::None => {}
+            crate::host::persistence::SaveRequest::Write {
+                expected_generation,
+            } => {
+                let Some(flavite) = &self.flavite else {
+                    return;
+                };
+                let uuid = flavite.vault_ref().uuid.to_string();
+                let persisted = flavite_workspace::persist_workspace(&self.workspace, &uuid);
+                let named = self.named_layouts.clone();
+                let persisted = flavite_workspace::PersistedWorkspace {
+                    named_layouts: named,
+                    ..persisted
+                };
+                let bytes = match flavite_workspace::encode_workspace(&persisted) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.persistence.record_failure(
+                            crate::host::persistence::PersistenceFailure::Failed {
+                                message: error.to_string(),
+                            },
+                        );
+                        return;
+                    }
+                };
+                // The store is behind &mut; go through the facade with a
+                // fresh mutable borrow.
+                let write = self
+                    .flavite
+                    .as_mut()
+                    .expect("checked above")
+                    .write_user_state(UserStateKind::WorkspaceLayouts, expected_generation, &bytes);
+                match write {
+                    Ok(generation) => self.persistence.record_success(generation),
+                    Err(flavite_api::FlaviteError::UserState(
+                        flavite_api::user_state::UserStateError::GenerationMismatch {
+                            expected,
+                            actual,
+                        },
+                    )) => {
+                        self.persistence.record_failure(
+                            crate::host::persistence::PersistenceFailure::GenerationMismatch {
+                                expected,
+                                actual,
+                            },
+                        );
+                    }
+                    Err(flavite_api::FlaviteError::UserState(error)) => {
+                        self.persistence.record_failure(
+                            crate::host::persistence::PersistenceFailure::Failed {
+                                message: error.to_string(),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        self.persistence.record_failure(
+                            crate::host::persistence::PersistenceFailure::Failed {
+                                message: error.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Load a bounded note catalog snapshot; failures stay visible.
@@ -382,23 +601,17 @@ impl App {
     /// Visible, identity-safe description of the insertion authority.
     #[must_use]
     pub fn writing_target_label(&self) -> String {
-        let Some(target) = self.workspace.writing_target() else {
+        if self.workspace.writing_target().is_none() {
             return "Writing target: none — focus an editor caret".into();
-        };
-        let Some(view) = self.workspace.tab(&target.tab) else {
-            return "Writing target: invalid — editor closed".into();
-        };
-        let current = self.note_editor_view(target.tab);
-        if view.interaction().incarnation != target.incarnation
-            || current.is_none_or(|snapshot| {
-                snapshot.buffer_id != target.buffer_id || snapshot.revision != target.revision
-            })
-        {
-            return "Writing target: invalid — place the caret again".into();
         }
+        // One validation authority: the same predicate the pump revalidates
+        // and the insertion gesture consumes (no divergent validity views).
+        let Some((tab, ..)) = self.valid_writing_target() else {
+            return "Writing target: invalid — place the caret again".into();
+        };
         let title = self
             .notes
-            .locator_of(target.tab)
+            .locator_of(tab)
             .map(|locator| locator.title().to_owned())
             .unwrap_or_else(|| "note".into());
         format!("Writing target: {title}")
@@ -494,6 +707,9 @@ impl App {
                 let effects = commit.effects;
                 self.apply_effects(&effects);
                 self.refresh_semantics();
+                // Every committed layout change marks the device-local
+                // layout dirty (W06 autosave).
+                self.persistence.mark_dirty(Instant::now());
             }
             Outcome::Rejected(error) => {
                 self.status = format!("Workspace: {error}");
@@ -751,6 +967,9 @@ impl App {
                 // acknowledged caret event may explicitly establish a new
                 // target; the old byte position is never silently rebased.
                 self.workspace.invalidate_writing_target(expected_buffer);
+                // Any different-origin mutation cancels an outstanding
+                // insertion gesture: no auto commit after cancellation.
+                self.linking.invalidate_if_source_changed(None);
                 let Some(flavite) = &self.flavite else {
                     self.status = "Open a vault before editing".into();
                     return;
@@ -1183,6 +1402,39 @@ impl App {
                 self.reconcile_contexts();
             }
             Message::OpenNoteFromContext { locator } => self.request_open(locator, None),
+            Message::InsertLink { locator } => self.request_link_insert(locator),
+            Message::PickerInsert(index) => {
+                let matches = self.picker_matches();
+                self.picker = Picker::default();
+                let Some(entry) = matches.get(index) else {
+                    self.status = "The picked note is no longer available".into();
+                    return Task::none();
+                };
+                match flavite_workspace::NoteLocator::from_relative(&entry.path) {
+                    Ok(locator) => self.request_link_insert(locator),
+                    Err(error) => {
+                        self.status = format!("The picked note path cannot be linked: {error}")
+                    }
+                }
+            }
+            Message::ConfirmLinkInsert => match self.linking.confirmed() {
+                Some((sequence, plan_id)) => {
+                    let (serialized, display) = match self.linking.state() {
+                        crate::host::linking::GestureState::Ready {
+                            serialized_link,
+                            target,
+                            ..
+                        } => (serialized_link.clone(), target.clone()),
+                        _ => (String::new(), String::new()),
+                    };
+                    self.commit_link_insert(sequence, plan_id, serialized, display);
+                }
+                None => self.status = "No confirmed link plan is outstanding".into(),
+            },
+            Message::CancelLinkInsert => {
+                self.linking.cancel();
+                self.status = "Link insertion cancelled; the note is unchanged".into();
+            }
         }
         self.project_geometry();
         self.refresh_semantics();
@@ -1303,25 +1555,27 @@ impl App {
         }
         self.completion_backlog = queue;
         self.reconcile_contexts();
+        self.persist_workspace_layout();
         if let Some(target) = self.workspace.writing_target() {
-            let remains_current = self.notes.incarnation(target.tab) == Some(target.incarnation)
-                && self.note_editor_view(target.tab).is_some_and(|view| {
-                    view.buffer_id == target.buffer_id && view.revision == target.revision
-                })
-                && self
-                    .workspace
-                    .tab(&target.tab)
-                    .is_some_and(|view| view.interaction().sequence == target.interaction_sequence);
+            let remains_current = self.valid_writing_target().is_some();
             if !remains_current {
                 self.workspace.invalidate_writing_target(target.buffer_id);
             }
         }
+        // A prepared gesture whose source caret/revision moved is cancelled,
+        // never committed (§9: no auto commit after cancellation).
+        self.linking
+            .invalidate_if_source_changed(self.valid_writing_target());
     }
 
     /// Route one completion to its document flight, independent of which
     /// tab still exists (TD-09). Outcomes without a live flight stay typed
     /// in the ledger and are presented with their real result.
     fn route_completion(&mut self, completion: flavite_api::OperationCompletion) {
+        if self.linking.handles(completion.request_id) {
+            self.route_link_completion(completion);
+            return;
+        }
         let flight = self.notes.finish_request(completion.request_id);
         let locator = flight.as_ref().map(|flight| flight.locator.clone());
         let tabs = flight.map(|flight| flight.tabs).unwrap_or_default();
@@ -1353,6 +1607,253 @@ impl App {
         }
         if locator.is_none() {
             self.status = crate::operation::describe_completion(&completion);
+        }
+    }
+
+    /// Route a served `link.prepare` completion: commit immediately by
+    /// default, or hold the plan for explicit confirmation (D-05).
+    fn route_link_completion(&mut self, completion: flavite_api::OperationCompletion) {
+        match &completion.result {
+            ExecutionResult::Local(LocalResult::Success(success)) => {
+                let Some(prepared) = crate::host::linking::prepared_from_data(&success.data) else {
+                    self.linking
+                        .finish(crate::host::linking::GestureState::Failed {
+                            code: "link.prepare_malformed".into(),
+                            repair: "prepare the link again".into(),
+                        });
+                    return;
+                };
+                let serialized = prepared.serialized_link.clone();
+                let display = prepared.target_display.clone();
+                match self.linking.observe_prepared(
+                    completion.request_id,
+                    prepared.plan_id,
+                    prepared.serialized_link,
+                    prepared.target_display,
+                    prepared.requires_confirmation,
+                ) {
+                    Some((sequence, plan_id)) => {
+                        self.commit_link_insert(sequence, plan_id, serialized, display)
+                    }
+                    None => {
+                        self.status =
+                            format!("Link plan to {display} is ready — confirm to insert it");
+                    }
+                }
+            }
+            ExecutionResult::Local(LocalResult::Error(error)) => {
+                self.linking
+                    .finish(crate::host::linking::GestureState::Failed {
+                        code: error.code.clone(),
+                        repair: error.message.clone(),
+                    });
+                self.status = crate::operation::describe_local_error(error);
+            }
+            other => {
+                self.linking
+                    .finish(crate::host::linking::GestureState::Failed {
+                        code: "link.prepare_failed".into(),
+                        repair: "prepare the link again".into(),
+                    });
+                self.status = format!("Link not inserted: {other:?}");
+            }
+        }
+    }
+
+    /// Commit one prepared plan (synchronous guarded edit at the core).
+    fn commit_link_insert(
+        &mut self,
+        sequence: u64,
+        plan_id: String,
+        serialized: String,
+        display: String,
+    ) {
+        let Some(flavite) = &self.flavite else {
+            self.linking.cancel();
+            return;
+        };
+        let Some(client) = self.linking.client else {
+            self.linking.cancel();
+            return;
+        };
+        let Ok(plan_id_value) = plan_id.parse::<u128>() else {
+            self.linking
+                .finish(crate::host::linking::GestureState::Failed {
+                    code: "link.plan_id".into(),
+                    repair: "prepare the link again".into(),
+                });
+            return;
+        };
+        let request_id = flavite.command_registry().next_request_id();
+        let invocation = Invocation::with_preconditions(
+            request_id,
+            "link.insert",
+            serde_json::json!({
+                "intent": { "client": client, "sequence": sequence },
+                "plan_id": plan_id_value,
+            }),
+            Origin::Gui,
+            flavite_api::Preconditions::new().requires_write(),
+        );
+        match flavite.execute(invocation) {
+            ExecutionResult::Local(LocalResult::Success(_)) => {
+                self.linking
+                    .finish(crate::host::linking::GestureState::Inserted {
+                        serialized_link: serialized.clone(),
+                        target: display,
+                    });
+                self.status = format!("Inserted {serialized}");
+            }
+            ExecutionResult::Local(LocalResult::Error(error)) => {
+                self.linking
+                    .finish(crate::host::linking::GestureState::Failed {
+                        code: error.code.clone(),
+                        repair: error.message.clone(),
+                    });
+                self.status = crate::operation::describe_local_error(error);
+            }
+            ExecutionResult::Rejected(rejected) => {
+                self.linking
+                    .finish(crate::host::linking::GestureState::Failed {
+                        code: format!("{:?}", rejected.reason),
+                        repair: "prepare the link again".into(),
+                    });
+                self.status = format!(
+                    "Link not inserted: {}",
+                    crate::operation::describe_rejection(&rejected.reason)
+                );
+            }
+            other => {
+                self.linking
+                    .finish(crate::host::linking::GestureState::Failed {
+                        code: "link.insert_unexpected".into(),
+                        repair: "prepare the link again".into(),
+                    });
+                self.status = format!("Link not inserted: {other:?}");
+            }
+        }
+    }
+
+    /// The acknowledged writing target identity, fully validated against the
+    /// live editor view (the same predicate the pump revalidates).
+    #[must_use]
+    pub fn valid_writing_target(&self) -> Option<(TabId, u64, u64, u64, usize)> {
+        let target = self.workspace.writing_target()?;
+        let remains = self.notes.incarnation(target.tab) == Some(target.incarnation)
+            && self.note_editor_view(target.tab).is_some_and(|view| {
+                view.buffer_id == target.buffer_id && view.revision == target.revision
+            })
+            && self
+                .workspace
+                .tab(&target.tab)
+                .is_some_and(|view| view.interaction().sequence == target.interaction_sequence);
+        remains.then_some((
+            target.tab,
+            target.incarnation,
+            target.buffer_id,
+            target.revision,
+            target.caret_text_byte,
+        ))
+    }
+
+    /// Begin one semantic insertion gesture from a picker or context action
+    /// (W05). The caret is never manufactured: an unmet precondition is an
+    /// honest refusal.
+    pub fn request_link_insert(&mut self, locator: NoteLocator) {
+        let Some(flavite) = &self.flavite else {
+            self.status = "Open a vault before inserting links".into();
+            return;
+        };
+        let Some((tab, incarnation, buffer_id, revision, caret)) = self.valid_writing_target()
+        else {
+            self.status = "Writing target: none — focus an editor caret to insert a link".into();
+            return;
+        };
+        if self
+            .notes
+            .locator_of(tab)
+            .is_some_and(|source| source == locator)
+        {
+            self.status =
+                "Links to the note you are editing are refused; choose another note".into();
+            return;
+        }
+        let target_path = locator.components().join("/");
+        let target_display = locator.title().to_owned();
+        let source = crate::host::linking::GestureSource {
+            tab,
+            incarnation,
+            buffer_id,
+            revision,
+            caret,
+        };
+        if let Err(reason) = self
+            .linking
+            .begin(source, target_path.clone(), target_display.clone())
+        {
+            self.status = reason;
+            return;
+        }
+        let client = match self.linking.client {
+            Some(client) => client,
+            None => {
+                let client = flavite.new_link_client();
+                self.linking.client = Some(client);
+                client
+            }
+        };
+        let request_id = flavite.command_registry().next_request_id();
+        self.linking.stamp_request(request_id);
+        let Some(sequence) = self.linking.pending_sequence() else {
+            return;
+        };
+        let invocation = Invocation::with_preconditions(
+            request_id,
+            "link.prepare",
+            serde_json::json!({
+                "intent": { "client": client, "sequence": sequence },
+                "source": { "buffer_id": buffer_id, "revision": revision, "caret": caret },
+                "target_path": target_path.clone(),
+                "stable_link_policy": "disabled",
+            }),
+            Origin::Gui,
+            flavite_api::Preconditions::new()
+                .with_buffer_id(buffer_id)
+                .with_revision(revision)
+                .requires_write(),
+        );
+        match flavite.execute(invocation) {
+            ExecutionResult::Pending { request_id } => {
+                self.operations.accept(request_id, "link.prepare");
+                self.status = format!("Preparing link to {target_display}…");
+            }
+            ExecutionResult::Local(LocalResult::Error(error)) => {
+                self.linking
+                    .finish(crate::host::linking::GestureState::Failed {
+                        code: error.code.clone(),
+                        repair: error.message.clone(),
+                    });
+                self.status = crate::operation::describe_local_error(error);
+            }
+            ExecutionResult::Rejected(rejected) => {
+                self.linking
+                    .finish(crate::host::linking::GestureState::Failed {
+                        code: format!("{:?}", rejected.reason),
+                        repair: "prepare the link again".into(),
+                    });
+                self.status = format!(
+                    "Link not inserted: {}",
+                    crate::operation::describe_rejection(&rejected.reason)
+                );
+            }
+            other => {
+                self.linking
+                    .finish(crate::host::linking::GestureState::Failed {
+                        code: "link.prepare_unexpected".into(),
+                        repair: "prepare the link again".into(),
+                    });
+                self.status = format!("Link not inserted: {other:?}");
+            }
         }
     }
 
@@ -1528,6 +2029,9 @@ mod tests {
             adapter: Adapter::build(&workspace),
             notes: DocumentRegistry::default(),
             contexts: ContextRegistry::default(),
+            linking: crate::host::linking::LinkIntents::default(),
+            persistence: crate::host::persistence::PersistenceHost::default(),
+            named_layouts: Vec::new(),
             picker: Picker::default(),
             palette_open: false,
             palette_query: String::new(),

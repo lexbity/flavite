@@ -14,6 +14,7 @@ pub mod history;
 pub mod identity;
 pub mod instance;
 pub mod journal;
+pub mod link;
 pub mod merge;
 pub mod open;
 mod reconcile_worker;
@@ -22,6 +23,7 @@ pub mod save;
 pub mod session;
 pub mod tokens;
 pub mod types;
+pub mod user_state;
 
 // Re-export key types for convenience.
 pub use actor::{

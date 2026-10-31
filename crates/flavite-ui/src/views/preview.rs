@@ -10,7 +10,7 @@ use crate::style;
 use crate::views::{context_header, empty_state};
 use crate::workspace::tab_strip;
 use flavite_workspace::TabId;
-use iced::widget::{button, column, container, rule, scrollable, text};
+use iced::widget::{button, column, container, row, rule, scrollable, text};
 use iced::{Element, Length};
 
 /// Render one Preview tab for the active view slot.
@@ -32,9 +32,30 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                         locator: source.locator.clone(),
                     }
                 }));
+            // Insert is offered only when the acknowledged writing target
+            // exists; the button never manufactures a fallback caret (D-05).
+            let insert = button(
+                text(format!(
+                    "Insert [[{}]]",
+                    app.contexts
+                        .observed(&tab)
+                        .map(|source| source.locator.title().to_owned())
+                        .unwrap_or_default()
+                ))
+                .size(style::TEXT_SM),
+            )
+            .padding(tab_strip::chip_padding())
+            .style(style::action())
+            .on_press_maybe(
+                app.valid_writing_target()
+                    .and_then(|_| app.contexts.observed(&tab))
+                    .map(|source| Message::InsertLink {
+                        locator: source.locator.clone(),
+                    }),
+            );
             container(
                 column![
-                    container(open).width(Length::Fill),
+                    container(row![open, insert].spacing(style::SPACING_SM)).width(Length::Fill),
                     scrollable(
                         text(saved.as_str())
                             .width(Length::Fill)

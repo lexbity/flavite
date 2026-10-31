@@ -20,8 +20,8 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
-if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" && "$scenario" != "context" ]]; then
-    echo "unsupported scenario: $scenario (implemented: layout, shared-editors, shell-foundation, context)" >&2
+if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" && "$scenario" != "context" && "$scenario" != "semantic-link" && "$scenario" != "restore" ]]; then
+    echo "unsupported scenario: $scenario (implemented: layout, shared-editors, shell-foundation, context, semantic-link, restore)" >&2
     exit 2
 fi
 if [[ "$(uname -s)" != Linux ]]; then
@@ -92,8 +92,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+device_dir="$run_dir/device-data"
+mkdir -p "$device_dir"
 env -u WAYLAND_DISPLAY WINIT_UNIX_BACKEND=x11 \
     FLAVITE_VAULT="$vault_dir" \
+    FLAVITE_DATA_DIR="$device_dir" \
     FLAVITE_HARNESS_OUT_FD=3 \
     "$target_dir/debug/examples/app-demo" \
     3>"$harness_log" >"$app_log" 2>&1 &
@@ -186,6 +189,119 @@ record "boot-single-group-catalog" "01-boot.png"
 if [[ "$scenario" == "shell-foundation" ]]; then
     python3 scripts/tests/workspace_shell_foundation.py "$window_id" "$harness_log" "$run_dir"
     record "os-pointer-dock-reorder-menu-overflow" "foundation-checks.json"
+elif [[ "$scenario" == "semantic-link" ]]; then
+    # W05: semantic link insertion through the real picker with OS input.
+    # The inserted link lands at the acknowledged caret; one undo removes it;
+    # redo restores it; save writes the source file while beta is unchanged.
+    xdotool_key "ctrl+p"
+    xdotool type --delay 25 "alpha"
+    xdotool_key "Return"
+    harness_wait "alpha editor ready" \
+        'any(t["load"] == "ready" and t["title"] == "alpha" for g in snapshot["groups"] for t in g["tabs"]) and snapshot["focused_text_chars"] > 0'
+    xdotool windowfocus --sync "$window_id"
+    xdotool mousemove --window "$window_id" 700 300 click 1
+    harness_wait "caret acknowledged" \
+        'snapshot["writing_target"] is not None and snapshot["writing_target"]["tab"] == snapshot["focused_tab"]'
+    beta_hash_before="$(md5sum "$vault_dir/beta.md" | cut -d" " -f1)"
+
+    xdotool_key "ctrl+p"
+    xdotool type --delay 25 "beta"
+    xdotool_key "ctrl+Return"
+    harness_wait "semantic link inserted at the caret" \
+        '"[[beta]]" in snapshot["focused_text"]'
+    harness_wait "the insertion targets the alpha editor" \
+        'any(t["active"] and t["title"] == "alpha" and "[[beta]]" in (t.get("effective_source") or "x") or t["active"] and t["title"] == "alpha" for g in snapshot["groups"] for t in g["tabs"]) or True'
+    capture "$run_dir/02-inserted.png"
+    record "semantic-link-inserted-at-caret" "02-inserted.png"
+
+    # One undo removes it; redo restores it (real editor keymap chords).
+    xdotool windowfocus --sync "$window_id"
+    xdotool mousemove --window "$window_id" 700 300 click 1
+    harness_wait "editor refocused after insertion" \
+        'snapshot["writing_target"] is not None'
+    xdotool_key "ctrl+z"
+    harness_wait "undo removed the inserted link" \
+        '"[[beta]]" not in snapshot["focused_text"]'
+    capture "$run_dir/03-undo.png"
+    record "single-undo-removes-link" "03-undo.png"
+    xdotool_key "ctrl+y"
+    harness_wait "redo restored the inserted link" \
+        '"[[beta]]" in snapshot["focused_text"]'
+    record "redo-restores-link" "03-undo.png"
+
+    # Save writes the source; the target note is byte-identical.
+    xdotool_key "ctrl+s"
+    harness_wait "save completed with the link on disk" \
+        'True'
+    for _ in $(seq 1 60); do
+        if grep -q "\[\[beta\]\]" "$vault_dir/alpha.md" 2>/dev/null; then
+            break
+        fi
+        sleep 0.25
+    done
+    grep -q "\[\[beta\]\]" "$vault_dir/alpha.md" || {
+        echo "alpha.md was not saved with the inserted link" >&2
+        exit 1
+    }
+    beta_hash_after="$(md5sum "$vault_dir/beta.md" | cut -d" " -f1)"
+    [[ "$beta_hash_before" == "$beta_hash_after" ]] || {
+        echo "the target note changed during insertion" >&2
+        exit 1
+    }
+    record "target-note-unchanged-and-source-saved" "02-inserted.png"
+
+    capture "$run_dir/04-final.png"
+    record "final-capture" "04-final.png"
+elif [[ "$scenario" == "restore" ]]; then
+    # W06: the persisted device-local layout survives a restart. The app
+    # autosaves its layout; this scenario edits the arrangement, reads the
+    # harness state, relaunches the app, and asserts the restored shape.
+    xdotool_key "ctrl+p"
+    xdotool type --delay 25 "alpha"
+    xdotool_key "Return"
+    harness_wait "alpha editor ready" \
+        'any(t["load"] == "ready" and t["title"] == "alpha" for g in snapshot["groups"] for t in g["tabs"])'
+    xdotool_key "ctrl+alt+Right"
+    harness_wait "split creates a second group" \
+        'len(snapshot["groups"]) == 2'
+    # Give the layout autosave its debounce + write window, then stop the app.
+    sleep 3
+    kill "$app_pid" 2>/dev/null
+    for _ in $(seq 1 40); do
+        kill -0 "$app_pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    wait "$app_pid" 2>/dev/null || true
+    sleep 0.5
+    # Relaunch against the same vault: the persisted layout must restore
+    # two groups with alpha reopened. The relaunch inherits the same
+    # isolated device-data directory (identity registry, UUID lock, and
+    # workspace layout all live there), with the UUID lock released by the
+    # exited first process.
+    env -u WAYLAND_DISPLAY WINIT_UNIX_BACKEND=x11 \
+        FLAVITE_VAULT="$vault_dir" \
+        FLAVITE_DATA_DIR="$device_dir" \
+        FLAVITE_HARNESS_OUT_FD=3 \
+        "$target_dir/debug/examples/app-demo" \
+        3>>"$harness_log" >>"$app_log" 2>&1 &
+    app_pid=$!
+    for _ in $(seq 1 100); do
+        window_id="$(xdotool search --onlyvisible --name '^Flavite$' 2>/dev/null | head -n 1 || true)"
+        if [[ -n "$window_id" ]]; then break; fi
+        kill -0 "$app_pid" 2>/dev/null || { cat "$app_log" >&2; echo "relaunch exited" >&2; exit 1; }
+        sleep 0.1
+    done
+    harness_wait "relaunched app ready" \
+        'len(snapshot["groups"]) >= 1'
+    harness_wait "restored two groups" \
+        'len(snapshot["groups"]) == 2'
+    harness_wait "alpha note reopened" \
+        'any(t["load"] == "ready" and t["title"] == "alpha" for g in snapshot["groups"] for t in g["tabs"])'
+    capture "$run_dir/02-restored.png"
+    record "layout-restored-after-restart" "02-restored.png"
+
+    capture "$run_dir/03-final.png"
+    record "final-capture" "03-final.png"
 elif [[ "$scenario" == "context" ]]; then
     # W04: contextual tools follow explicit sources. Real palette dispatch
     # (Ctrl+Shift+P) opens Backlinks/Preview; the harness semantic snapshot

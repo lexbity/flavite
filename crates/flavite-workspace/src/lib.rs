@@ -10,15 +10,24 @@
 //! its expected revision matches, applied to a copy, normalized, and
 //! validated before it commits. Rejected transactions leave state untouched.
 
+pub mod codec;
 pub mod context;
 pub mod geometry;
 pub mod ids;
 pub mod input;
 pub mod layout;
+pub mod migrate;
 pub mod reducer;
+pub mod restore;
 pub mod validate;
 pub mod view;
 
+pub use codec::{
+    CURRENT_SCHEMA, CodecError, MAX_WORKSPACE_FILE_BYTES, MIN_SUPPORTED_SCHEMA, NamedLayout,
+    PersistedBinding, PersistedGroup, PersistedKind, PersistedNode, PersistedTab,
+    PersistedWorkspace, decode as decode_workspace, encode as encode_workspace,
+    persist as persist_workspace, validate as validate_workspace,
+};
 pub use context::{
     ContextBinding, ContextRouter, ContextSource, ContextViewKind, EntityLocator,
     ExplorationSelection, UnboundReason, is_source_kind,
@@ -33,5 +42,6 @@ pub use layout::{
     TabDropTarget, TabGroup,
 };
 pub use reducer::{Commit, Effect, LayoutAction, Outcome, WorkspaceError, WorkspaceState, reduce};
+pub use restore::{RestoreError, RestorePlan, RestoredTab, plan as plan_restore};
 pub use validate::validate;
 pub use view::{NoteLoad, NoteLocator, ViewKind, ViewSession};

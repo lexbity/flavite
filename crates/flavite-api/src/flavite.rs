@@ -133,6 +133,53 @@ fn handle_save(session: &Session, invocation: &Invocation) -> Result<SessionResu
     let path = decode(invocation)?;
     Ok(session.execute(SessionCommand::SaveNote { path }))
 }
+fn handle_link_prepare(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: crate::links::LinkPrepareArgs = decode(invocation)?;
+    let policy = match args.stable_link_policy.as_str() {
+        "disabled" => flavite_vault::link::StableLinkPolicy::Disabled,
+        "prefer_stable" => flavite_vault::link::StableLinkPolicy::PreferStable,
+        other => {
+            return Err(format!(
+                "stable_link_policy must be `disabled` or `prefer_stable`, got {other:?}"
+            ));
+        }
+    };
+    let request = flavite_vault::link::LinkPrepareRequest {
+        intent: flavite_vault::link::LinkIntent {
+            client: flavite_vault::link::ClientToken(args.intent.client),
+            sequence: args.intent.sequence,
+        },
+        buffer_id: args.source.buffer_id,
+        revision: args.source.revision,
+        caret: args.source.caret,
+        target_path: args.target_path,
+        stable_link_policy: policy,
+    };
+    Ok(session.execute(SessionCommand::LinkPrepare {
+        request,
+        request_id: invocation.request_id,
+    }))
+}
+
+fn handle_link_insert(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
+    // The raw edit shape is rejected explicitly: no ambiguous union with
+    // the old link.insert payload (RFC §9.1).
+    if invocation.args.get("ops").is_some() {
+        return Err(Flavite::raw_link_insert_rejection().to_owned());
+    }
+    let args: crate::links::LinkInsertArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::LinkInsert {
+        intent: flavite_vault::link::LinkIntent {
+            client: flavite_vault::link::ClientToken(args.intent.client),
+            sequence: args.intent.sequence,
+        },
+        plan_id: args.plan_id,
+    }))
+}
+
 fn handle_edits(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
     let args: ApplyEditsArgs = decode(invocation)?;
     use flavite_buffer::undo::EditOp;
@@ -211,7 +258,9 @@ fn handle_resolve(session: &Session, invocation: &Invocation) -> Result<SessionR
 }
 
 type HandlerRegistration = (&'static str, &'static str, ArgSchema, CommandHandler);
-const MAX_NOTICE_ACKS: usize = 256;
+/// Outstanding-notice ledger capacity (NFR-18). The host's per-poll
+/// credit budget is derived from this single constant.
+pub const MAX_NOTICE_ACKS: usize = 256;
 
 /// Stable token for one notice presentation acknowledgement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -270,6 +319,8 @@ pub struct Flavite {
     owned_vault: Option<Vault>,
     /// Bounded asynchronous context query service (W04).
     queries: crate::query_service::QueryService,
+    /// Device-local user state (W06); `None` without an OS data directory.
+    pub(crate) user_state: Option<flavite_vault::user_state::UserStateStore>,
 }
 
 impl Flavite {
@@ -288,6 +339,7 @@ impl Flavite {
         _config: VaultConfig,
     ) -> Result<Self, FlaviteError> {
         let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
+        let vault_uuid = vault_ref.uuid.to_string();
 
         let session = Arc::new(session);
         let queries = crate::query_service::QueryService::new(
@@ -307,6 +359,11 @@ impl Flavite {
             read_only: false,
             owned_vault: None,
             queries,
+            user_state: flavite_vault::user_state::UserStateStore::open(
+                Box::new(flavite_fs::OsFs::new()),
+                &vault_uuid,
+            )
+            .ok(),
         };
 
         // Register built-in commands
@@ -315,6 +372,8 @@ impl Flavite {
         Ok(flavite)
     }
 
+    /// Build the device-local user-state store for a vault, `None` when the
+    /// OS data directory is unavailable (the host reports that honestly).
     /// Create a new Flavite with a custom session builder.
     ///
     /// This is useful for testing or when you need to customize the session.
@@ -323,6 +382,7 @@ impl Flavite {
         vault_ref: ApiVaultRef,
         _config: VaultConfig,
     ) -> Result<Self, FlaviteError> {
+        let vault_uuid = vault_ref.uuid.to_string();
         let session = Arc::new(session);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
@@ -341,6 +401,11 @@ impl Flavite {
             read_only: false,
             owned_vault: None,
             queries,
+            user_state: flavite_vault::user_state::UserStateStore::open(
+                Box::new(flavite_fs::OsFs::new()),
+                &vault_uuid,
+            )
+            .ok(),
         };
 
         flavite.register_builtin_commands()?;
@@ -357,6 +422,7 @@ impl Flavite {
         session: Arc<Session>,
         _config: VaultConfig,
     ) -> Result<Self, FlaviteError> {
+        let vault_uuid = identity.uuid.to_string();
         let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
@@ -370,6 +436,11 @@ impl Flavite {
             pending_requests: Mutex::new(HashSet::new()),
             terminal_backlog: Mutex::new(HashMap::new()),
             queries,
+            user_state: flavite_vault::user_state::UserStateStore::open(
+                Box::new(flavite_fs::OsFs::new()),
+                &vault_uuid,
+            )
+            .ok(),
             notice_acks: Mutex::new(std::collections::BTreeMap::new()),
             next_notice_id: AtomicU64::new(1),
             vault_ref,
@@ -399,7 +470,7 @@ impl Flavite {
     /// the legacy dotted alias as well. Both ids resolve to the same handler
     /// and schema.
     fn register_builtin_commands(&self) -> Result<(), FlaviteError> {
-        let registrations: [HandlerRegistration; 16] = [
+        let registrations: [HandlerRegistration; 17] = [
             (
                 "open_note",
                 "Open note",
@@ -443,10 +514,16 @@ impl Flavite {
                 handle_edits,
             ),
             (
+                "link.prepare",
+                "Prepare link insertion",
+                ArgSchema::typed::<crate::links::LinkPrepareArgs>(),
+                handle_link_prepare,
+            ),
+            (
                 "link.insert",
                 "Insert link",
-                ArgSchema::typed::<ApplyEditsArgs>(),
-                handle_edits,
+                ArgSchema::custom(crate::links::validate_link_insert_args),
+                handle_link_insert,
             ),
             (
                 "undo",
@@ -909,6 +986,13 @@ impl Flavite {
             SessionResult::Success(crate::session::CommandResult::EditsApplied { .. }) => {
                 "apply_edits"
             }
+            SessionResult::Success(crate::session::CommandResult::LinkPrepared { .. }) => {
+                "link.prepare"
+            }
+            SessionResult::Success(crate::session::CommandResult::LinkInserted { .. }) => {
+                "link.insert"
+            }
+            SessionResult::LinkRejected { .. } => "link.insert",
             SessionResult::Success(crate::session::CommandResult::NoteSaved { .. }) => "save_note",
             SessionResult::Success(crate::session::CommandResult::ReconcileComplete { .. }) => {
                 "reconcile"
@@ -943,6 +1027,32 @@ impl Flavite {
                         serde_json::json!({
                             "buffer_id": buffer_id.as_u64(),
                             "revision": revision.as_u64(),
+                        })
+                    }
+                    crate::session::CommandResult::LinkPrepared { prepared } => {
+                        serde_json::json!({
+                            "plan_id": prepared.plan_id.to_string(),
+                            "expires_in_ms": prepared.expires_in_ms,
+                            "serialized_link": prepared.serialized_link,
+                            "target_display": prepared.target_display,
+                            "target_path": prepared.target_path,
+                            "validated_epoch": prepared.validated_epoch,
+                            "validated_generation": prepared.validated_generation,
+                            "source": {
+                                "buffer_id": prepared.source.buffer_id,
+                                "revision": prepared.source.revision,
+                                "caret": prepared.source.caret,
+                            },
+                            "requires_confirmation": prepared.requires_confirmation,
+                        })
+                    }
+                    crate::session::CommandResult::LinkInserted {
+                        buffer_id,
+                        new_revision,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "revision": new_revision.as_u64(),
                         })
                     }
                     crate::session::CommandResult::NoteClosed => serde_json::Value::Null,
@@ -1046,6 +1156,9 @@ impl Flavite {
             ),
             SessionResult::Error { message } => ExecutionResult::Local(LocalResult::Error(
                 LocalError::with_request("session_error", message, request_id),
+            )),
+            SessionResult::LinkRejected { reason } => ExecutionResult::Local(LocalResult::Error(
+                LocalError::with_request(reason.code(), reason.repair_action(), request_id),
             )),
             SessionResult::Conflict { path } => {
                 ExecutionResult::Local(LocalResult::Error(LocalError::with_request(
@@ -1418,6 +1531,9 @@ pub enum FlaviteError {
     /// Vault open error.
     #[error("Vault open error: {0}")]
     VaultOpenError(String),
+    /// Device-local user state failed (W06).
+    #[error("User state error: {0}")]
+    UserState(#[from] flavite_vault::user_state::UserStateError),
 
     /// JSON serialization error.
     #[error("JSON error: {0}")]

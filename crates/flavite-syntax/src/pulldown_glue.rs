@@ -158,6 +158,13 @@ pub fn parse_note(bytes: &[u8]) -> Result<ParsedNote, String> {
                 text_buffer.clear();
                 text_start = range.end;
             }
+            Event::SoftBreak | Event::HardBreak => {
+                // Soft/hard breaks are part of the buffered text: their
+                // bytes must be appended so the buffer stays aligned with
+                // `snapshot[text_start..]` (a dropped newline shifted every
+                // later span and silently hid links after the first line).
+                text_buffer.push_str(&text[range.start..range.end]);
+            }
             Event::Text(_) => {
                 // Skip text in code blocks
                 if in_code_block {

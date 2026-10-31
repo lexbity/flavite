@@ -10,162 +10,26 @@ use flavite_api::{
     QueryPayload, VaultConfig,
 };
 use flavite_buffer::manager::BufferManager;
-use flavite_fs::{DirEntry, Fs, MemFs, Metadata, Result};
+use flavite_fs::Fs;
 use flavite_index::IndexActor;
 use flavite_vault::actor::VaultActorBuilder;
 use flavite_vault::channels::ChannelSet;
 use flavite_vault::session::Session;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+mod support;
+
+use support::{GateFs, SharedFs};
 
 /// `MemFs` with a per-call delay on reads of one gated note, so query
 /// workers stay busy while the test submits.
-struct GateFs {
-    inner: MemFs,
-    gated_path: PathBuf,
-    read_delay_ms: AtomicU64,
-}
-
-impl GateFs {
-    fn new(gated_path: PathBuf) -> Self {
-        Self {
-            inner: MemFs::new(),
-            gated_path,
-            read_delay_ms: AtomicU64::new(0),
-        }
-    }
-}
-
-impl Fs for GateFs {
-    fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
-        self.inner.canonicalize(path)
-    }
-    fn resolve_symlink(&self, path: &Path) -> Result<PathBuf> {
-        self.inner.resolve_symlink(path)
-    }
-    fn encode_path_key(&self, path: &Path) -> Result<Vec<u8>> {
-        self.inner.encode_path_key(path)
-    }
-    fn decode_path_key(&self, key: &[u8]) -> Result<PathBuf> {
-        self.inner.decode_path_key(key)
-    }
-    fn validate_in_root(&self, root: &Path, target: &Path) -> Result<()> {
-        self.inner.validate_in_root(root, target)
-    }
-    fn read_if_exists(&self, path: &Path) -> Result<Option<Vec<u8>>> {
-        let delay = self.read_delay_ms.load(Ordering::SeqCst);
-        if delay > 0 && path == self.gated_path {
-            std::thread::sleep(Duration::from_millis(delay));
-        }
-        self.inner.read_if_exists(path)
-    }
-    fn read_capped(&self, path: &Path, max: u64) -> Result<Vec<u8>> {
-        self.inner.read_capped(path, max)
-    }
-    fn metadata(&self, path: &Path) -> Result<Metadata> {
-        self.inner.metadata(path)
-    }
-    fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>> {
-        self.inner.read_dir(path)
-    }
-    fn exists(&self, path: &Path) -> Result<bool> {
-        self.inner.exists(path)
-    }
-    fn is_placeholder(&self, path: &Path) -> Result<bool> {
-        self.inner.is_placeholder(path)
-    }
-    fn write_new(&self, path: &Path, bytes: &[u8]) -> Result<()> {
-        self.inner.write_new(path, bytes)
-    }
-    fn copy_mode(&self, from: &Path, to: &Path) -> Result<()> {
-        self.inner.copy_mode(from, to)
-    }
-    fn create_dir_all(&self, path: &Path) -> Result<()> {
-        self.inner.create_dir_all(path)
-    }
-    fn remove(&self, path: &Path) -> Result<()> {
-        self.inner.remove(path)
-    }
-    fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        self.inner.rename_replace(from, to)
-    }
-    fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        self.inner.rename_no_replace(from, to)
-    }
-    fn fsync_file(&self, path: &Path) -> Result<()> {
-        self.inner.fsync_file(path)
-    }
-    fn fsync_dir(&self, path: &Path) -> Result<()> {
-        self.inner.fsync_dir(path)
-    }
-}
-
-/// Fs for a shared Arc<GateFs>.
-struct SharedFs(std::sync::Arc<GateFs>);
-
-impl Fs for SharedFs {
-    fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
-        self.0.canonicalize(path)
-    }
-    fn resolve_symlink(&self, path: &Path) -> Result<PathBuf> {
-        self.0.resolve_symlink(path)
-    }
-    fn encode_path_key(&self, path: &Path) -> Result<Vec<u8>> {
-        self.0.encode_path_key(path)
-    }
-    fn decode_path_key(&self, key: &[u8]) -> Result<PathBuf> {
-        self.0.decode_path_key(key)
-    }
-    fn validate_in_root(&self, root: &Path, target: &Path) -> Result<()> {
-        self.0.validate_in_root(root, target)
-    }
-    fn read_if_exists(&self, path: &Path) -> Result<Option<Vec<u8>>> {
-        self.0.read_if_exists(path)
-    }
-    fn read_capped(&self, path: &Path, max: u64) -> Result<Vec<u8>> {
-        self.0.read_capped(path, max)
-    }
-    fn metadata(&self, path: &Path) -> Result<Metadata> {
-        self.0.metadata(path)
-    }
-    fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>> {
-        self.0.read_dir(path)
-    }
-    fn exists(&self, path: &Path) -> Result<bool> {
-        self.0.exists(path)
-    }
-    fn is_placeholder(&self, path: &Path) -> Result<bool> {
-        self.0.is_placeholder(path)
-    }
-    fn write_new(&self, path: &Path, bytes: &[u8]) -> Result<()> {
-        self.0.write_new(path, bytes)
-    }
-    fn copy_mode(&self, from: &Path, to: &Path) -> Result<()> {
-        self.0.copy_mode(from, to)
-    }
-    fn create_dir_all(&self, path: &Path) -> Result<()> {
-        self.0.create_dir_all(path)
-    }
-    fn remove(&self, path: &Path) -> Result<()> {
-        self.0.remove(path)
-    }
-    fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        self.0.rename_replace(from, to)
-    }
-    fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        self.0.rename_no_replace(from, to)
-    }
-    fn fsync_file(&self, path: &Path) -> Result<()> {
-        self.0.fsync_file(path)
-    }
-    fn fsync_dir(&self, path: &Path) -> Result<()> {
-        self.0.fsync_dir(path)
-    }
-}
-
 fn fixture() -> (Flavite, PathBuf, std::sync::Arc<GateFs>, tempfile::TempDir) {
-    let fs = std::sync::Arc::new(GateFs::new(PathBuf::from("/test/queries/linked.md")));
+    let mem = std::sync::Arc::new(flavite_fs::MemFs::new());
+    let fs = std::sync::Arc::new(GateFs::around(
+        std::sync::Arc::clone(&mem),
+        PathBuf::from("/test/queries/linked.md"),
+    ));
     let root = PathBuf::from("/test/queries");
     fs.create_dir_all(&root).expect("vault root");
     fs.write_new(&root.join("linked.md"), b"See [[target]].\n")
@@ -177,7 +41,9 @@ fn fixture() -> (Flavite, PathBuf, std::sync::Arc<GateFs>, tempfile::TempDir) {
     drop(flavite_index::open_or_init(&db).expect("index"));
     let identity = flavite_api::VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![9]);
     let actor = VaultActorBuilder::new()
-        .with_fs(Box::new(SharedFs(fs.clone())) as Box<dyn Fs + Send + Sync>)
+        .with_fs(Box::new(SharedFs {
+            inner: std::sync::Arc::clone(&mem),
+        }) as Box<dyn Fs + Send + Sync>)
         .with_identity(identity.clone())
         .with_index(IndexActor::new(&db, 1).expect("index actor"))
         .build()
@@ -226,7 +92,7 @@ fn saturated_slots_return_busy_and_saves_still_finish() {
     reconcile(&flavite);
 
     // Hold every worker busy on gated reads of the linking note.
-    fs.read_delay_ms.store(50, Ordering::SeqCst);
+    fs.set_delay(50);
     let payload = QueryPayload::Backlinks {
         path: vec!["target.md".to_owned()],
     };
@@ -261,7 +127,7 @@ fn saturated_slots_return_busy_and_saves_still_finish() {
     assert!(completion.is_success(), "open finished while saturated");
 
     // Release the gate; every admitted query is served exactly once.
-    fs.read_delay_ms.store(0, Ordering::SeqCst);
+    fs.set_delay(0);
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut seen = 0;
     while seen < MAX_QUERY_SLOTS {

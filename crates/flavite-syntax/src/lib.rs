@@ -5,6 +5,7 @@
 //! glue. Pure and IO-free (§4.1, D10, D11).
 
 pub mod frontmatter;
+pub mod link_format;
 pub mod mask;
 pub mod pulldown_glue;
 pub mod scanner;

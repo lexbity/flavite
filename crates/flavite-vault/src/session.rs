@@ -231,6 +231,17 @@ pub enum SessionCommand {
     RestoreRecovery { path: PathBuf },
     /// Discard the recovery snapshot for a note after explicit user choice.
     DiscardRecovery { path: PathBuf },
+    /// Prepare a semantic link insertion plan (W05; expensive work runs on
+    /// a bounded worker, admission happens here under the ingress turn).
+    LinkPrepare {
+        request: crate::link::LinkPrepareRequest,
+        request_id: u64,
+    },
+    /// Commit a prepared semantic link with one guarded edit (W05).
+    LinkInsert {
+        intent: crate::link::LinkIntent,
+        plan_id: u128,
+    },
 }
 
 /// Conflict resolution strategy.
@@ -281,6 +292,10 @@ pub enum SessionResult {
         code: &'static str,
         data: Option<String>,
     },
+    /// Typed semantic-link rejection with its repair action (W05).
+    LinkRejected {
+        reason: crate::link::LinkInsertionError,
+    },
 }
 
 /// Data returned from successful commands.
@@ -296,6 +311,18 @@ pub enum CommandResult {
     /// Edits were applied.
     EditsApplied {
         buffer_id: BufferId,
+        new_revision: Revision,
+    },
+    /// A semantic link plan was prepared (W05).
+    LinkPrepared {
+        /// The prepared plan exposed to the host.
+        prepared: crate::link::PreparedLink,
+    },
+    /// A semantic link was inserted with one guarded edit (W05).
+    LinkInserted {
+        /// Source buffer.
+        buffer_id: BufferId,
+        /// New revision after the insertion.
         new_revision: Revision,
     },
     /// Note was saved.
@@ -448,6 +475,26 @@ pub struct Session {
     notice: NoticeChannel,
     /// Journal recovery findings waiting for the first host pump.
     recovery_notices: Mutex<VecDeque<&'static str>>,
+    /// Semantic link plan store (W05). Plans are process-local capabilities.
+    link_plans: std::sync::Arc<Mutex<crate::link::LinkPlanStore>>,
+    /// Bounded prepare workers' job queue.
+    link_jobs: Option<crossbeam::channel::Sender<LinkJob>>,
+    /// Completed prepare results awaiting installation on a Session turn.
+    link_results: crossbeam::channel::Receiver<LinkOutcomeMessage>,
+    /// Core-issued client namespace counter.
+    link_clients: std::sync::atomic::AtomicU64,
+}
+
+/// One queued semantic-link prepare job (W05).
+struct LinkJob {
+    request_id: u64,
+    request: crate::link::LinkPrepareRequest,
+}
+
+/// One finished prepare awaiting installation (W05).
+struct LinkOutcomeMessage {
+    request_id: u64,
+    result: SessionResult,
 }
 
 impl Session {
@@ -543,6 +590,58 @@ impl Session {
                 })
                 .expect("open worker thread creation failed");
         }
+        let link_plans = std::sync::Arc::new(Mutex::new(crate::link::LinkPlanStore::default()));
+        let (link_job_sender, link_job_receiver) = crossbeam::channel::unbounded::<LinkJob>();
+        let (link_result_sender, link_result_receiver) =
+            crossbeam::channel::unbounded::<LinkOutcomeMessage>();
+        {
+            for worker_index in 0..2 {
+                let manager = manager.clone();
+                let actor = actor.clone();
+                let link_plans = link_plans.clone();
+                let jobs = link_job_receiver.clone();
+                let results = link_result_sender.clone();
+                std::thread::Builder::new()
+                    .name(format!("vault-link-{worker_index}"))
+                    .spawn(move || {
+                        // Workers exit when the Session drops the job sender.
+                        while let Ok(job) = jobs.recv() {
+                            let context = crate::link::PrepareContext {
+                                manager: &manager,
+                                actor: &actor,
+                            };
+                            let outcome = match crate::link::prepare_work(&context, &job.request) {
+                                Ok((plan, mut prepared)) => {
+                                    let plan_id = {
+                                        let mut store = link_plans.lock().unwrap();
+                                        let plan_id = store.allocate_plan_id();
+                                        prepared.plan_id = plan_id;
+                                        store.complete_prepare(plan_id, plan);
+                                        plan_id
+                                    };
+                                    SessionResult::Success(CommandResult::LinkPrepared {
+                                        prepared: prepared.with_plan_id(plan_id),
+                                    })
+                                }
+                                Err(reason) => {
+                                    link_plans
+                                        .lock()
+                                        .unwrap()
+                                        .fail_prepare(job.request.intent.client);
+                                    SessionResult::LinkRejected { reason }
+                                }
+                            };
+                            // Sending only fails when the Session is gone;
+                            // the result is then unobservable by construction.
+                            let _ = results.send(LinkOutcomeMessage {
+                                request_id: job.request_id,
+                                result: outcome,
+                            });
+                        }
+                    })
+                    .expect("link worker thread creation failed");
+            }
+        }
         Self {
             driving_turn: Mutex::new(()),
             identity,
@@ -575,6 +674,10 @@ impl Session {
             pulse,
             notice,
             recovery_notices: Mutex::new(VecDeque::new()),
+            link_plans,
+            link_jobs: Some(link_job_sender),
+            link_results: link_result_receiver,
+            link_clients: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -623,6 +726,7 @@ impl Session {
         let _turn = self.driving_turn.lock().unwrap();
         self.pump_external_changes_inner();
         self.pump_recovery_notices();
+        self.pump_link_completions();
         self.pump_open_completions();
         self.pump_save_completions();
         self.pump_reconcile_completions();
@@ -631,6 +735,18 @@ impl Session {
         // Recovery checkpoints run on the dedicated worker created with the
         // Session. Never perform recovery filesystem or actor I/O while this
         // host pump owns the Session driving-turn lock.
+    }
+
+    fn pump_link_completions(&self) {
+        while let Ok(message) = self.link_results.try_recv() {
+            self.completions
+                .lock()
+                .unwrap()
+                .push_back(OperationCompletion {
+                    request_id: message.request_id,
+                    result: message.result,
+                });
+        }
     }
 
     fn pump_recovery_notices(&self) {
@@ -941,6 +1057,11 @@ impl Session {
             }
             SessionCommand::RestoreRecovery { path } => self.restore_recovery(path),
             SessionCommand::DiscardRecovery { path } => self.discard_recovery(path),
+            SessionCommand::LinkPrepare {
+                request,
+                request_id,
+            } => self.prepare_link(request, request_id),
+            SessionCommand::LinkInsert { intent, plan_id } => self.commit_link(intent, plan_id),
         }
     }
 
@@ -993,11 +1114,258 @@ impl Session {
         self.actor.search_notes(query, limit)
     }
 
+    /// Issue a core-semantic-link client namespace token (W05 §9.1). The
+    /// token is process-local and never persisted (FR-26).
+    #[must_use]
+    pub fn new_link_client(&self) -> crate::link::ClientToken {
+        let counter = self
+            .link_clients
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        crate::link::ClientToken(u128::from(counter).wrapping_add(1))
+    }
+
+    /// Admit one semantic-link prepare request under the ingress turn; the
+    /// expensive proof work runs on the bounded link worker pool (W05 §9.2).
+    fn prepare_link(
+        &self,
+        request: crate::link::LinkPrepareRequest,
+        request_id: u64,
+    ) -> SessionResult {
+        let admission = {
+            let mut store = self.link_plans.lock().unwrap();
+            store.admit_prepare(&request)
+        };
+        match admission {
+            Err(reason) => SessionResult::LinkRejected { reason },
+            Ok(crate::link::PrepareAdmission::Proceed) => match &self.link_jobs {
+                Some(jobs) => {
+                    let client = request.intent.client;
+                    if jobs
+                        .send(LinkJob {
+                            request_id,
+                            request,
+                        })
+                        .is_err()
+                    {
+                        self.link_plans.lock().unwrap().fail_prepare(client);
+                        return SessionResult::LinkRejected {
+                            reason: crate::link::LinkInsertionError::Busy,
+                        };
+                    }
+                    SessionResult::Pending { request_id }
+                }
+                None => {
+                    self.link_plans
+                        .lock()
+                        .unwrap()
+                        .fail_prepare(request.intent.client);
+                    SessionResult::LinkRejected {
+                        reason: crate::link::LinkInsertionError::Busy,
+                    }
+                }
+            },
+        }
+    }
+
+    /// Commit one prepared semantic link with one guarded edit under the
+    /// serialized mutation authority (W05 §9.2: TTL, revision, epoch, and
+    /// target identity are revalidated; the plan is consumed exactly once
+    /// and the terminal outcome is recorded atomically with the edit).
+    fn commit_link(&self, intent: crate::link::LinkIntent, plan_id: u128) -> SessionResult {
+        use crate::link::{CommitAdmission, LinkOutcome};
+        let admission = {
+            let mut store = self.link_plans.lock().unwrap();
+            store.admit_commit(&intent, plan_id)
+        };
+        let plan = match admission {
+            Err(reason) => return SessionResult::LinkRejected { reason },
+            Ok(CommitAdmission::Cached(outcome)) => {
+                return match outcome {
+                    Ok(LinkOutcome::Applied {
+                        buffer_id,
+                        new_revision,
+                    }) => SessionResult::Success(CommandResult::LinkInserted {
+                        buffer_id: BufferId::from(buffer_id),
+                        new_revision: Revision::new(new_revision),
+                    }),
+                    Err(reason) => SessionResult::LinkRejected { reason },
+                };
+            }
+            Ok(CommitAdmission::Proceed(plan)) => plan,
+        };
+        // Buffer state and revision guards.
+        let state = self
+            .buffer_manager
+            .lock()
+            .unwrap()
+            .get_buffer_by_id(BufferId::from(plan.source.buffer_id))
+            .map(|buffer| (buffer.state(), buffer.revision().as_u64()));
+        let Some((state, actual_revision)) = state else {
+            let mut store = self.link_plans.lock().unwrap();
+            store.record_outcome(
+                &intent,
+                crate::link::fingerprint_insert_public(plan_id),
+                Err(crate::link::LinkInsertionError::StaleSource {
+                    expected: plan.source.revision,
+                    actual: 0,
+                }),
+            );
+            return SessionResult::LinkRejected {
+                reason: crate::link::LinkInsertionError::StaleSource {
+                    expected: plan.source.revision,
+                    actual: 0,
+                },
+            };
+        };
+        if actual_revision != plan.source.revision {
+            self.link_plans.lock().unwrap().record_outcome(
+                &intent,
+                crate::link::fingerprint_insert_public(plan_id),
+                Err(crate::link::LinkInsertionError::StaleSource {
+                    expected: plan.source.revision,
+                    actual: actual_revision,
+                }),
+            );
+            return SessionResult::LinkRejected {
+                reason: crate::link::LinkInsertionError::StaleSource {
+                    expected: plan.source.revision,
+                    actual: actual_revision,
+                },
+            };
+        }
+        if !matches!(
+            state,
+            flavite_buffer::state::BufferState::Clean | flavite_buffer::state::BufferState::Dirty
+        ) {
+            let name = match state {
+                flavite_buffer::state::BufferState::Conflicted => "Conflicted",
+                flavite_buffer::state::BufferState::Orphaned => "Orphaned",
+                _ => "Unavailable",
+            };
+            self.link_plans.lock().unwrap().record_outcome(
+                &intent,
+                crate::link::fingerprint_insert_public(plan_id),
+                Err(crate::link::LinkInsertionError::BufferStateNeedsDecision { state: name }),
+            );
+            return SessionResult::LinkRejected {
+                reason: crate::link::LinkInsertionError::BufferStateNeedsDecision { state: name },
+            };
+        }
+        // Canonical catalog revalidation: same epoch, target still resolves
+        // to the exact planned entity (never retarget by title).
+        let version = match self.version() {
+            Ok(version) => version,
+            Err(_) => {
+                return SessionResult::LinkRejected {
+                    reason: crate::link::LinkInsertionError::StaleEpoch,
+                };
+            }
+        };
+        if version.epoch.value() != plan.validated_epoch
+            || version.generation.value() < plan.validated_generation
+        {
+            self.link_plans.lock().unwrap().record_outcome(
+                &intent,
+                crate::link::fingerprint_insert_public(plan_id),
+                Err(crate::link::LinkInsertionError::StaleEpoch),
+            );
+            return SessionResult::LinkRejected {
+                reason: crate::link::LinkInsertionError::StaleEpoch,
+            };
+        }
+        let raw_target = plan.target_path.join("/").strip_suffix(".md").map_or_else(
+            || plan.target_path.join("/"),
+            std::string::ToString::to_string,
+        );
+        let resolution = self
+            .resolve_target(
+                flavite_syntax::text::fold_key(&raw_target),
+                raw_target,
+                false,
+                None,
+            )
+            .ok()
+            .and_then(|resolution| resolution.note);
+        match resolution {
+            Some(note) if note.note_id == plan.target_entity_id => {}
+            Some(_) | None => {
+                self.link_plans.lock().unwrap().record_outcome(
+                    &intent,
+                    crate::link::fingerprint_insert_public(plan_id),
+                    Err(crate::link::LinkInsertionError::TargetRetargeted),
+                );
+                return SessionResult::LinkRejected {
+                    reason: crate::link::LinkInsertionError::TargetRetargeted,
+                };
+            }
+        }
+        // One guarded edit: a single-op batch is one undo-tree unit.
+        let (start, end, replacement) = plan.edit.clone();
+        let applied = self.apply_edits(
+            BufferId::from(plan.source.buffer_id),
+            Revision::new(plan.source.revision),
+            vec![flavite_buffer::EditOp::new(
+                flavite_syntax::text::Span::new(
+                    flavite_syntax::text::TextByte(start),
+                    flavite_syntax::text::TextByte(end),
+                ),
+                replacement,
+            )],
+        );
+        let result = match applied {
+            SessionResult::Success(CommandResult::EditsApplied {
+                buffer_id,
+                new_revision,
+            }) => SessionResult::Success(CommandResult::LinkInserted {
+                buffer_id,
+                new_revision,
+            }),
+            SessionResult::StaleRevision {
+                buffer_id: _,
+                expected,
+                actual,
+            } => SessionResult::LinkRejected {
+                reason: crate::link::LinkInsertionError::StaleSource {
+                    expected: expected.as_u64(),
+                    actual: actual.as_u64(),
+                },
+            },
+            SessionResult::Error { message } => SessionResult::LinkRejected {
+                reason: crate::link::LinkInsertionError::EditRejected(message),
+            },
+            other => SessionResult::LinkRejected {
+                reason: crate::link::LinkInsertionError::EditRejected(format!("{other:?}")),
+            },
+        };
+        // The terminal outcome is recorded atomically with the edit result:
+        // a retry of the same gesture replays exactly this result.
+        let cached: crate::link::CachedOutcome = match &result {
+            SessionResult::Success(CommandResult::LinkInserted {
+                buffer_id,
+                new_revision,
+            }) => Ok(LinkOutcome::Applied {
+                buffer_id: buffer_id.as_u64(),
+                new_revision: new_revision.as_u64(),
+            }),
+            SessionResult::LinkRejected { reason } => Err(reason.clone()),
+            other => Err(crate::link::LinkInsertionError::EditRejected(format!(
+                "{other:?}"
+            ))),
+        };
+        self.link_plans.lock().unwrap().record_outcome(
+            &intent,
+            crate::link::fingerprint_insert_public(plan_id),
+            cached,
+        );
+        result
+    }
+
     /// Process ready worker replies and return every terminal result that has
     /// not yet been presented to the host. This is lossless: completions stay
     /// queued until the host drains them.
     pub fn drain_operation_completions(&self) -> Vec<OperationCompletion> {
         let _turn = self.driving_turn.lock().unwrap();
+        self.pump_link_completions();
         self.pump_open_completions();
         self.pump_save_completions();
         self.pump_reconcile_completions();

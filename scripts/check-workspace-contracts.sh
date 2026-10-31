@@ -104,6 +104,49 @@ case "$profile" in
         assert_absent 'rusqlite|flavite_index|flavite_vault' \
             "$root/crates/flavite-ui/src/views"
         ;;
+    W05)
+        # W04 gates remain additive; W05 adds the semantic insertion contract.
+        bash "$0" W04 "$root"
+        for file in \
+            crates/flavite-syntax/src/link_format.rs \
+            crates/flavite-vault/src/link.rs \
+            crates/flavite-api/src/links.rs \
+            crates/flavite-ui/src/host/linking.rs \
+            crates/flavite-api/tests/semantic_links.rs \
+            crates/flavite-syntax/tests/link_insert_properties.rs \
+            crates/flavite-ui/tests/link_target.rs \
+            fuzz/fuzz_targets/link_insertion.rs; do
+            assert_nonempty "$root/$file"
+        done
+        assert_absent 'link\.insert.*handle_edits|command_id: "link\.insert".*ops' \
+            "$root/crates/flavite-api/src/flavite.rs" \
+            "$root/crates/flavite-editor/src/surface.rs"
+        assert_absent 'to_string_lossy\(\).*target|unwrap_or\(.*text\.len' \
+            "$root/crates/flavite-ui/src/host/linking.rs" \
+            "$root/crates/flavite-api/src/links.rs"
+        ;;
+    W06)
+        # W05 gates remain additive; W06 adds the persistence contract.
+        bash "$0" W05 "$root"
+        for file in \
+            crates/flavite-workspace/src/codec.rs \
+            crates/flavite-workspace/src/migrate.rs \
+            crates/flavite-workspace/src/restore.rs \
+            crates/flavite-api/src/user_state.rs \
+            crates/flavite-vault/src/user_state.rs \
+            crates/flavite-ui/src/host/persistence.rs \
+            crates/flavite-workspace/tests/workspace_codec.rs \
+            crates/flavite-api/tests/workspace_storage.rs \
+            crates/flavite-ui/tests/workspace_restore.rs \
+            fuzz/fuzz_targets/workspace_restore.rs; do
+            assert_nonempty "$root/$file"
+        done
+        # The UI persistence host and the workspace model stay IO-free:
+        # storage goes through the injected Fs behind the facade.
+        assert_absent 'std::fs|File::create|OpenOptions|fs::write|fs::rename' \
+            "$root/crates/flavite-ui/src/host/persistence.rs" \
+            "$root/crates/flavite-workspace/src"
+        ;;
     *)
         echo "unknown workspace contract profile: ${profile:-<empty>}" >&2
         exit 2

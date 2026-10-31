@@ -279,6 +279,19 @@ pub enum LayoutAction {
         expected_revision: u64,
         forward: bool,
     },
+    /// Replace the whole layout with a validated device-local restore
+    /// (W06): durable identities are rehydrated, note tabs reopen through
+    /// their normal open commands, and the transaction is atomic like any
+    /// other layout change.
+    RestoreWorkspace {
+        expected_revision: u64,
+        tree: crate::layout::LayoutNode,
+        tabs: Vec<(TabId, ViewKind)>,
+        groups: Vec<(GroupId, Vec<TabId>, TabId)>,
+        focus: TabId,
+        maximized: Option<GroupId>,
+        closed_history: Vec<NoteLocator>,
+    },
 }
 
 impl LayoutAction {
@@ -350,6 +363,9 @@ impl LayoutAction {
                 expected_revision, ..
             }
             | Self::CycleGroup {
+                expected_revision, ..
+            }
+            | Self::RestoreWorkspace {
                 expected_revision, ..
             } => *expected_revision,
         }
@@ -715,6 +731,18 @@ impl WorkspaceState {
     #[must_use]
     pub fn recently_closed_len(&self) -> usize {
         self.recently_closed.len()
+    }
+
+    /// The remembered closed-note locators, most recent last (device-local
+    /// persistence reads these to restore the reopen history).
+    pub fn recently_closed(&self) -> impl Iterator<Item = &NoteLocator> {
+        self.recently_closed.iter()
+    }
+
+    /// Remember closed-note locators (restore path; the reducer's own
+    /// history is only written by real closes).
+    pub fn remember_closed_for_restore(&mut self, locator: NoteLocator) {
+        self.remember_closed(locator);
     }
 
     /// First group in deterministic top-left traversal order.
@@ -1408,6 +1436,131 @@ fn apply(state: &mut WorkspaceState, action: &LayoutAction) -> Result<Vec<Effect
             state.focus = active;
             state.maximized = None;
             Ok(Vec::new())
+        }
+        LayoutAction::RestoreWorkspace {
+            tree,
+            tabs,
+            groups,
+            focus,
+            maximized,
+            closed_history,
+            ..
+        } => {
+            // The action is consumed by reference; the restore works on
+            // owned copies so the candidate state is built exactly once.
+            let tabs = tabs.clone();
+            let groups = groups.clone();
+            let tree = tree.clone();
+            let focus = *focus;
+            let maximized = *maximized;
+            let closed_history = closed_history.clone();
+            if state.tabs.len().saturating_add(tabs.len()) > MAX_TABS {
+                return Err(WorkspaceError::TabLimitReached);
+            }
+            if groups.len() > MAX_GROUPS {
+                return Err(WorkspaceError::GroupLimitReached);
+            }
+            if tree.depth() > MAX_DEPTH {
+                return Err(WorkspaceError::DepthLimitReached);
+            }
+            // Rehydrate identities: fresh allocation never collides with a
+            // restored persistent id.
+            for (tab, _) in &tabs {
+                state.ids.observe(tab.raw());
+            }
+            for (group, _, _) in &groups {
+                state.ids.observe(group.raw());
+            }
+            observe_split_ids(&tree, &mut state.ids);
+            let mut new_groups = BTreeMap::new();
+            let mut new_tabs = BTreeMap::new();
+            let mut referenced: BTreeSet<TabId> = BTreeSet::new();
+            for (group_id, members, active) in groups {
+                if members.is_empty()
+                    || !members.contains(&active)
+                    || new_groups.contains_key(&group_id)
+                {
+                    return Err(WorkspaceError::InvariantViolation(format!(
+                        "restore group {group_id} is empty, duplicated, or has a foreign active tab"
+                    )));
+                }
+                for tab in &members {
+                    if referenced.contains(tab) {
+                        return Err(WorkspaceError::InvariantViolation(format!(
+                            "restore tab {tab} belongs to two groups"
+                        )));
+                    }
+                    referenced.insert(*tab);
+                }
+                // TabGroup::new seeds the first member; insert the rest in
+                // strip order, then activate the persisted active tab.
+                new_groups.insert(group_id, TabGroup::new(members[0]));
+                let group = new_groups.get_mut(&group_id).expect("just inserted");
+                for tab in members.iter().skip(1) {
+                    let position = group.tabs().len();
+                    group.insert(position, *tab);
+                }
+                group.set_active(active);
+            }
+            for (tab_id, kind) in tabs {
+                if !referenced.contains(&tab_id) {
+                    return Err(WorkspaceError::InvariantViolation(format!(
+                        "restore tab {tab_id} belongs to no group"
+                    )));
+                }
+                new_tabs.insert(tab_id, ViewSession::new(tab_id, kind));
+            }
+            if !new_tabs.contains_key(&focus) {
+                return Err(WorkspaceError::InvariantViolation(
+                    "restore focus is not a known tab".into(),
+                ));
+            }
+            if let Some(maximized) = maximized
+                && !new_groups.contains_key(&maximized)
+            {
+                return Err(WorkspaceError::InvariantViolation(
+                    "restore maximized group is unknown".into(),
+                ));
+            }
+            // The whole layout is replaced atomically; validation below
+            // enforces the same tree/tab/focus invariants as any commit.
+            state.tree = tree;
+            state.groups = new_groups;
+            state.tabs = new_tabs;
+            state.focus = focus;
+            state.maximized = maximized;
+            state.document_anchor = None;
+            state.exploration = None;
+            state.writing_target = None;
+            state.recently_closed = closed_history
+                .into_iter()
+                .take(MAX_REOPEN)
+                .collect::<VecDeque<_>>();
+            // Effects: every tab is newly attached; the host opens note
+            // views through their normal commands.
+            let effects = state
+                .tabs
+                .iter()
+                .map(|(tab, session)| Effect::ViewAttached {
+                    tab: *tab,
+                    kind: session.kind().clone(),
+                })
+                .collect::<Vec<_>>();
+            Ok(effects)
+        }
+    }
+}
+
+/// Advance the id generator past every persisted split identity.
+fn observe_split_ids(node: &LayoutNode, ids: &mut Ids) {
+    match node {
+        LayoutNode::Group(_) => {}
+        LayoutNode::Split {
+            id, first, second, ..
+        } => {
+            ids.observe(id.raw());
+            observe_split_ids(first, ids);
+            observe_split_ids(second, ids);
         }
     }
 }

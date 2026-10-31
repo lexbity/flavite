@@ -107,6 +107,14 @@ pub type IdentityResult<T> = Result<T, IdentityError>;
 
 /// Get the OS data directory for Flavite.
 pub fn get_data_dir() -> Option<PathBuf> {
+    // Operational override for isolated runs (visual scenarios, tests):
+    // when set, it replaces the platform data directory entirely.
+    if let Some(override_dir) = std::env::var_os("FLAVITE_DATA_DIR") {
+        let path = PathBuf::from(override_dir);
+        if path.is_absolute() {
+            return Some(path);
+        }
+    }
     ProjectDirs::from("com", "flavite", "Flavite").map(|p| p.data_dir().to_path_buf())
 }
 
@@ -319,6 +327,24 @@ pub struct UuidGuard {
     _lock: File,
 }
 
+/// Whether an existing UUID lock file belongs to a dead process (FR-17:
+/// a crash must not lock the vault out of its own device state forever).
+/// The file carries the holder's PID; a PID that no longer exists (or is
+/// ourselves recycling after a crash) is stale and the lock is stolen.
+fn uuid_lock_is_stale(path: &std::path::Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return true; // unreadable lock file cannot prove a live holder
+    };
+    let holder = contents.trim().parse::<u32>().ok();
+    match holder {
+        Some(pid) if pid != std::process::id() => {
+            !std::path::Path::new(&format!("/proc/{pid}")).exists()
+        }
+        Some(_) => true, // our own PID: a leftover from an earlier crash
+        None => true,    // pre-PID lock files have no provable live holder
+    }
+}
+
 impl UuidGuard {
     /// Acquire a UUID guard for the given UUID.
     pub fn acquire(uuid: Uuid) -> IdentityResult<Self> {
@@ -332,10 +358,27 @@ impl UuidGuard {
             fs::create_dir_all(parent).map_err(IdentityError::Io)?;
         }
 
-        // Try to create the lock file with exclusive access
-        let lock = File::create(&path).map_err(|e| {
+        // Create/truncate the lock file and record the holder PID so a
+        // crashed process's lock is distinguishable from a live one.
+        let mut lock = File::create(&path).map_err(|e| {
             IdentityError::UuidLockFailed(format!(
                 "Failed to create UUID lock at {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        use std::io::Write as _;
+        lock.write_all(std::process::id().to_string().as_bytes())
+            .map_err(|e| {
+                IdentityError::UuidLockFailed(format!(
+                    "Failed to write UUID lock at {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+        lock.sync_all().map_err(|e| {
+            IdentityError::UuidLockFailed(format!(
+                "Failed to sync UUID lock at {}: {}",
                 path.display(),
                 e
             ))
@@ -430,11 +473,10 @@ impl IdentityManager {
         };
 
         // Step 5: Acquire UUID lock
-        // First, check if another process has the lock
         let uuid_lock_path = uuid_lock_path_in(data_dir, uuid);
 
-        if uuid_lock_path.exists() {
-            // Another process has the lock
+        if uuid_lock_path.exists() && !uuid_lock_is_stale(&uuid_lock_path) {
+            // Another live process holds the lock.
             return Err(IdentityError::UuidLockFailed(
                 "UUID lock already held by another process".to_string(),
             ));
@@ -686,7 +728,19 @@ mod tests {
         let root_key = compute_root_key(&fs, locked_vault.path()).unwrap();
         let lock = uuid_lock_path_in(locked_data.path(), locked_uuid);
         std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
-        std::fs::write(&lock, b"held").unwrap();
+        // A lock naming OUR pid is stale (a crashed earlier run of this
+        // process) and is recovered; a lock naming a live foreign pid is
+        // refused (FR-17 recovery vs. single-writer exclusion).
+        std::fs::write(&lock, std::process::id().to_string().as_bytes()).unwrap();
+        let recovered = IdentityManager::open_in_data_dir(
+            &fs,
+            locked_vault.path().to_path_buf(),
+            locked_data.path(),
+        )
+        .expect("stale lock is recovered");
+        drop(recovered);
+        // PID 1 always exists and is never us: a live foreign holder.
+        std::fs::write(&lock, b"1").unwrap();
         assert!(matches!(
             IdentityManager::open_in_data_dir(
                 &fs,

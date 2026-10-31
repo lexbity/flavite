@@ -162,7 +162,7 @@ fuzz-smoke:
     cd fuzz
     smoke_root="$(mktemp -d)"
     trap 'rm -rf "$smoke_root"' EXIT
-    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout"
+    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore"
     failed=0
     for target in $targets; do
         corpus_dir="$smoke_root/$target"
@@ -185,7 +185,7 @@ fuzz-smoke-ci:
     cd fuzz
     smoke_root="$(mktemp -d)"
     trap 'rm -rf "$smoke_root"' EXIT
-    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout"
+    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore"
     failed=0
     for target in $targets; do
         corpus_dir="$smoke_root/$target"
@@ -273,6 +273,31 @@ workspace-gate *profile="W02":
         cargo test -p flavite-ui --test context_routing
         cargo test -p flavite-api --test query_service
         cargo test -p flavite-api --test host_boundary
+    fi
+    if [ "{{profile}}" = "W05" ]; then
+        cargo test -p flavite-editor
+        cargo test -p flavite-ui --test shared_views
+        cargo test -p flavite-workspace --test context_properties
+        cargo test -p flavite-ui --test context_routing
+        cargo test -p flavite-api --test query_service
+        cargo test -p flavite-api --test host_boundary
+        cargo test -p flavite-syntax --test link_insert_properties
+        cargo test -p flavite-api --test semantic_links
+        cargo test -p flavite-ui --test link_target
+    fi
+    if [ "{{profile}}" = "W06" ]; then
+        cargo test -p flavite-editor
+        cargo test -p flavite-ui --test shared_views
+        cargo test -p flavite-workspace --test context_properties
+        cargo test -p flavite-ui --test context_routing
+        cargo test -p flavite-api --test query_service
+        cargo test -p flavite-api --test host_boundary
+        cargo test -p flavite-syntax --test link_insert_properties
+        cargo test -p flavite-api --test semantic_links
+        cargo test -p flavite-ui --test link_target
+        cargo test -p flavite-workspace --test workspace_codec
+        cargo test -p flavite-api --test workspace_storage
+        cargo test -p flavite-ui --test workspace_restore
     fi
 
 # RFC-0003 §31.1: real Linux window input, semantic checkpoints, screenshots,

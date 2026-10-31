@@ -240,13 +240,6 @@ impl EditorAction {
         }
     }
 
-    /// Build an explicit autocomplete text replacement. Semantic graph link
-    /// insertion uses its dedicated API plan and is not represented here.
-    #[must_use]
-    pub fn insert_link(view: &EditorView, start: usize, end: usize, text: String) -> Self {
-        Self::replace(view, start, end, text)
-    }
-
     /// Convert a local edit into the public command invocation contract.
     #[must_use]
     pub fn into_invocation(

@@ -19,7 +19,7 @@ use blake3;
 const TEMP_PREFIX: &str = ".flavite-atomic-";
 
 /// Generate a temporary path in the same directory as the target.
-fn temp_path<F: Fs>(fs: &F, target: &Path) -> Result<PathBuf> {
+fn temp_path<F: Fs + ?Sized>(fs: &F, target: &Path) -> Result<PathBuf> {
     let dir = target.parent().unwrap_or(Path::new("."));
     let canonical_dir = fs.canonicalize(dir)?;
 
@@ -53,7 +53,7 @@ fn temp_path<F: Fs>(fs: &F, target: &Path) -> Result<PathBuf> {
 /// 6. fsync the directory
 ///
 /// Returns the hash of the written content.
-pub fn atomic_write<F: Fs>(fs: &F, path: &Path, bytes: &[u8]) -> Result<[u8; 32]> {
+pub fn atomic_write<F: Fs + ?Sized>(fs: &F, path: &Path, bytes: &[u8]) -> Result<[u8; 32]> {
     // Step 1: Resolve symlink
     let target = fs.resolve_symlink(path)?;
 

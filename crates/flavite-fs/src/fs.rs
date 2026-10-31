@@ -233,7 +233,7 @@ pub trait Fs: Send + Sync {
 }
 
 /// Compute the BLAKE3 hash of a file's contents (convenience helper).
-pub fn hash_file(fs: &dyn Fs, path: &Path) -> Result<[u8; 32]> {
+pub fn hash_file<F: Fs + ?Sized>(fs: &F, path: &Path) -> Result<[u8; 32]> {
     match fs.read_if_exists(path)? {
         Some(bytes) => Ok(*blake3::hash(&bytes).as_bytes()),
         None => Err(FsError::NotFound(path.to_path_buf())),

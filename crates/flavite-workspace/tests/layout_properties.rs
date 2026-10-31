@@ -140,7 +140,8 @@ fn expected_delta(state: &WorkspaceState, action: &LayoutAction) -> Option<i64> 
         | A::ActivateTab { .. }
         | A::FocusGroup { .. }
         | A::CycleTab { .. }
-        | A::CycleGroup { .. } => Some(0),
+        | A::CycleGroup { .. }
+        | A::RestoreWorkspace { .. } => Some(0),
     }
 }
 

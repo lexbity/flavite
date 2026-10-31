@@ -84,6 +84,14 @@ impl Ids {
         Self::with_seed(time.rotate_left(64) ^ decorrelate)
     }
 
+    /// Advance the generator past an observed identity so freshly allocated
+    /// ids never collide with restored persistent ones (W06 restore).
+    pub fn observe(&mut self, value: u128) {
+        if value >= self.next {
+            self.next = value.saturating_add(1);
+        }
+    }
+
     /// A reproducible generator for tests and fuzz targets.
     #[must_use]
     pub fn with_seed(seed: u128) -> Self {

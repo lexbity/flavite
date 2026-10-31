@@ -366,6 +366,16 @@ impl VaultActorHandle {
     }
 
     /// Get the current version.
+    /// Read the current canonical catalog epoch/generation as plain values.
+    ///
+    /// # Errors
+    /// Returns the actor error when the version cannot be served.
+    pub fn index_version(&self) -> Result<(u64, u64), String> {
+        self.get_version()
+            .map(|version| (version.epoch.value(), version.generation.value()))
+            .map_err(|error| error.to_string())
+    }
+
     pub fn get_version(&self) -> Result<Version, VaultActorError> {
         match self.send(VaultActorMsg::GetVersion)? {
             VaultActorResp::Version(v) => Ok(v),

@@ -28,11 +28,14 @@ pub mod command;
 pub mod doctor;
 pub mod event;
 pub mod flavite;
+pub mod links;
 pub mod open;
 pub mod queries;
 pub mod query_service;
 pub mod result;
 pub mod types;
+pub mod user_state;
+pub use user_state::{StoredUserState, UserStateError, UserStateKind};
 
 // Re-export key types for convenience
 pub use capability::*;
@@ -61,10 +64,10 @@ pub use flavite_vault::types::{
 pub use flavite_fs::OsFs;
 
 /// API version for wire compatibility (D16).
-pub const API_VERSION: &str = "0.1.0";
+pub const API_VERSION: &str = "0.2.0";
 
 /// Maximum API version supported.
-pub const API_VERSION_MAX: &str = "0.1.0";
+pub const API_VERSION_MAX: &str = "0.2.0";
 
 /// Minimum API version supported.
 pub const API_VERSION_MIN: &str = "0.1.0";

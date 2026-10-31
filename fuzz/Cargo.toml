@@ -47,6 +47,14 @@ name = "scanner"
 path = "fuzz_targets/scanner.rs"
 
 [[bin]]
+name = "link_insertion"
+path = "fuzz_targets/link_insertion.rs"
+
+[[bin]]
+name = "workspace_restore"
+path = "fuzz_targets/workspace_restore.rs"
+
+[[bin]]
 name = "frontmatter_patcher"
 path = "fuzz_targets/frontmatter_patcher.rs"
 

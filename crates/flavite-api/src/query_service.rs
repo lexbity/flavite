@@ -370,30 +370,25 @@ fn execute_backlinks(session: &Arc<Session>, path: &[String]) -> ContextQueryRes
     }
 }
 
-/// The first line of `text` containing a `[[...]]` link whose target
-/// mentions `stem`. Excerpts are presentation-only; identity is the path.
+/// The first line of `text` containing a link occurrence whose target
+/// mentions `stem`, found by the one shared scanner (never a second,
+/// weaker parser). Excerpts are presentation-only; identity is the path.
 fn link_excerpt(text: &str, stem: &str) -> Option<String> {
-    let mut rest = text;
-    while let Some(start) = rest.find("[[") {
-        let after = &rest[start + 2..];
-        let Some(end) = after.find("]]") else {
-            break;
-        };
-        let target = &after[..end];
-        if target.contains(stem) {
-            let link_start_absolute = text.len() - rest.len() + start;
-            let line_start = text[..link_start_absolute]
-                .rfind('\n')
-                .map_or(0, |index| index + 1);
-            let link_end_absolute = link_start_absolute + 2 + end + 2;
-            let line_end = text[link_end_absolute..]
-                .find('\n')
-                .map_or(text.len(), |index| link_end_absolute + index);
-            return Some(text[line_start..line_end].trim_end().to_owned());
-        }
-        rest = &after[end + 2..];
-    }
-    None
+    let parsed = flavite_syntax::pulldown_glue::parse_note(text.as_bytes()).ok()?;
+    let link = parsed.links.iter().find(|link| {
+        link.target_raw.contains(stem)
+            || link
+                .alias
+                .as_deref()
+                .is_some_and(|alias| alias.contains(stem))
+    })?;
+    let line_start = text[..link.span.start.0]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let line_end = text[link.span.end.0..]
+        .find('\n')
+        .map_or(text.len(), |index| link.span.end.0 + index);
+    Some(text[line_start..line_end].trim_end().to_owned())
 }
 
 #[cfg(test)]
