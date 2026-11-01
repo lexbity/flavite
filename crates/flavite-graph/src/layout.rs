@@ -1260,6 +1260,23 @@ impl Layout {
     ///   a phyllotaxis disc, so a cold start is already spread out rather
     ///   than a single point that has to be pushed apart.
     ///
+    /// Retarget with preserved momentum for delta batches. Identical to
+    /// [`Layout::retarget`] except the adaptive global speed is carried over
+    /// from the previous run (capped at the configured initial speed)
+    /// instead of reset, and the speed-efficiency accumulator is kept.
+    /// Survivors keep their positions; the cooling schedule still restarts
+    /// so newcomers settle. Small index deltas during an editing session
+    /// therefore nudge the map instead of re-energizing it (manual-UX fix
+    /// for "nodes drift away upon rendering").
+    pub fn retarget_keep_momentum(&mut self, snapshot: &GraphSnapshot) -> RetargetStats {
+        let carried_speed = self.global_speed.min(self.params.initial_speed);
+        let carried_efficiency = self.speed_efficiency;
+        let stats = self.retarget(snapshot);
+        self.global_speed = carried_speed;
+        self.speed_efficiency = carried_efficiency;
+        stats
+    }
+
     /// A retarget restarts the cooling schedule and clears the adaptive state
     /// (the topology changed, so last step's speeds and swinging no longer
     /// describe this graph). Use [`Layout::wake`] to re-energize without
@@ -1834,6 +1851,45 @@ mod tests {
             "warm start puts the newcomer by its neighbour, got {distance}"
         );
         assert!(all_finite(&layout));
+    }
+
+    #[test]
+    fn retarget_keep_momentum_carries_speed_but_retarget_resets_it() {
+        let mut model = GraphModel::new();
+        model.apply(
+            &(0..4)
+                .map(|i| Delta::Node(NodeDelta::Added { id: note(i) }))
+                .collect::<Vec<_>>(),
+        );
+        let snapshot_a = model.snapshot();
+        model.apply(&[Delta::Node(NodeDelta::Added { id: note(9) })]);
+        let snapshot_b = model.snapshot();
+
+        let mut layout = Layout::from_snapshot(&snapshot_a, LayoutParams::default());
+        // A mid-flight editing session: the simulation has cooled to a slow,
+        // regulated speed with a settled efficiency accumulator.
+        layout.global_speed = 0.3;
+        layout.speed_efficiency = 0.7;
+        let stats = layout.retarget_keep_momentum(&snapshot_b);
+        assert_eq!(stats.kept, 4);
+        assert_eq!(stats.placed, 1);
+        assert_eq!(
+            layout.global_speed, 0.3,
+            "keep-momentum must carry the regulated speed over"
+        );
+        assert_eq!(layout.speed_efficiency, 0.7);
+        // Above the configured initial speed it clamps.
+        layout.global_speed = 50.0;
+        layout.retarget_keep_momentum(&snapshot_a);
+        assert_eq!(
+            layout.global_speed,
+            LayoutParams::default().initial_speed,
+            "carried speed is capped at the configured initial speed"
+        );
+        // Plain retarget resets to the initial speed (full re-energize).
+        layout.global_speed = 0.3;
+        layout.retarget(&snapshot_b);
+        assert_eq!(layout.global_speed, LayoutParams::default().initial_speed);
     }
 
     #[test]

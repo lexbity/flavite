@@ -192,7 +192,7 @@ fn pointer_selection_places_caret_at_grapheme_boundaries() {
     let run = shaped.layout_runs().next().expect("one shaped line");
     let mut state = EditorWidget::<EditorAction>::state_for_test();
     for glyph in run.glyphs {
-        state.place_caret_from_point(text, glyph.x + 0.1, 1.0, 300.0, false);
+        state.place_caret_from_point(text, 0, glyph.x + 0.1, 1.0, 300.0, false);
         let caret = state.caret();
         assert!(
             text.is_char_boundary(caret),

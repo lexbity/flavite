@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use flavite_api::{GraphServiceMetrics, GraphServiceStatus, StoredUserState};
 use flavite_graph::{
-    GraphNodeRecord, GraphPublication, NodeId, NodeKind, PositionFrame, RenderKey,
+    GraphNodeRecord, GraphPublication, LayoutState, NodeId, NodeKind, PositionFrame, RenderKey,
 };
 use flavite_workspace::{GraphCamera, GraphView, LayoutAction, NoteLocator, TabId, ViewKind};
 use iced::Rectangle;
@@ -119,6 +119,11 @@ pub struct GraphTabState {
     pub bounds: Option<Rectangle>,
     /// Last seen base epoch (epoch resets clear transient entity state).
     pub last_epoch: u64,
+    /// The user took the camera with a pan/zoom gesture; auto-fit and
+    /// follow stop until the tab is recreated.
+    pub user_camera_moved: bool,
+    /// Layout activity seen at the previous pump (settle detection).
+    last_layout_active: Option<bool>,
     pub scope: flavite_graph::GraphScope,
     pub scope_sequence: u64,
     pub scope_result: Option<Arc<flavite_graph::scope::ScopeResult>>,
@@ -160,6 +165,8 @@ impl GraphTabState {
             stale: false,
             bounds: None,
             last_epoch: 0,
+            user_camera_moved: false,
+            last_layout_active: None,
             scope: view.scope().clone(),
             scope_sequence: 1,
             scope_result: None,
@@ -726,6 +733,10 @@ pub fn pump(app: &mut App) {
             .graph
             .state(tab)
             .is_some_and(|state| state.stale || state.updating);
+        let had_geometry = app
+            .graph
+            .state(tab)
+            .is_some_and(|state| state.geometry.is_some());
         let rebuild = app
             .graph
             .state(tab)
@@ -792,6 +803,43 @@ pub fn pump(app: &mut App) {
             }
         }
 
+        // Camera auto-fit and follow (manual-UX: a fresh graph must settle
+        // into view like a network diagram, not stream past a stationary
+        // viewport). While the user has not taken the camera, fit on the
+        // first mount, keep fitting while the layout is running, and fit
+        // once more when it settles. A pan or zoom hands the camera to the
+        // user permanently for this tab.
+        let layout_active = matches!(positions.state(), LayoutState::Active);
+        if let Some(state) = app.graph.state_mut(tab) {
+            let was_active = state.last_layout_active;
+            state.last_layout_active = Some(layout_active);
+            // Before the first mounted-bounds message arrives, fit against
+            // a nominal viewport: a settled map in view is the point; the
+            // next real-bounds generation refines it.
+            let bounds = state.bounds.unwrap_or(Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            });
+            if !state.user_camera_moved
+                && let Some(geometry) = state.geometry.clone()
+                && ((!had_geometry && state.geometry.is_some())
+                    || layout_active
+                    || (was_active == Some(true) && !layout_active))
+                && let Some(camera) = fit_camera_to_geometry(&geometry, bounds)
+            {
+                state.camera = camera;
+                state.camera_pending = None;
+                if !layout_active {
+                    // Settled: persist the fitted camera once. While the
+                    // simulation runs, the camera stays ephemeral so
+                    // following it does not spam layout transactions.
+                    commit_camera_value(app, tab, camera);
+                }
+            }
+        }
+
         // Camera debounce commit (wheel bursts): one transaction at idle.
         let due = app
             .graph
@@ -805,6 +853,37 @@ pub fn pump(app: &mut App) {
 }
 
 /// Commit one tab's ephemeral camera into the authoritative model.
+/// Camera that fits every mounted node into `bounds` with margin, or `None`
+/// for an empty/unfittable geometry. Shared by the Fit command and the
+/// auto-fit/follow camera so a first render settles into view instead of
+/// streaming past a stationary viewport.
+fn fit_camera_to_geometry(geometry: &RenderGeometry, bounds: Rectangle) -> Option<Camera> {
+    if geometry.node_count() == 0 {
+        return None;
+    }
+    let mut min = [f32::MAX; 2];
+    let mut max = [f32::MIN; 2];
+    let mut radius = 1.0_f32;
+    for node in geometry.nodes() {
+        radius = radius.max(node.size);
+        for axis in 0..2 {
+            min[axis] = min[axis].min(node.center[axis] - node.size);
+            max[axis] = max[axis].max(node.center[axis] + node.size);
+        }
+    }
+    if !min[0].is_finite() {
+        return None;
+    }
+    let extent = (max[0] - min[0]).max(max[1] - min[1]).max(1.0) * 1.25;
+    let center = [(min[0] + max[0]) / 2.0, (min[1] + max[1]) / 2.0];
+    let mut camera = Camera::centered();
+    camera.fit_extent(extent, [0.0, 0.0], [bounds.width, bounds.height]);
+    // Tiny/new layouts must not turn dots into viewport-sized discs.
+    camera.zoom = camera.zoom.min(24.0 / radius).max(Camera::ZOOM_MIN);
+    camera.center = center;
+    Some(camera)
+}
+
 pub fn commit_camera(app: &mut App, tab: TabId) {
     let Some(camera) = app.graph.state(tab).map(|state| state.camera) else {
         return;
@@ -933,6 +1012,7 @@ pub fn handle_message(app: &mut App, tab: TabId, message: GraphMessage) {
             };
             state.camera.pan_by(world[0], world[1]);
             state.camera_pending = Some(now);
+            state.user_camera_moved = true;
         }
         GraphMessage::ZoomAt { anchor, factor } => {
             let Some(state) = app.graph.state_mut(tab) else {
@@ -948,6 +1028,7 @@ pub fn handle_message(app: &mut App, tab: TabId, message: GraphMessage) {
                 .camera
                 .zoom_at(anchor, [0.0, 0.0], [bounds.width, bounds.height], factor);
             state.camera_pending = Some(now);
+            state.user_camera_moved = true;
         }
         GraphMessage::NodeDragged { node, world } => {
             let Some(state) = app.graph.state_mut(tab) else {
@@ -1237,31 +1318,13 @@ pub fn command(app: &mut App, tab: TabId, command: GraphCommand) {
             else {
                 return;
             };
-            let mut min = [f32::MAX; 2];
-            let mut max = [f32::MIN; 2];
-            let mut radius = 1.0_f32;
-            for node in geometry.nodes() {
-                radius = radius.max(node.size);
-                for axis in 0..2 {
-                    min[axis] = min[axis].min(node.center[axis] - node.size);
-                    max[axis] = max[axis].max(node.center[axis] + node.size);
+            if let Some(camera) = fit_camera_to_geometry(&geometry, bounds) {
+                if let Some(state) = app.graph.state_mut(tab) {
+                    state.camera = camera;
+                    state.camera_pending = None;
                 }
+                commit_camera_value(app, tab, camera);
             }
-            if !min[0].is_finite() || geometry.node_count() == 0 {
-                return;
-            }
-            let extent = (max[0] - min[0]).max(max[1] - min[1]).max(1.0) * 1.25;
-            let center = [(min[0] + max[0]) / 2.0, (min[1] + max[1]) / 2.0];
-            let mut camera = Camera::centered();
-            camera.fit_extent(extent, [0.0, 0.0], [bounds.width, bounds.height]);
-            // Tiny/new layouts must not turn dots into viewport-sized discs.
-            camera.zoom = camera.zoom.min(24.0 / radius).max(Camera::ZOOM_MIN);
-            camera.center = center;
-            if let Some(state) = app.graph.state_mut(tab) {
-                state.camera = camera;
-                state.camera_pending = None;
-            }
-            commit_camera_value(app, tab, camera);
         }
         GraphCommand::OpenSelected | GraphCommand::InsertSelected => {
             let selected = app.graph.state(tab).and_then(|state| state.selection);

@@ -25,11 +25,17 @@ use iced::{Background, Border, Color, Length, Point, Rectangle, Size, Theme};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::time::{Duration, Instant};
 
 const FONT_SIZE: f32 = 16.0;
 const LINE_HEIGHT: f32 = 22.0;
 const PAD_X: f32 = 12.0;
 const PAD_Y: f32 = 10.0;
+
+/// Interaction snapshots are published immediately on press/release/scroll;
+/// during a drag they are coalesced to at most one per frame so a pointer
+/// sweep cannot flood the host acknowledgement loop.
+const INTERACTION_PUBLISH_INTERVAL: Duration = Duration::from_millis(16);
 
 thread_local! {
     static FONT_SYSTEM: RefCell<FontSystem> = RefCell::new(FontSystem::new());
@@ -413,6 +419,40 @@ pub struct EditorState {
     interaction_sequence: u64,
     controlled_pending: bool,
     controlled_ack: u64,
+    /// Cached shaping of the visible viewport text (see [`ShapingCache`]).
+    shaping: Option<ShapingCache>,
+    /// Last interaction-snapshot publication instant (drag coalescing).
+    last_publish: Option<Instant>,
+}
+
+/// Identity of one shaped viewport: the same revision, text allocation,
+/// viewport window, and layout width reuse the cached shaping. Any change
+/// reshapes, so hit-testing, IME placement, and drawing share one shaping
+/// pass per frame instead of re-shaping on every event.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ShapingKey {
+    revision: u64,
+    text_addr: usize,
+    text_len: usize,
+    first_line: usize,
+    visible_lines: usize,
+    width_bits: u32,
+}
+
+struct ShapingCache {
+    key: ShapingKey,
+    buffer: ShapingBuffer,
+    visible: String,
+    source_start: usize,
+}
+
+impl std::fmt::Debug for ShapingCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ShapingCache")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Host-visible per-view interaction state needed by accessibility and
@@ -815,9 +855,72 @@ impl EditorState {
 
     /// Pointer selection against shaped text: places or extends the
     /// selection at the glyph boundary under the point.
-    pub fn place_caret_from_point(&mut self, text: &str, x: f32, y: f32, width: f32, extend: bool) {
-        let byte = hit_test_visible(text, self.viewport, x, y, width);
+    pub fn place_caret_from_point(
+        &mut self,
+        text: &str,
+        revision: u64,
+        x: f32,
+        y: f32,
+        width: f32,
+        extend: bool,
+    ) {
+        let byte = self.hit_test_cached(text, revision, self.viewport, x, y, width);
         self.move_to(byte, extend);
+    }
+
+    /// Shape the visible viewport once per (revision, text, viewport, width)
+    /// and reuse the cached buffer for every consumer in the same frame.
+    fn shaped(
+        &mut self,
+        text: &str,
+        revision: u64,
+        viewport: Viewport,
+        width: f32,
+    ) -> (&ShapingBuffer, &str, usize) {
+        let key = ShapingKey {
+            revision,
+            text_addr: text.as_ptr() as usize,
+            text_len: text.len(),
+            first_line: viewport.first_line,
+            visible_lines: viewport.visible_lines,
+            width_bits: width.to_bits(),
+        };
+        if self.shaping.as_ref().is_none_or(|cache| cache.key != key) {
+            let (visible, source_start) = visible_text(text, viewport);
+            let buffer = shape_text(&visible, width);
+            self.shaping = Some(ShapingCache {
+                key,
+                buffer,
+                visible,
+                source_start,
+            });
+        }
+        let cache = self
+            .shaping
+            .as_ref()
+            .expect("shaping cache was just populated");
+        (&cache.buffer, cache.visible.as_str(), cache.source_start)
+    }
+
+    /// Hit-test against the cached viewport shaping.
+    fn hit_test_cached(
+        &mut self,
+        text: &str,
+        revision: u64,
+        viewport: Viewport,
+        x: f32,
+        y: f32,
+        width: f32,
+    ) -> usize {
+        {
+            let (buffer, visible, source_start) = self.shaped(text, revision, viewport, width);
+            let Some(cursor) = buffer.hit(x.max(0.0), y.max(0.0)) else {
+                return source_start + visible.len();
+            };
+            let line_start = line_start_byte(visible, cursor.line);
+            source_start
+                + clamp_char_boundary(visible, line_start + cursor.index).min(visible.len())
+        }
     }
 }
 
@@ -858,13 +961,35 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         let clip = bounds
             .intersection(viewport)
             .unwrap_or(Rectangle::with_size(Size::ZERO));
-        let (visible_text, source_start) = visible_text(&self.view.text, state.viewport);
-        let text_layout = shape_text(&visible_text, (bounds.width - PAD_X * 2.0).max(1.0));
-        let runs = text_layout.layout_runs().collect::<Vec<_>>();
+        let text_width = (bounds.width - PAD_X * 2.0).max(1.0);
+        let shaping_key = ShapingKey {
+            revision: self.view.revision,
+            text_addr: self.view.text.as_ptr() as usize,
+            text_len: self.view.text.len(),
+            first_line: state.viewport.first_line,
+            visible_lines: state.viewport.visible_lines,
+            width_bits: text_width.to_bits(),
+        };
+        let local_buffer;
+        let hoisted_visible;
+        let (visible_text, source_start, runs) = if let Some(cache) = state
+            .shaping
+            .as_ref()
+            .filter(|cache| cache.key == shaping_key)
+        {
+            let runs = cache.buffer.layout_runs().collect::<Vec<_>>();
+            (cache.visible.as_str(), cache.source_start, runs)
+        } else {
+            let (visible, start) = visible_text(&self.view.text, state.viewport);
+            hoisted_visible = visible;
+            local_buffer = shape_text(&hoisted_visible, text_width);
+            let runs = local_buffer.layout_runs().collect::<Vec<_>>();
+            (hoisted_visible.as_str(), start, runs)
+        };
         let (selection_start, selection_end) = state.selection();
         if selection_start < selection_end {
             for run in &runs {
-                let line_start = source_start + line_start_byte(&visible_text, run.line_i);
+                let line_start = source_start + line_start_byte(visible_text, run.line_i);
                 for glyph in run.glyphs {
                     let glyph_start = line_start + glyph.start;
                     let glyph_end = line_start + glyph.end;
@@ -888,22 +1013,35 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             }
         }
         // Use the semantic scanner for link decorations. No markdown parser or
-        // second link grammar is embedded in the widget.
+        // second link grammar is embedded in the widget. Spans intersecting
+        // each line are collected once per line, not once per glyph.
         for run in &runs {
-            let line_start = source_start + line_start_byte(&visible_text, run.line_i);
+            let line_start = source_start + line_start_byte(visible_text, run.line_i);
+            let line_end = line_bounds(&self.view.text, line_start).1;
+            let active_links: Vec<&LinkSpan> = state
+                .link_spans
+                .iter()
+                .filter(|span| span.span.start < line_end && span.span.end > line_start)
+                .collect();
+            let active_decorations: Vec<&flavite_syntax::ScannedSpan> = state
+                .decorations
+                .iter()
+                .filter(|span| {
+                    matches!(span.kind, SpanKind::Tag | SpanKind::BlockId)
+                        && span.span.start.0 < line_end
+                        && span.span.end.0 > line_start
+                })
+                .collect();
             for glyph in run.glyphs {
                 let glyph_start = line_start + glyph.start;
                 let glyph_end = line_start + glyph.end;
-                let link_resolution = state
-                    .link_spans
+                let link_resolution = active_links
                     .iter()
                     .find(|span| span.span.start < glyph_end && span.span.end > glyph_start)
                     .map(|span| span.resolution);
-                let other_decoration = state.decorations.iter().any(|span| {
-                    matches!(span.kind, SpanKind::Tag | SpanKind::BlockId)
-                        && span.span.start.0 < glyph_end
-                        && span.span.end.0 > glyph_start
-                });
+                let other_decoration = active_decorations
+                    .iter()
+                    .any(|span| span.span.start.0 < glyph_end && span.span.end.0 > glyph_start);
                 if link_resolution.is_some() || other_decoration {
                     let color = match link_resolution {
                         Some(LinkResolution::Unresolved) => Color::from_rgb(0.95, 0.48, 0.43),
@@ -931,7 +1069,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         }
         renderer.fill_text(
             text::Text {
-                content: visible_text.clone(),
+                content: visible_text.to_owned(),
                 bounds: Size::new(
                     (bounds.width - PAD_X * 2.0).max(1.0),
                     (bounds.height - PAD_Y * 2.0).max(1.0),
@@ -954,7 +1092,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             && composition.start <= source_start + visible_text.len()
         {
             let local_start = composition.start - source_start;
-            let (x, y) = caret_position(&runs, &visible_text, local_start);
+            let (x, y) = caret_position(&runs, visible_text, local_start);
             let preedit_layout =
                 shape_text(&composition.preedit, (bounds.width - PAD_X * 2.0).max(1.0));
             let preedit_width = preedit_layout
@@ -1072,7 +1210,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             && state.caret <= source_start + visible_text.len()
         {
             let local_caret = state.caret.saturating_sub(source_start);
-            let (x, y) = caret_position(&runs, &visible_text, local_caret);
+            let (x, y) = caret_position(&runs, visible_text, local_caret);
             renderer.fill_quad(
                 renderer::Quad {
                     bounds: Rectangle::new(
@@ -1191,16 +1329,10 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         _viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<EditorState>();
-        if !self.input_enabled {
-            return;
-        }
-        if !self.keyboard_enabled
-            && matches!(
-                event,
-                iced::Event::Keyboard(keyboard::Event::KeyPressed { .. })
-                    | iced::Event::InputMethod(_)
-            )
-        {
+        // Modal overlays suppress keyboard and IME edit input only; pointer
+        // hit-testing, selection, and focus stay live so an open overlay or
+        // stale overlay flag never leaves the editor dead to the mouse.
+        if keyboard_input_blocked(self.input_enabled, self.keyboard_enabled, event) {
             return;
         }
         let before_interaction = state.interaction_snapshot(Some(&self.view.text));
@@ -1263,18 +1395,21 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             }
             iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(position) = cursor.position_in(layout.bounds()) {
-                    let byte = hit_test_visible(
+                    let width = (layout.bounds().width - PAD_X * 2.0).max(1.0);
+                    let byte = state.hit_test_cached(
                         &self.view.text,
+                        self.view.revision,
                         state.viewport,
                         position.x - PAD_X,
                         position.y - PAD_Y,
-                        (layout.bounds().width - PAD_X * 2.0).max(1.0),
+                        width,
                     );
-                    if (state.modifiers.command() || state.modifiers.control())
-                        && let Some(action) = link_action_at(&self.view, &state.link_spans, byte)
-                    {
+                    // A click on a link navigates (point-and-click contract);
+                    // modifier clicks take the same path.
+                    if let Some(action) = link_action_at(&self.view, &state.link_spans, byte) {
                         self.emit(shell, action);
                         shell.capture_event();
+                        shell.request_redraw();
                         return;
                     }
                     state.focused = true;
@@ -1282,12 +1417,14 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     state.selecting = true;
                     state.place_caret_from_point(
                         &self.view.text,
+                        self.view.revision,
                         position.x - PAD_X,
                         position.y - PAD_Y,
-                        (layout.bounds().width - PAD_X * 2.0).max(1.0),
+                        width,
                         false,
                     );
                     shell.capture_event();
+                    shell.request_redraw();
                 } else {
                     state.focused = false;
                     state.ime_active = false;
@@ -1299,12 +1436,17 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 if let Some(position) = cursor.position_in(layout.bounds()) {
                     state.place_caret_from_point(
                         &self.view.text,
+                        self.view.revision,
                         position.x - PAD_X,
                         position.y - PAD_Y,
                         (layout.bounds().width - PAD_X * 2.0).max(1.0),
                         true,
                     );
                     shell.capture_event();
+                    // The selection highlight must be visible on the next
+                    // frame, not only after the host acknowledgement round
+                    // trip.
+                    shell.request_redraw();
                 }
             }
             iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
@@ -1349,12 +1491,16 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             }
             _ => {}
         }
-        if state.focused && state.ime_active {
-            let (visible, source_start) = visible_text(&self.view.text, state.viewport);
-            let layout_text = shape_text(&visible, (layout.bounds().width - PAD_X * 2.0).max(1.0));
-            let runs = layout_text.layout_runs().collect::<Vec<_>>();
-            let caret = state.caret.saturating_sub(source_start).min(visible.len());
-            let (x, y) = caret_position(&runs, &visible, caret);
+        if self.input_enabled && state.focused && state.ime_active {
+            let width = (layout.bounds().width - PAD_X * 2.0).max(1.0);
+            let caret_byte = state.caret;
+            let (x, y) = {
+                let (buffer, visible, source_start) =
+                    state.shaped(&self.view.text, self.view.revision, state.viewport, width);
+                let runs = buffer.layout_runs().collect::<Vec<_>>();
+                let caret = caret_byte.saturating_sub(source_start).min(visible.len());
+                caret_position(&runs, visible, caret)
+            };
             shell.request_input_method(&InputMethod::Enabled {
                 cursor: Rectangle::new(
                     Point::new(layout.bounds().x + PAD_X + x, layout.bounds().y + PAD_Y + y),
@@ -1376,14 +1522,20 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     | mouse::Event::WheelScrolled { .. }
             ) | iced::Event::Keyboard(keyboard::Event::KeyPressed { .. })
         );
+        let publish_due = !state.selecting
+            || state
+                .last_publish
+                .is_none_or(|instant| instant.elapsed() >= INTERACTION_PUBLISH_INTERVAL);
         if let Some(on_interaction) = &self.on_interaction
             && (explicit_interaction
                 || state.interaction_snapshot(Some(&self.view.text)) != before_interaction)
+            && publish_due
             && let Some(snapshot) = {
                 state.interaction_sequence = state.interaction_sequence.saturating_add(1);
                 state.interaction_snapshot(Some(&self.view.text))
             }
         {
+            state.last_publish = Some(Instant::now());
             shell.publish(on_interaction(snapshot));
         }
     }
@@ -1502,19 +1654,33 @@ fn shape_text(text: &str, width: f32) -> ShapingBuffer {
     })
 }
 
-fn hit_test(text: &str, x: f32, y: f32, width: f32) -> usize {
-    let buffer = shape_text(text, width);
-    let Some(cursor) = buffer.hit(x.max(0.0), y.max(0.0)) else {
-        return text.len();
-    };
-    let line_start = line_start_byte(text, cursor.line);
-    clamp_char_boundary(text, line_start + cursor.index).min(text.len())
+/// Whether this event is edit-capable keyboard/IME input that the current
+/// gating flags suppress. Both flags gate only keyboard and IME events;
+/// pointer events are never blocked, so an open overlay (or a stale overlay
+/// flag) can never leave the editor dead to mouse selection.
+fn keyboard_input_blocked(
+    input_enabled: bool,
+    keyboard_enabled: bool,
+    event: &iced::Event,
+) -> bool {
+    matches!(
+        event,
+        iced::Event::Keyboard(keyboard::Event::KeyPressed { .. }) | iced::Event::InputMethod(_)
+    ) && (!input_enabled || !keyboard_enabled)
 }
 
 /// Shape and hit-test only the logical lines currently in the viewport.
+/// Test-only reference implementation; the widget path goes through the
+/// cached shaping in [`EditorState::shaped`].
+#[cfg(test)]
 fn hit_test_visible(text: &str, viewport: Viewport, x: f32, y: f32, width: f32) -> usize {
     let (visible, source_start) = visible_text(text, viewport);
-    source_start + hit_test(&visible, x, y, width)
+    let buffer = shape_text(&visible, width);
+    let Some(cursor) = buffer.hit(x.max(0.0), y.max(0.0)) else {
+        return source_start + visible.len();
+    };
+    let line_start = line_start_byte(&visible, cursor.line);
+    source_start + clamp_char_boundary(&visible, line_start + cursor.index).min(visible.len())
 }
 
 fn visible_text(text: &str, viewport: Viewport) -> (String, usize) {
@@ -1579,6 +1745,78 @@ mod tests {
     use super::*;
     use flavite_syntax::text::{Span, TextByte};
     use iced::advanced::widget::Operation as _;
+
+    fn key_press() -> iced::Event {
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Character("a".into()),
+            modified_key: iced::keyboard::Key::Character("a".into()),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::KeyA),
+            location: iced::keyboard::Location::Standard,
+            modifiers: Modifiers::default(),
+            text: Some("a".into()),
+            repeat: false,
+        })
+    }
+
+    #[test]
+    fn input_gating_never_blocks_pointer_events() {
+        let mouse_press =
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left));
+        let mouse_move = iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+            position: Point::new(1.0, 1.0),
+        });
+        // Modal-overlay and find-focus flags suppress keyboard/IME input
+        // only; mouse selection must stay live in every combination.
+        for input_enabled in [true, false] {
+            for keyboard_enabled in [true, false] {
+                assert!(
+                    !keyboard_input_blocked(input_enabled, keyboard_enabled, &mouse_press),
+                    "pointer press blocked by (input={input_enabled}, keyboard={keyboard_enabled})"
+                );
+                assert!(
+                    !keyboard_input_blocked(input_enabled, keyboard_enabled, &mouse_move),
+                    "pointer move blocked by (input={input_enabled}, keyboard={keyboard_enabled})"
+                );
+            }
+        }
+        // Keyboard input is blocked by either flag.
+        assert!(keyboard_input_blocked(false, true, &key_press()));
+        assert!(keyboard_input_blocked(true, false, &key_press()));
+        assert!(!keyboard_input_blocked(true, true, &key_press()));
+    }
+
+    #[test]
+    fn cached_shaping_is_reused_until_the_key_changes() {
+        let text = "one\ntwo\nthree";
+        let viewport = Viewport {
+            visible_lines: 2,
+            ..Viewport::default()
+        };
+        let mut state = EditorState::default();
+        let buffer_ptr = state.shaped(text, 1, viewport, 300.0).0 as *const ShapingBuffer;
+        let (visible, source_start) = {
+            let (_, visible, source_start) = state.shaped(text, 1, viewport, 300.0);
+            (visible, source_start)
+        };
+        assert_eq!(source_start, 0);
+        assert_eq!(visible, "one\ntwo\n");
+        // Same key: the cached buffer is reused (identical allocation).
+        let (again, _, _) = state.shaped(text, 1, viewport, 300.0);
+        assert!(std::ptr::eq(buffer_ptr, again));
+        // A different viewport window reshapes.
+        let scrolled = Viewport {
+            first_line: 1,
+            ..viewport
+        };
+        let (_, visible3, start3) = state.shaped(text, 1, scrolled, 300.0);
+        assert_eq!(visible3, "two\nthree");
+        assert_eq!(start3, text.find("two").unwrap());
+        // Same length, different revision: still reshapes (revision in key).
+        let swapped = "six\nten\nseven";
+        assert_eq!(swapped.len(), text.len());
+        let (_, visible4, _) = state.shaped(swapped, 2, viewport, 300.0);
+        assert_eq!(visible4, "six\nten\n");
+    }
 
     #[test]
     fn ime_preedit_is_transient_and_commit_emits_one_edit() {
@@ -1911,7 +2149,11 @@ mod tests {
     #[test]
     fn cosmic_text_hit_test_returns_utf8_boundary() {
         let text = "a🧑🏽‍💻e\u{301}";
-        let byte = hit_test(text, 45.0, 4.0, 200.0);
+        let viewport = Viewport {
+            visible_lines: 1,
+            ..Viewport::default()
+        };
+        let byte = hit_test_visible(text, viewport, 45.0, 4.0, 200.0);
         assert!(text.is_char_boundary(byte));
     }
 
@@ -2137,10 +2379,10 @@ mod tests {
             ..EditorState::default()
         };
 
-        state.place_caret_from_point(text, target.x + 0.1, 1.0, 300.0, false);
+        state.place_caret_from_point(text, 0, target.x + 0.1, 1.0, 300.0, false);
         assert_eq!(state.caret(), expected_byte);
         assert_eq!(state.selection(), (expected_byte, expected_byte));
-        state.place_caret_from_point(text, first_run.glyphs[1].x + 0.1, 1.0, 300.0, true);
+        state.place_caret_from_point(text, 0, first_run.glyphs[1].x + 0.1, 1.0, 300.0, true);
         assert_eq!(
             state.selection(),
             (first_run.glyphs[1].start, expected_byte)

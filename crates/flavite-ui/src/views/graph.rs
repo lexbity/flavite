@@ -23,14 +23,19 @@ use crate::style;
 use crate::views::empty_state;
 use crate::workspace::{bounds as bounds_obs, tab_strip};
 use flavite_api::GraphServiceStatus;
-use flavite_workspace::{TabId, ViewKind};
-use iced::widget::{button, column, container, row, rule, scrollable, text};
+use flavite_workspace::{Direction, TabId, ViewKind};
+use iced::widget::{button, column, container, pick_list, row, scrollable, text};
 use iced::{Element, Length, Padding, alignment};
 
 /// Rows rendered in list/accessibility mode before truncation is noted.
 const LIST_ROW_BUDGET: usize = 50;
 
 /// Render one graph tab for the active view slot.
+///
+/// Compact chrome (concept 01): one toolbar row plus an optional selection
+/// row, the writing-target banner, a full-bleed canvas, and a single
+/// status/hint footer — the controls hug their content and the network
+/// gets the space.
 pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
     let Some(session) = app.workspace.tab(&tab) else {
         return empty_state("Empty", "This tab has no content.");
@@ -56,234 +61,284 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         }
     };
     column![
-        text(app.writing_target_label()).size(style::TEXT_SM),
-        scrollable(header).height(Length::FillPortion(2)),
-        rule::horizontal(1),
-        container(body)
-            .width(Length::Fill)
-            .height(Length::FillPortion(5))
+        header,
+        target_banner(app),
+        crate::host::occurrences::view(app, tab),
+        container(body).width(Length::Fill).height(Length::Fill),
+        footer(app, tab, state),
     ]
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
 }
 
-/// Toolbar: counts + provenance, explicit selection label, writing-target
-/// affordance, and the view's real controls.
+/// The persistent writing-target affordance (D-05): the double-click
+/// destination is visible before it happens; a missing target gets an
+/// explanation, never a hidden fallback.
+fn target_banner<'a>(app: &'a App) -> Element<'a, Message> {
+    let banner: Element<'a, Message> = if let Some((tab, ..)) = app.valid_writing_target() {
+        let title = app
+            .notes
+            .locator_of(tab)
+            .map_or_else(|| "the current note".into(), |l| l.title().to_owned());
+        row![
+            text("Insert links into:").size(style::TEXT_SM),
+            text(title).size(style::TEXT_SM).style(style::dim_text),
+            text("— double-click a note node to insert its link")
+                .size(style::TEXT_SM)
+                .style(style::dim_text),
+        ]
+        .spacing(4)
+        .align_y(alignment::Vertical::Center)
+        .into()
+    } else {
+        text("No insertion target — click in an editor to place the cursor; double-click insertion is disabled")
+            .size(style::TEXT_SM)
+            .style(style::dim_text)
+            .into()
+    };
+    container(banner)
+        .width(Length::Fill)
+        .padding(Padding {
+            top: 2.0,
+            bottom: 2.0,
+            left: style::SPACING,
+            right: style::SPACING,
+        })
+        .style(style::toolbar)
+        .into()
+}
+
+/// One status/hint line under the canvas: staleness, scope status, what
+/// publishes to context, provenance, and the keyboard hint.
+fn footer<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Message> {
+    let state_text = if state.stale {
+        "Frame stale — insertion disabled".to_owned()
+    } else if state.updating {
+        "Updating…".to_owned()
+    } else {
+        // D-04: a *source* view shows what it publishes, not a binding
+        // label (the graph has no follow-binding of its own).
+        match app.workspace.exploration() {
+            Some(selection) if selection.source_tab == tab => match &selection.target {
+                Some(target) => format!("Publishing to context: {}", target.title()),
+                None => "Publishing to context: no selection".into(),
+            },
+            _ => "Publishing to context: not publishing".into(),
+        }
+    };
+    let scope_status = if state.scope_result.as_ref().is_some_and(|s| s.excluded_root) {
+        "Root excluded — clear filters"
+    } else if state.scope_result.as_ref().is_some_and(|s| s.missing_root) {
+        "Neighborhood root is missing"
+    } else if state
+        .scope_result
+        .as_ref()
+        .is_some_and(|s| s.nodes.is_empty())
+    {
+        "No matching notes — clear filters"
+    } else {
+        ""
+    };
+    row![
+        text(state_text).size(style::TEXT_SM).style(style::dim_text),
+        text(scope_status)
+            .size(style::TEXT_SM)
+            .style(style::dim_text),
+        iced::widget::Space::new()
+            .width(Length::Fill)
+            .height(Length::Fixed(0.0)),
+        text(crate::graph::provenance::label(state))
+            .size(style::TEXT_SM)
+            .style(style::dim_text),
+        text("Enter opens · Ctrl+Enter inserts")
+            .size(style::TEXT_SM)
+            .style(style::dim_text),
+    ]
+    .spacing(style::SPACING)
+    .align_y(alignment::Vertical::Center)
+    .into()
+}
+
+/// Toolbar: compact counts, neighborhood controls, and the view's real
+/// controls on one hug-content row; selection actions appear only when a
+/// selection exists.
 fn header<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Message> {
     let counts = state
         .scope_result
         .as_ref()
         .map(|scope| {
-            format!(
-                "{} base notes · {} matching notes · {} rendered · {} omitted",
-                scope.total_base_notes,
-                scope.matching_notes,
-                state.geometry.as_ref().map_or(0, |g| g.node_count()),
-                scope
-                    .nodes
-                    .len()
-                    .saturating_sub(state.geometry.as_ref().map_or(0, |g| g.node_count()))
-            )
+            let rendered = state.geometry.as_ref().map_or(0, |g| g.node_count());
+            let omitted = scope.nodes.len().saturating_sub(rendered);
+            if omitted > 0 {
+                format!(
+                    "{} / {} notes · {} omitted",
+                    scope.matching_notes, scope.total_base_notes, omitted
+                )
+            } else {
+                format!(
+                    "{} / {} notes",
+                    scope.matching_notes, scope.total_base_notes
+                )
+            }
         })
-        .unwrap_or_else(|| "Graph: updating scope".into());
-    let provenance = crate::graph::provenance::label(state);
-    let selection = state
-        .selection
-        .and_then(|hit| graph::record_for(app, hit.id).map(|record| (hit, record)))
-        .map(|(hit, record)| {
-            format!(
-                "Selected: {} [{}] {}",
-                record.title,
-                if hit.kind == flavite_graph::NodeKind::Attachment {
-                    "attachment"
-                } else {
-                    "note"
-                },
-                if state
-                    .scope_result
-                    .as_ref()
-                    .is_some_and(|scope| !scope.nodes.contains(&hit.id))
-                {
-                    format!("{} · selected outside current scope", record.path)
-                } else {
-                    record.path
-                }
-            )
-        })
-        .unwrap_or_else(|| "Selected: none — click a node".into());
-    let stale = if state.stale || state.updating {
-        text("frame stale — insertion disabled").size(style::TEXT_SM)
-    } else {
-        text("").size(style::TEXT_SM)
-    };
+        .unwrap_or_else(|| "Updating…".into());
     let chip = |label: &'static str, command: GraphCommand, enabled: bool| {
         button(text(label).size(style::TEXT_SM))
             .padding(tab_strip::chip_padding())
             .style(style::ghost())
             .on_press_maybe(enabled.then_some(Message::GraphCommand { tab, command }))
     };
-    container(
-        column![
-            row![
-                text(counts).size(style::TEXT).width(Length::Fill),
-                iced::widget::Space::new()
-                    .width(Length::Fill)
-                    .height(Length::Fixed(0.0)),
-                chip(
-                    if state.frozen {
-                        "Resume layout"
+    let mut toolbar = row![]
+        .spacing(style::SPACING)
+        .align_y(alignment::Vertical::Center);
+    toolbar = toolbar.push(text(counts).size(style::TEXT_SM));
+    // Neighborhood controls live on the toolbar (concept 01), not buried
+    // in the filter panel; depth/direction only apply to a neighborhood
+    // scope.
+    if let Some(neighborhood) = &state.scope.neighborhood {
+        let direction = match neighborhood.direction {
+            Direction::In => "In",
+            Direction::Out => "Out",
+            Direction::Both => "Both",
+        };
+        toolbar = toolbar
+            .push(text("Depth").size(style::TEXT_SM).style(style::dim_text))
+            .push(pick_list(
+                vec![0u8, 1, 2, 3, 4, 5, 6],
+                Some(neighborhood.depth),
+                move |depth| Message::GraphCommand {
+                    tab,
+                    command: GraphCommand::Depth(depth),
+                },
+            ))
+            .push(pick_list(
+                vec!["In", "Out", "Both"],
+                Some(direction),
+                move |direction| Message::GraphCommand {
+                    tab,
+                    command: GraphCommand::Direction(match direction {
+                        "In" => Direction::In,
+                        "Out" => Direction::Out,
+                        _ => Direction::Both,
+                    }),
+                },
+            ));
+    }
+    toolbar = toolbar
+        .push(
+            iced::widget::Space::new()
+                .width(Length::Fill)
+                .height(Length::Fixed(0.0)),
+        )
+        .push(chip(
+            if state.filter.expanded {
+                "Close filters"
+            } else {
+                "Filters"
+            },
+            GraphCommand::ToggleFilters,
+            true,
+        ))
+        .push(chip("Clear filters", GraphCommand::ClearFilters, true))
+        .push(chip(
+            "Undo filters",
+            GraphCommand::UndoFilters,
+            state.previous_scope.is_some(),
+        ))
+        .push(chip(
+            "Neighborhood",
+            GraphCommand::ExploreSelected,
+            state.selection.is_some(),
+        ))
+        .push(chip(
+            if state.frozen {
+                "Resume layout"
+            } else {
+                "Freeze layout"
+            },
+            GraphCommand::ToggleFreeze,
+            true,
+        ))
+        .push(chip(
+            if state.list_mode {
+                "Show graph"
+            } else {
+                "Show list"
+            },
+            GraphCommand::ToggleList,
+            true,
+        ))
+        .push(chip(
+            "Retry",
+            GraphCommand::RetryService,
+            matches!(app.graph.status, Some(GraphServiceStatus::Failed { .. })),
+        ));
+    let mut chrome = column![
+        container(toolbar)
+            .width(Length::Fill)
+            .padding(Padding {
+                top: 4.0,
+                bottom: 4.0,
+                left: style::SPACING,
+                right: style::SPACING,
+            })
+            .style(style::toolbar)
+    ]
+    .spacing(2);
+    if state.selection.is_some() {
+        let selection = state
+            .selection
+            .and_then(|hit| graph::record_for(app, hit.id).map(|record| (hit, record)))
+            .map(|(hit, record)| {
+                format!(
+                    "Selected: {} [{}] · {}{}",
+                    record.title,
+                    if hit.kind == flavite_graph::NodeKind::Attachment {
+                        "attachment"
                     } else {
-                        "Freeze layout"
+                        "note"
                     },
-                    GraphCommand::ToggleFreeze,
-                    true
-                ),
-                chip(
-                    if state.list_mode {
-                        "Show graph"
-                    } else {
-                        "Show list"
-                    },
-                    GraphCommand::ToggleList,
-                    true
-                ),
-                chip("Fit", GraphCommand::FitView, state.geometry.is_some()),
-            ]
-            .spacing(style::SPACING)
-            .align_y(alignment::Vertical::Center),
-            row![
-                text(selection)
-                    .size(style::TEXT_SM)
-                    .style(style::dim_text)
-                    .width(Length::Fill),
-                iced::widget::Space::new()
-                    .width(Length::Fill)
-                    .height(Length::Fixed(0.0)),
-                chip(
-                    "Open (Enter)",
-                    GraphCommand::OpenSelected,
-                    state.selection.is_some()
-                ),
-                chip(
-                    "Insert link (Ctrl+Enter)",
-                    GraphCommand::InsertSelected,
-                    state.selection.is_some()
-                ),
-                chip(
-                    "Unpin",
-                    GraphCommand::UnpinSelected,
-                    state.selection.is_some()
-                ),
-            ]
-            .spacing(style::SPACING)
-            .align_y(alignment::Vertical::Center),
-            row![
-                text(app.writing_target_label()).size(style::TEXT_SM),
-                text(if app.valid_writing_target().is_some() {
-                    ""
-                } else {
-                    "— double-click inserts here; otherwise choose an editor and place the cursor"
-                })
-                .size(style::TEXT_SM)
-                .style(style::dim_text),
-                stale,
-                iced::widget::Space::new()
-                    .width(Length::Fill)
-                    .height(Length::Fixed(0.0)),
-                text(provenance).size(style::TEXT_SM).style(style::dim_text),
-                chip(
-                    "Retry",
-                    GraphCommand::RetryService,
-                    matches!(app.graph.status, Some(GraphServiceStatus::Failed { .. }))
-                ),
-            ]
-            .spacing(style::SPACING_SM)
-            .align_y(alignment::Vertical::Center),
-            row![
-                chip(
-                    if state.filter.expanded {
-                        "Close filters"
-                    } else {
-                        "Filters"
-                    },
-                    GraphCommand::ToggleFilters,
-                    true
-                ),
-                chip("Clear filters", GraphCommand::ClearFilters, true),
-                chip(
-                    "Undo filters",
-                    GraphCommand::UndoFilters,
-                    state.previous_scope.is_some()
-                ),
-                chip(
-                    "Neighborhood",
-                    GraphCommand::ExploreSelected,
-                    state.selection.is_some()
-                )
-            ]
-            .spacing(4),
-            crate::host::occurrences::view(app, tab),
-            row![
-                chip(
-                    "Reveal selection",
-                    GraphCommand::RevealSelected,
-                    state.selection.is_some()
-                ),
-                chip(
-                    "Clear selection",
-                    GraphCommand::ClearSelection,
-                    state.selection.is_some()
-                ),
-                text(if state.selection_summary.is_empty() {
-                    format!("{} selected", state.selected_nodes.len())
-                } else {
-                    state.selection_summary.clone()
-                })
-                .size(style::TEXT_SM),
-                text(
-                    if state.scope_result.as_ref().is_some_and(|s| s.excluded_root) {
-                        "Root excluded — clear filters"
-                    } else if state.scope_result.as_ref().is_some_and(|s| s.missing_root) {
-                        "Neighborhood root is missing"
-                    } else if state
+                    record.path,
+                    if state
                         .scope_result
                         .as_ref()
-                        .is_some_and(|s| s.nodes.is_empty())
+                        .is_some_and(|scope| !scope.nodes.contains(&hit.id))
                     {
-                        "No matching notes — clear filters"
+                        " · outside current scope"
                     } else {
                         ""
                     }
                 )
-                .size(style::TEXT_SM),
-            ]
-            .spacing(4),
+            })
+            .unwrap_or_else(|| "Selected".into());
+        let summary = if state.selection_summary.is_empty() {
+            format!("{} selected", state.selected_nodes.len())
+        } else {
+            state.selection_summary.clone()
+        };
+        chrome = chrome.push(
             row![
-                // D-04: a *source* view shows what it publishes, not a
-                // binding label (the graph has no follow-binding of its own).
-                text(match app.workspace.exploration() {
-                    Some(selection) if selection.source_tab == tab => match &selection.target {
-                        Some(target) => format!("Publishing to context: {}", target.title()),
-                        None => "Publishing to context: no selection".into(),
-                    },
-                    _ => "Publishing to context: not publishing".into(),
-                })
-                .size(style::TEXT_SM)
-                .style(style::dim_text),
-            ],
-        ]
-        .spacing(2),
-    )
-    .width(Length::Fill)
-    .padding(Padding {
-        top: 4.0,
-        bottom: 4.0,
-        left: style::SPACING,
-        right: style::SPACING,
-    })
-    .style(style::toolbar)
-    .into()
+                text(selection).size(style::TEXT_SM).style(style::dim_text),
+                text(summary).size(style::TEXT_SM).style(style::dim_text),
+                iced::widget::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(0.0)),
+                chip("Open (Enter)", GraphCommand::OpenSelected, true),
+                chip(
+                    "Insert link (Ctrl+Enter)",
+                    GraphCommand::InsertSelected,
+                    true
+                ),
+                chip("Unpin", GraphCommand::UnpinSelected, true),
+                chip("Reveal", GraphCommand::RevealSelected, true),
+                chip("Clear", GraphCommand::ClearSelection, true),
+            ]
+            .spacing(style::SPACING)
+            .align_y(alignment::Vertical::Center),
+        );
+    }
+    chrome.into()
 }
 
 /// Honest loading/error states before any frame exists (§13.4). The graph
@@ -451,6 +506,23 @@ fn visual_body<'a>(
     } else {
         surface
     };
+    // Corner fit control (concept 01): the canvas keeps every pixel; the
+    // button floats over it in the bottom-right.
+    let fit_control = container(
+        button(text("Fit to view").size(style::TEXT_SM))
+            .padding(tab_strip::chip_padding())
+            .style(style::ghost())
+            .on_press_maybe(state.geometry.is_some().then_some(Message::GraphCommand {
+                tab,
+                command: GraphCommand::FitView,
+            })),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .padding(6)
+    .align_x(alignment::Horizontal::Right)
+    .align_y(alignment::Vertical::Bottom);
+    let surface: Element<'a, Message> = iced::widget::stack![surface, fit_control].into();
     bounds_obs::observe(
         container(surface).width(Length::Fill).height(Length::Fill),
         move |rect| Message::GraphBounds(tab, rect),

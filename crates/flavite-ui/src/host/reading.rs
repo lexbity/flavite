@@ -363,7 +363,8 @@ pub fn observe(app: &mut App, outcome: &QueryOutcome) -> bool {
 }
 
 /// A callback must still belong to the tab's exact mounted reading resource.
-pub fn bound(app: &App, tab: TabId, doc: &Arc<ReadSnapshot>) -> bool {
+/// Is `doc` the (possibly embedded) document this tab is actually showing?
+fn snapshot_in_tab(app: &App, tab: TabId, doc: &Arc<ReadSnapshot>) -> bool {
     if !app.is_tab_visible(tab) || app.picker.open || app.palette_open || app.strip_menu.is_some() {
         return false;
     }
@@ -373,7 +374,23 @@ pub fn bound(app: &App, tab: TabId, doc: &Arc<ReadSnapshot>) -> bool {
                 |e| matches!(e, flavite_api::EmbedContent::Note(child) if contains(child, doc)),
             )
     }
-    document(app, tab).is_some_and(|root| contains(root, doc)) && current(app, doc)
+    document(app, tab).is_some_and(|root| contains(root, doc))
+}
+
+/// Strict admission for guarded edits, bounds, and presentation: the
+/// snapshot must be this tab's document *and* match the current catalog
+/// version, so an in-progress reindex never accepts revision-guarded
+/// edits against stale source.
+pub fn bound(app: &App, tab: TabId, doc: &Arc<ReadSnapshot>) -> bool {
+    snapshot_in_tab(app, tab, doc) && current(app, doc)
+}
+
+/// Navigation admission (`ReadActivate`/`OutlineNavigate`): pointer identity
+/// and visibility only. Following a link whose target path is recorded in
+/// the displayed snapshot is safe regardless of catalog freshness (D-08:
+/// navigation routes canonically); guarded edits keep the strict `bound`.
+pub fn bound_navigation(app: &App, tab: TabId, doc: &Arc<ReadSnapshot>) -> bool {
+    snapshot_in_tab(app, tab, doc)
 }
 pub fn handle(app: &mut App, message: crate::app::Message) -> iced::Task<crate::app::Message> {
     use crate::app::Message;
@@ -548,8 +565,8 @@ pub fn handle(app: &mut App, message: crate::app::Message) -> iced::Task<crate::
             document: doc,
             start,
         } => {
-            if !bound(app, tab, &doc) {
-                app.status = "Link source changed; refresh before opening".into();
+            if !bound_navigation(app, tab, &doc) {
+                app.status = "Read link: the source changed; refresh before opening".into();
                 return iced::Task::none();
             }
             match doc.links.get(&start).cloned() {
@@ -566,7 +583,7 @@ pub fn handle(app: &mut App, message: crate::app::Message) -> iced::Task<crate::
                     if let Some(byte) = anchor_byte(&doc, &anchor) {
                         app.reading.pending_anchor.insert(tab, byte);
                     } else {
-                        app.status = "Anchor missing from current note".into();
+                        app.status = "Read link: this anchor is missing from the note".into();
                     }
                 }
                 Some(flavite_api::ReadLink::External(url))
@@ -610,7 +627,9 @@ pub fn handle(app: &mut App, message: crate::app::Message) -> iced::Task<crate::
             document: doc,
             byte,
         } => {
-            if !bound(app, tab, &doc) || !doc.document.outline.iter().any(|h| h.byte == byte) {
+            if !bound_navigation(app, tab, &doc)
+                || !doc.document.outline.iter().any(|h| h.byte == byte)
+            {
                 app.status = "Outline changed; refresh before navigating".into();
                 return iced::Task::none();
             }

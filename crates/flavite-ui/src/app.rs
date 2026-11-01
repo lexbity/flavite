@@ -85,6 +85,12 @@ pub struct App {
     pub menu_selected: usize,
     pub pointer: Option<iced::Point>,
     pub drag_revision: Option<u64>,
+    /// Set by pointer handling when something observable changed (resize
+    /// preview, drag start, status); gates the per-move semantics rebuild.
+    pointer_feedback: bool,
+    /// Set when the window/workspace bounds changed; gates the geometry
+    /// re-solve that used to run on every message.
+    window_geometry_dirty: bool,
     catalog: Vec<NoteCatalogEntry>,
     catalog_error: Option<String>,
     settings: Settings,
@@ -374,6 +380,8 @@ impl App {
             menu_selected: 0,
             pointer: None,
             drag_revision: None,
+            pointer_feedback: false,
+            window_geometry_dirty: true,
             catalog: Vec::new(),
             catalog_error: None,
             settings: Settings::default(),
@@ -873,11 +881,10 @@ impl App {
         message: crate::graph::renderer::GraphMessage,
         key: flavite_graph::RenderKey,
     ) {
-        if self.picker.open
-            || self.palette_open
-            || self.strip_menu.is_some()
-            || !crate::host::reading::is_edit(self, tab)
-        {
+        // Overlays suppress graph pointer input. (The edit/read gate is for
+        // note tabs: a Graph view is never a Note, so `is_edit` would drop
+        // every action — pan, zoom, selection, insertion — unconditionally.)
+        if self.picker.open || self.palette_open || self.strip_menu.is_some() {
             return;
         }
         if !self.is_tab_visible(tab) {
@@ -1066,6 +1073,7 @@ impl App {
                     .expect("tab verified above")
                     .interaction()
                     .clone();
+                let previous_buffer = interaction.buffer_id;
                 interaction.buffer_id = Some(snapshot.buffer_id);
                 interaction.revision = snapshot.revision;
                 interaction.sequence = snapshot.sequence;
@@ -1097,9 +1105,14 @@ impl App {
                     {
                         find.focused = false;
                     }
-                    // The anchor publication may have changed; context tools
-                    // re-resolve immediately.
-                    self.reconcile_contexts();
+                    // Context tools resolve by anchor identity: a caret or
+                    // selection move within the same buffer does not change
+                    // what they display. Re-resolve only when the view took
+                    // a different buffer (first acknowledgement, retarget,
+                    // or a replaced view).
+                    if previous_buffer != Some(snapshot.buffer_id) {
+                        self.reconcile_contexts();
+                    }
                 }
             }
             EditorAction::Navigate {
@@ -1108,11 +1121,11 @@ impl App {
                 navigation,
             } => {
                 let Some(source) = self.note_editor_view(tab) else {
-                    self.status = "Link source is no longer open".into();
+                    self.status = "Edit link: the source note is no longer open".into();
                     return;
                 };
                 if source.buffer_id != buffer_id || source.revision != expected_revision {
-                    self.status = "Link source changed; activate the link again".into();
+                    self.status = "Edit link: the note changed; click the link again".into();
                     return;
                 }
                 let resolution = self.flavite.as_ref().and_then(|flavite| {
@@ -1122,19 +1135,20 @@ impl App {
                 });
                 let Some(resolution) = resolution else {
                     self.status =
-                        "Link target resolution is unavailable; retry after indexing".into();
+                        "Edit link: the index is not ready yet; try again after indexing".into();
                     return;
                 };
                 if resolution.is_ambiguous {
-                    self.status = "Link target is ambiguous; choose a note from the picker".into();
+                    self.status =
+                        "Edit link: several notes match; pick one in the quick switcher".into();
                     return;
                 }
                 let Some(target) = resolution.note else {
                     self.status = if resolution.is_unresolved && navigation.create_if_unresolved {
-                        "Link target does not exist; create it explicitly from the Notes view"
+                        "Edit link: no note with this name exists yet; create it from the Notes view"
                             .into()
                     } else {
-                        "Link target is not an indexed note".into()
+                        "Edit link: the target is not an indexed note".into()
                     };
                     return;
                 };
@@ -1150,11 +1164,13 @@ impl App {
                 match opened {
                     Some(Ok(locator)) => self.request_open(locator, self.group_of(tab)),
                     Some(Err(error)) => {
-                        self.status = format!("Resolved note path cannot be opened here: {error}");
+                        self.status =
+                            format!("Edit link: the resolved path cannot be opened here: {error}");
                     }
                     None => {
                         self.status =
-                            "Link target resolution is unavailable; retry after indexing".into();
+                            "Edit link: the index is not ready yet; try again after indexing"
+                                .into();
                     }
                 }
             }
@@ -1331,8 +1347,16 @@ impl App {
 
     /// Apply one host event.
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        // A raw pointer message that changed nothing observable (the
+        // overwhelmingly common case while hovering or drag-selecting)
+        // must not rebuild the accessibility map; the editor widget
+        // redraws its own selection.
+        let pointer_only = matches!(message, Message::Mouse(_));
+        self.pointer_feedback = false;
         let task = self.update_inner(message);
-        self.refresh_semantics();
+        if !pointer_only || self.pointer_feedback {
+            self.refresh_semantics();
+        }
         #[cfg(feature = "ui-test-support")]
         crate::harness::observe(self);
         task
@@ -1379,7 +1403,12 @@ impl App {
                     self.resizing_split = Some(split);
                 }
             }
-            Message::WorkspaceBounds(bounds) => self.workspace_bounds = bounds,
+            Message::WorkspaceBounds(bounds) => {
+                if self.workspace_bounds != bounds {
+                    self.workspace_bounds = bounds;
+                    self.window_geometry_dirty = true;
+                }
+            }
             Message::GroupBounds(group, bounds) => {
                 if self.workspace.group(&group).is_some() {
                     self.group_bounds.insert(group, bounds);
@@ -1781,8 +1810,13 @@ impl App {
                 self.status = "Link insertion cancelled; the note is unchanged".into();
             }
         }
-        self.project_geometry();
-        self.refresh_semantics();
+        // Geometry is re-solved on layout commits (see `commit`), window
+        // size changes, and active resize previews — not on every message.
+        // Semantics are refreshed once by `update` on every path.
+        if self.window_geometry_dirty || !self.resize_preview.is_empty() {
+            self.project_geometry();
+            self.window_geometry_dirty = false;
+        }
         if let Some(sequence) = self.linking.take_cancelled()
             && let Some(client) = self.linking.client
             && let Some(api) = &self.flavite
@@ -1799,11 +1833,18 @@ impl App {
                 self.pointer = Some(position);
                 if let Some(split) = self.resizing_split
                     && let Some(ratio) = self.pointer_resize_ratio(split, position)
+                    && self.resize_preview.get(&split) != Some(&ratio_to_ppm(ratio))
                 {
                     self.resize_preview.insert(split, ratio_to_ppm(ratio));
+                    self.pointer_feedback = true;
                 }
+                let was_dragging = self.gesture.dragging();
                 self.gesture.moved(position);
                 if self.gesture.dragging() {
+                    if !was_dragging {
+                        // The drag began: drop-zone overlays appear.
+                        self.pointer_feedback = true;
+                    }
                     let target = self.dock_target(position);
                     if let Some(target) = target
                         && self
@@ -1812,6 +1853,7 @@ impl App {
                             .is_some_and(|tab| !self.drop_allowed(tab, target))
                     {
                         self.status = "This split needs more space or another tab".into();
+                        self.pointer_feedback = true;
                     }
                     self.gesture.set_target(target);
                 }
@@ -2476,6 +2518,8 @@ mod tests {
             menu_selected: 0,
             pointer: None,
             drag_revision: None,
+            pointer_feedback: false,
+            window_geometry_dirty: true,
             catalog: Vec::new(),
             catalog_error: None,
             settings: Settings::default(),

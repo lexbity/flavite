@@ -737,12 +737,20 @@ impl Engine {
 
         let fresh = Arc::new(model.snapshot());
         let params = self.layout.params();
-        let mut layout = if self.poisoned {
+        let recovered = self.poisoned;
+        let mut layout = if recovered {
             Layout::new(params)
         } else {
             std::mem::take(&mut self.layout)
         };
-        let retarget = layout.retarget(&fresh);
+        // A healthy worker keeps its momentum across delta batches so
+        // editing-session saves nudge the map instead of re-energizing it;
+        // a recovered layout starts from scratch (positions untrusted).
+        let retarget = if recovered {
+            layout.retarget(&fresh)
+        } else {
+            layout.retarget_keep_momentum(&fresh)
+        };
 
         self.model = model;
         self.layout = layout;
