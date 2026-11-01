@@ -735,7 +735,7 @@ fn prepare_removal_work(
     text: &str,
     source_path: &std::path::Path,
 ) -> Result<(LinkPlan, PreparedLink), LinkInsertionError> {
-    let parsed = flavite_syntax::pulldown_glue::parse_note(text.as_bytes())
+    let parsed = flavite_syntax::pulldown_glue::parse_normalized(text)
         .map_err(LinkInsertionError::SourceUnparsable)?;
     let link = parsed
         .links

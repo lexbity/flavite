@@ -10,8 +10,8 @@
 #![no_main]
 
 use flavite_buffer::state::Buffer;
-use flavite_syntax::link_format::{prove_insertion, serialize_link, ProofRejection};
-use flavite_syntax::pulldown_glue::parse_note;
+use flavite_syntax::link_format::{ProofRejection, prove_insertion, serialize_link};
+use flavite_syntax::pulldown_glue::parse_normalized;
 use flavite_syntax::text::TextSnapshot;
 use libfuzzer_sys::fuzz_target;
 
@@ -64,7 +64,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    let Ok(original) = parse_note(normalized.as_bytes()) else {
+    let Ok(original) = parse_normalized(&normalized) else {
         // An unparsable source must reject, never authorize.
         let rejected = prove_insertion(&normalized, caret, &serialized);
         assert!(rejected.is_err());
@@ -86,7 +86,7 @@ fuzz_target!(|data: &[u8]| {
             edited.push_str(&normalized[..proof.start]);
             edited.push_str(&proof.replacement);
             edited.push_str(&normalized[proof.end..]);
-            let parsed = parse_note(edited.as_bytes()).expect("edited document parses");
+            let parsed = parse_normalized(&edited).expect("edited document parses");
             // Exactly one new intended occurrence at the inserted range.
             let inserted = parsed
                 .links
@@ -132,7 +132,7 @@ fuzz_target!(|data: &[u8]| {
                 ),
                 proof.replacement.clone(),
             )];
-            let mut buffer_model = Buffer::from_text(&normalized);
+            let mut buffer_model = Buffer::from_snapshot(snapshot.clone());
             let before_revision = buffer_model.revision();
             let applied = buffer_model.apply_local_edits(&ops);
             assert!(applied.is_some(), "a proven edit must apply to the buffer");

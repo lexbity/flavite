@@ -245,6 +245,7 @@ fn out_of_order_receipts_never_corrupt_and_notes_stay_untouched() {
         tabs: vec![PersistedTab {
             id: "1".into(),
             kind: flavite_workspace::PersistedKind::Note {
+                mode: flavite_workspace::NoteMode::Edit,
                 locator: vec!["alpha.md".into()],
             },
         }],

@@ -115,6 +115,28 @@ impl From<OpenPolicyArg> for flavite_vault::session::OpenPolicy {
     }
 }
 
+fn handle_property(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
+    let args: crate::PropertyEditArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::EditStructure {
+        buffer_id: args.buffer_id.into(),
+        revision: Revision::new(args.revision),
+        edit: flavite_vault::properties::StructureEdit::Property {
+            key: args.key,
+            value: args.value,
+        },
+    }))
+}
+fn handle_task(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
+    let args: crate::TaskEditArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::EditStructure {
+        buffer_id: args.buffer_id.into(),
+        revision: Revision::new(args.revision),
+        edit: flavite_vault::properties::StructureEdit::Task {
+            start: args.start,
+            checked: args.checked,
+        },
+    }))
+}
 fn handle_open(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
     let (path, policy) = match decode::<OpenArgs>(invocation)? {
         OpenArgs::Path(path) => (path, OpenPolicyArg::default()),
@@ -553,7 +575,7 @@ impl Flavite {
     /// the legacy dotted alias as well. Both ids resolve to the same handler
     /// and schema.
     fn register_builtin_commands(&self) -> Result<(), FlaviteError> {
-        let registrations: [HandlerRegistration; 19] = [
+        let registrations: [HandlerRegistration; 21] = [
             (
                 "open_note",
                 "Open note",
@@ -589,6 +611,18 @@ impl Flavite {
                 "Save note",
                 ArgSchema::typed::<PathBuf>(),
                 handle_save,
+            ),
+            (
+                "property.set",
+                "Set note property",
+                ArgSchema::typed::<crate::PropertyEditArgs>(),
+                handle_property,
+            ),
+            (
+                "task.toggle",
+                "Toggle note task",
+                ArgSchema::typed::<crate::TaskEditArgs>(),
+                handle_task,
             ),
             (
                 "apply_edits",
@@ -1062,7 +1096,7 @@ impl Flavite {
                 .and_then(|source| source.get("buffer_id"))
                 .and_then(serde_json::Value::as_u64)
                 .map(BufferId::from),
-            "apply_edits" | "undo" | "redo" => invocation
+            "property.set" | "task.toggle" | "apply_edits" | "undo" | "redo" => invocation
                 .args
                 .get("buffer_id")
                 .and_then(serde_json::Value::as_u64)
@@ -1088,6 +1122,8 @@ impl Flavite {
                 | "link.prepare_remove"
                 | "link.insert"
                 | "link.remove"
+                | "property.set"
+                | "task.toggle"
                 | "apply_edits"
                 | "undo"
                 | "redo"

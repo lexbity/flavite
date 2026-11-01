@@ -180,6 +180,14 @@ case "$profile" in
         assert_absent 'std::fs|rusqlite' "$root/crates/flavite-ui/src/graph/filters.rs" "$root/crates/flavite-ui/src/graph/provenance.rs" "$root/crates/flavite-ui/src/host/occurrences.rs"
         assert_absent 'iced|winit|wgpu|rusqlite|std::fs|flavite-api' "$root/crates/flavite-graph-protocol/src" "$root/crates/flavite-graph-protocol/Cargo.toml"
         ;;
+    W09)
+        bash "$0" W08 "$root"
+        for file in crates/flavite-syntax/src/read.rs crates/flavite-syntax/src/properties.rs crates/flavite-api/src/attachments.rs crates/flavite-api/src/reading.rs crates/flavite-api/src/properties.rs crates/flavite-vault/src/properties.rs crates/flavite-ui/src/read/renderer.rs crates/flavite-ui/src/views/outline.rs crates/flavite-ui/src/views/properties.rs crates/flavite-ui/tests/read_mode.rs crates/flavite-api/tests/property_edits.rs crates/flavite-api/tests/embed_limits.rs; do
+            assert_nonempty "$root/$file"
+        done
+        assert_absent 'dangerously|execute_script|raw_html|reqwest|ureq|std::fs' "$root/crates/flavite-ui/src/read"
+        assert_absent 'serde_yaml::to_string|yaml.*serialize_document' "$root/crates/flavite-api/src/properties.rs" "$root/crates/flavite-vault/src/properties.rs"
+        ;;
     *)
         echo "unknown workspace contract profile: ${profile:-<empty>}" >&2
         exit 2

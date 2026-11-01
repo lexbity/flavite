@@ -116,6 +116,8 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                         flavite_workspace::ViewKind::Notes => "notes",
                         flavite_workspace::ViewKind::Preview(_) => "preview",
                         flavite_workspace::ViewKind::Backlinks(_) => "backlinks",
+                        flavite_workspace::ViewKind::Outline(_) => "outline",
+                        flavite_workspace::ViewKind::Properties(_) => "properties",
                     };
                     let binding = app.workspace.binding_of(tab);
                     let context_state = app
@@ -204,6 +206,16 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                         "slot_index": state.tabs().iter().position(|t| t==tab).and_then(|i| i.checked_sub(slots.start)).filter(|i| *i<slots.count),
                         "title": session.title(),
                         "load": load,
+                        "reading_error": app.reading.notes.get(tab).and_then(|entry|entry.error.clone()),
+                        "mode": match session.kind() { flavite_workspace::ViewKind::Note(note) => Some(format!("{:?}",note.mode())), _ => None },
+                        "source_preview": app.reading.source_previews.contains(tab),
+                        "reading": crate::host::reading::document(app,*tab).map(|doc| serde_json::json!({
+                            "source": doc.path.to_string_lossy(), "buffer": doc.buffer, "current": crate::host::reading::current(app,doc), "catalog": doc.catalog_version, "published_catalog": app.flavite.as_ref().and_then(|api|api.read_catalog_version()), "unsaved": doc.unsaved, "scroll_y": app.reading.scroll.get(tab).copied().unwrap_or(0.0),
+                            "outline": doc.document.outline.iter().map(|h|serde_json::json!({"title":h.title,"byte":h.byte,"level":h.level,"bounds":app.reading.blocks.get(&(*tab,h.byte)).map(|r|[r.x,r.y,r.width,r.height])})).collect::<Vec<_>>(),
+                            "controls": app.reading.controls.iter().filter(|((t, source, _, _),_)| t == tab && *source == std::sync::Arc::as_ptr(doc) as usize).map(|((_,_,role,byte),r)|serde_json::json!({"role":role,"byte":byte,"bounds":[r.x,r.y,r.width,r.height]})).collect::<Vec<_>>()
+                        })),
+                        "find": app.reading.find.get(tab).map(|find|serde_json::json!({"query":find.query,"matches":crate::host::reading::find_matches(app,*tab).len()})),
+                        "viewport_anchor": interaction.viewport_anchor,
                         "active": *tab == state.active(),
                         "buffer": buffer_view.as_ref().map(|view| view.buffer_id),
                         "revision": buffer_view.as_ref().map(|view| view.revision),
@@ -277,6 +289,8 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "menu_open": app.strip_menu.is_some(),
         "picker_open": app.picker.open,
         "palette_open": app.palette_open,
+        "palette_query": app.palette_query,
+        "palette_matches": if app.palette_open { app.palette_snapshot().iter().map(|command| command.id).collect::<Vec<_>>() } else { Vec::new() },
         "desired_ratios": desired_ratios(app.workspace.tree()),
         "adaptive_maximized": !flavite_workspace::fits(&app.workspace,flavite_workspace::Size {width:app.workspace_bounds.width,height:app.workspace_bounds.height},1.0),
         "window_size": [app.window_size().width,app.window_size().height],

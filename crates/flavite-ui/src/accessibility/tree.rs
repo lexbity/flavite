@@ -12,6 +12,22 @@ use std::collections::BTreeMap;
 /// What a native action on a semantic node routes to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeTarget {
+    FindQuery(flavite_workspace::TabId),
+    FindNext {
+        tab: flavite_workspace::TabId,
+        forward: bool,
+    },
+    FindClose(flavite_workspace::TabId),
+    NoteMode(flavite_workspace::TabId),
+    ContextBinding {
+        tab: flavite_workspace::TabId,
+        binding: flavite_workspace::ContextBinding,
+    },
+    Reading {
+        tab: flavite_workspace::TabId,
+        document: std::sync::Arc<flavite_api::ReadSnapshot>,
+        action: super::reading::ReadingAction,
+    },
     /// Activate (and focus) a tab.
     ActivateTab(flavite_workspace::TabId),
     /// Close a tab.
@@ -71,7 +87,7 @@ const GRAPH_A11Y_ROW_BUDGET: usize = 50;
 
 /// Hash workspace identities into stable semantic node ids. `DefaultHasher`
 /// starts from fixed keys, so ids are deterministic across runs.
-fn node_id(kind: &str, raw: u128) -> NodeId {
+pub(crate) fn node_id(kind: &str, raw: u128) -> NodeId {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     kind.hash(&mut hasher);
@@ -181,7 +197,10 @@ pub fn build_node_map(app: &App) -> BTreeMap<NodeId, NodeTarget> {
                     NodeTarget::GroupMenu(group, menu),
                 );
             }
-            if let Some(view) = app.note_editor_view(g.active()) {
+            if let Some(view) = app
+                .note_editor_view(g.active())
+                .filter(|_| crate::host::reading::is_edit(app, g.active()))
+            {
                 let incarnation = app.notes.incarnation(g.active()).unwrap_or(0);
                 map.insert(
                     editor_node(app, g.active()),
@@ -250,6 +269,7 @@ pub fn build_node_map(app: &App) -> BTreeMap<NodeId, NodeTarget> {
             }
         }
     }
+    map.extend(super::reading::project(app).actions);
     map
 }
 
@@ -592,7 +612,10 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
             tablist.set_children(children);
             nodes.push((group_id, tablist));
             window_children.push(group_id);
-            if let Some(view) = app.note_editor_view(g.active()) {
+            if let Some(view) = app
+                .note_editor_view(g.active())
+                .filter(|_| crate::host::reading::is_edit(app, g.active()))
+            {
                 let tab = g.active();
                 let id = editor_node(app, tab);
                 let mut editor = Node::new(Role::MultilineTextInput);
@@ -635,6 +658,17 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
                 window_children.push(id);
             }
         }
+        if app
+            .reading
+            .find
+            .get(&app.workspace.focused_tab())
+            .is_some_and(|find| find.focused)
+        {
+            focus = node_id("find-query", app.workspace.focused_tab().raw());
+        }
+        let reading = super::reading::project(app);
+        nodes.extend(reading.nodes);
+        window_children.extend(reading.roots);
         for split in app.workspace.tree().splits() {
             let id = split_node_id(split);
             if !app.a11y_nodes.contains_key(&id) {

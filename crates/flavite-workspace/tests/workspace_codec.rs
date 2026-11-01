@@ -40,6 +40,7 @@ fn sample() -> PersistedWorkspace {
             PersistedTab {
                 id: "1".into(),
                 kind: PersistedKind::Note {
+                    mode: flavite_workspace::NoteMode::Edit,
                     locator: vec!["Systems".into(), "Feedback loops.md".into()],
                 },
             },
@@ -245,6 +246,7 @@ fn non_utf8_native_names_are_refused_not_percent_encoded() {
     // keeps raw bytes out of the JSON payload entirely.
     let mut workspace = sample();
     workspace.tabs[0].kind = PersistedKind::Note {
+        mode: flavite_workspace::NoteMode::Edit,
         locator: vec!["a\0b".into()],
     };
     let bytes = encode_workspace(&workspace).expect("encodes");
@@ -302,6 +304,7 @@ fn restore_plan_reports_missing_notes_and_drops_invalid_identities() {
     workspace.tabs.push(PersistedTab {
         id: "8".into(),
         kind: PersistedKind::Note {
+            mode: flavite_workspace::NoteMode::Edit,
             locator: vec!["gone.md".into()],
         },
     });

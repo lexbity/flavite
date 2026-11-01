@@ -18,6 +18,8 @@ macro_rules! chords {
 
 use flavite_api::command::modifiers::{ALT, CTRL, SHIFT};
 
+static KEYS_NOTE_MODE: LazyLock<[Chord; 1]> = chords!(CTRL; "E");
+static KEYS_FIND: LazyLock<[Chord; 1]> = chords!(CTRL; "F");
 static KEYS_QUICK_SWITCH: LazyLock<[Chord; 1]> = chords!(CTRL; "P");
 static KEYS_COMMAND_PALETTE: LazyLock<[Chord; 1]> = chords!(CTRL, SHIFT; "P");
 static KEYS_NEW_TAB: LazyLock<[Chord; 1]> = chords!(CTRL; "T");
@@ -37,6 +39,8 @@ static KEYS_MAXIMIZE_GROUP: LazyLock<[Chord; 1]> = chords!(CTRL, SHIFT; "M");
 fn keys_for(id: &str) -> Option<&'static [Chord]> {
     use flavite_api::command::modifiers as mods;
     Some(match id {
+        "workspace.note_mode" => &LazyLock::force(&KEYS_NOTE_MODE)[..],
+        "workspace.find" => &LazyLock::force(&KEYS_FIND)[..],
         "workspace.quick_switch" => &LazyLock::force(&KEYS_QUICK_SWITCH)[..],
         "workspace.command_palette" => &LazyLock::force(&KEYS_COMMAND_PALETTE)[..],
         "workspace.new_tab" => &LazyLock::force(&KEYS_NEW_TAB)[..],
@@ -72,6 +76,26 @@ pub struct UiCommand {
 /// All UI commands, in palette order. A capability absent from a stage
 /// build is absent here (RFC §16.1): no placeholder rows.
 pub const UI_COMMANDS: &[UiCommand] = &[
+    UiCommand {
+        id: "workspace.find",
+        title: "Find in current note (includes unsaved text)",
+    },
+    UiCommand {
+        id: "context.source_preview",
+        title: "Toggle source / rendered Preview",
+    },
+    UiCommand {
+        id: "workspace.note_mode",
+        title: "Toggle note Edit / Read",
+    },
+    UiCommand {
+        id: "workspace.open_outline",
+        title: "Open Outline",
+    },
+    UiCommand {
+        id: "workspace.open_properties",
+        title: "Open Properties",
+    },
     UiCommand {
         id: "workspace.group_actions",
         title: "Open group actions menu",
@@ -405,6 +429,12 @@ fn command_chord(app: &App, key: &keyboard::Key, modifiers: Modifiers) -> Option
     let revision = app.workspace.revision();
     match key.as_ref() {
         keyboard::Key::Character(character) => {
+            if character.eq_ignore_ascii_case("f") && available(app, "workspace.find") {
+                return Some(Message::RunHostCommand("workspace.find"));
+            }
+            if character.eq_ignore_ascii_case("e") && available(app, "workspace.note_mode") {
+                return Some(Message::RunHostCommand("workspace.note_mode"));
+            }
             if character.eq_ignore_ascii_case("p") {
                 return Some(if modifiers.shift() {
                     Message::PaletteOpen
@@ -481,8 +511,8 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
                 return app.update(Message::GroupMenu(group, menu));
             }
         }
-        "workspace.quick_switch" => return iced::Task::done(Message::PickerOpen),
-        "workspace.command_palette" => return iced::Task::done(Message::PaletteOpen),
+        "workspace.quick_switch" => return app.update(Message::PickerOpen),
+        "workspace.command_palette" => return app.update(Message::PaletteOpen),
         "workspace.new_tab" => {
             if let Some(group) = focused_group {
                 app.dispatch_layout(|revision| LayoutAction::OpenEmpty {
@@ -592,55 +622,55 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
             }
         }
         "graph.freeze" => {
-            return iced::Task::done(Message::GraphCommand {
+            return app.update(Message::GraphCommand {
                 tab: app.workspace.focused_tab(),
                 command: crate::host::graph::GraphCommand::ToggleFreeze,
             });
         }
         "graph.fit" => {
-            return iced::Task::done(Message::GraphCommand {
+            return app.update(Message::GraphCommand {
                 tab: app.workspace.focused_tab(),
                 command: crate::host::graph::GraphCommand::FitView,
             });
         }
         "graph.list" => {
-            return iced::Task::done(Message::GraphCommand {
+            return app.update(Message::GraphCommand {
                 tab: app.workspace.focused_tab(),
                 command: crate::host::graph::GraphCommand::ToggleList,
             });
         }
         "graph.filters" => {
-            return iced::Task::done(Message::GraphCommand {
+            return app.update(Message::GraphCommand {
                 tab: app.workspace.focused_tab(),
                 command: crate::host::graph::GraphCommand::ToggleFilters,
             });
         }
         "graph.apply_filters" => {
-            return iced::Task::done(Message::GraphCommand {
+            return app.update(Message::GraphCommand {
                 tab: app.workspace.focused_tab(),
                 command: crate::host::graph::GraphCommand::ApplyFilters,
             });
         }
         "graph.clear_filters" => {
-            return iced::Task::done(Message::GraphCommand {
+            return app.update(Message::GraphCommand {
                 tab: app.workspace.focused_tab(),
                 command: crate::host::graph::GraphCommand::ClearFilters,
             });
         }
         "graph.undo_filters" => {
-            return iced::Task::done(Message::GraphCommand {
+            return app.update(Message::GraphCommand {
                 tab: app.workspace.focused_tab(),
                 command: crate::host::graph::GraphCommand::UndoFilters,
             });
         }
         "graph.explore" => {
-            return iced::Task::done(Message::GraphCommand {
+            return app.update(Message::GraphCommand {
                 tab: app.workspace.focused_tab(),
                 command: crate::host::graph::GraphCommand::ExploreSelected,
             });
         }
         "graph.clear_selection" => {
-            return iced::Task::done(Message::GraphCommand {
+            return app.update(Message::GraphCommand {
                 tab: app.workspace.focused_tab(),
                 command: crate::host::graph::GraphCommand::ClearSelection,
             });
@@ -652,16 +682,37 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
             } else {
                 crate::host::graph::GraphCommand::InsertSelected
             };
-            return iced::Task::done(Message::GraphCommand { tab, command });
+            return app.update(Message::GraphCommand { tab, command });
+        }
+        "workspace.find" => {
+            return app.update(Message::FindOpen(app.workspace.focused_tab()));
+        }
+        "context.source_preview" => {
+            return app.update(Message::ToggleSourcePreview(app.workspace.focused_tab()));
+        }
+        "workspace.note_mode" => {
+            return app.update(Message::ToggleNoteMode(app.workspace.focused_tab()));
+        }
+        "workspace.open_outline" => {
+            return app.update(Message::OpenContextView {
+                view: flavite_workspace::ContextViewKind::Outline,
+                group: app.focused_group(),
+            });
+        }
+        "workspace.open_properties" => {
+            return app.update(Message::OpenContextView {
+                view: flavite_workspace::ContextViewKind::Properties,
+                group: app.focused_group(),
+            });
         }
         "workspace.open_preview" => {
-            return iced::Task::done(Message::OpenContextView {
+            return app.update(Message::OpenContextView {
                 view: flavite_workspace::ContextViewKind::Preview,
                 group: focused_group,
             });
         }
         "workspace.open_backlinks" => {
-            return iced::Task::done(Message::OpenContextView {
+            return app.update(Message::OpenContextView {
                 view: flavite_workspace::ContextViewKind::Backlinks,
                 group: focused_group,
             });
@@ -669,7 +720,7 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
         "context.pin" => {
             let tab = app.workspace.focused_tab();
             if let Some(source) = app.contexts.observed(&tab) {
-                return iced::Task::done(Message::SetContextBinding {
+                return app.update(Message::SetContextBinding {
                     tab,
                     binding: flavite_workspace::ContextBinding::Pinned(
                         flavite_workspace::EntityLocator::new(source.locator.clone()),
@@ -680,7 +731,7 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
         }
         "context.follow_document" => {
             let tab = app.workspace.focused_tab();
-            return iced::Task::done(Message::SetContextBinding {
+            return app.update(Message::SetContextBinding {
                 tab,
                 binding: flavite_workspace::ContextBinding::FollowDocument,
             });
@@ -688,7 +739,7 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
         "link.insert_target" => {
             let tab = app.workspace.focused_tab();
             if let Some(source) = app.contexts.observed(&tab) {
-                return iced::Task::done(Message::InsertLink {
+                return app.update(Message::InsertLink {
                     locator: source.locator.clone(),
                 });
             }
@@ -712,6 +763,16 @@ pub fn available(app: &App, id: &str) -> bool {
         return false;
     };
     match id {
+        "workspace.find" => app.note_editor_view(app.workspace.focused_tab()).is_some(),
+        "context.source_preview" => matches!(
+            app.workspace
+                .tab(&app.workspace.focused_tab())
+                .map(|s| s.kind()),
+            Some(ViewKind::Preview(_))
+        ),
+        "workspace.note_mode" => {
+            matches!(app.workspace.tab(&app.workspace.focused_tab()).map(|s| s.kind()), Some(ViewKind::Note(n)) if n.load() == flavite_workspace::NoteLoad::Ready)
+        }
         "context.pin" => {
             app.contexts
                 .observed(&app.workspace.focused_tab())

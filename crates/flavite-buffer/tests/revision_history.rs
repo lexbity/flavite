@@ -1,6 +1,31 @@
 //! Revision authority is independent of undo-node coalescing and branching.
 use flavite_buffer::{EditOp, EditorModel};
 use flavite_syntax::text::{Span, TextByte};
+
+#[test]
+fn unicode_separators_and_standalone_cr_are_content_through_edit_undo_and_save() {
+    let source = "|\u{0085}\u{2028}\u{2029}\rcontent\r\nnext\n";
+    let snapshot = flavite_syntax::TextSnapshot::new(source.as_bytes()).unwrap();
+    let mut model = EditorModel::from_snapshot(snapshot);
+    assert_eq!(model.line_count(), 3);
+    assert_eq!(model.to_source_bytes(), source.as_bytes());
+    let at = model.text().find("next").unwrap();
+    model.apply_edit_ops(&[EditOp::new(
+        Span::new(TextByte(at), TextByte(at)),
+        "[[target]]".into(),
+    )]);
+    assert_eq!(
+        model.to_source_bytes(),
+        source.replace("next", "[[target]]next").as_bytes()
+    );
+    model.undo().unwrap();
+    assert_eq!(model.to_source_bytes(), source.as_bytes());
+    model.redo().unwrap();
+    assert_eq!(
+        model.to_source_bytes(),
+        source.replace("next", "[[target]]next").as_bytes()
+    );
+}
 #[test]
 fn every_coalesced_edit_and_branch_has_a_fresh_revision_and_correct_undo_parent() {
     let mut model = EditorModel::from_text("");

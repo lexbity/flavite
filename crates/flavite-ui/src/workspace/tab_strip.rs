@@ -153,6 +153,8 @@ pub fn menu_entries(app: &App, group: GroupId, menu: StripMenu) -> Vec<MenuEntry
             ("Graph", "workspace.open_graph"),
             ("Preview", "workspace.open_preview"),
             ("Backlinks", "workspace.open_backlinks"),
+            ("Outline", "workspace.open_outline"),
+            ("Properties", "workspace.open_properties"),
         ]
         .into_iter()
         .map(|(label, id)| MenuEntry {

@@ -120,6 +120,8 @@ pub enum PersistedKind {
     Note {
         /// Vault-relative path components.
         locator: Vec<String>,
+        #[serde(default)]
+        mode: crate::NoteMode,
     },
     /// A graph view of the saved knowledge network (W07): the durable
     /// per-view camera only. Selection and hit candidates are transient and
@@ -140,6 +142,12 @@ pub enum PersistedKind {
     /// Inbound links.
     Backlinks {
         /// The durable binding.
+        binding: PersistedBinding,
+    },
+    Outline {
+        binding: PersistedBinding,
+    },
+    Properties {
         binding: PersistedBinding,
     },
     /// A kind written by a newer build; preserved and re-emitted untouched.
@@ -305,6 +313,7 @@ fn persist_kind(kind: &crate::view::ViewKind) -> PersistedKind {
         crate::view::ViewKind::Notes => PersistedKind::Notes,
         crate::view::ViewKind::Note(note) => PersistedKind::Note {
             locator: note.locator().components().to_vec(),
+            mode: note.mode(),
         },
         crate::view::ViewKind::Graph(view) => PersistedKind::Graph {
             scope: view.scope().clone(),
@@ -319,6 +328,12 @@ fn persist_kind(kind: &crate::view::ViewKind) -> PersistedKind {
             },
         },
         crate::view::ViewKind::Preview(binding) => PersistedKind::Preview {
+            binding: persist_binding(binding),
+        },
+        crate::view::ViewKind::Outline(binding) => PersistedKind::Outline {
+            binding: persist_binding(binding),
+        },
+        crate::view::ViewKind::Properties(binding) => PersistedKind::Properties {
             binding: persist_binding(binding),
         },
         crate::view::ViewKind::Backlinks(binding) => PersistedKind::Backlinks {

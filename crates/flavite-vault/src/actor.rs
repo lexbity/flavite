@@ -170,6 +170,16 @@ pub enum VaultActorMsg {
         path: std::path::PathBuf,
         reply: Sender<VaultActorResp>,
     },
+    ValidateAttachmentOpen {
+        path: PathBuf,
+        reply: Sender<VaultActorResp>,
+    },
+    /// Validated bounded vault read for attachments and rendered snapshots.
+    ReadBounded {
+        path: PathBuf,
+        max: u64,
+        reply: Sender<VaultActorResp>,
+    },
     /// Read the indexed title/alias snapshot for editor autocomplete.
     CompletionCandidates { reply: Sender<VaultActorResp> },
     /// Read a bounded native-identity note catalog for workspace shells.
@@ -225,6 +235,7 @@ pub enum VaultActorMsg {
 /// Responses from the VaultActor.
 #[derive(Debug, Clone)]
 pub enum VaultActorResp {
+    ValidatedAttachment(Result<PathBuf, String>),
     GraphPaths(Result<Vec<PathBuf>, String>),
     /// Reconcile completed.
     ReconcileComplete {
@@ -469,6 +480,27 @@ impl VaultActorHandle {
             VaultActorResp::File(bytes) => Ok(bytes),
             VaultActorResp::Error(_) => Err(VaultActorError::NotRunning),
             _ => Err(VaultActorError::NotRunning),
+        }
+    }
+
+    pub fn validate_attachment_open(&self, path: PathBuf) -> Result<PathBuf, String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::ValidateAttachmentOpen { path, reply })
+            .map_err(|_| "Read worker unavailable")?;
+        match response.recv().map_err(|_| "Read worker unavailable")? {
+            VaultActorResp::ValidatedAttachment(result) => result,
+            _ => Err("Attachment unavailable".into()),
+        }
+    }
+    pub fn read_bounded(&self, path: PathBuf, max: u64) -> Result<Option<Vec<u8>>, String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::ReadBounded { path, max, reply })
+            .map_err(|_| "Read worker unavailable")?;
+        match response.recv().map_err(|_| "Read worker unavailable")? {
+            VaultActorResp::File(bytes) => Ok(bytes),
+            _ => Err("Vault content unavailable or exceeds the read limit".into()),
         }
     }
 
@@ -1129,6 +1161,77 @@ impl VaultActor {
                 }
                 let _ = self.resp_sender.try_send(VaultActorResp::Ack);
                 // Shutdown will happen when the channel is dropped
+            }
+            VaultActorMsg::ValidateAttachmentOpen { path, reply } => {
+                let result = (|| {
+                    self.fs.validate_in_root(&self.identity.root, &path)?;
+                    if self.fs.is_placeholder(&path)? {
+                        return Err(flavite_fs::FsError::Unsupported(
+                            "Download this attachment locally first".into(),
+                        ));
+                    }
+                    let resolved = self.fs.canonicalize(&path)?;
+                    self.fs.validate_in_root(&self.identity.root, &resolved)?;
+                    let extension = resolved
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if !matches!(
+                        extension.as_str(),
+                        "png"
+                            | "jpg"
+                            | "jpeg"
+                            | "webp"
+                            | "gif"
+                            | "bmp"
+                            | "svg"
+                            | "pdf"
+                            | "txt"
+                            | "mp3"
+                            | "wav"
+                            | "ogg"
+                            | "mp4"
+                            | "webm"
+                            | "mov"
+                    ) {
+                        return Err(flavite_fs::FsError::Unsupported(
+                            "Attachment has no supported safe open action".into(),
+                        ));
+                    }
+                    Ok(resolved)
+                })()
+                .map_err(|_| {
+                    "Attachment unavailable, outside vault, or unsupported; locate a local document"
+                        .into()
+                });
+                let _ = reply.try_send(VaultActorResp::ValidatedAttachment(result));
+            }
+            VaultActorMsg::ReadBounded { path, max, reply } => {
+                let result = (|| {
+                    self.fs.validate_in_root(&self.identity.root, &path)?;
+                    if self.fs.is_placeholder(&path)? {
+                        return Err(flavite_fs::FsError::Unsupported(
+                            "Download this attachment locally first".into(),
+                        ));
+                    }
+                    match self.fs.read_capped_in_root(
+                        &self.identity.root,
+                        path.strip_prefix(&self.identity.root)
+                            .map_err(|_| flavite_fs::FsError::PathEscape(path.clone()))?,
+                        max,
+                    ) {
+                        Ok(bytes) => Ok(Some(bytes)),
+                        Err(flavite_fs::FsError::NotFound(_)) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                })();
+                let _ = reply.try_send(match result {
+                    Ok(bytes) => VaultActorResp::File(bytes),
+                    Err(_) => {
+                        VaultActorResp::Error("Content unavailable or exceeds read limit".into())
+                    }
+                });
             }
             VaultActorMsg::ReadFile { path, reply } => {
                 let response = self

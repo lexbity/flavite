@@ -73,6 +73,10 @@
       "kind": "external"
     },
     {
+      "id": "image",
+      "kind": "external"
+    },
+    {
       "id": "notify",
       "kind": "external"
     },
@@ -155,6 +159,11 @@
     {
       "from": "flavite-api",
       "to": "flavite-vault",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-api",
+      "to": "image",
       "kind": "normal"
     },
     {

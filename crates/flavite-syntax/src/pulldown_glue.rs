@@ -79,6 +79,17 @@ impl Link {
 /// the exclusion mask.
 pub fn parse_note(bytes: &[u8]) -> Result<ParsedNote, String> {
     let snapshot = TextSnapshot::new(bytes).map_err(|e| e.to_string())?;
+    parse_snapshot(snapshot)
+}
+
+/// Canonical parsing over exact Session TextByte coordinates.
+pub fn parse_normalized(text: &str) -> Result<ParsedNote, String> {
+    parse_snapshot(TextSnapshot::from_normalized(text))
+}
+
+/// Parse an already-owned coordinate snapshot through the same canonical
+/// scanner/mask path, without applying file normalization a second time.
+pub fn parse_snapshot(snapshot: TextSnapshot) -> Result<ParsedNote, String> {
     let text = snapshot.text();
     if text.contains('\0') {
         return Err("markdown contains an embedded NUL byte".into());
@@ -133,7 +144,18 @@ pub fn parse_note(bytes: &[u8]) -> Result<ParsedNote, String> {
                 {
                     headings.push((level, current_heading_text.clone()));
                 }
-                // Reset text buffer after heading
+                // Heading text participates in the same canonical extension scan.
+                if !text_buffer.is_empty() {
+                    scan_buffer(
+                        &snapshot,
+                        &mask,
+                        &text_buffer,
+                        text_start,
+                        &mut links,
+                        &mut tags,
+                        &mut block_ids,
+                    );
+                }
                 text_buffer.clear();
                 text_start = range.end;
             }
@@ -178,7 +200,6 @@ pub fn parse_note(bytes: &[u8]) -> Result<ParsedNote, String> {
                 // Collect heading text
                 if current_heading_level.is_some() {
                     current_heading_text.push_str(text_content);
-                    continue;
                 }
 
                 // Buffer text for scanning (to handle split wikilinks)
@@ -204,7 +225,7 @@ pub fn parse_note(bytes: &[u8]) -> Result<ParsedNote, String> {
                 text_buffer.clear();
                 text_start = range.end;
             }
-            Event::Html(_) => {
+            Event::Html(_) | Event::InlineHtml(_) => {
                 // HTML - flush buffer
                 if !text_buffer.is_empty() {
                     scan_buffer(
@@ -288,7 +309,7 @@ fn build_mask(text: &str) -> (TextMask, usize) {
     let mut body_start = 0usize;
 
     // Check for frontmatter delimiter.
-    if text.starts_with("---") {
+    if text.starts_with("---\n") {
         // Find the closing --- or ...
         if let Some(close) = find_frontmatter_close(text) {
             excluded.push(0..close);
@@ -321,7 +342,7 @@ fn build_mask(text: &str) -> (TextMask, usize) {
                 // Inline code span - exclude this range
                 excluded.push(range.clone());
             }
-            Event::Html(_) => {
+            Event::Html(_) | Event::InlineHtml(_) => {
                 // HTML block or inline - exclude this range
                 excluded.push(range.clone());
             }

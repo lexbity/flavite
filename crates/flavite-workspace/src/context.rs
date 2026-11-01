@@ -43,6 +43,8 @@ pub enum ContextViewKind {
     Preview,
     /// Inbound links.
     Backlinks,
+    Outline,
+    Properties,
 }
 
 impl ContextViewKind {
@@ -52,6 +54,8 @@ impl ContextViewKind {
         match self {
             Self::Preview => ViewKind::Preview(binding),
             Self::Backlinks => ViewKind::Backlinks(binding),
+            Self::Outline => ViewKind::Outline(binding),
+            Self::Properties => ViewKind::Properties(binding),
         }
     }
 }
@@ -134,7 +138,12 @@ pub fn is_source_kind(kind: &ViewKind) -> bool {
     match kind {
         ViewKind::Note(_) | ViewKind::Graph(_) => true,
         // Search sources arrive with their slice (W10).
-        ViewKind::Empty | ViewKind::Notes | ViewKind::Preview(_) | ViewKind::Backlinks(_) => false,
+        ViewKind::Empty
+        | ViewKind::Notes
+        | ViewKind::Preview(_)
+        | ViewKind::Backlinks(_)
+        | ViewKind::Outline(_)
+        | ViewKind::Properties(_) => false,
     }
 }
 

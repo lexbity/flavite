@@ -6,14 +6,14 @@
 //! every prior occurrence is unchanged.
 
 use flavite_syntax::link_format::{ProofRejection, prove_insertion, serialize_link};
-use flavite_syntax::pulldown_glue::parse_note;
+use flavite_syntax::pulldown_glue::parse_normalized;
 
 #[test]
 fn invalid_unicode_caret_and_unparsable_source_both_refuse_authorization() {
     // link_insertion fuzz repro bfb0d37043b906b81ae244a9ea45ce9af1e0af3a.
     let source = String::from_utf8_lossy(&[0xa1, 0, 0xf5, 0xcf, 0xc8]);
     let serialized = serialize_link(&["I".into()], None).unwrap();
-    assert!(parse_note(source.as_bytes()).is_err());
+    assert!(parse_normalized(&source).is_err());
     assert!(matches!(
         prove_insertion(&source, 2, &serialized),
         Err(ProofRejection::CaretOutOfBounds)
@@ -24,6 +24,29 @@ fn invalid_unicode_caret_and_unparsable_source_both_refuse_authorization() {
     ));
 }
 
+#[test]
+fn insertion_proof_preserves_normalized_carriage_return_offsets_and_other_occurrences() {
+    let source = "\r\n[[existing]] tail";
+    let caret = source.find("tail").unwrap();
+    let proof = prove_insertion(source, caret, &link("new")).unwrap();
+    let mut edited = source.to_owned();
+    edited.insert_str(caret, &proof.replacement);
+    let parsed = flavite_syntax::pulldown_glue::parse_normalized(&edited).unwrap();
+    assert_eq!(parsed.snapshot.text(), edited);
+    assert!(
+        parsed
+            .links
+            .iter()
+            .any(|l| l.target_raw == "existing" && l.span.start.0 == 2)
+    );
+    assert!(
+        parsed
+            .links
+            .iter()
+            .any(|l| l.target_raw == "new" && l.span.start.0 == caret)
+    );
+}
+
 fn link(name: &str) -> flavite_syntax::link_format::SerializedLink {
     serialize_link(&[name.to_owned()], None).expect("representable target")
 }
@@ -31,7 +54,7 @@ fn link(name: &str) -> flavite_syntax::link_format::SerializedLink {
 /// The contract every accepted proof must satisfy on the real parser.
 fn assert_proof_holds(source: &str, caret: usize, name: &str) {
     let serialized = link(name);
-    let Ok(original) = parse_note(source.as_bytes()) else {
+    let Ok(original) = parse_normalized(source) else {
         panic!("test source must parse: {source:?}");
     };
     let proof =
@@ -40,7 +63,7 @@ fn assert_proof_holds(source: &str, caret: usize, name: &str) {
     edited.push_str(&source[..proof.start]);
     edited.push_str(&proof.replacement);
     edited.push_str(&source[proof.end..]);
-    let parsed = parse_note(edited.as_bytes()).expect("edited document parses");
+    let parsed = parse_normalized(&edited).expect("edited document parses");
     // Exactly one new intended occurrence at the inserted range.
     let inserted = parsed
         .links

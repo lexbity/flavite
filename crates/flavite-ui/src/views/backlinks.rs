@@ -69,9 +69,11 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         Some(ToolState::Idle) | Some(ToolState::Querying) | None => {
             empty_state("Loading…", "The backlink query is in flight.")
         }
-        Some(ToolState::Ready(ToolContent::Preview { .. } | ToolContent::BufferPreview { .. })) => {
-            empty_state("Loading…", "The backlink query is in flight.")
-        }
+        Some(ToolState::Ready(
+            ToolContent::Document(_)
+            | ToolContent::Preview { .. }
+            | ToolContent::BufferPreview { .. },
+        )) => empty_state("Loading…", "The backlink query is in flight."),
     };
     column![header, rule::horizontal(1), body]
         .width(Length::Fill)

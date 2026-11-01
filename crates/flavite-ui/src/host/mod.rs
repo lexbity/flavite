@@ -14,3 +14,7 @@ pub mod linking;
 pub mod occurrences;
 pub mod persistence;
 pub mod shell;
+
+pub mod reading;
+
+pub mod input;

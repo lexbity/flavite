@@ -162,14 +162,14 @@ fuzz-smoke:
     cd fuzz
     smoke_root="$(mktemp -d)"
     trap 'rm -rf "$smoke_root"' EXIT
-    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore graph_scope"
+    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore graph_scope read_structure"
     failed=0
     for target in $targets; do
         corpus_dir="$smoke_root/$target"
         mkdir -p "$corpus_dir"
         while IFS= read -r -d '' seed; do
             cp "$seed" "$corpus_dir/$(basename "$seed")"
-        done < <(git ls-files -z --cached --others --exclude-standard -- "corpus/$target")
+        done < <(git ls-files -z --cached --others --exclude-standard -- "corpus/$target" "seeds/$target")
         echo "=== fuzz-smoke: $target (30s) ==="
         if ! cargo +nightly fuzz run "$target" "$corpus_dir" -- -max_total_time=30 -rss_limit_mb=4096; then
             echo "FUZZ SMOKE FAILED: $target"
@@ -185,14 +185,14 @@ fuzz-smoke-ci:
     cd fuzz
     smoke_root="$(mktemp -d)"
     trap 'rm -rf "$smoke_root"' EXIT
-    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore graph_scope"
+    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore graph_scope read_structure"
     failed=0
     for target in $targets; do
         corpus_dir="$smoke_root/$target"
         mkdir -p "$corpus_dir"
         while IFS= read -r -d '' seed; do
             cp "$seed" "$corpus_dir/$(basename "$seed")"
-        done < <(git ls-files -z --cached --others --exclude-standard -- "corpus/$target")
+        done < <(git ls-files -z --cached --others --exclude-standard -- "corpus/$target" "seeds/$target")
         echo "=== fuzz-smoke-ci: $target (60s) ==="
         if ! cargo +nightly fuzz run "$target" "$corpus_dir" -- -max_total_time=60 -rss_limit_mb=4096; then
             echo "FUZZ SMOKE FAILED: $target"
@@ -247,20 +247,20 @@ ui-visual-setup:
         exit 2
     fi
     sudo apt-get update
-    sudo apt-get install -y --no-install-recommends xvfb xdotool imagemagick python3-pil
+    sudo apt-get install -y --no-install-recommends xvfb xdotool imagemagick python3-pil tesseract-ocr
 
 # Full cleanup (§10.10): removes target/, fuzz/target/, fuzz/artifacts/,
 # profiling intermediates. Pass --dry-run to preview without removing.
 # RFC-0003 §16.1: headless workspace gates. During partial implementation
 # the profile argument limits scope to capabilities not yet shipped; it can
 # never disable a completed slice's gate (W01 runs additively inside W02+).
-workspace-contracts profile="W08":
+workspace-contracts profile="W09":
     bash scripts/check-workspace-contracts.sh {{profile}}
 
-workspace-gate profile="W08":
+workspace-gate profile="W09":
     #!/usr/bin/env bash
     set -euo pipefail
-    case "{{profile}}" in W0[1-8]) slice="{{profile}}"; stage="${slice#W0}" ;; *) echo "Expected W01–W08" >&2; exit 2 ;; esac
+    case "{{profile}}" in W0[1-9]) slice="{{profile}}"; stage="${slice#W0}" ;; *) echo "Expected W01–W09" >&2; exit 2 ;; esac
     just workspace-contracts "{{profile}}"
     cargo test -p xtask --test workspace_gates
     cargo test -p flavite-ui --test runtime_accessibility
@@ -297,6 +297,12 @@ workspace-gate profile="W08":
         cargo test -p flavite-index --test graph_identity
         cargo test -p flavite-buffer --test revision_history
         cargo test -p flavite-ui --test graph_filter_context
+    fi
+    if (( stage >= 9 )); then
+        cargo test -p flavite-syntax --test read_structure
+        cargo test -p flavite-api --test property_edits --test embed_limits
+        cargo test -p flavite-ui --test read_mode --test embed_limits
+        cargo test -p flavite-fs --features fault --test contained_read
     fi
 
 workspace-graph-visual backend="canvas":

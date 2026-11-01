@@ -754,8 +754,7 @@ impl EditorModel {
     fn rebuild_eol_table(&mut self, old_text: &str) {
         let dominant = self.eol_table.dominant_eol();
         let has_bom = self.eol_table.has_bom();
-        let snapshot =
-            TextSnapshot::new(self.text().as_bytes()).expect("EditorModel text is valid UTF-8");
+        let snapshot = TextSnapshot::from_normalized(self.text());
         let mut new_table = EolTable::from_snapshot(&snapshot);
         let old_lines = logical_lines(old_text);
         let new_lines = logical_lines(self.text());

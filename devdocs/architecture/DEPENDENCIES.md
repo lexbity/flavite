@@ -35,6 +35,7 @@ Normal/build:
 - `flavite-index` (normal)
 - `flavite-syntax` (normal)
 - `flavite-vault` (normal)
+- `image` (normal)
 - `rusqlite` (normal)
 - `tracing` (normal)
 
@@ -167,6 +168,7 @@ Normal/build:
 - `iced` ← flavite-editor, flavite-ui, xtask
 - `iced_runtime` ← flavite-ui
 - `iced_winit` ← flavite-ui
+- `image` ← flavite-api
 - `notify` ← flavite-fs, flavite-fs, xtask
 - `nucleo` ← flavite-ui
 - `nucleo-matcher` ← flavite-editor

@@ -7,7 +7,9 @@
 pub mod frontmatter;
 pub mod link_format;
 pub mod mask;
+pub mod properties;
 pub mod pulldown_glue;
+pub mod read;
 pub mod scanner;
 pub mod text;
 pub mod ts_ranges;

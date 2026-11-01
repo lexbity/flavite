@@ -255,6 +255,21 @@ pub struct TextSnapshot {
 }
 
 impl TextSnapshot {
+    /// Build from an existing Session/TextByte string without normalizing it
+    /// again. A preserved standalone CR before an LF is content here, and a
+    /// leading BOM character may also be real edited content.
+    #[must_use]
+    pub fn from_normalized(text: &str) -> Self {
+        let source = text.as_bytes().to_vec();
+        let lines = build_lines(text, &source, 0);
+        Self {
+            text: text.into(),
+            source,
+            lines,
+            has_bom: false,
+        }
+    }
+
     /// Build a snapshot from raw file bytes.
     ///
     /// # Errors

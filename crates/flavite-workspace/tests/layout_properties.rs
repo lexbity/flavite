@@ -129,7 +129,8 @@ fn expected_delta(state: &WorkspaceState, action: &LayoutAction) -> Option<i64> 
                 -closing
             }
         }),
-        A::SetContextBinding { .. }
+        A::SetNoteMode { .. }
+        | A::SetContextBinding { .. }
         | A::SetGraphCamera { .. }
         | A::SetGraphScope { .. }
         | A::MoveTab { .. }

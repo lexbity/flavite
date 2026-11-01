@@ -60,6 +60,8 @@ pub struct App {
     pub notes: DocumentRegistry,
     /// Context tool state: bindings, effective sources, and query states.
     pub contexts: ContextRegistry,
+    pub reading: crate::host::reading::ReadingHost,
+    pub input_chains: BTreeMap<TabId, crate::host::input::InputChain>,
     /// Semantic link insertion gestures (W05).
     pub linking: crate::host::linking::LinkIntents,
     /// Graph view host: per-tab camera/selection/pins/geometry (W07).
@@ -131,6 +133,69 @@ pub enum Message {
     Layout(flavite_workspace::LayoutAction),
     /// Open a real view kind in the focused group.
     NewViewInFocused(flavite_workspace::ViewKind),
+    EditorInput {
+        tab: TabId,
+        incarnation: u64,
+        input: flavite_editor::input::CapturedInput,
+    },
+    FindOpen(TabId),
+    FindClose(TabId),
+    FindQuery {
+        tab: TabId,
+        query: String,
+    },
+    FindNext {
+        tab: TabId,
+        forward: bool,
+    },
+    ToggleNoteMode(TabId),
+    RetryReading(TabId),
+    ToggleSourcePreview(TabId),
+    ReadControlBounds {
+        tab: TabId,
+        document: std::sync::Arc<flavite_api::ReadSnapshot>,
+        role: &'static str,
+        start: usize,
+        rect: iced::Rectangle,
+    },
+    ReadBlockBounds {
+        tab: TabId,
+        hash: [u8; 32],
+        start: usize,
+        rect: iced::Rectangle,
+    },
+    ReadScrolled {
+        tab: TabId,
+        offset: f32,
+    },
+    ReadActivate {
+        tab: TabId,
+        document: std::sync::Arc<flavite_api::ReadSnapshot>,
+        start: usize,
+    },
+    OutlineNavigate {
+        tab: TabId,
+        document: std::sync::Arc<flavite_api::ReadSnapshot>,
+        byte: usize,
+    },
+    StructureEdit {
+        tab: TabId,
+        document: std::sync::Arc<flavite_api::ReadSnapshot>,
+        command: &'static str,
+        args: serde_json::Value,
+    },
+    PropertyDraft {
+        tab: TabId,
+        document: std::sync::Arc<flavite_api::ReadSnapshot>,
+        key: String,
+        value: String,
+    },
+    PropertyApply {
+        tab: TabId,
+        document: std::sync::Arc<flavite_api::ReadSnapshot>,
+        key: String,
+    },
+    ExternalOpened(Result<(), String>),
     /// Open a Preview/Backlinks tool with its D-04 default binding.
     OpenContextView {
         view: flavite_workspace::ContextViewKind,
@@ -147,6 +212,9 @@ pub enum Message {
     },
     /// Open a note chosen from a context tool row.
     OpenNoteFromContext {
+        locator: NoteLocator,
+    },
+    EditSourceFromContext {
         locator: NoteLocator,
     },
     /// Insert a link to this note at the acknowledged writing target (W05).
@@ -278,6 +346,8 @@ impl App {
             adapter,
             notes: DocumentRegistry::default(),
             contexts: ContextRegistry::default(),
+            reading: crate::host::reading::ReadingHost::default(),
+            input_chains: BTreeMap::new(),
             linking: crate::host::linking::LinkIntents::default(),
             graph: {
                 let mut host = crate::host::graph::GraphHost::default();
@@ -647,16 +717,8 @@ impl App {
 
     /// The buffer state chip label for a note tab ("Clean"/"Dirty"/…).
     #[must_use]
-    pub fn note_buffer_state(&self, tab: TabId) -> Option<String> {
-        let buffer = self.notes.state(&tab)?.buffer?;
-        let flavite = self.flavite.as_ref()?;
-        Some(
-            flavite
-                .get_buffer_view(flavite_buffer::BufferId::from(buffer), None)
-                .ok()?
-                .state
-                .to_string(),
-        )
+    pub fn note_buffer_state(&self, tab: TabId) -> Option<flavite_api::BufferStatus> {
+        self.note_editor_view(tab).map(|view| view.state)
     }
 
     /// Visible, identity-safe description of the insertion authority.
@@ -810,7 +872,11 @@ impl App {
         message: crate::graph::renderer::GraphMessage,
         key: flavite_graph::RenderKey,
     ) {
-        if self.picker.open || self.palette_open || self.strip_menu.is_some() {
+        if self.picker.open
+            || self.palette_open
+            || self.strip_menu.is_some()
+            || !crate::host::reading::is_edit(self, tab)
+        {
             return;
         }
         if !self.is_tab_visible(tab) {
@@ -873,6 +939,7 @@ impl App {
                     }
                 }
                 Effect::ViewDetached { tab, .. } => {
+                    self.input_chains.remove(tab);
                     self.notes.detach(*tab);
                     self.contexts.detach(*tab);
                     self.graph.detach(*tab);
@@ -890,12 +957,33 @@ impl App {
     /// Re-resolve every context tool against the router and submit queries
     /// for changed sources. Busy admission is recorded, never lost.
     pub(crate) fn reconcile_contexts(&mut self) {
+        let stale: Vec<_> = self
+            .workspace
+            .tabs()
+            .filter_map(|(tab, _)| match self.contexts.state(tab) {
+                Some(crate::host::context::ToolState::Ready(
+                    crate::host::context::ToolContent::Document(doc),
+                )) if !crate::host::reading::current(self, doc) => Some(*tab),
+                _ => None,
+            })
+            .collect();
+        for tab in stale {
+            self.contexts.invalidate(tab);
+        }
         let Some(flavite) = &self.flavite else {
             return;
         };
         for (tab, session) in self.workspace.tabs() {
+            if !self.is_tab_visible(*tab)
+                && !matches!(session.kind(), flavite_workspace::ViewKind::Backlinks(_))
+            {
+                self.contexts.detach(*tab);
+                continue;
+            }
             let backlinks = match session.kind() {
-                flavite_workspace::ViewKind::Preview(_) => false,
+                flavite_workspace::ViewKind::Preview(_)
+                | flavite_workspace::ViewKind::Outline(_)
+                | flavite_workspace::ViewKind::Properties(_) => false,
                 flavite_workspace::ViewKind::Backlinks(_) => true,
                 _ => continue,
             };
@@ -913,8 +1001,9 @@ impl App {
                         path: job.path.clone(),
                     }
                 } else {
-                    flavite_api::QueryPayload::Preview {
+                    flavite_api::QueryPayload::Read {
                         path: job.path.clone(),
+                        expected_buffer: None,
                     }
                 };
                 match flavite.query_service().submit(
@@ -937,7 +1026,11 @@ impl App {
     }
 
     fn handle_editor_action(&mut self, tab: TabId, incarnation: u64, action: EditorAction) {
-        if self.picker.open || self.palette_open || self.strip_menu.is_some() {
+        if self.picker.open
+            || self.palette_open
+            || self.strip_menu.is_some()
+            || !crate::host::reading::is_edit(self, tab)
+        {
             return;
         }
         if !self.is_tab_visible(tab) {
@@ -959,6 +1052,7 @@ impl App {
                 };
                 if snapshot.buffer_id != current.buffer_id || snapshot.revision != current.revision
                 {
+                    self.input_chains.remove(&tab);
                     self.status =
                         "Editor input was stale; the current caret state was restored".into();
                     return;
@@ -997,6 +1091,11 @@ impl App {
                 {
                     self.status = format!("Editor state was not accepted: {error}");
                 } else {
+                    if snapshot.focused
+                        && let Some(find) = self.reading.find.get_mut(&tab)
+                    {
+                        find.focused = false;
+                    }
                     // The anchor publication may have changed; context tools
                     // re-resolve immediately.
                     self.reconcile_contexts();
@@ -1228,7 +1327,36 @@ impl App {
 
     /// Apply one host event.
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.update_inner(message);
+        self.refresh_semantics();
+        #[cfg(feature = "ui-test-support")]
+        crate::harness::observe(self);
+        task
+    }
+
+    fn update_inner(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::EditorInput {
+                tab,
+                incarnation,
+                input,
+            } => return crate::host::input::handle(self, tab, incarnation, input),
+            message @ (Message::FindOpen(_)
+            | Message::FindClose(_)
+            | Message::FindQuery { .. }
+            | Message::FindNext { .. }
+            | Message::ToggleNoteMode(_)
+            | Message::RetryReading(_)
+            | Message::ToggleSourcePreview(_)
+            | Message::ReadControlBounds { .. }
+            | Message::ReadBlockBounds { .. }
+            | Message::ReadScrolled { .. }
+            | Message::ReadActivate { .. }
+            | Message::OutlineNavigate { .. }
+            | Message::StructureEdit { .. }
+            | Message::PropertyDraft { .. }
+            | Message::PropertyApply { .. }
+            | Message::ExternalOpened(_)) => return crate::host::reading::handle(self, message),
             Message::ResizeBegin(split) => {
                 if !self.has_composing_view() {
                     self.resizing_split = Some(split);
@@ -1327,7 +1455,11 @@ impl App {
                 self.resizing_split = None;
             }
             Message::WindowEvent(_) => {}
-            Message::Pump => self.pump(),
+            Message::Pump => {
+                self.pump();
+                self.refresh_semantics();
+                return crate::host::reading::scroll_pending(self);
+            }
             Message::Layout(action) => {
                 if !self.has_composing_view() && self.layout_fits(&action) {
                     let outcome = flavite_workspace::reduce(&self.workspace, action);
@@ -1364,6 +1496,18 @@ impl App {
                             expected_revision: revision,
                             view: flavite_workspace::ContextViewKind::Preview,
                             binding: flavite_workspace::ContextBinding::FollowExplorationOrDocument,
+                            group,
+                        },
+                        flavite_workspace::ViewKind::Outline(_) => LayoutAction::OpenContext {
+                            expected_revision: revision,
+                            view: flavite_workspace::ContextViewKind::Outline,
+                            binding: flavite_workspace::ContextBinding::FollowDocument,
+                            group,
+                        },
+                        flavite_workspace::ViewKind::Properties(_) => LayoutAction::OpenContext {
+                            expected_revision: revision,
+                            view: flavite_workspace::ContextViewKind::Properties,
+                            binding: flavite_workspace::ContextBinding::FollowDocument,
                             group,
                         },
                         flavite_workspace::ViewKind::Backlinks(_) => LayoutAction::OpenContext {
@@ -1550,7 +1694,9 @@ impl App {
                         flavite_workspace::ContextViewKind::Preview => {
                             flavite_workspace::ContextBinding::FollowExplorationOrDocument
                         }
-                        flavite_workspace::ContextViewKind::Backlinks => {
+                        flavite_workspace::ContextViewKind::Backlinks
+                        | flavite_workspace::ContextViewKind::Outline
+                        | flavite_workspace::ContextViewKind::Properties => {
                             flavite_workspace::ContextBinding::FollowDocument
                         }
                     };
@@ -1576,6 +1722,14 @@ impl App {
                 self.reconcile_contexts();
             }
             Message::OpenNoteFromContext { locator } => self.request_open(locator, None),
+            Message::EditSourceFromContext { locator } => {
+                self.request_open(locator, None);
+                let tab = self.workspace.focused_tab();
+                if matches!(self.workspace.tab(&tab).map(|s| s.kind()), Some(flavite_workspace::ViewKind::Note(note)) if note.mode() == flavite_workspace::NoteMode::Read)
+                {
+                    return self.update(Message::ToggleNoteMode(tab));
+                }
+            }
             Message::InsertLink { locator } => self.request_link_insert(locator),
             Message::PickerInsert(index) => {
                 let matches = self.picker_matches();
@@ -1618,8 +1772,7 @@ impl App {
         {
             api.cancel_link_intent(client, sequence);
         }
-        #[cfg(feature = "ui-test-support")]
-        crate::harness::observe(self);
+
         Task::none()
     }
 
@@ -1719,8 +1872,13 @@ impl App {
             // by the registry, so a rebind or replaced view is never
             // repainted by an older query.
             for outcome in query_outcomes {
-                if crate::host::occurrences::observe(self, &outcome) {
+                if crate::host::reading::observe(self, &outcome)
+                    || crate::host::occurrences::observe(self, &outcome)
+                {
                     continue;
+                }
+                if let flavite_api::ContextQueryResult::Document(doc) = &outcome.result {
+                    crate::host::reading::cache_images(self, doc);
                 }
                 let _ = self.contexts.observe(
                     TabId::from_raw(outcome.token.context_tab),
@@ -1745,6 +1903,7 @@ impl App {
         }
         self.completion_backlog = queue;
         self.reconcile_contexts();
+        crate::host::reading::sync(self);
         self.persist_workspace_layout();
         if let Some(target) = self.workspace.writing_target() {
             let remains_current = self.valid_writing_target().is_some();
@@ -1963,6 +2122,9 @@ impl App {
     #[must_use]
     pub fn valid_writing_target(&self) -> Option<(TabId, u64, u64, u64, usize)> {
         let target = self.workspace.writing_target()?;
+        if !crate::host::reading::is_edit(self, target.tab) {
+            return None;
+        }
         let remains = self.notes.incarnation(target.tab) == Some(target.incarnation)
             && self.note_editor_view(target.tab).is_some_and(|view| {
                 view.buffer_id == target.buffer_id && view.revision == target.revision
@@ -2270,6 +2432,8 @@ mod tests {
             adapter: Adapter::build(&workspace),
             notes: DocumentRegistry::default(),
             contexts: ContextRegistry::default(),
+            reading: crate::host::reading::ReadingHost::default(),
+            input_chains: BTreeMap::new(),
             linking: crate::host::linking::LinkIntents::default(),
             graph: {
                 let mut host = crate::host::graph::GraphHost::default();

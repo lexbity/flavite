@@ -24,7 +24,7 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
-if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" && "$scenario" != "context" && "$scenario" != "semantic-link" && "$scenario" != "restore" && "$scenario" != "filtered-unsaved-graph" ]]; then
+if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" && "$scenario" != "context" && "$scenario" != "semantic-link" && "$scenario" != "restore" && "$scenario" != "read-structure" && "$scenario" != "filtered-unsaved-graph" ]]; then
     echo "unsupported scenario: $scenario (implemented: layout, shared-editors, shell-foundation, context, semantic-link, restore)" >&2
     exit 2
 fi
@@ -39,6 +39,10 @@ for tool in xdotool import identify python3; do
         exit 2
     fi
 done
+if [[ "$scenario" == "read-structure" ]] && ! command -v tesseract >/dev/null 2>&1; then
+    echo "read-structure requires tesseract to assert captured text" >&2
+    exit 2
+fi
 # Keep test pointer/keyboard ownership separate from the user's desktop.
 # Allow enough physical pixels for the default window at 2x display scale.
 if [[ "${FLAVITE_XVFB_ACTIVE:-0}" != 1 ]] && command -v xvfb-run >/dev/null 2>&1; then
@@ -75,6 +79,15 @@ mkdir -p "$vault_dir/Systems"
 printf '# Alpha\n\nalpha body\n' >"$vault_dir/alpha.md"
 printf '# Beta\n\nbeta body\n' >"$vault_dir/beta.md"
 printf '# Gamma\n\ngamma body\n' >"$vault_dir/Systems/gamma.md"
+if [[ "$scenario" == "read-structure" ]]; then
+    python3 - "$vault_dir" <<'PYFIXTURE'
+from pathlib import Path
+import sys
+root=Path(sys.argv[1])
+(root/"alpha.md").write_text("---\ntitle: 'Alpha' # preserve this comment\ncount: 2\n---\n# Alpha\n\nA **bold** paragraph with *emphasis* and [[beta|a note link]].\n\n- [ ] First task\n\n| Column A | Column B |\n|---|---|\n| One | Two |\n\n> A quotation\n\n```rust\nlet literal = \"[[not a link]]\";\n```\n\n**Before ![[beta]] after**\n\n## More detail\n\nFurther reading.\n")
+PYFIXTURE
+fi
+
 python3 - "$vault_dir" "$run_dir/expected-fixture.json" <<'PY'
 import hashlib,json,pathlib,sys
 root=pathlib.Path(sys.argv[1])
@@ -197,7 +210,10 @@ harness_wait "boot with the catalog loaded" \
 capture "$run_dir/01-boot.png"
 record "boot-single-group-catalog" "01-boot.png"
 
-if [[ "$scenario" == "filtered-unsaved-graph" ]]; then
+if [[ "$scenario" == "read-structure" ]]; then
+    python3 scripts/tests/workspace_reading.py "$window_id" "$harness_log" "$run_dir" "$vault_dir"
+    record "reading-os-input-mode-task-undo-properties" "reading-checks.json"
+elif [[ "$scenario" == "filtered-unsaved-graph" ]]; then
     python3 scripts/tests/workspace_graph.py "$window_id" "$harness_log" "$run_dir" "$vault_dir" "$render_backend"
     record "graph-os-input-filter-overlay-undo" "graph-checks.json"
 elif [[ "$scenario" == "shell-foundation" ]]; then

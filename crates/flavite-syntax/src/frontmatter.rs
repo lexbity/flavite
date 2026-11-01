@@ -62,7 +62,7 @@ pub fn parse_frontmatter(snapshot: &TextSnapshot) -> Option<Frontmatter> {
     // Look for `---` at the start.
     // TextSnapshot removes the BOM from normalized text, so all parser
     // offsets here are already in TextByte coordinates.
-    if !text.starts_with("---") {
+    if !text.starts_with("---\n") {
         return None;
     }
 
@@ -203,6 +203,14 @@ pub fn parse_frontmatter(snapshot: &TextSnapshot) -> Option<Frontmatter> {
 
 /// Extract supported scalar types without reserializing the YAML document.
 fn parse_property_scalar(value: &str) -> PropertyValue {
+    if let Some(value) = crate::properties::simple_scalar(value) {
+        return match value {
+            crate::properties::ScalarValue::Text(value) => PropertyValue::Text(value),
+            crate::properties::ScalarValue::Number(value) => PropertyValue::Number(value),
+            crate::properties::ScalarValue::Bool(value) => PropertyValue::Bool(value),
+            crate::properties::ScalarValue::Null => PropertyValue::Null,
+        };
+    }
     if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
         return PropertyValue::Text(value[1..value.len() - 1].replace("''", "'"));
     }
@@ -242,8 +250,14 @@ fn parse_yaml_value(value: &str) -> Vec<String> {
             .filter(|s| !s.is_empty())
             .collect()
     } else {
-        // Single string value - trim quotes
-        vec![trimmed.trim_matches('"').to_string()]
+        match crate::properties::simple_scalar(trimmed) {
+            Some(
+                crate::properties::ScalarValue::Text(value)
+                | crate::properties::ScalarValue::Number(value),
+            ) => vec![value],
+            Some(crate::properties::ScalarValue::Bool(value)) => vec![value.to_string()],
+            _ => vec![trimmed.trim_matches('"').to_string()],
+        }
     }
 }
 
@@ -282,7 +296,7 @@ pub fn patch_frontmatter_key(
     };
     let bom_len = usize::from(text.starts_with('\u{feff}')) * '\u{feff}'.len_utf8();
     let after_bom = &text[bom_len..];
-    if !after_bom.starts_with("---") {
+    if !after_bom.starts_with("---\n") && !after_bom.starts_with("---\r\n") {
         let mut output = Vec::with_capacity(bytes.len() + rendered.len() + 12);
         output.extend_from_slice(&bytes[..bom_len]);
         output.extend_from_slice(format!("---{newline}{rendered}{newline}---{newline}").as_bytes());

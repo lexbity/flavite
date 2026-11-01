@@ -189,6 +189,12 @@ pub enum BufferSnapshotError {
 /// Commands that can be executed by the Session.
 #[derive(Debug, Clone)]
 pub enum SessionCommand {
+    /// Guarded property/task edit; one standalone Undo transaction.
+    EditStructure {
+        buffer_id: BufferId,
+        revision: Revision,
+        edit: crate::properties::StructureEdit,
+    },
     /// Open a note.
     OpenNote { path: PathBuf, policy: OpenPolicy },
     /// Close a note.
@@ -430,6 +436,7 @@ type RenameFlight = (
 pub struct Session {
     /// Serializes every command transition and worker reply application.
     driving_turn: Mutex<()>,
+    pub(crate) structure_worker: crate::properties::StructureWorker,
     /// Vault identity.
     identity: VaultIdentity,
     /// Vault actor handle.
@@ -665,6 +672,7 @@ impl Session {
         }
         Self {
             driving_turn: Mutex::new(()),
+            structure_worker: crate::properties::StructureWorker::new(),
             identity,
             actor,
             actor_events,
@@ -711,7 +719,8 @@ impl Session {
         let _turn = self.driving_turn.lock().unwrap();
         self.pump_external_changes_inner();
         let edited_path = match &command {
-            SessionCommand::ApplyEdits { buffer_id, .. }
+            SessionCommand::EditStructure { buffer_id, .. }
+            | SessionCommand::ApplyEdits { buffer_id, .. }
             | SessionCommand::Undo { buffer_id, .. }
             | SessionCommand::Redo { buffer_id, .. } => self
                 .buffer_manager
@@ -761,6 +770,7 @@ impl Session {
         let _turn = self.driving_turn.lock().unwrap();
         self.pump_external_changes_inner();
         self.pump_recovery_notices();
+        self.pump_structure_completions();
         self.pump_link_completions();
         self.pump_open_completions();
         self.pump_save_completions();
@@ -770,6 +780,46 @@ impl Session {
         // Recovery checkpoints run on the dedicated worker created with the
         // Session. Never perform recovery filesystem or actor I/O while this
         // host pump owns the Session driving-turn lock.
+    }
+
+    pub(crate) fn structure_completions_full(&self) -> bool {
+        self.completions.lock().unwrap().len() >= MAX_PENDING_SAVE_OPERATIONS - 64
+    }
+    pub(crate) fn next_structure_request(&self) -> u64 {
+        self.next_request_id()
+    }
+    fn pump_structure_completions(&self) {
+        while let Ok(prepared) = self.structure_worker.results.try_recv() {
+            let result = match prepared.patch {
+                Ok(op) => self.apply_structure_patch(prepared.buffer, prepared.revision, op),
+                Err(message) => SessionResult::ActionRequired {
+                    code: "structure.source",
+                    data: Some(message),
+                },
+            };
+            if matches!(result, SessionResult::Success(_))
+                && let Some(path) = self
+                    .buffer_manager
+                    .lock()
+                    .unwrap()
+                    .path_for_id(prepared.buffer)
+                    .cloned()
+            {
+                self.last_edit
+                    .lock()
+                    .unwrap()
+                    .insert(path.clone(), std::time::Instant::now());
+                self.autosave_attempted.lock().unwrap().remove(&path);
+            }
+            self.completions
+                .lock()
+                .unwrap()
+                .push_back(OperationCompletion {
+                    request_id: prepared.request,
+                    result,
+                });
+            self.structure_worker.retired();
+        }
     }
 
     fn pump_link_completions(&self) {
@@ -1060,6 +1110,11 @@ impl Session {
 
     fn execute_inner(&self, command: SessionCommand) -> SessionResult {
         match command {
+            SessionCommand::EditStructure {
+                buffer_id,
+                revision,
+                edit,
+            } => self.edit_structure(buffer_id, revision, edit),
             SessionCommand::OpenNote { path, policy } => self.open_note(path, policy),
             SessionCommand::CloseNote { path } => self.close_note(path),
             SessionCommand::ApplyEdits {
@@ -1145,6 +1200,33 @@ impl Session {
             .map_err(|error| error.to_string())
     }
 
+    pub fn validate_attachment_open(&self, relative: &Path) -> Result<PathBuf, String> {
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err("Invalid vault path".into());
+        }
+        self.actor
+            .validate_attachment_open(self.root().join(relative))
+    }
+    /// Worker-only capped, contained vault content read.
+    pub fn read_content_bounded(
+        &self,
+        relative: &Path,
+        max: u64,
+    ) -> Result<Option<Vec<u8>>, String> {
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err("Invalid vault path".into());
+        }
+        self.actor.read_bounded(self.root().join(relative), max)
+    }
+
     /// Execute a text or hybrid query on the index actor.
     pub fn search_notes(
         &self,
@@ -1201,8 +1283,12 @@ impl Session {
     fn prepare_link(
         &self,
         request: crate::link::LinkPrepareRequest,
-        request_id: u64,
+        _caller_request_id: u64,
     ) -> SessionResult {
+        // Every accepted asynchronous operation shares the Session namespace;
+        // a caller request number must not collide with an open/save/structure
+        // receipt and overwrite the facade's correlation map.
+        let request_id = self.next_request_id();
         let admission = {
             let mut store = self.link_plans.lock().unwrap();
             store.admit_prepare(&request)
@@ -1456,6 +1542,7 @@ impl Session {
     /// queued until the host drains them.
     pub fn drain_operation_completions(&self) -> Vec<OperationCompletion> {
         let _turn = self.driving_turn.lock().unwrap();
+        self.pump_structure_completions();
         self.pump_link_completions();
         self.pump_open_completions();
         self.pump_save_completions();
@@ -2035,6 +2122,48 @@ impl Session {
     }
 
     /// Apply edits to a buffer.
+    pub(crate) fn apply_structure_patch(
+        &self,
+        buffer_id: BufferId,
+        revision: Revision,
+        op: EditOp,
+    ) -> SessionResult {
+        let mut manager = self.buffer_manager.lock().unwrap();
+        let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
+            return SessionResult::Error {
+                message: "Buffer no longer open".into(),
+            };
+        };
+        if buffer.revision() != revision {
+            return SessionResult::StaleRevision {
+                buffer_id,
+                expected: revision,
+                actual: buffer.revision(),
+            };
+        }
+        if !matches!(
+            buffer.state(),
+            flavite_buffer::state::BufferState::Clean | flavite_buffer::state::BufferState::Dirty
+        ) {
+            return SessionResult::ActionRequired {
+                code: "structure.state",
+                data: None,
+            };
+        }
+        buffer.model_mut().seal_undo_group();
+        let result = buffer.apply_local_edits(&[op]);
+        buffer.model_mut().seal_undo_group();
+        match result {
+            Some((new_revision, _)) => SessionResult::Success(CommandResult::EditsApplied {
+                buffer_id,
+                new_revision,
+            }),
+            None => SessionResult::Error {
+                message: "Invalid structure edit".into(),
+            },
+        }
+    }
+
     fn apply_edits(
         &self,
         buffer_id: BufferId,
@@ -2730,6 +2859,13 @@ impl Session {
         revision: Option<Revision>,
     ) -> Result<SharedBufferSnapshot, BufferSnapshotError> {
         let _turn = self.driving_turn.lock().unwrap();
+        self.shared_buffer_snapshot_inner(buffer_id, revision)
+    }
+    pub(crate) fn shared_buffer_snapshot_inner(
+        &self,
+        buffer_id: BufferId,
+        revision: Option<Revision>,
+    ) -> Result<SharedBufferSnapshot, BufferSnapshotError> {
         let manager = self.buffer_manager.lock().unwrap();
         let buffer = manager
             .get_buffer_by_id(buffer_id)

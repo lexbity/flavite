@@ -17,6 +17,7 @@ pub mod journal;
 pub mod link;
 pub mod merge;
 pub mod open;
+pub mod properties;
 mod reconcile_worker;
 pub mod rename;
 pub mod save;

@@ -128,6 +128,10 @@ pub enum ViewKind {
     Preview(ContextBinding),
     /// Inbound links of the bound context source (W04).
     Backlinks(ContextBinding),
+    /// Current revisioned heading/block structure.
+    Outline(ContextBinding),
+    /// Current frontmatter with guarded scalar edits.
+    Properties(ContextBinding),
 }
 
 impl ViewKind {
@@ -136,18 +140,30 @@ impl ViewKind {
     pub fn duplicate(&self) -> Option<ViewKind> {
         match self {
             ViewKind::Empty => None,
-            ViewKind::Note(note) => Some(ViewKind::Note(NoteView::new(
-                note.locator().clone(),
-                NoteLoad::Reserved,
-            ))),
+            ViewKind::Note(note) => Some(ViewKind::Note(
+                NoteView::new(note.locator().clone(), NoteLoad::Reserved).with_mode(note.mode()),
+            )),
             ViewKind::Graph(graph) => Some(ViewKind::Graph(graph.clone())),
             ViewKind::Notes => Some(ViewKind::Notes),
             // A duplicated context tool is an independent view with its own
             // copy of the binding; the binding target itself is unchanged.
             ViewKind::Preview(binding) => Some(ViewKind::Preview(binding.clone())),
             ViewKind::Backlinks(binding) => Some(ViewKind::Backlinks(binding.clone())),
+            ViewKind::Outline(binding) => Some(ViewKind::Outline(binding.clone())),
+            ViewKind::Properties(binding) => Some(ViewKind::Properties(binding.clone())),
         }
     }
+}
+
+/// Source editing and rendered reading are modes of the same note identity.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteMode {
+    #[default]
+    Edit,
+    Read,
 }
 
 /// Logical state of one note view.
@@ -155,12 +171,17 @@ impl ViewKind {
 pub struct NoteView {
     locator: NoteLocator,
     load: NoteLoad,
+    mode: NoteMode,
 }
 
 impl NoteView {
     #[must_use]
     pub const fn new(locator: NoteLocator, load: NoteLoad) -> Self {
-        Self { locator, load }
+        Self {
+            locator,
+            load,
+            mode: NoteMode::Edit,
+        }
     }
 
     #[must_use]
@@ -171,6 +192,19 @@ impl NoteView {
     #[must_use]
     pub const fn load(&self) -> NoteLoad {
         self.load
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> NoteMode {
+        self.mode
+    }
+    #[must_use]
+    pub fn with_mode(mut self, mode: NoteMode) -> Self {
+        self.mode = mode;
+        self
+    }
+    pub(crate) fn set_mode(&mut self, mode: NoteMode) {
+        self.mode = mode;
     }
 
     pub(crate) fn set_load(&mut self, load: NoteLoad) {
@@ -414,6 +448,8 @@ impl ViewSession {
             ViewKind::Graph(_) => "Graph".into(),
             ViewKind::Preview(_) => "Preview".into(),
             ViewKind::Backlinks(_) => "Backlinks".into(),
+            ViewKind::Outline(_) => "Outline".into(),
+            ViewKind::Properties(_) => "Properties".into(),
         }
     }
 
@@ -423,14 +459,15 @@ impl ViewSession {
     pub fn duplicate(&self) -> Option<ViewKind> {
         match &self.kind {
             ViewKind::Empty => None,
-            ViewKind::Note(note) => Some(ViewKind::Note(NoteView::new(
-                note.locator().clone(),
-                NoteLoad::Reserved,
-            ))),
+            ViewKind::Note(note) => Some(ViewKind::Note(
+                NoteView::new(note.locator().clone(), NoteLoad::Reserved).with_mode(note.mode()),
+            )),
             ViewKind::Graph(graph) => Some(ViewKind::Graph(graph.clone())),
             ViewKind::Notes => Some(ViewKind::Notes),
             ViewKind::Preview(binding) => Some(ViewKind::Preview(binding.clone())),
             ViewKind::Backlinks(binding) => Some(ViewKind::Backlinks(binding.clone())),
+            ViewKind::Outline(binding) => Some(ViewKind::Outline(binding.clone())),
+            ViewKind::Properties(binding) => Some(ViewKind::Properties(binding.clone())),
         }
     }
 }

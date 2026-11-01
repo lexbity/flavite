@@ -19,6 +19,16 @@ pub const MAX_QUERY_SLOTS: usize = 64;
 /// Upper bound on backlink rows per query (NFR-02 scale).
 pub const MAX_BACKLINK_ROWS: usize = 200;
 
+/// Independent request streams must never supersede another kind of action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum QueryPurpose {
+    Context,
+    NoteRead,
+    Occurrence,
+    AttachmentOpen,
+    Anchor,
+}
+
 /// Caller-correlated identity of one context query (§7.1). The service
 /// stamps the session nonce; the host owns tab, incarnation, and binding
 /// sequence so a rebind or replaced view can never be repainted by an
@@ -27,6 +37,7 @@ pub const MAX_BACKLINK_ROWS: usize = 200;
 pub struct RequestToken {
     /// Session-allocated nonce namespace.
     pub session_nonce: u128,
+    pub purpose: QueryPurpose,
     /// Requesting context tool tab (raw opaque ID).
     pub context_tab: u128,
     /// Requesting view incarnation.
@@ -41,6 +52,19 @@ pub struct RequestToken {
 /// without leaking locator types across the facade boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryPayload {
+    Anchor {
+        buffer_id: u64,
+        revision: u64,
+        anchor: String,
+    },
+    AttachmentOpen {
+        path: PathBuf,
+    },
+    /// Canonical rendered tree of the current source with bounded embeds.
+    Read {
+        path: Vec<String>,
+        expected_buffer: Option<(u64, u64)>,
+    },
     /// Inspect one exact current connection occurrence before a removal decision.
     Occurrence {
         epoch: u64,
@@ -87,6 +111,13 @@ pub struct BacklinkRow {
 /// Typed outcome of one query slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextQueryResult {
+    Anchor {
+        buffer_id: u64,
+        revision: u64,
+        byte: Option<usize>,
+    },
+    AttachmentOpen(Result<PathBuf, String>),
+    Document(Arc<crate::ReadSnapshot>),
     /// A scanner-validated occurrence with normalized positions and exact bytes.
     Occurrence(OccurrenceDetail),
     /// Current open-buffer preview, clearly distinguished from saved text.
@@ -170,6 +201,7 @@ pub struct QueryService {
     graph: Arc<arc_swap::ArcSwap<crate::GraphService>>,
     ready: Arc<Mutex<BTreeMap<RequestToken, (QueryPayload, ContextQueryResult)>>>,
     in_flight: Arc<AtomicUsize>,
+    read_resources: Arc<crate::reading::ReadResources>,
     session_nonce: u128,
     request_sequence: AtomicU64,
     _workers: Vec<std::thread::JoinHandle<()>>,
@@ -198,8 +230,10 @@ impl QueryService {
         let ready: Arc<Mutex<BTreeMap<RequestToken, (QueryPayload, ContextQueryResult)>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
         let in_flight = Arc::new(AtomicUsize::new(0));
+        let read_resources = Arc::new(crate::reading::ReadResources::default());
         let mut workers = Vec::new();
         for worker_index in 0..2 {
+            let read_resources = read_resources.clone();
             let receiver = receiver.clone();
             let session = Arc::clone(&session);
             let graph = Arc::clone(&graph);
@@ -212,7 +246,12 @@ impl QueryService {
                         while let Ok(job) = receiver.recv() {
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    execute(&session, &graph.load_full(), &job.payload)
+                                    execute(
+                                        &session,
+                                        &graph.load_full(),
+                                        &job.payload,
+                                        &read_resources,
+                                    )
                                 }))
                                 .unwrap_or(
                                     ContextQueryResult::Failed {
@@ -232,8 +271,16 @@ impl QueryService {
             in_flight,
             session_nonce,
             request_sequence: AtomicU64::new(0),
+            read_resources,
             _workers: workers,
         }
+    }
+
+    /// Conservative outstanding reading/attachment reservation, including
+    /// worker results retained by hosts. No per-note labels are collected.
+    #[must_use]
+    pub fn read_memory_reserved_bytes(&self) -> usize {
+        self.read_resources.reserved()
     }
 
     pub(crate) fn set_graph(&self, graph: Arc<crate::GraphService>) {
@@ -264,6 +311,16 @@ impl QueryService {
         }
         let token = RequestToken {
             session_nonce: self.session_nonce,
+            purpose: match &payload {
+                QueryPayload::Anchor { .. } => QueryPurpose::Anchor,
+                QueryPayload::AttachmentOpen { .. } => QueryPurpose::AttachmentOpen,
+                QueryPayload::Read {
+                    expected_buffer: Some(_),
+                    ..
+                } => QueryPurpose::NoteRead,
+                QueryPayload::Occurrence { .. } => QueryPurpose::Occurrence,
+                _ => QueryPurpose::Context,
+            },
             context_tab,
             incarnation,
             binding_sequence,
@@ -312,7 +369,9 @@ fn publish(
     // directions: a late sequence n can never overwrite or coexist with an
     // already-served n+1, and older entries never outlive a newer one.
     let same_view = |token: &RequestToken| {
-        token.context_tab == job.token.context_tab && token.incarnation == job.token.incarnation
+        token.context_tab == job.token.context_tab
+            && token.incarnation == job.token.incarnation
+            && token.purpose == job.token.purpose
     };
     let newer_exists = slots.keys().any(|token| {
         same_view(token)
@@ -345,10 +404,59 @@ fn execute(
     session: &Arc<Session>,
     graph: &Arc<crate::GraphService>,
     payload: &QueryPayload,
+    read_resources: &Arc<crate::reading::ReadResources>,
 ) -> ContextQueryResult {
     match payload {
+        QueryPayload::Anchor {
+            buffer_id,
+            revision,
+            anchor,
+        } => match session.shared_buffer_snapshot(
+            (*buffer_id).into(),
+            Some(flavite_buffer::Revision::new(*revision)),
+        ) {
+            Ok(snapshot) if anchor.len() <= 8192 => {
+                match flavite_syntax::read::resolve_anchor(&snapshot.text, anchor) {
+                    Ok(byte) => ContextQueryResult::Anchor {
+                        buffer_id: *buffer_id,
+                        revision: *revision,
+                        byte,
+                    },
+                    Err(message) => ContextQueryResult::Failed { message },
+                }
+            }
+            _ => ContextQueryResult::Failed {
+                message: "Anchor source changed; open link again".into(),
+            },
+        },
+        QueryPayload::AttachmentOpen { path } => {
+            ContextQueryResult::AttachmentOpen(session.validate_attachment_open(path))
+        }
         QueryPayload::Occurrence { epoch, occurrence } => {
             inspect_occurrence(session, graph, *epoch, occurrence)
+        }
+        QueryPayload::Read {
+            path,
+            expected_buffer,
+        } => {
+            let relative: PathBuf = path.iter().collect();
+            let before = session
+                .resolver_catalog()
+                .ok()
+                .map(|catalog| (catalog.epoch, catalog.generation));
+            if before.is_none() {
+                return ContextQueryResult::Updating;
+            }
+            let result = crate::reading::load(session, &relative, *expected_buffer, read_resources);
+            let after = session
+                .resolver_catalog()
+                .ok()
+                .map(|catalog| (catalog.epoch, catalog.generation));
+            match result {
+                Ok(document) => ContextQueryResult::Document(document),
+                Err(_) if before != after => ContextQueryResult::Updating,
+                Err(message) => ContextQueryResult::Failed { message },
+            }
         }
         QueryPayload::Preview { path } => execute_preview(session, path),
         QueryPayload::Backlinks { path } => execute_backlinks(session, graph, path),
@@ -403,7 +511,7 @@ fn inspect_occurrence(
     let Some((text, start, end)) = content else {
         return failure();
     };
-    let Ok(parsed) = flavite_syntax::pulldown_glue::parse_note(text.as_bytes()) else {
+    let Ok(parsed) = flavite_syntax::pulldown_glue::parse_normalized(&text) else {
         return failure();
     };
     if !parsed.links.iter().any(|link| {
@@ -585,7 +693,7 @@ fn exact_excerpt(text: &str, start: usize, end: usize) -> Option<String> {
 /// weaker parser). Excerpts are presentation-only; identity is the path.
 #[cfg(test)]
 fn link_excerpt(text: &str, stem: &str) -> Option<String> {
-    let parsed = flavite_syntax::pulldown_glue::parse_note(text.as_bytes()).ok()?;
+    let parsed = flavite_syntax::pulldown_glue::parse_normalized(text).ok()?;
     let link = parsed.links.iter().find(|link| {
         link.target_raw.contains(stem)
             || link

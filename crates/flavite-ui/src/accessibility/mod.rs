@@ -1,6 +1,7 @@
 //! AccessKit semantic tree and action integration for the Flavite shell.
 
 pub mod program;
+pub mod reading;
 pub mod tree;
 
 pub use tree::NodeTarget;
@@ -20,12 +21,47 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
     }
     let target = app.a11y_nodes.get(&request.target_node)?.clone();
     match target {
+        NodeTarget::FindQuery(tab)
+            if app.is_tab_visible(tab) && app.reading.find.contains_key(&tab) =>
+        {
+            match (request.action, request.data) {
+                (Action::SetValue, Some(ActionData::Value(value))) => Some(Message::FindQuery {
+                    tab,
+                    query: value.into(),
+                }),
+                (Action::Focus, _) => Some(Message::FindOpen(tab)),
+                _ => None,
+            }
+        }
+        NodeTarget::FindNext { tab, forward }
+            if request.action == Action::Click && app.is_tab_visible(tab) =>
+        {
+            Some(Message::FindNext { tab, forward })
+        }
+        NodeTarget::FindClose(tab)
+            if request.action == Action::Click && app.is_tab_visible(tab) =>
+        {
+            Some(Message::FindClose(tab))
+        }
+
+        NodeTarget::NoteMode(tab) if request.action == Action::Click && !app.has_composition() => {
+            Some(Message::ToggleNoteMode(tab))
+        }
+        NodeTarget::ContextBinding { tab, binding } if request.action == Action::Click => {
+            Some(Message::SetContextBinding { tab, binding })
+        }
+        NodeTarget::Reading {
+            tab,
+            document,
+            action,
+        } => reading::route(app, tab, document, action, request),
         NodeTarget::Editor {
             tab,
             incarnation,
             revision,
         } => {
-            if app.picker.open
+            if !crate::host::reading::is_edit(app, tab)
+                || app.picker.open
                 || app.palette_open
                 || app.strip_menu.is_some()
                 || !app.is_tab_visible(tab)

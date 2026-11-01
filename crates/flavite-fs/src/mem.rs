@@ -507,6 +507,11 @@ impl Fs for MemFs {
         }
     }
 
+    fn read_capped_in_root(&self, root: &Path, relative: &Path, max: u64) -> Result<Vec<u8>> {
+        let path = root.join(relative);
+        self.validate_in_root(root, &path)?;
+        self.read_capped(&path, max)
+    }
     fn read_capped(&self, path: &Path, max: u64) -> Result<Vec<u8>> {
         let state = self.lock();
         let resolved = Self::resolve_parents(&state, path);

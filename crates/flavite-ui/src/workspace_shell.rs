@@ -321,6 +321,8 @@ fn active_view(app: &App, group: GroupId, tab: TabId) -> Element<'_, Message> {
         ViewKind::Graph(_) => crate::views::graph::view(app, tab),
         ViewKind::Preview(_) => crate::views::preview::view(app, tab),
         ViewKind::Backlinks(_) => crate::views::backlinks::view(app, tab),
+        ViewKind::Outline(_) => crate::views::outline::view(app, tab),
+        ViewKind::Properties(_) => crate::views::properties::view(app, tab),
     }
 }
 
@@ -525,6 +527,7 @@ fn palette_card(app: &App) -> Element<'_, Message> {
             text_input("Type a command…", app.palette_query_text())
                 .id(PALETTE_INPUT_ID)
                 .on_input(Message::PaletteQuery)
+                .on_submit(Message::PaletteSubmit)
                 .size(style::TEXT_LG)
                 .padding(8),
             rule::horizontal(1),

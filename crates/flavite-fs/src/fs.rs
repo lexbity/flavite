@@ -139,6 +139,15 @@ pub trait Fs: Send + Sync {
     /// Read a file's contents, erroring if the size exceeds `max` bytes.
     fn read_capped(&self, path: &Path, max: u64) -> Result<Vec<u8>>;
 
+    /// Read through a directory capability, enforcing containment on the opened
+    /// file and bounding allocation even when an external writer grows it.
+    /// Custom filesystem adapters must implement this before serving embeds.
+    fn read_capped_in_root(&self, _root: &Path, _relative: &Path, _max: u64) -> Result<Vec<u8>> {
+        Err(FsError::Unsupported(
+            "Contained bounded reads unavailable".into(),
+        ))
+    }
+
     /// Get metadata for a path.
     ///
     /// Symlink contract (finalized in S3-2, matching the `MemFs` model):

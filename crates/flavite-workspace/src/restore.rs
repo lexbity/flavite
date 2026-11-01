@@ -78,13 +78,13 @@ pub fn plan(
         let kind = match &tab.kind {
             PersistedKind::Empty => Some(ViewKind::Empty),
             PersistedKind::Notes => Some(ViewKind::Notes),
-            PersistedKind::Note { locator } => NoteLocator::from_components(locator.clone())
+            PersistedKind::Note { locator, mode } => NoteLocator::from_components(locator.clone())
                 .ok()
                 .map(|resolved| {
-                    ViewKind::Note(crate::view::NoteView::new(
-                        resolved,
-                        crate::view::NoteLoad::Reserved,
-                    ))
+                    ViewKind::Note(
+                        crate::view::NoteView::new(resolved, crate::view::NoteLoad::Reserved)
+                            .with_mode(*mode),
+                    )
                 }),
             PersistedKind::Graph { camera, scope } => {
                 let mut view = match camera {
@@ -111,6 +111,12 @@ pub fn plan(
             }
             PersistedKind::Backlinks { binding } => {
                 restore_binding(binding, &mut report).map(ViewKind::Backlinks)
+            }
+            PersistedKind::Outline { binding } => {
+                restore_binding(binding, &mut report).map(ViewKind::Outline)
+            }
+            PersistedKind::Properties { binding } => {
+                restore_binding(binding, &mut report).map(ViewKind::Properties)
             }
             PersistedKind::Other { name, .. } => {
                 report.push(format!(

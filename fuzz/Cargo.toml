@@ -75,3 +75,7 @@ path = "fuzz_targets/workspace_layout.rs"
 [[bin]]
 name = "graph_scope"
 path = "fuzz_targets/graph_scope.rs"
+
+[[bin]]
+name = "read_structure"
+path = "fuzz_targets/read_structure.rs"

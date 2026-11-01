@@ -17,6 +17,8 @@ thiserror = { workspace = true }
 notify = { workspace = true }
 unicode-normalization = "0.1"
 
+cap-std = "4"
+
 [dev-dependencies]
 proptest = { workspace = true }
 # notify crate is used by the watcher wrapper; also needed for dev tests.

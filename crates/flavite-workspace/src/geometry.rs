@@ -53,7 +53,10 @@ pub fn view_minimum(kind: &ViewKind, scale: f32) -> Size {
         ViewKind::Note(_) => MIN_NOTE,
         ViewKind::Graph(_) => MIN_GRAPH,
         ViewKind::Notes | ViewKind::Empty => MIN_LIST,
-        ViewKind::Preview(_) | ViewKind::Backlinks(_) => MIN_CONTEXT,
+        ViewKind::Preview(_)
+        | ViewKind::Backlinks(_)
+        | ViewKind::Outline(_)
+        | ViewKind::Properties(_) => MIN_CONTEXT,
     };
     Size {
         width: width * scale,

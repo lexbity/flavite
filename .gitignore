@@ -31,6 +31,8 @@ scratch-devdocs/
 # OS / editor cruft.
 .zcode
 .claude
+.aws
+.cargo
 .codex
 .DS_Store
 Thumbs.db

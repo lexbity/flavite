@@ -16,6 +16,24 @@ mod links_fixture;
 use links_fixture::*;
 
 #[test]
+fn semantic_proof_keeps_session_coordinates_after_preserved_carriage_returns() {
+    let f = fixture(&[
+        ("source.md", "\r\r\nBefore after\n"),
+        ("target.md", "Target\n"),
+    ]);
+    let (buffer, revision) = f.open_note("source.md");
+    let original = f.text(buffer);
+    let caret = original.find("after").unwrap();
+    let (_, plan, _) = f.prepare(1, buffer, revision, caret, "target.md");
+    assert!(f.commit(1, plan).is_success());
+    assert_eq!(
+        f.text(buffer),
+        original.replacen("after", "[[target]]after", 1)
+    );
+    assert_eq!(f.saved_bytes("target.md"), b"Target\n");
+}
+
+#[test]
 fn cancellation_releases_capacity_and_old_plan_cannot_mutate_a_new_gesture() {
     let fixture = fixture(&[("source.md", "Text."), ("target.md", "Target.")]);
     let (buffer, revision) = fixture.open_note("source.md");

@@ -178,6 +178,12 @@ pub enum Outcome {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayoutAction {
+    /// Switch the same tab between Edit and Read; composition blocks it.
+    SetNoteMode {
+        expected_revision: u64,
+        tab: TabId,
+        mode: crate::NoteMode,
+    },
     /// Open a source-reading note tab at the end of `group`.
     OpenNote {
         expected_revision: u64,
@@ -325,7 +331,10 @@ impl LayoutAction {
     #[must_use]
     pub const fn expected_revision(&self) -> u64 {
         match self {
-            Self::OpenNote {
+            Self::SetNoteMode {
+                expected_revision, ..
+            }
+            | Self::OpenNote {
                 expected_revision, ..
             }
             | Self::OpenEmpty {
@@ -498,6 +507,9 @@ impl WorkspaceState {
     ) -> Result<(), &'static str> {
         let tab = interaction.tab;
         let current = self.tabs.get(&tab).ok_or("interaction tab is closed")?;
+        if !matches!(current.kind(), ViewKind::Note(note) if note.mode() == crate::NoteMode::Edit) {
+            return Err("View is not editable");
+        }
         interaction.validate(tab, current.interaction().incarnation, text.len())?;
         if interaction.sequence <= current.interaction().sequence {
             return Err("interaction sequence is stale");
@@ -711,11 +723,83 @@ impl WorkspaceState {
         }
     }
 
+    /// Update only a content viewport anchor; this never authorizes a caret.
+    ///
+    /// # Errors
+    /// Rejects missing views, active composition, and invalid UTF-8 positions.
+    pub fn set_content_anchor(
+        &mut self,
+        tab: TabId,
+        byte: usize,
+        text: &str,
+    ) -> Result<(), &'static str> {
+        if !text.is_char_boundary(byte) {
+            return Err("Invalid content anchor");
+        }
+        let session = self.tabs.get_mut(&tab).ok_or("Missing note view")?;
+        let mut interaction = session.interaction().clone();
+        if interaction.composition == crate::CompositionState::Active {
+            return Err("Composition active");
+        }
+        let previous_sequence = interaction.sequence;
+        interaction.viewport_anchor = byte;
+        interaction.sequence = interaction.sequence.saturating_add(1);
+        interaction.focused = false;
+        if let Some(target) = self
+            .writing_target
+            .as_mut()
+            .filter(|target| target.tab == tab)
+        {
+            if target.incarnation == interaction.incarnation
+                && Some(target.buffer_id) == interaction.buffer_id
+                && target.revision == interaction.revision
+                && target.interaction_sequence == previous_sequence
+                && interaction.selections == [crate::Selection::caret(target.caret_text_byte)]
+            {
+                target.interaction_sequence = interaction.sequence;
+            } else {
+                self.writing_target = None;
+            }
+        }
+        session.set_interaction(interaction);
+        Ok(())
+    }
+
+    /// A navigation/find selection is display state, never insertion authority.
+    ///
+    /// # Errors
+    /// Rejects reversed/invalid ranges, missing views, or active composition.
+    pub fn set_display_selection(
+        &mut self,
+        tab: TabId,
+        start: usize,
+        end: usize,
+        revision: u64,
+        text: &str,
+    ) -> Result<(), &'static str> {
+        if start > end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            return Err("Invalid selection");
+        }
+        self.set_content_anchor(tab, start, text)?;
+        let session = self.tabs.get_mut(&tab).ok_or("Missing view")?;
+        let mut interaction = session.interaction().clone();
+        interaction.selections = vec![crate::Selection::new(start, end)];
+        interaction.revision = revision;
+        session.set_interaction(interaction);
+        if self.writing_target.is_some_and(|target| target.tab == tab) {
+            self.writing_target = None;
+        }
+        Ok(())
+    }
+
     /// The explicit binding of a context tool tab.
     #[must_use]
     pub fn binding_of(&self, tab: &TabId) -> Option<&ContextBinding> {
         match self.tab(tab)?.kind() {
-            ViewKind::Preview(binding) | ViewKind::Backlinks(binding) => Some(binding),
+            ViewKind::Preview(binding)
+            | ViewKind::Backlinks(binding)
+            | ViewKind::Outline(binding)
+            | ViewKind::Properties(binding) => Some(binding),
             _ => None,
         }
     }
@@ -728,7 +812,10 @@ impl WorkspaceState {
             .filter(|(_, session)| {
                 matches!(
                     session.kind(),
-                    ViewKind::Preview(_) | ViewKind::Backlinks(_)
+                    ViewKind::Preview(_)
+                        | ViewKind::Backlinks(_)
+                        | ViewKind::Outline(_)
+                        | ViewKind::Properties(_)
                 )
             })
             .map(|(tab, _)| Effect::ContextRebound { tab: *tab })
@@ -968,6 +1055,15 @@ impl WorkspaceState {
         self.recently_closed.push_back(locator);
     }
 
+    fn focus_document_source(&mut self, tab: TabId) {
+        if matches!(self.tabs.get(&tab).map(ViewSession::kind), Some(ViewKind::Note(note)) if note.load() == NoteLoad::Ready)
+            && self.document_anchor != Some(tab)
+        {
+            self.document_anchor = Some(tab);
+            self.document_publication = self.document_publication.saturating_add(1);
+        }
+    }
+
     fn set_note_load(&mut self, tab: TabId, load: NoteLoad) -> Result<Vec<Effect>, WorkspaceError> {
         let Some(session) = self.tabs.get_mut(&tab) else {
             return Err(WorkspaceError::UnknownTab(tab));
@@ -979,6 +1075,9 @@ impl WorkspaceState {
             return Err(WorkspaceError::NoChange);
         }
         note.set_load(load);
+        if self.focus == tab && load == NoteLoad::Ready {
+            self.focus_document_source(tab);
+        }
         Ok(vec![Effect::NoteLoadChanged { tab, load }])
     }
 
@@ -1233,6 +1332,35 @@ fn apply(state: &mut WorkspaceState, action: &LayoutAction) -> Result<Vec<Effect
             }
             Ok(Vec::new())
         }
+        LayoutAction::SetNoteMode { tab, mode, .. } => {
+            let session = state
+                .tabs
+                .get_mut(tab)
+                .ok_or(WorkspaceError::UnknownTab(*tab))?;
+            if session.interaction().composition == crate::CompositionState::Active {
+                return Err(WorkspaceError::InvariantViolation(
+                    "Commit or cancel composition before switching modes".into(),
+                ));
+            }
+            let ViewKind::Note(note) = session.kind_mut() else {
+                return Err(WorkspaceError::InvariantViolation(
+                    "This view is not a note".into(),
+                ));
+            };
+            if note.mode() == *mode {
+                return Err(WorkspaceError::NoChange);
+            }
+            note.set_mode(*mode);
+            let mut interaction = session.interaction().clone();
+            interaction.focused = false;
+            interaction.sequence = interaction.sequence.saturating_add(1);
+            session.set_interaction(interaction);
+            if *mode == crate::NoteMode::Read && state.writing_target.is_some_and(|t| t.tab == *tab)
+            {
+                state.writing_target = None;
+            }
+            Ok(Vec::new())
+        }
         LayoutAction::OpenContext {
             view,
             binding,
@@ -1240,6 +1368,15 @@ fn apply(state: &mut WorkspaceState, action: &LayoutAction) -> Result<Vec<Effect
             ..
         } => {
             let tab = state.ids.tab_id();
+            if let ContextBinding::FollowSource { tab: source } = binding
+                && state
+                    .tab(source)
+                    .is_some_and(|view| !crate::context::is_source_kind(view.kind()))
+            {
+                return Err(WorkspaceError::InvariantViolation(
+                    "Context tools cannot follow other context tools".into(),
+                ));
+            }
             let kind = view.view_kind(binding.clone());
             let tab = state.append_tab(*group, ViewSession::new(tab, kind.clone()))?;
             Ok(vec![
@@ -1251,12 +1388,24 @@ fn apply(state: &mut WorkspaceState, action: &LayoutAction) -> Result<Vec<Effect
             ])
         }
         LayoutAction::SetContextBinding { tab, binding, .. } => {
+            if let ContextBinding::FollowSource { tab: source } = binding
+                && state
+                    .tab(source)
+                    .is_some_and(|view| !crate::context::is_source_kind(view.kind()))
+            {
+                return Err(WorkspaceError::InvariantViolation(
+                    "Context tools cannot follow other context tools".into(),
+                ));
+            }
             let session = state
                 .tabs
                 .get_mut(tab)
                 .ok_or(WorkspaceError::UnknownTab(*tab))?;
             match session.kind_mut() {
-                ViewKind::Preview(binding_slot) | ViewKind::Backlinks(binding_slot) => {
+                ViewKind::Preview(binding_slot)
+                | ViewKind::Backlinks(binding_slot)
+                | ViewKind::Outline(binding_slot)
+                | ViewKind::Properties(binding_slot) => {
                     *binding_slot = binding.clone();
                 }
                 _ => return Err(WorkspaceError::UnknownTab(*tab)),
@@ -1267,12 +1416,14 @@ fn apply(state: &mut WorkspaceState, action: &LayoutAction) -> Result<Vec<Effect
             let owner = state.owner_of(*tab)?;
             state.group_mut(&owner)?.set_active(*tab);
             state.focus = *tab;
+            state.focus_document_source(*tab);
             state.maximized = None;
             Ok(Vec::new())
         }
         LayoutAction::FocusGroup { group, .. } => {
             let active = state.group_mut(group)?.active();
             state.focus = active;
+            state.focus_document_source(active);
             state.maximized = None;
             Ok(Vec::new())
         }
@@ -1555,6 +1706,7 @@ fn apply(state: &mut WorkspaceState, action: &LayoutAction) -> Result<Vec<Effect
                 .ok_or(WorkspaceError::UnknownGroup(order[next]))?
                 .active();
             state.focus = active;
+            state.focus_document_source(active);
             state.maximized = None;
             Ok(Vec::new())
         }

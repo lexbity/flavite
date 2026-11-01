@@ -67,6 +67,16 @@ impl Flavite {
 }
 
 impl crate::Flavite {
+    /// Immutable resolver version for rejecting obsolete reading actions.
+    /// This reads the published catalog only; it performs no actor/DB IO.
+    #[must_use]
+    pub fn read_catalog_version(&self) -> Option<(u64, u64)> {
+        self.session
+            .resolver_catalog()
+            .ok()
+            .map(|catalog| (catalog.epoch, catalog.generation))
+    }
+
     /// Current shared buffer for an exact vault-relative source path, if open.
     pub fn open_source_view(&self, path: &std::path::Path) -> Option<crate::SharedBufferView> {
         let (id, revision, ..) =

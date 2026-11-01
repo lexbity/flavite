@@ -18,7 +18,9 @@ pedantic = { level = "warn", priority = -1 }
 iced = { version = "0.14", features = ["tokio", "canvas"] }
 cosmic-text = "0.15"
 # Core
-ropey = "1.6"
+# TextSnapshot/EolTable count LF only; standalone CR and Unicode separators
+# remain content. Ropey's default unicode_lines would split UTF-8 during save.
+ropey = { version = "1.6", default-features = false, features = ["simd"] }
 rusqlite = "0.41"
 tantivy = "0.27"
 pulldown-cmark = "0.13"

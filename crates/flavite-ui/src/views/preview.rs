@@ -1,125 +1,54 @@
-//! Revisioned source-text preview (RFC-0003 §20/§24, W04/W08).
-//!
-//! This is explicitly a source-text preview, not rendered reading (W09
-//! owns the renderer). Open notes use their current buffer; otherwise the
-//! saved snapshot is shown. The source header distinguishes their provenance.
-
-use crate::app::{App, Message};
-use crate::host::context::{ToolContent, ToolState};
-use crate::style;
-use crate::views::{context_header, empty_state};
-use crate::workspace::tab_strip;
+//! Rendered, source-bound Preview with an explicit Source preview option.
+use crate::{
+    app::{App, Message},
+    host::reading,
+    style,
+    views::{context_header, properties},
+};
 use flavite_workspace::TabId;
 use iced::widget::{button, column, container, row, rule, scrollable, text};
 use iced::{Element, Length};
-
-/// Render one Preview tab for the active view slot.
-pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
-    let Some(session) = app.workspace.tab(&tab) else {
-        return empty_state("Empty", "This tab has no content.");
-    };
-    if !matches!(session.kind(), flavite_workspace::ViewKind::Preview(_)) {
-        return empty_state("Preview", "This tab is not a preview view.");
-    }
-    let header = context_header::view(app, tab);
-    let body: Element<'a, Message> = match app.contexts.state(&tab) {
-        Some(ToolState::Ready(
-            ToolContent::Preview { text: saved, .. }
-            | ToolContent::BufferPreview { text: saved, .. },
-        )) => {
-            let open = button(text("Open note").size(style::TEXT_SM))
-                .padding(tab_strip::chip_padding())
-                .style(style::action())
-                .on_press_maybe(app.contexts.observed(&tab).map(|source| {
-                    Message::OpenNoteFromContext {
-                        locator: source.locator.clone(),
-                    }
-                }));
-            // Insert is offered only when the acknowledged writing target
-            // exists; the button never manufactures a fallback caret (D-05).
-            let insert = button(
-                text(format!(
-                    "Insert [[{}]]",
-                    app.contexts
-                        .observed(&tab)
-                        .map(|source| source.locator.title().to_owned())
-                        .unwrap_or_default()
-                ))
-                .size(style::TEXT_SM),
-            )
-            .padding(tab_strip::chip_padding())
-            .style(style::action())
-            .on_press_maybe(
+pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
+    let body: Element<'_, Message> = if let Some(doc) = reading::document(app, tab) {
+        let source = app.reading.source_previews.contains(&tab);
+        let open = flavite_workspace::NoteLocator::from_relative(&doc.path).ok();
+        let toolbar = row![
+            button("Open note").style(style::action()).on_press_maybe(
+                open.clone()
+                    .map(|locator| Message::OpenNoteFromContext { locator })
+            ),
+            button("Insert link").style(style::ghost()).on_press_maybe(
                 app.valid_writing_target()
-                    .and_then(|_| app.contexts.observed(&tab))
-                    .map(|source| Message::InsertLink {
-                        locator: source.locator.clone(),
-                    }),
-            );
-            container(
-                column![
-                    container(row![open, insert].spacing(style::SPACING_SM)).width(Length::Fill),
-                    scrollable(
-                        text(saved.as_str())
-                            .width(Length::Fill)
-                            .style(style::dim_text),
-                    )
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-                ]
-                .spacing(style::SPACING_SM),
+                    .and(open)
+                    .map(|locator| Message::InsertLink { locator })
+            ),
+            button(if source {
+                "Rendered preview"
+            } else {
+                "Source preview"
+            })
+            .style(style::ghost())
+            .on_press(Message::ToggleSourcePreview(tab)),
+        ]
+        .spacing(8);
+        let content = if source {
+            scrollable(
+                text(doc.text.to_string())
+                    .font(iced::Font::MONOSPACE)
+                    .size(14),
             )
-            .width(Length::Fill)
             .height(Length::Fill)
-            .padding(style::SPACING)
-            .style(style::content)
             .into()
-        }
-        Some(ToolState::Unbound { .. }) => empty_state(
-            "No source",
-            "Focus a note, publish a selection, or pin one to preview it.",
-        ),
-        Some(ToolState::Missing) => {
-            empty_state("Missing note", "The bound note is not in the saved vault.")
-        }
-        Some(ToolState::Failed { message }) => container(
-            column![
-                text("Preview unavailable").size(style::HEADING),
-                text(message.as_str()).style(style::dim_text),
-                retry_button(app, tab),
-            ]
-            .spacing(style::SPACING_SM),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(style::SPACING_LG)
-        .style(style::content)
-        .into(),
-        Some(ToolState::Busy) => empty_state(
-            "Queued",
-            "The query service is busy; this preview will update.",
-        ),
-        Some(
-            ToolState::Idle
-            | ToolState::Querying
-            | ToolState::NoBacklinks
-            | ToolState::Ready(ToolContent::Backlinks { .. }),
-        )
-        | None => empty_state("Loading…", "The preview query is in flight."),
+        } else {
+            crate::read::view(app, tab, doc)
+        };
+        column![container(toolbar).padding(8), content]
+            .height(Length::Fill)
+            .into()
+    } else {
+        properties::loading(app, tab)
     };
-    column![header, rule::horizontal(1), body]
-        .width(Length::Fill)
+    column![context_header::view(app, tab), rule::horizontal(1), body]
         .height(Length::Fill)
         .into()
-}
-
-fn retry_button(app: &App, tab: TabId) -> iced::widget::Button<'static, Message> {
-    button(text("Retry").size(style::TEXT_SM))
-        .padding(tab_strip::chip_padding())
-        .style(style::action())
-        .on_press_maybe(
-            app.contexts
-                .observed(&tab)
-                .map(|_| Message::RequeryContext { tab }),
-        )
 }

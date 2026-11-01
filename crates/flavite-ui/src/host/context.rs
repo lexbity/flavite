@@ -22,6 +22,7 @@ pub struct PendingQuery {
 /// Content of a served query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolContent {
+    Document(std::sync::Arc<flavite_api::ReadSnapshot>),
     /// Preview from the exact current open-buffer revision.
     BufferPreview {
         text: String,
@@ -254,7 +255,10 @@ impl ContextRegistry {
         }
         tool.pending = None;
         tool.state = match result {
-            QueryResult::Occurrence(_) => return false,
+            QueryResult::Document(doc) => ToolState::Ready(ToolContent::Document(doc.clone())),
+            QueryResult::Occurrence(_)
+            | QueryResult::AttachmentOpen(_)
+            | QueryResult::Anchor { .. } => return false,
             QueryResult::Updating => {
                 tool.invalidated = true;
                 if matches!(tool.state, ToolState::Ready(_) | ToolState::NoBacklinks) {
@@ -338,6 +342,11 @@ impl ContextRegistry {
 
     /// Force every tool to re-query on the next reconcile (saved vault
     /// content changed; the publication marker alone cannot see that).
+    pub fn invalidate(&mut self, tab: TabId) {
+        if let Some(tool) = self.tools.get_mut(&tab) {
+            tool.invalidated = true;
+        }
+    }
     pub fn invalidate_all(&mut self) {
         for tool in self.tools.values_mut() {
             tool.invalidated = true;

@@ -7,7 +7,7 @@ use flavite_graph::{
     PropertyValue,
 };
 use flavite_index::resolver::Resolver;
-use flavite_syntax::pulldown_glue::parse_note;
+use flavite_syntax::pulldown_glue::parse_normalized;
 use flavite_vault::session::Session;
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{BTreeMap, BTreeSet};
@@ -223,7 +223,7 @@ pub(crate) fn build(
         }
         effective.edges.retain(|edge| edge.from != id);
         occurrences.retain(|occurrence| occurrence.edge.from != id);
-        let parsed = match parse_note(snapshot.text.as_bytes()) {
+        let parsed = match parse_normalized(&snapshot.text) {
             Ok(parsed) => parsed,
             Err(_) => {
                 overlays.insert(

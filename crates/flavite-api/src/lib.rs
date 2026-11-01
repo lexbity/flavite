@@ -33,8 +33,14 @@ pub mod graph_service;
 pub use graph_projection::{
     GraphProjection, GraphViewToken, LinkOccurrence, OccurrenceSource, OverlayState, ScopeRequest,
 };
+pub mod attachments;
 pub mod links;
 pub mod open;
+pub use attachments::*;
+pub mod reading;
+pub use reading::*;
+pub mod properties;
+pub use properties::*;
 pub mod queries;
 pub mod query_service;
 pub mod result;

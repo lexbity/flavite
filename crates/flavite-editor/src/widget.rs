@@ -47,6 +47,8 @@ pub struct EditorWidget<'a, Message> {
     initial_interaction: Option<EditorInteractionSnapshot>,
     view_key: Option<(u128, u64)>,
     input_enabled: bool,
+    keyboard_enabled: bool,
+    on_input_intent: Option<Box<dyn Fn(crate::input::CapturedInput) -> Message + 'a>>,
     width: Length,
     height: Length,
     _message: PhantomData<Message>,
@@ -70,6 +72,8 @@ impl<'a, Message> EditorWidget<'a, Message> {
             initial_interaction: None,
             view_key: None,
             input_enabled: true,
+            keyboard_enabled: true,
+            on_input_intent: None,
             width: Length::Fill,
             height: Length::Fill,
             _message: PhantomData,
@@ -140,6 +144,24 @@ impl<'a, Message> EditorWidget<'a, Message> {
     #[must_use]
     pub fn width(mut self, width: impl Into<Length>) -> Self {
         self.width = width.into();
+        self
+    }
+
+    /// Keep pointer focus available while another control owns keyboard input.
+    #[must_use]
+    pub fn with_keyboard_enabled(mut self, enabled: bool) -> Self {
+        self.keyboard_enabled = enabled;
+        self
+    }
+
+    /// Capture ordered physical input for an acknowledged host controller.
+    /// Existing standalone adapters can retain the guarded edit callback.
+    #[must_use]
+    pub fn with_input_intents(
+        mut self,
+        callback: impl Fn(crate::input::CapturedInput) -> Message + 'a,
+    ) -> Self {
+        self.on_input_intent = Some(Box::new(callback));
         self
     }
 
@@ -275,6 +297,10 @@ impl<'a, Message> EditorWidget<'a, Message> {
                     KeyAction::Next if selected && !modifiers.shift() => end,
                     KeyAction::Previous => previous_grapheme_boundary(&self.view.text, state.caret),
                     KeyAction::Next => next_grapheme_boundary(&self.view.text, state.caret),
+                    KeyAction::Home if modifiers.command() || modifiers.control() => 0,
+                    KeyAction::End if modifiers.command() || modifiers.control() => {
+                        self.view.text.len()
+                    }
                     KeyAction::Home => line_bounds(&self.view.text, state.caret).0,
                     KeyAction::End => line_bounds(&self.view.text, state.caret).1,
                     _ => state.caret,
@@ -385,6 +411,8 @@ pub struct EditorState {
     viewport: Viewport,
     composition: Option<Composition>,
     interaction_sequence: u64,
+    controlled_pending: bool,
+    controlled_ack: u64,
 }
 
 /// Host-visible per-view interaction state needed by accessibility and
@@ -1070,7 +1098,32 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         };
         state.reconcile(&self.view, &self.link_resolutions);
         if let Some(interaction) = self.initial_interaction {
-            state.restore_interaction(&self.view.text, interaction);
+            if self.on_input_intent.is_some()
+                && state.controlled_pending
+                && interaction.sequence > state.controlled_ack
+            {
+                let captured_sequence = state.interaction_sequence;
+                state.interaction_sequence = interaction.sequence.saturating_sub(1);
+                state.restore_interaction(&self.view.text, interaction);
+                state.interaction_sequence = state.interaction_sequence.max(captured_sequence);
+                state.controlled_ack = interaction.sequence;
+                state.controlled_pending = interaction.sequence < captured_sequence;
+                if self
+                    .view
+                    .text
+                    .get(..state.caret)
+                    .is_some_and(|text| text.ends_with("[["))
+                {
+                    state.open_autocomplete(state.caret - 2);
+                }
+                if let Some(start) = state.autocomplete_start
+                    && let Some(query) = self.view.text.get(start + 2..state.caret)
+                {
+                    state.autocomplete_query = query.into();
+                }
+            } else {
+                state.restore_interaction(&self.view.text, interaction);
+            }
         }
         iced::advanced::widget::tree::State::new(state)
     }
@@ -1083,7 +1136,32 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         }
         state.reconcile(&self.view, &self.link_resolutions);
         if let Some(interaction) = self.initial_interaction {
-            state.restore_interaction(&self.view.text, interaction);
+            if self.on_input_intent.is_some()
+                && state.controlled_pending
+                && interaction.sequence > state.controlled_ack
+            {
+                let captured_sequence = state.interaction_sequence;
+                state.interaction_sequence = interaction.sequence.saturating_sub(1);
+                state.restore_interaction(&self.view.text, interaction);
+                state.interaction_sequence = state.interaction_sequence.max(captured_sequence);
+                state.controlled_ack = interaction.sequence;
+                state.controlled_pending = interaction.sequence < captured_sequence;
+                if self
+                    .view
+                    .text
+                    .get(..state.caret)
+                    .is_some_and(|text| text.ends_with("[["))
+                {
+                    state.open_autocomplete(state.caret - 2);
+                }
+                if let Some(start) = state.autocomplete_start
+                    && let Some(query) = self.view.text.get(start + 2..state.caret)
+                {
+                    state.autocomplete_query = query.into();
+                }
+            } else {
+                state.restore_interaction(&self.view.text, interaction);
+            }
         }
     }
 
@@ -1115,6 +1193,56 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         let state = tree.state.downcast_mut::<EditorState>();
         if !self.input_enabled {
             return;
+        }
+        if !self.keyboard_enabled
+            && matches!(
+                event,
+                iced::Event::Keyboard(keyboard::Event::KeyPressed { .. })
+                    | iced::Event::InputMethod(_)
+            )
+        {
+            return;
+        }
+        let before_interaction = state.interaction_snapshot(Some(&self.view.text));
+        if let iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            text,
+            ..
+        }) = event
+            && state.focused
+            && state.composition.is_none()
+            && let Some(callback) = &self.on_input_intent
+        {
+            let action = key_action(key, *modifiers, text.as_deref());
+            let completion_control = state.autocomplete_start.is_some()
+                && matches!(
+                    key,
+                    Key::Named(Named::Enter | Named::ArrowUp | Named::ArrowDown | Named::Escape)
+                );
+            if action != KeyAction::Ignore && !completion_control {
+                let committed = if action == KeyAction::Paste {
+                    clipboard
+                        .read(iced::advanced::clipboard::Kind::Standard)
+                        .unwrap_or_default()
+                } else {
+                    text.clone().unwrap_or_default().to_string()
+                };
+                state.interaction_sequence = state.interaction_sequence.saturating_add(1);
+                state.controlled_pending = true;
+                shell.publish(callback(crate::input::CapturedInput {
+                    buffer: self.view.buffer_id,
+                    observed_revision: self.view.revision,
+                    sequence: state.interaction_sequence,
+                    action,
+                    text: committed,
+                    extend: modifiers.shift(),
+                    document_boundary: modifiers.command() || modifiers.control(),
+                }));
+                shell.capture_event();
+                shell.request_redraw();
+                return;
+            }
         }
         match event {
             iced::Event::InputMethod(input_event) if state.focused => {
@@ -1240,7 +1368,17 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         } else {
             shell.request_input_method::<&str>(&InputMethod::Disabled);
         }
+        let explicit_interaction = matches!(
+            event,
+            iced::Event::Mouse(
+                mouse::Event::ButtonPressed(mouse::Button::Left)
+                    | mouse::Event::ButtonReleased(mouse::Button::Left)
+                    | mouse::Event::WheelScrolled { .. }
+            ) | iced::Event::Keyboard(keyboard::Event::KeyPressed { .. })
+        );
         if let Some(on_interaction) = &self.on_interaction
+            && (explicit_interaction
+                || state.interaction_snapshot(Some(&self.view.text)) != before_interaction)
             && let Some(snapshot) = {
                 state.interaction_sequence = state.interaction_sequence.saturating_add(1);
                 state.interaction_snapshot(Some(&self.view.text))
@@ -1288,6 +1426,8 @@ impl<'a, Message: 'static> From<EditorWidget<'a, Message>>
 fn key_action(key: &Key, modifiers: Modifiers, text: Option<&str>) -> KeyAction {
     if modifiers.command() || modifiers.control() {
         return match key {
+            Key::Named(Named::Home) => KeyAction::Home,
+            Key::Named(Named::End) => KeyAction::End,
             Key::Character(c) if c.eq_ignore_ascii_case("a") => KeyAction::SelectAll,
             Key::Character(c) if c.eq_ignore_ascii_case("c") => KeyAction::Copy,
             Key::Character(c) if c.eq_ignore_ascii_case("x") => KeyAction::Cut,

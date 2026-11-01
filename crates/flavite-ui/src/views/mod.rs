@@ -34,3 +34,6 @@ pub fn empty_state(title: &str, hint: &str) -> Element<'static, Message> {
     .align_y(alignment::Vertical::Top)
     .into()
 }
+
+pub mod outline;
+pub mod properties;

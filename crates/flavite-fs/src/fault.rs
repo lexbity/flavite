@@ -560,6 +560,17 @@ impl<F: Fs> Fs for FaultFs<F> {
         result
     }
 
+    fn read_capped_in_root(&self, root: &Path, relative: &Path, max: u64) -> Result<Vec<u8>> {
+        self.check_alive()?;
+        let occ = self.bump_count("read_capped_in_root");
+        self.inject_before("read_capped_in_root", occ)?;
+        let result = self.inner.read_capped_in_root(root, relative, max);
+        match &result {
+            Ok(_) => self.trace_ok("read_capped_in_root", occ, FaultBoundary::After),
+            Err(error) => self.trace_err("read_capped_in_root", occ, FaultBoundary::After, error),
+        }
+        result
+    }
     fn read_capped(&self, path: &Path, max: u64) -> Result<Vec<u8>> {
         self.check_alive()?;
         let occ = self.bump_count("read_capped");

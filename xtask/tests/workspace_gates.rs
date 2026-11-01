@@ -120,31 +120,8 @@ fn w02_gate_requires_the_visual_runner() {
 
 #[test]
 fn w08_gate_rejects_forbidden_graph_io_and_missing_projection_inputs() {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let script = fs::read_to_string(repo.join("scripts/check-workspace-contracts.sh")).unwrap();
     let temp = tempfile::tempdir().unwrap();
-    // These are inert search fixtures, not compiled substitute algorithms.
-    // Derive the input paths from the gate so missing-path behavior is tested
-    // for its actual additive W01–W08 profile.
-    for token in script.split_whitespace() {
-        let token = token.trim_matches(|c| c == '"' || c == ';');
-        let relative = token.strip_prefix("$root/").unwrap_or(token);
-        if !["crates/", "vendor/", "fuzz/", "scripts/"]
-            .iter()
-            .any(|prefix| relative.starts_with(prefix))
-        {
-            continue;
-        }
-        let source = repo.join(relative);
-        let target = temp.path().join(relative);
-        if source.is_file() {
-            fs::create_dir_all(target.parent().unwrap()).unwrap();
-            fs::write(target, "implementation\n").unwrap();
-        } else if source.is_dir() {
-            fs::create_dir_all(&target).unwrap();
-            fs::write(target.join("search_fixture.rs"), "implementation\n").unwrap();
-        }
-    }
+    seed_current_contract_inputs(temp.path());
     let clean = run_gate(temp.path(), "W08");
     assert!(
         clean.status.success(),
@@ -161,6 +138,50 @@ fn w08_gate_rejects_forbidden_graph_io_and_missing_projection_inputs() {
     )
     .unwrap();
     let missing = run_gate(temp.path(), "W08");
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("missing or empty"));
+}
+
+fn seed_current_contract_inputs(root: &Path) {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let script = fs::read_to_string(repo.join("scripts/check-workspace-contracts.sh")).unwrap();
+    // These are inert search fixtures, not compiled substitute algorithms.
+    // Derive the input paths from the gate so missing-path behavior is tested
+    // for its actual additive W01–W08 profile.
+    for token in script.split_whitespace() {
+        let token = token.trim_matches(|c| c == '"' || c == ';');
+        let relative = token.strip_prefix("$root/").unwrap_or(token);
+        if !["crates/", "vendor/", "fuzz/", "scripts/"]
+            .iter()
+            .any(|prefix| relative.starts_with(prefix))
+        {
+            continue;
+        }
+        let source = repo.join(relative);
+        let target = root.join(relative);
+        if source.is_file() {
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(target, "implementation\n").unwrap();
+        } else if source.is_dir() {
+            fs::create_dir_all(&target).unwrap();
+            fs::write(target.join("search_fixture.rs"), "implementation\n").unwrap();
+        }
+    }
+}
+
+#[test]
+fn w09_gate_rejects_unsafe_renderer_and_missing_property_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_current_contract_inputs(temp.path());
+    assert!(run_gate(temp.path(), "W09").status.success());
+    let renderer = temp.path().join("crates/flavite-ui/src/read/renderer.rs");
+    fs::write(&renderer, "use reqwest::Client;\n").unwrap();
+    let forbidden = run_gate(temp.path(), "W09");
+    assert!(!forbidden.status.success());
+    assert!(String::from_utf8_lossy(&forbidden.stderr).contains("forbidden production pattern"));
+    fs::write(renderer, "implementation\n").unwrap();
+    fs::remove_file(temp.path().join("crates/flavite-vault/src/properties.rs")).unwrap();
+    let missing = run_gate(temp.path(), "W09");
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("missing or empty"));
 }

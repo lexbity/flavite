@@ -114,15 +114,56 @@ impl Fs for OsFs {
     }
 
     fn read_capped(&self, path: &Path, max: u64) -> Result<Vec<u8>> {
-        let bytes = self.read_if_exists(path)?;
-        match bytes {
-            Some(b) if b.len() as u64 > max => Err(FsError::ReadTooLarge {
-                path: path.to_path_buf(),
+        use std::io::Read;
+        let file = std::fs::File::open(path).map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                FsError::NotFound(path.into())
+            } else {
+                FsError::Io("File could not be opened".into())
+            }
+        })?;
+        let mut bytes = Vec::new();
+        file.take(max.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|_| FsError::Io("Bounded read failed".into()))?;
+        if bytes.len() as u64 > max {
+            return Err(FsError::ReadTooLarge {
+                path: path.into(),
                 max,
-            }),
-            Some(b) => Ok(b),
-            None => Err(FsError::NotFound(path.to_path_buf())),
+            });
         }
+        Ok(bytes)
+    }
+
+    fn read_capped_in_root(&self, root: &Path, relative: &Path, max: u64) -> Result<Vec<u8>> {
+        use std::io::Read;
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(FsError::PathEscape(relative.into()));
+        }
+        let directory = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+            .map_err(|_| FsError::Io("Vault directory unavailable".into()))?;
+        let file = directory.open(relative).map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                FsError::NotFound(relative.into())
+            } else {
+                FsError::PathEscape(relative.into())
+            }
+        })?;
+        let mut bytes = Vec::new();
+        file.take(max.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|_| FsError::Io("Contained read failed".into()))?;
+        if bytes.len() as u64 > max {
+            return Err(FsError::ReadTooLarge {
+                path: relative.into(),
+                max,
+            });
+        }
+        Ok(bytes)
     }
 
     fn metadata(&self, path: &Path) -> Result<Metadata> {

@@ -46,6 +46,8 @@ toml = { workspace = true }
 # Filesystem (re-exported for CLI)
 flavite-fs = { path = "../flavite-fs" }
 
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+
 [dev-dependencies]
 # For tests
 tempfile = "3"

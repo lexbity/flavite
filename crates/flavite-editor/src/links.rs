@@ -77,7 +77,7 @@ pub enum LinkResolution {
 /// editor-only interpretation of link syntax.
 #[must_use]
 pub fn scan_links(text: &str) -> Vec<LinkSpan> {
-    let Ok(parsed) = flavite_syntax::pulldown_glue::parse_note(text.as_bytes()) else {
+    let Ok(parsed) = flavite_syntax::pulldown_glue::parse_normalized(text) else {
         return Vec::new();
     };
     parsed
@@ -114,7 +114,7 @@ pub fn resolve_link(span: &LinkSpan, verdict: Option<LinkResolution>) -> LinkRes
 /// Shared-scanner spans for editor decorations; code/math/HTML are excluded.
 #[must_use]
 pub fn scan_decorations(text: &str) -> Vec<ScannedSpan> {
-    let Ok(parsed) = flavite_syntax::pulldown_glue::parse_note(text.as_bytes()) else {
+    let Ok(parsed) = flavite_syntax::pulldown_glue::parse_normalized(text) else {
         return Vec::new();
     };
     scan_masked(&parsed.snapshot, &parsed.mask)

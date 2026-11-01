@@ -8,7 +8,9 @@
 //! document proves that exactly one new intended link occurrence is created
 //! and no neighboring link interpretation is altered.
 
-use crate::pulldown_glue::{Link, parse_note};
+#[cfg(test)]
+use crate::pulldown_glue::parse_note;
+use crate::pulldown_glue::{Link, parse_normalized};
 use crate::scanner::{LinkPayload, SpanKind};
 use crate::text::TextSnapshot;
 
@@ -295,13 +297,12 @@ pub fn prove_insertion(
     if caret > source.len() || !source.is_char_boundary(caret) {
         return Err(ProofRejection::CaretOutOfBounds);
     }
-    let original = parse_note(source.as_bytes()).map_err(ProofRejection::SourceUnparsable)?;
+    let original = parse_normalized(source).map_err(ProofRejection::SourceUnparsable)?;
     let mut prospective = String::with_capacity(source.len() + serialized.text.len());
     prospective.push_str(&source[..caret]);
     prospective.push_str(&serialized.text);
     prospective.push_str(&source[caret..]);
-    let parsed =
-        parse_note(prospective.as_bytes()).map_err(|_| ProofRejection::CaretNotLinkable)?;
+    let parsed = parse_normalized(&prospective).map_err(|_| ProofRejection::CaretNotLinkable)?;
     let delta = serialized.text.len();
 
     // Every original occurrence must survive unchanged: identical payload at

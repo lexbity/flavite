@@ -10,8 +10,8 @@ use crate::host::context::ToolState;
 use crate::style;
 use crate::workspace::tab_strip;
 use flavite_workspace::{ContextBinding, ContextRouter, ContextSource, TabId, ViewKind};
-use iced::widget::{button, container, row, text};
-use iced::{Element, Length, alignment};
+use iced::widget::{button, column, container, pick_list, row, text};
+use iced::{Element, Length};
 
 /// The binding a context tool tab currently carries.
 #[must_use]
@@ -68,6 +68,15 @@ pub fn status_label(app: &App, tab: TabId) -> String {
         ToolState::Querying => "Updating…".into(),
         ToolState::Busy => "Query queued; the service is busy".into(),
         ToolState::Ready(content) => match content {
+            crate::host::context::ToolContent::Document(doc) => {
+                if app.contexts.is_updating(&tab) {
+                    "Updating…".into()
+                } else if crate::host::reading::unsaved(app, doc) {
+                    "Current note · unsaved changes".into()
+                } else {
+                    "Saved content".into()
+                }
+            }
             crate::host::context::ToolContent::BufferPreview { unsaved, .. } => {
                 if *unsaved {
                     "Current note · unsaved changes".into()
@@ -132,7 +141,7 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         );
     } else {
         controls = controls.push(
-            button(text("Pin source").size(style::TEXT_SM))
+            button(text("Pin context").size(style::TEXT_SM))
                 .padding(tab_strip::chip_padding())
                 .style(style::ghost())
                 .on_press_maybe(
@@ -146,20 +155,72 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                 ),
         );
     }
+    let mut choices = vec![
+        BindingChoice {
+            label: "Follow document".into(),
+            binding: ContextBinding::FollowDocument,
+        },
+        BindingChoice {
+            label: "Follow selection or document".into(),
+            binding: ContextBinding::FollowExplorationOrDocument,
+        },
+    ];
+    for (index, (source, session)) in app
+        .workspace
+        .tabs()
+        .filter(|(_, session)| flavite_workspace::is_source_kind(session.kind()))
+        .enumerate()
+    {
+        choices.push(BindingChoice {
+            label: format!("{} · view {}", session.title(), index + 1),
+            binding: ContextBinding::FollowSource { tab: *source },
+        });
+    }
+    let selected = binding_of(app, tab).map(|binding| {
+        choices
+            .iter()
+            .find(|choice| choice.binding == binding)
+            .cloned()
+            .unwrap_or(BindingChoice {
+                label: label.clone(),
+                binding,
+            })
+    });
+    if let Some(selected) = &selected
+        && !choices.contains(selected)
+    {
+        choices.push(selected.clone());
+    }
+    let selector = pick_list(choices, selected, move |choice| {
+        Message::SetContextBinding {
+            tab,
+            binding: choice.binding,
+        }
+    })
+    .width(Length::Fill)
+    .text_size(style::TEXT_SM);
     container(
-        row![
-            text(label).size(style::TEXT_SM).width(Length::Fill),
-            text(status).size(style::TEXT_SM).style(style::dim_text),
-            controls,
+        column![
+            row![selector, controls].spacing(8),
+            text(label).size(style::TEXT_SM),
+            text(status).size(style::TEXT_SM).style(style::dim_text)
         ]
-        .spacing(style::SPACING)
-        .align_y(alignment::Vertical::Center),
+        .spacing(4),
     )
-    .height(32)
-    .padding([0, 12])
-    .align_y(alignment::Vertical::Center)
+    .padding(8)
     .style(style::toolbar)
     .into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BindingChoice {
+    label: String,
+    binding: ContextBinding,
+}
+impl std::fmt::Display for BindingChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.label)
+    }
 }
 
 /// Whether a tab is a context tool at all (shared guard for commands).
@@ -168,7 +229,10 @@ pub fn is_context_tab(app: &App, tab: TabId) -> bool {
     app.workspace.tab(&tab).is_some_and(|session| {
         matches!(
             session.kind(),
-            ViewKind::Preview(_) | ViewKind::Backlinks(_)
+            ViewKind::Preview(_)
+                | ViewKind::Backlinks(_)
+                | ViewKind::Outline(_)
+                | ViewKind::Properties(_)
         )
     })
 }
