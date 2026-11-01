@@ -185,3 +185,77 @@ fn w09_gate_rejects_unsafe_renderer_and_missing_property_authority() {
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("missing or empty"));
 }
+
+#[test]
+fn final_gate_rejects_demo_assets_and_placeholders() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_current_contract_inputs(temp.path());
+    // Ensure files checked by FINAL exist in seed
+    fs::create_dir_all(temp.path().join("crates/flavite-ui/src")).unwrap();
+    fs::create_dir_all(temp.path().join("crates/flavite-ui/examples")).unwrap();
+    fs::write(
+        temp.path().join("crates/flavite-ui/src/main.rs"),
+        "fn main(){}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("crates/flavite-ui/src/boot.rs"),
+        "fn boot(){}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("crates/flavite-ui/examples/app-demo.rs"),
+        "// ok\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("crates/flavite-ui/src/app.rs"),
+        "// clean\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("crates/flavite-ui/src/workspace/mod.rs"),
+        "// clean\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("crates/flavite-ui/src/views/note.rs"),
+        "// clean\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("crates/flavite-ui/src/host/commands.rs"),
+        "// clean\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("crates/flavite-editor/src/widget.rs"),
+        "// clean\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("crates/flavite-workspace/src/reducer.rs"),
+        "// clean\n",
+    )
+    .unwrap();
+    assert!(run_gate(temp.path(), "FINAL").status.success());
+
+    fs::write(
+        temp.path().join("crates/flavite-ui/examples/app-demo.rs"),
+        "prepare_demo_vault();\n",
+    )
+    .unwrap();
+    assert!(!run_gate(temp.path(), "FINAL").status.success());
+
+    fs::write(
+        temp.path().join("crates/flavite-ui/examples/app-demo.rs"),
+        "// ok\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("crates/flavite-ui/src/host/commands.rs"),
+        "// TODO: fix later\n",
+    )
+    .unwrap();
+    assert!(!run_gate(temp.path(), "FINAL").status.success());
+}

@@ -96,7 +96,10 @@ fn top_bar(app: &App) -> Element<'_, Message> {
     );
     container(
         row![
-            text("Flavite").size(style::BRAND),
+            button(text("Flavite").size(style::BRAND))
+                .padding(tab_strip::chip_padding())
+                .style(style::ghost())
+                .on_press(Message::AppMenu),
             text(vault_name).size(style::TEXT_SM).style(style::dim_text),
             Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
             button(text("Quick switch").size(style::TEXT_SM))
@@ -269,14 +272,20 @@ fn menu_overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Me
     let Some((group, menu)) = app.strip_menu else {
         return shell;
     };
-    let rect = app
-        .group_bounds
-        .get(&group)
-        .copied()
-        .unwrap_or(app.workspace_bounds);
     let width = 256.0_f32.min(app.window_size().width);
-    let x = (rect.x + rect.width - width).clamp(0.0, (app.window_size().width - width).max(0.0));
-    let y = (rect.y + tab_strip::TAB_HEIGHT).min((app.window_size().height - 80.0).max(0.0));
+    let (x, y) = if menu == crate::workspace::StripMenu::App {
+        (style::SPACING_LG, 36.0)
+    } else {
+        let rect = app
+            .group_bounds
+            .get(&group)
+            .copied()
+            .unwrap_or(app.workspace_bounds);
+        let x =
+            (rect.x + rect.width - width).clamp(0.0, (app.window_size().width - width).max(0.0));
+        let y = (rect.y + tab_strip::TAB_HEIGHT).min((app.window_size().height - 80.0).max(0.0));
+        (x, y)
+    };
     let mut entries = column![].spacing(2);
     for (i, entry) in tab_strip::menu_entries(app, group, menu)
         .into_iter()

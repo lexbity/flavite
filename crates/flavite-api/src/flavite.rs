@@ -937,6 +937,20 @@ impl Flavite {
         )
     }
 
+    /// Decode a resolved entity's native path bytes into the vault-relative
+    /// path it selects. Pure decode through the vault filesystem identity
+    /// codec: no filesystem or database access on the calling thread.
+    pub fn decode_note_path(
+        &self,
+        path_native: Vec<u8>,
+    ) -> Result<std::path::PathBuf, FlaviteError> {
+        self.session
+            .decode_graph_paths(vec![path_native])
+            .map_err(FlaviteError::IndexError)?
+            .pop()
+            .ok_or_else(|| FlaviteError::IndexError("native path decode produced no path".into()))
+    }
+
     /// Read the versioned vault settings document through the API boundary.
     pub fn read_settings(&self) -> Result<Option<String>, FlaviteError> {
         let path = self.vault_ref.root.join(".flavite").join("settings.toml");

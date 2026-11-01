@@ -536,4 +536,63 @@ mod tests {
                 < 1e-4
         );
     }
+
+    #[test]
+    fn nfr14_window_and_interface_scale_matrix_solves_without_overlap() {
+        // NFR-14 window matrix at the supported interface scales. Device
+        // pixel scale is not a geometry input: chrome constraints are
+        // logical and multiply by interface scale only. A window too small
+        // for the tree legitimately enters adaptive maximize (one visible
+        // group); the pure solver can never rewrite the saved state.
+        let sizes = [
+            Size {
+                width: 640.0,
+                height: 480.0,
+            },
+            Size {
+                width: 1024.0,
+                height: 768.0,
+            },
+            Size {
+                width: 1440.0,
+                height: 900.0,
+            },
+        ];
+        let interface_scales = [0.75f32, 1.0, 1.5, 2.0];
+        for &arrangement in &[Arrangement::SideBySide, Arrangement::Stacked] {
+            let mut ids = Ids::with_seed(12345);
+            let state = two_group_workspace(&mut ids, arrangement);
+            let before = state.clone();
+            for &available in &sizes {
+                for &interface in &interface_scales {
+                    let geometry = solve(&state, available, interface, &BTreeMap::new());
+                    if !fits(&state, available, interface) {
+                        assert!(
+                            geometry.adaptive_maximize,
+                            "{available:?} at {interface:?} must adapt, not shrink below minimums"
+                        );
+                        assert_eq!(
+                            geometry.rects.len(),
+                            1,
+                            "adaptive maximize shows exactly one group"
+                        );
+                        continue;
+                    }
+                    assert!(!geometry.adaptive_maximize);
+                    assert_eq!(geometry.rects.len(), state.group_order().len());
+                    assert_no_overlap(&geometry.rects, SPLITTER_WIDTH * interface);
+                    for (id, rect) in &geometry.rects {
+                        let minimum = group_minimum(&state, id, interface);
+                        assert!(
+                            rect.width + 1e-4 >= minimum.width,
+                            "{available:?} at {interface:?}: {rect:?} vs {minimum:?}"
+                        );
+                        assert!(rect.height + 1e-4 >= minimum.height);
+                    }
+                }
+            }
+            // The solver is pure: no matrix entry may rewrite the tree.
+            assert_eq!(state, before);
+        }
+    }
 }

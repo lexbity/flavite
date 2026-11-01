@@ -11,3 +11,6 @@ Prestin Liu
 
 - Mistral 4 large (Opencode)
 - Mistral 3.5 medium (mistral vibe)
+
+- Beam (opencode)
+- "IceMan" (opencode)

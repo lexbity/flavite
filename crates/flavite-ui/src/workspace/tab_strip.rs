@@ -16,6 +16,7 @@ pub enum StripMenu {
     NewView,
     Actions,
     Tabs,
+    App,
 }
 
 /// A contiguous window always containing the active tab. Every tab remains
@@ -178,6 +179,21 @@ pub fn menu_entries(app: &App, group: GroupId, menu: StripMenu) -> Vec<MenuEntry
             ("Move tab to next group", "workspace.move_tab_next_group"),
             ("Merge next group", "workspace.merge_next_group"),
             ("Close group", "workspace.close_group"),
+        ]
+        .into_iter()
+        .map(|(label, id)| MenuEntry {
+            label: label.into(),
+            action: crate::host::commands::available(app, id)
+                .then_some(Message::RunHostCommand(id)),
+        })
+        .collect(),
+        StripMenu::App => [
+            ("Open notes", "workspace.open_notes_view"),
+            ("Open graph", "workspace.open_graph"),
+            ("Quick switch", "workspace.quick_switch"),
+            ("Command palette", "workspace.command_palette"),
+            ("Split right", "workspace.split_right"),
+            ("Split down", "workspace.split_down"),
         ]
         .into_iter()
         .map(|(label, id)| MenuEntry {

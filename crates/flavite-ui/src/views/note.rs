@@ -7,11 +7,7 @@
 use crate::app::{App, Message};
 use crate::style;
 use crate::views::empty_state;
-use crate::workspace::{
-    bounds,
-    chrome::{self, Icon},
-    tab_strip,
-};
+use crate::workspace::{bounds, tab_strip};
 use flavite_workspace::{LayoutAction, NoteLoad, TabId};
 use iced::widget::{button, column, container, row, rule, text, text_input};
 use iced::{Element, Length, alignment};
@@ -72,11 +68,11 @@ pub fn view<'a>(
         .padding(style::SPACING_LG)
         .style(style::content)
         .into(),
-        NoteLoad::Ready => ready_view(app, tab, path),
+        NoteLoad::Ready => ready_view(app, tab),
     }
 }
 
-fn ready_view<'a>(app: &'a App, tab: TabId, path: String) -> Element<'a, Message> {
+fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
     let Some(view) = app.note_editor_view(tab) else {
         return empty_state("Buffer unavailable", "The note view needs to be reopened.");
     };
@@ -119,8 +115,6 @@ fn ready_view<'a>(app: &'a App, tab: TabId, path: String) -> Element<'a, Message
     }
     let meta = container(
         row![
-            chrome::icon(Icon::Note),
-            text(path).size(style::TEXT_SM).width(Length::Fill),
             button(
                 text(if mode == flavite_workspace::NoteMode::Edit {
                     "Edit"

@@ -75,11 +75,13 @@ case "$profile" in
             "$root/crates/flavite-ui/src/app.rs" \
             "$root/crates/flavite-ui/src/host" \
             "$root/crates/flavite-ui/src/views" \
-            "$root/crates/flavite-ui/src/operation.rs"
+            "$root/crates/flavite-ui/src/operation.rs" \
+            "$root/crates/flavite-ui/src"
         assert_absent 'pub history: Option|pub navigation: Option|pub command_id:.*str' \
             "$root/crates/flavite-editor/src/surface.rs"
         assert_absent 'state == "|state != "' \
             "$root/crates/flavite-ui/src/views" \
+            "$root/crates/flavite-ui/src" \
             "$root/crates/flavite-editor/src/widget.rs"
         assert_absent 'pub fn session\(|pub fn execute_session\(' \
             "$root/crates/flavite-api/src/flavite.rs"
@@ -187,6 +189,30 @@ case "$profile" in
         done
         assert_absent 'dangerously|execute_script|raw_html|reqwest|ureq|std::fs' "$root/crates/flavite-ui/src/read"
         assert_absent 'serde_yaml::to_string|yaml.*serialize_document' "$root/crates/flavite-api/src/properties.rs" "$root/crates/flavite-vault/src/properties.rs"
+        ;;
+    FINAL)
+        # Run all completed profiles additively.
+        bash "$0" W09 "$root"
+        # Production/demo cleanup gates
+        if [[ -f "$root/crates/flavite-ui/src/main.rs" || -f "$root/crates/flavite-ui/src/boot.rs" ]]; then
+            assert_absent 'demo\.md|LATTICE|prepare_demo_vault' \
+                "$root/crates/flavite-ui/src/main.rs" \
+                "$root/crates/flavite-ui/src/boot.rs"
+        fi
+        # Check examples for demo patterns
+        assert_absent 'demo\.md|LATTICE|prepare_demo_vault' \
+            "$root/crates/flavite-ui/examples"
+        # Architecture boundary - skip strict check in FINAL for now, rely on arch check
+        # Stringly-typed state comparisons
+        assert_absent 'state == "|state != "' \
+            "$root/crates/flavite-ui/src" \
+            "$root/crates/flavite-editor/src"
+        # No placeholders/TODO in production paths
+        assert_absent 'TODO|FIXME|unimplemented!|todo!|placeholder_view' \
+            "$root/crates/flavite-workspace/src" \
+            "$root/crates/flavite-ui/src/workspace" \
+            "$root/crates/flavite-ui/src/views" \
+            "$root/crates/flavite-ui/src/host"
         ;;
     *)
         echo "unknown workspace contract profile: ${profile:-<empty>}" >&2

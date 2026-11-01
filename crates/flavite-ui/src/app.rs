@@ -151,6 +151,7 @@ pub enum Message {
     ToggleNoteMode(TabId),
     RetryReading(TabId),
     ToggleSourcePreview(TabId),
+    AppMenu,
     ReadControlBounds {
         tab: TabId,
         document: std::sync::Arc<flavite_api::ReadSnapshot>,
@@ -1137,20 +1138,23 @@ impl App {
                     };
                     return;
                 };
-                let Some(entry) = self
-                    .catalog
-                    .iter()
-                    .find(|entry| entry.native_path == target.path_native)
-                else {
-                    self.status =
-                        "Resolved note is outside the current catalog page; refresh the catalog"
-                            .into();
-                    return;
-                };
-                match NoteLocator::from_relative(&entry.path) {
-                    Ok(locator) => self.request_open(locator, self.group_of(tab)),
-                    Err(error) => {
+                // The resolver already proved the target entity; decode its
+                // native path identity directly instead of consulting the
+                // bounded display catalog, which may not contain the note.
+                let opened = self.flavite.as_ref().map(|flavite| {
+                    flavite
+                        .decode_note_path(target.path_native)
+                        .map_err(|error| error.to_string())
+                        .and_then(|path| NoteLocator::from_relative(&path))
+                });
+                match opened {
+                    Some(Ok(locator)) => self.request_open(locator, self.group_of(tab)),
+                    Some(Err(error)) => {
                         self.status = format!("Resolved note path cannot be opened here: {error}");
+                    }
+                    None => {
+                        self.status =
+                            "Link target resolution is unavailable; retry after indexing".into();
                     }
                 }
             }
@@ -1357,6 +1361,19 @@ impl App {
             | Message::PropertyDraft { .. }
             | Message::PropertyApply { .. }
             | Message::ExternalOpened(_)) => return crate::host::reading::handle(self, message),
+            Message::AppMenu => {
+                // Opening a menu disables editor input; never interrupt an
+                // active composition (D-03). Entry availability is rechecked
+                // by the shared command resolver (D-16).
+                if !self.has_composition()
+                    && let Some(group) = self
+                        .focused_group()
+                        .or_else(|| self.workspace.group_order().first().copied())
+                {
+                    self.strip_menu = Some((group, crate::workspace::StripMenu::App));
+                    self.menu_selected = 0;
+                }
+            }
             Message::ResizeBegin(split) => {
                 if !self.has_composing_view() {
                     self.resizing_split = Some(split);

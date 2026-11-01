@@ -198,3 +198,42 @@ fn unrepresentable_targets_are_refused_before_any_proof() {
     assert!(prove_insertion("plain", 3, &link("beta")).is_ok());
     assert!(prove_insertion("plain", 5, &link("beta")).is_ok());
 }
+
+#[test]
+fn serialized_path_target_round_trips_to_exact_new_occurrences() {
+    // A serialized vault-relative path target, applied through an accepted
+    // proof, must re-parse into exactly the intended occurrence(s): the
+    // parser finds the serialized target verbatim (RFC-0003 §9.1/D-06).
+    let serialized =
+        serialize_link(&["systems/beta".to_owned()], None).expect("representable target");
+    assert_eq!(serialized.text, "[[systems/beta]]");
+
+    let source = "hello world";
+    let caret = 5;
+    let proof = prove_insertion(source, caret, &serialized).expect("proof");
+    let edited = format!("{source}{}", proof.replacement);
+    let parsed = parse_normalized(&edited).expect("edited source parses");
+    assert_eq!(
+        parsed
+            .links
+            .iter()
+            .filter(|l| l.target_raw == "systems/beta")
+            .count(),
+        1,
+        "the proof must create exactly one new occurrence"
+    );
+
+    // An existing link elsewhere does not prevent another intentional
+    // occurrence: a second accepted proof yields a second occurrence.
+    let proof2 = prove_insertion(&edited, edited.len(), &serialized).expect("second proof");
+    let edited2 = format!("{edited}{}", proof2.replacement);
+    let parsed2 = parse_normalized(&edited2).expect("second edit parses");
+    assert_eq!(
+        parsed2
+            .links
+            .iter()
+            .filter(|l| l.target_raw == "systems/beta")
+            .count(),
+        2
+    );
+}
