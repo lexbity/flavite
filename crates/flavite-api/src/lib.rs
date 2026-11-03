@@ -46,7 +46,9 @@ pub mod query_service;
 pub mod result;
 pub mod types;
 pub mod user_state;
-pub use user_state::{StoredUserState, UserStateError, UserStateKind};
+pub use user_state::{
+    StoredUserState, UserStateError, UserStateKind, read_last_vault_device, write_last_vault_device,
+};
 
 // Re-export key types for convenience
 pub use capability::*;

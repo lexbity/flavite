@@ -200,6 +200,34 @@ pub enum LayoutAction {
         expected_revision: u64,
         group: GroupId,
     },
+    /// Open a saved-content search view in `group` (W10).
+    OpenSearch {
+        expected_revision: u64,
+        group: GroupId,
+    },
+    /// Open the local-history view of `locator` in `group` (W10).
+    OpenHistory {
+        expected_revision: u64,
+        locator: NoteLocator,
+        group: GroupId,
+    },
+    /// Replace the note shown by an existing note tab without changing its
+    /// identity (W10 per-view back/forward navigation, §8.1). The tab keeps
+    /// its `TabId`, position, and mode; the view reserves a fresh open and
+    /// the previous caret/selection are dropped with the old note.
+    NavigateTab {
+        expected_revision: u64,
+        tab: TabId,
+        locator: NoteLocator,
+    },
+    /// A note was renamed/moved on disk (W10). Every note view, history
+    /// view, and pinned binding referring to `from` adopts `to`; buffers
+    /// and revisions are untouched because the vault renamed in place.
+    RelocateNote {
+        expected_revision: u64,
+        from: NoteLocator,
+        to: NoteLocator,
+    },
     /// Open a graph view of the saved knowledge network in `group` (W07).
     OpenGraph {
         expected_revision: u64,
@@ -341,6 +369,18 @@ impl LayoutAction {
                 expected_revision, ..
             }
             | Self::OpenNotes {
+                expected_revision, ..
+            }
+            | Self::OpenSearch {
+                expected_revision, ..
+            }
+            | Self::OpenHistory {
+                expected_revision, ..
+            }
+            | Self::NavigateTab {
+                expected_revision, ..
+            }
+            | Self::RelocateNote {
                 expected_revision, ..
             }
             | Self::OpenGraph {
@@ -1295,6 +1335,89 @@ fn apply(state: &mut WorkspaceState, action: &LayoutAction) -> Result<Vec<Effect
                 tab,
                 kind: ViewKind::Notes,
             }])
+        }
+        LayoutAction::OpenSearch { group, .. } => {
+            let tab = state.ids.tab_id();
+            let tab = state.append_tab(*group, ViewSession::new(tab, ViewKind::Search))?;
+            Ok(vec![Effect::ViewAttached {
+                tab,
+                kind: ViewKind::Search,
+            }])
+        }
+        LayoutAction::OpenHistory { locator, group, .. } => {
+            let tab = state.ids.tab_id();
+            let kind = ViewKind::History(locator.clone());
+            let tab = state.append_tab(*group, ViewSession::new(tab, kind.clone()))?;
+            Ok(vec![Effect::ViewAttached { tab, kind }])
+        }
+        LayoutAction::NavigateTab { tab, locator, .. } => {
+            let session = state
+                .tabs
+                .get_mut(tab)
+                .ok_or(WorkspaceError::UnknownTab(*tab))?;
+            if session.interaction().composition == crate::CompositionState::Active {
+                return Err(WorkspaceError::InvariantViolation(
+                    "Commit or cancel composition before navigating".into(),
+                ));
+            }
+            let ViewKind::Note(note) = session.kind_mut() else {
+                return Err(WorkspaceError::InvariantViolation(
+                    "Back/forward navigation applies to note tabs".into(),
+                ));
+            };
+            if note.locator() == locator {
+                return Err(WorkspaceError::NoChange);
+            }
+            let mode = note.mode();
+            *note = NoteView::new(locator.clone(), NoteLoad::Reserved).with_mode(mode);
+            // The caret/selection belonged to the replaced note; the fresh
+            // reservation starts from the documented default interaction.
+            session.set_interaction(crate::input::EditorInteraction::new(*tab, 1));
+            // A writing target pointing at the replaced view is invalid (§8.1:
+            // close/replace invalidates; there is no silent reauthorization).
+            if state
+                .writing_target
+                .is_some_and(|target| target.tab == *tab)
+            {
+                state.writing_target = None;
+            }
+            Ok(vec![Effect::ViewAttached {
+                tab: *tab,
+                kind: session.kind().clone(),
+            }])
+        }
+        LayoutAction::RelocateNote { from, to, .. } => {
+            let mut changed = false;
+            for session in state.tabs.values_mut() {
+                match session.kind_mut() {
+                    ViewKind::Note(note) if note.locator() == from => {
+                        note.set_locator(to.clone());
+                        changed = true;
+                    }
+                    ViewKind::History(locator) if locator == from => {
+                        *locator = to.clone();
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+            // Pinned context bindings referring to the old locator follow.
+            for session in state.tabs.values_mut() {
+                if let ViewKind::Preview(binding)
+                | ViewKind::Backlinks(binding)
+                | ViewKind::Outline(binding)
+                | ViewKind::Properties(binding) = session.kind_mut()
+                    && let crate::ContextBinding::Pinned(entity) = binding
+                    && entity.path() == from
+                {
+                    *entity = crate::context::EntityLocator::new(to.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Err(WorkspaceError::NoChange);
+            }
+            Ok(Vec::new())
         }
         LayoutAction::OpenGraph { group, .. } => {
             let tab = state.ids.tab_id();

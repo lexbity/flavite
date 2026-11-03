@@ -17,6 +17,10 @@
       "kind": "workspace"
     },
     {
+      "id": "flavite-app",
+      "kind": "workspace"
+    },
+    {
       "id": "flavite-buffer",
       "kind": "workspace"
     },
@@ -174,6 +178,16 @@
     {
       "from": "flavite-api",
       "to": "tracing",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-app",
+      "to": "flavite-ui",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-app",
+      "to": "iced_winit",
       "kind": "normal"
     },
     {

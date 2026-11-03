@@ -155,6 +155,10 @@ fn handle_save(session: &Session, invocation: &Invocation) -> Result<SessionResu
     let path = decode(invocation)?;
     Ok(session.execute(SessionCommand::SaveNote { path }))
 }
+fn handle_create(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
+    let path = decode(invocation)?;
+    Ok(session.execute(SessionCommand::CreateNote { path }))
+}
 fn handle_link_prepare(
     session: &Session,
     invocation: &Invocation,
@@ -322,6 +326,50 @@ fn handle_resolve(session: &Session, invocation: &Invocation) -> Result<SessionR
     Ok(session.execute(SessionCommand::ResolveConflict {
         path: args.path,
         resolution,
+    }))
+}
+/// Wire form of the local-history list request (W10).
+#[derive(Debug, Deserialize)]
+struct HistoryArgs {
+    path: PathBuf,
+    #[serde(default = "default_history_limit")]
+    limit: usize,
+}
+
+fn default_history_limit() -> usize {
+    100
+}
+
+fn handle_history(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
+    let args: HistoryArgs = decode(invocation)?;
+    let entries = session.note_history(&args.path, args.limit)?;
+    Ok(SessionResult::Success(
+        crate::session::CommandResult::NoteHistory {
+            path: args.path,
+            entries,
+        },
+    ))
+}
+
+/// Wire form of the local-history restore request (W10).
+#[derive(Debug, Deserialize)]
+struct RestoreHistoryArgs {
+    path: PathBuf,
+    buffer_id: u64,
+    revision: u64,
+    hash: String,
+}
+
+fn handle_restore_history(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: RestoreHistoryArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::RestoreHistory {
+        path: args.path,
+        buffer_id: BufferId::from(args.buffer_id),
+        revision: Revision::new(args.revision),
+        hash: args.hash,
     }))
 }
 
@@ -575,7 +623,7 @@ impl Flavite {
     /// the legacy dotted alias as well. Both ids resolve to the same handler
     /// and schema.
     fn register_builtin_commands(&self) -> Result<(), FlaviteError> {
-        let registrations: [HandlerRegistration; 21] = [
+        let registrations: [HandlerRegistration; 24] = [
             (
                 "open_note",
                 "Open note",
@@ -702,9 +750,27 @@ impl Flavite {
                 ArgSchema::typed::<ResolveArgs>(),
                 handle_resolve,
             ),
+            (
+                "note.create",
+                "Create note",
+                ArgSchema::typed::<PathBuf>(),
+                handle_create,
+            ),
+            (
+                "note.history",
+                "Note history",
+                ArgSchema::typed::<HistoryArgs>(),
+                handle_history,
+            ),
+            (
+                "note.restore_history",
+                "Restore history snapshot",
+                ArgSchema::typed::<RestoreHistoryArgs>(),
+                handle_restore_history,
+            ),
         ];
         for (id, title, args, handler) in registrations {
-            let spec = if matches!(id, "open_note" | "note.open") {
+            let spec = if matches!(id, "open_note" | "note.open" | "note.history") {
                 CommandSpec::new(id, title, args).requires(crate::Capability::ReadNotes)
             } else {
                 CommandSpec::new(id, title, args)
@@ -1183,6 +1249,15 @@ impl Flavite {
     ) -> ExecutionResult {
         let command_id = match &result {
             SessionResult::Success(crate::session::CommandResult::NoteOpened { .. }) => "open_note",
+            SessionResult::Success(crate::session::CommandResult::NoteCreated { .. }) => {
+                "note.create"
+            }
+            SessionResult::Success(crate::session::CommandResult::NoteHistory { .. }) => {
+                "note.history"
+            }
+            SessionResult::Success(crate::session::CommandResult::HistoryRestored { .. }) => {
+                "note.restore_history"
+            }
             SessionResult::Success(crate::session::CommandResult::NoteClosed) => "close_note",
             SessionResult::Success(crate::session::CommandResult::EditsApplied { .. }) => {
                 "apply_edits"
@@ -1257,6 +1332,40 @@ impl Flavite {
                         })
                     }
                     crate::session::CommandResult::NoteClosed => serde_json::Value::Null,
+                    crate::session::CommandResult::NoteCreated {
+                        buffer_id,
+                        revision,
+                        path,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "revision": revision.as_u64(),
+                            "path": path,
+                        })
+                    }
+                    crate::session::CommandResult::NoteHistory { path, entries } => {
+                        serde_json::json!({
+                            "path": path,
+                            "entries": entries
+                                .into_iter()
+                                .map(|entry| serde_json::json!({
+                                    "hash": entry.hash,
+                                    "timestamp_secs": entry.timestamp_secs,
+                                    "reason": entry.reason.as_str(),
+                                    "pins": entry.pins,
+                                }))
+                                .collect::<Vec<_>>(),
+                        })
+                    }
+                    crate::session::CommandResult::HistoryRestored {
+                        buffer_id,
+                        new_revision,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "revision": new_revision.as_u64(),
+                        })
+                    }
                     crate::session::CommandResult::EditsApplied {
                         buffer_id,
                         new_revision,
@@ -1587,10 +1696,11 @@ impl Flavite {
         let rows = page.items.into_iter().take(limit);
         Ok(QueryResult {
             notes: rows
-                .map(|(note_id, path, title)| NoteResult {
-                    note_id,
-                    path,
-                    title,
+                .map(|row| NoteResult {
+                    note_id: row.note_id,
+                    path: row.path,
+                    title: row.title,
+                    excerpt: row.excerpt,
                 })
                 .collect(),
             epoch: page.epoch,
@@ -1672,6 +1782,10 @@ pub struct NoteResult {
     pub path: String,
     /// Title.
     pub title: String,
+    /// Bounded saved-content excerpt around the first matched term (W10);
+    /// empty for structural-only results. Dirty edits are absent by design.
+    #[serde(default)]
+    pub excerpt: String,
 }
 
 /// Errors for Flavite operations.
@@ -2031,6 +2145,7 @@ mod tests {
                 note_id: 1,
                 path: "/test/note.md".to_string(),
                 title: "Test Note".to_string(),
+                excerpt: String::new(),
             }],
             epoch: 1,
             generation: 1,

@@ -3,15 +3,9 @@
 //! Matching is in-memory nucleo fuzzy scoring (§4.7): the registry list is
 //! small, so filtering happens on the UI thread without touching the database.
 
+use crate::picker::shared_matcher;
 use flavite_api::{CommandSpec, Flavite};
 use nucleo::pattern::{CaseMatching, Normalization, Pattern};
-use nucleo::{Config, Matcher};
-use std::sync::{LazyLock, Mutex};
-
-/// Shared nucleo matcher: reusing one instance avoids re-allocating its
-/// internal slab on every keystroke.
-static MATCHER: LazyLock<Mutex<Matcher>> =
-    LazyLock::new(|| Mutex::new(Matcher::new(Config::DEFAULT)));
 
 /// Filter registered commands by title, id, or declared keybinding, ranked by
 /// nucleo fuzzy score. An empty or whitespace query preserves registry order.
@@ -32,9 +26,7 @@ pub fn matching_specs(specs: Vec<CommandSpec>, query: &str) -> Vec<CommandSpec> 
     // "note.open" all find their command.
     let texts: Vec<String> = specs.iter().map(candidate_text).collect();
     let pattern = Pattern::parse(needle, CaseMatching::Smart, Normalization::Smart);
-    let mut matcher = MATCHER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut matcher = shared_matcher();
     pattern
         .match_list(texts.iter().map(String::as_str), &mut matcher)
         .into_iter()

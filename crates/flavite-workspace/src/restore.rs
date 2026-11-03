@@ -78,6 +78,10 @@ pub fn plan(
         let kind = match &tab.kind {
             PersistedKind::Empty => Some(ViewKind::Empty),
             PersistedKind::Notes => Some(ViewKind::Notes),
+            PersistedKind::Search => Some(ViewKind::Search),
+            PersistedKind::History { locator } => NoteLocator::from_components(locator.clone())
+                .ok()
+                .map(ViewKind::History),
             PersistedKind::Note { locator, mode } => NoteLocator::from_components(locator.clone())
                 .ok()
                 .map(|resolved| {

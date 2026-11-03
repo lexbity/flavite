@@ -30,6 +30,9 @@ pub enum UserStateKind {
     WorkspaceLayouts,
     /// Device UI preferences, split from vault safety settings.
     DevicePreferences,
+    /// App-launch memory (W10): the most recently opened vault root on this
+    /// device. Lives in the app scope, not under any vault UUID.
+    AppLaunch,
 }
 
 impl UserStateKind {
@@ -39,6 +42,7 @@ impl UserStateKind {
         match self {
             Self::WorkspaceLayouts => "workspace-layouts.json",
             Self::DevicePreferences => "device-preferences.json",
+            Self::AppLaunch => "app-launch.json",
         }
     }
 }
@@ -149,6 +153,19 @@ impl UserStateStore {
     #[must_use]
     pub fn at_root(fs: Box<dyn Fs + Send + Sync>, root: PathBuf) -> Self {
         Self { fs, root }
+    }
+
+    /// Build the device-wide app-scope store (W10): launch memory shared by
+    /// every vault on this device, rooted at `<data>/flavite/app`.
+    ///
+    /// # Errors
+    /// Returns [`UserStateError::Unavailable`] when no OS data directory
+    /// exists.
+    pub fn open_app_scope(fs: Box<dyn Fs + Send + Sync>) -> Result<Self, UserStateError> {
+        let data = get_data_dir().ok_or_else(|| {
+            UserStateError::Unavailable("no OS data directory is available".into())
+        })?;
+        Ok(Self::at_root(fs, data.join("flavite").join("app")))
     }
 
     /// The fixed file path for one kind.

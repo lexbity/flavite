@@ -650,7 +650,7 @@ fn query_membership(
             Ok(page
                 .items
                 .into_iter()
-                .map(|(id, _, _)| NodeId::note(id as u64))
+                .map(|row| NodeId::note(row.note_id as u64))
                 .collect())
         }
         Query::And(parts) | Query::Or(parts) => {

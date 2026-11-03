@@ -27,18 +27,31 @@ pub struct OperationPump {
     pending: BTreeMap<u64, PendingOperation>,
     terminal: VecDeque<TerminalOperation>,
     terminal_overflowed: u64,
+    /// Correlation labels that outlive their pending entry so completion
+    /// routing can tell which surface issued the request. Bounded with the
+    /// terminal ledger.
+    labels: BTreeMap<u64, String>,
 }
 
 impl OperationPump {
     /// Record an accepted asynchronous operation.
     pub fn accept(&mut self, request_id: u64, label: impl Into<String>) {
+        self.labels.insert(request_id, label.into());
         self.pending.insert(
             request_id,
             PendingOperation {
                 request_id,
-                label: label.into(),
+                label: self.labels[&request_id].clone(),
             },
         );
+    }
+
+    /// The label recorded for a request, when it is still known. Labels are
+    /// host presentation data; routing uses them only as hints and always
+    /// validates the payload shape.
+    #[must_use]
+    pub fn label_of(&self, request_id: u64) -> Option<&str> {
+        self.labels.get(&request_id).map(String::as_str)
     }
 
     /// Ingest one drained batch of completions, retiring matching pending
@@ -51,7 +64,9 @@ impl OperationPump {
                 completion: completion.clone(),
             });
             if self.terminal.len() > MAX_TERMINAL_COMPLETIONS {
-                self.terminal.pop_front();
+                if let Some(evicted) = self.terminal.pop_front() {
+                    self.labels.remove(&evicted.completion.request_id);
+                }
                 self.terminal_overflowed = self.terminal_overflowed.saturating_add(1);
             }
         }
@@ -91,6 +106,7 @@ impl OperationPump {
             return false;
         };
         self.terminal.remove(index);
+        self.labels.remove(&request_id);
         true
     }
 }

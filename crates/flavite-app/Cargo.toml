@@ -1,0 +1,24 @@
+[package]
+name = "flavite-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Flavite desktop application (production entry point; RFC-0003 TD-02/W13)"
+
+# The production desktop binary owns the `flavite` name: the GUI app is the
+# primary command. The headless CLI ships as `flavite-cli` (D16 dogfood).
+[[bin]]
+name = "flavite"
+path = "src/main.rs"
+
+[dependencies]
+# The shell library (iced/winit are permitted only inside flavite-editor and
+# flavite-ui — §4.1/§10.2; `cargo xtask arch check` enforces this).
+flavite-ui = { path = "../flavite-ui" }
+
+# Program adapter launched through the patched accessibility runtime (W01).
+iced_winit = "=0.14.1"
+
+# Argument parsing: `--help`/`--version` must never launch the window loop.
+clap = { version = "4", features = ["derive", "env"] }

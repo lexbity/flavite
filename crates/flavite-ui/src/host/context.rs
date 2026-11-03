@@ -299,6 +299,9 @@ impl ContextRegistry {
             QueryResult::Failed { message } => ToolState::Failed {
                 message: message.clone(),
             },
+            // Search pages (W10) are routed to the search host before the
+            // context registry; they never repaint a context tool.
+            QueryResult::Search { .. } => return false,
         };
         true
     }

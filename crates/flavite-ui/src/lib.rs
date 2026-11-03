@@ -13,6 +13,7 @@ pub mod harness;
 pub mod host;
 pub mod operation;
 pub mod palette;
+pub mod picker;
 pub mod settings;
 pub mod style;
 pub mod subscription;

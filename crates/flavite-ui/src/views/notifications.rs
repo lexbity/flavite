@@ -23,19 +23,36 @@ pub fn overlay(app: &App) -> Option<Element<'_, Message>> {
     ]
     .spacing(2);
     for notice in app.notices.iter().take(3) {
-        entries = entries.push(
-            row![
-                text(format!("{}: {:?}", notice.event.event_type(), notice.event))
-                    .size(style::TEXT_SM)
-                    .width(Length::Fill),
-                button(text("Dismiss").size(style::TEXT_SM))
+        // A detected external rename (W10) offers explicit review instead
+        // of a bare dismiss; T3/T4 evidence asks for identity confirmation.
+        let review = match &notice.event {
+            flavite_api::Event::RenameSuggested { .. } => {
+                Some(Message::ReviewRenameNotice(notice.id))
+            }
+            _ => None,
+        };
+        let mut entry = row![
+            text(format!("{}: {:?}", notice.event.event_type(), notice.event))
+                .size(style::TEXT_SM)
+                .width(Length::Fill),
+        ]
+        .spacing(style::SPACING_SM)
+        .align_y(alignment::Vertical::Center);
+        if let Some(review) = review {
+            entry = entry.push(
+                button(text("Review…").size(style::TEXT_SM))
                     .padding(tab_strip::chip_padding())
-                    .style(style::ghost())
-                    .on_press(Message::AcknowledgeNotice(notice.id)),
-            ]
-            .spacing(style::SPACING_SM)
-            .align_y(alignment::Vertical::Center),
+                    .style(style::action())
+                    .on_press(review),
+            );
+        }
+        entry = entry.push(
+            button(text("Dismiss").size(style::TEXT_SM))
+                .padding(tab_strip::chip_padding())
+                .style(style::ghost())
+                .on_press(Message::AcknowledgeNotice(notice.id)),
         );
+        entries = entries.push(entry);
     }
     if hidden > 0 {
         entries = entries.push(

@@ -7,7 +7,7 @@ fn doctor_uses_vault_identity_and_reports_corrupt_cache() {
     let cache_root = tempfile::tempdir().unwrap();
 
     let run = || {
-        Command::new(env!("CARGO_BIN_EXE_flavite"))
+        Command::new(env!("CARGO_BIN_EXE_flavite-cli"))
             .args(["doctor", "--path"])
             .arg(root.path())
             .arg("--json")

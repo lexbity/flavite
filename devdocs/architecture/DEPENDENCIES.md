@@ -9,6 +9,7 @@ Generated from `cargo metadata --format-version 1 --all-features`.
 | Crate | Tier | Responsibility |
 |---|---|---|
 | `flavite-api` | 2 | Registry, typed commands/results, revisioned views, events, capabilities (§4.1) |
+| `flavite-app` | 3 | Desktop application entry point; binary `flavite` (RFC-0003 TD-02/W13) |
 | `flavite-buffer` | 1 | EditorModel/ropey, undo tree, D7 state machine (§4.1) |
 | `flavite-cli` | 3 | Headless CLI; consumes flavite-api (D16 dogfood) (§4.1) |
 | `flavite-editor` | 3 | iced widget over EditorModel (iced permitted here and in flavite-ui only) (§4.1) |
@@ -17,7 +18,7 @@ Generated from `cargo metadata --format-version 1 --all-features`.
 | `flavite-graph-protocol` | 1 | IO-free bounded durable graph scope value types shared by core and workspace (RFC-0003 W08) |
 | `flavite-index` | 1 | SQLite, tantivy, resolver, query exec (§4.1) |
 | `flavite-syntax` | 1 | Scanner, frontmatter patcher, pulldown glue — pure, IO-free (§4.1) |
-| `flavite-ui` | 3 | iced application (§4.1) |
+| `flavite-ui` | 3 | iced shell library: views, host catalog, adapters (§4.1; no binary) |
 | `flavite-vault` | 1 | Session/BufferManager ownership + actors, journal, history, recovery (§4.1) |
 | `flavite-workspace` | 1 | IO-free workspace model: layout tree, tab groups, typed transactions, geometry (RFC-0003 D-02) |
 | `xtask` | ? | — |
@@ -38,6 +39,13 @@ Normal/build:
 - `image` (normal)
 - `rusqlite` (normal)
 - `tracing` (normal)
+
+### `flavite-app`
+
+Normal/build:
+
+- `flavite-ui` (normal)
+- `iced_winit` (normal)
 
 ### `flavite-buffer`
 
@@ -167,7 +175,7 @@ Normal/build:
 - `cosmic-text` ← flavite-editor, xtask
 - `iced` ← flavite-editor, flavite-ui, xtask
 - `iced_runtime` ← flavite-ui
-- `iced_winit` ← flavite-ui
+- `iced_winit` ← flavite-app, flavite-ui
 - `image` ← flavite-api
 - `notify` ← flavite-fs, flavite-fs, xtask
 - `nucleo` ← flavite-ui
@@ -195,7 +203,7 @@ UI crates (may depend on forbidden): flavite-editor, flavite-ui
 |---|---|---|
 | 1 — durability-critical | flavite-fs, flavite-syntax, flavite-buffer, flavite-vault, flavite-index, flavite-workspace, flavite-graph-protocol | ≥ 90% line |
 | 2 | flavite-api, flavite-graph | ≥ 80% line |
-| 3 — measured, not gating | flavite-cli, flavite-editor, flavite-ui | reported only |
+| 3 — measured, not gating | flavite-cli, flavite-editor, flavite-ui, flavite-app | reported only |
 
 Temporary floor waivers (must have a valid expiry and reason):
 

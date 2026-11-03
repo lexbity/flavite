@@ -21,7 +21,7 @@ tier1 = [
 # Tier 2 (§10.5: ≥ 80% line coverage floor).
 tier2 = ["flavite-api", "flavite-graph"]
 # Tier 3 — measured, not gating until Phase 6 (§10.5).
-tier3 = ["flavite-cli", "flavite-editor", "flavite-ui"]
+tier3 = ["flavite-cli", "flavite-editor", "flavite-ui", "flavite-app"]
 
 [responsibilities]
 flavite-graph-protocol = "IO-free bounded durable graph scope value types shared by core and workspace (RFC-0003 W08)"
@@ -35,7 +35,8 @@ flavite-graph = "Layout, spatial — CPU only (§4.1)"
 flavite-cli = "Headless CLI; consumes flavite-api (D16 dogfood) (§4.1)"
 flavite-workspace = "IO-free workspace model: layout tree, tab groups, typed transactions, geometry (RFC-0003 D-02)"
 flavite-editor = "iced widget over EditorModel (iced permitted here and in flavite-ui only) (§4.1)"
-flavite-ui = "iced application (§4.1)"
+flavite-ui = "iced shell library: views, host catalog, adapters (§4.1; no binary)"
+flavite-app = "Desktop application entry point; binary `flavite` (RFC-0003 TD-02/W13)"
 
 [edges]
 # Active internal edges for this checkout. A4 initially records the
@@ -95,6 +96,8 @@ active = [
     { from = "flavite-editor", to = "flavite-syntax" },
     # W02 - the shell reduces authoritative layout through the IO-free model.
     { from = "flavite-ui", to = "flavite-workspace" },
+    # W10/TD-02 - the production binary launches the shell library.
+    { from = "flavite-app", to = "flavite-ui" },
 ]
 
 [layering]

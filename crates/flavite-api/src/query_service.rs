@@ -27,6 +27,8 @@ pub enum QueryPurpose {
     Occurrence,
     AttachmentOpen,
     Anchor,
+    /// Saved-content search pages (W10).
+    Search,
 }
 
 /// Caller-correlated identity of one context query (§7.1). The service
@@ -80,6 +82,15 @@ pub enum QueryPayload {
         /// Vault-relative path components.
         path: Vec<String>,
     },
+    /// Saved-content full-text search (W10). Bounded to one page; a newer
+    /// request sequence supersedes the result of an older one, which is the
+    /// cancellation path for debounced keystrokes.
+    Search {
+        /// Raw query text, parsed by the canonical query parser.
+        text: String,
+        /// Page size (bounded by the service).
+        limit: u64,
+    },
 }
 
 /// Index provenance of a served snapshot. Cache IDs never migrate by
@@ -106,6 +117,19 @@ pub struct BacklinkRow {
     pub unsaved: bool,
     /// Number of current directed occurrences from this source.
     pub occurrences: usize,
+}
+
+/// One saved-search result row (W10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchResultRow {
+    /// Indexed note ID, valid within the served epoch.
+    pub note_id: i64,
+    /// Vault-relative portable path.
+    pub path: String,
+    /// Indexed title.
+    pub title: String,
+    /// Bounded saved-content excerpt around the first matched term.
+    pub excerpt: String,
 }
 
 /// Typed outcome of one query slot.
@@ -148,6 +172,18 @@ pub enum ContextQueryResult {
         links: Vec<BacklinkRow>,
         /// Index provenance.
         provenance: Provenance,
+    },
+    /// One saved-search page with bounded excerpts (W10). Results reflect
+    /// saved content only; dirty buffer text is absent by design (D-08).
+    Search {
+        /// Matching notes, canonical path order.
+        items: Vec<SearchResultRow>,
+        /// Index provenance of the served page.
+        provenance: Provenance,
+        /// Whether a further page exists.
+        has_more: bool,
+        /// The parsed page size this result was served for.
+        limit: u64,
     },
     /// The requested note does not exist in the saved vault.
     Missing,
@@ -319,6 +355,7 @@ impl QueryService {
                     ..
                 } => QueryPurpose::NoteRead,
                 QueryPayload::Occurrence { .. } => QueryPurpose::Occurrence,
+                QueryPayload::Search { .. } => QueryPurpose::Search,
                 _ => QueryPurpose::Context,
             },
             context_tab,
@@ -460,6 +497,7 @@ fn execute(
         }
         QueryPayload::Preview { path } => execute_preview(session, path),
         QueryPayload::Backlinks { path } => execute_backlinks(session, graph, path),
+        QueryPayload::Search { text, limit } => execute_search(session, text, *limit),
     }
 }
 
@@ -582,6 +620,63 @@ fn execute_preview(session: &Arc<Session>, path: &[String]) -> ContextQueryResul
         path: path.to_vec(),
         text: String::from_utf8_lossy(&bytes).into_owned(),
         provenance: Provenance { epoch, generation },
+    }
+}
+
+/// Run one bounded saved-content search page (W10). Runs on the query
+/// worker pool, never under the driving turn. The parsed query must be
+/// non-empty; parse failures and invalid limits are retryable failures.
+fn execute_search(session: &Arc<Session>, text: &str, limit: u64) -> ContextQueryResult {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return ContextQueryResult::Failed {
+            message: "Enter a search term".into(),
+        };
+    }
+    let limit = limit.clamp(1, 200);
+    // Free-text search input: whitespace-separated terms AND together.
+    // Structured terms (tag:, prop:, links-to:, …) parse individually
+    // through the canonical parser; no new query grammar is introduced.
+    let mut parsed = Vec::new();
+    for term in trimmed.split_whitespace() {
+        match crate::Query::parse(term) {
+            Ok(query) => parsed.push(query),
+            Err(message) => return ContextQueryResult::Failed { message },
+        }
+    }
+    let query = match parsed.len() {
+        0 => {
+            return ContextQueryResult::Failed {
+                message: "Enter a search term".into(),
+            };
+        }
+        1 => parsed.remove(0),
+        _ => crate::Query::And(parsed),
+    };
+    let page = match session.search_notes(query, limit as usize + 1) {
+        Ok(page) => page,
+        Err(message) => return ContextQueryResult::Failed { message },
+    };
+    let has_more = page.items.len() as u64 > limit;
+    let items = page
+        .items
+        .into_iter()
+        .take(limit as usize)
+        .map(|row| SearchResultRow {
+            note_id: row.note_id,
+            path: row.path,
+            title: row.title,
+            excerpt: row.excerpt,
+        })
+        .collect();
+    ContextQueryResult::Search {
+        items,
+        provenance: Provenance {
+            epoch: page.epoch,
+            generation: page.generation,
+        },
+        has_more,
+        limit,
     }
 }
 

@@ -13,7 +13,7 @@ impl CliEnv {
         }
     }
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_flavite"))
+        Command::new(env!("CARGO_BIN_EXE_flavite-cli"))
             .args(args)
             .env("XDG_DATA_HOME", self._data.path())
             .env("XDG_CACHE_HOME", self._cache.path())

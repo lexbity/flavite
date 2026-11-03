@@ -24,6 +24,9 @@ flavite-editor = { path = "../flavite-editor" }
 flavite-workspace = { path = "../flavite-workspace" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# W10 file/folder dialogs: xdg-desktop-portal backend (no C toolkit link),
+# with typed-path entry as the always-available fallback.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 # §10.4 convention: thiserror for libraries. Used for the CPU-side geometry
 # error type (`graph::instance::GeometryError`).
 thiserror = { workspace = true }

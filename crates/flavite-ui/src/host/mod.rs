@@ -7,10 +7,12 @@
 
 pub mod commands;
 pub mod context;
+pub mod dialogs;
 pub mod documents;
 pub mod env;
 pub mod graph;
 pub mod linking;
+pub mod navigation;
 pub mod occurrences;
 pub mod persistence;
 pub mod shell;

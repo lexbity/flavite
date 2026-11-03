@@ -34,6 +34,12 @@ static KEYS_SPLIT_DOWN: LazyLock<[Chord; 1]> = chords!(CTRL, ALT; "Down");
 static KEYS_MOVE_TAB_NEXT_GROUP: LazyLock<[Chord; 1]> = chords!(CTRL, ALT, SHIFT; "Right");
 static KEYS_MOVE_TAB_PREVIOUS_GROUP: LazyLock<[Chord; 1]> = chords!(CTRL, ALT, SHIFT; "Left");
 static KEYS_MAXIMIZE_GROUP: LazyLock<[Chord; 1]> = chords!(CTRL, SHIFT; "M");
+// W10: per-view navigation and note workflows.
+// Alt+Left/Alt+Shift+Right keep Alt+Right/Alt+Down free for splits.
+static KEYS_NAVIGATE_BACK: LazyLock<[Chord; 1]> = LazyLock::new(|| [Chord::new(ALT, "Left")]);
+static KEYS_NAVIGATE_FORWARD: LazyLock<[Chord; 1]> = chords!(ALT, SHIFT; "Right");
+static KEYS_NEW_NOTE: LazyLock<[Chord; 1]> = chords!(CTRL; "N");
+static KEYS_OPEN_NOTE: LazyLock<[Chord; 1]> = chords!(CTRL; "O");
 
 /// The `'static` default chord slice for a command id, if any.
 fn keys_for(id: &str) -> Option<&'static [Chord]> {
@@ -55,6 +61,10 @@ fn keys_for(id: &str) -> Option<&'static [Chord]> {
         "workspace.move_tab_next_group" => &LazyLock::force(&KEYS_MOVE_TAB_NEXT_GROUP)[..],
         "workspace.move_tab_previous_group" => &LazyLock::force(&KEYS_MOVE_TAB_PREVIOUS_GROUP)[..],
         "workspace.maximize_group" => &LazyLock::force(&KEYS_MAXIMIZE_GROUP)[..],
+        "workspace.navigate_back" => &LazyLock::force(&KEYS_NAVIGATE_BACK)[..],
+        "workspace.navigate_forward" => &LazyLock::force(&KEYS_NAVIGATE_FORWARD)[..],
+        "workspace.new_note" => &LazyLock::force(&KEYS_NEW_NOTE)[..],
+        "workspace.open_note_dialog" => &LazyLock::force(&KEYS_OPEN_NOTE)[..],
         _ => {
             let _ = mods::NONE;
             return None;
@@ -175,6 +185,58 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     UiCommand {
         id: "workspace.open_notes_view",
         title: "Open notes list",
+    },
+    UiCommand {
+        id: "workspace.open_search_view",
+        title: "Open saved-content search",
+    },
+    UiCommand {
+        id: "workspace.new_note",
+        title: "New note…",
+    },
+    UiCommand {
+        id: "workspace.open_note_dialog",
+        title: "Open note…",
+    },
+    UiCommand {
+        id: "workspace.open_in_tab",
+        title: "Open note in this tab…",
+    },
+    UiCommand {
+        id: "workspace.rename_note",
+        title: "Rename or move note…",
+    },
+    UiCommand {
+        id: "workspace.open_history",
+        title: "Open note history",
+    },
+    UiCommand {
+        id: "workspace.navigate_back",
+        title: "Navigate back",
+    },
+    UiCommand {
+        id: "workspace.navigate_forward",
+        title: "Navigate forward",
+    },
+    UiCommand {
+        id: "workspace.select_all",
+        title: "Select all",
+    },
+    UiCommand {
+        id: "workspace.caret_start",
+        title: "Move caret to start",
+    },
+    UiCommand {
+        id: "workspace.caret_end",
+        title: "Move caret to end",
+    },
+    UiCommand {
+        id: "workspace.refresh_catalog",
+        title: "Refresh note catalog",
+    },
+    UiCommand {
+        id: "help.about",
+        title: "About Flavite",
     },
     UiCommand {
         id: "workspace.open_graph",
@@ -459,6 +521,12 @@ fn command_chord(app: &App, key: &keyboard::Key, modifiers: Modifiers) -> Option
             if character.eq_ignore_ascii_case("s") {
                 return Some(Message::RunCoreCommand("note.save"));
             }
+            if character.eq_ignore_ascii_case("n") {
+                return Some(Message::RunHostCommand("workspace.new_note"));
+            }
+            if character.eq_ignore_ascii_case("o") {
+                return Some(Message::RunHostCommand("workspace.open_note_dialog"));
+            }
             None
         }
         keyboard::Key::Named(named) => match named {
@@ -468,6 +536,12 @@ fn command_chord(app: &App, key: &keyboard::Key, modifiers: Modifiers) -> Option
             }),
             keyboard::key::Named::ArrowLeft if modifiers.alt() && modifiers.shift() => {
                 Some(Message::RunHostCommand("workspace.move_tab_previous_group"))
+            }
+            keyboard::key::Named::ArrowLeft if modifiers.alt() => {
+                Some(Message::RunHostCommand("workspace.navigate_back"))
+            }
+            keyboard::key::Named::ArrowRight if modifiers.alt() && modifiers.shift() => {
+                Some(Message::RunHostCommand("workspace.navigate_forward"))
             }
             keyboard::key::Named::ArrowRight if modifiers.alt() && modifiers.shift() => {
                 Some(Message::RunHostCommand("workspace.move_tab_next_group"))
@@ -612,6 +686,85 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
                     group,
                 });
             }
+        }
+        // ---- W10 ----
+        "workspace.open_search_view" => {
+            if let Some(group) = focused_group {
+                app.dispatch_layout(|revision| LayoutAction::OpenSearch {
+                    expected_revision: revision,
+                    group,
+                });
+                // The search input is the view's primary control; focus it so
+                // typed queries land immediately.
+                if let Some(active) = app.workspace.group(&group).map(|g| g.active()) {
+                    let id = iced::widget::Id::from(format!(
+                        "{}{}",
+                        crate::views::search::SEARCH_INPUT_ID_PREFIX,
+                        active.raw()
+                    ));
+                    return iced::widget::operation::focus(id);
+                }
+            }
+        }
+        "workspace.new_note" => {
+            app.dialog = Some(crate::host::dialogs::Dialog::NewNote {
+                path: String::new(),
+            });
+            return iced::widget::operation::focus(crate::host::dialogs::NEW_NOTE_INPUT_ID);
+        }
+        "workspace.open_note_dialog" => {
+            return crate::host::dialogs::pick_note_file();
+        }
+        "workspace.open_in_tab" => {
+            // Replace the focused note tab through the shared picker; the
+            // replaced note lands in the tab's Back history.
+            app.picker.open = true;
+            app.picker.query.clear();
+            app.picker.selected = 0;
+            app.picker.replace_tab = app.focused_note_tab();
+        }
+        "workspace.rename_note" => {
+            if let Some(tab) = app.focused_note_tab()
+                && let Some(from) = app.note_locator(tab)
+            {
+                app.dialog = Some(crate::host::dialogs::Dialog::Rename {
+                    from,
+                    to: String::new(),
+                    tier: None,
+                });
+                return iced::widget::operation::focus(crate::host::dialogs::RENAME_INPUT_ID);
+            }
+        }
+        "workspace.open_history" => {
+            if let Some(tab) = app.focused_note_tab()
+                && let Some(locator) = app.note_locator(tab)
+                && let Some(group) = focused_group
+            {
+                app.dispatch_layout(|revision| LayoutAction::OpenHistory {
+                    expected_revision: revision,
+                    locator,
+                    group,
+                });
+            }
+        }
+        "workspace.navigate_back" => {
+            return app.update(Message::NavigateBack);
+        }
+        "workspace.navigate_forward" => {
+            return app.update(Message::NavigateForward);
+        }
+        "workspace.select_all" | "workspace.caret_start" | "workspace.caret_end" => {
+            let tab = app.workspace.focused_tab();
+            let (anchor, head) = match id {
+                "workspace.select_all" => (0usize, usize::MAX),
+                "workspace.caret_start" => (0usize, 0usize),
+                _ => (usize::MAX, usize::MAX),
+            };
+            return app.update(Message::SelectionCommand { tab, anchor, head });
+        }
+        "workspace.refresh_catalog" => app.load_catalog(),
+        "help.about" => {
+            app.dialog = Some(crate::host::dialogs::Dialog::About);
         }
         "workspace.open_graph" => {
             if let Some(group) = focused_group {
@@ -847,6 +1000,23 @@ pub fn available(app: &App, id: &str) -> bool {
         "workspace.move_tab_next_group"
         | "workspace.move_tab_previous_group"
         | "workspace.merge_next_group" => app.workspace.groups().count() > 1,
+        // ---- W10 ----
+        "workspace.navigate_back" => app
+            .focused_note_tab()
+            .is_some_and(|tab| app.nav.can_go_back(tab)),
+        "workspace.navigate_forward" => app
+            .focused_note_tab()
+            .is_some_and(|tab| app.nav.can_go_forward(tab)),
+        "workspace.open_history" | "workspace.rename_note" => app.focused_note_tab().is_some(),
+        "workspace.open_in_tab" => app.focused_note_tab().is_some(),
+        "workspace.select_all" | "workspace.caret_start" | "workspace.caret_end" => {
+            app.note_editor_view(app.workspace.focused_tab()).is_some()
+        }
+        "workspace.new_note"
+        | "workspace.open_note_dialog"
+        | "workspace.open_search_view"
+        | "workspace.refresh_catalog" => app.flavite.is_some(),
+        "help.about" => true,
         _ => true,
     }
 }

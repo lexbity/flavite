@@ -100,9 +100,15 @@ fn expected_delta(state: &WorkspaceState, action: &LayoutAction) -> Option<i64> 
         A::OpenNote { group, .. }
         | A::OpenEmpty { group, .. }
         | A::OpenNotes { group, .. }
+        | A::OpenSearch { group, .. }
+        | A::OpenHistory { group, .. }
         | A::OpenGraph { group, .. }
         | A::OpenContext { group, .. }
         | A::SplitGroup { group, .. } => state.group(group).is_some().then_some(1),
+        A::NavigateTab { tab, .. } => state
+            .tab(tab)
+            .filter(|s| matches!(s.kind(), flavite_workspace::ViewKind::Note(_)))
+            .map(|_| 1),
         A::DuplicateTab { tab, .. } => state
             .tab(tab)
             .filter(|session| session.kind().duplicate().is_some())
@@ -145,6 +151,7 @@ fn expected_delta(state: &WorkspaceState, action: &LayoutAction) -> Option<i64> 
         | A::FocusGroup { .. }
         | A::CycleTab { .. }
         | A::CycleGroup { .. }
+        | A::RelocateNote { .. }
         | A::RestoreWorkspace { .. } => Some(0),
     }
 }

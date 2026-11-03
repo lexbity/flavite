@@ -134,6 +134,15 @@ pub enum PersistedKind {
     },
     /// The vault note list.
     Notes,
+    /// A saved-content search view (W10). The query text is transient
+    /// interface state and is never persisted (FR-26).
+    Search,
+    /// The local-history view of one note (W10): the durable note locator
+    /// only. Snapshot lists and previews are transient.
+    History {
+        /// Vault-relative path components.
+        locator: Vec<String>,
+    },
     /// Saved source-text preview.
     Preview {
         /// The durable binding.
@@ -311,6 +320,10 @@ fn persist_kind(kind: &crate::view::ViewKind) -> PersistedKind {
     match kind {
         crate::view::ViewKind::Empty => PersistedKind::Empty,
         crate::view::ViewKind::Notes => PersistedKind::Notes,
+        crate::view::ViewKind::Search => PersistedKind::Search,
+        crate::view::ViewKind::History(locator) => PersistedKind::History {
+            locator: locator.components().to_vec(),
+        },
         crate::view::ViewKind::Note(note) => PersistedKind::Note {
             locator: note.locator().components().to_vec(),
             mode: note.mode(),

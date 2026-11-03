@@ -124,6 +124,10 @@ pub enum ViewKind {
     Graph(GraphView),
     /// The vault note list.
     Notes,
+    /// Saved-content full-text search over the indexed vault (W10).
+    Search,
+    /// Local history of one note: snapshots, previews, guarded restore (W10).
+    History(NoteLocator),
     /// Saved source-text preview of the bound context source (W04).
     Preview(ContextBinding),
     /// Inbound links of the bound context source (W04).
@@ -145,6 +149,8 @@ impl ViewKind {
             )),
             ViewKind::Graph(graph) => Some(ViewKind::Graph(graph.clone())),
             ViewKind::Notes => Some(ViewKind::Notes),
+            ViewKind::Search => Some(ViewKind::Search),
+            ViewKind::History(locator) => Some(ViewKind::History(locator.clone())),
             // A duplicated context tool is an independent view with its own
             // copy of the binding; the binding target itself is unchanged.
             ViewKind::Preview(binding) => Some(ViewKind::Preview(binding.clone())),
@@ -205,6 +211,12 @@ impl NoteView {
     }
     pub(crate) fn set_mode(&mut self, mode: NoteMode) {
         self.mode = mode;
+    }
+
+    /// Adopt a renamed/moved identity; load state and mode are unchanged
+    /// because the buffer was renamed in place by the vault.
+    pub(crate) fn set_locator(&mut self, locator: NoteLocator) {
+        self.locator = locator;
     }
 
     pub(crate) fn set_load(&mut self, load: NoteLoad) {
@@ -444,6 +456,8 @@ impl ViewSession {
         match &self.kind {
             ViewKind::Empty => "Empty".into(),
             ViewKind::Notes => "Notes".into(),
+            ViewKind::Search => "Search".into(),
+            ViewKind::History(locator) => format!("History: {}", locator.title()),
             ViewKind::Note(note) => note.locator().title().to_owned(),
             ViewKind::Graph(_) => "Graph".into(),
             ViewKind::Preview(_) => "Preview".into(),
@@ -464,6 +478,8 @@ impl ViewSession {
             )),
             ViewKind::Graph(graph) => Some(ViewKind::Graph(graph.clone())),
             ViewKind::Notes => Some(ViewKind::Notes),
+            ViewKind::Search => Some(ViewKind::Search),
+            ViewKind::History(locator) => Some(ViewKind::History(locator.clone())),
             ViewKind::Preview(binding) => Some(ViewKind::Preview(binding.clone())),
             ViewKind::Backlinks(binding) => Some(ViewKind::Backlinks(binding.clone())),
             ViewKind::Outline(binding) => Some(ViewKind::Outline(binding.clone())),

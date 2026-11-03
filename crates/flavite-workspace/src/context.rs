@@ -136,9 +136,9 @@ pub enum ContextSource {
 #[must_use]
 pub fn is_source_kind(kind: &ViewKind) -> bool {
     match kind {
-        ViewKind::Note(_) | ViewKind::Graph(_) => true,
-        // Search sources arrive with their slice (W10).
-        ViewKind::Empty
+        ViewKind::Note(_) | ViewKind::Graph(_) | ViewKind::Search => true,
+        ViewKind::History(_)
+        | ViewKind::Empty
         | ViewKind::Notes
         | ViewKind::Preview(_)
         | ViewKind::Backlinks(_)

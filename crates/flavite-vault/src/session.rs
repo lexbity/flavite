@@ -97,11 +97,17 @@ const OPEN_READ_WORKERS: usize = 4;
 /// (RFC-0003 §8.3). The policy cannot be inferred from a display title.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OpenPolicy {
-    /// Open only when the file exists; otherwise the open fails.
+    /// Open the note; when the file is absent, open an empty buffer that is
+    /// recorded in the absent-file creation guard and created on first save.
     #[default]
     CreateIfMissing,
     /// Open only when the file exists; otherwise the open fails.
     ExistingOnly,
+    /// Explicit creation (W10): fail when the file already exists; otherwise
+    /// create the empty file on disk through the vault actor and open it.
+    /// Unlike [`OpenPolicy::CreateIfMissing`], the file exists immediately,
+    /// so links and the index can resolve it without a save.
+    CreateNew,
 }
 
 #[derive(Debug)]
@@ -197,6 +203,10 @@ pub enum SessionCommand {
     },
     /// Open a note.
     OpenNote { path: PathBuf, policy: OpenPolicy },
+    /// Create a new empty note file and open it (W10). The command fails
+    /// when the path already exists; creation runs on the open workers and
+    /// the actor, never under the driving turn.
+    CreateNote { path: PathBuf },
     /// Close a note.
     CloseNote { path: PathBuf },
     /// Apply edits to a note.
@@ -246,6 +256,15 @@ pub enum SessionCommand {
     RestoreRecovery { path: PathBuf },
     /// Discard the recovery snapshot for a note after explicit user choice.
     DiscardRecovery { path: PathBuf },
+    /// Replace an open buffer's content with a local-history snapshot as one
+    /// guarded, undoable edit (W10). The note must already be open: restore
+    /// never mutates disk and never opens notes implicitly.
+    RestoreHistory {
+        path: PathBuf,
+        buffer_id: BufferId,
+        revision: Revision,
+        hash: String,
+    },
     /// Prepare a semantic link insertion plan (W05; expensive work runs on
     /// a bounded worker, admission happens here under the ingress turn).
     LinkPrepare {
@@ -326,6 +345,12 @@ pub enum CommandResult {
         buffer_id: BufferId,
         revision: Revision,
     },
+    /// A new empty note file was created and opened (W10 explicit creation).
+    NoteCreated {
+        buffer_id: BufferId,
+        revision: Revision,
+        path: PathBuf,
+    },
     /// Note was closed.
     NoteClosed,
     /// Edits were applied.
@@ -380,6 +405,17 @@ pub enum CommandResult {
     RecoveryRestored {
         buffer_id: BufferId,
         revision: Revision,
+    },
+    /// A local-history snapshot replaced the open buffer content as one
+    /// guarded, undoable edit (W10). Nothing was written to disk.
+    HistoryRestored {
+        buffer_id: BufferId,
+        new_revision: Revision,
+    },
+    /// A note's bounded local-history listing (W10).
+    NoteHistory {
+        path: PathBuf,
+        entries: Vec<crate::history::HistoryEntry>,
     },
 }
 
@@ -591,9 +627,33 @@ impl Session {
                 .spawn(move || {
                     // Workers exit when the Session drops the job sender.
                     while let Ok(job) = jobs.recv() {
-                        let outcome = actor
-                            .read_file(job.path.clone())
-                            .map_err(|error| error.to_string());
+                        let outcome = match job.policy {
+                            // Explicit creation (W10): refuse collisions, ask
+                            // the actor to create the empty file, then re-read
+                            // so installation sees the on-disk snapshot.
+                            OpenPolicy::CreateNew => match actor.read_file(job.path.clone()) {
+                                Ok(Some(_)) => {
+                                    Err(format!("note already exists: {}", job.path.display()))
+                                }
+                                Ok(None) => actor
+                                    .create_empty_note(job.path.clone())
+                                    .and_then(|()| {
+                                        actor
+                                            .read_file(job.path.clone())
+                                            .map_err(|error| error.to_string())
+                                    })
+                                    .and_then(|content| {
+                                        content.ok_or_else(|| {
+                                            "created note disappeared before open".to_owned()
+                                        })
+                                    })
+                                    .map(Some),
+                                Err(error) => Err(error.to_string()),
+                            },
+                            OpenPolicy::CreateIfMissing | OpenPolicy::ExistingOnly => actor
+                                .read_file(job.path.clone())
+                                .map_err(|error| error.to_string()),
+                        };
                         let recovery = recovery_writer.as_ref().and_then(|writer| {
                             writer.lock().unwrap().read_for_note_key(&job.note_key)
                         });
@@ -745,7 +805,8 @@ impl Session {
             }
             SessionCommand::ApplyMerge { path, .. }
             | SessionCommand::ResolveConflict { path, .. }
-            | SessionCommand::RestoreRecovery { path } => Some(path.clone()),
+            | SessionCommand::RestoreRecovery { path }
+            | SessionCommand::RestoreHistory { path, .. } => Some(path.clone()),
             _ => None,
         };
         let result = self.execute_inner(command);
@@ -1116,6 +1177,7 @@ impl Session {
                 edit,
             } => self.edit_structure(buffer_id, revision, edit),
             SessionCommand::OpenNote { path, policy } => self.open_note(path, policy),
+            SessionCommand::CreateNote { path } => self.create_note(path),
             SessionCommand::CloseNote { path } => self.close_note(path),
             SessionCommand::ApplyEdits {
                 buffer_id,
@@ -1146,6 +1208,12 @@ impl Session {
                 self.resolve_conflict(path, resolution)
             }
             SessionCommand::RestoreRecovery { path } => self.restore_recovery(path),
+            SessionCommand::RestoreHistory {
+                path,
+                buffer_id,
+                revision,
+                hash,
+            } => self.restore_history(path, buffer_id, revision, hash),
             SessionCommand::DiscardRecovery { path } => self.discard_recovery(path),
             SessionCommand::LinkPrepare {
                 request,
@@ -1234,6 +1302,28 @@ impl Session {
         limit: usize,
     ) -> Result<flavite_index::SearchPage, String> {
         self.actor.search_notes(query, limit)
+    }
+
+    /// List a note's bounded local-history records, newest first (W10).
+    ///
+    /// # Errors
+    /// Returns the actor error text when history is unavailable.
+    pub fn note_history(
+        &self,
+        path: &Path,
+        limit: usize,
+    ) -> Result<Vec<crate::history::HistoryEntry>, String> {
+        self.actor
+            .history_for_note(native_note_key(path, &self.identity.root), limit)
+    }
+
+    /// Read one content-addressed history snapshot, bounded (W10).
+    ///
+    /// # Errors
+    /// Returns the actor error text when the snapshot cannot be served.
+    pub fn read_history_snapshot(&self, hash: &str) -> Result<Vec<u8>, String> {
+        self.actor
+            .read_history_snapshot(hash.to_owned(), crate::history::MAX_HISTORY_READ_BYTES)
     }
 
     /// Issue a core-semantic-link client namespace token (W05 §9.1). The
@@ -1960,6 +2050,13 @@ impl Session {
                 revision: buffer_id.1,
             });
         }
+        self.open_note_inner(path, policy)
+    }
+
+    /// Shared open-flight admission for [`Self::open_note`] and
+    /// [`Self::create_note`]: reserve or join a flight keyed by path and
+    /// dispatch the read/create job to a bounded worker.
+    fn open_note_inner(&self, path: PathBuf, policy: OpenPolicy) -> SessionResult {
         {
             let flights = self.open_flights.lock().unwrap();
             if flights.len() >= MAX_PENDING_OPEN_NOTES {
@@ -2012,10 +2109,20 @@ impl Session {
             Err(message) => return SessionResult::Error { message },
         };
         let absent = content.is_none();
-        if absent && read.policy == OpenPolicy::ExistingOnly {
-            return SessionResult::Error {
-                message: SessionError::NoteNotFound(read.path.clone()).to_string(),
+        if absent
+            && matches!(
+                read.policy,
+                OpenPolicy::ExistingOnly | OpenPolicy::CreateNew
+            )
+        {
+            let message = if read.policy == OpenPolicy::CreateNew {
+                // The worker created the file moments ago; losing it again is
+                // an honest error, never a silently empty note.
+                format!("created note vanished before open: {}", read.path.display())
+            } else {
+                SessionError::NoteNotFound(read.path.clone()).to_string()
             };
+            return SessionResult::Error { message };
         }
         let content = content.unwrap_or_default();
         let (buffer_id, revision) = {
@@ -2041,10 +2148,18 @@ impl Session {
         // The flight slot is already consumed by the pump; keep the jobs
         // sender referenced so the field stays alive for later flights.
         let _ = open_jobs;
-        SessionResult::Success(CommandResult::NoteOpened {
-            buffer_id,
-            revision,
-        })
+        if read.policy == OpenPolicy::CreateNew {
+            SessionResult::Success(CommandResult::NoteCreated {
+                buffer_id,
+                revision,
+                path: read.path,
+            })
+        } else {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            })
+        }
     }
 
     fn pump_open_completions(&self) {
@@ -2071,6 +2186,50 @@ impl Session {
     }
 
     /// Close a note.
+    /// Create a new empty note file and open it (W10 explicit creation).
+    ///
+    /// The flight machinery of [`Self::open_note`] is reused with
+    /// [`OpenPolicy::CreateNew`]: the collision check and the empty-file
+    /// write run on an open worker and the vault actor, never under the
+    /// driving turn. Callers correlate the terminal result through the
+    /// returned request id.
+    fn create_note(&self, path: PathBuf) -> SessionResult {
+        if self
+            .buffer_manager
+            .lock()
+            .unwrap()
+            .get_buffer(&path)
+            .is_some()
+        {
+            return SessionResult::Error {
+                message: format!("note already exists: {}", path.display()),
+            };
+        }
+        // Path validation: the note must live inside this vault and carry
+        // no traversal or separator tricks. Absolute paths within the root
+        // are canonicalized to vault-relative, matching `note.open`.
+        let relative = match path.strip_prefix(&self.identity.root) {
+            Ok(relative) => relative.to_path_buf(),
+            Err(_) => {
+                return SessionResult::Error {
+                    message: "note path is outside this vault".into(),
+                };
+            }
+        };
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return SessionResult::Error {
+                message: "Invalid vault path".into(),
+            };
+        }
+        // The buffer key keeps the caller's exact path form (absolute),
+        // matching `note.open`.
+        self.open_note_inner(path, OpenPolicy::CreateNew)
+    }
+
     fn close_note(&self, path: PathBuf) -> SessionResult {
         // Get buffer ID
         let buffer_id = {
@@ -2796,6 +2955,89 @@ impl Session {
             SessionResult::Error {
                 message: "recovery snapshot could not be removed".into(),
             }
+        }
+    }
+
+    /// Replace an open buffer's content with a local-history snapshot (W10).
+    ///
+    /// The replacement is one guarded, undoable buffer edit: revision is
+    /// checked, disk is never touched here, and the user can undo. The note
+    /// must already be open; this command never opens notes implicitly, so
+    /// it cannot replay the recovery path's not-open branch.
+    fn restore_history(
+        &self,
+        path: PathBuf,
+        buffer_id: BufferId,
+        revision: Revision,
+        hash: String,
+    ) -> SessionResult {
+        // The buffer for `path` must be the exact buffer the caller saw:
+        // restoring into a buffer belonging to another note is refused.
+        {
+            let manager = self.buffer_manager.lock().unwrap();
+            let path_buffer = manager.get_buffer(&path).map(|buffer| buffer.buffer_id());
+            if path_buffer != Some(buffer_id) {
+                return SessionResult::Error {
+                    message: "buffer not found; open the note before restoring history".into(),
+                };
+            }
+        }
+        let snapshot = match self
+            .actor
+            .read_history_snapshot(hash, crate::history::MAX_HISTORY_READ_BYTES)
+        {
+            Ok(bytes) => bytes,
+            Err(message) => return SessionResult::Error { message },
+        };
+        let Ok(text) = String::from_utf8(snapshot) else {
+            return SessionResult::Error {
+                message: "history snapshot is not valid UTF-8".into(),
+            };
+        };
+        let mut manager = self.buffer_manager.lock().unwrap();
+        let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
+            return SessionResult::Error {
+                message: "Buffer no longer open".into(),
+            };
+        };
+        if buffer.revision() != revision {
+            return SessionResult::StaleRevision {
+                buffer_id,
+                expected: revision,
+                actual: buffer.revision(),
+            };
+        }
+        if !matches!(
+            buffer.state(),
+            flavite_buffer::state::BufferState::Clean | flavite_buffer::state::BufferState::Dirty
+        ) {
+            return SessionResult::ActionRequired {
+                code: "history.state",
+                data: None,
+            };
+        }
+        // One undo unit: the full-content replacement never merges with
+        // surrounding typing.
+        buffer.model_mut().seal_undo_group();
+        let end = buffer.model().to_source_bytes().len();
+        let mut op = EditOp::new(
+            flavite_syntax::text::Span::new(
+                flavite_syntax::text::TextByte(0),
+                flavite_syntax::text::TextByte(end),
+            ),
+            text,
+        );
+        op.boundary = true;
+        let result = buffer.apply_local_edits(&[op]);
+        buffer.model_mut().seal_undo_group();
+        match result {
+            Some((new_revision, _)) => SessionResult::Success(CommandResult::HistoryRestored {
+                buffer_id,
+                new_revision,
+            }),
+            None => SessionResult::Error {
+                message: "history snapshot could not be applied".into(),
+            },
         }
     }
 

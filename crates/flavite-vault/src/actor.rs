@@ -230,6 +230,24 @@ pub enum VaultActorMsg {
         hash: String,
         reply: Sender<VaultActorResp>,
     },
+    /// Create a new empty note file (W10 explicit creation). The actor owns
+    /// filesystem writes; creation fails when the path already exists.
+    CreateEmptyNote {
+        path: PathBuf,
+        reply: Sender<VaultActorResp>,
+    },
+    /// List a note's bounded local-history records, newest first (W10).
+    HistoryList {
+        note_key: Vec<u8>,
+        limit: usize,
+        reply: Sender<VaultActorResp>,
+    },
+    /// Read one content-addressed history snapshot, bounded (W10).
+    HistoryRead {
+        hash: String,
+        max_bytes: u64,
+        reply: Sender<VaultActorResp>,
+    },
 }
 
 /// Responses from the VaultActor.
@@ -269,6 +287,12 @@ pub enum VaultActorResp {
     Saved(Result<SaveReceipt, SaveFailure>),
     /// Durable history snapshot record.
     HistorySnapshot(Result<SnapshotRef, String>),
+    /// A new empty note file was created.
+    Created,
+    /// A note's bounded history records, newest first.
+    HistoryList(Result<Vec<crate::history::HistoryEntry>, String>),
+    /// Bounded history snapshot bytes.
+    HistoryBytes(Result<Vec<u8>, String>),
 }
 
 /// Errors from the VaultActor.
@@ -480,6 +504,57 @@ impl VaultActorHandle {
             VaultActorResp::File(bytes) => Ok(bytes),
             VaultActorResp::Error(_) => Err(VaultActorError::NotRunning),
             _ => Err(VaultActorError::NotRunning),
+        }
+    }
+
+    /// Create one new empty note file (W10). Fails when the path exists.
+    pub fn create_empty_note(&self, path: std::path::PathBuf) -> Result<(), String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::CreateEmptyNote { path, reply })
+            .map_err(|error| error.to_string())?;
+        match response.recv().map_err(|error| error.to_string())? {
+            VaultActorResp::Created => Ok(()),
+            VaultActorResp::Error(message) => Err(message),
+            _ => Err("unexpected note-creation response".to_owned()),
+        }
+    }
+
+    /// List a note's bounded local-history records, newest first (W10).
+    pub fn history_for_note(
+        &self,
+        note_key: Vec<u8>,
+        limit: usize,
+    ) -> Result<Vec<crate::history::HistoryEntry>, String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::HistoryList {
+                note_key,
+                limit,
+                reply,
+            })
+            .map_err(|error| error.to_string())?;
+        match response.recv().map_err(|error| error.to_string())? {
+            VaultActorResp::HistoryList(result) => result,
+            VaultActorResp::Error(error) => Err(error),
+            _ => Err("unexpected history-list response".to_owned()),
+        }
+    }
+
+    /// Read one content-addressed history snapshot, bounded (W10).
+    pub fn read_history_snapshot(&self, hash: String, max_bytes: u64) -> Result<Vec<u8>, String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::HistoryRead {
+                hash,
+                max_bytes,
+                reply,
+            })
+            .map_err(|error| error.to_string())?;
+        match response.recv().map_err(|error| error.to_string())? {
+            VaultActorResp::HistoryBytes(result) => result,
+            VaultActorResp::Error(error) => Err(error),
+            _ => Err("unexpected history-read response".to_owned()),
         }
     }
 
@@ -1337,7 +1412,101 @@ impl VaultActor {
                     .unwrap_or_else(VaultActorResp::Error);
                 let _ = reply.try_send(response);
             }
+            VaultActorMsg::CreateEmptyNote { path, reply } => {
+                let response = match self.create_empty_note(&path) {
+                    Ok(()) => VaultActorResp::Created,
+                    Err(message) => VaultActorResp::Error(message),
+                };
+                let _ = reply.try_send(response);
+            }
+            VaultActorMsg::HistoryList {
+                note_key,
+                limit,
+                reply,
+            } => {
+                let key_hex = hex::encode(&note_key);
+                let response = self.history_store().map(|history| {
+                    let mut entries: Vec<crate::history::HistoryEntry> = history
+                        .records()
+                        .iter()
+                        .filter(|record| record.note_key == key_hex)
+                        .map(crate::history::HistoryEntry::from_ref)
+                        .collect();
+                    entries.sort_by(|a, b| {
+                        b.timestamp_secs
+                            .cmp(&a.timestamp_secs)
+                            .then_with(|| a.hash.cmp(&b.hash))
+                    });
+                    entries.truncate(limit);
+                    entries
+                });
+                let _ = reply.try_send(VaultActorResp::HistoryList(response));
+            }
+            VaultActorMsg::HistoryRead {
+                hash,
+                max_bytes,
+                reply,
+            } => {
+                let response = self
+                    .history_store()
+                    .and_then(|history| history.get(&hash).map_err(|error| error.to_string()))
+                    .and_then(|bytes| {
+                        (bytes.len() as u64 <= max_bytes)
+                            .then_some(bytes)
+                            .ok_or_else(|| {
+                                format!("history snapshot exceeds the {max_bytes} byte read limit")
+                            })
+                    });
+                let _ = reply.try_send(VaultActorResp::HistoryBytes(response));
+            }
         }
+    }
+
+    /// Create one new empty note file. `write_new` is create-new, so the
+    /// existence race closes at the filesystem call; the parent directory
+    /// tree is created on demand.
+    fn create_empty_note(&mut self, path: &std::path::Path) -> Result<(), String> {
+        if self
+            .fs
+            .read_if_exists(path)
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return Err(format!("note already exists: {}", path.display()));
+        }
+        // Missing folder levels are created on explicit creation (W10):
+        // the dialog names nested paths, and OsFs only auto-creates the
+        // temp-file parent at save time.
+        if let Some(parent) = path.parent()
+            && self.fs.read_dir(parent).is_err()
+        {
+            self.fs.create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        self.fs.write_new(path, &[]).map_err(|e| e.to_string())?;
+        self.fs.fsync_file(path).map_err(|e| e.to_string())?;
+        if let Some(parent) = path.parent() {
+            self.fs.fsync_dir(parent).map_err(|e| e.to_string())?;
+        }
+        // A created note is immediately visible to the catalog, search, and
+        // resolvers — creation is a real vault event, not just a file write.
+        let relative = path
+            .strip_prefix(&self.identity.root)
+            .map_err(|_| "note path is outside this vault".to_owned())?;
+        let display_path = relative.to_string_lossy().replace('\\', "/");
+        let index_path_key = self
+            .fs
+            .encode_path_key(relative)
+            .map_err(|e| e.to_string())?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let mtime_ns = now.as_nanos().min(i64::MAX as u128) as i64;
+        self.index
+            .apply_saved_note(&index_path_key, &display_path, &[], mtime_ns, mtime_ns)
+            .map_err(|e| e.to_string())?;
+        self.catalog.begin();
+        self.catalog.finish(&self.index);
+        Ok(())
     }
 
     fn handle_save(&mut self, request: SaveRequest, reply: Sender<VaultActorResp>) {

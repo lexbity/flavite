@@ -114,6 +114,8 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                         flavite_workspace::ViewKind::Graph(_) => "graph",
                         flavite_workspace::ViewKind::Empty => "empty",
                         flavite_workspace::ViewKind::Notes => "notes",
+                        flavite_workspace::ViewKind::Search => "search",
+                        flavite_workspace::ViewKind::History(_) => "history",
                         flavite_workspace::ViewKind::Preview(_) => "preview",
                         flavite_workspace::ViewKind::Backlinks(_) => "backlinks",
                         flavite_workspace::ViewKind::Outline(_) => "outline",
@@ -287,6 +289,21 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "status": app.status_text(),
         "groups": groups,
         "menu_open": app.strip_menu.is_some(),
+        "dialog_open": app.dialog.is_some(),
+        "search_states": app
+            .search
+            .tabs
+            .iter()
+            .map(|(tab, state)| {
+                serde_json::json!({
+                    "tab": tab.to_string(),
+                    "query": state.query,
+                    "results": state.results.iter().map(|row| serde_json::json!({"path": row.path, "title": row.title, "excerpt": row.excerpt})).collect::<Vec<_>>(),
+                    "has_more": state.has_more,
+                    "error": state.error,
+                })
+            })
+            .collect::<Vec<_>>(),
         "picker_open": app.picker.open,
         "palette_open": app.palette_open,
         "palette_query": app.palette_query,

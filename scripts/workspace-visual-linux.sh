@@ -24,8 +24,8 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
-if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" && "$scenario" != "context" && "$scenario" != "semantic-link" && "$scenario" != "restore" && "$scenario" != "read-structure" && "$scenario" != "filtered-unsaved-graph" ]]; then
-    echo "unsupported scenario: $scenario (implemented: layout, shared-editors, shell-foundation, context, semantic-link, restore)" >&2
+if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" && "$scenario" != "context" && "$scenario" != "semantic-link" && "$scenario" != "restore" && "$scenario" != "read-structure" && "$scenario" != "filtered-unsaved-graph" && "$scenario" != "develop-connected-note" ]]; then
+    echo "unsupported scenario: $scenario (implemented: layout, shared-editors, shell-foundation, context, semantic-link, restore, develop-connected-note)" >&2
     exit 2
 fi
 if [[ "$(uname -s)" != Linux ]]; then
@@ -282,6 +282,50 @@ elif [[ "$scenario" == "semantic-link" ]]; then
 
     capture "$run_dir/04-final.png"
     record "final-capture" "04-final.png"
+elif [[ "$scenario" == "develop-connected-note" ]]; then
+    # W10: create a note through the explicit dialog, find it via saved
+    # search, navigate back in the same tab, and confirm catalog identity.
+    xdotool_key "ctrl+n"
+    harness_wait "new-note dialog open" \
+        'snapshot["dialog_open"] is True'
+    xdotool type --delay 25 "developed/idea.md"
+    xdotool_key "Return"
+    harness_wait "created note tab ready" \
+        'any(t["load"] == "ready" and t["title"] == "idea" for g in snapshot["groups"] for t in g["tabs"])'
+    capture "$run_dir/10-created.png"
+    record "explicit-note-creation-opens-tab" "10-created.png"
+    [[ -f "$vault_dir/developed/idea.md" ]] || {
+        echo "the created note file is missing on disk" >&2
+        exit 1
+    }
+
+    # Open alpha through the unified picker, then Back returns to idea in
+    # the SAME tab (per-view navigation history).
+    xdotool_key "ctrl+p"
+    xdotool type --delay 25 "alpha"
+    xdotool_key "Return"
+    harness_wait "alpha opened in the same tab" \
+        'any(t["load"] == "ready" and t["title"] == "alpha" for g in snapshot["groups"] for t in g["tabs"])'
+    xdotool_key "alt+Left"
+    harness_wait "back returns to the created note" \
+        'any(t["load"] == "ready" and t["title"] == "idea" for g in snapshot["groups"] for t in g["tabs"])'
+    capture "$run_dir/11-back.png"
+    record "per-view-back-returns" "11-back.png"
+
+    # Saved-content search finds alpha's saved body, via the command palette.
+    xdotool_key "ctrl+shift+p"
+    xdotool type --delay 25 "search"
+    sleep 0.3
+    xdotool_key "Return"
+    harness_wait "search view active" \
+        'any(t["load"] == "search" for g in snapshot["groups"] for t in g["tabs"])'
+    xdotool windowfocus --sync "$window_id"
+    xdotool type --delay 25 "alpha body"
+    harness_wait "search results list alpha" \
+        'any("alpha.md" in (row["path"]) for state in snapshot["search_states"] for row in state["results"])'
+    capture "$run_dir/12-search.png"
+    record "saved-search-finds-alpha" "12-search.png"
+
 elif [[ "$scenario" == "restore" ]]; then
     # W06: the persisted device-local layout survives a restart. The app
     # autosaves its layout; this scenario edits the arrangement, reads the

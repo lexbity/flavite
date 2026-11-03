@@ -17,6 +17,55 @@ pub enum StripMenu {
     Actions,
     Tabs,
     App,
+    /// Standard top menu bar (W10): File.
+    File,
+    /// Standard top menu bar (W10): Edit.
+    Edit,
+    /// Standard top menu bar (W10): Selection.
+    Selection,
+    /// Standard top menu bar (W10): View.
+    View,
+    /// Standard top menu bar (W10): Go.
+    Go,
+    /// Standard top menu bar (W10): Graph.
+    Graph,
+    /// Standard top menu bar (W10): Tools.
+    Tools,
+    /// Standard top menu bar (W10): Help.
+    Help,
+}
+
+impl StripMenu {
+    /// Horizontal slot of a top menu bar entry, in logical pixels.
+    #[must_use]
+    pub const fn bar_x(self) -> f32 {
+        match self {
+            Self::File => 148.0,
+            Self::Edit => 196.0,
+            Self::Selection => 240.0,
+            Self::View => 312.0,
+            Self::Go => 360.0,
+            Self::Graph => 400.0,
+            Self::Tools => 460.0,
+            _ => 148.0,
+        }
+    }
+
+    /// Whether this menu belongs to the top menu bar.
+    #[must_use]
+    pub const fn is_top_menu(self) -> bool {
+        matches!(
+            self,
+            Self::File
+                | Self::Edit
+                | Self::Selection
+                | Self::View
+                | Self::Go
+                | Self::Graph
+                | Self::Tools
+                | Self::Help
+        )
+    }
 }
 
 /// A contiguous window always containing the active tab. Every tab remains
@@ -202,7 +251,133 @@ pub fn menu_entries(app: &App, group: GroupId, menu: StripMenu) -> Vec<MenuEntry
                 .then_some(Message::RunHostCommand(id)),
         })
         .collect(),
+        // ---- W10 standard menu bar ----
+        StripMenu::File => [
+            ("New note…", "workspace.new_note"),
+            ("Open note…", "workspace.open_note_dialog"),
+            ("Save note", "note.save"),
+            ("Rename or move…", "workspace.rename_note"),
+            ("Note history", "workspace.open_history"),
+            ("Close tab", "workspace.close_tab"),
+        ]
+        .into_iter()
+        .map(|(label, id)| MenuEntry {
+            label: label.into(),
+            action: menu_action(app, id),
+        })
+        .collect(),
+        StripMenu::Edit => [
+            ("Undo", "buffer.undo"),
+            ("Redo", "buffer.redo"),
+            ("Find in note", "workspace.find"),
+            ("Command palette", "workspace.command_palette"),
+        ]
+        .into_iter()
+        .map(|(label, id)| MenuEntry {
+            label: label.into(),
+            action: menu_action(app, id),
+        })
+        .collect(),
+        StripMenu::Selection => [
+            ("Select all", "workspace.select_all"),
+            ("Move caret to start", "workspace.caret_start"),
+            ("Move caret to end", "workspace.caret_end"),
+        ]
+        .into_iter()
+        .map(|(label, id)| MenuEntry {
+            label: label.into(),
+            action: menu_action(app, id),
+        })
+        .collect(),
+        StripMenu::View => [
+            ("Notes list", "workspace.open_notes_view"),
+            ("Search", "workspace.open_search_view"),
+            ("Graph", "workspace.open_graph"),
+            ("Preview", "workspace.open_preview"),
+            ("Backlinks", "workspace.open_backlinks"),
+            ("Outline", "workspace.open_outline"),
+            ("Properties", "workspace.open_properties"),
+            ("New tab", "workspace.new_tab"),
+            ("Split right", "workspace.split_right"),
+            ("Split down", "workspace.split_down"),
+            ("Maximize group", "workspace.maximize_group"),
+        ]
+        .into_iter()
+        .map(|(label, id)| MenuEntry {
+            label: label.into(),
+            action: menu_action(app, id),
+        })
+        .collect(),
+        StripMenu::Go => [
+            ("Quick switch", "workspace.quick_switch"),
+            ("Navigate back", "workspace.navigate_back"),
+            ("Navigate forward", "workspace.navigate_forward"),
+            ("Open note in this tab…", "workspace.open_in_tab"),
+            ("Next tab", "workspace.next_tab"),
+            ("Previous tab", "workspace.previous_tab"),
+            ("Next group", "workspace.next_group"),
+            ("Previous group", "workspace.previous_group"),
+        ]
+        .into_iter()
+        .map(|(label, id)| MenuEntry {
+            label: label.into(),
+            action: menu_action(app, id),
+        })
+        .collect(),
+        StripMenu::Graph => [
+            ("Open graph", "workspace.open_graph"),
+            ("Freeze layout", "graph.freeze"),
+            ("Fit to view", "graph.fit"),
+            ("List view", "graph.list"),
+            ("Filters", "graph.filters"),
+            ("Open selected note", "graph.open_selected"),
+            ("Insert selected link", "graph.insert_selected"),
+            ("Clear selection", "graph.clear_selection"),
+        ]
+        .into_iter()
+        .map(|(label, id)| MenuEntry {
+            label: label.into(),
+            action: menu_action(app, id),
+        })
+        .collect(),
+        StripMenu::Tools => [
+            ("Rename or move…", "workspace.rename_note"),
+            ("Note history", "workspace.open_history"),
+            ("Refresh catalog", "workspace.refresh_catalog"),
+            ("Save workspace layout", "workspace.save_layout"),
+            ("Reset workspace layout", "workspace.reset_layout"),
+        ]
+        .into_iter()
+        .map(|(label, id)| MenuEntry {
+            label: label.into(),
+            action: menu_action(app, id),
+        })
+        .collect(),
+        StripMenu::Help => [("About Flavite", "help.about")]
+            .into_iter()
+            .map(|(label, id)| MenuEntry {
+                label: label.into(),
+                action: menu_action(app, id),
+            })
+            .collect(),
     }
+}
+
+/// Resolve one menu entry through the shared catalog: UI commands dispatch
+/// as host commands, core command ids as typed invocations (D-16).
+fn menu_action(app: &App, id: &'static str) -> Option<Message> {
+    if !crate::host::commands::available(app, id) {
+        return None;
+    }
+    Some(match id {
+        "note.save" | "buffer.undo" | "buffer.redo" => Message::RunCoreCommand(id),
+        "help.about" => Message::AboutDialog,
+        "workspace.new_note" => Message::NewNoteDialog,
+        "workspace.open_note_dialog" => Message::OpenNoteDialog,
+        "workspace.rename_note" => Message::RenameDialog,
+        "workspace.refresh_catalog" => Message::RefreshCatalog,
+        _ => Message::RunHostCommand(id),
+    })
 }
 
 #[cfg(test)]

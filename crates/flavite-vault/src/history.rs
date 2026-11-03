@@ -12,6 +12,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub const DEFAULT_HISTORY_CAP: u64 = 1024 * 1024 * 1024;
+/// Upper bound for a single history read served to Session/API consumers
+/// (W10). Matches the bounded reading limit for live documents.
+pub const MAX_HISTORY_READ_BYTES: u64 = 16 * 1024 * 1024;
 const META_FILE: &str = "history.json";
 
 pub(crate) fn now_secs() -> u64 {
@@ -30,6 +33,48 @@ pub enum HistoryReason {
     Rename,
     RecoveryBase,
     Transaction,
+}
+
+impl HistoryReason {
+    /// Stable wire name for API consumers; unknown names never deserialize.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Save => "save",
+            Self::ConflictResolution => "conflict_resolution",
+            Self::Merge => "merge",
+            Self::Rename => "rename",
+            Self::RecoveryBase => "recovery_base",
+            Self::Transaction => "transaction",
+        }
+    }
+}
+
+/// One listed local-history record exposed to Session/API consumers (W10).
+/// The blob content is read separately through its content hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    /// Blake3 hex hash of the uncompressed snapshot bytes.
+    pub hash: String,
+    /// Snapshot creation time, Unix seconds.
+    pub timestamp_secs: u64,
+    /// Why the snapshot exists.
+    pub reason: HistoryReason,
+    /// Pinned/protected record count (merge bases survive eviction).
+    pub pins: u32,
+}
+
+impl HistoryEntry {
+    /// Project a durable record into a consumer-facing entry.
+    #[must_use]
+    pub fn from_ref(record: &SnapshotRef) -> Self {
+        Self {
+            hash: record.hash.clone(),
+            timestamp_secs: record.timestamp_secs,
+            reason: record.reason,
+            pins: record.pins,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

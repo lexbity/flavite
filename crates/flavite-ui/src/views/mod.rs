@@ -7,9 +7,12 @@
 pub mod backlinks;
 pub mod context_header;
 pub mod graph;
+pub mod history;
 pub mod note;
+pub mod notes;
 pub mod notifications;
 pub mod preview;
+pub mod search;
 
 use crate::app::Message;
 use crate::style;

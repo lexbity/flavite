@@ -20,7 +20,7 @@ use flavite_workspace::{
     Effect, GroupId, Ids, LayoutAction, NoteLocator, Outcome, SplitId, TabId, WorkspaceState,
 };
 use iced::{Subscription, Task, keyboard};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 
 /// Outstanding notice credits per poll (W03: bounded credit-based polling)
@@ -39,6 +39,10 @@ pub struct Picker {
     pub query: String,
     /// Selected row.
     pub selected: usize,
+    /// When set, the picker replaces this note tab in place (W10 open in
+    /// this tab) instead of opening a new tab; the replaced note enters the
+    /// tab's Back history.
+    pub replace_tab: Option<TabId>,
 }
 
 /// Lossless notice retained until the user dismisses its visible entry.
@@ -66,6 +70,24 @@ pub struct App {
     pub linking: crate::host::linking::LinkIntents,
     /// Graph view host: per-tab camera/selection/pins/geometry (W07).
     pub graph: crate::host::graph::GraphHost,
+    /// Saved-content search states (W10).
+    pub search: crate::views::search::SearchHost,
+    /// Local-history listings (W10).
+    pub history: crate::views::history::HistoryHost,
+    /// Per-view back/forward navigation (W10).
+    pub nav: crate::host::navigation::NavHost,
+    /// One modal dialog, when open (W10).
+    pub dialog: Option<crate::host::dialogs::Dialog>,
+    /// No-vault start screen state (FR-22, W13-compatible).
+    pub start: crate::host::dialogs::StartState,
+    /// Notes view filter text per tab.
+    notes_filters: BTreeMap<TabId, String>,
+    /// Search tabs whose input focus was already requested once (W10): the
+    /// pane mounts a frame after the open commit, so the pump re-issues the
+    /// focus exactly once per tab.
+    search_focus_tried: BTreeSet<TabId>,
+    /// Unified candidate snapshot, rebuilt with the catalog (W10).
+    note_candidates: crate::picker::NoteCandidates,
     /// Device-local workspace persistence (W06).
     pub persistence: crate::host::persistence::PersistenceHost,
     /// Named layouts carried for the next layout save (W06).
@@ -278,6 +300,63 @@ pub enum Message {
     },
     /// Toggle a group strip's inline menu row.
     GroupMenu(GroupId, StripMenu),
+    /// Open the top menu bar entry (W10 standard menus).
+    TopMenu(crate::workspace::StripMenu),
+    // ---- W10: Notes view ----
+    /// Edit the Notes view filter for one tab.
+    NotesFilter {
+        tab: TabId,
+        value: String,
+    },
+    // ---- W10: Search view ----
+    SearchQuery {
+        tab: TabId,
+        value: String,
+    },
+    SearchSubmitNow {
+        tab: TabId,
+    },
+    SearchLoadMore {
+        tab: TabId,
+    },
+    // ---- W10: History view ----
+    HistoryRefresh {
+        tab: TabId,
+    },
+    HistoryRestore {
+        tab: TabId,
+        hash: String,
+    },
+    // ---- W10: navigation ----
+    NavigateBack,
+    NavigateForward,
+    // ---- W10: dialogs and menubar actions ----
+    /// Open a note through the native file dialog.
+    OpenNoteDialog,
+    /// Open the new-note dialog.
+    NewNoteDialog,
+    /// Open the rename/move dialog for the focused note tab.
+    RenameDialog,
+    AboutDialog,
+    /// Edit the active dialog's text field.
+    DialogInput(String),
+    /// Commit the active dialog.
+    DialogSubmit,
+    /// Dismiss the active dialog.
+    DialogCancel,
+    /// Result of the native open-note file dialog.
+    NotePicked(Option<std::path::PathBuf>),
+    // ---- W10: no-vault start screen (FR-22) ----
+    /// Open the native folder dialog for vault selection.
+    VaultDialog,
+    /// Result of the native vault folder dialog.
+    VaultPicked(Option<std::path::PathBuf>),
+    /// Edit the typed vault path on the start screen.
+    VaultPathInput(String),
+    /// Open (or adopt) the vault at this root.
+    StartOpenVault(std::path::PathBuf),
+    /// Open the rename dialog from a detected-rename notice.
+    ReviewRenameNotice(flavite_api::NoticeId),
     /// A tab was pressed (activation + drag candidate).
     TabPressed(TabId),
     PaletteOpen,
@@ -310,6 +389,14 @@ pub enum Message {
         incarnation: u64,
         action: EditorAction,
     },
+    /// A menu-initiated selection/caret command (W10 Selection menu).
+    /// `usize::MAX` means "end of text"; the handler resolves against the
+    /// live buffer and routes through the acknowledged interaction path.
+    SelectionCommand {
+        tab: TabId,
+        anchor: usize,
+        head: usize,
+    },
 }
 
 impl App {
@@ -322,12 +409,19 @@ impl App {
     }
 
     /// Construct the shell against an explicit vault root.
+    ///
+    /// When no vault can be opened, the shell starts vaultless on the start
+    /// screen (FR-22): real open/create actions, never demo content.
     #[must_use]
     pub fn boot_from_root(root: PathBuf) -> Self {
         let mut app = Self::empty_at(root.clone());
         match Flavite::open_root(root, VaultConfig::default()) {
             Ok(flavite) => app.attach_vault(flavite),
-            Err(error) => app.status = format!("Vault unavailable: {error}"),
+            Err(error) => {
+                app.start.last_vault = flavite_api::read_last_vault_device().ok().flatten();
+                app.start.error = Some(format!("Could not open that vault: {error}"));
+                app.status = "Choose a vault folder to continue".into();
+            }
         }
         app
     }
@@ -361,6 +455,14 @@ impl App {
                 host.backend = crate::host::graph::GraphBackend::from_env();
                 host
             },
+            search: crate::views::search::SearchHost::default(),
+            history: crate::views::history::HistoryHost::default(),
+            nav: crate::host::navigation::NavHost::default(),
+            dialog: None,
+            start: crate::host::dialogs::StartState::default(),
+            notes_filters: BTreeMap::new(),
+            search_focus_tried: BTreeSet::new(),
+            note_candidates: crate::picker::NoteCandidates::default(),
             persistence: crate::host::persistence::PersistenceHost::default(),
             named_layouts: Vec::new(),
             picker: Picker::default(),
@@ -442,6 +544,10 @@ impl App {
         self.restore_workspace_layout();
         crate::host::graph::sync_hosts(self);
         self.refresh_semantics();
+        // Device-local launch memory (W10): best effort, never a gate for
+        // vault usability.
+        // Best effort: a missing data directory never blocks the vault.
+        let _ = flavite_api::write_last_vault_device(&self.root);
     }
 
     /// Restore the device-local workspace layout (W06): decode, plan, and
@@ -642,7 +748,7 @@ impl App {
     }
 
     /// Load a bounded note catalog snapshot; failures stay visible.
-    fn load_catalog(&mut self) {
+    pub(crate) fn load_catalog(&mut self) {
         let Some(flavite) = &self.flavite else {
             return;
         };
@@ -653,6 +759,333 @@ impl App {
             }
             Err(error) => {
                 self.catalog_error = Some(error.to_string());
+            }
+        }
+        // One candidate snapshot feeds the picker, Notes view, dialogs, and
+        // open-in-tab flows (W10 de-duplication).
+        self.note_candidates = crate::picker::NoteCandidates::from_catalog(&self.catalog);
+    }
+
+    /// The unified note-candidate snapshot (W10 matcher service).
+    #[must_use]
+    pub fn note_candidates(&self) -> &crate::picker::NoteCandidates {
+        &self.note_candidates
+    }
+
+    /// The Notes view filter text for one tab.
+    #[must_use]
+    pub fn notes_filter(&self, tab: TabId) -> &str {
+        self.notes_filters
+            .get(&tab)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    /// The focused note tab, when the focused view is a note.
+    #[must_use]
+    pub fn focused_note_tab(&self) -> Option<TabId> {
+        let tab = self.workspace.focused_tab();
+        matches!(
+            self.workspace
+                .tab(&tab)
+                .map(flavite_workspace::ViewSession::kind),
+            Some(flavite_workspace::ViewKind::Note(_))
+        )
+        .then_some(tab)
+    }
+
+    /// Request focus for a just-opened Search view's input, once per tab.
+    /// The pane mounts one frame after the open commit, so the focus issued
+    /// at dispatch time lands before the widget exists; the pump retries.
+    fn focus_fresh_search_input(&mut self) -> Option<iced::Task<Message>> {
+        let tab = self.focused_group().and_then(|group| {
+            self.workspace
+                .group(&group)
+                .map(|g| g.active())
+                .filter(|active| {
+                    matches!(
+                        self.workspace
+                            .tab(active)
+                            .map(flavite_workspace::ViewSession::kind),
+                        Some(flavite_workspace::ViewKind::Search)
+                    )
+                })
+        })?;
+        if self.search_focus_tried.contains(&tab) || self.search.tabs.contains_key(&tab) {
+            return None;
+        }
+        self.search_focus_tried.insert(tab);
+        let id = iced::widget::Id::from(format!(
+            "{}{}",
+            crate::views::search::SEARCH_INPUT_ID_PREFIX,
+            tab.raw()
+        ));
+        Some(iced::widget::operation::focus(id))
+    }
+
+    /// The locator of one note tab.
+    #[must_use]
+    pub fn note_locator(&self, tab: TabId) -> Option<NoteLocator> {
+        match self
+            .workspace
+            .tab(&tab)
+            .map(flavite_workspace::ViewSession::kind)
+        {
+            Some(flavite_workspace::ViewKind::Note(note)) => Some(note.locator().clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether a history restore is currently possible for this note: the
+    /// note must be open with a live buffer (restore never opens notes).
+    #[must_use]
+    pub fn can_restore_history(&self, locator: &NoteLocator) -> bool {
+        let Some(flavite) = &self.flavite else {
+            return false;
+        };
+        flavite.is_note_open(&locator.to_path(&self.root))
+    }
+
+    /// Menu-initiated selection/caret command (W10 Selection menu): resolve
+    /// `usize::MAX` against the live buffer and route through the same
+    /// acknowledged interaction path as native selection actions.
+    fn selection_command(&mut self, tab: TabId, anchor: usize, head: usize) {
+        let Some(view) = self.note_editor_view(tab) else {
+            return;
+        };
+        let incarnation = self.notes.incarnation(tab).unwrap_or(0);
+        let resolve = |at: usize| {
+            if at == usize::MAX {
+                view.text.len()
+            } else {
+                at
+            }
+        };
+        self.accessible_selection(
+            tab,
+            incarnation,
+            view.revision,
+            resolve(anchor),
+            resolve(head),
+        );
+    }
+
+    /// One step of per-view back/forward navigation (W10). The replacement
+    /// is a typed reducer transaction; the nav host records the move only
+    /// when the transaction committed.
+    fn navigate_history(&mut self, forward: bool) {
+        let Some(tab) = self.focused_note_tab() else {
+            self.status = "Back/forward applies to a note tab".into();
+            return;
+        };
+        let anchor = self
+            .workspace
+            .tab(&tab)
+            .map(|session| session.interaction().viewport_anchor);
+        let Some(entry) = (if forward {
+            self.nav.go_forward(tab, anchor)
+        } else {
+            self.nav.go_back(tab, anchor)
+        }) else {
+            return;
+        };
+        let target = entry.locator.clone();
+        let committed = self.dispatch_layout_result(|revision| LayoutAction::NavigateTab {
+            expected_revision: revision,
+            tab,
+            locator: target,
+        });
+        // go_back/go_forward already maintain the stacks; only a fresh
+        // in-tab replacement (open-in-tab) records a new history branch.
+        if committed {
+            self.status = if forward {
+                "Forward".into()
+            } else {
+                "Back".into()
+            };
+        }
+    }
+
+    /// Commit the active dialog (W10). Creation and rename run through the
+    /// core commands; nothing here touches the filesystem directly.
+    fn submit_dialog(&mut self) {
+        let Some(dialog) = self.dialog.clone() else {
+            return;
+        };
+        match dialog {
+            crate::host::dialogs::Dialog::NewNote { path } => {
+                let trimmed = path.trim().to_owned();
+                if NoteLocator::from_components(trimmed.split('/')).is_err() {
+                    return;
+                }
+                if self
+                    .note_candidates()
+                    .all()
+                    .iter()
+                    .any(|candidate| candidate.path().to_string() == trimmed)
+                {
+                    self.status = "Create refused: a note already exists at this path".into();
+                    return;
+                }
+                let Some(flavite) = &self.flavite else {
+                    return;
+                };
+                let full = self.root.join(&trimmed);
+                let request_id = flavite.command_registry().next_request_id();
+                let invocation = Invocation::new(
+                    request_id,
+                    "note.create",
+                    serde_json::json!(full),
+                    Origin::Gui,
+                );
+                match flavite.execute(invocation) {
+                    ExecutionResult::Pending { request_id } => {
+                        self.operations.accept(request_id, "note.create");
+                        self.status = format!("Creating {}…", trimmed);
+                        self.dialog = None;
+                    }
+                    ExecutionResult::Local(LocalResult::Error(error)) => {
+                        self.status = format!("Could not create the note: {}", error.message);
+                    }
+                    ExecutionResult::Rejected(rejected) => {
+                        self.status = format!("Create rejected: {:?}", rejected.reason);
+                    }
+                    _ => {
+                        self.status = "Create is unavailable right now".into();
+                    }
+                }
+            }
+            crate::host::dialogs::Dialog::Rename { from, to, tier } => {
+                let trimmed = to.trim().to_owned();
+                let Ok(target) = NoteLocator::from_components(trimmed.split('/')) else {
+                    return;
+                };
+                // Keyboard submit bypasses the dialog button guard; the same
+                // validation runs here so a collision never dispatches.
+                let collides = target == from
+                    || self
+                        .note_candidates()
+                        .all()
+                        .iter()
+                        .any(|candidate| candidate.path().to_string() == trimmed);
+                if collides {
+                    self.status = "Rename refused: the destination already exists".into();
+                    return;
+                }
+                let Some(flavite) = &self.flavite else {
+                    return;
+                };
+                let strategy = match self.settings.rename_behavior {
+                    crate::settings::RenameBehavior::Rewrite => "rewrite",
+                    crate::settings::RenameBehavior::Alias => "alias",
+                    crate::settings::RenameBehavior::None => "none",
+                };
+                let request_id = flavite.command_registry().next_request_id();
+                let invocation = Invocation::new(
+                    request_id,
+                    "note.rename",
+                    serde_json::json!({
+                        "from": self.root.join(from.components().join("/")),
+                        "to": self.root.join(target.components().join("/")),
+                        "strategy": strategy,
+                    }),
+                    Origin::Gui,
+                );
+                let _ = tier;
+                match flavite.execute(invocation) {
+                    ExecutionResult::Pending { request_id } => {
+                        self.operations.accept(request_id, "note.rename");
+                        self.status = "Renaming with inbound-link rewrite…".into();
+                        self.dialog = None;
+                    }
+                    ExecutionResult::Local(LocalResult::Error(error)) => {
+                        self.status = format!("Rename failed: {}", error.message);
+                    }
+                    _ => {
+                        self.status = "Rename is unavailable right now".into();
+                    }
+                }
+            }
+            crate::host::dialogs::Dialog::About => {
+                self.dialog = None;
+            }
+        }
+    }
+
+    /// Open a note picked through the native file dialog, when it lives in
+    /// this vault. Foreign paths are refused honestly (never guessed).
+    /// Open a note picked through the native file dialog, when it lives in
+    /// this vault. Foreign paths are refused honestly (never guessed).
+    pub fn open_picked_note(&mut self, picked: Option<std::path::PathBuf>) {
+        let Some(path) = picked else {
+            return;
+        };
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            self.status = "That file is outside this vault".into();
+            return;
+        };
+        match NoteLocator::from_relative(relative) {
+            Ok(locator) => self.request_open(locator, None),
+            Err(error) => self.status = format!("Cannot open that file: {error}"),
+        }
+    }
+
+    /// Restore one local-history snapshot into the open note buffer (W10):
+    /// one guarded, undoable Session edit; disk is written only on save.
+    fn restore_history_snapshot(&mut self, tab: TabId, hash: &str) {
+        let Some(locator) = self
+            .workspace
+            .tab(&tab)
+            .and_then(|session| match session.kind() {
+                flavite_workspace::ViewKind::History(locator) => Some(locator.clone()),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let Some(flavite) = &self.flavite else {
+            return;
+        };
+        // The API owns open-buffer lookup (open_source_view), keyed by the
+        // vault-relative path: the restore targets the exact live buffer and
+        // revision it reports.
+        let relative = locator.to_path(std::path::Path::new(""));
+        let Some(view) = flavite.open_source_view(&relative) else {
+            self.status = "Open the note before restoring a snapshot".into();
+            return;
+        };
+        let request_id = flavite.command_registry().next_request_id();
+        let invocation = Invocation::new(
+            request_id,
+            "note.restore_history",
+            serde_json::json!({
+                "path": self.root.join(&relative),
+                "buffer_id": view.buffer_id,
+                "revision": view.revision,
+                "hash": hash,
+            }),
+            Origin::Gui,
+        );
+        match flavite.execute(invocation) {
+            ExecutionResult::Local(LocalResult::Success(success)) => {
+                let revision = success
+                    .data
+                    .get("revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                self.status = format!("Snapshot restored at revision {revision} (undoable)");
+            }
+            ExecutionResult::Local(LocalResult::Error(error)) => {
+                self.status = format!("Restore failed: {}", error.message);
+            }
+            ExecutionResult::Rejected(rejected) => {
+                self.status = format!("Restore rejected: {:?}", rejected.reason);
+            }
+            ExecutionResult::ActionRequired { code, .. } => {
+                self.status = format!("Restore needs attention: {code}");
+            }
+            _ => {
+                self.status = "Restore is unavailable right now".into();
             }
         }
     }
@@ -852,18 +1285,25 @@ impl App {
 
     /// Build and reduce one layout transaction at the current revision.
     pub fn dispatch_layout(&mut self, build: impl FnOnce(u64) -> LayoutAction) {
+        self.dispatch_layout_result(build);
+    }
+
+    /// [`Self::dispatch_layout`] reporting whether the transaction committed.
+    pub fn dispatch_layout_result(&mut self, build: impl FnOnce(u64) -> LayoutAction) -> bool {
         if self.has_composing_view() {
             self.status = "Finish or cancel text composition before changing the layout".into();
-            return;
+            return false;
         }
         let revision = self.workspace.revision();
         let action = build(revision);
         if !self.layout_fits(&action) {
             self.status = "There is not enough space for that split".into();
-            return;
+            return false;
         }
         let outcome = flavite_workspace::reduce(&self.workspace, action);
+        let committed = matches!(outcome, Outcome::Committed(_));
         self.commit(outcome);
+        committed
     }
 
     fn has_composing_view(&self) -> bool {
@@ -920,8 +1360,19 @@ impl App {
                     if let flavite_workspace::ViewKind::Graph(view) = kind {
                         self.graph.attach(*tab, view);
                     }
+                    if let flavite_workspace::ViewKind::History(locator) = kind {
+                        crate::views::history::load(self, *tab, locator);
+                    }
                     if let flavite_workspace::ViewKind::Note(note) = kind {
                         let locator = note.locator().clone();
+                        self.nav.seed(*tab, locator.clone());
+                        // In-place navigation (W10 NavigateTab) re-attaches a
+                        // tab that already holds a lease for the replaced
+                        // note; release the old lease before reserving.
+                        if self.notes.locator_of(*tab).is_some() {
+                            self.input_chains.remove(tab);
+                            self.notes.detach(*tab);
+                        }
                         let (tab, incarnation, decision) = self.notes.attach(*tab, locator.clone());
                         if let Err(error) =
                             self.workspace.install_view_incarnation(tab, incarnation)
@@ -951,6 +1402,11 @@ impl App {
                     self.notes.detach(*tab);
                     self.contexts.detach(*tab);
                     self.graph.detach(*tab);
+                    self.search.detach(*tab);
+                    self.search_focus_tried.remove(tab);
+                    self.history.detach(*tab);
+                    self.nav.detach(*tab);
+                    self.notes_filters.remove(tab);
                     if let Some(api) = self.flavite.as_ref() {
                         api.graph_release_scope(tab.raw());
                     }
@@ -1144,12 +1600,16 @@ impl App {
                     return;
                 }
                 let Some(target) = resolution.note else {
-                    self.status = if resolution.is_unresolved && navigation.create_if_unresolved {
-                        "Edit link: no note with this name exists yet; create it from the Notes view"
-                            .into()
+                    if resolution.is_unresolved && navigation.create_if_unresolved {
+                        // Explicit creation on unresolved activation (W10):
+                        // the dialog pre-fills the canonical path and the
+                        // user confirms; nothing is created implicitly.
+                        self.dialog = Some(crate::host::dialogs::offer_create_for_link(
+                            &navigation.target,
+                        ));
                     } else {
-                        "Edit link: the target is not an indexed note".into()
-                    };
+                        self.status = "Edit link: the target is not an indexed note".into();
+                    }
                     return;
                 };
                 // The resolver already proved the target entity; decode its
@@ -1478,6 +1938,9 @@ impl App {
                 anchor,
                 head,
             } => self.accessible_selection(tab, incarnation, revision, anchor, head),
+            Message::SelectionCommand { tab, anchor, head } => {
+                self.selection_command(tab, anchor, head);
+            }
             Message::Keyboard(event) => {
                 if let Some(message) = host_commands::keyboard_message(self, event) {
                     return self.update(message);
@@ -1504,6 +1967,9 @@ impl App {
             Message::Pump => {
                 self.pump();
                 self.refresh_semantics();
+                if let Some(task) = self.focus_fresh_search_input() {
+                    return task;
+                }
                 return crate::host::reading::scroll_pending(self);
             }
             Message::Layout(action) => {
@@ -1560,6 +2026,16 @@ impl App {
                             expected_revision: revision,
                             view: flavite_workspace::ContextViewKind::Backlinks,
                             binding: flavite_workspace::ContextBinding::FollowDocument,
+                            group,
+                        },
+                        flavite_workspace::ViewKind::Search => LayoutAction::OpenSearch {
+                            expected_revision: revision,
+                            group,
+                        },
+                        // History opens for a specific note through the
+                        // note tab's group actions, never generically.
+                        flavite_workspace::ViewKind::History(_) => LayoutAction::OpenEmpty {
+                            expected_revision: revision,
                             group,
                         },
                     });
@@ -1692,6 +2168,7 @@ impl App {
                     open: true,
                     query: String::new(),
                     selected: 0,
+                    replace_tab: None,
                 };
                 if self.catalog.is_empty() {
                     self.load_catalog();
@@ -1718,6 +2195,158 @@ impl App {
             Message::RunHostCommand(id) => return host_commands::dispatch(self, id),
             Message::RunCoreCommand(id) => self.run_core_command(id),
             Message::RefreshCatalog => self.load_catalog(),
+            Message::TopMenu(menu) => {
+                // The standard menu bar never interrupts composition (D-03).
+                if !self.has_composition() {
+                    let group = self
+                        .focused_group()
+                        .or_else(|| self.workspace.group_order().first().copied());
+                    if let Some(group) = group {
+                        self.strip_menu = Some((group, menu));
+                        self.menu_selected = 0;
+                    }
+                }
+            }
+            // ---- W10: Notes view ----
+            Message::NotesFilter { tab, value } => {
+                if self.workspace.tab(&tab).is_some() {
+                    self.notes_filters.insert(tab, value);
+                } else {
+                    self.notes_filters.remove(&tab);
+                }
+            }
+            // ---- W10: Search view ----
+            Message::SearchQuery { tab, value } => self.search.edited(tab, value),
+            Message::SearchSubmitNow { tab } => {
+                self.search.submit_now(tab);
+            }
+            Message::SearchLoadMore { tab } => self.search.load_more(tab),
+            // ---- W10: History view ----
+            Message::HistoryRefresh { tab } => {
+                if let Some(locator) =
+                    self.workspace
+                        .tab(&tab)
+                        .and_then(|session| match session.kind() {
+                            flavite_workspace::ViewKind::History(locator) => Some(locator.clone()),
+                            _ => None,
+                        })
+                {
+                    crate::views::history::load(self, tab, &locator);
+                }
+            }
+            Message::HistoryRestore { tab, hash } => {
+                self.restore_history_snapshot(tab, &hash);
+            }
+            // ---- W10: navigation ----
+            Message::NavigateBack => self.navigate_history(false),
+            Message::NavigateForward => self.navigate_history(true),
+            // ---- W10: dialogs ----
+            Message::NewNoteDialog => {
+                if !self.has_composition() {
+                    self.dialog = Some(crate::host::dialogs::Dialog::NewNote {
+                        path: String::new(),
+                    });
+                    return iced::widget::operation::focus(crate::host::dialogs::NEW_NOTE_INPUT_ID);
+                }
+            }
+            Message::RenameDialog => {
+                if !self.has_composition()
+                    && let Some(tab) = self.focused_note_tab()
+                    && let Some(from) = self.note_locator(tab)
+                {
+                    self.dialog = Some(crate::host::dialogs::Dialog::Rename {
+                        from,
+                        to: String::new(),
+                        tier: None,
+                    });
+                    return iced::widget::operation::focus(crate::host::dialogs::RENAME_INPUT_ID);
+                }
+            }
+            Message::AboutDialog => {
+                self.dialog = Some(crate::host::dialogs::Dialog::About);
+            }
+            Message::OpenNoteDialog => {
+                if self.has_composition() {
+                    return iced::Task::none();
+                }
+                return crate::host::dialogs::pick_note_file();
+            }
+            Message::DialogInput(value) => match &mut self.dialog {
+                Some(crate::host::dialogs::Dialog::NewNote { path }) => {
+                    *path = value;
+                }
+                Some(crate::host::dialogs::Dialog::Rename { to, .. }) => {
+                    *to = value;
+                }
+                _ => {}
+            },
+            Message::DialogSubmit => {
+                self.submit_dialog();
+            }
+            Message::DialogCancel => self.dialog = None,
+            Message::NotePicked(picked) => {
+                self.open_picked_note(picked);
+            }
+            // ---- W10: start screen ----
+            Message::VaultDialog => {
+                return crate::host::dialogs::pick_vault_folder();
+            }
+            Message::VaultPicked(picked) => {
+                if let Some(root) = picked {
+                    return self.update(Message::StartOpenVault(root));
+                }
+            }
+            Message::VaultPathInput(value) => {
+                self.start.path = value;
+                self.start.error = None;
+            }
+            Message::StartOpenVault(root) => {
+                if self.flavite.is_some() {
+                    return iced::Task::none();
+                }
+                if !root.is_dir() {
+                    self.start.error =
+                        Some("That folder does not exist. Create it first, then open it.".into());
+                    return iced::Task::none();
+                }
+                match Flavite::open_root(root, VaultConfig::default()) {
+                    Ok(flavite) => {
+                        self.start = crate::host::dialogs::StartState::default();
+                        self.attach_vault(flavite);
+                    }
+                    Err(error) => {
+                        self.start.error = Some(format!("Could not open that vault: {error}"));
+                    }
+                }
+            }
+            Message::ReviewRenameNotice(id) => {
+                // Find the notice's from/to pair and open the rename dialog.
+                let suggestion = self.notices.iter().find_map(|notice| {
+                    if notice.id == id
+                        && let flavite_api::Event::RenameSuggested { from, to, tier, .. } =
+                            &notice.event
+                    {
+                        Some((from.clone(), to.clone(), tier.clone()))
+                    } else {
+                        None
+                    }
+                });
+                if let Some((from, to, tier)) = suggestion
+                    && let Ok(from_locator) = NoteLocator::from_relative(&from)
+                {
+                    self.dialog = Some(crate::host::dialogs::Dialog::Rename {
+                        from: from_locator,
+                        to: to.display().to_string(),
+                        tier: Some(tier.as_str().to_owned()),
+                    });
+                    if let Some(index) = self.notices.iter().position(|notice| notice.id == id) {
+                        self.notices.remove(index);
+                        if let Some(flavite) = &self.flavite {
+                            flavite.acknowledge_notice(id);
+                        }
+                    }
+                }
+            }
             Message::AcknowledgeNotice(id) => {
                 if let Some(index) = self.notices.iter().position(|notice| notice.id == id) {
                     self.notices.remove(index);
@@ -1922,6 +2551,22 @@ impl App {
             (events, completions)
         };
         let (_events, completions) = drained;
+        // W10: admit debounced search submissions whose window elapsed.
+        let search_incarnations: BTreeMap<TabId, u64> = self
+            .search
+            .tabs
+            .keys()
+            .copied()
+            .filter_map(|tab| {
+                let incarnation = self
+                    .workspace
+                    .tab(&tab)
+                    .map(|session| session.interaction().incarnation)?;
+                Some((tab, incarnation))
+            })
+            .collect();
+        let search_api = self.flavite.as_ref();
+        self.search.admit_due(search_api, &search_incarnations);
         let query_outcomes = self
             .flavite
             .as_ref()
@@ -1933,6 +2578,7 @@ impl App {
             for outcome in query_outcomes {
                 if crate::host::reading::observe(self, &outcome)
                     || crate::host::occurrences::observe(self, &outcome)
+                    || self.search.observe(&outcome)
                 {
                     continue;
                 }
@@ -1982,12 +2628,70 @@ impl App {
     /// Route one completion to its document flight, independent of which
     /// tab still exists (TD-09). Outcomes without a live flight stay typed
     /// in the ledger and are presented with their real result.
-    fn route_completion(&mut self, completion: flavite_api::OperationCompletion) {
+    /// Route one terminal completion to its owning surface. Public so the
+    /// visual/integration harnesses can drive correlated completions
+    /// directly; production callers go through the pump.
+    pub fn route_completion(&mut self, completion: flavite_api::OperationCompletion) {
         if crate::host::occurrences::completion(self, &completion) {
             return;
         }
         if self.linking.handles(completion.request_id) {
             self.route_link_completion(completion);
+            return;
+        }
+        let success_data = match &completion.result {
+            ExecutionResult::Local(LocalResult::Success(success)) => Some(&success.data),
+            _ => None,
+        };
+        let is_create = self.operations.label_of(completion.request_id) == Some("note.create")
+            || success_data.is_some_and(|data| {
+                data.get("path").is_some()
+                    && data.get("buffer_id").is_some()
+                    && data.get("hash").is_none()
+            });
+        let is_rename = self.operations.label_of(completion.request_id) == Some("note.rename")
+            || success_data.is_some_and(|data| {
+                data.get("txn_id").is_some()
+                    && data.get("from").is_some()
+                    && data.get("to").is_some()
+            });
+        if is_create
+            && let ExecutionResult::Local(LocalResult::Success(success)) = &completion.result
+            && let Some(path) = success.data.get("path").and_then(serde_json::Value::as_str)
+            && let Ok(relative) = std::path::Path::new(path).strip_prefix(&self.root)
+            && let Ok(locator) = NoteLocator::from_relative(relative)
+        {
+            self.status = format!("Created {}", locator.components().join("/"));
+            self.load_catalog();
+            self.request_open(locator, None);
+            return;
+        }
+        if is_rename
+            && let ExecutionResult::Local(LocalResult::Success(success)) = &completion.result
+            && let (Some(from), Some(to)) = (
+                success.data.get("from").and_then(serde_json::Value::as_str),
+                success.data.get("to").and_then(serde_json::Value::as_str),
+            )
+            && let (Ok(from_path), Ok(to_path)) = (
+                std::path::Path::new(from).strip_prefix(&self.root),
+                std::path::Path::new(to).strip_prefix(&self.root),
+            )
+            && let (Ok(from_locator), Ok(to_locator)) = (
+                NoteLocator::from_relative(from_path),
+                NoteLocator::from_relative(to_path),
+            )
+        {
+            self.status = format!("Renamed to {}", to_locator.components().join("/"));
+            // Every note view, history view, pinned binding, and nav entry
+            // follows the renamed identity (T0–T2 authoritative update).
+            self.dispatch_layout(|revision| LayoutAction::RelocateNote {
+                expected_revision: revision,
+                from: from_locator.clone(),
+                to: to_locator.clone(),
+            });
+            self.nav.relocate(&from_locator, &to_locator);
+            self.load_catalog();
+            self.refresh_semantics();
             return;
         }
         let flight = self.notes.finish_request(completion.request_id);
@@ -2334,6 +3038,17 @@ impl App {
                 serde_json::json!(state.locator.to_path(&self.root))
             }
             "vault.reconcile" => serde_json::json!({ "scope": "full", "mode": "fast" }),
+            "buffer.undo" | "buffer.redo" => {
+                let focused = self.workspace.focused_tab();
+                let Some(view) = self.note_editor_view(focused) else {
+                    self.status = format!("{command_id} requires an open note");
+                    return;
+                };
+                serde_json::json!({
+                    "buffer_id": view.buffer_id,
+                    "revision": view.revision,
+                })
+            }
             _ => serde_json::Value::Null,
         };
         let request_id = flavite.command_registry().next_request_id();
@@ -2344,6 +3059,8 @@ impl App {
                     "note.save" => "Note saved".into(),
                     "note.close" => "Note closed".into(),
                     "vault.reconcile" => "Vault refreshed".into(),
+                    "buffer.undo" => "Undo".into(),
+                    "buffer.redo" => "Redo".into(),
                     _ => format!("{command_id} completed"),
                 };
             }
@@ -2399,11 +3116,16 @@ impl App {
     /// Fuzzy-matched catalog entries for the picker.
     #[must_use]
     pub fn picker_matches(&self) -> Vec<NoteCatalogEntry> {
-        picker_matches(self.catalog.clone(), &self.picker.query)
+        self.note_candidates
+            .matches(&self.picker.query)
+            .into_iter()
+            .map(|candidate| candidate.entry)
+            .collect()
     }
 
     fn run_picker_selection(&mut self, index: usize) -> Task<Message> {
         let matches = self.picker_matches();
+        let replace = self.picker.replace_tab.take();
         self.picker = Picker::default();
         let Some(entry) = matches.get(index.min(matches.len().saturating_sub(1))) else {
             return Task::none();
@@ -2415,6 +3137,30 @@ impl App {
             );
             return Task::none();
         };
+        if let Some(tab) = replace {
+            // Open in this tab (W10): same TabId/mode, old note to Back.
+            if let Some(previous) = self.note_locator(tab) {
+                if previous == locator {
+                    self.status = "This tab already shows that note".into();
+                    return Task::none();
+                }
+                let anchor = self
+                    .workspace
+                    .tab(&tab)
+                    .map(|session| session.interaction().viewport_anchor);
+                let previous_clone = previous.clone();
+                let committed = self.dispatch_layout_result(|revision| LayoutAction::NavigateTab {
+                    expected_revision: revision,
+                    tab,
+                    locator: locator.clone(),
+                });
+                if committed {
+                    self.nav
+                        .record_replacement(tab, previous_clone, anchor, locator);
+                }
+                return Task::none();
+            }
+        }
         self.request_open(locator, None);
         Task::none()
     }
@@ -2447,37 +3193,6 @@ fn ratio_to_ppm(ratio: f32) -> u32 {
     ) as u32
 }
 
-/// Fuzzy-match catalog entries against title and path (§4.7 in-memory).
-#[must_use]
-pub fn picker_matches(entries: Vec<NoteCatalogEntry>, query: &str) -> Vec<NoteCatalogEntry> {
-    let needle = query.trim();
-    if needle.is_empty() {
-        return entries;
-    }
-    use nucleo::pattern::{CaseMatching, Normalization, Pattern};
-    use nucleo::{Config, Matcher};
-    static MATCHER: std::sync::LazyLock<std::sync::Mutex<Matcher>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(Matcher::new(Config::DEFAULT)));
-    let texts: Vec<String> = entries
-        .iter()
-        .map(|entry| format!("{} {}", entry.title, entry.path.display()))
-        .collect();
-    let pattern = Pattern::parse(needle, CaseMatching::Smart, Normalization::Smart);
-    let mut matcher = MATCHER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    pattern
-        .match_list(texts.iter().map(String::as_str), &mut matcher)
-        .into_iter()
-        .filter_map(|(matched, _)| {
-            texts
-                .iter()
-                .position(|candidate| *candidate == matched)
-                .map(|index| entries[index].clone())
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2499,6 +3214,14 @@ mod tests {
                 host.backend = crate::host::graph::GraphBackend::from_env();
                 host
             },
+            search: crate::views::search::SearchHost::default(),
+            history: crate::views::history::HistoryHost::default(),
+            nav: crate::host::navigation::NavHost::default(),
+            dialog: None,
+            start: crate::host::dialogs::StartState::default(),
+            notes_filters: BTreeMap::new(),
+            search_focus_tried: BTreeSet::new(),
+            note_candidates: crate::picker::NoteCandidates::default(),
             persistence: crate::host::persistence::PersistenceHost::default(),
             named_layouts: Vec::new(),
             picker: Picker::default(),
@@ -2598,9 +3321,9 @@ mod tests {
                 title: "Archive".into(),
             },
         ];
-        let matched = picker_matches(entries, "feedback");
+        let matched = crate::picker::NoteCandidates::from_catalog(&entries).matches("feedback");
         assert_eq!(matched.len(), 1);
-        assert_eq!(matched[0].title, "Feedback loops");
+        assert_eq!(matched[0].title(), "Feedback loops");
     }
 
     #[test]

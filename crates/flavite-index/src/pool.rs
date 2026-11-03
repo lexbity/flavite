@@ -59,6 +59,73 @@ pub struct IndexActor {
     needs_reparse: bool,
 }
 
+/// Build one bounded excerpt around the first occurrence of any term.
+///
+/// Matching is case-insensitive on the saved body; the excerpt is
+/// character-bounded (not byte-bounded) so multi-byte text is never split.
+#[must_use]
+fn build_excerpt(body: Option<&str>, terms: &[String]) -> String {
+    let Some(body) = body.filter(|body| !body.is_empty()) else {
+        return String::new();
+    };
+    let Some(anchor) = terms
+        .iter()
+        .filter_map(|term| {
+            if term.is_empty() {
+                return None;
+            }
+            find_case_insensitive(body, term)
+        })
+        .min()
+    else {
+        // No matched term found in the cached body (tokenization drift):
+        // show the document head instead of an empty excerpt.
+        return body.chars().take(EXCERPT_MAX_CHARS).collect();
+    };
+    let anchor = anchor.min(body.len());
+    // Start at most one third of the excerpt budget before the match, on a
+    // char boundary, so the excerpt opens with context.
+    let before_anchor = &body[..anchor];
+    let context = EXCERPT_MAX_CHARS / 3;
+    let total = before_anchor.chars().count();
+    let skip = total.saturating_sub(context);
+    let start = before_anchor
+        .char_indices()
+        .nth(skip)
+        .map_or(0, |(index, _)| index);
+    let excerpt = &body[start..];
+    excerpt.chars().take(EXCERPT_MAX_CHARS).collect()
+}
+
+/// Byte offset of the first case-insensitive occurrence of `needle`.
+///
+/// Walks char boundaries so multi-byte text is never split mid-char; the
+/// fold comparison is per-char, which stays correct for ASCII terms and
+/// one-char-per-char-folded Unicode alike.
+fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    let needle_chars: Vec<char> = needle.to_lowercase().chars().collect();
+    if needle_chars.is_empty() {
+        return None;
+    }
+    let haystack_chars: Vec<(usize, char)> = haystack.char_indices().collect();
+    for start in 0..haystack_chars.len() {
+        let mut matched = true;
+        for (offset, expected) in needle_chars.iter().enumerate() {
+            match haystack_chars.get(start + offset) {
+                Some((_, actual)) if actual.to_lowercase().eq(expected.to_lowercase()) => {}
+                _ => {
+                    matched = false;
+                    break;
+                }
+            }
+        }
+        if matched {
+            return Some(haystack_chars[start].0);
+        }
+    }
+    None
+}
+
 /// Text-search results paired with the structural index version used to fetch them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchPage {
@@ -70,8 +137,23 @@ pub struct SearchPage {
     pub items: Vec<SearchNote>,
 }
 
-/// One matching note from a text or hybrid query.
-pub type SearchNote = (i64, String, String);
+/// One matching note from a text or hybrid query (W10: with a bounded
+/// saved-content excerpt around the first matched term).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchNote {
+    /// Indexed note ID (valid within the returned epoch).
+    pub note_id: i64,
+    /// Vault-relative portable path.
+    pub path: String,
+    /// Indexed title.
+    pub title: String,
+    /// Bounded saved-content excerpt, or empty for structural-only results.
+    /// Dirty buffer text is never included (D-08).
+    pub excerpt: String,
+}
+
+/// Excerpt length budget per result (§7.5-style bounded display text).
+const EXCERPT_MAX_CHARS: usize = 160;
 
 /// One catalog entry: the portable path string, the raw native path bytes
 /// (authoritative identity), and the indexed title.
@@ -1669,7 +1751,11 @@ impl IndexActor {
         }
         hits.truncate(limit.saturating_add(1));
         hits.truncate(limit);
-        let rows = self.search_note_rows(hits)?;
+        let terms = text
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let rows = self.search_note_rows(hits, &terms)?;
         let (epoch, generation) = self.version()?;
         Ok(SearchPage {
             epoch,
@@ -1697,7 +1783,7 @@ impl IndexActor {
             .take(limit)
             .map(|note| note.note_id)
             .collect();
-        let rows = self.search_note_rows(note_ids)?;
+        let rows = self.search_note_rows(note_ids, &[])?;
         Ok(SearchPage {
             epoch: page.epoch,
             generation: page.generation,
@@ -1705,23 +1791,45 @@ impl IndexActor {
         })
     }
 
-    fn search_note_rows(&self, note_ids: Vec<i64>) -> Result<Vec<(i64, String, String)>, String> {
+    /// Assemble result rows with bounded excerpts around the first matched
+    /// term. The excerpt comes from the indexed saved-body cache; unsaved
+    /// edits are deliberately absent (D-08, labeled by the UI).
+    fn search_note_rows(
+        &self,
+        note_ids: Vec<i64>,
+        terms: &[String],
+    ) -> Result<Vec<SearchNote>, String> {
         let conn = self
             .read_pool
             .get(Some(Duration::from_secs(2)))
             .map_err(|error| error.to_string())?;
         let mut rows = Vec::with_capacity(note_ids.len());
         for note_id in note_ids {
-            if let Some(row) = conn
+            let row = conn
                 .query_row(
-                    "SELECT note_id,path,title FROM notes WHERE note_id=?1",
+                    "SELECT n.note_id, n.path, n.title, d.body_text \
+                     FROM notes n LEFT JOIN search_docs d ON d.note_id = n.note_id \
+                     WHERE n.note_id=?1",
                     [note_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
                 )
                 .optional()
-                .map_err(|error| error.to_string())?
-            {
-                rows.push(row);
+                .map_err(|error| error.to_string())?;
+            if let Some((note_id, path, title, body)) = row {
+                let excerpt = build_excerpt(body.as_deref(), terms);
+                rows.push(SearchNote {
+                    note_id,
+                    path,
+                    title,
+                    excerpt,
+                });
             }
         }
         Ok(rows)
@@ -2135,7 +2243,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits.items.len(), 1);
-        assert_eq!(hits.items[0].1, "notes/49.md");
+        assert_eq!(hits.items[0].path, "notes/49.md");
         assert_eq!(index.search_generations().unwrap(), (50, 50));
     }
 
@@ -2474,7 +2582,7 @@ mod tests {
                     .unwrap()
                     .items
                     .into_iter()
-                    .map(|(_, path, title)| (path, title))
+                    .map(|row| (row.path, row.title))
                     .collect::<Vec<_>>();
                 docs.sort();
                 docs
@@ -2515,9 +2623,9 @@ mod tests {
             .search_notes_with_filter_limit(&query, 10, 10)
             .unwrap();
         assert_eq!(filtered.items.len(), 1);
-        assert_eq!(filtered.items[0].1, "a.md");
+        assert_eq!(filtered.items[0].path, "a.md");
         let intersected = index.search_notes_with_filter_limit(&query, 10, 0).unwrap();
         assert_eq!(intersected.items.len(), 1);
-        assert_eq!(intersected.items[0].1, "a.md");
+        assert_eq!(intersected.items[0].path, "a.md");
     }
 }

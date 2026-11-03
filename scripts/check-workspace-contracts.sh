@@ -190,6 +190,18 @@ case "$profile" in
         assert_absent 'dangerously|execute_script|raw_html|reqwest|ureq|std::fs' "$root/crates/flavite-ui/src/read"
         assert_absent 'serde_yaml::to_string|yaml.*serialize_document' "$root/crates/flavite-api/src/properties.rs" "$root/crates/flavite-vault/src/properties.rs"
         ;;
+    W10)
+        bash "$0" W09 "$root"
+        for file in crates/flavite-ui/src/views/search.rs crates/flavite-ui/src/views/notes.rs crates/flavite-ui/src/views/history.rs crates/flavite-ui/src/host/navigation.rs crates/flavite-ui/src/host/dialogs.rs crates/flavite-ui/src/picker.rs crates/flavite-app/src/main.rs crates/flavite-api/tests/workspace_search.rs crates/flavite-ui/tests/knowledge_workflow.rs crates/flavite-ui/tests/navigation_identity.rs; do
+            assert_nonempty "$root/$file"
+        done
+        assert_absent 'demo\.md|LATTICE|std::fs|rusqlite' \
+            "$root/crates/flavite-ui/src/host/navigation.rs" \
+            "$root/crates/flavite-ui/src/views/search.rs" \
+            "$root/crates/flavite-ui/src/views/notes.rs"
+        assert_absent 'fn resolve_by_stem|fn guess_target' "$root/crates/flavite-ui/src"
+        assert_absent 'std::fs|rusqlite|flavite_index' "$root/crates/flavite-ui/src/picker.rs"
+        ;;
     FINAL)
         # Run all completed profiles additively.
         bash "$0" W09 "$root"

@@ -7,7 +7,6 @@
 use crate::app::{App, Message};
 use crate::style;
 use crate::workspace::{bounds, tab_strip};
-use flavite_api::queries::NoteCatalogEntry;
 use flavite_workspace::{GroupId, LayoutAction, NoteLoad, TabId, ViewKind};
 use iced::widget::{
     Space, button, column, container, opaque, pane_grid, row, rule, scrollable, stack, text,
@@ -23,6 +22,11 @@ pub const PICKER_INPUT_ID: &str = "picker-query-input";
 /// Draw the full shell: chrome, workspace region, status bar, overlays.
 #[must_use]
 pub fn view(app: &App) -> Element<'_, Message> {
+    // No vault yet: the start screen owns the window (FR-22, W10). It
+    // offers real open/create actions; no demo content ever appears.
+    if app.flavite.is_none() {
+        return crate::host::dialogs::start_view(app);
+    }
     let shell = shell(app);
     if app.strip_menu.is_some() && !app.picker.open && !app.palette_open {
         return menu_overlay(app, shell);
@@ -31,6 +35,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Some(picker_card(app))
     } else if app.palette_open {
         Some(palette_card(app))
+    } else if app.dialog.is_some() {
+        Some(crate::host::dialogs::view(app))
     } else {
         None
     };
@@ -41,8 +47,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .style(style::backdrop)
         .on_press(if app.palette_open {
             Message::PaletteClose
-        } else {
+        } else if app.picker.open {
             Message::PickerClose
+        } else {
+            Message::DialogCancel
         });
     stack![
         shell,
@@ -101,6 +109,10 @@ fn top_bar(app: &App) -> Element<'_, Message> {
                 .style(style::ghost())
                 .on_press(Message::AppMenu),
             text(vault_name).size(style::TEXT_SM).style(style::dim_text),
+            Space::new()
+                .width(Length::Fixed(8.0))
+                .height(Length::Fixed(0.0)),
+            menu_bar(app),
             Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
             button(text("Quick switch").size(style::TEXT_SM))
                 .padding(tab_strip::chip_padding())
@@ -122,6 +134,44 @@ fn top_bar(app: &App) -> Element<'_, Message> {
         right: style::SPACING_LG,
     })
     .into()
+}
+
+/// The standard sorted menu bar (W10): every entry resolves through the
+/// shared host-command catalog availability, so menu, palette, keyboard,
+/// and accessibility surfaces cannot drift (D-16).
+fn menu_bar(app: &App) -> Element<'_, Message> {
+    const MENUS: [(&str, crate::workspace::StripMenu); 8] = [
+        ("File", crate::workspace::StripMenu::File),
+        ("Edit", crate::workspace::StripMenu::Edit),
+        ("Selection", crate::workspace::StripMenu::Selection),
+        ("View", crate::workspace::StripMenu::View),
+        ("Go", crate::workspace::StripMenu::Go),
+        ("Graph", crate::workspace::StripMenu::Graph),
+        ("Tools", crate::workspace::StripMenu::Tools),
+        ("Help", crate::workspace::StripMenu::Help),
+    ];
+    let mut bar = row![].spacing(style::SPACING_SM);
+    for (label, menu) in MENUS {
+        let active = app.strip_menu.is_some_and(|(_, open)| open == menu);
+        bar = bar.push(
+            button(text(label).size(style::TEXT_SM))
+                .padding(Padding {
+                    top: 2.0,
+                    bottom: 2.0,
+                    left: 6.0,
+                    right: 6.0,
+                })
+                .style(move |theme, status| {
+                    if active {
+                        style::list_row(true)(theme, status)
+                    } else {
+                        style::ghost()(theme, status)
+                    }
+                })
+                .on_press(Message::TopMenu(menu)),
+        );
+    }
+    bar.into()
 }
 
 fn workspace_region(app: &App) -> Element<'_, Message> {
@@ -325,7 +375,9 @@ fn active_view(app: &App, group: GroupId, tab: TabId) -> Element<'_, Message> {
             "Empty",
             "Open a note with Quick switch (Ctrl+P) or add a Notes list.",
         ),
-        ViewKind::Notes => notes_view(app, group),
+        ViewKind::Notes => crate::views::notes::view(app, tab, group),
+        ViewKind::Search => crate::views::search::view(app, tab),
+        ViewKind::History(locator) => crate::views::history::view(app, tab, locator),
         ViewKind::Note(note) => crate::views::note::view(app, tab, note.load(), note.locator()),
         ViewKind::Graph(_) => crate::views::graph::view(app, tab),
         ViewKind::Preview(_) => crate::views::preview::view(app, tab),
@@ -333,93 +385,6 @@ fn active_view(app: &App, group: GroupId, tab: TabId) -> Element<'_, Message> {
         ViewKind::Outline(_) => crate::views::outline::view(app, tab),
         ViewKind::Properties(_) => crate::views::properties::view(app, tab),
     }
-}
-
-/// The Notes list view: bounded catalog snapshot with an in-memory filter.
-fn notes_view(app: &App, group: GroupId) -> Element<'_, Message> {
-    if let Some(error) = app.catalog_error() {
-        return container(
-            column![
-                text("Notes unavailable").size(style::HEADING),
-                text(error.to_owned()).style(style::dim_text),
-                button(text("Retry"))
-                    .padding(tab_strip::chip_padding())
-                    .style(style::action())
-                    .on_press(Message::RefreshCatalog),
-            ]
-            .spacing(style::SPACING_SM),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(style::SPACING_LG)
-        .style(style::content)
-        .into();
-    }
-    let entries = app.catalog();
-    let total = entries.len();
-    let mut list = column![].spacing(2);
-    for entry in entries.iter().take(500) {
-        list = list.push(note_row(entry, group));
-    }
-    container(
-        column![
-            row![
-                text(format!("{total} notes")).size(style::TEXT_LG),
-                Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
-                button(text("Refresh"))
-                    .padding(tab_strip::chip_padding())
-                    .style(style::ghost())
-                    .on_press(Message::RefreshCatalog),
-            ]
-            .spacing(style::SPACING)
-            .align_y(alignment::Vertical::Center),
-            text("Pick a note to open it in this group")
-                .size(style::TEXT_SM)
-                .style(style::dim_text),
-            container(scrollable(list).height(Length::Fill))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .padding(style::SPACING_SM)
-                .style(style::card),
-        ]
-        .spacing(style::SPACING_SM),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .padding(style::SPACING_LG)
-    .style(style::content)
-    .into()
-}
-
-fn note_row(entry: &NoteCatalogEntry, group: GroupId) -> Element<'_, Message> {
-    let Ok(locator) = flavite_workspace::NoteLocator::from_relative(&entry.path) else {
-        return text(entry.path.display().to_string())
-            .size(style::TEXT_SM)
-            .style(style::dim_text)
-            .into();
-    };
-    button(
-        row![
-            text(entry.title.clone()).width(Length::Fill),
-            text(entry.path.display().to_string())
-                .size(style::TEXT_SM)
-                .style(style::dim_text),
-        ]
-        .spacing(style::SPACING),
-    )
-    .width(Length::Fill)
-    .padding(Padding {
-        top: 6.0,
-        bottom: 6.0,
-        left: 10.0,
-        right: 10.0,
-    })
-    .style(style::list_row(false))
-    .on_press(Message::OpenNote {
-        locator,
-        group: Some(group),
-    })
-    .into()
 }
 
 fn status_bar(app: &App) -> Element<'_, Message> {

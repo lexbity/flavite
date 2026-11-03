@@ -8,6 +8,51 @@ pub use flavite_vault::user_state::{StoredUserState, UserStateError, UserStateKi
 
 use crate::{Flavite, FlaviteError};
 
+/// The most recently opened vault root on this device, if any (W10 no-vault
+/// startup, FR-22). Device-local app-scope state, independent of any vault,
+/// so it is readable before a vault is open.
+///
+/// # Errors
+/// Returns [`UserStateError`] on read/corruption failures; an absent record
+/// is `Ok(None)` and a missing OS data directory is `Ok(None)` as well (the
+/// start screen simply offers no remembered vault).
+pub fn read_last_vault_device() -> Result<Option<std::path::PathBuf>, UserStateError> {
+    let Ok(store) =
+        flavite_vault::user_state::UserStateStore::open_app_scope(Box::new(crate::OsFs::new()))
+    else {
+        return Ok(None);
+    };
+    let Some(stored) = store.read(UserStateKind::AppLaunch)? else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_slice(&stored.payload)
+        .map_err(|error| UserStateError::Corrupt(error.to_string()))?;
+    Ok(value
+        .get("root")
+        .and_then(serde_json::Value::as_str)
+        .map(std::path::PathBuf::from))
+}
+
+/// Record the most recently opened vault root on this device (W10).
+///
+/// # Errors
+/// Returns [`UserStateError`]; callers treat failures as non-fatal because
+/// they never affect note safety.
+pub fn write_last_vault_device(root: &std::path::Path) -> Result<(), UserStateError> {
+    let mut store =
+        flavite_vault::user_state::UserStateStore::open_app_scope(Box::new(crate::OsFs::new()))?;
+    let expected = store
+        .read(UserStateKind::AppLaunch)?
+        .map_or(0, |stored| stored.generation);
+    let payload = serde_json::json!({ "root": root.display().to_string() });
+    store.write(
+        UserStateKind::AppLaunch,
+        expected,
+        &serde_json::to_vec(&payload).expect("bounded json payload"),
+    )?;
+    Ok(())
+}
+
 impl Flavite {
     /// Read a device-local user-state document for this vault.
     ///
