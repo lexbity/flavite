@@ -349,7 +349,7 @@ fn missing_notes_render_an_actionable_failed_state() {
 #[test]
 fn host_catalog_and_palette_resolve_the_same_commands() {
     let Fixture { mut app, .. } = fixture();
-    let specs = host_commands::ui_specs();
+    let specs = host_commands::ui_specs(&Default::default());
     assert!(!specs.is_empty());
     let _ = app.update(Message::PaletteOpen);
     let _ = app.update(Message::PaletteQuery("quick".into()));

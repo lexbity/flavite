@@ -224,8 +224,11 @@ fn inline<'a>(
             nodes,
             InlineStyle {
                 bold,
+                italic: false,
+                strike: false,
+                link: None,
                 query,
-                ..InlineStyle::default()
+                scheme: app.appearance.scheme(),
             },
         );
         flow.flush();
@@ -238,8 +241,11 @@ fn inline<'a>(
             n,
             InlineStyle {
                 bold,
+                italic: false,
+                strike: false,
+                link: None,
                 query,
-                ..InlineStyle::default()
+                scheme: app.appearance.scheme(),
             },
             &mut spans,
         );
@@ -252,13 +258,15 @@ fn inline<'a>(
         .on_link_click(|message| message)
         .into()
 }
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct InlineStyle<'q> {
     bold: bool,
     italic: bool,
     strike: bool,
     link: Option<usize>,
     query: Option<&'q str>,
+    /// The active scheme, so highlights derive from the live palette.
+    scheme: crate::style::Scheme,
 }
 fn contains_embed(node: &ReadNode) -> bool {
     matches!(node.kind, ReadKind::Link { embed: true, .. })
@@ -306,6 +314,7 @@ impl<'a> EmbedFlow<'a> {
                             style.link
                         },
                         query: style.query,
+                        scheme: self.app.appearance.scheme(),
                     },
                 );
             } else {
@@ -363,8 +372,8 @@ fn collect_spans<'a>(
                 }
                 let mut highlight = s.clone();
                 highlight.text = content[found..found + query.len()].to_owned().into();
-                highlight =
-                    highlight.background(style::theme().extended_palette().primary.weak.color);
+                let theme = style::theme(format.scheme);
+                highlight = highlight.background(theme.extended_palette().primary.weak.color);
                 spans.push(highlight);
                 at = found + query.len();
             }
@@ -391,6 +400,7 @@ fn collect_spans<'a>(
                     format.link
                 },
                 query: format.query,
+                scheme: format.scheme,
             },
             spans,
         );

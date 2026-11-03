@@ -18,6 +18,7 @@ use iced::{Color, Event, Point, Rectangle, Theme, mouse};
 use super::geometry::RenderGeometry;
 use super::instance::{Camera, edge_alpha_factor};
 use super::renderer::{GraphMessage, GraphProgram, GraphProgramState};
+use crate::style::tokens::{self, Scheme};
 
 /// A canvas program that mirrors the production shader backend: identical
 /// geometry, identical camera, and event handling delegated to the *same*
@@ -30,11 +31,11 @@ pub struct GraphCanvas {
 
 impl GraphCanvas {
     /// The software twin of
-    /// `GraphProgram::new(geometry, camera).widget()`.
+    /// `GraphProgram::new(geometry, camera, scheme).widget()`.
     #[must_use]
-    pub const fn new(geometry: Arc<RenderGeometry>, camera: Camera) -> Self {
+    pub const fn new(geometry: Arc<RenderGeometry>, camera: Camera, scheme: Scheme) -> Self {
         Self {
-            program: GraphProgram::new(geometry, camera),
+            program: GraphProgram::new(geometry, camera, scheme),
         }
     }
 
@@ -72,6 +73,7 @@ impl Program<GraphMessage> for GraphCanvas {
     ) -> Vec<canvas::Geometry> {
         let geometry = self.program.geometry();
         let camera = self.program.camera();
+        let scheme = self.program.scheme();
         let zoom = camera.zoom.max(0.001);
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         let to_screen = |world: [f32; 2]| {
@@ -80,7 +82,9 @@ impl Program<GraphMessage> for GraphCanvas {
         };
 
         // Edges first, under the importance cap exactly as the GPU draws
-        // the prefix, with the same alpha model (D15).
+        // the prefix, with the same alpha model (D15) and the same semantic
+        // edge token the WGSL uniform carries (W11: both backends match).
+        let [edge_r, edge_g, edge_b] = tokens::graph_edge_color(scheme);
         let alpha_factor = edge_alpha_factor(zoom);
         let edge_count = geometry.visible_edge_count(zoom);
         for edge in geometry.edges().iter().take(edge_count) {
@@ -94,8 +98,10 @@ impl Program<GraphMessage> for GraphCanvas {
                 &path,
                 canvas::Stroke::default()
                     .with_color(Color {
+                        r: edge_r,
+                        g: edge_g,
+                        b: edge_b,
                         a: alpha,
-                        ..EDGE_COLOR_CANVAS
                     })
                     .with_width(edge.width.max(0.5)),
             );
@@ -139,16 +145,14 @@ impl Program<GraphMessage> for GraphCanvas {
     }
 }
 
-/// Canvas edge color — the constant the WGSL `EDGE_COLOR` uses, kept in
-/// Rust for the software path so both backends match visually.
-const EDGE_COLOR_CANVAS: Color = Color::from_rgb(0.62, 0.66, 0.74);
-
-/// Version-paired labels shared by GPU and canvas; the overlay takes no input.
+/// Version-paired labels shared by GPU and canvas; the overlay takes no
+/// input. Label color comes from the active scheme's semantic label token.
 pub fn label_overlay<'a>(
     camera: Camera,
     labels: Vec<([f32; 2], f32, String)>,
+    scheme: Scheme,
 ) -> iced::Element<'a, crate::app::Message> {
-    struct Labels(Camera, Vec<([f32; 2], f32, String)>);
+    struct Labels(Camera, Vec<([f32; 2], f32, String)>, Scheme);
     impl canvas::Program<crate::app::Message> for Labels {
         type State = ();
         fn draw(
@@ -170,7 +174,7 @@ pub fn label_overlay<'a>(
                 frame.fill_text(canvas::Text {
                     content: title.clone(),
                     position: Point::new(p[0] + radius * self.0.zoom + 5.0, p[1] - 7.0),
-                    color: Color::from_rgb(0.88, 0.9, 0.94),
+                    color: tokens::graph_label_color(self.2),
                     size: iced::Pixels(12.0),
                     ..canvas::Text::default()
                 });
@@ -178,19 +182,21 @@ pub fn label_overlay<'a>(
             vec![frame.into_geometry()]
         }
     }
-    Canvas::new(Labels(camera, labels))
+    Canvas::new(Labels(camera, labels, scheme))
         .width(iced::Length::Fill)
         .height(iced::Length::Fill)
         .into()
 }
 
 /// Transparent, input-pass-through rectangle used by both graph backends.
+/// The stroke uses the active scheme's semantic selection token.
 pub fn selection_overlay<'a>(
     camera: Camera,
     first: [f32; 2],
     second: [f32; 2],
+    scheme: Scheme,
 ) -> iced::Element<'a, crate::app::Message> {
-    struct BoxOverlay(Camera, [f32; 2], [f32; 2]);
+    struct BoxOverlay(Camera, [f32; 2], [f32; 2], Scheme);
     impl canvas::Program<crate::app::Message> for BoxOverlay {
         type State = ();
         fn draw(
@@ -215,13 +221,13 @@ pub fn selection_overlay<'a>(
             frame.stroke(
                 &path,
                 canvas::Stroke::default()
-                    .with_color(Color::from_rgb(0.16, 0.66, 0.62))
+                    .with_color(tokens::graph_selection_color(self.3))
                     .with_width(2.0),
             );
             vec![frame.into_geometry()]
         }
     }
-    canvas::Canvas::new(BoxOverlay(camera, first, second))
+    canvas::Canvas::new(BoxOverlay(camera, first, second, scheme))
         .width(iced::Length::Fill)
         .height(iced::Length::Fill)
         .into()
@@ -230,7 +236,7 @@ pub fn selection_overlay<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::instance::{EdgeInstance, NOTE_COLOR, NodeInstance, NodeShape};
+    use crate::graph::instance::{EdgeInstance, NodeInstance, NodeShape, note_color};
     use crate::graph::renderer::{GraphMessage, ReleaseKind};
     use flavite_graph::{NodeId, NodeKind};
 
@@ -242,13 +248,13 @@ mod tests {
                     center: [0.0, 0.0],
                     size: 4.0,
                     shape: NodeShape::Circle,
-                    color: NOTE_COLOR,
+                    color: note_color(Scheme::Dark),
                 },
                 NodeInstance {
                     center: [10.0, 0.0],
                     size: 4.0,
                     shape: NodeShape::Square,
-                    color: NOTE_COLOR,
+                    color: note_color(Scheme::Dark),
                 },
             ],
             vec![EdgeInstance {
@@ -264,7 +270,7 @@ mod tests {
 
     #[test]
     fn canvas_emits_the_same_click_messages_as_the_shader_backend() {
-        let canvas = GraphCanvas::new(geometry(), Camera::centered());
+        let canvas = GraphCanvas::new(geometry(), Camera::centered(), Scheme::Dark);
         let bounds = Rectangle {
             x: 0.0,
             y: 0.0,

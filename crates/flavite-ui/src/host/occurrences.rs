@@ -1,7 +1,6 @@
 //! Correlated read/choose/open/prepare/commit workflow for one directed occurrence.
 use crate::app::{App, Message};
 use crate::host::graph::GraphCommand;
-use crate::style;
 use flavite_api::{
     ContextQueryResult, ExecutionResult, Invocation, LocalResult, OccurrenceDetail,
     OccurrenceSource, QueryOutcome, QueryPayload, RequestToken,
@@ -313,6 +312,7 @@ fn fail(app: &mut App, message: &str) {
 }
 
 pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
+    let metrics = app.appearance.metrics();
     let mut content = column![].spacing(4);
     let Some(state) = app.graph.state(tab) else {
         return content.into();
@@ -331,9 +331,9 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                             "Saved"
                         }
                     ))
-                    .size(style::TEXT_SM),
+                    .size(metrics.text_sm),
                 );
-                content = content.push(text(&detail.excerpt).size(style::TEXT_SM));
+                content = content.push(text(&detail.excerpt).size(metrics.text_sm));
                 content = content.push(button("Remove this occurrence").on_press(
                     Message::GraphCommand {
                         tab,
@@ -342,11 +342,11 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                 ));
             }
             RemovalStage::Failed(message) => {
-                content = content.push(text(message).size(style::TEXT_SM));
+                content = content.push(text(message).size(metrics.text_sm));
             }
             _ => {
                 content =
-                    content.push(text("Preparing connection occurrence…").size(style::TEXT_SM));
+                    content.push(text("Preparing connection occurrence…").size(metrics.text_sm));
             }
         }
         return content
@@ -379,7 +379,7 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             "{} directed occurrence(s) · choose a source span",
             related.len()
         ))
-        .size(style::TEXT_SM),
+        .size(metrics.text_sm),
     );
     for (index, occurrence) in related.iter().skip(state.occurrence_offset).take(12) {
         content = content.push(
@@ -394,7 +394,7 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                         "Saved"
                     }
                 ))
-                .size(style::TEXT_SM),
+                .size(metrics.text_sm),
                 button("Inspect / remove").on_press_maybe(
                     (!state.updating && !state.stale).then_some(Message::InspectGraphOccurrence {
                         tab,

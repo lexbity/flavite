@@ -260,7 +260,11 @@ workspace-contracts profile="W09":
 workspace-gate profile="W09":
     #!/usr/bin/env bash
     set -euo pipefail
-    case "{{profile}}" in W0[1-9]) slice="{{profile}}"; stage="${slice#W0}" ;; *) echo "Expected W01–W09" >&2; exit 2 ;; esac
+    case "{{profile}}" in
+        W0[1-9]) slice="{{profile}}"; stage="${slice#W0}" ;;
+        W1[01]) slice="{{profile}}"; stage="${slice#W}" ;;
+        *) echo "Expected W01–W11" >&2; exit 2 ;;
+    esac
     just workspace-contracts "{{profile}}"
     cargo test -p xtask --test workspace_gates
     cargo test -p flavite-ui --test runtime_accessibility
@@ -303,6 +307,14 @@ workspace-gate profile="W09":
         cargo test -p flavite-api --test property_edits --test embed_limits
         cargo test -p flavite-ui --test read_mode --test embed_limits
         cargo test -p flavite-fs --features fault --test contained_read
+    fi
+    if (( stage >= 10 )); then
+        cargo test -p flavite-ui --test knowledge_workflow --test navigation_identity
+        cargo test -p flavite-api --test workspace_search
+    fi
+    if (( stage >= 11 )); then
+        cargo test -p flavite-ui --test appearance_preferences --test visual_contract
+        cargo test -p flavite-workspace --test geometry_matrix
     fi
 
 workspace-graph-visual backend="canvas":

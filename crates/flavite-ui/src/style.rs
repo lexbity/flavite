@@ -1,25 +1,23 @@
 //! Shell visual language: theme choice, spacing/type scale, and reusable
 //! component styles. Every surface derives from the active theme palette so
 //! the shell stays coherent without hand-picked colors per widget.
+//! [`tokens`] owns the semantic light/dark palettes (W11), [`contrast`]
+//! the WCAG arithmetic, and [`type_scale`] the scale-aware metrics.
+
+pub mod contrast;
+pub mod tokens;
+pub mod type_scale;
+
+pub use tokens::Scheme;
+pub use type_scale::Metrics;
 
 use iced::widget::{button, container, text};
 use iced::{Background, Border, Color, Shadow, Theme, Vector, border};
 
-/// Neutral shell surfaces with a distinct violet writing/focus accent.
-/// Full user-selectable light/System preferences remain owned by W11.
+/// The iced theme for one semantic scheme (W11: light/dark/System).
 #[must_use]
-pub fn theme() -> Theme {
-    Theme::custom(
-        "Flavite Dark",
-        iced::theme::Palette {
-            background: Color::from_rgb8(25, 29, 35),
-            text: Color::from_rgb8(226, 229, 239),
-            primary: Color::from_rgb8(180, 137, 240),
-            success: Color::from_rgb8(94, 206, 193),
-            warning: Color::from_rgb8(232, 187, 108),
-            danger: Color::from_rgb8(237, 128, 142),
-        },
-    )
+pub fn theme(scheme: Scheme) -> Theme {
+    tokens::theme(scheme)
 }
 
 /// Base spacing unit.
@@ -44,8 +42,9 @@ pub const HEADING: f32 = 20.0;
 pub const BRAND: f32 = 19.0;
 /// Tab strip height (§13.1: tab height 32 px).
 pub const TAB_HEIGHT: f32 = 32.0;
-/// Splitter thickness at 100% scale (§7.5).
-pub const SPLITTER_WIDTH: f32 = 4.0;
+/// Splitter thickness at 100% scale (§7.5). Single source: the workspace
+/// model owns the value; the layout solver divides by exactly this width.
+pub const SPLITTER_WIDTH: f32 = flavite_workspace::SPLITTER_WIDTH;
 /// Focus ring width (§7.5/NFR-15: focus ring ≥ 2 px).
 pub const FOCUS_WIDTH: f32 = 2.0;
 
@@ -210,9 +209,36 @@ pub fn chip(theme: &Theme, tone: Tone) -> container::Style {
         Tone::Warning => ext.warning.weak,
         Tone::Danger => ext.danger.weak,
     };
+    // NFR-15: chip text must meet AA against the painted fill; the
+    // toolkit-generated pair can fall short for mid-tone accents. The
+    // best of the candidate text colors wins, and the fill is blended
+    // toward the shell background just enough to reach 4.5:1.
+    let candidates = [pair.text, theme.palette().text, theme.palette().background];
+    let mut text = candidates
+        .into_iter()
+        .max_by(|a, b| {
+            contrast::ratio(*a, pair.color)
+                .partial_cmp(&contrast::ratio(*b, pair.color))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .expect("non-empty candidates");
+    let mut fill = pair.color;
+    let mut steps = 0;
+    while contrast::ratio(text, fill) < 4.5 && steps < 4 {
+        fill = contrast::blend(fill, theme.palette().background, 0.25);
+        text = candidates
+            .into_iter()
+            .max_by(|a, b| {
+                contrast::ratio(*a, fill)
+                    .partial_cmp(&contrast::ratio(*b, fill))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("non-empty candidates");
+        steps += 1;
+    }
     container::Style {
-        text_color: Some(pair.text),
-        background: Some(Background::Color(pair.color)),
+        text_color: Some(text),
+        background: Some(Background::Color(fill)),
         border: Border {
             color: Color::TRANSPARENT,
             width: 0.0,
@@ -368,13 +394,32 @@ pub fn palette_card(theme: &Theme) -> container::Style {
     card_style
 }
 
-/// Text style: secondary/de-emphasized text.
+/// Text style: secondary/de-emphasized text. The alpha is the smallest
+/// of the fixed dimming steps that still meets the 4.5:1 contract over
+/// the surface it paints (NFR-15), so dimming never costs readability.
 #[must_use]
 pub fn dim_text(theme: &Theme) -> text::Style {
+    let palette = theme.palette();
+    let surface = theme.extended_palette().background.weaker.color;
+    let alpha = [0.65f32, 0.7, 0.75, 0.8, 0.85, 0.9, 1.0]
+        .into_iter()
+        .find(|alpha| {
+            contrast::ratio(
+                contrast::over(
+                    Color {
+                        a: *alpha,
+                        ..palette.text
+                    },
+                    surface,
+                ),
+                surface,
+            ) >= 4.5
+        })
+        .unwrap_or(1.0);
     text::Style {
         color: Some(Color {
-            a: 0.65,
-            ..theme.palette().text
+            a: alpha,
+            ..palette.text
         }),
     }
 }
@@ -382,8 +427,20 @@ pub fn dim_text(theme: &Theme) -> text::Style {
 /// Text style: accent-colored text (brand, hints).
 #[must_use]
 pub fn accent_text(theme: &Theme) -> text::Style {
+    // The toolkit's derived `primary.strong` is tuned for the opposite
+    // surface family and can fall below AA; the accent is whichever of
+    // the base/strong pair contrasts better on the actual background.
+    let palette = theme.palette();
+    let strong = theme.extended_palette().primary.strong.color;
+    let accent = if contrast::ratio(palette.primary, palette.background)
+        >= contrast::ratio(strong, palette.background)
+    {
+        palette.primary
+    } else {
+        strong
+    };
     text::Style {
-        color: Some(theme.extended_palette().primary.strong.color),
+        color: Some(accent),
     }
 }
 
@@ -441,7 +498,7 @@ mod tests {
 
     #[test]
     fn component_styles_derive_from_the_theme_palette() {
-        let theme = theme();
+        let theme = theme(crate::style::tokens::Scheme::Dark);
         let palette = theme.palette();
         let card_style = card(&theme);
         let Some(Background::Color(card_background)) = card_style.background else {

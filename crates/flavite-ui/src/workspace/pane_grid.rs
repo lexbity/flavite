@@ -41,6 +41,7 @@ impl Adapter {
         &mut self,
         state: &WorkspaceState,
         size: iced::Size,
+        scale: f32,
         preview: &BTreeMap<SplitId, u32>,
     ) {
         let geometry = flavite_workspace::solve(
@@ -49,7 +50,7 @@ impl Adapter {
                 width: size.width,
                 height: size.height,
             },
-            1.0,
+            scale,
             preview,
         );
         if geometry.adaptive_maximize {
@@ -226,13 +227,11 @@ fn build_configuration(node: &LayoutNode) -> Configuration<GroupPane> {
     }
 }
 
-/// Ratio ppm to f32. Splitting by 10_000 first keeps the value inside the
-/// u16 range, which converts to f32 exactly.
+/// Ratio ppm to f32 via the single canonical workspace conversion. Iced
+/// measures ratios through the divider centre, but the fraction value is
+/// the same nearest-`f32` of the stored parts-per-million.
 fn f32_ratio(ratio_ppm: u32) -> f32 {
-    #[allow(clippy::cast_precision_loss)]
-    {
-        f32::from((ratio_ppm / 100) as u16) / 10_000.0
-    }
+    flavite_workspace::geometry::ratio_f32(ratio_ppm)
 }
 
 /// Map a pane-grid drop edge to the workspace model.

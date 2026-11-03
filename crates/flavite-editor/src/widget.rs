@@ -32,6 +32,87 @@ const LINE_HEIGHT: f32 = 22.0;
 const PAD_X: f32 = 12.0;
 const PAD_Y: f32 = 10.0;
 
+/// The editor's type settings: font size in logical pixels and the derived
+/// line height. The host sets these from its interface preferences (W11);
+/// the default reproduces the historical fixed metrics.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TypeMetrics {
+    /// Font size in logical pixels.
+    pub font_size: f32,
+    /// Line height in logical pixels; caret, scroll, and glyph math all
+    /// derive from this single value.
+    pub line_height: f32,
+}
+
+impl Default for TypeMetrics {
+    fn default() -> Self {
+        Self {
+            font_size: FONT_SIZE,
+            line_height: LINE_HEIGHT,
+        }
+    }
+}
+
+impl TypeMetrics {
+    /// Metrics for a font size with the standard 1.4 line ratio, rounded
+    /// to the nearest half pixel so positions stay stable.
+    #[must_use]
+    pub fn for_font_size(font_size: f32) -> Self {
+        Self {
+            font_size,
+            line_height: (font_size * 1.4 * 2.0).round() / 2.0,
+        }
+    }
+}
+
+/// Host-provided semantic colors for editor chrome (W11): selection,
+/// link families, text, preedit, and autocomplete. The host derives these
+/// from its active scheme; the defaults reproduce the historical palette
+/// so headless callers keep the previous rendering.
+#[derive(Debug, Clone, Copy)]
+pub struct EditorColors {
+    /// Selection highlight fill.
+    pub selection: Color,
+    /// Resolved link underline.
+    pub link: Color,
+    /// Unresolved link underline.
+    pub link_unresolved: Color,
+    /// Ambiguous link underline.
+    pub link_multiple: Color,
+    /// Editor text fill.
+    pub text: Color,
+    /// Composition preedit underline.
+    pub preedit_underline: Color,
+    /// Composition preedit text.
+    pub preedit_text: Color,
+    /// Autocomplete popup background.
+    pub autocomplete_background: Color,
+    /// Autocomplete selected row.
+    pub autocomplete_selected: Color,
+    /// Autocomplete unselected row.
+    pub autocomplete_text: Color,
+    /// Autocomplete create-row accent.
+    pub autocomplete_accent: Color,
+}
+
+impl Default for EditorColors {
+    fn default() -> Self {
+        Self {
+            selection: Color::from_rgba(0.24, 0.42, 0.67, 0.55),
+            link: Color::from_rgb(0.35, 0.67, 0.98),
+            link_unresolved: Color::from_rgb(0.95, 0.48, 0.43),
+            link_multiple: Color::from_rgb(0.96, 0.73, 0.32),
+            text: Color::from_rgb(0.88, 0.90, 0.93),
+            preedit_underline: Color::from_rgb(0.98, 0.78, 0.35),
+            preedit_text: Color::from_rgb(1.0, 0.86, 0.55),
+            autocomplete_background: Color::from_rgb(0.15, 0.17, 0.20),
+            autocomplete_selected: Color::from_rgb(0.55, 0.78, 1.0),
+            autocomplete_text: Color::from_rgb(0.82, 0.84, 0.87),
+            autocomplete_accent: Color::from_rgb(0.45, 0.72, 1.0),
+        }
+    }
+}
+
 /// Interaction snapshots are published immediately on press/release/scroll;
 /// during a drag they are coalesced to at most one per frame so a pointer
 /// sweep cannot flood the host acknowledgement loop.
@@ -57,6 +138,14 @@ pub struct EditorWidget<'a, Message> {
     on_input_intent: Option<Box<dyn Fn(crate::input::CapturedInput) -> Message + 'a>>,
     width: Length,
     height: Length,
+    /// Host-configured type settings (W11 editor font size).
+    type_metrics: TypeMetrics,
+    /// Optional readable-line-width cap in logical pixels (`None` = the
+    /// full pane width minus padding). Text wraps inside this width and
+    /// stays left-aligned; it is a wrap constraint, not a reflow anchor.
+    max_line_width: Option<f32>,
+    /// Host-provided semantic chrome colors (W11).
+    colors: EditorColors,
     _message: PhantomData<Message>,
 }
 
@@ -82,7 +171,43 @@ impl<'a, Message> EditorWidget<'a, Message> {
             on_input_intent: None,
             width: Length::Fill,
             height: Length::Fill,
+            type_metrics: TypeMetrics::default(),
+            max_line_width: None,
+            colors: EditorColors::default(),
             _message: PhantomData,
+        }
+    }
+
+    /// Set the semantic chrome colors from the host's active scheme (W11).
+    #[must_use]
+    pub fn with_colors(mut self, colors: EditorColors) -> Self {
+        self.colors = colors;
+        self
+    }
+
+    /// Set the editor type settings from the host's preferences (W11).
+    #[must_use]
+    pub fn with_type_metrics(mut self, metrics: TypeMetrics) -> Self {
+        self.type_metrics = metrics;
+        self
+    }
+
+    /// Cap the wrap width (readable line width, W11). `None` restores the
+    /// full pane width.
+    #[must_use]
+    pub fn with_max_line_width(mut self, max_line_width: Option<f32>) -> Self {
+        self.max_line_width = max_line_width;
+        self
+    }
+
+    /// The wrap width for a pane of `bounds.width`: the readable-line
+    /// preference caps the text column; the pane width bounds it below.
+    #[must_use]
+    pub(crate) fn text_wrap_width(&self, bounds_width: f32) -> f32 {
+        let available = (bounds_width - PAD_X * 2.0).max(1.0);
+        match self.max_line_width {
+            Some(max) => available.min(max.max(1.0)),
+            None => available,
         }
     }
 
@@ -423,6 +548,8 @@ pub struct EditorState {
     shaping: Option<ShapingCache>,
     /// Last interaction-snapshot publication instant (drag coalescing).
     last_publish: Option<Instant>,
+    /// The active type settings, synced from the widget in `diff` (W11).
+    type_metrics: TypeMetrics,
 }
 
 /// Identity of one shaped viewport: the same revision, text allocation,
@@ -437,6 +564,30 @@ struct ShapingKey {
     first_line: usize,
     visible_lines: usize,
     width_bits: u32,
+    /// Font/line-height bits, so a preference change reshapes immediately.
+    type_bits: u64,
+}
+
+impl ShapingKey {
+    fn new(
+        revision: u64,
+        text_addr: usize,
+        text_len: usize,
+        viewport: Viewport,
+        width_bits: u32,
+        metrics: TypeMetrics,
+    ) -> Self {
+        Self {
+            revision,
+            text_addr,
+            text_len,
+            first_line: viewport.first_line,
+            visible_lines: viewport.visible_lines,
+            width_bits,
+            type_bits: (metrics.font_size.to_bits() as u64) << 32
+                | u64::from(metrics.line_height.to_bits()),
+        }
+    }
 }
 
 struct ShapingCache {
@@ -830,7 +981,7 @@ impl EditorState {
         }
         self.caret = clamp_char_boundary(&view.text, self.caret);
         self.anchor = clamp_char_boundary(&view.text, self.anchor);
-        self.viewport.line_height = LINE_HEIGHT;
+        self.viewport.line_height = self.type_metrics.line_height;
         self.viewport.first_line = self
             .viewport
             .first_line
@@ -877,17 +1028,17 @@ impl EditorState {
         viewport: Viewport,
         width: f32,
     ) -> (&ShapingBuffer, &str, usize) {
-        let key = ShapingKey {
+        let key = ShapingKey::new(
             revision,
-            text_addr: text.as_ptr() as usize,
-            text_len: text.len(),
-            first_line: viewport.first_line,
-            visible_lines: viewport.visible_lines,
-            width_bits: width.to_bits(),
-        };
+            text.as_ptr() as usize,
+            text.len(),
+            viewport,
+            width.to_bits(),
+            self.type_metrics,
+        );
         if self.shaping.as_ref().is_none_or(|cache| cache.key != key) {
             let (visible, source_start) = visible_text(text, viewport);
-            let buffer = shape_text(&visible, width);
+            let buffer = shape_text(&visible, width, self.type_metrics);
             self.shaping = Some(ShapingCache {
                 key,
                 buffer,
@@ -961,15 +1112,15 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         let clip = bounds
             .intersection(viewport)
             .unwrap_or(Rectangle::with_size(Size::ZERO));
-        let text_width = (bounds.width - PAD_X * 2.0).max(1.0);
-        let shaping_key = ShapingKey {
-            revision: self.view.revision,
-            text_addr: self.view.text.as_ptr() as usize,
-            text_len: self.view.text.len(),
-            first_line: state.viewport.first_line,
-            visible_lines: state.viewport.visible_lines,
-            width_bits: text_width.to_bits(),
-        };
+        let text_width = self.text_wrap_width(bounds.width);
+        let shaping_key = ShapingKey::new(
+            self.view.revision,
+            self.view.text.as_ptr() as usize,
+            self.view.text.len(),
+            state.viewport,
+            text_width.to_bits(),
+            self.type_metrics,
+        );
         let local_buffer;
         let hoisted_visible;
         let (visible_text, source_start, runs) = if let Some(cache) = state
@@ -982,7 +1133,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         } else {
             let (visible, start) = visible_text(&self.view.text, state.viewport);
             hoisted_visible = visible;
-            local_buffer = shape_text(&hoisted_visible, text_width);
+            local_buffer = shape_text(&hoisted_visible, text_width, self.type_metrics);
             let runs = local_buffer.layout_runs().collect::<Vec<_>>();
             (hoisted_visible.as_str(), start, runs)
         };
@@ -1001,12 +1152,12 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                                         bounds.x + PAD_X + glyph.x,
                                         bounds.y + PAD_Y + run.line_top,
                                     ),
-                                    Size::new(glyph.w.max(1.0), LINE_HEIGHT),
+                                    Size::new(glyph.w.max(1.0), self.type_metrics.line_height),
                                 ),
                                 border: Border::default(),
                                 ..renderer::Quad::default()
                             },
-                            Background::Color(Color::from_rgba(0.24, 0.42, 0.67, 0.55)),
+                            Background::Color(self.colors.selection),
                         );
                     }
                 }
@@ -1044,18 +1195,17 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     .any(|span| span.span.start.0 < glyph_end && span.span.end.0 > glyph_start);
                 if link_resolution.is_some() || other_decoration {
                     let color = match link_resolution {
-                        Some(LinkResolution::Unresolved) => Color::from_rgb(0.95, 0.48, 0.43),
-                        Some(LinkResolution::MultipleCandidates) => {
-                            Color::from_rgb(0.96, 0.73, 0.32)
-                        }
-                        _ => Color::from_rgb(0.35, 0.67, 0.98),
+                        Some(LinkResolution::Unresolved) => self.colors.link_unresolved,
+                        Some(LinkResolution::MultipleCandidates) => self.colors.link_multiple,
+                        _ => self.colors.link,
                     };
                     renderer.fill_quad(
                         renderer::Quad {
                             bounds: Rectangle::new(
                                 Point::new(
                                     bounds.x + PAD_X + glyph.x,
-                                    bounds.y + PAD_Y + run.line_top + LINE_HEIGHT - 2.0,
+                                    bounds.y + PAD_Y + run.line_top + self.type_metrics.line_height
+                                        - 2.0,
                                 ),
                                 Size::new(glyph.w.max(1.0), 1.0),
                             ),
@@ -1074,8 +1224,10 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     (bounds.width - PAD_X * 2.0).max(1.0),
                     (bounds.height - PAD_Y * 2.0).max(1.0),
                 ),
-                size: iced::Pixels(FONT_SIZE),
-                line_height: text::LineHeight::Absolute(iced::Pixels(LINE_HEIGHT)),
+                size: iced::Pixels(self.type_metrics.font_size),
+                line_height: text::LineHeight::Absolute(iced::Pixels(
+                    self.type_metrics.line_height,
+                )),
                 font: iced::Font::MONOSPACE,
                 align_x: text::Alignment::Left,
                 align_y: iced::alignment::Vertical::Top,
@@ -1083,7 +1235,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 wrapping: text::Wrapping::WordOrGlyph,
             },
             Point::new(bounds.x + PAD_X, bounds.y + PAD_Y),
-            Color::from_rgb(0.88, 0.90, 0.93),
+            self.colors.text,
             clip,
         );
         if let Some(composition) = &state.composition
@@ -1093,8 +1245,11 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         {
             let local_start = composition.start - source_start;
             let (x, y) = caret_position(&runs, visible_text, local_start);
-            let preedit_layout =
-                shape_text(&composition.preedit, (bounds.width - PAD_X * 2.0).max(1.0));
+            let preedit_layout = shape_text(
+                &composition.preedit,
+                self.text_wrap_width(bounds.width),
+                self.type_metrics,
+            );
             let preedit_width = preedit_layout
                 .layout_runs()
                 .map(|run| run.glyphs.iter().map(|glyph| glyph.w).sum::<f32>())
@@ -1104,21 +1259,26 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     bounds: Rectangle::new(
                         Point::new(
                             bounds.x + PAD_X + x,
-                            bounds.y + PAD_Y + y + LINE_HEIGHT - 2.0,
+                            bounds.y + PAD_Y + y + self.type_metrics.line_height - 2.0,
                         ),
                         Size::new(preedit_width.max(1.0), 1.5),
                     ),
                     border: Border::default(),
                     ..renderer::Quad::default()
                 },
-                Background::Color(Color::from_rgb(0.98, 0.78, 0.35)),
+                Background::Color(self.colors.preedit_underline),
             );
             renderer.fill_text(
                 text::Text {
                     content: composition.preedit.clone(),
-                    bounds: Size::new((bounds.width - PAD_X * 2.0).max(1.0), LINE_HEIGHT),
-                    size: iced::Pixels(FONT_SIZE),
-                    line_height: text::LineHeight::Absolute(iced::Pixels(LINE_HEIGHT)),
+                    bounds: Size::new(
+                        (bounds.width - PAD_X * 2.0).max(1.0),
+                        self.type_metrics.line_height,
+                    ),
+                    size: iced::Pixels(self.type_metrics.font_size),
+                    line_height: text::LineHeight::Absolute(iced::Pixels(
+                        self.type_metrics.line_height,
+                    )),
                     font: iced::Font::MONOSPACE,
                     align_x: text::Alignment::Left,
                     align_y: iced::alignment::Vertical::Top,
@@ -1126,7 +1286,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     wrapping: text::Wrapping::None,
                 },
                 Point::new(bounds.x + PAD_X + x, bounds.y + PAD_Y + y),
-                Color::from_rgb(1.0, 0.86, 0.55),
+                self.colors.preedit_text,
                 clip,
             );
         }
@@ -1144,7 +1304,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                         bounds.y
                             + PAD_Y
                             + (line.saturating_sub(state.viewport.first_line) as f32 + 1.0)
-                                * LINE_HEIGHT,
+                                * self.type_metrics.line_height,
                     ),
                     Size::new(320.0, row_count as f32 * 23.0 + 8.0),
                 );
@@ -1154,13 +1314,13 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                         border: Border::default(),
                         ..renderer::Quad::default()
                     },
-                    Background::Color(Color::from_rgb(0.15, 0.17, 0.20)),
+                    Background::Color(self.colors.autocomplete_background),
                 );
                 for (index, candidate) in matches.iter().enumerate() {
                     let color = if index == state.autocomplete_selected {
-                        Color::from_rgb(0.55, 0.78, 1.0)
+                        self.colors.autocomplete_selected
                     } else {
-                        Color::from_rgb(0.82, 0.84, 0.87)
+                        self.colors.autocomplete_text
                     };
                     renderer.fill_text(
                         text::Text {
@@ -1182,9 +1342,9 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 if has_create {
                     let index = matches.len();
                     let color = if index == state.autocomplete_selected {
-                        Color::from_rgb(0.55, 0.78, 1.0)
+                        self.colors.autocomplete_selected
                     } else {
-                        Color::from_rgb(0.82, 0.84, 0.87)
+                        self.colors.autocomplete_text
                     };
                     renderer.fill_text(
                         text::Text {
@@ -1215,12 +1375,12 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 renderer::Quad {
                     bounds: Rectangle::new(
                         Point::new(bounds.x + PAD_X + x, bounds.y + PAD_Y + y),
-                        Size::new(1.5, LINE_HEIGHT),
+                        Size::new(1.5, self.type_metrics.line_height),
                     ),
                     border: Border::default(),
                     ..renderer::Quad::default()
                 },
-                Background::Color(Color::from_rgb(0.45, 0.72, 1.0)),
+                Background::Color(self.colors.autocomplete_accent),
             );
         }
     }
@@ -1268,6 +1428,13 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
 
     fn diff(&self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<EditorState>();
+        // Host type preferences (W11) apply on the next frame; dropping the
+        // shaping cache forces one reshape with the new metrics.
+        if state.type_metrics != self.type_metrics {
+            state.type_metrics = self.type_metrics;
+            state.viewport.line_height = self.type_metrics.line_height;
+            state.shaping = None;
+        }
         if state.view_key != self.view_key {
             *state = EditorState::default();
             state.view_key = self.view_key;
@@ -1460,7 +1627,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             {
                 let lines = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => *y,
-                    mouse::ScrollDelta::Pixels { y, .. } => *y / LINE_HEIGHT,
+                    mouse::ScrollDelta::Pixels { y, .. } => *y / self.type_metrics.line_height,
                 };
                 let last_line = logical_line_count(&self.view.text).saturating_sub(1);
                 if lines > 0.0 {
@@ -1504,7 +1671,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             shell.request_input_method(&InputMethod::Enabled {
                 cursor: Rectangle::new(
                     Point::new(layout.bounds().x + PAD_X + x, layout.bounds().y + PAD_Y + y),
-                    Size::new(1.0, LINE_HEIGHT),
+                    Size::new(1.0, self.type_metrics.line_height),
                 ),
                 purpose: input_method::Purpose::Normal,
                 // The widget paints preedit inline itself. Sending a runtime
@@ -1634,13 +1801,16 @@ fn link_action_at(view: &EditorView, spans: &[LinkSpan], byte: usize) -> Option<
 #[doc(hidden)]
 #[must_use]
 pub fn shape_for_test(text: &str, width: f32) -> ShapingBuffer {
-    shape_text(text, width)
+    shape_text(text, width, TypeMetrics::default())
 }
 
-fn shape_text(text: &str, width: f32) -> ShapingBuffer {
+fn shape_text(text: &str, width: f32, metrics: TypeMetrics) -> ShapingBuffer {
     FONT_SYSTEM.with(|font_system| {
         let mut font_system = font_system.borrow_mut();
-        let mut buffer = ShapingBuffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let mut buffer = ShapingBuffer::new(
+            &mut font_system,
+            Metrics::new(metrics.font_size, metrics.line_height),
+        );
         buffer.set_size(&mut font_system, Some(width), None);
         buffer.set_text(
             &mut font_system,
@@ -1675,7 +1845,7 @@ fn keyboard_input_blocked(
 #[cfg(test)]
 fn hit_test_visible(text: &str, viewport: Viewport, x: f32, y: f32, width: f32) -> usize {
     let (visible, source_start) = visible_text(text, viewport);
-    let buffer = shape_text(&visible, width);
+    let buffer = shape_text(&visible, width, TypeMetrics::default());
     let Some(cursor) = buffer.hit(x.max(0.0), y.max(0.0)) else {
         return source_start + visible.len();
     };
@@ -2160,7 +2330,7 @@ mod tests {
     #[test]
     fn cosmic_text_layout_contains_the_editor_text() {
         let text = "Heading\n\nbody\n\n- item\n- final visual editor input";
-        let shaped = shape_text(text, 400.0);
+        let shaped = shape_text(text, 400.0, TypeMetrics::default());
         let runs = shaped.layout_runs().collect::<Vec<_>>();
         assert!(!runs.is_empty());
         assert!(runs.iter().any(|run| run.text == "Heading"));
@@ -2170,7 +2340,7 @@ mod tests {
 
     #[test]
     fn cosmic_text_layout_wraps_long_lines() {
-        let shaped = shape_text("abcdefghij", 24.0);
+        let shaped = shape_text("abcdefghij", 24.0, TypeMetrics::default());
         assert!(shaped.layout_runs().count() > 1);
     }
 
@@ -2367,7 +2537,7 @@ mod tests {
     #[test]
     fn pointer_hit_test_places_and_extends_selection_at_glyph_boundary() {
         let text = "abcdef";
-        let shaped = shape_text(text, 300.0);
+        let shaped = shape_text(text, 300.0, TypeMetrics::default());
         let first_run = shaped.layout_runs().next().expect("one shaped line");
         let target = &first_run.glyphs[3];
         let expected_byte = target.start;

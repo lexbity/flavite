@@ -15,10 +15,11 @@ pub fn overlay(app: &App) -> Option<Element<'_, Message>> {
     if app.notices.is_empty() {
         return None;
     }
+    let metrics = app.appearance.metrics();
     let hidden = app.notices.len().saturating_sub(3);
     let mut entries = column![
         text(format!("Notifications ({})", app.notices.len()))
-            .size(style::TEXT_SM)
+            .size(metrics.text_sm)
             .style(style::dim_text)
     ]
     .spacing(2);
@@ -33,21 +34,21 @@ pub fn overlay(app: &App) -> Option<Element<'_, Message>> {
         };
         let mut entry = row![
             text(format!("{}: {:?}", notice.event.event_type(), notice.event))
-                .size(style::TEXT_SM)
+                .size(metrics.text_sm)
                 .width(Length::Fill),
         ]
-        .spacing(style::SPACING_SM)
+        .spacing(metrics.spacing_sm)
         .align_y(alignment::Vertical::Center);
         if let Some(review) = review {
             entry = entry.push(
-                button(text("Review…").size(style::TEXT_SM))
+                button(text("Review…").size(metrics.text_sm))
                     .padding(tab_strip::chip_padding())
                     .style(style::action())
                     .on_press(review),
             );
         }
         entry = entry.push(
-            button(text("Dismiss").size(style::TEXT_SM))
+            button(text("Dismiss").size(metrics.text_sm))
                 .padding(tab_strip::chip_padding())
                 .style(style::ghost())
                 .on_press(Message::AcknowledgeNotice(notice.id)),
@@ -59,7 +60,7 @@ pub fn overlay(app: &App) -> Option<Element<'_, Message>> {
             text(format!(
                 "{hidden} additional notices are waiting for presentation"
             ))
-            .size(style::TEXT_SM)
+            .size(metrics.text_sm)
             .style(style::dim_text),
         );
     }
@@ -67,10 +68,10 @@ pub fn overlay(app: &App) -> Option<Element<'_, Message>> {
         container(entries)
             .width(Length::Fill)
             .padding(Padding {
-                top: style::SPACING_SM,
-                bottom: style::SPACING_SM,
-                left: style::SPACING_LG,
-                right: style::SPACING_LG,
+                top: metrics.spacing_sm,
+                bottom: metrics.spacing_sm,
+                left: metrics.spacing_lg,
+                right: metrics.spacing_lg,
             })
             .style(style::card)
             .into(),

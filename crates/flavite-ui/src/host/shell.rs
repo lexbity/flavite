@@ -13,6 +13,7 @@ impl App {
         iced::Rectangle,
         iced::widget::pane_grid::Axis,
     )> {
+        let scale = self.appearance.metrics().scale;
         if self.maximized_group().is_some()
             || !flavite_workspace::fits(
                 &self.workspace,
@@ -20,7 +21,7 @@ impl App {
                     width: self.workspace_bounds.width,
                     height: self.workspace_bounds.height,
                 },
-                1.0,
+                scale,
             )
         {
             return vec![];
@@ -28,7 +29,11 @@ impl App {
         self.adapter
             .panes
             .layout()
-            .split_regions(4.0, 0.0, self.workspace_bounds.size())
+            .split_regions(
+                flavite_workspace::SPLITTER_WIDTH * scale,
+                0.0,
+                self.workspace_bounds.size(),
+            )
             .into_iter()
             .filter_map(|(split, (axis, rect, ratio))| {
                 let id = self.adapter.workspace_split(split)?;
@@ -70,13 +75,16 @@ impl App {
                 (position.y - self.workspace_bounds.y - rect.y, rect.height)
             }
         };
-        Some((position - 2.0) / (extent - 4.0).max(1.0))
+        let divider = flavite_workspace::SPLITTER_WIDTH * self.appearance.metrics().scale;
+        Some((position - divider / 2.0) / (extent - divider).max(1.0))
     }
 
     pub(crate) fn project_geometry(&mut self) {
+        let scale = self.appearance.metrics().scale;
         self.adapter.project(
             &self.workspace,
             self.workspace_bounds.size(),
+            scale,
             &self.resize_preview,
         );
         self.group_bounds
@@ -103,7 +111,7 @@ impl App {
                 width: self.workspace_bounds.width,
                 height: self.workspace_bounds.height,
             },
-            1.0,
+            self.appearance.metrics().scale,
         );
         self.maximized_group()
             .or_else(|| adaptive.then(|| self.focused_group()).flatten())
@@ -144,20 +152,20 @@ impl App {
         let Some(view) = self.workspace.tab(&tab) else {
             return false;
         };
-        let a = flavite_workspace::view_minimum(view.kind(), 1.0);
+        let scale = self.appearance.metrics().scale;
+        let a = flavite_workspace::view_minimum(view.kind(), scale);
         let b = flavite_workspace::geometry::subtree_minimum(
             &self.workspace,
             &LayoutNode::Group(group),
-            1.0,
+            scale,
         );
+        let divider = flavite_workspace::SPLITTER_WIDTH * scale;
         match arrangement {
             Arrangement::SideBySide => {
-                rect.width >= a.width + b.width + flavite_workspace::SPLITTER_WIDTH
-                    && rect.height >= a.height.max(b.height)
+                rect.width >= a.width + b.width + divider && rect.height >= a.height.max(b.height)
             }
             Arrangement::Stacked => {
-                rect.height >= a.height + b.height + flavite_workspace::SPLITTER_WIDTH
-                    && rect.width >= a.width.max(b.width)
+                rect.height >= a.height + b.height + divider && rect.width >= a.width.max(b.width)
             }
         }
     }
@@ -177,6 +185,10 @@ impl App {
     /// Pointer hit tests consume the same width-aware tab plan as paint.
     pub(crate) fn dock_target(&self, position: iced::Point) -> Option<Target> {
         let tab = self.gesture.dragged_tab()?;
+        // Edge zones track the scaled tab strip chrome so hits land where
+        // the drop targets are painted.
+        let metrics = self.appearance.metrics();
+        let tab_height = metrics.tab_height;
         for group in self.workspace.group_order() {
             let g = self.workspace.group(&group)?;
             if !self.is_tab_visible(g.active()) {
@@ -191,9 +203,9 @@ impl App {
             let x = position.x - rect.x;
             let y = position.y - rect.y;
             let active = g.tabs().iter().position(|t| *t == g.active()).unwrap_or(0);
-            let slots = tab_strip::plan(rect.width, g.tabs().len(), active);
-            if y < tab_strip::TAB_HEIGHT {
-                if x >= rect.width - tab_strip::CONTROLS_WIDTH {
+            let slots = tab_strip::plan(rect.width, metrics.controls_width, g.tabs().len(), active);
+            if y < tab_height {
+                if x >= rect.width - metrics.controls_width {
                     return None;
                 }
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -204,13 +216,13 @@ impl App {
                     edge: None,
                 });
             }
-            let edge = if x < 32.0 {
+            let edge = if x < tab_height {
                 Some(flavite_workspace::Edge::Left)
-            } else if x > rect.width - 32.0 {
+            } else if x > rect.width - tab_height {
                 Some(flavite_workspace::Edge::Right)
-            } else if y < tab_strip::TAB_HEIGHT + 32.0 {
+            } else if y < tab_height + tab_height {
                 Some(flavite_workspace::Edge::Top)
-            } else if y > rect.height - 32.0 {
+            } else if y > rect.height - tab_height {
                 Some(flavite_workspace::Edge::Bottom)
             } else {
                 None

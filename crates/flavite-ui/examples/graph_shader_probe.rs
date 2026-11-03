@@ -17,6 +17,7 @@ use flavite_ui::graph::{
     Camera, GraphMessage, ProbeMessage, ProbeProgram, ProbeTimings, RenderGeometry,
     SyntheticOptions, generate,
 };
+use flavite_ui::style::tokens::Scheme;
 
 /// The probe state.
 pub struct ProbeState {
@@ -40,8 +41,9 @@ impl ProbeState {
         let synthetic = generate(&SyntheticOptions::probe_default());
         let positions = synthetic.positions.clone();
 
-        let geometry = RenderGeometry::from_snapshot(&synthetic.snapshot, &positions, 0)
-            .expect("fixture snapshot and positions must match");
+        let geometry =
+            RenderGeometry::from_snapshot(&synthetic.snapshot, &positions, 0, Scheme::Dark)
+                .expect("fixture snapshot and positions must match");
 
         let geometry = Arc::new(geometry);
         let timings = Arc::new(ProbeTimings::default());
@@ -96,6 +98,7 @@ impl ProbeState {
         let program = ProbeProgram::new(
             Arc::clone(&self.geometry),
             self.camera,
+            Scheme::Dark,
             Arc::clone(&self.timings),
         );
 

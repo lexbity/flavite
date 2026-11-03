@@ -20,21 +20,22 @@ fn filter_id(tab: TabId) -> iced::widget::Id {
 
 /// Render the Notes list for one tab. `group` is where picked notes open.
 pub fn view(app: &App, tab: TabId, group: flavite_workspace::GroupId) -> Element<'_, Message> {
+    let metrics = app.appearance.metrics();
     if let Some(error) = app.catalog_error() {
         return container(
             column![
-                text("Notes unavailable").size(style::HEADING),
+                text("Notes unavailable").size(metrics.heading),
                 text(error.to_owned()).style(style::dim_text),
                 button(text("Retry"))
                     .padding(tab_strip::chip_padding())
                     .style(style::action())
                     .on_press(Message::RefreshCatalog),
             ]
-            .spacing(style::SPACING_SM),
+            .spacing(metrics.spacing_sm),
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(style::SPACING_LG)
+        .padding(metrics.spacing_lg)
         .style(style::content)
         .into();
     }
@@ -63,16 +64,16 @@ pub fn view(app: &App, tab: TabId, group: flavite_workspace::GroupId) -> Element
             current_folder = Some(folder.clone());
             list = list.push(
                 row![
-                    text("📁").size(style::TEXT_SM),
+                    text("📁").size(metrics.text_sm),
                     text(if folder.is_empty() {
                         "Vault root".to_owned()
                     } else {
                         folder
                     })
-                    .size(style::TEXT_SM)
+                    .size(metrics.text_sm)
                     .style(style::dim_text),
                 ]
-                .spacing(style::SPACING_SM)
+                .spacing(metrics.spacing_sm)
                 .padding(iced::Padding {
                     top: 4.0,
                     bottom: 2.0,
@@ -81,13 +82,13 @@ pub fn view(app: &App, tab: TabId, group: flavite_workspace::GroupId) -> Element
                 }),
             );
         }
-        list = list.push(note_row(candidate, group));
+        list = list.push(note_row(*metrics, candidate, group));
         rendered += 1;
     }
     if shown > rendered {
         list = list.push(
             text(format!("{shown} notes match; showing the first {rendered}"))
-                .size(style::TEXT_SM)
+                .size(metrics.text_sm)
                 .style(style::dim_text),
         );
     }
@@ -105,34 +106,34 @@ pub fn view(app: &App, tab: TabId, group: flavite_workspace::GroupId) -> Element
     container(
         column![
             row![
-                text(format!("{total} notes")).size(style::TEXT_LG),
+                text(format!("{total} notes")).size(metrics.text_lg),
                 Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
                 button(text("Refresh"))
                     .padding(tab_strip::chip_padding())
                     .style(style::ghost())
                     .on_press(Message::RefreshCatalog),
             ]
-            .spacing(style::SPACING)
+            .spacing(metrics.spacing)
             .align_y(alignment::Vertical::Center),
             text_input("Filter notes…", &filter)
                 .id(filter_id(tab))
                 .on_input(move |value| Message::NotesFilter { tab, value })
                 .padding(tab_strip::chip_padding())
-                .size(style::TEXT_SM),
+                .size(metrics.text_sm),
             text("Pick a note to open it in this group")
-                .size(style::TEXT_SM)
+                .size(metrics.text_sm)
                 .style(style::dim_text),
             container(scrollable(list).height(Length::Fill))
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .padding(style::SPACING_SM)
+                .padding(metrics.spacing_sm)
                 .style(style::card),
         ]
-        .spacing(style::SPACING_SM),
+        .spacing(metrics.spacing_sm),
     )
     .width(Length::Fill)
     .height(Length::Fill)
-    .padding(style::SPACING_LG)
+    .padding(metrics.spacing_lg)
     .style(style::content)
     .into()
 }
@@ -140,6 +141,7 @@ pub fn view(app: &App, tab: TabId, group: flavite_workspace::GroupId) -> Element
 /// One selectable note row (title plus native path), shared by grouping.
 /// The row owns its content, so it can outlive the candidate snapshot.
 fn note_row(
+    metrics: crate::style::Metrics,
     candidate: &picker::NoteCandidate,
     group: flavite_workspace::GroupId,
 ) -> Element<'static, Message> {
@@ -147,10 +149,10 @@ fn note_row(
         row![
             text(candidate.title().to_owned()).width(Length::Fill),
             text(candidate.path().to_string())
-                .size(style::TEXT_SM)
+                .size(metrics.text_sm)
                 .style(style::dim_text),
         ]
-        .spacing(style::SPACING),
+        .spacing(metrics.spacing),
     )
     .width(Length::Fill)
     .padding(iced::Padding {

@@ -231,13 +231,14 @@ impl SearchHost {
 /// first edit so the view is immediately usable after opening.
 #[allow(clippy::too_many_lines)]
 pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
+    let metrics = app.appearance.metrics();
     let default = SearchState::default();
     let state = app.search.tabs.get(&tab).unwrap_or(&default);
     let query = state.query.clone();
     let results_snapshot = state.results.clone();
     let mut results = column![].spacing(2);
     for result in &results_snapshot {
-        results = results.push(result_row(result, tab));
+        results = results.push(result_row(*metrics, result, tab));
     }
     let _ = &results_snapshot;
     if state.results.is_empty() && state.error.is_none() && !state.updating {
@@ -274,32 +275,36 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
                     .on_input(move |value| Message::SearchQuery { tab, value })
                     .on_submit(Message::SearchSubmitNow { tab })
                     .padding(tab_strip::chip_padding())
-                    .size(style::TEXT_SM)
+                    .size(metrics.text_sm)
                     .width(Length::Fill),
             ]
-            .spacing(style::SPACING_SM),
-            text(status).size(style::TEXT_SM).style(style::dim_text),
+            .spacing(metrics.spacing_sm),
+            text(status).size(metrics.text_sm).style(style::dim_text),
             container(scrollable(results).height(Length::Fill))
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .padding(style::SPACING_SM)
+                .padding(metrics.spacing_sm)
                 .style(style::card),
             row![
                 Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
                 load_more,
             ]
-            .spacing(style::SPACING_SM),
+            .spacing(metrics.spacing_sm),
         ]
-        .spacing(style::SPACING_SM),
+        .spacing(metrics.spacing_sm),
     )
     .width(Length::Fill)
     .height(Length::Fill)
-    .padding(style::SPACING_LG)
+    .padding(metrics.spacing_lg)
     .style(style::content)
     .into()
 }
 
-fn result_row(result: &SearchResultRow, tab: TabId) -> Element<'static, Message> {
+fn result_row(
+    metrics: crate::style::Metrics,
+    result: &SearchResultRow,
+    tab: TabId,
+) -> Element<'static, Message> {
     let locator = flavite_workspace::NoteLocator::from_relative(std::path::Path::new(&result.path));
     let open = locator.ok().map(|locator| Message::OpenNote {
         locator,
@@ -308,14 +313,14 @@ fn result_row(result: &SearchResultRow, tab: TabId) -> Element<'static, Message>
     let mut body = column![
         text(result.title.clone()),
         text(result.path.clone())
-            .size(style::TEXT_SM)
+            .size(metrics.text_sm)
             .style(style::dim_text),
     ]
     .spacing(2);
     if !result.excerpt.is_empty() {
         body = body.push(
             text(result.excerpt.clone())
-                .size(style::TEXT_SM)
+                .size(metrics.text_sm)
                 .style(style::dim_text),
         );
     }

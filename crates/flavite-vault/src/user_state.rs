@@ -246,14 +246,16 @@ impl UserStateStore {
         let envelope = serde_json::json!({ "generation": next, "payload": payload_text });
         let bytes = serde_json::to_vec_pretty(&envelope)
             .map_err(|error| UserStateError::Corrupt(error.to_string()))?;
-        // Keep the last good copy before replacing it.
+        // Keep the last good copy before replacing it. The backup is
+        // replaced atomically (not create-new): a save that follows an
+        // earlier save must update the `.bak`, or the third save of any
+        // kind would fail once a backup already exists.
         if let Some(previous) = self
             .fs
             .read_if_exists(&path)
             .map_err(|error| UserStateError::Fs(error.to_string()))?
         {
-            self.fs
-                .write_new(&backup, &previous)
+            flavite_fs::atomic::atomic_write(self.fs.as_ref(), &backup, &previous)
                 .map_err(|error| UserStateError::Fs(error.to_string()))?;
         }
         // One shared durability primitive (§4.4/D6, consolidated rather than

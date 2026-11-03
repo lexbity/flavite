@@ -77,6 +77,10 @@ pub struct FrameSignature {
     writing_target: Option<NodeId>,
     pins_count: usize,
     node_count: usize,
+    /// The active color scheme (W11): instance colors are semantic token
+    /// data, so a light/dark switch rebuilds geometry from the *same*
+    /// publication and positions frame — camera and layout never reset.
+    scheme: crate::style::tokens::Scheme,
 }
 
 /// Per-graph-tab host state.
@@ -459,6 +463,7 @@ impl GraphHost {
         pinned: &BTreeMap<NodeId, [f32; 2]>,
         publication: &GraphPublication,
         writing_target: Option<NodeId>,
+        scheme: crate::style::tokens::Scheme,
     ) -> FrameSignature {
         let state = self.tabs.get(&tab);
         FrameSignature {
@@ -476,6 +481,7 @@ impl GraphHost {
             writing_target,
             pins_count: pinned.len(),
             node_count: publication.node_count(),
+            scheme,
         }
     }
 }
@@ -692,9 +698,16 @@ pub fn pump(app: &mut App) {
             state.arbiter.invalidate_frame(&key);
         }
 
-        let signature =
-            app.graph
-                .signature_for(tab, &key, &positions, &pinned, &publication, target_node);
+        let scheme = app.appearance.scheme();
+        let signature = app.graph.signature_for(
+            tab,
+            &key,
+            &positions,
+            &pinned,
+            &publication,
+            target_node,
+            scheme,
+        );
         if let Some(state) = app.graph.state_mut(tab) {
             let summary_key = (base_key, state.selected_nodes.clone());
             if state.summary_key.as_ref() != Some(&summary_key) {
@@ -750,6 +763,7 @@ pub fn pump(app: &mut App) {
                         && old.drag == signature.drag
                         && old.writing_target == signature.writing_target
                         && old.pins_count == signature.pins_count
+                        && old.scheme == signature.scheme
                 })
         });
         if rebuild
@@ -780,7 +794,8 @@ pub fn pump(app: &mut App) {
                 .graph
                 .state(tab)
                 .map_or(1, |state| state.geometry_generation.saturating_add(1));
-            let outcome = RenderGeometry::build(&publication, &positions, &overrides, generation);
+            let outcome =
+                RenderGeometry::build(&publication, &positions, &overrides, generation, scheme);
             if let Some(state) = app.graph.state_mut(tab) {
                 match outcome {
                     Ok(geometry) => {

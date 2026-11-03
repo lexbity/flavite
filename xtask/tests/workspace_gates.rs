@@ -187,6 +187,23 @@ fn w09_gate_rejects_unsafe_renderer_and_missing_property_authority() {
 }
 
 #[test]
+fn w11_gate_rejects_raw_view_colors_and_missing_appearance_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_current_contract_inputs(temp.path());
+    assert!(run_gate(temp.path(), "W11").status.success());
+    let view = temp.path().join("crates/flavite-ui/src/views/note.rs");
+    fs::write(&view, "let c = Color::from_rgb(0.1, 0.2, 0.3);\n").unwrap();
+    let forbidden = run_gate(temp.path(), "W11");
+    assert!(!forbidden.status.success());
+    assert!(String::from_utf8_lossy(&forbidden.stderr).contains("forbidden production pattern"));
+    fs::write(view, "implementation\n").unwrap();
+    fs::remove_file(temp.path().join("crates/flavite-ui/src/preferences.rs")).unwrap();
+    let missing = run_gate(temp.path(), "W11");
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("missing or empty"));
+}
+
+#[test]
 fn final_gate_rejects_demo_assets_and_placeholders() {
     let temp = tempfile::tempdir().unwrap();
     seed_current_contract_inputs(temp.path());

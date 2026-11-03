@@ -202,9 +202,28 @@ case "$profile" in
         assert_absent 'fn resolve_by_stem|fn guess_target' "$root/crates/flavite-ui/src"
         assert_absent 'std::fs|rusqlite|flavite_index' "$root/crates/flavite-ui/src/picker.rs"
         ;;
+    W11)
+        bash "$0" W10 "$root"
+        for file in crates/flavite-ui/src/style/tokens.rs crates/flavite-ui/src/style/contrast.rs crates/flavite-ui/src/style/type_scale.rs crates/flavite-ui/src/preferences.rs crates/flavite-ui/src/host/appearance.rs crates/flavite-ui/tests/appearance_preferences.rs crates/flavite-ui/tests/visual_contract.rs crates/flavite-workspace/tests/geometry_matrix.rs; do
+            assert_nonempty "$root/$file"
+        done
+        # Semantic tokens: production view/layout chrome carries no raw
+        # color literals; graph data colors map to token roles.
+        assert_absent 'Color::from_rgb|Color::from_rgba|Theme::Catppuccin' \
+            "$root/crates/flavite-ui/src/views" \
+            "$root/crates/flavite-ui/src/workspace"
+        # D-13: the 940x620 demo window default is retired; the supported
+        # minimum is 640x480.
+        assert_absent 'min_size: Some\(Size::new\(940' \
+            "$root/crates/flavite-ui/src" \
+            "$root/crates/flavite-ui/examples/app-demo.rs"
+        # Scale-aware chrome: solver call sites must not hardcode scale 1.0.
+        assert_absent 'view_minimum\(view.kind\(\), 1\.0\)' \
+            "$root/crates/flavite-ui/src/host/shell.rs"
+        ;;
     FINAL)
         # Run all completed profiles additively.
-        bash "$0" W09 "$root"
+        bash "$0" W11 "$root"
         # Production/demo cleanup gates
         if [[ -f "$root/crates/flavite-ui/src/main.rs" || -f "$root/crates/flavite-ui/src/boot.rs" ]]; then
             assert_absent 'demo\.md|LATTICE|prepare_demo_vault' \

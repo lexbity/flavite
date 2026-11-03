@@ -7,10 +7,11 @@
 //! through the journaled `note.rename` — no GUI-side file mutation.
 
 use crate::app::{App, Message};
+use crate::preferences::{LineWidth, ThemeChoice};
 use crate::style;
 use crate::workspace::tab_strip;
 use flavite_workspace::NoteLocator;
-use iced::widget::{button, column, container, row, text, text_input};
+use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Length};
 
 /// Maximum dialog text input length (NFR-12: 8 KiB per text setting).
@@ -36,6 +37,9 @@ pub enum Dialog {
     },
     /// Version and command surface summary.
     About,
+    /// Interface preferences (W11): theme, scale, editor type, motion,
+    /// and shortcut overrides with collision capture.
+    Preferences,
 }
 
 impl Dialog {
@@ -46,6 +50,7 @@ impl Dialog {
             Self::NewNote { .. } => "New note",
             Self::Rename { .. } => "Rename or move note",
             Self::About => "About Flavite",
+            Self::Preferences => "Preferences",
         }
     }
 }
@@ -77,6 +82,7 @@ pub fn offer_create_for_link(raw: &str) -> Dialog {
 
 /// Render the active dialog as a modal card body.
 pub fn view(app: &App) -> Element<'_, Message> {
+    let metrics = app.appearance.metrics();
     let Some(dialog) = &app.dialog else {
         return column![].into();
     };
@@ -84,9 +90,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Dialog::NewNote { path } => {
             let error = validate_new_note(app, path);
             let mut body = column![
-                text("New note").size(style::HEADING),
+                text("New note").size(metrics.heading),
                 text("Exact vault-relative path; missing folders are created on save.")
-                    .size(style::TEXT_SM)
+                    .size(metrics.text_sm)
                     .style(style::dim_text),
                 text_input("folder/note.md", path)
                     .id(iced::widget::Id::new(NEW_NOTE_INPUT_ID))
@@ -94,12 +100,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
                     .on_submit(Message::DialogSubmit)
                     .padding(tab_strip::chip_padding()),
             ]
-            .spacing(style::SPACING_SM);
+            .spacing(metrics.spacing_sm);
             let submittable = error.is_none();
             if let Some(error) = &error {
                 body = body.push(
                     text(error.clone())
-                        .size(style::TEXT_SM)
+                        .size(metrics.text_sm)
                         .style(style::dim_text),
                 );
             }
@@ -111,16 +117,16 @@ pub fn view(app: &App) -> Element<'_, Message> {
                         .on_press_maybe(submittable.then_some(Message::DialogSubmit)),
                     cancel_button(),
                 ]
-                .spacing(style::SPACING_SM),
+                .spacing(metrics.spacing_sm),
             );
-            dialog_card(body)
+            dialog_card(*metrics, body)
         }
         Dialog::Rename { from, to, tier } => {
             let error = validate_rename(app, from, to);
             let mut body = column![
-                text("Rename or move note").size(style::HEADING),
+                text("Rename or move note").size(metrics.heading),
                 text(format!("From: {}", from.components().join("/")))
-                    .size(style::TEXT_SM)
+                    .size(metrics.text_sm)
                     .style(style::dim_text),
                 text(match tier.as_deref() {
                     Some("T0") | Some("T1") | Some("T2") => {
@@ -131,7 +137,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
                     }
                     _ => "Inbound links are rewritten through the durable rename journal.",
                 })
-                .size(style::TEXT_SM)
+                .size(metrics.text_sm)
                 .style(style::dim_text),
                 text_input("new/folder/note.md", to)
                     .id(iced::widget::Id::new(RENAME_INPUT_ID))
@@ -139,12 +145,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
                     .on_submit(Message::DialogSubmit)
                     .padding(tab_strip::chip_padding()),
             ]
-            .spacing(style::SPACING_SM);
+            .spacing(metrics.spacing_sm);
             let submittable = error.is_none();
             if let Some(error) = &error {
                 body = body.push(
                     text(error.clone())
-                        .size(style::TEXT_SM)
+                        .size(metrics.text_sm)
                         .style(style::dim_text),
                 );
             }
@@ -156,13 +162,14 @@ pub fn view(app: &App) -> Element<'_, Message> {
                         .on_press_maybe(submittable.then_some(Message::DialogSubmit)),
                     cancel_button(),
                 ]
-                .spacing(style::SPACING_SM),
+                .spacing(metrics.spacing_sm),
             );
-            dialog_card(body)
+            dialog_card(*metrics, body)
         }
         Dialog::About => dialog_card(
+            *metrics,
             column![
-                text("Flavite").size(style::HEADING),
+                text("Flavite").size(metrics.heading),
                 text(concat!(
                     "A local-first plain-text knowledge vault.\nVersion ",
                     env!("CARGO_PKG_VERSION"),
@@ -170,8 +177,250 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 .style(style::dim_text),
                 cancel_button(),
             ]
-            .spacing(style::SPACING_SM),
+            .spacing(metrics.spacing_sm),
         ),
+        Dialog::Preferences => preferences_body(app, *metrics),
+    }
+}
+
+/// One choice row: a label plus the mutually exclusive option buttons.
+fn choice_row<'a>(
+    metrics: style::Metrics,
+    label: &str,
+    options: &[(&'static str, bool, Message)],
+) -> Element<'a, Message> {
+    let mut row = row![text(label.to_owned()).size(metrics.text)]
+        .spacing(metrics.spacing_sm)
+        .align_y(iced::alignment::Vertical::Center);
+    for (name, active, message) in options {
+        row = row.push(
+            button(text(*name).size(metrics.text_sm))
+                .padding(tab_strip::chip_padding())
+                .style(action_or_ghost(*active))
+                .on_press(message.clone()),
+        );
+    }
+    row.into()
+}
+
+/// The current display chord for a command (override or default).
+fn chord_label(app: &App, id: &str) -> String {
+    crate::host::commands::resolved_chord(id, &app.appearance.prefs.shortcuts)
+        .map(|chord| crate::preferences::chord_string(&chord))
+        .unwrap_or_else(|| "unbound".into())
+}
+
+/// One shortcut-editor row: the command's default id, its effective
+/// chord, a capture button, and a reset button when overridden.
+fn shortcut_row<'a>(metrics: style::Metrics, app: &App, id: &'static str) -> Element<'a, Message> {
+    use crate::host::appearance::PreferenceMessage as P;
+    let capturing = app.shortcut_capture.as_deref() == Some(id);
+    let overridden = app.appearance.prefs.shortcuts.contains_key(id);
+    let mut row = row![
+        text(id).size(metrics.text_sm),
+        text(chord_label(app, id)).size(metrics.text),
+    ]
+    .spacing(metrics.spacing_sm)
+    .align_y(iced::alignment::Vertical::Center);
+    row = row.push(
+        button(text(if capturing { "Press keys…" } else { "Change" }).size(metrics.text_sm))
+            .padding(tab_strip::chip_padding())
+            .style(action_or_ghost(capturing))
+            .on_press(Message::Preferences(P::BeginShortcutCapture(id.to_owned()))),
+    );
+    if overridden {
+        row = row.push(
+            button(text("Reset").size(metrics.text_sm))
+                .padding(tab_strip::chip_padding())
+                .style(style::ghost())
+                .on_press(Message::Preferences(P::SetShortcut {
+                    command: id.to_owned(),
+                    chord: None,
+                })),
+        );
+    }
+    row.into()
+}
+
+/// The Preferences dialog body (W11): theme, scale, editor type, motion,
+/// and the shortcut editor with capture and restore-defaults (D-15).
+fn preferences_body(app: &App, metrics: style::Metrics) -> Element<'_, Message> {
+    use crate::host::appearance::PreferenceMessage as P;
+    let appearance = &app.appearance;
+    let scale = appearance.prefs.interface_scale_pct;
+    let font = appearance.prefs.editor_font_size;
+    let width = appearance.prefs.line_width;
+
+    let mut body = column![
+        text("Preferences").size(metrics.heading),
+        choice_row(
+            metrics,
+            "Theme",
+            &[
+                (
+                    "System",
+                    appearance.prefs.theme == ThemeChoice::System,
+                    Message::Preferences(P::SetTheme(ThemeChoice::System)),
+                ),
+                (
+                    "Light",
+                    appearance.prefs.theme == ThemeChoice::Light,
+                    Message::Preferences(P::SetTheme(ThemeChoice::Light)),
+                ),
+                (
+                    "Dark",
+                    appearance.prefs.theme == ThemeChoice::Dark,
+                    Message::Preferences(P::SetTheme(ThemeChoice::Dark)),
+                ),
+            ],
+        ),
+        choice_row(
+            metrics,
+            "Interface scale",
+            &[
+                ("75%", scale == 75, Message::Preferences(P::SetScale(75))),
+                ("100%", scale == 100, Message::Preferences(P::SetScale(100))),
+                ("150%", scale == 150, Message::Preferences(P::SetScale(150))),
+                ("200%", scale == 200, Message::Preferences(P::SetScale(200))),
+            ],
+        ),
+        choice_row(
+            metrics,
+            "Editor font size",
+            &[
+                (
+                    "12",
+                    font == 12,
+                    Message::Preferences(P::SetEditorFontSize(12))
+                ),
+                (
+                    "14",
+                    font == 14,
+                    Message::Preferences(P::SetEditorFontSize(14))
+                ),
+                (
+                    "16",
+                    font == 16,
+                    Message::Preferences(P::SetEditorFontSize(16))
+                ),
+                (
+                    "18",
+                    font == 18,
+                    Message::Preferences(P::SetEditorFontSize(18))
+                ),
+                (
+                    "20",
+                    font == 20,
+                    Message::Preferences(P::SetEditorFontSize(20))
+                ),
+                (
+                    "24",
+                    font == 24,
+                    Message::Preferences(P::SetEditorFontSize(24))
+                ),
+                (
+                    "28",
+                    font == 28,
+                    Message::Preferences(P::SetEditorFontSize(28))
+                ),
+            ],
+        ),
+        choice_row(
+            metrics,
+            "Editor line width",
+            &[
+                (
+                    "Full",
+                    width == LineWidth::Full,
+                    Message::Preferences(P::SetLineWidth(LineWidth::Full)),
+                ),
+                (
+                    "60",
+                    width == LineWidth::Columns(60),
+                    Message::Preferences(P::SetLineWidth(LineWidth::Columns(60))),
+                ),
+                (
+                    "80",
+                    width == LineWidth::Columns(80),
+                    Message::Preferences(P::SetLineWidth(LineWidth::Columns(80))),
+                ),
+                (
+                    "100",
+                    width == LineWidth::Columns(100),
+                    Message::Preferences(P::SetLineWidth(LineWidth::Columns(100))),
+                ),
+                (
+                    "120",
+                    width == LineWidth::Columns(120),
+                    Message::Preferences(P::SetLineWidth(LineWidth::Columns(120))),
+                ),
+                (
+                    "160",
+                    width == LineWidth::Columns(160),
+                    Message::Preferences(P::SetLineWidth(LineWidth::Columns(160))),
+                ),
+            ],
+        ),
+        choice_row(
+            metrics,
+            "Reduced motion",
+            &[
+                (
+                    "Off",
+                    !appearance.prefs.reduced_motion,
+                    Message::Preferences(P::SetReducedMotion(false)),
+                ),
+                (
+                    "On",
+                    appearance.prefs.reduced_motion,
+                    Message::Preferences(P::SetReducedMotion(true)),
+                ),
+            ],
+        ),
+        text("Keyboard shortcuts").size(metrics.text_lg),
+    ]
+    .spacing(metrics.spacing_sm);
+    for (id, _) in crate::host::commands::DEFAULT_CHORDS {
+        body = body.push(shortcut_row(metrics, app, id));
+    }
+    body = body.push(
+        row![
+            button(text("Restore default shortcuts").size(metrics.text_sm))
+                .padding(tab_strip::chip_padding())
+                .style(style::ghost())
+                .on_press(Message::Preferences(P::RestoreShortcuts)),
+            cancel_button(),
+        ]
+        .spacing(metrics.spacing_sm),
+    );
+    if let Some(error) = &appearance.shortcut_error {
+        body = body.push(
+            text(error.clone())
+                .size(metrics.text_sm)
+                .style(style::dim_text),
+        );
+    }
+    if appearance.last_error.is_some() {
+        body = body.push(
+            text(appearance.last_error.clone().unwrap_or_default())
+                .size(metrics.text_sm)
+                .style(style::dim_text),
+        );
+    }
+    dialog_card(metrics, body)
+}
+
+/// The pressed (action) or quiet (ghost) style, chosen at call time so
+/// option rows can highlight the active choice with one helper.
+fn action_or_ghost(
+    active: bool,
+) -> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style + Copy {
+    move |theme, status| {
+        if active {
+            style::action()(theme, status)
+        } else {
+            style::ghost()(theme, status)
+        }
     }
 }
 
@@ -182,10 +431,17 @@ fn cancel_button() -> iced::widget::Button<'static, Message> {
         .on_press(Message::DialogCancel)
 }
 
-fn dialog_card(body: iced::widget::Column<'_, Message>) -> Element<'_, Message> {
-    container(body)
+fn dialog_card(
+    metrics: style::Metrics,
+    body: iced::widget::Column<'_, Message>,
+) -> Element<'_, Message> {
+    let _ = metrics;
+    // The shortcut list can exceed a small window; the card scrolls
+    // instead of clipping (observed in the appearance-matrix evidence).
+    container(scrollable(body).width(Length::Fill).height(Length::Fill))
         .padding(style::SPACING_LG)
-        .max_width(520)
+        .max_width(560)
+        .max_height(720)
         .style(style::palette_card)
         .into()
 }
@@ -235,12 +491,13 @@ fn validate_rename(app: &App, from: &NoteLocator, to: &str) -> Option<String> {
 
 /// Render the no-vault start screen (FR-22).
 pub fn start_view(app: &App) -> Element<'_, Message> {
+    let metrics = app.appearance.metrics();
     let mut body = column![
-        text("Flavite").size(style::HEADING),
+        text("Flavite").size(metrics.heading),
         text("Open a folder of Markdown notes to begin. A folder is adopted as a vault on first open; no note content is created for you.")
             .style(style::dim_text),
     ]
-    .spacing(style::SPACING_SM);
+    .spacing(metrics.spacing_sm);
     if let Some(error) = &app.start.error {
         body = body.push(text(error.clone()).style(style::dim_text));
     }
@@ -265,7 +522,7 @@ pub fn start_view(app: &App) -> Element<'_, Message> {
                 .style(style::ghost())
                 .on_press(Message::VaultDialog),
         ]
-        .spacing(style::SPACING_SM),
+        .spacing(metrics.spacing_sm),
     );
     if let Some(last) = app.start.last_vault.clone() {
         body = body.push(
@@ -279,7 +536,7 @@ pub fn start_view(app: &App) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
         .center_x(Length::Fill)
-        .padding(style::SPACING_LG * 4.0)
+        .padding(metrics.spacing_lg * 4.0)
         .style(style::content)
         .into()
 }

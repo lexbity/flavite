@@ -8,67 +8,123 @@ use crate::app::{App, Message};
 use flavite_api::{ArgSchema, Chord, CommandSpec};
 use flavite_workspace::{GroupId, LayoutAction, NoteLocator, TabId, ViewKind};
 use iced::keyboard::{self, Modifiers};
-use std::sync::LazyLock;
 
-macro_rules! chords {
-    ($($modifiers:expr),+; $key:literal $(,)?) => {
-        LazyLock::new(|| [Chord::new($($modifiers)|+, $key)])
-    };
+/// Remappable shell commands and their default chords (W11 input catalog).
+/// The chord strings parse through [`crate::preferences::parse_chord`];
+/// `Mod` is the platform command modifier. A preference override replaces
+/// the default for that command id only.
+pub const DEFAULT_CHORDS: &[(&str, &str)] = &[
+    ("workspace.find", "Mod+F"),
+    ("workspace.note_mode", "Mod+E"),
+    ("workspace.quick_switch", "Mod+P"),
+    ("workspace.command_palette", "Mod+Shift+P"),
+    ("workspace.new_tab", "Mod+T"),
+    ("workspace.close_tab", "Mod+W"),
+    ("workspace.reopen_tab", "Mod+Shift+T"),
+    ("workspace.next_tab", "Mod+Tab"),
+    ("workspace.previous_tab", "Mod+Shift+Tab"),
+    ("workspace.next_group", "F6"),
+    ("workspace.previous_group", "Shift+F6"),
+    ("workspace.split_right", "Mod+Alt+Right"),
+    ("workspace.split_down", "Mod+Alt+Down"),
+    ("workspace.move_tab_next_group", "Mod+Alt+Shift+Right"),
+    ("workspace.move_tab_previous_group", "Mod+Alt+Shift+Left"),
+    ("workspace.maximize_group", "Mod+Shift+M"),
+    ("workspace.navigate_back", "Alt+Left"),
+    ("workspace.navigate_forward", "Alt+Shift+Right"),
+    ("workspace.new_note", "Mod+N"),
+    ("workspace.open_note_dialog", "Mod+O"),
+    ("workspace.group_actions", "Shift+F10"),
+    ("workspace.preferences", "Mod+,"),
+    ("note.save", "Mod+S"),
+];
+
+/// The pressed modifier state as the API's chord bit mask.
+#[must_use]
+pub fn modifier_bits(modifiers: &Modifiers) -> u8 {
+    use flavite_api::command::modifiers as mods;
+    let mut bits = mods::NONE;
+    if modifiers.command() {
+        bits |= mods::CTRL;
+    }
+    if modifiers.shift() {
+        bits |= mods::SHIFT;
+    }
+    if modifiers.alt() {
+        bits |= mods::ALT;
+    }
+    if modifiers.logo() {
+        bits |= mods::SUPER;
+    }
+    bits
 }
 
-use flavite_api::command::modifiers::{ALT, CTRL, SHIFT};
-
-static KEYS_NOTE_MODE: LazyLock<[Chord; 1]> = chords!(CTRL; "E");
-static KEYS_FIND: LazyLock<[Chord; 1]> = chords!(CTRL; "F");
-static KEYS_QUICK_SWITCH: LazyLock<[Chord; 1]> = chords!(CTRL; "P");
-static KEYS_COMMAND_PALETTE: LazyLock<[Chord; 1]> = chords!(CTRL, SHIFT; "P");
-static KEYS_NEW_TAB: LazyLock<[Chord; 1]> = chords!(CTRL; "T");
-static KEYS_CLOSE_TAB: LazyLock<[Chord; 1]> = chords!(CTRL; "W");
-static KEYS_REOPEN_TAB: LazyLock<[Chord; 1]> = chords!(CTRL, SHIFT; "T");
-static KEYS_NEXT_TAB: LazyLock<[Chord; 1]> = chords!(CTRL; "Tab");
-static KEYS_PREVIOUS_TAB: LazyLock<[Chord; 1]> = chords!(CTRL, SHIFT; "Tab");
-static KEYS_NEXT_GROUP: LazyLock<[Chord; 1]> = LazyLock::new(|| [Chord::new(0, "F6")]);
-static KEYS_PREVIOUS_GROUP: LazyLock<[Chord; 1]> = chords!(SHIFT; "F6");
-static KEYS_SPLIT_RIGHT: LazyLock<[Chord; 1]> = chords!(CTRL, ALT; "Right");
-static KEYS_SPLIT_DOWN: LazyLock<[Chord; 1]> = chords!(CTRL, ALT; "Down");
-static KEYS_MOVE_TAB_NEXT_GROUP: LazyLock<[Chord; 1]> = chords!(CTRL, ALT, SHIFT; "Right");
-static KEYS_MOVE_TAB_PREVIOUS_GROUP: LazyLock<[Chord; 1]> = chords!(CTRL, ALT, SHIFT; "Left");
-static KEYS_MAXIMIZE_GROUP: LazyLock<[Chord; 1]> = chords!(CTRL, SHIFT; "M");
-// W10: per-view navigation and note workflows.
-// Alt+Left/Alt+Shift+Right keep Alt+Right/Alt+Down free for splits.
-static KEYS_NAVIGATE_BACK: LazyLock<[Chord; 1]> = LazyLock::new(|| [Chord::new(ALT, "Left")]);
-static KEYS_NAVIGATE_FORWARD: LazyLock<[Chord; 1]> = chords!(ALT, SHIFT; "Right");
-static KEYS_NEW_NOTE: LazyLock<[Chord; 1]> = chords!(CTRL; "N");
-static KEYS_OPEN_NOTE: LazyLock<[Chord; 1]> = chords!(CTRL; "O");
-
-/// The `'static` default chord slice for a command id, if any.
-fn keys_for(id: &str) -> Option<&'static [Chord]> {
-    use flavite_api::command::modifiers as mods;
-    Some(match id {
-        "workspace.note_mode" => &LazyLock::force(&KEYS_NOTE_MODE)[..],
-        "workspace.find" => &LazyLock::force(&KEYS_FIND)[..],
-        "workspace.quick_switch" => &LazyLock::force(&KEYS_QUICK_SWITCH)[..],
-        "workspace.command_palette" => &LazyLock::force(&KEYS_COMMAND_PALETTE)[..],
-        "workspace.new_tab" => &LazyLock::force(&KEYS_NEW_TAB)[..],
-        "workspace.close_tab" => &LazyLock::force(&KEYS_CLOSE_TAB)[..],
-        "workspace.reopen_tab" => &LazyLock::force(&KEYS_REOPEN_TAB)[..],
-        "workspace.next_tab" => &LazyLock::force(&KEYS_NEXT_TAB)[..],
-        "workspace.previous_tab" => &LazyLock::force(&KEYS_PREVIOUS_TAB)[..],
-        "workspace.next_group" => &LazyLock::force(&KEYS_NEXT_GROUP)[..],
-        "workspace.previous_group" => &LazyLock::force(&KEYS_PREVIOUS_GROUP)[..],
-        "workspace.split_right" => &LazyLock::force(&KEYS_SPLIT_RIGHT)[..],
-        "workspace.split_down" => &LazyLock::force(&KEYS_SPLIT_DOWN)[..],
-        "workspace.move_tab_next_group" => &LazyLock::force(&KEYS_MOVE_TAB_NEXT_GROUP)[..],
-        "workspace.move_tab_previous_group" => &LazyLock::force(&KEYS_MOVE_TAB_PREVIOUS_GROUP)[..],
-        "workspace.maximize_group" => &LazyLock::force(&KEYS_MAXIMIZE_GROUP)[..],
-        "workspace.navigate_back" => &LazyLock::force(&KEYS_NAVIGATE_BACK)[..],
-        "workspace.navigate_forward" => &LazyLock::force(&KEYS_NAVIGATE_FORWARD)[..],
-        "workspace.new_note" => &LazyLock::force(&KEYS_NEW_NOTE)[..],
-        "workspace.open_note_dialog" => &LazyLock::force(&KEYS_OPEN_NOTE)[..],
-        _ => {
-            let _ = mods::NONE;
-            return None;
+/// The canonical chord token for an iced key (`P`, `F6`, `ArrowLeft`, ...).
+#[must_use]
+pub fn key_token(key: &keyboard::Key) -> Option<String> {
+    match key {
+        keyboard::Key::Character(character) => {
+            let mut characters = character.chars();
+            match (characters.next(), characters.next()) {
+                (Some(single), None) => Some(single.to_uppercase().next()?.to_string()),
+                _ => None,
+            }
         }
+        keyboard::Key::Named(named) => named_token(*named).map(str::to_owned),
+        keyboard::Key::Unidentified => None,
+    }
+}
+
+/// The canonical chord token stored in a chord's key string.
+#[must_use]
+pub fn chord_key_token(key: &str) -> Option<String> {
+    let token = key.trim();
+    const NAMED: &[(&str, &str)] = &[
+        ("Return", "Enter"),
+        ("Esc", "Escape"),
+        ("Del", "Delete"),
+        ("Up", "ArrowUp"),
+        ("Down", "ArrowDown"),
+        ("Left", "ArrowLeft"),
+        ("Right", "ArrowRight"),
+    ];
+    for (alias, canonical) in NAMED {
+        if token.eq_ignore_ascii_case(alias) {
+            return Some((*canonical).to_owned());
+        }
+    }
+    Some(token.to_uppercase())
+}
+
+fn named_token(named: keyboard::key::Named) -> Option<&'static str> {
+    use keyboard::key::Named;
+    Some(match named {
+        Named::Enter => "Enter",
+        Named::Tab => "Tab",
+        Named::Escape => "Escape",
+        Named::Backspace => "Backspace",
+        Named::Delete => "Delete",
+        Named::Home => "Home",
+        Named::End => "End",
+        Named::PageUp => "PageUp",
+        Named::PageDown => "PageDown",
+        Named::ArrowUp => "ArrowUp",
+        Named::ArrowDown => "ArrowDown",
+        Named::ArrowLeft => "ArrowLeft",
+        Named::ArrowRight => "ArrowRight",
+        Named::F1 => "F1",
+        Named::F2 => "F2",
+        Named::F3 => "F3",
+        Named::F4 => "F4",
+        Named::F5 => "F5",
+        Named::F6 => "F6",
+        Named::F7 => "F7",
+        Named::F8 => "F8",
+        Named::F9 => "F9",
+        Named::F10 => "F10",
+        Named::F11 => "F11",
+        Named::F12 => "F12",
+        _ => return None,
     })
 }
 
@@ -125,6 +181,18 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     UiCommand {
         id: "workspace.command_palette",
         title: "Command palette",
+    },
+    UiCommand {
+        id: "workspace.preferences",
+        title: "Open preferences (theme, scale, shortcuts)",
+    },
+    UiCommand {
+        id: "workspace.toggle_theme",
+        title: "Toggle light / dark theme",
+    },
+    UiCommand {
+        id: "workspace.cycle_interface_scale",
+        title: "Cycle interface scale (100 / 150 / 200 / 75 %)",
     },
     UiCommand {
         id: "workspace.new_tab",
@@ -323,19 +391,35 @@ pub const UI_COMMANDS: &[UiCommand] = &[
 /// The UI portion of the host catalog, rendered as core `CommandSpec`s for
 /// the shared palette matcher.
 #[must_use]
-pub fn ui_specs() -> Vec<CommandSpec> {
+pub fn ui_specs(overrides: &std::collections::BTreeMap<String, String>) -> Vec<CommandSpec> {
     UI_COMMANDS
         .iter()
         .map(|command| {
+            let keys: Vec<Chord> = resolved_chord(command.id, overrides).into_iter().collect();
             CommandSpec::with_availability(
                 command.id,
                 command.title,
                 ArgSchema::typed::<serde_json::Value>(),
                 None,
-                keys_for(command.id).unwrap_or(&[]),
+                crate::preferences::intern_chords(&keys),
             )
         })
         .collect()
+}
+
+/// The effective chord for a command id: the validated preference
+/// override when present, otherwise the catalog default.
+#[must_use]
+pub fn resolved_chord(
+    id: &str,
+    overrides: &std::collections::BTreeMap<String, String>,
+) -> Option<Chord> {
+    let default = DEFAULT_CHORDS
+        .iter()
+        .find(|(command, _)| *command == id)
+        .map(|(_, chord)| *chord)?;
+    let text = overrides.get(id).map(String::as_str).unwrap_or(default);
+    crate::preferences::parse_chord(text).or_else(|| crate::preferences::parse_chord(default))
 }
 
 /// Verify the composed catalog has no collisions with the core registry.
@@ -371,6 +455,46 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
     else {
         return None;
     };
+    // A Preferences shortcut row is capturing: the next key press becomes
+    // that command's chord; Escape cancels (W11 collision editor).
+    if let Some(command) = app.shortcut_capture.clone() {
+        if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+            return Some(Message::Preferences(
+                crate::host::appearance::PreferenceMessage::ShortcutCaptured {
+                    command,
+                    chord: None,
+                },
+            ));
+        }
+        let Some(token) = key_token(&key) else {
+            // Bare modifier key presses carry no key token; wait for the
+            // full combination.
+            return None;
+        };
+        let mut parts = Vec::new();
+        if modifiers.command() {
+            parts.push("Mod");
+        }
+        if modifiers.alt() {
+            parts.push("Alt");
+        }
+        if modifiers.shift() {
+            parts.push("Shift");
+        }
+        parts.push(token.as_str());
+        let chord = parts.join("+");
+        return Some(Message::Preferences(
+            crate::host::appearance::PreferenceMessage::ShortcutCaptured {
+                command,
+                chord: Some(chord),
+            },
+        ));
+    }
+    // Modal dialogs take Escape first (W10 UX fix observed in the
+    // appearance-matrix evidence run: the dialog never closed).
+    if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape)) && app.dialog.is_some() {
+        return Some(Message::DialogCancel);
+    }
     if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
         && !app.palette_open
         && !app.picker.open
@@ -435,21 +559,182 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
             return Some(Message::GraphCommand { tab, command });
         }
     }
-    // Layout and shell chords.
-    if modifiers.command() {
-        return command_chord(app, &key, modifiers);
+    // Layout and shell chords resolve through the effective shortcut
+    // table (W11): defaults with validated preference overrides, matched
+    // exactly on modifiers and key. Availability is rechecked per command.
+    if let Some(id) = app.appearance.chord_command(&key, &modifiers) {
+        return keyboard_command_message(app, id);
     }
-    if matches!(&key, keyboard::Key::Named(keyboard::key::Named::F6)) {
-        return Some(Message::Layout(LayoutAction::CycleGroup {
-            expected_revision: app.workspace.revision(),
-            forward: !modifiers.shift(),
-        }));
+    if let Some(action) = splitter_increment(app, &key, &modifiers) {
+        return Some(Message::Layout(action));
     }
     // An overlay hotkey that is also a printable character (P) must not
     // fire while the user types into a text field; overlays are the only
     // text inputs in W02, handled above.
     let _ = text;
     None
+}
+
+/// The message for a chord-resolved command id. This preserves the exact
+/// keyboard semantics of the pre-W11 chords (layout actions carry the
+/// current revision guard; availability is presentation advice).
+fn keyboard_command_message(app: &App, id: &'static str) -> Option<Message> {
+    let layout = |action: LayoutAction| Some(Message::Layout(action));
+    let revision = app.workspace.revision();
+    match id {
+        "workspace.find"
+        | "workspace.note_mode"
+        | "workspace.new_tab"
+        | "workspace.close_tab"
+        | "workspace.maximize_group"
+        | "workspace.new_note"
+        | "workspace.open_note_dialog"
+        | "workspace.group_actions"
+        | "workspace.move_tab_next_group"
+        | "workspace.move_tab_previous_group"
+        | "workspace.navigate_back"
+        | "workspace.navigate_forward" => Some(Message::RunHostCommand(id)),
+        "workspace.quick_switch" => Some(Message::PickerOpen),
+        "workspace.command_palette" => Some(Message::PaletteOpen),
+        "workspace.reopen_tab" => layout(LayoutAction::ReopenClosed {
+            expected_revision: revision,
+        }),
+        "workspace.next_tab" => layout(LayoutAction::CycleTab {
+            expected_revision: revision,
+            forward: true,
+        }),
+        "workspace.previous_tab" => layout(LayoutAction::CycleTab {
+            expected_revision: revision,
+            forward: false,
+        }),
+        "workspace.next_group" => layout(LayoutAction::CycleGroup {
+            expected_revision: revision,
+            forward: true,
+        }),
+        "workspace.previous_group" => layout(LayoutAction::CycleGroup {
+            expected_revision: revision,
+            forward: false,
+        }),
+        "workspace.split_right" => layout(LayoutAction::SplitGroup {
+            expected_revision: revision,
+            group: app.focused_group()?,
+            arrangement: flavite_workspace::Arrangement::SideBySide,
+        }),
+        "workspace.split_down" => layout(LayoutAction::SplitGroup {
+            expected_revision: revision,
+            group: app.focused_group()?,
+            arrangement: flavite_workspace::Arrangement::Stacked,
+        }),
+        "note.save" => Some(Message::RunCoreCommand("note.save")),
+        _ => None,
+    }
+}
+
+/// Keyboard splitter increments (D-13, W11): with a focused group,
+/// `Mod+Alt+Shift+Arrow` grows or shrinks the split that separates it from
+/// its sibling. The arrow points in the growth direction of the focused
+/// group; only the arrows along the split's axis fire. The step is 2.5%
+/// of usable space, committed as one normal `ResizeSplit` transaction.
+fn splitter_increment(
+    app: &App,
+    key: &keyboard::Key,
+    modifiers: &Modifiers,
+) -> Option<LayoutAction> {
+    use flavite_workspace::{Side, layout::Arrangement as Arr};
+    use keyboard::key::Named;
+    if modifier_bits(modifiers)
+        != flavite_api::command::modifiers::CTRL
+            | flavite_api::command::modifiers::ALT
+            | flavite_api::command::modifiers::SHIFT
+    {
+        return None;
+    }
+    let keyboard::Key::Named(named) = key else {
+        return None;
+    };
+    if !matches!(
+        named,
+        Named::ArrowUp | Named::ArrowDown | Named::ArrowLeft | Named::ArrowRight
+    ) {
+        return None;
+    }
+    let focused = app.focused_group()?;
+    let (split, arrangement, side) = adjacent_split(app.workspace.tree(), &focused)?;
+    let grow_toward_sibling = match (named, arrangement) {
+        (Named::ArrowRight, Arr::SideBySide) | (Named::ArrowUp, Arr::Stacked) => false,
+        (Named::ArrowLeft, Arr::SideBySide) | (Named::ArrowDown, Arr::Stacked) => true,
+        _ => return None,
+    };
+    // Growing a first child raises the ratio; growing a second child
+    // lowers it. Shrink arrows mirror this.
+    let direction: i64 = match (side, grow_toward_sibling) {
+        (Side::First, false) | (Side::Second, true) => 1,
+        (Side::First, true) | (Side::Second, false) => -1,
+    };
+    let current = current_ratio(app.workspace.tree(), split)?;
+    let step = 25_000_i64;
+    let desired = (i64::from(current) + direction * step).clamp(
+        i64::from(flavite_workspace::MIN_RATIO_PPM),
+        i64::from(flavite_workspace::MAX_RATIO_PPM),
+    );
+    Some(LayoutAction::ResizeSplit {
+        expected_revision: app.workspace.revision(),
+        split,
+        desired_ratio_ppm: desired as u32,
+    })
+}
+
+/// The split adjacent to `group` (its own parent split), with the side
+/// the group sits on. Returns the innermost enclosing split first.
+fn adjacent_split(
+    node: &flavite_workspace::LayoutNode,
+    group: &GroupId,
+) -> Option<(
+    flavite_workspace::SplitId,
+    flavite_workspace::Arrangement,
+    flavite_workspace::Side,
+)> {
+    match node {
+        flavite_workspace::LayoutNode::Group(_) => None,
+        flavite_workspace::LayoutNode::Split {
+            id,
+            arrangement,
+            first,
+            second,
+            ..
+        } => {
+            if first.contains_group(*group) {
+                Some((*id, *arrangement, flavite_workspace::Side::First))
+            } else if second.contains_group(*group) {
+                Some((*id, *arrangement, flavite_workspace::Side::Second))
+            } else {
+                adjacent_split(first, group).or_else(|| adjacent_split(second, group))
+            }
+        }
+    }
+}
+
+/// The current desired ratio of a split.
+fn current_ratio(
+    node: &flavite_workspace::LayoutNode,
+    split: flavite_workspace::SplitId,
+) -> Option<u32> {
+    match node {
+        flavite_workspace::LayoutNode::Group(_) => None,
+        flavite_workspace::LayoutNode::Split {
+            id,
+            desired_ratio_ppm,
+            first,
+            second,
+            ..
+        } => {
+            if *id == split {
+                Some(*desired_ratio_ppm)
+            } else {
+                current_ratio(first, split).or_else(|| current_ratio(second, split))
+            }
+        }
+    }
 }
 
 fn overlay_navigation(app: &App, named: keyboard::key::Named) -> Option<Message> {
@@ -485,87 +770,6 @@ fn overlay_navigation(app: &App, named: keyboard::key::Named) -> Option<Message>
         _ => None,
     }
 }
-
-fn command_chord(app: &App, key: &keyboard::Key, modifiers: Modifiers) -> Option<Message> {
-    let layout = |action: LayoutAction| Some(Message::Layout(action));
-    let revision = app.workspace.revision();
-    match key.as_ref() {
-        keyboard::Key::Character(character) => {
-            if character.eq_ignore_ascii_case("f") && available(app, "workspace.find") {
-                return Some(Message::RunHostCommand("workspace.find"));
-            }
-            if character.eq_ignore_ascii_case("e") && available(app, "workspace.note_mode") {
-                return Some(Message::RunHostCommand("workspace.note_mode"));
-            }
-            if character.eq_ignore_ascii_case("p") {
-                return Some(if modifiers.shift() {
-                    Message::PaletteOpen
-                } else {
-                    Message::PickerOpen
-                });
-            }
-            if character.eq_ignore_ascii_case("t") && modifiers.shift() {
-                return layout(LayoutAction::ReopenClosed {
-                    expected_revision: revision,
-                });
-            }
-            if character.eq_ignore_ascii_case("t") {
-                return Some(Message::RunHostCommand("workspace.new_tab"));
-            }
-            if character.eq_ignore_ascii_case("w") {
-                return Some(Message::RunHostCommand("workspace.close_tab"));
-            }
-            if character.eq_ignore_ascii_case("m") && modifiers.shift() {
-                return Some(Message::RunHostCommand("workspace.maximize_group"));
-            }
-            if character.eq_ignore_ascii_case("s") {
-                return Some(Message::RunCoreCommand("note.save"));
-            }
-            if character.eq_ignore_ascii_case("n") {
-                return Some(Message::RunHostCommand("workspace.new_note"));
-            }
-            if character.eq_ignore_ascii_case("o") {
-                return Some(Message::RunHostCommand("workspace.open_note_dialog"));
-            }
-            None
-        }
-        keyboard::Key::Named(named) => match named {
-            keyboard::key::Named::Tab => layout(LayoutAction::CycleTab {
-                expected_revision: revision,
-                forward: !modifiers.shift(),
-            }),
-            keyboard::key::Named::ArrowLeft if modifiers.alt() && modifiers.shift() => {
-                Some(Message::RunHostCommand("workspace.move_tab_previous_group"))
-            }
-            keyboard::key::Named::ArrowLeft if modifiers.alt() => {
-                Some(Message::RunHostCommand("workspace.navigate_back"))
-            }
-            keyboard::key::Named::ArrowRight if modifiers.alt() && modifiers.shift() => {
-                Some(Message::RunHostCommand("workspace.navigate_forward"))
-            }
-            keyboard::key::Named::ArrowRight if modifiers.alt() && modifiers.shift() => {
-                Some(Message::RunHostCommand("workspace.move_tab_next_group"))
-            }
-            keyboard::key::Named::ArrowRight if modifiers.alt() => {
-                layout(LayoutAction::SplitGroup {
-                    expected_revision: revision,
-                    group: app.focused_group()?,
-                    arrangement: flavite_workspace::Arrangement::SideBySide,
-                })
-            }
-            keyboard::key::Named::ArrowDown if modifiers.alt() => {
-                layout(LayoutAction::SplitGroup {
-                    expected_revision: revision,
-                    group: app.focused_group()?,
-                    arrangement: flavite_workspace::Arrangement::Stacked,
-                })
-            }
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 /// Dispatch a host command id against current shell state. Availability
 /// failures surface as a status message, never as a silent no-op.
 pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
@@ -765,6 +969,33 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
         "workspace.refresh_catalog" => app.load_catalog(),
         "help.about" => {
             app.dialog = Some(crate::host::dialogs::Dialog::About);
+        }
+        "workspace.preferences" => {
+            app.shortcut_capture = None;
+            app.dialog = Some(crate::host::dialogs::Dialog::Preferences);
+        }
+        "workspace.toggle_theme" => {
+            // Toggle resolves the active scheme to an explicit choice, so
+            // the flip is one undoable, inspectable preference edit.
+            let next = match app.appearance.scheme() {
+                crate::style::Scheme::Dark => crate::preferences::ThemeChoice::Light,
+                crate::style::Scheme::Light => crate::preferences::ThemeChoice::Dark,
+            };
+            return app.update(Message::Preferences(
+                crate::host::appearance::PreferenceMessage::SetTheme(next),
+            ));
+        }
+        "workspace.cycle_interface_scale" => {
+            const LADDER: [u16; 4] = [100, 150, 200, 75];
+            let current = app.appearance.prefs.interface_scale_pct;
+            let position = LADDER.iter().position(|step| *step == current);
+            let next = match position {
+                Some(index) => LADDER[(index + 1) % LADDER.len()],
+                None => 100,
+            };
+            return app.update(Message::Preferences(
+                crate::host::appearance::PreferenceMessage::SetScale(next),
+            ));
         }
         "workspace.open_graph" => {
             if let Some(group) = focused_group {

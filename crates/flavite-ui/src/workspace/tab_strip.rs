@@ -8,7 +8,8 @@ use flavite_workspace::{GroupId, TabId, ViewKind};
 use iced::widget::{Space, container, mouse_area, row, text};
 use iced::{Element, Length, alignment};
 
-pub const TAB_HEIGHT: f32 = 32.0;
+/// Tab-strip action controls reserve width at 100% scale; paint and hit-test
+/// paths use the scaled [`crate::style::Metrics::controls_width`].
 pub const CONTROLS_WIDTH: f32 = 96.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,8 +79,8 @@ pub struct StripPlan {
 }
 
 #[must_use]
-pub fn plan(width: f32, count: usize, active: usize) -> StripPlan {
-    let available = (width - CONTROLS_WIDTH).max(0.0);
+pub fn plan(width: f32, controls_width: f32, count: usize, active: usize) -> StripPlan {
+    let available = (width - controls_width).max(0.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let visible = ((available / 104.0).floor() as usize)
         .max(1)
@@ -100,32 +101,36 @@ pub fn view(app: &App, group: GroupId) -> Element<'_, Message> {
     let Some(g) = app.workspace.group(&group) else {
         return row![].into();
     };
+    let metrics = app.appearance.metrics();
     let width = app.group_bounds.get(&group).map_or(400.0, |r| r.width);
     let active_index = g.tabs().iter().position(|t| *t == g.active()).unwrap_or(0);
-    let slots = plan(width, g.tabs().len(), active_index);
+    let slots = plan(width, metrics.controls_width, g.tabs().len(), active_index);
     let mut tabs = row![].spacing(0);
     for tab in g.tabs().iter().skip(slots.start).take(slots.count) {
         tabs = tabs.push(tab_view(app, *tab, *tab == g.active(), slots.tab_width));
     }
     tabs = tabs.push(Space::new().width(Length::Fill));
     tabs = tabs.push(chrome::icon_button(
+        *metrics,
         Icon::Tabs,
         "All tabs",
         Some(Message::GroupMenu(group, StripMenu::Tabs)),
     ));
     tabs = tabs.push(chrome::icon_button(
+        *metrics,
         Icon::Add,
         "New view",
         Some(Message::GroupMenu(group, StripMenu::NewView)),
     ));
     tabs = tabs.push(chrome::icon_button(
+        *metrics,
         Icon::More,
         "Group actions",
         Some(Message::GroupMenu(group, StripMenu::Actions)),
     ));
     container(tabs.align_y(alignment::Vertical::Center))
         .width(Length::Fill)
-        .height(TAB_HEIGHT)
+        .height(metrics.tab_height)
         .style(style::toolbar)
         .into()
 }
@@ -134,6 +139,7 @@ fn tab_view(app: &App, tab: TabId, active: bool, width: f32) -> Element<'_, Mess
     let Some(view) = app.workspace.tab(&tab) else {
         return row![].into();
     };
+    let metrics = app.appearance.metrics();
     let kind = match view.kind() {
         ViewKind::Notes => Icon::Notes,
         _ => Icon::Note,
@@ -141,16 +147,16 @@ fn tab_view(app: &App, tab: TabId, active: bool, width: f32) -> Element<'_, Mess
     let label = view.title();
     let title = container(
         row![
-            chrome::icon(kind),
+            chrome::icon(*metrics, kind),
             text(label)
-                .size(style::TEXT_SM)
+                .size(metrics.text_sm)
                 .wrapping(iced::widget::text::Wrapping::None)
         ]
         .spacing(6)
         .align_y(alignment::Vertical::Center),
     )
-    .width((width - 32.0).max(0.0))
-    .height(TAB_HEIGHT)
+    .width((width - metrics.icon_target).max(0.0))
+    .height(metrics.tab_height)
     .padding([0, 8])
     .align_y(alignment::Vertical::Center)
     .clip(true);
@@ -159,10 +165,15 @@ fn tab_view(app: &App, tab: TabId, active: bool, width: f32) -> Element<'_, Mess
         .interaction(iced::mouse::Interaction::Pointer);
     container(row![
         title,
-        chrome::icon_button(Icon::Close, "Close tab", Some(Message::CloseTab(tab)))
+        chrome::icon_button(
+            *metrics,
+            Icon::Close,
+            "Close tab",
+            Some(Message::CloseTab(tab))
+        )
     ])
     .width(width)
-    .height(TAB_HEIGHT)
+    .height(metrics.tab_height)
     .style(move |theme| style::tab(theme, active))
     .into()
 }
@@ -388,7 +399,7 @@ mod tests {
         for width in [200.0, 240.0, 320.0, 640.0, 1200.0] {
             for count in 1..=128 {
                 for active in 0..count {
-                    let p = plan(width, count, active);
+                    let p = plan(width, CONTROLS_WIDTH, count, active);
                     assert!(p.start <= active && active < p.start + p.count);
                     #[allow(clippy::cast_precision_loss)]
                     let occupied = p.count as f32 * p.tab_width + CONTROLS_WIDTH;

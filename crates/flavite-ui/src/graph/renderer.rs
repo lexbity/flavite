@@ -40,6 +40,7 @@ use super::geometry::{HitNode, RenderGeometry};
 use super::instance::{
     self, CAMERA_UNIFORM_SIZE, Camera, CameraUniform, EDGE_INSTANCE_SIZE, NODE_INSTANCE_SIZE,
 };
+use crate::style::tokens::{self, Scheme};
 
 /// The production WGSL module: camera uniform, instanced nodes, instanced
 /// edges. The `Camera` struct here must match [`CameraUniform`]
@@ -57,6 +58,7 @@ struct Camera {
     viewport_size: vec2<f32>,    // 32  widget viewport size, physical px
     edge_instances: u32,         // 40  importance-capped draw count
     node_instances: u32,         // 44
+    edge_color: vec4<f32>,       // 48  scheme token (W11), written per frame
 }
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -155,11 +157,14 @@ fn vs_edges(input: EdgeInput) -> EdgeOutput {
     return out;
 }
 
-const EDGE_COLOR: vec3<f32> = vec3<f32>(0.62, 0.66, 0.74);
+// The edge line color is no longer a shader constant: it arrives in the
+// per-frame uniform (`camera.edge_color`) from the active scheme's semantic
+// edge token (W11/D-01), so a light/dark switch recolors edges without a
+// re-layout or a pipeline rebuild.
 
 @fragment
 fn fs_edges(input: EdgeOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(EDGE_COLOR, input.alpha);
+    return vec4<f32>(camera.edge_color.rgb, input.alpha);
 }
 "#;
 
@@ -322,20 +327,25 @@ pub struct GraphPrimitive {
     resources: Arc<arc_swap::ArcSwapOption<ViewBuffers>>,
     geometry: Arc<RenderGeometry>,
     camera: Camera,
+    /// Active color scheme; only affects per-frame uniform data (edge
+    /// color), never the camera, positions, or topology.
+    scheme: Scheme,
     node_count: u32,
     edge_count: u32,
 }
 
 impl GraphPrimitive {
-    /// Build the primitive for `camera` over `geometry`.
+    /// Build the primitive for `camera` over `geometry`, painting with
+    /// `scheme`'s semantic tokens.
     #[must_use]
-    pub fn new(geometry: Arc<RenderGeometry>, camera: Camera) -> Self {
+    pub fn new(geometry: Arc<RenderGeometry>, camera: Camera, scheme: Scheme) -> Self {
         let node_count = count_u32(geometry.node_count());
         let edge_count = count_u32(geometry.visible_edge_count(camera.zoom));
         Self {
             resources: Arc::default(),
             geometry,
             camera,
+            scheme,
             node_count,
             edge_count,
         }
@@ -375,7 +385,7 @@ fn count_u32(count: usize) -> u32 {
 /// The GPU state behind every [`GraphPrimitive`]: created by `iced` on
 /// first use and cached for the window's lifetime. Instance buffers are
 /// (re)uploaded only when the geometry generation moves; a steady-state
-/// frame is one 48-byte uniform write plus two instanced draws.
+/// frame is one 64-byte uniform write plus two instanced draws.
 pub struct GraphPipeline {
     identity: Arc<()>,
     camera_layout: wgpu::BindGroupLayout,
@@ -657,8 +667,10 @@ fn widget_camera_uniform(
     scale: f32,
     nodes: u32,
     edges: u32,
+    scheme: Scheme,
 ) -> CameraUniform {
     let physical = [size.width * scale, size.height * scale];
+    let [r, g, b] = tokens::graph_edge_color(scheme);
     CameraUniform {
         center: camera.center,
         zoom: camera.zoom * scale,
@@ -668,6 +680,7 @@ fn widget_camera_uniform(
         viewport_size: physical,
         edge_instances: edges,
         node_instances: nodes,
+        edge_color: [r, g, b, 1.0],
     }
 }
 
@@ -691,6 +704,7 @@ impl ShaderPrimitive for GraphPrimitive {
             viewport.scale_factor(),
             self.node_count,
             self.edge_count,
+            self.scheme,
         );
         // A recreated pipeline/device must not inherit buffers or bind groups
         // belonging to the previous GPU device.
@@ -789,19 +803,31 @@ pub const DRAG_THRESHOLD_LOGICAL: f32 = 4.0;
 pub struct GraphProgram {
     geometry: Arc<RenderGeometry>,
     camera: Camera,
+    scheme: Scheme,
 }
 
 impl GraphProgram {
-    /// A program that renders `geometry` through `camera`.
+    /// A program that renders `geometry` through `camera`, painting with
+    /// `scheme`'s semantic tokens.
     #[must_use]
-    pub const fn new(geometry: Arc<RenderGeometry>, camera: Camera) -> Self {
-        Self { geometry, camera }
+    pub const fn new(geometry: Arc<RenderGeometry>, camera: Camera, scheme: Scheme) -> Self {
+        Self {
+            geometry,
+            camera,
+            scheme,
+        }
     }
 
     /// The camera this program renders with.
     #[must_use]
     pub const fn camera(&self) -> Camera {
         self.camera
+    }
+
+    /// The color scheme this program paints with.
+    #[must_use]
+    pub const fn scheme(&self) -> Scheme {
+        self.scheme
     }
 
     /// The geometry this program renders.
@@ -1021,7 +1047,8 @@ impl ShaderProgram<GraphMessage> for GraphProgram {
         _cursor: mouse::Cursor,
         _bounds: Rectangle,
     ) -> Self::Primitive {
-        let mut primitive = GraphPrimitive::new(Arc::clone(&self.geometry), self.camera);
+        let mut primitive =
+            GraphPrimitive::new(Arc::clone(&self.geometry), self.camera, self.scheme);
         primitive.resources = state.resources.clone();
         primitive
     }
@@ -1052,7 +1079,8 @@ impl ShaderProgram<GraphMessage> for GraphProgram {
 mod tests {
     use super::*;
     use crate::graph::geometry::RenderGeometry;
-    use crate::graph::instance::{NOTE_COLOR, NodeInstance, NodeShape};
+    use crate::graph::instance::{NodeInstance, NodeShape, note_color};
+    use crate::style::tokens::Scheme;
     use flavite_graph::NodeId;
 
     #[test]
@@ -1068,7 +1096,7 @@ mod tests {
             height: 454.0,
         };
         for scale in [1.0, 1.25, 1.5, 2.0] {
-            let uniform = widget_camera_uniform(camera, bounds.size(), scale, 3, 2);
+            let uniform = widget_camera_uniform(camera, bounds.size(), scale, 3, 2, Scheme::Dark);
             for world in [[0.0, 0.0], [72.5, -30.0], [-15.0, 82.0]] {
                 let cpu = camera.world_to_screen(
                     world,
@@ -1091,7 +1119,7 @@ mod tests {
 
     #[test]
     fn simultaneous_graph_views_have_independent_gpu_buffers_even_at_equal_generations() {
-        let program = GraphProgram::new(tiny_geometry(), Camera::centered());
+        let program = GraphProgram::new(tiny_geometry(), Camera::centered(), Scheme::Dark);
         let first = GraphProgramState::default();
         let second = GraphProgramState::default();
         let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(320.0, 240.0));
@@ -1110,13 +1138,13 @@ mod tests {
                     center: [0.0, 0.0],
                     size: 4.0,
                     shape: NodeShape::Circle,
-                    color: NOTE_COLOR,
+                    color: note_color(Scheme::Dark),
                 },
                 NodeInstance {
                     center: [10.0, 0.0],
                     size: 4.0,
                     shape: NodeShape::Square,
-                    color: NOTE_COLOR,
+                    color: note_color(Scheme::Dark),
                 },
             ],
             vec![],
@@ -1129,7 +1157,7 @@ mod tests {
 
     #[test]
     fn another_panes_pointer_input_cannot_select_pan_or_zoom_this_graph() {
-        let program = GraphProgram::new(tiny_geometry(), Camera::centered());
+        let program = GraphProgram::new(tiny_geometry(), Camera::centered(), Scheme::Dark);
         let bounds = Rectangle {
             x: 10.0,
             y: 50.0,
@@ -1185,7 +1213,7 @@ mod tests {
 
     #[test]
     fn press_over_a_node_captures_a_drag_candidate_and_release_is_a_click() {
-        let program = GraphProgram::new(tiny_geometry(), Camera::centered());
+        let program = GraphProgram::new(tiny_geometry(), Camera::centered(), Scheme::Dark);
         let bounds = Rectangle {
             x: 0.0,
             y: 0.0,
@@ -1224,7 +1252,7 @@ mod tests {
 
     #[test]
     fn a_four_pixel_move_starts_a_node_drag_and_the_release_completes_it() {
-        let program = GraphProgram::new(tiny_geometry(), Camera::centered());
+        let program = GraphProgram::new(tiny_geometry(), Camera::centered(), Scheme::Dark);
         let bounds = Rectangle {
             x: 0.0,
             y: 0.0,
@@ -1276,7 +1304,7 @@ mod tests {
 
     #[test]
     fn background_release_reports_pan_completion_not_a_click() {
-        let program = GraphProgram::new(tiny_geometry(), Camera::centered());
+        let program = GraphProgram::new(tiny_geometry(), Camera::centered(), Scheme::Dark);
         let bounds = Rectangle {
             x: 0.0,
             y: 0.0,
@@ -1319,7 +1347,7 @@ mod tests {
 
     #[test]
     fn primitive_counts_follow_the_geometry_and_the_zoom_cap() {
-        let primitive = GraphPrimitive::new(tiny_geometry(), Camera::centered());
+        let primitive = GraphPrimitive::new(tiny_geometry(), Camera::centered(), Scheme::Dark);
         assert_eq!(primitive.node_count(), 2);
         assert_eq!(primitive.edge_count(), 0);
         assert_eq!(primitive.generation(), 1);

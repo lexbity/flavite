@@ -12,6 +12,8 @@ use std::mem::size_of;
 
 use flavite_graph::NodeKind;
 
+use crate::style::tokens::{self, Scheme};
+
 /// Vertex-layout stride of [`NodeInstance`], in bytes.
 ///
 /// Enforced by compile-time assertions so the Rust layout and the
@@ -32,11 +34,11 @@ const _: () = assert!(
 );
 const _: () = assert!(
     size_of::<CameraUniform>() == CAMERA_UNIFORM_SIZE,
-    "CameraUniform must stay 48 bytes to match the WGSL uniform layout"
+    "CameraUniform must stay 64 bytes to match the WGSL uniform layout"
 );
 
 /// Byte size of the camera uniform (`shader_probe` writes it to the GPU).
-pub const CAMERA_UNIFORM_SIZE: usize = 48;
+pub const CAMERA_UNIFORM_SIZE: usize = 64;
 
 /// Base node radius, in world units, for a degree-0 node (D15: nodes are
 /// sized by degree).
@@ -74,11 +76,19 @@ pub const EDGE_CAP_ZOOM_MAX: f32 = 4.0;
 /// Base edge stroke width, in physical pixels.
 pub const EDGE_WIDTH_BASE: f32 = 1.0;
 
-/// Note nodes — circular dots (D15: `instanced dots`).
-pub const NOTE_COLOR: [f32; 4] = [0.42, 0.66, 1.00, 1.00];
+/// Note nodes — circular dots (D15: `instanced dots`), colored by the
+/// active scheme's semantic note token (W11/D-01: no literals here).
+#[must_use]
+pub fn note_color(scheme: Scheme) -> [f32; 4] {
+    tokens::graph_note_color(scheme)
+}
 
-/// Attachment nodes — squares (D15, v2/R3: squares sized by degree).
-pub const ATTACHMENT_COLOR: [f32; 4] = [1.00, 0.78, 0.35, 1.00];
+/// Attachment nodes — squares (D15, v2/R3: squares sized by degree),
+/// colored by the active scheme's semantic attachment token.
+#[must_use]
+pub fn attachment_color(scheme: Scheme) -> [f32; 4] {
+    tokens::graph_attachment_color(scheme)
+}
 
 /// The shape a node is drawn with.
 ///
@@ -310,9 +320,10 @@ impl Default for Camera {
     }
 }
 
-/// The per-frame camera uniform handed to the WGSL shaders: 48 bytes.
+/// The per-frame camera uniform handed to the WGSL shaders: 64 bytes.
 ///
-/// WGSL struct (uniform address space — `vec2<f32>` aligns to 8):
+/// WGSL struct (uniform address space — `vec2<f32>` aligns to 8,
+/// `vec4<f32>` to 16):
 ///
 /// ```wgsl
 /// struct Camera {
@@ -324,11 +335,14 @@ impl Default for Camera {
 ///     viewport_size: vec2<f32>, // offset 32
 ///     edge_instances: u32,      // offset 40
 ///     node_instances: u32,      // offset 44
+///     edge_color: vec4<f32>,    // offset 48 (W11: scheme token, not a const)
 /// };
 /// ```
 ///
-/// The Rust `repr(C)` offsets are identical (every member aligns to 4 in
-/// Rust), so [`Self::to_bytes`] can be written straight into the buffer.
+/// The Rust `repr(C)` offsets are identical (`edge_color` is stored as
+/// `[f32; 4]`, which lands on the same 16-byte-aligned offset 48 the WGSL
+/// `vec4<f32>` requires), so [`Self::to_bytes`] can be written straight
+/// into the buffer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
 pub struct CameraUniform {
@@ -348,6 +362,9 @@ pub struct CameraUniform {
     pub edge_instances: u32,
     /// Node instances to draw this frame.
     pub node_instances: u32,
+    /// Edge line color, RGBA, from the active scheme's semantic edge token
+    /// (W11: recolors the graph on a theme change without a re-layout).
+    pub edge_color: [f32; 4],
 }
 
 impl CameraUniform {
@@ -368,6 +385,7 @@ impl CameraUniform {
         put(&pack_f32x2(self.viewport_size));
         put(&self.edge_instances.to_le_bytes());
         put(&self.node_instances.to_le_bytes());
+        put(&pack_f32x4(self.edge_color));
         debug_assert_eq!(at, CAMERA_UNIFORM_SIZE, "uniform packed in order");
         out
     }
@@ -459,13 +477,14 @@ pub fn edge_cap(total: usize, zoom: f32) -> usize {
     scaled.min(total)
 }
 
-/// The base colour for a node kind.
+/// The base colour for a node kind, from the active scheme's semantic
+/// tokens (W11/D-01: data colors map to token roles, never literals).
 #[must_use]
-pub fn color_of(kind: NodeKind) -> [f32; 4] {
+pub fn color_of(kind: NodeKind, scheme: Scheme) -> [f32; 4] {
     match kind {
-        NodeKind::Note => NOTE_COLOR,
-        NodeKind::Attachment => ATTACHMENT_COLOR,
-        NodeKind::Unresolved => [0.92, 0.67, 0.25, 1.0],
+        NodeKind::Note => note_color(scheme),
+        NodeKind::Attachment => attachment_color(scheme),
+        NodeKind::Unresolved => tokens::graph_unresolved_color(scheme),
     }
 }
 
@@ -597,6 +616,7 @@ mod tests {
             viewport_size: [1920.0, 1080.0],
             edge_instances: 7,
             node_instances: 9,
+            edge_color: [0.25, 0.5, 0.75, 1.0],
         };
         let b = camera.to_bytes();
         let f = |at: usize| f32::from_le_bytes(b[at..at + 4].try_into().unwrap());
@@ -613,6 +633,10 @@ mod tests {
         assert_eq!(f(36), 1080.0);
         assert_eq!(u(40), 7, "edge_instances @40");
         assert_eq!(u(44), 9, "node_instances @44");
+        assert_eq!(f(48), 0.25, "edge_color.r @48");
+        assert_eq!(f(52), 0.5, "edge_color.g @52");
+        assert_eq!(f(56), 0.75, "edge_color.b @56");
+        assert_eq!(f(60), 1.0, "edge_color.a @60");
         assert_eq!(b.len(), CAMERA_UNIFORM_SIZE);
     }
 
@@ -751,7 +775,8 @@ mod tests {
     fn from_snapshot_builds_one_node_instance_per_node() {
         let snapshot = fixture();
         let positions = [[0.0, 0.0], [10.0, 0.0], [20.0, 20.0]];
-        let geometry = RenderGeometry::from_snapshot(&snapshot, &positions, 7).unwrap();
+        let geometry =
+            RenderGeometry::from_snapshot(&snapshot, &positions, 7, Scheme::Dark).unwrap();
         assert_eq!(geometry.node_count(), 3);
         assert_eq!(geometry.generation(), 7);
         assert_eq!(geometry.edge_count(), 3);
@@ -762,7 +787,7 @@ mod tests {
         assert_eq!(geometry.nodes()[0].shape, NodeShape::Circle);
         assert_eq!(geometry.nodes()[1].center, [10.0, 0.0]);
         assert_eq!(geometry.nodes()[2].shape, NodeShape::Square);
-        assert_eq!(geometry.nodes()[2].color, ATTACHMENT_COLOR);
+        assert_eq!(geometry.nodes()[2].color, attachment_color(Scheme::Dark));
 
         // Degree-based sizing: the hub is largest.
         assert!(geometry.nodes()[0].size > geometry.nodes()[1].size);
@@ -780,7 +805,8 @@ mod tests {
     #[test]
     fn from_snapshot_rejects_a_mismatched_position_buffer() {
         let snapshot = fixture();
-        let err = RenderGeometry::from_snapshot(&snapshot, &[[0.0, 0.0]], 0).unwrap_err();
+        let err =
+            RenderGeometry::from_snapshot(&snapshot, &[[0.0, 0.0]], 0, Scheme::Dark).unwrap_err();
         assert_eq!(
             err,
             GeometryError::PositionCountMismatch {
@@ -789,9 +815,13 @@ mod tests {
             }
         );
         // Same topology, exactly one position per node → accepted.
-        assert!(RenderGeometry::from_snapshot(&snapshot, &[[0.0, 0.0]; 3], 0).is_ok());
+        assert!(
+            RenderGeometry::from_snapshot(&snapshot, &[[0.0, 0.0]; 3], 0, Scheme::Dark).is_ok()
+        );
         // Too many positions is just as stale as too few.
-        assert!(RenderGeometry::from_snapshot(&snapshot, &[[0.0, 0.0]; 4], 0).is_err());
+        assert!(
+            RenderGeometry::from_snapshot(&snapshot, &[[0.0, 0.0]; 4], 0, Scheme::Dark).is_err()
+        );
     }
 
     #[test]
@@ -828,7 +858,8 @@ mod tests {
         ]);
         let snapshot = model.snapshot();
         let positions: Vec<[f32; 2]> = (0..5).map(|i| [i as f32 * 10.0, 0.0]).collect();
-        let geometry = RenderGeometry::from_snapshot(&snapshot, &positions, 0).unwrap();
+        let geometry =
+            RenderGeometry::from_snapshot(&snapshot, &positions, 0, Scheme::Dark).unwrap();
         assert_eq!(geometry.edge_count(), 6);
 
         // Recompute every expected alpha straight from the snapshot's degree
@@ -877,8 +908,8 @@ mod tests {
     fn geometry_is_deterministic_for_a_given_snapshot() {
         let snapshot = fixture();
         let positions = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
-        let a = RenderGeometry::from_snapshot(&snapshot, &positions, 1).unwrap();
-        let b = RenderGeometry::from_snapshot(&snapshot, &positions, 1).unwrap();
+        let a = RenderGeometry::from_snapshot(&snapshot, &positions, 1, Scheme::Dark).unwrap();
+        let b = RenderGeometry::from_snapshot(&snapshot, &positions, 1, Scheme::Dark).unwrap();
         assert_eq!(a, b);
     }
 
@@ -886,7 +917,8 @@ mod tests {
     fn visible_edge_count_is_a_prefix_of_the_sorted_edges() {
         let snapshot = fixture();
         let positions = [[0.0, 0.0]; 3];
-        let geometry = RenderGeometry::from_snapshot(&snapshot, &positions, 0).unwrap();
+        let geometry =
+            RenderGeometry::from_snapshot(&snapshot, &positions, 0, Scheme::Dark).unwrap();
         let cap = geometry.visible_edge_count(1.0);
         assert!(cap <= geometry.edge_count());
         // At reference zoom the cap (100k) exceeds this tiny graph, so the
@@ -994,14 +1026,24 @@ mod tests {
     fn node_shape_maps_from_node_kind() {
         assert_eq!(NodeShape::from(NodeKind::Note), NodeShape::Circle);
         assert_eq!(NodeShape::from(NodeKind::Attachment), NodeShape::Square);
-        assert_eq!(color_of(NodeKind::Note), NOTE_COLOR);
-        assert_eq!(color_of(NodeKind::Attachment), ATTACHMENT_COLOR);
+        assert_eq!(
+            color_of(NodeKind::Note, Scheme::Dark),
+            note_color(Scheme::Dark)
+        );
+        assert_eq!(
+            color_of(NodeKind::Attachment, Scheme::Dark),
+            attachment_color(Scheme::Dark)
+        );
+        assert_eq!(
+            color_of(NodeKind::Unresolved, Scheme::Light),
+            tokens::graph_unresolved_color(Scheme::Light)
+        );
     }
 
     #[test]
     fn empty_snapshot_yields_empty_geometry() {
         let snapshot = flavite_graph::GraphModel::new().snapshot();
-        let geometry = RenderGeometry::from_snapshot(&snapshot, &[], 3).unwrap();
+        let geometry = RenderGeometry::from_snapshot(&snapshot, &[], 3, Scheme::Dark).unwrap();
         assert_eq!(geometry.node_count(), 0);
         assert_eq!(geometry.edge_count(), 0);
         assert_eq!(geometry.visible_edge_count(1.0), 0);

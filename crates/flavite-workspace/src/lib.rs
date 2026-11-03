@@ -33,7 +33,8 @@ pub use context::{
     ExplorationSelection, UnboundReason, is_source_kind,
 };
 pub use geometry::{
-    Rect, SPLITTER_WIDTH, Size, fits, rects, required_minimum, solve, view_minimum,
+    Geometry, Rect, SPLITTER_WIDTH, Size, fits, group_minimum, ratio_f32, rects, required_minimum,
+    solve, view_minimum,
 };
 pub use ids::{GroupId, Ids, SplitId, TabId, WorkspaceId};
 pub use input::{CompositionState, EditorInteraction, Selection, WritingTarget};

@@ -65,7 +65,8 @@ pub fn view_minimum(kind: &ViewKind, scale: f32) -> Size {
 }
 
 /// The smallest group size that satisfies every member view.
-fn group_minimum(state: &WorkspaceState, id: &GroupId, scale: f32) -> Size {
+#[must_use]
+pub fn group_minimum(state: &WorkspaceState, id: &GroupId, scale: f32) -> Size {
     let Some(group) = state.group(id) else {
         return Size::ZERO;
     };
@@ -232,7 +233,7 @@ fn solve_node(
             match arrangement {
                 Arrangement::SideBySide => {
                     let usable = (rect.width - divider).max(0.0);
-                    let desired = usable * f32_ratio(ratio) / 1_000_000.0;
+                    let desired = usable * ratio_f32(ratio);
                     let first_width =
                         desired.clamp(first_min.width, (usable - second_min.width).max(0.0));
                     solve_node(
@@ -264,7 +265,7 @@ fn solve_node(
                 }
                 Arrangement::Stacked => {
                     let usable = (rect.height - divider).max(0.0);
-                    let desired = usable * f32_ratio(ratio) / 1_000_000.0;
+                    let desired = usable * ratio_f32(ratio);
                     let first_height =
                         desired.clamp(first_min.height, (usable - second_min.height).max(0.0));
                     solve_node(
@@ -299,13 +300,17 @@ fn solve_node(
     }
 }
 
-/// Ratio ppm to f32. The bounded range (`<= 950_000`) is exact in an f32
-/// mantissa, so the cast cannot lose precision for stored ratios.
-fn f32_ratio(ratio: u32) -> f32 {
-    debug_assert!(ratio <= MAX_RATIO_PPM);
+/// Ratio ppm to an f32 fraction of usable space. The single canonical
+/// conversion for the whole workspace stack (the toolkit adapter shares
+/// it): the bounded numerator (`<= 950_000`) is exact in an f32 mantissa
+/// and the division is correctly rounded, so every caller observes the
+/// same nearest-`f32` value for a stored ratio.
+#[must_use]
+pub fn ratio_f32(ratio_ppm: u32) -> f32 {
+    debug_assert!(ratio_ppm <= MAX_RATIO_PPM);
     #[allow(clippy::cast_precision_loss)]
     {
-        ratio as f32
+        ratio_ppm as f32 / 1_000_000.0
     }
 }
 

@@ -4,7 +4,7 @@
 use crate::{
     accessibility,
     app::{App, Message},
-    style, workspace_shell,
+    workspace_shell,
 };
 use accesskit::{ActionRequest, TreeUpdate};
 use iced::{Element, Settings, Size, Theme, window};
@@ -37,7 +37,7 @@ impl program::Program for FlaviteProgram {
     }
 
     fn boot(&self) -> (App, runtime::Task<Message>) {
-        (App::boot(), runtime::Task::none())
+        (App::boot(), iced::system::theme().map(Message::SystemTheme))
     }
 
     fn update(&self, state: &mut App, message: Message) -> runtime::Task<Message> {
@@ -73,7 +73,7 @@ impl program::Program for FlaviteProgram {
         App::subscription(state)
     }
 
-    fn theme(&self, _state: &App, _window: core::window::Id) -> Option<Theme> {
-        Some(style::theme())
+    fn theme(&self, state: &App, _window: core::window::Id) -> Option<Theme> {
+        Some(state.appearance.theme())
     }
 }

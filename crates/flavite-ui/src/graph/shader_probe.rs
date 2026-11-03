@@ -150,9 +150,14 @@ impl ProbePrimitive {
     /// Build the primitive for `camera` over `geometry`, reporting into
     /// `timings`.
     #[must_use]
-    pub fn new(geometry: Arc<RenderGeometry>, camera: Camera, timings: Arc<ProbeTimings>) -> Self {
+    pub fn new(
+        geometry: Arc<RenderGeometry>,
+        camera: Camera,
+        scheme: crate::style::tokens::Scheme,
+        timings: Arc<ProbeTimings>,
+    ) -> Self {
         Self {
-            inner: GraphPrimitive::new(geometry, camera),
+            inner: GraphPrimitive::new(geometry, camera, scheme),
             timings,
         }
     }
@@ -217,12 +222,17 @@ pub struct ProbeProgram {
 }
 
 impl ProbeProgram {
-    /// A program that renders `geometry` through `camera`, reporting into
-    /// `timings`.
+    /// A program that renders `geometry` through `camera` in `scheme`,
+    /// reporting into `timings`.
     #[must_use]
-    pub fn new(geometry: Arc<RenderGeometry>, camera: Camera, timings: Arc<ProbeTimings>) -> Self {
+    pub fn new(
+        geometry: Arc<RenderGeometry>,
+        camera: Camera,
+        scheme: crate::style::tokens::Scheme,
+        timings: Arc<ProbeTimings>,
+    ) -> Self {
         Self {
-            inner: ProbeCore::new(geometry, camera),
+            inner: ProbeCore::new(geometry, camera, scheme),
             timings,
         }
     }
@@ -299,7 +309,8 @@ pub use super::renderer::scroll_factor;
 mod tests {
     use super::super::renderer::ReleaseKind;
     use super::*;
-    use crate::graph::instance::{NOTE_COLOR, NodeInstance, NodeShape};
+    use crate::graph::instance::{NodeInstance, NodeShape, note_color};
+    use crate::style::tokens::Scheme;
     use flavite_graph::NodeId;
     use iced::Point;
 
@@ -311,13 +322,13 @@ mod tests {
                     center: [0.0, 0.0],
                     size: 4.0,
                     shape: NodeShape::Circle,
-                    color: NOTE_COLOR,
+                    color: note_color(Scheme::Dark),
                 },
                 NodeInstance {
                     center: [10.0, 0.0],
                     size: 4.0,
                     shape: NodeShape::Square,
-                    color: NOTE_COLOR,
+                    color: note_color(Scheme::Dark),
                 },
             ],
             vec![
@@ -359,6 +370,7 @@ mod tests {
         let program = ProbeProgram::new(
             tiny_geometry(),
             Camera::centered(),
+            Scheme::Dark,
             Arc::new(ProbeTimings::default()),
         );
         let bounds = Rectangle {
@@ -399,6 +411,7 @@ mod tests {
         let primitive = ProbePrimitive::new(
             Arc::clone(&geometry),
             Camera::default(),
+            Scheme::Dark,
             Arc::clone(&timings),
         );
         assert_eq!(primitive.node_count(), 2);

@@ -37,15 +37,16 @@ const LIST_ROW_BUDGET: usize = 50;
 /// status/hint footer — the controls hug their content and the network
 /// gets the space.
 pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
+    let metrics = *app.appearance.metrics();
     let Some(session) = app.workspace.tab(&tab) else {
-        return empty_state("Empty", "This tab has no content.");
+        return empty_state(metrics, "Empty", "This tab has no content.");
     };
     let ViewKind::Graph(_) = session.kind() else {
-        return empty_state("Graph", "This tab is not a graph view.");
+        return empty_state(metrics, "Graph", "This tab is not a graph view.");
     };
     let incarnation = session.interaction().incarnation;
     let Some(state) = app.graph.state(tab) else {
-        return empty_state("Graph", "The graph view is starting…");
+        return empty_state(metrics, "Graph", "The graph view is starting…");
     };
 
     let header = header(app, tab, state);
@@ -76,16 +77,17 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
 /// destination is visible before it happens; a missing target gets an
 /// explanation, never a hidden fallback.
 fn target_banner<'a>(app: &'a App) -> Element<'a, Message> {
+    let metrics = app.appearance.metrics();
     let banner: Element<'a, Message> = if let Some((tab, ..)) = app.valid_writing_target() {
         let title = app
             .notes
             .locator_of(tab)
             .map_or_else(|| "the current note".into(), |l| l.title().to_owned());
         row![
-            text("Insert links into:").size(style::TEXT_SM),
-            text(title).size(style::TEXT_SM).style(style::dim_text),
+            text("Insert links into:").size(metrics.text_sm),
+            text(title).size(metrics.text_sm).style(style::dim_text),
             text("— double-click a note node to insert its link")
-                .size(style::TEXT_SM)
+                .size(metrics.text_sm)
                 .style(style::dim_text),
         ]
         .spacing(4)
@@ -93,7 +95,7 @@ fn target_banner<'a>(app: &'a App) -> Element<'a, Message> {
         .into()
     } else {
         text("No insertion target — click in an editor to place the cursor; double-click insertion is disabled")
-            .size(style::TEXT_SM)
+            .size(metrics.text_sm)
             .style(style::dim_text)
             .into()
     };
@@ -102,8 +104,8 @@ fn target_banner<'a>(app: &'a App) -> Element<'a, Message> {
         .padding(Padding {
             top: 2.0,
             bottom: 2.0,
-            left: style::SPACING,
-            right: style::SPACING,
+            left: metrics.spacing,
+            right: metrics.spacing,
         })
         .style(style::toolbar)
         .into()
@@ -112,6 +114,7 @@ fn target_banner<'a>(app: &'a App) -> Element<'a, Message> {
 /// One status/hint line under the canvas: staleness, scope status, what
 /// publishes to context, provenance, and the keyboard hint.
 fn footer<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Message> {
+    let metrics = app.appearance.metrics();
     let state_text = if state.stale {
         "Frame stale — insertion disabled".to_owned()
     } else if state.updating {
@@ -141,21 +144,23 @@ fn footer<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Me
         ""
     };
     row![
-        text(state_text).size(style::TEXT_SM).style(style::dim_text),
+        text(state_text)
+            .size(metrics.text_sm)
+            .style(style::dim_text),
         text(scope_status)
-            .size(style::TEXT_SM)
+            .size(metrics.text_sm)
             .style(style::dim_text),
         iced::widget::Space::new()
             .width(Length::Fill)
             .height(Length::Fixed(0.0)),
         text(crate::graph::provenance::label(state))
-            .size(style::TEXT_SM)
+            .size(metrics.text_sm)
             .style(style::dim_text),
         text("Enter opens · Ctrl+Enter inserts")
-            .size(style::TEXT_SM)
+            .size(metrics.text_sm)
             .style(style::dim_text),
     ]
-    .spacing(style::SPACING)
+    .spacing(metrics.spacing)
     .align_y(alignment::Vertical::Center)
     .into()
 }
@@ -164,6 +169,7 @@ fn footer<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Me
 /// controls on one hug-content row; selection actions appear only when a
 /// selection exists.
 fn header<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Message> {
+    let metrics = app.appearance.metrics();
     let counts = state
         .scope_result
         .as_ref()
@@ -184,15 +190,15 @@ fn header<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Me
         })
         .unwrap_or_else(|| "Updating…".into());
     let chip = |label: &'static str, command: GraphCommand, enabled: bool| {
-        button(text(label).size(style::TEXT_SM))
+        button(text(label).size(metrics.text_sm))
             .padding(tab_strip::chip_padding())
             .style(style::ghost())
             .on_press_maybe(enabled.then_some(Message::GraphCommand { tab, command }))
     };
     let mut toolbar = row![]
-        .spacing(style::SPACING)
+        .spacing(metrics.spacing)
         .align_y(alignment::Vertical::Center);
-    toolbar = toolbar.push(text(counts).size(style::TEXT_SM));
+    toolbar = toolbar.push(text(counts).size(metrics.text_sm));
     // Neighborhood controls live on the toolbar (concept 01), not buried
     // in the filter panel; depth/direction only apply to a neighborhood
     // scope.
@@ -203,7 +209,7 @@ fn header<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Me
             Direction::Both => "Both",
         };
         toolbar = toolbar
-            .push(text("Depth").size(style::TEXT_SM).style(style::dim_text))
+            .push(text("Depth").size(metrics.text_sm).style(style::dim_text))
             .push(pick_list(
                 vec![0u8, 1, 2, 3, 4, 5, 6],
                 Some(neighborhood.depth),
@@ -280,8 +286,8 @@ fn header<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Me
             .padding(Padding {
                 top: 4.0,
                 bottom: 4.0,
-                left: style::SPACING,
-                right: style::SPACING,
+                left: metrics.spacing,
+                right: metrics.spacing,
             })
             .style(style::toolbar)
     ]
@@ -319,8 +325,8 @@ fn header<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Me
         };
         chrome = chrome.push(
             row![
-                text(selection).size(style::TEXT_SM).style(style::dim_text),
-                text(summary).size(style::TEXT_SM).style(style::dim_text),
+                text(selection).size(metrics.text_sm).style(style::dim_text),
+                text(summary).size(metrics.text_sm).style(style::dim_text),
                 iced::widget::Space::new()
                     .width(Length::Fill)
                     .height(Length::Fixed(0.0)),
@@ -334,7 +340,7 @@ fn header<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Me
                 chip("Reveal", GraphCommand::RevealSelected, true),
                 chip("Clear", GraphCommand::ClearSelection, true),
             ]
-            .spacing(style::SPACING)
+            .spacing(metrics.spacing)
             .align_y(alignment::Vertical::Center),
         );
     }
@@ -344,6 +350,7 @@ fn header<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Me
 /// Honest loading/error states before any frame exists (§13.4). The graph
 /// never shows an empty network because the index is merely behind.
 fn unavailable<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Message> {
+    let metrics = app.appearance.metrics();
     let pins_failure = app.graph.pins.load_failure().map(str::to_owned);
     let (title, detail, retry) = match app.graph.status.as_ref() {
         Some(GraphServiceStatus::Indexing { reason }) => (
@@ -363,10 +370,10 @@ fn unavailable<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'
         ),
     };
     let mut body = column![
-        text(title).size(style::HEADING),
+        text(title).size(metrics.heading),
         text(detail).style(style::dim_text).width(Length::Fill),
     ]
-    .spacing(style::SPACING_SM);
+    .spacing(metrics.spacing_sm);
     if let Some(error) = pins_failure {
         body =
             body.push(text(format!("Graph pins were not loaded: {error}")).style(style::dim_text));
@@ -375,9 +382,9 @@ fn unavailable<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'
         body = body.push(
             row![
                 text(format!("Pin storage error (retry scheduled): {error}"))
-                    .size(style::TEXT_SM)
+                    .size(metrics.text_sm)
                     .style(style::dim_text),
-                button(text("Retry pins now").size(style::TEXT_SM))
+                button(text("Retry pins now").size(metrics.text_sm))
                     .padding(tab_strip::chip_padding())
                     .style(style::action())
                     .on_press(Message::GraphCommand {
@@ -385,12 +392,12 @@ fn unavailable<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'
                         command: GraphCommand::RetryPins,
                     }),
             ]
-            .spacing(style::SPACING_SM),
+            .spacing(metrics.spacing_sm),
         );
     }
     container(
         body.push(
-            button(text("Retry service").size(style::TEXT_SM))
+            button(text("Retry service").size(metrics.text_sm))
                 .padding(tab_strip::chip_padding())
                 .style(style::action())
                 .on_press_maybe(retry.then_some(Message::GraphCommand {
@@ -401,7 +408,7 @@ fn unavailable<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'
     )
     .width(Length::Fill)
     .height(Length::Fill)
-    .padding(style::SPACING_LG)
+    .padding(metrics.spacing_lg)
     .style(style::content)
     .into()
 }
@@ -415,6 +422,7 @@ fn visual_body<'a>(
     state: &GraphTabState,
     geometry: &Arc<RenderGeometry>,
 ) -> Element<'a, Message> {
+    let metrics = app.appearance.metrics();
     let key = state.geometry_key.expect("mounted geometry has a version");
     let publish = move |message: GraphMessage| Message::GraphAction {
         tab,
@@ -422,14 +430,15 @@ fn visual_body<'a>(
         message,
         key,
     };
+    let scheme = app.appearance.scheme();
     let canvas: Element<'a, GraphMessage> = match app.graph.backend {
         crate::host::graph::GraphBackend::Gpu => {
-            GraphProgram::new(Arc::clone(geometry), state.camera)
+            GraphProgram::new(Arc::clone(geometry), state.camera, scheme)
                 .widget()
                 .into()
         }
         crate::host::graph::GraphBackend::Canvas => {
-            GraphCanvas::new(Arc::clone(geometry), state.camera)
+            GraphCanvas::new(Arc::clone(geometry), state.camera, scheme)
                 .element()
                 .into()
         }
@@ -494,13 +503,13 @@ fn visual_body<'a>(
     let labels = labels.into_values().collect();
     let surface: Element<'a, Message> = iced::widget::stack![
         surface,
-        crate::graph::canvas::label_overlay(state.camera, labels)
+        crate::graph::canvas::label_overlay(state.camera, labels, scheme)
     ]
     .into();
     let surface: Element<'a, Message> = if let Some((first, second)) = state.box_preview {
         iced::widget::stack![
             surface,
-            crate::graph::canvas::selection_overlay(state.camera, first, second)
+            crate::graph::canvas::selection_overlay(state.camera, first, second, scheme)
         ]
         .into()
     } else {
@@ -509,7 +518,7 @@ fn visual_body<'a>(
     // Corner fit control (concept 01): the canvas keeps every pixel; the
     // button floats over it in the bottom-right.
     let fit_control = container(
-        button(text("Fit to view").size(style::TEXT_SM))
+        button(text("Fit to view").size(metrics.text_sm))
             .padding(tab_strip::chip_padding())
             .style(style::ghost())
             .on_press_maybe(state.geometry.is_some().then_some(Message::GraphCommand {
@@ -539,13 +548,14 @@ fn list_body<'a>(
     state: &GraphTabState,
     geometry: &Arc<RenderGeometry>,
 ) -> Element<'a, Message> {
+    let metrics = app.appearance.metrics();
     let Some(publication) = app
         .flavite
         .as_ref()
         .and_then(|flavite| flavite.graph_frame())
         .map(|frame| Arc::clone(frame.publication()))
     else {
-        return empty_state("Graph", "The base publication disappeared.");
+        return empty_state(*metrics, "Graph", "The base publication disappeared.");
     };
     let incarnation = app
         .workspace
@@ -585,10 +595,10 @@ fn list_body<'a>(
                 row![
                     text(record.title.clone()).width(Length::Fill),
                     text(record.path.clone())
-                        .size(style::TEXT_SM)
+                        .size(metrics.text_sm)
                         .style(style::dim_text),
                 ]
-                .spacing(style::SPACING)
+                .spacing(metrics.spacing)
             )
             .width(Length::Fill)
             .padding(Padding {
@@ -604,7 +614,7 @@ fn list_body<'a>(
                 key,
                 command: GraphCommand::Select(id),
             }),
-            button(text("Open").size(style::TEXT_SM))
+            button(text("Open").size(metrics.text_sm))
                 .padding(tab_strip::chip_padding())
                 .style(style::action())
                 .on_press_maybe((record.id.kind == flavite_graph::NodeKind::Note).then_some(
@@ -615,7 +625,7 @@ fn list_body<'a>(
                         command: GraphCommand::Open(id),
                     }
                 ),),
-            button(text("Insert").size(style::TEXT_SM))
+            button(text("Insert").size(metrics.text_sm))
                 .padding(tab_strip::chip_padding())
                 .style(style::action())
                 .on_press_maybe((has_target && locator.is_some()).then_some(
@@ -627,7 +637,7 @@ fn list_body<'a>(
                     }
                 ),),
         ]
-        .spacing(style::SPACING_SM);
+        .spacing(metrics.spacing_sm);
         rows = rows.push(row_view);
     }
     let omitted = geometry.node_count().saturating_sub(LIST_ROW_BUDGET);
@@ -667,13 +677,13 @@ fn list_body<'a>(
             ]
             .spacing(4),
             scrollable(rows).width(Length::Fill).height(Length::Fill),
-            text(footer).size(style::TEXT_SM).style(style::dim_text),
+            text(footer).size(metrics.text_sm).style(style::dim_text),
         ]
-        .spacing(style::SPACING_SM),
+        .spacing(metrics.spacing_sm),
     )
     .width(Length::Fill)
     .height(Length::Fill)
-    .padding(style::SPACING)
+    .padding(metrics.spacing)
     .style(style::content)
     .into()
 }

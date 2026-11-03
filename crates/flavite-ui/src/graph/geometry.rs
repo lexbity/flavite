@@ -23,6 +23,8 @@ use std::collections::BTreeMap;
 
 use flavite_graph::{GraphPublication, GraphSnapshot, NodeId, NodeKind, PositionFrame, RenderKey};
 
+use crate::style::tokens::Scheme;
+
 use super::instance::{
     EDGE_WIDTH_BASE, EdgeInstance, NodeInstance, color_of, edge_base_alpha, edge_cap,
     edge_importance, needs_upload, node_radius,
@@ -138,6 +140,7 @@ impl RenderGeometry {
         frame: &PositionFrame,
         overrides: &GeometryOverrides,
         generation: u64,
+        scheme: Scheme,
     ) -> Result<Self, GeometryError> {
         if frame.topology_version() != publication.topology_version {
             return Err(GeometryError::TopologyMismatch {
@@ -172,7 +175,7 @@ impl RenderGeometry {
         }
 
         let node_ids: Vec<NodeId> = snapshot.node_ids.clone();
-        let nodes: Vec<NodeInstance> = node_visuals(snapshot)
+        let nodes: Vec<NodeInstance> = node_visuals(snapshot, scheme)
             .into_iter()
             .zip(positions.iter().copied())
             .filter(|(visual, _)| {
@@ -317,6 +320,7 @@ impl RenderGeometry {
         snapshot: &GraphSnapshot,
         positions: &[[f32; 2]],
         generation: u64,
+        scheme: Scheme,
     ) -> Result<Self, GeometryError> {
         let node_count = snapshot.node_count();
         if positions.len() != node_count {
@@ -326,7 +330,7 @@ impl RenderGeometry {
             });
         }
         let node_ids: Vec<NodeId> = snapshot.node_ids.clone();
-        let nodes = node_visuals(snapshot)
+        let nodes = node_visuals(snapshot, scheme)
             .into_iter()
             .zip(positions.iter().copied())
             .map(|(visual, center)| NodeInstance {
@@ -494,8 +498,8 @@ pub fn drawn_node_radius(degree: u32) -> f32 {
 
 /// Base color for a node kind (re-export for canvas parity).
 #[must_use]
-pub fn kind_base_color(kind: NodeKind) -> [f32; 4] {
-    color_of(kind)
+pub fn kind_base_color(kind: NodeKind, scheme: Scheme) -> [f32; 4] {
+    color_of(kind, scheme)
 }
 
 #[cfg(test)]
@@ -551,9 +555,14 @@ mod tests {
     fn build_pairs_publication_and_frame_positions() {
         let publication = publication_with(vec![(1, 2)]);
         let frame = frame_for(&publication);
-        let geometry =
-            RenderGeometry::build(&publication, &frame, &GeometryOverrides::default(), 3)
-                .expect("matching pair builds");
+        let geometry = RenderGeometry::build(
+            &publication,
+            &frame,
+            &GeometryOverrides::default(),
+            3,
+            Scheme::Dark,
+        )
+        .expect("matching pair builds");
         assert_eq!(geometry.node_count(), 2);
         assert_eq!(geometry.edge_count(), 1);
         assert_eq!(geometry.generation(), 3);
@@ -580,8 +589,14 @@ mod tests {
             );
             buffer.load()
         };
-        let error = RenderGeometry::build(&publication, &stale, &GeometryOverrides::default(), 0)
-            .expect_err("stale pair must be refused");
+        let error = RenderGeometry::build(
+            &publication,
+            &stale,
+            &GeometryOverrides::default(),
+            0,
+            Scheme::Dark,
+        )
+        .expect_err("stale pair must be refused");
         assert!(matches!(error, GeometryError::TopologyMismatch { .. }));
     }
 
@@ -600,6 +615,7 @@ mod tests {
                 ..GeometryOverrides::default()
             },
             4,
+            Scheme::Dark,
         )
         .expect("overrides build");
         assert_eq!(geometry.nodes()[0].center, [0.0, 50.0]);
@@ -621,6 +637,7 @@ mod tests {
                 ..GeometryOverrides::default()
             },
             0,
+            Scheme::Dark,
         )
         .expect("build");
         assert_eq!(geometry.nodes()[0].color, SELECTED_NODE_COLOR);
@@ -708,7 +725,14 @@ mod tests {
             "mismatched publication must panic at store"
         );
         assert!(
-            RenderGeometry::build(&publication, &frame, &GeometryOverrides::default(), 0).is_ok()
+            RenderGeometry::build(
+                &publication,
+                &frame,
+                &GeometryOverrides::default(),
+                0,
+                Scheme::Dark
+            )
+            .is_ok()
         );
     }
 }

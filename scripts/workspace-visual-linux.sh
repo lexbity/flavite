@@ -24,8 +24,8 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
-if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" && "$scenario" != "context" && "$scenario" != "semantic-link" && "$scenario" != "restore" && "$scenario" != "read-structure" && "$scenario" != "filtered-unsaved-graph" && "$scenario" != "develop-connected-note" ]]; then
-    echo "unsupported scenario: $scenario (implemented: layout, shared-editors, shell-foundation, context, semantic-link, restore, develop-connected-note)" >&2
+if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" && "$scenario" != "context" && "$scenario" != "semantic-link" && "$scenario" != "restore" && "$scenario" != "read-structure" && "$scenario" != "filtered-unsaved-graph" && "$scenario" != "develop-connected-note" && "$scenario" != "appearance-matrix" ]]; then
+    echo "unsupported scenario: $scenario (implemented: layout, shared-editors, shell-foundation, context, semantic-link, restore, develop-connected-note, appearance-matrix)" >&2
     exit 2
 fi
 if [[ "$(uname -s)" != Linux ]]; then
@@ -325,6 +325,94 @@ elif [[ "$scenario" == "develop-connected-note" ]]; then
         'any("alpha.md" in (row["path"]) for state in snapshot["search_states"] for row in state["results"])'
     capture "$run_dir/12-search.png"
     record "saved-search-finds-alpha" "12-search.png"
+
+elif [[ "$scenario" == "appearance-matrix" ]]; then
+    # W11: theme/scale matrix through real keyboard input, representative
+    # captures, and preserved layout ratios. The concept art is not a
+    # baseline; the assertions are the harness's own semantic state.
+    harness_wait "shell ready (dark default)" \
+        'snapshot["theme"] == "dark" and snapshot["interface_scale_pct"] == 100'
+    capture "$run_dir/10-dark-100.png"
+    record "dark-100-default" "10-dark-100.png"
+
+    xdotool_key "ctrl+shift+p"
+    xdotool type --delay 25 "light"
+    sleep 0.3
+    xdotool_key "Return"
+    harness_wait "light theme active" \
+        'snapshot["theme"] == "light"'
+    capture "$run_dir/11-light-100.png"
+    record "light-theme-switch" "11-light-100.png"
+
+    xdotool_key "ctrl+shift+p"
+    xdotool type --delay 25 "cycle"
+    sleep 0.3
+    xdotool_key "Return"
+    harness_wait "interface scale at 150%" \
+        'snapshot["interface_scale_pct"] == 150'
+    capture "$run_dir/12-light-150.png"
+    record "light-150-scale" "12-light-150.png"
+
+    # High scale: the editor font size preference rides its own ladder.
+    xdotool_key "ctrl+shift+p"
+    xdotool type --delay 25 "preferences"
+    sleep 0.3
+    xdotool_key "Return"
+    harness_wait "preferences dialog open" \
+        'snapshot["dialog_open"] is True'
+    capture "$run_dir/13-preferences-dialog.png"
+    record "preferences-dialog" "13-preferences-dialog.png"
+    xdotool_key "Escape"
+
+    # Narrow window: adaptive maximize shows one group plus the complete
+    # switcher without rewriting saved ratios.
+    ratios_before="$(python3 -c "
+import json,sys
+for line in reversed([line for line in open(sys.argv[1]) if line.strip()]):
+    try: print(json.dumps(json.loads(line)['desired_ratios'])); break
+    except Exception: continue
+" "$harness_log")"
+    xdotool_key "ctrl+shift+p"
+    xdotool type --delay 25 "cycle"
+    sleep 0.3
+    xdotool_key "Return"
+    harness_wait "interface scale at 200%" \
+        'snapshot["interface_scale_pct"] == 200'
+    xdotool windowsize "$window_id" 640 480
+    sleep 1
+    harness_wait "narrow window adapts without losing tabs" \
+        'all(any(t["load"] in ("ready","empty","search","loading","failed") for t in g["tabs"]) for g in snapshot["groups"]) and snapshot["workspace_bounds"][2] > 0'
+    capture "$run_dir/14-light-200-narrow.png"
+    record "light-200-narrow-adaptive" "14-light-200-narrow.png"
+    ratios_after="$(python3 -c "
+import json,sys
+for line in reversed([line for line in open(sys.argv[1]) if line.strip()]):
+    try: print(json.dumps(json.loads(line)['desired_ratios'])); break
+    except Exception: continue
+" "$harness_log")"
+    [[ "$ratios_before" == "$ratios_after" ]] || {
+        echo "adaptive layout rewrote desired ratios: $ratios_before -> $ratios_after" >&2
+        exit 1
+    }
+    record "desired-ratios-preserved" "14-light-200-narrow.png"
+
+    # Restore: scale back to 100%, theme back to dark; preferences persisted.
+    xdotool_key "ctrl+shift+p"
+    xdotool type --delay 25 "cycle"
+    sleep 0.3
+    xdotool_key "Return"
+    xdotool_key "ctrl+shift+p"
+    xdotool type --delay 25 "cycle"
+    sleep 0.3
+    xdotool_key "Return"
+    xdotool_key "ctrl+shift+p"
+    xdotool type --delay 25 "dark"
+    sleep 0.3
+    xdotool_key "Return"
+    harness_wait "restored dark at 100%" \
+        'snapshot["theme"] == "dark" and snapshot["interface_scale_pct"] == 100'
+    capture "$run_dir/15-restored.png"
+    record "preferences-restore" "15-restored.png"
 
 elif [[ "$scenario" == "restore" ]]; then
     # W06: the persisted device-local layout survives a restart. The app

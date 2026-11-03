@@ -56,11 +56,11 @@ pub use geometry::{
     WRITING_TARGET_NODE_COLOR, keys_pairable,
 };
 pub use instance::{
-    ATTACHMENT_COLOR, Camera, CameraUniform, EDGE_ALPHA_MIN, EDGE_ALPHA_PER_OCTAVE,
-    EDGE_ALPHA_SATURATE, EDGE_ALPHA_ZOOM_FLOOR, EDGE_CAP_AT_REFERENCE_ZOOM, EDGE_CAP_ZOOM_MAX,
-    EDGE_CAP_ZOOM_MIN, EDGE_INSTANCE_SIZE, EDGE_WIDTH_BASE, NODE_INSTANCE_SIZE, NODE_RADIUS_BASE,
-    NODE_RADIUS_PER_OCTAVE, NOTE_COLOR, NodeInstance, NodeShape, edge_alpha_factor,
-    edge_base_alpha, edge_cap, edge_importance, needs_upload, node_radius,
+    Camera, CameraUniform, EDGE_ALPHA_MIN, EDGE_ALPHA_PER_OCTAVE, EDGE_ALPHA_SATURATE,
+    EDGE_ALPHA_ZOOM_FLOOR, EDGE_CAP_AT_REFERENCE_ZOOM, EDGE_CAP_ZOOM_MAX, EDGE_CAP_ZOOM_MIN,
+    EDGE_INSTANCE_SIZE, EDGE_WIDTH_BASE, NODE_INSTANCE_SIZE, NODE_RADIUS_BASE,
+    NODE_RADIUS_PER_OCTAVE, NodeInstance, NodeShape, attachment_color, edge_alpha_factor,
+    edge_base_alpha, edge_cap, edge_importance, needs_upload, node_radius, note_color,
 };
 pub use nodes::{GraphNodeVisual, node_visuals};
 pub use pins::{PinCommand, PinKey, PinRecord, PinStore, PinStoreError, carry_pin_for_tier};

@@ -30,8 +30,9 @@ pub type ShaderViewMessage = GraphMessage;
 pub fn production_widget(
     geometry: Arc<RenderGeometry>,
     camera: Camera,
+    scheme: crate::style::tokens::Scheme,
 ) -> Shader<GraphMessage, GraphProgram> {
-    GraphProgram::new(geometry, camera).widget()
+    GraphProgram::new(geometry, camera, scheme).widget()
 }
 
 /// Whether two version keys may share one mounted frame. Hosts call this
@@ -51,8 +52,9 @@ pub type WidgetHitNode = HitNode;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::instance::{NOTE_COLOR, NodeInstance, NodeShape};
+    use crate::graph::instance::{NodeInstance, NodeShape, note_color};
     use crate::graph::renderer::ReleaseKind;
+    use crate::style::tokens::Scheme;
     use flavite_graph::{NodeId, NodeKind};
 
     #[test]
@@ -67,12 +69,12 @@ mod tests {
                 center: [1.0, 2.0],
                 size: 4.0,
                 shape: NodeShape::Circle,
-                color: NOTE_COLOR,
+                color: note_color(Scheme::Dark),
             }],
             vec![],
             vec![NodeId::note(9)],
         ));
-        let _widget = production_widget(Arc::clone(&geometry), Camera::centered());
+        let _widget = production_widget(Arc::clone(&geometry), Camera::centered(), Scheme::Dark);
         assert_eq!(geometry.generation(), 3);
     }
 

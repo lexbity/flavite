@@ -19,6 +19,7 @@ pub fn view<'a>(
     load: NoteLoad,
     locator: &'a flavite_workspace::NoteLocator,
 ) -> Element<'a, Message> {
+    let metrics = app.appearance.metrics();
     let path = locator.components().join("/");
     match load {
         NoteLoad::Reserved => container(
@@ -32,16 +33,16 @@ pub fn view<'a>(
                         tab,
                     })),
             ]
-            .spacing(style::SPACING),
+            .spacing(metrics.spacing),
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(style::SPACING_LG)
+        .padding(metrics.spacing_lg)
         .style(style::content)
         .into(),
         NoteLoad::Failed => container(
             column![
-                text("Note unavailable").size(style::HEADING),
+                text("Note unavailable").size(metrics.heading),
                 text(path.clone()).style(style::dim_text),
                 row![
                     button(text("Retry"))
@@ -59,13 +60,13 @@ pub fn view<'a>(
                             tab,
                         })),
                 ]
-                .spacing(style::SPACING),
+                .spacing(metrics.spacing),
             ]
-            .spacing(style::SPACING_SM),
+            .spacing(metrics.spacing_sm),
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(style::SPACING_LG)
+        .padding(metrics.spacing_lg)
         .style(style::content)
         .into(),
         NoteLoad::Ready => ready_view(app, tab),
@@ -73,11 +74,20 @@ pub fn view<'a>(
 }
 
 fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
+    let metrics = app.appearance.metrics();
     let Some(view) = app.note_editor_view(tab) else {
-        return empty_state("Buffer unavailable", "The note view needs to be reopened.");
+        return empty_state(
+            *metrics,
+            "Buffer unavailable",
+            "The note view needs to be reopened.",
+        );
     };
     let Some(incarnation) = app.notes.incarnation(tab) else {
-        return empty_state("View unavailable", "This note view is no longer active.");
+        return empty_state(
+            *metrics,
+            "View unavailable",
+            "This note view is no longer active.",
+        );
     };
     let mode = app
         .workspace
@@ -98,6 +108,9 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             action,
         })
         .with_view_key(tab.raw(), incarnation)
+        .with_type_metrics(app.appearance.metrics().editor_type())
+        .with_max_line_width(app.appearance.metrics().editor_max_line_width())
+        .with_colors(crate::style::tokens::editor_colors(app.appearance.scheme()))
         .with_keyboard_enabled(!app.reading.find.get(&tab).is_some_and(|find| find.focused))
         .with_input_intents(move |input| Message::EditorInput {
             tab,
@@ -121,7 +134,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                 } else {
                     "Read"
                 })
-                .size(style::TEXT_SM)
+                .size(metrics.text_sm)
             )
             .style(style::action())
             .on_press_maybe((!app.has_composition()).then_some(Message::ToggleNoteMode(tab)))
@@ -129,7 +142,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         .spacing(8)
         .align_y(alignment::Vertical::Center),
     )
-    .height(32)
+    .height(metrics.tab_height)
     .padding([0, 12])
     .align_y(alignment::Vertical::Center)
     .style(style::toolbar);
@@ -144,7 +157,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
     };
     let footer = container(
         text(state.to_owned())
-            .size(style::TEXT_SM)
+            .size(metrics.text_sm)
             .style(style::dim_text),
     )
     .height(24)
@@ -174,7 +187,11 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         .height(Length::Fill)
         .into()
     } else {
-        empty_state("Loading reading view…", "Preparing the current revision.")
+        empty_state(
+            *metrics,
+            "Loading reading view…",
+            "Preparing the current revision.",
+        )
     };
     let mut content = column![meta, rule::horizontal(1)];
     if let Some(find) = app.reading.find.get(&tab) {

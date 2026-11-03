@@ -281,6 +281,7 @@ pub fn command(app: &mut App, tab: TabId, command: GraphCommand) {
 }
 
 pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
+    let metrics = app.appearance.metrics();
     let state = app.graph.state(tab).expect("mounted graph");
     if state.filter.advanced {
         return column![
@@ -302,7 +303,7 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         .incarnation;
     let command = move |command| Message::GraphCommand { tab, command };
     let action = |title, cmd| {
-        button(text(title).size(style::TEXT_SM))
+        button(text(title).size(metrics.text_sm))
             .on_press(command(cmd))
             .style(style::ghost())
     };
@@ -327,7 +328,7 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         let input =
             move |placeholder: &'static str, value: &'a str, field| {
                 let widget = text_input(placeholder, value)
-                    .size(style::TEXT_SM)
+                    .size(metrics.text_sm)
                     .on_input(move |value| Message::GraphFilterInput {
                         tab,
                         incarnation,
@@ -419,7 +420,7 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         );
     }
     if let Some(error) = &state.filter_error {
-        content = content.push(text(error).size(style::TEXT_SM));
+        content = content.push(text(error).size(metrics.text_sm));
     }
     content.width(Length::Fill).into()
 }

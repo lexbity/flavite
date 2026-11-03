@@ -15,23 +15,23 @@ pub mod preview;
 pub mod search;
 
 use crate::app::Message;
-use crate::style;
+use crate::style::{self, Metrics};
 use iced::widget::{column, container, text};
 use iced::{Element, Length, alignment};
 
 /// A centered placeholder used by every view kind for honest empty,
 /// loading, and unavailable states.
-pub fn empty_state(title: &str, hint: &str) -> Element<'static, Message> {
+pub fn empty_state(metrics: Metrics, title: &str, hint: &str) -> Element<'static, Message> {
     container(
         column![
-            text(title.to_owned()).size(style::HEADING),
+            text(title.to_owned()).size(metrics.heading),
             text(hint.to_owned()).style(style::dim_text),
         ]
-        .spacing(style::SPACING_SM),
+        .spacing(metrics.spacing_sm),
     )
     .width(Length::Fill)
     .height(Length::Fill)
-    .padding(style::SPACING_LG)
+    .padding(metrics.spacing_lg)
     .style(style::content)
     .center_x(Length::Fill)
     .align_y(alignment::Vertical::Top)

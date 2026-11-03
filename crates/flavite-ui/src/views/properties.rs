@@ -115,6 +115,7 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
         .into()
 }
 pub(crate) fn loading(app: &App, tab: TabId) -> Element<'_, Message> {
+    let metrics = *app.appearance.metrics();
     match app.contexts.state(&tab) {
         Some(ToolState::Failed { message }) => container(
             column![
@@ -126,14 +127,16 @@ pub(crate) fn loading(app: &App, tab: TabId) -> Element<'_, Message> {
         .padding(16)
         .into(),
         Some(ToolState::Missing) => empty_state(
+            metrics,
             "Missing note",
             "Locate the bound source or choose another binding.",
         ),
         Some(ToolState::Unbound { .. }) => empty_state(
+            metrics,
             "No selection",
             "Choose a source using the binding controls.",
         ),
-        Some(ToolState::Busy) => empty_state("Queued", "The query service is busy."),
-        _ => empty_state("Loading…", "Reading the current source structure."),
+        Some(ToolState::Busy) => empty_state(metrics, "Queued", "The query service is busy."),
+        _ => empty_state(metrics, "Loading…", "Reading the current source structure."),
     }
 }

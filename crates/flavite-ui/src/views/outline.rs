@@ -9,9 +9,14 @@ use flavite_workspace::TabId;
 use iced::widget::{button, column, container, rule, scrollable, text};
 use iced::{Element, Length};
 pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
+    let metrics = *app.appearance.metrics();
     let body = if let Some(doc) = reading::document(app, tab) {
         if doc.document.outline.is_empty() {
-            empty_state("No headings", "Add a Markdown heading in the source note.")
+            empty_state(
+                metrics,
+                "No headings",
+                "Add a Markdown heading in the source note.",
+            )
         } else {
             let items = doc
                 .document

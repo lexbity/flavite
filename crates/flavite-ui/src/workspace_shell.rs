@@ -98,40 +98,43 @@ fn shell(app: &App) -> Element<'_, Message> {
 }
 
 fn top_bar(app: &App) -> Element<'_, Message> {
+    let metrics = app.appearance.metrics();
     let vault_name = app.root().file_name().map_or_else(
         || app.root().display().to_string(),
         |name| name.to_string_lossy().to_string(),
     );
     container(
         row![
-            button(text("Flavite").size(style::BRAND))
+            button(text("Flavite").size(metrics.brand))
                 .padding(tab_strip::chip_padding())
                 .style(style::ghost())
                 .on_press(Message::AppMenu),
-            text(vault_name).size(style::TEXT_SM).style(style::dim_text),
+            text(vault_name)
+                .size(metrics.text_sm)
+                .style(style::dim_text),
             Space::new()
                 .width(Length::Fixed(8.0))
                 .height(Length::Fixed(0.0)),
             menu_bar(app),
             Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
-            button(text("Quick switch").size(style::TEXT_SM))
+            button(text("Quick switch").size(metrics.text_sm))
                 .padding(tab_strip::chip_padding())
                 .style(style::ghost())
                 .on_press(Message::PickerOpen),
-            button(text("Commands").size(style::TEXT_SM))
+            button(text("Commands").size(metrics.text_sm))
                 .padding(tab_strip::chip_padding())
                 .style(style::ghost())
                 .on_press(Message::PaletteOpen),
         ]
-        .spacing(style::SPACING)
+        .spacing(metrics.spacing)
         .align_y(alignment::Vertical::Center),
     )
     .width(Length::Fill)
     .padding(Padding {
         top: 6.0,
         bottom: 6.0,
-        left: style::SPACING_LG,
-        right: style::SPACING_LG,
+        left: metrics.spacing_lg,
+        right: metrics.spacing_lg,
     })
     .into()
 }
@@ -150,11 +153,12 @@ fn menu_bar(app: &App) -> Element<'_, Message> {
         ("Tools", crate::workspace::StripMenu::Tools),
         ("Help", crate::workspace::StripMenu::Help),
     ];
-    let mut bar = row![].spacing(style::SPACING_SM);
+    let metrics = app.appearance.metrics();
+    let mut bar = row![].spacing(metrics.spacing_sm);
     for (label, menu) in MENUS {
         let active = app.strip_menu.is_some_and(|(_, open)| open == menu);
         bar = bar.push(
-            button(text(label).size(style::TEXT_SM))
+            button(text(label).size(metrics.text_sm))
                 .padding(Padding {
                     top: 2.0,
                     bottom: 2.0,
@@ -179,7 +183,12 @@ fn workspace_region(app: &App) -> Element<'_, Message> {
         width: app.workspace_bounds.width,
         height: app.workspace_bounds.height,
     };
-    let geometry = flavite_workspace::solve(&app.workspace, available, 1.0, &app.resize_preview);
+    let geometry = flavite_workspace::solve(
+        &app.workspace,
+        available,
+        app.appearance.metrics().scale,
+        &app.resize_preview,
+    );
     let maximized = app.maximized_group().or_else(|| {
         geometry
             .adaptive_maximize
@@ -198,11 +207,12 @@ fn workspace_region(app: &App) -> Element<'_, Message> {
 }
 
 fn group_switcher(app: &App) -> Element<'_, Message> {
-    let mut switcher = row![].spacing(style::SPACING_SM);
+    let metrics = app.appearance.metrics();
+    let mut switcher = row![].spacing(metrics.spacing_sm);
     for group in app.workspace.group_order() {
         let focused = app.focused_group() == Some(group);
         switcher = switcher.push(
-            button(text(group_label(app, group)).size(style::TEXT_SM))
+            button(text(group_label(app, group)).size(metrics.text_sm))
                 .padding(tab_strip::chip_padding())
                 .style(style::list_row(focused))
                 .on_press(Message::Layout(LayoutAction::FocusGroup {
@@ -213,19 +223,19 @@ fn group_switcher(app: &App) -> Element<'_, Message> {
     }
     container(
         row![
-            text("Groups").size(style::TEXT_SM).style(style::dim_text),
+            text("Groups").size(metrics.text_sm).style(style::dim_text),
             scrollable(switcher).direction(iced::widget::scrollable::Direction::Horizontal(
                 iced::widget::scrollable::Scrollbar::default()
             ))
         ]
-        .spacing(style::SPACING),
+        .spacing(metrics.spacing),
     )
     .width(Length::Fill)
     .padding(Padding {
         top: 6.0,
         bottom: 6.0,
-        left: style::SPACING_LG,
-        right: style::SPACING_LG,
+        left: metrics.spacing_lg,
+        right: metrics.spacing_lg,
     })
     .style(style::status_bar)
     .into()
@@ -248,7 +258,7 @@ fn pane_grid_view(app: &App) -> Element<'_, Message> {
         pane_grid::Content::new(group_panel(app, group, focused == Some(group)))
             .style(move |theme| style::pane(theme, focused == Some(group)))
     })
-    .spacing(flavite_workspace::SPLITTER_WIDTH);
+    .spacing(flavite_workspace::SPLITTER_WIDTH * app.appearance.metrics().scale);
     container(grid)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -259,6 +269,7 @@ fn group_panel(app: &App, group: GroupId, _focused: bool) -> Element<'_, Message
     let Some(g) = app.workspace.group(&group) else {
         return column![].into();
     };
+    let metrics = app.appearance.metrics();
     let panel: Element<'_, Message> = column![
         tab_strip::view(app, group),
         rule::horizontal(1),
@@ -270,30 +281,38 @@ fn group_panel(app: &App, group: GroupId, _focused: bool) -> Element<'_, Message
     let panel = if let Some(target) = app.gesture.target().filter(|t| t.group == group) {
         let rect = app.group_bounds.get(&group).copied().unwrap_or_default();
         let active = g.tabs().iter().position(|t| *t == g.active()).unwrap_or(0);
-        let slots = tab_strip::plan(rect.width, g.tabs().len(), active);
+        let slots = tab_strip::plan(rect.width, metrics.controls_width, g.tabs().len(), active);
+        // Drop-target geometry tracks the scaled tab strip chrome.
+        let tab_height = metrics.tab_height;
         #[allow(clippy::cast_precision_loss)]
         let (x, y, w, h) = match target.edge {
             Some(flavite_workspace::Edge::Left) => {
-                (0.0, 32.0, rect.width / 2.0, rect.height - 32.0)
+                (0.0, tab_height, rect.width / 2.0, rect.height - tab_height)
             }
-            Some(flavite_workspace::Edge::Right) => {
-                (rect.width / 2.0, 32.0, rect.width / 2.0, rect.height - 32.0)
-            }
-            Some(flavite_workspace::Edge::Top) => {
-                (0.0, 32.0, rect.width, (rect.height - 32.0) / 2.0)
-            }
+            Some(flavite_workspace::Edge::Right) => (
+                rect.width / 2.0,
+                tab_height,
+                rect.width / 2.0,
+                rect.height - tab_height,
+            ),
+            Some(flavite_workspace::Edge::Top) => (
+                0.0,
+                tab_height,
+                rect.width,
+                (rect.height - tab_height) / 2.0,
+            ),
             Some(flavite_workspace::Edge::Bottom) => (
                 0.0,
-                32.0 + (rect.height - 32.0) / 2.0,
+                tab_height + (rect.height - tab_height) / 2.0,
                 rect.width,
-                (rect.height - 32.0) / 2.0,
+                (rect.height - tab_height) / 2.0,
             ),
             None => (
                 (target.index.saturating_sub(slots.start) as f32 * slots.tab_width)
-                    .min(rect.width - 96.0),
+                    .min(rect.width - metrics.controls_width),
                 0.0,
                 3.0,
-                32.0,
+                tab_height,
             ),
         };
         stack![
@@ -322,9 +341,10 @@ fn menu_overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Me
     let Some((group, menu)) = app.strip_menu else {
         return shell;
     };
+    let metrics = app.appearance.metrics();
     let width = 256.0_f32.min(app.window_size().width);
     let (x, y) = if menu == crate::workspace::StripMenu::App {
-        (style::SPACING_LG, 36.0)
+        (metrics.spacing_lg, 36.0)
     } else {
         let rect = app
             .group_bounds
@@ -333,7 +353,7 @@ fn menu_overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Me
             .unwrap_or(app.workspace_bounds);
         let x =
             (rect.x + rect.width - width).clamp(0.0, (app.window_size().width - width).max(0.0));
-        let y = (rect.y + tab_strip::TAB_HEIGHT).min((app.window_size().height - 80.0).max(0.0));
+        let y = (rect.y + metrics.tab_height).min((app.window_size().height - 80.0).max(0.0));
         (x, y)
     };
     let mut entries = column![].spacing(2);
@@ -342,7 +362,7 @@ fn menu_overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Me
         .enumerate()
     {
         entries = entries.push(
-            button(text(entry.label).size(style::TEXT))
+            button(text(entry.label).size(metrics.text))
                 .width(Length::Fill)
                 .padding([7, 10])
                 .style(style::list_row(i == app.menu_selected))
@@ -367,11 +387,13 @@ fn menu_overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Me
 }
 
 fn active_view(app: &App, group: GroupId, tab: TabId) -> Element<'_, Message> {
+    let metrics = *app.appearance.metrics();
     let Some(session) = app.workspace.tab(&tab) else {
-        return crate::views::empty_state("Empty", "This tab has no content.");
+        return crate::views::empty_state(metrics, "Empty", "This tab has no content.");
     };
     match session.kind() {
         ViewKind::Empty => crate::views::empty_state(
+            metrics,
             "Empty",
             "Open a note with Quick switch (Ctrl+P) or add a Notes list.",
         ),
@@ -388,15 +410,16 @@ fn active_view(app: &App, group: GroupId, tab: TabId) -> Element<'_, Message> {
 }
 
 fn status_bar(app: &App) -> Element<'_, Message> {
-    let mut right = row![].spacing(style::SPACING_SM);
+    let metrics = app.appearance.metrics();
+    let mut right = row![].spacing(metrics.spacing_sm);
     right = right.push(
-        container(text(app.writing_target_label()).size(style::TEXT_SM))
+        container(text(app.writing_target_label()).size(metrics.text_sm))
             .style(|theme| style::chip(theme, style::Tone::Primary))
             .padding(tab_strip::chip_padding()),
     );
     if let Some(state) = focused_note_state(app) {
         right = right.push(
-            container(text(state).size(style::TEXT_SM))
+            container(text(state).size(metrics.text_sm))
                 .style(move |theme| style::chip(theme, style::Tone::Neutral))
                 .padding(tab_strip::chip_padding()),
         );
@@ -404,7 +427,7 @@ fn status_bar(app: &App) -> Element<'_, Message> {
     let pending = app.pending_operations();
     if pending > 0 {
         right = right.push(
-            container(text(format!("{pending} in flight")).size(style::TEXT_SM))
+            container(text(format!("{pending} in flight")).size(metrics.text_sm))
                 .style(|theme| style::chip(theme, style::Tone::Warning))
                 .padding(tab_strip::chip_padding()),
         );
@@ -413,7 +436,7 @@ fn status_bar(app: &App) -> Element<'_, Message> {
     if displaced > 0 {
         right = right.push(
             container(
-                text(format!("{displaced} older outcomes outside history")).size(style::TEXT_SM),
+                text(format!("{displaced} older outcomes outside history")).size(metrics.text_sm),
             )
             .style(|theme| style::chip(theme, style::Tone::Warning))
             .padding(tab_strip::chip_padding()),
@@ -421,7 +444,7 @@ fn status_bar(app: &App) -> Element<'_, Message> {
     }
     if let Some((done, total)) = app.reconcile_progress() {
         right = right.push(
-            container(text(format!("Indexing {done}/{total}")).size(style::TEXT_SM))
+            container(text(format!("Indexing {done}/{total}")).size(metrics.text_sm))
                 .style(|theme| style::chip(theme, style::Tone::Warning))
                 .padding(tab_strip::chip_padding()),
         );
@@ -429,18 +452,18 @@ fn status_bar(app: &App) -> Element<'_, Message> {
     container(
         row![
             text(app.status_text())
-                .size(style::TEXT_SM)
+                .size(metrics.text_sm)
                 .width(Length::Fill),
             right,
         ]
-        .spacing(style::SPACING),
+        .spacing(metrics.spacing),
     )
     .width(Length::Fill)
     .padding(Padding {
         top: 6.0,
         bottom: 6.0,
-        left: style::SPACING_LG,
-        right: style::SPACING_LG,
+        left: metrics.spacing_lg,
+        right: metrics.spacing_lg,
     })
     .style(style::status_bar)
     .into()
@@ -461,6 +484,7 @@ fn focused_note_state(app: &App) -> Option<&'static str> {
 
 /// The floating command palette card (core + host commands).
 fn palette_card(app: &App) -> Element<'_, Message> {
+    let metrics = app.appearance.metrics();
     let matches = app.palette_snapshot();
     let selected = app.palette_selection(matches.len());
     let mut rows = column![].spacing(2);
@@ -470,12 +494,12 @@ fn palette_card(app: &App) -> Element<'_, Message> {
             button(
                 row![
                     text(spec.title).width(Length::Fill),
-                    text(spec.id).size(style::TEXT_SM).style(style::dim_text),
+                    text(spec.id).size(metrics.text_sm).style(style::dim_text),
                     text(crate::palette::keybinding(spec).unwrap_or_default())
-                        .size(style::TEXT_SM)
+                        .size(metrics.text_sm)
                         .style(style::dim_text),
                 ]
-                .spacing(style::SPACING),
+                .spacing(metrics.spacing),
             )
             .width(Length::Fill)
             .padding(Padding {
@@ -502,28 +526,29 @@ fn palette_card(app: &App) -> Element<'_, Message> {
                 .id(PALETTE_INPUT_ID)
                 .on_input(Message::PaletteQuery)
                 .on_submit(Message::PaletteSubmit)
-                .size(style::TEXT_LG)
+                .size(metrics.text_lg)
                 .padding(8),
             rule::horizontal(1),
             container(body).max_height(360).width(Length::Fill),
             row![
                 Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
                 text("Up/Down navigate · Enter runs · Esc dismisses")
-                    .size(style::TEXT_SM)
+                    .size(metrics.text_sm)
                     .style(style::dim_text),
             ],
         ]
-        .spacing(style::SPACING_SM)
+        .spacing(metrics.spacing_sm)
         .width(Length::Fill),
     )
-    .width(Length::Fixed(style::PALETTE_WIDTH))
-    .padding(style::SPACING)
+    .width(Length::Fixed(metrics.palette_width))
+    .padding(metrics.spacing)
     .style(style::palette_card)
     .into()
 }
 
 /// The floating note picker card (quick switch).
 fn picker_card(app: &App) -> Element<'_, Message> {
+    let metrics = app.appearance.metrics();
     let matches = app.picker_matches();
     let selected = app.picker.selected.min(matches.len().saturating_sub(1));
     let mut rows = column![].spacing(2);
@@ -534,10 +559,10 @@ fn picker_card(app: &App) -> Element<'_, Message> {
                 row![
                     text(entry.title.clone()).width(Length::Fill),
                     text(entry.path.display().to_string())
-                        .size(style::TEXT_SM)
+                        .size(metrics.text_sm)
                         .style(style::dim_text),
                 ]
-                .spacing(style::SPACING),
+                .spacing(metrics.spacing),
             )
             .width(Length::Fill)
             .padding(Padding {
@@ -570,22 +595,22 @@ fn picker_card(app: &App) -> Element<'_, Message> {
             text_input("Open a note…", &app.picker.query)
                 .id(PICKER_INPUT_ID)
                 .on_input(Message::PickerQuery)
-                .size(style::TEXT_LG)
+                .size(metrics.text_lg)
                 .padding(8),
             rule::horizontal(1),
             container(body).max_height(360).width(Length::Fill),
             row![
                 Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
                 text("Enter opens · Ctrl+Enter inserts a link at the caret · Esc dismisses")
-                    .size(style::TEXT_SM)
+                    .size(metrics.text_sm)
                     .style(style::dim_text),
             ],
         ]
-        .spacing(style::SPACING_SM)
+        .spacing(metrics.spacing_sm)
         .width(Length::Fill),
     )
-    .width(Length::Fixed(style::PALETTE_WIDTH))
-    .padding(style::SPACING)
+    .width(Length::Fixed(metrics.palette_width))
+    .padding(metrics.spacing)
     .style(style::palette_card)
     .into()
 }

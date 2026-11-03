@@ -90,6 +90,12 @@ pub struct App {
     note_candidates: crate::picker::NoteCandidates,
     /// Device-local workspace persistence (W06).
     pub persistence: crate::host::persistence::PersistenceHost,
+    /// Interface appearance: theme, scale, editor type, reduced motion,
+    /// shortcut overrides (W11).
+    pub appearance: crate::host::appearance::AppearanceHost,
+    /// While a Preferences shortcut editor row is capturing, the command
+    /// id waiting for the next key press (W11). Escape cancels capture.
+    pub shortcut_capture: Option<String>,
     /// Named layouts carried for the next layout save (W06).
     pub named_layouts: Vec<flavite_workspace::NamedLayout>,
     pub picker: Picker,
@@ -112,7 +118,7 @@ pub struct App {
     pointer_feedback: bool,
     /// Set when the window/workspace bounds changed; gates the geometry
     /// re-solve that used to run on every message.
-    window_geometry_dirty: bool,
+    pub(crate) window_geometry_dirty: bool,
     catalog: Vec<NoteCatalogEntry>,
     catalog_error: Option<String>,
     settings: Settings,
@@ -159,6 +165,10 @@ pub enum Message {
     WindowEvent(iced::window::Event),
     /// A typed layout transaction.
     Layout(flavite_workspace::LayoutAction),
+    /// The OS color scheme changed (W11 System theme).
+    SystemTheme(iced::theme::Mode),
+    /// A device-preference edit (W11).
+    Preferences(crate::host::appearance::PreferenceMessage),
     /// Open a real view kind in the focused group.
     NewViewInFocused(flavite_workspace::ViewKind),
     EditorInput {
@@ -464,6 +474,8 @@ impl App {
             search_focus_tried: BTreeSet::new(),
             note_candidates: crate::picker::NoteCandidates::default(),
             persistence: crate::host::persistence::PersistenceHost::default(),
+            appearance: crate::host::appearance::AppearanceHost::boot(),
+            shortcut_capture: None,
             named_layouts: Vec::new(),
             picker: Picker::default(),
             palette_open: false,
@@ -520,8 +532,14 @@ impl App {
         if !conflicts.is_empty() {
             self.status = format!("Command catalog conflict: {}", conflicts.join(", "));
         }
+        // Device preferences load at attach (W11): parse failures keep
+        // defaults with saving disabled; the document is never overwritten.
+        self.appearance.load(&flavite);
+        if let Some(note) = self.appearance.status_note() {
+            self.status = format!("{} — {}", self.status, note);
+        }
         self.flavite = Some(flavite);
-        if self.settings_valid && conflicts.is_empty() {
+        if self.settings_valid && conflicts.is_empty() && self.appearance.last_error.is_none() {
             self.status = "Vault ready".into();
         }
         // Graph pins load once through the API at attach (TD-11): a decode
@@ -1008,6 +1026,12 @@ impl App {
             }
             crate::host::dialogs::Dialog::About => {
                 self.dialog = None;
+            }
+            // Preferences edits commit through Message::Preferences as
+            // they are made; submit only closes the dialog.
+            crate::host::dialogs::Dialog::Preferences => {
+                self.dialog = None;
+                self.shortcut_capture = None;
             }
         }
     }
@@ -1947,6 +1971,11 @@ impl App {
                 }
             }
             Message::Mouse(event) => self.handle_mouse(event),
+            Message::SystemTheme(mode) => self.appearance.system_theme(mode),
+            Message::Preferences(update) => {
+                // Preference edits persist inline; the task is always none.
+                let _ = self.update_preferences(update);
+            }
             Message::WindowEvent(iced::window::Event::Focused) => {
                 if let Some(flavite) = &self.flavite
                     && let Err(error) = flavite.focus()
@@ -2283,7 +2312,10 @@ impl App {
             Message::DialogSubmit => {
                 self.submit_dialog();
             }
-            Message::DialogCancel => self.dialog = None,
+            Message::DialogCancel => {
+                self.dialog = None;
+                self.shortcut_capture = None;
+            }
             Message::NotePicked(picked) => {
                 self.open_picked_note(picked);
             }
@@ -3089,7 +3121,7 @@ impl App {
     /// The combined catalog snapshot for the palette: core specs plus the
     /// host commands, in stable order.
     fn palette_matches(&self) -> Vec<flavite_api::CommandSpec> {
-        let mut specs = host_commands::ui_specs();
+        let mut specs = host_commands::ui_specs(&self.appearance.prefs.shortcuts);
         if let Some(flavite) = &self.flavite {
             specs.extend(flavite.command_registry().specs());
         }
@@ -3180,6 +3212,7 @@ impl App {
                 _ => None,
             }),
             iced::window::events().map(|(_, event)| Message::WindowEvent(event)),
+            iced::system::theme_changes().map(Message::SystemTheme),
         ])
     }
 }
@@ -3223,6 +3256,8 @@ mod tests {
             search_focus_tried: BTreeSet::new(),
             note_candidates: crate::picker::NoteCandidates::default(),
             persistence: crate::host::persistence::PersistenceHost::default(),
+            appearance: crate::host::appearance::AppearanceHost::boot(),
+            shortcut_capture: None,
             named_layouts: Vec::new(),
             picker: Picker::default(),
             palette_open: false,

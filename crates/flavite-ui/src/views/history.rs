@@ -112,8 +112,9 @@ pub fn load(app: &mut App, tab: TabId, locator: &NoteLocator) {
 
 /// Render the history view for one tab.
 pub fn view(app: &App, tab: TabId, locator: &NoteLocator) -> Element<'static, Message> {
+    let metrics = app.appearance.metrics();
     let Some(list) = app.history.tabs.get(&tab) else {
-        return crate::views::empty_state("History", "Loading snapshots…");
+        return crate::views::empty_state(*metrics, "History", "Loading snapshots…");
     };
     let mut rows = column![].spacing(2);
     if list.entries.is_empty() && list.error.is_none() {
@@ -127,26 +128,26 @@ pub fn view(app: &App, tab: TabId, locator: &NoteLocator) -> Element<'static, Me
     }
     let header = if let Some(error) = &list.error {
         column![
-            text("History unavailable").size(style::HEADING),
+            text("History unavailable").size(metrics.heading),
             text(error.clone()).style(style::dim_text),
             button(text("Retry"))
                 .padding(tab_strip::chip_padding())
                 .style(style::action())
                 .on_press(Message::HistoryRefresh { tab }),
         ]
-        .spacing(style::SPACING_SM)
+        .spacing(metrics.spacing_sm)
     } else {
         column![
-            text(format!("History: {}", locator.title())).size(style::TEXT_LG),
+            text(format!("History: {}", locator.title())).size(metrics.text_lg),
             text(format!("{} snapshots · restore replaces the open buffer as one undoable edit; disk is written only when you save", list.entries.len()))
-                .size(style::TEXT_SM)
+                .size(metrics.text_sm)
                 .style(style::dim_text),
         ]
-        .spacing(style::SPACING_SM)
+        .spacing(metrics.spacing_sm)
     };
     container(
         column![
-            row![header,].spacing(style::SPACING_SM),
+            row![header,].spacing(metrics.spacing_sm),
             button(text("Refresh"))
                 .padding(tab_strip::chip_padding())
                 .style(style::ghost())
@@ -154,14 +155,14 @@ pub fn view(app: &App, tab: TabId, locator: &NoteLocator) -> Element<'static, Me
             container(scrollable(rows).height(Length::Fill))
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .padding(style::SPACING_SM)
+                .padding(metrics.spacing_sm)
                 .style(style::card),
         ]
-        .spacing(style::SPACING_SM),
+        .spacing(metrics.spacing_sm),
     )
     .width(Length::Fill)
     .height(Length::Fill)
-    .padding(style::SPACING_LG)
+    .padding(metrics.spacing_lg)
     .style(style::content)
     .into()
 }
@@ -172,26 +173,27 @@ fn entry_row(
     locator: &NoteLocator,
     entry: &HistoryRow,
 ) -> Element<'static, Message> {
+    let metrics = app.appearance.metrics();
     let age = format_age(entry.timestamp_secs);
     let restoreable = app.can_restore_history(locator);
     let mut line = row![
         text(age).width(Length::Fixed(150.0)),
         text(reason_label(&entry.reason)).width(Length::Fixed(170.0)),
     ]
-    .spacing(style::SPACING_SM);
+    .spacing(metrics.spacing_sm);
     if entry.pins > 0 {
         line = line.push(
             text(format!("pinned ×{}", entry.pins))
-                .size(style::TEXT_SM)
+                .size(metrics.text_sm)
                 .style(style::dim_text),
         );
     }
     line = line.push(
         text(entry.hash.chars().take(12).collect::<String>())
-            .size(style::TEXT_SM)
+            .size(metrics.text_sm)
             .style(style::dim_text),
     );
-    button(row![line, text("Restore").size(style::TEXT_SM),].spacing(style::SPACING))
+    button(row![line, text("Restore").size(metrics.text_sm),].spacing(metrics.spacing))
         .width(Length::Fill)
         .padding(iced::Padding {
             top: 6.0,

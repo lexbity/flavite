@@ -1,5 +1,6 @@
 //! Shared compact shell controls. Icons are drawn as vectors, without font glyphs.
 
+use crate::style::Metrics;
 use crate::{app::Message, style};
 use iced::advanced::{Layout, Widget, layout, mouse, renderer, widget};
 use iced::widget::{button, container, tooltip};
@@ -18,19 +19,34 @@ pub enum Icon {
     Maximize,
 }
 
-pub fn icon<'a>(kind: Icon) -> Element<'a, Message> {
-    Element::new(kind)
+/// A vector icon drawn at half the scaled icon-button target (16 px at 100%).
+#[derive(Debug, Clone, Copy)]
+pub struct Glyph {
+    kind: Icon,
+    size: f32,
 }
 
-pub fn icon_button(kind: Icon, label: &str, message: Option<Message>) -> Element<'_, Message> {
+pub fn icon<'a>(metrics: Metrics, kind: Icon) -> Element<'a, Message> {
+    Element::new(Glyph {
+        kind,
+        size: metrics.icon_target * 0.5,
+    })
+}
+
+pub fn icon_button(
+    metrics: Metrics,
+    kind: Icon,
+    label: &str,
+    message: Option<Message>,
+) -> Element<'_, Message> {
     tooltip(
-        button(container(icon(kind)).center(Length::Fixed(24.0)))
-            .width(32)
-            .height(32)
+        button(container(icon(metrics, kind)).center(Length::Fixed(metrics.icon_target * 0.5)))
+            .width(metrics.icon_target)
+            .height(metrics.icon_target)
             .padding(4)
             .style(style::toolbar_button)
             .on_press_maybe(message),
-        container(iced::widget::text(label).size(style::TEXT_SM))
+        container(iced::widget::text(label).size(metrics.text_sm))
             .padding(6)
             .style(style::card),
         tooltip::Position::Bottom,
@@ -38,9 +54,9 @@ pub fn icon_button(kind: Icon, label: &str, message: Option<Message>) -> Element
     .into()
 }
 
-impl Widget<Message, Theme, Renderer> for Icon {
+impl Widget<Message, Theme, Renderer> for Glyph {
     fn size(&self) -> Size<Length> {
-        Size::new(Length::Fixed(16.0), Length::Fixed(16.0))
+        Size::new(Length::Fixed(self.size), Length::Fixed(self.size))
     }
     fn layout(
         &mut self,
@@ -48,7 +64,7 @@ impl Widget<Message, Theme, Renderer> for Icon {
         _renderer: &Renderer,
         _limits: &layout::Limits,
     ) -> layout::Node {
-        layout::Node::new(Size::new(16.0, 16.0))
+        layout::Node::new(Size::new(self.size, self.size))
     }
     fn draw(
         &self,
@@ -62,38 +78,41 @@ impl Widget<Message, Theme, Renderer> for Icon {
     ) {
         use iced::advanced::Renderer as _;
         let p = layout.bounds();
+        // Glyph geometry is authored on a 16 px grid and scales with the
+        // laid-out size.
+        let s = p.width / 16.0;
         let mut line = |x: f32, y: f32, w: f32, h: f32| {
             renderer.fill_quad(
                 renderer::Quad {
                     bounds: Rectangle {
-                        x: p.x + x,
-                        y: p.y + y,
-                        width: w,
-                        height: h,
+                        x: p.x + x * s,
+                        y: p.y + y * s,
+                        width: w * s,
+                        height: h * s,
                     },
                     ..renderer::Quad::default()
                 },
                 theme.palette().text,
             );
         };
-        match self {
-            Self::Add => {
+        match self.kind {
+            Icon::Add => {
                 line(7.25, 2.0, 1.5, 12.0);
                 line(2.0, 7.25, 12.0, 1.5);
             }
-            Self::More => {
+            Icon::More => {
                 for x in [2.0, 7.0, 12.0] {
                     line(x, 7.0, 2.0, 2.0);
                 }
             }
-            Self::Close => {
+            Icon::Close => {
                 for i in 0_u16..10 {
                     let x = f32::from(i);
                     line(3.0 + x, 3.0 + x, 1.5, 1.5);
                     line(12.0 - x, 3.0 + x, 1.5, 1.5);
                 }
             }
-            Self::Note => {
+            Icon::Note => {
                 line(3.0, 1.0, 9.0, 1.0);
                 line(3.0, 1.0, 1.0, 14.0);
                 line(12.0, 1.0, 1.0, 14.0);
@@ -101,7 +120,7 @@ impl Widget<Message, Theme, Renderer> for Icon {
                 line(6.0, 6.0, 4.0, 1.0);
                 line(6.0, 9.0, 4.0, 1.0);
             }
-            Self::Notes => {
+            Icon::Notes => {
                 line(1.0, 4.0, 14.0, 1.0);
                 line(1.0, 4.0, 1.0, 10.0);
                 line(14.0, 4.0, 1.0, 10.0);
@@ -112,10 +131,10 @@ impl Widget<Message, Theme, Renderer> for Icon {
                 renderer.fill_quad(
                     renderer::Quad {
                         bounds: Rectangle {
-                            x: p.x + 2.0,
-                            y: p.y + 2.0,
-                            width: 12.0,
-                            height: 12.0,
+                            x: p.x + 2.0 * s,
+                            y: p.y + 2.0 * s,
+                            width: 12.0 * s,
+                            height: 12.0 * s,
                         },
                         border: Border {
                             color: theme.palette().text,
@@ -127,25 +146,25 @@ impl Widget<Message, Theme, Renderer> for Icon {
                     Background::Color(iced::Color::TRANSPARENT),
                 );
                 match kind {
-                    Self::SplitRight | Self::Tabs => renderer.fill_quad(
+                    Icon::SplitRight | Icon::Tabs => renderer.fill_quad(
                         renderer::Quad {
                             bounds: Rectangle {
-                                x: p.x + 7.0,
-                                y: p.y + 3.0,
-                                width: 1.0,
-                                height: 10.0,
+                                x: p.x + 7.0 * s,
+                                y: p.y + 3.0 * s,
+                                width: 1.0 * s,
+                                height: 10.0 * s,
                             },
                             ..renderer::Quad::default()
                         },
                         theme.palette().text,
                     ),
-                    Self::SplitDown => renderer.fill_quad(
+                    Icon::SplitDown => renderer.fill_quad(
                         renderer::Quad {
                             bounds: Rectangle {
-                                x: p.x + 3.0,
-                                y: p.y + 7.0,
-                                width: 10.0,
-                                height: 1.0,
+                                x: p.x + 3.0 * s,
+                                y: p.y + 7.0 * s,
+                                width: 10.0 * s,
+                                height: 1.0 * s,
                             },
                             ..renderer::Quad::default()
                         },

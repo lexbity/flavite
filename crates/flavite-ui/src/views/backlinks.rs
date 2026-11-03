@@ -15,18 +15,19 @@ use iced::{Element, Length, Padding};
 
 /// Render one Backlinks tab for the active view slot.
 pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
+    let metrics = *app.appearance.metrics();
     let Some(session) = app.workspace.tab(&tab) else {
-        return empty_state("Empty", "This tab has no content.");
+        return empty_state(metrics, "Empty", "This tab has no content.");
     };
     if !matches!(session.kind(), flavite_workspace::ViewKind::Backlinks(_)) {
-        return empty_state("Backlinks", "This tab is not a backlinks view.");
+        return empty_state(metrics, "Backlinks", "This tab is not a backlinks view.");
     }
     let header = context_header::view(app, tab);
     let body: Element<'a, Message> = match app.contexts.state(&tab) {
         Some(ToolState::Ready(ToolContent::Backlinks { rows, .. })) => {
             let mut list = column![].spacing(2);
             for row in rows {
-                list = list.push(backlink_row(row));
+                list = list.push(backlink_row(metrics, row));
             }
             container(
                 scrollable(list.width(Length::Fill))
@@ -35,45 +36,51 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             )
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding(style::SPACING_SM)
+            .padding(metrics.spacing_sm)
             .style(style::card)
             .into()
         }
-        Some(ToolState::NoBacklinks) => {
-            empty_state("No backlinks", "No current note links to this one yet.")
-        }
+        Some(ToolState::NoBacklinks) => empty_state(
+            metrics,
+            "No backlinks",
+            "No current note links to this one yet.",
+        ),
         Some(ToolState::Unbound { .. }) => empty_state(
+            metrics,
             "No source",
             "Focus a note, publish a selection, or pin one to inspect its backlinks.",
         ),
-        Some(ToolState::Missing) => {
-            empty_state("Missing note", "The bound note is not in the saved vault.")
-        }
+        Some(ToolState::Missing) => empty_state(
+            metrics,
+            "Missing note",
+            "The bound note is not in the saved vault.",
+        ),
         Some(ToolState::Failed { message }) => container(
             column![
-                text("Backlinks unavailable").size(style::HEADING),
+                text("Backlinks unavailable").size(metrics.heading),
                 text(message.as_str()).style(style::dim_text),
                 retry_button(app, tab),
             ]
-            .spacing(style::SPACING_SM),
+            .spacing(metrics.spacing_sm),
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(style::SPACING_LG)
+        .padding(metrics.spacing_lg)
         .style(style::content)
         .into(),
         Some(ToolState::Busy) => empty_state(
+            metrics,
             "Queued",
             "The query service is busy; these backlinks will update.",
         ),
         Some(ToolState::Idle) | Some(ToolState::Querying) | None => {
-            empty_state("Loading…", "The backlink query is in flight.")
+            empty_state(metrics, "Loading…", "The backlink query is in flight.")
         }
         Some(ToolState::Ready(
             ToolContent::Document(_)
             | ToolContent::Preview { .. }
             | ToolContent::BufferPreview { .. },
-        )) => empty_state("Loading…", "The backlink query is in flight."),
+        )) => empty_state(metrics, "Loading…", "The backlink query is in flight."),
     };
     column![header, rule::horizontal(1), body]
         .width(Length::Fill)
@@ -81,7 +88,10 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         .into()
 }
 
-fn backlink_row<'a>(row: &'a flavite_api::BacklinkRow) -> Element<'a, Message> {
+fn backlink_row<'a>(
+    metrics: crate::style::Metrics,
+    row: &'a flavite_api::BacklinkRow,
+) -> Element<'a, Message> {
     let action = NoteLocator::from_relative(std::path::Path::new(&row.source_path))
         .ok()
         .map(|locator| Message::OpenNoteFromContext { locator });
@@ -99,7 +109,7 @@ fn backlink_row<'a>(row: &'a flavite_api::BacklinkRow) -> Element<'a, Message> {
                     .clone()
                     .unwrap_or_else(|| row.source_path.clone())
             )
-            .size(style::TEXT_SM)
+            .size(metrics.text_sm)
             .style(style::dim_text),
         ]
         .spacing(2),
@@ -117,7 +127,8 @@ fn backlink_row<'a>(row: &'a flavite_api::BacklinkRow) -> Element<'a, Message> {
 }
 
 fn retry_button(app: &App, tab: TabId) -> iced::widget::Button<'static, Message> {
-    button(text("Retry").size(style::TEXT_SM))
+    let metrics = app.appearance.metrics();
+    button(text("Retry").size(metrics.text_sm))
         .padding(tab_strip::chip_padding())
         .style(style::action())
         .on_press_maybe(

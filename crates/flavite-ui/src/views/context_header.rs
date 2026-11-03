@@ -120,6 +120,7 @@ pub fn status_label(app: &App, tab: TabId) -> String {
 /// One header row: source label, status, and the Follow/Pin binding
 /// selector. Rendered above every Preview/Backlinks view.
 pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
+    let metrics = app.appearance.metrics();
     let label = source_label(app, tab);
     let status = status_label(app, tab);
     let status = if app.contexts.is_updating(&tab) {
@@ -128,10 +129,10 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         status
     };
     let is_pinned = matches!(binding_of(app, tab), Some(ContextBinding::Pinned(_)));
-    let mut controls = row![].spacing(style::SPACING_SM);
+    let mut controls = row![].spacing(metrics.spacing_sm);
     if is_pinned {
         controls = controls.push(
-            button(text("Follow document").size(style::TEXT_SM))
+            button(text("Follow document").size(metrics.text_sm))
                 .padding(tab_strip::chip_padding())
                 .style(style::ghost())
                 .on_press(Message::SetContextBinding {
@@ -141,7 +142,7 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         );
     } else {
         controls = controls.push(
-            button(text("Pin context").size(style::TEXT_SM))
+            button(text("Pin context").size(metrics.text_sm))
                 .padding(tab_strip::chip_padding())
                 .style(style::ghost())
                 .on_press_maybe(
@@ -198,12 +199,12 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         }
     })
     .width(Length::Fill)
-    .text_size(style::TEXT_SM);
+    .text_size(metrics.text_sm);
     container(
         column![
             row![selector, controls].spacing(8),
-            text(label).size(style::TEXT_SM),
-            text(status).size(style::TEXT_SM).style(style::dim_text)
+            text(label).size(metrics.text_sm),
+            text(status).size(metrics.text_sm).style(style::dim_text)
         ]
         .spacing(4),
     )

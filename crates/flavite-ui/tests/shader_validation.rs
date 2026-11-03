@@ -27,14 +27,15 @@ use iced::widget::shader::{Pipeline as _, Primitive as _};
 
 use flavite_ui::graph::geometry::RenderGeometry;
 use flavite_ui::graph::instance::{
-    CAMERA_UNIFORM_SIZE, Camera, CameraUniform, EdgeInstance, NODE_INSTANCE_SIZE, NOTE_COLOR,
-    NodeInstance, NodeShape,
+    CAMERA_UNIFORM_SIZE, Camera, CameraUniform, EdgeInstance, NODE_INSTANCE_SIZE, NodeInstance,
+    NodeShape, note_color,
 };
 use flavite_ui::graph::renderer::{
     CAMERA_UNIFORM_NAME, EDGE_FRAGMENT_ENTRY, EDGE_VERTEX_ENTRY, NODE_FRAGMENT_ENTRY,
     NODE_VERTEX_ENTRY,
 };
 use flavite_ui::graph::shader_probe::{PROBE_WGSL, ProbePipeline, ProbePrimitive, ProbeTimings};
+use flavite_ui::style::tokens::Scheme;
 
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 
@@ -170,6 +171,7 @@ fn camera_uniform_offsets_match_the_wgsl_struct() {
         viewport_size: [1920.0, 1080.0],
         edge_instances: 123_456,
         node_instances: 65_432,
+        edge_color: [0.25, 0.5, 0.75, 1.0],
     };
     let bytes = uniform.to_bytes();
     assert_eq!(bytes.len(), CAMERA_UNIFORM_SIZE);
@@ -243,6 +245,7 @@ fn camera_uniform_offsets_match_the_wgsl_struct() {
             ("viewport_size".to_string(), 32),
             ("edge_instances".to_string(), 40),
             ("node_instances".to_string(), 44),
+            ("edge_color".to_string(), 48),
         ],
         "`Camera` grew, shrank, or was reordered — update the WGSL comments \
          and the `to_bytes` packing together"
@@ -330,13 +333,13 @@ fn probe_pipelines_compile_and_link_on_a_real_device() {
                 center: [0.0, 0.0],
                 size: 4.0,
                 shape: NodeShape::Circle,
-                color: NOTE_COLOR,
+                color: note_color(Scheme::Dark),
             },
             NodeInstance {
                 center: [10.0, 0.0],
                 size: 6.0,
                 shape: NodeShape::Square,
-                color: NOTE_COLOR,
+                color: note_color(Scheme::Dark),
             },
         ],
         vec![EdgeInstance {
@@ -351,6 +354,7 @@ fn probe_pipelines_compile_and_link_on_a_real_device() {
     let primitive = ProbePrimitive::new(
         geometry,
         Camera::centered(),
+        Scheme::Dark,
         std::sync::Arc::new(ProbeTimings::default()),
     );
 
@@ -436,7 +440,7 @@ fn instance_strides_match_the_wgpu_vertex_layouts() {
         "from 0..8, to 8..16, alpha 16..20, width 20..24, pad 24..32"
     );
     assert_eq!(
-        CAMERA_UNIFORM_SIZE, 48,
-        "eight members, last one ending at 48"
+        CAMERA_UNIFORM_SIZE, 64,
+        "nine members (16-byte aligned), the last ending at 64"
     );
 }

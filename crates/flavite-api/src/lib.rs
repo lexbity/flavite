@@ -25,6 +25,7 @@
 
 pub mod capability;
 pub mod command;
+pub mod device_preferences;
 pub mod doctor;
 pub mod event;
 pub mod flavite;

@@ -99,7 +99,7 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         .filter_map(|group| {
             let state = app.workspace.group(&group)?;
             let bounds = app.group_bounds.get(&group).copied();
-            let slots = crate::workspace::tab_strip::plan(bounds.map_or(0.0,|r|r.width),state.tabs().len(),state.tabs().iter().position(|t| *t==state.active()).unwrap_or(0));
+            let slots = crate::workspace::tab_strip::plan(bounds.map_or(0.0,|r|r.width),app.appearance.metrics().controls_width,state.tabs().len(),state.tabs().iter().position(|t| *t==state.active()).unwrap_or(0));
             let tabs: Vec<serde_json::Value> = state
                 .tabs()
                 .iter()
@@ -309,7 +309,7 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "palette_query": app.palette_query,
         "palette_matches": if app.palette_open { app.palette_snapshot().iter().map(|command| command.id).collect::<Vec<_>>() } else { Vec::new() },
         "desired_ratios": desired_ratios(app.workspace.tree()),
-        "adaptive_maximized": !flavite_workspace::fits(&app.workspace,flavite_workspace::Size {width:app.workspace_bounds.width,height:app.workspace_bounds.height},1.0),
+        "adaptive_maximized": !flavite_workspace::fits(&app.workspace,flavite_workspace::Size {width:app.workspace_bounds.width,height:app.workspace_bounds.height},app.appearance.metrics().scale),
         "window_size": [app.window_size().width,app.window_size().height],
         "drag_target": app.gesture.target().map(|target|format!("{target:?}")),
         "dragging": app.gesture.dragging(),
@@ -327,5 +327,10 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "graph_service": graph_service,
         "maximized": app.maximized_group().map(|group| group.to_string()),
         "catalog": app.catalog().len(),
+        "theme": app.appearance.scheme().name(),
+        "theme_choice": app.appearance.prefs.theme.name(),
+        "interface_scale_pct": app.appearance.prefs.interface_scale_pct,
+        "editor_font_size": app.appearance.prefs.editor_font_size,
+        "reduced_motion": app.appearance.prefs.reduced_motion,
     })
 }

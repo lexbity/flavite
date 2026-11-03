@@ -5,6 +5,7 @@
 //! resolve through the same availability logic. UI commands reduce the
 //! workspace; core commands stay `Invocation`s through `flavite-api`.
 
+pub mod appearance;
 pub mod commands;
 pub mod context;
 pub mod dialogs;

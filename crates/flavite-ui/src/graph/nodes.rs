@@ -4,9 +4,10 @@
 //! are circular dots, while attachments are square nodes. Size follows total
 //! degree for both kinds, matching the instanced renderer's rule.
 
-use flavite_graph::{GraphSnapshot, NodeId, NodeKind};
+use flavite_graph::{GraphSnapshot, NodeId};
 
-use super::instance::{ATTACHMENT_COLOR, NOTE_COLOR, NodeShape, node_radius};
+use super::instance::{NodeShape, color_of, node_radius};
+use crate::style::tokens::Scheme;
 
 /// Renderer-ready appearance for one node in a snapshot.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -23,9 +24,11 @@ pub struct GraphNodeVisual {
     pub degree: u32,
 }
 
-/// Build visuals in the snapshot's dense-node order.
+/// Build visuals in the snapshot's dense-node order. Colors come from the
+/// active scheme's semantic tokens (W11/D-01), so a theme change recolors
+/// the graph by rebuilding geometry — never by re-running the layout.
 #[must_use]
-pub fn node_visuals(snapshot: &GraphSnapshot) -> Vec<GraphNodeVisual> {
+pub fn node_visuals(snapshot: &GraphSnapshot, scheme: Scheme) -> Vec<GraphNodeVisual> {
     snapshot
         .node_ids
         .iter()
@@ -36,11 +39,7 @@ pub fn node_visuals(snapshot: &GraphSnapshot) -> Vec<GraphNodeVisual> {
             id,
             shape: NodeShape::from(kind),
             size: node_radius(degree),
-            color: match kind {
-                NodeKind::Note => NOTE_COLOR,
-                NodeKind::Attachment => ATTACHMENT_COLOR,
-                NodeKind::Unresolved => [0.92, 0.67, 0.25, 1.0],
-            },
+            color: color_of(kind, scheme),
             degree,
         })
         .collect()
@@ -77,14 +76,17 @@ mod tests {
             }),
         ]);
         let snapshot = graph.snapshot();
-        let visuals = node_visuals(&snapshot);
+        let visuals = node_visuals(&snapshot, Scheme::Dark);
         let attachment_visual = visuals
             .iter()
             .find(|visual| visual.id == attachment)
             .unwrap();
         assert_eq!(attachment_visual.shape, NodeShape::Square);
         assert_eq!(attachment_visual.degree, 1);
-        assert_eq!(attachment_visual.color, ATTACHMENT_COLOR);
+        assert_eq!(
+            attachment_visual.color,
+            crate::style::tokens::graph_attachment_color(Scheme::Dark)
+        );
         assert_eq!(attachment_visual.size, node_radius(1));
     }
 
