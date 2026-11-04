@@ -72,6 +72,14 @@ pub enum Event {
         code: String,
         note_path: Option<String>,
     },
+    /// The vault Session contained a panic in a command turn or pump
+    /// (S4/FR-8). The session remains operable; the host decides whether
+    /// to continue or restart.
+    SessionPanicked {
+        vault: ApiVaultRef,
+        message: String,
+        panics_total: u64,
+    },
 }
 
 impl Event {
@@ -89,6 +97,7 @@ impl Event {
             Self::Conflict { .. } => "conflict",
             Self::RecoveryOffer { .. } => "recovery_offer",
             Self::ActionRequired { .. } => "action_required",
+            Self::SessionPanicked { .. } => "session_panicked",
         }
     }
 

@@ -857,20 +857,15 @@ impl Flavite {
     /// auto-acknowledged when the host stops presenting them.
     pub fn poll_events(&self, notice_credits: usize) -> Vec<EventDelivery> {
         use flavite_vault::channels::{Notice, Pulse};
-        use flavite_vault::session::SessionEvent;
 
         let available = MAX_NOTICE_ACKS.saturating_sub(self.notice_acks.lock_recovering().len());
         let notice_limit = notice_credits.min(available);
         let mut events = Vec::new();
         for event in self.session.drain_events() {
-            if let SessionEvent::ExternalChangeDetected { path, deleted } = event {
+            if let Some(event) = Self::session_event_to_api(&self.vault_ref, event) {
                 events.push(EventDelivery {
                     notice_id: None,
-                    event: crate::Event::ExternalChangeDetected {
-                        vault: self.vault_ref.clone(),
-                        note_path: path.to_string_lossy().into_owned(),
-                        deleted,
-                    },
+                    event,
                 });
             }
         }
@@ -944,6 +939,36 @@ impl Flavite {
             });
         }
         events
+    }
+
+    /// Map a vault `SessionEvent` onto the api-tier event surface. Variants
+    /// the vault already delivers through dedicated channels (pulses /
+    /// notices) are filtered here; `Panicked` MUST surface so UI/CLI hosts
+    /// observe contained session panics without importing vault types
+    /// (FR-8). Pure function of `(vault_ref, event)` — testable directly.
+    fn session_event_to_api(
+        vault: &ApiVaultRef,
+        event: flavite_vault::session::SessionEvent,
+    ) -> Option<crate::Event> {
+        use flavite_vault::session::SessionEvent;
+        match event {
+            SessionEvent::ExternalChangeDetected { path, deleted } => {
+                Some(crate::Event::ExternalChangeDetected {
+                    vault: vault.clone(),
+                    note_path: path.to_string_lossy().into_owned(),
+                    deleted,
+                })
+            }
+            SessionEvent::Panicked {
+                message,
+                panics_total,
+            } => Some(crate::Event::SessionPanicked {
+                vault: vault.clone(),
+                message,
+                panics_total,
+            }),
+            _ => None,
+        }
     }
 
     /// Acknowledge a notice only after its host presentation is visible.
@@ -1947,6 +1972,63 @@ pub struct VaultInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-8 passthrough: a vault `SessionEvent::Panicked` must convert onto
+    /// the api event surface so hosts see it without importing vault types.
+    /// Removing the `Panicked` arm in `session_event_to_api` fails this.
+    #[test]
+    fn session_panicked_event_surfaces_on_api_tier() {
+        use flavite_vault::session::SessionEvent;
+        let vault = ApiVaultRef::new(uuid::Uuid::new_v4(), PathBuf::from("/test/vault"));
+
+        let mapped = Flavite::session_event_to_api(
+            &vault,
+            SessionEvent::Panicked {
+                message: "disk write tripped an assert".into(),
+                panics_total: 3,
+            },
+        );
+        assert!(
+            matches!(
+                mapped,
+                Some(crate::Event::SessionPanicked {
+                    ref message,
+                    panics_total: 3,
+                    ..
+                }) if message == "disk write tripped an assert"
+            ),
+            "Panicked must surface: {mapped:?}"
+        );
+        assert_eq!(
+            mapped.unwrap().event_type(),
+            "session_panicked",
+            "event_type must name the new variant"
+        );
+
+        // Existing externally observable behavior preserved (FR-13): the
+        // change-detected mapping is untouched, other variants stay on
+        // their dedicated channels (filtered here as before).
+        let external = Flavite::session_event_to_api(
+            &vault,
+            SessionEvent::ExternalChangeDetected {
+                path: PathBuf::from("/test/vault/note.md"),
+                deleted: false,
+            },
+        );
+        assert!(matches!(
+            external,
+            Some(crate::Event::ExternalChangeDetected { .. })
+        ));
+        assert!(
+            Flavite::session_event_to_api(
+                &vault,
+                SessionEvent::RecoveryAvailable {
+                    path: PathBuf::from("/test/vault/note.md"),
+                },
+            )
+            .is_none()
+        );
+    }
 
     fn test_flavite() -> (Flavite, PathBuf, tempfile::TempDir) {
         use flavite_buffer::manager::BufferManager;

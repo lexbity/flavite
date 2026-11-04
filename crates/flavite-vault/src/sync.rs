@@ -98,18 +98,42 @@ impl<T> RwLockExt<T> for RwLock<T> {
     }
 }
 
+/// Serialize poison-injecting tests across the crate: they all move the
+/// process-global `POISON_RECOVERIES`, and lib tests run on many threads,
+/// so exact per-test deltas are only honest under this shared lock.
+#[cfg(test)]
+pub(crate) fn poison_test_serial() -> &'static Mutex<()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    &SERIAL
+}
+
+/// Deliberately poison a `Mutex` by panicking while holding it. Test-only
+/// injection for NFR-2 proofs; keep the caller's `poison_test_serial`
+/// guard held across the whole test.
+#[cfg(test)]
+pub(crate) fn poison_mutex_for_test<T>(mutex: &Mutex<T>) {
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = mutex.lock().unwrap();
+        panic!("test-injected panic while holding the lock");
+    }));
+    assert!(caught.is_err(), "injected panic must unwind the holder");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::panic;
 
     /// NFR-2 at the lock level: a panic while holding a lock poisons it;
-    /// plain `.lock().unwrap()` would then wedge every later acquisition in
-    /// the process, but the extension returns a usable guard and counts the
-    /// recovery. Removing the recovery (naive unwrap body) makes this test
-    /// panic — it is the honest guard for this file.
+    /// plain unwrap-lock acquisition would then wedge every later
+    /// acquisition in the process, but the extension returns a usable
+    /// guard and counts the recovery. Removing the recovery (naive unwrap
+    /// body) makes this test panic — it is the honest guard for this file.
     #[test]
     fn poison_is_recovered_and_counted() {
+        let _serial = poison_test_serial()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let before = POISON_RECOVERIES.load(Ordering::Relaxed);
 
         let m = Mutex::new(vec![7u32]);

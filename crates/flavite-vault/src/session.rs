@@ -476,6 +476,10 @@ pub enum SessionEvent {
     RecoveryAvailable { path: PathBuf },
     /// An external writer changed or deleted a note on disk.
     ExternalChangeDetected { path: PathBuf, deleted: bool },
+    /// The session caught a panic in a command transition or pump turn.
+    /// The session remains operable; the host decides whether to continue
+    /// or restart.
+    Panicked { message: String, panics_total: u64 },
 }
 
 /// A correlated D9 rename flight: source, destination, and the rename
@@ -485,6 +489,18 @@ type RenameFlight = (
     PathBuf,
     crossbeam::channel::Receiver<crate::actor::VaultActorResp>,
 );
+
+/// Downcast a panic payload through the `&str` / `String` chain with a
+/// debug-format backstop, for containment logging and events.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        format!("{payload:?}")
+    }
+}
 
 /// The Session itself.
 ///
@@ -531,6 +547,14 @@ pub struct Session {
     recovery_stop: Arc<std::sync::atomic::AtomicBool>,
     /// Request ID counter.
     request_counter: AtomicU64,
+    /// Contained panics across this Session's turn entry points (`execute`,
+    /// `pump`). Atomic so hosts can read the operator ground truth without
+    /// locks (NFR-5).
+    panics_total: AtomicU64,
+    /// Poison-recovering lock acquisitions, mirrored (monotonic max) from
+    /// `sync::POISON_RECOVERIES` at `drain_events` time. Advisory mirror;
+    /// the counter stays the single observability surface across crates.
+    poison_recoveries_total: AtomicU64,
     /// One active save and at most one coalesced successor per buffer.
     save_flights: Mutex<HashMap<u64, SaveFlight>>,
     /// Correlated reconcile workers.
@@ -778,6 +802,8 @@ impl Session {
             recovery_worker,
             recovery_stop,
             request_counter: AtomicU64::new(0),
+            panics_total: AtomicU64::new(0),
+            poison_recoveries_total: AtomicU64::new(0),
             save_flights: Mutex::new(HashMap::new()),
             reconcile_flights: Mutex::new(HashMap::new()),
             rename_flights: Mutex::new(HashMap::new()),
@@ -799,8 +825,26 @@ impl Session {
     }
 
     /// Execute a command.
+    ///
+    /// The turn body runs inside an unwinding-catch boundary: a panic in a
+    /// command
+    /// transition is contained at this boundary, logged, counted in
+    /// [`Session::panics_total`], and surfaced as
+    /// [`SessionEvent::Panicked`]; the caller receives an honest
+    /// [`SessionResult::Error`] naming the panic instead of an unwinding
+    /// host. The Session stays operable (locks recover per `sync.rs`;
+    /// collections are memory-safe after unwind) — the host decides
+    /// whether to continue or restart.
     pub fn execute(&self, command: SessionCommand) -> SessionResult {
         let _turn = self.driving_turn.lock_recovering();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.execute_turn(command)))
+        {
+            Ok(result) => result,
+            Err(payload) => self.record_contained_panic(&payload, "execute"),
+        }
+    }
+
+    fn execute_turn(&self, command: SessionCommand) -> SessionResult {
         self.pump_external_changes_inner();
         let edited_path = match &command {
             SessionCommand::EditStructure { buffer_id, .. }
@@ -847,8 +891,23 @@ impl Session {
 
     /// Apply queued disk observations on the host pump. GUI hosts call this
     /// from their regular timer; command execution also drains before running.
+    ///
+    /// Like [`Session::execute`], the whole turn is panic-contained: a panic
+    /// in any pump helper is recorded (log + counter +
+    /// [`SessionEvent::Panicked`]) and the turn is released. The pump has no
+    /// result to fail, so the event is the signal.
     pub fn pump(&self) {
         let _turn = self.driving_turn.lock_recovering();
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.pump_turn()))
+        {
+            // The pump has no result to fail: the recorded event is the
+            // signal and the turn is released when this frame returns.
+            self.record_contained_panic(&payload, "pump");
+        }
+    }
+
+    fn pump_turn(&self) {
         self.pump_external_changes_inner();
         self.pump_recovery_notices();
         self.pump_structure_completions();
@@ -861,6 +920,40 @@ impl Session {
         // Recovery checkpoints run on the dedicated worker created with the
         // Session. Never perform recovery filesystem or actor I/O while this
         // host pump owns the Session driving-turn lock.
+    }
+
+    /// Shared containment core called by both turn wrappers.
+    ///
+    /// Behaviour proven by tests (the six-line catch plumbing in the two
+    /// turn wrappers is reviewed by eye): (a) logs at error level, (b) increments
+    /// [`Session::panics_total`], (c) emits [`SessionEvent::Panicked`]
+    /// through the event channel, (d) returns the honest error result
+    /// naming the panic for `execute` (the pump wrapper discards it — the
+    /// event is its signal). Never re-panics, never aborts.
+    fn record_contained_panic(
+        &self,
+        payload: &(dyn std::any::Any + Send),
+        turn: &'static str,
+    ) -> SessionResult {
+        let message = panic_message(payload);
+        tracing::error!(
+            target: "vault::session",
+            turn,
+            panic = %message,
+            "session turn panicked",
+        );
+        // SeqCst: this counter is the operator's ground truth and is read
+        // cross-thread.
+        let panics_total = self.panics_total.fetch_add(1, Ordering::SeqCst) + 1;
+        self.session_events
+            .lock_recovering()
+            .push_back(SessionEvent::Panicked {
+                message: message.clone(),
+                panics_total,
+            });
+        SessionResult::Error {
+            message: format!("session turn panicked during {turn}: {message}"),
+        }
     }
 
     pub(crate) fn structure_completions_full(&self) -> bool {
@@ -1688,6 +1781,12 @@ impl Session {
     pub fn drain_events(&self) -> Vec<SessionEvent> {
         let _turn = self.driving_turn.lock_recovering();
         self.pump_external_changes_inner();
+        // Advisory mirror (NFR-5): fold process-local poison recoveries
+        // recorded outside this Session (`sync::POISON_RECOVERIES`) into the
+        // observable counter, monotonic-max so the mirror never rewinds.
+        let live = crate::sync::POISON_RECOVERIES.load(Ordering::Relaxed);
+        self.poison_recoveries_total
+            .fetch_max(live, Ordering::Relaxed);
         self.session_events.lock_recovering().drain(..).collect()
     }
 
@@ -3693,6 +3792,120 @@ mod tests {
         let (session, _, _) = test_session();
         assert_eq!(session.next_request_id(), 0);
         assert_eq!(session.next_request_id(), 1);
+    }
+
+    /// S4/FR-7 core contract, proven on the shared containment core that
+    /// both turn wrappers call: log + `panics_total` + `SessionEvent::Panicked`
+    /// + honest error result naming the panic. Removing any leg fails it.
+    #[test]
+    fn contained_panic_records_event_counter_and_error() {
+        let (session, _fs, _temp) = test_session();
+
+        let result = session
+            .record_contained_panic(&String::from("disk write tripped an assert"), "execute");
+        match result {
+            SessionResult::Error { message } => {
+                assert!(
+                    message.contains("session turn panicked during execute"),
+                    "error must name the turn honestly: {message}"
+                );
+                assert!(message.contains("disk write tripped an assert"));
+            }
+            other => panic!("expected contained-panic error, got {other:?}"),
+        }
+        assert_eq!(session.panics_total.load(Ordering::SeqCst), 1);
+
+        let events = session.drain_events();
+        let panicked: Vec<&SessionEvent> = events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::Panicked { .. }))
+            .collect();
+        assert_eq!(panicked.len(), 1, "contained panic emits exactly one event");
+        assert!(matches!(
+            panicked[0],
+            SessionEvent::Panicked { message, panics_total: 1 }
+                if message == "disk write tripped an assert"
+        ));
+
+        // A second containment accumulates: the event carries the running
+        // total so hosts can alert on `panics_total > 0` (R1 signal).
+        session.record_contained_panic(&"again", "pump");
+        assert_eq!(session.panics_total.load(Ordering::SeqCst), 2);
+        let second = session
+            .drain_events()
+            .into_iter()
+            .find(|e| matches!(e, SessionEvent::Panicked { .. }));
+        assert!(matches!(
+            second,
+            Some(SessionEvent::Panicked {
+                panics_total: 2,
+                ..
+            })
+        ));
+    }
+
+    /// Payload downcast chain locked by Q3: `&str` → `String` → debug
+    /// backstop.
+    #[test]
+    fn panic_message_downcasts_through_the_chain() {
+        assert_eq!(panic_message(&"static slice"), "static slice");
+        assert_eq!(panic_message(&String::from("owned string")), "owned string");
+        // Non-string payloads fall back to the Debug representation;
+        // `dyn Any`'s Debug is opaque ("Any { .. }") — the message is still
+        // honest about being a panic without claiming payload detail.
+        assert_eq!(panic_message(&42u8), "Any { .. }");
+    }
+
+    /// Wrapper transparency: no happy-path result is swallowed by the
+    /// containment. `execute` returns exactly what the turn returns and
+    /// `pump` completes; `panics_total` stays 0 across real traffic.
+    #[test]
+    fn execute_and_pump_wrappers_pass_results_through() {
+        let (session, _fs, _temp) = test_session();
+        let path = PathBuf::from("/test/vault/note.md");
+
+        let result = session.execute(SessionCommand::SaveNote { path: path.clone() });
+        assert!(
+            !matches!(&result, SessionResult::Error { message }
+                if message.contains("session turn panicked")),
+            "happy path must not be reported as a contained panic: {result:?}"
+        );
+        session.pump();
+        let again = session.execute(SessionCommand::SaveNote { path });
+        assert!(!matches!(&again, SessionResult::Error { message }
+                if message.contains("session turn panicked")),);
+        assert_eq!(session.panics_total.load(Ordering::SeqCst), 0);
+    }
+
+    /// NFR-2 at the turn level: one panic-while-held poisons a Session
+    /// mutex, and afterwards `execute`, `pump`, and `drain_events` must
+    /// complete (with recovery counted), not cascade into a wedged vault.
+    /// This test can fail: revert any S3 site and later turns panic.
+    #[test]
+    fn poisoned_mutex_does_not_wedge_execute_pump_or_drain() {
+        let _serial = crate::sync::poison_test_serial()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (session, _fs, _temp) = test_session();
+
+        crate::sync::poison_mutex_for_test(&session.save_flights);
+        let before = crate::sync::POISON_RECOVERIES.load(Ordering::Relaxed);
+
+        // Every later turn touches the poisoned mutex through recovering
+        // locks; none of this may panic.
+        let path = PathBuf::from("/test/vault/note.md");
+        let _ = session.execute(SessionCommand::SaveNote { path });
+        session.pump();
+        let _ = session.drain_events();
+
+        let live = crate::sync::POISON_RECOVERIES.load(Ordering::Relaxed);
+        assert!(live > before, "recoveries must be counted, not hidden");
+        assert_eq!(
+            session.poison_recoveries_total.load(Ordering::Relaxed),
+            live,
+            "drain_events must mirror the process counter into the Session"
+        );
+        assert_eq!(session.panics_total.load(Ordering::SeqCst), 0);
     }
 
     #[test]
