@@ -485,8 +485,8 @@ impl QuadTree {
             max_x = max_x.max(*x);
             max_y = max_y.max(*y);
         }
-        let centre_x = (min_x + max_x) * 0.5;
-        let centre_y = (min_y + max_y) * 0.5;
+        let centre_x = f64::midpoint(min_x, max_x);
+        let centre_y = f64::midpoint(min_y, max_y);
         let half = ((max_x - min_x).max(max_y - min_y)) * 0.5 * 1.05 + 1.0;
 
         let mut tree = Self {

@@ -2885,7 +2885,7 @@ mod tests {
             let mut drainer_holds = false;
             let mut won_at = None;
             while !drainer_holds && !waiter.is_finished() {
-                if std::time::Instant::now() - started > Duration::from_secs(5) {
+                if started.elapsed() > Duration::from_secs(5) {
                     panic!(
                         "concurrent drain/wait stalled; pending={:?} events={:?}",
                         flavite_ref.pending_requests.lock_recovering().len(),
