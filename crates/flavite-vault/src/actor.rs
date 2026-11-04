@@ -818,6 +818,11 @@ impl VaultActor {
         } else {
             "false"
         };
+        // §6.7: the resolver/feed counters live on the writer owner
+        // (`IndexActor::resolver_diagnostics`) and are drained to meta so
+        // the standalone doctor (`change-log-health`, `resolver-parity`)
+        // can surface them without a live actor.
+        let resolver = self.index.resolver_diagnostics();
         let values = [
             (
                 flavite_index::schema::MetaKey::WatcherConnected,
@@ -838,6 +843,34 @@ impl VaultActor {
                 self.rename_items_skipped_total
                     .load(Ordering::Relaxed)
                     .to_string(),
+            ),
+            (
+                flavite_index::schema::MetaKey::ResolverGenerationsSinceFull,
+                resolver.generations_since_full.to_string(),
+            ),
+            (
+                flavite_index::schema::MetaKey::ResolverResolveFullTotal,
+                resolver.resolve_full_total.to_string(),
+            ),
+            (
+                flavite_index::schema::MetaKey::ResolverResolveTargetedTotal,
+                resolver.resolve_targeted_total.to_string(),
+            ),
+            (
+                flavite_index::schema::MetaKey::ResolverAffectedLinksLast,
+                resolver.affected_links_last.to_string(),
+            ),
+            (
+                flavite_index::schema::MetaKey::ResolverIdConflictGroupUpdatesTotal,
+                resolver.id_conflict_group_updates_total.to_string(),
+            ),
+            (
+                flavite_index::schema::MetaKey::ResolverApplyGenerationsTotal,
+                resolver.apply_generations_total.to_string(),
+            ),
+            (
+                flavite_index::schema::MetaKey::ResolverChangesRowsTotal,
+                resolver.changes_rows_total.to_string(),
             ),
         ];
         for (key, value) in values {
@@ -1621,6 +1654,13 @@ impl VaultActor {
         reply: Option<Sender<VaultActorResp>>,
         nominated: std::collections::HashSet<PathBuf>,
     ) {
+        // RFC-0004 S3 (D13 explicit trigger): full-verify jobs are the
+        // sanctioned repair path, so the next structural apply must run
+        // the whole-vault backstop re-resolve regardless of the 4096
+        // generation counter. The demand survives a rolled-back apply.
+        if matches!(mode, ReconcileMode::VerifyContent) {
+            self.index.force_resolver_backstop();
+        }
         self.next_reconcile_id = self.next_reconcile_id.saturating_add(1);
         let id = self.next_reconcile_id;
         let job = crate::reconcile_worker::ReconcileJob {
@@ -2703,6 +2743,64 @@ mod tests {
 
     fn collect_rename_events(actor: &VaultActorHandle) -> Vec<VaultActorEvent> {
         actor.events().try_iter().collect()
+    }
+
+    /// RFC-0004 S3 (D13 explicit trigger): a `{mode: "verify"}` full
+    /// reconcile is the sanctioned repair path, so it must force the
+    /// whole-vault backstop re-resolve on its first structural apply —
+    /// verified through the drained `resolver.resolve_full_total` meta
+    /// counter the actor flushes at the reconcile boundary.
+    #[test]
+    fn verify_reconcile_forces_the_resolver_backstop() {
+        let fs = MemFs::new();
+        fs.create_dir_all(std::path::Path::new("/vault")).unwrap();
+        fs.write_new(std::path::Path::new("/vault/a.md"), b"# Alpha target")
+            .unwrap();
+        fs.write_new(std::path::Path::new("/vault/b.md"), b"See [[a]]")
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("index.sqlite3");
+        drop(flavite_index::open_or_init(&db_path).unwrap());
+        let index = IndexActor::new(&db_path, 1).unwrap();
+        let identity = VaultIdentity::new(
+            uuid::Uuid::now_v7(),
+            std::path::PathBuf::from("/vault"),
+            vec![1, 2, 3, 4],
+        );
+        let actor = VaultActorBuilder::new()
+            .with_fs(Box::new(fs))
+            .with_identity(identity)
+            .with_index(index)
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        reconcile_test_actor(&actor);
+        // No rusqlite dependency in this crate: `open_or_init` hands back a
+        // connection and every read below is name-free inference.
+        let conn = flavite_index::open_or_init(&db_path).unwrap();
+        let full_total = flavite_index::schema::get_meta_u64(
+            &conn,
+            flavite_index::schema::MetaKey::ResolverResolveFullTotal,
+        )
+        .unwrap()
+        .unwrap_or(0);
+        assert!(
+            full_total >= 1,
+            "full-verify reconcile must force the backstop re-resolve (drained counter was {full_total})"
+        );
+        let notes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(notes, 2);
+        let resolved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM links WHERE res_state='resolved'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved, 1, "B's link to A resolves through the verify");
     }
 
     #[test]

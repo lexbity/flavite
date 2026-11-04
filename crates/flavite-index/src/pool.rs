@@ -599,6 +599,22 @@ fn reserve_graph_identity(
     Ok(())
 }
 
+/// Whole-vault backstop walk on the writer transaction (D13; the sole
+/// `re_resolve_all` call site in this file, per the RFC's grep gate).
+/// Returns the flipped sources and the catalog rebuilt from the
+/// transaction's own rows, to be installed at commit. A free function
+/// because the transaction holds a borrow of the writer connection.
+fn backstop_walk(
+    tx: &Transaction<'_>,
+) -> Result<(Vec<i64>, crate::catalog::ResolverCatalog), String> {
+    let mut walk = Resolver::new(tx);
+    let changed = walk.re_resolve_all()?;
+    let catalog = walk
+        .take_catalog()
+        .ok_or("resolver catalog missing after backstop walk")?;
+    Ok((changed, catalog))
+}
+
 impl IndexActor {
     /// Create a new index actor.
     ///
@@ -684,10 +700,18 @@ impl IndexActor {
     }
 
     /// Committed resolver diagnostics: backstop cadence and resolution
-    /// strategy counters (doctor wiring lands in RFC-0004 S3).
+    /// strategy counters (surfaced by doctor via the vault actor's runtime
+    /// meta drain, RFC-0004 §6.7/S3).
     #[must_use]
     pub fn resolver_diagnostics(&self) -> ResolverDiagnostics {
         self.resolver.diagnostics()
+    }
+
+    /// Force the next structural apply to run the whole-vault backstop walk
+    /// (D13 explicit trigger; S3 full-verify jobs). Idempotent demand: a
+    /// rolled-back apply leaves it standing.
+    pub fn force_resolver_backstop(&mut self) {
+        self.resolver.force_backstop();
     }
 
     /// Whether opening this index found a parser version that requires a
@@ -1097,7 +1121,8 @@ impl IndexActor {
         }
         let counters = SpineCounters { generation };
         let mut plan = ApplyPlan::default();
-        if mutate(&tx, pre.as_ref(), &counters, &mut plan)? == CoreStep::FastPath {
+        let mutated = mutate(&tx, pre.as_ref(), &counters, &mut plan)?;
+        if mutated == CoreStep::FastPath && !self.resolver.backstop_due() {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok((
                 SpineOutcome::FastPath {
@@ -1106,6 +1131,54 @@ impl IndexActor {
                 },
                 plan,
             ));
+        }
+        if mutated == CoreStep::FastPath {
+            // RFC-0004 S3 (D13): a forced backstop demand (full-verify
+            // job) rides even an unchanged-content apply. The whole-vault
+            // walk decides: no flips ⇒ demand consumed without touching
+            // the generation (the refreshed base is still installed at
+            // commit); flips ⇒ drift repairs itself as a logged structural
+            // apply (outgoing rows per FR-1 plus the touched entity row).
+            let (changed, catalog) = backstop_walk(&tx)?;
+            if changed.is_empty() {
+                tx.commit().map_err(|error| error.to_string())?;
+                self.resolver.commit_backstop(catalog);
+                return Ok((
+                    SpineOutcome::FastPath {
+                        epoch,
+                        generation: current_generation,
+                    },
+                    plan,
+                ));
+            }
+            let mut rows: Vec<(ChangeKind, i64)> = plan.entity_rows.clone();
+            if rows.is_empty() {
+                // The fast-path closure plans no entity rows; the touched
+                // entity is nonetheless refreshed, and the apply paths
+                // post-commit steps expect the id there.
+                let entity_row = match pre.as_ref() {
+                    Some(EntityPre::Note(image)) => Some((ChangeKind::Note, image.id)),
+                    Some(EntityPre::Attachment(image)) => Some((ChangeKind::Attachment, image.id)),
+                    None => None,
+                };
+                if let Some(row) = entity_row {
+                    plan.entity_rows.push(row);
+                    rows.push(row);
+                }
+            }
+            rows.extend(changed.into_iter().map(|src| (ChangeKind::Outgoing, src)));
+            let row_count = rows.len();
+            tx.execute(
+                "UPDATE meta SET value=?1 WHERE key=?2",
+                rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
+            )
+            .map_err(|error| error.to_string())?;
+            ChangeLogWriter::record_all(&tx, generation, &rows)?;
+            tx.commit().map_err(|error| error.to_string())?;
+            self.resolver.commit_backstop(catalog);
+            self.resolver.note_committed_apply(row_count as u64);
+            self.resolver.fold_overlay(epoch, generation);
+            return Ok((SpineOutcome::Applied { epoch, generation }, plan));
         }
         tx.execute(
             "UPDATE meta SET value=?1 WHERE key=?2",
@@ -1148,17 +1221,16 @@ impl IndexActor {
         let mut targeted_pass: Option<u64> = None;
         let mut backstop_catalog = None;
         if backstop {
-            // D13 backstop site — the ONLY `re_resolve_all` invocation in
-            // this file (grep-gated; apply paths must never reach it). The
-            // walk reads this transaction's own rows, so it needs no
-            // overlay; its rebuilt catalog is installed at commit, never
-            // before, so a rolled-back backstop cannot touch the base.
-            let mut walk = Resolver::new(&tx);
-            changed_sources = walk.re_resolve_all()?;
-            backstop_catalog = Some(
-                walk.take_catalog()
-                    .ok_or("resolver catalog missing after backstop walk")?,
-            );
+            // D13 backstop site — reached only from the spine's two
+            // backstop rides; the apply paths themselves never walk (the
+            // grep gate holds the single `re_resolve_all` occurrence to
+            // `backstop_walk` below). The walk reads this transaction's
+            // own rows, so it needs no overlay; its rebuilt catalog is
+            // installed at commit, never before, so a rolled-back backstop
+            // cannot touch the base.
+            let (changed, catalog) = backstop_walk(&tx)?;
+            changed_sources = changed;
+            backstop_catalog = Some(catalog);
         } else {
             {
                 let overlay = self.resolver.overlay_mut();
@@ -1197,6 +1269,7 @@ impl IndexActor {
                 .map(|src| (ChangeKind::Outgoing, src)),
         );
         ChangeLogWriter::record_all(&tx, generation, &rows)?;
+        let change_rows = rows.len();
         tx.commit().map_err(|error| error.to_string())?;
         // Commit fold (§6.2.4): SQLite writes are durable; in-memory state
         // follows. Counters track committed applies only.
@@ -1207,6 +1280,7 @@ impl IndexActor {
         if let Some(visited) = targeted_pass {
             self.resolver.note_targeted_pass(visited);
         }
+        self.resolver.note_committed_apply(change_rows as u64);
         self.resolver.fold_overlay(epoch, generation);
         Ok((SpineOutcome::Applied { epoch, generation }, plan))
     }

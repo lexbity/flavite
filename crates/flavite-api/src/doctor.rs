@@ -283,6 +283,14 @@ impl DoctorChecker {
                 "attachments",
                 "Index cache is not present; attachment hydration and orphan counts unavailable",
             ));
+            report.add_check(DoctorCheck::ok(
+                "resolver-parity",
+                "Index cache is not present; resolver parity is established by the first full index",
+            ));
+            report.add_check(DoctorCheck::ok(
+                "change-log-health",
+                "Index cache is not present; the change feed is created empty",
+            ));
         } else {
             report.add_check(unresolved_links_check(conn.as_ref()));
             report.add_check(db_count_check(
@@ -293,6 +301,8 @@ impl DoctorChecker {
             ));
             report.add_check(duplicate_ids_check(conn.as_ref()));
             report.add_check(attachment_check(conn.as_ref()));
+            report.add_check(resolver_parity_check(conn.as_ref()));
+            report.add_check(change_log_health_check(conn.as_ref()));
         }
         report.add_check(temp_check(&self.vault.root));
         report.add_check(journal_check(&self.vault.root));
@@ -307,6 +317,159 @@ impl DoctorChecker {
         report.summary.calculate_total();
         report
     }
+}
+
+/// Read-only resolver parity check (RFC-0004 §6.2.5, S3; never auto-repair):
+/// recomputes the from-scratch `re_resolve_all` projection of every stored
+/// link in memory — no writes — and diffs it against the stored rows.
+/// A mismatch means the incremental resolver state diverged from the
+/// full-walk truth (FR-2); the sanctioned repair is an explicit full
+/// verify, which forces the backstop walk
+/// (`vault.reconcile {mode: "verify"}`). The strategy counters come from
+/// `IndexActor::resolver_diagnostics()`, drained to index meta by the
+/// vault actor at reconcile boundaries (§6.7).
+fn resolver_parity_check(conn: Option<&Connection>) -> DoctorCheck {
+    let Some(conn) = conn else {
+        return DoctorCheck::error(
+            "resolver-parity",
+            "Stored link state matches full re-resolution",
+            "Index database unavailable".to_string(),
+            "Open the vault once or rebuild its cache".to_string(),
+        );
+    };
+    match flavite_index::re_resolve_preview(conn) {
+        Ok(mismatches) if mismatches.is_empty() => DoctorCheck::ok(
+            "resolver-parity",
+            "Stored link state matches full re-resolution",
+        )
+        .with_details(resolver_counter_details(conn)),
+        Ok(mismatches) => {
+            let samples = mismatches
+                .iter()
+                .take(5)
+                .map(|mismatch| {
+                    format!(
+                        "src={} ord={} target={:?} stored={:?} projected={:?}",
+                        mismatch.src,
+                        mismatch.ord,
+                        mismatch.target_key,
+                        mismatch.stored,
+                        mismatch.projected
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            DoctorCheck::error(
+                "resolver-parity",
+                "Stored link state diverged from full re-resolution",
+                format!(
+                    "{} mismatching link row(s): {samples}{}",
+                    mismatches.len(),
+                    if mismatches.len() > 5 {
+                        " (first five shown)"
+                    } else {
+                        ""
+                    }
+                ),
+                "Run a full-verify reconcile (vault.reconcile {mode: \"verify\"}) to force the backstop re-resolve; the doctor never writes"
+                    .to_string(),
+            )
+        }
+        Err(error) => DoctorCheck::error(
+            "resolver-parity",
+            "Could not recompute resolver parity",
+            error,
+            "Rebuild the disposable index cache".to_string(),
+        ),
+    }
+}
+
+/// Change-feed health check (§6.2.5, S3): the `(log_floor, generation]`
+/// window must be sane, no row may sit outside it, and pruning must honor
+/// `MIN_LOG_RETENTION` — a shortfall only legally comes from a
+/// budget-forced prune, which §4.3 demands be surfaced, never silent.
+fn change_log_health_check(conn: Option<&Connection>) -> DoctorCheck {
+    let Some(conn) = conn else {
+        return DoctorCheck::error(
+            "change-log-health",
+            "Change feed window and retention are sane",
+            "Index database unavailable".to_string(),
+            "Open the vault once or rebuild its cache".to_string(),
+        );
+    };
+    match flavite_index::changelog::change_log_health(conn) {
+        Ok(health) => {
+            let window = format!(
+                "epoch={} generation={} floor={} retention={} generations; rows={} (below floor={}, ahead of generation={})",
+                health.epoch,
+                health.generation,
+                health.log_floor,
+                health.retention_generations,
+                health.rows_total,
+                health.rows_below_floor,
+                health.rows_ahead_of_generation,
+            );
+            if health.is_corrupt() {
+                DoctorCheck::error(
+                    "change-log-health",
+                    "Change feed window is corrupted",
+                    window,
+                    "Rebuild the disposable index cache (the change log is a cache, RFC-0004 §4.7)"
+                        .to_string(),
+                )
+            } else if health.retention_violated() {
+                DoctorCheck::warn(
+                    "change-log-health",
+                    "Change-feed retention is below MIN_LOG_RETENTION; a budget-forced prune must have been counted",
+                    window,
+                )
+            } else {
+                DoctorCheck::ok(
+                    "change-log-health",
+                    "Change feed window and retention are sane",
+                )
+                .with_details(format!("{window}; {}", feed_counter_details(conn)))
+            }
+        }
+        Err(error) => DoctorCheck::error(
+            "change-log-health",
+            "Could not read change-feed metadata",
+            error,
+            "Rebuild the disposable index cache".to_string(),
+        ),
+    }
+}
+
+fn resolver_counter_details(conn: &Connection) -> String {
+    let keys = [
+        flavite_index::schema::MetaKey::ResolverGenerationsSinceFull,
+        flavite_index::schema::MetaKey::ResolverResolveFullTotal,
+        flavite_index::schema::MetaKey::ResolverResolveTargetedTotal,
+        flavite_index::schema::MetaKey::ResolverAffectedLinksLast,
+        flavite_index::schema::MetaKey::ResolverIdConflictGroupUpdatesTotal,
+    ];
+    persisted_counter_details(conn, &keys)
+}
+
+fn feed_counter_details(conn: &Connection) -> String {
+    let keys = [
+        flavite_index::schema::MetaKey::ResolverApplyGenerationsTotal,
+        flavite_index::schema::MetaKey::ResolverChangesRowsTotal,
+    ];
+    persisted_counter_details(conn, &keys)
+}
+
+fn persisted_counter_details(conn: &Connection, keys: &[flavite_index::schema::MetaKey]) -> String {
+    keys.iter()
+        .map(|key| {
+            let value = flavite_index::schema::get_meta_u64(conn, *key)
+                .ok()
+                .flatten()
+                .map_or_else(|| "not drained".to_owned(), |value| value.to_string());
+            format!("{}={value}", key.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Local diagnostics directory used by the rotating log and crash report.
@@ -1114,5 +1277,108 @@ mod tests {
                 assert!(c.get(field).is_some(), "missing {field}");
             }
         }
+    }
+
+    /// Index a consistent two-note vault (B links to A) so the parity
+    /// walk has real, correctly-resolved rows to verify.
+    fn indexed_fixture() -> (tempfile::TempDir, PathBuf, ApiVaultRef) {
+        let (root, db, vault) = fixture();
+        {
+            let mut actor = flavite_index::IndexActor::new(&db, 1).unwrap();
+            actor
+                .apply_saved_note(b"a.md", "a.md", b"# Alpha target", 1, 1)
+                .unwrap();
+            actor
+                .apply_saved_note(b"b.md", "b.md", b"See [[a]]", 2, 2)
+                .unwrap();
+        }
+        (root, db, vault)
+    }
+
+    #[test]
+    fn resolver_parity_and_change_log_health_pass_on_healthy_index() {
+        let (_root, db, vault) = indexed_fixture();
+        let checker = DoctorChecker::with_db_path(vault, db);
+        let parity = check(&checker, "resolver-parity");
+        assert!(parity.is_ok(), "parity: {:?}", parity.details);
+        let health = check(&checker, "change-log-health");
+        assert!(health.is_ok(), "health: {:?}", health.details);
+        // §6.7 counters surface through the meta rows; the vault actor
+        // drains live values (proven by `verify_reconcile_forces_the_resolver_backstop`),
+        // while `create_schema` seeds zeros the doctor must read cleanly.
+        let details = parity.details.unwrap();
+        assert!(details.contains("resolver.resolve_full_total=0"));
+        assert!(details.contains("resolver.resolve_targeted_total=0"));
+        assert!(details.contains("resolver.generations_since_full=0"));
+        let health_details = health.details.unwrap();
+        assert!(health_details.contains("resolver.apply_generations_total=0"));
+        assert!(health_details.contains("resolver.changes_rows_total=0"));
+    }
+
+    #[test]
+    fn seeded_link_drift_flips_resolver_parity() {
+        let (_root, db, vault) = indexed_fixture();
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "UPDATE links SET res_state='ambiguous' WHERE res_state='resolved'",
+                [],
+            )
+            .unwrap();
+        }
+        let checker = DoctorChecker::with_db_path(vault, db);
+        let parity = check(&checker, "resolver-parity");
+        assert!(parity.has_issues());
+        let details = parity.details.unwrap();
+        assert!(
+            details.contains("1 mismatching link row"),
+            "expected exactly one reported drift: {details}"
+        );
+        assert!(parity.fix.unwrap().contains("verify"));
+    }
+
+    #[test]
+    fn seeded_log_floor_violations_flip_change_log_health() {
+        // Window sanity: a floor ahead of the current generation is corruption.
+        let (_root, db, vault) = indexed_fixture();
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("UPDATE meta SET value='999999' WHERE key='log_floor'", [])
+                .unwrap();
+        }
+        let checker = DoctorChecker::with_db_path(vault, db);
+        let health = check(&checker, "change-log-health");
+        assert!(health.has_issues());
+        assert_eq!(health.status, CheckStatus::Error);
+
+        // Retention contract: with a long log, a floor that keeps fewer
+        // than MIN_LOG_RETENTION generations surfaces as a finding (§4.3).
+        let (_root2, db2, vault2) = fixture();
+        {
+            let conn = Connection::open(&db2).unwrap();
+            let top: u64 = flavite_index::MIN_LOG_RETENTION + 1000;
+            for generation in 1..=top {
+                conn.execute(
+                    "INSERT INTO changes(generation,kind,entity_id) VALUES(?1,'note',?2)",
+                    rusqlite::params![i64::try_from(generation).unwrap(), 1_i64],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "UPDATE meta SET value=?1 WHERE key='generation'",
+                [top.to_string()],
+            )
+            .unwrap();
+            // Legal-looking prune depth (retention 10) without the budget
+            // counters a forced advance must have counted.
+            conn.execute("UPDATE meta SET value='4990' WHERE key='log_floor'", [])
+                .unwrap();
+            conn.execute("DELETE FROM changes WHERE generation < 4990", [])
+                .unwrap();
+        }
+        let checker2 = DoctorChecker::with_db_path(vault2, db2);
+        let retention = check(&checker2, "change-log-health");
+        assert!(retention.has_issues());
+        assert_eq!(retention.status, CheckStatus::Warning);
     }
 }

@@ -291,3 +291,99 @@ impl<'a> ChangeLogReader<'a> {
         Ok(IndexVersion { epoch, generation })
     }
 }
+
+/// A snapshot of change-log integrity for the doctor's `change-log-health`
+/// check (§6.2.5, S3): the meta triple, the retention window, and row
+/// placement relative to the window — all read atomically in one read
+/// transaction, all read-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeLogHealth {
+    pub epoch: u64,
+    pub generation: u64,
+    pub log_floor: u64,
+    /// Generations retained between `log_floor` and `generation`.
+    pub retention_generations: u64,
+    /// `log_floor > generation` — the window is nonsense (corruption).
+    pub floor_above_generation: bool,
+    /// Retention below [`MIN_LOG_RETENTION`] while the log is long enough
+    /// to honor it: either a budget-forced advance (a counted, legal-but-
+    /// surfaced event, §4.3) or a corrupted floor.
+    pub retention_below_contract: bool,
+    /// Rows below the floor: `prune` deletes them, so any are leftovers
+    /// from out-of-band writes (corruption signal).
+    pub rows_below_floor: i64,
+    /// Rows ahead of the current generation: impossible under writer
+    /// discipline (corruption signal).
+    pub rows_ahead_of_generation: i64,
+    pub rows_total: i64,
+}
+
+impl ChangeLogHealth {
+    /// Whether the log violates its hard invariants (window sanity and row
+    /// placement). A contract-retention shortfall alone is a warning:
+    /// §4.3 makes it legal only as a counted budget event, never silent.
+    #[must_use]
+    pub const fn is_corrupt(&self) -> bool {
+        self.floor_above_generation
+            || self.rows_below_floor > 0
+            || self.rows_ahead_of_generation > 0
+    }
+
+    #[must_use]
+    pub const fn retention_violated(&self) -> bool {
+        self.retention_below_contract
+    }
+}
+
+/// Compute [`ChangeLogHealth`] on a read connection in ONE read
+/// transaction (§6.2.5: doctor `change-log-health` — floor/generation
+/// sanity, `MIN_LOG_RETENTION` honored, row-count sanity).
+///
+/// # Errors
+/// Returns the error text when metadata or row counts cannot be read.
+pub fn change_log_health(conn: &Connection) -> Result<ChangeLogHealth, String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let epoch = get_meta_u64(&tx, MetaKey::Epoch)
+        .map_err(|error| error.to_string())?
+        .unwrap_or(1);
+    let generation = get_meta_u64(&tx, MetaKey::Generation)
+        .map_err(|error| error.to_string())?
+        .unwrap_or(0);
+    let log_floor = get_meta_u64(&tx, MetaKey::LogFloor)
+        .map_err(|error| error.to_string())?
+        .unwrap_or(0);
+    let count = |where_clause: &str, bound: i64| -> Result<i64, String> {
+        tx.query_row(
+            &format!("SELECT COUNT(*) FROM changes WHERE {where_clause}"),
+            params![bound],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
+    };
+    let rows_below_floor = count(
+        "generation < ?1",
+        i64::try_from(log_floor).map_err(|e| e.to_string())?,
+    )?;
+    let rows_ahead_of_generation = count(
+        "generation > ?1",
+        i64::try_from(generation).map_err(|e| e.to_string())?,
+    )?;
+    let rows_total: i64 = tx
+        .query_row("SELECT COUNT(*) FROM changes", [], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(ChangeLogHealth {
+        epoch,
+        generation,
+        log_floor,
+        retention_generations: generation.saturating_sub(log_floor),
+        floor_above_generation: log_floor > generation,
+        retention_below_contract: generation >= MIN_LOG_RETENTION
+            && generation.saturating_sub(log_floor) < MIN_LOG_RETENTION,
+        rows_below_floor,
+        rows_ahead_of_generation,
+        rows_total,
+    })
+}

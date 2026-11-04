@@ -443,13 +443,19 @@ pub struct ResolverState {
     overlay: ResolverOverlay,
     generations_since_full: u64,
     backstop_interval: u64,
+    /// Explicit full-verify forcing (S3): the next apply runs the
+    /// whole-vault walk regardless of the generation cadence.
+    backstop_forced: bool,
     resolve_full_total: u64,
     resolve_targeted_total: u64,
     affected_links_last: u64,
     id_conflict_group_updates_total: u64,
+    apply_generations_total: u64,
+    changes_rows_total: u64,
 }
 
-/// Counter surface for diagnostics (doctor wiring lands in RFC-0004 S3).
+/// Counter surface for doctor diagnostics (§6.7; the vault actor drains
+/// these to meta, `change-log-health`/`resolver-parity` surface them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolverDiagnostics {
     pub generations_since_full: u64,
@@ -457,6 +463,8 @@ pub struct ResolverDiagnostics {
     pub resolve_targeted_total: u64,
     pub affected_links_last: u64,
     pub id_conflict_group_updates_total: u64,
+    pub apply_generations_total: u64,
+    pub changes_rows_total: u64,
 }
 
 impl ResolverState {
@@ -470,10 +478,13 @@ impl ResolverState {
             overlay: ResolverOverlay::default(),
             generations_since_full: 0,
             backstop_interval: RESOLVER_BACKSTOP_GENERATIONS,
+            backstop_forced: false,
             resolve_full_total: 0,
             resolve_targeted_total: 0,
             affected_links_last: 0,
             id_conflict_group_updates_total: 0,
+            apply_generations_total: 0,
+            changes_rows_total: 0,
         })
     }
 
@@ -497,6 +508,8 @@ impl ResolverState {
             resolve_targeted_total: self.resolve_targeted_total,
             affected_links_last: self.affected_links_last,
             id_conflict_group_updates_total: self.id_conflict_group_updates_total,
+            apply_generations_total: self.apply_generations_total,
+            changes_rows_total: self.changes_rows_total,
         }
     }
 
@@ -516,10 +529,18 @@ impl ResolverState {
     }
 
     /// Whether this apply must run the whole-vault backstop instead of the
-    /// targeted pass (D13).
+    /// targeted pass (D13): the generation cadence, or an explicit forcing
+    /// (full-verify reconcile jobs — S3; graph-mirror parity failure — S6).
     #[must_use]
     pub const fn backstop_due(&self) -> bool {
-        self.generations_since_full >= self.backstop_interval
+        self.backstop_forced || self.generations_since_full >= self.backstop_interval
+    }
+
+    /// Force the next apply to run the whole-vault backstop walk. Consumed
+    /// when the forced walk commits; a rolled-back apply leaves the demand
+    /// standing so the verification still lands.
+    pub fn force_backstop(&mut self) {
+        self.backstop_forced = true;
     }
 
     /// Install a completed backstop walk at commit and reset the counter.
@@ -528,7 +549,15 @@ impl ResolverState {
     pub fn commit_backstop(&mut self, catalog: ResolverCatalog) {
         self.base = catalog;
         self.generations_since_full = 0;
+        self.backstop_forced = false;
         self.resolve_full_total += 1;
+    }
+
+    /// Record a committed structural apply and its change-log row volume
+    /// (§6.7: `apply_generations_total`, `changes_rows_total`).
+    pub fn note_committed_apply(&mut self, change_rows: u64) {
+        self.apply_generations_total += 1;
+        self.changes_rows_total += change_rows;
     }
 
     /// Record a committed targeted pass; `visited` counts candidate rows read.
@@ -667,6 +696,99 @@ pub fn projected_resolution(resolution: &Resolution) -> (Option<i64>, Option<i64
         ),
         ResState::Unresolved => (None, None, ResState::Unresolved.as_str()),
     }
+}
+
+/// One stored link row with its resolution state, shared by the backstop
+/// walk and the read-only parity preview so the two compare exactly the
+/// same projection of the same rows.
+struct StoredLink {
+    src: i64,
+    ord: i32,
+    dst_raw: String,
+    target_key: String,
+    embed: bool,
+    dst_note: Option<i64>,
+    dst_att: Option<i64>,
+    res_state: String,
+}
+
+impl StoredLink {
+    fn stored(&self) -> (Option<i64>, Option<i64>, String) {
+        (self.dst_note, self.dst_att, self.res_state.clone())
+    }
+}
+
+fn fetch_all_links(conn: &Connection) -> Result<Vec<StoredLink>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT src, ord, dst_raw, target_key, kind, dst_note, dst_att, res_state FROM links",
+        )
+        .map_err(|error| error.to_string())?;
+    statement
+        .query_map([], |row| {
+            Ok(StoredLink {
+                src: row.get(0)?,
+                ord: row.get(1)?,
+                dst_raw: row.get(2)?,
+                target_key: row.get(3)?,
+                embed: row.get::<_, String>(4)? == "embed",
+                dst_note: row.get(5)?,
+                dst_att: row.get(6)?,
+                res_state: row.get(7)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn project_link(
+    catalog: &ResolverCatalog,
+    row: &StoredLink,
+) -> (Option<i64>, Option<i64>, &'static str) {
+    let resolution = catalog.resolve(&row.target_key, &row.dst_raw, row.embed, Some(row.src));
+    projected_resolution(&resolution)
+}
+
+/// One link row whose stored resolution differs from the from-scratch
+/// projection — the unit of the `resolver-parity` doctor finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkParityMismatch {
+    pub src: i64,
+    pub ord: i32,
+    pub target_key: String,
+    /// Stored `(dst_note, dst_att, res_state)`.
+    pub stored: (Option<i64>, Option<i64>, String),
+    /// Projected `(dst_note, dst_att, res_state)` from a fresh full walk.
+    pub projected: (Option<i64>, Option<i64>, String),
+}
+
+/// Read-only parity recomputation (§6.2.5, doctor `resolver-parity`): the
+/// from-scratch `re_resolve_all` projection over every stored link,
+/// collected as mismatches without writing anything. A non-empty result
+/// means the incremental state drifted from the full-walk truth (FR-2) —
+/// the fix is an explicit full verify, never an implicit doctor repair.
+///
+/// # Errors
+/// Returns the error text when the catalog or link rows cannot be read.
+pub fn re_resolve_preview(conn: &Connection) -> Result<Vec<LinkParityMismatch>, String> {
+    let catalog = ResolverCatalog::load(conn).map_err(|error| error.to_string())?;
+    let rows = fetch_all_links(conn)?;
+    let mut mismatches = Vec::new();
+    for row in rows {
+        let projected = project_link(&catalog, &row);
+        let stored = row.stored();
+        if stored != (projected.0, projected.1, projected.2.to_owned()) {
+            mismatches.push(LinkParityMismatch {
+                src: row.src,
+                ord: row.ord,
+                target_key: row.target_key,
+                stored,
+                projected: (projected.0, projected.1, projected.2.to_owned()),
+            });
+        }
+    }
+    Ok(mismatches)
 }
 
 /// Targeted `id_conflict` maintenance (§6.2.6): recompute the flag only for
@@ -853,29 +975,7 @@ impl<'a> Resolver<'a> {
             .catalog
             .as_ref()
             .ok_or("resolver catalog missing after refresh")?;
-        let rows = {
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "SELECT src, ord, dst_raw, target_key, kind, dst_note, dst_att, res_state FROM links",
-                )
-                .map_err(|error| error.to_string())?;
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i32>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, String>(7)?,
-                ))
-            })
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?
-        };
+        let rows = fetch_all_links(self.conn)?;
         let mut changed: BTreeSet<i64> = BTreeSet::new();
         let mut update = self
             .conn
@@ -883,14 +983,20 @@ impl<'a> Resolver<'a> {
                 "UPDATE links SET dst_note=?1, dst_att=?2, res_state=?3 WHERE src=?4 AND ord=?5",
             )
             .map_err(|error| error.to_string())?;
-        for (src, ord, dst_raw, target_key, kind_str, dst_note, dst_att, res_state) in rows {
-            let resolution = catalog.resolve(&target_key, &dst_raw, kind_str == "embed", Some(src));
-            let projected = projected_resolution(&resolution);
-            if dst_note != projected.0 || dst_att != projected.1 || res_state != projected.2 {
+        for row in rows {
+            let projected = project_link(catalog, &row);
+            let stored = row.stored();
+            if stored.0 != projected.0 || stored.1 != projected.1 || stored.2 != projected.2 {
                 update
-                    .execute(params![projected.0, projected.1, projected.2, src, ord])
+                    .execute(params![
+                        projected.0,
+                        projected.1,
+                        projected.2,
+                        row.src,
+                        row.ord
+                    ])
                     .map_err(|error| error.to_string())?;
-                changed.insert(src);
+                changed.insert(row.src);
             }
         }
         Ok(changed.into_iter().collect())

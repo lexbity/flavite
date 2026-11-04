@@ -67,6 +67,20 @@ pub enum MetaKey {
     AutosaveFailuresTotal,
     /// Cumulative rename journal items skipped by the actor.
     RenameItemsSkippedTotal,
+    /// Resolver: applied generations since the last whole-vault walk.
+    ResolverGenerationsSinceFull,
+    /// Resolver: committed whole-vault backstop walks.
+    ResolverResolveFullTotal,
+    /// Resolver: committed targeted resolution passes.
+    ResolverResolveTargetedTotal,
+    /// Resolver: candidate rows visited by the last targeted pass.
+    ResolverAffectedLinksLast,
+    /// Resolver: committed group-scoped `id_conflict` statements (§6.2.6).
+    ResolverIdConflictGroupUpdatesTotal,
+    /// Feed: committed structural applies (§6.7 `apply_generations_total`).
+    ResolverApplyGenerationsTotal,
+    /// Feed: change rows submitted (§6.7 `changes_rows_total`).
+    ResolverChangesRowsTotal,
 }
 
 impl MetaKey {
@@ -84,6 +98,13 @@ impl MetaKey {
             Self::DriftFoundTotal => "drift_found_total",
             Self::AutosaveFailuresTotal => "autosave.failures_total",
             Self::RenameItemsSkippedTotal => "rename.items_skipped_total",
+            Self::ResolverGenerationsSinceFull => "resolver.generations_since_full",
+            Self::ResolverResolveFullTotal => "resolver.resolve_full_total",
+            Self::ResolverResolveTargetedTotal => "resolver.resolve_targeted_total",
+            Self::ResolverAffectedLinksLast => "resolver.affected_links_last",
+            Self::ResolverIdConflictGroupUpdatesTotal => "resolver.id_conflict_group_updates_total",
+            Self::ResolverApplyGenerationsTotal => "resolver.apply_generations_total",
+            Self::ResolverChangesRowsTotal => "resolver.changes_rows_total",
         }
     }
 }
@@ -410,6 +431,13 @@ pub fn create_schema(conn: &mut Connection) -> Result<()> {
         (MetaKey::DriftFoundTotal, "0"),
         (MetaKey::AutosaveFailuresTotal, "0"),
         (MetaKey::RenameItemsSkippedTotal, "0"),
+        (MetaKey::ResolverGenerationsSinceFull, "0"),
+        (MetaKey::ResolverResolveFullTotal, "0"),
+        (MetaKey::ResolverResolveTargetedTotal, "0"),
+        (MetaKey::ResolverAffectedLinksLast, "0"),
+        (MetaKey::ResolverIdConflictGroupUpdatesTotal, "0"),
+        (MetaKey::ResolverApplyGenerationsTotal, "0"),
+        (MetaKey::ResolverChangesRowsTotal, "0"),
     ] {
         tx.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)",
