@@ -35,8 +35,11 @@ reconcile-bench:
 
 # RFC-0004 S6 scale gate (AC-4/NFR-2): graph-mirror synchronize wall at the
 # 50k-note / 150k-link design bound plus the full-read fallback parity.
+# RFC-0005 S4: materialization (AC-6/NFR-4) and the NFR-6 allocation gate
+# (5k-note bound) ride the same release-profile ignored test run.
 bench-scale:
     cargo test -p flavite-api --test graph_mirror_scale --release -- --ignored --nocapture
+    cargo test -p flavite-api --test graph_allocation_profile --release -- --ignored --nocapture
 
 # Architecture debt gates from RFC-0002 §7; zero matches are required.
 lint-arch:

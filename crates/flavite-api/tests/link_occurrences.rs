@@ -126,7 +126,13 @@ fn removes_one_saved_crlf_occurrence_keeps_other_occurrences_prose_and_reciproca
 fn unresolved_connection_removal_uses_the_exact_source_occurrence() {
     let f = fixture(&[("a.md", "Before [[missing]] after [[missing]].")]);
     let frame = wait_graph(&f);
-    let selected = frame.projection().occurrences[0].clone();
+    let selected = frame
+        .projection()
+        .occurrences
+        .iter()
+        .next()
+        .unwrap()
+        .clone();
     assert_eq!(selected.edge.to.kind, flavite_graph::NodeKind::Unresolved);
     let detail = detail(&f, selected, frame.render_key().epoch);
     let (id, revision) = f.open_note("a.md");
@@ -141,7 +147,13 @@ fn an_unresolved_target_resolved_after_prepare_requires_a_new_choice() {
     let frame = wait_graph(&f);
     let detail = detail(
         &f,
-        frame.projection().occurrences[0].clone(),
+        frame
+            .projection()
+            .occurrences
+            .iter()
+            .next()
+            .unwrap()
+            .clone(),
         frame.render_key().epoch,
     );
     let (id, revision) = f.open_note("a.md");
@@ -158,7 +170,13 @@ fn an_unresolved_target_resolved_after_prepare_requires_a_new_choice() {
 fn later_typing_invalidates_prepared_removal_without_deleting_another_span() {
     let f = fixture(&[("a.md", "[[b]] [[b]]"), ("b.md", "B")]);
     let frame = wait_graph(&f);
-    let selected = frame.projection().occurrences[1].clone();
+    let selected = frame
+        .projection()
+        .occurrences
+        .iter()
+        .nth(1)
+        .unwrap()
+        .clone();
     let detail = detail(&f, selected, frame.render_key().epoch);
     let (id, revision) = f.open_note("a.md");
     let plan = prepare(&f, id, revision, &detail, 1);

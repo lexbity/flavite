@@ -38,6 +38,18 @@
 //! of the saved view, bounded like the mirror itself (NFR-5, asserted by
 //! the scale bench accounting).
 //!
+//! # F3 shared-field refresh (RFC-0005 S4)
+//!
+//! `SavedGraph`'s `saved`/`occurrences`/`metadata` are `Arc`-backed so the
+//! projection builder and the snapshot share them without cloning
+//! (FR-9): the per-publish `O(V)` allocation is exactly one `effective`
+//! batch construction. The mirror splices owned working copies inside
+//! [`MirrorState`] and publishes them into the shared fields lazily
+//! ([`MirrorState::refresh_view`]) when a consumer needs a fresh view —
+//! `view()` and a `view_arc` miss — so the splice path stays pure
+//! `O(change)` and the keystroke/stamp-only path never refreshes (NFR-6,
+//! asserted by the allocation-counting gate at 5k notes).
+//!
 //! # Reset policy (§6.5.2, FR-5)
 //!
 //! [`Synchronize::Reset`] fires on: epoch change, `cursor.generation <
@@ -136,6 +148,17 @@ impl Default for ParityPolicy {
 /// unresolved occurrences after resolved ones, metadata per note with
 /// property values in `(key, ord)` order, unresolved nodes unique by id and
 /// sorted.
+///
+/// # F3 sharing (RFC-0005 S4)
+///
+/// `saved`, `occurrences`, and `metadata` are `Arc`-backed: the mirror
+/// owns the *mutable* working copies inside [`MirrorState`] (the splice
+/// targets), and publishes them into these shared fields on demand
+/// ([`MirrorState::refresh_view`]) so the handoff snapshot
+/// ([`GraphMirror::view_arc`]) and the projection builder
+/// ([`crate::graph_projection::build`]) can borrow them without cloning —
+/// the per-publish cost is one owned `effective` batch construction, never
+/// a per-publish copy of the vault (FR-9, NFR-6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedGraph {
     /// Exact index version every field was read at.
@@ -143,7 +166,7 @@ pub struct SavedGraph {
     /// Saved notes + attachments + resolved edges — the exact
     /// [`read_current`](crate::graph_service::read_current) shape, native
     /// paths decoded.
-    pub saved: GraphBatch,
+    pub saved: Arc<GraphBatch>,
     /// Unresolved target nodes derived from saved unresolved links, sorted
     /// by [`NodeId`]. Never part of [`Self::saved`] (same invariant as the
     /// pre-S6 bridge).
@@ -153,9 +176,9 @@ pub struct SavedGraph {
     /// Saved occurrences: the RESOLVED section first (contiguous
     /// `(src, ord)` runs, ordered by source), then the UNRESOLVED section
     /// (contiguous `(src, ord)` runs, ordered by source).
-    pub occurrences: Vec<LinkOccurrence>,
+    pub occurrences: Arc<[LinkOccurrence]>,
     /// Tags + properties per note node.
-    pub metadata: BTreeMap<NodeId, NoteMetadata>,
+    pub metadata: Arc<BTreeMap<NodeId, NoteMetadata>>,
     /// Unresolved identity guard (`blake3`-prefix id → folded key) covering
     /// the unresolved nodes of this view.
     pub unresolved_keys: BTreeMap<u64, String>,
@@ -165,53 +188,59 @@ impl SavedGraph {
     /// The complete batch as it enters the publisher *before* buffer
     /// overlays: saved records plus unresolved nodes, saved edges plus
     /// unresolved edges. `build` clones this and applies overlays on top —
-    /// exactly where the pre-S6 bridge did.
+    /// exactly where the pre-S6 bridge did. This is the **one** owned
+    /// `O(V)` construction per publish (RFC-0005 §4.7): the saved base
+    /// itself is shared through the `Arc` and never copied.
     #[must_use]
     pub fn effective_pre_overlay(&self) -> GraphBatch {
-        let mut batch = self.saved.clone();
+        let mut batch = (*self.saved).clone();
         batch.nodes.extend(self.unresolved_nodes.iter().cloned());
         batch.edges.extend(self.unresolved_edges.iter().copied());
         batch
     }
+}
 
-    /// The sorted position of one node record, if present. Node ids are the
-    /// [`NodeId`] order (notes by id, then attachments by id), so a binary
-    /// search locates any record.
-    fn node_position(&self, id: NodeId) -> Option<usize> {
-        let start = self.saved.nodes.partition_point(|node| node.id < id);
-        self.saved
-            .nodes
-            .get(start)
-            .filter(|node| node.id == id)
-            .map(|_| start)
-    }
+/// The sorted position of one node record in a batch, if present. Node ids
+/// are the [`NodeId`] order (notes by id, then attachments by id), so a
+/// binary search locates any record.
+fn node_position(batch: &GraphBatch, id: NodeId) -> Option<usize> {
+    let start = batch.nodes.partition_point(|node| node.id < id);
+    batch
+        .nodes
+        .get(start)
+        .filter(|node| node.id == id)
+        .map(|_| start)
+}
 
-    /// Replace or insert one node's canonical record.
-    fn upsert_node(&mut self, record: GraphNodeRecord) {
-        match self.node_position(record.id) {
-            Some(position) => self.saved.nodes[position] = record,
-            None => {
-                let start = self.saved.nodes.partition_point(|node| node.id < record.id);
-                self.saved.nodes.insert(start, record);
-            }
+/// Replace or insert one node's canonical record.
+fn upsert_node(batch: &mut GraphBatch, record: GraphNodeRecord) {
+    match node_position(batch, record.id) {
+        Some(position) => batch.nodes[position] = record,
+        None => {
+            let start = batch.nodes.partition_point(|node| node.id < record.id);
+            batch.nodes.insert(start, record);
         }
     }
+}
 
-    /// Remove one node record.
-    fn remove_node(&mut self, id: NodeId) {
-        if let Some(position) = self.node_position(id) {
-            self.saved.nodes.remove(position);
-        }
+/// Remove one node record.
+fn remove_node(batch: &mut GraphBatch, id: NodeId) {
+    if let Some(position) = node_position(batch, id) {
+        batch.nodes.remove(position);
     }
+}
 
-    /// Replace the contiguous run of resolved edges leaving `from` (edges
-    /// are globally sorted by `(from, to, kind)`, so one source's edges are
-    /// one region).
-    fn splice_edge_run(&mut self, from: NodeId, run: impl IntoIterator<Item = GraphEdgeRecord>) {
-        let start = self.saved.edges.partition_point(|edge| edge.from < from);
-        let end = self.saved.edges.partition_point(|edge| edge.from <= from);
-        self.saved.edges.splice(start..end, run);
-    }
+/// Replace the contiguous run of resolved edges leaving `from` (edges
+/// are globally sorted by `(from, to, kind)`, so one source's edges are
+/// one region).
+fn splice_edge_run(
+    batch: &mut GraphBatch,
+    from: NodeId,
+    run: impl IntoIterator<Item = GraphEdgeRecord>,
+) {
+    let start = batch.edges.partition_point(|edge| edge.from < from);
+    let end = batch.edges.partition_point(|edge| edge.from <= from);
+    batch.edges.splice(start..end, run);
 }
 
 /// The verdict of one parity comparison (§6.5.4): the version both sides
@@ -328,9 +357,32 @@ pub struct GraphMirror {
 /// the splices need. Fields are mutated together inside one `&mut`;
 /// drift (a contract-violating splice) sets [`MirrorState::drift`] and the
 /// mirror poisons toward the full-truth rebuild.
+///
+/// # F3 ownership (RFC-0005 S4)
+///
+/// The view's `saved`/`occurrences`/`metadata` are shared `Arc`s (the
+/// snapshot/projection face). The mirror splices owned **working copies**
+/// (`saved`, `occurrences`, `metadata`) and publishes them into the view
+/// via [`Self::refresh_view`] — lazily, when a consumer needs a fresh view
+/// ([`GraphMirror::view`]/[`GraphMirror::view_arc`]) — so the splice path
+/// stays pure `O(change)` and the per-publish path never copies the vault.
+/// Resident data is ≤ 2× one saved view: one owned working generation plus
+/// one shared `Arc` generation (the handoff snapshot reuses the same
+/// `Arc` payloads, NFR-5).
 #[derive(Debug)]
 struct MirrorState {
     view: SavedGraph,
+    /// Owned mutable working copy of the canonical batch (nodes/edges) the
+    /// splices mutate; published into [`Self::view`] on refresh.
+    saved: GraphBatch,
+    /// Owned mutable working copy of the canonical occurrence vector
+    /// (resolved section, then unresolved section).
+    occurrences: Vec<LinkOccurrence>,
+    /// Owned mutable working copy of the saved note metadata.
+    metadata: BTreeMap<NodeId, NoteMetadata>,
+    /// Whether [`Self::view`]'s shared fields are stale relative to the
+    /// working copies (set by any splice; cleared by refresh).
+    view_dirty: bool,
     /// End index of the RESOLVED occurrence section (the boundary the
     /// two-section occurrence vector is spliced against).
     resolved_occurrences: usize,
@@ -347,7 +399,22 @@ struct MirrorState {
 }
 
 impl MirrorState {
+    /// Publish the owned working copies into the view's shared (`Arc`)
+    /// fields. One `O(V)`+`O(M)` construction per *refresh* (per delta
+    /// window that reaches a pump, or per parity/test read) — never per
+    /// publish: the keystroke/stamp-only path reuses the cached snapshot
+    /// and never calls this (FR-9, NFR-6).
+    fn refresh_view(&mut self) {
+        self.view.saved = Arc::new(self.saved.clone());
+        self.view.occurrences = Arc::from(self.occurrences.clone());
+        self.view.metadata = Arc::new(self.metadata.clone());
+        self.view_dirty = false;
+    }
+
     /// Build the full auxiliary state from one canonical view (reset path).
+    /// The incoming view already carries fresh shared payloads; the owned
+    /// working copies are materialized from them once (a reset is an
+    /// `O(V)` operation anyway).
     fn from_view(view: SavedGraph) -> Self {
         let resolved_occurrences = view
             .occurrences
@@ -359,7 +426,11 @@ impl MirrorState {
             resolved_occurrences,
             source_hashes: source_hashes(&view.occurrences),
             collision_ids: view.unresolved_keys.clone(),
+            saved: (*view.saved).clone(),
+            occurrences: Vec::from(&*view.occurrences),
+            metadata: (*view.metadata).clone(),
             view,
+            view_dirty: false,
             drift: false,
         }
     }
@@ -449,7 +520,7 @@ impl MirrorState {
                 continue;
             }
             let node = node_id_of(*id);
-            if self.view.node_position(node).is_none()
+            if node_position(&self.saved, node).is_none()
                 && !link_rows[id].is_empty()
                 && let Some(row) = note_stmt
                     .query_row([*id], NoteRow::from_row)
@@ -496,13 +567,13 @@ impl MirrorState {
                 self.remove_note(node, *id);
                 continue;
             };
-            self.view.upsert_node(decoded[*position].clone());
+            upsert_node(&mut self.saved, decoded[*position].clone());
             let rows = link_rows.remove(id).unwrap_or_default();
             self.splice_source_links(*id, rows, &arriving)?;
-            self.view.metadata.remove(&node);
+            self.metadata.remove(&node);
             let metadata = read_note_metadata(&mut tag_stmt, &mut property_stmt, *id)?;
             if !metadata.tags.is_empty() || !metadata.properties.is_empty() {
-                self.view.metadata.insert(node, metadata);
+                self.metadata.insert(node, metadata);
             }
         }
         // Attachments: the graph shows connectivity, not multiplicity, so
@@ -510,8 +581,8 @@ impl MirrorState {
         // rows (FR-1) and splice the referencing sources.
         for id in &attachment_ids {
             match decode_index.get(&(NodeKind::Attachment, *id)) {
-                None => self.view.remove_node(attachment_id_of(*id)),
-                Some(position) => self.view.upsert_node(decoded[*position].clone()),
+                None => remove_node(&mut self.saved, attachment_id_of(*id)),
+                Some(position) => upsert_node(&mut self.saved, decoded[*position].clone()),
             }
         }
         // Outgoing-only sources: splice just the link set — the record and
@@ -521,7 +592,7 @@ impl MirrorState {
                 continue;
             }
             if let Some(position) = decode_index.get(&(NodeKind::Note, *id)) {
-                self.view.upsert_node(decoded[*position].clone());
+                upsert_node(&mut self.saved, decoded[*position].clone());
             }
             let rows = link_rows.remove(id).unwrap_or_default();
             self.splice_source_links(*id, rows, &arriving)?;
@@ -532,8 +603,12 @@ impl MirrorState {
         // inside one window).
         self.rebuild_unresolved();
         self.view.version = to;
-        self.view.saved.epoch = to.epoch;
-        self.view.saved.generation = to.generation;
+        self.saved.epoch = to.epoch;
+        self.saved.generation = to.generation;
+        // The shared (Arc) view fields are now stale relative to the owned
+        // working copies; they are refreshed lazily by `view`/`view_arc`
+        // (F3, RFC-0005 S4).
+        self.view_dirty = true;
         Ok(u64::try_from(
             note_ids.len()
                 + attachment_ids.len()
@@ -558,10 +633,8 @@ impl MirrorState {
         arriving: &BTreeSet<NodeId>,
     ) -> Result<(), String> {
         let from = node_id_of(src);
-        let source_path = self
-            .view
-            .node_position(from)
-            .map(|position| self.view.saved.nodes[position].native_path.clone())
+        let source_path = node_position(&self.saved, from)
+            .map(|position| self.saved.nodes[position].native_path.clone())
             .unwrap_or_default();
         let mut new_edges: BTreeSet<GraphEdgeRecord> = BTreeSet::new();
         let mut new_resolved: Vec<LinkOccurrence> = Vec::new();
@@ -583,7 +656,7 @@ impl MirrorState {
                     // holds nor this window is bringing in is a change-log
                     // contract violation — counted, never published, drift
                     // toward the full-truth rebuild.
-                    if self.view.node_position(target).is_none() && !arriving.contains(&target) {
+                    if node_position(&self.saved, target).is_none() && !arriving.contains(&target) {
                         tracing::warn!(
                             target: "flavite_api::graph_mirror",
                             src,
@@ -637,7 +710,7 @@ impl MirrorState {
         } else {
             self.source_hashes.remove(&src);
         }
-        self.view.splice_edge_run(from, new_edges);
+        splice_edge_run(&mut self.saved, from, new_edges);
         self.splice_resolved_run(from, new_resolved);
         if new_unresolved.is_empty() {
             self.unresolved_by_src.remove(&src);
@@ -650,10 +723,10 @@ impl MirrorState {
     /// Remove a note wholesale: node record, edge run, occurrence runs,
     /// unresolved rows, and metadata.
     fn remove_note(&mut self, node: NodeId, id: i64) {
-        self.view.remove_node(node);
-        self.view.splice_edge_run(node, []);
+        remove_node(&mut self.saved, node);
+        splice_edge_run(&mut self.saved, node, []);
         self.splice_resolved_run(node, Vec::new());
-        self.view.metadata.remove(&node);
+        self.metadata.remove(&node);
         self.unresolved_by_src.remove(&id);
         self.source_hashes.remove(&id);
     }
@@ -662,11 +735,11 @@ impl MirrorState {
     /// section, keeping the section boundary exact.
     fn splice_resolved_run(&mut self, from: NodeId, run: Vec<LinkOccurrence>) {
         let boundary = self.resolved_occurrences;
-        let start = self.view.occurrences[..boundary].partition_point(|o| o.edge.from < from);
-        let end = self.view.occurrences[..boundary].partition_point(|o| o.edge.from <= from);
+        let start = self.occurrences[..boundary].partition_point(|o| o.edge.from < from);
+        let end = self.occurrences[..boundary].partition_point(|o| o.edge.from <= from);
         let removed = end - start;
         let inserted = run.len();
-        self.view.occurrences.splice(start..end, run);
+        self.occurrences.splice(start..end, run);
         self.resolved_occurrences = boundary + inserted - removed;
     }
 
@@ -692,14 +765,14 @@ impl MirrorState {
         // oracle over exactly this path).
         let mut pushed: BTreeSet<u64> = BTreeSet::new();
         let boundary = self.resolved_occurrences;
-        self.view.occurrences.truncate(boundary);
+        self.occurrences.truncate(boundary);
         let unresolved = std::mem::take(&mut self.unresolved_by_src);
         for (src, list) in &unresolved {
-            let Some(entry) = self.view.node_position(node_id_of(*src)) else {
+            let Some(entry) = node_position(&self.saved, node_id_of(*src)) else {
                 continue;
             };
             let from = node_id_of(*src);
-            let source_path = self.view.saved.nodes[entry].native_path.clone();
+            let source_path = self.saved.nodes[entry].native_path.clone();
             let content_hash = self.source_hashes.get(src).cloned().unwrap_or_default();
             for occurrence in list {
                 let id = unresolved_id_for(&occurrence.raw);
@@ -714,7 +787,7 @@ impl MirrorState {
                     kind: occurrence.kind,
                 };
                 edges.push(edge);
-                self.view.occurrences.push(LinkOccurrence {
+                self.occurrences.push(LinkOccurrence {
                     edge,
                     source_path: source_path.clone(),
                     source: OccurrenceSource::Saved {
@@ -782,9 +855,20 @@ impl GraphMirror {
     /// a position. Used by the parity comparison and tests, which need the
     /// view *under* the mutex. Pumps that need to work outside the lock
     /// take [`Self::view_arc`] instead (RFC-0005 F1).
+    ///
+    /// F3 refresh (RFC-0005 S4): when a splice has dirtied the owned
+    /// working copies since the last exposure, this publishes them into the
+    /// view's shared `Arc` fields first, so the returned view is always
+    /// current (the parity oracle compares byte-for-byte). A fresh view is
+    /// returned as-is; the refresh is lazy and never runs on the
+    /// keystroke/stamp-only path.
     #[must_use]
-    pub fn view(&self) -> Option<&SavedGraph> {
-        self.state.as_ref().map(|state| &state.view)
+    pub fn view(&mut self) -> Option<&SavedGraph> {
+        let state = self.state.as_mut()?;
+        if state.view_dirty {
+            state.refresh_view();
+        }
+        Some(&state.view)
     }
 
     /// The cursor-versioned `Arc` snapshot of the canonical view (F1,
@@ -812,8 +896,20 @@ impl GraphMirror {
     /// the same version — see [`Self::force_reset`]). Readers never see a
     /// torn snapshot: the slot is written only by the mutex holder and
     /// replaced in one assignment.
+    ///
+    /// F3 refresh: a miss first publishes the owned working copies into the
+    /// view's shared `Arc` fields ([`MirrorState::refresh_view`]), so the
+    /// snapshot carries the post-delta data — same one `O(V)` construction
+    /// per delta window S3 already accepted. Cache hits (stamp-only
+    /// republishes) skip the refresh entirely: the cursor has not moved,
+    /// so the shared payloads are unchanged.
     #[must_use]
     pub fn view_arc(&mut self) -> Option<Arc<SavedGraph>> {
+        if let Some(state) = self.state.as_mut()
+            && state.view_dirty
+        {
+            state.refresh_view();
+        }
         let view = self.state.as_ref().map(|state| &state.view)?;
         if let Some((version, snapshot)) = &self.handoff
             && *version == self.cursor
@@ -1144,12 +1240,7 @@ fn property_value(
     }
 }
 
-fn node_id_entity(id: NodeId) -> i64 {
-    i64::try_from(id.id).unwrap_or(-1)
-}
-
 /// RFC-0005 §7 identity helper — one sentinel policy for every row id
-/// entering the mirror view.
 ///
 /// Note and attachment ids are ROWID-allocated positive integers
 /// (`note_id`/`att_id` are `INTEGER PRIMARY KEY`); a negative id cannot
@@ -1161,22 +1252,30 @@ fn node_id_entity(id: NodeId) -> i64 {
 /// `u64::try_from(..).unwrap_or(0)` expressions were this same rule
 /// repeated per call site.
 #[inline]
-fn node_row_id(id: i64) -> u64 {
+pub(crate) fn node_row_id(id: i64) -> u64 {
     u64::try_from(id).unwrap_or(0)
 }
 
 /// The [`NodeId`] of a note row (first call shape; sentinel policy in
 /// [`node_row_id`]).
 #[inline]
-fn node_id_of(id: i64) -> NodeId {
+pub(crate) fn node_id_of(id: i64) -> NodeId {
     NodeId::note(node_row_id(id))
 }
 
 /// The [`NodeId`] of an attachment row (second call shape over the same
 /// policy, RFC-0005 §7).
 #[inline]
-fn attachment_id_of(id: i64) -> NodeId {
+pub(crate) fn attachment_id_of(id: i64) -> NodeId {
     NodeId::attachment(node_row_id(id))
+}
+
+/// The row-id side of a [`NodeId`] (the mirror's per-source keying and
+/// [`crate::graph_projection::OccurrenceSet`]'s dirty-source skip set share
+/// one conversion policy).
+#[inline]
+pub(crate) fn node_id_entity(id: NodeId) -> i64 {
+    i64::try_from(id.id).unwrap_or(-1)
 }
 
 /// Derive the per-source unresolved inputs from the canonical unresolved
@@ -1332,11 +1431,11 @@ pub fn full_saved_graph(
     unresolved_edges.dedup();
     Ok(SavedGraph {
         version,
-        saved,
+        saved: Arc::new(saved),
         unresolved_nodes,
         unresolved_edges,
-        occurrences,
-        metadata,
+        occurrences: Arc::from(occurrences),
+        metadata: Arc::new(metadata),
         unresolved_keys: unresolved_ids,
     })
 }
@@ -1814,6 +1913,7 @@ mod tests {
             "the applied change must arrive as a delta, not a reset"
         );
 
+        let resolved_targets = mirror.stats().unresolved_targets;
         let view = mirror.view().expect("view");
         for pair in view.unresolved_nodes.windows(2) {
             assert!(
@@ -1832,7 +1932,7 @@ mod tests {
             "the identity guard must cover the new target"
         );
         assert_eq!(
-            mirror.stats().unresolved_targets,
+            resolved_targets,
             u64::try_from(baseline + 1).unwrap(),
             "the F2 telemetry counter must track the rebuild"
         );

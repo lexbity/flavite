@@ -35,7 +35,8 @@ pub mod graph_projection;
 pub mod graph_service;
 pub mod recovery;
 pub use graph_projection::{
-    GraphProjection, GraphViewToken, LinkOccurrence, OccurrenceSource, OverlayState, ScopeRequest,
+    GraphProjection, GraphViewToken, LinkOccurrence, OccurrenceSet, OccurrenceSource, OverlayState,
+    ScopeRequest,
 };
 pub mod attachments;
 pub mod links;
