@@ -18,13 +18,13 @@ use crate::types::{ApiVaultRef, RequestId};
 use flavite_buffer::revision::{BufferId, Revision};
 use flavite_vault::open::Vault;
 use flavite_vault::session::{Session, SessionCommand, SessionError, SessionResult};
-use flavite_vault::sync::MutexExt;
+use flavite_vault::sync::{MutexExt, WAIT_TICK, wait_result_recovering};
 use flavite_vault::types::{Epoch, Generation, VaultConfig, VaultIdentity};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use thiserror::Error;
 
 /// Re-export vault types for API consumers.
@@ -422,6 +422,12 @@ pub struct Flavite {
     pending_requests: Mutex<HashSet<RequestId>>,
     /// Completions collected while waiting for another operation.
     terminal_backlog: Mutex<HashMap<RequestId, ExecutionResult>>,
+    /// Wake edge for [`Flavite::wait_for_operation`], paired with
+    /// `terminal_backlog` — NOT with the Session's completion queue: the
+    /// api tier's mutex is the backlog, so condvar duplication across the
+    /// two tiers is deliberate correctness, not drift (Q5/FR-9: a condvar
+    /// shared across different mutexes would be a bug).
+    backlog_cv: Condvar,
     /// Notices delivered to consumers, retained until presentation ack.
     notice_acks: Mutex<
         std::collections::BTreeMap<NoticeId, (crate::Event, flavite_vault::channels::Notice)>,
@@ -499,6 +505,7 @@ impl Flavite {
             operation_ids: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashSet::new()),
             terminal_backlog: Mutex::new(HashMap::new()),
+            backlog_cv: Condvar::new(),
             notice_acks: Mutex::new(std::collections::BTreeMap::new()),
             next_notice_id: AtomicU64::new(1),
             catalog_sequence: AtomicU64::new(1),
@@ -546,6 +553,7 @@ impl Flavite {
             operation_ids: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashSet::new()),
             terminal_backlog: Mutex::new(HashMap::new()),
+            backlog_cv: Condvar::new(),
             notice_acks: Mutex::new(std::collections::BTreeMap::new()),
             next_notice_id: AtomicU64::new(1),
             catalog_sequence: AtomicU64::new(1),
@@ -591,6 +599,7 @@ impl Flavite {
             operation_ids: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashSet::new()),
             terminal_backlog: Mutex::new(HashMap::new()),
+            backlog_cv: Condvar::new(),
             queries,
             user_state: flavite_vault::user_state::UserStateStore::open(
                 Box::new(flavite_fs::OsFs::new()),
@@ -1592,9 +1601,17 @@ impl Flavite {
 
     /// Drain lossless terminal results for admitted asynchronous operations.
     /// Results are correlated to the original public invocation ID.
+    ///
+    /// This is the only way completions enter the api tier, so it wakes any
+    /// parked [`Flavite::wait_for_operation`] when it returns a non-empty
+    /// batch. The notify fires AFTER conversion: a woken waiter observes
+    /// fully converted results (pending/id bookkeeping done), never a
+    /// half-installed one. Waiters additionally re-check under the same
+    /// backlog mutex they park on, so the edge cannot be lost.
     pub fn drain_operation_completions(&self) -> Vec<OperationCompletion> {
         let _turn = self.ingress.lock_recovering();
-        self.session
+        let completions: Vec<_> = self
+            .session
             .drain_operation_completions()
             .into_iter()
             .map(|completion| {
@@ -1607,10 +1624,26 @@ impl Flavite {
                 let result = self.convert_session_result(completion.result, request_id);
                 OperationCompletion { request_id, result }
             })
-            .collect()
+            .collect();
+        if !completions.is_empty() {
+            self.backlog_cv.notify_all();
+        }
+        completions
     }
 
     /// Wait for one admitted operation to reach a terminal result.
+    ///
+    /// Parks on the backlog's own condvar (Q5/S7): this loop performs no
+    /// sleeping poll. The park predicate watches BOTH delivery signals —
+    /// "my result is not yet in the backlog" AND "the operation is still
+    /// pending" — evaluated under the same mutexes the producers mutate, so
+    /// neither a sibling waiter's backlog insert nor another thread's
+    /// `drain_operation_completions` (which removes the pending mark) can
+    /// be missed: a state change before the park is visible to the
+    /// predicate, a change after is delivered by the notify. The 25 ms
+    /// tick remains only the absolute ceiling. The `Rejected{Unavailable}`
+    /// semantics for unknown/already-drained ids are byte-for-byte the
+    /// former ones.
     pub fn wait_for_operation(&self, request_id: RequestId) -> ExecutionResult {
         loop {
             if let Some(result) = self.terminal_backlog.lock_recovering().remove(&request_id) {
@@ -1626,6 +1659,7 @@ impl Flavite {
                         .with_message("operation is not pending or has already been drained"),
                 );
             }
+            let mut parked_backlog = false;
             for completion in self.drain_operation_completions() {
                 if completion.request_id == request_id {
                     return completion.result;
@@ -1633,8 +1667,26 @@ impl Flavite {
                 self.terminal_backlog
                     .lock_recovering()
                     .insert(completion.request_id, completion.result);
+                parked_backlog = true;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            if parked_backlog {
+                // The drain-level notify fired BEFORE these sibling results
+                // were visible in the backlog; this one closes that window
+                // for every other parked waiter.
+                self.backlog_cv.notify_all();
+            }
+            let backlog = self.terminal_backlog.lock_recovering();
+            let _waited = wait_result_recovering(self.backlog_cv.wait_timeout_while(
+                backlog,
+                WAIT_TICK,
+                |backlog| {
+                    !backlog.contains_key(&request_id)
+                        && self
+                            .pending_requests
+                            .lock_recovering()
+                            .contains(&request_id)
+                },
+            ));
         }
     }
 
@@ -2093,7 +2145,14 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "initial reconcile timed out"
+                "initial reconcile timed out; session backlog={:?} api pending={:?}",
+                flavite
+                    .session
+                    .drain_operation_completions()
+                    .into_iter()
+                    .map(|completion| completion.request_id)
+                    .collect::<Vec<_>>(),
+                flavite.pending_requests.lock_recovering().len(),
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -2409,7 +2468,12 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(events.iter().any(|delivery| matches!(&delivery.event, crate::Event::ExternalChangeDetected { note_path, deleted: false, .. } if note_path.ends_with("note.md"))), "{events:?}");
+        assert!(
+            events.iter().any(|delivery| matches!(&delivery.event, crate::Event::ExternalChangeDetected { note_path, deleted: false, .. } if note_path.ends_with("note.md"))),
+            "{events:?}; backlog={:?} notices={:?}",
+            flavite.drain_operation_completions().len(),
+            flavite.session.drain_notices().len(),
+        );
         flavite
             .session
             .notice_channel()
@@ -2618,6 +2682,251 @@ mod tests {
         let terminal = flavite.wait_for_operation(14);
         assert!(
             matches!(terminal, ExecutionResult::Local(LocalResult::Success(LocalSuccess { request_id: 14, command_id, .. })) if command_id == "reconcile")
+        );
+    }
+
+    /// S7 concurrency net (R3): a waiter and an external drainer race for
+    /// one admitted operation. The api ledger must deliver the terminal
+    /// result to exactly ONE consumer — either the waiter returns the real
+    /// success (its own drain won) or the drainer holds it and the waiter
+    /// gets the pinned `Rejected{Unavailable}` ("not pending or has already
+    /// been drained"). Two successes, zero successes, or a hang fails.
+    #[test]
+    fn flavite_wait_delivers_exactly_once_under_concurrent_drain() {
+        use crate::command::Invocation;
+        use crate::types::Origin;
+        use std::time::Duration;
+        let (flavite, _root, _temp) = test_flavite();
+        await_initial_reconcile(&flavite);
+
+        let request_id = match flavite.execute(Invocation::new(
+            45,
+            "reconcile",
+            serde_json::json!({"scope": "full", "mode": "verify"}),
+            Origin::Cli,
+        )) {
+            ExecutionResult::Pending { request_id } => request_id,
+            other => panic!("expected a pending reconcile: {other:?}"),
+        };
+        let started = std::time::Instant::now();
+        let flavite_ref = &flavite;
+        let waiter_done = std::sync::Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+        let (waited, drainer_holds, woke_after) = std::thread::scope(|scope| {
+            let done_stamp = std::sync::Arc::clone(&waiter_done);
+            let waiter = scope.spawn(move || {
+                let result = flavite_ref.wait_for_operation(request_id);
+                *done_stamp.lock().unwrap() = Some(std::time::Instant::now());
+                result
+            });
+            let mut drainer_holds = false;
+            let mut won_at = None;
+            while !drainer_holds && !waiter.is_finished() {
+                if std::time::Instant::now() - started > Duration::from_secs(5) {
+                    panic!(
+                        "concurrent drain/wait stalled; pending={:?} events={:?}",
+                        flavite_ref.pending_requests.lock_recovering().len(),
+                        flavite_ref.session.drain_events().len(),
+                    );
+                }
+                drainer_holds = flavite_ref
+                    .drain_operation_completions()
+                    .iter()
+                    .any(|completion| completion.request_id == request_id);
+                if drainer_holds {
+                    won_at = Some(std::time::Instant::now());
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let waited = waiter.join().expect("waiter thread");
+            // When the drainer won, the waiter's next exit must come from
+            // the drain's notify (µs), not from waking out at the tick
+            // ceiling: measure it. (Without the notify edge the same test
+            // measured ~20 ms — the tick — against this 5 ms bound.)
+            let woke_after = match won_at {
+                Some(at) => {
+                    let stamp = waiter_done
+                        .lock()
+                        .unwrap()
+                        .expect("the waiter completed before the join");
+                    Some(if stamp > at {
+                        stamp - at
+                    } else {
+                        Duration::ZERO
+                    })
+                }
+                None => None,
+            };
+            (waited, drainer_holds, woke_after)
+        });
+        let waiter_holds = matches!(waited, ExecutionResult::Local(LocalResult::Success(_)));
+        assert!(
+            waiter_holds ^ drainer_holds,
+            "terminal result must reach exactly one consumer: waiter={waited:?} drainer_holds={drainer_holds}"
+        );
+        if drainer_holds {
+            assert!(
+                matches!(
+                    &waited,
+                    ExecutionResult::Rejected(RejectedResult {
+                        reason: RejectionReason::Unavailable,
+                        ..
+                    })
+                ),
+                "the losing waiter must get the pinned unavailable rejection, got {waited:?}"
+            );
+            let woke_after = woke_after.expect("drainer won, so the wake was timed");
+            assert!(
+                woke_after < Duration::from_millis(5),
+                "the losing waiter woke on the tick, not the drain notify: {woke_after:?} (tick ceiling {WAIT_TICK:?})"
+            );
+        }
+    }
+
+    /// S7 pinned semantics (t2): an unknown id and an already-drained id
+    /// both return `Rejected{Unavailable}` immediately — they never park
+    /// behind the tick. These semantics are load-bearing for the backlog
+    /// model, so nobody "simplifies" the wait into delegation later.
+    #[test]
+    fn flavite_wait_rejects_unknown_and_drained_immediately() {
+        use std::time::Duration;
+        let (flavite, root, _temp) = test_flavite();
+        await_initial_reconcile(&flavite);
+
+        // (a) Unknown id: immediate.
+        let started = std::time::Instant::now();
+        let unknown = flavite.wait_for_operation(999_999);
+        let took = started.elapsed();
+        assert!(
+            matches!(
+                &unknown,
+                ExecutionResult::Rejected(RejectedResult {
+                    reason: RejectionReason::Unavailable,
+                    ..
+                })
+            ),
+            "{unknown:?}"
+        );
+        assert!(
+            took < Duration::from_millis(10),
+            "unknown id must not park: took {took:?} (tick ceiling is {WAIT_TICK:?})"
+        );
+
+        // (b) Already-drained id: real pending op, drained away, then wait.
+        use crate::command::Invocation;
+        use crate::types::Origin;
+        let request_id = match flavite.execute(Invocation::new(
+            46,
+            "reconcile",
+            serde_json::json!({"scope": "full", "mode": "verify"}),
+            Origin::Cli,
+        )) {
+            ExecutionResult::Pending { request_id } => request_id,
+            other => panic!("expected a pending reconcile: {other:?}"),
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut delivered = false;
+        while !delivered {
+            delivered = flavite
+                .drain_operation_completions()
+                .iter()
+                .any(|completion| completion.request_id == request_id);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reconcile never completed; events={:?}",
+                flavite.session.drain_events()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let started = std::time::Instant::now();
+        let after_drain = flavite.wait_for_operation(request_id);
+        assert!(
+            matches!(
+                &after_drain,
+                ExecutionResult::Rejected(RejectedResult {
+                    reason: RejectionReason::Unavailable,
+                    ..
+                })
+            ),
+            "{after_drain:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(10),
+            "the drained exit must not park: {started:?}"
+        );
+        let _ = root;
+    }
+
+    /// S7 pin (t3, the anti-delegation proof): a waiter servicing one id
+    /// relocates its batch siblings into the backlog instead of dropping
+    /// them — the very reason the api tier cannot delegate to
+    /// `Session::wait_for_operation` (Q5). Deterministic through the
+    /// supersede path: the third save admission SYNCHRONOUSLY records the
+    /// second save's `Superseded` completion into the Session queue before
+    /// the third save's worker can finish, so the waiting third operation's
+    /// batch provably carries the superseded sibling first, and it must
+    /// still be retrievable afterwards.
+    #[test]
+    fn flavite_backlog_preserves_sibling_completions() {
+        use crate::command::Invocation;
+        use crate::types::Origin;
+        let (flavite, root, _temp) = test_flavite();
+        await_initial_reconcile(&flavite);
+        let note = root.join("note.md");
+
+        let opened = match flavite.execute(Invocation::new(
+            50,
+            "open_note",
+            serde_json::to_value(&note).unwrap(),
+            Origin::Gui,
+        )) {
+            result @ ExecutionResult::Local(_) => result,
+            ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
+            other => panic!("unexpected open result: {other:?}"),
+        };
+        opened.into_success().expect("open succeeds");
+        let note_value = serde_json::json!(note.to_string_lossy().into_owned());
+
+        // Three admissions with no pump between them: save #1 becomes the
+        // active flight, #2 the coalesced queued successor, #3 replaces the
+        // queued slot — recording `Superseded{#2 by #3}` synchronously.
+        for id in 51..=53 {
+            match flavite.execute(Invocation::new(
+                id,
+                "save_note",
+                note_value.clone(),
+                Origin::Gui,
+            )) {
+                ExecutionResult::Pending { request_id } => {
+                    assert_eq!(request_id, id, "api request id is the invocation id");
+                }
+                other => panic!("expected pending save {id}: {other:?}"),
+            }
+        }
+        let third = flavite.wait_for_operation(53);
+        assert!(
+            matches!(&third, ExecutionResult::Local(LocalResult::Success(_))),
+            "third save must terminate successfully: {third:?}"
+        );
+
+        // The superseded sibling survived the relocation into the backlog.
+        let superseded = flavite.wait_for_operation(52);
+        assert!(
+            matches!(
+                superseded,
+                ExecutionResult::Superseded {
+                    request_id: 52,
+                    by_request: 53,
+                }
+            ),
+            "backlog must preserve the unrelated sibling completion: {superseded:?}"
+        );
+        // …to exactly one consumer: it is no longer in the drain batch.
+        assert!(
+            !flavite
+                .drain_operation_completions()
+                .iter()
+                .any(|completion| completion.request_id == 52),
+            "a backlog-served result must not be delivered twice"
         );
     }
 

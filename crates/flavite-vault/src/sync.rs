@@ -16,6 +16,20 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Duration;
+
+/// Lone-waiter park ceiling for every headless wait loop in the tier
+/// (Session waits ×2 and the api backlog wait). The wake MECHANISM is the
+/// paired condvar's `notify_all` — `record_completion` in the Session,
+/// `drain_operation_completions`/backlog-insert in the api tier; the tick
+/// only bounds how long a waiter that must pump its own installation
+/// idles between passes. Contract: ≤ 40 wakeups/s/idle waiter (vs 1,000/s
+/// for the former 1 ms sleep-poll); worst-case added headless latency
+/// 25 ms — accepted because these are CLI/restore paths, not keystroke
+/// paths (NFR-4). One home for the value (S7): session.rs and flavite.rs
+/// both reference this const; each tier pairs it with its OWN condvar
+/// because a condvar shared across different mutexes would be a bug.
+pub const WAIT_TICK: Duration = Duration::from_millis(25);
 
 /// Process-local count of poison recoveries. Lock sites outside a Session
 /// context increment this directly; the Session mirrors it into its own
@@ -125,6 +139,31 @@ pub(crate) fn poison_test_serial() -> &'static Mutex<()> {
     static SERIAL: Mutex<()> = Mutex::new(());
     &SERIAL
 }
+
+/// Parks taken by the Session's shared wait loop matching
+/// `OBSERVED_WAIT_ID`, for the NFR-3 wakeup-count proof. Lives here (not
+/// in session.rs) so session.rs's first `#[cfg(test)]` stays the tests
+/// module boundary — the per-line production gates must not flip early.
+#[cfg(test)]
+pub(crate) static WAIT_PARKS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static OBSERVED_WAIT_ID: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Park observer for the Session wait loop. The test build counts parks
+/// for the designated observed id; the production build calls an empty
+/// always-inlined function, keeping `#[cfg(test)]` branches out of the
+/// wait loop body (and out of the production region of session.rs, so the
+/// lock-discipline line gates boundary at the real tests module).
+#[cfg(test)]
+pub(crate) fn observe_park(request_id: u64) {
+    if request_id == OBSERVED_WAIT_ID.load(Ordering::Relaxed) {
+        WAIT_PARKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn observe_park(_request_id: u64) {}
 
 /// Deliberately poison a `Mutex` by panicking while holding it. Test-only
 /// injection for NFR-2 proofs; keep the caller's `poison_test_serial`

@@ -13,6 +13,7 @@ use crate::actor::VaultActorHandle;
 use crate::channels::{NoticeChannel, PulseChannel};
 use crate::save::{DiskPrecondition, DurabilityOutcome, SaveFailureStage, SaveRequest};
 use crate::sync::MutexExt;
+use crate::sync::WAIT_TICK;
 use crate::types::{
     Epoch, Generation, ReconcileMode, ReconcileScope, ReconcileSummary, RenameStrategy,
     VaultConfig, VaultIdentity,
@@ -95,23 +96,6 @@ const MAX_PENDING_SAVE_OPERATIONS: usize = 4096;
 /// guard (proven by the S5 replay test).
 const JOURNAL_MEMO_CAP: usize = 4096;
 
-/// Lone-waiter park ceiling for the headless wait loops (S6). The wake
-/// MECHANISM is `record_completion`'s `notify_all` on the paired
-/// `completions_cv`; this tick only bounds how long a waiter that must
-/// pump its own worker installation idles between passes. Timing-contract
-/// table (Session waits ×2, api backlog wait): wake source = recorded
-/// completion; ceiling = 25 ms; ≤ 40 wakeups/s/idle waiter (vs 1,000/s for
-/// the former 1 ms sleep-poll).
-const WAIT_TICK: Duration = Duration::from_millis(25);
-
-/// Parks taken by the shared wait loop, for the NFR-3 wakeup-count proof.
-/// Test-gated counter: production wait paths hold no telemetry branches.
-/// Counts only the waiter whose id is designated in `OBSERVED_WAIT_ID` so
-/// concurrent tests' waits cannot contaminate the budget.
-#[cfg(test)]
-static WAIT_PARKS: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
-static OBSERVED_WAIT_ID: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Bounded pending cold opens (RFC-0003 §12.1: pending opens ≤128).
 const MAX_PENDING_OPEN_NOTES: usize = 128;
 /// Concurrent cold-open read flights (RFC-0003 §12.1).
@@ -1945,7 +1929,7 @@ impl Session {
     /// completions only inside the pump functions, so a lone waiter must
     /// pump itself), takes its own result losslessly, checks liveness, then
     /// parks on `completions_cv` until a recorded completion or the
-    /// `WAIT_TICK` ceiling. No `thread::sleep`, no `driving_turn`.
+    /// `WAIT_TICK` ceiling. No sleeping poll, no `driving_turn`.
     /// Worst-case lone-waiter added latency is 25 ms versus the old 1 ms
     /// busy-poll — accepted for headless paths: CPU per idle waiter drops
     /// from ~1,000 wakeups/s to ≤ 40/s (NFR-3/NFR-4).
@@ -1970,10 +1954,7 @@ impl Session {
             // completion recorded between the check and the park is visible
             // to the condition predicate before the waiter ever sleeps.
             let completions = self.completions.lock_recovering();
-            #[cfg(test)]
-            if request_id == OBSERVED_WAIT_ID.load(Ordering::Relaxed) {
-                WAIT_PARKS.fetch_add(1, Ordering::Relaxed);
-            }
+            crate::sync::observe_park(request_id);
             let _waited = crate::sync::wait_result_recovering(
                 self.completions_cv
                     .wait_timeout_while(completions, WAIT_TICK, |queue| {
@@ -4200,7 +4181,7 @@ mod tests {
         let (session, _fs, _temp) = test_session();
 
         // (a) Unknown id: immediate, no park.
-        let before_parks = WAIT_PARKS.load(Ordering::Relaxed);
+        let before_parks = crate::sync::WAIT_PARKS.load(Ordering::Relaxed);
         let unknown = session.wait_for_operation(9_999);
         assert!(
             matches!(&unknown, SessionResult::Error { message }
@@ -4208,7 +4189,7 @@ mod tests {
             "{unknown:?}"
         );
         assert_eq!(
-            WAIT_PARKS.load(Ordering::Relaxed),
+            crate::sync::WAIT_PARKS.load(Ordering::Relaxed),
             before_parks,
             "the unknown-id exit must not park"
         );
@@ -4217,8 +4198,8 @@ mod tests {
         // delivery ends the wait.
         let request_id = 6_666u64;
         let _keep = fabricate_inflight_save(&session, request_id);
-        OBSERVED_WAIT_ID.store(request_id, Ordering::Relaxed);
-        WAIT_PARKS.store(0, Ordering::Relaxed);
+        crate::sync::OBSERVED_WAIT_ID.store(request_id, Ordering::Relaxed);
+        crate::sync::WAIT_PARKS.store(0, Ordering::Relaxed);
         let session = std::sync::Arc::new(session);
         std::thread::scope(|scope| {
             let waiter = {
@@ -4230,10 +4211,10 @@ mod tests {
                 !waiter.is_finished(),
                 "a never-completed wait must stay parked, not exit silently"
             );
-            let parks = WAIT_PARKS.load(Ordering::Relaxed);
+            let parks = crate::sync::WAIT_PARKS.load(Ordering::Relaxed);
             session.record_completion(request_id, SessionResult::Busy);
             let result = waiter.join().expect("waiter thread");
-            OBSERVED_WAIT_ID.store(u64::MAX, Ordering::Relaxed);
+            crate::sync::OBSERVED_WAIT_ID.store(u64::MAX, Ordering::Relaxed);
             assert!(matches!(result, SessionResult::Busy));
             // ≤ 40/s budget over 600 ms = 24, plus scheduling slack; a 1 ms
             // spin would show ~600 parks. ≥ 10 proves timeout-driven
