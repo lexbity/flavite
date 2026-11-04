@@ -1,14 +1,27 @@
 //! Per-vault graph base service (RFC-0003 TD-12, W07, §10.1, §12.1;
-//! RFC-0004 S6 incremental bridge).
+//! RFC-0004 S6 incremental bridge; RFC-0005 event spine).
 //!
 //! One service per vault, one bounded worker thread: it owns the *only*
-//! database handle on the graph path, polls the index at a fixed cadence
-//! plus host-sent invalidation hints, and advances a [`GraphMirror`] from
+//! database handle on the graph path. Freshness is event-driven
+//! (RFC-0005): the index writer's [`GenerationSignal`] broadcast wakes the
+//! service on every committed structural generation; buffer transitions
+//! (S6) wake it through [`BufferWatch`] with a trailing-edge debounce;
+//! a slow sweep is recovery, not the mechanism. The mirror advances from
 //! the typed change feed — reading only changed entities — then publishes
 //! immutable [`GraphFrame`]s the UI consumes without ever waiting (D15:
 //! the frame path is an atomic pointer load). The SQLite-backed feed bridge
 //! lives here — below the facade boundary, never inside `flavite-graph` and
 //! never exposed as a connection handle to the UI (§5.1).
+//!
+//! # The change log stays the only correctness authority
+//!
+//! Events are a latency optimization (§4.1). Every wake is verified
+//! against the mirror's own cursor over the change feed before touching the
+//! database; a wake whose watermark equals the mirror cursor with an
+//! unchanged buffer stamp skips all DB work (FR-3); the 5 s sweep
+//! re-checks currency against the *database* (never the channel); and the
+//! parity guard stays the drift-detection path. A dropped event is
+//! invisible until the next event or sweep — never a correctness loss.
 //!
 //! Publications stay *complete* (D7): the mirror emits a full [`GraphBatch`]
 //! per bump and [`GraphPublisher`] still diffs consecutive complete sets, so
@@ -20,6 +33,12 @@
 //! A changed epoch (entity ids may be reused) rebuilds the model and
 //! re-installs the layout worker instead of delta-feeding through the reset
 //! (§4.14).
+//!
+//! The service holds ONE long-lived read-only connection per service
+//! attempt (RFC-0005 §4.5), revalidated each wake against `meta.vault_uuid`
+//! and reopened on mismatch or error. Every read runs inside a short
+//! `unchecked_transaction` that ends before the pump returns, so the WAL
+//! is never pinned across writer checkpoints.
 
 use flavite_vault::sync::MutexExt;
 use std::path::{Path, PathBuf};
@@ -36,18 +55,28 @@ use flavite_graph::{
     GraphPublisher, LayoutCommand, LayoutWorker, LayoutWorkerConfig, NodeId, PositionBuffer,
     RenderKey,
 };
+use flavite_index::types::IndexVersion;
 use flavite_index::GenerationWatch;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::graph_mirror::{GraphMirror, MirrorStats, ParityOutcome, ParityPolicy, Synchronize};
 use crate::graph_projection::{GraphProjection, GraphViewToken, ScopeRequest};
 use crate::{Flavite, FlaviteError, StoredUserState};
-use flavite_vault::session::Session;
+use flavite_vault::session::{BufferWatch, Session};
 use std::collections::BTreeMap;
 
-/// Base feed poll cadence (§12.1: "One service per vault, 250 ms poll plus
-/// invalidation hints").
-pub const GRAPH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// RFC-0005 §4.1: the sweep is *recovery*, not the mechanism. A quiet
+/// system wakes at this cadence to re-check currency against the database
+/// (one cursor meta read) — the leg that catches external writers and any
+/// notification bug. The 250 ms poll cadence of RFC-0004 retires.
+pub const GRAPH_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// RFC-0005 §4.4: trailing-edge debounce for buffer-triggered rebuilds.
+/// The first stamp change schedules a rebuild at `last_change + 150 ms`;
+/// further changes within the window move the deadline; the deadline fire
+/// rebuilds once over the accumulated stamp. Index-delta rebuilds are
+/// never debounced.
+pub const GRAPH_BUFFER_DEBOUNCE: Duration = Duration::from_millis(150);
 
 fn workspace_layout_config() -> LayoutWorkerConfig {
     LayoutWorkerConfig {
@@ -63,18 +92,24 @@ fn workspace_layout_config() -> LayoutWorkerConfig {
     }
 }
 
-/// Bounded hint queue: a saturated service coalesces into the next poll
-/// rather than growing an unbounded backlog (§12.1 typed Busy).
+/// Bounded control-channel capacity: a saturated service coalesces rather
+/// than growing an unbounded backlog (§12.1 typed Busy).
 const HINT_QUEUE_CAPACITY: usize = 8;
 
-/// Why the service thread must poll right now.
+/// Control-channel directives. RFC-0005 FR-11: `Directive::Poll` is
+/// deleted — the index wake rides the writer's generation broadcast and
+/// the sweep is the timeout; what remains is explicit, semantic control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Directive {
-    /// Poll the bridge on the next loop pass.
-    Poll,
     /// Re-install the layout worker from the current publication (explicit
-    /// "Retry layout" after a worker panic, §12.1 restart policy).
+    /// "Retry layout" after a worker panic, §12.1 restart policy). Also
+    /// forces a pump (recovery runs the full loop).
     Relayout,
+    /// Force an immediate re-evaluation pump: a scope change (request or
+    /// release — the pump reads `Shared::scopes` each pass) and the
+    /// test/doctor kick. Never skip-able: scope changes alter output at an
+    /// unchanged index version.
+    Reevaluate,
     #[cfg(test)]
     Panic,
 }
@@ -139,8 +174,17 @@ pub enum GraphServiceStatus {
 /// Bounded fixed-cardinality counters (§13.4 metrics; no per-note labels).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GraphServiceMetrics {
-    /// Poll passes executed.
-    pub polls_total: u64,
+    /// Event-driven wakes (index broadcast) executed.
+    pub wakes_total: u64,
+    /// Sweep (timeout) passes executed.
+    pub sweeps_total: u64,
+    /// Trailing-edge debounce deadline fires (buffer-triggered rebuilds).
+    pub debounced_rebuilds_total: u64,
+    /// Wakes skipped on `watermark == cursor` with an unchanged buffer
+    /// stamp (FR-3): no database read, no mirror lock.
+    pub watermark_skips_total: u64,
+    /// Long-lived read-connection (re)establishments.
+    pub connection_reopens_total: u64,
     /// Complete batches applied.
     pub batches_total: u64,
     /// Full-model rebuilds (first read and epoch changes).
@@ -178,27 +222,38 @@ struct Shared {
     /// writes the database through it. True invariant (FR-8, RFC-0005 S3):
     /// the pump's critical section is exactly `synchronize` → poison →
     /// parity-when-due → `view_arc` — the overlay assembly (`build`) runs
-    /// on the `Arc<SavedGraph>` snapshot handoff **after the guard is
+    /// on the `Arc<SavedSnapshot>` snapshot handoff **after the guard is
     /// dropped**, so a concurrent `check_mirror_parity` waits at most one
     /// synchronize (≈1 ms p99) plus, when the guard is due, one parity
     /// full read — never an overlay pass (NFR-7; proven by
     /// `doctor_parity_never_waits_behind_overlay_assembly`).
     mirror: std::sync::Mutex<GraphMirror>,
-    /// RFC-0005 S1: the watch half of the writer-side generation broadcast
-    /// (when the host constructed the vault with a signal). Stored per
-    /// service so S5's event loop can wake on it; until then the pump
-    /// ignores it and freshness remains the 250 ms cadence + hint path —
-    /// this field's presence must not change any pump behavior.
-    #[allow(
-        dead_code,
-        reason = "wired in RFC-0005 S1 (constructor seam); the S5 event loop is its first consumer"
-    )]
+    /// RFC-0005 S1: the watch half of the writer-side generation broadcast.
+    /// `None` when no signal was wired (CLI/tests): the index channel is
+    /// then a never-sending stub and freshness rides the sweep + control
+    /// wakes.
     index_watch: Option<Arc<GenerationWatch>>,
+    /// RFC-0005 S6: the watch half of the session's buffer-transition
+    /// broadcast. `None` when no buffer signal was wired: the buffer
+    /// channel is a never-sending stub.
+    buffer_watch: Option<Arc<BufferWatch>>,
+    /// The mirror cursor as of the last synchronize (advisory; written
+    /// only by the mutex holder). The FR-3 skip compares the wake's
+    /// watermark against these — never opening the database or locking
+    /// the mirror to do so.
+    mirror_epoch: AtomicU64,
+    mirror_generation: AtomicU64,
+    /// Injectable time source (debounce tests; `None` = `Instant::now`).
+    clock: Option<Arc<dyn Fn() -> std::time::Instant + Send + Sync>>,
 }
 
 #[derive(Debug, Default)]
 struct Counters {
-    polls: AtomicU64,
+    wakes: AtomicU64,
+    sweeps: AtomicU64,
+    debounced_rebuilds: AtomicU64,
+    watermark_skips: AtomicU64,
+    connection_reopens: AtomicU64,
     batches: AtomicU64,
     resets: AtomicU64,
     stale_dropped: AtomicU64,
@@ -259,19 +314,17 @@ impl GraphService {
     }
 
     pub(crate) fn start_with_session(db_path: PathBuf, session: Option<Arc<Session>>) -> Arc<Self> {
-        Self::start_with_policy(db_path, session, ParityPolicy::default(), None)
+        Self::start_with_policy(db_path, session, ParityPolicy::default(), None, None, None)
     }
 
     /// RFC-0005 S1 seam: start the service holding the generation broadcast's
-    /// watch. The pump does not consume it yet (S5 rewrites the wake
-    /// mechanics); until then freshness behavior is byte-identical to
-    /// [`Self::start_with_session`].
+    /// watch. The event loop consumes it (S5).
     pub(crate) fn start_with_index_watch(
         db_path: PathBuf,
         session: Option<Arc<Session>>,
         index_watch: Option<Arc<GenerationWatch>>,
     ) -> Arc<Self> {
-        Self::start_with_policy(db_path, session, ParityPolicy::default(), index_watch)
+        Self::start_with_policy(db_path, session, ParityPolicy::default(), index_watch, None, None)
     }
 
     /// Test/bench seam: same service with a tightened mirror drift guard
@@ -283,7 +336,22 @@ impl GraphService {
         session: Option<Arc<Session>>,
         policy: ParityPolicy,
     ) -> Arc<Self> {
-        Self::start_with_policy(db_path, session, policy, None)
+        Self::start_with_policy(db_path, session, policy, None, None, None)
+    }
+
+    /// RFC-0005 S5/S6 test seam: start the service with the full event-spine
+    /// wiring (index watch, buffer watch) and an injectable clock for
+    /// debounce tests. `clock = None` uses `Instant::now`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn start_with_signals(
+        db_path: PathBuf,
+        session: Option<Arc<Session>>,
+        index_watch: Option<Arc<GenerationWatch>>,
+        buffer_watch: Option<Arc<BufferWatch>>,
+        clock: Option<Arc<dyn Fn() -> std::time::Instant + Send + Sync>>,
+    ) -> Arc<Self> {
+        Self::start_with_policy(db_path, session, ParityPolicy::default(), index_watch, buffer_watch, clock)
     }
 
     fn start_with_policy(
@@ -291,6 +359,8 @@ impl GraphService {
         session: Option<Arc<Session>>,
         policy: ParityPolicy,
         index_watch: Option<Arc<GenerationWatch>>,
+        buffer_watch: Option<Arc<BufferWatch>>,
+        clock: Option<Arc<dyn Fn() -> std::time::Instant + Send + Sync>>,
     ) -> Arc<Self> {
         let shared = Arc::new(Shared {
             frame: ArcSwapOption::empty(),
@@ -302,6 +372,10 @@ impl GraphService {
             retry_layout: AtomicBool::new(false),
             mirror: std::sync::Mutex::new(GraphMirror::with_parity_policy(session.clone(), policy)),
             index_watch,
+            buffer_watch,
+            mirror_epoch: AtomicU64::new(0),
+            mirror_generation: AtomicU64::new(0),
+            clock,
         });
         let (hints, hint_rx) = bounded::<Directive>(HINT_QUEUE_CAPACITY);
         let stop = Arc::new(AtomicBool::new(false));
@@ -366,7 +440,7 @@ impl GraphService {
         }
         scopes.insert(request.token.tab, request);
         drop(scopes);
-        self.notify_changed();
+        self.reevaluate();
         Ok(())
     }
 
@@ -391,7 +465,11 @@ impl GraphService {
     pub fn metrics(&self) -> GraphServiceMetrics {
         let counters = &self.shared.counters;
         GraphServiceMetrics {
-            polls_total: counters.polls.load(Ordering::Relaxed),
+            wakes_total: counters.wakes.load(Ordering::Relaxed),
+            sweeps_total: counters.sweeps.load(Ordering::Relaxed),
+            debounced_rebuilds_total: counters.debounced_rebuilds.load(Ordering::Relaxed),
+            watermark_skips_total: counters.watermark_skips.load(Ordering::Relaxed),
+            connection_reopens_total: counters.connection_reopens.load(Ordering::Relaxed),
             batches_total: counters.batches.load(Ordering::Relaxed),
             resets_total: counters.resets.load(Ordering::Relaxed),
             stale_dropped_total: counters.stale_dropped.load(Ordering::Relaxed),
@@ -422,18 +500,28 @@ impl GraphService {
         Ok(outcome)
     }
 
-    /// Wake the poller after a vault-changed pulse (§12.1 invalidation
-    /// hints). A full queue coalesces into the next scheduled poll — the
-    /// cadence bounds the work either way.
-    pub fn notify_changed(&self) {
-        let _ = self.hints.try_send(Directive::Poll);
+    /// Force an immediate re-evaluation pump (RFC-0005 FR-11: `Poll` is
+    /// gone; this is the explicit wake for scope changes and the
+    /// test/doctor kick). Never skip-able — scope changes alter output at
+    /// an unchanged index version.
+    pub fn reevaluate(&self) {
+        let _ = self.hints.try_send(Directive::Reevaluate);
     }
 
     /// Re-install the layout worker from the current publication (worker
-    /// panic recovery and the explicit "Retry layout" control).
+    /// panic recovery and the explicit "Retry layout" control). Also
+    /// forces a pump (recovery runs the full loop).
     pub fn relayout(&self) {
         self.shared.retry_layout.store(true, Ordering::Release);
         let _ = self.hints.try_send(Directive::Relayout);
+    }
+
+    /// The service's time source (tests inject a fake clock).
+    fn now(&self) -> std::time::Instant {
+        match &self.shared.clock {
+            Some(clock) => clock(),
+            None => std::time::Instant::now(),
+        }
     }
 
     /// The database path this service reads (diagnostics only; no handle
@@ -446,7 +534,7 @@ impl GraphService {
     /// Ask the thread to stop and join it. Idempotent.
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Release);
-        let _ = self.hints.try_send(Directive::Poll);
+        let _ = self.hints.try_send(Directive::Reevaluate);
         if let Some(handle) = self.thread.lock_recovering().take() {
             let _ = handle.join();
         }
@@ -456,9 +544,9 @@ impl GraphService {
 impl Drop for GraphService {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        let _ = self.hints.try_send(Directive::Poll);
+        let _ = self.hints.try_send(Directive::Reevaluate);
         // The thread is joined opportunistically by `shutdown`; dropping
-        // without an explicit join still ends it within one poll interval.
+        // without an explicit join still ends it within one sweep interval.
     }
 }
 
@@ -469,13 +557,13 @@ impl Drop for GraphService {
 fn run_service(
     db_path: &Path,
     shared: &Arc<Shared>,
-    hint_rx: &Receiver<Directive>,
+    control_rx: &Receiver<Directive>,
     stop: &AtomicBool,
     session: Option<&Arc<Session>>,
 ) {
     let mut restarts = std::collections::VecDeque::new();
     while !stop.load(Ordering::Acquire) {
-        if !run_service_attempt(db_path, shared, hint_rx, stop, session) {
+        if !run_service_attempt(db_path, shared, control_rx, stop, session) {
             break;
         }
         let now = std::time::Instant::now();
@@ -495,7 +583,7 @@ fn run_service(
                     restarts.clear();
                     break;
                 }
-                match hint_rx.recv_timeout(GRAPH_POLL_INTERVAL) {
+                match control_rx.recv_timeout(GRAPH_SWEEP_INTERVAL) {
                     Ok(Directive::Relayout) => {}
                     Err(crossbeam::channel::RecvTimeoutError::Disconnected) => return,
                     _ => {}
@@ -510,10 +598,22 @@ fn run_service(
     }
 }
 
+/// The per-attempt signal receivers. Watches are `Arc`-shared across
+/// restarts (RFC-0005 §4.10): a send into a dead attempt's channel is a
+/// `try_send` drop — harmless. Missing watches become never-sending stub
+/// channels held open by their keep-alive senders, so the select shape is
+/// uniform.
+struct SignalHandles {
+    index: Receiver<IndexVersion>,
+    buffer: Receiver<()>,
+    _index_keepalive: Sender<IndexVersion>,
+    _buffer_keepalive: Sender<()>,
+}
+
 fn run_service_attempt(
     db_path: &Path,
     shared: &Arc<Shared>,
-    hint_rx: &Receiver<Directive>,
+    control_rx: &Receiver<Directive>,
     stop: &AtomicBool,
     session: Option<&Arc<Session>>,
 ) -> bool {
@@ -521,13 +621,124 @@ fn run_service_attempt(
         let mut publisher = GraphPublisher::new();
         let mut layout = LayoutState::default();
         let mut last_signature = None;
+        let mut connection = MaybeConnection::new();
+        let mut debounce_deadline: Option<std::time::Instant> = None;
+        let mut last_stamp_version: u64 = 0;
+
+        let (dummy_tx, dummy_rx) = bounded::<IndexVersion>(1);
+        let (dummy_buf_tx, dummy_buf_rx) = bounded::<()>(1);
+        let handles = SignalHandles {
+            index: shared
+                .index_watch
+                .as_ref()
+                .map_or_else(|| dummy_rx, |watch| watch.receiver().clone()),
+            buffer: shared
+                .buffer_watch
+                .as_ref()
+                .map_or_else(|| dummy_buf_rx, |watch| watch.receiver().clone()),
+            _index_keepalive: dummy_tx,
+            _buffer_keepalive: dummy_buf_tx,
+        };
+
         while !stop.load(Ordering::Acquire) {
-            match hint_rx.recv_timeout(GRAPH_POLL_INTERVAL) {
-                #[cfg(test)]
-                Ok(Directive::Panic) => panic!("injected graph worker failure"),
-                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
-                _ => {}
+            // Compute the select timeout: the sweep period, shortened by a
+            // pending debounce deadline.
+            let now = shared_clock(shared);
+            let mut timeout = GRAPH_SWEEP_INTERVAL;
+            if let Some(deadline) = debounce_deadline {
+                timeout = if now >= deadline {
+                    Duration::ZERO
+                } else {
+                    timeout.min(deadline.saturating_duration_since(now))
+                };
             }
+
+            let mut timed_out = false;
+            let mut index_wake: Option<IndexVersion> = None;
+            let mut force_pump = false;
+            crossbeam::select! {
+                recv(handles.index) -> msg => {
+                    index_wake = msg.ok();
+                }
+                recv(handles.buffer) -> msg => {
+                    // S6: any buffer transition arms (or moves) the
+                    // trailing-edge debounce deadline.
+                    if msg.is_ok() {
+                        debounce_deadline = Some(shared_clock(shared) + GRAPH_BUFFER_DEBOUNCE);
+                    }
+                }
+                recv(control_rx) -> msg => {
+                    match msg {
+                        Ok(Directive::Relayout) => {
+                            shared.retry_layout.store(true, Ordering::Release);
+                            force_pump = true;
+                        }
+                        Ok(Directive::Reevaluate) => force_pump = true,
+                        Err(_) => break,
+                        #[cfg(test)]
+                        Ok(Directive::Panic) => panic!("injected graph worker failure"),
+                    }
+                }
+                default(timeout) => timed_out = true,
+            }
+
+            // A full sweep period elapsed with no signal: recovery wake.
+            if timed_out && timeout == GRAPH_SWEEP_INTERVAL {
+                shared.counters.sweeps.fetch_add(1, Ordering::Relaxed);
+                force_pump = true;
+            }
+
+            // Coalesce bursts (RFC-0005 §4.2): drain queued index wakes;
+            // the newest wins — intermediate generations are never observed.
+            if index_wake.is_some() {
+                while let Ok(latest) = handles.index.try_recv() {
+                    index_wake = Some(latest);
+                }
+            }
+
+            // Trailing-edge debounce deadline fire (S6).
+            if debounce_deadline.is_some_and(|deadline| shared_clock(shared) >= deadline) {
+                debounce_deadline = None;
+                shared
+                    .counters
+                    .debounced_rebuilds
+                    .fetch_add(1, Ordering::Relaxed);
+                force_pump = true;
+            }
+
+            let wake: Option<IndexVersion> = match index_wake {
+                Some(version) => Some(version),
+                None => {
+                    if !force_pump {
+                        continue;
+                    }
+                    // Sweep/control/debounce pumps carry no watermark; they
+                    // always verify against the database (FR-5).
+                    None
+                }
+            };
+
+            if wake.is_some() {
+                shared.counters.wakes.fetch_add(1, Ordering::Relaxed);
+            }
+
+            // FR-3: an index wake whose watermark equals the mirror's last
+            // synchronized cursor with an unchanged buffer stamp (and no
+            // pending debounce/force) skips ALL database work — no
+            // connection open, no mirror lock.
+            if !force_pump
+                && let Some(wake) = wake
+                && wake.epoch == shared.mirror_epoch.load(Ordering::Acquire)
+                && wake.generation == shared.mirror_generation.load(Ordering::Acquire)
+                && session.map_or(0, |s| s.buffer_stamp_version()) == last_stamp_version
+            {
+                shared
+                    .counters
+                    .watermark_skips
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
             if shared.retry_layout.swap(false, Ordering::AcqRel) {
                 layout.relayout(shared);
                 last_signature = None;
@@ -535,23 +746,18 @@ fn run_service_attempt(
             if stop.load(Ordering::Acquire) {
                 break;
             }
-            shared.counters.polls.fetch_add(1, Ordering::Relaxed);
+
             let scopes = shared.scopes.lock_recovering().clone();
             let read = (|| -> Result<Option<(Arc<GraphProjection>, bool)>, String> {
                 if !db_path.exists() {
                     return Err("Index not available yet".to_owned());
                 }
-                let mut connection =
-                    Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-                        .map_err(|_| "Graph index unavailable")?;
-                connection
-                    .busy_timeout(Duration::from_millis(50))
-                    .map_err(|_| "Graph index unavailable")?;
+                let conn = connection.ensure(db_path, &shared.counters)?;
                 let previous = shared.frame.load_full();
                 // RFC-0004 S6: advance the mirror by the change feed, run
                 // the §6.5.4 drift guard when due. RFC-0005 F1 (FR-8): the
                 // complete saved state leaves the mutex as an
-                // `Arc<SavedGraph>` snapshot handoff — the critical
+                // `Arc<SavedSnapshot>` snapshot handoff — the critical
                 // section below is exactly synchronize → poison → parity →
                 // view_arc, and `build`'s overlay assembly runs after the
                 // guard is dropped. A concurrent doctor `check_mirror_parity`
@@ -561,7 +767,7 @@ fn run_service_attempt(
                 let (snapshot, force_reset) = {
                     let mut mirror = shared.mirror.lock_recovering();
                     let mut force_reset = false;
-                    match mirror.synchronize(&connection)? {
+                    match mirror.synchronize(conn)? {
                         Synchronize::UpToDate => {}
                         Synchronize::Delta { reset, .. } => {
                             force_reset = reset;
@@ -572,7 +778,7 @@ fn run_service_attempt(
                                 ?reason,
                                 "graph mirror rebuilding from a full consistent read"
                             );
-                            mirror.force_reset(&connection)?;
+                            mirror.force_reset(conn)?;
                             force_reset = true;
                         }
                     }
@@ -581,15 +787,15 @@ fn run_service_attempt(
                     // rebuild from the full truth and reset the model in
                     // this same pump (§4.7).
                     if mirror.is_poisoned() {
-                        mirror.force_reset(&connection)?;
+                        mirror.force_reset(conn)?;
                         force_reset = true;
-                    } else if mirror.parity_due(std::time::Instant::now()) {
+                    } else if mirror.parity_due(shared_clock(shared)) {
                         // Parity guard (D8, §6.5.4): counter-driven, inside
                         // this loop — no dedicated thread. A mismatch
                         // rebuilds the view before the projection is built,
                         // so the drifted state never reaches a published
                         // frame.
-                        let parity = mirror.parity_check(&connection)?;
+                        let parity = mirror.parity_check(conn)?;
                         if !parity.matched() {
                             tracing::warn!(
                                 target: "flavite_api::graph_service",
@@ -598,10 +804,17 @@ fn run_service_attempt(
                                 findings = ?parity.findings,
                                 "graph mirror drifted from the full consistent read; rebuilding"
                             );
-                            mirror.force_reset(&connection)?;
+                            mirror.force_reset(conn)?;
                             force_reset = true;
                         }
                     }
+                    // Record the post-synchronize cursor: the FR-3 skip
+                    // compares future wake watermarks against it without
+                    // locking the mirror again.
+                    shared.mirror_epoch.store(mirror.cursor().epoch, Ordering::Release);
+                    shared
+                        .mirror_generation
+                        .store(mirror.cursor().generation, Ordering::Release);
                     // Counters publish last within the section: the set
                     // handed to `GraphServiceMetrics` includes this pump's
                     // snapshot build, so a settled service satisfies the
@@ -612,7 +825,7 @@ fn run_service_attempt(
                     (snapshot, force_reset)
                 };
                 crate::graph_projection::build(
-                    &mut connection,
+                    conn,
                     &snapshot,
                     session,
                     &scopes,
@@ -622,6 +835,9 @@ fn run_service_attempt(
             })();
             match read {
                 Ok(None) => {
+                    // The mirror is current and the projection is unchanged;
+                    // record the stamp so quiet index wakes skip cleanly.
+                    last_stamp_version = session.map_or(0, |s| s.buffer_stamp_version());
                     if let Some(frame) = shared.frame.load_full()
                         && layout.drive(frame.publication(), shared)
                         && let Some(positions) = &layout.positions
@@ -649,6 +865,7 @@ fn run_service_attempt(
                         projection.digest,
                         scopes,
                     );
+                    last_stamp_version = session.map_or(0, |s| s.buffer_stamp_version());
                     if last_signature.as_ref() == Some(&signature) {
                         continue;
                     }
@@ -709,6 +926,75 @@ fn run_service_attempt(
             .fetch_add(1, Ordering::Relaxed);
     }
     guarded.is_err()
+}
+
+/// The service's time source (tests inject a fake clock via
+/// [`GraphService::start_with_signals`]).
+fn shared_clock(shared: &Arc<Shared>) -> std::time::Instant {
+    match &shared.clock {
+        Some(clock) => clock(),
+        None => std::time::Instant::now(),
+    }
+}
+
+/// The service's long-lived read connection (RFC-0005 §4.5): opened once
+/// per service attempt, kept open across pumps, revalidated each wake
+/// against `meta.vault_uuid` and reopened on mismatch or any read error —
+/// a DB recreate must never be read silently through a stale handle. Every
+/// read inside a pump runs in a short transaction that ends before the pump
+/// returns, so this handle never pins the WAL across writer checkpoints.
+struct MaybeConnection {
+    conn: Option<Connection>,
+    expected_uuid: Option<String>,
+}
+
+impl MaybeConnection {
+    fn new() -> Self {
+        Self {
+            conn: None,
+            expected_uuid: None,
+        }
+    }
+
+    /// Revalidate and return the current read connection, reopening when
+    /// the vault UUID changed (DB recreate), the meta read fails, or the
+    /// handle was never opened. Each (re)open is counted.
+    fn ensure(&mut self, db_path: &Path, counters: &Counters) -> Result<&mut Connection, String> {
+        if let Some(conn) = &self.conn {
+            let still_valid = match read_meta_string(conn, "vault_uuid") {
+                Ok(uuid) => uuid == self.expected_uuid,
+                Err(_) => false,
+            };
+            if still_valid {
+                return Ok(self.conn.as_mut().expect("held connection"));
+            }
+            // Mismatch or read error: drop the stale handle and reopen.
+            self.conn = None;
+        }
+        let conn = open_readonly(db_path)?;
+        let uuid = read_meta_string(&conn, "vault_uuid")
+            .map_err(|_| "Graph index unavailable".to_owned())?;
+        counters.connection_reopens.fetch_add(1, Ordering::Relaxed);
+        self.conn = Some(conn);
+        self.expected_uuid = uuid;
+        Ok(self.conn.as_mut().expect("just opened"))
+    }
+}
+
+fn open_readonly(db_path: &Path) -> Result<Connection, String> {
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| "Graph index unavailable")?;
+    conn.busy_timeout(Duration::from_millis(50))
+        .map_err(|_| "Graph index unavailable")?;
+    Ok(conn)
+}
+
+/// Read one `meta` value as text (`None` when the key is absent).
+fn read_meta_string(conn: &Connection, key: &str) -> Result<Option<String>, rusqlite::Error> {
+    conn.query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
+        row.get::<_, String>(0)
+    })
+    .optional()
 }
 
 /// The service's layout-worker ownership (spawn on demand, replace on
@@ -971,11 +1257,6 @@ impl Flavite {
     #[must_use]
     pub fn graph_metrics(&self) -> GraphServiceMetrics {
         self.graph.metrics()
-    }
-
-    /// Hint the graph service after a vault-content change (§12.1).
-    pub fn graph_notify_changed(&self) {
-        self.graph.notify_changed();
     }
 
     /// Explicitly re-install the layout worker from the current base

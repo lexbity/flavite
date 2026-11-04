@@ -64,7 +64,7 @@ pub fn inspect(
     else {
         return;
     };
-    let Some(occurrence) = state.occurrences.get(index).cloned() else {
+    let Some(occurrence) = state.occurrences.iter().nth(index).cloned() else {
         return;
     };
     let Some(api) = app.flavite.as_ref() else {

@@ -183,6 +183,61 @@ pub type GraphBufferStamp = (
     Option<[u8; 32]>,
 );
 
+/// Writer-side broadcast of buffer transitions that can change
+/// `graph_buffer_stamp()` output (RFC-0005 §5.1/§4.4).
+///
+/// Same discipline as the index's [`flavite_index::GenerationSignal`]:
+/// lossy by design — bounded(1), latest-wins, drop-on-full — because the
+/// graph service debounces buffer triggers (trailing 150 ms) and never
+/// needs a queue of stale pulses, only "a stamp-relevant transition
+/// happened". The change log / saved index stays the only correctness
+/// authority; a dropped buffer wake is bounded by the service's 5 s
+/// sweep.
+#[derive(Clone, Debug)]
+pub struct BufferSignal {
+    tx: crossbeam::channel::Sender<()>,
+}
+
+/// The receiver half of a buffer-transition broadcast (owned by the graph
+/// service).
+pub struct BufferWatch {
+    rx: crossbeam::channel::Receiver<()>,
+}
+
+impl BufferSignal {
+    /// Create a connected sender/watch pair. No `Default` (mirrors
+    /// [`flavite_index::GenerationSignal`]): a default sender would drop
+    /// its watch half silently.
+    #[must_use]
+    pub fn new() -> (Self, BufferWatch) {
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        (Self { tx }, BufferWatch { rx })
+    }
+
+    /// Announce one stamp-relevant buffer transition. Cost: one atomic
+    /// traffic + one `try_send` (~50 ns on the calling thread). Drops
+    /// silently when the slot is occupied or no watch remains.
+    pub fn publish(&self) {
+        let _ = self.tx.try_send(());
+    }
+}
+
+impl BufferWatch {
+    /// Wait up to `timeout` for the next buffer transition. `None` on
+    /// timeout and on disconnection.
+    #[must_use]
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<()> {
+        self.rx.recv_timeout(timeout).ok()
+    }
+
+    /// The underlying receiver, for the graph service's select loop.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn receiver(&self) -> &crossbeam::channel::Receiver<()> {
+        &self.rx
+    }
+}
+
 /// Immutable shared snapshot for multiple views of the same buffer revision.
 #[derive(Debug, Clone)]
 pub struct SharedBufferSnapshot {
@@ -660,6 +715,18 @@ pub struct Session {
     link_jobs: Option<crossbeam::channel::Sender<LinkJob>>,
     /// Completed prepare results awaiting installation on a Session turn.
     link_results: crossbeam::channel::Receiver<LinkOutcomeMessage>,
+    /// RFC-0005 S6: writer-side broadcast of stamp-relevant buffer
+    /// transitions (revision bump, state dirty/clean, path change,
+    /// base-hash change). `None` when no consumer wired a watch (CLI/
+    /// tests): transitions are still counted on `buffer_stamp_version`.
+    buffer_signal: Option<BufferSignal>,
+    /// Monotonic version of `graph_buffer_stamp()` output (RFC-0005 S5):
+    /// incremented on every transition that can change the stamp, so the
+    /// graph service can detect "stamp unchanged" without an actor hop.
+    /// Advisory: a mutation that does not change the stamp (e.g. a save of
+    /// an already-clean buffer) is a harmless false positive — it only
+    /// arms a debounce.
+    buffer_stamp_version: AtomicU64,
 }
 
 /// One queued semantic-link prepare job (W05).
@@ -675,7 +742,7 @@ struct LinkOutcomeMessage {
 }
 
 impl Session {
-    /// Create a new Session.
+    /// Create a new Session without a buffer-transition broadcast.
     pub fn new(
         identity: VaultIdentity,
         actor: VaultActorHandle,
@@ -683,6 +750,49 @@ impl Session {
         pulse: PulseChannel,
         notice: NoticeChannel,
         config: VaultConfig,
+    ) -> Self {
+        Self::new_inner(
+            identity,
+            actor,
+            buffer_manager,
+            pulse,
+            notice,
+            config,
+            None,
+        )
+    }
+
+    /// Create a Session whose stamp-relevant buffer transitions are
+    /// broadcast on `buffer_signal` (RFC-0005 S6; the graph service holds
+    /// the matching [`BufferWatch`]).
+    pub fn with_buffer_signal(
+        identity: VaultIdentity,
+        actor: VaultActorHandle,
+        buffer_manager: BufferManager,
+        pulse: PulseChannel,
+        notice: NoticeChannel,
+        config: VaultConfig,
+        buffer_signal: BufferSignal,
+    ) -> Self {
+        Self::new_inner(
+            identity,
+            actor,
+            buffer_manager,
+            pulse,
+            notice,
+            config,
+            Some(buffer_signal),
+        )
+    }
+
+    fn new_inner(
+        identity: VaultIdentity,
+        actor: VaultActorHandle,
+        buffer_manager: BufferManager,
+        pulse: PulseChannel,
+        notice: NoticeChannel,
+        config: VaultConfig,
+        buffer_signal: Option<BufferSignal>,
     ) -> Self {
         let actor_events = actor.events();
         let actor_buffer_patches = actor.buffer_patch_requests();
@@ -892,6 +1002,26 @@ impl Session {
             link_plans,
             link_jobs: Some(link_job_sender),
             link_results: link_result_receiver,
+            buffer_signal,
+            buffer_stamp_version: AtomicU64::new(0),
+        }
+    }
+
+    /// The current version of `graph_buffer_stamp()` output (RFC-0005
+    /// S5). Monotonic within this process; the graph service compares it
+    /// across wakes to skip database work when nothing changed (FR-3).
+    #[must_use]
+    pub fn buffer_stamp_version(&self) -> u64 {
+        self.buffer_stamp_version.load(Ordering::Acquire)
+    }
+
+    /// Record one stamp-relevant buffer transition: bump the version
+    /// atomic and, when a signal is wired, publish it (lossy; RFC-0005
+    /// S6). Callers are all buffer-mutation sites in this module.
+    fn note_buffer_transition(&self) {
+        self.buffer_stamp_version.fetch_add(1, Ordering::Release);
+        if let Some(signal) = &self.buffer_signal {
+            signal.publish();
         }
     }
 
@@ -1147,6 +1277,7 @@ impl Session {
                     } else {
                         manager.notify_external_change(&path, &bytes);
                     }
+                    self.note_buffer_transition();
                     if manager.get_buffer(&path).is_some_and(|buffer| {
                         buffer.state() == flavite_buffer::state::BufferState::Conflicted
                     }) {
@@ -1167,6 +1298,7 @@ impl Session {
                     );
                     let mut manager = self.buffer_manager.lock_recovering();
                     if !manager.notify_file_deleted(&path).is_empty() {
+                        self.note_buffer_transition();
                         self.notice.send(crate::channels::Notice::ActionRequired {
                             code: "external_delete",
                             note: Some(flavite_buffer::manager::NoteRef::new(path)),

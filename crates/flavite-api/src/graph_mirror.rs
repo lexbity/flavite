@@ -214,6 +214,90 @@ impl SavedGraph {
     }
 }
 
+/// The cursor-versioned read-only snapshot the pump hands to the projection
+/// builder (RFC-0005 F1/F3, §4.6/§4.7).
+///
+/// This is the *shared* spine of a publication: `saved`, `occurrences`, and
+/// `metadata` are `Arc`-backed so [`crate::graph_projection::build`] clones
+/// the `Arc`s (free) instead of re-cloning the vault per publish (FR-9).
+/// The mirror's owned [`SavedGraph`] stays the mutable splice target; this
+/// snapshot is a cold clone of it, produced by [`GraphMirror::view_arc`]
+/// on a handoff-cache miss and reused (free `Arc` clone) while the cursor
+/// is unchanged. Resident cost: at most one extra copy of the saved view
+/// (NFR-5).
+#[derive(Debug)]
+pub struct SavedSnapshot {
+    /// Exact index version every field was read at.
+    pub version: IndexVersion,
+    /// Saved notes + attachments + resolved edges — the exact
+    /// [`read_current`](crate::graph_service::read_current) shape, native
+    /// paths decoded. Shared with the projection (`Arc` clone, free).
+    pub saved: Arc<GraphBatch>,
+    /// Saved occurrences: RESOLVED section first (contiguous `(src, ord)`
+    /// runs, ordered by source), then the UNRESOLVED section. Shared with
+    /// the projection's [`OccurrenceSet`](crate::graph_projection::OccurrenceSet).
+    pub occurrences: Arc<[LinkOccurrence]>,
+    /// Tags + properties per note node. Shared with the projection (`Arc`
+    /// clone, free); dirty-buffer metadata never mutates this map — it
+    /// lives in the projection's own dirty overlay (RFC-0005 §4.7).
+    pub metadata: Arc<BTreeMap<NodeId, NoteMetadata>>,
+    /// Unresolved identity guard (`blake3`-prefix id → folded key) covering
+    /// the unresolved nodes of this view.
+    pub unresolved_keys: BTreeMap<u64, String>,
+    /// Unresolved target nodes derived from saved unresolved links, sorted
+    /// by [`NodeId`]. Never part of [`Self::saved`] (same invariant as the
+    /// pre-S6 bridge).
+    pub unresolved_nodes: Vec<GraphNodeRecord>,
+    /// Edges into unresolved nodes, sorted and deduplicated.
+    pub unresolved_edges: Vec<GraphEdgeRecord>,
+}
+
+impl SavedSnapshot {
+    /// The complete batch as it enters the publisher *before* buffer
+    /// overlays: saved records plus unresolved nodes, saved edges plus
+    /// unresolved edges. This is the projection's single owned `O(V)`
+    /// construction per publish (RFC-0005 FR-9): the saved portion is
+    /// cloned once from the shared `Arc`, then the unresolved sections are
+    /// appended.
+    #[must_use]
+    pub fn effective_pre_overlay(&self) -> GraphBatch {
+        let mut batch = (*self.saved).clone();
+        batch.nodes.extend(self.unresolved_nodes.iter().cloned());
+        batch.edges.extend(self.unresolved_edges.iter().copied());
+        batch
+    }
+
+    /// Byte-equality against the mirror's owned view — the S3 assertion
+    /// that a handoff snapshot is a faithful clone of the canonical view
+    /// (the projection's output identity depends on it).
+    #[must_use]
+    pub fn equivalent_to(&self, view: &SavedGraph) -> bool {
+        self.version == view.version
+            && *self.saved == view.saved
+            && self.occurrences.as_ref() == view.occurrences.as_slice()
+            && self.metadata.as_ref() == &view.metadata
+            && self.unresolved_keys == view.unresolved_keys
+            && self.unresolved_nodes == view.unresolved_nodes
+            && self.unresolved_edges == view.unresolved_edges
+    }
+}
+
+impl From<&SavedGraph> for SavedSnapshot {
+    /// One cold O(V) copy of the owned view into the Arc-backed snapshot
+    /// shape (F1 handoff miss; RFC-0005 §4.6/§4.7).
+    fn from(view: &SavedGraph) -> Self {
+        Self {
+            version: view.version,
+            saved: Arc::new(view.saved.clone()),
+            occurrences: Arc::from(view.occurrences.clone()),
+            metadata: Arc::new(view.metadata.clone()),
+            unresolved_keys: view.unresolved_keys.clone(),
+            unresolved_nodes: view.unresolved_nodes.clone(),
+            unresolved_edges: view.unresolved_edges.clone(),
+        }
+    }
+}
+
 /// The verdict of one parity comparison (§6.5.4): the version both sides
 /// were read at, and bounded, human-readable findings (empty means the
 /// mirror equals the full consistent read).
@@ -310,14 +394,14 @@ pub struct GraphMirror {
     policy: ParityPolicy,
     cursor: IndexVersion,
     state: Option<MirrorState>,
-    /// RFC-0005 F1 handoff cache (§4.6): the last `Arc<SavedGraph>`
-    /// snapshot, keyed by the cursor it was built at. The pump takes this
-    /// handle and releases the mutex before assembling the projection, so
-    /// `build` never runs under the lock (FR-8) and a stamp-only republish
-    /// reuses the cached `Arc` — zero O(vault) work on the keystroke path.
-    /// One slot, replaced wholesale by the mutex holder: a torn snapshot
-    /// is structurally impossible (§4.11).
-    handoff: Option<(IndexVersion, Arc<SavedGraph>)>,
+    /// RFC-0005 F1 handoff cache (§4.6): the last
+    /// `Arc<SavedSnapshot>` snapshot, keyed by the cursor it was built at.
+    /// The pump takes this handle and releases the mutex before assembling
+    /// the projection, so `build` never runs under the lock (FR-8) and a
+    /// stamp-only republish reuses the cached `Arc` — zero O(vault) work
+    /// on the keystroke path. One slot, replaced wholesale by the mutex
+    /// holder: a torn snapshot is structurally impossible (§4.11).
+    handoff: Option<(IndexVersion, Arc<SavedSnapshot>)>,
     poisoned: bool,
     delta_generations_since_parity: u64,
     last_parity: Instant,
@@ -813,14 +897,24 @@ impl GraphMirror {
     /// torn snapshot: the slot is written only by the mutex holder and
     /// replaced in one assignment.
     #[must_use]
-    pub fn view_arc(&mut self) -> Option<Arc<SavedGraph>> {
+    pub fn view_arc(&mut self) -> Option<Arc<SavedSnapshot>> {
         let view = self.state.as_ref().map(|state| &state.view)?;
         if let Some((version, snapshot)) = &self.handoff
             && *version == self.cursor
         {
             return Some(Arc::clone(snapshot));
         }
-        let snapshot = Arc::new(view.clone());
+        let snapshot = Arc::new(SavedSnapshot {
+            version: view.version,
+            saved: Arc::new(view.saved.clone()),
+            // `Arc::from` moves the cloned slice into the Arc allocation —
+            // the clone is the one O(V) copy; the wrap is a move.
+            occurrences: Arc::from(view.occurrences.clone()),
+            metadata: Arc::new(view.metadata.clone()),
+            unresolved_keys: view.unresolved_keys.clone(),
+            unresolved_nodes: view.unresolved_nodes.clone(),
+            unresolved_edges: view.unresolved_edges.clone(),
+        });
         self.handoff = Some((self.cursor, Arc::clone(&snapshot)));
         self.stats.snapshots_built_total += 1;
         Some(snapshot)
@@ -1879,7 +1973,7 @@ mod tests {
         mirror.force_reset(&reader).unwrap();
         let first = mirror.view_arc().expect("snapshot after reset");
         // S3 assertion: the snapshot equals the owned view byte-wise.
-        assert_eq!(&*first, mirror.view().expect("owned view"));
+        assert!(first.equivalent_to(mirror.view().expect("owned view")));
         assert_eq!(mirror.stats().snapshots_built_total, 1);
 
         // Cache hit: same cursor ⇒ the very same Arc, counter flat.
@@ -1915,7 +2009,7 @@ mod tests {
             "a moved cursor must rebuild once"
         );
         assert_eq!(mirror.stats().snapshots_built_total, 2);
-        assert_eq!(&*second, mirror.view().expect("owned view"));
+        assert!(second.equivalent_to(mirror.view().expect("owned view")));
         // And it keeps hitting until the next move.
         let third = mirror.view_arc().expect("cached again");
         assert!(Arc::ptr_eq(&second, &third));
@@ -1931,7 +2025,7 @@ mod tests {
         tampered
             .unresolved_nodes
             .push(unresolved_record(u64::MAX, "tampered-by-drift"));
-        mirror.handoff = Some((repair_version, Arc::new(tampered)));
+        mirror.handoff = Some((repair_version, Arc::new(SavedSnapshot::from(&tampered))));
         mirror.force_reset(&reader).unwrap();
         assert_eq!(
             mirror.cursor, repair_version,
@@ -1945,7 +2039,7 @@ mod tests {
                 .any(|node| node.title.contains("tampered")),
             "force_reset must never re-serve the poisoned snapshot"
         );
-        assert_eq!(&*repaired, mirror.view().expect("owned view"));
+        assert!(repaired.equivalent_to(mirror.view().expect("owned view")));
         assert_eq!(
             mirror.stats().snapshots_built_total,
             3,

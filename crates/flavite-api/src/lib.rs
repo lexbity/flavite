@@ -35,7 +35,8 @@ pub mod graph_projection;
 pub mod graph_service;
 pub mod recovery;
 pub use graph_projection::{
-    GraphProjection, GraphViewToken, LinkOccurrence, OccurrenceSource, OverlayState, ScopeRequest,
+    GraphProjection, GraphViewToken, LinkOccurrence, OccurrenceSet, OccurrenceSource, OverlayState,
+    ScopeRequest,
 };
 pub mod attachments;
 pub mod links;
@@ -61,7 +62,8 @@ pub use doctor::*;
 pub use event::*;
 pub use flavite::*;
 pub use graph_service::{
-    GRAPH_POLL_INTERVAL, GraphFrame, GraphService, GraphServiceMetrics, GraphServiceStatus,
+    GRAPH_BUFFER_DEBOUNCE, GRAPH_SWEEP_INTERVAL, GraphFrame, GraphService, GraphServiceMetrics,
+    GraphServiceStatus,
 };
 pub use queries::*;
 pub use query_service::*;

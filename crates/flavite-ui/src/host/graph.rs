@@ -138,7 +138,9 @@ pub struct GraphTabState {
     pub updating: bool,
     pub overlay_count: usize,
     pub failed_overlay_count: usize,
-    pub occurrences: Arc<[flavite_api::LinkOccurrence]>,
+    /// The canonical occurrence view of the current frame (RFC-0005 F3;
+    /// iterates saved-minus-dirty then overlay).
+    pub occurrences: flavite_api::OccurrenceSet,
 }
 
 impl GraphTabState {
@@ -181,7 +183,7 @@ impl GraphTabState {
             updating: true,
             overlay_count: 0,
             failed_overlay_count: 0,
-            occurrences: Arc::from([]),
+            occurrences: flavite_api::OccurrenceSet::new(),
         }
     }
 }

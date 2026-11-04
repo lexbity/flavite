@@ -169,6 +169,15 @@ impl GenerationWatch {
     pub fn recv_timeout(&self, timeout: Duration) -> Option<IndexVersion> {
         self.rx.recv_timeout(timeout).ok()
     }
+
+    /// The underlying receiver, for select loops (RFC-0005 S5). The watch
+    /// is `Arc`-shared across service restarts; sending into a dead
+    /// attempt's receiver is a `try_send` drop.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn receiver(&self) -> &Receiver<IndexVersion> {
+        &self.rx
+    }
 }
 
 impl fmt::Debug for GenerationSignal {

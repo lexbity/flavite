@@ -83,7 +83,7 @@ fn dirty_replacement_survives_unrelated_generation_save_later_edit_and_undo() {
     assert_eq!(edges(&frame), vec![("a.md".into(), "c.md".into())]);
     assert_eq!(frame.projection().saved.edges.len(), 1);
     assert!(
-        matches!(frame.projection().occurrences[0].source, flavite_api::OccurrenceSource::Buffer { revision:r,.. } if r==revision)
+        matches!(frame.projection().occurrences.iter().next().expect("occurrence").source, flavite_api::OccurrenceSource::Buffer { revision:r,.. } if r==revision)
     );
     f.fs.write_new(&f.root.join("unrelated.md"), b"unrelated")
         .unwrap();

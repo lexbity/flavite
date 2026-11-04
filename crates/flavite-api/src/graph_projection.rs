@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::graph_mirror::{SavedGraph, unresolved_node};
+use crate::graph_mirror::{SavedSnapshot, unresolved_node};
 
 /// Exact source version, including the buffer instance (same path is insufficient).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,13 +68,88 @@ pub struct ScopedGraph {
     pub result: Result<Arc<ScopeResult>, String>,
 }
 
+/// The canonical occurrence view of one publication (RFC-0005 §5.4, F3).
+///
+/// Saved occurrences are shared as an `Arc` slice; dirty sources' saved
+/// runs are *excluded* (they are re-emitted in `overlay`), so iteration is
+/// byte-identical to the pre-RFC constructed `saved-then-overlay-with-
+/// retain` order — which preserves `(src, ord)` run adjacency for every
+/// untouched source (the backlinks excerpt grouping relies on it,
+/// `query_service.rs`). Building the set costs O(dirty): no O(vault)
+/// occurrence work per publish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OccurrenceSet {
+    /// Canonical `(src, ord)` runs: resolved then unresolved.
+    saved: Arc<[LinkOccurrence]>,
+    /// Sources whose saved run is replaced by `overlay` (`NodeId::id`).
+    dirty_srcs: BTreeSet<u64>,
+    /// Dirty sources' fresh runs, in canonical order.
+    overlay: Vec<LinkOccurrence>,
+}
+
+impl OccurrenceSet {
+    /// An empty set (used by tests and empty fixtures).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            saved: Arc::from([]),
+            dirty_srcs: BTreeSet::new(),
+            overlay: Vec::new(),
+        }
+    }
+
+    /// Saved occurrences minus dirty sources, then the overlay runs.
+    #[must_use]
+    pub fn iter(&self) -> impl Iterator<Item = &LinkOccurrence> {
+        self.saved
+            .iter()
+            .filter(move |o| !self.dirty_srcs.contains(&o.edge.from.id))
+            .chain(self.overlay.iter())
+    }
+
+    /// Raw cardinality (`saved.len() + overlay.len()`); used by metrics and
+    /// tests only. Iteration length may be smaller when dirty sources are
+    /// present (RFC-0005 §5.4).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.saved.len() + self.overlay.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.saved.is_empty() && self.overlay.is_empty()
+    }
+
+    /// Membership on the canonical view (saved-minus-dirty plus overlay).
+    #[must_use]
+    pub fn contains(&self, occurrence: &LinkOccurrence) -> bool {
+        self.iter().any(|candidate| candidate == occurrence)
+    }
+}
+
+impl Default for OccurrenceSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug)]
 pub struct GraphProjection {
-    pub saved: GraphBatch,
+    /// Shared with the mirror snapshot (`Arc` clone, free).
+    pub saved: Arc<GraphBatch>,
+    /// The projection's single owned O(V) construction: the snapshot's
+    /// pre-overlay batch, mutated in place by the overlay (FR-9).
     pub effective: GraphBatch,
-    pub occurrences: Arc<[LinkOccurrence]>,
+    pub occurrences: OccurrenceSet,
     pub overlays: BTreeMap<NodeId, OverlayState>,
-    pub metadata: BTreeMap<NodeId, NoteMetadata>,
+    /// Saved metadata, shared with the mirror snapshot (`Arc` clone, free).
+    /// Never mutated by `build`: dirty-buffer metadata lives in
+    /// `dirty_metadata`/`removed_metadata` (RFC-0005 §4.7).
+    pub metadata: Arc<BTreeMap<NodeId, NoteMetadata>>,
+    /// Dirty buffers' fresh metadata, keyed by node id (O(dirty)).
+    pub dirty_metadata: BTreeMap<NodeId, NoteMetadata>,
+    /// Dirty buffers whose parse failed: their saved metadata is retired.
+    pub removed_metadata: BTreeSet<NodeId>,
     pub scopes: BTreeMap<u128, ScopedGraph>,
     pub buffer_stamp: Vec<flavite_vault::session::GraphBufferStamp>,
     pub digest: u64,
@@ -98,7 +173,7 @@ pub struct ScopeRequest {
 )]
 pub(crate) fn build(
     connection: &mut Connection,
-    graph: &SavedGraph,
+    graph: &Arc<SavedSnapshot>,
     session: Option<&Arc<Session>>,
     requests: &BTreeMap<u128, ScopeRequest>,
     previous: Option<&GraphProjection>,
@@ -117,11 +192,23 @@ pub(crate) fn build(
         .map_err(|_| "cannot begin graph snapshot")?;
     // The mirrored saved view: complete, decoded, canonical — identical to
     // what a full consistent read produces at `graph.version` (AC-3 gate).
-    let saved = graph.saved.clone();
+    // F3 (FR-9): saved base, metadata, and occurrences are shared with the
+    // snapshot via `Arc` clones — free. The single owned O(V) construction
+    // per publish is `effective` (the pre-overlay batch, mutated below).
+    let saved = Arc::clone(&graph.saved);
     let mut effective = graph.effective_pre_overlay();
-    let mut occurrences = graph.occurrences.clone();
+    let mut occurrences = OccurrenceSet {
+        saved: Arc::clone(&graph.occurrences),
+        dirty_srcs: BTreeSet::new(),
+        overlay: Vec::new(),
+    };
     let mut unresolved_ids = graph.unresolved_keys.clone();
-    let mut metadata = graph.metadata.clone();
+    let metadata = Arc::clone(&graph.metadata);
+    // Dirty-buffer metadata overrides (RFC-0005 §4.7): never mutate the
+    // shared saved map; keep the delta in O(dirty) structures and merge it
+    // for scope evaluation below.
+    let mut dirty_metadata: BTreeMap<NodeId, NoteMetadata> = BTreeMap::new();
+    let mut removed_metadata: BTreeSet<NodeId> = BTreeSet::new();
     let snapshots = session.map_or_else(Vec::new, |s| s.graph_buffer_snapshots());
     let buffer_stamp = snapshots
         .iter()
@@ -213,7 +300,9 @@ pub(crate) fn build(
             effective.nodes.push(record);
         }
         effective.edges.retain(|edge| edge.from != id);
-        occurrences.retain(|occurrence| occurrence.edge.from != id);
+        // F3: omit the dirty source's saved run instead of removing it
+        // from a cloned slice; the fresh run joins `overlay` below.
+        occurrences.dirty_srcs.insert(id.id);
         let parsed = match parse_normalized(&snapshot.text) {
             Ok(parsed) => parsed,
             Err(_) => {
@@ -225,12 +314,14 @@ pub(crate) fn build(
                         reason: "Current relationships unavailable; fix the source parse error",
                     },
                 );
-                metadata.remove(&id);
+                // F3: retire the saved metadata for this node in the dirty
+                // overlay — the shared map is never mutated.
+                removed_metadata.insert(id);
                 continue;
             }
         };
         let current_metadata = parse_metadata(&parsed);
-        metadata.insert(id, current_metadata);
+        dirty_metadata.insert(id, current_metadata);
         if let Some(record) = effective.nodes.iter_mut().find(|r| r.id == id) {
             let frontmatter = flavite_syntax::frontmatter::parse_frontmatter(&parsed.snapshot);
             record.missing_on_disk = snapshot.state == crate::BufferStatus::Orphaned;
@@ -275,7 +366,7 @@ pub(crate) fn build(
                 },
             };
             effective.edges.push(edge);
-            occurrences.push(LinkOccurrence {
+            occurrences.overlay.push(LinkOccurrence {
                 edge,
                 source_path: path.clone(),
                 source: OccurrenceSource::Buffer {
@@ -303,6 +394,29 @@ pub(crate) fn build(
     effective.edges.sort();
     effective.edges.dedup();
     let mut scopes = BTreeMap::new();
+    // Scope evaluation consults metadata per node. The shared saved map is
+    // used directly unless a metadata-sensitive predicate coexists with a
+    // dirty overlay — only then is one merged map built for this build
+    // (O(V); RFC-0005 §4.7's "dirty buffers don't touch saved metadata"
+    // is honored: the shared map never mutates, the merge is a transient
+    // evaluation input, not a published field).
+    let needs_metadata = requests
+        .values()
+        .any(|request| predicate_needs_metadata(&request.scope.predicate));
+    let merged_metadata = if needs_metadata && (!dirty_metadata.is_empty() || !removed_metadata.is_empty())
+    {
+        let mut merged = (*metadata).clone();
+        for id in &removed_metadata {
+            merged.remove(id);
+        }
+        for (id, note_metadata) in &dirty_metadata {
+            merged.insert(*id, note_metadata.clone());
+        }
+        Some(merged)
+    } else {
+        None
+    };
+    let eval_metadata = merged_metadata.as_ref().unwrap_or(metadata.as_ref());
     for (tab, request) in requests {
         let result = (|| {
             let mut queries = BTreeMap::new();
@@ -312,9 +426,13 @@ pub(crate) fn build(
                 session,
                 &mut queries,
             )?;
-            let mut result =
-                flavite_graph::scope::evaluate(&effective, &metadata, &queries, &request.scope)
-                    .map_err(str::to_owned)?;
+            let mut result = flavite_graph::scope::evaluate(
+                &effective,
+                eval_metadata,
+                &queries,
+                &request.scope,
+            )
+            .map_err(str::to_owned)?;
             result.total_base_notes = saved
                 .nodes
                 .iter()
@@ -345,9 +463,11 @@ pub(crate) fn build(
     Ok(Some(GraphProjection {
         saved,
         effective,
-        occurrences: occurrences.into(),
+        occurrences,
         overlays,
         metadata,
+        dirty_metadata,
+        removed_metadata,
         scopes,
         buffer_stamp,
         digest: u64::from_le_bytes(
@@ -357,6 +477,22 @@ pub(crate) fn build(
         ),
         requests: requests.clone(),
     }))
+}
+
+/// Whether a predicate consults `NoteMetadata` during evaluation. `All`
+/// short-circuits before metadata; `PathPrefix`/`SavedQuery` use path/query
+/// membership only; `Tag`/`Property` read metadata.
+fn predicate_needs_metadata(predicate: &flavite_graph::NotePredicate) -> bool {
+    match predicate {
+        flavite_graph::NotePredicate::Tag { .. }
+        | flavite_graph::NotePredicate::Property { .. } => true,
+        flavite_graph::NotePredicate::And { clauses }
+        | flavite_graph::NotePredicate::Or { clauses } => {
+            clauses.iter().any(predicate_needs_metadata)
+        }
+        flavite_graph::NotePredicate::Not { clause } => predicate_needs_metadata(clause),
+        _ => false,
+    }
 }
 
 fn meta(conn: &Connection, key: &str, default: u64) -> Result<u64, String> {
