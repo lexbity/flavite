@@ -57,73 +57,38 @@ impl SearchDocCache {
         })
     }
 
-    /// Get multiple search documents by note IDs.
+    /// Get multiple search documents by note IDs: chunked `IN` lookups of at
+    /// most 100 ids each (RFC-0004 §6.3, C11 — the historical >100-id branch
+    /// scanned the whole table and filtered in memory). Missing documents are
+    /// simply absent from the map.
     ///
     /// # Errors
     ///
-    /// Returns a SQLite error when any lookup cannot be prepared or read;
-    /// missing documents are simply absent from the map.
+    /// Returns a SQLite error when any chunk lookup cannot be prepared or
+    /// read.
     pub fn get_many(&self, note_ids: &[i64]) -> Result<HashMap<i64, SearchDoc>> {
+        const ID_CHUNK: usize = 100;
         let mut result = HashMap::new();
-
-        if note_ids.is_empty() {
-            return Ok(result);
-        }
-
-        // For a small number of IDs, use IN clause
-        if note_ids.len() <= 100 {
-            let placeholders = vec!["?"; note_ids.len()].join(",");
+        for chunk in note_ids.chunks(ID_CHUNK) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT note_id, content_hash, body_text FROM search_docs WHERE note_id IN ({placeholders})"
             );
-
-            let params: Vec<i64> = note_ids.to_vec();
-            let mut stmt = self.conn.prepare(&sql)?;
-
-            // Convert to &dyn ToSql references as a slice
+            let mut statement = self.conn.prepare(&sql)?;
             let param_refs: Vec<&dyn rusqlite::ToSql> =
-                params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
-
-            let rows = stmt.query_map(&param_refs as &[&dyn rusqlite::ToSql], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    SearchDoc {
-                        note_id: row.get(0)?,
-                        content_hash: row.get(1)?,
-                        body_text: row.get(2)?,
-                    },
-                ))
+                chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let rows = statement.query_map(&param_refs as &[&dyn rusqlite::ToSql], |row| {
+                Ok(SearchDoc {
+                    note_id: row.get(0)?,
+                    content_hash: row.get(1)?,
+                    body_text: row.get(2)?,
+                })
             })?;
-
             for row in rows {
-                let (note_id, doc) = row?;
-                result.insert(note_id, doc);
-            }
-        } else {
-            // For many IDs, query all and filter
-            let mut stmt = self
-                .conn
-                .prepare("SELECT note_id, content_hash, body_text FROM search_docs")?;
-
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    SearchDoc {
-                        note_id: row.get(0)?,
-                        content_hash: row.get(1)?,
-                        body_text: row.get(2)?,
-                    },
-                ))
-            })?;
-
-            for row in rows {
-                let (note_id, doc) = row?;
-                if note_ids.contains(&note_id) {
-                    result.insert(note_id, doc);
-                }
+                let doc = row?;
+                result.insert(doc.note_id, doc);
             }
         }
-
         Ok(result)
     }
 

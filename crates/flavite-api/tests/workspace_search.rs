@@ -251,3 +251,43 @@ fn excerpts_are_bounded_and_never_split_characters() {
     assert!(!items[0].excerpt.is_empty());
     assert!(items[0].excerpt.chars().count() <= 160 + 1);
 }
+
+/// RFC-0004 §4.4/FR-7 — the paging sentinel end-to-end. `SearchPage` now
+/// carries the pool-computed `has_more` (single truncate, `limit+1` probe),
+/// and `execute_search` consumes it; before S4 the pool double-truncated
+/// its probe row and the field did not exist at all — this assertion could
+/// not even compile against the pre-S4 contract. Truth table at the exact
+/// boundary: T = 5 matches.
+#[test]
+fn has_more_is_true_exactly_when_a_limit_plus_one_row_exists() {
+    let notes: Vec<(String, String)> = (0..5)
+        .map(|index| {
+            (
+                format!("page{index}.md"),
+                format!("pagetoken unique{index} body words\n"),
+            )
+        })
+        .collect();
+    let borrowed: Vec<(&str, &str)> = notes
+        .iter()
+        .map(|(path, body)| (path.as_str(), body.as_str()))
+        .collect();
+    let f = fixture(&borrowed);
+    for (limit, expected_items, expected_has_more) in
+        [(3u64, 3usize, true), (4, 4, true), (5, 5, false)]
+    {
+        let result = search_once(&f.flavite, "pagetoken", limit);
+        let ContextQueryResult::Search {
+            items, has_more, ..
+        } = result
+        else {
+            panic!("expected a search page for limit {limit}");
+        };
+        assert_eq!(items.len(), expected_items, "page size at limit {limit}");
+        assert_eq!(has_more, expected_has_more, "sentinel at limit {limit}");
+        assert!(
+            items.iter().all(|row| !row.excerpt.is_empty()),
+            "saved-content excerpts stay assembled"
+        );
+    }
+}

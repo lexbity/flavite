@@ -657,7 +657,11 @@ fn execute_search(session: &Arc<Session>, text: &str, limit: u64) -> ContextQuer
         Ok(page) => page,
         Err(message) => return ContextQueryResult::Failed { message },
     };
-    let has_more = page.items.len() as u64 > limit;
+    // §4.4: consume the pool's explicit sentinel and truncate once. The
+    // items-length leg covers the service's own `limit+1` probe; the OR is
+    // exactly "a `limit+1`'th result exists" (D11 semantics end-to-end —
+    // the pre-fix pool double-truncate made both legs dead).
+    let has_more = page.has_more || page.items.len() as u64 > limit;
     let items = page
         .items
         .into_iter()

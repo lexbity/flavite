@@ -59,6 +59,14 @@ struct SearchFields {
     body: Field,
 }
 
+/// One scored text-search hit (RFC-0004 §6.3). The score is Tantivy-internal
+/// and relative-only (D11): never persisted, never compared across queries.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hit {
+    pub note_id: i64,
+    pub score: f32,
+}
+
 impl TantivyBackend {
     /// Open or create a persistent Tantivy index below `cache_dir/tantivy`.
     ///
@@ -293,16 +301,26 @@ impl TantivyBackend {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Search documents matching text, optionally intersecting a structural ID set.
+    /// Search documents matching text, optionally intersecting a structural
+    /// ID set, keeping Tantivy relevance scores.
+    ///
+    /// Scores are Tantivy-internal and relative-only (D11): never persisted,
+    /// never compared across queries or index versions. Order is score-desc
+    /// (`TopDocs::order_by_score`), so assembling `Hit` vectors preserves rank.
+    ///
+    /// The oversized-filter branch (> [`MAX_TANTIVY_FILTER_SIZE`] ids) fetches
+    /// up to 100k scored hits and post-filters with a hash set; `retain`
+    /// preserves score order, and the 100k `TopDocs` bound is the documented
+    /// ceiling of one Tantivy fetch.
     ///
     /// # Errors
     /// Returns an error when commit-before-search or query execution fails.
-    pub fn search_text(
+    pub fn search_hits(
         &self,
         query: &str,
         note_ids: &[i64],
         limit: usize,
-    ) -> Result<Vec<i64>, SearchError> {
+    ) -> Result<Vec<Hit>, SearchError> {
         if self.is_dirty() {
             self.commit()?;
         }
@@ -322,10 +340,28 @@ impl TantivyBackend {
                 .iter()
                 .copied()
                 .collect::<std::collections::HashSet<_>>();
-            hits.retain(|id| allowed.contains(id));
+            hits.retain(|hit| allowed.contains(&hit.note_id));
             hits.truncate(limit);
             Ok(hits)
         }
+    }
+
+    /// Thin ID-only wrapper for degraded/title-only callers that never see
+    /// scores. Text search stays behind this API for those paths (D-08).
+    ///
+    /// # Errors
+    /// Returns an error when commit-before-search or query execution fails.
+    pub fn search_text(
+        &self,
+        query: &str,
+        note_ids: &[i64],
+        limit: usize,
+    ) -> Result<Vec<i64>, SearchError> {
+        Ok(self
+            .search_hits(query, note_ids, limit)?
+            .into_iter()
+            .map(|hit| hit.note_id)
+            .collect())
     }
 }
 
@@ -459,14 +495,17 @@ impl SearcherTrait for TantivySearcher {
         limit: usize,
     ) -> Result<Vec<i64>, SearchError> {
         match query {
-            QueryAst::Text(text) => search_reader(
+            QueryAst::Text(text) => Ok(search_reader(
                 &self.index,
                 &self.reader,
                 self.fields,
                 text,
                 note_ids,
                 limit,
-            ),
+            )?
+            .into_iter()
+            .map(|hit| hit.note_id)
+            .collect()),
             _ => Ok(Vec::new()),
         }
     }
@@ -479,7 +518,7 @@ fn search_reader(
     query: &str,
     note_ids: &[i64],
     limit: usize,
-) -> Result<Vec<i64>, SearchError> {
+) -> Result<Vec<Hit>, SearchError> {
     let parser = QueryParser::for_index(
         index,
         vec![fields.title, fields.aliases, fields.tags, fields.body],
@@ -501,8 +540,8 @@ fn search_reader(
     let top = searcher
         .search(&parsed, &TopDocs::with_limit(100_000).order_by_score())
         .map_err(|e| SearchError::Tantivy(e.to_string()))?;
-    let mut ids = Vec::new();
-    for (_score, addr) in top {
+    let mut hits = Vec::new();
+    for (score, addr) in top {
         let document: TantivyDocument = searcher
             .doc(addr)
             .map_err(|e| SearchError::Tantivy(e.to_string()))?;
@@ -511,13 +550,13 @@ fn search_reader(
             .and_then(|value| value.as_u64())
             .and_then(|value| i64::try_from(value).ok())
         {
-            ids.push(id);
-            if ids.len() >= limit {
+            hits.push(Hit { note_id: id, score });
+            if hits.len() >= limit {
                 break;
             }
         }
     }
-    Ok(ids)
+    Ok(hits)
 }
 
 fn search_schema() -> Schema {

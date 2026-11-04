@@ -20,7 +20,7 @@ use crate::types::IndexVersion;
 use blake3::Hash;
 use flavite_syntax::{pulldown_glue::parse_note, text::TextSnapshot};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Result, Transaction};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -133,20 +133,27 @@ fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
     None
 }
 
-/// Text-search results paired with the structural index version used to fetch them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Text-search results paired with the structural index version used to
+/// fetch them. `has_more` is the pool-computed sentinel (RFC-0004 §4.4/§6.3,
+/// D11): true exactly when a `limit+1`'th row exists — the assembly fetched
+/// `limit+1` and reports whether it filled the probe slot.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SearchPage {
     /// Structural epoch.
     pub epoch: u64,
     /// Structural generation.
     pub generation: u64,
-    /// Matching note ID, vault-relative path, and title rows.
+    /// Matching note ID, vault-relative path, title, and (text-search only)
+    /// relative relevance score rows, in hit order.
     pub items: Vec<SearchNote>,
+    /// True when more matching rows exist beyond `items` (which holds at
+    /// most the requested `limit`).
+    pub has_more: bool,
 }
 
 /// One matching note from a text or hybrid query (W10: with a bounded
 /// saved-content excerpt around the first matched term).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SearchNote {
     /// Indexed note ID (valid within the returned epoch).
     pub note_id: i64,
@@ -157,6 +164,11 @@ pub struct SearchNote {
     /// Bounded saved-content excerpt, or empty for structural-only results.
     /// Dirty buffer text is never included (D-08).
     pub excerpt: String,
+    /// Tantivy relative relevance score, descending in `SearchPage::items`
+    /// order. `None` for structural-only pages. Relative-only (D11): never
+    /// persisted, never compared across queries; not exposed across the
+    /// facade until a consumer needs it.
+    pub score: Option<f32>,
 }
 
 /// Excerpt length budget per result (§7.5-style bounded display text).
@@ -1904,6 +1916,25 @@ impl IndexActor {
         Ok(hits)
     }
 
+    /// Scored variant of [`IndexActor::search_text`] (D11): the hit list
+    /// keeps Tantivy's relative relevance for result assembly.
+    ///
+    /// # Errors
+    /// Returns an error when a commit or Tantivy search fails.
+    pub fn search_hits(
+        &mut self,
+        text: &str,
+        note_ids: &[i64],
+        limit: usize,
+    ) -> Result<Vec<crate::search::Hit>, String> {
+        let hits = self
+            .search
+            .search_hits(text, note_ids, limit)
+            .map_err(|e| e.to_string())?;
+        self.last_search_commit = Instant::now();
+        Ok(hits)
+    }
+
     /// Commit the search view after bulk reconcile or when its deferred timer expires.
     ///
     /// # Errors
@@ -2055,6 +2086,7 @@ impl IndexActor {
                 epoch,
                 generation,
                 items: Vec::new(),
+                has_more: false,
             });
         }
         let filter = if has_structural && structural_ids.len() <= filter_limit {
@@ -2062,7 +2094,7 @@ impl IndexActor {
         } else {
             &[]
         };
-        let mut hits = self.search_text(
+        let mut hits = self.search_hits(
             &text,
             filter,
             if has_structural && structural_ids.len() > filter_limit {
@@ -2075,20 +2107,30 @@ impl IndexActor {
             let allowed = structural_ids
                 .into_iter()
                 .collect::<std::collections::HashSet<_>>();
-            hits.retain(|id| allowed.contains(id));
+            // `retain` on scored hits preserves Tantivy rank order (C16).
+            hits.retain(|hit| allowed.contains(&hit.note_id));
         }
-        hits.truncate(limit.saturating_add(1));
+        // §4.4/§6.3: the fetch requested `limit+1`; whether that probe slot
+        // filled is the sentinel. One truncate, explicit `has_more` — the
+        // old double-truncate (limit+1 then limit) made the downstream
+        // signal provably dead.
+        let has_more = hits.len() > limit;
         hits.truncate(limit);
         let terms = text
             .split_whitespace()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        let rows = self.search_note_rows(hits, &terms)?;
+        let scored: Vec<(i64, Option<f32>)> = hits
+            .into_iter()
+            .map(|hit| (hit.note_id, Some(hit.score)))
+            .collect();
+        let rows = self.search_note_rows(&scored, &terms)?;
         let (epoch, generation) = self.version()?;
         Ok(SearchPage {
             epoch,
             generation,
             items: rows,
+            has_more,
         })
     }
 
@@ -2105,58 +2147,86 @@ impl IndexActor {
             .execute(&conn, limit.saturating_add(1), None)
             .map_err(|error| error.to_string())?;
         drop(conn);
-        let note_ids = page
+        // Same `limit+1` probe semantics as the text path (§6.3): the
+        // structural page was fetched one deep; scores are `None` for
+        // structural-only results (D11).
+        let has_more = page.items.len() > limit;
+        let scored: Vec<(i64, Option<f32>)> = page
             .items
             .into_iter()
             .take(limit)
-            .map(|note| note.note_id)
+            .map(|note| (note.note_id, None))
             .collect();
-        let rows = self.search_note_rows(note_ids, &[])?;
+        let rows = self.search_note_rows(&scored, &[])?;
         Ok(SearchPage {
             epoch: page.epoch,
             generation: page.generation,
             items: rows,
+            has_more,
         })
     }
 
-    /// Assemble result rows with bounded excerpts around the first matched
-    /// term. The excerpt comes from the indexed saved-body cache; unsaved
-    /// edits are deliberately absent (D-08, labeled by the UI).
+    /// Assemble result rows from the hit list with one batched query per
+    /// 512 ids (§6.3 — replaces the per-row N+1 assembly), restoring hit
+    /// order through an id map. Bounded excerpts around the first matched
+    /// term come from the indexed saved-body cache; unsaved edits are
+    /// deliberately absent (D-08, labeled by the UI). Excerpt logic itself
+    /// is unchanged (`build_excerpt`).
     fn search_note_rows(
         &self,
-        note_ids: Vec<i64>,
+        hits: &[(i64, Option<f32>)],
         terms: &[String],
     ) -> Result<Vec<SearchNote>, String> {
+        const ROW_CHUNK: usize = 512;
         let conn = self
             .read_pool
             .get(Some(Duration::from_secs(2)))
             .map_err(|error| error.to_string())?;
-        let mut rows = Vec::with_capacity(note_ids.len());
-        for note_id in note_ids {
-            let row = conn
-                .query_row(
-                    "SELECT n.note_id, n.path, n.title, d.body_text \
-                     FROM notes n LEFT JOIN search_docs d ON d.note_id = n.note_id \
-                     WHERE n.note_id=?1",
-                    [note_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, Option<String>>(3)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(|error| error.to_string())?;
-            if let Some((note_id, path, title, body)) = row {
+        let mut found: HashMap<i64, (String, String, Option<String>)> = HashMap::new();
+        for chunk in hits.chunks(ROW_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT n.note_id, n.path, n.title, d.body_text \
+                 FROM notes n LEFT JOIN search_docs d ON d.note_id = n.note_id \
+                 WHERE n.note_id IN ({placeholders})"
+            );
+            let rows = {
+                let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+                statement
+                    .query_map(
+                        rusqlite::params_from_iter(chunk.iter().map(|(id, _)| id)),
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                            ))
+                        },
+                    )
+                    .map_err(|error| error.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?
+            };
+            for (note_id, path, title, body) in rows {
+                found.insert(note_id, (path, title, body));
+            }
+        }
+        let mut rows = Vec::with_capacity(hits.len());
+        for (note_id, score) in hits {
+            // Deleted between fetch and assembly (or never present): omit,
+            // exactly as the historical per-row lookup did for a miss.
+            if let Some((path, title, body)) = found.get(note_id) {
                 let excerpt = build_excerpt(body.as_deref(), terms);
                 rows.push(SearchNote {
-                    note_id,
-                    path,
-                    title,
+                    note_id: *note_id,
+                    path: path.clone(),
+                    title: title.clone(),
                     excerpt,
+                    score: *score,
                 });
             }
         }

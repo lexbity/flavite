@@ -11,8 +11,8 @@
 //! Run with `cargo bench -p flavite-index --bench apply_and_search`
 //! (threshold assertions land in RFC-0004 S8; S2 records the numbers).
 
-use flavite_index::{IndexActor, open_or_init};
-use std::path::Path;
+use flavite_index::{IndexActor, Query, open_or_init};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const NOTE_COUNT: usize = 10_000;
@@ -20,7 +20,7 @@ const SAMPLES: usize = 300;
 
 fn body(index: usize, nonce: usize) -> Vec<u8> {
     format!(
-        "# Note {index}\n\ncontent-{index}-{nonce} [[n{}]]\n",
+        "# Note {index}\n\nbenchtoken content-{index}-{nonce} [[n{}]]\n",
         index % 50
     )
     .into_bytes()
@@ -33,9 +33,13 @@ fn percentiles(samples: &[Duration]) -> (Duration, Duration) {
     (at(50), at(99))
 }
 
-fn build_vault(db: &Path, backstop: u64) -> IndexActor {
-    drop(open_or_init(db).expect("schema"));
-    let mut actor = IndexActor::with_resolver_backstop(db, 1, backstop)
+fn build_vault(dir: &Path, name: &str, backstop: u64) -> (PathBuf, IndexActor) {
+    // Each vault owns its cache directory: the Tantivy index lives beside
+    // the SQLite file, and two actors must never share one directory.
+    std::fs::create_dir_all(dir.join(name)).expect("vault dir");
+    let db = dir.join(name).join("index.sqlite3");
+    drop(open_or_init(&db).expect("schema"));
+    let mut actor = IndexActor::with_resolver_backstop(&db, 1, backstop)
         .expect("index actor with backstop seam");
     for index in 0..NOTE_COUNT {
         actor
@@ -48,7 +52,7 @@ fn build_vault(db: &Path, backstop: u64) -> IndexActor {
             )
             .expect("fixture apply");
     }
-    actor
+    (db, actor)
 }
 
 fn measure_update_saves(actor: &mut IndexActor, nonce: usize) -> Vec<Duration> {
@@ -68,16 +72,18 @@ fn measure_update_saves(actor: &mut IndexActor, nonce: usize) -> Vec<Duration> {
 fn main() {
     let temp = tempfile::tempdir().expect("tempdir");
 
-    let db_targeted = temp.path().join("index-targeted.sqlite3");
     let build_started = Instant::now();
-    let mut targeted = build_vault(&db_targeted, flavite_index::RESOLVER_BACKSTOP_GENERATIONS);
+    let (_db_targeted, mut targeted) = build_vault(
+        temp.path(),
+        "targeted",
+        flavite_index::RESOLVER_BACKSTOP_GENERATIONS,
+    );
     let build_wall = build_started.elapsed();
     let targeted_samples = measure_update_saves(&mut targeted, 1);
     let (targeted_p50, targeted_p99) = percentiles(&targeted_samples);
     let targeted_diagnostics = targeted.resolver_diagnostics();
 
-    let db_full = temp.path().join("index-full.sqlite3");
-    let mut full = build_vault(&db_full, 1);
+    let (_db_full, mut full) = build_vault(temp.path(), "full", 1);
     let full_samples = measure_update_saves(&mut full, 1);
     let (full_p50, full_p99) = percentiles(&full_samples);
 
@@ -96,6 +102,37 @@ fn main() {
         targeted_p99 <= full_p99,
         "targeted spine must not be slower than the full-walk baseline (targeted p99 {targeted_p99:?} > full p99 {full_p99:?})"
     );
-    // The search half of this bench lands with RFC-0004 S4 (200-row excerpt
-    // assembly wall); S2 delivers the apply half.
+    // RFC-0004 S4 half: 200-row excerpt assembly wall on the same 10k
+    // corpus (AC-5 precursor). The first call absorbs the deferred tantivy
+    // commit; subsequent samples run against a clean writer, isolating the
+    // query + batched-assembly path from post-commit cost.
+    let mut search_samples = Vec::with_capacity(SAMPLES);
+    let probe = Query::Text("benchtoken".into());
+    let warm = Instant::now();
+    let page = targeted
+        .search_notes(&probe, 200)
+        .expect("warm search commits pending writer ops");
+    let warm_wall = warm.elapsed();
+    assert_eq!(page.items.len(), 200);
+    assert!(page.has_more, "10k corpus must exceed a 200-row page");
+    assert!(
+        page.items
+            .iter()
+            .all(|row| row.score.is_some() && !row.excerpt.is_empty()),
+        "text pages carry relative scores and excerpts (D11)"
+    );
+    for _ in 0..SAMPLES {
+        let started = Instant::now();
+        let page = targeted.search_notes(&probe, 200).expect("measured search");
+        assert_eq!(page.items.len(), 200);
+        search_samples.push(started.elapsed());
+    }
+    let (search_p50, search_p99) = percentiles(&search_samples);
+    println!(
+        "apply_and_search search half: 200-row assembly p50 {search_p50:?} p99 {search_p99:?} (first-call commit absorbed separately: {warm_wall:?})"
+    );
+    assert!(
+        search_p99 > Duration::ZERO && search_p50 <= search_p99,
+        "search assembly must produce real, ordered timings"
+    );
 }
