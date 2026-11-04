@@ -17,11 +17,9 @@ const SAMPLES: usize = 200;
 
 fn main() {
     let temp = tempfile::tempdir().expect("tempdir");
-    // History writes must stay inside this benchmark's disposable directory.
-    // SAFETY: set once, before any actor or benchmark worker thread is started.
-    unsafe {
-        std::env::set_var("XDG_DATA_HOME", temp.path().join("xdg-data"));
-    }
+    // (S8/M3) The history store roots here explicitly, per-builder — the
+    // former `XDG_DATA_HOME` process-global injection is gone.
+    let data_dir = temp.path().join("xdg-data");
 
     let fs = MemFs::new();
     let root = PathBuf::from("/reconcile-bench");
@@ -48,6 +46,7 @@ fn main() {
             root.clone(),
             vec![0x44],
         ))
+        .with_data_dir(data_dir)
         .with_index(IndexActor::new(&db, 2).expect("index actor"))
         .build()
         .expect("vault actor")

@@ -684,10 +684,28 @@ impl Session {
         notice: NoticeChannel,
         config: VaultConfig,
     ) -> Self {
+        Self::new_with_data_dir(identity, actor, buffer_manager, pulse, notice, config, None)
+    }
+
+    /// Create a new Session with an explicit OS data directory (S8/M3).
+    ///
+    /// Library code never reads the data-directory override; binaries and
+    /// tests pass the resolved directory here. `None` selects the resolved
+    /// platform default. The recovery checkpoint store roots under this
+    /// directory.
+    pub fn new_with_data_dir(
+        identity: VaultIdentity,
+        actor: VaultActorHandle,
+        buffer_manager: BufferManager,
+        pulse: PulseChannel,
+        notice: NoticeChannel,
+        config: VaultConfig,
+        data_dir: Option<PathBuf>,
+    ) -> Self {
         let actor_events = actor.events();
         let actor_buffer_patches = actor.buffer_patch_requests();
         let manager = Arc::new(Mutex::new(buffer_manager));
-        let recovery_writer = crate::identity::get_data_dir().map(|data| {
+        let recovery_writer = crate::identity::resolve_data_dir(data_dir.as_deref()).map(|data| {
             let dir = data
                 .join("flavite")
                 .join("vaults")
@@ -3718,6 +3736,9 @@ pub struct SessionBuilder {
     notice: Option<NoticeChannel>,
     config: Option<VaultConfig>,
     recovery_notices: Vec<&'static str>,
+    /// Explicit OS data directory (S8/M3); `None` = resolved platform
+    /// default. Libraries never read the environment.
+    data_dir: Option<PathBuf>,
 }
 
 impl SessionBuilder {
@@ -3769,6 +3790,16 @@ impl SessionBuilder {
         self
     }
 
+    /// Set the explicit OS data directory (S8/M3). The Session's recovery
+    /// checkpoint store roots here instead of the ambient platform default.
+    /// Libraries never read the data-directory override; binaries resolve
+    /// it before spawning threads and pass it through this builder.
+    #[must_use]
+    pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
+        self.data_dir = Some(data_dir.into());
+        self
+    }
+
     /// Queue recovery findings for delivery on the first host pump.
     #[must_use]
     pub fn with_recovery_notices(mut self, notices: Vec<&'static str>) -> Self {
@@ -3778,7 +3809,7 @@ impl SessionBuilder {
 
     /// Build the Session.
     pub fn build(self) -> Result<Session, String> {
-        let session = Session::new(
+        let session = Session::new_with_data_dir(
             self.identity.ok_or("Missing identity")?,
             self.actor.ok_or("Missing actor")?,
             self.buffer_manager.unwrap_or_default(),
@@ -3786,6 +3817,7 @@ impl SessionBuilder {
             self.notice
                 .unwrap_or_else(|| NoticeChannel::new(Duration::from_millis(300))),
             self.config.unwrap_or_default(),
+            self.data_dir,
         );
         *session.recovery_notices.lock_recovering() = self.recovery_notices.into();
         Ok(session)

@@ -349,16 +349,18 @@ impl InstanceManager {
 }
 
 /// Get the path to the data directory. One authority with the identity
-/// layer: the `FLAVITE_DATA_DIR` override must hold for the instance IPC
-/// too, or a fresh isolated run binds its socket in the default user data
-/// directory while everything else lives under the override (W12 fix).
-fn get_data_dir() -> InstanceResult<PathBuf> {
-    crate::identity::get_data_dir().ok_or(InstanceError::NoProjectDirs)
+/// layer: the resolved data directory (binary-bound, explicit, or the
+/// platform default) must hold for the instance IPC too, or a fresh
+/// isolated run binds its socket in the default user data directory while
+/// everything else lives under the override — the ambient state that S8
+/// removes.
+fn instance_data_dir() -> InstanceResult<PathBuf> {
+    crate::identity::resolve_data_dir(None).ok_or(InstanceError::NoProjectDirs)
 }
 
 /// Get the path to the IPC endpoint for a UUID.
 fn get_ipc_path(uuid: Uuid) -> InstanceResult<PathBuf> {
-    let data_dir = get_data_dir()?;
+    let data_dir = instance_data_dir()?;
     Ok(data_dir
         .join(FLAVITE_DIR)
         .join(VAULTS_DIR)
@@ -385,7 +387,7 @@ pub fn is_instance_running(identity: &VaultIdentity) -> bool {
 
 /// Get the root guard path for a root key.
 fn get_root_guard_path(root_key: &[u8]) -> PathBuf {
-    get_data_dir()
+    instance_data_dir()
         .unwrap_or_else(|_| PathBuf::from("/tmp/flavite"))
         .join(FLAVITE_DIR)
         .join(ROOTS_DIR)
@@ -423,7 +425,7 @@ mod tests {
     #[test]
     fn test_get_data_dir() {
         // This should not panic
-        let result = get_data_dir();
+        let result = instance_data_dir();
         assert!(result.is_ok() || result.is_err());
     }
 

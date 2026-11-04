@@ -624,8 +624,23 @@ impl Flavite {
     /// Open a vault and construct the public facade while retaining ownership
     /// guards for the lifetime of the facade.
     pub fn open_root(root: PathBuf, config: VaultConfig) -> Result<Self, FlaviteError> {
-        let vault = Vault::open(root, Box::new(flavite_fs::OsFs::new()), config.clone())
-            .map_err(|error| FlaviteError::VaultOpenError(error.to_string()))?;
+        Self::open_root_with_data_dir(root, config, None)
+    }
+
+    /// Open a vault root with an explicit OS data directory (S8/M3); see
+    /// [`Flavite::open_root`] and `flavite_vault::open::Vault::open_with_data_dir`.
+    pub fn open_root_with_data_dir(
+        root: PathBuf,
+        config: VaultConfig,
+        data_dir: Option<PathBuf>,
+    ) -> Result<Self, FlaviteError> {
+        let vault = flavite_vault::open::Vault::open_with_data_dir(
+            root,
+            Box::new(flavite_fs::OsFs::new()),
+            config.clone(),
+            data_dir,
+        )
+        .map_err(|error| FlaviteError::VaultOpenError(error.to_string()))?;
         let mut flavite = Self::with_vault(vault.identity().clone(), vault.session_arc(), config)?;
         flavite.owned_vault = Some(vault);
         Ok(flavite)
