@@ -134,6 +134,16 @@ impl PersistenceHost {
             SaveRequest::None
         }
     }
+
+    /// The write request for an explicit flush (W06/W12): never debounced
+    /// and never backed off — an explicit flush always attempts the durable
+    /// write, so its durability acknowledgement is never a false report.
+    pub fn flush_request(&mut self) -> SaveRequest {
+        self.dirty_since = None;
+        SaveRequest::Write {
+            expected_generation: self.generation,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -262,7 +262,7 @@ workspace-gate profile="W09":
     set -euo pipefail
     case "{{profile}}" in
         W0[1-9]) slice="{{profile}}"; stage="${slice#W0}" ;;
-        W1[01]) slice="{{profile}}"; stage="${slice#W}" ;;
+        W1[012]) slice="{{profile}}"; stage="${slice#W}" ;;
         *) echo "Expected W01–W11" >&2; exit 2 ;;
     esac
     just workspace-contracts "{{profile}}"
@@ -315,6 +315,11 @@ workspace-gate profile="W09":
     if (( stage >= 11 )); then
         cargo test -p flavite-ui --test appearance_preferences --test visual_contract
         cargo test -p flavite-workspace --test geometry_matrix
+    fi
+    if (( stage >= 12 )); then
+        cargo test -p flavite-ui --test close_safety --test shutdown
+        cargo test -p flavite-api --test recovery_close
+        just fault-tests
     fi
 
 workspace-graph-visual backend="canvas":

@@ -95,6 +95,42 @@ impl DocumentRegistry {
         (tab, incarnation, decision)
     }
 
+    /// How many *other* live view leases share the tab's document (W12
+    /// final-view lease accounting: a close decision is required only
+    /// when this is zero and a buffer is attached).
+    #[must_use]
+    pub fn other_leases(&self, tab: flavite_workspace::TabId) -> usize {
+        self.documents
+            .values()
+            .filter(|entry| entry.leases.contains_key(&tab))
+            .map(|entry| entry.leases.len().saturating_sub(1))
+            .next_back()
+            .unwrap_or(0)
+    }
+
+    /// The buffer attached to the tab's document, if any.
+    #[must_use]
+    pub fn buffer_of(&self, tab: flavite_workspace::TabId) -> Option<u64> {
+        self.documents
+            .values()
+            .find(|entry| entry.leases.contains_key(&tab))
+            .and_then(|entry| entry.buffer)
+    }
+
+    /// The document is fully closed: drop the retained entry so the next
+    /// open starts a fresh Session buffer (W12 §8.3 last-view close).
+    pub fn close_document(&mut self, tab: flavite_workspace::TabId) {
+        let Some(locator) = self
+            .documents
+            .iter()
+            .find(|(_, entry)| entry.leases.contains_key(&tab))
+            .map(|(locator, _)| locator.clone())
+        else {
+            return;
+        };
+        self.documents.remove(&locator);
+    }
+
     /// Release one view's lease. The document entry is retained while its
     /// buffer or open flight persists, so reopening deduplicates and late
     /// completions stay correlated.

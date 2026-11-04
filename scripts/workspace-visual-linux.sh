@@ -24,8 +24,8 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
-if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" && "$scenario" != "context" && "$scenario" != "semantic-link" && "$scenario" != "restore" && "$scenario" != "read-structure" && "$scenario" != "filtered-unsaved-graph" && "$scenario" != "develop-connected-note" && "$scenario" != "appearance-matrix" ]]; then
-    echo "unsupported scenario: $scenario (implemented: layout, shared-editors, shell-foundation, context, semantic-link, restore, develop-connected-note, appearance-matrix)" >&2
+if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" && "$scenario" != "context" && "$scenario" != "semantic-link" && "$scenario" != "restore" && "$scenario" != "read-structure" && "$scenario" != "filtered-unsaved-graph" && "$scenario" != "develop-connected-note" && "$scenario" != "appearance-matrix" && "$scenario" != "conflict-recovery" ]]; then
+    echo "unsupported scenario: $scenario (implemented: layout, shared-editors, shell-foundation, context, semantic-link, restore, develop-connected-note, appearance-matrix, conflict-recovery)" >&2
     exit 2
 fi
 if [[ "$(uname -s)" != Linux ]]; then
@@ -112,16 +112,20 @@ cleanup() {
     done
     kill "$app_pid" 2>/dev/null || true
     wait "$app_pid" 2>/dev/null || true
+    rm -rf "$device_dir" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-device_dir="$run_dir/device-data"
-mkdir -p "$device_dir"
+# The instance IPC socket is a Unix socket under the data dir, so the
+# data dir must be short (SUN_LEN) and absolute (the override requires
+# it): a fresh short /tmp directory per run keeps runs hermetic.
+device_dir="$(mktemp -d "${TMPDIR:-/tmp}/flavite-visual-device.XXXXXXXX")"
 env -u WAYLAND_DISPLAY WINIT_UNIX_BACKEND=x11 \
     FLAVITE_VAULT="$vault_dir" \
     FLAVITE_DATA_DIR="$device_dir" \
     FLAVITE_GRAPH_BACKEND="$render_backend" \
     FLAVITE_HARNESS_OUT_FD=3 \
+    FLAVITE_HARNESS_AUTOSAVE_IDLE_SECS=60 \
     "$target_dir/debug/examples/app-demo" "$vault_dir" \
     3>"$harness_log" >"$app_log" 2>&1 &
 app_pid=$!
@@ -326,6 +330,73 @@ elif [[ "$scenario" == "develop-connected-note" ]]; then
     capture "$run_dir/12-search.png"
     record "saved-search-finds-alpha" "12-search.png"
 
+elif [[ "$scenario" == "conflict-recovery" ]]; then
+    # W12: edit → hard process death (no destructors) → reopen → the
+    # retained recovery copy is offered → restore → save; the recovered
+    # bytes land on disk through the normal save path.
+    xdotool_key "ctrl+p"
+    xdotool type --delay 25 "alpha"
+    xdotool_key "Return"
+    harness_wait "alpha editor ready" \
+        'any(t["load"] == "ready" and t["title"] == "alpha" for g in snapshot["groups"] for t in g["tabs"])'
+    xdotool windowfocus --sync "$window_id"
+    xdotool mousemove --window "$window_id" 700 300 click 1
+    xdotool_key "End"
+    xdotool type --delay 25 " crashed draft"
+    harness_wait "the edit reached the buffer" \
+        'any("crashed draft" in (t.get("buffer_text") or "") for g in snapshot["groups"] for t in g["tabs"])'
+    capture "$run_dir/10-edited.png"
+    record "edit-before-crash" "10-edited.png"
+    # Autosave idle is stretched by the fixture knob, so the recovery
+    # writer's second checkpoint (~2s) is the newest durable copy: kill -9
+    # after it (no destructors, no graceful flush) and the complete edit
+    # exists only as a retained recovery copy.
+    sleep 3
+    kill -9 "$app_pid" 2>/dev/null
+    wait "$app_pid" 2>/dev/null || true
+    sleep 0.5
+    grep -q "crashed draft" "$vault_dir/alpha.md" && {
+        echo "the unsaved edit must not have been written to disk by the crash" >&2
+        exit 1
+    } || true
+    env -u WAYLAND_DISPLAY WINIT_UNIX_BACKEND=x11 \
+        FLAVITE_VAULT="$vault_dir" \
+        FLAVITE_DATA_DIR="$device_dir" \
+        FLAVITE_HARNESS_OUT_FD=3 \
+        FLAVITE_HARNESS_AUTOSAVE_IDLE_SECS=60 \
+        "$target_dir/debug/examples/app-demo" \
+        3>>"$harness_log" >>"$app_log" 2>&1 &
+    app_pid=$!
+    for _ in $(seq 1 100); do
+        window_id="$(xdotool search --onlyvisible --name '^Flavite$' 2>/dev/null | head -n 1 || true)"
+        if [[ -n "$window_id" ]]; then break; fi
+        kill -0 "$app_pid" 2>/dev/null || { cat "$app_log" >&2; echo "relaunch exited" >&2; exit 1; }
+        sleep 0.1
+    done
+    harness_wait "recovery offer dialog appears after restart" \
+        'snapshot["dialog_kind"] == "recovery_offer"'
+    capture "$run_dir/11-recovery-offer.png"
+    record "recovery-offer-after-crash" "11-recovery-offer.png"
+    # Enter restores (the dialog's primary, non-destructive action).
+    xdotool_key "Return"
+    harness_wait "the recovered edit is back in the buffer" \
+        'any("crashed draft" in (t.get("buffer_text") or "") for g in snapshot["groups"] for t in g["tabs"])'
+    capture "$run_dir/12-restored.png"
+    record "recovered-edits-restored" "12-restored.png"
+    # A save persists the recovered bytes through the normal path.
+    xdotool_key "ctrl+s"
+    for _ in $(seq 1 60); do
+        if grep -q "crashed draft" "$vault_dir/alpha.md" 2>/dev/null; then
+            break
+        fi
+        sleep 0.25
+    done
+    grep -q "crashed draft" "$vault_dir/alpha.md" || {
+        echo "the recovered edit was not saved to disk" >&2
+        exit 1
+    }
+    record "recovered-bytes-saved" "12-restored.png"
+
 elif [[ "$scenario" == "appearance-matrix" ]]; then
     # W11: theme/scale matrix through real keyboard input, representative
     # captures, and preserved layout ratios. The concept art is not a
@@ -444,6 +515,7 @@ elif [[ "$scenario" == "restore" ]]; then
         FLAVITE_VAULT="$vault_dir" \
         FLAVITE_DATA_DIR="$device_dir" \
         FLAVITE_HARNESS_OUT_FD=3 \
+        FLAVITE_HARNESS_AUTOSAVE_IDLE_SECS=60 \
         "$target_dir/debug/examples/app-demo" \
         3>>"$harness_log" >>"$app_log" 2>&1 &
     app_pid=$!

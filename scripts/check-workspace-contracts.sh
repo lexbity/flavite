@@ -192,7 +192,7 @@ case "$profile" in
         ;;
     W10)
         bash "$0" W09 "$root"
-        for file in crates/flavite-ui/src/views/search.rs crates/flavite-ui/src/views/notes.rs crates/flavite-ui/src/views/history.rs crates/flavite-ui/src/host/navigation.rs crates/flavite-ui/src/host/dialogs.rs crates/flavite-ui/src/picker.rs crates/flavite-app/src/main.rs crates/flavite-api/tests/workspace_search.rs crates/flavite-ui/tests/knowledge_workflow.rs crates/flavite-ui/tests/navigation_identity.rs; do
+        for file in crates/flavite-ui/src/views/search.rs crates/flavite-ui/src/views/notes.rs crates/flavite-ui/src/views/history.rs crates/flavite-ui/src/host/navigation.rs crates/flavite-ui/src/host/dialogs/mod.rs crates/flavite-ui/src/picker.rs crates/flavite-app/src/main.rs crates/flavite-api/tests/workspace_search.rs crates/flavite-ui/tests/knowledge_workflow.rs crates/flavite-ui/tests/navigation_identity.rs; do
             assert_nonempty "$root/$file"
         done
         assert_absent 'demo\.md|LATTICE|std::fs|rusqlite' \
@@ -221,9 +221,22 @@ case "$profile" in
         assert_absent 'view_minimum\(view.kind\(\), 1\.0\)' \
             "$root/crates/flavite-ui/src/host/shell.rs"
         ;;
+    W12)
+        bash "$0" W11 "$root"
+        for file in crates/flavite-api/src/recovery.rs crates/flavite-api/src/documents.rs crates/flavite-ui/src/host/closing.rs crates/flavite-ui/src/host/shutdown.rs crates/flavite-ui/src/host/dialogs/close.rs crates/flavite-ui/src/host/dialogs/conflict.rs crates/flavite-ui/src/host/dialogs/recovery.rs crates/flavite-ui/src/host/dialogs/merge.rs crates/flavite-ui/tests/close_safety.rs crates/flavite-api/tests/recovery_close.rs crates/flavite-ui/tests/shutdown.rs; do
+            assert_nonempty "$root/$file"
+        done
+        # W12 gates (RFC-0003 §28): no buffer drops, no unwraps on the close
+        # path, no save acknowledgement by notice, no string-matched results.
+        assert_absent 'drop\(.*buffer|close_note.*unwrap|acknowledge.*save' \
+            "$root/crates/flavite-ui/src/host/closing.rs" \
+            "$root/crates/flavite-ui/src/host/shutdown.rs"
+        assert_absent 'result\.contains\(|result\.starts_with\(' \
+            "$root/crates/flavite-ui/src/operation.rs"
+        ;;
     FINAL)
         # Run all completed profiles additively.
-        bash "$0" W11 "$root"
+        bash "$0" W12 "$root"
         # Production/demo cleanup gates
         if [[ -f "$root/crates/flavite-ui/src/main.rs" || -f "$root/crates/flavite-ui/src/boot.rs" ]]; then
             assert_absent 'demo\.md|LATTICE|prepare_demo_vault' \

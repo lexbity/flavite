@@ -333,3 +333,291 @@ fn unresolved_link_activation_offers_explicit_creation() {
     });
     let _ = tab;
 }
+
+// ---- W12: crash subprocess test (edit → kill -9 without destructors →
+// reopen → recover → the recovered note's link reaches the graph) ----
+
+/// The child half of the crash test: seeds an edit with a link, waits for
+/// the durable recovery checkpoint, writes the marker, and parks until the
+/// parent kills the process (no destructors run).
+#[test]
+fn w12_crash_child_seeds_and_parks() {
+    let Some(root) = std::env::var_os("FLAVITE_W12_CRASH_ROOT").map(std::path::PathBuf::from)
+    else {
+        // Not the child run: nothing to do.
+        return;
+    };
+    let flavite =
+        flavite_api::Flavite::open_root(root.clone(), flavite_api::VaultConfig::default())
+            .expect("child vault opens");
+    let path = root.join("alpha.md");
+    let opened = flavite.execute(flavite_api::Invocation::new(
+        flavite.command_registry().next_request_id(),
+        "note.open",
+        serde_json::json!({ "path": path, "policy": "existing_only" }),
+        flavite_api::Origin::Gui,
+    ));
+    let request = match opened {
+        flavite_api::ExecutionResult::Pending { request_id } => request_id,
+        other => panic!("child open not admitted: {other:?}"),
+    };
+    let opened_result = loop {
+        flavite.pump();
+        let done = flavite.wait_for_operation(request);
+        if !done.is_pending() {
+            break done;
+        }
+        assert!(Instant::now() < Instant::now() + Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let opened_success = opened_result.into_success().expect("child open succeeds");
+    let buffer = opened_success.data["buffer_id"]
+        .as_u64()
+        .expect("child buffer id");
+    let view = flavite.get_buffer_view(buffer.into(), None).expect("view");
+    let edited = flavite.execute(flavite_api::Invocation::new(
+        flavite.command_registry().next_request_id(),
+        "apply_edits",
+        serde_json::json!({
+            "buffer_id": buffer,
+            "revision": view.revision,
+            "ops": [{ "range": [0, view.text.len()], "replacement": "# Alpha\n\ncrash draft\n\nSee [[b]].\n" }],
+        }),
+        flavite_api::Origin::Gui,
+    ));
+    assert!(edited.is_success(), "child edit admitted: {edited:?}");
+
+    // The recovery worker checkpoints within ~100ms of the edit; wait for
+    // the durable file under the identity-keyed recovery store.
+    let uuid = flavite.vault_ref().uuid.to_string();
+    let data = std::env::var_os("FLAVITE_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("child data dir");
+    let recovery_dir = data.join("flavite/vaults").join(&uuid).join("recovery");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let has_snapshot = std::fs::read_dir(&recovery_dir)
+            .map(|entries| entries.filter_map(Result::ok).next().is_some())
+            .unwrap_or(false);
+        if has_snapshot {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let has_snapshot = std::fs::read_dir(&recovery_dir)
+        .map(|entries| entries.filter_map(Result::ok).next().is_some())
+        .unwrap_or(false);
+    assert!(has_snapshot, "child recovery checkpoint never landed");
+    // The disk file must still hold the pre-crash bytes.
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"# Alpha\n\nalpha body\n",
+        "the child's edit must exist only as recovery bytes"
+    );
+    std::fs::write(root.join(".recovery-durable"), b"ok").expect("marker");
+    // Park until the parent's kill -9.
+    loop {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn crash_recovery_matches_the_recovered_note_in_the_workspace() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+
+    if std::env::var_os("FLAVITE_W12_CRASH_ROOT").is_some() {
+        // This is the child invocation running under --exact for the child
+        // test; the parent test body must not run.
+        return;
+    }
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("vault");
+    std::fs::create_dir_all(&root).expect("vault root");
+    std::fs::write(root.join("alpha.md"), b"# Alpha\n\nalpha body\n").expect("seed alpha");
+    std::fs::write(root.join("b.md"), b"# B\n\ntarget body\n").expect("seed b");
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).expect("data dir");
+    // SAFETY: the test owns its process-wide data-dir env for the whole
+    // crash sequence (child inherits it; this process re-reads it below).
+    unsafe { std::env::set_var("FLAVITE_DATA_DIR", &data) };
+
+    let test_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(test_exe)
+        .arg("--exact")
+        .arg("w12_crash_child_seeds_and_parks")
+        .arg("--nocapture")
+        .env("FLAVITE_W12_CRASH_ROOT", &root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("child spawns");
+    let marker = root.join(".recovery-durable");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && !marker.exists() {
+        if let Some(status) = child.try_wait().expect("child status") {
+            panic!("crash child exited before its recovery checkpoint: {status}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        marker.exists(),
+        "child never reached its recovery checkpoint"
+    );
+    child.kill().expect("kill -9");
+    let killed = child.wait().expect("child exit");
+    assert_eq!(killed.signal(), Some(9), "the child died by SIGKILL");
+    // No destructors ran: the disk file never received the unsaved edit.
+    assert_eq!(
+        std::fs::read(root.join("alpha.md")).unwrap(),
+        b"# Alpha\n\nalpha body\n",
+        "SIGKILL leaves the unsaved edit out of the disk file"
+    );
+
+    // Reopen in-process: the retained recovery copy is offered, restored
+    // explicitly, and saved; the recovered link reaches the saved graph.
+    let flavite =
+        flavite_api::Flavite::open_root(root.clone(), flavite_api::VaultConfig::default())
+            .expect("parent vault opens");
+    let path = root.join("alpha.md");
+    let opened = flavite.execute(flavite_api::Invocation::new(
+        flavite.command_registry().next_request_id(),
+        "note.open",
+        serde_json::json!({ "path": path, "policy": "existing_only" }),
+        flavite_api::Origin::Gui,
+    ));
+    let request = match opened {
+        flavite_api::ExecutionResult::Pending { request_id } => request_id,
+        other => panic!("parent open not admitted: {other:?}"),
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let result = loop {
+        flavite.pump();
+        let done = flavite.wait_for_operation(request);
+        if !done.is_pending() {
+            break done;
+        }
+        assert!(Instant::now() < deadline, "parent open never finished");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(result.is_success(), "parent open succeeds: {result:?}");
+
+    // The recovery offer arrives as presentation, never mutation.
+    let offer_deadline = Instant::now() + Duration::from_secs(10);
+    let mut offered = false;
+    while Instant::now() < offer_deadline && !offered {
+        flavite.pump();
+        for delivery in flavite.poll_events(64) {
+            if let flavite_api::Event::RecoveryOffer { note_path, .. } = delivery.event {
+                assert!(
+                    note_path.ends_with("alpha.md"),
+                    "the offer names the crashed note: {note_path}"
+                );
+                offered = true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(offered, "the retained recovery copy was never offered");
+
+    let restored = flavite.execute(flavite_api::Invocation::new(
+        flavite.command_registry().next_request_id(),
+        "recovery.restore",
+        serde_json::json!({ "path": path }),
+        flavite_api::Origin::Gui,
+    ));
+    assert!(restored.is_success(), "restore succeeds: {restored:?}");
+    let restored_success = restored.into_success().expect("restore success data");
+    let buffer = restored_success.data["buffer_id"]
+        .as_u64()
+        .expect("restored buffer id");
+    let view = flavite.get_buffer_view(buffer.into(), None).expect("view");
+    assert!(
+        view.text.contains("See [[b]]."),
+        "the recovered bytes are back in the buffer: {:?}",
+        view.text
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"# Alpha\n\nalpha body\n",
+        "a restore never writes the disk"
+    );
+
+    let saved = flavite.execute(flavite_api::Invocation::new(
+        flavite.command_registry().next_request_id(),
+        "note.save",
+        serde_json::json!(path),
+        flavite_api::Origin::Gui,
+    ));
+    let save = match saved {
+        flavite_api::ExecutionResult::Pending { request_id } => {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                flavite.pump();
+                let done = flavite.wait_for_operation(request_id);
+                if !done.is_pending() {
+                    break done;
+                }
+                assert!(Instant::now() < deadline, "save never finished");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        other => other,
+    };
+    assert!(save.is_success(), "save succeeds: {save:?}");
+    let saved_bytes = std::fs::read(&path).unwrap();
+    assert!(
+        String::from_utf8_lossy(&saved_bytes).contains("See [[b]]."),
+        "the recovered bytes are saved to disk: {:?}",
+        String::from_utf8_lossy(&saved_bytes)
+    );
+
+    // Reconcile publishes the saved topology; the recovered link is an
+    // edge from alpha to b in the saved graph projection.
+    let reconciled = flavite.execute(flavite_api::Invocation::new(
+        flavite.command_registry().next_request_id(),
+        "vault.reconcile",
+        serde_json::json!({ "scope": "full", "mode": "verify" }),
+        flavite_api::Origin::Gui,
+    ));
+    let reconcile = match reconciled {
+        flavite_api::ExecutionResult::Pending { request_id } => {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                flavite.pump();
+                let done = flavite.wait_for_operation(request_id);
+                if !done.is_pending() {
+                    break done;
+                }
+                assert!(Instant::now() < deadline, "reconcile never finished");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        other => other,
+    };
+    assert!(reconcile.is_success(), "reconcile succeeds: {reconcile:?}");
+    let edge_deadline = Instant::now() + Duration::from_secs(10);
+    let mut edge_found = false;
+    while Instant::now() < edge_deadline && !edge_found {
+        flavite.pump();
+        flavite.graph_notify_changed();
+        if let Some(frame) = flavite.graph_frame() {
+            // The effective projection batch carries the record-level
+            // graph; after the save it equals the saved topology.
+            let batch = &frame.projection().effective;
+            let alpha = batch.nodes.iter().find(|node| node.path == "alpha.md");
+            let b = batch.nodes.iter().find(|node| node.path == "b.md");
+            if let (Some(alpha), Some(b)) = (alpha, b) {
+                edge_found = batch
+                    .edges
+                    .iter()
+                    .any(|edge| edge.from == alpha.id && edge.to == b.id);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        edge_found,
+        "the recovered note's link reaches the saved graph projection"
+    );
+}

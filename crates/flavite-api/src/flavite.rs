@@ -77,7 +77,7 @@ struct ResolveArgs {
     new_path: Option<PathBuf>,
 }
 
-fn decode<T: serde::de::DeserializeOwned>(invocation: &Invocation) -> Result<T, String> {
+pub(crate) fn decode<T: serde::de::DeserializeOwned>(invocation: &Invocation) -> Result<T, String> {
     serde_json::from_value(invocation.args.clone()).map_err(|error| error.to_string())
 }
 
@@ -148,8 +148,7 @@ fn handle_open(session: &Session, invocation: &Invocation) -> Result<SessionResu
     }))
 }
 fn handle_close(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
-    let path = decode(invocation)?;
-    Ok(session.execute(SessionCommand::CloseNote { path }))
+    crate::documents::handle_close(session, invocation)
 }
 fn handle_save(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
     let path = decode(invocation)?;
@@ -623,7 +622,7 @@ impl Flavite {
     /// the legacy dotted alias as well. Both ids resolve to the same handler
     /// and schema.
     fn register_builtin_commands(&self) -> Result<(), FlaviteError> {
-        let registrations: [HandlerRegistration; 24] = [
+        let registrations: Vec<HandlerRegistration> = vec![
             (
                 "open_note",
                 "Open note",
@@ -637,15 +636,9 @@ impl Flavite {
                 handle_open,
             ),
             (
-                "close_note",
-                "Close note",
-                ArgSchema::typed::<PathBuf>(),
-                handle_close,
-            ),
-            (
                 "note.close",
                 "Close note",
-                ArgSchema::typed::<PathBuf>(),
+                ArgSchema::typed::<crate::documents::CloseArgs>(),
                 handle_close,
             ),
             (
@@ -767,6 +760,36 @@ impl Flavite {
                 "Restore history snapshot",
                 ArgSchema::typed::<RestoreHistoryArgs>(),
                 handle_restore_history,
+            ),
+            (
+                "recovery.restore",
+                "Restore retained recovery snapshot",
+                ArgSchema::typed::<crate::recovery::RecoveryNoteArgs>(),
+                crate::recovery::handle_restore,
+            ),
+            (
+                "recovery.discard",
+                "Discard retained recovery snapshot",
+                ArgSchema::typed::<crate::recovery::RecoveryNoteArgs>(),
+                crate::recovery::handle_discard,
+            ),
+            (
+                "recovery.flush",
+                "Durably retain unsaved changes now",
+                ArgSchema::typed::<crate::recovery::FlushRecoveryArgs>(),
+                crate::recovery::handle_flush,
+            ),
+            (
+                "note.discard_edits",
+                "Discard unsaved edits (restores disk content)",
+                ArgSchema::typed::<crate::recovery::RecoveryNoteArgs>(),
+                crate::documents::handle_discard_edits,
+            ),
+            (
+                "conflict.apply_merge",
+                "Apply a confirmed conflict merge",
+                ArgSchema::typed::<crate::documents::ApplyMergeArgs>(),
+                crate::documents::handle_apply_merge,
             ),
         ];
         for (id, title, args, handler) in registrations {
@@ -1282,7 +1305,13 @@ impl Flavite {
                 "resolve_conflict"
             }
             SessionResult::Success(crate::session::CommandResult::RecoveryRestored { .. }) => {
-                "restore_recovery"
+                "recovery.restore"
+            }
+            SessionResult::Success(crate::session::CommandResult::RecoveryFlushed { .. }) => {
+                "recovery.flush"
+            }
+            SessionResult::Success(crate::session::CommandResult::EditsDiscarded { .. }) => {
+                "note.discard_edits"
             }
             SessionResult::MergeReady { .. }
             | SessionResult::Conflict { .. }
@@ -1428,10 +1457,18 @@ impl Flavite {
                     crate::session::CommandResult::RecoveryRestored {
                         buffer_id,
                         revision,
+                    }
+                    | crate::session::CommandResult::RecoveryFlushed {
+                        buffer_id,
+                        revision,
+                        ..
                     } => serde_json::json!({
                         "buffer_id": buffer_id.as_u64(),
                         "revision": revision.as_u64(),
                     }),
+                    crate::session::CommandResult::EditsDiscarded { buffer_id } => {
+                        serde_json::json!({ "buffer_id": buffer_id.as_u64() })
+                    }
                 };
                 ExecutionResult::Local(LocalResult::Success(LocalSuccess::with_command(
                     request_id, command_id, data,
@@ -2406,8 +2443,8 @@ mod tests {
         let buffer_id = data["buffer_id"].as_u64().unwrap();
         let closed = flavite.execute(Invocation::new(
             6,
-            "close_note",
-            serde_json::to_value(root.join("note.md")).unwrap(),
+            "note.close",
+            serde_json::json!({ "path": root.join("note.md"), "policy": "clean" }),
             Origin::Gui,
         ));
         assert!(closed.is_success());

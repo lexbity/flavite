@@ -32,6 +32,9 @@ impl program::Program for FlaviteProgram {
             size: Size::new(1180.0, 760.0),
             // D-13: the supported default minimum window is 640×480.
             min_size: Some(Size::new(640.0, 480.0)),
+            // W12: the app owns the quit schedule (decisions, recovery and
+            // layout flushes); the runtime must not exit behind its back.
+            exit_on_close_request: false,
             ..window::Settings::default()
         })
     }

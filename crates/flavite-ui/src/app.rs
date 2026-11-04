@@ -96,6 +96,15 @@ pub struct App {
     /// While a Preferences shortcut editor row is capturing, the command
     /// id waiting for the next key press (W11). Escape cancels capture.
     pub shortcut_capture: Option<String>,
+    /// The active close decision (W12), when a final dirty/conflicted view
+    /// needs an explicit safety outcome before its tab may disappear.
+    pub closing: Option<crate::host::closing::ClosePlan>,
+    /// Tabs still awaiting decisions in a group/quit close sequence.
+    pub close_queue: Vec<TabId>,
+    /// The quit schedule (W12), when the window close request is being
+    /// resolved through document decisions, operation flushes, and the
+    /// layout flush.
+    pub shutdown: Option<crate::host::shutdown::ShutdownPlan>,
     /// Named layouts carried for the next layout save (W06).
     pub named_layouts: Vec<flavite_workspace::NamedLayout>,
     pub picker: Picker,
@@ -123,7 +132,7 @@ pub struct App {
     catalog_error: Option<String>,
     settings: Settings,
     settings_valid: bool,
-    pub(crate) operations: OperationPump,
+    pub operations: OperationPump,
     /// Completions routed past the per-pump turn budget; the next pump tick
     /// continues (NFR-08: UI event-loop work is budgeted, never lost).
     completion_backlog: VecDeque<flavite_api::OperationCompletion>,
@@ -169,6 +178,33 @@ pub enum Message {
     SystemTheme(iced::theme::Mode),
     /// A device-preference edit (W11).
     Preferences(crate::host::appearance::PreferenceMessage),
+    /// Begin a close for one tab (W12): decide or close.
+    RequestCloseTab(TabId),
+    /// Begin a close for a whole group (W12): plan per tab.
+    RequestCloseGroup(GroupId),
+    /// The user's decision for the active close plan (W12).
+    CloseDecision(crate::host::closing::CloseDecision),
+    /// Keep the document open; cancel the active close plan (W12).
+    CloseKeepOpen,
+    /// Arm or disarm the destructive discard confirmation (W12); arming
+    /// captures the current revision the user actually sees.
+    CloseDiscardArm(bool),
+    /// Execute the armed revision-bound discard (W12).
+    CloseDiscardConfirm,
+    /// Resolve a conflicted buffer through the core policy (W12).
+    ConflictResolve {
+        tab: TabId,
+        resolution: String,
+    },
+    /// Apply the confirmed merged text of a prepared merge (W12).
+    MergeApply,
+    /// Restore or discard a retained recovery copy (W12).
+    RecoveryResolve {
+        path: String,
+        restore: bool,
+    },
+    /// Shutdown schedule steps and choices (W12).
+    Shutdown(crate::host::shutdown::ShutdownMessage),
     /// Open a real view kind in the focused group.
     NewViewInFocused(flavite_workspace::ViewKind),
     EditorInput {
@@ -425,7 +461,22 @@ impl App {
     #[must_use]
     pub fn boot_from_root(root: PathBuf) -> Self {
         let mut app = Self::empty_at(root.clone());
-        match Flavite::open_root(root, VaultConfig::default()) {
+        // Fixture-only knob: the visual harness stretches the autosave idle
+        // window so a crash lands between the recovery checkpoint and the
+        // autosave. Production execution never reads this variable.
+        #[cfg(feature = "ui-test-support")]
+        let config = {
+            let mut config = VaultConfig::default();
+            if let Ok(secs) = std::env::var("FLAVITE_HARNESS_AUTOSAVE_IDLE_SECS")
+                && let Ok(idle) = secs.parse::<u64>()
+            {
+                config.autosave_idle_interval = std::time::Duration::from_secs(idle);
+            }
+            config
+        };
+        #[cfg(not(feature = "ui-test-support"))]
+        let config = VaultConfig::default();
+        match Flavite::open_root(root, config) {
             Ok(flavite) => app.attach_vault(flavite),
             Err(error) => {
                 app.start.last_vault = flavite_api::read_last_vault_device().ok().flatten();
@@ -476,6 +527,9 @@ impl App {
             persistence: crate::host::persistence::PersistenceHost::default(),
             appearance: crate::host::appearance::AppearanceHost::boot(),
             shortcut_capture: None,
+            closing: None,
+            close_queue: Vec::new(),
+            shutdown: None,
             named_layouts: Vec::new(),
             picker: Picker::default(),
             palette_open: false,
@@ -663,11 +717,12 @@ impl App {
     }
 
     /// Save the workspace layout immediately (W06: explicit flush with a
-    /// durability acknowledgement in the status line).
+    /// durability acknowledgement in the status line). The flush always
+    /// attempts the write: the debounce governs the autosave, never the
+    /// acknowledgement, so "saved" is only reported after a durable receipt.
     pub fn save_layout_now(&mut self) {
-        self.persistence
-            .mark_dirty(Instant::now() - crate::host::persistence::LAYOUT_SAVE_DEBOUNCE);
-        self.persist_workspace_layout();
+        let request = self.persistence.flush_request();
+        self.write_layout(request);
         match self.persistence.last_error() {
             None => {
                 self.status = format!(
@@ -694,73 +749,72 @@ impl App {
     /// Persist the device-local workspace layout when the autosave is due
     /// (W06: debounce, receipts, retry; independent of note saves).
     fn persist_workspace_layout(&mut self) {
+        self.write_layout(self.persistence.due(Instant::now()));
+    }
+
+    /// Write the device-local layout under this save request (W06).
+    /// Failures are recorded on the persistence host, never silent.
+    fn write_layout(&mut self, request: crate::host::persistence::SaveRequest) {
         use flavite_api::UserStateKind;
-        if self.flavite.is_none() {
+        let crate::host::persistence::SaveRequest::Write {
+            expected_generation,
+        } = request
+        else {
             return;
-        }
-        match self.persistence.due(Instant::now()) {
-            crate::host::persistence::SaveRequest::None => {}
-            crate::host::persistence::SaveRequest::Write {
-                expected_generation,
-            } => {
-                let Some(flavite) = &self.flavite else {
-                    return;
-                };
-                let uuid = flavite.vault_ref().uuid.to_string();
-                let persisted = flavite_workspace::persist_workspace(&self.workspace, &uuid);
-                let named = self.named_layouts.clone();
-                let persisted = flavite_workspace::PersistedWorkspace {
-                    named_layouts: named,
-                    ..persisted
-                };
-                let bytes = match flavite_workspace::encode_workspace(&persisted) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        self.persistence.record_failure(
-                            crate::host::persistence::PersistenceFailure::Failed {
-                                message: error.to_string(),
-                            },
-                        );
-                        return;
-                    }
-                };
-                // The store is behind &mut; go through the facade with a
-                // fresh mutable borrow.
-                let write = self
-                    .flavite
-                    .as_mut()
-                    .expect("checked above")
-                    .write_user_state(UserStateKind::WorkspaceLayouts, expected_generation, &bytes);
-                match write {
-                    Ok(generation) => self.persistence.record_success(generation),
-                    Err(flavite_api::FlaviteError::UserState(
-                        flavite_api::user_state::UserStateError::GenerationMismatch {
-                            expected,
-                            actual,
-                        },
-                    )) => {
-                        self.persistence.record_failure(
-                            crate::host::persistence::PersistenceFailure::GenerationMismatch {
-                                expected,
-                                actual,
-                            },
-                        );
-                    }
-                    Err(flavite_api::FlaviteError::UserState(error)) => {
-                        self.persistence.record_failure(
-                            crate::host::persistence::PersistenceFailure::Failed {
-                                message: error.to_string(),
-                            },
-                        );
-                    }
-                    Err(error) => {
-                        self.persistence.record_failure(
-                            crate::host::persistence::PersistenceFailure::Failed {
-                                message: error.to_string(),
-                            },
-                        );
-                    }
-                }
+        };
+        let Some(flavite) = &self.flavite else {
+            return;
+        };
+        let uuid = flavite.vault_ref().uuid.to_string();
+        let persisted = flavite_workspace::persist_workspace(&self.workspace, &uuid);
+        let named = self.named_layouts.clone();
+        let persisted = flavite_workspace::PersistedWorkspace {
+            named_layouts: named,
+            ..persisted
+        };
+        let bytes = match flavite_workspace::encode_workspace(&persisted) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.persistence.record_failure(
+                    crate::host::persistence::PersistenceFailure::Failed {
+                        message: error.to_string(),
+                    },
+                );
+                return;
+            }
+        };
+        // The store is behind &mut; go through the facade with a
+        // fresh mutable borrow.
+        let write = self
+            .flavite
+            .as_mut()
+            .expect("checked above")
+            .write_user_state(UserStateKind::WorkspaceLayouts, expected_generation, &bytes);
+        match write {
+            Ok(generation) => self.persistence.record_success(generation),
+            Err(flavite_api::FlaviteError::UserState(
+                flavite_api::user_state::UserStateError::GenerationMismatch { expected, actual },
+            )) => {
+                self.persistence.record_failure(
+                    crate::host::persistence::PersistenceFailure::GenerationMismatch {
+                        expected,
+                        actual,
+                    },
+                );
+            }
+            Err(flavite_api::FlaviteError::UserState(error)) => {
+                self.persistence.record_failure(
+                    crate::host::persistence::PersistenceFailure::Failed {
+                        message: error.to_string(),
+                    },
+                );
+            }
+            Err(error) => {
+                self.persistence.record_failure(
+                    crate::host::persistence::PersistenceFailure::Failed {
+                        message: error.to_string(),
+                    },
+                );
             }
         }
     }
@@ -1030,6 +1084,20 @@ impl App {
             // Preferences edits commit through Message::Preferences as
             // they are made; submit only closes the dialog.
             crate::host::dialogs::Dialog::Preferences => {
+                self.dialog = None;
+                self.shortcut_capture = None;
+            }
+            // W12 dialogs resolve through their own messages; Enter runs
+            // the primary action where it is safe (never a destructive one).
+            crate::host::dialogs::Dialog::RecoveryOffer { path } => {
+                self.resolve_recovery(&path, true);
+            }
+            crate::host::dialogs::Dialog::Merge { .. } => self.apply_prepared_merge(),
+            crate::host::dialogs::Dialog::ShutdownTimeout { .. } => {
+                let _ = self.update_shutdown(crate::host::shutdown::ShutdownMessage::KeepWaiting);
+            }
+            crate::host::dialogs::Dialog::Close { .. }
+            | crate::host::dialogs::Dialog::Conflict { .. } => {
                 self.dialog = None;
                 self.shortcut_capture = None;
             }
@@ -1951,10 +2019,11 @@ impl App {
                     tab,
                 });
             }
-            Message::CloseTab(tab) => self.dispatch_layout(|revision| LayoutAction::CloseTab {
-                expected_revision: revision,
-                tab,
-            }),
+            // W12: the tab-strip close button goes through the close plan
+            // (final-view lease accounting, decisions, core policy).
+            Message::CloseTab(tab) => {
+                let _ = self.request_close_tab(tab);
+            }
             Message::AccessibleSelection {
                 tab,
                 incarnation,
@@ -1971,10 +2040,69 @@ impl App {
                 }
             }
             Message::Mouse(event) => self.handle_mouse(event),
+            Message::RequestCloseTab(tab) => {
+                let _ = self.request_close_tab(tab);
+            }
+            Message::RequestCloseGroup(group) => {
+                let _ = self.request_close_group(group);
+            }
+            Message::CloseDecision(decision) => {
+                let _ = self.apply_close_decision(decision);
+            }
+            Message::CloseKeepOpen => {
+                // W12: keeping the note open during a quit cancels the whole
+                // quit schedule, not just the close plan.
+                if self.shutdown.is_some() {
+                    self.cancel_shutdown();
+                } else {
+                    self.cancel_close();
+                }
+            }
+            Message::CloseDiscardArm(arm) => {
+                if arm {
+                    let revision = self
+                        .closing
+                        .as_ref()
+                        .and_then(|plan| self.note_editor_view(plan.tab))
+                        .map(|view| view.revision);
+                    if let (Some(plan), Some(revision)) = (self.closing.as_mut(), revision) {
+                        plan.discard_armed = Some(revision);
+                        // Arming re-presents the document to the user (D-07):
+                        // the plan is valid for the revision they now see,
+                        // otherwise a re-armed discard could never proceed.
+                        plan.captured_revision = revision;
+                    }
+                } else if let Some(plan) = self.closing.as_mut() {
+                    plan.discard_armed = None;
+                }
+            }
+            Message::ConflictResolve { tab, resolution } => {
+                self.resolve_conflict(tab, &resolution);
+            }
+            Message::MergeApply => self.apply_prepared_merge(),
+            Message::RecoveryResolve { path, restore } => {
+                self.resolve_recovery(&path, restore);
+            }
+            Message::CloseDiscardConfirm => {
+                let revision = self
+                    .closing
+                    .as_ref()
+                    .and_then(|plan| plan.discard_armed)
+                    .unwrap_or_default();
+                let _ = self.apply_close_decision(crate::host::closing::CloseDecision::Discard {
+                    expected_revision: revision,
+                });
+            }
+            Message::Shutdown(message) => {
+                let _ = self.update_shutdown(message);
+            }
             Message::SystemTheme(mode) => self.appearance.system_theme(mode),
             Message::Preferences(update) => {
                 // Preference edits persist inline; the task is always none.
                 let _ = self.update_preferences(update);
+            }
+            Message::WindowEvent(iced::window::Event::CloseRequested) => {
+                self.begin_shutdown();
             }
             Message::WindowEvent(iced::window::Event::Focused) => {
                 if let Some(flavite) = &self.flavite
@@ -1996,13 +2124,24 @@ impl App {
             Message::Pump => {
                 self.pump();
                 self.refresh_semantics();
+                // W12: the quit schedule advances with the pump; the exit
+                // task closes the window only from ReadyToExit.
+                if let Some(task) = self.shutdown_step() {
+                    return task;
+                }
                 if let Some(task) = self.focus_fresh_search_input() {
                     return task;
                 }
                 return crate::host::reading::scroll_pending(self);
             }
             Message::Layout(action) => {
-                if !self.has_composing_view() && self.layout_fits(&action) {
+                // W12: while the quit schedule is being resolved the layout
+                // is frozen; the close machinery mutates it exclusively.
+                if self.shutdown.is_some() {
+                    self.status =
+                        "Quitting: resolve the quit (decide or cancel) before changing the layout"
+                            .into();
+                } else if !self.has_composing_view() && self.layout_fits(&action) {
                     let outcome = flavite_workspace::reduce(&self.workspace, action);
                     self.commit(outcome);
                 } else {
@@ -2313,8 +2452,26 @@ impl App {
                 self.submit_dialog();
             }
             Message::DialogCancel => {
-                self.dialog = None;
                 self.shortcut_capture = None;
+                if matches!(
+                    self.dialog,
+                    Some(crate::host::dialogs::Dialog::Close { .. })
+                ) {
+                    // W12: cancelling the decision dialog during a quit
+                    // cancels the whole quit schedule.
+                    if self.shutdown.is_some() {
+                        self.cancel_shutdown();
+                    } else {
+                        self.cancel_close();
+                    }
+                } else if matches!(
+                    self.dialog,
+                    Some(crate::host::dialogs::Dialog::ShutdownTimeout { .. })
+                ) {
+                    self.cancel_shutdown();
+                } else {
+                    self.dialog = None;
+                }
             }
             Message::NotePicked(picked) => {
                 self.open_picked_note(picked);
@@ -2562,6 +2719,23 @@ impl App {
                 if let flavite_api::Event::ReconcileProgress { done, total } = &event {
                     self.reconcile_progress = (*done < *total).then_some((*done, *total));
                 }
+                // W12: a recovery offer is presentation, never mutation —
+                // the dialog offers restore/discard explicitly (D-12).
+                if let flavite_api::Event::RecoveryOffer { note_path, .. } = &event
+                    && self.dialog.is_none()
+                {
+                    self.dialog = Some(crate::host::dialogs::Dialog::RecoveryOffer {
+                        path: note_path.clone(),
+                    });
+                }
+                // A conflicted buffer surfaces its resolution dialog once;
+                // resolution stays explicit (no notice-driven mutation).
+                if let flavite_api::Event::Conflict { note_path, .. } = &event
+                    && self.dialog.is_none()
+                    && let Some(tab) = self.tab_for_note_path(note_path)
+                {
+                    self.dialog = Some(crate::host::dialogs::Dialog::Conflict { tab });
+                }
                 if matches!(&event, flavite_api::Event::VaultChanged { .. }) {
                     refresh_catalog = true;
                     // Saved content changed: previews and backlinks re-query.
@@ -2664,6 +2838,11 @@ impl App {
     /// visual/integration harnesses can drive correlated completions
     /// directly; production callers go through the pump.
     pub fn route_completion(&mut self, completion: flavite_api::OperationCompletion) {
+        // W12: a close plan's own save completion drives the close; other
+        // routing must not consume it.
+        if self.route_close_completion(completion.request_id, &completion.result) {
+            return;
+        }
         if crate::host::occurrences::completion(self, &completion) {
             return;
         }
@@ -3061,13 +3240,19 @@ impl App {
             return;
         };
         let args = match command_id {
-            "note.save" | "note.close" => {
+            "note.save" => {
                 let focused = self.workspace.focused_tab();
                 let Some(state) = self.notes.state(&focused) else {
                     self.status = format!("{command_id} requires a note tab");
                     return;
                 };
                 serde_json::json!(state.locator.to_path(&self.root))
+            }
+            "note.close" => {
+                // Palette close goes through the full W12 decision path.
+                let focused = self.workspace.focused_tab();
+                let _ = self.request_close_tab(focused);
+                return;
             }
             "vault.reconcile" => serde_json::json!({ "scope": "full", "mode": "fast" }),
             "buffer.undo" | "buffer.redo" => {
@@ -3226,6 +3411,189 @@ fn ratio_to_ppm(ratio: f32) -> u32 {
     ) as u32
 }
 
+impl App {
+    /// The tab whose document lives at `note_path` (vault-relative or
+    /// native display form), if any.
+    #[must_use]
+    pub fn tab_for_note_path(&self, note_path: &str) -> Option<TabId> {
+        let native = std::path::PathBuf::from(note_path);
+        self.notes.tabs().map(|(tab, _)| tab).find(|tab| {
+            self.notes.state(tab).is_some_and(|state| {
+                state.locator.to_path(self.root()) == native
+                    || state.locator.components().join("/") == note_path.replace('\\', "/")
+            })
+        })
+    }
+
+    /// Resolve a conflicted buffer through the core policy (W12). A merge
+    /// preparation opens the merge-confirmation dialog with the typed
+    /// receipt; nothing is applied without explicit confirmation.
+    pub fn resolve_conflict(&mut self, tab: TabId, resolution: &str) {
+        let Some(flavite) = self.flavite.as_mut() else {
+            return;
+        };
+        let Some(state) = self.notes.state(&tab) else {
+            return;
+        };
+        let path = state.locator.to_path(&self.root);
+        let request_id = flavite.command_registry().next_request_id();
+        let invocation = flavite_api::Invocation::new(
+            request_id,
+            "resolve_conflict",
+            serde_json::json!({ "path": path, "resolution": resolution }),
+            flavite_api::Origin::Gui,
+        );
+        match flavite.execute(invocation) {
+            flavite_api::ExecutionResult::Local(flavite_api::LocalResult::Success(success)) => {
+                if resolution == "merge"
+                    && let Some(prepared) = prepared_merge_from(&success.data, &self.root)
+                {
+                    self.dialog = Some(crate::host::dialogs::Dialog::Merge { tab, prepared });
+                    self.status = "Merge prepared; confirm to apply".into();
+                    return;
+                }
+                self.dialog = None;
+                self.status = match resolution {
+                    "reload" => "Reloaded from disk; my edits were kept in local history".into(),
+                    "keep_mine" => "My edits kept; save to persist them".into(),
+                    _ => "Conflict resolution completed".into(),
+                };
+            }
+            flavite_api::ExecutionResult::ActionRequired { code, .. } => {
+                self.status = format!("Conflict resolution needs attention: {code}");
+            }
+            other => {
+                self.status = format!("Conflict resolution did not complete: {other:?}");
+            }
+        }
+    }
+
+    /// Apply the confirmed merged text against the prepared receipt.
+    pub fn apply_prepared_merge(&mut self) {
+        let Some(crate::host::dialogs::Dialog::Merge { prepared, .. }) = self.dialog.clone() else {
+            return;
+        };
+        let Some(flavite) = self.flavite.as_mut() else {
+            return;
+        };
+        let request_id = flavite.command_registry().next_request_id();
+        let invocation = flavite_api::Invocation::new(
+            request_id,
+            "conflict.apply_merge",
+            serde_json::json!({
+                "path": prepared.path,
+                "buffer_id": prepared.buffer_id,
+                "revision": prepared.revision,
+                "disk_hash": prepared.disk_hash,
+                "merged": prepared.merged,
+            }),
+            flavite_api::Origin::Gui,
+        );
+        match flavite.execute(invocation) {
+            flavite_api::ExecutionResult::Local(local) => {
+                self.dialog = None;
+                if local.is_success() {
+                    self.status = "Merged text applied as one guarded edit".into();
+                } else {
+                    self.status = format!(
+                        "Merge not applied: {}",
+                        crate::operation::describe_result(&local)
+                    );
+                }
+            }
+            other => {
+                self.status = format!("Merge not applied: {other:?}");
+            }
+        }
+    }
+
+    /// Restore or discard a retained recovery copy through the API (W12).
+    pub fn resolve_recovery(&mut self, path: &str, restore: bool) {
+        let Some(flavite) = self.flavite.as_mut() else {
+            return;
+        };
+        let command = if restore {
+            "recovery.restore"
+        } else {
+            "recovery.discard"
+        };
+        let request_id = flavite.command_registry().next_request_id();
+        let invocation = flavite_api::Invocation::new(
+            request_id,
+            command,
+            serde_json::json!({ "path": path }),
+            flavite_api::Origin::Gui,
+        );
+        match flavite.execute(invocation) {
+            flavite_api::ExecutionResult::Pending { request_id } => {
+                self.operations.accept(
+                    request_id,
+                    if restore {
+                        "recovery restore"
+                    } else {
+                        "recovery discard"
+                    },
+                );
+                self.dialog = None;
+                self.status = "Recovery command accepted".into();
+            }
+            flavite_api::ExecutionResult::Local(local) => {
+                self.dialog = None;
+                self.status = if local.is_success() {
+                    if restore {
+                        "Recovered changes restored into the note".into()
+                    } else {
+                        "Recovered copy discarded".into()
+                    }
+                } else {
+                    format!(
+                        "Recovery command failed: {}",
+                        crate::operation::describe_result(&local)
+                    )
+                };
+            }
+            other => {
+                self.status = format!("Recovery command did not complete: {other:?}");
+            }
+        }
+    }
+}
+
+/// Build a [`PreparedMerge`] from a `MergeReady` success payload.
+fn prepared_merge_from(
+    data: &serde_json::Value,
+    root: &std::path::Path,
+) -> Option<crate::host::dialogs::PreparedMerge> {
+    let path = data.get("path")?.as_str()?;
+    let buffer_id = data.get("buffer_id")?.as_u64()?;
+    let revision = data.get("revision")?.as_u64()?;
+    let disk_hash = data.get("disk_hash")?.as_str()?.to_owned();
+    let merged = data.get("merged")?.as_str()?.to_owned();
+    let conflicts = data
+        .get("conflicts")
+        .and_then(serde_json::Value::as_array)
+        .map(|hunks| {
+            hunks
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    // Display paths stay vault-relative; identity uses the native path.
+    let display = std::path::PathBuf::from(path)
+        .strip_prefix(root)
+        .map(|relative| relative.display().to_string())
+        .unwrap_or_else(|_| path.to_owned());
+    Some(crate::host::dialogs::PreparedMerge {
+        path: display,
+        buffer_id,
+        revision,
+        disk_hash,
+        merged,
+        conflicts,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3258,6 +3626,9 @@ mod tests {
             persistence: crate::host::persistence::PersistenceHost::default(),
             appearance: crate::host::appearance::AppearanceHost::boot(),
             shortcut_capture: None,
+            closing: None,
+            close_queue: Vec::new(),
+            shutdown: None,
             named_layouts: Vec::new(),
             picker: Picker::default(),
             palette_open: false,

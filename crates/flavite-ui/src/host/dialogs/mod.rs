@@ -6,11 +6,17 @@
 //! submit. Creation goes through the core `note.create` command, renames
 //! through the journaled `note.rename` — no GUI-side file mutation.
 
+pub mod close;
+pub mod conflict;
+pub mod merge;
+pub mod recovery;
+
 use crate::app::{App, Message};
 use crate::preferences::{LineWidth, ThemeChoice};
 use crate::style;
 use crate::workspace::tab_strip;
 use flavite_workspace::NoteLocator;
+use flavite_workspace::TabId;
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Length};
 
@@ -40,9 +46,52 @@ pub enum Dialog {
     /// Interface preferences (W11): theme, scale, editor type, motion,
     /// and shortcut overrides with collision capture.
     Preferences,
+    /// Close decision for a final unsaved view (W12).
+    Close { tab: TabId },
+    /// Conflict resolution for a buffer whose file changed on disk (W12).
+    Conflict { tab: TabId },
+    /// A prepared three-way merge awaiting explicit confirmation (W12).
+    Merge { tab: TabId, prepared: PreparedMerge },
+    /// A retained recovery snapshot was found for a note (W12).
+    RecoveryOffer { path: String },
+    /// Quit stalled on unresolved work; the user chooses explicitly (W12).
+    ShutdownTimeout { concern: String },
+}
+
+/// A core-prepared merge receipt plus the merged text it carries (W12).
+#[derive(Debug, Clone)]
+pub struct PreparedMerge {
+    /// Exact native note path.
+    pub path: String,
+    /// The buffer id from the `MergeReady` receipt.
+    pub buffer_id: u64,
+    /// The expected buffer revision from the receipt.
+    pub revision: u64,
+    /// The disk hash the merge was prepared against (hex).
+    pub disk_hash: String,
+    /// The merged document text awaiting confirmation.
+    pub merged: String,
+    /// Structured conflict hunks for the compare view.
+    pub conflicts: Vec<String>,
 }
 
 impl Dialog {
+    /// The stable kind name for semantic snapshots (W12 harness).
+    #[must_use]
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::NewNote { .. } => "new_note",
+            Self::Rename { .. } => "rename",
+            Self::About => "about",
+            Self::Preferences => "preferences",
+            Self::Close { .. } => "close",
+            Self::Conflict { .. } => "conflict",
+            Self::Merge { .. } => "merge",
+            Self::RecoveryOffer { .. } => "recovery_offer",
+            Self::ShutdownTimeout { .. } => "shutdown_timeout",
+        }
+    }
+
     /// The dialog headline.
     #[must_use]
     pub fn title(&self) -> &'static str {
@@ -51,6 +100,11 @@ impl Dialog {
             Self::Rename { .. } => "Rename or move note",
             Self::About => "About Flavite",
             Self::Preferences => "Preferences",
+            Self::Close { .. } => "Unsaved changes",
+            Self::Conflict { .. } => "Conflict",
+            Self::Merge { .. } => "Confirm merge",
+            Self::RecoveryOffer { .. } => "Recover unsaved changes",
+            Self::ShutdownTimeout { .. } => "Quit with unresolved work?",
         }
     }
 }
@@ -180,6 +234,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
             .spacing(metrics.spacing_sm),
         ),
         Dialog::Preferences => preferences_body(app, *metrics),
+        Dialog::Close { tab } => close::view(app, *tab, *metrics),
+        Dialog::Conflict { tab } => conflict::view(app, *tab, *metrics),
+        Dialog::Merge { prepared, .. } => merge::view(prepared, *metrics),
+        Dialog::RecoveryOffer { path } => recovery::view(path, *metrics),
+        Dialog::ShutdownTimeout { concern } => close::shutdown_view(app, concern, *metrics),
     }
 }
 

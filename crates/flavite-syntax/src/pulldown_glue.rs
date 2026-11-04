@@ -180,12 +180,45 @@ pub fn parse_snapshot(snapshot: TextSnapshot) -> Result<ParsedNote, String> {
                 text_buffer.clear();
                 text_start = range.end;
             }
-            Event::SoftBreak | Event::HardBreak => {
-                // Soft/hard breaks are part of the buffered text: their
-                // bytes must be appended so the buffer stays aligned with
-                // `snapshot[text_start..]` (a dropped newline shifted every
-                // later span and silently hid links after the first line).
-                text_buffer.push_str(&text[range.start..range.end]);
+            Event::Start(Tag::Paragraph) => {
+                // A paragraph boundary's structural newlines appear in no
+                // text event. Flush before the block so the buffer never
+                // spans one: a buffer that skips the separator bytes no
+                // longer matches `snapshot[buffer_start..]`, and the
+                // truncated scan range silently hid every link after the
+                // first paragraph (the same failure mode the SoftBreak arm
+                // below fixes for line breaks).
+                if !text_buffer.is_empty() {
+                    scan_buffer(
+                        &snapshot,
+                        &mask,
+                        &text_buffer,
+                        text_start,
+                        &mut links,
+                        &mut tags,
+                        &mut block_ids,
+                    );
+                    text_buffer.clear();
+                }
+                text_start = range.start;
+            }
+            Event::End(TagEnd::Paragraph) => {
+                // Flush at the block end and re-anchor to it: the next
+                // paragraph's first text event re-anchors from its own
+                // start, so each paragraph scans aligned bytes.
+                if !text_buffer.is_empty() {
+                    scan_buffer(
+                        &snapshot,
+                        &mask,
+                        &text_buffer,
+                        text_start,
+                        &mut links,
+                        &mut tags,
+                        &mut block_ids,
+                    );
+                    text_buffer.clear();
+                }
+                text_start = range.end;
             }
             Event::Text(_) => {
                 // Skip text in code blocks
@@ -202,7 +235,18 @@ pub fn parse_snapshot(snapshot: TextSnapshot) -> Result<ParsedNote, String> {
                     current_heading_text.push_str(text_content);
                 }
 
-                // Buffer text for scanning (to handle split wikilinks)
+                // Buffer text for scanning (to handle split wikilinks).
+                // The buffer must stay byte-identical to
+                // `snapshot[text_start..]`: structural bytes the event
+                // stream drops (paragraph separators, emphasis markers,
+                // soft/hard breaks) are filled in from the snapshot, so
+                // every scan range covers exactly the bytes it names. A
+                // buffer that skipped them desynchronized the scan window
+                // and silently hid links after the first dropped byte.
+                let expected_start = text_start + text_buffer.len();
+                if range.start > expected_start {
+                    text_buffer.push_str(&text[expected_start..range.start]);
+                }
                 if text_buffer.is_empty() {
                     text_start = range.start;
                 }
@@ -399,6 +443,31 @@ mod tests {
         }
         assert_eq!(result.links.len(), 1);
         assert_eq!(result.links[0].target_raw, "link");
+        // Regression (W12 crash-recovery evidence): a wikilink after a
+        // second paragraph — with inline markup before it — was silently
+        // lost because the scan buffer skipped structural bytes and its
+        // window desynchronized from the snapshot.
+        {
+            let multi =
+                parse_note(b"# H\n\nfirst paragraph with **bold**\n\nSee [[target]].\n").unwrap();
+            let targets: Vec<&str> = multi
+                .links
+                .iter()
+                .map(|link| link.target_raw.as_str())
+                .collect();
+            assert_eq!(
+                targets,
+                ["target"],
+                "links after later paragraphs are indexed"
+            );
+            let last = multi.links.last().unwrap();
+            let text = multi.snapshot.text();
+            assert_eq!(
+                &text[last.span.start.0..last.span.end.0],
+                "[[target]]",
+                "the extracted span names the real snapshot bytes"
+            );
+        }
         assert!(!result.links[0].is_embed);
     }
 

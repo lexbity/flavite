@@ -13,7 +13,6 @@
 
 use crate::identity::uuid_lock_path;
 use crate::types::VaultIdentity;
-use directories::ProjectDirs;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -349,11 +348,12 @@ impl InstanceManager {
     }
 }
 
-/// Get the path to the data directory.
+/// Get the path to the data directory. One authority with the identity
+/// layer: the `FLAVITE_DATA_DIR` override must hold for the instance IPC
+/// too, or a fresh isolated run binds its socket in the default user data
+/// directory while everything else lives under the override (W12 fix).
 fn get_data_dir() -> InstanceResult<PathBuf> {
-    ProjectDirs::from("com", "flavite", "Flavite")
-        .map(|p| p.data_dir().to_path_buf())
-        .ok_or(InstanceError::NoProjectDirs)
+    crate::identity::get_data_dir().ok_or(InstanceError::NoProjectDirs)
 }
 
 /// Get the path to the IPC endpoint for a UUID.

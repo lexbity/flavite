@@ -18,7 +18,7 @@ use crate::types::{
 };
 use flavite_buffer::manager::{BufferManager, BufferStateChanged};
 use flavite_buffer::recovery::{RecoveryConfig, RecoveryWriter};
-use flavite_buffer::revision::{BufferId, Revision};
+use flavite_buffer::revision::{BaseHash, BufferId, Revision};
 use flavite_buffer::undo::EditOp;
 use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
@@ -208,7 +208,12 @@ pub enum SessionCommand {
     /// the actor, never under the driving turn.
     CreateNote { path: PathBuf },
     /// Close a note.
-    CloseNote { path: PathBuf },
+    CloseNote {
+        path: PathBuf,
+        /// Retain a durable recovery snapshot covering the unsaved edits
+        /// before the buffer is dropped (W12: close-with-recovery policy).
+        retain_recovery: bool,
+    },
     /// Apply edits to a note.
     ApplyEdits {
         buffer_id: BufferId,
@@ -256,6 +261,12 @@ pub enum SessionCommand {
     RestoreRecovery { path: PathBuf },
     /// Discard the recovery snapshot for a note after explicit user choice.
     DiscardRecovery { path: PathBuf },
+    /// Durably checkpoint one dirty buffer's recovery snapshot now and
+    /// return a revision-bound receipt (W12).
+    FlushRecovery { path: PathBuf },
+    /// Snapshot the buffer's unsaved edits into local history, drop them,
+    /// and reload from disk as one explicit destructive action (W12).
+    DiscardEdits { path: PathBuf },
     /// Replace an open buffer's content with a local-history snapshot as one
     /// guarded, undoable edit (W10). The note must already be open: restore
     /// never mutates disk and never opens notes implicitly.
@@ -406,6 +417,16 @@ pub enum CommandResult {
         buffer_id: BufferId,
         revision: Revision,
     },
+    /// A durable recovery snapshot was written for `buffer_id` covering
+    /// `revision` with content hash `hash` (W12 FlushRecovery receipt).
+    RecoveryFlushed {
+        buffer_id: BufferId,
+        revision: Revision,
+        hash: BaseHash,
+    },
+    /// Unsaved edits were snapshotted into local history and reloaded
+    /// from disk (W12 explicit discard).
+    EditsDiscarded { buffer_id: BufferId },
     /// A local-history snapshot replaced the open buffer content as one
     /// guarded, undoable edit (W10). Nothing was written to disk.
     HistoryRestored {
@@ -1178,7 +1199,10 @@ impl Session {
             } => self.edit_structure(buffer_id, revision, edit),
             SessionCommand::OpenNote { path, policy } => self.open_note(path, policy),
             SessionCommand::CreateNote { path } => self.create_note(path),
-            SessionCommand::CloseNote { path } => self.close_note(path),
+            SessionCommand::CloseNote {
+                path,
+                retain_recovery,
+            } => self.close_note(path, retain_recovery),
             SessionCommand::ApplyEdits {
                 buffer_id,
                 revision,
@@ -1215,6 +1239,11 @@ impl Session {
                 hash,
             } => self.restore_history(path, buffer_id, revision, hash),
             SessionCommand::DiscardRecovery { path } => self.discard_recovery(path),
+            SessionCommand::FlushRecovery { path } => match self.flush_recovery_note(&path) {
+                Ok(receipt) => SessionResult::Success(receipt),
+                Err(message) => SessionResult::Error { message },
+            },
+            SessionCommand::DiscardEdits { path } => self.discard_edits(path),
             SessionCommand::LinkPrepare {
                 request,
                 request_id,
@@ -1697,8 +1726,15 @@ impl Session {
     /// CLI/headless convenience for commands that promise a disk mutation.
     /// GUI hosts use `drain_operation_completions` from their normal pump.
     pub fn wait_for_operation(&self, request_id: u64) -> SessionResult {
+        let _turn = self.driving_turn.lock().unwrap();
+        self.wait_for_operation_holding_turn(request_id)
+    }
+
+    /// Wait for an operation while the driving turn is already held (W12:
+    /// `restore_recovery`'s implicit open runs inside `execute`, which
+    /// holds the turn; re-acquiring here would self-deadlock).
+    fn wait_for_operation_holding_turn(&self, request_id: u64) -> SessionResult {
         loop {
-            let _turn = self.driving_turn.lock().unwrap();
             self.pump_external_changes_inner();
             self.pump_open_completions();
             self.pump_save_completions();
@@ -1741,7 +1777,9 @@ impl Session {
                     message: format!("unknown or already-drained operation {request_id}"),
                 };
             }
-            drop(_turn);
+            // The caller holds the driving turn for the whole wait; only
+            // the sleep is released so concurrent pumps on other threads
+            // can make progress against the actor.
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -2018,6 +2056,17 @@ impl Session {
                 }
                 if failure.stage == SaveFailureStage::Compare {
                     SessionResult::Conflict { path }
+                } else if failure.stage == SaveFailureStage::IndexApply
+                    && failure.outcome == DurabilityOutcome::ReplacedIndexPending
+                {
+                    // W12: the bytes are durably on disk; only the index
+                    // application is pending. Surfaced separately from the
+                    // generic error so hosts can report save success and
+                    // indexing failure apart (the UI reconcile clears it).
+                    SessionResult::ActionRequired {
+                        code: "index-pending",
+                        data: Some(path.display().to_string()),
+                    }
                 } else {
                     SessionResult::Error {
                         message: failure.to_string(),
@@ -2230,7 +2279,11 @@ impl Session {
         self.open_note_inner(path, OpenPolicy::CreateNew)
     }
 
-    fn close_note(&self, path: PathBuf) -> SessionResult {
+    /// The one core close policy (W12 consolidation): a pending save
+    /// flight refuses every close; a dirty buffer refuses a plain close
+    /// but may close while retaining a durable recovery snapshot that
+    /// provably covers its current revision and bytes.
+    fn close_note(&self, path: PathBuf, retain_recovery: bool) -> SessionResult {
         // Get buffer ID
         let buffer_id = {
             self.buffer_manager
@@ -2252,19 +2305,28 @@ impl Session {
                     data: Some(path.display().to_string()),
                 };
             }
-            let dirty = self
+            let unsaved = self
                 .buffer_manager
                 .lock()
                 .unwrap()
                 .get_buffer_by_id(_buffer_id)
-                .is_some_and(|buffer| buffer.is_dirty());
-            if dirty {
-                return SessionResult::ActionRequired {
-                    code: "dirty-buffer-close",
-                    data: Some(path.display().to_string()),
-                };
+                .is_some_and(|buffer| buffer.is_dirty() || buffer.needs_resolution());
+            if unsaved {
+                if !retain_recovery {
+                    return SessionResult::ActionRequired {
+                        code: "dirty-buffer-close",
+                        data: Some(path.display().to_string()),
+                    };
+                }
+                // The receipt must provably cover the buffer being dropped:
+                // durable snapshot, revision-bound, hash-verified.
+                if let Err(message) = self.flush_recovery_note(&path) {
+                    return SessionResult::Error { message };
+                }
             }
-            // Close the buffer
+            // Close the buffer. The recovery file is intentionally not
+            // deleted here: retain-recovery means the snapshot outlives
+            // the buffer and is offered again on reopen.
             let mut buffer_manager = self.buffer_manager.lock().unwrap();
             buffer_manager.close_note(&path);
             drop(buffer_manager);
@@ -2278,6 +2340,135 @@ impl Session {
                 message: format!("Buffer not found: {}", path.display()),
             }
         }
+    }
+
+    /// Durably checkpoint one buffer's recovery snapshot and verify the
+    /// receipt covers the current revision and content (W12). Returns the
+    /// revision-bound receipt.
+    fn flush_recovery_note(&self, path: &PathBuf) -> Result<CommandResult, String> {
+        let (key, base, snapshot, revision) = {
+            let manager = self.buffer_manager.lock().unwrap();
+            let Some(buffer) = manager.get_buffer(path) else {
+                return Err(format!("Buffer not found: {}", path.display()));
+            };
+            if !buffer.is_dirty() && !buffer.needs_resolution() {
+                return Err(format!(
+                    "Buffer has no unsaved changes to retain: {}",
+                    path.display()
+                ));
+            }
+            (
+                native_note_key(path, &self.identity.root),
+                buffer.base_bytes().to_vec(),
+                flavite_buffer::recovery::RecoveryFile::from_buffer(buffer, 0, false),
+                buffer.revision(),
+            )
+        };
+        let Some(writer) = &self.recovery_writer else {
+            return Err("local recovery storage is unavailable".into());
+        };
+        self.actor
+            .pin_merge_base(key.clone(), base)
+            .map_err(|error| format!("could not persist recovery merge base: {error}"))?;
+        // `None` means an equally-covering snapshot is already durable;
+        // the read-back verification below is the receipt check either way.
+        let _ = writer.lock().unwrap().write_snapshot_now(&key, snapshot);
+        let stored = writer
+            .lock()
+            .unwrap()
+            .read_for_note_key(&key)
+            .ok_or_else(|| "no durable recovery snapshot exists for this buffer".to_owned())?;
+        if stored.header.revision < revision {
+            return Err(format!(
+                "durable recovery snapshot covers revision {} but the buffer is at {}",
+                stored.header.revision.as_u64(),
+                revision.as_u64()
+            ));
+        }
+        let hash = {
+            let manager = self.buffer_manager.lock().unwrap();
+            manager
+                .get_buffer(path)
+                .map(|buffer| buffer.content_hash())
+                .ok_or_else(|| format!("Buffer not found: {}", path.display()))?
+        };
+        if !stored.matches_hash(hash) {
+            return Err("durable recovery snapshot does not match the buffer content".into());
+        }
+        Ok(CommandResult::RecoveryFlushed {
+            buffer_id: stored.header.buffer_id,
+            revision: stored.header.revision,
+            hash: stored.content_hash,
+        })
+    }
+
+    /// Explicit discard (W12): snapshot the unsaved edits into local
+    /// history, drop the retained recovery copy of the same edits, and
+    /// reload the buffer from disk as one guarded destructive action.
+    fn discard_edits(&self, path: PathBuf) -> SessionResult {
+        let Some(buffer_id) = self.get_buffer_id(&path) else {
+            return SessionResult::Error {
+                message: "Buffer not found".into(),
+            };
+        };
+        if self
+            .save_flights
+            .lock()
+            .unwrap()
+            .contains_key(&buffer_id.as_u64())
+        {
+            return SessionResult::ActionRequired {
+                code: "save-pending",
+                data: Some(path.display().to_string()),
+            };
+        }
+        let Some(theirs) = self.actor.read_file(path.clone()).ok().flatten() else {
+            return SessionResult::ActionRequired {
+                code: "file-deleted",
+                data: Some(path.display().to_string()),
+            };
+        };
+        let mine = {
+            let manager = self.buffer_manager.lock().unwrap();
+            match manager.get_buffer_by_id(buffer_id) {
+                Some(buffer) => buffer.model().to_source_bytes(),
+                None => {
+                    return SessionResult::Error {
+                        message: "Buffer not found".into(),
+                    };
+                }
+            }
+        };
+        if let Err(error) = self.actor.snapshot_history(
+            native_note_key(&path, &self.identity.root),
+            mine,
+            crate::history::HistoryReason::ConflictResolution,
+        ) {
+            return SessionResult::Error {
+                message: format!("could not snapshot discarded bytes: {error}"),
+            };
+        }
+        {
+            let mut manager = self.buffer_manager.lock().unwrap();
+            match manager
+                .get_buffer_by_id_mut(buffer_id)
+                .and_then(|buffer| buffer.reload_from_disk(&theirs))
+            {
+                Some(_) => {}
+                None => {
+                    return SessionResult::Error {
+                        message: "disk bytes are not valid UTF-8".into(),
+                    };
+                }
+            }
+        }
+        // The retained recovery copy holds the same discarded edits; keep
+        // them from re-appearing as a recovery offer on the next open.
+        if let Some(writer) = &self.recovery_writer {
+            let key = native_note_key(&path, &self.identity.root);
+            writer.lock().unwrap().delete_for_note_key(&key);
+        }
+        SessionResult::Success(CommandResult::EditsDiscarded { buffer_id })
     }
 
     /// Apply edits to a buffer.
@@ -2897,7 +3088,7 @@ impl Session {
             match self.open_note(path.clone(), OpenPolicy::CreateIfMissing) {
                 SessionResult::Success(_) => {}
                 SessionResult::Pending { request_id } => {
-                    match self.wait_for_operation(request_id) {
+                    match self.wait_for_operation_holding_turn(request_id) {
                         SessionResult::Success(_) => {}
                         other => return other,
                     }
@@ -3748,7 +3939,10 @@ mod tests {
         ));
         assert_eq!(_fs.read_if_exists(&path).unwrap().unwrap(), b"hello world");
         assert!(matches!(
-            session.execute(SessionCommand::CloseNote { path: path.clone() }),
+            session.execute(SessionCommand::CloseNote {
+                path: path.clone(),
+                retain_recovery: false,
+            }),
             SessionResult::Success(CommandResult::NoteClosed)
         ));
         assert!(!session.is_open(&path));
@@ -3760,7 +3954,10 @@ mod tests {
                 .contains_key(&buffer_id)
         );
         assert!(matches!(
-            session.execute(SessionCommand::CloseNote { path }),
+            session.execute(SessionCommand::CloseNote {
+                path,
+                retain_recovery: false,
+            }),
             SessionResult::Error { .. }
         ));
     }
@@ -4353,7 +4550,8 @@ mod tests {
         ));
         assert!(matches!(
             session.execute(SessionCommand::CloseNote {
-                path: never_opened.clone()
+                path: never_opened.clone(),
+                retain_recovery: false,
             }),
             SessionResult::Error { .. }
         ));
@@ -4410,7 +4608,10 @@ mod tests {
             other => panic!("unexpected edit result: {other:?}"),
         };
         assert!(matches!(
-            session.execute(SessionCommand::CloseNote { path: path.clone() }),
+            session.execute(SessionCommand::CloseNote {
+                path: path.clone(),
+                retain_recovery: false,
+            }),
             SessionResult::ActionRequired {
                 code: "dirty-buffer-close",
                 ..
@@ -4761,7 +4962,10 @@ mod tests {
         };
         assert!(new_revision > revision);
         assert!(matches!(
-            session.execute(SessionCommand::CloseNote { path: path.clone() }),
+            session.execute(SessionCommand::CloseNote {
+                path: path.clone(),
+                retain_recovery: false,
+            }),
             SessionResult::ActionRequired {
                 code: "dirty-buffer-close",
                 ..
@@ -4842,7 +5046,10 @@ mod tests {
         ));
         assert_eq!(actor.read_file(path.clone()).unwrap().unwrap(), b"# Merged");
         assert!(matches!(
-            session.execute(SessionCommand::CloseNote { path }),
+            session.execute(SessionCommand::CloseNote {
+                path,
+                retain_recovery: false,
+            }),
             SessionResult::Success(CommandResult::NoteClosed)
         ));
         assert!(session.drain_operation_completions().is_empty());

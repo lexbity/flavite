@@ -204,6 +204,28 @@ fn w11_gate_rejects_raw_view_colors_and_missing_appearance_inputs() {
 }
 
 #[test]
+fn w12_gate_rejects_unsafe_close_paths_and_missing_close_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_current_contract_inputs(temp.path());
+    assert!(run_gate(temp.path(), "W12").status.success());
+    let closing = temp.path().join("crates/flavite-ui/src/host/closing.rs");
+    fs::write(&closing, "drop(buffer);\n").unwrap();
+    let forbidden = run_gate(temp.path(), "W12");
+    assert!(!forbidden.status.success());
+    assert!(String::from_utf8_lossy(&forbidden.stderr).contains("forbidden production pattern"));
+    fs::write(closing, "implementation\n").unwrap();
+    let operation = temp.path().join("crates/flavite-ui/src/operation.rs");
+    fs::write(&operation, "if result.contains(\"conflict\") {}\n").unwrap();
+    let forbidden = run_gate(temp.path(), "W12");
+    assert!(!forbidden.status.success());
+    fs::write(operation, "implementation\n").unwrap();
+    fs::remove_file(temp.path().join("crates/flavite-api/src/recovery.rs")).unwrap();
+    let missing = run_gate(temp.path(), "W12");
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("missing or empty"));
+}
+
+#[test]
 fn final_gate_rejects_demo_assets_and_placeholders() {
     let temp = tempfile::tempdir().unwrap();
     seed_current_contract_inputs(temp.path());

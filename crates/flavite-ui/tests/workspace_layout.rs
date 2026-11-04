@@ -277,14 +277,14 @@ fn split_move_merge_preserve_identity_text_and_semantics() {
 fn close_reopen_round_trip_restores_the_note() {
     let Fixture { mut app, .. } = fixture();
     let (alpha, alpha_buffer) = open_note(&mut app, "alpha.md");
-    let _ = app.update(Message::Layout(LayoutAction::CloseTab {
-        expected_revision: app.workspace.revision(),
-        tab: alpha,
-    }));
+    // W12 (§8.3): the tab-strip close goes through the close plan; a final
+    // clean view closes its Session buffer through the core policy before
+    // the tab is removed.
+    let _ = app.update(Message::CloseTab(alpha));
     assert!(app.workspace.tab(&alpha).is_none());
     assert!(
         app.notes.state(&alpha).is_none(),
-        "the view lease is released"
+        "the view lease is released and the document entry closed"
     );
     run_host(&mut app, "workspace.reopen_tab");
     let reopened = app.workspace.focused_tab();
@@ -295,9 +295,9 @@ fn close_reopen_round_trip_restores_the_note() {
         .state(&reopened)
         .and_then(|state| state.buffer)
         .expect("the reopened note reopens its buffer");
-    assert_eq!(
+    assert_ne!(
         reopened_buffer, alpha_buffer,
-        "the Session buffer is reused by identity"
+        "a fully closed note reopens as a fresh Session buffer (§8.3)"
     );
     assert_eq!(
         app.note_state_text(reopened).as_deref(),

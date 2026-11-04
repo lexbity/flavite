@@ -51,3 +51,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 [dev-dependencies]
 # For tests
 tempfile = "3"
+
+[features]
+# Test-only fault injection (FaultFs) for durability tests; flavite-fs is
+# already a regular dependency.
+fault = ["flavite-fs/fault"]

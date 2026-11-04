@@ -158,6 +158,23 @@ pub fn describe_completion(completion: &OperationCompletion) -> String {
     }
 }
 
+/// Present one typed local (core) result honestly: W12 close paths surface
+/// refusals and failures without string-matching results (TD-09).
+#[must_use]
+pub fn describe_result(local: &flavite_api::LocalResult) -> String {
+    match local {
+        flavite_api::LocalResult::Success(success) => success
+            .data
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(|| "completed".to_owned(), |value| value.to_owned()),
+        flavite_api::LocalResult::Void => "completed".to_owned(),
+        flavite_api::LocalResult::Error(error) => {
+            format!("{} ({})", error.message, error.code)
+        }
+    }
+}
+
 /// Present one typed local (core) error honestly: stable code + message.
 #[must_use]
 pub fn describe_local_error(error: impl std::borrow::Borrow<flavite_api::LocalError>) -> String {

@@ -490,10 +490,15 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
             },
         ));
     }
-    // Modal dialogs take Escape first (W10 UX fix observed in the
-    // appearance-matrix evidence run: the dialog never closed).
-    if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape)) && app.dialog.is_some() {
-        return Some(Message::DialogCancel);
+    // Modal dialogs take Escape (cancel) and Enter (primary action) first;
+    // the submit arm routes per dialog kind (W12).
+    if app.dialog.is_some() {
+        if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Enter)) {
+            return Some(Message::DialogSubmit);
+        }
+        if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+            return Some(Message::DialogCancel);
+        }
     }
     if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
         && !app.palette_open
@@ -773,6 +778,12 @@ fn overlay_navigation(app: &App, named: keyboard::key::Named) -> Option<Message>
 /// Dispatch a host command id against current shell state. Availability
 /// failures surface as a status message, never as a silent no-op.
 pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
+    // W12: while the quit schedule is being resolved the interface is
+    // paused; every command waits for the user's decision or cancellation.
+    if app.shutdown.is_some() {
+        app.status = "Quitting: resolve the quit (decide or cancel) first".into();
+        return iced::Task::none();
+    }
     if !available(app, id) {
         app.status = "This command is unavailable in the current view".into();
         return iced::Task::none();
@@ -800,11 +811,8 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
             }
         }
         "workspace.close_tab" => {
-            let tab = app.workspace.focused_tab();
-            app.dispatch_layout(|revision| LayoutAction::CloseTab {
-                expected_revision: revision,
-                tab,
-            });
+            // W12: through the close plan (final-view lease accounting).
+            let _ = app.request_close_tab(app.workspace.focused_tab());
         }
         "workspace.reopen_tab" => app.dispatch_layout(|revision| LayoutAction::ReopenClosed {
             expected_revision: revision,
@@ -859,11 +867,9 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
             }
         }
         "workspace.close_group" => {
+            // W12: group close plans per tab; undecided tabs are retained.
             if let Some(group) = focused_group {
-                app.dispatch_layout(|revision| LayoutAction::CloseGroup {
-                    expected_revision: revision,
-                    group,
-                });
+                let _ = app.request_close_group(group);
             }
         }
         "workspace.move_tab_next_group" => {

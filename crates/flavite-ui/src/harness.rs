@@ -227,6 +227,7 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                         "incarnation": interaction.incarnation,
                         "interaction_focused": interaction.focused,
                         "composing": interaction.composition == flavite_workspace::CompositionState::Active,
+                        "buffer_state": buffer_view.as_ref().map(|view| format!("{:?}", view.state)),
                         "binding": binding.map(|binding| format!("{binding:?}")),
                         "effective_source": app
                             .contexts
@@ -327,6 +328,8 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "graph_service": graph_service,
         "maximized": app.maximized_group().map(|group| group.to_string()),
         "catalog": app.catalog().len(),
+        "dialog_kind": app.dialog.as_ref().map(|dialog| dialog.kind_name()),
+        "start_error": app.start.error.clone(),
         "theme": app.appearance.scheme().name(),
         "theme_choice": app.appearance.prefs.theme.name(),
         "interface_scale_pct": app.appearance.prefs.interface_scale_pct,
