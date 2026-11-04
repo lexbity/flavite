@@ -1,6 +1,7 @@
 //! Current-buffer/saved reading snapshots, resolved links and bounded embeds.
 use crate::{ReadDocument, ReadImage, ReadKind, ReadNode};
 use flavite_vault::session::Session;
+use flavite_vault::sync::MutexExt;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -39,11 +40,11 @@ impl ReadReservation {
                 used.checked_add(bytes).filter(|n| *n <= READ_CACHE_BUDGET)
             })
             .map_err(|_| "Reading memory limit; close a Read/Preview view and retry")?;
-        *self.charged.lock().unwrap() += bytes;
+        *self.charged.lock_recovering() += bytes;
         Ok(())
     }
     fn release(&self, bytes: usize) {
-        *self.charged.lock().unwrap() -= bytes;
+        *self.charged.lock_recovering() -= bytes;
         self.resources.used.fetch_sub(bytes, Ordering::AcqRel);
     }
 }
@@ -51,7 +52,7 @@ impl Drop for ReadReservation {
     fn drop(&mut self) {
         self.resources
             .used
-            .fetch_sub(*self.charged.lock().unwrap(), Ordering::AcqRel);
+            .fetch_sub(*self.charged.lock_recovering(), Ordering::AcqRel);
     }
 }
 pub const MAX_READ_BYTES: usize = 16 * 1024 * 1024;

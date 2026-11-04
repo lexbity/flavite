@@ -5,6 +5,7 @@
 use crate::capability::Capability;
 use crate::types::{Origin, Preconditions, RequestId};
 use flavite_vault::session::{Session, SessionResult};
+use flavite_vault::sync::RwLockExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -292,7 +293,7 @@ impl CommandRegistry {
         handler: CommandHandler,
     ) -> Result<(), CommandRegistrationError> {
         let id = spec.id;
-        let mut commands = self.commands.write().unwrap();
+        let mut commands = self.commands.write_recovering();
         if commands.contains_key(id) {
             return Err(CommandRegistrationError::DuplicateId(id));
         }
@@ -303,7 +304,7 @@ impl CommandRegistry {
     /// Get a command specification.
     #[must_use]
     pub fn get_spec(&self, id: &str) -> Option<CommandSpec> {
-        let commands = self.commands.read().unwrap();
+        let commands = self.commands.read_recovering();
         commands.get(id).map(|registered| registered.spec.clone())
     }
 
@@ -313,7 +314,7 @@ impl CommandRegistry {
         id: &str,
         args: &serde_json::Value,
     ) -> Result<(), CommandValidationError> {
-        let commands = self.commands.read().unwrap();
+        let commands = self.commands.read_recovering();
         let registered = commands
             .get(id)
             .ok_or_else(|| CommandValidationError::Unavailable(id.to_owned()))?;
@@ -331,7 +332,7 @@ impl CommandRegistry {
         session: &Session,
         invocation: &Invocation,
     ) -> Result<SessionResult, CommandDispatchError> {
-        let commands = self.commands.read().unwrap();
+        let commands = self.commands.read_recovering();
         let registered = commands
             .get(invocation.command_id)
             .ok_or_else(|| CommandDispatchError::Unavailable(invocation.command_id.to_owned()))?;
@@ -346,7 +347,7 @@ impl CommandRegistry {
     /// List all command IDs.
     #[must_use]
     pub fn command_ids(&self) -> Vec<&'static str> {
-        let commands = self.commands.read().unwrap();
+        let commands = self.commands.read_recovering();
         let mut ids = commands.keys().copied().collect::<Vec<_>>();
         ids.sort_unstable();
         ids
@@ -355,7 +356,7 @@ impl CommandRegistry {
     /// Return the registered command specifications in stable display order.
     #[must_use]
     pub fn specs(&self) -> Vec<CommandSpec> {
-        let commands = self.commands.read().unwrap();
+        let commands = self.commands.read_recovering();
         let mut values = commands
             .values()
             .map(|registered| registered.spec.clone())

@@ -12,6 +12,8 @@
 use crate::actor::VaultActorHandle;
 use crate::channels::{NoticeChannel, PulseChannel};
 use crate::save::{DiskPrecondition, DurabilityOutcome, SaveFailureStage, SaveRequest};
+use crate::sync::MutexExt;
+use crate::sync::WAIT_TICK;
 use crate::types::{
     Epoch, Generation, ReconcileMode, ReconcileScope, ReconcileSummary, RenameStrategy,
     VaultConfig, VaultIdentity,
@@ -24,7 +26,7 @@ use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 fn located_patch(
@@ -85,6 +87,15 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const MAX_PENDING_SAVE_OPERATIONS: usize = 4096;
+/// Per-buffer journal memo cap (C1). Entries are keyed `(txn_id, item_id)`
+/// inside the buffer's own memo: total memo memory is bounded by
+/// `open_buffers × JOURNAL_MEMO_CAP × entry`, roughly ≤ 800 KiB per open
+/// buffer (NFR-1) instead of the unbounded process-lifetime growth of the
+/// former global maps. Eviction is FIFO by insertion order; a replayed
+/// patch after eviction re-derives safely through the actor's revision
+/// guard (proven by the S5 replay test).
+const JOURNAL_MEMO_CAP: usize = 4096;
+
 /// Bounded pending cold opens (RFC-0003 §12.1: pending opens ≤128).
 const MAX_PENDING_OPEN_NOTES: usize = 128;
 /// Concurrent cold-open read flights (RFC-0003 §12.1).
@@ -475,6 +486,10 @@ pub enum SessionEvent {
     RecoveryAvailable { path: PathBuf },
     /// An external writer changed or deleted a note on disk.
     ExternalChangeDetected { path: PathBuf, deleted: bool },
+    /// The session caught a panic in a command transition or pump turn.
+    /// The session remains operable; the host decides whether to continue
+    /// or restart.
+    Panicked { message: String, panics_total: u64 },
 }
 
 /// A correlated D9 rename flight: source, destination, and the rename
@@ -484,6 +499,75 @@ type RenameFlight = (
     PathBuf,
     crossbeam::channel::Receiver<crate::actor::VaultActorResp>,
 );
+
+/// Per-buffer journal memo (C1). Lives exactly as long as the buffer:
+/// created on first tracked journal interaction, removed by `close_note`,
+/// FIFO-capped at `JOURNAL_MEMO_CAP` keys as a safety net.
+#[derive(Debug, Default)]
+struct BufferJournalMemo {
+    /// Outcome of each journaled patch already applied to this buffer.
+    applied: HashMap<(String, u64), Result<u64, String>>,
+    /// Insertion order of keys held by either substructure below. One
+    /// deque orders both: FIFO eviction of the front key removes it from
+    /// whichever substructure still holds it, so `cancelled` retention is
+    /// bounded too and never outlives the buffer (FR-3).
+    order: VecDeque<(String, u64)>,
+    /// Journal items cancelled by undo on this buffer (redo must refuse).
+    cancelled: HashSet<(String, u64)>,
+}
+
+impl BufferJournalMemo {
+    /// Make room for one fresh key: evict oldest-first until under the cap.
+    fn make_room(&mut self) {
+        while self.order.len() >= JOURNAL_MEMO_CAP {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.applied.remove(&oldest);
+            self.cancelled.remove(&oldest);
+        }
+    }
+
+    /// Record a patch outcome for this buffer. Updating a key that already
+    /// has a slot keeps the slot (no re-ordering, no growth).
+    fn memoize_applied(&mut self, key: (String, u64), result: Result<u64, String>) {
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            self.applied.entry(key.clone())
+        {
+            *entry.get_mut() = result;
+            return;
+        }
+        if !self.cancelled.contains(&key) {
+            self.make_room();
+            self.order.push_back(key.clone());
+        }
+        self.applied.insert(key, result);
+    }
+
+    /// Record an undo-driven cancel for this buffer (redo refuses).
+    fn memoize_cancelled(&mut self, key: (String, u64)) {
+        if self.cancelled.contains(&key) {
+            return;
+        }
+        if !self.applied.contains_key(&key) {
+            self.make_room();
+            self.order.push_back(key.clone());
+        }
+        self.cancelled.insert(key);
+    }
+}
+
+/// Downcast a panic payload through the `&str` / `String` chain with a
+/// debug-format backstop, for containment logging and events.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        format!("{payload:?}")
+    }
+}
 
 /// The Session itself.
 ///
@@ -530,6 +614,14 @@ pub struct Session {
     recovery_stop: Arc<std::sync::atomic::AtomicBool>,
     /// Request ID counter.
     request_counter: AtomicU64,
+    /// Contained panics across this Session's turn entry points (`execute`,
+    /// `pump`). Atomic so hosts can read the operator ground truth without
+    /// locks (NFR-5).
+    panics_total: AtomicU64,
+    /// Poison-recovering lock acquisitions, mirrored (monotonic max) from
+    /// `sync::POISON_RECOVERIES` at `drain_events` time. Advisory mirror;
+    /// the counter stays the single observability surface across crates.
+    poison_recoveries_total: AtomicU64,
     /// One active save and at most one coalesced successor per buffer.
     save_flights: Mutex<HashMap<u64, SaveFlight>>,
     /// Correlated reconcile workers.
@@ -543,10 +635,19 @@ pub struct Session {
     open_jobs: Option<crossbeam::channel::Sender<OpenJob>>,
     /// Completed reads awaiting installation on a Session turn.
     open_results: crossbeam::channel::Receiver<OpenRead>,
-    journal_applied: Mutex<HashMap<(String, u64), Result<u64, String>>>,
-    cancelled_journal_items: Mutex<HashSet<(String, u64)>>,
+    /// Per-buffer journal memos (C1): merged replacement of the former
+    /// ownerless global maps. Keyed by
+    /// `BufferId` so the memo's lifetime is provably the buffer's —
+    /// removed whole by `close_note`, FIFO-capped per buffer at
+    /// `JOURNAL_MEMO_CAP`.
+    journal_memos: Mutex<HashMap<BufferId, BufferJournalMemo>>,
     /// Lossless terminal results. Admission is bounded by the pending-save cap.
     completions: Mutex<VecDeque<OperationCompletion>>,
+    /// Wake edge for the headless wait loops, paired with `completions`
+    /// (S6): `record_completion` is the only writer and notifies under no
+    /// lock it holds past the push — waiters re-check under the same mutex
+    /// they park on, so no wakeup can be lost by construction.
+    completions_cv: Condvar,
     /// Pulse channel.
     pulse: PulseChannel,
     /// Notice channel.
@@ -595,7 +696,7 @@ impl Session {
             Arc::new(Mutex::new(RecoveryWriter::new(RecoveryConfig::new(
                 identity.uuid.to_string(),
                 dir,
-                manager.lock().unwrap().recovery_interval(),
+                manager.lock_recovering().recovery_interval(),
             ))))
         });
         let recovery_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -609,7 +710,7 @@ impl Session {
                 .name("vault-recovery".into())
                 .spawn(move || {
                     while !stop.load(Ordering::Acquire) {
-                        let buffer_manager = manager.lock().unwrap();
+                        let buffer_manager = manager.lock_recovering();
                         let dirty = buffer_manager
                             .dirty_buffers()
                             .into_iter()
@@ -625,9 +726,9 @@ impl Session {
                             .collect::<Vec<_>>();
                         drop(buffer_manager);
                         for (key, base, snapshot) in dirty {
-                            let due = writer.lock().unwrap().should_write_snapshot(&snapshot);
+                            let due = writer.lock_recovering().should_write_snapshot(&snapshot);
                             if due && actor.pin_merge_base(key.clone(), base).is_ok() {
-                                writer.lock().unwrap().write_snapshot(&key, snapshot);
+                                writer.lock_recovering().write_snapshot(&key, snapshot);
                             }
                         }
                         std::thread::sleep(Duration::from_millis(100));
@@ -676,7 +777,7 @@ impl Session {
                                 .map_err(|error| error.to_string()),
                         };
                         let recovery = recovery_writer.as_ref().and_then(|writer| {
-                            writer.lock().unwrap().read_for_note_key(&job.note_key)
+                            writer.lock_recovering().read_for_note_key(&job.note_key)
                         });
                         // Sending only fails when the Session is gone; the
                         // read result is then unobservable by construction.
@@ -715,7 +816,7 @@ impl Session {
                             let outcome = match crate::link::prepare_work(&context, &job.request) {
                                 Ok((plan, mut prepared)) => {
                                     let plan_id = {
-                                        let mut store = link_plans.lock().unwrap();
+                                        let mut store = link_plans.lock_recovering();
                                         let plan_id = store.allocate_plan_id();
                                         prepared.plan_id = plan_id;
                                         if store.complete_prepare(plan_id, plan) {
@@ -736,7 +837,9 @@ impl Session {
                                     }
                                 }
                                 Err(reason) => {
-                                    link_plans.lock().unwrap().fail_prepare(job.request.intent);
+                                    link_plans
+                                        .lock_recovering()
+                                        .fail_prepare(job.request.intent);
                                     SessionResult::LinkRejected { reason }
                                 }
                             };
@@ -775,12 +878,14 @@ impl Session {
             recovery_worker,
             recovery_stop,
             request_counter: AtomicU64::new(0),
+            panics_total: AtomicU64::new(0),
+            poison_recoveries_total: AtomicU64::new(0),
             save_flights: Mutex::new(HashMap::new()),
             reconcile_flights: Mutex::new(HashMap::new()),
             rename_flights: Mutex::new(HashMap::new()),
-            journal_applied: Mutex::new(HashMap::new()),
-            cancelled_journal_items: Mutex::new(HashSet::new()),
+            journal_memos: Mutex::new(HashMap::new()),
             completions: Mutex::new(VecDeque::new()),
+            completions_cv: Condvar::new(),
             pulse,
             notice,
             recovery_notices: Mutex::new(VecDeque::new()),
@@ -796,8 +901,26 @@ impl Session {
     }
 
     /// Execute a command.
+    ///
+    /// The turn body runs inside an unwinding-catch boundary: a panic in a
+    /// command
+    /// transition is contained at this boundary, logged, counted in
+    /// [`Session::panics_total`], and surfaced as
+    /// [`SessionEvent::Panicked`]; the caller receives an honest
+    /// [`SessionResult::Error`] naming the panic instead of an unwinding
+    /// host. The Session stays operable (locks recover per `sync.rs`;
+    /// collections are memory-safe after unwind) — the host decides
+    /// whether to continue or restart.
     pub fn execute(&self, command: SessionCommand) -> SessionResult {
-        let _turn = self.driving_turn.lock().unwrap();
+        let _turn = self.driving_turn.lock_recovering();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.execute_turn(command)))
+        {
+            Ok(result) => result,
+            Err(payload) => self.record_contained_panic(&payload, "execute"),
+        }
+    }
+
+    fn execute_turn(&self, command: SessionCommand) -> SessionResult {
         self.pump_external_changes_inner();
         let edited_path = match &command {
             SessionCommand::EditStructure { buffer_id, .. }
@@ -805,21 +928,18 @@ impl Session {
             | SessionCommand::Undo { buffer_id, .. }
             | SessionCommand::Redo { buffer_id, .. } => self
                 .buffer_manager
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .path_for_id(*buffer_id)
                 .cloned(),
             SessionCommand::LinkInsert { intent, plan_id }
             | SessionCommand::LinkRemove { intent, plan_id } => {
                 let source = self
                     .link_plans
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .source_for(*intent, *plan_id);
                 source.and_then(|id| {
                     self.buffer_manager
-                        .lock()
-                        .unwrap()
+                        .lock_recovering()
                         .path_for_id(id.into())
                         .cloned()
                 })
@@ -838,18 +958,32 @@ impl Session {
             )
         {
             self.last_edit
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .insert(path.clone(), std::time::Instant::now());
-            self.autosave_attempted.lock().unwrap().remove(&path);
+            self.autosave_attempted.lock_recovering().remove(&path);
         }
         result
     }
 
     /// Apply queued disk observations on the host pump. GUI hosts call this
     /// from their regular timer; command execution also drains before running.
+    ///
+    /// Like [`Session::execute`], the whole turn is panic-contained: a panic
+    /// in any pump helper is recorded (log + counter +
+    /// [`SessionEvent::Panicked`]) and the turn is released. The pump has no
+    /// result to fail, so the event is the signal.
     pub fn pump(&self) {
-        let _turn = self.driving_turn.lock().unwrap();
+        let _turn = self.driving_turn.lock_recovering();
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.pump_turn()))
+        {
+            // The pump has no result to fail: the recorded event is the
+            // signal and the turn is released when this frame returns.
+            self.record_contained_panic(&payload, "pump");
+        }
+    }
+
+    fn pump_turn(&self) {
         self.pump_external_changes_inner();
         self.pump_recovery_notices();
         self.pump_structure_completions();
@@ -864,8 +998,42 @@ impl Session {
         // host pump owns the Session driving-turn lock.
     }
 
+    /// Shared containment core called by both turn wrappers.
+    ///
+    /// Behaviour proven by tests (the six-line catch plumbing in the two
+    /// turn wrappers is reviewed by eye): (a) logs at error level, (b) increments
+    /// [`Session::panics_total`], (c) emits [`SessionEvent::Panicked`]
+    /// through the event channel, (d) returns the honest error result
+    /// naming the panic for `execute` (the pump wrapper discards it — the
+    /// event is its signal). Never re-panics, never aborts.
+    fn record_contained_panic(
+        &self,
+        payload: &(dyn std::any::Any + Send),
+        turn: &'static str,
+    ) -> SessionResult {
+        let message = panic_message(payload);
+        tracing::error!(
+            target: "vault::session",
+            turn,
+            panic = %message,
+            "session turn panicked",
+        );
+        // SeqCst: this counter is the operator's ground truth and is read
+        // cross-thread.
+        let panics_total = self.panics_total.fetch_add(1, Ordering::SeqCst) + 1;
+        self.session_events
+            .lock_recovering()
+            .push_back(SessionEvent::Panicked {
+                message: message.clone(),
+                panics_total,
+            });
+        SessionResult::Error {
+            message: format!("session turn panicked during {turn}: {message}"),
+        }
+    }
+
     pub(crate) fn structure_completions_full(&self) -> bool {
-        self.completions.lock().unwrap().len() >= MAX_PENDING_SAVE_OPERATIONS - 64
+        self.completions.lock_recovering().len() >= MAX_PENDING_SAVE_OPERATIONS - 64
     }
     pub(crate) fn next_structure_request(&self) -> u64 {
         self.next_request_id()
@@ -882,45 +1050,30 @@ impl Session {
             if matches!(result, SessionResult::Success(_))
                 && let Some(path) = self
                     .buffer_manager
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .path_for_id(prepared.buffer)
                     .cloned()
             {
                 self.last_edit
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .insert(path.clone(), std::time::Instant::now());
-                self.autosave_attempted.lock().unwrap().remove(&path);
+                self.autosave_attempted.lock_recovering().remove(&path);
             }
-            self.completions
-                .lock()
-                .unwrap()
-                .push_back(OperationCompletion {
-                    request_id: prepared.request,
-                    result,
-                });
+            self.record_completion(prepared.request, result);
             self.structure_worker.retired();
         }
     }
 
     fn pump_link_completions(&self) {
         while let Ok(message) = self.link_results.try_recv() {
-            self.completions
-                .lock()
-                .unwrap()
-                .push_back(OperationCompletion {
-                    request_id: message.request_id,
-                    result: message.result,
-                });
+            self.record_completion(message.request_id, message.result);
         }
     }
 
     fn pump_recovery_notices(&self) {
         let codes = self
             .recovery_notices
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .drain(..)
             .collect::<Vec<_>>();
         for code in codes {
@@ -933,8 +1086,7 @@ impl Session {
         let now = std::time::Instant::now();
         let dirty = self
             .buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .dirty_buffers()
             .into_iter()
             .filter(|(_, buffer)| buffer.allows_autosave())
@@ -942,27 +1094,25 @@ impl Session {
             .collect::<Vec<_>>();
         for (path, buffer_id, revision) in dirty {
             let last_edit = {
-                let mut deadlines = self.last_edit.lock().unwrap();
+                let mut deadlines = self.last_edit.lock_recovering();
                 *deadlines.entry(path.clone()).or_insert(now)
             };
             if now.duration_since(last_edit) < self.autosave_idle_interval
-                || self.autosave_attempted.lock().unwrap().get(&path) == Some(&revision)
+                || self.autosave_attempted.lock_recovering().get(&path) == Some(&revision)
                 || self
                     .save_flights
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .contains_key(&buffer_id.as_u64())
             {
                 continue;
             }
             self.autosave_attempted
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .insert(path.clone(), revision);
             let result = self.save_note(path.clone());
             match result {
                 SessionResult::Pending { request_id } => {
-                    self.autosave_requests.lock().unwrap().insert(request_id);
+                    self.autosave_requests.lock_recovering().insert(request_id);
                 }
                 SessionResult::Success(_) => {}
                 failure => self.record_autosave_failure(&path, &failure),
@@ -983,13 +1133,13 @@ impl Session {
         while let Ok(event) = self.actor_events.try_recv() {
             match event {
                 crate::actor::VaultActorEvent::ExternalChange { path, bytes } => {
-                    self.session_events.lock().unwrap().push_back(
+                    self.session_events.lock_recovering().push_back(
                         SessionEvent::ExternalChangeDetected {
                             path: path.clone(),
                             deleted: false,
                         },
                     );
-                    let mut manager = self.buffer_manager.lock().unwrap();
+                    let mut manager = self.buffer_manager.lock_recovering();
                     if manager.get_buffer(&path).is_some_and(|buffer| {
                         buffer.state() == flavite_buffer::state::BufferState::Orphaned
                     }) {
@@ -1009,13 +1159,13 @@ impl Session {
                     });
                 }
                 crate::actor::VaultActorEvent::Deleted { path } => {
-                    self.session_events.lock().unwrap().push_back(
+                    self.session_events.lock_recovering().push_back(
                         SessionEvent::ExternalChangeDetected {
                             path: path.clone(),
                             deleted: true,
                         },
                     );
-                    let mut manager = self.buffer_manager.lock().unwrap();
+                    let mut manager = self.buffer_manager.lock_recovering();
                     if !manager.notify_file_deleted(&path).is_empty() {
                         self.notice.send(crate::channels::Notice::ActionRequired {
                             code: "external_delete",
@@ -1024,23 +1174,23 @@ impl Session {
                     }
                 }
                 crate::actor::VaultActorEvent::Renamed { from, to, .. } => {
-                    let mut manager = self.buffer_manager.lock().unwrap();
+                    let mut manager = self.buffer_manager.lock_recovering();
                     if manager.rename_buffer(&from, to.clone()) {
                         drop(manager);
                         {
-                            let mut last_edit = self.last_edit.lock().unwrap();
+                            let mut last_edit = self.last_edit.lock_recovering();
                             if let Some(edit_time) = last_edit.remove(&from) {
                                 last_edit.insert(to.clone(), edit_time);
                             }
                         }
                         {
-                            let mut attempted = self.autosave_attempted.lock().unwrap();
+                            let mut attempted = self.autosave_attempted.lock_recovering();
                             if let Some(revision) = attempted.remove(&from) {
                                 attempted.insert(to.clone(), revision);
                             }
                         }
                         {
-                            let mut absent = self.absent_on_open.lock().unwrap();
+                            let mut absent = self.absent_on_open.lock_recovering();
                             if absent.remove(&from) {
                                 absent.insert(to.clone());
                             }
@@ -1081,24 +1231,47 @@ impl Session {
     fn pump_buffer_patch_requests(&self) {
         while let Ok(request) = self.actor_buffer_patches.try_recv() {
             let key = (request.txn_id.clone(), request.item_id);
-            if let Some(result) = self.journal_applied.lock().unwrap().get(&key).cloned() {
-                let _ = request.reply.send(result);
-                continue;
-            }
-            let result = self.apply_buffer_patch(&request);
-            if let Ok(revision) = result {
-                self.journal_applied
-                    .lock()
-                    .unwrap()
-                    .insert(key, Ok(revision));
-            } else {
-                self.journal_applied
-                    .lock()
-                    .unwrap()
-                    .insert(key, result.clone());
-            }
+            let buffer_id = BufferId::from(request.buffer_id);
+            // One lock on the memoized path (the former code took three).
+            let memoized = self
+                .journal_memos
+                .lock_recovering()
+                .entry(buffer_id)
+                .or_default()
+                .applied
+                .get(&key)
+                .cloned();
+            let result = match memoized {
+                // FR-2: replay the recorded outcome without re-applying.
+                Some(result) => result,
+                None => {
+                    let result = self.apply_buffer_patch(&request);
+                    self.memo_insert(buffer_id, key, result.clone());
+                    result
+                }
+            };
             let _ = request.reply.send(result);
         }
+    }
+
+    /// Record a patch outcome into the buffer's memo, FIFO-evicting at
+    /// `JOURNAL_MEMO_CAP` (C1).
+    fn memo_insert(&self, buffer_id: BufferId, key: (String, u64), result: Result<u64, String>) {
+        self.journal_memos
+            .lock_recovering()
+            .entry(buffer_id)
+            .or_default()
+            .memoize_applied(key, result);
+    }
+
+    /// Record an undo-driven journal cancel into the buffer's memo; redo
+    /// consults the same per-buffer scope.
+    fn memo_cancel(&self, buffer_id: BufferId, key: (String, u64)) {
+        self.journal_memos
+            .lock_recovering()
+            .entry(buffer_id)
+            .or_default()
+            .memoize_cancelled(key);
     }
 
     fn apply_buffer_patch(
@@ -1106,7 +1279,7 @@ impl Session {
         request: &crate::actor::ApplyBufferPatchRequest,
     ) -> Result<u64, String> {
         let buffer_id = BufferId::from(request.buffer_id);
-        let mut manager = self.buffer_manager.lock().unwrap();
+        let mut manager = self.buffer_manager.lock_recovering();
         if manager
             .get_buffer_by_id(buffer_id)
             .is_some_and(|buffer| buffer.state() == flavite_buffer::state::BufferState::Conflicted)
@@ -1360,13 +1533,13 @@ impl Session {
     #[must_use]
     pub fn new_link_client(&self) -> crate::link::ClientToken {
         let token = crate::link::ClientToken(u128::from(uuid::Uuid::now_v7().as_u64_pair().1));
-        self.link_plans.lock().unwrap().register_client(token);
+        self.link_plans.lock_recovering().register_client(token);
         token
     }
 
     /// Cancel an uncommitted gesture; late worker results cannot revive it.
     pub fn cancel_link_intent(&self, intent: crate::link::LinkIntent) {
-        self.link_plans.lock().unwrap().cancel(intent);
+        self.link_plans.lock_recovering().cancel(intent);
     }
 
     /// Read the immutable canonical publication without actor IO.
@@ -1383,16 +1556,14 @@ impl Session {
         plan_id: u128,
     ) -> Option<BufferId> {
         self.link_plans
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .source_for(intent, plan_id)
             .map(BufferId::from)
     }
     /// Native path for an open buffer without cloning note contents.
     pub fn buffer_path(&self, buffer: BufferId) -> Option<PathBuf> {
         self.buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .path_for_id(buffer)
             .cloned()
     }
@@ -1409,7 +1580,7 @@ impl Session {
         // receipt and overwrite the facade's correlation map.
         let request_id = self.next_request_id();
         let admission = {
-            let mut store = self.link_plans.lock().unwrap();
+            let mut store = self.link_plans.lock_recovering();
             store.admit_prepare(&request)
         };
         match admission {
@@ -1424,7 +1595,7 @@ impl Session {
                         })
                         .is_err()
                     {
-                        self.link_plans.lock().unwrap().fail_prepare(intent);
+                        self.link_plans.lock_recovering().fail_prepare(intent);
                         return SessionResult::LinkRejected {
                             reason: crate::link::LinkInsertionError::Busy,
                         };
@@ -1432,7 +1603,9 @@ impl Session {
                     SessionResult::Pending { request_id }
                 }
                 None => {
-                    self.link_plans.lock().unwrap().fail_prepare(request.intent);
+                    self.link_plans
+                        .lock_recovering()
+                        .fail_prepare(request.intent);
                     SessionResult::LinkRejected {
                         reason: crate::link::LinkInsertionError::Busy,
                     }
@@ -1453,7 +1626,7 @@ impl Session {
     ) -> SessionResult {
         use crate::link::{CommitAdmission, LinkOutcome};
         let admission = {
-            let mut store = self.link_plans.lock().unwrap();
+            let mut store = self.link_plans.lock_recovering();
             store.admit_commit(&intent, plan_id, removal)
         };
         let plan = match admission {
@@ -1482,12 +1655,11 @@ impl Session {
         // Buffer state and revision guards.
         let state = self
             .buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .get_buffer_by_id(BufferId::from(plan.source.buffer_id))
             .map(|buffer| (buffer.state(), buffer.revision().as_u64()));
         let Some((state, actual_revision)) = state else {
-            let mut store = self.link_plans.lock().unwrap();
+            let mut store = self.link_plans.lock_recovering();
             store.record_outcome(
                 &intent,
                 crate::link::fingerprint_insert_public(plan_id),
@@ -1504,7 +1676,7 @@ impl Session {
             };
         };
         if actual_revision != plan.source.revision {
-            self.link_plans.lock().unwrap().record_outcome(
+            self.link_plans.lock_recovering().record_outcome(
                 &intent,
                 crate::link::fingerprint_insert_public(plan_id),
                 Err(crate::link::LinkInsertionError::StaleSource {
@@ -1528,7 +1700,7 @@ impl Session {
                 flavite_buffer::state::BufferState::Orphaned => "Orphaned",
                 _ => "Unavailable",
             };
-            self.link_plans.lock().unwrap().record_outcome(
+            self.link_plans.lock_recovering().record_outcome(
                 &intent,
                 crate::link::fingerprint_insert_public(plan_id),
                 Err(crate::link::LinkInsertionError::BufferStateNeedsDecision { state: name }),
@@ -1548,7 +1720,7 @@ impl Session {
             }
         };
         if catalog.epoch != plan.validated_epoch || catalog.generation < plan.validated_generation {
-            self.link_plans.lock().unwrap().record_outcome(
+            self.link_plans.lock_recovering().record_outcome(
                 &intent,
                 crate::link::fingerprint_insert_public(plan_id),
                 Err(crate::link::LinkInsertionError::StaleEpoch),
@@ -1573,7 +1745,7 @@ impl Session {
         } else {
             current_id != Some(plan.target_entity_id)
         } {
-            self.link_plans.lock().unwrap().record_outcome(
+            self.link_plans.lock_recovering().record_outcome(
                 &intent,
                 crate::link::fingerprint_insert_public(plan_id),
                 Err(crate::link::LinkInsertionError::TargetRetargeted),
@@ -1637,7 +1809,7 @@ impl Session {
                 "{other:?}"
             ))),
         };
-        self.link_plans.lock().unwrap().record_outcome(
+        self.link_plans.lock_recovering().record_outcome(
             &intent,
             crate::link::fingerprint_insert_public(plan_id),
             cached,
@@ -1660,14 +1832,14 @@ impl Session {
     /// not yet been presented to the host. This is lossless: completions stay
     /// queued until the host drains them.
     pub fn drain_operation_completions(&self) -> Vec<OperationCompletion> {
-        let _turn = self.driving_turn.lock().unwrap();
+        let _turn = self.driving_turn.lock_recovering();
         self.pump_structure_completions();
         self.pump_link_completions();
         self.pump_open_completions();
         self.pump_save_completions();
         self.pump_reconcile_completions();
         self.pump_rename_completions();
-        self.completions.lock().unwrap().drain(..).collect()
+        self.completions.lock_recovering().drain(..).collect()
     }
 
     /// Drain lossy vault pulses for a host adapter.
@@ -1698,9 +1870,15 @@ impl Session {
 
     /// Drain session observations, including external disk changes.
     pub fn drain_events(&self) -> Vec<SessionEvent> {
-        let _turn = self.driving_turn.lock().unwrap();
+        let _turn = self.driving_turn.lock_recovering();
         self.pump_external_changes_inner();
-        self.session_events.lock().unwrap().drain(..).collect()
+        // Advisory mirror (NFR-5): fold process-local poison recoveries
+        // recorded outside this Session (`sync::POISON_RECOVERIES`) into the
+        // observable counter, monotonic-max so the mirror never rewinds.
+        let live = crate::sync::POISON_RECOVERIES.load(Ordering::Relaxed);
+        self.poison_recoveries_total
+            .fetch_max(live, Ordering::Relaxed);
+        self.session_events.lock_recovering().drain(..).collect()
     }
 
     /// Request a throttled verification after the host window gains focus.
@@ -1725,68 +1903,121 @@ impl Session {
 
     /// CLI/headless convenience for commands that promise a disk mutation.
     /// GUI hosts use `drain_operation_completions` from their normal pump.
+    /// Wait for a headless operation to reach its terminal result.
+    ///
+    /// Turn-free by contract (S6/Q4): the pumps are turn-free and command
+    /// transitions self-serialize under `driving_turn` inside `execute`, so
+    /// a waiting observer must not hold the turn that the producer needs to
+    /// deliver its result. The one path that already holds the turn — the
+    /// W12 `restore_recovery` implicit open inside `execute` — uses the
+    /// dedicated [`Session::wait_for_operation_holding_turn`] entry, which
+    /// must not re-acquire it (self-deadlock).
     pub fn wait_for_operation(&self, request_id: u64) -> SessionResult {
-        let _turn = self.driving_turn.lock().unwrap();
-        self.wait_for_operation_holding_turn(request_id)
+        self.wait_loop(request_id)
     }
 
-    /// Wait for an operation while the driving turn is already held (W12:
-    /// `restore_recovery`'s implicit open runs inside `execute`, which
-    /// holds the turn; re-acquiring here would self-deadlock).
+    /// Wait while the driving turn is already held (W12: `restore_recovery`'s
+    /// implicit open runs inside `execute`, which holds the turn;
+    /// re-acquiring here would self-deadlock).
     fn wait_for_operation_holding_turn(&self, request_id: u64) -> SessionResult {
+        self.wait_loop(request_id)
+    }
+
+    /// Shared park-and-pump wait body for both entry points.
+    ///
+    /// Every pass pumps this thread's installers (worker replies become
+    /// completions only inside the pump functions, so a lone waiter must
+    /// pump itself), takes its own result losslessly, checks liveness, then
+    /// parks on `completions_cv` until a recorded completion or the
+    /// `WAIT_TICK` ceiling. No sleeping poll, no `driving_turn`.
+    /// Worst-case lone-waiter added latency is 25 ms versus the old 1 ms
+    /// busy-poll — accepted for headless paths: CPU per idle waiter drops
+    /// from ~1,000 wakeups/s to ≤ 40/s (NFR-3/NFR-4).
+    fn wait_loop(&self, request_id: u64) -> SessionResult {
         loop {
             self.pump_external_changes_inner();
             self.pump_open_completions();
             self.pump_save_completions();
             self.pump_reconcile_completions();
             self.pump_rename_completions();
-            let completed = {
-                let mut completions = self.completions.lock().unwrap();
-                completions
-                    .iter()
-                    .position(|completion| completion.request_id == request_id)
-                    .map(|position| completions.remove(position).unwrap().result)
-            };
-            if let Some(result) = completed {
+            if let Some(result) = self.take_completion(request_id) {
                 return result;
             }
-            let active = self.save_flights.lock().unwrap().values().any(|flight| {
-                flight.request.request_id == request_id
-                    || flight
-                        .queued
-                        .as_ref()
-                        .is_some_and(|request| request.request_id == request_id)
-            }) || self
-                .reconcile_flights
-                .lock()
-                .unwrap()
-                .contains_key(&request_id)
-                || self
-                    .rename_flights
-                    .lock()
-                    .unwrap()
-                    .contains_key(&request_id)
-                || self
-                    .open_flights
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .any(|flight| flight.request_ids.contains(&request_id));
-            if !active {
+            if !self.operation_in_flight(request_id) {
                 return SessionResult::Error {
                     message: format!("unknown or already-drained operation {request_id}"),
                 };
             }
-            // The caller holds the driving turn for the whole wait; only
-            // the sleep is released so concurrent pumps on other threads
-            // can make progress against the actor.
-            std::thread::sleep(Duration::from_millis(1));
+            // No lost wakeups by construction: the completion check above
+            // and the parking happen under the same `completions` mutex,
+            // and `record_completion` holds that mutex while pushing, so a
+            // completion recorded between the check and the park is visible
+            // to the condition predicate before the waiter ever sleeps.
+            let completions = self.completions.lock_recovering();
+            crate::sync::observe_park(request_id);
+            let _waited = crate::sync::wait_result_recovering(
+                self.completions_cv
+                    .wait_timeout_while(completions, WAIT_TICK, |queue| {
+                        queue
+                            .iter()
+                            .all(|completion| completion.request_id != request_id)
+                    }),
+            );
         }
+    }
+
+    /// Remove and return the recorded result for `request_id`, leaving all
+    /// other completions in place (the ledger stays lossless for other
+    /// consumers such as `drain_operation_completions`).
+    fn take_completion(&self, request_id: u64) -> Option<SessionResult> {
+        let mut completions = self.completions.lock_recovering();
+        completions
+            .iter()
+            .position(|completion| completion.request_id == request_id)
+            .map(|position| completions.remove(position).unwrap().result)
+    }
+
+    /// True while any flight can still deliver the terminal result for this
+    /// request: a save (primary or coalesced successor), reconcile, rename,
+    /// or open flight.
+    fn operation_in_flight(&self, request_id: u64) -> bool {
+        self.save_flights.lock_recovering().values().any(|flight| {
+            flight.request.request_id == request_id
+                || flight
+                    .queued
+                    .as_ref()
+                    .is_some_and(|request| request.request_id == request_id)
+        }) || self
+            .reconcile_flights
+            .lock_recovering()
+            .contains_key(&request_id)
+            || self
+                .rename_flights
+                .lock_recovering()
+                .contains_key(&request_id)
+            || self
+                .open_flights
+                .lock_recovering()
+                .values()
+                .any(|flight| flight.request_ids.contains(&request_id))
+    }
+
+    /// Record a terminal operation result and wake any parked waiters (S6).
+    ///
+    /// The ONLY writer of `OperationCompletion` into the queue: the ten
+    /// former inline push sites all routed through here, which is what makes
+    /// the notify edge auditable — one site, not ten. Admission remains
+    /// bounded by the pending-save cap (unchanged).
+    fn record_completion(&self, request_id: u64, result: SessionResult) {
+        self.completions
+            .lock_recovering()
+            .push_back(OperationCompletion { request_id, result });
+        self.completions_cv.notify_all();
     }
 
     fn pump_save_completions(&self) {
         let ready = {
-            let mut flights = self.save_flights.lock().unwrap();
+            let mut flights = self.save_flights.lock_recovering();
             let ready_ids = flights
                 .iter()
                 .filter_map(|(buffer, flight)| match flight.response.try_recv() {
@@ -1814,20 +2045,13 @@ impl Session {
             let operation_result = self.finish_save(&flight.request, &response);
             if self
                 .autosave_requests
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .remove(&flight.request.request_id)
                 && !matches!(&operation_result, SessionResult::Success(_))
             {
                 self.record_autosave_failure(&flight.request.path, &operation_result);
             }
-            self.completions
-                .lock()
-                .unwrap()
-                .push_back(OperationCompletion {
-                    request_id: flight.request.request_id,
-                    result: operation_result,
-                });
+            self.record_completion(flight.request.request_id, operation_result);
 
             let Some(mut queued) = flight.queued else {
                 continue;
@@ -1841,26 +2065,21 @@ impl Session {
                     queued.merge_base = flight.request.bytes.clone();
                     let buffer_is_live = self
                         .buffer_manager
-                        .lock()
-                        .unwrap()
+                        .lock_recovering()
                         .get_buffer_by_id(BufferId::from(buffer_id))
                         .is_some();
                     if !buffer_is_live {
-                        self.completions
-                            .lock()
-                            .unwrap()
-                            .push_back(OperationCompletion {
-                                request_id: queued.request_id,
-                                result: SessionResult::Error {
-                                    message: "queued save's buffer was closed before admission"
-                                        .into(),
-                                },
-                            });
+                        self.record_completion(
+                            queued.request_id,
+                            SessionResult::Error {
+                                message: "queued save's buffer was closed before admission".into(),
+                            },
+                        );
                         continue;
                     }
                     match self.actor.submit_save(queued.clone()) {
                         Ok(response) => {
-                            self.save_flights.lock().unwrap().insert(
+                            self.save_flights.lock_recovering().insert(
                                 buffer_id,
                                 SaveFlight {
                                     request: queued,
@@ -1869,39 +2088,30 @@ impl Session {
                                 },
                             );
                         }
-                        Err(error) => {
-                            self.completions
-                                .lock()
-                                .unwrap()
-                                .push_back(OperationCompletion {
-                                    request_id: queued.request_id,
-                                    result: SessionResult::Error {
-                                        message: error.to_string(),
-                                    },
-                                })
-                        }
+                        Err(error) => self.record_completion(
+                            queued.request_id,
+                            SessionResult::Error {
+                                message: error.to_string(),
+                            },
+                        ),
                     }
                 }
-                _ => self
-                    .completions
-                    .lock()
-                    .unwrap()
-                    .push_back(OperationCompletion {
-                        request_id: queued.request_id,
-                        result: SessionResult::Error {
-                            message: format!(
-                                "queued save was not admitted because save {} did not complete",
-                                flight.request.request_id
-                            ),
-                        },
-                    }),
+                _ => self.record_completion(
+                    queued.request_id,
+                    SessionResult::Error {
+                        message: format!(
+                            "queued save was not admitted because save {} did not complete",
+                            flight.request.request_id
+                        ),
+                    },
+                ),
             }
         }
     }
 
     fn pump_reconcile_completions(&self) {
         let ready = {
-            let mut flights = self.reconcile_flights.lock().unwrap();
+            let mut flights = self.reconcile_flights.lock_recovering();
             let ids = flights
                 .iter()
                 .filter_map(|(id, receiver)| match receiver.try_recv() {
@@ -1936,16 +2146,13 @@ impl Session {
                     message: "reconcile worker returned an invalid response".into(),
                 },
             };
-            self.completions
-                .lock()
-                .unwrap()
-                .push_back(OperationCompletion { request_id, result });
+            self.record_completion(request_id, result);
         }
     }
 
     fn pump_rename_completions(&self) {
         let ready = {
-            let mut flights = self.rename_flights.lock().unwrap();
+            let mut flights = self.rename_flights.lock_recovering();
             let ids = flights
                 .iter()
                 .filter_map(|(id, (_, _, receiver))| match receiver.try_recv() {
@@ -1978,10 +2185,7 @@ impl Session {
                     message: "rename worker returned an invalid response".into(),
                 },
             };
-            self.completions
-                .lock()
-                .unwrap()
-                .push_back(OperationCompletion { request_id, result });
+            self.record_completion(request_id, result);
         }
     }
 
@@ -1995,16 +2199,16 @@ impl Session {
         match response {
             crate::actor::VaultActorResp::Saved(Ok(receipt)) => {
                 let revision = Revision::new(request.revision);
-                let mut manager = self.buffer_manager.lock().unwrap();
+                let mut manager = self.buffer_manager.lock_recovering();
                 if let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) {
                     buffer.handle_save_completed_revision(revision, &request.bytes);
                 }
                 drop(manager);
                 if let Some(writer) = &self.recovery_writer {
-                    let mut writer = writer.lock().unwrap();
+                    let mut writer = writer.lock_recovering();
                     writer.retire_covered(buffer_id, revision);
                 }
-                self.absent_on_open.lock().unwrap().remove(&path);
+                self.absent_on_open.lock_recovering().remove(&path);
                 SessionResult::Success(CommandResult::NoteSaved {
                     buffer_id,
                     saved_revision: revision,
@@ -2018,8 +2222,7 @@ impl Session {
                 if failure.stage == SaveFailureStage::Compare {
                     if let Some(buffer) = self
                         .buffer_manager
-                        .lock()
-                        .unwrap()
+                        .lock_recovering()
                         .get_buffer_by_id_mut(buffer_id)
                         && let Some(hash) = failure.current_hash
                     {
@@ -2035,7 +2238,7 @@ impl Session {
                         | DurabilityOutcome::ReplacedDurabilityUncertain
                         | DurabilityOutcome::OutcomeUnknown
                 ) {
-                    let mut manager = self.buffer_manager.lock().unwrap();
+                    let mut manager = self.buffer_manager.lock_recovering();
                     if let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) {
                         let saved_hash = *blake3::hash(&request.bytes).as_bytes();
                         if failure.current_hash == Some(saved_hash) {
@@ -2051,7 +2254,7 @@ impl Session {
                     }
                     drop(manager);
                     if failure.current_hash.is_some() {
-                        self.absent_on_open.lock().unwrap().remove(&path);
+                        self.absent_on_open.lock_recovering().remove(&path);
                     }
                 }
                 if failure.stage == SaveFailureStage::Compare {
@@ -2089,8 +2292,7 @@ impl Session {
     fn open_note(&self, path: PathBuf, policy: OpenPolicy) -> SessionResult {
         if let Some(buffer_id) = self
             .buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .get_buffer(&path)
             .map(|buffer| (buffer.buffer_id(), buffer.revision()))
         {
@@ -2107,13 +2309,13 @@ impl Session {
     /// dispatch the read/create job to a bounded worker.
     fn open_note_inner(&self, path: PathBuf, policy: OpenPolicy) -> SessionResult {
         {
-            let flights = self.open_flights.lock().unwrap();
+            let flights = self.open_flights.lock_recovering();
             if flights.len() >= MAX_PENDING_OPEN_NOTES {
                 return SessionResult::Busy;
             }
         }
         let request_id = self.next_request_id();
-        let mut flights = self.open_flights.lock().unwrap();
+        let mut flights = self.open_flights.lock_recovering();
         match flights.entry(path.clone()) {
             std::collections::hash_map::Entry::Occupied(mut flight) => {
                 flight.get_mut().request_ids.push(request_id);
@@ -2175,7 +2377,7 @@ impl Session {
         }
         let content = content.unwrap_or_default();
         let (buffer_id, revision) = {
-            let mut buffer_manager_guard = self.buffer_manager.lock().unwrap();
+            let mut buffer_manager_guard = self.buffer_manager.lock_recovering();
             let (buffer, _transition) = buffer_manager_guard.open_note(read.path.clone(), &content);
             (buffer.buffer_id(), buffer.revision())
         };
@@ -2190,8 +2392,7 @@ impl Session {
         }
         if absent {
             self.absent_on_open
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .insert(read.path.clone());
         }
         // The flight slot is already consumed by the pump; keep the jobs
@@ -2219,17 +2420,16 @@ impl Session {
         if ready.is_empty() {
             return;
         }
-        let mut completions = self.completions.lock().unwrap();
         for read in ready {
-            let Some(flight) = self.open_flights.lock().unwrap().remove(&read.path) else {
+            let Some(flight) = self.open_flights.lock_recovering().remove(&read.path) else {
                 continue;
             };
             let result = self.install_open_read(read);
+            // The former code held the completions lock across the open-flights
+            // removal and the install; every lock now lives inside its owner
+            // (S6: completions is only ever touched by `record_completion`).
             for request_id in flight.request_ids {
-                completions.push_back(OperationCompletion {
-                    request_id,
-                    result: result.clone(),
-                });
+                self.record_completion(request_id, result.clone());
             }
         }
     }
@@ -2245,8 +2445,7 @@ impl Session {
     fn create_note(&self, path: PathBuf) -> SessionResult {
         if self
             .buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .get_buffer(&path)
             .is_some()
         {
@@ -2287,8 +2486,7 @@ impl Session {
         // Get buffer ID
         let buffer_id = {
             self.buffer_manager
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .get_buffer(&path)
                 .map(|buffer| buffer.buffer_id())
         };
@@ -2296,8 +2494,7 @@ impl Session {
         if let Some(_buffer_id) = buffer_id {
             if self
                 .save_flights
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .contains_key(&_buffer_id.as_u64())
             {
                 return SessionResult::ActionRequired {
@@ -2307,8 +2504,7 @@ impl Session {
             }
             let unsaved = self
                 .buffer_manager
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .get_buffer_by_id(_buffer_id)
                 .is_some_and(|buffer| buffer.is_dirty() || buffer.needs_resolution());
             if unsaved {
@@ -2327,12 +2523,16 @@ impl Session {
             // Close the buffer. The recovery file is intentionally not
             // deleted here: retain-recovery means the snapshot outlives
             // the buffer and is offered again on reopen.
-            let mut buffer_manager = self.buffer_manager.lock().unwrap();
+            let mut buffer_manager = self.buffer_manager.lock_recovering();
             buffer_manager.close_note(&path);
             drop(buffer_manager);
-            self.shared_snapshots.lock().unwrap().remove(&_buffer_id);
+            self.shared_snapshots.lock_recovering().remove(&_buffer_id);
 
-            self.absent_on_open.lock().unwrap().remove(&path);
+            self.absent_on_open.lock_recovering().remove(&path);
+            // The buffer's journal memo dies with the buffer (C1): a
+            // re-opened buffer (new id) starts cold, and the close tier
+            // keeps total memo memory bounded by open buffers.
+            self.journal_memos.lock_recovering().remove(&_buffer_id);
 
             SessionResult::Success(CommandResult::NoteClosed)
         } else {
@@ -2347,7 +2547,7 @@ impl Session {
     /// revision-bound receipt.
     fn flush_recovery_note(&self, path: &PathBuf) -> Result<CommandResult, String> {
         let (key, base, snapshot, revision) = {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             let Some(buffer) = manager.get_buffer(path) else {
                 return Err(format!("Buffer not found: {}", path.display()));
             };
@@ -2372,10 +2572,9 @@ impl Session {
             .map_err(|error| format!("could not persist recovery merge base: {error}"))?;
         // `None` means an equally-covering snapshot is already durable;
         // the read-back verification below is the receipt check either way.
-        let _ = writer.lock().unwrap().write_snapshot_now(&key, snapshot);
+        let _ = writer.lock_recovering().write_snapshot_now(&key, snapshot);
         let stored = writer
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .read_for_note_key(&key)
             .ok_or_else(|| "no durable recovery snapshot exists for this buffer".to_owned())?;
         if stored.header.revision < revision {
@@ -2386,7 +2585,7 @@ impl Session {
             ));
         }
         let hash = {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             manager
                 .get_buffer(path)
                 .map(|buffer| buffer.content_hash())
@@ -2413,8 +2612,7 @@ impl Session {
         };
         if self
             .save_flights
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .contains_key(&buffer_id.as_u64())
         {
             return SessionResult::ActionRequired {
@@ -2429,7 +2627,7 @@ impl Session {
             };
         };
         let mine = {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             match manager.get_buffer_by_id(buffer_id) {
                 Some(buffer) => buffer.model().to_source_bytes(),
                 None => {
@@ -2449,7 +2647,7 @@ impl Session {
             };
         }
         {
-            let mut manager = self.buffer_manager.lock().unwrap();
+            let mut manager = self.buffer_manager.lock_recovering();
             match manager
                 .get_buffer_by_id_mut(buffer_id)
                 .and_then(|buffer| buffer.reload_from_disk(&theirs))
@@ -2466,7 +2664,7 @@ impl Session {
         // them from re-appearing as a recovery offer on the next open.
         if let Some(writer) = &self.recovery_writer {
             let key = native_note_key(&path, &self.identity.root);
-            writer.lock().unwrap().delete_for_note_key(&key);
+            writer.lock_recovering().delete_for_note_key(&key);
         }
         SessionResult::Success(CommandResult::EditsDiscarded { buffer_id })
     }
@@ -2478,7 +2676,7 @@ impl Session {
         revision: Revision,
         op: EditOp,
     ) -> SessionResult {
-        let mut manager = self.buffer_manager.lock().unwrap();
+        let mut manager = self.buffer_manager.lock_recovering();
         let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
             return SessionResult::Error {
                 message: "Buffer no longer open".into(),
@@ -2520,7 +2718,7 @@ impl Session {
         revision: Revision,
         ops: Vec<EditOp>,
     ) -> SessionResult {
-        let mut buffer_manager = self.buffer_manager.lock().unwrap();
+        let mut buffer_manager = self.buffer_manager.lock_recovering();
 
         // Get the buffer and apply all edit ops
         if let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) {
@@ -2556,8 +2754,7 @@ impl Session {
     fn save_note(&self, path: PathBuf) -> SessionResult {
         let buffer_id = {
             self.buffer_manager
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .get_buffer(&path)
                 .map(|buffer| buffer.buffer_id())
         };
@@ -2567,7 +2764,7 @@ impl Session {
             };
         };
         let (bytes, revision, base_hash, base_bytes, state) = {
-            let mut manager = self.buffer_manager.lock().unwrap();
+            let mut manager = self.buffer_manager.lock_recovering();
             let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
                 return SessionResult::Error {
                     message: "Buffer not found".into(),
@@ -2585,7 +2782,7 @@ impl Session {
         if !state.allows_manual_save() {
             return SessionResult::Conflict { path };
         }
-        let precondition = if self.absent_on_open.lock().unwrap().contains(&path) {
+        let precondition = if self.absent_on_open.lock_recovering().contains(&path) {
             DiskPrecondition::Absent
         } else if let Some(hash) = base_hash {
             DiskPrecondition::Existing(hash.as_bytes())
@@ -2607,28 +2804,26 @@ impl Session {
             revision: revision.as_u64(),
         };
 
-        let mut flights = self.save_flights.lock().unwrap();
-        let outstanding = self.completions.lock().unwrap().len()
+        let mut flights = self.save_flights.lock_recovering();
+        let outstanding = self.completions.lock_recovering().len()
             + flights
                 .values()
                 .map(|flight| 1 + usize::from(flight.queued.is_some()))
                 .sum::<usize>();
-        if outstanding + self.reconcile_flights.lock().unwrap().len() >= MAX_PENDING_SAVE_OPERATIONS
+        if outstanding + self.reconcile_flights.lock_recovering().len()
+            >= MAX_PENDING_SAVE_OPERATIONS
         {
             return SessionResult::Busy;
         }
         if let Some(flight) = flights.get_mut(&buffer_id.as_u64()) {
             if let Some(superseded) = flight.queued.replace(request) {
-                self.completions
-                    .lock()
-                    .unwrap()
-                    .push_back(OperationCompletion {
+                self.record_completion(
+                    superseded.request_id,
+                    SessionResult::Superseded {
                         request_id: superseded.request_id,
-                        result: SessionResult::Superseded {
-                            request_id: superseded.request_id,
-                            by_request: request_id,
-                        },
-                    });
+                        by_request: request_id,
+                    },
+                );
             }
             return SessionResult::Pending { request_id };
         }
@@ -2653,13 +2848,13 @@ impl Session {
     /// Trigger a reconcile.
     fn reconcile(&self, scope: ReconcileScope, mode: ReconcileMode) -> SessionResult {
         let request_id = self.next_request_id();
-        let flights = self.save_flights.lock().unwrap();
-        let outstanding = self.completions.lock().unwrap().len()
+        let flights = self.save_flights.lock_recovering();
+        let outstanding = self.completions.lock_recovering().len()
             + flights
                 .values()
                 .map(|flight| 1 + usize::from(flight.queued.is_some()))
                 .sum::<usize>()
-            + self.reconcile_flights.lock().unwrap().len();
+            + self.reconcile_flights.lock_recovering().len();
         drop(flights);
         if outstanding >= MAX_PENDING_SAVE_OPERATIONS {
             return SessionResult::Busy;
@@ -2667,8 +2862,7 @@ impl Session {
         match self.actor.submit_reconcile(scope, mode) {
             Ok(response) => {
                 self.reconcile_flights
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .insert(request_id, response);
                 SessionResult::Pending { request_id }
             }
@@ -2690,13 +2884,13 @@ impl Session {
         } else {
             self.identity.root.join(to)
         };
-        if self.buffer_manager.lock().unwrap().has_buffer(&to) {
+        if self.buffer_manager.lock_recovering().has_buffer(&to) {
             return SessionResult::Error {
                 message: format!("destination-open: {}", to.display()),
             };
         }
         let (buffer_ids, buffer_revisions) = {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             let mut buffer_ids = HashMap::new();
             let mut buffer_revisions = HashMap::new();
             for (path, buffer_id) in manager.open_paths() {
@@ -2709,10 +2903,10 @@ impl Session {
             }
             (buffer_ids, buffer_revisions)
         };
-        let outstanding = self.completions.lock().unwrap().len()
-            + self.save_flights.lock().unwrap().len()
-            + self.reconcile_flights.lock().unwrap().len()
-            + self.rename_flights.lock().unwrap().len();
+        let outstanding = self.completions.lock_recovering().len()
+            + self.save_flights.lock_recovering().len()
+            + self.reconcile_flights.lock_recovering().len()
+            + self.rename_flights.lock_recovering().len();
         if outstanding >= MAX_PENDING_SAVE_OPERATIONS {
             return SessionResult::Busy;
         }
@@ -2726,8 +2920,7 @@ impl Session {
         ) {
             Ok(response) => {
                 self.rename_flights
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .insert(request_id, (from, to, response));
                 SessionResult::Pending { request_id }
             }
@@ -2740,7 +2933,7 @@ impl Session {
 
     /// Undo an edit.
     fn undo(&self, buffer_id: BufferId, revision: Revision) -> SessionResult {
-        let mut buffer_manager = self.buffer_manager.lock().unwrap();
+        let mut buffer_manager = self.buffer_manager.lock_recovering();
 
         // Get the buffer and call undo on its model
         if let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) {
@@ -2765,10 +2958,7 @@ impl Session {
                     {
                         return SessionResult::Error { message };
                     }
-                    self.cancelled_journal_items
-                        .lock()
-                        .unwrap()
-                        .insert((tag.txn_id, tag.item_id));
+                    self.memo_cancel(buffer_id, (tag.txn_id, tag.item_id));
                 }
                 SessionResult::Success(CommandResult::UndoPerformed {
                     buffer_id,
@@ -2788,7 +2978,7 @@ impl Session {
 
     /// Redo an edit.
     fn redo(&self, buffer_id: BufferId, revision: Revision) -> SessionResult {
-        let mut buffer_manager = self.buffer_manager.lock().unwrap();
+        let mut buffer_manager = self.buffer_manager.lock_recovering();
 
         // Get the buffer and call redo on its model
         if let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) {
@@ -2799,16 +2989,21 @@ impl Session {
                     actual: buffer.revision(),
                 };
             }
-            if buffer
+            let cancelled_tags: Vec<(String, u64)> = buffer
                 .model()
                 .next_redo_ops()
                 .iter()
                 .filter_map(|op| op.journal.as_ref())
-                .any(|tag| {
-                    self.cancelled_journal_items
-                        .lock()
-                        .unwrap()
-                        .contains(&(tag.txn_id.clone(), tag.item_id))
+                .map(|tag| (tag.txn_id.clone(), tag.item_id))
+                .collect();
+            if self
+                .journal_memos
+                .lock_recovering()
+                .get(&buffer_id)
+                .is_some_and(|memo| {
+                    cancelled_tags
+                        .iter()
+                        .any(|key| memo.cancelled.contains(key))
                 })
             {
                 return SessionResult::Error {
@@ -2869,7 +3064,7 @@ impl Session {
                 message: format!("could not snapshot conflict bytes: {error}"),
             };
         }
-        let mut manager = self.buffer_manager.lock().unwrap();
+        let mut manager = self.buffer_manager.lock_recovering();
         match manager
             .get_buffer_by_id_mut(buffer_id)
             .and_then(|buffer| buffer.resolve_keep_local(&theirs).map(|_| ()))
@@ -2894,7 +3089,7 @@ impl Session {
             };
         };
         let mine = {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             match manager.get_buffer_by_id(buffer_id) {
                 Some(buffer) => buffer.model().to_source_bytes(),
                 None => {
@@ -2913,7 +3108,7 @@ impl Session {
                 message: format!("could not snapshot discarded bytes: {error}"),
             };
         }
-        let mut manager = self.buffer_manager.lock().unwrap();
+        let mut manager = self.buffer_manager.lock_recovering();
         match manager
             .get_buffer_by_id_mut(buffer_id)
             .and_then(|buffer| buffer.reload_from_disk(&theirs))
@@ -2938,7 +3133,7 @@ impl Session {
             };
         };
         let (base, mine, revision) = {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             match manager.get_buffer_by_id(buffer_id) {
                 Some(buffer) => (
                     buffer.base_bytes().to_vec(),
@@ -2997,8 +3192,7 @@ impl Session {
         if blake3::hash(&theirs).as_bytes() != &expected_disk_hash {
             if let Some(buffer) = self
                 .buffer_manager
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .get_buffer_by_id_mut(buffer_id)
             {
                 buffer.mark_conflicted_disk_hash(*blake3::hash(&theirs).as_bytes());
@@ -3015,7 +3209,7 @@ impl Session {
             };
         }
         let mine = {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             let Some(buffer) = manager.get_buffer_by_id(buffer_id) else {
                 return SessionResult::Error {
                     message: "merge preview buffer was closed".into(),
@@ -3039,7 +3233,7 @@ impl Session {
                 message: format!("could not snapshot merge buffer: {error}"),
             };
         }
-        let mut manager = self.buffer_manager.lock().unwrap();
+        let mut manager = self.buffer_manager.lock_recovering();
         let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
             return SessionResult::Error {
                 message: "merge preview buffer was closed".into(),
@@ -3070,7 +3264,7 @@ impl Session {
             };
         };
         let key = native_note_key(&path, &self.identity.root);
-        let Some(recovery) = writer.lock().unwrap().read_for_note_key(&key) else {
+        let Some(recovery) = writer.lock_recovering().read_for_note_key(&key) else {
             return SessionResult::Error {
                 message: "no valid recovery snapshot exists for this note".into(),
             };
@@ -3104,8 +3298,7 @@ impl Session {
         let recovered = recovery.to_source_bytes();
         let transition = self
             .buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .get_buffer_by_id_mut(buffer_id)
             .and_then(|buffer| buffer.restore_recovery(&recovered, &disk, recovery.base_hash));
         if transition.is_none() {
@@ -3122,8 +3315,7 @@ impl Session {
         }
         let revision = self
             .buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .get_buffer_by_id(buffer_id)
             .map(|buffer| buffer.revision())
             .unwrap_or(Revision::INITIAL);
@@ -3140,7 +3332,7 @@ impl Session {
             };
         };
         let key = native_note_key(&path, &self.identity.root);
-        if writer.lock().unwrap().delete_for_note_key(&key) {
+        if writer.lock_recovering().delete_for_note_key(&key) {
             SessionResult::Success(CommandResult::ConflictResolved)
         } else {
             SessionResult::Error {
@@ -3165,7 +3357,7 @@ impl Session {
         // The buffer for `path` must be the exact buffer the caller saw:
         // restoring into a buffer belonging to another note is refused.
         {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             let path_buffer = manager.get_buffer(&path).map(|buffer| buffer.buffer_id());
             if path_buffer != Some(buffer_id) {
                 return SessionResult::Error {
@@ -3185,7 +3377,7 @@ impl Session {
                 message: "history snapshot is not valid UTF-8".into(),
             };
         };
-        let mut manager = self.buffer_manager.lock().unwrap();
+        let mut manager = self.buffer_manager.lock_recovering();
         let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
             return SessionResult::Error {
                 message: "Buffer no longer open".into(),
@@ -3257,7 +3449,7 @@ impl Session {
     /// Lightweight current buffer stamp for rejecting obsolete graph publications.
     /// No text copies, database access, or filesystem work.
     pub fn graph_buffer_stamp(&self) -> Vec<GraphBufferStamp> {
-        let manager = self.buffer_manager.lock().unwrap();
+        let manager = self.buffer_manager.lock_recovering();
         let mut stamp: Vec<_> = manager
             .open_paths()
             .into_iter()
@@ -3291,7 +3483,7 @@ impl Session {
         buffer_id: BufferId,
         revision: Option<Revision>,
     ) -> Result<SharedBufferSnapshot, BufferSnapshotError> {
-        let _turn = self.driving_turn.lock().unwrap();
+        let _turn = self.driving_turn.lock_recovering();
         self.shared_buffer_snapshot_inner(buffer_id, revision)
     }
     pub(crate) fn shared_buffer_snapshot_inner(
@@ -3299,7 +3491,7 @@ impl Session {
         buffer_id: BufferId,
         revision: Option<Revision>,
     ) -> Result<SharedBufferSnapshot, BufferSnapshotError> {
-        let manager = self.buffer_manager.lock().unwrap();
+        let manager = self.buffer_manager.lock_recovering();
         let buffer = manager
             .get_buffer_by_id(buffer_id)
             .ok_or(BufferSnapshotError::NotFound(buffer_id.as_u64()))?;
@@ -3317,7 +3509,7 @@ impl Session {
             .ok_or(BufferSnapshotError::NotFound(buffer_id.as_u64()))?;
         let current_revision = buffer.revision();
         let text = {
-            let mut cache = self.shared_snapshots.lock().unwrap();
+            let mut cache = self.shared_snapshots.lock_recovering();
             match cache.get(&buffer_id) {
                 Some((cached_revision, text)) if *cached_revision == current_revision => {
                     text.clone()
@@ -3354,7 +3546,7 @@ impl Session {
         let Some(writer) = &self.recovery_writer else {
             return Vec::new();
         };
-        let manager = self.buffer_manager.lock().unwrap();
+        let manager = self.buffer_manager.lock_recovering();
         let dirty = manager
             .dirty_buffers()
             .into_iter()
@@ -3369,10 +3561,10 @@ impl Session {
         drop(manager);
         let mut written = Vec::new();
         for (key, base, snapshot) in dirty {
-            let due = writer.lock().unwrap().should_write_snapshot(&snapshot);
+            let due = writer.lock_recovering().should_write_snapshot(&snapshot);
             if due
                 && self.actor.pin_merge_base(key.clone(), base).is_ok()
-                && let Some(path) = writer.lock().unwrap().write_snapshot(&key, snapshot)
+                && let Some(path) = writer.lock_recovering().write_snapshot(&key, snapshot)
             {
                 written.push(path);
             }
@@ -3385,7 +3577,7 @@ impl Session {
     /// protects edits made shortly before shutdown.
     pub fn flush_recovery(&self) -> Result<Vec<PathBuf>, String> {
         let snapshots = {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             manager
                 .dirty_buffers()
                 .into_iter()
@@ -3410,8 +3602,7 @@ impl Session {
                 .pin_merge_base(key.clone(), base)
                 .map_err(|error| format!("could not persist recovery merge base: {error}"))?;
             writer
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .write_snapshot_now(&key, snapshot)
                 .ok_or_else(|| {
                     "could not durably write a dirty-buffer recovery snapshot".to_owned()
@@ -3455,8 +3646,7 @@ impl Session {
     #[must_use]
     pub fn is_open(&self, path: &Path) -> bool {
         self.buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .has_buffer(&path.to_path_buf())
     }
 
@@ -3464,8 +3654,7 @@ impl Session {
     #[must_use]
     pub fn get_buffer_id(&self, path: &Path) -> Option<BufferId> {
         self.buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .get_buffer(&path.to_path_buf())
             .map(|buffer| buffer.buffer_id())
     }
@@ -3598,7 +3787,7 @@ impl SessionBuilder {
                 .unwrap_or_else(|| NoticeChannel::new(Duration::from_millis(300))),
             self.config.unwrap_or_default(),
         );
-        *session.recovery_notices.lock().unwrap() = self.recovery_notices.into();
+        *session.recovery_notices.lock_recovering() = self.recovery_notices.into();
         Ok(session)
     }
 }
@@ -3736,6 +3925,339 @@ mod tests {
         let (session, _, _) = test_session();
         assert_eq!(session.next_request_id(), 0);
         assert_eq!(session.next_request_id(), 1);
+    }
+
+    /// S4/FR-7 core contract, proven on the shared containment core that
+    /// both turn wrappers call: log + `panics_total` + `SessionEvent::Panicked`
+    /// + honest error result naming the panic. Removing any leg fails it.
+    #[test]
+    fn contained_panic_records_event_counter_and_error() {
+        let (session, _fs, _temp) = test_session();
+
+        let result = session
+            .record_contained_panic(&String::from("disk write tripped an assert"), "execute");
+        match result {
+            SessionResult::Error { message } => {
+                assert!(
+                    message.contains("session turn panicked during execute"),
+                    "error must name the turn honestly: {message}"
+                );
+                assert!(message.contains("disk write tripped an assert"));
+            }
+            other => panic!("expected contained-panic error, got {other:?}"),
+        }
+        assert_eq!(session.panics_total.load(Ordering::SeqCst), 1);
+
+        let events = session.drain_events();
+        let panicked: Vec<&SessionEvent> = events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::Panicked { .. }))
+            .collect();
+        assert_eq!(panicked.len(), 1, "contained panic emits exactly one event");
+        assert!(matches!(
+            panicked[0],
+            SessionEvent::Panicked { message, panics_total: 1 }
+                if message == "disk write tripped an assert"
+        ));
+
+        // A second containment accumulates: the event carries the running
+        // total so hosts can alert on `panics_total > 0` (R1 signal).
+        session.record_contained_panic(&"again", "pump");
+        assert_eq!(session.panics_total.load(Ordering::SeqCst), 2);
+        let second = session
+            .drain_events()
+            .into_iter()
+            .find(|e| matches!(e, SessionEvent::Panicked { .. }));
+        assert!(matches!(
+            second,
+            Some(SessionEvent::Panicked {
+                panics_total: 2,
+                ..
+            })
+        ));
+    }
+
+    /// Payload downcast chain locked by Q3: `&str` → `String` → debug
+    /// backstop.
+    #[test]
+    fn panic_message_downcasts_through_the_chain() {
+        assert_eq!(panic_message(&"static slice"), "static slice");
+        assert_eq!(panic_message(&String::from("owned string")), "owned string");
+        // Non-string payloads fall back to the Debug representation;
+        // `dyn Any`'s Debug is opaque ("Any { .. }") — the message is still
+        // honest about being a panic without claiming payload detail.
+        assert_eq!(panic_message(&42u8), "Any { .. }");
+    }
+
+    /// Wrapper transparency: no happy-path result is swallowed by the
+    /// containment. `execute` returns exactly what the turn returns and
+    /// `pump` completes; `panics_total` stays 0 across real traffic.
+    #[test]
+    fn execute_and_pump_wrappers_pass_results_through() {
+        let (session, _fs, _temp) = test_session();
+        let path = PathBuf::from("/test/vault/note.md");
+
+        let result = session.execute(SessionCommand::SaveNote { path: path.clone() });
+        assert!(
+            !matches!(&result, SessionResult::Error { message }
+                if message.contains("session turn panicked")),
+            "happy path must not be reported as a contained panic: {result:?}"
+        );
+        session.pump();
+        let again = session.execute(SessionCommand::SaveNote { path });
+        assert!(!matches!(&again, SessionResult::Error { message }
+                if message.contains("session turn panicked")),);
+        assert_eq!(session.panics_total.load(Ordering::SeqCst), 0);
+    }
+
+    /// NFR-2 at the turn level: one panic-while-held poisons a Session
+    /// mutex, and afterwards `execute`, `pump`, and `drain_events` must
+    /// complete (with recovery counted), not cascade into a wedged vault.
+    /// This test can fail: revert any S3 site and later turns panic.
+    #[test]
+    fn poisoned_mutex_does_not_wedge_execute_pump_or_drain() {
+        let _serial = crate::sync::poison_test_serial()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (session, _fs, _temp) = test_session();
+
+        crate::sync::poison_mutex_for_test(&session.save_flights);
+        let before = crate::sync::POISON_RECOVERIES.load(Ordering::Relaxed);
+
+        // Every later turn touches the poisoned mutex through recovering
+        // locks; none of this may panic.
+        let path = PathBuf::from("/test/vault/note.md");
+        let _ = session.execute(SessionCommand::SaveNote { path });
+        session.pump();
+        let _ = session.drain_events();
+
+        let live = crate::sync::POISON_RECOVERIES.load(Ordering::Relaxed);
+        assert!(live > before, "recoveries must be counted, not hidden");
+        assert_eq!(
+            session.poison_recoveries_total.load(Ordering::Relaxed),
+            live,
+            "drain_events must mirror the process counter into the Session"
+        );
+        assert_eq!(session.panics_total.load(Ordering::SeqCst), 0);
+    }
+
+    /// Keep-alive in-flight save so `operation_in_flight` answers `true`
+    /// without a live worker: the sender stays with the caller, the
+    /// receiver parks in the flight table until the test delivers.
+    fn fabricate_inflight_save(
+        session: &Session,
+        request_id: u64,
+    ) -> crossbeam::channel::Sender<crate::actor::VaultActorResp> {
+        let (keep_tx, keep_rx) = crossbeam::channel::unbounded();
+        session.save_flights.lock_recovering().insert(
+            request_id,
+            SaveFlight {
+                request: SaveRequest {
+                    request_id,
+                    path: PathBuf::from("/test/vault/note.md"),
+                    note_key: b"fabricated-key".to_vec(),
+                    bytes: Vec::new(),
+                    merge_base: Vec::new(),
+                    precondition: crate::save::DiskPrecondition::Existing([7u8; 32]),
+                    buffer_id: request_id,
+                    revision: 0,
+                },
+                response: keep_rx,
+                queued: None,
+            },
+        );
+        keep_tx
+    }
+
+    /// S6/Q4: a headless wait must NOT hold the driving turn. Thread A
+    /// waits an in-flight save while thread B executes unrelated commands
+    /// for a fixed window. Under the former turn-holding wait B is starved
+    /// for the entire window (it blocks on the first `execute`), which is
+    /// exactly what this test shows red against the old design.
+    #[test]
+    fn wait_for_operation_returns_without_turn_and_terminates() {
+        let (session, _fs, _temp) = test_session();
+        let request_id = 7_777u64;
+        let _keep = fabricate_inflight_save(&session, request_id);
+        let session = std::sync::Arc::new(session);
+
+        std::thread::scope(|scope| {
+            let waiter = {
+                let session = std::sync::Arc::clone(&session);
+                scope.spawn(move || session.wait_for_operation(request_id))
+            };
+            let driver = {
+                let session = std::sync::Arc::clone(&session);
+                scope.spawn(move || {
+                    let started = std::time::Instant::now();
+                    let mut completed = 0u64;
+                    while started.elapsed() < Duration::from_millis(250) {
+                        // Cheap unrelated command: closing a never-opened
+                        // path is a preflight error and mutates nothing.
+                        session.execute(SessionCommand::CloseNote {
+                            path: PathBuf::from("/test/vault/not-open.md"),
+                            retain_recovery: false,
+                        });
+                        completed += 1;
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    completed
+                })
+            };
+            std::thread::sleep(Duration::from_millis(300));
+            // Deliver through the production writer. This test's subject is
+            // the turn, not the wake latency (the wake-edge test pins that).
+            session.record_completion(
+                request_id,
+                SessionResult::Error {
+                    message: "test-delivered".into(),
+                },
+            );
+            let b_count = driver.join().expect("driver thread");
+            let result = waiter.join().expect("waiter thread");
+            assert!(
+                matches!(&result, SessionResult::Error { message } if message == "test-delivered"),
+                "{result:?}"
+            );
+            assert!(
+                b_count >= 20,
+                "waiter starved the driving turn: B completed only {b_count} commands in 250ms"
+            );
+        });
+    }
+
+    /// S6 wake-edge proof: a completion recorded on another thread wakes a
+    /// parked waiter materially BEFORE its 25 ms tick ceiling. If
+    /// `record_completion`'s `notify_all` regressed to a silent push, the
+    /// wake would wait out the remaining tick — near-certainly > 5 ms.
+    #[test]
+    fn wait_wakes_on_completion_from_another_thread() {
+        let (session, _fs, _temp) = test_session();
+        let request_id = 8_888u64;
+        let _keep = fabricate_inflight_save(&session, request_id);
+        let session = std::sync::Arc::new(session);
+
+        std::thread::scope(|scope| {
+            let waiter = {
+                let session = std::sync::Arc::clone(&session);
+                scope.spawn(move || session.wait_for_operation(request_id))
+            };
+            // Guarantee the waiter is parked before delivery is timed.
+            std::thread::sleep(Duration::from_millis(30));
+            let started = std::time::Instant::now();
+            session.record_completion(
+                request_id,
+                SessionResult::Success(CommandResult::NoteClosed),
+            );
+            let result = waiter.join().expect("waiter thread");
+            let woke_in = started.elapsed();
+            assert!(matches!(
+                result,
+                SessionResult::Success(CommandResult::NoteClosed)
+            ));
+            assert!(
+                woke_in < Duration::from_millis(5),
+                "wake came on the tick, not the notify edge: {woke_in:?} (WAIT_TICK is {WAIT_TICK:?})"
+            );
+        });
+    }
+
+    /// R4/NFR-3: forward progress is bounded without any notify —
+    /// (a) an unknown request id returns the honest
+    /// "unknown or already-drained" error immediately, never parking;
+    /// (b) an in-flight id that never completes parks at the tick ceiling:
+    /// over a 600 ms window the observed waiter takes ~24 parks (bound
+    /// 40/s), proving neither a 1 ms spin nor a hang; a delivery still
+    /// terminates it afterwards.
+    ///
+    /// The park counter observes only a designated request id (and the test
+    /// serializes that designation) so concurrent waiters in other tests
+    /// cannot contaminate the budget.
+    #[test]
+    fn unknown_and_parked_waits_make_bounded_progress() {
+        let _serial = crate::sync::poison_test_serial()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (session, _fs, _temp) = test_session();
+
+        // (a) Unknown id: immediate, no park.
+        let before_parks = crate::sync::WAIT_PARKS.load(Ordering::Relaxed);
+        let unknown = session.wait_for_operation(9_999);
+        assert!(
+            matches!(&unknown, SessionResult::Error { message }
+                if message == "unknown or already-drained operation 9999"),
+            "{unknown:?}"
+        );
+        assert_eq!(
+            crate::sync::WAIT_PARKS.load(Ordering::Relaxed),
+            before_parks,
+            "the unknown-id exit must not park"
+        );
+
+        // (b) Never-completed in-flight id: tick-bounded parks, then a
+        // delivery ends the wait.
+        let request_id = 6_666u64;
+        let _keep = fabricate_inflight_save(&session, request_id);
+        crate::sync::OBSERVED_WAIT_ID.store(request_id, Ordering::Relaxed);
+        crate::sync::WAIT_PARKS.store(0, Ordering::Relaxed);
+        let session = std::sync::Arc::new(session);
+        std::thread::scope(|scope| {
+            let waiter = {
+                let session = std::sync::Arc::clone(&session);
+                scope.spawn(move || session.wait_for_operation(request_id))
+            };
+            std::thread::sleep(Duration::from_millis(600));
+            assert!(
+                !waiter.is_finished(),
+                "a never-completed wait must stay parked, not exit silently"
+            );
+            let parks = crate::sync::WAIT_PARKS.load(Ordering::Relaxed);
+            session.record_completion(request_id, SessionResult::Busy);
+            let result = waiter.join().expect("waiter thread");
+            crate::sync::OBSERVED_WAIT_ID.store(u64::MAX, Ordering::Relaxed);
+            assert!(matches!(result, SessionResult::Busy));
+            // ≤ 40/s budget over 600 ms = 24, plus scheduling slack; a 1 ms
+            // spin would show ~600 parks. ≥ 10 proves timeout-driven
+            // forward progress rather than a lost-wakeup hang.
+            assert!(
+                (10..=40).contains(&parks),
+                "idle waiter parked {parks} times in ~600ms — expected ~24 (25ms tick), \
+                 the old 1ms poll would show ~600"
+            );
+        });
+    }
+
+    /// FR-10 unit leg: a recorded completion is visible to `take_completion`
+    /// and `drain_operation_completions` with FIFO order; taking one id is
+    /// lossless for the others (the ledger contract of the old inline scan).
+    #[test]
+    fn recorded_completions_are_lossless_and_fifo() {
+        let (session, _fs, _temp) = test_session();
+        session.record_completion(1, SessionResult::Busy);
+        session.record_completion(
+            2,
+            SessionResult::Error {
+                message: "second".into(),
+            },
+        );
+        session.record_completion(3, SessionResult::Success(CommandResult::NoteClosed));
+
+        let taken = session.take_completion(2);
+        match &taken {
+            Some(SessionResult::Error { message }) => assert_eq!(message, "second"),
+            other => panic!("expected the recorded error for id 2, got {other:?}"),
+        }
+        assert!(session.take_completion(2).is_none(), "take is consuming");
+
+        let drained = session.drain_operation_completions();
+        assert_eq!(
+            drained
+                .iter()
+                .map(|completion| completion.request_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3],
+            "untouched completions keep FIFO order after a mid-queue take"
+        );
     }
 
     #[test]
@@ -4159,7 +4681,15 @@ mod tests {
             session.pump();
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert!(session.is_open(&to));
+        // M2 paydown (bounded to loops in this file, S6): on exhaustion the
+        // failure message carries the Session backlog, not just the bool.
+        if !session.is_open(&to) {
+            panic!(
+                "renamed buffer never surfaced open; events={:?} notices={:?}",
+                session.drain_events(),
+                session.drain_notices()
+            );
+        }
         assert_eq!(session.get_buffer_id(&to), Some(buffer_id));
         let save_result = save_to_terminal(&session, to.clone());
         assert!(
@@ -4236,6 +4766,345 @@ mod tests {
             b"See [[note]] / [[note]] / [[other]]"
         );
         let _ = revision;
+    }
+
+    /// C1 scoping proof: a journal patch memo must never cross buffers.
+    /// Both requests carry the same `(txn_id, item_id)` (the global-memo
+    /// bug: the second buffer gets the first buffer's memoized reply and is
+    /// never patched). On the per-buffer memo each buffer patches itself.
+    #[test]
+    fn journal_memo_is_scoped_per_buffer() {
+        let (session, fs, _temp) = test_session();
+        let path_a = PathBuf::from("/test/vault/links-a.md");
+        let path_b = PathBuf::from("/test/vault/links-b.md");
+        fs.write_new(&path_a, b"See [[note]] and [[other]].")
+            .unwrap();
+        fs.write_new(&path_b, b"Ref [[note]] here.").unwrap();
+        let scan = session
+            .actor
+            .submit_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent)
+            .unwrap();
+        scan.recv_timeout(Duration::from_secs(2)).unwrap();
+        let a_id = match open_to_terminal(&session, path_a.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => buffer_id,
+            other => panic!("expected buffer A to open: {other:?}"),
+        };
+        let b_id = match open_to_terminal(&session, path_b.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => buffer_id,
+            other => panic!("expected buffer B to open: {other:?}"),
+        };
+
+        fn patch_state(
+            session: &Session,
+            buffer_id: flavite_buffer::revision::BufferId,
+        ) -> (u64, [u8; 32], String) {
+            let manager = session.buffer_manager.lock().unwrap();
+            let buffer = manager.get_buffer_by_id(buffer_id).unwrap();
+            (
+                buffer.revision().as_u64(),
+                *blake3::hash(buffer.base_bytes()).as_bytes(),
+                buffer.text().to_string(),
+            )
+        }
+        let request = |txn: &str,
+                       item: u64,
+                       buffer_id: flavite_buffer::revision::BufferId,
+                       expected: u64,
+                       hash: [u8; 32],
+                       _base: &str,
+                       patched: &str,
+                       recovery: &[u8]| {
+            let (reply, receipt) = crossbeam::channel::bounded(1);
+            (
+                crate::actor::ApplyBufferPatchRequest {
+                    txn_id: txn.to_owned(),
+                    item_id: item,
+                    kind: crate::journal::TransactionItemKind::Patch,
+                    buffer_id: buffer_id.as_u64(),
+                    expected_revision: expected,
+                    old_stem: "note".into(),
+                    new_stem: "renamed".into(),
+                    target_key: "note".into(),
+                    indexed_hash: hash,
+                    recovery_key: Some(recovery.to_vec()),
+                    new_base_bytes: patched.as_bytes().to_vec(),
+                    reply,
+                },
+                receipt,
+            )
+        };
+
+        let (rev_a, hash_a, _text_a) = patch_state(&session, a_id);
+        let (req_a, receipt_a) = request(
+            "memo-scope",
+            7,
+            a_id,
+            rev_a,
+            hash_a,
+            "See [[note]] and [[other]].",
+            "See [[renamed]] and [[other]].",
+            b"memo-scope-a",
+        );
+        session
+            .actor
+            .buffer_patch_sender_for_test()
+            .send(req_a)
+            .unwrap();
+        session.pump();
+        let reply_a = receipt_a.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(reply_a.is_ok(), "buffer A patch must succeed: {reply_a:?}");
+
+        // Same (txn_id, item_id), different buffer: must patch B itself.
+        let (rev_b, hash_b, _text_b) = patch_state(&session, b_id);
+        let (req_b, receipt_b) = request(
+            "memo-scope",
+            7,
+            b_id,
+            rev_b,
+            hash_b,
+            "Ref [[note]] here.",
+            "Ref [[renamed]] here.",
+            b"memo-scope-b",
+        );
+        session
+            .actor
+            .buffer_patch_sender_for_test()
+            .send(req_b)
+            .unwrap();
+        session.pump();
+        let reply_b = receipt_b.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(reply_b.is_ok(), "buffer B patch must succeed: {reply_b:?}");
+        assert_eq!(
+            patch_state(&session, b_id).2,
+            "Ref [[renamed]] here.",
+            "a shared (txn_id, item_id) key must not mask buffer B's patch"
+        );
+        assert_eq!(
+            patch_state(&session, a_id).2,
+            "See [[renamed]] and [[other]].",
+            "buffer A keeps its own patched text"
+        );
+    }
+
+    /// S5/Q1 proof obligation — decided by test, not by assumption. Before
+    /// eviction a replayed `(txn_id, item_id)` MUST return the memoized
+    /// outcome without re-applying (FR-2); after FIFO-cap eviction the
+    /// replay MUST go through the actor's revision guard and come back as
+    /// an honest error with text and revision untouched. This is what makes
+    /// the FIFO cap safe to ship; if the final leg failed, the Q1 fallback
+    /// (reject-and-log) would activate instead of trusting eviction.
+    #[test]
+    fn journaled_patch_replay_is_memoized_then_safe_after_eviction() {
+        let (session, fs, _temp) = test_session();
+        let path = PathBuf::from("/test/vault/links.md");
+        fs.write_new(&path, b"See [[note]] and [[other]].").unwrap();
+        let scan = session
+            .actor
+            .submit_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent)
+            .unwrap();
+        scan.recv_timeout(Duration::from_secs(2)).unwrap();
+        let buffer_id = match open_to_terminal(&session, path.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => buffer_id,
+            other => panic!("expected buffer to open: {other:?}"),
+        };
+
+        let state = |session: &Session| -> (u64, [u8; 32], String) {
+            let manager = session.buffer_manager.lock().unwrap();
+            let buffer = manager.get_buffer_by_id(buffer_id).unwrap();
+            (
+                buffer.revision().as_u64(),
+                *blake3::hash(buffer.base_bytes()).as_bytes(),
+                buffer.text().to_string(),
+            )
+        };
+
+        // Capture the pristine pre-patch expectation once; every request
+        // below carries it, exactly as a journal replay would.
+        let (rev0, hash0, _text0) = state(&session);
+        let make = || {
+            let (tx, receipt) = crossbeam::channel::bounded(1);
+            (
+                crate::actor::ApplyBufferPatchRequest {
+                    txn_id: "memo-proof".into(),
+                    item_id: 9,
+                    kind: crate::journal::TransactionItemKind::Patch,
+                    buffer_id: buffer_id.as_u64(),
+                    expected_revision: rev0,
+                    old_stem: "note".into(),
+                    new_stem: "renamed".into(),
+                    target_key: "note".into(),
+                    indexed_hash: hash0,
+                    recovery_key: Some(b"memo-proof".to_vec()),
+                    new_base_bytes: b"See [[renamed]] and [[other]].".to_vec(),
+                    reply: tx,
+                },
+                receipt,
+            )
+        };
+        let sender = session.actor.buffer_patch_sender_for_test();
+
+        // 1) First application goes through the real patch path.
+        let (req1, receipt1) = make();
+        sender.send(req1).unwrap();
+        session.pump();
+        let reply1 = receipt1.recv_timeout(Duration::from_secs(2)).unwrap();
+        let applied_revision = *reply1.as_ref().expect("first patch must succeed");
+        assert_eq!(state(&session).2, "See [[renamed]] and [[other]].");
+        assert_eq!(state(&session).0, applied_revision);
+
+        // 2) FR-2: identical key replays the memoized outcome without
+        //    re-applying. A re-apply here would hit the revision guard and
+        //    return Err — the identical Ok proves the memo answered.
+        for _ in 0..4 {
+            let (req, receipt) = make();
+            sender.send(req).unwrap();
+            session.pump();
+            let replay = receipt.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(replay, reply1, "replay must return the memoized outcome");
+        }
+        assert_eq!(state(&session).2, "See [[renamed]] and [[other]].");
+
+        // 3) Evict the recorded key via the FIFO cap: push exactly
+        //    JOURNAL_MEMO_CAP newer keys, the oldest (ours) must go, and the
+        //    memo must respect its bound throughout (NFR-1 invariant).
+        {
+            let mut memos = session.journal_memos.lock_recovering();
+            let memo = memos.entry(buffer_id).or_default();
+            for i in 0..JOURNAL_MEMO_CAP {
+                memo.memoize_applied((format!("evict-{i}"), i as u64), Ok(0));
+                assert!(memo.applied.len() <= JOURNAL_MEMO_CAP);
+                assert!(memo.order.len() <= JOURNAL_MEMO_CAP);
+            }
+            assert!(
+                !memo.applied.contains_key(&("memo-proof".to_string(), 9u64)),
+                "FIFO eviction must drop the oldest recorded key"
+            );
+        }
+
+        // 4) Post-eviction replay: memo cold, patch re-attempted against the
+        //    actor's revision guard — honest error, zero corruption, the
+        //    revision did not advance, and no duplicated text.
+        let (req3, receipt3) = make();
+        sender.send(req3).unwrap();
+        session.pump();
+        let after_eviction = receipt3.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            after_eviction.is_err(),
+            "evicted replay must not fabricate success: {after_eviction:?}"
+        );
+        let (rev_now, _, text_now) = state(&session);
+        assert_eq!(
+            text_now, "See [[renamed]] and [[other]].",
+            "no duplicated patch text"
+        );
+        assert_eq!(
+            rev_now, applied_revision,
+            "replay must not advance the revision"
+        );
+    }
+
+    /// NFR-1: per-buffer memo memory is bounded under sustained synthetic
+    /// load — `applied`, `cancelled`, and `order` never exceed the cap, the
+    /// newest entries survive, and buffers stay independent entries.
+    #[test]
+    fn memo_is_bounded_under_sustained_load() {
+        let (session, _fs, _temp) = test_session();
+        let hot = BufferId::new();
+        for i in 0..(2 * JOURNAL_MEMO_CAP) {
+            let key = (format!("txn-{i}"), i as u64);
+            session.memo_insert(hot, key.clone(), Ok(i as u64));
+            session.memo_cancel(hot, key);
+        }
+        let memos = session.journal_memos.lock_recovering();
+        let memo = memos.get(&hot).expect("hot buffer memo exists");
+        assert!(memo.order.len() <= JOURNAL_MEMO_CAP, "order cap");
+        assert!(
+            memo.applied.len() <= JOURNAL_MEMO_CAP,
+            "applied cap: {}",
+            memo.applied.len()
+        );
+        assert!(
+            memo.cancelled.len() <= JOURNAL_MEMO_CAP,
+            "cancelled cap: {}",
+            memo.cancelled.len()
+        );
+        let newest = (
+            format!("txn-{}", 2 * JOURNAL_MEMO_CAP - 1),
+            (2 * JOURNAL_MEMO_CAP - 1) as u64,
+        );
+        assert!(
+            memo.applied.contains_key(&newest),
+            "FIFO keeps newest entries"
+        );
+        let oldest = ("txn-0".to_string(), 0u64);
+        assert!(
+            !memo.applied.contains_key(&oldest) && !memo.cancelled.contains(&oldest),
+            "FIFO drops oldest from both substructures"
+        );
+    }
+
+    /// Close tier (exact): `close_note` removes the buffer's whole memo —
+    /// the memo's lifetime is now provably the buffer's lifetime (FR-1).
+    #[test]
+    fn close_note_clears_the_buffer_memo() {
+        let (session, _fs, _temp) = test_session();
+        let path = PathBuf::from("/test/vault/note.md");
+        let buffer_id = match open_to_terminal(&session, path.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => buffer_id,
+            other => panic!("expected buffer to open: {other:?}"),
+        };
+        session.memo_insert(buffer_id, ("txn-close".into(), 1), Ok(3));
+        session.memo_cancel(buffer_id, ("txn-close".into(), 2));
+        assert!(
+            session
+                .journal_memos
+                .lock_recovering()
+                .contains_key(&buffer_id)
+        );
+
+        let closed = session.execute(SessionCommand::CloseNote {
+            path: path.clone(),
+            retain_recovery: true,
+        });
+        assert!(
+            matches!(closed, SessionResult::Success(CommandResult::NoteClosed)),
+            "{closed:?}"
+        );
+        assert!(
+            session
+                .journal_memos
+                .lock_recovering()
+                .get(&buffer_id)
+                .is_none(),
+            "close_note must evict the buffer's journal memo (C1)"
+        );
+    }
+
+    /// Cancel scope is the buffer that undid, not the journal key's global
+    /// neighborhood: a cancel recorded on one buffer can never make another
+    /// buffer's redo refuse (the false-positive latent in the former
+    /// ownerless set).
+    #[test]
+    fn cancelled_entries_are_scoped_to_their_buffer() {
+        let (session, _fs, _temp) = test_session();
+        let a = BufferId::new();
+        let b = BufferId::new();
+        let key = ("txn-shared".to_string(), 3u64);
+
+        session.memo_cancel(a, key.clone());
+
+        let memos = session.journal_memos.lock_recovering();
+        assert!(
+            memos
+                .get(&a)
+                .is_some_and(|memo| memo.cancelled.contains(&key))
+        );
+        assert!(
+            memos
+                .get(&b)
+                .is_none_or(|memo| !memo.cancelled.contains(&key)),
+            "cancel must never cross buffers"
+        );
     }
 
     #[test]
@@ -4512,8 +5381,14 @@ mod tests {
             session.pump();
             std::thread::sleep(Duration::from_millis(2));
         }
-
-        assert_eq!(session.autosave_failures_total(), 1);
+        // M2 paydown (bounded, S6): include the Session backlog on stall.
+        assert_eq!(
+            session.autosave_failures_total(),
+            1,
+            "autosave failure never surfaced; events={:?} notices={:?}",
+            session.drain_events(),
+            session.drain_notices()
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! If more than 500 events arrive within 1 second, enter bulk mode:
 //! suspend per-event UI updates, run one full reconcile, show progress.
 
+use crate::sync::MutexExt;
 use crate::types::{ReconcileMode, ReconcileScope};
 use crossbeam::channel::{Receiver, Sender, TryRecvError};
 use std::collections::HashSet;
@@ -196,7 +197,7 @@ impl EventCoalescer {
             }
         }
         let now = self.clock.now();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock_recovering();
         if let Some((scope, mode)) = state.manual.take() {
             let mut batch = std::mem::take(&mut state.pending);
             batch.scope = scope;
@@ -228,7 +229,7 @@ impl EventCoalescer {
 
     fn ingest(&self, event: CoalescerEvent) {
         let now = self.clock.now();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock_recovering();
         match event {
             CoalescerEvent::PathNominated(path) => state.pending.add_path(path),
             CoalescerEvent::RenamePair(from, to) => {
@@ -278,12 +279,12 @@ impl EventCoalescer {
     pub fn pending(&self) -> Arc<Mutex<EventBatch>> {
         // Compatibility accessor; returns a snapshot that is intentionally
         // detached so callers cannot violate the coalescer's timing state.
-        Arc::new(Mutex::new(self.state.lock().unwrap().pending.clone()))
+        Arc::new(Mutex::new(self.state.lock_recovering().pending.clone()))
     }
 
     /// Reset the coalescer (for testing).
     pub fn reset(&self) {
-        *self.state.lock().unwrap() = CoalescerState {
+        *self.state.lock_recovering() = CoalescerState {
             pending: EventBatch::default(),
             ..CoalescerState::default()
         };

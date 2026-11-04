@@ -3,9 +3,19 @@
 //! Write tokens prevent concurrent writes to the same file and track
 //! self-write events for classification. Tokens are used to distinguish
 //! between external changes and our own writes.
+//!
+//! Ownership: `acquire` replaces any existing token for a path, so at most
+//! one token per path is *live*. `release` honors that ownership: it removes
+//! the path's token only when the released token is the live one, matched on
+//! [`WriteToken::token_id`]. Releasing a stale, replaced token is a silent
+//! no-op — it must never revoke the current writer's token (that
+//! misclassification would let a concurrent writer read a false "no token"
+//! and treat its own write as external).
 
+use crate::sync::RwLockExt;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -14,8 +24,13 @@ use std::time::{Duration, Instant};
 /// Tokens are created when we initiate a write and expire after a timeout.
 /// They store the expected hash so we can detect if an external write
 /// occurred during our operation.
+///
+/// Cloning preserves `token_id`: a clone represents the same write right,
+/// so releasing a clone releases the token. That is intentional.
 #[derive(Debug, Clone)]
 pub struct WriteToken {
+    /// Monotonic identity; release matches on this, not on path or hash.
+    pub token_id: u64,
     /// The path being written.
     pub path: PathBuf,
     /// The expected hash of the file after our write.
@@ -27,10 +42,13 @@ pub struct WriteToken {
 }
 
 impl WriteToken {
-    /// Create a new write token.
-    #[must_use]
-    pub fn new(path: PathBuf, expected_hash: [u8; 32], timeout: Duration) -> Self {
+    /// Create a new write token, drawing its identity from the manager's
+    /// counter. Public construction goes through `WriteTokenManager` only.
+    fn new(counter: &AtomicU64, path: PathBuf, expected_hash: [u8; 32], timeout: Duration) -> Self {
         Self {
+            // Relaxed is sufficient: ids are compared for equality only,
+            // never used to order operations across threads.
+            token_id: counter.fetch_add(1, Ordering::Relaxed),
             path,
             expected_hash,
             acquired_at: Instant::now(),
@@ -45,6 +63,9 @@ impl WriteToken {
     }
 
     /// Check if the hash matches the expected value.
+    ///
+    /// Note: the hash is not identity — two saves of unchanged content
+    /// produce the same hash. Release and classification use `token_id`.
     #[must_use]
     pub fn matches(&self, hash: &[u8; 32]) -> bool {
         &self.expected_hash == hash
@@ -70,6 +91,10 @@ impl WriteToken {
 pub struct WriteTokenManager {
     /// Map from path to token.
     tokens: RwLock<HashMap<PathBuf, WriteToken>>,
+    /// Monotonic source of `WriteToken::token_id` values, local to this
+    /// manager. A clone starts a fresh sequence with an empty map, so no
+    /// live token of another manager can reference the clone's ids.
+    next_id: AtomicU64,
     /// Default timeout for new tokens.
     default_timeout: Duration,
 }
@@ -81,10 +106,13 @@ impl Default for WriteTokenManager {
 }
 
 impl Clone for WriteTokenManager {
+    /// Clone yields a fresh, empty manager: the token map does not carry
+    /// over and ids restart at zero. An empty map makes id collisions with
+    /// the source manager's tokens unreachable.
     fn clone(&self) -> Self {
-        // Clone with a new empty token map but same timeout
         Self {
             tokens: RwLock::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
             default_timeout: self.default_timeout,
         }
     }
@@ -96,6 +124,7 @@ impl WriteTokenManager {
     pub fn new() -> Self {
         Self {
             tokens: RwLock::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
             default_timeout: Duration::from_secs(5), // 5 seconds as per D5
         }
     }
@@ -105,6 +134,7 @@ impl WriteTokenManager {
     pub fn with_timeout(timeout: Duration) -> Self {
         Self {
             tokens: RwLock::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
             default_timeout: timeout,
         }
     }
@@ -122,84 +152,84 @@ impl WriteTokenManager {
 
     /// Acquire a write token for a path.
     ///
-    /// If a token already exists for the path, it is replaced.
+    /// If a token already exists for the path, it is replaced: the returned
+    /// token becomes the path's live token, and the replaced token's
+    /// `release` (or guard drop) becomes a no-op.
     pub fn acquire(&self, path: PathBuf, expected_hash: [u8; 32]) -> WriteToken {
-        let token = WriteToken::new(path.clone(), expected_hash, self.default_timeout);
-        let mut tokens = self.tokens.write().unwrap();
+        let token = WriteToken::new(
+            &self.next_id,
+            path.clone(),
+            expected_hash,
+            self.default_timeout,
+        );
+        let mut tokens = self.tokens.write_recovering();
         tokens.insert(path, token.clone());
         token
     }
 
     /// Acquire a write token with a custom timeout.
+    ///
+    /// Replacement semantics are as for [`WriteTokenManager::acquire`].
     pub fn acquire_with_timeout(
         &self,
         path: PathBuf,
         expected_hash: [u8; 32],
         timeout: Duration,
     ) -> WriteToken {
-        let token = WriteToken::new(path.clone(), expected_hash, timeout);
-        let mut tokens = self.tokens.write().unwrap();
+        let token = WriteToken::new(&self.next_id, path.clone(), expected_hash, timeout);
+        let mut tokens = self.tokens.write_recovering();
         tokens.insert(path, token.clone());
         token
     }
 
     /// Release a write token.
+    ///
+    /// Only the token that currently *is* the path's live token may remove
+    /// it, matched on `token_id`. Releasing a token that was replaced by a
+    /// newer `acquire` for the same path is a silent no-op: expiry +
+    /// replacement + late drop is a normal lifecycle, and the guard API has
+    /// no channel to report a failed release.
     pub fn release(&self, token: &WriteToken) {
-        let mut tokens = self.tokens.write().unwrap();
-        tokens.remove(&token.path);
+        let mut tokens = self.tokens.write_recovering();
+        if tokens
+            .get(&token.path)
+            .is_some_and(|live| live.token_id == token.token_id)
+        {
+            tokens.remove(&token.path);
+        }
     }
 
     /// Check if a token exists for a path.
     #[must_use]
-    pub fn has_token(&self, path: &PathBuf) -> bool {
-        let tokens = self.tokens.read().unwrap();
+    pub fn has_token(&self, path: &Path) -> bool {
+        let tokens = self.tokens.read_recovering();
         tokens.contains_key(path)
     }
 
     /// Get the token for a path, if any.
     #[must_use]
-    pub fn get_token(&self, path: &PathBuf) -> Option<WriteToken> {
-        let tokens = self.tokens.read().unwrap();
+    pub fn get_token(&self, path: &Path) -> Option<WriteToken> {
+        let tokens = self.tokens.read_recovering();
         tokens.get(path).cloned()
-    }
-
-    /// Get a reference to the token for a path, if any.
-    #[must_use]
-    pub fn get_token_ref(
-        &self,
-        path: &PathBuf,
-    ) -> Option<std::sync::RwLockReadGuard<'_, HashMap<PathBuf, WriteToken>>> {
-        let tokens = self.tokens.read().unwrap();
-        if tokens.contains_key(path) {
-            Some(tokens)
-        } else {
-            None
-        }
     }
 
     /// Check if a path has an active, non-expired token.
     #[must_use]
-    pub fn has_active_token(&self, path: &PathBuf) -> bool {
-        if let Some(token) = self.get_token(path) {
-            !token.is_expired()
-        } else {
-            false
-        }
+    pub fn has_active_token(&self, path: &Path) -> bool {
+        self.get_token(path)
+            .is_some_and(|token| !token.is_expired())
     }
 
     /// Check if the expected hash matches for a path.
     #[must_use]
-    pub fn matches_expected(&self, path: &PathBuf, hash: &[u8; 32]) -> bool {
-        if let Some(token) = self.get_token(path) {
-            !token.is_expired() && token.matches(hash)
-        } else {
-            false
-        }
+    pub fn matches_expected(&self, path: &Path, hash: &[u8; 32]) -> bool {
+        self.get_token(path)
+            .is_some_and(|token| !token.is_expired() && token.matches(hash))
     }
 
     /// Remove expired tokens.
     pub fn cleanup_expired(&self) -> usize {
-        let mut tokens = self.tokens.write().unwrap();
+        let mut tokens = self.tokens.write_recovering();
         let now = Instant::now();
         let mut count = 0;
 
@@ -217,14 +247,14 @@ impl WriteTokenManager {
 
     /// Clear all tokens.
     pub fn clear(&self) {
-        let mut tokens = self.tokens.write().unwrap();
+        let mut tokens = self.tokens.write_recovering();
         tokens.clear();
     }
 
     /// Get the number of active tokens.
     #[must_use]
     pub fn len(&self) -> usize {
-        let tokens = self.tokens.read().unwrap();
+        let tokens = self.tokens.read_recovering();
         tokens.len()
     }
 
@@ -237,7 +267,7 @@ impl WriteTokenManager {
     /// Get all token paths.
     #[must_use]
     pub fn paths(&self) -> Vec<PathBuf> {
-        let tokens = self.tokens.read().unwrap();
+        let tokens = self.tokens.read_recovering();
         tokens.keys().cloned().collect()
     }
 }
@@ -303,7 +333,7 @@ mod tests {
         assert!(first.matches(&[1; 32]));
         assert!(!manager.matches_expected(&path, &[1; 32]));
         assert!(manager.matches_expected(&path, &[2; 32]));
-        assert!(manager.get_token_ref(&path).is_some());
+        assert!(manager.has_token(&path));
         assert_eq!(manager.paths(), vec![path.clone()]);
         assert_eq!(manager.len(), 1);
         assert!(!manager.is_empty());
@@ -312,7 +342,15 @@ mod tests {
         assert!(manager.has_active_token(&path));
         assert_eq!(manager.cleanup_expired(), 0);
         assert!(manager.has_token(&path));
-        assert!(manager.get_token_ref(&path).is_some());
+
+        // The audit gap: releasing the replaced token must not revoke the
+        // live replacement (identity-matched release, S1/H2).
+        manager.release(&first);
+        assert!(
+            manager.has_token(&path),
+            "replacement revoked by stale release"
+        );
+        assert!(manager.matches_expected(&path, &[2; 32]));
 
         manager.release(&replacement);
         assert!(!manager.has_token(&path));
@@ -336,6 +374,88 @@ mod tests {
         let cloned = manager.as_ref().clone();
         assert_eq!(cloned.default_timeout(), manager.default_timeout());
         assert!(cloned.is_empty());
+    }
+
+    /// H2 regression: releasing a token that was replaced must never revoke
+    /// the replacement. On release-by-path this test fails — A's release
+    /// deletes B.
+    #[test]
+    fn stale_guard_release_does_not_revoke_replacement() {
+        let manager = WriteTokenManager::new();
+        let path = PathBuf::from("/test/stale-release.md");
+        let hash_a = [1u8; 32];
+        let hash_b = [2u8; 32];
+
+        let token_a = manager.acquire(path.clone(), hash_a);
+        let token_b = manager.acquire(path.clone(), hash_b);
+
+        // Stale release: must be a no-op against the live replacement.
+        manager.release(&token_a);
+        assert!(
+            manager.has_token(&path),
+            "replacement revoked by stale release"
+        );
+        assert!(manager.matches_expected(&path, &hash_b));
+        assert!(!manager.matches_expected(&path, &hash_a));
+
+        // The live token still releases normally.
+        manager.release(&token_b);
+        assert!(!manager.has_token(&path));
+    }
+
+    /// Same contract through the guard's Drop path: dropping the guard of a
+    /// replaced token leaves the replacement in place.
+    #[test]
+    fn token_guard_of_replaced_token_is_a_no_op() {
+        let manager = Arc::new(WriteTokenManager::new());
+        let path = PathBuf::from("/test/stale-guard.md");
+
+        let token_a = manager.acquire(path.clone(), [1u8; 32]);
+        let token_b = manager.acquire(path.clone(), [2u8; 32]);
+        let guard_a = TokenGuard::new(manager.clone(), token_a);
+        let guard_b = TokenGuard::new(manager.clone(), token_b);
+
+        // Dropping the stale guard must not revoke the live token.
+        drop(guard_a);
+        assert!(
+            manager.has_token(&path),
+            "replacement revoked by stale guard drop"
+        );
+        assert!(manager.matches_expected(&path, &[2u8; 32]));
+
+        // Dropping the live guard releases normally.
+        drop(guard_b);
+        assert!(!manager.has_token(&path));
+    }
+
+    /// R5 coverage: cloning resets the id sequence (fresh manager, empty
+    /// map), so ids legitimately repeat across managers — but a release is
+    /// always scoped to the manager that holds the token, and releasing on
+    /// the source manager must never touch the clone's map.
+    #[test]
+    fn clone_manager_then_old_id_cannot_release() {
+        let path = PathBuf::from("/test/clone-id-collision.md");
+        let m1 = WriteTokenManager::new();
+        let token_a = m1.acquire(path.clone(), [1u8; 32]);
+
+        let m2 = m1.clone();
+        assert!(m2.is_empty(), "clone starts with an empty map");
+        let token_a2 = m2.acquire(path.clone(), [2u8; 32]);
+
+        // The collision case: fresh sequences hand out the same id.
+        assert_eq!(token_a.token_id, token_a2.token_id);
+
+        // Releasing on the source manager cannot reach the clone's map.
+        m1.release(&token_a);
+        assert!(!m1.has_token(&path));
+        assert!(
+            m2.has_token(&path),
+            "clone's token touched by source release"
+        );
+
+        // The clone's own live token releases normally.
+        m2.release(&token_a2);
+        assert!(m2.is_empty());
     }
 
     #[test]

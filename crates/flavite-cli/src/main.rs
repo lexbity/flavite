@@ -639,6 +639,22 @@ fn main() -> Result<()> {
     if let Some(flavite) = driver.flavite.as_ref() {
         let events = flavite.poll_events(256);
         if !events.is_empty() {
+            // S4: a contained vault-session panic gets an operator warning
+            // line here; it also surfaces below through the generic stderr
+            // event print (json or human), no vault-type import required.
+            for delivery in &events {
+                if let flavite_api::Event::SessionPanicked {
+                    message,
+                    panics_total,
+                    ..
+                } = &delivery.event
+                {
+                    tracing::warn!(
+                        panics_total,
+                        "vault session contained an internal panic: {message}"
+                    );
+                }
+            }
             if driver.json {
                 for delivery in events {
                     eprintln!("{}", serde_json::to_string(&delivery.event)?);

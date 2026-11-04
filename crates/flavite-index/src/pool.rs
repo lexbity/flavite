@@ -1318,14 +1318,7 @@ impl IndexActor {
         }
         self.resolver.note_committed_apply(change_rows as u64);
         self.resolver.fold_overlay(epoch, generation);
-        if PH_FOLD.fetch_add(__t4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed)
-            == 0
-        {
-            let n = PH_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n == 1 {
-                println!("spine phase timers armed (ns cumulative since last print)");
-            }
-        }
+        PH_FOLD.fetch_add(__t4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let n = PH_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n % 256 == 255 && std::env::var("FLAVITE_SPINE_TIMING").is_ok() {
             let g = |a: &std::sync::atomic::AtomicU64| {

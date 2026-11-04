@@ -2875,6 +2875,22 @@ impl App {
                     // only wakes it early (§12.1 invalidation hints).
                     flavite.graph_notify_changed();
                 }
+                // S4: a contained vault-session panic is an operator-grade
+                // signal — warn on stderr (the crate's host-side channel,
+                // cf. host/env.rs) and surface on the status line. The
+                // session stays operable; the host decides whether to
+                // continue or restart.
+                if let flavite_api::Event::SessionPanicked {
+                    message,
+                    panics_total,
+                    ..
+                } = &event
+                {
+                    eprintln!(
+                        "warning: vault session contained an internal panic (#{panics_total}): {message}"
+                    );
+                    self.status = format!("Recovered from an internal error: {message}");
+                }
                 events.push(format!("{}: {event:?}", event.event_type()));
                 if let Some(id) = delivery.notice_id {
                     self.notices.push_back(NoticePresentation { id, event });
