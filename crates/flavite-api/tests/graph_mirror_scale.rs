@@ -13,6 +13,11 @@
 //!   the end — the drift guard compares the mirror against
 //!   `full_saved_graph` with ZERO findings (mirror-assembled == full
 //!   consistent read byte-comparably, FR-5).
+//! * RFC-0005 S2: one in fifty seeded links targets a ghost (≈3 000
+//!   distinct unresolved targets across the vault), so every delta's
+//!   `rebuild_unresolved` runs over a real section — the scale the F2
+//!   linear dedup replaced an O(U²) scan on. The settle line prints the
+//!   full counter set including `unresolved_targets`.
 //!
 //! Numbers are printed for the slice notes; the guard is honest — if a
 //! machine cannot meet the bound it fails visibly rather than skipping.
@@ -76,13 +81,45 @@ fn seed_vault(conn: &Connection) {
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'resolved')",
             )
             .unwrap();
+        // RFC-0005 S2: one in fifty links is a ghost (an unresolved row no
+        // edit can resolve — `g{link}` matches no note identity). That
+        // seeds ≥3_000 distinct unresolved targets across the vault, so
+        // every delta's `rebuild_unresolved` runs over a real section —
+        // the scale that made the former O(U²) membership scan O(U²) and
+        // what the F2 linear rebuild now handles at O(U log U).
+        let mut ghost = tx
+            .prepare(
+                "INSERT INTO links(src, ord, kind, dst_raw, target_key, target_stem,
+                                   span_start, span_end, res_state)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'unresolved')",
+            )
+            .unwrap();
         let mut rng = Rng(0x5EED);
         for link in 0..LINKS {
             let src = (link % NOTES) + 1;
             let ord = link / NOTES;
-            let target = rng.next(NOTES) + 1;
-            let raw = format!("n{target}");
+            let raw = if link % 50 == 0 {
+                format!("g{link}")
+            } else {
+                format!("n{}", rng.next(NOTES) + 1)
+            };
             let key = flavite_syntax::text::fold_key(&raw);
+            if raw.starts_with('g') {
+                ghost
+                    .execute(params![
+                        src,
+                        ord,
+                        "link",
+                        raw,
+                        key,
+                        key,
+                        10_i64 + ord * 100,
+                        20_i64 + ord * 100,
+                    ])
+                    .unwrap();
+                continue;
+            }
+            let target: i64 = raw[1..].parse().expect("resolved ghost-free target");
             statement
                 .execute(params![
                     src,
@@ -174,6 +211,11 @@ fn mirror_synchronize_meets_the_bound_at_design_scale() {
             version.generation
         );
         last_generation = version.generation;
+        // RFC-0005 S3: mimic the service pump's handoff exactly — every
+        // delta window takes the snapshot Arc once (where the §4.6 clone
+        // cost now lives) and UpToDate pumps would reuse the cached slot.
+        // Untimed: the p99 budget above guards `synchronize` alone.
+        let _snapshot = mirror.view_arc().expect("handoff snapshot");
         // Sampled equivalence proof (FR-5): the spliced view stays
         // byte-equal to a fresh full read at the same version.
         if index % 37 == 0 {
@@ -214,4 +256,83 @@ fn mirror_synchronize_meets_the_bound_at_design_scale() {
         mirror.synchronize(&reader).unwrap(),
         Synchronize::UpToDate
     ));
+
+    // RFC-0005 S2: the settled counter set — `unresolved_targets` is the
+    // scale every delta's linear `rebuild_unresolved` (F2) carries; the
+    // count is printed, never an adjective, and never a behavior input.
+    //
+    // RFC-0005 S3 (F1): the handoff pattern above builds exactly one
+    // snapshot per delta window that a pump takes — never one per publish
+    // tick, never one per UpToDate pump. (The service pump additionally
+    // builds once for its cold reset; the tests assert that shape.)
+    let stats = mirror.stats();
+    assert_eq!(
+        stats.snapshots_built_total, stats.deltas_total,
+        "F1 accounting: one snapshot build per handoff window, no more"
+    );
+    println!("mirror stats at settle: {stats:?}");
+
+    // RFC-0005 NFR-5: resident snapshot-cache overhead by allocation
+    // count × record size — never guessed from RSS. The handoff keeps at
+    // most one slot, so the saved-view footprint is resident at most
+    // twice (owned view + handed-out Arc).
+    let view = mirror.view().expect("view");
+    let node_strings: usize = view
+        .saved
+        .nodes
+        .iter()
+        .map(|node| {
+            node.path.len()
+                + node.path_native.len()
+                + node.title.len()
+                + node.stable_id.as_ref().map_or(0, String::len)
+        })
+        .sum();
+    let unresolved_strings: usize = view
+        .unresolved_nodes
+        .iter()
+        .map(|node| node.path.len() + node.path_native.len() + node.title.len())
+        .sum();
+    let occurrence_heap: usize = view
+        .occurrences
+        .iter()
+        .map(|occurrence| {
+            let provenance = match &occurrence.source {
+                flavite_api::graph_projection::OccurrenceSource::Saved { content_hash } => {
+                    content_hash.len()
+                }
+                flavite_api::graph_projection::OccurrenceSource::Buffer { .. } => 0,
+            };
+            occurrence.source_path.as_os_str().len() + occurrence.target_raw.len() + provenance
+        })
+        .sum();
+    let footprint = view.saved.nodes.len() * std::mem::size_of::<flavite_graph::GraphNodeRecord>()
+        + node_strings
+        + view.saved.edges.len() * std::mem::size_of::<flavite_graph::GraphEdgeRecord>()
+        + view.occurrences.len()
+            * std::mem::size_of::<flavite_api::graph_projection::LinkOccurrence>()
+        + occurrence_heap
+        + view.unresolved_nodes.len() * std::mem::size_of::<flavite_graph::GraphNodeRecord>()
+        + unresolved_strings
+        + view.unresolved_edges.len() * std::mem::size_of::<flavite_graph::GraphEdgeRecord>()
+        + view.unresolved_keys.len() * (std::mem::size_of::<(u64, String)>() + 48)
+        + view.metadata.len() * (std::mem::size_of::<flavite_graph::scope::NoteMetadata>() + 64);
+    let mib =
+        |bytes: usize| f64::from(u32::try_from(bytes).unwrap_or(u32::MAX)) / (1024.0 * 1024.0);
+    println!(
+        "NFR-5 snapshot accounting: single saved-view footprint ≈ {:.1} MiB \
+         (nodes {} + heap {}B, edges {}, occurrences {} + heap {}B, \
+         unresolved {}+{}, metadata {}); handoff slot ⇒ resident ≤ 2× = {:.1} MiB",
+        mib(footprint),
+        view.saved.nodes.len(),
+        node_strings,
+        view.saved.edges.len(),
+        view.occurrences.len(),
+        occurrence_heap,
+        view.unresolved_nodes.len(),
+        view.unresolved_edges.len(),
+        view.metadata.len(),
+        mib(footprint * 2),
+    );
+    assert!(footprint > 0, "the accounting model must measure the vault");
 }

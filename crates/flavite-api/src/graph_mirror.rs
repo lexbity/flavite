@@ -15,11 +15,28 @@
 //! section, edges sorted and deduplicated), so one source's rows occupy a
 //! CONTIGUOUS region of the canonical vectors. A delta therefore replaces
 //! those regions in place — element moves, not vault-wide record clones —
-//! keeping synchronize + assembly at O(change + affected-run memmove)
-//! instead of O(vault) allocations. The equivalence gate
+//! keeping synchronize + assembly at O(change + affected-run memmove +
+//! unresolved-section rebuild) instead of O(vault) allocations; the
+//! rebuild's dedup is linear (O(U log U)) since RFC-0005 F2 — before that
+//! it re-scanned the growing node list per occurrence, an O(U²) tax on
+//! every delta. The equivalence gate
 //! (`tests/graph_mirror_equivalence.rs`) asserts the spliced view
 //! byte-equals a fresh full read after every change, so the incremental
 //! path can never silently diverge from `read_current` semantics.
+//!
+//! # Snapshot handoff (F1, RFC-0005 S3)
+//!
+//! The mirror hands pumps a cursor-versioned `Arc<SavedGraph>` snapshot
+//! ([`GraphMirror::view_arc`]) so the mutex is released before overlay
+//! assembly: the critical section is `synchronize` + poison/parity +
+//! `view_arc` only, never `build` (FR-8, NFR-7). The snapshot is keyed by
+//! the cursor — delta advances make the next call rebuild (one O(V) clone
+//! per published delta window), stamp-only republishes reuse the cached
+//! `Arc` (zero clone), and `force_reset` drops the slot explicitly
+//! (drift repair can land at the poisoned snapshot's own version). At most
+//! one snapshot slot exists at any time: resident overhead is two copies
+//! of the saved view, bounded like the mirror itself (NFR-5, asserted by
+//! the scale bench accounting).
 //!
 //! # Reset policy (§6.5.2, FR-5)
 //!
@@ -230,12 +247,25 @@ pub struct MirrorStats {
     pub mismatches_total: u64,
     /// Deduplicated entities touched by the last delta.
     pub last_delta_entities: u64,
+    /// Distinct unresolved guard nodes in the view after the last
+    /// synchronize/reset — the scale `rebuild_unresolved` works over on
+    /// every delta (RFC-0005 F2 telemetry: the count whose scan went from
+    /// O(U²) to O(U log U)). Printed by the scale bench; never a behavior
+    /// input.
+    pub unresolved_targets: u64,
+    /// Cold builds of the F1 handoff snapshot (`view_arc` cache misses).
+    /// The steady-state identity is one per delta/reset that reaches a
+    /// pump — stamp-only republishes hit the cached `Arc` and never
+    /// increment it (RFC-0005 §5.2 counter table).
+    pub snapshots_built_total: u64,
 }
 
-/// The outcome of one [`GraphMirror::synchronize`] step. The updated view
-/// is read through [`GraphMirror::view`] while the mirror is borrowed — a
-/// pump that needs the complete saved state gets it without the mirror
-/// cloning the whole vault first.
+/// The outcome of one [`GraphMirror::synchronize`] step. A pump that needs
+/// the complete saved state takes the [`GraphMirror::view_arc`] snapshot
+/// (cursor-versioned `Arc`, RFC-0005 F1) and drops the mutex with it —
+/// overlay assembly runs outside the lock; the cached snapshot makes a
+/// stamp-only republish free. [`GraphMirror::view`] remains for consumers
+/// that legitimately compare under the mutex (the parity guard).
 #[derive(Debug)]
 pub enum Synchronize {
     /// The mirror cursor already equals the current index version; the
@@ -280,6 +310,14 @@ pub struct GraphMirror {
     policy: ParityPolicy,
     cursor: IndexVersion,
     state: Option<MirrorState>,
+    /// RFC-0005 F1 handoff cache (§4.6): the last `Arc<SavedGraph>`
+    /// snapshot, keyed by the cursor it was built at. The pump takes this
+    /// handle and releases the mutex before assembling the projection, so
+    /// `build` never runs under the lock (FR-8) and a stamp-only republish
+    /// reuses the cached `Arc` — zero O(vault) work on the keystroke path.
+    /// One slot, replaced wholesale by the mutex holder: a torn snapshot
+    /// is structurally impossible (§4.11).
+    handoff: Option<(IndexVersion, Arc<SavedGraph>)>,
     poisoned: bool,
     delta_generations_since_parity: u64,
     last_parity: Instant,
@@ -410,7 +448,7 @@ impl MirrorState {
             if note_ids.contains(id) {
                 continue;
             }
-            let node = NodeId::note(u64::try_from(*id).unwrap_or(0));
+            let node = node_id_of(*id);
             if self.view.node_position(node).is_none()
                 && !link_rows[id].is_empty()
                 && let Some(row) = note_stmt
@@ -444,7 +482,7 @@ impl MirrorState {
             .keys()
             .map(|(kind, id)| NodeId {
                 kind: *kind,
-                id: u64::try_from(*id).unwrap_or(0),
+                id: node_row_id(*id),
             })
             .collect();
 
@@ -453,7 +491,7 @@ impl MirrorState {
         // own `note` row (§6.1.2), so span/raw-only link rewrites and
         // tag/property edits land here.
         for id in &note_ids {
-            let node = NodeId::note(u64::try_from(*id).unwrap_or(0));
+            let node = node_id_of(*id);
             let Some(position) = decode_index.get(&(NodeKind::Note, *id)) else {
                 self.remove_note(node, *id);
                 continue;
@@ -472,9 +510,7 @@ impl MirrorState {
         // rows (FR-1) and splice the referencing sources.
         for id in &attachment_ids {
             match decode_index.get(&(NodeKind::Attachment, *id)) {
-                None => self
-                    .view
-                    .remove_node(NodeId::attachment(u64::try_from(*id).unwrap_or(0))),
+                None => self.view.remove_node(attachment_id_of(*id)),
                 Some(position) => self.view.upsert_node(decoded[*position].clone()),
             }
         }
@@ -521,7 +557,7 @@ impl MirrorState {
         rows: Vec<LinkRow>,
         arriving: &BTreeSet<NodeId>,
     ) -> Result<(), String> {
-        let from = NodeId::note(u64::try_from(src).unwrap_or(0));
+        let from = node_id_of(src);
         let source_path = self
             .view
             .node_position(from)
@@ -539,8 +575,8 @@ impl MirrorState {
             match (row.dst_note, row.dst_att) {
                 (Some(_), _) | (None, Some(_)) => {
                     let target = match (row.dst_note, row.dst_att) {
-                        (Some(note), _) => NodeId::note(u64::try_from(note).unwrap_or(0)),
-                        (_, Some(att)) => NodeId::attachment(u64::try_from(att).unwrap_or(0)),
+                        (Some(note), _) => node_id_of(note),
+                        (_, Some(att)) => attachment_id_of(att),
                         (None, None) => continue,
                     };
                     // §6.5 "How": an edge into a node the view neither
@@ -637,30 +673,39 @@ impl MirrorState {
     /// Rebuild the canonical unresolved structures from
     /// [`Self::unresolved_by_src`]. Unresolved rows are, by graph-domain
     /// convention, the minority (ghost targets); the resolved structures —
-    /// which dominate at the design bound — are spliced in place, so this
-    /// stays O(unresolved + their records) per delta.
+    /// which dominate at the design bound — are spliced in place. The
+    /// section rebuild is O(U log U) since RFC-0005 F2 (first-visit
+    /// membership rides a seen-set; the scan it replaced re-walked
+    /// `nodes` per occurrence, which was O(U²) for every delta).
     fn rebuild_unresolved(&mut self) {
         let mut nodes: Vec<GraphNodeRecord> = Vec::new();
         let mut edges: Vec<GraphEdgeRecord> = Vec::new();
         let mut keys: BTreeMap<u64, String> = BTreeMap::new();
+        // F2: target ids already pushed into `nodes`. Membership via
+        // `insert` (true = first visit) replaces the former
+        // `!nodes.iter().any(|node| node.id.id == id)` re-scan. Push
+        // order is unchanged — statement order, first spelling of a
+        // target wins — and the section is re-sorted canonically at the
+        // end of this function regardless, which is what makes the
+        // set rewrite output-identical (FR-10; the
+        // `graph_mirror_equivalence` proptest is the byte-equality
+        // oracle over exactly this path).
+        let mut pushed: BTreeSet<u64> = BTreeSet::new();
         let boundary = self.resolved_occurrences;
         self.view.occurrences.truncate(boundary);
         let unresolved = std::mem::take(&mut self.unresolved_by_src);
         for (src, list) in &unresolved {
-            let Some(entry) = self
-                .view
-                .node_position(NodeId::note(u64::try_from(*src).unwrap_or(0)))
-            else {
+            let Some(entry) = self.view.node_position(node_id_of(*src)) else {
                 continue;
             };
-            let from = NodeId::note(u64::try_from(*src).unwrap_or(0));
+            let from = node_id_of(*src);
             let source_path = self.view.saved.nodes[entry].native_path.clone();
             let content_hash = self.source_hashes.get(src).cloned().unwrap_or_default();
             for occurrence in list {
                 let id = unresolved_id_for(&occurrence.raw);
                 let key = flavite_syntax::text::fold_key(&occurrence.raw);
                 keys.insert(id, key);
-                if !nodes.iter().any(|node| node.id.id == id) {
+                if pushed.insert(id) {
                     nodes.push(unresolved_record(id, &occurrence.raw));
                 }
                 let edge = GraphEdgeRecord {
@@ -682,6 +727,10 @@ impl MirrorState {
             }
         }
         self.unresolved_by_src = unresolved;
+        // F2 honesty: this canonical sort is why first-visit push order
+        // (statement order) is not an observable — the sections' final
+        // shape depends only on membership, and membership is exactly
+        // the set of targets seen in the scan.
         nodes.sort_by_key(|record| record.id);
         edges.sort();
         edges.dedup();
@@ -711,6 +760,7 @@ impl GraphMirror {
             // cold mirror can only ever synchronize into a Reset.
             cursor: IndexVersion::new(0, 0),
             state: None,
+            handoff: None,
             poisoned: false,
             delta_generations_since_parity: 0,
             last_parity: Instant::now(),
@@ -729,11 +779,51 @@ impl GraphMirror {
     }
 
     /// The canonical complete saved view at the cursor, if the mirror holds
-    /// a position. `UpToDate` pumps with changed buffers/scopes rebuild the
-    /// projection from this without reading the saved tables at all.
+    /// a position. Used by the parity comparison and tests, which need the
+    /// view *under* the mutex. Pumps that need to work outside the lock
+    /// take [`Self::view_arc`] instead (RFC-0005 F1).
     #[must_use]
     pub fn view(&self) -> Option<&SavedGraph> {
         self.state.as_ref().map(|state| &state.view)
+    }
+
+    /// The cursor-versioned `Arc` snapshot of the canonical view (F1,
+    /// RFC-0005 §4.6): the caller holds the mutex, takes the handle, and
+    /// drops the lock — the projection assembles from the snapshot outside
+    /// the critical section (FR-8), and the doctor's parity check waits at
+    /// most one synchronize/parity cycle, never an overlay pass (NFR-7).
+    ///
+    /// Cache discipline:
+    /// - **Hit** while `handoff` is keyed at the current cursor: a free
+    ///   `Arc` clone. This is the keystroke/stamp-only path — the cursor
+    ///   did not move, so the saved view cannot have changed.
+    /// - **Miss**: clone the owned view once, replace the slot wholesale,
+    ///   count it (`snapshots_built_total`). Clone cost moves from *per
+    ///   publish* to *per index delta (or reset) that reaches a pump* —
+    ///   the §4.6 tradeoff, with at most one extra resident view copy
+    ///   (NFR-5, asserted by the scale bench's accounting).
+    ///
+    /// Invalidation: a successful `apply_delta` needs none — `synchronize`
+    /// only advances the cursor strictly forward within an epoch (the
+    /// `UpToDate` early return proves the cursor equals the feed head;
+    /// anything past it arrives as a delta with a new `to`), so the next
+    /// call misses and rebuilds. Epoch change replaces `state` wholesale
+    /// and `force_reset` clears the slot with it (drift repair can land at
+    /// the same version — see [`Self::force_reset`]). Readers never see a
+    /// torn snapshot: the slot is written only by the mutex holder and
+    /// replaced in one assignment.
+    #[must_use]
+    pub fn view_arc(&mut self) -> Option<Arc<SavedGraph>> {
+        let view = self.state.as_ref().map(|state| &state.view)?;
+        if let Some((version, snapshot)) = &self.handoff
+            && *version == self.cursor
+        {
+            return Some(Arc::clone(snapshot));
+        }
+        let snapshot = Arc::new(view.clone());
+        self.handoff = Some((self.cursor, Arc::clone(&snapshot)));
+        self.stats.snapshots_built_total += 1;
+        Some(snapshot)
     }
 
     /// Whether the delta machinery failed mid-apply (or a freshly spliced
@@ -804,6 +894,7 @@ impl GraphMirror {
             Ok(entities) => {
                 tx.commit().map_err(|error| error.to_string())?;
                 let drift = state.drift;
+                let unresolved_targets = state.view.unresolved_nodes.len();
                 let previous_generation = self.cursor.generation;
                 self.cursor = to;
                 self.delta_generations_since_parity = self
@@ -811,6 +902,8 @@ impl GraphMirror {
                     .saturating_add(to.generation.saturating_sub(previous_generation));
                 self.stats.deltas_total += 1;
                 self.stats.last_delta_entities = entities;
+                self.stats.unresolved_targets =
+                    u64::try_from(unresolved_targets).unwrap_or(u64::MAX);
                 if drift {
                     self.stats.mismatches_total += 1;
                     self.poisoned = true;
@@ -831,19 +924,31 @@ impl GraphMirror {
 
     /// The §6.5.2 reset path: the full consistent read (existing functions,
     /// reused verbatim) installed as the canonical view. Afterwards the
-    /// complete view is readable through [`Self::view`].
+    /// complete view is readable through [`Self::view`] or a fresh
+    /// [`Self::view_arc`] snapshot.
+    ///
+    /// The handoff slot is dropped with the state it was built from: a
+    /// repair reset can land at the very version a poisoned snapshot is
+    /// keyed at (poison/parity repair with no newer commit), and the
+    /// drifted bytes must never be handed to a pump again. Version-key
+    /// equality alone would miss that case — `force_reset` is the one
+    /// transition that must clear explicitly (see [`Self::view_arc`] for
+    /// why a successful delta does not).
     ///
     /// # Errors
     /// Returns the failure text when the full read fails.
     pub fn force_reset(&mut self, conn: &Connection) -> Result<IndexVersion, String> {
         let graph = full_saved_graph(conn, self.session.as_deref())?;
         let version = graph.version;
+        let unresolved_targets = graph.unresolved_nodes.len();
         self.state = Some(MirrorState::from_view(graph));
+        self.handoff = None;
         self.cursor = version;
         self.poisoned = false;
         self.delta_generations_since_parity = 0;
         self.last_parity = Instant::now();
         self.stats.resets_total += 1;
+        self.stats.unresolved_targets = u64::try_from(unresolved_targets).unwrap_or(u64::MAX);
         Ok(version)
     }
 
@@ -927,7 +1032,7 @@ impl NoteRow {
     /// The exact `read_current` note record construction.
     fn record(&self) -> GraphNodeRecord {
         GraphNodeRecord::note(
-            u64::try_from(self.id).unwrap_or(0),
+            node_row_id(self.id),
             self.path.clone(),
             self.path_native.clone(),
             self.title.clone(),
@@ -955,7 +1060,7 @@ impl AttachmentRow {
     /// The exact `read_current` attachment record construction.
     fn record(&self) -> GraphNodeRecord {
         GraphNodeRecord::attachment(
-            u64::try_from(self.id).unwrap_or(0),
+            node_row_id(self.id),
             self.path.clone(),
             self.path_native.clone(),
         )
@@ -1041,6 +1146,37 @@ fn property_value(
 
 fn node_id_entity(id: NodeId) -> i64 {
     i64::try_from(id.id).unwrap_or(-1)
+}
+
+/// RFC-0005 §7 identity helper — one sentinel policy for every row id
+/// entering the mirror view.
+///
+/// Note and attachment ids are ROWID-allocated positive integers
+/// (`note_id`/`att_id` are `INTEGER PRIMARY KEY`); a negative id cannot
+/// exist in a database this writer created. The 0 sentinel is therefore
+/// unreachable and exists only to keep the conversion total: a corrupt
+/// negative row id collapses to node 0 rather than panicking the pump,
+/// and the parity guard still surfaces the drift against the full truth.
+/// One policy, written once — the former scattered
+/// `u64::try_from(..).unwrap_or(0)` expressions were this same rule
+/// repeated per call site.
+#[inline]
+fn node_row_id(id: i64) -> u64 {
+    u64::try_from(id).unwrap_or(0)
+}
+
+/// The [`NodeId`] of a note row (first call shape; sentinel policy in
+/// [`node_row_id`]).
+#[inline]
+fn node_id_of(id: i64) -> NodeId {
+    NodeId::note(node_row_id(id))
+}
+
+/// The [`NodeId`] of an attachment row (second call shape over the same
+/// policy, RFC-0005 §7).
+#[inline]
+fn attachment_id_of(id: i64) -> NodeId {
+    NodeId::attachment(node_row_id(id))
 }
 
 /// Derive the per-source unresolved inputs from the canonical unresolved
@@ -1556,4 +1692,264 @@ fn diff_metadata(
         full.len(),
         mirrored.len()
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests (RFC-0005 S2)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+
+    /// Seed source notes each carrying `ghosts` distinct unresolved links
+    /// straight into the base tables, then advance generation once (the
+    /// seeded-state convention of the scale/service fixtures). Returns the
+    /// database connection positioned at generation 1.
+    fn seed_ghost_matrix(conn: &Connection, sources: i64, ghosts: i64) {
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            let mut note = tx
+                .prepare(
+                    "INSERT INTO notes(path, path_native, path_key, stem_key, title,
+                                       id_conflict, content_hash, size, mtime_ns, scan_ns,
+                                       parse_ok, generation)
+                     VALUES(?1, ?2, ?3, ?4, ?5, 0, ?6, 64, 1, 1, 1, 1)",
+                )
+                .unwrap();
+            let mut link = tx
+                .prepare(
+                    "INSERT INTO links(src, ord, kind, dst_raw, target_key, target_stem,
+                                       span_start, span_end, res_state)
+                     VALUES(?1, ?2, 'link', ?3, ?4, ?5, ?6, ?7, 'unresolved')",
+                )
+                .unwrap();
+            for src in 1..=sources {
+                let path = format!("src{src}.md");
+                note.execute(params![
+                    path,
+                    path.as_bytes(),
+                    flavite_syntax::text::fold_key(&path),
+                    flavite_syntax::text::fold_key(&format!("src{src}")),
+                    format!("Source {src}"),
+                    blake3::hash(&src.to_le_bytes()).as_bytes().to_vec(),
+                ])
+                .unwrap();
+            }
+            for ghost in 0..sources * ghosts {
+                // Spread deterministically: source k owns ghosts k, k+U, …
+                let src = ghost % sources + 1;
+                let ord = ghost / sources;
+                let raw = format!("ghost{ghost}");
+                let key = flavite_syntax::text::fold_key(&raw);
+                link.execute(params![
+                    src,
+                    ord,
+                    raw,
+                    key,
+                    key,
+                    10 + ord * 100,
+                    20 + ord * 100,
+                ])
+                .unwrap();
+            }
+        }
+        tx.execute("UPDATE meta SET value='1' WHERE key='generation'", [])
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// RFC-0005 F2 exit test: ≥1_000 distinct unresolved targets spread
+    /// across sources, one delta splice through the real writer, and the
+    /// rebuilt canonical sections must be complete, strictly sorted by
+    /// [`NodeId`], unique, and byte-equal to a fresh full consistent read
+    /// at the same version — the FR-10 oracle, same `parity_findings`
+    /// comparison the drift guard and the equivalence proptest run. The
+    /// O(U²) scan this replaced would also pass this test; the permanent
+    /// regression teeth are the proptest (identity) plus the scale bench's
+    /// printed `unresolved_targets` count (the measurement).
+    #[test]
+    fn delta_rebuild_over_a_thousand_unresolved_targets_is_exact() {
+        const SOURCES: i64 = 4;
+        const GHOSTS_PER_SOURCE: i64 = 256; // 1_024 distinct targets
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("dedup.sqlite");
+        let reader = open_reader(&db);
+        seed_ghost_matrix(&reader, SOURCES, GHOSTS_PER_SOURCE);
+
+        let mut mirror = GraphMirror::new(None);
+        assert!(
+            matches!(
+                mirror.synchronize(&reader).unwrap(),
+                Synchronize::Reset { .. }
+            ),
+            "a cold mirror must take the reset path"
+        );
+        mirror.force_reset(&reader).unwrap();
+        let baseline = mirror.view().expect("view").unresolved_nodes.len();
+        assert_eq!(
+            baseline,
+            usize::try_from(SOURCES * GHOSTS_PER_SOURCE).unwrap(),
+            "the reset rebuild must hold every seeded ghost"
+        );
+        assert!(baseline >= 1_000, "the exit gate needs ≥1_000 targets");
+        assert_eq!(mirror.stats().unresolved_targets, baseline as u64);
+
+        // One delta splice through the real apply spine: a brand-new
+        // source note with a brand-new ghost target.
+        let mut actor = flavite_index::IndexActor::new(&db, 1).unwrap();
+        actor
+            .apply_saved_note(
+                b"src9.md",
+                "src9.md",
+                b"# Nine\nFresh ghost [[ghost-new]].\n",
+                10,
+                11,
+            )
+            .unwrap();
+        let outcome = mirror.synchronize(&reader).unwrap();
+        assert!(
+            matches!(outcome, Synchronize::Delta { .. }),
+            "the applied change must arrive as a delta, not a reset"
+        );
+
+        let view = mirror.view().expect("view");
+        for pair in view.unresolved_nodes.windows(2) {
+            assert!(
+                pair[0].id < pair[1].id,
+                "unresolved nodes must be strictly sorted by NodeId (unique + canonical)"
+            );
+        }
+        assert_eq!(
+            view.unresolved_nodes.len(),
+            baseline + 1,
+            "the new ghost lands and nothing else changed"
+        );
+        assert!(
+            view.unresolved_keys
+                .contains_key(&unresolved_id_for("ghost-new")),
+            "the identity guard must cover the new target"
+        );
+        assert_eq!(
+            mirror.stats().unresolved_targets,
+            u64::try_from(baseline + 1).unwrap(),
+            "the F2 telemetry counter must track the rebuild"
+        );
+        // Byte-equality oracle at the shared version (FR-10):
+        let full = full_saved_graph(&reader, None).unwrap();
+        assert_eq!(
+            parity_findings(&full, view),
+            Vec::<String>::new(),
+            "the linear rebuild must equal the full truth byte-for-byte"
+        );
+    }
+
+    /// A fresh schema at the path, WAL set, returned as the mirror's read
+    /// handle (the actor and the seed share the file through separate
+    /// connections, exactly like the service fixtures).
+    fn open_reader(db: &std::path::Path) -> Connection {
+        let conn = flavite_index::open_or_init(db).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn
+    }
+
+    /// RFC-0005 S3 (F1): the handoff snapshot equals the owned view, the
+    /// cache hits while the cursor is unchanged (free `Arc` clone, counter
+    /// flat), a delta makes the next call miss exactly once, and
+    /// `force_reset` — even landing at the *same* version — never serves
+    /// the pre-repair snapshot again. The last case is the hole the
+    /// version-key check alone would leave open (drift repair with no new
+    /// commit): the poisoned bytes share the cursor the repair rebuilt to.
+    #[test]
+    fn view_arc_caches_by_cursor_and_reset_drops_the_slot() {
+        const SOURCES: i64 = 2;
+        const GHOSTS_PER_SOURCE: i64 = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("handoff.sqlite");
+        let reader = open_reader(&db);
+        seed_ghost_matrix(&reader, SOURCES, GHOSTS_PER_SOURCE);
+
+        let mut mirror = GraphMirror::new(None);
+        assert!(
+            mirror.view_arc().is_none(),
+            "no cursor position yet: no snapshot may be handed out"
+        );
+
+        mirror.force_reset(&reader).unwrap();
+        let first = mirror.view_arc().expect("snapshot after reset");
+        // S3 assertion: the snapshot equals the owned view byte-wise.
+        assert_eq!(&*first, mirror.view().expect("owned view"));
+        assert_eq!(mirror.stats().snapshots_built_total, 1);
+
+        // Cache hit: same cursor ⇒ the very same Arc, counter flat.
+        let again = mirror.view_arc().expect("cached snapshot");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "cursor-keyed reuse must hand out the same Arc"
+        );
+        assert_eq!(mirror.stats().snapshots_built_total, 1);
+
+        // A delta advances the cursor ⇒ the next call misses exactly once
+        // and the new snapshot equals the fresh owned view.
+        let mut actor = flavite_index::IndexActor::new(&db, 1).unwrap();
+        actor
+            .apply_saved_note(
+                b"src9.md",
+                "src9.md",
+                b"# Nine\nAnother ghost [[handoff-new]].\n",
+                10,
+                11,
+            )
+            .unwrap();
+        let outcome = mirror.synchronize(&reader).unwrap();
+        assert!(matches!(outcome, Synchronize::Delta { .. }));
+        assert_eq!(
+            mirror.stats().snapshots_built_total,
+            1,
+            "synchronize itself builds no snapshot — the pump's view_arc does"
+        );
+        let second = mirror.view_arc().expect("rebuilt snapshot");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a moved cursor must rebuild once"
+        );
+        assert_eq!(mirror.stats().snapshots_built_total, 2);
+        assert_eq!(&*second, mirror.view().expect("owned view"));
+        // And it keeps hitting until the next move.
+        let third = mirror.view_arc().expect("cached again");
+        assert!(Arc::ptr_eq(&second, &third));
+        assert_eq!(mirror.stats().snapshots_built_total, 2);
+
+        // Same-version repair: poison the slot's CONTENTS while keeping
+        // its key at the cursor (exactly the drifted-snapshot state a
+        // failed splice can leave behind), then force_reset without any
+        // new commit. The version key alone would now hit on the suspect
+        // bytes; `force_reset` must have dropped the slot instead.
+        let repair_version = mirror.cursor;
+        let mut tampered = mirror.view().expect("view").clone();
+        tampered
+            .unresolved_nodes
+            .push(unresolved_record(u64::MAX, "tampered-by-drift"));
+        mirror.handoff = Some((repair_version, Arc::new(tampered)));
+        mirror.force_reset(&reader).unwrap();
+        assert_eq!(
+            mirror.cursor, repair_version,
+            "the repair must land at the same version to exercise the hole"
+        );
+        let repaired = mirror.view_arc().expect("post-repair snapshot");
+        assert!(
+            !repaired
+                .unresolved_nodes
+                .iter()
+                .any(|node| node.title.contains("tampered")),
+            "force_reset must never re-serve the poisoned snapshot"
+        );
+        assert_eq!(&*repaired, mirror.view().expect("owned view"));
+        assert_eq!(
+            mirror.stats().snapshots_built_total,
+            3,
+            "the cleared slot rebuilds exactly once after repair"
+        );
+    }
 }

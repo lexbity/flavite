@@ -411,6 +411,12 @@ pub fn create_schema(conn: &mut Connection) -> Result<()> {
         params![MetaKey::Epoch.as_str(), current_epoch.to_string()],
     )?;
 
+    // Fresh-schema seed, not a generation bump. RFC-0005 FR-1 requires a
+    // `publish_generation` call only where a committed transaction bumps an
+    // existing generation: a brand-new database has no structural state to
+    // announce and no consumer can hold a cursor against a file that did not
+    // exist yet (epoch/cold-start consumers take the reset path, which reads
+    // this seeded value from the database).
     tx.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)",
         params![MetaKey::Generation.as_str(), current_generation.to_string()],
@@ -619,6 +625,14 @@ pub fn set_meta(conn: &Connection, key: MetaKey, value: &str) -> Result<()> {
 }
 
 /// Increment the generation and return the new value.
+///
+/// This bypasses the apply spine and therefore cannot publish the generation
+/// broadcast: RFC-0005 FR-1 makes the spine's bump-and-commit sites the only
+/// production writers of `MetaKey::Generation` (the grep gate in
+/// `signal.rs` names the enforcement). This helper exists for schema-layer
+/// tests that need a raw counter bump; a production mutation path using it
+/// would silently strand every derived cursor, so it MUST NOT be called
+/// from writer code.
 ///
 /// # Errors
 ///

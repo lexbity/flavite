@@ -380,12 +380,13 @@ impl DoctorChecker {
                     ),
                 )
                 .with_details(format!(
-                    "deltas={} resets={} parity_checks={} mismatches={} last_delta_entities={}",
+                    "deltas={} resets={} parity_checks={} mismatches={} last_delta_entities={} snapshots_built={}",
                     stats.mirror_deltas_total,
                     stats.mirror_resets_total,
                     stats.mirror_parity_checks_total,
                     stats.mirror_mismatches_total,
-                    stats.mirror_last_delta_entities
+                    stats.mirror_last_delta_entities,
+                    stats.mirror_snapshots_built_total
                 ))
             }
             Ok(outcome) => DoctorCheck::error(
