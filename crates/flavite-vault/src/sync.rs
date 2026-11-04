@@ -98,6 +98,25 @@ impl<T> RwLockExt<T> for RwLock<T> {
     }
 }
 
+/// Complete a condvar wait on an already-recovered guard, recovering from
+/// poison (loudly) if the paired mutex was poisoned during the park,
+/// instead of cascading a panic from a wait path that is deliberately NOT
+/// wrapped in the turn-boundary containment.
+///
+/// Generic over the std wait-result shape (`MutexGuard` pairs or
+/// `WaitTimeoutResult`): every timed/while wait returns
+/// `Result<R, PoisonError<R>>`, and the recovery is identical.
+#[track_caller]
+pub fn wait_result_recovering<R>(result: Result<R, PoisonError<R>>) -> R {
+    match result {
+        Ok(waited) => waited,
+        Err(poisoned) => {
+            note_recovery("condvar wait (paired mutex)");
+            PoisonError::into_inner(poisoned)
+        }
+    }
+}
+
 /// Serialize poison-injecting tests across the crate: they all move the
 /// process-global `POISON_RECOVERIES`, and lib tests run on many threads,
 /// so exact per-test deltas are only honest under this shared lock.

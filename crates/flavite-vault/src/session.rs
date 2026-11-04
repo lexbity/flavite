@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 fn located_patch(
@@ -94,6 +94,24 @@ const MAX_PENDING_SAVE_OPERATIONS: usize = 4096;
 /// patch after eviction re-derives safely through the actor's revision
 /// guard (proven by the S5 replay test).
 const JOURNAL_MEMO_CAP: usize = 4096;
+
+/// Lone-waiter park ceiling for the headless wait loops (S6). The wake
+/// MECHANISM is `record_completion`'s `notify_all` on the paired
+/// `completions_cv`; this tick only bounds how long a waiter that must
+/// pump its own worker installation idles between passes. Timing-contract
+/// table (Session waits ×2, api backlog wait): wake source = recorded
+/// completion; ceiling = 25 ms; ≤ 40 wakeups/s/idle waiter (vs 1,000/s for
+/// the former 1 ms sleep-poll).
+const WAIT_TICK: Duration = Duration::from_millis(25);
+
+/// Parks taken by the shared wait loop, for the NFR-3 wakeup-count proof.
+/// Test-gated counter: production wait paths hold no telemetry branches.
+/// Counts only the waiter whose id is designated in `OBSERVED_WAIT_ID` so
+/// concurrent tests' waits cannot contaminate the budget.
+#[cfg(test)]
+static WAIT_PARKS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static OBSERVED_WAIT_ID: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Bounded pending cold opens (RFC-0003 §12.1: pending opens ≤128).
 const MAX_PENDING_OPEN_NOTES: usize = 128;
 /// Concurrent cold-open read flights (RFC-0003 §12.1).
@@ -641,6 +659,11 @@ pub struct Session {
     journal_memos: Mutex<HashMap<BufferId, BufferJournalMemo>>,
     /// Lossless terminal results. Admission is bounded by the pending-save cap.
     completions: Mutex<VecDeque<OperationCompletion>>,
+    /// Wake edge for the headless wait loops, paired with `completions`
+    /// (S6): `record_completion` is the only writer and notifies under no
+    /// lock it holds past the push — waiters re-check under the same mutex
+    /// they park on, so no wakeup can be lost by construction.
+    completions_cv: Condvar,
     /// Pulse channel.
     pulse: PulseChannel,
     /// Notice channel.
@@ -878,6 +901,7 @@ impl Session {
             rename_flights: Mutex::new(HashMap::new()),
             journal_memos: Mutex::new(HashMap::new()),
             completions: Mutex::new(VecDeque::new()),
+            completions_cv: Condvar::new(),
             pulse,
             notice,
             recovery_notices: Mutex::new(VecDeque::new()),
@@ -1051,24 +1075,14 @@ impl Session {
                     .insert(path.clone(), std::time::Instant::now());
                 self.autosave_attempted.lock_recovering().remove(&path);
             }
-            self.completions
-                .lock_recovering()
-                .push_back(OperationCompletion {
-                    request_id: prepared.request,
-                    result,
-                });
+            self.record_completion(prepared.request, result);
             self.structure_worker.retired();
         }
     }
 
     fn pump_link_completions(&self) {
         while let Ok(message) = self.link_results.try_recv() {
-            self.completions
-                .lock_recovering()
-                .push_back(OperationCompletion {
-                    request_id: message.request_id,
-                    result: message.result,
-                });
+            self.record_completion(message.request_id, message.result);
         }
     }
 
@@ -1905,60 +1919,119 @@ impl Session {
 
     /// CLI/headless convenience for commands that promise a disk mutation.
     /// GUI hosts use `drain_operation_completions` from their normal pump.
+    /// Wait for a headless operation to reach its terminal result.
+    ///
+    /// Turn-free by contract (S6/Q4): the pumps are turn-free and command
+    /// transitions self-serialize under `driving_turn` inside `execute`, so
+    /// a waiting observer must not hold the turn that the producer needs to
+    /// deliver its result. The one path that already holds the turn — the
+    /// W12 `restore_recovery` implicit open inside `execute` — uses the
+    /// dedicated [`Session::wait_for_operation_holding_turn`] entry, which
+    /// must not re-acquire it (self-deadlock).
     pub fn wait_for_operation(&self, request_id: u64) -> SessionResult {
-        let _turn = self.driving_turn.lock_recovering();
-        self.wait_for_operation_holding_turn(request_id)
+        self.wait_loop(request_id)
     }
 
-    /// Wait for an operation while the driving turn is already held (W12:
-    /// `restore_recovery`'s implicit open runs inside `execute`, which
-    /// holds the turn; re-acquiring here would self-deadlock).
+    /// Wait while the driving turn is already held (W12: `restore_recovery`'s
+    /// implicit open runs inside `execute`, which holds the turn;
+    /// re-acquiring here would self-deadlock).
     fn wait_for_operation_holding_turn(&self, request_id: u64) -> SessionResult {
+        self.wait_loop(request_id)
+    }
+
+    /// Shared park-and-pump wait body for both entry points.
+    ///
+    /// Every pass pumps this thread's installers (worker replies become
+    /// completions only inside the pump functions, so a lone waiter must
+    /// pump itself), takes its own result losslessly, checks liveness, then
+    /// parks on `completions_cv` until a recorded completion or the
+    /// `WAIT_TICK` ceiling. No `thread::sleep`, no `driving_turn`.
+    /// Worst-case lone-waiter added latency is 25 ms versus the old 1 ms
+    /// busy-poll — accepted for headless paths: CPU per idle waiter drops
+    /// from ~1,000 wakeups/s to ≤ 40/s (NFR-3/NFR-4).
+    fn wait_loop(&self, request_id: u64) -> SessionResult {
         loop {
             self.pump_external_changes_inner();
             self.pump_open_completions();
             self.pump_save_completions();
             self.pump_reconcile_completions();
             self.pump_rename_completions();
-            let completed = {
-                let mut completions = self.completions.lock_recovering();
-                completions
-                    .iter()
-                    .position(|completion| completion.request_id == request_id)
-                    .map(|position| completions.remove(position).unwrap().result)
-            };
-            if let Some(result) = completed {
+            if let Some(result) = self.take_completion(request_id) {
                 return result;
             }
-            let active = self.save_flights.lock_recovering().values().any(|flight| {
-                flight.request.request_id == request_id
-                    || flight
-                        .queued
-                        .as_ref()
-                        .is_some_and(|request| request.request_id == request_id)
-            }) || self
-                .reconcile_flights
-                .lock_recovering()
-                .contains_key(&request_id)
-                || self
-                    .rename_flights
-                    .lock_recovering()
-                    .contains_key(&request_id)
-                || self
-                    .open_flights
-                    .lock_recovering()
-                    .values()
-                    .any(|flight| flight.request_ids.contains(&request_id));
-            if !active {
+            if !self.operation_in_flight(request_id) {
                 return SessionResult::Error {
                     message: format!("unknown or already-drained operation {request_id}"),
                 };
             }
-            // The caller holds the driving turn for the whole wait; only
-            // the sleep is released so concurrent pumps on other threads
-            // can make progress against the actor.
-            std::thread::sleep(Duration::from_millis(1));
+            // No lost wakeups by construction: the completion check above
+            // and the parking happen under the same `completions` mutex,
+            // and `record_completion` holds that mutex while pushing, so a
+            // completion recorded between the check and the park is visible
+            // to the condition predicate before the waiter ever sleeps.
+            let completions = self.completions.lock_recovering();
+            #[cfg(test)]
+            if request_id == OBSERVED_WAIT_ID.load(Ordering::Relaxed) {
+                WAIT_PARKS.fetch_add(1, Ordering::Relaxed);
+            }
+            let _waited = crate::sync::wait_result_recovering(
+                self.completions_cv
+                    .wait_timeout_while(completions, WAIT_TICK, |queue| {
+                        queue
+                            .iter()
+                            .all(|completion| completion.request_id != request_id)
+                    }),
+            );
         }
+    }
+
+    /// Remove and return the recorded result for `request_id`, leaving all
+    /// other completions in place (the ledger stays lossless for other
+    /// consumers such as `drain_operation_completions`).
+    fn take_completion(&self, request_id: u64) -> Option<SessionResult> {
+        let mut completions = self.completions.lock_recovering();
+        completions
+            .iter()
+            .position(|completion| completion.request_id == request_id)
+            .map(|position| completions.remove(position).unwrap().result)
+    }
+
+    /// True while any flight can still deliver the terminal result for this
+    /// request: a save (primary or coalesced successor), reconcile, rename,
+    /// or open flight.
+    fn operation_in_flight(&self, request_id: u64) -> bool {
+        self.save_flights.lock_recovering().values().any(|flight| {
+            flight.request.request_id == request_id
+                || flight
+                    .queued
+                    .as_ref()
+                    .is_some_and(|request| request.request_id == request_id)
+        }) || self
+            .reconcile_flights
+            .lock_recovering()
+            .contains_key(&request_id)
+            || self
+                .rename_flights
+                .lock_recovering()
+                .contains_key(&request_id)
+            || self
+                .open_flights
+                .lock_recovering()
+                .values()
+                .any(|flight| flight.request_ids.contains(&request_id))
+    }
+
+    /// Record a terminal operation result and wake any parked waiters (S6).
+    ///
+    /// The ONLY writer of `OperationCompletion` into the queue: the ten
+    /// former inline push sites all routed through here, which is what makes
+    /// the notify edge auditable — one site, not ten. Admission remains
+    /// bounded by the pending-save cap (unchanged).
+    fn record_completion(&self, request_id: u64, result: SessionResult) {
+        self.completions
+            .lock_recovering()
+            .push_back(OperationCompletion { request_id, result });
+        self.completions_cv.notify_all();
     }
 
     fn pump_save_completions(&self) {
@@ -1997,12 +2070,7 @@ impl Session {
             {
                 self.record_autosave_failure(&flight.request.path, &operation_result);
             }
-            self.completions
-                .lock_recovering()
-                .push_back(OperationCompletion {
-                    request_id: flight.request.request_id,
-                    result: operation_result,
-                });
+            self.record_completion(flight.request.request_id, operation_result);
 
             let Some(mut queued) = flight.queued else {
                 continue;
@@ -2020,15 +2088,12 @@ impl Session {
                         .get_buffer_by_id(BufferId::from(buffer_id))
                         .is_some();
                     if !buffer_is_live {
-                        self.completions
-                            .lock_recovering()
-                            .push_back(OperationCompletion {
-                                request_id: queued.request_id,
-                                result: SessionResult::Error {
-                                    message: "queued save's buffer was closed before admission"
-                                        .into(),
-                                },
-                            });
+                        self.record_completion(
+                            queued.request_id,
+                            SessionResult::Error {
+                                message: "queued save's buffer was closed before admission".into(),
+                            },
+                        );
                         continue;
                     }
                     match self.actor.submit_save(queued.clone()) {
@@ -2042,30 +2107,23 @@ impl Session {
                                 },
                             );
                         }
-                        Err(error) => {
-                            self.completions
-                                .lock_recovering()
-                                .push_back(OperationCompletion {
-                                    request_id: queued.request_id,
-                                    result: SessionResult::Error {
-                                        message: error.to_string(),
-                                    },
-                                })
-                        }
+                        Err(error) => self.record_completion(
+                            queued.request_id,
+                            SessionResult::Error {
+                                message: error.to_string(),
+                            },
+                        ),
                     }
                 }
-                _ => self
-                    .completions
-                    .lock_recovering()
-                    .push_back(OperationCompletion {
-                        request_id: queued.request_id,
-                        result: SessionResult::Error {
-                            message: format!(
-                                "queued save was not admitted because save {} did not complete",
-                                flight.request.request_id
-                            ),
-                        },
-                    }),
+                _ => self.record_completion(
+                    queued.request_id,
+                    SessionResult::Error {
+                        message: format!(
+                            "queued save was not admitted because save {} did not complete",
+                            flight.request.request_id
+                        ),
+                    },
+                ),
             }
         }
     }
@@ -2107,9 +2165,7 @@ impl Session {
                     message: "reconcile worker returned an invalid response".into(),
                 },
             };
-            self.completions
-                .lock_recovering()
-                .push_back(OperationCompletion { request_id, result });
+            self.record_completion(request_id, result);
         }
     }
 
@@ -2148,9 +2204,7 @@ impl Session {
                     message: "rename worker returned an invalid response".into(),
                 },
             };
-            self.completions
-                .lock_recovering()
-                .push_back(OperationCompletion { request_id, result });
+            self.record_completion(request_id, result);
         }
     }
 
@@ -2385,17 +2439,16 @@ impl Session {
         if ready.is_empty() {
             return;
         }
-        let mut completions = self.completions.lock_recovering();
         for read in ready {
             let Some(flight) = self.open_flights.lock_recovering().remove(&read.path) else {
                 continue;
             };
             let result = self.install_open_read(read);
+            // The former code held the completions lock across the open-flights
+            // removal and the install; every lock now lives inside its owner
+            // (S6: completions is only ever touched by `record_completion`).
             for request_id in flight.request_ids {
-                completions.push_back(OperationCompletion {
-                    request_id,
-                    result: result.clone(),
-                });
+                self.record_completion(request_id, result.clone());
             }
         }
     }
@@ -2783,15 +2836,13 @@ impl Session {
         }
         if let Some(flight) = flights.get_mut(&buffer_id.as_u64()) {
             if let Some(superseded) = flight.queued.replace(request) {
-                self.completions
-                    .lock_recovering()
-                    .push_back(OperationCompletion {
+                self.record_completion(
+                    superseded.request_id,
+                    SessionResult::Superseded {
                         request_id: superseded.request_id,
-                        result: SessionResult::Superseded {
-                            request_id: superseded.request_id,
-                            by_request: request_id,
-                        },
-                    });
+                        by_request: request_id,
+                    },
+                );
             }
             return SessionResult::Pending { request_id };
         }
@@ -4009,6 +4060,225 @@ mod tests {
         assert_eq!(session.panics_total.load(Ordering::SeqCst), 0);
     }
 
+    /// Keep-alive in-flight save so `operation_in_flight` answers `true`
+    /// without a live worker: the sender stays with the caller, the
+    /// receiver parks in the flight table until the test delivers.
+    fn fabricate_inflight_save(
+        session: &Session,
+        request_id: u64,
+    ) -> crossbeam::channel::Sender<crate::actor::VaultActorResp> {
+        let (keep_tx, keep_rx) = crossbeam::channel::unbounded();
+        session.save_flights.lock_recovering().insert(
+            request_id,
+            SaveFlight {
+                request: SaveRequest {
+                    request_id,
+                    path: PathBuf::from("/test/vault/note.md"),
+                    note_key: b"fabricated-key".to_vec(),
+                    bytes: Vec::new(),
+                    merge_base: Vec::new(),
+                    precondition: crate::save::DiskPrecondition::Existing([7u8; 32]),
+                    buffer_id: request_id,
+                    revision: 0,
+                },
+                response: keep_rx,
+                queued: None,
+            },
+        );
+        keep_tx
+    }
+
+    /// S6/Q4: a headless wait must NOT hold the driving turn. Thread A
+    /// waits an in-flight save while thread B executes unrelated commands
+    /// for a fixed window. Under the former turn-holding wait B is starved
+    /// for the entire window (it blocks on the first `execute`), which is
+    /// exactly what this test shows red against the old design.
+    #[test]
+    fn wait_for_operation_returns_without_turn_and_terminates() {
+        let (session, _fs, _temp) = test_session();
+        let request_id = 7_777u64;
+        let _keep = fabricate_inflight_save(&session, request_id);
+        let session = std::sync::Arc::new(session);
+
+        std::thread::scope(|scope| {
+            let waiter = {
+                let session = std::sync::Arc::clone(&session);
+                scope.spawn(move || session.wait_for_operation(request_id))
+            };
+            let driver = {
+                let session = std::sync::Arc::clone(&session);
+                scope.spawn(move || {
+                    let started = std::time::Instant::now();
+                    let mut completed = 0u64;
+                    while started.elapsed() < Duration::from_millis(250) {
+                        // Cheap unrelated command: closing a never-opened
+                        // path is a preflight error and mutates nothing.
+                        session.execute(SessionCommand::CloseNote {
+                            path: PathBuf::from("/test/vault/not-open.md"),
+                            retain_recovery: false,
+                        });
+                        completed += 1;
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    completed
+                })
+            };
+            std::thread::sleep(Duration::from_millis(300));
+            // Deliver through the production writer. This test's subject is
+            // the turn, not the wake latency (the wake-edge test pins that).
+            session.record_completion(
+                request_id,
+                SessionResult::Error {
+                    message: "test-delivered".into(),
+                },
+            );
+            let b_count = driver.join().expect("driver thread");
+            let result = waiter.join().expect("waiter thread");
+            assert!(
+                matches!(&result, SessionResult::Error { message } if message == "test-delivered"),
+                "{result:?}"
+            );
+            assert!(
+                b_count >= 20,
+                "waiter starved the driving turn: B completed only {b_count} commands in 250ms"
+            );
+        });
+    }
+
+    /// S6 wake-edge proof: a completion recorded on another thread wakes a
+    /// parked waiter materially BEFORE its 25 ms tick ceiling. If
+    /// `record_completion`'s `notify_all` regressed to a silent push, the
+    /// wake would wait out the remaining tick — near-certainly > 5 ms.
+    #[test]
+    fn wait_wakes_on_completion_from_another_thread() {
+        let (session, _fs, _temp) = test_session();
+        let request_id = 8_888u64;
+        let _keep = fabricate_inflight_save(&session, request_id);
+        let session = std::sync::Arc::new(session);
+
+        std::thread::scope(|scope| {
+            let waiter = {
+                let session = std::sync::Arc::clone(&session);
+                scope.spawn(move || session.wait_for_operation(request_id))
+            };
+            // Guarantee the waiter is parked before delivery is timed.
+            std::thread::sleep(Duration::from_millis(30));
+            let started = std::time::Instant::now();
+            session.record_completion(
+                request_id,
+                SessionResult::Success(CommandResult::NoteClosed),
+            );
+            let result = waiter.join().expect("waiter thread");
+            let woke_in = started.elapsed();
+            assert!(matches!(
+                result,
+                SessionResult::Success(CommandResult::NoteClosed)
+            ));
+            assert!(
+                woke_in < Duration::from_millis(5),
+                "wake came on the tick, not the notify edge: {woke_in:?} (WAIT_TICK is {WAIT_TICK:?})"
+            );
+        });
+    }
+
+    /// R4/NFR-3: forward progress is bounded without any notify —
+    /// (a) an unknown request id returns the honest
+    /// "unknown or already-drained" error immediately, never parking;
+    /// (b) an in-flight id that never completes parks at the tick ceiling:
+    /// over a 600 ms window the observed waiter takes ~24 parks (bound
+    /// 40/s), proving neither a 1 ms spin nor a hang; a delivery still
+    /// terminates it afterwards.
+    ///
+    /// The park counter observes only a designated request id (and the test
+    /// serializes that designation) so concurrent waiters in other tests
+    /// cannot contaminate the budget.
+    #[test]
+    fn unknown_and_parked_waits_make_bounded_progress() {
+        let _serial = crate::sync::poison_test_serial()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (session, _fs, _temp) = test_session();
+
+        // (a) Unknown id: immediate, no park.
+        let before_parks = WAIT_PARKS.load(Ordering::Relaxed);
+        let unknown = session.wait_for_operation(9_999);
+        assert!(
+            matches!(&unknown, SessionResult::Error { message }
+                if message == "unknown or already-drained operation 9999"),
+            "{unknown:?}"
+        );
+        assert_eq!(
+            WAIT_PARKS.load(Ordering::Relaxed),
+            before_parks,
+            "the unknown-id exit must not park"
+        );
+
+        // (b) Never-completed in-flight id: tick-bounded parks, then a
+        // delivery ends the wait.
+        let request_id = 6_666u64;
+        let _keep = fabricate_inflight_save(&session, request_id);
+        OBSERVED_WAIT_ID.store(request_id, Ordering::Relaxed);
+        WAIT_PARKS.store(0, Ordering::Relaxed);
+        let session = std::sync::Arc::new(session);
+        std::thread::scope(|scope| {
+            let waiter = {
+                let session = std::sync::Arc::clone(&session);
+                scope.spawn(move || session.wait_for_operation(request_id))
+            };
+            std::thread::sleep(Duration::from_millis(600));
+            assert!(
+                !waiter.is_finished(),
+                "a never-completed wait must stay parked, not exit silently"
+            );
+            let parks = WAIT_PARKS.load(Ordering::Relaxed);
+            session.record_completion(request_id, SessionResult::Busy);
+            let result = waiter.join().expect("waiter thread");
+            OBSERVED_WAIT_ID.store(u64::MAX, Ordering::Relaxed);
+            assert!(matches!(result, SessionResult::Busy));
+            // ≤ 40/s budget over 600 ms = 24, plus scheduling slack; a 1 ms
+            // spin would show ~600 parks. ≥ 10 proves timeout-driven
+            // forward progress rather than a lost-wakeup hang.
+            assert!(
+                (10..=40).contains(&parks),
+                "idle waiter parked {parks} times in ~600ms — expected ~24 (25ms tick), \
+                 the old 1ms poll would show ~600"
+            );
+        });
+    }
+
+    /// FR-10 unit leg: a recorded completion is visible to `take_completion`
+    /// and `drain_operation_completions` with FIFO order; taking one id is
+    /// lossless for the others (the ledger contract of the old inline scan).
+    #[test]
+    fn recorded_completions_are_lossless_and_fifo() {
+        let (session, _fs, _temp) = test_session();
+        session.record_completion(1, SessionResult::Busy);
+        session.record_completion(
+            2,
+            SessionResult::Error {
+                message: "second".into(),
+            },
+        );
+        session.record_completion(3, SessionResult::Success(CommandResult::NoteClosed));
+
+        let taken = session.take_completion(2);
+        match &taken {
+            Some(SessionResult::Error { message }) => assert_eq!(message, "second"),
+            other => panic!("expected the recorded error for id 2, got {other:?}"),
+        }
+        assert!(session.take_completion(2).is_none(), "take is consuming");
+
+        let drained = session.drain_operation_completions();
+        assert_eq!(
+            drained
+                .iter()
+                .map(|completion| completion.request_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3],
+            "untouched completions keep FIFO order after a mid-queue take"
+        );
+    }
+
     #[test]
     fn reconcile_and_save_completions_keep_request_identity_and_revision() {
         let (session, fs, _temp) = test_session();
@@ -4430,7 +4700,15 @@ mod tests {
             session.pump();
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert!(session.is_open(&to));
+        // M2 paydown (bounded to loops in this file, S6): on exhaustion the
+        // failure message carries the Session backlog, not just the bool.
+        if !session.is_open(&to) {
+            panic!(
+                "renamed buffer never surfaced open; events={:?} notices={:?}",
+                session.drain_events(),
+                session.drain_notices()
+            );
+        }
         assert_eq!(session.get_buffer_id(&to), Some(buffer_id));
         let save_result = save_to_terminal(&session, to.clone());
         assert!(
@@ -5122,8 +5400,14 @@ mod tests {
             session.pump();
             std::thread::sleep(Duration::from_millis(2));
         }
-
-        assert_eq!(session.autosave_failures_total(), 1);
+        // M2 paydown (bounded, S6): include the Session backlog on stall.
+        assert_eq!(
+            session.autosave_failures_total(),
+            1,
+            "autosave failure never surfaced; events={:?} notices={:?}",
+            session.drain_events(),
+            session.drain_notices()
+        );
     }
 
     #[test]
