@@ -24,6 +24,20 @@
 //! byte-equals a fresh full read after every change, so the incremental
 //! path can never silently diverge from `read_current` semantics.
 //!
+//! # Snapshot handoff (F1, RFC-0005 S3)
+//!
+//! The mirror hands pumps a cursor-versioned `Arc<SavedGraph>` snapshot
+//! ([`GraphMirror::view_arc`]) so the mutex is released before overlay
+//! assembly: the critical section is `synchronize` + poison/parity +
+//! `view_arc` only, never `build` (FR-8, NFR-7). The snapshot is keyed by
+//! the cursor — delta advances make the next call rebuild (one O(V) clone
+//! per published delta window), stamp-only republishes reuse the cached
+//! `Arc` (zero clone), and `force_reset` drops the slot explicitly
+//! (drift repair can land at the poisoned snapshot's own version). At most
+//! one snapshot slot exists at any time: resident overhead is two copies
+//! of the saved view, bounded like the mirror itself (NFR-5, asserted by
+//! the scale bench accounting).
+//!
 //! # Reset policy (§6.5.2, FR-5)
 //!
 //! [`Synchronize::Reset`] fires on: epoch change, `cursor.generation <
@@ -239,12 +253,19 @@ pub struct MirrorStats {
     /// O(U²) to O(U log U)). Printed by the scale bench; never a behavior
     /// input.
     pub unresolved_targets: u64,
+    /// Cold builds of the F1 handoff snapshot (`view_arc` cache misses).
+    /// The steady-state identity is one per delta/reset that reaches a
+    /// pump — stamp-only republishes hit the cached `Arc` and never
+    /// increment it (RFC-0005 §5.2 counter table).
+    pub snapshots_built_total: u64,
 }
 
-/// The outcome of one [`GraphMirror::synchronize`] step. The updated view
-/// is read through [`GraphMirror::view`] while the mirror is borrowed — a
-/// pump that needs the complete saved state gets it without the mirror
-/// cloning the whole vault first.
+/// The outcome of one [`GraphMirror::synchronize`] step. A pump that needs
+/// the complete saved state takes the [`GraphMirror::view_arc`] snapshot
+/// (cursor-versioned `Arc`, RFC-0005 F1) and drops the mutex with it —
+/// overlay assembly runs outside the lock; the cached snapshot makes a
+/// stamp-only republish free. [`GraphMirror::view`] remains for consumers
+/// that legitimately compare under the mutex (the parity guard).
 #[derive(Debug)]
 pub enum Synchronize {
     /// The mirror cursor already equals the current index version; the
@@ -289,6 +310,14 @@ pub struct GraphMirror {
     policy: ParityPolicy,
     cursor: IndexVersion,
     state: Option<MirrorState>,
+    /// RFC-0005 F1 handoff cache (§4.6): the last `Arc<SavedGraph>`
+    /// snapshot, keyed by the cursor it was built at. The pump takes this
+    /// handle and releases the mutex before assembling the projection, so
+    /// `build` never runs under the lock (FR-8) and a stamp-only republish
+    /// reuses the cached `Arc` — zero O(vault) work on the keystroke path.
+    /// One slot, replaced wholesale by the mutex holder: a torn snapshot
+    /// is structurally impossible (§4.11).
+    handoff: Option<(IndexVersion, Arc<SavedGraph>)>,
     poisoned: bool,
     delta_generations_since_parity: u64,
     last_parity: Instant,
@@ -731,6 +760,7 @@ impl GraphMirror {
             // cold mirror can only ever synchronize into a Reset.
             cursor: IndexVersion::new(0, 0),
             state: None,
+            handoff: None,
             poisoned: false,
             delta_generations_since_parity: 0,
             last_parity: Instant::now(),
@@ -749,11 +779,51 @@ impl GraphMirror {
     }
 
     /// The canonical complete saved view at the cursor, if the mirror holds
-    /// a position. `UpToDate` pumps with changed buffers/scopes rebuild the
-    /// projection from this without reading the saved tables at all.
+    /// a position. Used by the parity comparison and tests, which need the
+    /// view *under* the mutex. Pumps that need to work outside the lock
+    /// take [`Self::view_arc`] instead (RFC-0005 F1).
     #[must_use]
     pub fn view(&self) -> Option<&SavedGraph> {
         self.state.as_ref().map(|state| &state.view)
+    }
+
+    /// The cursor-versioned `Arc` snapshot of the canonical view (F1,
+    /// RFC-0005 §4.6): the caller holds the mutex, takes the handle, and
+    /// drops the lock — the projection assembles from the snapshot outside
+    /// the critical section (FR-8), and the doctor's parity check waits at
+    /// most one synchronize/parity cycle, never an overlay pass (NFR-7).
+    ///
+    /// Cache discipline:
+    /// - **Hit** while `handoff` is keyed at the current cursor: a free
+    ///   `Arc` clone. This is the keystroke/stamp-only path — the cursor
+    ///   did not move, so the saved view cannot have changed.
+    /// - **Miss**: clone the owned view once, replace the slot wholesale,
+    ///   count it (`snapshots_built_total`). Clone cost moves from *per
+    ///   publish* to *per index delta (or reset) that reaches a pump* —
+    ///   the §4.6 tradeoff, with at most one extra resident view copy
+    ///   (NFR-5, asserted by the scale bench's accounting).
+    ///
+    /// Invalidation: a successful `apply_delta` needs none — `synchronize`
+    /// only advances the cursor strictly forward within an epoch (the
+    /// `UpToDate` early return proves the cursor equals the feed head;
+    /// anything past it arrives as a delta with a new `to`), so the next
+    /// call misses and rebuilds. Epoch change replaces `state` wholesale
+    /// and `force_reset` clears the slot with it (drift repair can land at
+    /// the same version — see [`Self::force_reset`]). Readers never see a
+    /// torn snapshot: the slot is written only by the mutex holder and
+    /// replaced in one assignment.
+    #[must_use]
+    pub fn view_arc(&mut self) -> Option<Arc<SavedGraph>> {
+        let view = self.state.as_ref().map(|state| &state.view)?;
+        if let Some((version, snapshot)) = &self.handoff
+            && *version == self.cursor
+        {
+            return Some(Arc::clone(snapshot));
+        }
+        let snapshot = Arc::new(view.clone());
+        self.handoff = Some((self.cursor, Arc::clone(&snapshot)));
+        self.stats.snapshots_built_total += 1;
+        Some(snapshot)
     }
 
     /// Whether the delta machinery failed mid-apply (or a freshly spliced
@@ -854,7 +924,16 @@ impl GraphMirror {
 
     /// The §6.5.2 reset path: the full consistent read (existing functions,
     /// reused verbatim) installed as the canonical view. Afterwards the
-    /// complete view is readable through [`Self::view`].
+    /// complete view is readable through [`Self::view`] or a fresh
+    /// [`Self::view_arc`] snapshot.
+    ///
+    /// The handoff slot is dropped with the state it was built from: a
+    /// repair reset can land at the very version a poisoned snapshot is
+    /// keyed at (poison/parity repair with no newer commit), and the
+    /// drifted bytes must never be handed to a pump again. Version-key
+    /// equality alone would miss that case — `force_reset` is the one
+    /// transition that must clear explicitly (see [`Self::view_arc`] for
+    /// why a successful delta does not).
     ///
     /// # Errors
     /// Returns the failure text when the full read fails.
@@ -863,6 +942,7 @@ impl GraphMirror {
         let version = graph.version;
         let unresolved_targets = graph.unresolved_nodes.len();
         self.state = Some(MirrorState::from_view(graph));
+        self.handoff = None;
         self.cursor = version;
         self.poisoned = false;
         self.delta_generations_since_parity = 0;
@@ -1772,5 +1852,104 @@ mod tests {
         let conn = flavite_index::open_or_init(db).unwrap();
         conn.pragma_update(None, "journal_mode", "WAL").unwrap();
         conn
+    }
+
+    /// RFC-0005 S3 (F1): the handoff snapshot equals the owned view, the
+    /// cache hits while the cursor is unchanged (free `Arc` clone, counter
+    /// flat), a delta makes the next call miss exactly once, and
+    /// `force_reset` — even landing at the *same* version — never serves
+    /// the pre-repair snapshot again. The last case is the hole the
+    /// version-key check alone would leave open (drift repair with no new
+    /// commit): the poisoned bytes share the cursor the repair rebuilt to.
+    #[test]
+    fn view_arc_caches_by_cursor_and_reset_drops_the_slot() {
+        const SOURCES: i64 = 2;
+        const GHOSTS_PER_SOURCE: i64 = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("handoff.sqlite");
+        let reader = open_reader(&db);
+        seed_ghost_matrix(&reader, SOURCES, GHOSTS_PER_SOURCE);
+
+        let mut mirror = GraphMirror::new(None);
+        assert!(
+            mirror.view_arc().is_none(),
+            "no cursor position yet: no snapshot may be handed out"
+        );
+
+        mirror.force_reset(&reader).unwrap();
+        let first = mirror.view_arc().expect("snapshot after reset");
+        // S3 assertion: the snapshot equals the owned view byte-wise.
+        assert_eq!(&*first, mirror.view().expect("owned view"));
+        assert_eq!(mirror.stats().snapshots_built_total, 1);
+
+        // Cache hit: same cursor ⇒ the very same Arc, counter flat.
+        let again = mirror.view_arc().expect("cached snapshot");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "cursor-keyed reuse must hand out the same Arc"
+        );
+        assert_eq!(mirror.stats().snapshots_built_total, 1);
+
+        // A delta advances the cursor ⇒ the next call misses exactly once
+        // and the new snapshot equals the fresh owned view.
+        let mut actor = flavite_index::IndexActor::new(&db, 1).unwrap();
+        actor
+            .apply_saved_note(
+                b"src9.md",
+                "src9.md",
+                b"# Nine\nAnother ghost [[handoff-new]].\n",
+                10,
+                11,
+            )
+            .unwrap();
+        let outcome = mirror.synchronize(&reader).unwrap();
+        assert!(matches!(outcome, Synchronize::Delta { .. }));
+        assert_eq!(
+            mirror.stats().snapshots_built_total,
+            1,
+            "synchronize itself builds no snapshot — the pump's view_arc does"
+        );
+        let second = mirror.view_arc().expect("rebuilt snapshot");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a moved cursor must rebuild once"
+        );
+        assert_eq!(mirror.stats().snapshots_built_total, 2);
+        assert_eq!(&*second, mirror.view().expect("owned view"));
+        // And it keeps hitting until the next move.
+        let third = mirror.view_arc().expect("cached again");
+        assert!(Arc::ptr_eq(&second, &third));
+        assert_eq!(mirror.stats().snapshots_built_total, 2);
+
+        // Same-version repair: poison the slot's CONTENTS while keeping
+        // its key at the cursor (exactly the drifted-snapshot state a
+        // failed splice can leave behind), then force_reset without any
+        // new commit. The version key alone would now hit on the suspect
+        // bytes; `force_reset` must have dropped the slot instead.
+        let repair_version = mirror.cursor;
+        let mut tampered = mirror.view().expect("view").clone();
+        tampered
+            .unresolved_nodes
+            .push(unresolved_record(u64::MAX, "tampered-by-drift"));
+        mirror.handoff = Some((repair_version, Arc::new(tampered)));
+        mirror.force_reset(&reader).unwrap();
+        assert_eq!(
+            mirror.cursor, repair_version,
+            "the repair must land at the same version to exercise the hole"
+        );
+        let repaired = mirror.view_arc().expect("post-repair snapshot");
+        assert!(
+            !repaired
+                .unresolved_nodes
+                .iter()
+                .any(|node| node.title.contains("tampered")),
+            "force_reset must never re-serve the poisoned snapshot"
+        );
+        assert_eq!(&*repaired, mirror.view().expect("owned view"));
+        assert_eq!(
+            mirror.stats().snapshots_built_total,
+            3,
+            "the cleared slot rebuilds exactly once after repair"
+        );
     }
 }

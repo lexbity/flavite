@@ -389,3 +389,299 @@ fn doctor_reports_explicit_skip_without_a_live_mirror() {
         let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
     }
 }
+
+// ---------------------------------------------------------------------------
+// RFC-0005 S3 — the snapshot handoff (F1): cache discipline, exact rebuild
+// accounting, and the doctor's bounded wait.
+// ---------------------------------------------------------------------------
+
+#[path = "support/links.rs"]
+mod links_fixture;
+
+/// (a) Snapshot reuse: buffer-stamp-only republishes over a quiet index —
+/// the generalized shape of the S6 scope-change test — must reuse the
+/// cursor-keyed handoff: zero new deltas, zero new snapshot builds, while
+/// frames genuinely republish (batches climb and the stamp converges).
+/// This is the keystroke path the F1 cache exists to make clone-free.
+#[test]
+fn stamp_only_republishes_reuse_the_snapshot_handoff() {
+    use flavite_api::{ExecutionResult, Invocation, LocalResult, Origin};
+
+    let f = links_fixture::fixture(&[("keep.md", "# Keep\nbase body\n")]);
+    // Settle: first frame published, every index delta of the reconcile
+    // consumed (the frame's generation has reached the index head), and
+    // counters published by that same pump — the baseline is then
+    // immovable while only buffers change.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        f.flavite.pump();
+        f.flavite.graph_notify_changed();
+        let head = f.flavite.vault_info().expect("vault info").generation;
+        let caught_up = f.flavite.graph_frame().is_some_and(|frame| {
+            frame.publication().generation >= head && f.flavite.graph_is_current()
+        });
+        if caught_up {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first current, caught-up frame never arrived: {:?}",
+            f.flavite.graph_status()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let before = f.flavite.graph_metrics();
+    assert!(before.mirror_snapshots_built_total >= 1, "{before:?}");
+    // The handoff invariant holds at quiescence (see test (b)).
+    assert_eq!(
+        before.mirror_snapshots_built_total,
+        before.mirror_deltas_total + before.mirror_resets_total,
+        "settled metrics must satisfy snapshots == deltas + resets: {before:?}"
+    );
+
+    let (buffer_id, _revision) = f.open_note("keep.md");
+    let mut last_digest = f
+        .flavite
+        .graph_frame()
+        .expect("settled frame")
+        .projection()
+        .digest;
+    for step in 1..=5u64 {
+        let view = f
+            .flavite
+            .get_buffer_view(flavite_buffer::BufferId::from(buffer_id), None)
+            .expect("buffer view");
+        let result = f.flavite.execute(Invocation::new(
+            links_fixture::next_id(&f.flavite),
+            "apply_edits",
+            serde_json::json!({
+                "buffer_id": buffer_id,
+                "revision": view.revision,
+                "ops": [{ "range": [0, view.text.len()],
+                          "replacement": format!("# Keep\nstamped edit {step}\n") }],
+            }),
+            Origin::Gui,
+        ));
+        assert!(
+            matches!(result, ExecutionResult::Local(LocalResult::Success(_))),
+            "edit {step} must apply locally: {result:?}"
+        );
+        // Wait for the republished frame to carry this stamp
+        // (`graph_is_current` compares the frame's buffer stamp against
+        // the session's) and to be genuinely new: the digest moves every
+        // step because the overlay content changed.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            f.flavite.pump();
+            f.flavite.graph_notify_changed();
+            let settled = f.flavite.graph_frame().filter(|frame| {
+                f.flavite.graph_is_current()
+                    && frame.projection().buffer_stamp.len() == 1
+                    && frame.projection().digest != last_digest
+            });
+            if let Some(frame) = settled {
+                last_digest = frame.projection().digest;
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stamp-only republish stalled at step {step}: {:?}",
+                f.flavite.graph_metrics()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let after = f.flavite.graph_metrics();
+    assert_eq!(
+        after.mirror_deltas_total, before.mirror_deltas_total,
+        "buffer edits never move the index cursor"
+    );
+    assert_eq!(
+        after.mirror_snapshots_built_total, before.mirror_snapshots_built_total,
+        "the keystroke path must reuse the cached Arc — no view clone"
+    );
+    assert!(
+        after.batches_total > before.batches_total,
+        "frames must genuinely republish over the quiet index: {before:?} -> {after:?}"
+    );
+}
+
+/// (b) Cache rebuild accounting: every delta window that reaches a pump
+/// rebuilds the snapshot exactly once, and idle cadence pumps hit the
+/// cache. The invariant `snapshots_built == deltas + resets` is the
+/// machine-checkable statement of §4.6's "clone cost moves from per
+/// publish to per index delta that reaches a publish".
+#[test]
+fn each_delta_window_rebuilds_the_snapshot_exactly_once() {
+    let mut fixture = Fixture::start(ParityPolicy::default());
+    fixture.settle_once();
+    let cold = fixture.service.metrics();
+    assert_eq!(cold.mirror_resets_total, 1, "service start is one reset");
+    assert_eq!(
+        cold.mirror_snapshots_built_total,
+        cold.mirror_deltas_total + cold.mirror_resets_total,
+        "the cold pump builds exactly its one snapshot: {cold:?}"
+    );
+
+    for step in 0..6u64 {
+        fixture.apply(
+            &format!("w{step}.md"),
+            format!("# Window {step}\n[[w{}]]\n", (step + 1) % 6).as_bytes(),
+            100 + i64::try_from(step).unwrap(),
+        );
+        fixture.wait_current();
+        let metrics = fixture.service.metrics();
+        assert_eq!(
+            metrics.mirror_snapshots_built_total,
+            metrics.mirror_deltas_total + metrics.mirror_resets_total,
+            "handoff invariant violated at step {step}: {metrics:?}"
+        );
+        assert_eq!(
+            metrics.mirror_resets_total, 1,
+            "no surprise resets while the feed advances: {metrics:?}"
+        );
+    }
+    let busy = fixture.service.metrics();
+    assert!(
+        busy.mirror_snapshots_built_total > busy.mirror_deltas_total,
+        "the cold reset window adds its own build on top of the delta set: {busy:?}"
+    );
+
+    // Idle cadence pumps (the 250 ms tick keeps waking the pump with
+    // nothing moved): every wake is a cache hit — the counter, the delta
+    // set, and the reset set all stay flat.
+    let before_idle = fixture.service.metrics().mirror_snapshots_built_total;
+    std::thread::sleep(Duration::from_millis(600));
+    let idle = fixture.service.metrics();
+    assert!(
+        idle.polls_total > busy.polls_total,
+        "the cadence must have pumped while idle: {busy:?} -> {idle:?}"
+    );
+    assert_eq!(
+        idle.mirror_snapshots_built_total, before_idle,
+        "UpToDate pumps must reuse the cached snapshot"
+    );
+    assert_eq!(
+        idle.mirror_snapshots_built_total,
+        idle.mirror_deltas_total + idle.mirror_resets_total,
+        "the invariant survives idle: {idle:?}"
+    );
+    fixture.service.shutdown();
+}
+
+/// (c) NFR-7 / FR-8 (AC-5): the service pumps a scripted delta stream
+/// while another thread calls `check_mirror_parity` in a loop. Every
+/// parity call completes within 200 ms wall — the mutex is never held
+/// across overlay assembly anymore, so the worst wait is one
+/// synchronize/parity cycle — and every verdict settles matched (a
+/// legitimately behind mirror catches up inside the call itself).
+#[test]
+fn doctor_parity_never_waits_behind_overlay_assembly() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let mut fixture = Fixture::start(ParityPolicy::default());
+    // Seed real topology so each pump's build does genuine overlay work.
+    for step in 0..24u64 {
+        let stamp = i64::try_from(10 + step).unwrap();
+        fixture.apply(
+            &format!("seed{step}.md"),
+            format!("# Seed {step}\nlinks [[seed{}]]\n", (step + 1) % 24).as_bytes(),
+            stamp,
+        );
+    }
+    fixture.wait_current();
+
+    let service = Arc::clone(&fixture.service);
+    let conn = fixture.read();
+    let stop = Arc::new(AtomicBool::new(false));
+    let worst_micros = Arc::new(AtomicU64::new(0));
+    let calls = Arc::new(AtomicU64::new(0));
+    let matched = Arc::new(AtomicU64::new(0));
+    let (stop_t, worst_t, calls_t, matched_t) = (
+        Arc::clone(&stop),
+        Arc::clone(&worst_micros),
+        Arc::clone(&calls),
+        Arc::clone(&matched),
+    );
+    let driver = std::thread::spawn(move || {
+        let mut max_wall = Duration::ZERO;
+        while !stop_t.load(Ordering::Acquire) {
+            let started = std::time::Instant::now();
+            let call = service.check_mirror_parity(&conn);
+            let wall = started.elapsed();
+            if wall > max_wall {
+                max_wall = wall;
+            }
+            worst_t.fetch_max(
+                u64::try_from(wall.as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            calls_t.fetch_add(1, Ordering::Relaxed);
+            match call {
+                Ok(outcome) => {
+                    assert!(
+                        outcome.matched(),
+                        "the pump and the guard must keep the mirror true: {outcome:?}"
+                    );
+                    matched_t.fetch_add(1, Ordering::Relaxed);
+                }
+                // Legitimate stale-under-load verdict (§6.5.4): the bounded
+                // catch-up loop declines to render a verdict while the
+                // writer continuously outruns it. That refusal — never a
+                // mismatch, never a hang — is the honest outcome here.
+                Err(error) => assert!(
+                    error.contains("could not settle"),
+                    "unexpected parity failure: {error}"
+                ),
+            }
+        }
+        max_wall
+    });
+
+    // A live delta stream while the doctor loops.
+    for step in 0..40u64 {
+        let stamp = i64::try_from(200 + step).unwrap();
+        fixture.apply(
+            &format!("live{step}.md"),
+            format!("# Live {step}\n[[seed{}]]\n", step % 24).as_bytes(),
+            stamp,
+        );
+    }
+    fixture.wait_current();
+    // Quiescent landing: with the writer done, the guard settles matched
+    // — the "stale-then-matched" verdict the stream deliberately raced.
+    let settled = fixture
+        .service
+        .check_mirror_parity(&fixture.read())
+        .expect("quiescent parity settles");
+    assert!(settled.matched(), "quiescent verdict: {settled:?}");
+    // Let the driver land a few more calls on the settled state, then stop.
+    let settle_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while matched.load(Ordering::Relaxed) < 2 && std::time::Instant::now() < settle_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    stop.store(true, Ordering::Release);
+    let max_wall = driver.join().expect("parity driver finished cleanly");
+
+    println!(
+        "doctor parity under pump load: worst wall {max_wall:?}, {} calls, {} matched verdicts",
+        calls.load(Ordering::Relaxed),
+        matched.load(Ordering::Relaxed)
+    );
+    assert!(
+        calls.load(Ordering::Relaxed) >= 3,
+        "the parity loop must overlap the pump stream"
+    );
+    assert!(
+        matched.load(Ordering::Relaxed) >= 2,
+        "every settled verdict must be matched once the stream lands"
+    );
+    assert!(
+        max_wall <= Duration::from_millis(200),
+        "NFR-7 violated: a parity call waited {max_wall:?} for the mirror mutex"
+    );
+    let metrics = fixture.service.metrics();
+    assert_eq!(metrics.mirror_mismatches_total, 0, "{metrics:?}");
+    fixture.service.shutdown();
+}

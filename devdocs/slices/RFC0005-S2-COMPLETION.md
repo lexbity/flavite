@@ -135,7 +135,10 @@ machine):
 - `cargo clippy -p flavite-api --all-targets -- -D warnings` (and
   workspace) — green — ✔.
 - `cargo test -p flavite-api --lib` incl. the new test; `just gate` —
-  green (recorded below when the background run completed).
+  **green, end to end**: "G0 passed (fmt + clippy + test + arch check)"
+  after "arch check passed (drift + edges + layering)"; `just` aborts on
+  the first failing recipe, so fmt, clippy, the full workspace test
+  suite, fault-tests, lint-arch, and arch-check all succeeded in one run.
 - Scale bench at bound — green, numbers recorded above.
 
 ## Costs accepted
