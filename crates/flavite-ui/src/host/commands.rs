@@ -972,7 +972,7 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
             };
             return app.update(Message::SelectionCommand { tab, anchor, head });
         }
-        "workspace.refresh_catalog" => app.load_catalog(),
+        "workspace.refresh_catalog" => app.request_catalog_refresh(),
         "help.about" => {
             app.dialog = Some(crate::host::dialogs::Dialog::About);
         }

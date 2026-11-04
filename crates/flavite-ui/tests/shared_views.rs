@@ -241,7 +241,17 @@ fn editor_link_navigation_resolves_through_the_api_catalog() {
         std::thread::sleep(Duration::from_millis(5));
     }
     let _ = app.update(Message::RefreshCatalog);
-    assert!(!app.catalog().is_empty(), "canonical catalog is ready");
+    // RFC-0004 W-D: ticketed acquisition — the page lands under pumping.
+    let catalog_deadline = Instant::now() + Duration::from_secs(10);
+    while app.catalog().is_empty() {
+        assert!(
+            Instant::now() < catalog_deadline,
+            "canonical catalog never arrived: {:?}",
+            app.catalog_status()
+        );
+        let _ = app.update(Message::Pump);
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let group = app.focused_group().unwrap();
     let locator = flavite_workspace::NoteLocator::from_components(["source.md"]).unwrap();
     let _ = app.update(Message::OpenNote {

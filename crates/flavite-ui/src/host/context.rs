@@ -258,7 +258,8 @@ impl ContextRegistry {
             QueryResult::Document(doc) => ToolState::Ready(ToolContent::Document(doc.clone())),
             QueryResult::Occurrence(_)
             | QueryResult::AttachmentOpen(_)
-            | QueryResult::Anchor { .. } => return false,
+            | QueryResult::Anchor { .. }
+            | QueryResult::Catalog { .. } => return false,
             QueryResult::Updating => {
                 tool.invalidated = true;
                 if matches!(tool.state, ToolState::Ready(_) | ToolState::NoBacklinks) {

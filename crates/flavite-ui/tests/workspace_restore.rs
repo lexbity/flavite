@@ -130,14 +130,6 @@ fn restart_restores_groups_tabs_and_reports_missing_notes() {
         app.pending_operations() == 0
     });
     let _ = restarted.update(Message::RefreshCatalog);
-    let _ = restarted.update(Message::Pump);
-    if restarted.catalog().is_empty() {
-        panic!(
-            "debug: restarted catalog empty, status={:?}",
-            restarted.status
-        );
-    }
-    let _ = restarted.update(Message::RefreshCatalog);
     wait_for(&mut restarted, "catalog", |app| !app.catalog().is_empty());
     // Seed the saved layout into the restarted app BEFORE attach (the
     // production ordering: storage exists, then attach restores). Build a

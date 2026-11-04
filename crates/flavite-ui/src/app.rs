@@ -13,7 +13,7 @@ use crate::palette::matching_specs;
 use crate::settings::Settings;
 use crate::subscription;
 use crate::workspace::{Adapter, StripMenu, gestures};
-use flavite_api::queries::{MAX_NOTE_CATALOG_LIMIT, NoteCatalogEntry};
+use flavite_api::queries::NoteCatalogEntry;
 use flavite_api::{ExecutionResult, Flavite, Invocation, LocalResult, Origin, VaultConfig};
 use flavite_editor::{EditorAction, EditorInteractionSnapshot, EditorView};
 use flavite_workspace::{
@@ -21,7 +21,7 @@ use flavite_workspace::{
 };
 use iced::{Subscription, Task, keyboard};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Outstanding notice credits per poll (W03: bounded credit-based polling)
 /// — the same bound as the core ledger, imported rather than duplicated.
@@ -129,7 +129,14 @@ pub struct App {
     /// re-solve that used to run on every message.
     pub(crate) window_geometry_dirty: bool,
     catalog: Vec<NoteCatalogEntry>,
-    catalog_error: Option<String>,
+    /// Ticketed acquisition state machine (RFC-0004 §6.4, D9).
+    catalog_status: CatalogStatus,
+    /// Saved-layout restore waits for the first terminal catalog outcome
+    /// (W-D): `plan_restore` validates membership against the catalog,
+    /// which is no longer synchronously available on the attach turn.
+    restore_pending: bool,
+    catalog_last_submit: Option<Instant>,
+    catalog_retry_due: bool,
     settings: Settings,
     settings_valid: bool,
     pub operations: OperationPump,
@@ -445,6 +452,30 @@ pub enum Message {
     },
 }
 
+/// Catalog acquisition state (RFC-0004 §6.4, D9): the catalog is a
+/// ticketed QueryService read, so the host turn never blocks on it.
+/// `Loading` never clears an existing ready snapshot (no picker flicker);
+/// `Failed` is visible retryable text while the snapshot stays served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogStatus {
+    /// No vault attached yet (or nothing ever requested).
+    Empty,
+    /// A ticket is admitted; the previous snapshot (if any) keeps serving.
+    Loading,
+    /// Snapshot served from index `epoch`/`generation`; `truncated` means
+    /// the vault holds more notes than the 50k catalog bound (R9).
+    Ready {
+        epoch: u64,
+        generation: u64,
+        truncated: bool,
+    },
+    /// The last acquisition failed with a retryable message.
+    Failed { message: String },
+}
+
+/// `VaultChanged` catalog pulses coalesce to at most one ticket per window.
+pub const CATALOG_REFRESH_THROTTLE: Duration = Duration::from_secs(1);
+
 impl App {
     /// Open the configured vault and construct the shell.
     #[must_use]
@@ -551,7 +582,10 @@ impl App {
             pointer_feedback: false,
             window_geometry_dirty: true,
             catalog: Vec::new(),
-            catalog_error: None,
+            catalog_status: CatalogStatus::Empty,
+            catalog_last_submit: None,
+            catalog_retry_due: false,
+            restore_pending: false,
             settings: Settings::default(),
             settings_valid: true,
             operations: OperationPump::default(),
@@ -612,8 +646,11 @@ impl App {
                 }
             }
         }
-        self.load_catalog();
-        self.restore_workspace_layout();
+        // RFC-0004 W-D: the catalog arrives as a ticketed page, so the
+        // saved-layout restore (which validates membership against the
+        // catalog) defers to the first terminal acquisition outcome.
+        self.restore_pending = true;
+        self.request_catalog_refresh();
         crate::host::graph::sync_hosts(self);
         self.refresh_semantics();
         // Device-local launch memory (W10): best effort, never a gate for
@@ -819,23 +856,106 @@ impl App {
         }
     }
 
-    /// Load a bounded note catalog snapshot; failures stay visible.
-    pub(crate) fn load_catalog(&mut self) {
-        let Some(flavite) = &self.flavite else {
+    /// Request a catalog refresh (replaces the pre-S5 blocking load): the
+    /// whole read goes out as a QueryService ticket, so this turn pays only
+    /// an admission (NFR-4). Results apply in the pump drain path.
+    /// Explicit triggers (startup, vault-open completion, create/rename
+    /// completions, retry) submit even while a ticket is in flight — the
+    /// newest ticket supersedes, so responding to an event can never be
+    /// swallowed by an older read that started before the event landed.
+    pub(crate) fn request_catalog_refresh(&mut self) {
+        self.try_submit_catalog_ticket();
+    }
+
+    /// A `VaultChanged` pulse refreshes at most once per throttle window
+    /// (§6.4: ≥ 1 s); later pulses coalesce into one retry.
+    pub(crate) fn note_vault_changed_pulse(&mut self) {
+        if self
+            .catalog_last_submit
+            .is_none_or(|when| when.elapsed() >= CATALOG_REFRESH_THROTTLE)
+        {
+            self.try_submit_catalog_ticket();
+        } else {
+            self.catalog_retry_due = true;
+        }
+    }
+
+    fn try_submit_catalog_ticket(&mut self) {
+        let Some(flavite) = self.flavite.as_ref() else {
             return;
         };
-        match flavite.note_catalog(MAX_NOTE_CATALOG_LIMIT) {
-            Ok(catalog) => {
-                self.catalog = catalog.entries;
-                self.catalog_error = None;
+        match flavite.submit_catalog() {
+            Ok(_token) => {
+                self.catalog_status = CatalogStatus::Loading;
+                self.catalog_last_submit = Some(Instant::now());
+                self.catalog_retry_due = false;
             }
-            Err(error) => {
-                self.catalog_error = Some(error.to_string());
+            Err(flavite_api::QuerySubmitError::Busy) => {
+                // No silent loss: keep the last status and snapshot, retry
+                // from the pump once the throttle window has passed.
+                self.catalog_retry_due = true;
             }
         }
-        // One candidate snapshot feeds the picker, Notes view, dialogs, and
-        // open-in-tab flows (W10 de-duplication).
-        self.note_candidates = crate::picker::NoteCandidates::from_catalog(&self.catalog);
+    }
+
+    /// Apply one drained catalog outcome. `Loading` and `Failed` never
+    /// clear the existing snapshot (picker keeps serving candidates, no
+    /// flicker); `Failed` surfaces visible retryable text.
+    pub(crate) fn apply_catalog_outcome(&mut self, result: &flavite_api::ContextQueryResult) {
+        match result {
+            flavite_api::ContextQueryResult::Catalog {
+                entries,
+                provenance,
+                truncated,
+                ..
+            } => {
+                self.catalog = entries.to_vec();
+                // One candidate snapshot feeds the picker, Notes view,
+                // dialogs, and open-in-tab flows (W10 de-duplication).
+                self.note_candidates = crate::picker::NoteCandidates::from_catalog(&self.catalog);
+                self.catalog_status = CatalogStatus::Ready {
+                    epoch: provenance.epoch,
+                    generation: provenance.generation,
+                    truncated: *truncated,
+                };
+            }
+            flavite_api::ContextQueryResult::Failed { message } => {
+                self.catalog_status = CatalogStatus::Failed {
+                    message: message.clone(),
+                };
+            }
+            other => {
+                self.catalog_status = CatalogStatus::Failed {
+                    message: format!("unexpected catalog outcome: {other:?}"),
+                };
+            }
+        }
+        // The first terminal outcome (page served or honest failure)
+        // unblocks the deferred workspace restore.
+        self.run_pending_restore();
+    }
+
+    fn run_pending_restore(&mut self) {
+        if !self.restore_pending {
+            return;
+        }
+        self.restore_pending = false;
+        self.restore_workspace_layout();
+    }
+
+    /// Consume a coalesced retry once the previous ticket has settled and
+    /// the throttle window has passed.
+    pub(crate) fn catalog_retry_tick(&mut self) {
+        if !self.catalog_retry_due
+            || matches!(self.catalog_status, CatalogStatus::Loading)
+            || !self
+                .catalog_last_submit
+                .is_some_and(|when| when.elapsed() >= CATALOG_REFRESH_THROTTLE)
+        {
+            return;
+        }
+        self.catalog_retry_due = false;
+        self.try_submit_catalog_ticket();
     }
 
     /// The unified note-candidate snapshot (W10 matcher service).
@@ -1298,10 +1418,20 @@ impl App {
         &self.status
     }
 
-    /// The catalog's last load error, if any.
+    /// The catalog's last acquisition error, if any (visible text pattern
+    /// backed by the ticketed status machine).
     #[must_use]
     pub fn catalog_error(&self) -> Option<&str> {
-        self.catalog_error.as_deref()
+        match &self.catalog_status {
+            CatalogStatus::Failed { message } => Some(message),
+            _ => None,
+        }
+    }
+
+    /// The catalog acquisition state (ticketed; RFC-0004 §6.4).
+    #[must_use]
+    pub const fn catalog_status(&self) -> &CatalogStatus {
+        &self.catalog_status
     }
 
     /// The vault root (locators join against it).
@@ -2123,6 +2253,7 @@ impl App {
             Message::WindowEvent(_) => {}
             Message::Pump => {
                 self.pump();
+                self.catalog_retry_tick();
                 self.refresh_semantics();
                 // W12: the quit schedule advances with the pump; the exit
                 // task closes the window only from ReadyToExit.
@@ -2339,7 +2470,7 @@ impl App {
                     replace_tab: None,
                 };
                 if self.catalog.is_empty() {
-                    self.load_catalog();
+                    self.request_catalog_refresh();
                 }
                 return iced::widget::operation::focus(crate::workspace_shell::PICKER_INPUT_ID);
             }
@@ -2362,7 +2493,7 @@ impl App {
             Message::PickerPick(index) => return self.run_picker_selection(index),
             Message::RunHostCommand(id) => return host_commands::dispatch(self, id),
             Message::RunCoreCommand(id) => self.run_core_command(id),
-            Message::RefreshCatalog => self.load_catalog(),
+            Message::RefreshCatalog => self.request_catalog_refresh(),
             Message::TopMenu(menu) => {
                 // The standard menu bar never interrupts composition (D-03).
                 if !self.has_composition() {
@@ -2752,7 +2883,7 @@ impl App {
             let completions = flavite.drain_operation_completions();
             if refresh_catalog {
                 // Scoped borrow ends before mutation below.
-                self.load_catalog();
+                self.note_vault_changed_pulse();
             }
             (events, completions)
         };
@@ -2782,6 +2913,12 @@ impl App {
             // by the registry, so a rebind or replaced view is never
             // repainted by an older query.
             for outcome in query_outcomes {
+                if outcome.token.purpose == flavite_api::QueryPurpose::Catalog
+                    && outcome.token.context_tab == flavite_api::CATALOG_CONTEXT_TAB
+                {
+                    self.apply_catalog_outcome(&outcome.result);
+                    continue;
+                }
                 if crate::host::reading::observe(self, &outcome)
                     || crate::host::occurrences::observe(self, &outcome)
                     || self.search.observe(&outcome)
@@ -2873,7 +3010,7 @@ impl App {
             && let Ok(locator) = NoteLocator::from_relative(relative)
         {
             self.status = format!("Created {}", locator.components().join("/"));
-            self.load_catalog();
+            self.request_catalog_refresh();
             self.request_open(locator, None);
             return;
         }
@@ -2901,7 +3038,7 @@ impl App {
                 to: to_locator.clone(),
             });
             self.nav.relocate(&from_locator, &to_locator);
-            self.load_catalog();
+            self.request_catalog_refresh();
             self.refresh_semantics();
             return;
         }
@@ -3598,6 +3735,144 @@ fn prepared_merge_from(
 mod tests {
     use super::*;
 
+    fn catalog_page(
+        entries: &[(&str, &str)],
+        epoch: u64,
+        generation: u64,
+        truncated: bool,
+        total: u64,
+    ) -> flavite_api::ContextQueryResult {
+        let entries: std::sync::Arc<[NoteCatalogEntry]> = std::sync::Arc::from(
+            entries
+                .iter()
+                .map(|(path, title)| NoteCatalogEntry {
+                    path: PathBuf::from(path),
+                    native_path: path.as_bytes().to_vec(),
+                    title: (*title).to_owned(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        flavite_api::ContextQueryResult::Catalog {
+            entries,
+            provenance: flavite_api::Provenance { epoch, generation },
+            total,
+            truncated,
+        }
+    }
+
+    /// S5 (D9, R9): the ticketed state machine serves the last good
+    /// snapshot through `Loading` and `Failed` (no flicker), surfaces
+    /// retryable text on failure, and propagates the 50k truncation flag.
+    #[test]
+    fn catalog_status_machine_preserves_snapshots_and_flags() {
+        let mut app = empty_app();
+        assert_eq!(*app.catalog_status(), CatalogStatus::Empty);
+        assert_eq!(app.catalog_error(), None);
+
+        app.apply_catalog_outcome(&catalog_page(
+            &[("alpha.md", "Alpha"), ("beta.md", "Beta")],
+            1,
+            7,
+            true,
+            50_001,
+        ));
+        assert_eq!(
+            *app.catalog_status(),
+            CatalogStatus::Ready {
+                epoch: 1,
+                generation: 7,
+                truncated: true
+            }
+        );
+        assert_eq!(app.catalog().len(), 2);
+        assert_eq!(app.note_candidates().all().len(), 2);
+        assert_eq!(app.catalog_error(), None, "Ready clears the failure text");
+
+        // Failed: visible retryable text, snapshot and candidates retained.
+        app.apply_catalog_outcome(&flavite_api::ContextQueryResult::Failed {
+            message: "catalog ticket failed".into(),
+        });
+        assert!(matches!(
+            app.catalog_status(),
+            CatalogStatus::Failed { message } if message == "catalog ticket failed"
+        ));
+        assert_eq!(app.catalog_error(), Some("catalog ticket failed"));
+        assert_eq!(app.catalog().len(), 2, "failures never clear the snapshot");
+        assert_eq!(app.note_candidates().all().len(), 2);
+
+        // An out-of-contract outcome is honest failure text, not a panic.
+        app.apply_catalog_outcome(&flavite_api::ContextQueryResult::Missing);
+        assert!(
+            app.catalog_error()
+                .is_some_and(|error| error.contains("unexpected"))
+        );
+        assert_eq!(app.catalog().len(), 2);
+
+        // A fresh Ready replaces both the text and the snapshot wholesale.
+        app.apply_catalog_outcome(&catalog_page(&[("gamma.md", "Gamma")], 2, 9, false, 1));
+        assert_eq!(
+            *app.catalog_status(),
+            CatalogStatus::Ready {
+                epoch: 2,
+                generation: 9,
+                truncated: false
+            }
+        );
+        assert_eq!(app.catalog().len(), 1);
+        assert_eq!(app.catalog_error(), None);
+    }
+
+    /// Without an attached vault the trigger is inert; with one, every
+    /// refresh is an admission (never a blocking read — the load path that
+    /// used to run `note_catalog` on this turn is gone).
+    #[test]
+    fn catalog_triggers_never_block_without_an_attachment() {
+        let mut app = empty_app();
+        app.request_catalog_refresh();
+        app.note_vault_changed_pulse();
+        app.catalog_retry_tick();
+        assert_eq!(*app.catalog_status(), CatalogStatus::Empty);
+    }
+
+    /// §6.4 throttle: pulses inside the window coalesce into exactly one
+    /// pending retry; the retry fires only after the window elapsed and is
+    /// consumed once (never a queue of redundant host-turn work).
+    #[test]
+    fn vault_pulse_throttle_coalesces_into_one_retry() {
+        let mut app = empty_app();
+        app.catalog_status = CatalogStatus::Ready {
+            epoch: 1,
+            generation: 9,
+            truncated: false,
+        };
+        app.catalog_last_submit = Some(Instant::now());
+
+        app.note_vault_changed_pulse();
+        assert!(app.catalog_retry_due, "in-window pulse must coalesce");
+        assert!(matches!(
+            app.catalog_status(),
+            CatalogStatus::Ready { generation: 9, .. }
+        ));
+
+        // Retry tick respects the window while it is open.
+        app.catalog_retry_tick();
+        assert!(
+            app.catalog_retry_due,
+            "tick before the window keeps the retry"
+        );
+
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("test clock started more than two seconds ago");
+        app.catalog_last_submit = Some(long_ago);
+        app.catalog_retry_tick();
+        assert!(
+            !app.catalog_retry_due,
+            "expired window consumes the single coalesced retry"
+        );
+    }
+
     fn empty_app() -> App {
         let mut ids = Ids::new();
         let workspace = WorkspaceState::with_ids(&mut ids);
@@ -3650,7 +3925,10 @@ mod tests {
             pointer_feedback: false,
             window_geometry_dirty: true,
             catalog: Vec::new(),
-            catalog_error: None,
+            catalog_status: CatalogStatus::Empty,
+            catalog_last_submit: None,
+            catalog_retry_due: false,
+            restore_pending: false,
             settings: Settings::default(),
             settings_valid: true,
             operations: OperationPump::default(),

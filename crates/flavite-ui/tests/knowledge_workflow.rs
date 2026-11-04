@@ -93,13 +93,16 @@ fn create_note_opens_a_tab_and_reaches_disk_on_first_save() {
             .is_note_open(&app.root().join("Notes/New idea.md"))
     );
 
-    // Catalog carries the new note for search and pickers.
-    assert!(
-        app.note_candidates()
+    // Catalog carries the new note for search and pickers. RFC-0004 W-D
+    // made acquisition ticketed: the completion trigger admits a refresh,
+    // the pump applies the page — so this is now eventually, never
+    // synchronously, true (D9's accepted visible change).
+    wait(app, |a| {
+        a.note_candidates()
             .all()
             .iter()
             .any(|candidate| candidate.path().to_string() == "Notes/New idea.md")
-    );
+    });
 }
 
 #[test]

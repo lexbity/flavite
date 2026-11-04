@@ -6,11 +6,18 @@
 //! or superseded sequences never overwrite newer ones, and no SQLite,
 //! index, or vault types cross this boundary.
 
+use crate::queries::MAX_NOTE_CATALOG_LIMIT;
 use flavite_vault::session::Session;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// The catalog acquisition ticket answers with exactly this entry shape;
+/// re-exported so the result type has one definition (RFC-0004 §6.4 — the
+/// `queries::NoteCatalogEntry` debt is resolved by re-export, not a second
+/// struct).
+pub use crate::queries::NoteCatalogEntry as CatalogEntry;
 
 /// Live query slots the service admits (RFC §20: saturating 64 slots yields
 /// typed `Busy`, never unbounded queueing).
@@ -29,6 +36,8 @@ pub enum QueryPurpose {
     Anchor,
     /// Saved-content search pages (W10).
     Search,
+    /// Ticketed note-catalog acquisition (RFC-0004 W-D/D9).
+    Catalog,
 }
 
 /// Caller-correlated identity of one context query (§7.1). The service
@@ -89,6 +98,14 @@ pub enum QueryPayload {
         /// Raw query text, parsed by the canonical query parser.
         text: String,
         /// Page size (bounded by the service).
+        limit: u64,
+    },
+    /// Bounded note-catalog acquisition (RFC-0004 W-D): the whole
+    /// `MAX_NOTE_CATALOG_LIMIT` read runs on a query worker, never on a
+    /// host turn. A newer request sequence supersedes an older pending
+    /// result, so refresh triggers coalesce to the newest ticket.
+    Catalog {
+        /// Catalog bound (the service clamps to `1..=MAX_NOTE_CATALOG_LIMIT`).
         limit: u64,
     },
 }
@@ -184,6 +201,19 @@ pub enum ContextQueryResult {
         has_more: bool,
         /// The parsed page size this result was served for.
         limit: u64,
+    },
+    /// A complete bounded note catalog with provenance (RFC-0004 W-D).
+    /// `Arc`-shared so hosts swap snapshots wholesale; stale snapshots
+    /// are dropped by provenance, never merged (D9/§4.7 UI trust).
+    Catalog {
+        /// Entries in canonical path order.
+        entries: Arc<[CatalogEntry]>,
+        /// Index provenance of the served snapshot.
+        provenance: Provenance,
+        /// Total indexed notes (may exceed `entries.len()`).
+        total: u64,
+        /// True when the 50k bound truncated the catalog.
+        truncated: bool,
     },
     /// The requested note does not exist in the saved vault.
     Missing,
@@ -356,6 +386,7 @@ impl QueryService {
                 } => QueryPurpose::NoteRead,
                 QueryPayload::Occurrence { .. } => QueryPurpose::Occurrence,
                 QueryPayload::Search { .. } => QueryPurpose::Search,
+                QueryPayload::Catalog { .. } => QueryPurpose::Catalog,
                 _ => QueryPurpose::Context,
             },
             context_tab,
@@ -498,6 +529,42 @@ fn execute(
         QueryPayload::Preview { path } => execute_preview(session, path),
         QueryPayload::Backlinks { path } => execute_backlinks(session, graph, path),
         QueryPayload::Search { text, limit } => execute_search(session, text, *limit),
+        QueryPayload::Catalog { limit } => execute_catalog(session, *limit),
+    }
+}
+
+/// Run one ticketed catalog acquisition (RFC-0004 W-D, D9). Blocking on the
+/// query worker is by design — the bounded read leaves the host turn; Busy
+/// and backpressure semantics are identical to Search. The provenance is
+/// stamped with the snapshot so hosts can drop stale pages by version
+/// (§4.7 UI trust boundary); no caller-chosen path is involved (§22 rule).
+fn execute_catalog(session: &Arc<Session>, limit: u64) -> ContextQueryResult {
+    let limit = limit.clamp(1, u64::try_from(MAX_NOTE_CATALOG_LIMIT).unwrap_or(u64::MAX));
+    let bound = usize::try_from(limit).unwrap_or(MAX_NOTE_CATALOG_LIMIT);
+    match session.note_catalog(bound) {
+        Ok(page) => {
+            let entries: Arc<[CatalogEntry]> = Arc::from(
+                page.items
+                    .into_iter()
+                    .map(|item| CatalogEntry {
+                        path: PathBuf::from(item.path),
+                        native_path: item.path_native,
+                        title: item.title,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            );
+            ContextQueryResult::Catalog {
+                truncated: page.total > entries.len() as u64,
+                total: page.total,
+                provenance: Provenance {
+                    epoch: page.epoch,
+                    generation: page.generation,
+                },
+                entries,
+            }
+        }
+        Err(message) => ContextQueryResult::Failed { message },
     }
 }
 

@@ -61,6 +61,11 @@ lint-arch:
     check_absent '\[\.\.?[^]]*1024\]' crates/flavite-index/src
     check_absent 'nothing enforces' crates/flavite-api/src/capability.rs
     check_absent 'expected_identities' crates
+    # RFC-0004 grep gates: the catalog leaves the host turn (S5/D9) and the
+    # change feed keeps one writer/one whole-vault call site (S1/S2).
+    check_absent '\.note_catalog\(' crates/flavite-ui/src
+    check_absent 'INSERT INTO changes\(' crates/flavite-index/src
+    check_absent 'UPDATE notes SET id_conflict=CASE' crates/flavite-index/src/pool.rs
     echo "lint-arch passed (RFC-0002 debt gates)."
 
 # S3 watcher-truth probe (PLAN-C C1, §9 S3-1): per-OS watcher evidence with a

@@ -194,7 +194,15 @@ fn picker_insert_places_one_link_at_the_acknowledged_caret() {
     reconcile(&mut app);
     let tab = open_note(&mut app, "source.md");
     // Open the picker and insert (Ctrl+Enter path) instead of opening.
+    // RFC-0004 W-D: the catalog arrives through a ticketed page, so the
+    // picker's candidate snapshot converges under pumping, never on the
+    // opening turn.
     let _ = app.update(Message::PickerOpen);
+    wait_for(&mut app, "picker catalog carries beta", |app| {
+        app.picker_matches()
+            .iter()
+            .any(|entry| entry.path == std::path::Path::new("beta.md"))
+    });
     let _ = app.update(Message::PickerQuery("beta".to_owned()));
     let _ = app.update(Message::PickerInsert(0));
     wait_for(&mut app, "insertion settles", |app| {

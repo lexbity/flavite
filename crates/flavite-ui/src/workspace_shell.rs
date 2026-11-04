@@ -546,6 +546,29 @@ fn palette_card(app: &App) -> Element<'_, Message> {
     .into()
 }
 
+/// Provenance line under the established "index epoch/generation" label
+/// style (RFC-0004 §6.4): ticketed catalog state, with the 50k-bound
+/// truncation flag surfaced (R9).
+fn picker_catalog_provenance(app: &App) -> String {
+    match app.catalog_status() {
+        crate::app::CatalogStatus::Ready {
+            epoch,
+            generation,
+            truncated,
+        } => format!(
+            "index {epoch}/{generation}{}",
+            if *truncated {
+                " · catalog truncated at the 50k limit"
+            } else {
+                ""
+            }
+        ),
+        crate::app::CatalogStatus::Loading => "index · catalog loading".to_owned(),
+        crate::app::CatalogStatus::Failed { .. } => "catalog unavailable".to_owned(),
+        crate::app::CatalogStatus::Empty => String::new(),
+    }
+}
+
 /// The floating note picker card (quick switch).
 fn picker_card(app: &App) -> Element<'_, Message> {
     let metrics = app.appearance.metrics();
@@ -581,7 +604,11 @@ fn picker_card(app: &App) -> Element<'_, Message> {
             .into()
     } else if matches.is_empty() {
         text(if app.catalog().is_empty() {
-            "No notes in this vault yet"
+            if matches!(app.catalog_status(), crate::app::CatalogStatus::Loading) {
+                "Indexing notes…"
+            } else {
+                "No notes in this vault yet"
+            }
         } else {
             "No matching notes"
         })
@@ -599,6 +626,12 @@ fn picker_card(app: &App) -> Element<'_, Message> {
                 .padding(8),
             rule::horizontal(1),
             container(body).max_height(360).width(Length::Fill),
+            row![
+                Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
+                text(picker_catalog_provenance(app))
+                    .size(metrics.text_sm)
+                    .style(style::dim_text),
+            ],
             row![
                 Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
                 text("Enter opens · Ctrl+Enter inserts a link at the caret · Esc dismisses")

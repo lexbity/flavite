@@ -39,6 +39,27 @@ pub fn view(app: &App, tab: TabId, group: flavite_workspace::GroupId) -> Element
         .style(style::content)
         .into();
     }
+    if app.catalog().is_empty()
+        && matches!(
+            app.catalog_status(),
+            crate::app::CatalogStatus::Loading | crate::app::CatalogStatus::Empty
+        )
+    {
+        // Ticketed acquisition in flight (RFC-0004 W-D): honest loading
+        // text over the existing empty-state pattern, never a blank list.
+        return container(
+            column![
+                text("Notes").size(metrics.heading),
+                text("Indexing notes…").style(style::dim_text),
+            ]
+            .spacing(metrics.spacing_sm),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(metrics.spacing_lg)
+        .style(style::content)
+        .into();
+    }
     let filter = app.notes_filter(tab).to_owned();
     let candidates = app.note_candidates();
     let total = candidates.all().len();

@@ -441,6 +441,9 @@ pub struct Flavite {
     /// One graph base service per vault (W07/TD-12): the only graph-path
     /// owner of an index read handle.
     pub(crate) graph: Arc<crate::graph_service::GraphService>,
+    /// Monotonic sequence for the reserved catalog context (RFC-0004 D9):
+    /// every `submit_catalog` ticket supersedes the previous pending one.
+    pub(crate) catalog_sequence: AtomicU64,
 }
 
 /// Build the per-vault attached services shared by every constructor.
@@ -497,6 +500,7 @@ impl Flavite {
             terminal_backlog: Mutex::new(HashMap::new()),
             notice_acks: Mutex::new(std::collections::BTreeMap::new()),
             next_notice_id: AtomicU64::new(1),
+            catalog_sequence: AtomicU64::new(1),
             vault_ref,
             read_only: false,
             owned_vault: None,
@@ -543,6 +547,7 @@ impl Flavite {
             terminal_backlog: Mutex::new(HashMap::new()),
             notice_acks: Mutex::new(std::collections::BTreeMap::new()),
             next_notice_id: AtomicU64::new(1),
+            catalog_sequence: AtomicU64::new(1),
             vault_ref,
             read_only: false,
             owned_vault: None,
@@ -595,6 +600,7 @@ impl Flavite {
             graph,
             notice_acks: Mutex::new(std::collections::BTreeMap::new()),
             next_notice_id: AtomicU64::new(1),
+            catalog_sequence: AtomicU64::new(1),
             vault_ref,
             read_only: false,
             owned_vault: None,

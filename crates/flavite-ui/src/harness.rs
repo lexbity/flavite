@@ -328,6 +328,19 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "graph_service": graph_service,
         "maximized": app.maximized_group().map(|group| group.to_string()),
         "catalog": app.catalog().len(),
+        "catalog_status": match app.catalog_status() {
+            crate::app::CatalogStatus::Empty => "empty".to_owned(),
+            crate::app::CatalogStatus::Loading => "loading".to_owned(),
+            crate::app::CatalogStatus::Ready {
+                epoch,
+                generation,
+                truncated,
+            } => format!(
+                "ready:{epoch}/{generation}{}",
+                if *truncated { "·truncated" } else { "" }
+            ),
+            crate::app::CatalogStatus::Failed { .. } => "failed".to_owned(),
+        },
         "dialog_kind": app.dialog.as_ref().map(|dialog| dialog.kind_name()),
         "start_error": app.start.error.clone(),
         "theme": app.appearance.scheme().name(),
