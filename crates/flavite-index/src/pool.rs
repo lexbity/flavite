@@ -8,13 +8,15 @@
 //! The pool size is based on S4-2's recommendations: default 4 connections,
 //! hard cap 8.
 
+use crate::changelog::{ChangeKind, ChangeLogWriter};
 use crate::resolver::Resolver;
 use crate::schema::{AttachmentKind, MetaKey, get_meta_u64};
 use crate::search::SearchBackend;
+use crate::types::IndexVersion;
 use blake3::Hash;
 use flavite_syntax::{pulldown_glue::parse_note, text::TextSnapshot};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Result};
-use std::collections::VecDeque;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Result, Transaction};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -437,6 +439,59 @@ impl Writer {
     }
 }
 
+/// A link row's resolution state as stored: the tuple that FR-2 equality
+/// compares. Keyed by `(src, ord)` for the pre/post diff.
+type LinkState = (Option<i64>, Option<i64>, String);
+
+/// Snapshot every link row's resolution state inside the writer
+/// transaction. RFC-0004 §6.1.2: until targeted resolution (S2) makes the
+/// affected set intrinsic, the apply paths capture pre/post states around
+/// the existing `re_resolve_all` walk to emit truthful `outgoing(src)`
+/// rows. This is a deliberate, bounded O(links) read for one slice.
+fn snapshot_link_states(tx: &Transaction<'_>) -> Result<HashMap<(i64, i32), LinkState>, String> {
+    let mut statement = tx
+        .prepare("SELECT src, ord, dst_note, dst_att, res_state FROM links")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                (row.get::<_, i64>(0)?, row.get::<_, i32>(1)?),
+                (
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, String>(4)?,
+                ),
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<HashMap<(i64, i32), LinkState>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+/// Feed rows for every source note whose link rows changed between two
+/// snapshots (FR-1: one `outgoing(src)` row per flipped source; the PK
+/// collapses duplicates with the applied note's own row).
+fn changed_outgoing_rows(
+    pre: &HashMap<(i64, i32), LinkState>,
+    post: &HashMap<(i64, i32), LinkState>,
+) -> Vec<(ChangeKind, i64)> {
+    let mut changed = BTreeSet::new();
+    for ((src, ord), state) in post {
+        if pre.get(&(*src, *ord)).is_none_or(|old| old != state) {
+            changed.insert(*src);
+        }
+    }
+    for (src, ord) in pre.keys() {
+        if !post.contains_key(&(*src, *ord)) {
+            changed.insert(*src);
+        }
+    }
+    changed
+        .into_iter()
+        .map(|src| (ChangeKind::Outgoing, src))
+        .collect()
+}
+
 /// Reserve an epoch-local identity even when the largest live row was deleted.
 /// SQLite's default ROWID allocator can reuse it; active graph references cannot.
 fn reserve_graph_identity(
@@ -499,16 +554,13 @@ impl IndexActor {
                 .rebuild_from_sqlite()
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         } else if committed < sqlite_generation {
-            let floor = crate::schema::get_meta_u64(writer.conn(), MetaKey::LogFloor)?.unwrap_or(0);
-            if committed < floor {
-                search
-                    .rebuild_from_sqlite()
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-            } else {
-                search
-                    .replay_since(committed)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-            }
+            // The typed reader owns cursor validity: a floor overrun or epoch
+            // mismatch arrives as `Reset` and rebuilds inside `replay_since`
+            // (§6.1.4 — the bespoke floor check is deleted with its trap).
+            let epoch = crate::schema::get_meta_u64(writer.conn(), MetaKey::Epoch)?.unwrap_or(1);
+            search
+                .replay_since(IndexVersion::new(epoch, committed))
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         }
 
         Ok(Self {
@@ -894,6 +946,7 @@ impl IndexActor {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or("index generation overflow")?;
+        let pre_states = snapshot_link_states(&tx)?;
         tx.execute("DELETE FROM notes WHERE note_id=?1", [note_id])
             .map_err(|e| e.to_string())?;
         tx.execute("UPDATE notes SET id_conflict=CASE WHEN stable_id_key IS NOT NULL AND path_key<>(SELECT MIN(n2.path_key) FROM notes n2 WHERE n2.stable_id_key=notes.stable_id_key) THEN 1 ELSE 0 END", [])
@@ -907,17 +960,12 @@ impl IndexActor {
             rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
         )
         .map_err(|e| e.to_string())?;
-        tx.execute(
-            "INSERT INTO changes(generation,kind,entity_id) VALUES(?1,'note',?2)",
-            rusqlite::params![
-                i64::try_from(generation).map_err(|e| e.to_string())?,
-                note_id
-            ],
-        )
-        .map_err(|e| e.to_string())?;
+        ChangeLogWriter::record(&tx, generation, ChangeKind::Note, note_id)?;
         Resolver::new(&tx)
             .re_resolve_all()
             .map_err(|error| error.to_string())?;
+        let changed = changed_outgoing_rows(&pre_states, &snapshot_link_states(&tx)?);
+        ChangeLogWriter::record_all(&tx, generation, &changed)?;
         tx.commit().map_err(|e| e.to_string())?;
         self.search
             .delete_document(note_id)
@@ -1136,6 +1184,7 @@ impl IndexActor {
             .map(|value| serde_json::json!({ "yaml": value.yaml_text }))
             .map(|value| value.to_string());
         let size = i64::try_from(bytes.len()).map_err(|e| e.to_string())?;
+        let pre_states = snapshot_link_states(&tx)?;
         reserve_graph_identity(&tx, true, true)?;
         tx.execute(
             "INSERT INTO notes(note_id,path,path_native,path_key,stem_key,title,stable_id,stable_id_key,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation)
@@ -1240,25 +1289,13 @@ impl IndexActor {
             rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
         )
         .map_err(|e| e.to_string())?;
-        tx.execute(
-            "INSERT INTO changes(generation,kind,entity_id) VALUES(?1,'note',?2)",
-            rusqlite::params![
-                i64::try_from(generation).map_err(|e| e.to_string())?,
-                note_id
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-        tx.execute(
-            "INSERT INTO changes(generation,kind,entity_id) VALUES(?1,'outgoing',?2)",
-            rusqlite::params![
-                i64::try_from(generation).map_err(|e| e.to_string())?,
-                note_id
-            ],
-        )
-        .map_err(|e| e.to_string())?;
+        ChangeLogWriter::record(&tx, generation, ChangeKind::Note, note_id)?;
+        ChangeLogWriter::record(&tx, generation, ChangeKind::Outgoing, note_id)?;
         Resolver::new(&tx)
             .re_resolve_all()
             .map_err(|error| error.to_string())?;
+        let changed = changed_outgoing_rows(&pre_states, &snapshot_link_states(&tx)?);
+        ChangeLogWriter::record_all(&tx, generation, &changed)?;
         tx.commit().map_err(|e| e.to_string())?;
         let mut alias_stmt = conn
             .prepare("SELECT alias FROM aliases WHERE note_id=?1 ORDER BY alias_key")
@@ -1378,6 +1415,7 @@ impl IndexActor {
         let epoch = get_meta_u64(&tx, MetaKey::Epoch)
             .map_err(|error| error.to_string())?
             .unwrap_or(1);
+        let pre_states = snapshot_link_states(&tx)?;
         reserve_graph_identity(&tx, true, true)?;
         tx.execute("INSERT INTO notes(note_id,path,path_native,path_key,stem_key,title,stable_id,stable_id_key,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation) VALUES((SELECT CAST(value AS INTEGER) FROM meta WHERE key='note_identity_high_water'),?1,?2,?3,?4,?5,NULL,NULL,0,NULL,?6,?7,?8,NULL,?9,0,?10) ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,title=excluded.title,stable_id=NULL,stable_id_key=NULL,content_hash=NULL,size=excluded.size,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,frontmatter=NULL,preview=excluded.preview,parse_ok=0,generation=excluded.generation", rusqlite::params![display_path,path_native,flavite_syntax::text::fold_key(display_path),flavite_syntax::text::fold_key(stem),stem,size,mtime_ns,scan_ns,preview,i64::try_from(generation).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
         let note_id: i64 = tx
@@ -1402,17 +1440,12 @@ impl IndexActor {
             rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
         )
         .map_err(|error| error.to_string())?;
-        tx.execute(
-            "INSERT INTO changes(generation,kind,entity_id) VALUES(?1,'note',?2)",
-            rusqlite::params![
-                i64::try_from(generation).map_err(|error| error.to_string())?,
-                note_id
-            ],
-        )
-        .map_err(|error| error.to_string())?;
+        ChangeLogWriter::record(&tx, generation, ChangeKind::Note, note_id)?;
         Resolver::new(&tx)
             .re_resolve_all()
             .map_err(|error| error.to_string())?;
+        let changed = changed_outgoing_rows(&pre_states, &snapshot_link_states(&tx)?);
+        ChangeLogWriter::record_all(&tx, generation, &changed)?;
         tx.commit().map_err(|error| error.to_string())?;
         self.search
             .apply_title_only_document(note_id, stem)
@@ -1476,6 +1509,7 @@ impl IndexActor {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or("index generation overflow")?;
+        let pre_states = snapshot_link_states(&tx)?;
         reserve_graph_identity(&tx, false, true)?;
         tx.execute(
             "INSERT INTO attachments(att_id,path,path_native,path_key,stem_key,kind,mime,size,content_hash,width,height,mtime_ns,scan_ns,hydrated,generation) VALUES((SELECT CAST(value AS INTEGER) FROM meta WHERE key='attachment_identity_high_water'),?1,?2,?3,?4,?5,NULL,?6,?7,NULL,NULL,?8,?9,?10,?11) ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,kind=excluded.kind,size=excluded.size,content_hash=excluded.content_hash,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,hydrated=excluded.hydrated,generation=excluded.generation",
@@ -1493,17 +1527,12 @@ impl IndexActor {
             rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
         )
         .map_err(|error| error.to_string())?;
-        tx.execute(
-            "INSERT INTO changes(generation,kind,entity_id) VALUES(?1,'attachment',?2)",
-            rusqlite::params![
-                i64::try_from(generation).map_err(|error| error.to_string())?,
-                att_id
-            ],
-        )
-        .map_err(|error| error.to_string())?;
+        ChangeLogWriter::record(&tx, generation, ChangeKind::Attachment, att_id)?;
         Resolver::new(&tx)
             .re_resolve_all()
             .map_err(|error| error.to_string())?;
+        let changed = changed_outgoing_rows(&pre_states, &snapshot_link_states(&tx)?);
+        ChangeLogWriter::record_all(&tx, generation, &changed)?;
         tx.commit().map_err(|error| error.to_string())?;
         let epoch = get_meta_u64(self.writer.conn(), MetaKey::Epoch)
             .map_err(|error| error.to_string())?
@@ -1535,6 +1564,7 @@ impl IndexActor {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or("index generation overflow")?;
+        let pre_states = snapshot_link_states(&tx)?;
         tx.execute("DELETE FROM attachments WHERE att_id=?1", [id])
             .map_err(|error| error.to_string())?;
         tx.execute(
@@ -1542,17 +1572,12 @@ impl IndexActor {
             rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
         )
         .map_err(|error| error.to_string())?;
-        tx.execute(
-            "INSERT INTO changes(generation,kind,entity_id) VALUES(?1,'attachment',?2)",
-            rusqlite::params![
-                i64::try_from(generation).map_err(|error| error.to_string())?,
-                id
-            ],
-        )
-        .map_err(|error| error.to_string())?;
+        ChangeLogWriter::record(&tx, generation, ChangeKind::Attachment, id)?;
         Resolver::new(&tx)
             .re_resolve_all()
             .map_err(|error| error.to_string())?;
+        let changed = changed_outgoing_rows(&pre_states, &snapshot_link_states(&tx)?);
+        ChangeLogWriter::record_all(&tx, generation, &changed)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(true)
     }

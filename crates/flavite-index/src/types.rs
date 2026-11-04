@@ -200,33 +200,6 @@ pub struct ExtFact {
     pub value_json: String,
 }
 
-/// A change record in the invalidation log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChangeRecord {
-    pub generation: i64,
-    pub kind: ChangeKind,
-    pub entity_id: i64,
-}
-
-/// Kind of change: note, attachment, or outgoing (links from a note).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ChangeKind {
-    Note,
-    Attachment,
-    Outgoing,
-}
-
-impl ChangeKind {
-    #[must_use]
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Note => "note",
-            Self::Attachment => "attachment",
-            Self::Outgoing => "outgoing",
-        }
-    }
-}
-
 /// An epoch and generation pair - the index version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IndexVersion {

@@ -4,8 +4,10 @@
 //! and `SearchBackend` abstraction. The stub backend remains a lightweight test
 //! double; `IndexActor` uses `TantivyBackend` in production.
 
+use crate::changelog::{ChangeKind, ChangeLogRead, ChangeLogReader};
 use crate::query::Query as QueryAst;
 use crate::schema::{MetaKey, get_meta_u64, set_meta};
+use crate::types::IndexVersion;
 use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -234,18 +236,28 @@ impl TantivyBackend {
         Ok(())
     }
 
-    /// Replay changed IDs from SQLite's invalidation log, then commit once.
+    /// Replay changed IDs from the typed change feed (§4.3, §6.1.4), then
+    /// commit once. A `Reset` outcome (epoch change or floor overrun) is
+    /// handled as the contract demands: a full rebuild from a consistent
+    /// SQLite read, never a silent no-op.
     ///
     /// # Errors
     /// Returns an error when the change log cannot be read or replay cannot commit.
-    pub fn replay_since(&self, generation: u64) -> Result<(), SearchError> {
+    pub fn replay_since(&self, cursor: IndexVersion) -> Result<(), SearchError> {
         let conn = Connection::open(&self.db_path)?;
-        let mut stmt=conn.prepare("SELECT DISTINCT entity_id FROM changes WHERE generation > ?1 AND kind IN ('note','outgoing') ORDER BY entity_id")?;
-        let ids = stmt
-            .query_map([i64::try_from(generation).unwrap_or(i64::MAX)], |r| {
-                r.get::<_, i64>(0)
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let records = match ChangeLogReader::new(&conn).read_since(cursor) {
+            Ok(ChangeLogRead::Delta { records, .. }) => records,
+            Ok(ChangeLogRead::Reset { .. }) => return self.rebuild_from_sqlite(),
+            Err(error) => return Err(SearchError::Checkpoint(error)),
+        };
+        // Dedupe (kind, entity_id) per §4.6; the replay only needs the set of
+        // note ids whose document content may have moved.
+        let mut ids = std::collections::BTreeSet::new();
+        for record in records {
+            if matches!(record.kind, ChangeKind::Note | ChangeKind::Outgoing) {
+                ids.insert(record.entity_id);
+            }
+        }
         for id in ids {
             let current: Option<(String,String)> = conn.query_row("SELECT n.title,COALESCE(s.body_text,'') FROM notes n LEFT JOIN search_docs s USING(note_id) WHERE n.note_id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
             if let Some((title, body)) = current {

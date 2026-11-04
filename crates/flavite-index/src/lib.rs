@@ -27,6 +27,7 @@
 //!   authority, not the SQLite mirror.
 
 pub mod change;
+pub mod changelog;
 pub mod pool;
 pub mod query;
 pub mod resolver;
@@ -47,8 +48,9 @@ pub use query::*;
 // Re-export resolver items
 pub use resolver::*;
 
-// Re-export change items (but not DEFAULT_LOG_BUDGET which conflicts with types)
-pub use change::{ChangeBatch, InvalidationFeed};
+// Re-export change-feed items (retention helpers stay module-scoped in
+// `change`; `DEFAULT_LOG_BUDGET` here would conflict with the types export)
+pub use changelog::*;
 
 // Re-export pool items
 pub use pool::*;
