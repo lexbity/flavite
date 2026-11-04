@@ -12,6 +12,7 @@
 use crate::actor::VaultActorHandle;
 use crate::channels::{NoticeChannel, PulseChannel};
 use crate::save::{DiskPrecondition, DurabilityOutcome, SaveFailureStage, SaveRequest};
+use crate::sync::MutexExt;
 use crate::types::{
     Epoch, Generation, ReconcileMode, ReconcileScope, ReconcileSummary, RenameStrategy,
     VaultConfig, VaultIdentity,
@@ -595,7 +596,7 @@ impl Session {
             Arc::new(Mutex::new(RecoveryWriter::new(RecoveryConfig::new(
                 identity.uuid.to_string(),
                 dir,
-                manager.lock().unwrap().recovery_interval(),
+                manager.lock_recovering().recovery_interval(),
             ))))
         });
         let recovery_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -609,7 +610,7 @@ impl Session {
                 .name("vault-recovery".into())
                 .spawn(move || {
                     while !stop.load(Ordering::Acquire) {
-                        let buffer_manager = manager.lock().unwrap();
+                        let buffer_manager = manager.lock_recovering();
                         let dirty = buffer_manager
                             .dirty_buffers()
                             .into_iter()
@@ -625,9 +626,9 @@ impl Session {
                             .collect::<Vec<_>>();
                         drop(buffer_manager);
                         for (key, base, snapshot) in dirty {
-                            let due = writer.lock().unwrap().should_write_snapshot(&snapshot);
+                            let due = writer.lock_recovering().should_write_snapshot(&snapshot);
                             if due && actor.pin_merge_base(key.clone(), base).is_ok() {
-                                writer.lock().unwrap().write_snapshot(&key, snapshot);
+                                writer.lock_recovering().write_snapshot(&key, snapshot);
                             }
                         }
                         std::thread::sleep(Duration::from_millis(100));
@@ -676,7 +677,7 @@ impl Session {
                                 .map_err(|error| error.to_string()),
                         };
                         let recovery = recovery_writer.as_ref().and_then(|writer| {
-                            writer.lock().unwrap().read_for_note_key(&job.note_key)
+                            writer.lock_recovering().read_for_note_key(&job.note_key)
                         });
                         // Sending only fails when the Session is gone; the
                         // read result is then unobservable by construction.
@@ -715,7 +716,7 @@ impl Session {
                             let outcome = match crate::link::prepare_work(&context, &job.request) {
                                 Ok((plan, mut prepared)) => {
                                     let plan_id = {
-                                        let mut store = link_plans.lock().unwrap();
+                                        let mut store = link_plans.lock_recovering();
                                         let plan_id = store.allocate_plan_id();
                                         prepared.plan_id = plan_id;
                                         if store.complete_prepare(plan_id, plan) {
@@ -736,7 +737,9 @@ impl Session {
                                     }
                                 }
                                 Err(reason) => {
-                                    link_plans.lock().unwrap().fail_prepare(job.request.intent);
+                                    link_plans
+                                        .lock_recovering()
+                                        .fail_prepare(job.request.intent);
                                     SessionResult::LinkRejected { reason }
                                 }
                             };
@@ -797,7 +800,7 @@ impl Session {
 
     /// Execute a command.
     pub fn execute(&self, command: SessionCommand) -> SessionResult {
-        let _turn = self.driving_turn.lock().unwrap();
+        let _turn = self.driving_turn.lock_recovering();
         self.pump_external_changes_inner();
         let edited_path = match &command {
             SessionCommand::EditStructure { buffer_id, .. }
@@ -805,21 +808,18 @@ impl Session {
             | SessionCommand::Undo { buffer_id, .. }
             | SessionCommand::Redo { buffer_id, .. } => self
                 .buffer_manager
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .path_for_id(*buffer_id)
                 .cloned(),
             SessionCommand::LinkInsert { intent, plan_id }
             | SessionCommand::LinkRemove { intent, plan_id } => {
                 let source = self
                     .link_plans
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .source_for(*intent, *plan_id);
                 source.and_then(|id| {
                     self.buffer_manager
-                        .lock()
-                        .unwrap()
+                        .lock_recovering()
                         .path_for_id(id.into())
                         .cloned()
                 })
@@ -838,10 +838,9 @@ impl Session {
             )
         {
             self.last_edit
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .insert(path.clone(), std::time::Instant::now());
-            self.autosave_attempted.lock().unwrap().remove(&path);
+            self.autosave_attempted.lock_recovering().remove(&path);
         }
         result
     }
@@ -849,7 +848,7 @@ impl Session {
     /// Apply queued disk observations on the host pump. GUI hosts call this
     /// from their regular timer; command execution also drains before running.
     pub fn pump(&self) {
-        let _turn = self.driving_turn.lock().unwrap();
+        let _turn = self.driving_turn.lock_recovering();
         self.pump_external_changes_inner();
         self.pump_recovery_notices();
         self.pump_structure_completions();
@@ -865,7 +864,7 @@ impl Session {
     }
 
     pub(crate) fn structure_completions_full(&self) -> bool {
-        self.completions.lock().unwrap().len() >= MAX_PENDING_SAVE_OPERATIONS - 64
+        self.completions.lock_recovering().len() >= MAX_PENDING_SAVE_OPERATIONS - 64
     }
     pub(crate) fn next_structure_request(&self) -> u64 {
         self.next_request_id()
@@ -882,20 +881,17 @@ impl Session {
             if matches!(result, SessionResult::Success(_))
                 && let Some(path) = self
                     .buffer_manager
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .path_for_id(prepared.buffer)
                     .cloned()
             {
                 self.last_edit
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .insert(path.clone(), std::time::Instant::now());
-                self.autosave_attempted.lock().unwrap().remove(&path);
+                self.autosave_attempted.lock_recovering().remove(&path);
             }
             self.completions
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .push_back(OperationCompletion {
                     request_id: prepared.request,
                     result,
@@ -907,8 +903,7 @@ impl Session {
     fn pump_link_completions(&self) {
         while let Ok(message) = self.link_results.try_recv() {
             self.completions
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .push_back(OperationCompletion {
                     request_id: message.request_id,
                     result: message.result,
@@ -919,8 +914,7 @@ impl Session {
     fn pump_recovery_notices(&self) {
         let codes = self
             .recovery_notices
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .drain(..)
             .collect::<Vec<_>>();
         for code in codes {
@@ -933,8 +927,7 @@ impl Session {
         let now = std::time::Instant::now();
         let dirty = self
             .buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .dirty_buffers()
             .into_iter()
             .filter(|(_, buffer)| buffer.allows_autosave())
@@ -942,27 +935,25 @@ impl Session {
             .collect::<Vec<_>>();
         for (path, buffer_id, revision) in dirty {
             let last_edit = {
-                let mut deadlines = self.last_edit.lock().unwrap();
+                let mut deadlines = self.last_edit.lock_recovering();
                 *deadlines.entry(path.clone()).or_insert(now)
             };
             if now.duration_since(last_edit) < self.autosave_idle_interval
-                || self.autosave_attempted.lock().unwrap().get(&path) == Some(&revision)
+                || self.autosave_attempted.lock_recovering().get(&path) == Some(&revision)
                 || self
                     .save_flights
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .contains_key(&buffer_id.as_u64())
             {
                 continue;
             }
             self.autosave_attempted
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .insert(path.clone(), revision);
             let result = self.save_note(path.clone());
             match result {
                 SessionResult::Pending { request_id } => {
-                    self.autosave_requests.lock().unwrap().insert(request_id);
+                    self.autosave_requests.lock_recovering().insert(request_id);
                 }
                 SessionResult::Success(_) => {}
                 failure => self.record_autosave_failure(&path, &failure),
@@ -983,13 +974,13 @@ impl Session {
         while let Ok(event) = self.actor_events.try_recv() {
             match event {
                 crate::actor::VaultActorEvent::ExternalChange { path, bytes } => {
-                    self.session_events.lock().unwrap().push_back(
+                    self.session_events.lock_recovering().push_back(
                         SessionEvent::ExternalChangeDetected {
                             path: path.clone(),
                             deleted: false,
                         },
                     );
-                    let mut manager = self.buffer_manager.lock().unwrap();
+                    let mut manager = self.buffer_manager.lock_recovering();
                     if manager.get_buffer(&path).is_some_and(|buffer| {
                         buffer.state() == flavite_buffer::state::BufferState::Orphaned
                     }) {
@@ -1009,13 +1000,13 @@ impl Session {
                     });
                 }
                 crate::actor::VaultActorEvent::Deleted { path } => {
-                    self.session_events.lock().unwrap().push_back(
+                    self.session_events.lock_recovering().push_back(
                         SessionEvent::ExternalChangeDetected {
                             path: path.clone(),
                             deleted: true,
                         },
                     );
-                    let mut manager = self.buffer_manager.lock().unwrap();
+                    let mut manager = self.buffer_manager.lock_recovering();
                     if !manager.notify_file_deleted(&path).is_empty() {
                         self.notice.send(crate::channels::Notice::ActionRequired {
                             code: "external_delete",
@@ -1024,23 +1015,23 @@ impl Session {
                     }
                 }
                 crate::actor::VaultActorEvent::Renamed { from, to, .. } => {
-                    let mut manager = self.buffer_manager.lock().unwrap();
+                    let mut manager = self.buffer_manager.lock_recovering();
                     if manager.rename_buffer(&from, to.clone()) {
                         drop(manager);
                         {
-                            let mut last_edit = self.last_edit.lock().unwrap();
+                            let mut last_edit = self.last_edit.lock_recovering();
                             if let Some(edit_time) = last_edit.remove(&from) {
                                 last_edit.insert(to.clone(), edit_time);
                             }
                         }
                         {
-                            let mut attempted = self.autosave_attempted.lock().unwrap();
+                            let mut attempted = self.autosave_attempted.lock_recovering();
                             if let Some(revision) = attempted.remove(&from) {
                                 attempted.insert(to.clone(), revision);
                             }
                         }
                         {
-                            let mut absent = self.absent_on_open.lock().unwrap();
+                            let mut absent = self.absent_on_open.lock_recovering();
                             if absent.remove(&from) {
                                 absent.insert(to.clone());
                             }
@@ -1081,20 +1072,18 @@ impl Session {
     fn pump_buffer_patch_requests(&self) {
         while let Ok(request) = self.actor_buffer_patches.try_recv() {
             let key = (request.txn_id.clone(), request.item_id);
-            if let Some(result) = self.journal_applied.lock().unwrap().get(&key).cloned() {
+            if let Some(result) = self.journal_applied.lock_recovering().get(&key).cloned() {
                 let _ = request.reply.send(result);
                 continue;
             }
             let result = self.apply_buffer_patch(&request);
             if let Ok(revision) = result {
                 self.journal_applied
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .insert(key, Ok(revision));
             } else {
                 self.journal_applied
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .insert(key, result.clone());
             }
             let _ = request.reply.send(result);
@@ -1106,7 +1095,7 @@ impl Session {
         request: &crate::actor::ApplyBufferPatchRequest,
     ) -> Result<u64, String> {
         let buffer_id = BufferId::from(request.buffer_id);
-        let mut manager = self.buffer_manager.lock().unwrap();
+        let mut manager = self.buffer_manager.lock_recovering();
         if manager
             .get_buffer_by_id(buffer_id)
             .is_some_and(|buffer| buffer.state() == flavite_buffer::state::BufferState::Conflicted)
@@ -1360,13 +1349,13 @@ impl Session {
     #[must_use]
     pub fn new_link_client(&self) -> crate::link::ClientToken {
         let token = crate::link::ClientToken(u128::from(uuid::Uuid::now_v7().as_u64_pair().1));
-        self.link_plans.lock().unwrap().register_client(token);
+        self.link_plans.lock_recovering().register_client(token);
         token
     }
 
     /// Cancel an uncommitted gesture; late worker results cannot revive it.
     pub fn cancel_link_intent(&self, intent: crate::link::LinkIntent) {
-        self.link_plans.lock().unwrap().cancel(intent);
+        self.link_plans.lock_recovering().cancel(intent);
     }
 
     /// Read the immutable canonical publication without actor IO.
@@ -1383,16 +1372,14 @@ impl Session {
         plan_id: u128,
     ) -> Option<BufferId> {
         self.link_plans
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .source_for(intent, plan_id)
             .map(BufferId::from)
     }
     /// Native path for an open buffer without cloning note contents.
     pub fn buffer_path(&self, buffer: BufferId) -> Option<PathBuf> {
         self.buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .path_for_id(buffer)
             .cloned()
     }
@@ -1409,7 +1396,7 @@ impl Session {
         // receipt and overwrite the facade's correlation map.
         let request_id = self.next_request_id();
         let admission = {
-            let mut store = self.link_plans.lock().unwrap();
+            let mut store = self.link_plans.lock_recovering();
             store.admit_prepare(&request)
         };
         match admission {
@@ -1424,7 +1411,7 @@ impl Session {
                         })
                         .is_err()
                     {
-                        self.link_plans.lock().unwrap().fail_prepare(intent);
+                        self.link_plans.lock_recovering().fail_prepare(intent);
                         return SessionResult::LinkRejected {
                             reason: crate::link::LinkInsertionError::Busy,
                         };
@@ -1432,7 +1419,9 @@ impl Session {
                     SessionResult::Pending { request_id }
                 }
                 None => {
-                    self.link_plans.lock().unwrap().fail_prepare(request.intent);
+                    self.link_plans
+                        .lock_recovering()
+                        .fail_prepare(request.intent);
                     SessionResult::LinkRejected {
                         reason: crate::link::LinkInsertionError::Busy,
                     }
@@ -1453,7 +1442,7 @@ impl Session {
     ) -> SessionResult {
         use crate::link::{CommitAdmission, LinkOutcome};
         let admission = {
-            let mut store = self.link_plans.lock().unwrap();
+            let mut store = self.link_plans.lock_recovering();
             store.admit_commit(&intent, plan_id, removal)
         };
         let plan = match admission {
@@ -1482,12 +1471,11 @@ impl Session {
         // Buffer state and revision guards.
         let state = self
             .buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .get_buffer_by_id(BufferId::from(plan.source.buffer_id))
             .map(|buffer| (buffer.state(), buffer.revision().as_u64()));
         let Some((state, actual_revision)) = state else {
-            let mut store = self.link_plans.lock().unwrap();
+            let mut store = self.link_plans.lock_recovering();
             store.record_outcome(
                 &intent,
                 crate::link::fingerprint_insert_public(plan_id),
@@ -1504,7 +1492,7 @@ impl Session {
             };
         };
         if actual_revision != plan.source.revision {
-            self.link_plans.lock().unwrap().record_outcome(
+            self.link_plans.lock_recovering().record_outcome(
                 &intent,
                 crate::link::fingerprint_insert_public(plan_id),
                 Err(crate::link::LinkInsertionError::StaleSource {
@@ -1528,7 +1516,7 @@ impl Session {
                 flavite_buffer::state::BufferState::Orphaned => "Orphaned",
                 _ => "Unavailable",
             };
-            self.link_plans.lock().unwrap().record_outcome(
+            self.link_plans.lock_recovering().record_outcome(
                 &intent,
                 crate::link::fingerprint_insert_public(plan_id),
                 Err(crate::link::LinkInsertionError::BufferStateNeedsDecision { state: name }),
@@ -1548,7 +1536,7 @@ impl Session {
             }
         };
         if catalog.epoch != plan.validated_epoch || catalog.generation < plan.validated_generation {
-            self.link_plans.lock().unwrap().record_outcome(
+            self.link_plans.lock_recovering().record_outcome(
                 &intent,
                 crate::link::fingerprint_insert_public(plan_id),
                 Err(crate::link::LinkInsertionError::StaleEpoch),
@@ -1573,7 +1561,7 @@ impl Session {
         } else {
             current_id != Some(plan.target_entity_id)
         } {
-            self.link_plans.lock().unwrap().record_outcome(
+            self.link_plans.lock_recovering().record_outcome(
                 &intent,
                 crate::link::fingerprint_insert_public(plan_id),
                 Err(crate::link::LinkInsertionError::TargetRetargeted),
@@ -1637,7 +1625,7 @@ impl Session {
                 "{other:?}"
             ))),
         };
-        self.link_plans.lock().unwrap().record_outcome(
+        self.link_plans.lock_recovering().record_outcome(
             &intent,
             crate::link::fingerprint_insert_public(plan_id),
             cached,
@@ -1660,14 +1648,14 @@ impl Session {
     /// not yet been presented to the host. This is lossless: completions stay
     /// queued until the host drains them.
     pub fn drain_operation_completions(&self) -> Vec<OperationCompletion> {
-        let _turn = self.driving_turn.lock().unwrap();
+        let _turn = self.driving_turn.lock_recovering();
         self.pump_structure_completions();
         self.pump_link_completions();
         self.pump_open_completions();
         self.pump_save_completions();
         self.pump_reconcile_completions();
         self.pump_rename_completions();
-        self.completions.lock().unwrap().drain(..).collect()
+        self.completions.lock_recovering().drain(..).collect()
     }
 
     /// Drain lossy vault pulses for a host adapter.
@@ -1698,9 +1686,9 @@ impl Session {
 
     /// Drain session observations, including external disk changes.
     pub fn drain_events(&self) -> Vec<SessionEvent> {
-        let _turn = self.driving_turn.lock().unwrap();
+        let _turn = self.driving_turn.lock_recovering();
         self.pump_external_changes_inner();
-        self.session_events.lock().unwrap().drain(..).collect()
+        self.session_events.lock_recovering().drain(..).collect()
     }
 
     /// Request a throttled verification after the host window gains focus.
@@ -1726,7 +1714,7 @@ impl Session {
     /// CLI/headless convenience for commands that promise a disk mutation.
     /// GUI hosts use `drain_operation_completions` from their normal pump.
     pub fn wait_for_operation(&self, request_id: u64) -> SessionResult {
-        let _turn = self.driving_turn.lock().unwrap();
+        let _turn = self.driving_turn.lock_recovering();
         self.wait_for_operation_holding_turn(request_id)
     }
 
@@ -1741,7 +1729,7 @@ impl Session {
             self.pump_reconcile_completions();
             self.pump_rename_completions();
             let completed = {
-                let mut completions = self.completions.lock().unwrap();
+                let mut completions = self.completions.lock_recovering();
                 completions
                     .iter()
                     .position(|completion| completion.request_id == request_id)
@@ -1750,7 +1738,7 @@ impl Session {
             if let Some(result) = completed {
                 return result;
             }
-            let active = self.save_flights.lock().unwrap().values().any(|flight| {
+            let active = self.save_flights.lock_recovering().values().any(|flight| {
                 flight.request.request_id == request_id
                     || flight
                         .queued
@@ -1758,18 +1746,15 @@ impl Session {
                         .is_some_and(|request| request.request_id == request_id)
             }) || self
                 .reconcile_flights
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .contains_key(&request_id)
                 || self
                     .rename_flights
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .contains_key(&request_id)
                 || self
                     .open_flights
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .values()
                     .any(|flight| flight.request_ids.contains(&request_id));
             if !active {
@@ -1786,7 +1771,7 @@ impl Session {
 
     fn pump_save_completions(&self) {
         let ready = {
-            let mut flights = self.save_flights.lock().unwrap();
+            let mut flights = self.save_flights.lock_recovering();
             let ready_ids = flights
                 .iter()
                 .filter_map(|(buffer, flight)| match flight.response.try_recv() {
@@ -1814,16 +1799,14 @@ impl Session {
             let operation_result = self.finish_save(&flight.request, &response);
             if self
                 .autosave_requests
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .remove(&flight.request.request_id)
                 && !matches!(&operation_result, SessionResult::Success(_))
             {
                 self.record_autosave_failure(&flight.request.path, &operation_result);
             }
             self.completions
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .push_back(OperationCompletion {
                     request_id: flight.request.request_id,
                     result: operation_result,
@@ -1841,14 +1824,12 @@ impl Session {
                     queued.merge_base = flight.request.bytes.clone();
                     let buffer_is_live = self
                         .buffer_manager
-                        .lock()
-                        .unwrap()
+                        .lock_recovering()
                         .get_buffer_by_id(BufferId::from(buffer_id))
                         .is_some();
                     if !buffer_is_live {
                         self.completions
-                            .lock()
-                            .unwrap()
+                            .lock_recovering()
                             .push_back(OperationCompletion {
                                 request_id: queued.request_id,
                                 result: SessionResult::Error {
@@ -1860,7 +1841,7 @@ impl Session {
                     }
                     match self.actor.submit_save(queued.clone()) {
                         Ok(response) => {
-                            self.save_flights.lock().unwrap().insert(
+                            self.save_flights.lock_recovering().insert(
                                 buffer_id,
                                 SaveFlight {
                                     request: queued,
@@ -1871,8 +1852,7 @@ impl Session {
                         }
                         Err(error) => {
                             self.completions
-                                .lock()
-                                .unwrap()
+                                .lock_recovering()
                                 .push_back(OperationCompletion {
                                     request_id: queued.request_id,
                                     result: SessionResult::Error {
@@ -1884,8 +1864,7 @@ impl Session {
                 }
                 _ => self
                     .completions
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .push_back(OperationCompletion {
                         request_id: queued.request_id,
                         result: SessionResult::Error {
@@ -1901,7 +1880,7 @@ impl Session {
 
     fn pump_reconcile_completions(&self) {
         let ready = {
-            let mut flights = self.reconcile_flights.lock().unwrap();
+            let mut flights = self.reconcile_flights.lock_recovering();
             let ids = flights
                 .iter()
                 .filter_map(|(id, receiver)| match receiver.try_recv() {
@@ -1937,15 +1916,14 @@ impl Session {
                 },
             };
             self.completions
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .push_back(OperationCompletion { request_id, result });
         }
     }
 
     fn pump_rename_completions(&self) {
         let ready = {
-            let mut flights = self.rename_flights.lock().unwrap();
+            let mut flights = self.rename_flights.lock_recovering();
             let ids = flights
                 .iter()
                 .filter_map(|(id, (_, _, receiver))| match receiver.try_recv() {
@@ -1979,8 +1957,7 @@ impl Session {
                 },
             };
             self.completions
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .push_back(OperationCompletion { request_id, result });
         }
     }
@@ -1995,16 +1972,16 @@ impl Session {
         match response {
             crate::actor::VaultActorResp::Saved(Ok(receipt)) => {
                 let revision = Revision::new(request.revision);
-                let mut manager = self.buffer_manager.lock().unwrap();
+                let mut manager = self.buffer_manager.lock_recovering();
                 if let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) {
                     buffer.handle_save_completed_revision(revision, &request.bytes);
                 }
                 drop(manager);
                 if let Some(writer) = &self.recovery_writer {
-                    let mut writer = writer.lock().unwrap();
+                    let mut writer = writer.lock_recovering();
                     writer.retire_covered(buffer_id, revision);
                 }
-                self.absent_on_open.lock().unwrap().remove(&path);
+                self.absent_on_open.lock_recovering().remove(&path);
                 SessionResult::Success(CommandResult::NoteSaved {
                     buffer_id,
                     saved_revision: revision,
@@ -2018,8 +1995,7 @@ impl Session {
                 if failure.stage == SaveFailureStage::Compare {
                     if let Some(buffer) = self
                         .buffer_manager
-                        .lock()
-                        .unwrap()
+                        .lock_recovering()
                         .get_buffer_by_id_mut(buffer_id)
                         && let Some(hash) = failure.current_hash
                     {
@@ -2035,7 +2011,7 @@ impl Session {
                         | DurabilityOutcome::ReplacedDurabilityUncertain
                         | DurabilityOutcome::OutcomeUnknown
                 ) {
-                    let mut manager = self.buffer_manager.lock().unwrap();
+                    let mut manager = self.buffer_manager.lock_recovering();
                     if let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) {
                         let saved_hash = *blake3::hash(&request.bytes).as_bytes();
                         if failure.current_hash == Some(saved_hash) {
@@ -2051,7 +2027,7 @@ impl Session {
                     }
                     drop(manager);
                     if failure.current_hash.is_some() {
-                        self.absent_on_open.lock().unwrap().remove(&path);
+                        self.absent_on_open.lock_recovering().remove(&path);
                     }
                 }
                 if failure.stage == SaveFailureStage::Compare {
@@ -2089,8 +2065,7 @@ impl Session {
     fn open_note(&self, path: PathBuf, policy: OpenPolicy) -> SessionResult {
         if let Some(buffer_id) = self
             .buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .get_buffer(&path)
             .map(|buffer| (buffer.buffer_id(), buffer.revision()))
         {
@@ -2107,13 +2082,13 @@ impl Session {
     /// dispatch the read/create job to a bounded worker.
     fn open_note_inner(&self, path: PathBuf, policy: OpenPolicy) -> SessionResult {
         {
-            let flights = self.open_flights.lock().unwrap();
+            let flights = self.open_flights.lock_recovering();
             if flights.len() >= MAX_PENDING_OPEN_NOTES {
                 return SessionResult::Busy;
             }
         }
         let request_id = self.next_request_id();
-        let mut flights = self.open_flights.lock().unwrap();
+        let mut flights = self.open_flights.lock_recovering();
         match flights.entry(path.clone()) {
             std::collections::hash_map::Entry::Occupied(mut flight) => {
                 flight.get_mut().request_ids.push(request_id);
@@ -2175,7 +2150,7 @@ impl Session {
         }
         let content = content.unwrap_or_default();
         let (buffer_id, revision) = {
-            let mut buffer_manager_guard = self.buffer_manager.lock().unwrap();
+            let mut buffer_manager_guard = self.buffer_manager.lock_recovering();
             let (buffer, _transition) = buffer_manager_guard.open_note(read.path.clone(), &content);
             (buffer.buffer_id(), buffer.revision())
         };
@@ -2190,8 +2165,7 @@ impl Session {
         }
         if absent {
             self.absent_on_open
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .insert(read.path.clone());
         }
         // The flight slot is already consumed by the pump; keep the jobs
@@ -2219,9 +2193,9 @@ impl Session {
         if ready.is_empty() {
             return;
         }
-        let mut completions = self.completions.lock().unwrap();
+        let mut completions = self.completions.lock_recovering();
         for read in ready {
-            let Some(flight) = self.open_flights.lock().unwrap().remove(&read.path) else {
+            let Some(flight) = self.open_flights.lock_recovering().remove(&read.path) else {
                 continue;
             };
             let result = self.install_open_read(read);
@@ -2245,8 +2219,7 @@ impl Session {
     fn create_note(&self, path: PathBuf) -> SessionResult {
         if self
             .buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .get_buffer(&path)
             .is_some()
         {
@@ -2287,8 +2260,7 @@ impl Session {
         // Get buffer ID
         let buffer_id = {
             self.buffer_manager
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .get_buffer(&path)
                 .map(|buffer| buffer.buffer_id())
         };
@@ -2296,8 +2268,7 @@ impl Session {
         if let Some(_buffer_id) = buffer_id {
             if self
                 .save_flights
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .contains_key(&_buffer_id.as_u64())
             {
                 return SessionResult::ActionRequired {
@@ -2307,8 +2278,7 @@ impl Session {
             }
             let unsaved = self
                 .buffer_manager
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .get_buffer_by_id(_buffer_id)
                 .is_some_and(|buffer| buffer.is_dirty() || buffer.needs_resolution());
             if unsaved {
@@ -2327,12 +2297,12 @@ impl Session {
             // Close the buffer. The recovery file is intentionally not
             // deleted here: retain-recovery means the snapshot outlives
             // the buffer and is offered again on reopen.
-            let mut buffer_manager = self.buffer_manager.lock().unwrap();
+            let mut buffer_manager = self.buffer_manager.lock_recovering();
             buffer_manager.close_note(&path);
             drop(buffer_manager);
-            self.shared_snapshots.lock().unwrap().remove(&_buffer_id);
+            self.shared_snapshots.lock_recovering().remove(&_buffer_id);
 
-            self.absent_on_open.lock().unwrap().remove(&path);
+            self.absent_on_open.lock_recovering().remove(&path);
 
             SessionResult::Success(CommandResult::NoteClosed)
         } else {
@@ -2347,7 +2317,7 @@ impl Session {
     /// revision-bound receipt.
     fn flush_recovery_note(&self, path: &PathBuf) -> Result<CommandResult, String> {
         let (key, base, snapshot, revision) = {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             let Some(buffer) = manager.get_buffer(path) else {
                 return Err(format!("Buffer not found: {}", path.display()));
             };
@@ -2372,10 +2342,9 @@ impl Session {
             .map_err(|error| format!("could not persist recovery merge base: {error}"))?;
         // `None` means an equally-covering snapshot is already durable;
         // the read-back verification below is the receipt check either way.
-        let _ = writer.lock().unwrap().write_snapshot_now(&key, snapshot);
+        let _ = writer.lock_recovering().write_snapshot_now(&key, snapshot);
         let stored = writer
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .read_for_note_key(&key)
             .ok_or_else(|| "no durable recovery snapshot exists for this buffer".to_owned())?;
         if stored.header.revision < revision {
@@ -2386,7 +2355,7 @@ impl Session {
             ));
         }
         let hash = {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             manager
                 .get_buffer(path)
                 .map(|buffer| buffer.content_hash())
@@ -2413,8 +2382,7 @@ impl Session {
         };
         if self
             .save_flights
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .contains_key(&buffer_id.as_u64())
         {
             return SessionResult::ActionRequired {
@@ -2429,7 +2397,7 @@ impl Session {
             };
         };
         let mine = {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             match manager.get_buffer_by_id(buffer_id) {
                 Some(buffer) => buffer.model().to_source_bytes(),
                 None => {
@@ -2449,7 +2417,7 @@ impl Session {
             };
         }
         {
-            let mut manager = self.buffer_manager.lock().unwrap();
+            let mut manager = self.buffer_manager.lock_recovering();
             match manager
                 .get_buffer_by_id_mut(buffer_id)
                 .and_then(|buffer| buffer.reload_from_disk(&theirs))
@@ -2466,7 +2434,7 @@ impl Session {
         // them from re-appearing as a recovery offer on the next open.
         if let Some(writer) = &self.recovery_writer {
             let key = native_note_key(&path, &self.identity.root);
-            writer.lock().unwrap().delete_for_note_key(&key);
+            writer.lock_recovering().delete_for_note_key(&key);
         }
         SessionResult::Success(CommandResult::EditsDiscarded { buffer_id })
     }
@@ -2478,7 +2446,7 @@ impl Session {
         revision: Revision,
         op: EditOp,
     ) -> SessionResult {
-        let mut manager = self.buffer_manager.lock().unwrap();
+        let mut manager = self.buffer_manager.lock_recovering();
         let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
             return SessionResult::Error {
                 message: "Buffer no longer open".into(),
@@ -2520,7 +2488,7 @@ impl Session {
         revision: Revision,
         ops: Vec<EditOp>,
     ) -> SessionResult {
-        let mut buffer_manager = self.buffer_manager.lock().unwrap();
+        let mut buffer_manager = self.buffer_manager.lock_recovering();
 
         // Get the buffer and apply all edit ops
         if let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) {
@@ -2556,8 +2524,7 @@ impl Session {
     fn save_note(&self, path: PathBuf) -> SessionResult {
         let buffer_id = {
             self.buffer_manager
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .get_buffer(&path)
                 .map(|buffer| buffer.buffer_id())
         };
@@ -2567,7 +2534,7 @@ impl Session {
             };
         };
         let (bytes, revision, base_hash, base_bytes, state) = {
-            let mut manager = self.buffer_manager.lock().unwrap();
+            let mut manager = self.buffer_manager.lock_recovering();
             let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
                 return SessionResult::Error {
                     message: "Buffer not found".into(),
@@ -2585,7 +2552,7 @@ impl Session {
         if !state.allows_manual_save() {
             return SessionResult::Conflict { path };
         }
-        let precondition = if self.absent_on_open.lock().unwrap().contains(&path) {
+        let precondition = if self.absent_on_open.lock_recovering().contains(&path) {
             DiskPrecondition::Absent
         } else if let Some(hash) = base_hash {
             DiskPrecondition::Existing(hash.as_bytes())
@@ -2607,21 +2574,21 @@ impl Session {
             revision: revision.as_u64(),
         };
 
-        let mut flights = self.save_flights.lock().unwrap();
-        let outstanding = self.completions.lock().unwrap().len()
+        let mut flights = self.save_flights.lock_recovering();
+        let outstanding = self.completions.lock_recovering().len()
             + flights
                 .values()
                 .map(|flight| 1 + usize::from(flight.queued.is_some()))
                 .sum::<usize>();
-        if outstanding + self.reconcile_flights.lock().unwrap().len() >= MAX_PENDING_SAVE_OPERATIONS
+        if outstanding + self.reconcile_flights.lock_recovering().len()
+            >= MAX_PENDING_SAVE_OPERATIONS
         {
             return SessionResult::Busy;
         }
         if let Some(flight) = flights.get_mut(&buffer_id.as_u64()) {
             if let Some(superseded) = flight.queued.replace(request) {
                 self.completions
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .push_back(OperationCompletion {
                         request_id: superseded.request_id,
                         result: SessionResult::Superseded {
@@ -2653,13 +2620,13 @@ impl Session {
     /// Trigger a reconcile.
     fn reconcile(&self, scope: ReconcileScope, mode: ReconcileMode) -> SessionResult {
         let request_id = self.next_request_id();
-        let flights = self.save_flights.lock().unwrap();
-        let outstanding = self.completions.lock().unwrap().len()
+        let flights = self.save_flights.lock_recovering();
+        let outstanding = self.completions.lock_recovering().len()
             + flights
                 .values()
                 .map(|flight| 1 + usize::from(flight.queued.is_some()))
                 .sum::<usize>()
-            + self.reconcile_flights.lock().unwrap().len();
+            + self.reconcile_flights.lock_recovering().len();
         drop(flights);
         if outstanding >= MAX_PENDING_SAVE_OPERATIONS {
             return SessionResult::Busy;
@@ -2667,8 +2634,7 @@ impl Session {
         match self.actor.submit_reconcile(scope, mode) {
             Ok(response) => {
                 self.reconcile_flights
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .insert(request_id, response);
                 SessionResult::Pending { request_id }
             }
@@ -2690,13 +2656,13 @@ impl Session {
         } else {
             self.identity.root.join(to)
         };
-        if self.buffer_manager.lock().unwrap().has_buffer(&to) {
+        if self.buffer_manager.lock_recovering().has_buffer(&to) {
             return SessionResult::Error {
                 message: format!("destination-open: {}", to.display()),
             };
         }
         let (buffer_ids, buffer_revisions) = {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             let mut buffer_ids = HashMap::new();
             let mut buffer_revisions = HashMap::new();
             for (path, buffer_id) in manager.open_paths() {
@@ -2709,10 +2675,10 @@ impl Session {
             }
             (buffer_ids, buffer_revisions)
         };
-        let outstanding = self.completions.lock().unwrap().len()
-            + self.save_flights.lock().unwrap().len()
-            + self.reconcile_flights.lock().unwrap().len()
-            + self.rename_flights.lock().unwrap().len();
+        let outstanding = self.completions.lock_recovering().len()
+            + self.save_flights.lock_recovering().len()
+            + self.reconcile_flights.lock_recovering().len()
+            + self.rename_flights.lock_recovering().len();
         if outstanding >= MAX_PENDING_SAVE_OPERATIONS {
             return SessionResult::Busy;
         }
@@ -2726,8 +2692,7 @@ impl Session {
         ) {
             Ok(response) => {
                 self.rename_flights
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .insert(request_id, (from, to, response));
                 SessionResult::Pending { request_id }
             }
@@ -2740,7 +2705,7 @@ impl Session {
 
     /// Undo an edit.
     fn undo(&self, buffer_id: BufferId, revision: Revision) -> SessionResult {
-        let mut buffer_manager = self.buffer_manager.lock().unwrap();
+        let mut buffer_manager = self.buffer_manager.lock_recovering();
 
         // Get the buffer and call undo on its model
         if let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) {
@@ -2766,8 +2731,7 @@ impl Session {
                         return SessionResult::Error { message };
                     }
                     self.cancelled_journal_items
-                        .lock()
-                        .unwrap()
+                        .lock_recovering()
                         .insert((tag.txn_id, tag.item_id));
                 }
                 SessionResult::Success(CommandResult::UndoPerformed {
@@ -2788,7 +2752,7 @@ impl Session {
 
     /// Redo an edit.
     fn redo(&self, buffer_id: BufferId, revision: Revision) -> SessionResult {
-        let mut buffer_manager = self.buffer_manager.lock().unwrap();
+        let mut buffer_manager = self.buffer_manager.lock_recovering();
 
         // Get the buffer and call redo on its model
         if let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) {
@@ -2806,8 +2770,7 @@ impl Session {
                 .filter_map(|op| op.journal.as_ref())
                 .any(|tag| {
                     self.cancelled_journal_items
-                        .lock()
-                        .unwrap()
+                        .lock_recovering()
                         .contains(&(tag.txn_id.clone(), tag.item_id))
                 })
             {
@@ -2869,7 +2832,7 @@ impl Session {
                 message: format!("could not snapshot conflict bytes: {error}"),
             };
         }
-        let mut manager = self.buffer_manager.lock().unwrap();
+        let mut manager = self.buffer_manager.lock_recovering();
         match manager
             .get_buffer_by_id_mut(buffer_id)
             .and_then(|buffer| buffer.resolve_keep_local(&theirs).map(|_| ()))
@@ -2894,7 +2857,7 @@ impl Session {
             };
         };
         let mine = {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             match manager.get_buffer_by_id(buffer_id) {
                 Some(buffer) => buffer.model().to_source_bytes(),
                 None => {
@@ -2913,7 +2876,7 @@ impl Session {
                 message: format!("could not snapshot discarded bytes: {error}"),
             };
         }
-        let mut manager = self.buffer_manager.lock().unwrap();
+        let mut manager = self.buffer_manager.lock_recovering();
         match manager
             .get_buffer_by_id_mut(buffer_id)
             .and_then(|buffer| buffer.reload_from_disk(&theirs))
@@ -2938,7 +2901,7 @@ impl Session {
             };
         };
         let (base, mine, revision) = {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             match manager.get_buffer_by_id(buffer_id) {
                 Some(buffer) => (
                     buffer.base_bytes().to_vec(),
@@ -2997,8 +2960,7 @@ impl Session {
         if blake3::hash(&theirs).as_bytes() != &expected_disk_hash {
             if let Some(buffer) = self
                 .buffer_manager
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .get_buffer_by_id_mut(buffer_id)
             {
                 buffer.mark_conflicted_disk_hash(*blake3::hash(&theirs).as_bytes());
@@ -3015,7 +2977,7 @@ impl Session {
             };
         }
         let mine = {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             let Some(buffer) = manager.get_buffer_by_id(buffer_id) else {
                 return SessionResult::Error {
                     message: "merge preview buffer was closed".into(),
@@ -3039,7 +3001,7 @@ impl Session {
                 message: format!("could not snapshot merge buffer: {error}"),
             };
         }
-        let mut manager = self.buffer_manager.lock().unwrap();
+        let mut manager = self.buffer_manager.lock_recovering();
         let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
             return SessionResult::Error {
                 message: "merge preview buffer was closed".into(),
@@ -3070,7 +3032,7 @@ impl Session {
             };
         };
         let key = native_note_key(&path, &self.identity.root);
-        let Some(recovery) = writer.lock().unwrap().read_for_note_key(&key) else {
+        let Some(recovery) = writer.lock_recovering().read_for_note_key(&key) else {
             return SessionResult::Error {
                 message: "no valid recovery snapshot exists for this note".into(),
             };
@@ -3104,8 +3066,7 @@ impl Session {
         let recovered = recovery.to_source_bytes();
         let transition = self
             .buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .get_buffer_by_id_mut(buffer_id)
             .and_then(|buffer| buffer.restore_recovery(&recovered, &disk, recovery.base_hash));
         if transition.is_none() {
@@ -3122,8 +3083,7 @@ impl Session {
         }
         let revision = self
             .buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .get_buffer_by_id(buffer_id)
             .map(|buffer| buffer.revision())
             .unwrap_or(Revision::INITIAL);
@@ -3140,7 +3100,7 @@ impl Session {
             };
         };
         let key = native_note_key(&path, &self.identity.root);
-        if writer.lock().unwrap().delete_for_note_key(&key) {
+        if writer.lock_recovering().delete_for_note_key(&key) {
             SessionResult::Success(CommandResult::ConflictResolved)
         } else {
             SessionResult::Error {
@@ -3165,7 +3125,7 @@ impl Session {
         // The buffer for `path` must be the exact buffer the caller saw:
         // restoring into a buffer belonging to another note is refused.
         {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             let path_buffer = manager.get_buffer(&path).map(|buffer| buffer.buffer_id());
             if path_buffer != Some(buffer_id) {
                 return SessionResult::Error {
@@ -3185,7 +3145,7 @@ impl Session {
                 message: "history snapshot is not valid UTF-8".into(),
             };
         };
-        let mut manager = self.buffer_manager.lock().unwrap();
+        let mut manager = self.buffer_manager.lock_recovering();
         let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
             return SessionResult::Error {
                 message: "Buffer no longer open".into(),
@@ -3257,7 +3217,7 @@ impl Session {
     /// Lightweight current buffer stamp for rejecting obsolete graph publications.
     /// No text copies, database access, or filesystem work.
     pub fn graph_buffer_stamp(&self) -> Vec<GraphBufferStamp> {
-        let manager = self.buffer_manager.lock().unwrap();
+        let manager = self.buffer_manager.lock_recovering();
         let mut stamp: Vec<_> = manager
             .open_paths()
             .into_iter()
@@ -3291,7 +3251,7 @@ impl Session {
         buffer_id: BufferId,
         revision: Option<Revision>,
     ) -> Result<SharedBufferSnapshot, BufferSnapshotError> {
-        let _turn = self.driving_turn.lock().unwrap();
+        let _turn = self.driving_turn.lock_recovering();
         self.shared_buffer_snapshot_inner(buffer_id, revision)
     }
     pub(crate) fn shared_buffer_snapshot_inner(
@@ -3299,7 +3259,7 @@ impl Session {
         buffer_id: BufferId,
         revision: Option<Revision>,
     ) -> Result<SharedBufferSnapshot, BufferSnapshotError> {
-        let manager = self.buffer_manager.lock().unwrap();
+        let manager = self.buffer_manager.lock_recovering();
         let buffer = manager
             .get_buffer_by_id(buffer_id)
             .ok_or(BufferSnapshotError::NotFound(buffer_id.as_u64()))?;
@@ -3317,7 +3277,7 @@ impl Session {
             .ok_or(BufferSnapshotError::NotFound(buffer_id.as_u64()))?;
         let current_revision = buffer.revision();
         let text = {
-            let mut cache = self.shared_snapshots.lock().unwrap();
+            let mut cache = self.shared_snapshots.lock_recovering();
             match cache.get(&buffer_id) {
                 Some((cached_revision, text)) if *cached_revision == current_revision => {
                     text.clone()
@@ -3354,7 +3314,7 @@ impl Session {
         let Some(writer) = &self.recovery_writer else {
             return Vec::new();
         };
-        let manager = self.buffer_manager.lock().unwrap();
+        let manager = self.buffer_manager.lock_recovering();
         let dirty = manager
             .dirty_buffers()
             .into_iter()
@@ -3369,10 +3329,10 @@ impl Session {
         drop(manager);
         let mut written = Vec::new();
         for (key, base, snapshot) in dirty {
-            let due = writer.lock().unwrap().should_write_snapshot(&snapshot);
+            let due = writer.lock_recovering().should_write_snapshot(&snapshot);
             if due
                 && self.actor.pin_merge_base(key.clone(), base).is_ok()
-                && let Some(path) = writer.lock().unwrap().write_snapshot(&key, snapshot)
+                && let Some(path) = writer.lock_recovering().write_snapshot(&key, snapshot)
             {
                 written.push(path);
             }
@@ -3385,7 +3345,7 @@ impl Session {
     /// protects edits made shortly before shutdown.
     pub fn flush_recovery(&self) -> Result<Vec<PathBuf>, String> {
         let snapshots = {
-            let manager = self.buffer_manager.lock().unwrap();
+            let manager = self.buffer_manager.lock_recovering();
             manager
                 .dirty_buffers()
                 .into_iter()
@@ -3410,8 +3370,7 @@ impl Session {
                 .pin_merge_base(key.clone(), base)
                 .map_err(|error| format!("could not persist recovery merge base: {error}"))?;
             writer
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .write_snapshot_now(&key, snapshot)
                 .ok_or_else(|| {
                     "could not durably write a dirty-buffer recovery snapshot".to_owned()
@@ -3455,8 +3414,7 @@ impl Session {
     #[must_use]
     pub fn is_open(&self, path: &Path) -> bool {
         self.buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .has_buffer(&path.to_path_buf())
     }
 
@@ -3464,8 +3422,7 @@ impl Session {
     #[must_use]
     pub fn get_buffer_id(&self, path: &Path) -> Option<BufferId> {
         self.buffer_manager
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .get_buffer(&path.to_path_buf())
             .map(|buffer| buffer.buffer_id())
     }
@@ -3598,7 +3555,7 @@ impl SessionBuilder {
                 .unwrap_or_else(|| NoticeChannel::new(Duration::from_millis(300))),
             self.config.unwrap_or_default(),
         );
-        *session.recovery_notices.lock().unwrap() = self.recovery_notices.into();
+        *session.recovery_notices.lock_recovering() = self.recovery_notices.into();
         Ok(session)
     }
 }

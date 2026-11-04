@@ -7,6 +7,7 @@
 //! never trusted merely because they appear in client JSON. The store is
 //! owned by the Session; commit linearizes under the session ingress.
 
+use crate::sync::MutexExt;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -586,8 +587,7 @@ pub(crate) fn prepare_work(
 
     let buffer_id = request.buffer_id;
     let (text, source_path) = {
-        let manager: std::sync::MutexGuard<'_, BufferManager> =
-            context.manager.lock().expect("buffer manager lock");
+        let manager: std::sync::MutexGuard<'_, BufferManager> = context.manager.lock_recovering();
         let buffer = manager
             .get_buffer_by_id(flavite_buffer::BufferId::from(buffer_id))
             .ok_or(LinkInsertionError::StaleSource {

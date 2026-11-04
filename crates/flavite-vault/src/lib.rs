@@ -22,6 +22,7 @@ mod reconcile_worker;
 pub mod rename;
 pub mod save;
 pub mod session;
+pub mod sync;
 pub mod tokens;
 pub mod types;
 pub mod user_state;
@@ -67,6 +68,7 @@ pub use session::{
     CommandResult, ConflictResolution, OpenPolicy, Session, SessionBuilder, SessionCommand,
     SessionError, SessionEvent, SessionResult,
 };
+pub use sync::{MutexExt, RwLockExt};
 pub use tokens::{TokenGuard, WriteToken, WriteTokenManager};
 pub use types::{
     AtomicVersion, ChangeKind, Epoch, Generation, ReconcileMode, ReconcileScope, ReconcileSummary,

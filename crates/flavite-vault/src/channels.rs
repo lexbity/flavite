@@ -10,6 +10,7 @@
 //! This separation ensures conflict banners and recovery offers are never dropped
 //! (R5) even when telemetry events flood the channel.
 
+use crate::sync::MutexExt;
 use crate::types::{Epoch, Generation, ReconcileSummary};
 use crossbeam::channel::{Receiver, Sender, bounded, unbounded};
 use flavite_buffer::manager::NoteRef;
@@ -234,7 +235,7 @@ impl NoticeChannel {
     pub fn send(&self, notice: Notice) {
         let key = Self::key_for_notice(&notice);
 
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.pending.lock_recovering();
 
         // Replace existing pending notice with the same key
         pending.insert(key.clone(), notice.clone());
@@ -279,7 +280,7 @@ impl NoticeChannel {
     /// a command or journal item.
     pub fn ack(&self, notice: &Notice) {
         let key = Self::key_for_notice(notice);
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.pending.lock_recovering();
         pending.remove(&key);
     }
 

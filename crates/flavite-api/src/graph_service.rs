@@ -15,6 +15,7 @@
 //! reused) rebuilds the model and re-installs the layout worker instead of
 //! delta-feeding through the reset.
 
+use flavite_vault::sync::MutexExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -242,11 +243,7 @@ impl GraphService {
     /// an incarnation or sequence; the worker publishes the same token.
     pub fn request_scope(&self, request: ScopeRequest) -> Result<(), &'static str> {
         request.scope.validate()?;
-        let mut scopes = self
-            .shared
-            .scopes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut scopes = self.shared.scopes.lock_recovering();
         if let Some(old) = scopes.get(&request.token.tab) {
             if (old.token.incarnation, old.token.sequence)
                 > (request.token.incarnation, request.token.sequence)
@@ -271,11 +268,7 @@ impl GraphService {
     }
 
     pub fn release_scope(&self, tab: u128) {
-        self.shared
-            .scopes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&tab);
+        self.shared.scopes.lock_recovering().remove(&tab);
     }
 
     /// The newest base frame, if any has been published.
@@ -287,11 +280,7 @@ impl GraphService {
     /// Current service status (drives honest loading/error states).
     #[must_use]
     pub fn status(&self) -> GraphServiceStatus {
-        self.shared
-            .status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.shared.status.lock_recovering().clone()
     }
 
     /// Fixed-cardinality counters for diagnostics (§13.4).
@@ -333,12 +322,7 @@ impl GraphService {
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Release);
         let _ = self.hints.try_send(Directive::Poll);
-        if let Some(handle) = self
-            .thread
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
+        if let Some(handle) = self.thread.lock_recovering().take() {
             let _ = handle.join();
         }
     }
@@ -427,11 +411,7 @@ fn run_service_attempt(
                 break;
             }
             shared.counters.polls.fetch_add(1, Ordering::Relaxed);
-            let scopes = shared
-                .scopes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
+            let scopes = shared.scopes.lock_recovering().clone();
             let read = (|| {
                 if !db_path.exists() {
                     return Err("Index not available yet".to_owned());
@@ -635,10 +615,7 @@ impl LayoutState {
 }
 
 fn set_status(shared: &Arc<Shared>, status: GraphServiceStatus) {
-    let mut guard = shared
-        .status
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = shared.status.lock_recovering();
     if *guard != status {
         *guard = status;
     }

@@ -6,6 +6,7 @@
 //! [`crate::Flavite::read_user_state`] / [`write_user_state`]. The codec is
 //! pure data: no toolkit, filesystem, or shell dependency.
 
+use flavite_vault::sync::MutexExt;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
@@ -513,7 +514,7 @@ pub fn intern_chords(chords: &[Chord]) -> &'static [Chord] {
         .collect::<Vec<_>>()
         .join(";");
     let cache = INTERNED.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().expect("chord interning lock");
+    let mut guard = cache.lock_recovering();
     if let Some(slice) = guard.get(&key) {
         return slice;
     }

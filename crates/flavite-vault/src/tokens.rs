@@ -12,6 +12,7 @@
 //! misclassification would let a concurrent writer read a false "no token"
 //! and treat its own write as external).
 
+use crate::sync::RwLockExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -161,7 +162,7 @@ impl WriteTokenManager {
             expected_hash,
             self.default_timeout,
         );
-        let mut tokens = self.tokens.write().unwrap();
+        let mut tokens = self.tokens.write_recovering();
         tokens.insert(path, token.clone());
         token
     }
@@ -176,7 +177,7 @@ impl WriteTokenManager {
         timeout: Duration,
     ) -> WriteToken {
         let token = WriteToken::new(&self.next_id, path.clone(), expected_hash, timeout);
-        let mut tokens = self.tokens.write().unwrap();
+        let mut tokens = self.tokens.write_recovering();
         tokens.insert(path, token.clone());
         token
     }
@@ -189,7 +190,7 @@ impl WriteTokenManager {
     /// replacement + late drop is a normal lifecycle, and the guard API has
     /// no channel to report a failed release.
     pub fn release(&self, token: &WriteToken) {
-        let mut tokens = self.tokens.write().unwrap();
+        let mut tokens = self.tokens.write_recovering();
         if tokens
             .get(&token.path)
             .is_some_and(|live| live.token_id == token.token_id)
@@ -201,14 +202,14 @@ impl WriteTokenManager {
     /// Check if a token exists for a path.
     #[must_use]
     pub fn has_token(&self, path: &Path) -> bool {
-        let tokens = self.tokens.read().unwrap();
+        let tokens = self.tokens.read_recovering();
         tokens.contains_key(path)
     }
 
     /// Get the token for a path, if any.
     #[must_use]
     pub fn get_token(&self, path: &Path) -> Option<WriteToken> {
-        let tokens = self.tokens.read().unwrap();
+        let tokens = self.tokens.read_recovering();
         tokens.get(path).cloned()
     }
 
@@ -228,7 +229,7 @@ impl WriteTokenManager {
 
     /// Remove expired tokens.
     pub fn cleanup_expired(&self) -> usize {
-        let mut tokens = self.tokens.write().unwrap();
+        let mut tokens = self.tokens.write_recovering();
         let now = Instant::now();
         let mut count = 0;
 
@@ -246,14 +247,14 @@ impl WriteTokenManager {
 
     /// Clear all tokens.
     pub fn clear(&self) {
-        let mut tokens = self.tokens.write().unwrap();
+        let mut tokens = self.tokens.write_recovering();
         tokens.clear();
     }
 
     /// Get the number of active tokens.
     #[must_use]
     pub fn len(&self) -> usize {
-        let tokens = self.tokens.read().unwrap();
+        let tokens = self.tokens.read_recovering();
         tokens.len()
     }
 
@@ -266,7 +267,7 @@ impl WriteTokenManager {
     /// Get all token paths.
     #[must_use]
     pub fn paths(&self) -> Vec<PathBuf> {
-        let tokens = self.tokens.read().unwrap();
+        let tokens = self.tokens.read_recovering();
         tokens.keys().cloned().collect()
     }
 }

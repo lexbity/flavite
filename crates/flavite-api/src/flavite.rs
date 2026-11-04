@@ -18,6 +18,7 @@ use crate::types::{ApiVaultRef, RequestId};
 use flavite_buffer::revision::{BufferId, Revision};
 use flavite_vault::open::Vault;
 use flavite_vault::session::{Session, SessionCommand, SessionError, SessionResult};
+use flavite_vault::sync::MutexExt;
 use flavite_vault::types::{Epoch, Generation, VaultConfig, VaultIdentity};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -858,7 +859,7 @@ impl Flavite {
         use flavite_vault::channels::{Notice, Pulse};
         use flavite_vault::session::SessionEvent;
 
-        let available = MAX_NOTICE_ACKS.saturating_sub(self.notice_acks.lock().unwrap().len());
+        let available = MAX_NOTICE_ACKS.saturating_sub(self.notice_acks.lock_recovering().len());
         let notice_limit = notice_credits.min(available);
         let mut events = Vec::new();
         for event in self.session.drain_events() {
@@ -935,8 +936,7 @@ impl Flavite {
             };
             let id = NoticeId(self.next_notice_id.fetch_add(1, Ordering::Relaxed));
             self.notice_acks
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .insert(id, (event.clone(), notice));
             events.push(EventDelivery {
                 notice_id: Some(id),
@@ -949,7 +949,7 @@ impl Flavite {
     /// Acknowledge a notice only after its host presentation is visible.
     /// This never completes a command or advances journal work.
     pub fn acknowledge_notice(&self, id: NoticeId) -> bool {
-        let mut pending = self.notice_acks.lock().unwrap();
+        let mut pending = self.notice_acks.lock_recovering();
         if let Some((_, notice)) = pending.remove(&id) {
             self.session.acknowledge_notice(&notice);
             return true;
@@ -975,7 +975,7 @@ impl Flavite {
     /// Current number of notice credits held by the host.
     #[must_use]
     pub fn outstanding_notice_count(&self) -> usize {
-        self.notice_acks.lock().unwrap().len()
+        self.notice_acks.lock_recovering().len()
     }
 
     /// Ask the vault actor to perform its throttled focus verification.
@@ -1081,7 +1081,7 @@ impl Flavite {
 
     /// Execute a typed command through the registry.
     pub fn execute(&self, invocation: Invocation) -> ExecutionResult {
-        let _turn = self.ingress.lock().unwrap();
+        let _turn = self.ingress.lock_recovering();
         if let Err(error) = self
             .command_registry
             .validate(invocation.command_id, &invocation.args)
@@ -1484,10 +1484,9 @@ impl Flavite {
                 request_id: session_id,
             } => {
                 self.operation_ids
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .insert(session_id, request_id);
-                self.pending_requests.lock().unwrap().insert(request_id);
+                self.pending_requests.lock_recovering().insert(request_id);
                 ExecutionResult::Pending { request_id }
             }
             SessionResult::Busy => ExecutionResult::Rejected(
@@ -1554,8 +1553,7 @@ impl Flavite {
             SessionResult::Superseded { by_request, .. } => {
                 let by_request = self
                     .operation_ids
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .get(&by_request)
                     .copied()
                     .unwrap_or(by_request);
@@ -1570,18 +1568,17 @@ impl Flavite {
     /// Drain lossless terminal results for admitted asynchronous operations.
     /// Results are correlated to the original public invocation ID.
     pub fn drain_operation_completions(&self) -> Vec<OperationCompletion> {
-        let _turn = self.ingress.lock().unwrap();
+        let _turn = self.ingress.lock_recovering();
         self.session
             .drain_operation_completions()
             .into_iter()
             .map(|completion| {
                 let request_id = self
                     .operation_ids
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .remove(&completion.request_id)
                     .unwrap_or(completion.request_id);
-                self.pending_requests.lock().unwrap().remove(&request_id);
+                self.pending_requests.lock_recovering().remove(&request_id);
                 let result = self.convert_session_result(completion.result, request_id);
                 OperationCompletion { request_id, result }
             })
@@ -1591,10 +1588,14 @@ impl Flavite {
     /// Wait for one admitted operation to reach a terminal result.
     pub fn wait_for_operation(&self, request_id: RequestId) -> ExecutionResult {
         loop {
-            if let Some(result) = self.terminal_backlog.lock().unwrap().remove(&request_id) {
+            if let Some(result) = self.terminal_backlog.lock_recovering().remove(&request_id) {
                 return result;
             }
-            if !self.pending_requests.lock().unwrap().contains(&request_id) {
+            if !self
+                .pending_requests
+                .lock_recovering()
+                .contains(&request_id)
+            {
                 return ExecutionResult::Rejected(
                     RejectedResult::with_request(RejectionReason::Unavailable, request_id)
                         .with_message("operation is not pending or has already been drained"),
@@ -1605,8 +1606,7 @@ impl Flavite {
                     return completion.result;
                 }
                 self.terminal_backlog
-                    .lock()
-                    .unwrap()
+                    .lock_recovering()
                     .insert(completion.request_id, completion.result);
             }
             std::thread::sleep(std::time::Duration::from_millis(1));

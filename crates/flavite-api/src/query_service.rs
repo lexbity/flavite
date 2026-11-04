@@ -8,6 +8,7 @@
 
 use crate::queries::MAX_NOTE_CATALOG_LIMIT;
 use flavite_vault::session::Session;
+use flavite_vault::sync::MutexExt;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -405,7 +406,7 @@ impl QueryService {
     /// already dropped here: a late sequence `n` can never overwrite or
     /// coexist with a served `n+1` for the same requesting view.
     pub fn drain(&self) -> Vec<QueryOutcome> {
-        let mut ready = self.ready.lock().expect("query slot lock");
+        let mut ready = self.ready.lock_recovering();
         let drained = std::mem::take(&mut *ready);
         self.in_flight.fetch_sub(drained.len(), Ordering::AcqRel);
         drained
@@ -432,7 +433,7 @@ fn publish(
     job: Job,
     result: ContextQueryResult,
 ) {
-    let mut slots = ready.lock().expect("query slot lock");
+    let mut slots = ready.lock_recovering();
     // Superseded results for the same view identity are discarded in both
     // directions: a late sequence n can never overwrite or coexist with an
     // already-served n+1, and older entries never outlive a newer one.

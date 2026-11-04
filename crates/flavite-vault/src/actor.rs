@@ -12,6 +12,7 @@ use crate::history::HistoryStore;
 use crate::history::{HistoryReason, SnapshotRef};
 use crate::rename::RenamePlanner;
 use crate::save::{SaveFailure, SaveReceipt, SaveRequest};
+use crate::sync::MutexExt;
 use crate::types::{
     Epoch, Generation, ReconcileMode, ReconcileScope, ReconcileSummary, RenameStrategy,
     VaultIdentity, Version,
@@ -1056,7 +1057,7 @@ impl VaultActor {
                             .name("vault-watch-bridge".into())
                             .spawn(move || {
                                 loop {
-                                    let result = std_receiver.lock().unwrap().recv();
+                                    let result = std_receiver.lock_recovering().recv();
                                     let Ok(event) = result else {
                                         break;
                                     };
