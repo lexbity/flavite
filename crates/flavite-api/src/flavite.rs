@@ -30,6 +30,88 @@ use thiserror::Error;
 /// Re-export vault types for API consumers.
 pub use flavite_vault::types::{ReconcileMode, ReconcileScope};
 
+/// RFC-0004 §6.7 (NFR-10): the host-turn budget guard. Every [`Flavite::execute`]
+/// turn is measured in debug builds; a turn over [`TURN_BUDGET`] emits a
+/// `tracing::warn` naming the command, rate-limited to one per second.
+/// Release builds compile the measurement away entirely — the overhead
+/// policy is zero beyond the two compares the optimizer folds into the
+/// call site's absence.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub mod turn_budget {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// The turn budget (§6.7): a host turn over this wall emits a
+    /// rate-limited warn.
+    pub const TURN_BUDGET: Duration = Duration::from_millis(2);
+
+    /// Rate-limit window: at most one budget warn per second.
+    const RATE_LIMIT: Duration = Duration::from_secs(1);
+
+    /// Millis-since-epoch of the last emitted (or decided) warn, on a
+    /// process-start anchor so the state is a single lock-free atomic.
+    /// `0` means "never warned" (millis-since-epoch 0 is only the first
+    /// millisecond of process life; a warn then is indistinguishable from
+    /// never — harmless by one rate window).
+    static LAST_WARN_MILLIS: AtomicU64 = AtomicU64::new(0);
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+    fn millis_since_epoch() -> u64 {
+        let epoch = EPOCH.get_or_init(Instant::now);
+        u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn millis_since_last_warn() -> u64 {
+        let last = LAST_WARN_MILLIS.load(Ordering::Relaxed);
+        if last == 0 {
+            // Never warned: the elapsed window is unbounded.
+            u64::MAX
+        } else {
+            // Stored values are `epoch + 1`, so the "never warned" sentinel
+            // is unambiguous even in the first millisecond of process life.
+            millis_since_epoch().saturating_sub(last.saturating_sub(1))
+        }
+    }
+
+    /// The rate-limited decision, exposed as the test hook (§6.7: warn
+    /// emission asserted through the decision, not a subscriber): `true`
+    /// when a turn of `elapsed` exceeds the budget AND the rate window has
+    /// elapsed — and records the window when it does.
+    #[doc(hidden)]
+    pub fn warn_decision(elapsed: Duration) -> bool {
+        if elapsed <= TURN_BUDGET {
+            return false;
+        }
+        let since_last = millis_since_last_warn();
+        if since_last < RATE_LIMIT.as_millis().min(u128::from(u64::MAX)) as u64 {
+            return false;
+        }
+        LAST_WARN_MILLIS.store(millis_since_epoch().saturating_add(1), Ordering::Relaxed);
+        true
+    }
+
+    /// Test reset for the rate-window state.
+    #[doc(hidden)]
+    pub fn reset_for_test() {
+        LAST_WARN_MILLIS.store(0, Ordering::Relaxed);
+    }
+
+    /// Measure one host turn (debug builds only).
+    pub fn observe(command_id: &'static str, started: Instant) {
+        let elapsed = started.elapsed();
+        if warn_decision(elapsed) {
+            tracing::warn!(
+                target: "flavite_api::turn_budget",
+                command_id,
+                elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+                "host turn exceeded budget"
+            );
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditOpArgs {
@@ -1183,6 +1265,20 @@ impl Flavite {
 
     /// Execute a typed command through the registry.
     pub fn execute(&self, invocation: Invocation) -> ExecutionResult {
+        #[cfg(debug_assertions)]
+        let turn_started = std::time::Instant::now();
+        // `&'static str`: the id outlives the moved invocation.
+        #[cfg(debug_assertions)]
+        let command_id = invocation.command_id;
+        let result = self.execute_turn(invocation);
+        // NFR-10: debug builds measure every host turn; release pays nothing.
+        #[cfg(debug_assertions)]
+        turn_budget::observe(command_id, turn_started);
+        result
+    }
+
+    /// The turn body: ingress-serialized validation + dispatch + conversion.
+    fn execute_turn(&self, invocation: Invocation) -> ExecutionResult {
         let _turn = self.ingress.lock_recovering();
         if let Err(error) = self
             .command_registry

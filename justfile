@@ -56,7 +56,9 @@ lint-arch:
         fi
     }
     check_absent 'fn apply_attachment\b' crates
-    check_absent 'open_buffers' crates/flavite-vault/src/session.rs
+    # The Session-global `open_buffers` map (C1-adjacent) is gone; the name
+    # may still appear in prose (the memo NFR-1 bound references it).
+    check_absent 'self\.open_buffers|open_buffers\s*:' crates/flavite-vault/src/session.rs
     check_absent 'not yet implemented' crates/flavite-vault/src/rename
     check_absent 'JournalRecovery\b' crates
     check_absent 'normalize_target_key' crates
@@ -71,6 +73,14 @@ lint-arch:
     check_absent '\.note_catalog\(' crates/flavite-ui/src
     check_absent 'INSERT INTO changes\(' crates/flavite-index/src
     check_absent 'UPDATE notes SET id_conflict=CASE' crates/flavite-index/src/pool.rs
+    # FR-10: `re_resolve_all` is backstop-only — exactly one production
+    # invocation in pool.rs, inside `backstop_walk` (the apply paths never
+    # walk; the doc-comment mentions are not invocations).
+    re_resolve_count=$(rg -c '\.re_resolve_all\(' crates/flavite-index/src/pool.rs || true)
+    if [ "${re_resolve_count:-0}" != "1" ]; then
+        echo "lint-arch: .re_resolve_all( invocations in pool.rs = ${re_resolve_count:-0}, expected exactly 1 (backstop_walk)" >&2
+        exit 1
+    fi
     echo "lint-arch passed (RFC-0002 debt gates)."
 
 # S3 watcher-truth probe (PLAN-C C1, §9 S3-1): per-OS watcher evidence with a
