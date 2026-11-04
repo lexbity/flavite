@@ -9,14 +9,18 @@
 //! hard cap 8.
 
 use crate::changelog::{ChangeKind, ChangeLogWriter};
-use crate::resolver::Resolver;
+use crate::resolver::{
+    AttImage, EntityPre, NoteImage, Resolver, ResolverDiagnostics, ResolverState,
+    affected_resolution_keys, group_winner_in_tx, identity_relevant, refresh_id_conflict_groups,
+    resolve_affected, target_stem_key,
+};
 use crate::schema::{AttachmentKind, MetaKey, get_meta_u64};
 use crate::search::SearchBackend;
 use crate::types::IndexVersion;
 use blake3::Hash;
 use flavite_syntax::{pulldown_glue::parse_note, text::TextSnapshot};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Result, Transaction};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -59,6 +63,7 @@ pub struct IndexActor {
     search: crate::search::TantivyBackend,
     last_search_commit: Instant,
     needs_reparse: bool,
+    resolver: ResolverState,
 }
 
 /// Build one bounded excerpt around the first occurrence of any term.
@@ -439,57 +444,139 @@ impl Writer {
     }
 }
 
-/// A link row's resolution state as stored: the tuple that FR-2 equality
-/// compares. Keyed by `(src, ord)` for the pre/post diff.
-type LinkState = (Option<i64>, Option<i64>, String);
-
-/// Snapshot every link row's resolution state inside the writer
-/// transaction. RFC-0004 §6.1.2: until targeted resolution (S2) makes the
-/// affected set intrinsic, the apply paths capture pre/post states around
-/// the existing `re_resolve_all` walk to emit truthful `outgoing(src)`
-/// rows. This is a deliberate, bounded O(links) read for one slice.
-fn snapshot_link_states(tx: &Transaction<'_>) -> Result<HashMap<(i64, i32), LinkState>, String> {
-    let mut statement = tx
-        .prepare("SELECT src, ord, dst_note, dst_att, res_state FROM links")
-        .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                (row.get::<_, i64>(0)?, row.get::<_, i32>(1)?),
-                (
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, String>(4)?,
-                ),
-            ))
-        })
-        .map_err(|error| error.to_string())?;
-    rows.collect::<Result<HashMap<(i64, i32), LinkState>, _>>()
-        .map_err(|error| error.to_string())
+/// Generation values visible to the apply closure. The spine owns the bump
+/// discipline: closures stamp rows with `counters.generation`, and the meta
+/// update happens exactly once in the spine.
+struct SpineCounters {
+    generation: u64,
 }
 
-/// Feed rows for every source note whose link rows changed between two
-/// snapshots (FR-1: one `outgoing(src)` row per flipped source; the PK
-/// collapses duplicates with the applied note's own row).
-fn changed_outgoing_rows(
-    pre: &HashMap<(i64, i32), LinkState>,
-    post: &HashMap<(i64, i32), LinkState>,
-) -> Vec<(ChangeKind, i64)> {
-    let mut changed = BTreeSet::new();
-    for ((src, ord), state) in post {
-        if pre.get(&(*src, *ord)).is_none_or(|old| old != state) {
-            changed.insert(*src);
-        }
-    }
-    for (src, ord) in pre.keys() {
-        if !post.contains_key(&(*src, *ord)) {
-            changed.insert(*src);
-        }
-    }
-    changed
-        .into_iter()
-        .map(|src| (ChangeKind::Outgoing, src))
-        .collect()
+/// The closure's verdict after applying its row mutations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoreStep {
+    /// Structural mutation happened: resolve, log, bump, commit.
+    Proceed,
+    /// Nothing structural changed: commit the touched stat columns with no
+    /// generation bump and no change rows (content-hash / stat fast path).
+    FastPath,
+}
+
+/// What the closure hands back to the spine: the post-image to mirror into
+/// the overlay, the entity change rows, the fresh own-outgoing target keys
+/// (collected where `target_key` is computed anyway, `pool.rs` link loop),
+/// and the ids whose base records this transaction replaced or removed.
+#[derive(Default)]
+struct ApplyPlan {
+    post: Option<EntityPre>,
+    entity_rows: Vec<(ChangeKind, i64)>,
+    fresh_target_keys: BTreeSet<String>,
+    touched_notes: BTreeSet<i64>,
+    touched_attachments: BTreeSet<i64>,
+    /// Upserted note row needing the targeted self-flag refresh (§6.2.6).
+    conflict_row: Option<i64>,
+}
+
+/// Outcome of [`IndexActor::apply_entity_core`].
+#[derive(Debug, Clone, Copy)]
+enum SpineOutcome {
+    /// The required entity was absent; the transaction rolled back and
+    /// nothing was written.
+    RolledBack,
+    /// Fast path committed without a generation bump.
+    FastPath { epoch: u64, generation: u64 },
+    /// Structural apply committed at `generation`.
+    Applied { epoch: u64, generation: u64 },
+}
+
+/// Load the note pre-image (identity columns + alias keys) inside the
+/// writer transaction before rows are mutated (§6.2.2; D3 requires the
+/// pre-image in the affected key set).
+fn load_note_pre_image(
+    tx: &Transaction<'_>,
+    path_native: &[u8],
+) -> Result<Option<NoteImage>, String> {
+    let row = tx
+        .query_row(
+            "SELECT note_id,path,path_native,path_key,stem_key,title,stable_id,stable_id_key,id_conflict,content_hash \
+             FROM notes WHERE path_native=?1",
+            [path_native],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<Vec<u8>>>(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((
+        id,
+        path,
+        path_native,
+        path_key,
+        stem_key,
+        title,
+        stable_id,
+        stable_id_key,
+        id_conflict,
+        content_hash,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let aliases = {
+        let mut statement = tx
+            .prepare("SELECT alias_key FROM aliases WHERE note_id=?1 ORDER BY alias_key")
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    Ok(Some(NoteImage {
+        id,
+        path,
+        path_native,
+        path_key,
+        stem_key,
+        title,
+        aliases,
+        stable_id,
+        stable_id_key,
+        id_conflict: id_conflict != 0,
+        content_hash,
+    }))
+}
+
+/// Load the attachment pre-image inside the writer transaction.
+fn load_att_pre_image(
+    tx: &Transaction<'_>,
+    path_native: &[u8],
+) -> Result<Option<AttImage>, String> {
+    tx.query_row(
+        "SELECT att_id,path,path_native,path_key,stem_key FROM attachments WHERE path_native=?1",
+        [path_native],
+        |row| {
+            Ok(AttImage {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                path_native: row.get(2)?,
+                path_key: row.get(3)?,
+                stem_key: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| error.to_string())
 }
 
 /// Reserve an epoch-local identity even when the largest live row was deleted.
@@ -518,6 +605,25 @@ impl IndexActor {
     /// # Errors
     /// Returns a SQLite error if the writer or read pool cannot be initialized.
     pub fn new(db_path: &Path, pool_size: usize) -> Result<Self> {
+        Self::construct(db_path, pool_size, None)
+    }
+
+    /// Create an actor whose resolver backstop fires on a custom generation
+    /// cadence. Measurement seam for benches and RFC-0004 backstop tests
+    /// (S2/S8); production callers use [`IndexActor::new`] with
+    /// [`crate::resolver::RESOLVER_BACKSTOP_GENERATIONS`].
+    ///
+    /// # Errors
+    /// Returns a SQLite error if the writer or read pool cannot be initialized.
+    pub fn with_resolver_backstop(
+        db_path: &Path,
+        pool_size: usize,
+        generations: u64,
+    ) -> Result<Self> {
+        Self::construct(db_path, pool_size, Some(generations.max(1)))
+    }
+
+    fn construct(db_path: &Path, pool_size: usize, backstop: Option<u64>) -> Result<Self> {
         let parser_version = crate::schema::open_or_init(db_path)?;
         let needs_reparse = crate::schema::get_meta_u32(&parser_version, MetaKey::ParserVersion)?
             != Some(crate::schema::PARSER_VERSION);
@@ -563,13 +669,25 @@ impl IndexActor {
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         }
 
+        let resolver = match backstop {
+            Some(generations) => ResolverState::with_backstop_interval(writer.conn(), generations)?,
+            None => ResolverState::load(writer.conn())?,
+        };
         Ok(Self {
             writer,
             read_pool,
             search,
             last_search_commit: Instant::now(),
             needs_reparse,
+            resolver,
         })
+    }
+
+    /// Committed resolver diagnostics: backstop cadence and resolution
+    /// strategy counters (doctor wiring lands in RFC-0004 S3).
+    #[must_use]
+    pub fn resolver_diagnostics(&self) -> ResolverDiagnostics {
+        self.resolver.diagnostics()
     }
 
     /// Whether opening this index found a parser version that requires a
@@ -921,6 +1039,178 @@ impl IndexActor {
             .map_err(|error| error.to_string())
     }
 
+    /// The single apply spine (§6.2 "How"): pre-image → mutate → post →
+    /// generation bump → group-scoped `id_conflict` → resolution (targeted
+    /// against the staged overlay, or the whole-vault backstop walk at D13
+    /// cadence) → change rows → commit → fold. All five apply paths keep
+    /// their distinct row shapes but delegate everything else here, so the
+    /// sequence that previously existed five divergent times — including
+    /// the divergent change-row writes of C4 — exists exactly once.
+    ///
+    /// Transaction boundaries stay the writer's: one `conn.transaction()`
+    /// owns every structural write, the generation meta bump, and the
+    /// change rows, matching the commit discipline each path had before.
+    /// On any error the transaction (and the overlay, which is dropped at
+    /// the next fold rather than here) leaves no trace in the base —
+    /// rollback safety is structural (§6.2.4).
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transaction's pre/mutate/post/resolve/log/commit discipline; splitting would only relocate it"
+    )]
+    fn apply_entity_core<F>(
+        &mut self,
+        note: bool,
+        require_present: bool,
+        path_native: &[u8],
+        mutate: F,
+    ) -> Result<(SpineOutcome, ApplyPlan), String>
+    where
+        F: FnOnce(
+            &Transaction<'_>,
+            Option<&EntityPre>,
+            &SpineCounters,
+            &mut ApplyPlan,
+        ) -> Result<CoreStep, String>,
+    {
+        let tx = self
+            .writer
+            .conn
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let epoch = get_meta_u64(&tx, MetaKey::Epoch)
+            .map_err(|error| error.to_string())?
+            .unwrap_or(1);
+        let current_generation = get_meta_u64(&tx, MetaKey::Generation)
+            .map_err(|error| error.to_string())?
+            .unwrap_or(0);
+        let generation = current_generation
+            .checked_add(1)
+            .ok_or("index generation overflow")?;
+        let pre: Option<EntityPre> = if note {
+            load_note_pre_image(&tx, path_native)?.map(EntityPre::Note)
+        } else {
+            load_att_pre_image(&tx, path_native)?.map(EntityPre::Attachment)
+        };
+        if require_present && pre.is_none() {
+            tx.rollback().map_err(|error| error.to_string())?;
+            return Ok((SpineOutcome::RolledBack, ApplyPlan::default()));
+        }
+        let counters = SpineCounters { generation };
+        let mut plan = ApplyPlan::default();
+        if mutate(&tx, pre.as_ref(), &counters, &mut plan)? == CoreStep::FastPath {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok((
+                SpineOutcome::FastPath {
+                    epoch,
+                    generation: current_generation,
+                },
+                plan,
+            ));
+        }
+        tx.execute(
+            "UPDATE meta SET value=?1 WHERE key=?2",
+            rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
+        )
+        .map_err(|error| error.to_string())?;
+        let relevant = identity_relevant(pre.as_ref(), plan.post.as_ref());
+        let mut stable_id_keys: BTreeSet<String> = BTreeSet::new();
+        for image in pre.iter().chain(plan.post.iter()) {
+            if let Some(key) = image.stable_id_key() {
+                stable_id_keys.insert(key.clone());
+            }
+        }
+        // Targeted id_conflict maintenance (§6.2.6): only the groups whose
+        // membership can have moved, plus the applied row's own flag.
+        let group_updates = if relevant {
+            refresh_id_conflict_groups(
+                &tx,
+                &stable_id_keys,
+                if note { plan.conflict_row } else { None },
+            )?
+        } else {
+            0
+        };
+        // The post-image mirrors the committed flag into the base.
+        if group_updates > 0
+            && let Some(EntityPre::Note(image)) = &mut plan.post
+        {
+            image.id_conflict = tx
+                .query_row(
+                    "SELECT id_conflict FROM notes WHERE note_id=?1",
+                    [image.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| error.to_string())?
+                != 0;
+        }
+        let backstop = self.resolver.backstop_due();
+        let changed_sources;
+        let mut targeted_pass: Option<u64> = None;
+        let mut backstop_catalog = None;
+        if backstop {
+            // D13 backstop site — the ONLY `re_resolve_all` invocation in
+            // this file (grep-gated; apply paths must never reach it). The
+            // walk reads this transaction's own rows, so it needs no
+            // overlay; its rebuilt catalog is installed at commit, never
+            // before, so a rolled-back backstop cannot touch the base.
+            let mut walk = Resolver::new(&tx);
+            changed_sources = walk.re_resolve_all()?;
+            backstop_catalog = Some(
+                walk.take_catalog()
+                    .ok_or("resolver catalog missing after backstop walk")?,
+            );
+        } else {
+            {
+                let overlay = self.resolver.overlay_mut();
+                for id in &plan.touched_notes {
+                    overlay.remove_note(*id);
+                }
+                for id in &plan.touched_attachments {
+                    overlay.remove_attachment(*id);
+                }
+                match &plan.post {
+                    Some(EntityPre::Note(image)) => overlay.upsert_note(image),
+                    Some(EntityPre::Attachment(image)) => overlay.upsert_attachment(image),
+                    None => {}
+                }
+            }
+            for key in &stable_id_keys {
+                let winner = group_winner_in_tx(&tx, key)?;
+                self.resolver.overlay_mut().set_stable_winner(key, winner);
+            }
+            let affected_keys = affected_resolution_keys(
+                relevant.then_some(pre.as_ref()).flatten(),
+                relevant.then_some(plan.post.as_ref()).flatten(),
+                &plan.fresh_target_keys,
+            );
+            let (changed, visited) = resolve_affected(&tx, &self.resolver, &affected_keys)?;
+            changed_sources = changed;
+            targeted_pass = (!affected_keys.is_empty()).then_some(visited);
+        }
+        // FR-1, D5: the entity rows plus one `outgoing(src)` row per source
+        // whose link rows actually flipped. Duplicates collapse via the PK
+        // when a flipped source is the applied entity itself (§4.6).
+        let mut rows = plan.entity_rows.clone();
+        rows.extend(
+            changed_sources
+                .into_iter()
+                .map(|src| (ChangeKind::Outgoing, src)),
+        );
+        ChangeLogWriter::record_all(&tx, generation, &rows)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        // Commit fold (§6.2.4): SQLite writes are durable; in-memory state
+        // follows. Counters track committed applies only.
+        if let Some(catalog) = backstop_catalog {
+            self.resolver.commit_backstop(catalog);
+        }
+        self.resolver.note_group_updates(group_updates);
+        if let Some(visited) = targeted_pass {
+            self.resolver.note_targeted_pass(visited);
+        }
+        self.resolver.fold_overlay(epoch, generation);
+        Ok((SpineOutcome::Applied { epoch, generation }, plan))
+    }
+
     /// Remove a vanished note and its dependent structural/search rows in one
     /// transaction. Returns whether an indexed note was removed.
     ///
@@ -928,49 +1218,37 @@ impl IndexActor {
     /// Returns the underlying error text when the transaction cannot be
     /// started, a query fails, or the commit fails.
     pub fn remove_note_path(&mut self, path_native: &[u8]) -> Result<bool, String> {
-        let tx = self.writer.conn.transaction().map_err(|e| e.to_string())?;
-        let note_id: Option<i64> = tx
-            .query_row(
-                "SELECT note_id FROM notes WHERE path_native=?1",
-                [path_native],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        let Some(note_id) = note_id else {
-            tx.rollback().map_err(|e| e.to_string())?;
-            return Ok(false);
-        };
-        let generation = get_meta_u64(&tx, MetaKey::Generation)
-            .map_err(|error| error.to_string())?
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or("index generation overflow")?;
-        let pre_states = snapshot_link_states(&tx)?;
-        tx.execute("DELETE FROM notes WHERE note_id=?1", [note_id])
-            .map_err(|e| e.to_string())?;
-        tx.execute("UPDATE notes SET id_conflict=CASE WHEN stable_id_key IS NOT NULL AND path_key<>(SELECT MIN(n2.path_key) FROM notes n2 WHERE n2.stable_id_key=notes.stable_id_key) THEN 1 ELSE 0 END", [])
-            .map_err(|error| error.to_string())?;
-        tx.execute("DELETE FROM properties WHERE note_id=?1", [note_id])
-            .map_err(|error| error.to_string())?;
-        tx.execute("DELETE FROM search_docs WHERE note_id=?1", [note_id])
-            .map_err(|e| e.to_string())?;
-        tx.execute(
-            "UPDATE meta SET value=?1 WHERE key=?2",
-            rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
-        )
-        .map_err(|e| e.to_string())?;
-        ChangeLogWriter::record(&tx, generation, ChangeKind::Note, note_id)?;
-        Resolver::new(&tx)
-            .re_resolve_all()
-            .map_err(|error| error.to_string())?;
-        let changed = changed_outgoing_rows(&pre_states, &snapshot_link_states(&tx)?);
-        ChangeLogWriter::record_all(&tx, generation, &changed)?;
-        tx.commit().map_err(|e| e.to_string())?;
-        self.search
-            .delete_document(note_id)
-            .map_err(|error| error.to_string())?;
-        Ok(true)
+        let (outcome, plan) =
+            self.apply_entity_core(true, true, path_native, |tx, pre, _counters, plan| {
+                let Some(EntityPre::Note(image)) = pre else {
+                    return Err("missing note pre-image".to_owned());
+                };
+                let note_id = image.id;
+                tx.execute("DELETE FROM notes WHERE note_id=?1", [note_id])
+                    .map_err(|error| error.to_string())?;
+                tx.execute("DELETE FROM properties WHERE note_id=?1", [note_id])
+                    .map_err(|error| error.to_string())?;
+                tx.execute("DELETE FROM search_docs WHERE note_id=?1", [note_id])
+                    .map_err(|error| error.to_string())?;
+                plan.entity_rows.push((ChangeKind::Note, note_id));
+                plan.touched_notes.insert(note_id);
+                Ok(CoreStep::Proceed)
+            })?;
+        match outcome {
+            SpineOutcome::RolledBack => Ok(false),
+            SpineOutcome::Applied { .. } => {
+                let note_id = plan
+                    .entity_rows
+                    .first()
+                    .map(|(_, id)| *id)
+                    .ok_or("note removal planned no entity row")?;
+                self.search
+                    .delete_document(note_id)
+                    .map_err(|error| error.to_string())?;
+                Ok(true)
+            }
+            SpineOutcome::FastPath { .. } => Err("note removal cannot take a fast path".to_owned()),
+        }
     }
 
     /// Return true when stat data safely proves the indexed note unchanged.
@@ -1057,78 +1335,6 @@ impl IndexActor {
     ) -> Result<(u64, u64), String> {
         let snapshot = TextSnapshot::new(bytes).map_err(|error| error.to_string())?;
         let content_hash = Hash::from_bytes(*blake3::hash(bytes).as_bytes());
-        let conn = &mut self.writer.conn;
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        let current_generation: u64 = tx
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                [MetaKey::Generation.as_str()],
-                |row| {
-                    let value: String = row.get(0)?;
-                    value.parse().map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })
-                },
-            )
-            .map_err(|e| e.to_string())?;
-        let existing_hash: Option<Option<Vec<u8>>> = tx
-            .query_row(
-                "SELECT content_hash FROM notes WHERE path_native = ?1",
-                [path_native],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        if existing_hash.as_ref().and_then(Option::as_deref)
-            == Some(content_hash.as_bytes().as_slice())
-        {
-            let epoch = tx
-                .query_row(
-                    "SELECT value FROM meta WHERE key = ?1",
-                    [MetaKey::Epoch.as_str()],
-                    |row| {
-                        let value: String = row.get(0)?;
-                        value.parse().map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })
-                    },
-                )
-                .map_err(|error| error.to_string())?;
-            tx.execute(
-                "UPDATE notes SET mtime_ns=?1,scan_ns=?2 WHERE path_native=?3",
-                rusqlite::params![mtime_ns, scan_ns, path_native],
-            )
-            .map_err(|error| error.to_string())?;
-            tx.commit().map_err(|error| error.to_string())?;
-            return Ok((epoch, current_generation));
-        }
-        let generation = current_generation
-            .checked_add(1)
-            .ok_or("index generation overflow")?;
-        let epoch = tx
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                [MetaKey::Epoch.as_str()],
-                |row| {
-                    let value: String = row.get(0)?;
-                    value.parse().map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })
-                },
-            )
-            .map_err(|e| e.to_string())?;
         let stem = std::path::Path::new(display_path)
             .file_stem()
             .and_then(|value| value.to_str())
@@ -1165,6 +1371,14 @@ impl IndexActor {
             })
             .cloned()
             .unwrap_or_default();
+        let mut alias_keys: Vec<String> = aliases
+            .iter()
+            .map(|alias| flavite_syntax::wellknown::normalize_tag(alias))
+            .collect();
+        alias_keys.sort();
+        // Mirror the aliases table's PK: duplicate keys collapse to one row,
+        // so the image (relevance compare + overlay indexing) must too.
+        alias_keys.dedup();
         let frontmatter_tags = frontmatter.as_ref().map_or_else(Vec::new, |value| {
             value
                 .well_known
@@ -1183,142 +1397,176 @@ impl IndexActor {
             .as_ref()
             .map(|value| serde_json::json!({ "yaml": value.yaml_text }))
             .map(|value| value.to_string());
-        let size = i64::try_from(bytes.len()).map_err(|e| e.to_string())?;
-        let pre_states = snapshot_link_states(&tx)?;
-        reserve_graph_identity(&tx, true, true)?;
-        tx.execute(
-            "INSERT INTO notes(note_id,path,path_native,path_key,stem_key,title,stable_id,stable_id_key,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation)
-             VALUES((SELECT CAST(value AS INTEGER) FROM meta WHERE key='note_identity_high_water'),?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10,?11,?12,?13,1,?14)
-             ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,title=excluded.title,stable_id=excluded.stable_id,stable_id_key=excluded.stable_id_key,content_hash=excluded.content_hash,size=excluded.size,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,frontmatter=excluded.frontmatter,preview=excluded.preview,parse_ok=1,generation=excluded.generation",
-            rusqlite::params![display_path, path_native, path_key, stem_key, title, stable_id, stable_id_key, content_hash.as_bytes(), size, mtime_ns, scan_ns, frontmatter_json, flavite_syntax::text::safe_prefix(parsed.snapshot.text(), 1024), i64::try_from(generation).map_err(|e| e.to_string())?],
-        ).map_err(|e| e.to_string())?;
-        let note_id: i64 = tx
-            .query_row(
-                "SELECT note_id FROM notes WHERE path_native = ?1",
-                [path_native],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        tx.execute("UPDATE notes SET id_conflict=CASE WHEN stable_id_key IS NOT NULL AND path_key<>(SELECT MIN(n2.path_key) FROM notes n2 WHERE n2.stable_id_key=notes.stable_id_key) THEN 1 ELSE 0 END", [])
-            .map_err(|error| error.to_string())?;
-        tx.execute("DELETE FROM links WHERE src = ?1", [note_id])
-            .map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM tags WHERE note_id = ?1", [note_id])
-            .map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM aliases WHERE note_id = ?1", [note_id])
-            .map_err(|e| e.to_string())?;
-        for (ord, link) in parsed.links.iter().enumerate() {
-            let source_span = snapshot
-                .span_to_source(link.span)
-                .ok_or("link span cannot be mapped to source bytes")?;
-            let target_key = flavite_syntax::text::fold_key(&link.target_raw);
-            tx.execute(
-                "INSERT INTO links(src,ord,kind,dst_raw,target_key,anchor,alias,by_id,span_start,span_end,dst_note,dst_att,res_state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL,NULL,'unresolved')",
-                rusqlite::params![note_id, i64::try_from(ord).map_err(|e| e.to_string())?, if link.is_embed { "embed" } else { "link" }, link.target_raw, target_key, link.anchor, link.alias, i64::from(link.by_id), i64::try_from(source_span.start.0).map_err(|e| e.to_string())?, i64::try_from(source_span.end.0).map_err(|e| e.to_string())?],
-            ).map_err(|e| e.to_string())?;
-        }
-        for tag in &parsed.tags {
-            let value = parsed
-                .snapshot
-                .text()
-                .get(tag.start.0..tag.end.0)
-                .ok_or("tag span is invalid")?;
-            tx.execute(
-                "INSERT OR IGNORE INTO tags(note_id,tag,source) VALUES(?1,?2,'inline')",
-                rusqlite::params![note_id, value.trim_start_matches('#')],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        for tag in frontmatter_tags {
-            tx.execute(
-                "INSERT OR IGNORE INTO tags(note_id,tag,source) VALUES(?1,?2,'frontmatter')",
-                rusqlite::params![note_id, flavite_syntax::wellknown::normalize_tag(&tag)],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        for alias in aliases {
-            tx.execute(
-                "INSERT OR IGNORE INTO aliases(note_id,alias,alias_key) VALUES(?1,?2,?3)",
-                rusqlite::params![
-                    note_id,
-                    alias,
-                    flavite_syntax::wellknown::normalize_tag(&alias)
-                ],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        tx.execute("DELETE FROM properties WHERE note_id=?1", [note_id])
-            .map_err(|error| error.to_string())?;
-        if let Some(frontmatter) = &frontmatter {
-            for (key, values) in &frontmatter.properties {
-                let mut ordinal: i64 = 0;
-                let mut pending: Vec<_> = values.iter().rev().map(|(_, value)| value).collect();
-                while let Some(value) = pending.pop() {
-                    use flavite_syntax::frontmatter::PropertyValue as V;
-                    let (kind, text, number) = match value {
-                        V::Text(value) | V::Raw(value) => ("text", Some(value.clone()), None),
-                        V::Number(value) => (
-                            "num",
-                            None,
-                            value.parse::<f64>().ok().filter(|v| v.is_finite()),
-                        ),
-                        V::Bool(value) => (
-                            "bool",
-                            Some(value.to_string()),
-                            Some(f64::from(u8::from(*value))),
-                        ),
-                        V::Date(value) => ("date", Some(value.clone()), None),
-                        V::DateTime(value) => ("datetime", Some(value.clone()), None),
-                        V::Null => ("null", None, None),
-                        V::List(values) => {
-                            pending.extend(values.iter().rev());
-                            continue;
-                        }
-                    };
-                    tx.execute("INSERT INTO properties(note_id,key,ord,vtype,v_text,v_num) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![note_id, key, ordinal, kind, text, number]).map_err(|error| error.to_string())?;
-                    ordinal += 1;
+        let size = i64::try_from(bytes.len()).map_err(|error| error.to_string())?;
+        let (outcome, plan) = self.apply_entity_core(
+            true,
+            false,
+            path_native,
+            |tx, pre, counters, plan| {
+                let existing_hash = match pre {
+                    Some(EntityPre::Note(image)) => Some(image.content_hash.clone()),
+                    Some(EntityPre::Attachment(_)) => {
+                        return Err("attachment occupies the note path".to_owned());
+                    }
+                    None => None,
+                };
+                if existing_hash.flatten().as_deref() == Some(content_hash.as_bytes().as_slice()) {
+                    tx.execute(
+                        "UPDATE notes SET mtime_ns=?1,scan_ns=?2 WHERE path_native=?3",
+                        rusqlite::params![mtime_ns, scan_ns, path_native],
+                    )
+                    .map_err(|error| error.to_string())?;
+                    return Ok(CoreStep::FastPath);
                 }
+                reserve_graph_identity(tx, true, true)?;
+                tx.execute(
+                    "INSERT INTO notes(note_id,path,path_native,path_key,stem_key,title,stable_id,stable_id_key,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation)
+                     VALUES((SELECT CAST(value AS INTEGER) FROM meta WHERE key='note_identity_high_water'),?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10,?11,?12,?13,1,?14)
+                     ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,title=excluded.title,stable_id=excluded.stable_id,stable_id_key=excluded.stable_id_key,content_hash=excluded.content_hash,size=excluded.size,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,frontmatter=excluded.frontmatter,preview=excluded.preview,parse_ok=1,generation=excluded.generation",
+                    rusqlite::params![display_path, path_native, path_key, stem_key, title, stable_id, stable_id_key, content_hash.as_bytes(), size, mtime_ns, scan_ns, frontmatter_json, flavite_syntax::text::safe_prefix(parsed.snapshot.text(), 1024), i64::try_from(counters.generation).map_err(|error| error.to_string())?],
+                ).map_err(|error| error.to_string())?;
+                let note_id: i64 = tx
+                    .query_row(
+                        "SELECT note_id FROM notes WHERE path_native = ?1",
+                        [path_native],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                tx.execute("DELETE FROM links WHERE src = ?1", [note_id])
+                    .map_err(|error| error.to_string())?;
+                tx.execute("DELETE FROM tags WHERE note_id = ?1", [note_id])
+                    .map_err(|error| error.to_string())?;
+                tx.execute("DELETE FROM aliases WHERE note_id = ?1", [note_id])
+                    .map_err(|error| error.to_string())?;
+                for (ord, link) in parsed.links.iter().enumerate() {
+                    let source_span = snapshot
+                        .span_to_source(link.span)
+                        .ok_or("link span cannot be mapped to source bytes")?;
+                    let target_key = flavite_syntax::text::fold_key(&link.target_raw);
+                    let target_stem = target_stem_key(&link.target_raw, &target_key);
+                    plan.fresh_target_keys.insert(target_key.clone());
+                    tx.execute(
+                        "INSERT INTO links(src,ord,kind,dst_raw,target_key,target_stem,anchor,alias,by_id,span_start,span_end,dst_note,dst_att,res_state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,'unresolved')",
+                        rusqlite::params![note_id, i64::try_from(ord).map_err(|error| error.to_string())?, if link.is_embed { "embed" } else { "link" }, link.target_raw, target_key, target_stem, link.anchor, link.alias, i64::from(link.by_id), i64::try_from(source_span.start.0).map_err(|error| error.to_string())?, i64::try_from(source_span.end.0).map_err(|error| error.to_string())?],
+                    ).map_err(|error| error.to_string())?;
+                }
+                for tag in &parsed.tags {
+                    let value = parsed
+                        .snapshot
+                        .text()
+                        .get(tag.start.0..tag.end.0)
+                        .ok_or("tag span is invalid")?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO tags(note_id,tag,source) VALUES(?1,?2,'inline')",
+                        rusqlite::params![note_id, value.trim_start_matches('#')],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                for tag in &frontmatter_tags {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO tags(note_id,tag,source) VALUES(?1,?2,'frontmatter')",
+                        rusqlite::params![note_id, flavite_syntax::wellknown::normalize_tag(tag)],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                for alias in &aliases {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO aliases(note_id,alias,alias_key) VALUES(?1,?2,?3)",
+                        rusqlite::params![note_id, alias, flavite_syntax::wellknown::normalize_tag(alias)],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                tx.execute("DELETE FROM properties WHERE note_id=?1", [note_id])
+                    .map_err(|error| error.to_string())?;
+                if let Some(frontmatter) = &frontmatter {
+                    for (key, values) in &frontmatter.properties {
+                        let mut ordinal: i64 = 0;
+                        let mut pending: Vec<_> = values.iter().rev().map(|(_, value)| value).collect();
+                        while let Some(value) = pending.pop() {
+                            use flavite_syntax::frontmatter::PropertyValue as V;
+                            let (kind, text, number) = match value {
+                                V::Text(value) | V::Raw(value) => ("text", Some(value.clone()), None),
+                                V::Number(value) => (
+                                    "num",
+                                    None,
+                                    value.parse::<f64>().ok().filter(|v| v.is_finite()),
+                                ),
+                                V::Bool(value) => (
+                                    "bool",
+                                    Some(value.to_string()),
+                                    Some(f64::from(u8::from(*value))),
+                                ),
+                                V::Date(value) => ("date", Some(value.clone()), None),
+                                V::DateTime(value) => ("datetime", Some(value.clone()), None),
+                                V::Null => ("null", None, None),
+                                V::List(values) => {
+                                    pending.extend(values.iter().rev());
+                                    continue;
+                                }
+                            };
+                            tx.execute("INSERT INTO properties(note_id,key,ord,vtype,v_text,v_num) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![note_id, key, ordinal, kind, text, number]).map_err(|error| error.to_string())?;
+                            ordinal += 1;
+                        }
+                    }
+                }
+                tx.execute(
+                    "INSERT INTO search_docs(note_id,content_hash,body_text) VALUES(?1,?2,?3) ON CONFLICT(note_id) DO UPDATE SET content_hash=excluded.content_hash,body_text=excluded.body_text",
+                    rusqlite::params![note_id, content_hash.as_bytes(), parsed.snapshot.text()],
+                )
+                .map_err(|error| error.to_string())?;
+                plan.post = Some(EntityPre::Note(NoteImage {
+                    id: note_id,
+                    path: display_path.to_owned(),
+                    path_native: path_native.to_vec(),
+                    path_key: path_key.clone(),
+                    stem_key: stem_key.clone(),
+                    title: title.clone(),
+                    aliases: alias_keys.clone(),
+                    stable_id: stable_id.clone(),
+                    stable_id_key: stable_id_key.clone(),
+                    id_conflict: false,
+                    content_hash: Some(content_hash.as_bytes().to_vec()),
+                }));
+                plan.entity_rows.push((ChangeKind::Note, note_id));
+                plan.touched_notes.insert(note_id);
+                plan.conflict_row = Some(note_id);
+                Ok(CoreStep::Proceed)
+            },
+        )?;
+        match outcome {
+            SpineOutcome::RolledBack => Err("parsed note apply cannot be a no-op".to_owned()),
+            SpineOutcome::FastPath { epoch, generation } => Ok((epoch, generation)),
+            SpineOutcome::Applied { epoch, generation } => {
+                let note_id = plan
+                    .entity_rows
+                    .first()
+                    .map(|(_, id)| *id)
+                    .ok_or("parsed note apply planned no entity row")?;
+                let conn = self.writer.conn();
+                let mut alias_stmt = conn
+                    .prepare("SELECT alias FROM aliases WHERE note_id=?1 ORDER BY alias_key")
+                    .map_err(|error| error.to_string())?;
+                let aliases = alias_stmt
+                    .query_map([note_id], |row| row.get::<_, String>(0))
+                    .map_err(|error| error.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                let mut tag_stmt = conn
+                    .prepare("SELECT tag FROM tags WHERE note_id=?1 ORDER BY tag")
+                    .map_err(|error| error.to_string())?;
+                let tags = tag_stmt
+                    .query_map([note_id], |row| row.get::<_, String>(0))
+                    .map_err(|error| error.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                drop(alias_stmt);
+                drop(tag_stmt);
+                self.search
+                    .apply_document_full(note_id, &title, &aliases, &tags, parsed.snapshot.text())
+                    .map_err(|error| error.to_string())?;
+                Ok((epoch, generation))
             }
         }
-        tx.execute(
-            "INSERT INTO search_docs(note_id,content_hash,body_text) VALUES(?1,?2,?3) ON CONFLICT(note_id) DO UPDATE SET content_hash=excluded.content_hash,body_text=excluded.body_text",
-            rusqlite::params![note_id, content_hash.as_bytes(), parsed.snapshot.text()],
-        ).map_err(|e| e.to_string())?;
-        tx.execute(
-            "UPDATE meta SET value=?1 WHERE key=?2",
-            rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
-        )
-        .map_err(|e| e.to_string())?;
-        ChangeLogWriter::record(&tx, generation, ChangeKind::Note, note_id)?;
-        ChangeLogWriter::record(&tx, generation, ChangeKind::Outgoing, note_id)?;
-        Resolver::new(&tx)
-            .re_resolve_all()
-            .map_err(|error| error.to_string())?;
-        let changed = changed_outgoing_rows(&pre_states, &snapshot_link_states(&tx)?);
-        ChangeLogWriter::record_all(&tx, generation, &changed)?;
-        tx.commit().map_err(|e| e.to_string())?;
-        let mut alias_stmt = conn
-            .prepare("SELECT alias FROM aliases WHERE note_id=?1 ORDER BY alias_key")
-            .map_err(|e| e.to_string())?;
-        let aliases = alias_stmt
-            .query_map([note_id], |row| row.get::<_, String>(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        let mut tag_stmt = conn
-            .prepare("SELECT tag FROM tags WHERE note_id=?1 ORDER BY tag")
-            .map_err(|e| e.to_string())?;
-        let tags = tag_stmt
-            .query_map([note_id], |row| row.get::<_, String>(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        drop(alias_stmt);
-        drop(tag_stmt);
-        self.search
-            .apply_document_full(note_id, &title, &aliases, &tags, parsed.snapshot.text())
-            .map_err(|e| e.to_string())?;
-        Ok((epoch, generation))
     }
 
     /// Apply parse-failed note bytes using the same title-only degraded row
@@ -1378,79 +1626,77 @@ impl IndexActor {
             .and_then(|value| value.to_str())
             .unwrap_or(display_path);
         let size = i64::try_from(size).map_err(|error| error.to_string())?;
-        let tx = self
-            .writer
-            .conn
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        let unchanged: bool = tx
-            .query_row(
-                "SELECT parse_ok=0 AND size=?1 AND mtime_ns=?2 FROM notes WHERE path_native=?3",
-                rusqlite::params![size, mtime_ns, path_native],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .unwrap_or(false);
-        if unchanged {
-            tx.execute(
-                "UPDATE notes SET scan_ns=?1 WHERE path_native=?2",
-                rusqlite::params![scan_ns, path_native],
-            )
-            .map_err(|error| error.to_string())?;
-            let epoch = get_meta_u64(&tx, MetaKey::Epoch)
-                .map_err(|error| error.to_string())?
-                .unwrap_or(1);
-            let generation = get_meta_u64(&tx, MetaKey::Generation)
-                .map_err(|error| error.to_string())?
-                .unwrap_or(0);
-            tx.commit().map_err(|error| error.to_string())?;
-            return Ok((epoch, generation));
+        let (outcome, plan) =
+            self.apply_entity_core(true, false, path_native, |tx, _pre, counters, plan| {
+                let unchanged: bool = tx
+                    .query_row(
+                        "SELECT parse_ok=0 AND size=?1 AND mtime_ns=?2 FROM notes WHERE path_native=?3",
+                        rusqlite::params![size, mtime_ns, path_native],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or(false);
+                if unchanged {
+                    tx.execute(
+                        "UPDATE notes SET scan_ns=?1 WHERE path_native=?2",
+                        rusqlite::params![scan_ns, path_native],
+                    )
+                    .map_err(|error| error.to_string())?;
+                    return Ok(CoreStep::FastPath);
+                }
+                reserve_graph_identity(tx, true, true)?;
+                tx.execute("INSERT INTO notes(note_id,path,path_native,path_key,stem_key,title,stable_id,stable_id_key,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation) VALUES((SELECT CAST(value AS INTEGER) FROM meta WHERE key='note_identity_high_water'),?1,?2,?3,?4,?5,NULL,NULL,0,NULL,?6,?7,?8,NULL,?9,0,?10) ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,title=excluded.title,stable_id=NULL,stable_id_key=NULL,content_hash=NULL,size=excluded.size,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,frontmatter=NULL,preview=excluded.preview,parse_ok=0,generation=excluded.generation", rusqlite::params![display_path,path_native,flavite_syntax::text::fold_key(display_path),flavite_syntax::text::fold_key(stem),stem,size,mtime_ns,scan_ns,preview,i64::try_from(counters.generation).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
+                let note_id: i64 = tx
+                    .query_row(
+                        "SELECT note_id FROM notes WHERE path_native=?1",
+                        [path_native],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                tx.execute("DELETE FROM links WHERE src=?1", [note_id])
+                    .map_err(|error| error.to_string())?;
+                tx.execute("DELETE FROM tags WHERE note_id=?1", [note_id])
+                    .map_err(|error| error.to_string())?;
+                tx.execute("DELETE FROM aliases WHERE note_id=?1", [note_id])
+                    .map_err(|error| error.to_string())?;
+                tx.execute("DELETE FROM properties WHERE note_id=?1", [note_id])
+                    .map_err(|error| error.to_string())?;
+                tx.execute("DELETE FROM search_docs WHERE note_id=?1", [note_id])
+                    .map_err(|error| error.to_string())?;
+                plan.post = Some(EntityPre::Note(NoteImage {
+                    id: note_id,
+                    path: display_path.to_owned(),
+                    path_native: path_native.to_vec(),
+                    path_key: flavite_syntax::text::fold_key(display_path),
+                    stem_key: flavite_syntax::text::fold_key(stem),
+                    title: stem.to_owned(),
+                    aliases: Vec::new(),
+                    stable_id: None,
+                    stable_id_key: None,
+                    id_conflict: false,
+                    content_hash: None,
+                }));
+                plan.entity_rows.push((ChangeKind::Note, note_id));
+                plan.touched_notes.insert(note_id);
+                plan.conflict_row = Some(note_id);
+                Ok(CoreStep::Proceed)
+            })?;
+        match outcome {
+            SpineOutcome::RolledBack => Err("unparsed note apply cannot be a no-op".to_owned()),
+            SpineOutcome::FastPath { epoch, generation } => Ok((epoch, generation)),
+            SpineOutcome::Applied { epoch, generation } => {
+                let note_id = plan
+                    .entity_rows
+                    .first()
+                    .map(|(_, id)| *id)
+                    .ok_or("unparsed note apply planned no entity row")?;
+                self.search
+                    .apply_title_only_document(note_id, stem)
+                    .map_err(|error| error.to_string())?;
+                Ok((epoch, generation))
+            }
         }
-        let generation = get_meta_u64(&tx, MetaKey::Generation)
-            .map_err(|error| error.to_string())?
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or("index generation overflow")?;
-        let epoch = get_meta_u64(&tx, MetaKey::Epoch)
-            .map_err(|error| error.to_string())?
-            .unwrap_or(1);
-        let pre_states = snapshot_link_states(&tx)?;
-        reserve_graph_identity(&tx, true, true)?;
-        tx.execute("INSERT INTO notes(note_id,path,path_native,path_key,stem_key,title,stable_id,stable_id_key,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation) VALUES((SELECT CAST(value AS INTEGER) FROM meta WHERE key='note_identity_high_water'),?1,?2,?3,?4,?5,NULL,NULL,0,NULL,?6,?7,?8,NULL,?9,0,?10) ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,title=excluded.title,stable_id=NULL,stable_id_key=NULL,content_hash=NULL,size=excluded.size,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,frontmatter=NULL,preview=excluded.preview,parse_ok=0,generation=excluded.generation", rusqlite::params![display_path,path_native,flavite_syntax::text::fold_key(display_path),flavite_syntax::text::fold_key(stem),stem,size,mtime_ns,scan_ns,preview,i64::try_from(generation).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
-        let note_id: i64 = tx
-            .query_row(
-                "SELECT note_id FROM notes WHERE path_native=?1",
-                [path_native],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        tx.execute("DELETE FROM links WHERE src=?1", [note_id])
-            .map_err(|error| error.to_string())?;
-        tx.execute("DELETE FROM tags WHERE note_id=?1", [note_id])
-            .map_err(|error| error.to_string())?;
-        tx.execute("DELETE FROM aliases WHERE note_id=?1", [note_id])
-            .map_err(|error| error.to_string())?;
-        tx.execute("DELETE FROM properties WHERE note_id=?1", [note_id])
-            .map_err(|error| error.to_string())?;
-        tx.execute("DELETE FROM search_docs WHERE note_id=?1", [note_id])
-            .map_err(|error| error.to_string())?;
-        tx.execute(
-            "UPDATE meta SET value=?1 WHERE key=?2",
-            rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
-        )
-        .map_err(|error| error.to_string())?;
-        ChangeLogWriter::record(&tx, generation, ChangeKind::Note, note_id)?;
-        Resolver::new(&tx)
-            .re_resolve_all()
-            .map_err(|error| error.to_string())?;
-        let changed = changed_outgoing_rows(&pre_states, &snapshot_link_states(&tx)?);
-        ChangeLogWriter::record_all(&tx, generation, &changed)?;
-        tx.commit().map_err(|error| error.to_string())?;
-        self.search
-            .apply_title_only_document(note_id, stem)
-            .map_err(|error| error.to_string())?;
-        Ok((epoch, generation))
     }
 
     /// Insert or refresh one attachment record. Bytes are hashed only when
@@ -1499,45 +1745,41 @@ impl IndexActor {
             None
         };
         let size = i64::try_from(size).map_err(|error| error.to_string())?;
-        let tx = self
-            .writer
-            .conn
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        let generation = get_meta_u64(&tx, MetaKey::Generation)
-            .map_err(|error| error.to_string())?
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or("index generation overflow")?;
-        let pre_states = snapshot_link_states(&tx)?;
-        reserve_graph_identity(&tx, false, true)?;
-        tx.execute(
-            "INSERT INTO attachments(att_id,path,path_native,path_key,stem_key,kind,mime,size,content_hash,width,height,mtime_ns,scan_ns,hydrated,generation) VALUES((SELECT CAST(value AS INTEGER) FROM meta WHERE key='attachment_identity_high_water'),?1,?2,?3,?4,?5,NULL,?6,?7,NULL,NULL,?8,?9,?10,?11) ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,kind=excluded.kind,size=excluded.size,content_hash=excluded.content_hash,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,hydrated=excluded.hydrated,generation=excluded.generation",
-            rusqlite::params![display_path,path_native,path_key,stem_key,kind.as_str(),size,content_hash,mtime_ns,scan_ns,i64::from(hydrated),i64::try_from(generation).map_err(|error| error.to_string())?],
-        ).map_err(|error| error.to_string())?;
-        let att_id: i64 = tx
-            .query_row(
-                "SELECT att_id FROM attachments WHERE path_native=?1",
-                [path_native],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        tx.execute(
-            "UPDATE meta SET value=?1 WHERE key=?2",
-            rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
-        )
-        .map_err(|error| error.to_string())?;
-        ChangeLogWriter::record(&tx, generation, ChangeKind::Attachment, att_id)?;
-        Resolver::new(&tx)
-            .re_resolve_all()
-            .map_err(|error| error.to_string())?;
-        let changed = changed_outgoing_rows(&pre_states, &snapshot_link_states(&tx)?);
-        ChangeLogWriter::record_all(&tx, generation, &changed)?;
-        tx.commit().map_err(|error| error.to_string())?;
-        let epoch = get_meta_u64(self.writer.conn(), MetaKey::Epoch)
-            .map_err(|error| error.to_string())?
-            .unwrap_or(1);
-        Ok((epoch, generation))
+        let (outcome, _plan) = self.apply_entity_core(
+            false,
+            false,
+            path_native,
+            |tx, _pre, counters, plan| {
+                reserve_graph_identity(tx, false, true)?;
+                tx.execute(
+                    "INSERT INTO attachments(att_id,path,path_native,path_key,stem_key,kind,mime,size,content_hash,width,height,mtime_ns,scan_ns,hydrated,generation) VALUES((SELECT CAST(value AS INTEGER) FROM meta WHERE key='attachment_identity_high_water'),?1,?2,?3,?4,?5,NULL,?6,?7,NULL,NULL,?8,?9,?10,?11) ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,kind=excluded.kind,size=excluded.size,content_hash=excluded.content_hash,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,hydrated=excluded.hydrated,generation=excluded.generation",
+                    rusqlite::params![display_path,path_native,path_key,stem_key,kind.as_str(),size,content_hash,mtime_ns,scan_ns,i64::from(hydrated),i64::try_from(counters.generation).map_err(|error| error.to_string())?],
+                ).map_err(|error| error.to_string())?;
+                let att_id: i64 = tx
+                    .query_row(
+                        "SELECT att_id FROM attachments WHERE path_native=?1",
+                        [path_native],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                plan.post = Some(EntityPre::Attachment(AttImage {
+                    id: att_id,
+                    path: display_path.to_owned(),
+                    path_native: path_native.to_vec(),
+                    path_key: path_key.clone(),
+                    stem_key: stem_key.clone(),
+                }));
+                plan.entity_rows.push((ChangeKind::Attachment, att_id));
+                plan.touched_attachments.insert(att_id);
+                Ok(CoreStep::Proceed)
+            },
+        )?;
+        match outcome {
+            SpineOutcome::RolledBack | SpineOutcome::FastPath { .. } => {
+                Err("attachment apply cannot be a no-op".to_owned())
+            }
+            SpineOutcome::Applied { epoch, generation } => Ok((epoch, generation)),
+        }
     }
 
     /// Remove an attachment and re-resolve embeds that may have targeted it.
@@ -1545,41 +1787,28 @@ impl IndexActor {
     /// # Errors
     /// Returns an error if SQLite or link resolution fails.
     pub fn remove_attachment_path(&mut self, path_native: &[u8]) -> Result<bool, String> {
-        let tx = self
-            .writer
-            .conn
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        let id: Option<i64> = tx
-            .query_row(
-                "SELECT att_id FROM attachments WHERE path_native=?1",
-                [path_native],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        let Some(id) = id else { return Ok(false) };
-        let generation = get_meta_u64(&tx, MetaKey::Generation)
-            .map_err(|error| error.to_string())?
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or("index generation overflow")?;
-        let pre_states = snapshot_link_states(&tx)?;
-        tx.execute("DELETE FROM attachments WHERE att_id=?1", [id])
-            .map_err(|error| error.to_string())?;
-        tx.execute(
-            "UPDATE meta SET value=?1 WHERE key=?2",
-            rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
-        )
-        .map_err(|error| error.to_string())?;
-        ChangeLogWriter::record(&tx, generation, ChangeKind::Attachment, id)?;
-        Resolver::new(&tx)
-            .re_resolve_all()
-            .map_err(|error| error.to_string())?;
-        let changed = changed_outgoing_rows(&pre_states, &snapshot_link_states(&tx)?);
-        ChangeLogWriter::record_all(&tx, generation, &changed)?;
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(true)
+        let (outcome, plan) =
+            self.apply_entity_core(false, true, path_native, |tx, pre, _counters, plan| {
+                let Some(EntityPre::Attachment(image)) = pre else {
+                    return Err("missing attachment pre-image".to_owned());
+                };
+                let id = image.id;
+                tx.execute("DELETE FROM attachments WHERE att_id=?1", [id])
+                    .map_err(|error| error.to_string())?;
+                plan.entity_rows.push((ChangeKind::Attachment, id));
+                plan.touched_attachments.insert(id);
+                Ok(CoreStep::Proceed)
+            })?;
+        match outcome {
+            SpineOutcome::RolledBack => Ok(false),
+            SpineOutcome::Applied { .. } => {
+                debug_assert!(!plan.entity_rows.is_empty());
+                Ok(true)
+            }
+            SpineOutcome::FastPath { .. } => {
+                Err("attachment removal cannot take a fast path".to_owned())
+            }
+        }
     }
 
     /// Search the derived Tantivy view. Dirty documents are committed before
@@ -2043,7 +2272,10 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(search_body, std::str::from_utf8(original).unwrap());
-            assert_eq!((link_count, tag_count, changes), (2, 2, 2));
+            // S2 (D4/§6.2.3): generation 1 carries the applied note's row only.
+            // Both links resolve to nothing, so no link row flipped and no
+            // `outgoing` row is emitted — truthful logging, not unconditional.
+            assert_eq!((link_count, tag_count, changes), (2, 2, 1));
             let alias_count: i64 = conn
                 .query_row("SELECT COUNT(*) FROM aliases", [], |row| row.get(0))
                 .unwrap();

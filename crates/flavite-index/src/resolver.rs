@@ -1,4 +1,4 @@
-//! Link resolver (§4.3, D8).
+//! Link resolver (§4.3, D8, RFC-0004 W-A).
 //!
 //! This module implements the 5-step resolution algorithm from the specification:
 //!
@@ -17,10 +17,26 @@
 //!
 //! Duplicate IDs are co-ingested. The lowest folded path key wins `id:` lookup;
 //! remaining rows carry `id_conflict` and are reported by doctor.
+//!
+//! # Backstop policy (D13, RFC-0004 §6.2.5)
+//!
+//! Targeted resolution is superset-sound by construction (§4.2, FR-3): a
+//! changed entity E re-resolves every link whose `target_key` is in
+//! `K(pre) ∪ K(post) ∪ fresh-own-outgoing-keys`, fetched through the
+//! `links_target` index. Redundant re-resolution is acceptable (idempotent);
+//! a missed link is a correctness bug — the equality property test is the
+//! arbiter. The whole-vault `re_resolve_all` walk is backstop-only: epoch
+//! change/database recreate (fresh [`ResolverState`] load), every
+//! [`RESOLVER_BACKSTOP_GENERATIONS`] applied generations, doctor/repair, and
+//! parity failure. Rollback safety is structural: overlays and pending
+//! backstop catalogs are dropped, never inverted; SQLite remains the sole
+//! truth.
 
+use crate::catalog::ResolverCatalog;
 use crate::schema::ResState;
 use crate::types::{AttRef, NoteRef};
-use rusqlite::{Connection, Result, params};
+use rusqlite::{Connection, OptionalExtension, Result, Transaction, params};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Pure candidate ordering used by persisted and on-demand resolution.
@@ -110,6 +126,617 @@ impl Resolution {
     }
 }
 
+/// Generations between whole-vault re-resolves (D13). Amortized cost at the
+/// design bound is < 0.2 ms per apply (NFR-7).
+pub const RESOLVER_BACKSTOP_GENERATIONS: u64 = 4096;
+
+/// IN-list chunk size for targeted candidate fetches (§6.2.3). Headroom
+/// below SQLite's parameter limit.
+const AFFECTED_KEY_CHUNK: usize = 900;
+
+/// A note's matchable identity, as an image before (`pre`) or after
+/// (`post`) a mutation (§6.2.2). Plain data: the apply paths build it from
+/// rows they read or write, and both images feed `note_identity_keys`
+/// (D3 pre-image).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteImage {
+    pub id: i64,
+    pub path: String,
+    pub path_native: Vec<u8>,
+    pub path_key: String,
+    pub stem_key: String,
+    pub title: String,
+    /// Stored `alias_key` values (the resolver's indexed form), ascending.
+    pub aliases: Vec<String>,
+    pub stable_id: Option<String>,
+    pub stable_id_key: Option<String>,
+    pub id_conflict: bool,
+    pub content_hash: Option<Vec<u8>>,
+}
+
+/// An attachment's matchable identity image (§6.2.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttImage {
+    pub id: i64,
+    pub path: String,
+    pub path_native: Vec<u8>,
+    pub path_key: String,
+    pub stem_key: String,
+}
+
+/// Every stored `target_key` form that can resolve to note E (§6.2.2).
+/// Superset by construction; the equality gate (FR-2) is the arbiter.
+/// Co-located with the resolver so future target forms extend in one place.
+#[must_use]
+pub fn note_identity_keys(image: &NoteImage) -> BTreeSet<String> {
+    let mut keys = path_key_forms(&image.path_key);
+    keys.insert(image.stem_key.clone());
+    for alias in &image.aliases {
+        keys.insert(alias.clone());
+        keys.insert(flavite_syntax::text::fold_key(alias));
+    }
+    if let Some(stable_id) = &image.stable_id {
+        keys.insert(flavite_syntax::text::fold_key(stable_id));
+        keys.insert(flavite_syntax::text::fold_key(&format!("id:{stable_id}")));
+    }
+    if let Some(stable_id_key) = &image.stable_id_key {
+        keys.insert(stable_id_key.clone());
+        keys.insert(flavite_syntax::text::fold_key(&format!(
+            "id:{stable_id_key}"
+        )));
+    }
+    keys
+}
+
+/// Every stored `target_key` form that can resolve to attachment E:
+/// path, every path suffix (and their `.md`-stripped consult inverses —
+/// the catalog tries `raw + ".md"` on the note side, so exact spellings
+/// stay on the attachment side; keeping the stripped forms is harmless
+/// superset), stem (§6.2.2).
+#[must_use]
+pub fn attachment_identity_keys(image: &AttImage) -> BTreeSet<String> {
+    let mut keys = path_key_forms(&image.path_key);
+    keys.insert(image.stem_key.clone());
+    keys
+}
+
+/// Every suffix of a folded vault path after each `/`, unbounded (the
+/// catalog itself caps stored suffixes; the candidate fetch must not).
+fn path_suffix_forms(path_key: &str) -> impl Iterator<Item = String> + '_ {
+    path_key
+        .match_indices('/')
+        .map(move |(index, _)| path_key[index + 1..].to_owned())
+}
+
+/// Every path form an exact-`target_key` fetch can hit for this folded
+/// path: the path, every suffix, and the catalog's `raw + ".md"` consult
+/// inverse — each minus a trailing `.md` (a link written as `folder/idea`
+/// resolves through `note_paths["folder/idea.md"]`, so `folder/idea` is a
+/// matchable stored form of the entity).
+fn path_key_forms(path_key: &str) -> BTreeSet<String> {
+    let mut forms = BTreeSet::new();
+    forms.insert(path_key.to_owned());
+    forms.extend(path_suffix_forms(path_key));
+    for base in forms.clone() {
+        if let Some(stripped) = base.strip_suffix(".md") {
+            forms.insert(stripped.to_owned());
+        }
+    }
+    forms
+}
+
+/// Final-component stem of a raw target key, exactly as `resolve_at_path`
+/// computes it — one implementation for the catalog's stem-fallback branch
+/// and the stored `links.target_stem` column, so the two can never drift.
+#[must_use]
+pub fn target_stem_key(target_raw: &str, folded_target_key: &str) -> String {
+    Path::new(target_raw)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map_or_else(
+            || folded_target_key.to_owned(),
+            flavite_syntax::text::fold_key,
+        )
+}
+
+/// The stem-space keys an entity is discoverable through: its stem plus its
+/// alias keys — the consult surface of the catalog's stem-fallback branch.
+/// Links whose final-component stem equals one of these can resolve to the
+/// entity from any directory or extension spelling, which is what the
+/// indexed `target_stem` arm of the candidate fetch exists to capture.
+fn entity_stem_keys(image: &EntityPre) -> BTreeSet<String> {
+    match image {
+        EntityPre::Note(note) => {
+            let mut keys = BTreeSet::new();
+            keys.insert(note.stem_key.clone());
+            keys.extend(note.aliases.iter().cloned());
+            keys
+        }
+        EntityPre::Attachment(attachment) => BTreeSet::from([attachment.stem_key.clone()]),
+    }
+}
+
+/// The entity this apply transaction mutated, before and/or after the
+/// mutation. Removals carry only the pre-image; upserts carry both.
+#[derive(Debug, Clone)]
+pub enum EntityPre {
+    Note(NoteImage),
+    Attachment(AttImage),
+}
+
+impl EntityPre {
+    /// `stable_id_key` whose group membership can move for this image.
+    #[must_use]
+    pub fn stable_id_key(&self) -> Option<&String> {
+        match self {
+            Self::Note(image) => image.stable_id_key.as_ref(),
+            Self::Attachment(_) => None,
+        }
+    }
+}
+
+/// The candidate-fetch key set for one mutation (FR-3):
+/// `K(pre) ∪ K(post) ∪ fresh outgoing keys`, split into the two indexed
+/// arms the fetch runs: exact `target_key` forms and the stem-fallback
+/// surface (`target_stem`, schema 3.1). A pass with both sets empty has
+/// nothing to re-resolve (the D4 short-circuit).
+#[derive(Debug, Default)]
+pub struct AffectedKeys {
+    pub exact: BTreeSet<String>,
+    pub stems: BTreeSet<String>,
+}
+
+impl AffectedKeys {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.exact.is_empty() && self.stems.is_empty()
+    }
+}
+
+/// Union of both identity-key sides plus every freshly written outgoing
+/// target key (FR-3: `K(pre) ∪ K(post) ∪ fresh outgoing keys`). When the
+/// mutation is identity-irrelevant (D4) the caller passes `pre`/`post`
+/// `None`, leaving only the fresh-outgoing component (whose own rows are
+/// always exact-key hits — the stem arm contributes only on relevance).
+#[must_use]
+pub fn affected_resolution_keys(
+    pre: Option<&EntityPre>,
+    post: Option<&EntityPre>,
+    fresh_target_keys: &BTreeSet<String>,
+) -> AffectedKeys {
+    let mut keys = AffectedKeys::default();
+    for image in pre.into_iter().chain(post) {
+        match image {
+            EntityPre::Note(note) => keys.exact.extend(note_identity_keys(note)),
+            EntityPre::Attachment(attachment) => {
+                keys.exact.extend(attachment_identity_keys(attachment));
+            }
+        }
+        keys.stems.extend(entity_stem_keys(image));
+    }
+    keys.exact.extend(fresh_target_keys.iter().cloned());
+    keys
+}
+
+/// Identity-relevance test (D4): if neither existence nor any of
+/// `{path, path_key, stem_key, alias set, stable_id, stable_id_key}`
+/// changed, no *other* note's link resolution can move, and the
+/// `K`-derived pass is skipped. Freshly re-inserted own outgoing links are
+/// always resolved regardless (their keys join the set unconditionally).
+#[must_use]
+pub fn identity_relevant(pre: Option<&EntityPre>, post: Option<&EntityPre>) -> bool {
+    match (pre, post) {
+        (None, None) => false,
+        (Some(EntityPre::Note(pre)), Some(EntityPre::Note(post))) => {
+            pre.id != post.id
+                || pre.path != post.path
+                || pre.path_key != post.path_key
+                || pre.stem_key != post.stem_key
+                || pre.aliases != post.aliases
+                || pre.stable_id != post.stable_id
+                || pre.stable_id_key != post.stable_id_key
+        }
+        (Some(EntityPre::Attachment(pre)), Some(EntityPre::Attachment(post))) => {
+            pre.id != post.id
+                || pre.path != post.path
+                || pre.path_key != post.path_key
+                || pre.stem_key != post.stem_key
+        }
+        // Existence flipped — or (defensively) the kind did, which no
+        // mutation path can do on one native path.
+        _ => true,
+    }
+}
+
+/// Per-transaction overlay over the persistent base catalog (§6.2.4).
+/// Lookup order is overlay first, then base; the overlay is built from
+/// exactly the rows this transaction wrote (including removals). On commit
+/// it folds into the base; on rollback it is dropped — SQLite remains the
+/// sole truth, and rollback safety is structural (drop, not invert).
+#[derive(Debug, Default)]
+pub struct ResolverOverlay {
+    /// Note ids removed or replaced in this transaction. The merged view
+    /// hides their base contributions entirely.
+    pub(crate) shadowed_notes: BTreeSet<i64>,
+    pub(crate) shadowed_attachments: BTreeSet<i64>,
+    /// Sparse catalog of the post-mutation images written by this
+    /// transaction. Indexing rules are shared with the base by construction.
+    pub(crate) current: ResolverCatalog,
+    /// Authoritative group winners for every touched `stable_id_key`,
+    /// recomputed from the transaction after the row mutations. `None`
+    /// means the group lost its winner (or emptied).
+    pub(crate) stable_winners: BTreeMap<String, Option<i64>>,
+}
+
+impl ResolverOverlay {
+    #[must_use]
+    pub fn new(epoch: u64, generation: u64) -> Self {
+        Self {
+            current: ResolverCatalog::empty(epoch, generation),
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.shadowed_notes.is_empty()
+            && self.shadowed_attachments.is_empty()
+            && self.stable_winners.is_empty()
+    }
+
+    pub fn upsert_note(&mut self, image: &NoteImage) {
+        self.shadowed_notes.insert(image.id);
+        self.current.upsert_note(image);
+    }
+
+    pub fn upsert_attachment(&mut self, image: &AttImage) {
+        self.shadowed_attachments.insert(image.id);
+        self.current.upsert_attachment(image);
+    }
+
+    pub fn remove_note(&mut self, id: i64) {
+        self.shadowed_notes.insert(id);
+        self.current.remove_note(id);
+    }
+
+    pub fn remove_attachment(&mut self, id: i64) {
+        self.shadowed_attachments.insert(id);
+        self.current.remove_attachment(id);
+    }
+
+    pub fn set_stable_winner(&mut self, stable_id_key: &str, winner: Option<i64>) {
+        self.stable_winners.insert(stable_id_key.to_owned(), winner);
+    }
+
+    /// Resolve a stored link through the merged overlay-then-base view.
+    #[must_use]
+    pub fn resolve(
+        &self,
+        base: &ResolverCatalog,
+        target_key: &str,
+        raw: &str,
+        embed: bool,
+        source: Option<i64>,
+    ) -> Resolution {
+        base.resolve_with_overlay(Some(self), target_key, raw, embed, source)
+    }
+
+    /// Resolve an open, unindexed source's link through the merged view.
+    #[must_use]
+    pub fn resolve_at_path(
+        &self,
+        base: &ResolverCatalog,
+        target_key: &str,
+        raw: &str,
+        embed: bool,
+        source: Option<&Path>,
+    ) -> Resolution {
+        base.resolve_at_path_with_overlay(Some(self), target_key, raw, embed, source)
+    }
+}
+
+/// The persistent resolver base plus the per-transaction overlay and the
+/// backstop bookkeeping (§6.2.1). Lives on the index writer owner.
+#[derive(Debug)]
+pub struct ResolverState {
+    base: ResolverCatalog,
+    overlay: ResolverOverlay,
+    generations_since_full: u64,
+    backstop_interval: u64,
+    resolve_full_total: u64,
+    resolve_targeted_total: u64,
+    affected_links_last: u64,
+    id_conflict_group_updates_total: u64,
+}
+
+/// Counter surface for diagnostics (doctor wiring lands in RFC-0004 S3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolverDiagnostics {
+    pub generations_since_full: u64,
+    pub resolve_full_total: u64,
+    pub resolve_targeted_total: u64,
+    pub affected_links_last: u64,
+    pub id_conflict_group_updates_total: u64,
+}
+
+impl ResolverState {
+    /// Fresh persistent base from a consistent read of the writer.
+    ///
+    /// # Errors
+    /// Returns a SQLite error when the catalog queries fail.
+    pub fn load(conn: &Connection) -> Result<Self> {
+        Ok(Self {
+            base: ResolverCatalog::load(conn)?,
+            overlay: ResolverOverlay::default(),
+            generations_since_full: 0,
+            backstop_interval: RESOLVER_BACKSTOP_GENERATIONS,
+            resolve_full_total: 0,
+            resolve_targeted_total: 0,
+            affected_links_last: 0,
+            id_conflict_group_updates_total: 0,
+        })
+    }
+
+    /// Measurement seam: a state whose backstop fires on a custom
+    /// generation cadence (bench comparison; lowered-const unit tests).
+    ///
+    /// # Errors
+    /// Returns a SQLite error when the catalog queries fail.
+    pub fn with_backstop_interval(conn: &Connection, generations: u64) -> Result<Self> {
+        Ok(Self {
+            backstop_interval: generations.max(1),
+            ..Self::load(conn)?
+        })
+    }
+
+    #[must_use]
+    pub fn diagnostics(&self) -> ResolverDiagnostics {
+        ResolverDiagnostics {
+            generations_since_full: self.generations_since_full,
+            resolve_full_total: self.resolve_full_total,
+            resolve_targeted_total: self.resolve_targeted_total,
+            affected_links_last: self.affected_links_last,
+            id_conflict_group_updates_total: self.id_conflict_group_updates_total,
+        }
+    }
+
+    #[must_use]
+    pub const fn base(&self) -> &ResolverCatalog {
+        &self.base
+    }
+
+    #[must_use]
+    pub const fn overlay(&self) -> &ResolverOverlay {
+        &self.overlay
+    }
+
+    /// Stage this transaction's overlay before the resolution pass.
+    pub fn overlay_mut(&mut self) -> &mut ResolverOverlay {
+        &mut self.overlay
+    }
+
+    /// Whether this apply must run the whole-vault backstop instead of the
+    /// targeted pass (D13).
+    #[must_use]
+    pub const fn backstop_due(&self) -> bool {
+        self.generations_since_full >= self.backstop_interval
+    }
+
+    /// Install a completed backstop walk at commit and reset the counter.
+    /// The walk itself runs in the apply spine (pool.rs) so the whole-vault
+    /// call site stays the single grep-gated `re_resolve_all` invocation.
+    pub fn commit_backstop(&mut self, catalog: ResolverCatalog) {
+        self.base = catalog;
+        self.generations_since_full = 0;
+        self.resolve_full_total += 1;
+    }
+
+    /// Record a committed targeted pass; `visited` counts candidate rows read.
+    pub fn note_targeted_pass(&mut self, visited: u64) {
+        self.resolve_targeted_total += 1;
+        self.affected_links_last = visited;
+    }
+
+    /// Fold the current transaction's overlay into the base at commit and
+    /// advance the backstop counter (§6.2.4). Never call on rollback: the
+    /// overlay is simply dropped instead.
+    pub fn fold_overlay(&mut self, epoch: u64, generation: u64) {
+        let overlay = std::mem::take(&mut self.overlay);
+        if !overlay.is_empty() {
+            self.base.fold_overlay(&overlay);
+            self.base.generation = generation;
+            self.base.epoch = epoch;
+        }
+        self.generations_since_full += 1;
+    }
+
+    /// Record `id_conflict` group recomputes executed in one apply.
+    pub fn note_group_updates(&mut self, groups: u64) {
+        self.id_conflict_group_updates_total += groups;
+    }
+}
+
+/// Runs inside the writer transaction AFTER entity rows are mutated and
+/// outgoing links re-inserted (`dst NULL`). Returns the sources whose link
+/// rows changed (feeds `ChangeLogWriter`, D5) and the number of candidate
+/// rows visited (counter plumbing). Candidates are fetched through two
+/// indexed arms (schema 3.1): `target_key IN (…)` (`links_target`) for
+/// every exact spelling, and `target_stem IN (…)` (`links_target_stem`)
+/// for every directory/extension spelling that resolves through the
+/// catalog's stem-fallback branch — together a sound superset (FR-3).
+/// IN lists are chunked at 900 keys; each candidate resolves through the
+/// overlay-then-base merge, and a row is written only when the projected
+/// state differs from the stored one (redundant re-resolution is a no-op,
+/// never a spurious `outgoing` row). State is read-only here: the caller
+/// books counters at commit so a rolled-back apply cannot drift them.
+///
+/// # Errors
+/// Returns the error text when a candidate fetch or batched update fails.
+pub fn resolve_affected(
+    tx: &Transaction<'_>,
+    state: &ResolverState,
+    affected_keys: &AffectedKeys,
+) -> Result<(Vec<i64>, u64), String> {
+    if affected_keys.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let base = &state.base;
+    let overlay = &state.overlay;
+    let mut changed: BTreeSet<i64> = BTreeSet::new();
+    let mut visited: u64 = 0;
+    let mut update = tx
+        .prepare("UPDATE links SET dst_note=?1, dst_att=?2, res_state=?3 WHERE src=?4 AND ord=?5")
+        .map_err(|error| error.to_string())?;
+    for (column, keys) in [
+        ("target_key", &affected_keys.exact),
+        ("target_stem", &affected_keys.stems),
+    ] {
+        let keys: Vec<String> = keys.iter().cloned().collect();
+        for chunk in keys.chunks(AFFECTED_KEY_CHUNK) {
+            let sql = format!(
+                "SELECT src, ord, kind, dst_raw, target_key, dst_note, dst_att, res_state \
+                 FROM links WHERE {column} IN ({})",
+                (1..=chunk.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let rows = {
+                let mut statement = tx.prepare(&sql).map_err(|error| error.to_string())?;
+                statement
+                    .query_map(
+                        rusqlite::params_from_iter(chunk.iter().map(String::as_str)),
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i32>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, Option<i64>>(5)?,
+                                row.get::<_, Option<i64>>(6)?,
+                                row.get::<_, String>(7)?,
+                            ))
+                        },
+                    )
+                    .map_err(|error| error.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?
+            };
+            for (src, ord, kind, dst_raw, target_key, dst_note, dst_att, res_state) in rows {
+                visited += 1;
+                let resolution = base.resolve_with_overlay(
+                    Some(overlay),
+                    &target_key,
+                    &dst_raw,
+                    kind == "embed",
+                    Some(src),
+                );
+                let projected = projected_resolution(&resolution);
+                if dst_note != projected.0 || dst_att != projected.1 || res_state != projected.2 {
+                    update
+                        .execute(params![projected.0, projected.1, projected.2, src, ord])
+                        .map_err(|error| error.to_string())?;
+                    changed.insert(src);
+                }
+            }
+        }
+    }
+    Ok((changed.into_iter().collect(), visited))
+}
+
+/// `(dst_note, dst_att, res_state)` as stored for one `Resolution` —
+/// shared by the targeted pass, the backstop walk, and
+/// `update_link_resolution` so comparison and write can never drift apart.
+#[must_use]
+pub fn projected_resolution(resolution: &Resolution) -> (Option<i64>, Option<i64>, &'static str) {
+    match resolution.state {
+        ResState::Resolved => {
+            if let Some(note) = &resolution.note {
+                (Some(note.note_id), None, ResState::Resolved.as_str())
+            } else if let Some(attachment) = &resolution.attachment {
+                (None, Some(attachment.att_id), ResState::Resolved.as_str())
+            } else {
+                (None, None, ResState::Unresolved.as_str())
+            }
+        }
+        ResState::Ambiguous => (
+            resolution.note.as_ref().map(|note| note.note_id),
+            resolution.attachment.as_ref().map(|att| att.att_id),
+            ResState::Ambiguous.as_str(),
+        ),
+        ResState::Unresolved => (None, None, ResState::Unresolved.as_str()),
+    }
+}
+
+/// Targeted `id_conflict` maintenance (§6.2.6): recompute the flag only for
+/// the groups whose membership can have moved — the changed entity's
+/// pre/post `stable_id_key`s — plus the applied row itself (it may have
+/// left its group with a stale flag). Same CASE semantics as the retired
+/// full-table statements, scoped by `WHERE stable_id_key`. Returns the
+/// number of statements executed (counter plumbing).
+///
+/// # Errors
+/// Returns the error text when an update fails.
+pub fn refresh_id_conflict_groups(
+    tx: &Transaction<'_>,
+    stable_id_keys: &BTreeSet<String>,
+    applied_note: Option<i64>,
+) -> Result<u64, String> {
+    let mut executed: u64 = 0;
+    {
+        let mut statement = tx
+            .prepare(
+                "UPDATE notes SET id_conflict = \
+                 CASE WHEN stable_id_key IS NOT NULL \
+                      AND path_key <> (SELECT MIN(n2.path_key) FROM notes n2 \
+                                       WHERE n2.stable_id_key = notes.stable_id_key) \
+                 THEN 1 ELSE 0 END \
+                 WHERE stable_id_key = ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        for key in stable_id_keys {
+            statement
+                .execute(params![key])
+                .map_err(|error| error.to_string())?;
+            executed += 1;
+        }
+    }
+    if let Some(note_id) = applied_note {
+        tx.execute(
+            "UPDATE notes SET id_conflict = \
+             CASE WHEN stable_id_key IS NOT NULL \
+                  AND path_key <> (SELECT MIN(n2.path_key) FROM notes n2 \
+                                   WHERE n2.stable_id_key = notes.stable_id_key) \
+             THEN 1 ELSE 0 END \
+             WHERE note_id = ?1",
+            params![note_id],
+        )
+        .map_err(|error| error.to_string())?;
+        executed += 1;
+    }
+    Ok(executed)
+}
+
+/// Winner query for one touched `stable_id_key`, run on the writer
+/// transaction after the row mutations: the same first-wins rule the full
+/// catalog load applies (`ORDER BY path_key, note_id`).
+///
+/// # Errors
+/// Returns the error text when the query fails.
+pub fn group_winner_in_tx(
+    tx: &Transaction<'_>,
+    stable_id_key: &str,
+) -> Result<Option<i64>, String> {
+    tx.query_row(
+        "SELECT note_id FROM notes WHERE stable_id_key = ?1 ORDER BY path_key, note_id LIMIT 1",
+        params![stable_id_key],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
 /// The link resolver.
 pub struct Resolver<'a> {
     conn: &'a Connection,
@@ -167,18 +794,13 @@ impl<'a> Resolver<'a> {
             })
     }
 
-    /// Re-resolve all links affected by a note change.
-    ///
-    /// This is called when notes are created, renamed, or deleted to invalidate
-    /// cached resolutions.
+    /// Invalidate canonical note candidates after an index change.
     ///
     /// # Errors
-    ///
-    /// Returns a SQLite error when the cache-refresh queries cannot be
-    /// prepared; unreadable rows are skipped.
+    /// Retains the existing fallible API; the immutable in-memory removal cannot fail.
     pub fn invalidate_for_note(&mut self, note_id: i64) -> Result<()> {
         if let Some(catalog) = &mut self.catalog {
-            catalog.invalidate_note(note_id);
+            catalog.remove_note(note_id);
         }
         Ok(())
     }
@@ -189,7 +811,7 @@ impl<'a> Resolver<'a> {
     /// Retains the existing fallible API; the immutable in-memory removal cannot fail.
     pub fn invalidate_for_attachment(&mut self, att_id: i64) -> Result<()> {
         if let Some(catalog) = &mut self.catalog {
-            catalog.invalidate_attachment(att_id);
+            catalog.remove_attachment(att_id);
         }
         Ok(())
     }
@@ -205,68 +827,79 @@ impl<'a> Resolver<'a> {
         ord: i32,
         resolution: &Resolution,
     ) -> Result<()> {
-        let (dst_note, dst_att, res_state) = match resolution.state {
-            ResState::Resolved => {
-                if let Some(ref note) = resolution.note {
-                    (Some(note.note_id), None, ResState::Resolved)
-                } else if let Some(ref att) = resolution.attachment {
-                    (None, Some(att.att_id), ResState::Resolved)
-                } else {
-                    (None, None, ResState::Unresolved)
-                }
-            }
-            ResState::Ambiguous => (
-                resolution.note.as_ref().map(|note| note.note_id),
-                resolution
-                    .attachment
-                    .as_ref()
-                    .map(|attachment| attachment.att_id),
-                ResState::Ambiguous,
-            ),
-            ResState::Unresolved => (None, None, ResState::Unresolved),
-        };
-
+        let (dst_note, dst_att, res_state) = projected_resolution(resolution);
         self.conn.execute(
             "UPDATE links SET dst_note = ?, dst_att = ?, res_state = ? WHERE src = ? AND ord = ?",
-            params![dst_note, dst_att, res_state.as_str(), src, ord,],
+            params![dst_note, dst_att, res_state, src, ord,],
         )?;
 
         Ok(())
     }
 
-    /// Re-resolve all links in the database.
-    ///
-    /// This should be called during index initialization or after bulk changes.
+    /// Re-resolve every link in the database. Backstop-only (D13, §6.2.5):
+    /// refreshes the whole catalog, then writes each link row only when the
+    /// projected state differs from the stored state, returning the sources
+    /// whose link rows flipped (feeds the change log, D5). Apply paths MUST
+    /// NOT call this; they route through `resolve_affected` instead, and a
+    /// grep gate enforces the rule.
     ///
     /// # Errors
     ///
-    /// Returns a SQLite error when the cache refresh or any link re-resolution
-    /// query fails.
-    pub fn re_resolve_all(&mut self) -> Result<()> {
-        self.refresh_cache()?;
-
-        let mut stmt = self
+    /// Returns the error text when the cache refresh or any link
+    /// re-resolution query fails.
+    pub fn re_resolve_all(&mut self) -> Result<Vec<i64>, String> {
+        self.refresh_cache().map_err(|error| error.to_string())?;
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or("resolver catalog missing after refresh")?;
+        let rows = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT src, ord, dst_raw, target_key, kind, dst_note, dst_att, res_state FROM links",
+                )
+                .map_err(|error| error.to_string())?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+        };
+        let mut changed: BTreeSet<i64> = BTreeSet::new();
+        let mut update = self
             .conn
-            .prepare("SELECT src, ord, dst_raw, target_key, kind FROM links")?;
-
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i32>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
-
-        for row in rows {
-            let (src, ord, dst_raw, target_key, kind_str) = row?;
-            let is_embed = kind_str == "embed";
-            let resolution = self.resolve(&target_key, &dst_raw, is_embed, Some(src));
-            self.update_link_resolution(src, ord, &resolution)?;
+            .prepare(
+                "UPDATE links SET dst_note=?1, dst_att=?2, res_state=?3 WHERE src=?4 AND ord=?5",
+            )
+            .map_err(|error| error.to_string())?;
+        for (src, ord, dst_raw, target_key, kind_str, dst_note, dst_att, res_state) in rows {
+            let resolution = catalog.resolve(&target_key, &dst_raw, kind_str == "embed", Some(src));
+            let projected = projected_resolution(&resolution);
+            if dst_note != projected.0 || dst_att != projected.1 || res_state != projected.2 {
+                update
+                    .execute(params![projected.0, projected.1, projected.2, src, ord])
+                    .map_err(|error| error.to_string())?;
+                changed.insert(src);
+            }
         }
+        Ok(changed.into_iter().collect())
+    }
 
-        Ok(())
+    /// Hand the refreshed catalog to the persistent base (backstop fold-in).
+    #[must_use]
+    pub fn take_catalog(&mut self) -> Option<ResolverCatalog> {
+        self.catalog.take()
     }
 }
 

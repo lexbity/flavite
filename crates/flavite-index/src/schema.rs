@@ -14,7 +14,13 @@ use std::path::Path;
 pub const SCHEMA_MAJOR: u32 = 3;
 
 /// Current schema minor version for in-place migrations within the same major.
-pub const SCHEMA_MINOR: u32 = 0;
+/// 3.1 (RFC-0004 S2): `links.target_stem` + `links_target_stem` — the
+/// discovery D12 anticipated. The catalog's stem-fallback branch lets any
+/// `dir/key.ext` target resolve through `stem(target)`, a form an
+/// `target_key IN (…)` fetch cannot enumerate; the stored, indexed final-
+/// component stem makes the targeted resolution pass superset-sound (§4.2,
+/// FR-3) with two indexed arms instead of a per-apply walk.
+pub const SCHEMA_MINOR: u32 = 1;
 
 /// Parser version - used to trigger background reindex when parser changes.
 pub const PARSER_VERSION: u32 = 3;
@@ -282,6 +288,7 @@ pub fn create_schema(conn: &mut Connection) -> Result<()> {
             kind       TEXT NOT NULL CHECK(kind IN ('link','embed')),
             dst_raw    TEXT NOT NULL,
             target_key TEXT NOT NULL,
+            target_stem TEXT NOT NULL DEFAULT '',
             anchor     TEXT,
             alias      TEXT,
             by_id      INTEGER NOT NULL DEFAULT 0,
@@ -299,7 +306,8 @@ pub fn create_schema(conn: &mut Connection) -> Result<()> {
         "CREATE INDEX links_dst ON links(dst_note);
          CREATE INDEX links_dstatt ON links(dst_att);
          CREATE INDEX links_unresolved ON links(target_key) WHERE res_state <> 'resolved';
-         CREATE INDEX links_target ON links(target_key)",
+         CREATE INDEX links_target ON links(target_key);
+         CREATE INDEX links_target_stem ON links(target_stem)",
     )?;
 
     // tags table
@@ -479,7 +487,15 @@ pub fn open_or_init(path: &Path) -> Result<Connection> {
             && notes_columns
                 .iter()
                 .any(|(name, not_null)| name == "content_hash" && !not_null);
-        major_matches && table_count == 10 && has_schema_three_columns
+        let links_columns = conn
+            .prepare("PRAGMA table_info(links)")
+            .and_then(|mut statement| {
+                let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        let has_target_stem = links_columns.iter().any(|name| name == "target_stem");
+        major_matches && table_count == 10 && has_schema_three_columns && has_target_stem
     } else {
         false
     };

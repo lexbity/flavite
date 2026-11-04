@@ -27,3 +27,9 @@ proptest = { workspace = true }
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+
+# RFC-0004 S2: apply-transaction wall bench (no criterion; manual timing, see
+# `crates/flavite-graph/benches/layout.rs` for the rationale).
+[[bench]]
+name = "apply_and_search"
+harness = false
