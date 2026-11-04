@@ -447,10 +447,17 @@ pub struct Flavite {
 }
 
 /// Build the per-vault attached services shared by every constructor.
+///
+/// RFC-0005 S1: `index_watch` is the watch half of the writer-side
+/// generation broadcast when the vault was opened with
+/// [`flavite_vault::Vault::open_with_generation_signal`] (the
+/// [`Flavite::open_root`] production path). The graph service stores it for
+/// its S5 event loop; until then it only keeps the channel open.
 fn attach_services(
     uuid: uuid::Uuid,
     root: &std::path::Path,
     session: &Arc<Session>,
+    index_watch: Option<Arc<flavite_index::GenerationWatch>>,
 ) -> (
     flavite_vault::user_state::VaultUserStateStore,
     Arc<crate::graph_service::GraphService>,
@@ -459,9 +466,10 @@ fn attach_services(
         Box::new(flavite_fs::OsFs::new()),
         root,
     );
-    let graph = crate::graph_service::GraphService::start_with_session(
+    let graph = crate::graph_service::GraphService::start_with_index_watch(
         crate::doctor::cache_db_path(uuid),
         Some(Arc::clone(session)),
+        index_watch,
     );
     (vault_user_state, graph)
 }
@@ -485,7 +493,8 @@ impl Flavite {
         let vault_uuid = vault_ref.uuid.to_string();
 
         let session = Arc::new(session);
-        let (vault_user_state, graph) = attach_services(vault_ref.uuid, &identity.root, &session);
+        let (vault_user_state, graph) =
+            attach_services(vault_ref.uuid, &identity.root, &session, None);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
             uuid::Uuid::now_v7().as_u128(),
@@ -532,7 +541,8 @@ impl Flavite {
     ) -> Result<Self, FlaviteError> {
         let vault_uuid = vault_ref.uuid.to_string();
         let session = Arc::new(session);
-        let (vault_user_state, graph) = attach_services(vault_ref.uuid, &vault_ref.root, &session);
+        let (vault_user_state, graph) =
+            attach_services(vault_ref.uuid, &vault_ref.root, &session, None);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
             uuid::Uuid::now_v7().as_u128(),
@@ -569,15 +579,28 @@ impl Flavite {
     /// Create a new Flavite with a shared Session reference.
     ///
     /// This is useful when the Session is owned by another component
-    /// (e.g., the Vault in the CLI integration).
+    /// (e.g., the Vault in the CLI integration). The graph service starts
+    /// without an index watch here: hosts that need the event spine use
+    /// [`Flavite::open_root`], which wires the vault's generation broadcast
+    /// into the service.
     pub fn with_vault(
         identity: VaultIdentity,
         session: Arc<Session>,
+        config: VaultConfig,
+    ) -> Result<Self, FlaviteError> {
+        Self::with_vault_inner(identity, session, config, None)
+    }
+
+    fn with_vault_inner(
+        identity: VaultIdentity,
+        session: Arc<Session>,
         _config: VaultConfig,
+        index_watch: Option<Arc<flavite_index::GenerationWatch>>,
     ) -> Result<Self, FlaviteError> {
         let vault_uuid = identity.uuid.to_string();
         let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
-        let (vault_user_state, graph) = attach_services(vault_ref.uuid, &identity.root, &session);
+        let (vault_user_state, graph) =
+            attach_services(vault_ref.uuid, &identity.root, &session, index_watch);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
             uuid::Uuid::now_v7().as_u128(),
@@ -613,10 +636,28 @@ impl Flavite {
 
     /// Open a vault and construct the public facade while retaining ownership
     /// guards for the lifetime of the facade.
+    ///
+    /// This is the production wiring for RFC-0005's event spine: the
+    /// generation broadcast is constructed here (the only place owning both
+    /// sides), the sender is handed into the vault's index actor — every
+    /// committed structural generation publishes from the apply spine's
+    /// commit sites (FR-1) — and the watch is held by the graph service's
+    /// constructor seam.
     pub fn open_root(root: PathBuf, config: VaultConfig) -> Result<Self, FlaviteError> {
-        let vault = Vault::open(root, Box::new(flavite_fs::OsFs::new()), config.clone())
-            .map_err(|error| FlaviteError::VaultOpenError(error.to_string()))?;
-        let mut flavite = Self::with_vault(vault.identity().clone(), vault.session_arc(), config)?;
+        let (generation_signal, generation_watch) = flavite_index::GenerationSignal::new();
+        let vault = Vault::open_with_generation_signal(
+            root,
+            Box::new(flavite_fs::OsFs::new()),
+            config.clone(),
+            generation_signal,
+        )
+        .map_err(|error| FlaviteError::VaultOpenError(error.to_string()))?;
+        let mut flavite = Self::with_vault_inner(
+            vault.identity().clone(),
+            vault.session_arc(),
+            config,
+            Some(Arc::new(generation_watch)),
+        )?;
         flavite.owned_vault = Some(vault);
         Ok(flavite)
     }

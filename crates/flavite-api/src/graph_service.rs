@@ -35,6 +35,7 @@ use flavite_graph::{
     GraphPublisher, LayoutCommand, LayoutWorker, LayoutWorkerConfig, NodeId, PositionBuffer,
     RenderKey,
 };
+use flavite_index::GenerationWatch;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::graph_mirror::{GraphMirror, MirrorStats, ParityOutcome, ParityPolicy, Synchronize};
@@ -172,6 +173,16 @@ struct Shared {
     /// by the on-demand doctor parity check; both are read-mostly and the
     /// critical sections are bounded reads on the graph connection.
     mirror: std::sync::Mutex<GraphMirror>,
+    /// RFC-0005 S1: the watch half of the writer-side generation broadcast
+    /// (when the host constructed the vault with a signal). Stored per
+    /// service so S5's event loop can wake on it; until then the pump
+    /// ignores it and freshness remains the 250 ms cadence + hint path —
+    /// this field's presence must not change any pump behavior.
+    #[allow(
+        dead_code,
+        reason = "wired in RFC-0005 S1 (constructor seam); the S5 event loop is its first consumer"
+    )]
+    index_watch: Option<Arc<GenerationWatch>>,
 }
 
 #[derive(Debug, Default)]
@@ -234,7 +245,19 @@ impl GraphService {
     }
 
     pub(crate) fn start_with_session(db_path: PathBuf, session: Option<Arc<Session>>) -> Arc<Self> {
-        Self::start_with_policy(db_path, session, ParityPolicy::default())
+        Self::start_with_policy(db_path, session, ParityPolicy::default(), None)
+    }
+
+    /// RFC-0005 S1 seam: start the service holding the generation broadcast's
+    /// watch. The pump does not consume it yet (S5 rewrites the wake
+    /// mechanics); until then freshness behavior is byte-identical to
+    /// [`Self::start_with_session`].
+    pub(crate) fn start_with_index_watch(
+        db_path: PathBuf,
+        session: Option<Arc<Session>>,
+        index_watch: Option<Arc<GenerationWatch>>,
+    ) -> Arc<Self> {
+        Self::start_with_policy(db_path, session, ParityPolicy::default(), index_watch)
     }
 
     /// Test/bench seam: same service with a tightened mirror drift guard
@@ -246,13 +269,14 @@ impl GraphService {
         session: Option<Arc<Session>>,
         policy: ParityPolicy,
     ) -> Arc<Self> {
-        Self::start_with_policy(db_path, session, policy)
+        Self::start_with_policy(db_path, session, policy, None)
     }
 
     fn start_with_policy(
         db_path: PathBuf,
         session: Option<Arc<Session>>,
         policy: ParityPolicy,
+        index_watch: Option<Arc<GenerationWatch>>,
     ) -> Arc<Self> {
         let shared = Arc::new(Shared {
             frame: ArcSwapOption::empty(),
@@ -263,6 +287,7 @@ impl GraphService {
             scopes: std::sync::Mutex::new(BTreeMap::new()),
             retry_layout: AtomicBool::new(false),
             mirror: std::sync::Mutex::new(GraphMirror::with_parity_policy(session.clone(), policy)),
+            index_watch,
         });
         let (hints, hint_rx) = bounded::<Directive>(HINT_QUEUE_CAPACITY);
         let stop = Arc::new(AtomicBool::new(false));

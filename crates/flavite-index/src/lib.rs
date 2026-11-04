@@ -34,6 +34,7 @@ pub mod resolver;
 pub mod schema;
 pub mod search;
 pub mod search_docs;
+pub mod signal;
 pub mod types;
 
 // Re-export key types for convenience from types module
@@ -60,6 +61,10 @@ pub use search::*;
 
 // Re-export search_docs items (but not SearchDoc which conflicts with types)
 pub use search_docs::{SearchDocBatch, SearchDocCache, SearchDocUpdate};
+
+// Re-export the generation broadcast types (RFC-0005 §5.1): the only
+// writer-side signal surface.
+pub use signal::{GenerationSignal, GenerationWatch};
 
 #[cfg(test)]
 mod tests {

@@ -805,7 +805,6 @@ pub fn re_resolve_preview(conn: &Connection) -> Result<Vec<LinkParityMismatch>, 
 ///
 /// # Errors
 /// Returns the error text when an update fails.
-
 pub fn refresh_id_conflict_groups(
     tx: &Transaction<'_>,
     stable_id_keys: &BTreeSet<String>,

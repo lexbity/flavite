@@ -16,6 +16,8 @@ thiserror = { workspace = true }
 pulldown-cmark = { workspace = true }
 tantivy = { workspace = true }
 tracing = { workspace = true }
+# RFC-0005 S1: the writer-side generation broadcast (signal.rs).
+crossbeam = { workspace = true }
 
 # Internal deps
 flavite-syntax = { path = "../flavite-syntax" }

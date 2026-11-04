@@ -16,6 +16,7 @@ use crate::resolver::{
 };
 use crate::schema::{AttachmentKind, MetaKey, get_meta_u64};
 use crate::search::SearchBackend;
+use crate::signal::GenerationSignal;
 use crate::types::IndexVersion;
 use blake3::Hash;
 use flavite_syntax::{pulldown_glue::parse_note, text::TextSnapshot};
@@ -64,6 +65,10 @@ pub struct IndexActor {
     last_search_commit: Instant,
     needs_reparse: bool,
     resolver: ResolverState,
+    /// RFC-0005 S1: the writer-side generation broadcast. `None` keeps the
+    /// actor signal-less (CLI/test pools); `Some` publishes every committed
+    /// structural generation from the apply spine's commit sites (FR-1).
+    signal: Option<GenerationSignal>,
 }
 
 /// Build one bounded excerpt around the first occurrence of any term.
@@ -633,7 +638,23 @@ impl IndexActor {
     /// # Errors
     /// Returns a SQLite error if the writer or read pool cannot be initialized.
     pub fn new(db_path: &Path, pool_size: usize) -> Result<Self> {
-        Self::construct(db_path, pool_size, None)
+        Self::construct(db_path, pool_size, None, None)
+    }
+
+    /// Create a new index actor wired to a [`GenerationSignal`]
+    /// (RFC-0005 §5.1/FR-1): every committed structural generation bump
+    /// publishes its `IndexVersion` from the apply spine's commit sites,
+    /// and `FastPath` commits stay silent. This is the production path —
+    /// derived views subscribe to the matching [`crate::GenerationWatch`].
+    ///
+    /// # Errors
+    /// Returns a SQLite error if the writer or read pool cannot be initialized.
+    pub fn with_generation_signal(
+        db_path: &Path,
+        pool_size: usize,
+        signal: GenerationSignal,
+    ) -> Result<Self> {
+        Self::construct(db_path, pool_size, None, Some(signal))
     }
 
     /// Create an actor whose resolver backstop fires on a custom generation
@@ -648,10 +669,15 @@ impl IndexActor {
         pool_size: usize,
         generations: u64,
     ) -> Result<Self> {
-        Self::construct(db_path, pool_size, Some(generations.max(1)))
+        Self::construct(db_path, pool_size, Some(generations.max(1)), None)
     }
 
-    fn construct(db_path: &Path, pool_size: usize, backstop: Option<u64>) -> Result<Self> {
+    fn construct(
+        db_path: &Path,
+        pool_size: usize,
+        backstop: Option<u64>,
+        signal: Option<GenerationSignal>,
+    ) -> Result<Self> {
         let parser_version = crate::schema::open_or_init(db_path)?;
         let needs_reparse = crate::schema::get_meta_u32(&parser_version, MetaKey::ParserVersion)?
             != Some(crate::schema::PARSER_VERSION);
@@ -708,6 +734,7 @@ impl IndexActor {
             last_search_commit: Instant::now(),
             needs_reparse,
             resolver,
+            signal,
         })
     }
 
@@ -1075,6 +1102,29 @@ impl IndexActor {
             .map_err(|error| error.to_string())
     }
 
+    /// Advertise a committed structural generation on the writer-side
+    /// broadcast (RFC-0005 §5.1/§4.3, FR-1).
+    ///
+    /// Contract, enforced structurally at the spine's commit sites and by
+    /// the `graph_event_contract.rs` property test over every public apply
+    /// path:
+    /// - MUST be called immediately after a `tx.commit()` that bumped
+    ///   `MetaKey::Generation` succeeds — never before the commit is durable
+    ///   (§4.9: a reader that observes the watermark must find that
+    ///   generation in the database).
+    /// - MUST NOT be called for `FastPath` commits (no bump, no change
+    ///   rows — graph-invisible by contract).
+    /// - A no-op when the pool was constructed signal-less (CLI/test pools).
+    ///
+    /// Cost on the writer thread: two atomic stores and one `try_send`
+    /// (~50 ns, NFR-9) — strictly smaller than the change-row write it
+    /// accompanies.
+    fn publish_generation(&self, version: IndexVersion) {
+        if let Some(signal) = &self.signal {
+            signal.publish(version);
+        }
+    }
+
     /// The single apply spine (§6.2 "How"): pre-image → mutate → post →
     /// generation bump → group-scoped `id_conflict` → resolution (targeted
     /// against the staged overlay, or the whole-vault backstop walk at D13
@@ -1082,6 +1132,11 @@ impl IndexActor {
     /// their distinct row shapes but delegate everything else here, so the
     /// sequence that previously existed five divergent times — including
     /// the divergent change-row writes of C4 — exists exactly once.
+    ///
+    /// This is also the signal choke point (RFC-0005 FR-1): the two sites
+    /// that commit a bumped generation publish it via
+    /// [`Self::publish_generation`] immediately on commit success; the two
+    /// `FastPath` commit sites never publish.
     ///
     /// Transaction boundaries stay the writer's: one `conn.transaction()`
     /// owns every structural write, the generation meta bump, and the
@@ -1135,6 +1190,9 @@ impl IndexActor {
         let mut plan = ApplyPlan::default();
         let mutated = mutate(&tx, pre.as_ref(), &counters, &mut plan)?;
         if mutated == CoreStep::FastPath && !self.resolver.backstop_due() {
+            // FastPath commit: stat columns only, no generation bump and no
+            // change rows — graph-invisible by contract, so no
+            // publish_generation (RFC-0005 FR-1).
             tx.commit().map_err(|error| error.to_string())?;
             return Ok((
                 SpineOutcome::FastPath {
@@ -1153,6 +1211,9 @@ impl IndexActor {
             // apply (outgoing rows per FR-1 plus the touched entity row).
             let (changed, catalog) = backstop_walk(&tx)?;
             if changed.is_empty() {
+                // The walk found no drift: no bump, no change rows, so this
+                // commit is still a FastPath — no publish_generation
+                // (RFC-0005 FR-1).
                 tx.commit().map_err(|error| error.to_string())?;
                 self.resolver.commit_backstop(catalog);
                 return Ok((
@@ -1187,6 +1248,10 @@ impl IndexActor {
             .map_err(|error| error.to_string())?;
             ChangeLogWriter::record_all(&tx, generation, &rows)?;
             tx.commit().map_err(|error| error.to_string())?;
+            // FR-1 site: this commit bumped `MetaKey::Generation` (the walk
+            // found drift and repaired it as a logged structural apply), so
+            // the generation is broadcast immediately on commit success.
+            self.publish_generation(IndexVersion::new(epoch, generation));
             self.resolver.commit_backstop(catalog);
             self.resolver.note_committed_apply(row_count as u64);
             self.resolver.fold_overlay(epoch, generation);
@@ -1291,6 +1356,11 @@ impl IndexActor {
         ChangeLogWriter::record_all(&tx, generation, &rows)?;
         let change_rows = rows.len();
         tx.commit().map_err(|error| error.to_string())?;
+        // FR-1 site: the structural apply bumped `MetaKey::Generation` in
+        // this transaction, so the generation is broadcast immediately on
+        // commit success — ahead of the in-memory fold, because the feed
+        // (database) is the truth any subscriber verifies against.
+        self.publish_generation(IndexVersion::new(epoch, generation));
         // Commit fold (§6.2.4): SQLite writes are durable; in-memory state
         // follows. Counters track committed applies only.
         if let Some(catalog) = backstop_catalog {

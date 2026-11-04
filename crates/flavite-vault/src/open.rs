@@ -81,10 +81,37 @@ impl Vault {
     ///
     /// Resolves identity, acquires the instance lock, initializes the index,
     /// starts the vault actor, and creates a session.
+    ///
+    /// The index actor is signal-less: committed generations are durable in
+    /// the change log, but nothing is broadcast. Hosts that run derived
+    /// consumers (the graph service, RFC-0005) use
+    /// [`Vault::open_with_generation_signal`] so the writer announces every
+    /// commit instead of leaving consumers to poll for it.
     pub fn open(
         root: PathBuf,
         fs: Box<dyn Fs + Send + Sync>,
         config: VaultConfig,
+    ) -> OpenVaultResult<Self> {
+        Self::open_inner(root, fs, config, None)
+    }
+
+    /// Open a vault whose index writer publishes every committed structural
+    /// generation on `generation_signal` (RFC-0005 S1, FR-1: the writer-side
+    /// broadcast; `FastPath` commits stay silent by contract).
+    pub fn open_with_generation_signal(
+        root: PathBuf,
+        fs: Box<dyn Fs + Send + Sync>,
+        config: VaultConfig,
+        generation_signal: flavite_index::GenerationSignal,
+    ) -> OpenVaultResult<Self> {
+        Self::open_inner(root, fs, config, Some(generation_signal))
+    }
+
+    fn open_inner(
+        root: PathBuf,
+        fs: Box<dyn Fs + Send + Sync>,
+        config: VaultConfig,
+        generation_signal: Option<flavite_index::GenerationSignal>,
     ) -> OpenVaultResult<Self> {
         info!("Opening vault at: {}", root.display());
 
@@ -136,7 +163,7 @@ impl Vault {
         }
 
         // Step 5: Open the index
-        let index = Self::open_or_rebuild_index(&identity, &config)?;
+        let index = Self::open_or_rebuild_index(&identity, &config, generation_signal)?;
 
         // Step 6: Create channels
         let channels =
@@ -180,10 +207,12 @@ impl Vault {
         })
     }
 
-    /// Open or rebuild the index.
+    /// Open or rebuild the index, wiring the writer-side generation broadcast
+    /// when the host supplied one (RFC-0005 S1).
     fn open_or_rebuild_index(
         identity: &VaultIdentity,
         _config: &VaultConfig,
+        generation_signal: Option<flavite_index::GenerationSignal>,
     ) -> Result<IndexActor, OpenVaultError> {
         let cache_dir =
             Self::get_cache_dir(identity.uuid)?.join(format!("v{}", flavite_index::SCHEMA_MAJOR));
@@ -194,8 +223,15 @@ impl Vault {
             flavite_index::open_or_init(&db_path)
                 .map_err(|error| OpenVaultError::Index(error.to_string()))?,
         );
-        IndexActor::new(&db_path, flavite_index::pool::DEFAULT_POOL_SIZE)
-            .map_err(|error| OpenVaultError::Index(error.to_string()))
+        let actor = match generation_signal {
+            Some(signal) => IndexActor::with_generation_signal(
+                &db_path,
+                flavite_index::pool::DEFAULT_POOL_SIZE,
+                signal,
+            ),
+            None => IndexActor::new(&db_path, flavite_index::pool::DEFAULT_POOL_SIZE),
+        };
+        actor.map_err(|error| OpenVaultError::Index(error.to_string()))
     }
 
     /// Get the cache directory for a vault UUID.
