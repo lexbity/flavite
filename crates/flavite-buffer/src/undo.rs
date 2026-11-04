@@ -112,24 +112,36 @@ impl EditOp {
     }
     /// Check if this edit can be coalesced with another.
     ///
-    /// Edits can be coalesced if:
-    /// - They are adjacent or overlapping
-    /// - They happen within the coalesce window
+    /// Coalescing merges typing bursts: same-place, back-to-back edits.
+    /// Two edits coalesce iff they are both non-boundary, non-journal, and
+    /// their ranges are adjacent — `self` ends exactly where `other` starts,
+    /// or vice versa (the time window is enforced by callers). Zero-length
+    /// (insertion) ranges coalesce at the shared point, so same-point
+    /// insertions merge in application order.
+    ///
+    /// Overlapping ranges do NOT coalesce: for overlapping edits the merged
+    /// replacement over the `min..max` span cannot be derived by
+    /// concatenation — sequential application leaves displaced original
+    /// bytes inside the span that concatenation silently drops. (The live
+    /// undo tree recomputes its merged edit from before/after snapshots and
+    /// does not rely on this predicate for text correctness; `coalesce` and
+    /// `LinearUndoStack` do, which is why adjacency is the whole contract.)
     #[must_use]
     pub fn can_coalesce(&self, other: &EditOp) -> bool {
         if self.boundary || other.boundary || self.journal.is_some() || other.journal.is_some() {
             return false;
         }
-        // Check if ranges are adjacent or overlapping
-        let self_end = self.range.end.0;
-        let other_start = other.range.start.0;
-        let other_end = other.range.end.0;
-        // Overlapping or adjacent
-        self_end >= other_start && other_end >= self.range.start.0
-            || self_end == other_start
-            || other_end == self.range.start.0
+        // Adjacent only: `self` ends where `other` starts, or vice versa.
+        // Zero-length (insertion) ranges coalesce at the shared point, which
+        // makes same-point insertions merge in application order — correct.
+        self.range.end.0 == other.range.start.0 || other.range.end.0 == self.range.start.0
     }
-    /// Coalesce this edit with another.
+    /// Coalesce this edit with another into one edit over the union span.
+    ///
+    /// Precondition: [`EditOp::can_coalesce`]. Correct because adjacency
+    /// makes `start..end` exactly the union of the two touched spans, and
+    /// the left-to-right replacement order matches application order for
+    /// both orderings of the query.
     #[must_use]
     pub fn coalesce(&self, other: &EditOp) -> Option<EditOp> {
         if !self.can_coalesce(other) {
@@ -619,21 +631,22 @@ impl LinearUndoStack {
     }
     /// Push an edit onto the undo stack.
     ///
-    /// If within the coalesce window and coalescible with the top edit,
-    /// it is merged instead of pushed.
+    /// If within the coalesce window and the edit merges into the top entry
+    /// (`EditOp::coalesce` returns `Some`), the entry is replaced by the
+    /// merged edit and the revision does not advance. Otherwise the edit is
+    /// pushed as a new entry. Falls through to a plain push whenever
+    /// `coalesce` declines, so this path can never panic regardless of any
+    /// future divergence between `can_coalesce` and `coalesce`.
     ///
     /// Returns the new revision.
     pub fn push(&mut self, edit: EditOp, _text: &str) -> Revision {
         let now = Instant::now();
-        // Check if we can coalesce
         if let Some(last_time) = self.last_edit_time
             && now.duration_since(last_time) < self.coalesce_window
             && let Some(last_edit) = self.undo_stack.back_mut()
-            && last_edit.can_coalesce(&edit)
+            && let Some(merged) = last_edit.coalesce(&edit)
         {
-            *last_edit = last_edit
-                .coalesce(&edit)
-                .expect("coalescible edits must produce a combined edit");
+            *last_edit = merged;
             return self.current_revision;
         }
         // Push as new edit
@@ -728,10 +741,16 @@ mod tests {
     fn edit_op_coalesce_adjacent() {
         let op1 = EditOp::new(Span::new(TextByte(5), TextByte(5)), "a".to_string());
         let op2 = EditOp::new(Span::new(TextByte(6), TextByte(6)), "b".to_string());
-        assert!(!op1.can_coalesce(&op2)); // Not adjacent in text
+        assert!(!op1.can_coalesce(&op2)); // Gap of one byte: not adjacent
         let op3 = EditOp::new(Span::new(TextByte(5), TextByte(5)), "a".to_string());
         let op4 = EditOp::new(Span::new(TextByte(5), TextByte(6)), "b".to_string());
-        assert!(op3.can_coalesce(&op4)); // Overlapping
+        assert!(op3.can_coalesce(&op4)); // Shared point: insertion at 5 == start of [5,6)
+        // M1 pin: a true overlap (neither endpoint shared) never coalesces.
+        let left = EditOp::new(Span::new(TextByte(1), TextByte(5)), "x".to_string());
+        let right = EditOp::new(Span::new(TextByte(3), TextByte(8)), "y".to_string());
+        assert!(!left.can_coalesce(&right));
+        assert!(!right.can_coalesce(&left));
+        assert_eq!(left.coalesce(&right), None);
     }
     #[test]
     fn linear_undo_stack_basic() {
@@ -870,5 +889,330 @@ mod tests {
         stack.clear();
         assert_eq!(stack.undo_count(), 0);
         assert_eq!(stack.current_revision(), Revision::INITIAL);
+    }
+
+    /// M1 pin: strictly overlapping edits must NOT coalesce. Sequential
+    /// application of `[1,5)->"x"` then `[3,8)->"y"` cannot be reproduced by
+    /// concatenating replacements over the `min..max` span, so they take two
+    /// undo entries and each restores its own pre-state exactly.
+    #[test]
+    fn overlapping_rapid_edits_take_separate_undo_entries() {
+        let mut stack = LinearUndoStack::new();
+        stack.set_coalesce_window(Duration::from_secs(3600));
+
+        let base = "abcdefghijklm".to_string();
+        let e1 = EditOp::new(Span::new(TextByte(1), TextByte(5)), "x".to_string());
+        let text1 = e1.apply(&base);
+        let e2 = EditOp::new(Span::new(TextByte(3), TextByte(8)), "yyyyy".to_string());
+        let text2 = e2.apply(&text1);
+
+        stack.push(e1.clone(), &base);
+        stack.push(e2.clone(), &text1);
+
+        // Two separate entries, one revision per edit.
+        assert_eq!(stack.undo_count(), 2, "overlapping edits must not merge");
+
+        // Undoing twice with each entry's recorded pre-state restores the
+        // exact prior text at every step (invert takes the edit's pre-text).
+        let (inv2, _) = stack.undo(&text1).expect("undo available");
+        assert_eq!(inv2.apply(&text2), text1);
+        let (inv1, _) = stack.undo(&base).expect("undo available");
+        assert_eq!(inv1.apply(&text1), base);
+    }
+
+    /// Adjacency merges correctly on a real text, in both push orders: the
+    /// merged span is the union and the replacement keeps left-to-right
+    /// order, never the reversed `CDAB` concatenation.
+    #[test]
+    fn adjacent_burst_merges_correctly_in_both_orders() {
+        // Forward order: [0,2)->"AB" then [2,4)->"CD" on "wxyz".
+        let mut stack = LinearUndoStack::new();
+        stack.set_coalesce_window(Duration::from_secs(3600));
+        stack.push(
+            EditOp::new(Span::new(TextByte(0), TextByte(2)), "AB".into()),
+            "wxyz",
+        );
+        stack.push(
+            EditOp::new(Span::new(TextByte(2), TextByte(4)), "CD".into()),
+            "AByz",
+        );
+        assert_eq!(stack.undo_count(), 1);
+        // The single merged entry applied to the base yields the same text
+        // the two sequential edits produced, and undoing restores exactly.
+        let (inv, _) = stack.undo("wxyz").expect("undo available");
+        assert_eq!(inv.range.start, TextByte(0));
+        assert_eq!(inv.range.end, TextByte(4));
+        assert_eq!(inv.replacement, "wxyz");
+        assert_eq!(inv.apply("ABCD"), "wxyz");
+
+        // Reverse order: [2,4)->"CD" pushed first, then [0,2)->"AB".
+        let mut stack = LinearUndoStack::new();
+        stack.set_coalesce_window(Duration::from_secs(3600));
+        stack.push(
+            EditOp::new(Span::new(TextByte(2), TextByte(4)), "CD".into()),
+            "wxyz",
+        );
+        stack.push(
+            EditOp::new(Span::new(TextByte(0), TextByte(2)), "AB".into()),
+            "wxCD",
+        );
+        assert_eq!(stack.undo_count(), 1);
+        // Ordering branch must put the LEFT edit's bytes first: "ABCD",
+        // matching sequential application ("wxCD" then [0,2)->"AB" = "ABCD").
+        let (inv, _) = stack.undo("wxyz").expect("undo available");
+        assert_eq!(inv.apply("ABCD"), "wxyz");
+    }
+
+    /// Zero-length (insertion) ranges coalesce at the shared point, merging
+    /// in application order: insert "a" at 5, then "b" at 5 -> one entry
+    /// whose replacement is "ab".
+    #[test]
+    fn same_point_insertions_merge_in_application_order() {
+        let mut stack = LinearUndoStack::new();
+        stack.set_coalesce_window(Duration::from_secs(3600));
+        stack.push(
+            EditOp::new(Span::new(TextByte(5), TextByte(5)), "a".into()),
+            "hello",
+        );
+        stack.push(
+            EditOp::new(Span::new(TextByte(5), TextByte(5)), "b".into()),
+            "hello",
+        );
+        assert_eq!(stack.undo_count(), 1);
+        // The merged op applied to the base places "ab" at the point.
+        let merged = EditOp::new(Span::new(TextByte(5), TextByte(5)), "ab".into());
+        assert_eq!(merged.apply("hello"), "helloab");
+        // Undoing the merged insertion deletes exactly the inserted bytes.
+        let (inv, _) = stack.undo("hello").expect("undo available");
+        assert_eq!(inv.apply("helloab"), "hello");
+    }
+
+    /// Boundary and journal edits never merge in the stack either (pin of
+    /// existing predicate behavior at the stack level).
+    #[test]
+    fn boundary_and_journal_edits_never_merge_in_stack() {
+        let mut stack = LinearUndoStack::new();
+        stack.set_coalesce_window(Duration::from_secs(3600));
+        stack.push(
+            EditOp::new(Span::new(TextByte(0), TextByte(0)), "a".into()),
+            "",
+        );
+        let mut boundary = EditOp::new(Span::new(TextByte(0), TextByte(0)), "b".into());
+        boundary.boundary = true;
+        stack.push(boundary, "a");
+        assert_eq!(stack.undo_count(), 2, "boundary edit must not merge");
+
+        let tagged =
+            EditOp::new(Span::new(TextByte(0), TextByte(0)), "c".into()).with_journal(JournalTag {
+                txn_id: "txn".into(),
+                item_id: 7,
+            });
+        stack.push(tagged, "ab");
+        assert_eq!(stack.undo_count(), 3, "journal edit must not merge");
+    }
+
+    /// Stack-level invariant under a long randomized burst: 200 same-point
+    /// insertion ops (the regime that merges, including merged chains)
+    /// driven onto a short base, then undo-to-bottom with each inverse
+    /// applied — the original text must return exactly. Catches cumulative
+    /// merge errors the pairwise properties cannot.
+    #[test]
+    fn randomized_stack_drive_restores_original_exactly() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15; // deterministic xorshift64*
+        let mut rnd = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+
+        let base = "abc".to_string();
+        let mut text = base.clone();
+        let mut stack = LinearUndoStack::new();
+        stack.set_coalesce_window(Duration::from_secs(3600));
+
+        for _ in 0..200 {
+            let pos = (rnd() as usize) % (text.len() + 1);
+            let ch = (b'a' + (rnd() % 26) as u8) as char;
+            let edit = EditOp::new(Span::new(TextByte(pos), TextByte(pos)), ch.to_string());
+            text = edit.apply(&text);
+            stack.push(edit, &text);
+        }
+        // The drive must actually have merged (bursts at the same point).
+        assert!(
+            stack.undo_count() < 200,
+            "expected merged chains, got {}",
+            stack.undo_count()
+        );
+
+        // Undo-to-bottom: each popped entry's inverse removes the bytes it
+        // contributed; the exact original must survive.
+        while let Some((inverse, _)) = stack.undo(&text) {
+            text = inverse.apply(&text);
+        }
+        assert_eq!(text, base);
+    }
+
+    /// LinearUndoStack::push cannot panic for any input: fully randomized
+    /// ops (arbitrary ranges and replacements, mixed windows, undo/redo
+    /// churn) are driven without a single panic. The stack never indexes
+    /// text itself; the merged push path must never trust `can_coalesce`
+    /// with an `expect` (the old panic landmine).
+    #[test]
+    fn push_never_panics_under_randomized_ops() {
+        use proptest::prelude::*;
+        proptest!(|(
+            seed in any::<u64>(),
+            window_millis in 0u64..2_000,
+            ops in proptest::collection::vec(
+                (any::<usize>(), any::<usize>(), "[\\x20-\\x7e]{0,8}"),
+                1..50,
+            ),
+        )| {
+            let mut state = seed | 1;
+            let mut next = move || {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            };
+            let mut stack = LinearUndoStack::new();
+            stack.set_coalesce_window(Duration::from_millis(window_millis));
+            for (a, b, repl) in &ops {
+                let (start, end) = if a <= b { (*a, *b) } else { (*b, *a) };
+                let edit = EditOp::new(Span::new(TextByte(start), TextByte(end)), repl.clone());
+                stack.push(edit, "");
+                // Churn the other entry points too.
+                if next() % 3 == 0 {
+                    let _ = stack.undo("");
+                } else if next() % 3 == 1 {
+                    let _ = stack.redo();
+                }
+            }
+        });
+    }
+
+    mod coalesce_properties {
+        //! Pairwise coalescing correctness, proved on arbitrary input:
+        //! adjacency merges exactly (and agrees with sequential application
+        //! whenever coordinates stay aligned), strict overlap never merges.
+
+        use super::*;
+        use proptest::prelude::*;
+
+        /// ASCII-only text so every byte index is a char boundary.
+        fn arb_text() -> impl Strategy<Value = String> {
+            "[a-zA-Z0-9 .,!?]{0,24}"
+        }
+
+        #[test]
+        fn adjacent_pairs_merge_exactly() {
+            proptest!(|(
+                base in arb_text(),
+                (x, y, z) in (any::<usize>(), any::<usize>(), any::<usize>()),
+                r1 in "[a-zA-Z]{0,6}",
+                r2 in "[a-zA-Z]{0,6}",
+            )| {
+                let len = base.len();
+                // Order the three points: s <= m <= e, so `a` = [s,m) and
+                // `b` = [m,e) are adjacent on shared base coordinates.
+                let [s, m, e] = {
+                    let mut p = [x % (len + 1), y % (len + 1), z % (len + 1)];
+                    p.sort_unstable();
+                    p
+                };
+                let a = EditOp::new(Span::new(TextByte(s), TextByte(m)), r1.clone());
+                let b = EditOp::new(Span::new(TextByte(m), TextByte(e)), r2.clone());
+
+                // Adjacency: coalescible in both query orders.
+                prop_assert!(a.can_coalesce(&b));
+                prop_assert!(b.can_coalesce(&a));
+
+                // The merged op is the union span with left-to-right bytes.
+                prop_assert!(a.coalesce(&b).is_some(), "adjacent pair must merge");
+                let merged = a.coalesce(&b).unwrap();
+                prop_assert_eq!(&merged.range, &Span::new(TextByte(s), TextByte(e)));
+                prop_assert_eq!(&merged.replacement, &(r1.clone() + &r2));
+
+                // Reverse-ordered query: same union span; the replacement
+                // keeps left-to-right order whenever the starts differ, and
+                // flips to self-first exactly in the shared-point tie
+                // (both ranges zero-length at the same point).
+                prop_assert!(b.coalesce(&a).is_some(), "reverse adjacent pair must merge");
+                let reverse = b.coalesce(&a).unwrap();
+                prop_assert_eq!(&reverse.range, &Span::new(TextByte(s), TextByte(e)));
+                if s < m {
+                    prop_assert_eq!(&reverse.replacement, &(r1.clone() + &r2));
+                } else {
+                    prop_assert_eq!(&reverse.replacement, &(r2.clone() + &r1));
+                }
+
+                // Merged application equals simultaneous (both-at-once)
+                // editing of the two disjoint adjacent spans.
+                let simultaneous = format!("{}{}{}{}", &base[..s], r1, r2, &base[e..]);
+                prop_assert_eq!(&merged.apply(&base), &simultaneous);
+
+                // Sequential equivalence under the spec pairing: applying
+                // `a` then `b` (b's coordinates in the post-a text) equals
+                // coalesce(b, a) — the LAST-applied edit is `self` so its
+                // bytes win the left slot at a shared point. Holds whenever
+                // coordinates stay aligned (length-preserving replacements).
+                if r1.len() == m - s && r2.len() == e - m {
+                    prop_assert_eq!(
+                        &b.apply(&a.apply(&base)),
+                        &reverse.apply(&base),
+                        "a-then-b must equal coalesce(b,a)"
+                    );
+                    prop_assert_eq!(
+                        &a.apply(&b.apply(&base)),
+                        &merged.apply(&base),
+                        "b-then-a must equal coalesce(a,b)"
+                    );
+                }
+            });
+        }
+
+        #[test]
+        fn overlapping_and_gapped_pairs_never_merge() {
+            proptest!(|(
+                base in arb_text(),
+                (x, y, z, w) in (any::<usize>(), any::<usize>(), any::<usize>(), any::<usize>()),
+                r1 in "[a-zA-Z]{0,6}",
+                r2 in "[a-zA-Z]{0,6}",
+                shape in 0u8..3,
+            )| {
+                let len = base.len();
+                let mut p = [
+                    x % (len + 1), y % (len + 1), z % (len + 1), w % (len + 1),
+                ];
+                p.sort_unstable();
+                let [p0, p1, p2, p3] = p;
+                // Require strict inequality so the generated geometry is a
+                // genuine overlap/gap — touching endpoints ARE adjacency.
+                prop_assume!(p0 < p1 && p1 < p2 && p2 < p3);
+                let (a, b) = match shape {
+                    // Partial overlap: s1 < s2 < e1 < e2.
+                    0 => (
+                        EditOp::new(Span::new(TextByte(p0), TextByte(p2)), r1),
+                        EditOp::new(Span::new(TextByte(p1), TextByte(p3)), r2),
+                    ),
+                    // Containment: s1 < s2 < e2 < e1.
+                    1 => (
+                        EditOp::new(Span::new(TextByte(p0), TextByte(p3)), r1),
+                        EditOp::new(Span::new(TextByte(p1), TextByte(p2)), r2),
+                    ),
+                    // Gap: e1 < s2 (a strictly left of b, at least one byte).
+                    _ => (
+                        EditOp::new(Span::new(TextByte(p0), TextByte(p1)), r1),
+                        EditOp::new(Span::new(TextByte(p2), TextByte(p3)), r2),
+                    ),
+                };
+                // The M1 regression guard: none of these ever coalesce.
+                prop_assert!(!a.can_coalesce(&b));
+                prop_assert!(!b.can_coalesce(&a));
+                prop_assert_eq!(a.coalesce(&b), None);
+                prop_assert_eq!(b.coalesce(&a), None);
+            });
+        }
     }
 }

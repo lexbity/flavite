@@ -1522,6 +1522,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "flavite-syntax",
+ "proptest",
  "ropey",
  "serde",
  "serde_json",
