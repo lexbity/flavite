@@ -16,11 +16,11 @@ use flavite_index::resolver::Resolver;
 use flavite_syntax::pulldown_glue::parse_normalized;
 use flavite_vault::session::Session;
 use rusqlite::{Connection, OptionalExtension};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::graph_mirror::{SavedSnapshot, unresolved_node};
+use crate::graph_mirror::{SavedGraph, node_id_entity, unresolved_node};
 
 /// Exact source version, including the buffer instance (same path is insufficient).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +39,100 @@ pub struct LinkOccurrence {
     pub start: usize,
     pub end: usize,
     pub target_raw: String,
+}
+
+/// The occurrence collection of one projection (RFC-0005 F3, §4.7/§5.4).
+///
+/// The saved occurrence runs are shared with the mirror snapshot — an
+/// `Arc`, never copied per publish. Dirty sources' saved runs are replaced
+/// by fresh overlay runs; [`Self::iter`] yields the saved runs (dirty
+/// sources omitted) followed by the overlay runs, byte-identical to the
+/// retired `retain` + `extend` construction so `(src, ord)` run adjacency
+/// for every untouched source is preserved (the backlinks grouping relies
+/// on it — pinned by the order-equivalence property test).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OccurrenceSet {
+    /// Canonical saved occurrence runs (`(src, ord)` order; resolved then
+    /// unresolved sections), shared with the snapshot.
+    saved: Arc<[LinkOccurrence]>,
+    /// Sources whose saved runs are replaced by `overlay` (row-id keying,
+    /// the mirror's `node_id_entity` policy).
+    dirty_srcs: BTreeSet<i64>,
+    /// Fresh runs for the dirty sources, in canonical `(src, ord)` order.
+    overlay: Vec<LinkOccurrence>,
+}
+
+impl OccurrenceSet {
+    /// Assemble an explicit set (tests, future consumers). The invariant
+    /// [`Self::iter`] guarantees is up to the caller in this constructor;
+    /// the projection builder maintains it.
+    #[must_use]
+    pub fn from_parts(
+        saved: Arc<[LinkOccurrence]>,
+        dirty_srcs: BTreeSet<i64>,
+        overlay: Vec<LinkOccurrence>,
+    ) -> Self {
+        Self {
+            saved,
+            dirty_srcs,
+            overlay,
+        }
+    }
+
+    /// Saved runs (dirty sources omitted) then overlay runs — the exact
+    /// order of the pre-F3 construction.
+    pub fn iter(&self) -> impl Iterator<Item = &LinkOccurrence> {
+        self.saved
+            .iter()
+            .filter(move |occurrence| {
+                !self
+                    .dirty_srcs
+                    .contains(&node_id_entity(occurrence.edge.from))
+            })
+            .chain(self.overlay.iter())
+    }
+
+    /// Total occurrence count; `O(saved + overlay)` (metrics/tests only).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        let removed = self
+            .saved
+            .iter()
+            .filter(|occurrence| {
+                self.dirty_srcs
+                    .contains(&node_id_entity(occurrence.edge.from))
+            })
+            .count();
+        self.saved.len() - removed + self.overlay.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Membership over the merged view (element equality, like a slice).
+    #[must_use]
+    pub fn contains(&self, occurrence: &LinkOccurrence) -> bool {
+        self.iter().any(|candidate| candidate == occurrence)
+    }
+
+    /// The `index`-th occurrence of [`Self::iter`] (the chooser's indexed
+    /// access).
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&LinkOccurrence> {
+        self.iter().nth(index)
+    }
+}
+
+impl Default for OccurrenceSet {
+    fn default() -> Self {
+        Self {
+            saved: Arc::from([]),
+            dirty_srcs: BTreeSet::new(),
+            overlay: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,87 +162,24 @@ pub struct ScopedGraph {
     pub result: Result<Arc<ScopeResult>, String>,
 }
 
-/// The canonical occurrence view of one publication (RFC-0005 §5.4, F3).
-///
-/// Saved occurrences are shared as an `Arc` slice; dirty sources' saved
-/// runs are *excluded* (they are re-emitted in `overlay`), so iteration is
-/// byte-identical to the pre-RFC constructed `saved-then-overlay-with-
-/// retain` order — which preserves `(src, ord)` run adjacency for every
-/// untouched source (the backlinks excerpt grouping relies on it,
-/// `query_service.rs`). Building the set costs O(dirty): no O(vault)
-/// occurrence work per publish.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OccurrenceSet {
-    /// Canonical `(src, ord)` runs: resolved then unresolved.
-    saved: Arc<[LinkOccurrence]>,
-    /// Sources whose saved run is replaced by `overlay` (`NodeId::id`).
-    dirty_srcs: BTreeSet<u64>,
-    /// Dirty sources' fresh runs, in canonical order.
-    overlay: Vec<LinkOccurrence>,
-}
-
-impl OccurrenceSet {
-    /// An empty set (used by tests and empty fixtures).
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            saved: Arc::from([]),
-            dirty_srcs: BTreeSet::new(),
-            overlay: Vec::new(),
-        }
-    }
-
-    /// Saved occurrences minus dirty sources, then the overlay runs.
-    pub fn iter(&self) -> impl Iterator<Item = &LinkOccurrence> {
-        self.saved
-            .iter()
-            .filter(move |o| !self.dirty_srcs.contains(&o.edge.from.id))
-            .chain(self.overlay.iter())
-    }
-
-    /// Raw cardinality (`saved.len() + overlay.len()`); used by metrics and
-    /// tests only. Iteration length may be smaller when dirty sources are
-    /// present (RFC-0005 §5.4).
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.saved.len() + self.overlay.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.saved.is_empty() && self.overlay.is_empty()
-    }
-
-    /// Membership on the canonical view (saved-minus-dirty plus overlay).
-    #[must_use]
-    pub fn contains(&self, occurrence: &LinkOccurrence) -> bool {
-        self.iter().any(|candidate| candidate == occurrence)
-    }
-}
-
-impl Default for OccurrenceSet {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[derive(Debug)]
 pub struct GraphProjection {
-    /// Shared with the mirror snapshot (`Arc` clone, free).
+    /// Saved base, shared with the mirror snapshot (never copied per
+    /// publish).
     pub saved: Arc<GraphBatch>,
-    /// The projection's single owned O(V) construction: the snapshot's
-    /// pre-overlay batch, mutated in place by the overlay (FR-9).
+    /// The one owned `O(V)` construction per publish: the snapshot's
+    /// pre-overlay batch, mutated in place by the overlay.
     pub effective: GraphBatch,
+    /// Occurrences: shared saved runs + dirty-source overlay (F3).
     pub occurrences: OccurrenceSet,
     pub overlays: BTreeMap<NodeId, OverlayState>,
-    /// Saved metadata, shared with the mirror snapshot (`Arc` clone, free).
-    /// Never mutated by `build`: dirty-buffer metadata lives in
-    /// `dirty_metadata`/`removed_metadata` (RFC-0005 §4.7).
+    /// Saved metadata, shared with the mirror snapshot; dirty-buffer
+    /// overrides live in [`Self::overlay_metadata`].
     pub metadata: Arc<BTreeMap<NodeId, NoteMetadata>>,
-    /// Dirty buffers' fresh metadata, keyed by node id (O(dirty)).
-    pub dirty_metadata: BTreeMap<NodeId, NoteMetadata>,
-    /// Dirty buffers whose parse failed: their saved metadata is retired.
-    pub removed_metadata: BTreeSet<NodeId>,
+    /// Dirty-buffer metadata overrides (`Some` replaces the saved entry,
+    /// `None` removes it — a failed parse). Consumed by scope evaluation;
+    /// the saved map itself is never mutated.
+    pub overlay_metadata: BTreeMap<NodeId, Option<NoteMetadata>>,
     pub scopes: BTreeMap<u128, ScopedGraph>,
     pub buffer_stamp: Vec<flavite_vault::session::GraphBufferStamp>,
     pub digest: u64,
@@ -166,13 +197,22 @@ pub struct ScopeRequest {
 /// predicates and occurrence hashes; the saved base itself comes complete from
 /// the [`GraphMirror`](crate::graph_mirror::GraphMirror). Only immutable Session
 /// snapshots cross in.
+///
+/// F3 sharing (RFC-0005 S4): the saved base, metadata, and occurrence runs
+/// are borrowed from the snapshot's `Arc`s — the only owned `O(V)`
+/// construction is the `effective` batch. Dirty-buffer metadata overrides
+/// land in [`GraphProjection::overlay_metadata`] and are merged into the
+/// evaluation map only when a scope request exists (the saved map is never
+/// mutated).
 #[allow(
     clippy::too_many_lines,
     reason = "overlay + scope assembly is one pass over the mirrored base; splitting would only relocate it"
 )]
-pub(crate) fn build(
+/// Internal projection builder (`pub` for the scale/allocation gates and
+/// the service pump; not part of the public facade surface).
+pub fn build(
     connection: &mut Connection,
-    graph: &Arc<SavedSnapshot>,
+    graph: &Arc<SavedGraph>,
     session: Option<&Arc<Session>>,
     requests: &BTreeMap<u128, ScopeRequest>,
     previous: Option<&GraphProjection>,
@@ -189,11 +229,37 @@ pub(crate) fn build(
     let transaction = connection
         .transaction()
         .map_err(|_| "cannot begin graph snapshot")?;
+    let mut resolver = Resolver::new(&transaction);
+    resolver
+        .refresh_cache()
+        .map_err(|_| "cannot load graph resolver")?;
+    let projection = assemble(&transaction, &mut resolver, graph, session, requests)?;
+    transaction
+        .commit()
+        .map_err(|_| "cannot finish graph snapshot")?;
+    Ok(Some(projection))
+}
+
+/// The post-resolution projection assembly: everything [`build`] does after
+/// the transaction and resolver catalog are ready — the F3 sharing, the
+/// one owned `effective` clone, the dirty-buffer overlay, canonicalization,
+/// scope evaluation, and the projection record.
+///
+/// (`pub` for the scale and allocation gates, which time exactly this
+/// phase: the RFC-0005 S6 25 ms materialization baseline decomposes into
+/// these passes alone — never the resolver/DB leg, which is pre-existing
+/// and out of S4's blast radius.)
+pub fn assemble(
+    transaction: &rusqlite::Transaction<'_>,
+    resolver: &mut Resolver<'_>,
+    graph: &Arc<SavedGraph>,
+    session: Option<&Arc<Session>>,
+    requests: &BTreeMap<u128, ScopeRequest>,
+) -> Result<GraphProjection, String> {
     // The mirrored saved view: complete, decoded, canonical — identical to
     // what a full consistent read produces at `graph.version` (AC-3 gate).
-    // F3 (FR-9): saved base, metadata, and occurrences are shared with the
-    // snapshot via `Arc` clones — free. The single owned O(V) construction
-    // per publish is `effective` (the pre-overlay batch, mutated below).
+    // F3: shared `Arc`s — the only owned O(V) construction below is the
+    // `effective` batch (FR-9, NFR-6).
     let saved = Arc::clone(&graph.saved);
     let mut effective = graph.effective_pre_overlay();
     let mut occurrences = OccurrenceSet {
@@ -203,11 +269,7 @@ pub(crate) fn build(
     };
     let mut unresolved_ids = graph.unresolved_keys.clone();
     let metadata = Arc::clone(&graph.metadata);
-    // Dirty-buffer metadata overrides (RFC-0005 §4.7): never mutate the
-    // shared saved map; keep the delta in O(dirty) structures and merge it
-    // for scope evaluation below.
-    let mut dirty_metadata: BTreeMap<NodeId, NoteMetadata> = BTreeMap::new();
-    let mut removed_metadata: BTreeSet<NodeId> = BTreeSet::new();
+    let mut overlay_metadata: BTreeMap<NodeId, Option<NoteMetadata>> = BTreeMap::new();
     let snapshots = session.map_or_else(Vec::new, |s| s.graph_buffer_snapshots());
     let buffer_stamp = snapshots
         .iter()
@@ -222,10 +284,6 @@ pub(crate) fn build(
         })
         .collect();
     let mut overlays = BTreeMap::new();
-    let mut resolver = Resolver::new(&transaction);
-    resolver
-        .refresh_cache()
-        .map_err(|_| "cannot load graph resolver")?;
     let mut digest = blake3::Hasher::new();
     for snapshot in snapshots {
         digest.update(&snapshot.buffer_id.as_u64().to_le_bytes());
@@ -299,9 +357,10 @@ pub(crate) fn build(
             effective.nodes.push(record);
         }
         effective.edges.retain(|edge| edge.from != id);
-        // F3: omit the dirty source's saved run instead of removing it
-        // from a cloned slice; the fresh run joins `overlay` below.
-        occurrences.dirty_srcs.insert(id.id);
+        // F3: instead of `occurrences.retain(...)` (an O(V) scan+copy of
+        // the whole run), mark the source dirty; `iter()` skips its saved
+        // runs and emits the overlay runs below. Byte-identical order.
+        occurrences.dirty_srcs.insert(node_id_entity(id));
         let parsed = match parse_normalized(&snapshot.text) {
             Ok(parsed) => parsed,
             Err(_) => {
@@ -313,14 +372,12 @@ pub(crate) fn build(
                         reason: "Current relationships unavailable; fix the source parse error",
                     },
                 );
-                // F3: retire the saved metadata for this node in the dirty
-                // overlay — the shared map is never mutated.
-                removed_metadata.insert(id);
+                overlay_metadata.insert(id, None);
                 continue;
             }
         };
         let current_metadata = parse_metadata(&parsed);
-        dirty_metadata.insert(id, current_metadata);
+        overlay_metadata.insert(id, Some(current_metadata));
         if let Some(record) = effective.nodes.iter_mut().find(|r| r.id == id) {
             let frontmatter = flavite_syntax::frontmatter::parse_frontmatter(&parsed.snapshot);
             record.missing_on_disk = snapshot.state == crate::BufferStatus::Orphaned;
@@ -385,49 +442,56 @@ pub(crate) fn build(
             },
         );
     }
-    let linked_unresolved: BTreeSet<_> = effective.edges.iter().map(|e| e.to).collect();
+    // F3/AC-6: the orphan-unresolved pruning set is a `HashSet` over the
+    // live `NodeId`s of the batch (bounded by the node count — O(U)
+    // auxiliary memory, never a per-edge allocation; `NodeId` derives
+    // `Hash`). `with_capacity(edges.len())` was measured to preallocate
+    // the full edge count (8.9 MB at 300k edges for ~5k distinct targets);
+    // the default grow-on-insert keeps the table O(distinct).
+    let mut linked_unresolved: HashSet<NodeId> = HashSet::new();
+    for edge in &effective.edges {
+        linked_unresolved.insert(edge.to);
+    }
     effective.nodes.retain(|n| {
         n.id.kind != flavite_graph::NodeKind::Unresolved || linked_unresolved.contains(&n.id)
     });
-    effective.nodes.sort_by_key(|record| record.id);
-    effective.edges.sort();
+    // Canonicalization is identity-preserving, so the allocation-free
+    // unstable sorts are used: node ids are unique (equal keys cannot
+    // exist), and duplicate edges are byte-identical — dedup output is
+    // unchanged (NFR-6: the stable sorts' O(E) scratch would be a second
+    // O(vault) allocation per publish). The mirror maintains canonical
+    // order, so the common publish is already sorted and the O(n log n)
+    // pass is skipped (AC-6 at the design bound).
+    if !effective.nodes.is_sorted_by_key(|record| record.id) {
+        effective.nodes.sort_unstable_by_key(|record| record.id);
+    }
+    if !effective.edges.is_sorted() {
+        effective.edges.sort_unstable();
+    }
     effective.edges.dedup();
+    // F3: the saved metadata map is shared and never mutated; dirty-buffer
+    // overrides are merged only when a scope request exists — the common
+    // keystroke publish (no filters) never pays the merge. The
+    // scope-evaluation caching follow-on (RFC-0005 §11 triggers) owns
+    // optimizing the filtered case further.
+    let effective_metadata = if requests.is_empty() {
+        None
+    } else {
+        Some(merge_metadata(&metadata, &overlay_metadata))
+    };
     let mut scopes = BTreeMap::new();
-    // Scope evaluation consults metadata per node. The shared saved map is
-    // used directly unless a metadata-sensitive predicate coexists with a
-    // dirty overlay — only then is one merged map built for this build
-    // (O(V); RFC-0005 §4.7's "dirty buffers don't touch saved metadata"
-    // is honored: the shared map never mutates, the merge is a transient
-    // evaluation input, not a published field).
-    let needs_metadata = requests
-        .values()
-        .any(|request| predicate_needs_metadata(&request.scope.predicate));
-    let merged_metadata =
-        if needs_metadata && (!dirty_metadata.is_empty() || !removed_metadata.is_empty()) {
-            let mut merged = (*metadata).clone();
-            for id in &removed_metadata {
-                merged.remove(id);
-            }
-            for (id, note_metadata) in &dirty_metadata {
-                merged.insert(*id, note_metadata.clone());
-            }
-            Some(merged)
-        } else {
-            None
-        };
-    let eval_metadata = merged_metadata.as_ref().unwrap_or(metadata.as_ref());
     for (tab, request) in requests {
         let result = (|| {
             let mut queries = BTreeMap::new();
-            collect_queries(
-                &request.scope.predicate,
-                &transaction,
-                session,
-                &mut queries,
-            )?;
-            let mut result =
-                flavite_graph::scope::evaluate(&effective, eval_metadata, &queries, &request.scope)
-                    .map_err(str::to_owned)?;
+            collect_queries(&request.scope.predicate, transaction, session, &mut queries)?;
+            let metadata_for_eval = effective_metadata.as_ref().unwrap_or(&metadata);
+            let mut result = flavite_graph::scope::evaluate(
+                &effective,
+                metadata_for_eval,
+                &queries,
+                &request.scope,
+            )
+            .map_err(str::to_owned)?;
             result.total_base_notes = saved
                 .nodes
                 .iter()
@@ -452,17 +516,13 @@ pub(crate) fn build(
             },
         );
     }
-    transaction
-        .commit()
-        .map_err(|_| "cannot finish graph snapshot")?;
-    Ok(Some(GraphProjection {
+    Ok(GraphProjection {
         saved,
         effective,
         occurrences,
         overlays,
         metadata,
-        dirty_metadata,
-        removed_metadata,
+        overlay_metadata,
         scopes,
         buffer_stamp,
         digest: u64::from_le_bytes(
@@ -471,23 +531,28 @@ pub(crate) fn build(
                 .expect("hash prefix"),
         ),
         requests: requests.clone(),
-    }))
+    })
 }
 
-/// Whether a predicate consults `NoteMetadata` during evaluation. `All`
-/// short-circuits before metadata; `PathPrefix`/`SavedQuery` use path/query
-/// membership only; `Tag`/`Property` read metadata.
-fn predicate_needs_metadata(predicate: &flavite_graph::NotePredicate) -> bool {
-    match predicate {
-        flavite_graph::NotePredicate::Tag { .. }
-        | flavite_graph::NotePredicate::Property { .. } => true,
-        flavite_graph::NotePredicate::And { clauses }
-        | flavite_graph::NotePredicate::Or { clauses } => {
-            clauses.iter().any(predicate_needs_metadata)
+/// Merge dirty-buffer metadata overrides over the shared saved map —
+/// `Some` replaces a saved entry, `None` removes it (a failed parse hides
+/// the saved metadata from scope predicates).
+fn merge_metadata(
+    base: &BTreeMap<NodeId, NoteMetadata>,
+    overlay: &BTreeMap<NodeId, Option<NoteMetadata>>,
+) -> BTreeMap<NodeId, NoteMetadata> {
+    let mut merged = base.clone();
+    for (id, meta) in overlay {
+        match meta {
+            Some(meta) => {
+                merged.insert(*id, meta.clone());
+            }
+            None => {
+                merged.remove(id);
+            }
         }
-        flavite_graph::NotePredicate::Not { clause } => predicate_needs_metadata(clause),
-        _ => false,
     }
+    merged
 }
 
 fn meta(conn: &Connection, key: &str, default: u64) -> Result<u64, String> {

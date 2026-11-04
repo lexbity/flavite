@@ -138,9 +138,7 @@ pub struct GraphTabState {
     pub updating: bool,
     pub overlay_count: usize,
     pub failed_overlay_count: usize,
-    /// The canonical occurrence view of the current frame (RFC-0005 F3;
-    /// iterates saved-minus-dirty then overlay).
-    pub occurrences: flavite_api::OccurrenceSet,
+    pub occurrences: Arc<flavite_api::OccurrenceSet>,
 }
 
 impl GraphTabState {
@@ -183,7 +181,7 @@ impl GraphTabState {
             updating: true,
             overlay_count: 0,
             failed_overlay_count: 0,
-            occurrences: flavite_api::OccurrenceSet::new(),
+            occurrences: Arc::new(flavite_api::OccurrenceSet::default()),
         }
     }
 }
@@ -660,7 +658,7 @@ pub fn pump(app: &mut App) {
                 .values()
                 .filter(|s| matches!(s, flavite_api::OverlayState::Failed { .. }))
                 .count();
-            state.occurrences = projection.occurrences.clone();
+            state.occurrences = Arc::new(projection.occurrences.clone());
             if let Some(scoped) = accepted_scope {
                 match &scoped.result {
                     Ok(result) => state.scope_result = Some(result.clone()),

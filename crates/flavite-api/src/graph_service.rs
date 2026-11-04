@@ -246,7 +246,7 @@ struct Shared {
     /// writes the database through it. True invariant (FR-8, RFC-0005 S3):
     /// the pump's critical section is exactly `synchronize` → poison →
     /// parity-when-due → `view_arc` — the overlay assembly (`build`) runs
-    /// on the `Arc<SavedSnapshot>` snapshot handoff **after the guard is
+    /// on the `Arc<SavedGraph>` snapshot handoff **after the guard is
     /// dropped**, so a concurrent `check_mirror_parity` waits at most one
     /// synchronize (≈1 ms p99) plus, when the guard is due, one parity
     /// full read — never an overlay pass (NFR-7; proven by
@@ -787,7 +787,7 @@ fn run_service_attempt(
                 // RFC-0004 S6: advance the mirror by the change feed, run
                 // the §6.5.4 drift guard when due. RFC-0005 F1 (FR-8): the
                 // complete saved state leaves the mutex as an
-                // `Arc<SavedSnapshot>` snapshot handoff — the critical
+                // `Arc<SavedGraph>` snapshot handoff — the critical
                 // section below is exactly synchronize → poison → parity →
                 // view_arc, and `build`'s overlay assembly runs after the
                 // guard is dropped. A concurrent doctor `check_mirror_parity`
@@ -1367,6 +1367,10 @@ mod tests {
         let db = dir.path().join("graph.sqlite");
         drop(flavite_index::open_or_init(&db).unwrap());
         let service = GraphService::start(db);
+        // Event spine: the first pump is event-driven — the explicit
+        // reevaluate kick stands in for the scope request a host makes;
+        // waiting on the 5 s sweep would race this test's own deadline.
+        service.reevaluate();
         wait(&service, || service.frame().is_some());
         for failures in 1..=4 {
             service.hints.send(Directive::Panic).unwrap();

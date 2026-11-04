@@ -105,7 +105,7 @@ impl Harness {
     /// Compare the mirror's canonical view against a fresh full consistent
     /// read — byte-equal per AC-3 (the canonical order makes `PartialEq`
     /// the byte comparison; findings make failures readable).
-    fn check_view(&self, when: &str) {
+    fn check_view(&mut self, when: &str) {
         let view = self.mirror.view().expect("mirror view");
         let full = full_saved_graph(&self.conn, None).expect("full read");
         let findings = parity_findings(&full, view);
