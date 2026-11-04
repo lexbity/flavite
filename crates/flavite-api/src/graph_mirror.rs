@@ -15,8 +15,11 @@
 //! section, edges sorted and deduplicated), so one source's rows occupy a
 //! CONTIGUOUS region of the canonical vectors. A delta therefore replaces
 //! those regions in place — element moves, not vault-wide record clones —
-//! keeping synchronize + assembly at O(change + affected-run memmove)
-//! instead of O(vault) allocations. The equivalence gate
+//! keeping synchronize + assembly at O(change + affected-run memmove +
+//! unresolved-section rebuild) instead of O(vault) allocations; the
+//! rebuild's dedup is linear (O(U log U)) since RFC-0005 F2 — before that
+//! it re-scanned the growing node list per occurrence, an O(U²) tax on
+//! every delta. The equivalence gate
 //! (`tests/graph_mirror_equivalence.rs`) asserts the spliced view
 //! byte-equals a fresh full read after every change, so the incremental
 //! path can never silently diverge from `read_current` semantics.
@@ -230,6 +233,12 @@ pub struct MirrorStats {
     pub mismatches_total: u64,
     /// Deduplicated entities touched by the last delta.
     pub last_delta_entities: u64,
+    /// Distinct unresolved guard nodes in the view after the last
+    /// synchronize/reset — the scale `rebuild_unresolved` works over on
+    /// every delta (RFC-0005 F2 telemetry: the count whose scan went from
+    /// O(U²) to O(U log U)). Printed by the scale bench; never a behavior
+    /// input.
+    pub unresolved_targets: u64,
 }
 
 /// The outcome of one [`GraphMirror::synchronize`] step. The updated view
@@ -410,7 +419,7 @@ impl MirrorState {
             if note_ids.contains(id) {
                 continue;
             }
-            let node = NodeId::note(u64::try_from(*id).unwrap_or(0));
+            let node = node_id_of(*id);
             if self.view.node_position(node).is_none()
                 && !link_rows[id].is_empty()
                 && let Some(row) = note_stmt
@@ -444,7 +453,7 @@ impl MirrorState {
             .keys()
             .map(|(kind, id)| NodeId {
                 kind: *kind,
-                id: u64::try_from(*id).unwrap_or(0),
+                id: node_row_id(*id),
             })
             .collect();
 
@@ -453,7 +462,7 @@ impl MirrorState {
         // own `note` row (§6.1.2), so span/raw-only link rewrites and
         // tag/property edits land here.
         for id in &note_ids {
-            let node = NodeId::note(u64::try_from(*id).unwrap_or(0));
+            let node = node_id_of(*id);
             let Some(position) = decode_index.get(&(NodeKind::Note, *id)) else {
                 self.remove_note(node, *id);
                 continue;
@@ -472,9 +481,7 @@ impl MirrorState {
         // rows (FR-1) and splice the referencing sources.
         for id in &attachment_ids {
             match decode_index.get(&(NodeKind::Attachment, *id)) {
-                None => self
-                    .view
-                    .remove_node(NodeId::attachment(u64::try_from(*id).unwrap_or(0))),
+                None => self.view.remove_node(attachment_id_of(*id)),
                 Some(position) => self.view.upsert_node(decoded[*position].clone()),
             }
         }
@@ -521,7 +528,7 @@ impl MirrorState {
         rows: Vec<LinkRow>,
         arriving: &BTreeSet<NodeId>,
     ) -> Result<(), String> {
-        let from = NodeId::note(u64::try_from(src).unwrap_or(0));
+        let from = node_id_of(src);
         let source_path = self
             .view
             .node_position(from)
@@ -539,8 +546,8 @@ impl MirrorState {
             match (row.dst_note, row.dst_att) {
                 (Some(_), _) | (None, Some(_)) => {
                     let target = match (row.dst_note, row.dst_att) {
-                        (Some(note), _) => NodeId::note(u64::try_from(note).unwrap_or(0)),
-                        (_, Some(att)) => NodeId::attachment(u64::try_from(att).unwrap_or(0)),
+                        (Some(note), _) => node_id_of(note),
+                        (_, Some(att)) => attachment_id_of(att),
                         (None, None) => continue,
                     };
                     // §6.5 "How": an edge into a node the view neither
@@ -637,30 +644,39 @@ impl MirrorState {
     /// Rebuild the canonical unresolved structures from
     /// [`Self::unresolved_by_src`]. Unresolved rows are, by graph-domain
     /// convention, the minority (ghost targets); the resolved structures —
-    /// which dominate at the design bound — are spliced in place, so this
-    /// stays O(unresolved + their records) per delta.
+    /// which dominate at the design bound — are spliced in place. The
+    /// section rebuild is O(U log U) since RFC-0005 F2 (first-visit
+    /// membership rides a seen-set; the scan it replaced re-walked
+    /// `nodes` per occurrence, which was O(U²) for every delta).
     fn rebuild_unresolved(&mut self) {
         let mut nodes: Vec<GraphNodeRecord> = Vec::new();
         let mut edges: Vec<GraphEdgeRecord> = Vec::new();
         let mut keys: BTreeMap<u64, String> = BTreeMap::new();
+        // F2: target ids already pushed into `nodes`. Membership via
+        // `insert` (true = first visit) replaces the former
+        // `!nodes.iter().any(|node| node.id.id == id)` re-scan. Push
+        // order is unchanged — statement order, first spelling of a
+        // target wins — and the section is re-sorted canonically at the
+        // end of this function regardless, which is what makes the
+        // set rewrite output-identical (FR-10; the
+        // `graph_mirror_equivalence` proptest is the byte-equality
+        // oracle over exactly this path).
+        let mut pushed: BTreeSet<u64> = BTreeSet::new();
         let boundary = self.resolved_occurrences;
         self.view.occurrences.truncate(boundary);
         let unresolved = std::mem::take(&mut self.unresolved_by_src);
         for (src, list) in &unresolved {
-            let Some(entry) = self
-                .view
-                .node_position(NodeId::note(u64::try_from(*src).unwrap_or(0)))
-            else {
+            let Some(entry) = self.view.node_position(node_id_of(*src)) else {
                 continue;
             };
-            let from = NodeId::note(u64::try_from(*src).unwrap_or(0));
+            let from = node_id_of(*src);
             let source_path = self.view.saved.nodes[entry].native_path.clone();
             let content_hash = self.source_hashes.get(src).cloned().unwrap_or_default();
             for occurrence in list {
                 let id = unresolved_id_for(&occurrence.raw);
                 let key = flavite_syntax::text::fold_key(&occurrence.raw);
                 keys.insert(id, key);
-                if !nodes.iter().any(|node| node.id.id == id) {
+                if pushed.insert(id) {
                     nodes.push(unresolved_record(id, &occurrence.raw));
                 }
                 let edge = GraphEdgeRecord {
@@ -682,6 +698,10 @@ impl MirrorState {
             }
         }
         self.unresolved_by_src = unresolved;
+        // F2 honesty: this canonical sort is why first-visit push order
+        // (statement order) is not an observable — the sections' final
+        // shape depends only on membership, and membership is exactly
+        // the set of targets seen in the scan.
         nodes.sort_by_key(|record| record.id);
         edges.sort();
         edges.dedup();
@@ -804,6 +824,7 @@ impl GraphMirror {
             Ok(entities) => {
                 tx.commit().map_err(|error| error.to_string())?;
                 let drift = state.drift;
+                let unresolved_targets = state.view.unresolved_nodes.len();
                 let previous_generation = self.cursor.generation;
                 self.cursor = to;
                 self.delta_generations_since_parity = self
@@ -811,6 +832,8 @@ impl GraphMirror {
                     .saturating_add(to.generation.saturating_sub(previous_generation));
                 self.stats.deltas_total += 1;
                 self.stats.last_delta_entities = entities;
+                self.stats.unresolved_targets =
+                    u64::try_from(unresolved_targets).unwrap_or(u64::MAX);
                 if drift {
                     self.stats.mismatches_total += 1;
                     self.poisoned = true;
@@ -838,12 +861,14 @@ impl GraphMirror {
     pub fn force_reset(&mut self, conn: &Connection) -> Result<IndexVersion, String> {
         let graph = full_saved_graph(conn, self.session.as_deref())?;
         let version = graph.version;
+        let unresolved_targets = graph.unresolved_nodes.len();
         self.state = Some(MirrorState::from_view(graph));
         self.cursor = version;
         self.poisoned = false;
         self.delta_generations_since_parity = 0;
         self.last_parity = Instant::now();
         self.stats.resets_total += 1;
+        self.stats.unresolved_targets = u64::try_from(unresolved_targets).unwrap_or(u64::MAX);
         Ok(version)
     }
 
@@ -927,7 +952,7 @@ impl NoteRow {
     /// The exact `read_current` note record construction.
     fn record(&self) -> GraphNodeRecord {
         GraphNodeRecord::note(
-            u64::try_from(self.id).unwrap_or(0),
+            node_row_id(self.id),
             self.path.clone(),
             self.path_native.clone(),
             self.title.clone(),
@@ -955,7 +980,7 @@ impl AttachmentRow {
     /// The exact `read_current` attachment record construction.
     fn record(&self) -> GraphNodeRecord {
         GraphNodeRecord::attachment(
-            u64::try_from(self.id).unwrap_or(0),
+            node_row_id(self.id),
             self.path.clone(),
             self.path_native.clone(),
         )
@@ -1041,6 +1066,37 @@ fn property_value(
 
 fn node_id_entity(id: NodeId) -> i64 {
     i64::try_from(id.id).unwrap_or(-1)
+}
+
+/// RFC-0005 §7 identity helper — one sentinel policy for every row id
+/// entering the mirror view.
+///
+/// Note and attachment ids are ROWID-allocated positive integers
+/// (`note_id`/`att_id` are `INTEGER PRIMARY KEY`); a negative id cannot
+/// exist in a database this writer created. The 0 sentinel is therefore
+/// unreachable and exists only to keep the conversion total: a corrupt
+/// negative row id collapses to node 0 rather than panicking the pump,
+/// and the parity guard still surfaces the drift against the full truth.
+/// One policy, written once — the former scattered
+/// `u64::try_from(..).unwrap_or(0)` expressions were this same rule
+/// repeated per call site.
+#[inline]
+fn node_row_id(id: i64) -> u64 {
+    u64::try_from(id).unwrap_or(0)
+}
+
+/// The [`NodeId`] of a note row (first call shape; sentinel policy in
+/// [`node_row_id`]).
+#[inline]
+fn node_id_of(id: i64) -> NodeId {
+    NodeId::note(node_row_id(id))
+}
+
+/// The [`NodeId`] of an attachment row (second call shape over the same
+/// policy, RFC-0005 §7).
+#[inline]
+fn attachment_id_of(id: i64) -> NodeId {
+    NodeId::attachment(node_row_id(id))
 }
 
 /// Derive the per-source unresolved inputs from the canonical unresolved
@@ -1556,4 +1612,165 @@ fn diff_metadata(
         full.len(),
         mirrored.len()
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests (RFC-0005 S2)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+
+    /// Seed source notes each carrying `ghosts` distinct unresolved links
+    /// straight into the base tables, then advance generation once (the
+    /// seeded-state convention of the scale/service fixtures). Returns the
+    /// database connection positioned at generation 1.
+    fn seed_ghost_matrix(conn: &Connection, sources: i64, ghosts: i64) {
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            let mut note = tx
+                .prepare(
+                    "INSERT INTO notes(path, path_native, path_key, stem_key, title,
+                                       id_conflict, content_hash, size, mtime_ns, scan_ns,
+                                       parse_ok, generation)
+                     VALUES(?1, ?2, ?3, ?4, ?5, 0, ?6, 64, 1, 1, 1, 1)",
+                )
+                .unwrap();
+            let mut link = tx
+                .prepare(
+                    "INSERT INTO links(src, ord, kind, dst_raw, target_key, target_stem,
+                                       span_start, span_end, res_state)
+                     VALUES(?1, ?2, 'link', ?3, ?4, ?5, ?6, ?7, 'unresolved')",
+                )
+                .unwrap();
+            for src in 1..=sources {
+                let path = format!("src{src}.md");
+                note.execute(params![
+                    path,
+                    path.as_bytes(),
+                    flavite_syntax::text::fold_key(&path),
+                    flavite_syntax::text::fold_key(&format!("src{src}")),
+                    format!("Source {src}"),
+                    blake3::hash(&src.to_le_bytes()).as_bytes().to_vec(),
+                ])
+                .unwrap();
+            }
+            for ghost in 0..sources * ghosts {
+                // Spread deterministically: source k owns ghosts k, k+U, …
+                let src = ghost % sources + 1;
+                let ord = ghost / sources;
+                let raw = format!("ghost{ghost}");
+                let key = flavite_syntax::text::fold_key(&raw);
+                link.execute(params![
+                    src,
+                    ord,
+                    raw,
+                    key,
+                    key,
+                    10 + ord * 100,
+                    20 + ord * 100,
+                ])
+                .unwrap();
+            }
+        }
+        tx.execute("UPDATE meta SET value='1' WHERE key='generation'", [])
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// RFC-0005 F2 exit test: ≥1_000 distinct unresolved targets spread
+    /// across sources, one delta splice through the real writer, and the
+    /// rebuilt canonical sections must be complete, strictly sorted by
+    /// [`NodeId`], unique, and byte-equal to a fresh full consistent read
+    /// at the same version — the FR-10 oracle, same `parity_findings`
+    /// comparison the drift guard and the equivalence proptest run. The
+    /// O(U²) scan this replaced would also pass this test; the permanent
+    /// regression teeth are the proptest (identity) plus the scale bench's
+    /// printed `unresolved_targets` count (the measurement).
+    #[test]
+    fn delta_rebuild_over_a_thousand_unresolved_targets_is_exact() {
+        const SOURCES: i64 = 4;
+        const GHOSTS_PER_SOURCE: i64 = 256; // 1_024 distinct targets
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("dedup.sqlite");
+        let reader = open_reader(&db);
+        seed_ghost_matrix(&reader, SOURCES, GHOSTS_PER_SOURCE);
+
+        let mut mirror = GraphMirror::new(None);
+        assert!(
+            matches!(
+                mirror.synchronize(&reader).unwrap(),
+                Synchronize::Reset { .. }
+            ),
+            "a cold mirror must take the reset path"
+        );
+        mirror.force_reset(&reader).unwrap();
+        let baseline = mirror.view().expect("view").unresolved_nodes.len();
+        assert_eq!(
+            baseline,
+            usize::try_from(SOURCES * GHOSTS_PER_SOURCE).unwrap(),
+            "the reset rebuild must hold every seeded ghost"
+        );
+        assert!(baseline >= 1_000, "the exit gate needs ≥1_000 targets");
+        assert_eq!(mirror.stats().unresolved_targets, baseline as u64);
+
+        // One delta splice through the real apply spine: a brand-new
+        // source note with a brand-new ghost target.
+        let mut actor = flavite_index::IndexActor::new(&db, 1).unwrap();
+        actor
+            .apply_saved_note(
+                b"src9.md",
+                "src9.md",
+                b"# Nine\nFresh ghost [[ghost-new]].\n",
+                10,
+                11,
+            )
+            .unwrap();
+        let outcome = mirror.synchronize(&reader).unwrap();
+        assert!(
+            matches!(outcome, Synchronize::Delta { .. }),
+            "the applied change must arrive as a delta, not a reset"
+        );
+
+        let view = mirror.view().expect("view");
+        for pair in view.unresolved_nodes.windows(2) {
+            assert!(
+                pair[0].id < pair[1].id,
+                "unresolved nodes must be strictly sorted by NodeId (unique + canonical)"
+            );
+        }
+        assert_eq!(
+            view.unresolved_nodes.len(),
+            baseline + 1,
+            "the new ghost lands and nothing else changed"
+        );
+        assert!(
+            view.unresolved_keys
+                .contains_key(&unresolved_id_for("ghost-new")),
+            "the identity guard must cover the new target"
+        );
+        assert_eq!(
+            mirror.stats().unresolved_targets,
+            u64::try_from(baseline + 1).unwrap(),
+            "the F2 telemetry counter must track the rebuild"
+        );
+        // Byte-equality oracle at the shared version (FR-10):
+        let full = full_saved_graph(&reader, None).unwrap();
+        assert_eq!(
+            parity_findings(&full, view),
+            Vec::<String>::new(),
+            "the linear rebuild must equal the full truth byte-for-byte"
+        );
+    }
+
+    /// A fresh schema at the path, WAL set, returned as the mirror's read
+    /// handle (the actor and the seed share the file through separate
+    /// connections, exactly like the service fixtures).
+    fn open_reader(db: &std::path::Path) -> Connection {
+        let conn = flavite_index::open_or_init(db).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn
+    }
 }

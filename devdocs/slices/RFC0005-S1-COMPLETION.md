@@ -149,7 +149,11 @@ slice added no behavior there, only a stored, unread watch handle.
 - `cargo clippy --workspace --all-targets -- -D warnings` — green.
 - Prior suites green unmodified: `graph_mirror_equivalence` 9,
   `graph_mirror_service` 6, `graph_projection` 3, `link_occurrences` 5.
-- `just gate` — green (recorded when the background run completed).
+- `just gate` — **green, end to end**: "G0 passed (fmt + clippy + test +
+  arch check)" after `lint-arch` and "arch check passed (drift + edges +
+  layering)"; `just` aborts on the first failing recipe, so every recipe
+  (fmt, clippy, workspace test, fault-tests, lint-arch, arch-check, gc)
+  succeeded in one run.
 
 ## Exit-criteria verification
 

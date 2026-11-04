@@ -169,9 +169,17 @@ struct Shared {
     counters: Counters,
     scopes: std::sync::Mutex<BTreeMap<u128, ScopeRequest>>,
     retry_layout: AtomicBool,
-    /// The saved-graph mirror (RFC-0004 S6). Locked by the service pump and
-    /// by the on-demand doctor parity check; both are read-mostly and the
-    /// critical sections are bounded reads on the graph connection.
+    /// The saved-graph mirror (RFC-0004 S6). Locked by the service pump
+    /// and by the on-demand doctor parity check — both read-mostly, and
+    /// no lock holder ever writes the database through it. True cost
+    /// bound (RFC-0005 S2 doc-truth fix; the former "bounded reads" claim
+    /// was false): the pump's critical section spans `synchronize`, the
+    /// parity check when due, **and the full `graph_projection::build`
+    /// overlay assembly** — so a concurrent `check_mirror_parity` can wait
+    /// behind an overlay pass, not behind a bounded read. The honest
+    /// current bound is one pump; S3's snapshot handoff (FR-8) moves
+    /// `build` out from under this lock, after which the sections are
+    /// genuinely bounded (`synchronize` + `parity_check` only).
     mirror: std::sync::Mutex<GraphMirror>,
     /// RFC-0005 S1: the watch half of the writer-side generation broadcast
     /// (when the host constructed the vault with a signal). Stored per

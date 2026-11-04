@@ -13,6 +13,11 @@
 //!   the end — the drift guard compares the mirror against
 //!   `full_saved_graph` with ZERO findings (mirror-assembled == full
 //!   consistent read byte-comparably, FR-5).
+//! * RFC-0005 S2: one in fifty seeded links targets a ghost (≈3 000
+//!   distinct unresolved targets across the vault), so every delta's
+//!   `rebuild_unresolved` runs over a real section — the scale the F2
+//!   linear dedup replaced an O(U²) scan on. The settle line prints the
+//!   full counter set including `unresolved_targets`.
 //!
 //! Numbers are printed for the slice notes; the guard is honest — if a
 //! machine cannot meet the bound it fails visibly rather than skipping.
@@ -76,13 +81,45 @@ fn seed_vault(conn: &Connection) {
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'resolved')",
             )
             .unwrap();
+        // RFC-0005 S2: one in fifty links is a ghost (an unresolved row no
+        // edit can resolve — `g{link}` matches no note identity). That
+        // seeds ≥3_000 distinct unresolved targets across the vault, so
+        // every delta's `rebuild_unresolved` runs over a real section —
+        // the scale that made the former O(U²) membership scan O(U²) and
+        // what the F2 linear rebuild now handles at O(U log U).
+        let mut ghost = tx
+            .prepare(
+                "INSERT INTO links(src, ord, kind, dst_raw, target_key, target_stem,
+                                   span_start, span_end, res_state)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'unresolved')",
+            )
+            .unwrap();
         let mut rng = Rng(0x5EED);
         for link in 0..LINKS {
             let src = (link % NOTES) + 1;
             let ord = link / NOTES;
-            let target = rng.next(NOTES) + 1;
-            let raw = format!("n{target}");
+            let raw = if link % 50 == 0 {
+                format!("g{link}")
+            } else {
+                format!("n{}", rng.next(NOTES) + 1)
+            };
             let key = flavite_syntax::text::fold_key(&raw);
+            if raw.starts_with('g') {
+                ghost
+                    .execute(params![
+                        src,
+                        ord,
+                        "link",
+                        raw,
+                        key,
+                        key,
+                        10_i64 + ord * 100,
+                        20_i64 + ord * 100,
+                    ])
+                    .unwrap();
+                continue;
+            }
+            let target: i64 = raw[1..].parse().expect("resolved ghost-free target");
             statement
                 .execute(params![
                     src,
@@ -214,4 +251,9 @@ fn mirror_synchronize_meets_the_bound_at_design_scale() {
         mirror.synchronize(&reader).unwrap(),
         Synchronize::UpToDate
     ));
+
+    // RFC-0005 S2: the settled counter set — `unresolved_targets` is the
+    // scale every delta's linear `rebuild_unresolved` (F2) carries; the
+    // count is printed, never an adjective, and never a behavior input.
+    println!("mirror stats at settle: {:?}", mirror.stats());
 }
