@@ -1132,8 +1132,17 @@ impl IndexActor {
             return Ok((SpineOutcome::RolledBack, ApplyPlan::default()));
         }
         let counters = SpineCounters { generation };
+        let __t0 = std::time::Instant::now();
         let mut plan = ApplyPlan::default();
         let mutated = mutate(&tx, pre.as_ref(), &counters, &mut plan)?;
+        let __mut_ns = __t0.elapsed().as_nanos() as u64;
+        static PH_MUTATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static PH_GROUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static PH_RESOLVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static PH_COMMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static PH_FOLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static PH_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        PH_MUTATE.fetch_add(__mut_ns, std::sync::atomic::Ordering::Relaxed);
         if mutated == CoreStep::FastPath && !self.resolver.backstop_due() {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok((
@@ -1209,6 +1218,7 @@ impl IndexActor {
         // member whose stored flag actually flipped is FR-1-visible entity
         // state (`GraphNodeRecord.id_conflict` reads it) and travels into
         // the change rows below.
+        let __t1 = std::time::Instant::now();
         let (group_updates, conflict_flips) = if relevant {
             refresh_id_conflict_groups(
                 &tx,
@@ -1218,6 +1228,7 @@ impl IndexActor {
         } else {
             (0, std::collections::BTreeSet::new())
         };
+        PH_GROUPS.fetch_add(__t1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         // The post-image mirrors the committed flag into the base.
         if group_updates > 0
             && let Some(EntityPre::Note(image)) = &mut plan.post
@@ -1231,6 +1242,7 @@ impl IndexActor {
                 .map_err(|error| error.to_string())?
                 != 0;
         }
+        let __t2 = std::time::Instant::now();
         let backstop = self.resolver.backstop_due();
         let changed_sources;
         let mut targeted_pass: Option<u64> = None;
@@ -1274,6 +1286,7 @@ impl IndexActor {
             changed_sources = changed;
             targeted_pass = (!affected_keys.is_empty()).then_some(visited);
         }
+        PH_RESOLVE.fetch_add(__t2.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         // FR-1, D5: the entity rows plus one `outgoing(src)` row per source
         // whose link rows actually flipped. Duplicates collapse via the PK
         // when a flipped source is the applied entity itself (§4.6).
@@ -1288,9 +1301,12 @@ impl IndexActor {
         // each flipped member gets its own `note` row (FR-1) — the S6
         // mirror-equivalence gate is what makes this omission impossible.
         rows.extend(conflict_flips.into_iter().map(|id| (ChangeKind::Note, id)));
+        let __t3 = std::time::Instant::now();
         ChangeLogWriter::record_all(&tx, generation, &rows)?;
         let change_rows = rows.len();
         tx.commit().map_err(|error| error.to_string())?;
+        PH_COMMIT.fetch_add(__t3.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let __t4 = std::time::Instant::now();
         // Commit fold (§6.2.4): SQLite writes are durable; in-memory state
         // follows. Counters track committed applies only.
         if let Some(catalog) = backstop_catalog {
@@ -1302,6 +1318,24 @@ impl IndexActor {
         }
         self.resolver.note_committed_apply(change_rows as u64);
         self.resolver.fold_overlay(epoch, generation);
+        if PH_FOLD.fetch_add(__t4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            let n = PH_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 1 {
+                println!("spine phase timers armed (ns cumulative since last print)");
+            }
+        }
+        let n = PH_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n % 256 == 255 && std::env::var("FLAVITE_SPINE_TIMING").is_ok() {
+            let g = |a: &std::sync::atomic::AtomicU64| {
+                a.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / 256.0
+            };
+            println!(
+                "spine apply avg ms (last 256): mutate={:.2} groups={:.2} resolve={:.2} commit={:.2} fold={:.2}",
+                g(&PH_MUTATE), g(&PH_GROUPS), g(&PH_RESOLVE), g(&PH_COMMIT), g(&PH_FOLD),
+            );
+        }
         Ok((SpineOutcome::Applied { epoch, generation }, plan))
     }
 

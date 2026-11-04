@@ -1665,6 +1665,7 @@ dependencies = [
  "flavite-syntax",
  "hex",
  "proptest",
+ "rayon",
  "serde",
  "serde_json",
  "similar",

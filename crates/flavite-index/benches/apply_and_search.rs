@@ -19,6 +19,20 @@ const NOTE_COUNT: usize = 10_000;
 const SAMPLES: usize = 300;
 
 fn body(index: usize, nonce: usize) -> Vec<u8> {
+    if std::env::var("HEAVY").is_ok() {
+        let mut note = format!(
+            "---\nid: I{index}\ntags: [topic-{m}, shared, project/{p}]\naliases: [N{index}, note {index}]\nrating: {m}\n---\n# Note {index}\n\nIntro.\n",
+            m = index % 97, p = index % 13,
+        );
+        for section in 0..6 {
+            note.push_str(&format!("## S{section}\n- a\n- b\n\ncode {index}-{section}\n\n"));
+            for link in 0..3 {
+                note.push_str(&format!("See [[n{:05}]] ![[pic{index}-{link}.png]] [[tt{index}-{link}]]\n", (index * 31 + link * 7) % NOTE_COUNT));
+            }
+        }
+        note.push_str("trailing #tag [[target]] and [[deep/in/nest]]\n");
+        return note.into_bytes();
+    }
     format!(
         "# Note {index}\n\nbenchtoken content-{index}-{nonce} [[n{}]]\n",
         index % 50

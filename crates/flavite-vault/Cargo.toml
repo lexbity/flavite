@@ -16,6 +16,8 @@ flavite-buffer = { path = "../flavite-buffer" }
 crossbeam = { workspace = true }
 arc-swap = { workspace = true }
 directories = { workspace = true }
+# RFC-0004 S7: ordered parallel segments for the reconcile scan (D10).
+rayon = { workspace = true }
 
 # Serialization
 serde = { workspace = true }

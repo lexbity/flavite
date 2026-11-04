@@ -1003,9 +1003,24 @@ impl VaultActor {
         let worker = thread::Builder::new()
             .name("vault-reconcile".into())
             .spawn(move || {
+                // RFC-0004 S7: the scan pool is created once per worker
+                // thread lifetime (serial when forced by the env switch or
+                // when the machine has one core — identical outputs either
+                // way, guaranteed by the single shared Emitter).
+                let scan_pool = crate::reconcile_worker::scan_pool();
                 while let Ok(Some(job)) = worker_jobs_rx.recv() {
-                    let result =
-                        crate::reconcile_worker::scan(&*worker_fs, &worker_root, &job, &worker_tx);
+                    let scan_job = crate::reconcile_worker::ScanJob {
+                        id: job.id,
+                        scope: &job.scope,
+                        nominated: &job.nominated,
+                    };
+                    let result = crate::reconcile_worker::scan(
+                        &*worker_fs,
+                        &worker_root,
+                        &scan_job,
+                        &worker_tx,
+                        scan_pool.as_ref(),
+                    );
                     if let Some(signal) = &scan_signal {
                         let _ = signal.send(());
                     }
@@ -1796,6 +1811,20 @@ impl VaultActor {
         context: &mut ReconcileContext,
         result: crate::reconcile_worker::ScanResult,
     ) -> ReconcileSummary {
+        let __t = std::time::Instant::now();
+        let __outcomes = result.outcomes.len();
+        let out = self.apply_scan_result_timed(context, result);
+        if std::env::var("FLAVITE_SCAN_TIMING").is_ok() {
+            eprintln!("apply_scan_result outcomes={__outcomes} wall={:?}", __t.elapsed());
+        }
+        out
+    }
+
+    fn apply_scan_result_timed(
+        &mut self,
+        context: &mut ReconcileContext,
+        result: crate::reconcile_worker::ScanResult,
+    ) -> ReconcileSummary {
         let scan_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1847,6 +1876,7 @@ impl VaultActor {
                     bytes,
                     parsed,
                 } => {
+                    let __note_started = std::time::Instant::now();
                     present_notes.insert(path_key.clone());
                     let prior = context.initial_paths.contains(&path_key);
                     let previous_generation = self.generation.0;
