@@ -1,19 +1,25 @@
-//! Per-vault graph base service (RFC-0003 TD-12, W07, §10.1, §12.1).
+//! Per-vault graph base service (RFC-0003 TD-12, W07, §10.1, §12.1;
+//! RFC-0004 S6 incremental bridge).
 //!
 //! One service per vault, one bounded worker thread: it owns the *only*
 //! database handle on the graph path, polls the index at a fixed cadence
-//! plus host-sent invalidation hints, reads complete current node/edge
-//! sets under one consistent read transaction, and publishes immutable
-//! [`GraphFrame`]s the UI consumes without ever waiting (D15: the frame
-//! path is an atomic pointer load). The SQLite-backed feed bridge lives
-//! here — below the facade boundary, never inside `flavite-graph` and
+//! plus host-sent invalidation hints, and advances a [`GraphMirror`] from
+//! the typed change feed — reading only changed entities — then publishes
+//! immutable [`GraphFrame`]s the UI consumes without ever waiting (D15:
+//! the frame path is an atomic pointer load). The SQLite-backed feed bridge
+//! lives here — below the facade boundary, never inside `flavite-graph` and
 //! never exposed as a connection handle to the UI (§5.1).
 //!
-//! Deletions survive (§4.14): the bridge reloads *current* index rows and
-//! [`GraphPublisher`] diffs consecutive complete sets, so an edge removed
-//! between polls leaves the model. A changed epoch (entity ids may be
-//! reused) rebuilds the model and re-installs the layout worker instead of
-//! delta-feeding through the reset.
+//! Publications stay *complete* (D7): the mirror emits a full [`GraphBatch`]
+//! per bump and [`GraphPublisher`] still diffs consecutive complete sets, so
+//! the dense node-record alignment invariant is untouched. Deletions survive
+//! because the change feed logs every re-resolution flip (FR-1), and the
+//! mirror's periodic parity guard (§6.5.4) rebuilds from the full consistent
+//! read on any drift.
+//!
+//! A changed epoch (entity ids may be reused) rebuilds the model and
+//! re-installs the layout worker instead of delta-feeding through the reset
+//! (§4.14).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,6 +37,7 @@ use flavite_graph::{
 };
 use rusqlite::{Connection, OpenFlags};
 
+use crate::graph_mirror::{GraphMirror, MirrorStats, ParityOutcome, ParityPolicy, Synchronize};
 use crate::graph_projection::{GraphProjection, GraphViewToken, ScopeRequest};
 use crate::{Flavite, FlaviteError, StoredUserState};
 use flavite_vault::session::Session;
@@ -142,6 +149,16 @@ pub struct GraphServiceMetrics {
     pub bridge_errors_total: u64,
     /// Layout worker (re)spawns.
     pub worker_restarts_total: u64,
+    /// Mirror delta synchronizations (RFC-0004 §6.5.5).
+    pub mirror_deltas_total: u64,
+    /// Mirror full rebuilds (epoch change, floor overrun, parity failure).
+    pub mirror_resets_total: u64,
+    /// Mirror parity comparisons executed.
+    pub mirror_parity_checks_total: u64,
+    /// Mirror parity mismatches (each forced or forces a rebuild).
+    pub mirror_mismatches_total: u64,
+    /// Deduplicated entities touched by the last mirror delta (last value).
+    pub mirror_last_delta_entities: u64,
 }
 
 #[derive(Debug)]
@@ -151,6 +168,10 @@ struct Shared {
     counters: Counters,
     scopes: std::sync::Mutex<BTreeMap<u128, ScopeRequest>>,
     retry_layout: AtomicBool,
+    /// The saved-graph mirror (RFC-0004 S6). Locked by the service pump and
+    /// by the on-demand doctor parity check; both are read-mostly and the
+    /// critical sections are bounded reads on the graph connection.
+    mirror: std::sync::Mutex<GraphMirror>,
 }
 
 #[derive(Debug, Default)]
@@ -161,6 +182,29 @@ struct Counters {
     stale_dropped: AtomicU64,
     bridge_errors: AtomicU64,
     worker_restarts: AtomicU64,
+    mirror_deltas: AtomicU64,
+    mirror_resets: AtomicU64,
+    mirror_parity_checks: AtomicU64,
+    mirror_mismatches: AtomicU64,
+    mirror_last_delta_entities: AtomicU64,
+}
+
+impl Counters {
+    /// Publish one fixed-cardinality mirror counter set (§6.5.5). Called by
+    /// whoever last drove the mirror (the pump or the doctor check) so the
+    /// metrics always reflect the freshest mirror verdict.
+    fn publish_mirror(&self, stats: MirrorStats) {
+        self.mirror_deltas
+            .store(stats.deltas_total, Ordering::Relaxed);
+        self.mirror_resets
+            .store(stats.resets_total, Ordering::Relaxed);
+        self.mirror_parity_checks
+            .store(stats.parity_checks_total, Ordering::Relaxed);
+        self.mirror_mismatches
+            .store(stats.mismatches_total, Ordering::Relaxed);
+        self.mirror_last_delta_entities
+            .store(stats.last_delta_entities, Ordering::Relaxed);
+    }
 }
 
 /// The graph base service for one vault.
@@ -190,6 +234,26 @@ impl GraphService {
     }
 
     pub(crate) fn start_with_session(db_path: PathBuf, session: Option<Arc<Session>>) -> Arc<Self> {
+        Self::start_with_policy(db_path, session, ParityPolicy::default())
+    }
+
+    /// Test/bench seam: same service with a tightened mirror drift guard
+    /// (RFC-0004 §6.5.4 intervals stay fixed in production).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn start_with_parity_policy(
+        db_path: PathBuf,
+        session: Option<Arc<Session>>,
+        policy: ParityPolicy,
+    ) -> Arc<Self> {
+        Self::start_with_policy(db_path, session, policy)
+    }
+
+    fn start_with_policy(
+        db_path: PathBuf,
+        session: Option<Arc<Session>>,
+        policy: ParityPolicy,
+    ) -> Arc<Self> {
         let shared = Arc::new(Shared {
             frame: ArcSwapOption::empty(),
             status: std::sync::Mutex::new(GraphServiceStatus::Indexing {
@@ -198,6 +262,7 @@ impl GraphService {
             counters: Counters::default(),
             scopes: std::sync::Mutex::new(BTreeMap::new()),
             retry_layout: AtomicBool::new(false),
+            mirror: std::sync::Mutex::new(GraphMirror::with_parity_policy(session.clone(), policy)),
         });
         let (hints, hint_rx) = bounded::<Directive>(HINT_QUEUE_CAPACITY);
         let stop = Arc::new(AtomicBool::new(false));
@@ -305,7 +370,32 @@ impl GraphService {
             stale_dropped_total: counters.stale_dropped.load(Ordering::Relaxed),
             bridge_errors_total: counters.bridge_errors.load(Ordering::Relaxed),
             worker_restarts_total: counters.worker_restarts.load(Ordering::Relaxed),
+            mirror_deltas_total: counters.mirror_deltas.load(Ordering::Relaxed),
+            mirror_resets_total: counters.mirror_resets.load(Ordering::Relaxed),
+            mirror_parity_checks_total: counters.mirror_parity_checks.load(Ordering::Relaxed),
+            mirror_mismatches_total: counters.mirror_mismatches.load(Ordering::Relaxed),
+            mirror_last_delta_entities: counters.mirror_last_delta_entities.load(Ordering::Relaxed),
         }
+    }
+
+    /// On-demand read-only mirror parity (RFC-0004 §6.5.4, doctor
+    /// `graph-mirror-parity`): lock the mirror, advance it to the current
+    /// index version if the pump has not yet, and compare against a fresh
+    /// full consistent read. This never writes and never forces a rebuild —
+    /// the service's own scheduled guard does that; findings are returned
+    /// for the doctor to surface.
+    ///
+    /// # Errors
+    /// Returns the failure text when the full read or a catch-up fails.
+    pub fn check_mirror_parity(&self, conn: &Connection) -> Result<ParityOutcome, String> {
+        let mut mirror = self
+            .shared
+            .mirror
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outcome = mirror.parity_check(conn)?;
+        self.shared.counters.publish_mirror(mirror.stats());
+        Ok(outcome)
     }
 
     /// Wake the poller after a vault-changed pulse (§12.1 invalidation
@@ -432,7 +522,7 @@ fn run_service_attempt(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            let read = (|| {
+            let read = (|| -> Result<Option<(Arc<GraphProjection>, bool)>, String> {
                 if !db_path.exists() {
                     return Err("Index not available yet".to_owned());
                 }
@@ -443,13 +533,65 @@ fn run_service_attempt(
                     .busy_timeout(Duration::from_millis(50))
                     .map_err(|_| "Graph index unavailable")?;
                 let previous = shared.frame.load_full();
+                // RFC-0004 S6: advance the mirror by the change feed, run
+                // the §6.5.4 drift guard when due, and hand the complete
+                // canonical view to the projection builder. `force_reset`
+                // says the publisher must rebuild the model (§6.5.2).
+                let mut mirror = shared
+                    .mirror
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut force_reset = false;
+                match mirror.synchronize(&connection)? {
+                    Synchronize::UpToDate => {}
+                    Synchronize::Delta { reset, .. } => {
+                        force_reset = reset;
+                    }
+                    Synchronize::Reset { reason } => {
+                        tracing::info!(
+                            target: "flavite_api::graph_service",
+                            ?reason,
+                            "graph mirror rebuilding from a full consistent read"
+                        );
+                        mirror.force_reset(&connection)?;
+                        force_reset = true;
+                    }
+                }
+                // Poisoned delta machinery — a failed splice or a
+                // contract-violating row: never publish suspect output;
+                // rebuild from the full truth and reset the model in this
+                // same pump (§4.7).
+                if mirror.is_poisoned() {
+                    mirror.force_reset(&connection)?;
+                    force_reset = true;
+                } else if mirror.parity_due(std::time::Instant::now()) {
+                    // Parity guard (D8, §6.5.4): counter-driven, inside
+                    // this loop — no dedicated thread. A mismatch rebuilds
+                    // the view before the projection is built, so the
+                    // drifted state never reaches a published frame.
+                    let parity = mirror.parity_check(&connection)?;
+                    if !parity.matched() {
+                        tracing::warn!(
+                            target: "flavite_api::graph_service",
+                            epoch = parity.version.epoch,
+                            generation = parity.version.generation,
+                            findings = ?parity.findings,
+                            "graph mirror drifted from the full consistent read; rebuilding"
+                        );
+                        mirror.force_reset(&connection)?;
+                        force_reset = true;
+                    }
+                }
+                shared.counters.publish_mirror(mirror.stats());
+                let graph = mirror.view().ok_or("graph mirror holds no view")?;
                 crate::graph_projection::build(
                     &mut connection,
+                    graph,
                     session,
                     &scopes,
                     previous.as_ref().map(|frame| frame.projection.as_ref()),
                 )
-                .map(|projection| projection.map(Arc::new))
+                .map(|projection| projection.map(|projection| (Arc::new(projection), force_reset)))
             })();
             match read {
                 Ok(None) => {
@@ -466,7 +608,14 @@ fn run_service_attempt(
                     }
                     set_status(shared, GraphServiceStatus::Live);
                 }
-                Ok(Some(projection)) => {
+                Ok(Some((projection, force_reset))) => {
+                    if force_reset {
+                        // A rebuild of the saved view at an already
+                        // published version (floor overrun, parity repair)
+                        // must re-publish: drop the dedup so the corrected
+                        // frame replaces the drifted one (§6.5.4).
+                        last_signature = None;
+                    }
                     let signature = (
                         projection.effective.epoch,
                         projection.effective.generation,
@@ -476,8 +625,9 @@ fn run_service_attempt(
                     if last_signature.as_ref() == Some(&signature) {
                         continue;
                     }
-                    let reset =
-                        !publisher.initialized() || publisher.epoch() != projection.effective.epoch;
+                    let reset = force_reset
+                        || !publisher.initialized()
+                        || publisher.epoch() != projection.effective.epoch;
                     let publication =
                         publisher.apply_current(&projection.effective, reset, projection.digest);
                     shared

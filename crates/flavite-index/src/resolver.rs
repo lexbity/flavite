@@ -796,16 +796,23 @@ pub fn re_resolve_preview(conn: &Connection) -> Result<Vec<LinkParityMismatch>, 
 /// pre/post `stable_id_key`s — plus the applied row itself (it may have
 /// left its group with a stale flag). Same CASE semantics as the retired
 /// full-table statements, scoped by `WHERE stable_id_key`. Returns the
-/// number of statements executed (counter plumbing).
+/// executed statement count plus the note ids whose stored `id_conflict`
+/// value actually flipped — the group UPDATE rewrites *other* members'
+/// rows too, and those flags are graph-visible entity state
+/// (`GraphNodeRecord.id_conflict` reads them), so the change feed MUST
+/// describe each flipped member (FR-1) or derived views drift (the S6
+/// mirror-equivalence gate is what makes this omission impossible).
 ///
 /// # Errors
 /// Returns the error text when an update fails.
+
 pub fn refresh_id_conflict_groups(
     tx: &Transaction<'_>,
     stable_id_keys: &BTreeSet<String>,
     applied_note: Option<i64>,
-) -> Result<u64, String> {
+) -> Result<(u64, BTreeSet<i64>), String> {
     let mut executed: u64 = 0;
+    let mut flipped: BTreeSet<i64> = BTreeSet::new();
     {
         let mut statement = tx
             .prepare(
@@ -817,14 +824,47 @@ pub fn refresh_id_conflict_groups(
                  WHERE stable_id_key = ?1",
             )
             .map_err(|error| error.to_string())?;
+        let mut group_select = tx
+            .prepare(
+                "SELECT note_id, id_conflict FROM notes WHERE stable_id_key = ?1 ORDER BY note_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let capture = |group_select: &mut rusqlite::Statement<'_>,
+                       key: &str|
+         -> Result<Vec<(i64, i64)>, String> {
+            group_select
+                .query_map(params![key], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())
+        };
         for key in stable_id_keys {
+            let before = capture(&mut group_select, key)?;
             statement
                 .execute(params![key])
                 .map_err(|error| error.to_string())?;
             executed += 1;
+            let after = capture(&mut group_select, key)?;
+            for (id, flag) in after {
+                if before
+                    .iter()
+                    .any(|(other, other_flag)| *other == id && *other_flag != flag)
+                {
+                    flipped.insert(id);
+                }
+            }
         }
     }
     if let Some(note_id) = applied_note {
+        let before = tx
+            .query_row(
+                "SELECT id_conflict FROM notes WHERE note_id = ?1",
+                params![note_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok();
         tx.execute(
             "UPDATE notes SET id_conflict = \
              CASE WHEN stable_id_key IS NOT NULL \
@@ -836,8 +876,20 @@ pub fn refresh_id_conflict_groups(
         )
         .map_err(|error| error.to_string())?;
         executed += 1;
+        let after = tx
+            .query_row(
+                "SELECT id_conflict FROM notes WHERE note_id = ?1",
+                params![note_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok();
+        if let (Some(before), Some(after)) = (before, after)
+            && before != after
+        {
+            flipped.insert(note_id);
+        }
     }
-    Ok(executed)
+    Ok((executed, flipped))
 }
 
 /// Winner query for one touched `stable_id_key`, run on the writer

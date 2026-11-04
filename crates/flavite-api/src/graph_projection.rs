@@ -1,6 +1,12 @@
 //! Revisioned current relationships built on a consistent saved index transaction.
 //! Dirty sources replace their outgoing occurrences; failures never become empty
 //! successful parses. Saved full-text membership always uses the canonical query.
+//!
+//! RFC-0004 S6: the saved base arrives as a [`SavedGraph`] — assembled by the
+//! [`crate::graph_mirror`] from change-feed deltas or from the full consistent
+//! read on a reset. This module no longer reads the saved tables; the overlay
+//! and scope machinery, the retirement rules, `OccurrenceSource`, and the
+//! `buffer_stamp`/digest semantics are exactly as before.
 use flavite_graph::scope::{NoteMetadata, ScopeResult};
 use flavite_graph::{
     EdgeKind, GraphBatch, GraphEdgeRecord, GraphNodeRecord, GraphScope, NodeId, NotePredicate,
@@ -13,6 +19,8 @@ use rusqlite::{Connection, OptionalExtension};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use crate::graph_mirror::{SavedGraph, unresolved_node};
 
 /// Exact source version, including the buffer instance (same path is insufficient).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,57 +88,40 @@ pub struct ScopeRequest {
     pub scope: GraphScope,
 }
 
-/// One consistent DB transaction supplies base, resolver, metadata, saved text
-/// predicates and occurrence hashes. Only immutable Session snapshots cross in.
+/// One consistent DB transaction supplies overlay provenance, resolver, saved text
+/// predicates and occurrence hashes; the saved base itself comes complete from
+/// the [`GraphMirror`](crate::graph_mirror::GraphMirror). Only immutable Session
+/// snapshots cross in.
+#[allow(
+    clippy::too_many_lines,
+    reason = "overlay + scope assembly is one pass over the mirrored base; splitting would only relocate it"
+)]
 pub(crate) fn build(
     connection: &mut Connection,
+    graph: &SavedGraph,
     session: Option<&Arc<Session>>,
     requests: &BTreeMap<u128, ScopeRequest>,
     previous: Option<&GraphProjection>,
 ) -> Result<Option<GraphProjection>, String> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| "cannot begin graph snapshot")?;
-    let epoch = meta(&transaction, "epoch", 1)?;
-    let generation = meta(&transaction, "generation", 0)?;
     let stamp = session.map_or_else(Vec::new, |s| s.graph_buffer_stamp());
     if previous.is_some_and(|p| {
-        p.saved.epoch == epoch
-            && p.saved.generation == generation
+        p.saved.epoch == graph.version.epoch
+            && p.saved.generation == graph.version.generation
             && p.buffer_stamp == stamp
             && &p.requests == requests
     }) {
         return Ok(None);
     }
-    let mut saved = super::graph_service::read_current(&transaction, epoch, generation)
-        .map_err(|_| "cannot read graph base")?;
-    if let Some(session) = session {
-        let decoded = session
-            .decode_graph_paths(saved.nodes.iter().map(|n| n.path_native.clone()).collect())?;
-        if decoded.len() != saved.nodes.len() {
-            return Err("graph native path catalog is incomplete".into());
-        }
-        for (record, native) in saved.nodes.iter_mut().zip(decoded) {
-            if native.is_absolute()
-                || native
-                    .components()
-                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
-            {
-                return Err("graph native path is outside the vault".into());
-            }
-            record.native_path = native;
-        }
-    }
-    let mut effective = saved.clone();
-    let mut occurrences = saved_occurrences(&transaction, &saved)?;
-    let mut unresolved_ids = BTreeMap::new();
-    add_saved_unresolved(
-        &transaction,
-        &mut effective,
-        &mut occurrences,
-        &mut unresolved_ids,
-    )?;
-    let mut metadata = saved_metadata(&transaction)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|_| "cannot begin graph snapshot")?;
+    // The mirrored saved view: complete, decoded, canonical — identical to
+    // what a full consistent read produces at `graph.version` (AC-3 gate).
+    let saved = graph.saved.clone();
+    let mut effective = graph.effective_pre_overlay();
+    let mut occurrences = graph.occurrences.clone();
+    let mut unresolved_ids = graph.unresolved_keys.clone();
+    let mut metadata = graph.metadata.clone();
     let snapshots = session.map_or_else(Vec::new, |s| s.graph_buffer_snapshots());
     let buffer_stamp = snapshots
         .iter()
@@ -377,178 +368,6 @@ fn meta(conn: &Connection, key: &str, default: u64) -> Result<u64, String> {
     .map_or(Ok(default), |s| {
         s.parse().map_err(|_| "invalid index version".into())
     })
-}
-
-fn saved_occurrences(conn: &Connection, batch: &GraphBatch) -> Result<Vec<LinkOccurrence>, String> {
-    let mut stmt = conn.prepare("SELECT l.src,l.kind,l.dst_note,l.dst_att,l.span_start,l.span_end,l.dst_raw,n.content_hash FROM links l JOIN notes n ON n.note_id=l.src WHERE l.dst_note IS NOT NULL OR l.dst_att IS NOT NULL ORDER BY l.src,l.ord").map_err(|_| "cannot read occurrences")?;
-    stmt.query_map([], |r| {
-        let from = NodeId::note(r.get::<_, i64>(0)? as u64);
-        let note: Option<i64> = r.get(2)?;
-        let att: Option<i64> = r.get(3)?;
-        Ok(LinkOccurrence {
-            edge: GraphEdgeRecord {
-                from,
-                to: note.map_or_else(
-                    || NodeId::attachment(att.expect("resolved occurrence") as u64),
-                    |id| NodeId::note(id as u64),
-                ),
-                kind: if r.get::<_, String>(1)? == "link" {
-                    EdgeKind::Link
-                } else {
-                    EdgeKind::Embed
-                },
-            },
-            source_path: batch
-                .nodes
-                .iter()
-                .find(|n| n.id == from)
-                .map(|n| n.native_path.clone())
-                .unwrap_or_default(),
-            source: OccurrenceSource::Saved {
-                content_hash: r.get(7)?,
-            },
-            start: r.get::<_, i64>(4)? as usize,
-            end: r.get::<_, i64>(5)? as usize,
-            target_raw: r.get(6)?,
-        })
-    })
-    .map_err(|_| "cannot read occurrences")?
-    .collect::<Result<_, _>>()
-    .map_err(|_| "invalid occurrence record".into())
-}
-
-fn unresolved_node(
-    batch: &mut GraphBatch,
-    ids: &mut BTreeMap<u64, String>,
-    raw: &str,
-) -> Result<NodeId, String> {
-    let key = flavite_syntax::text::fold_key(raw);
-    let hash = blake3::hash(key.as_bytes());
-    let id = u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("hash prefix"));
-    if let Some(previous) = ids.get(&id) {
-        if previous != &key {
-            return Err("Unresolved target identity collision; edit the source".into());
-        }
-        return Ok(NodeId::unresolved(id));
-    }
-    ids.insert(id, key);
-    let mut record = GraphNodeRecord::note(
-        id,
-        "",
-        Vec::new(),
-        format!("[[{raw}]] (unresolved)"),
-        None,
-        false,
-    );
-    record.id = NodeId::unresolved(id);
-    batch.nodes.push(record);
-    Ok(NodeId::unresolved(id))
-}
-fn add_saved_unresolved(
-    conn: &Connection,
-    batch: &mut GraphBatch,
-    occurrences: &mut Vec<LinkOccurrence>,
-    ids: &mut BTreeMap<u64, String>,
-) -> Result<(), String> {
-    let mut stmt = conn.prepare("SELECT l.src,l.kind,l.dst_raw,l.span_start,l.span_end,n.content_hash FROM links l JOIN notes n ON n.note_id=l.src WHERE l.dst_note IS NULL AND l.dst_att IS NULL ORDER BY l.src,l.ord").map_err(|_| "Cannot read unresolved targets")?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, Vec<u8>>(5)?,
-            ))
-        })
-        .map_err(|_| "Cannot read unresolved targets")?;
-    for row in rows {
-        let (source, kind, raw, start, end, hash) = row.map_err(|_| "Invalid unresolved target")?;
-        let from = NodeId::note(source as u64);
-        let source_path = batch
-            .nodes
-            .iter()
-            .find(|r| r.id == from)
-            .ok_or("Missing unresolved source")?
-            .native_path
-            .clone();
-        let to = unresolved_node(batch, ids, &raw)?;
-        let edge = GraphEdgeRecord {
-            from,
-            to,
-            kind: if kind == "embed" {
-                EdgeKind::Embed
-            } else {
-                EdgeKind::Link
-            },
-        };
-        batch.edges.push(edge);
-        occurrences.push(LinkOccurrence {
-            edge,
-            source_path,
-            source: OccurrenceSource::Saved { content_hash: hash },
-            start: start as usize,
-            end: end as usize,
-            target_raw: raw,
-        });
-    }
-    Ok(())
-}
-
-fn saved_metadata(conn: &Connection) -> Result<BTreeMap<NodeId, NoteMetadata>, String> {
-    let mut metadata: BTreeMap<NodeId, NoteMetadata> = BTreeMap::new();
-    let mut stmt = conn
-        .prepare("SELECT note_id,tag FROM tags")
-        .map_err(|_| "cannot read tags")?;
-    for row in stmt
-        .query_map([], |r| {
-            Ok((
-                NodeId::note(r.get::<_, i64>(0)? as u64),
-                r.get::<_, String>(1)?,
-            ))
-        })
-        .map_err(|_| "cannot read tags")?
-    {
-        let (id, tag) = row.map_err(|_| "invalid tag record")?;
-        metadata.entry(id).or_default().tags.insert(tag);
-    }
-    let mut stmt = conn
-        .prepare("SELECT note_id,key,vtype,v_text,v_num FROM properties ORDER BY note_id,key,ord")
-        .map_err(|_| "cannot read properties")?;
-    for row in stmt
-        .query_map([], |r| {
-            let kind: String = r.get(2)?;
-            let text: Option<String> = r.get(3)?;
-            let number: Option<f64> = r.get(4)?;
-            let value = match kind.as_str() {
-                "num" => PropertyValue::Number(number.map(|n| n.to_string()).unwrap_or_default()),
-                "bool" => {
-                    PropertyValue::Bool(number == Some(1.0) || text.as_deref() == Some("true"))
-                }
-                "date" => PropertyValue::Date(text.unwrap_or_default()),
-                "datetime" => PropertyValue::DateTime(text.unwrap_or_default()),
-                "null" => PropertyValue::Null,
-                _ => PropertyValue::Text(text.unwrap_or_default()),
-            };
-            Ok((
-                NodeId::note(r.get::<_, i64>(0)? as u64),
-                r.get::<_, String>(1)?,
-                value,
-            ))
-        })
-        .map_err(|_| "cannot read properties")?
-    {
-        let (id, key, value) = row.map_err(|_| "invalid property record")?;
-        metadata
-            .entry(id)
-            .or_default()
-            .properties
-            .entry(key)
-            .or_default()
-            .push(value);
-    }
-    Ok(metadata)
 }
 
 fn parse_metadata(parsed: &flavite_syntax::pulldown_glue::ParsedNote) -> NoteMetadata {

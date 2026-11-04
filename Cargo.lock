@@ -1496,6 +1496,7 @@ dependencies = [
  "flavite-vault",
  "hex",
  "image",
+ "proptest",
  "rusqlite",
  "serde",
  "serde_json",

@@ -1205,15 +1205,18 @@ impl IndexActor {
             }
         }
         // Targeted id_conflict maintenance (§6.2.6): only the groups whose
-        // membership can have moved, plus the applied row's own flag.
-        let group_updates = if relevant {
+        // membership can have moved, plus the applied row's own flag. Every
+        // member whose stored flag actually flipped is FR-1-visible entity
+        // state (`GraphNodeRecord.id_conflict` reads it) and travels into
+        // the change rows below.
+        let (group_updates, conflict_flips) = if relevant {
             refresh_id_conflict_groups(
                 &tx,
                 &stable_id_keys,
                 if note { plan.conflict_row } else { None },
             )?
         } else {
-            0
+            (0, std::collections::BTreeSet::new())
         };
         // The post-image mirrors the committed flag into the base.
         if group_updates > 0
@@ -1280,6 +1283,11 @@ impl IndexActor {
                 .into_iter()
                 .map(|src| (ChangeKind::Outgoing, src)),
         );
+        // Group-scoped `id_conflict` maintenance rewrote other members'
+        // rows (§6.2.6): those flags are graph-visible entity state, so
+        // each flipped member gets its own `note` row (FR-1) — the S6
+        // mirror-equivalence gate is what makes this omission impossible.
+        rows.extend(conflict_flips.into_iter().map(|id| (ChangeKind::Note, id)));
         ChangeLogWriter::record_all(&tx, generation, &rows)?;
         let change_rows = rows.len();
         tx.commit().map_err(|error| error.to_string())?;

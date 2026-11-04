@@ -33,8 +33,9 @@
 //!
 //! Reader isolation: consumers read on their own connections (WAL). The
 //! meta triple (`epoch`, `generation`, `log_floor`) and the row range are
-//! read in ONE read transaction, so a consumer can never observe a torn
-//! view of the log.
+//! read in ONE read transaction — the transaction is caller-owned, so a
+//! consumer's dependent per-entity point reads join the same snapshot and
+//! can never observe a torn view of the log.
 //!
 //! # Retention (§4.3)
 //!
@@ -177,22 +178,19 @@ pub enum ChangeLogRead {
 }
 
 /// Typed consumer reader over the change feed. Reads happen on the
-/// consumer's own connection (WAL), never on the writer.
-pub struct ChangeLogReader<'a> {
-    conn: &'a Connection,
-}
+/// consumer's own connection (WAL), never on the writer — and inside the
+/// consumer's own read transaction: §4.6 requires the meta triple, the row
+/// range, and any dependent per-entity point reads to share ONE snapshot,
+/// so the transaction is caller-owned (a mirror that read the log in one
+/// transaction and entity rows in the next could splice a torn generation
+/// into its state).
+pub struct ChangeLogReader;
 
-impl<'a> ChangeLogReader<'a> {
-    /// Build a reader bound to one read connection.
-    #[must_use]
-    pub const fn new(conn: &'a Connection) -> Self {
-        Self { conn }
-    }
-
-    /// Read everything after `cursor` in ONE read transaction: the meta
-    /// triple (`epoch`, `generation`, `log_floor`) plus all rows with
-    /// `generation > cursor.generation AND generation <= generation`, in
-    /// PK order.
+impl ChangeLogReader {
+    /// Read everything after `cursor` inside the caller's read
+    /// transaction: the meta triple (`epoch`, `generation`, `log_floor`)
+    /// plus all rows with `generation > cursor.generation AND generation
+    /// <= generation`, in PK order.
     ///
     /// An epoch mismatch or `cursor.generation < log_floor` returns
     /// `Reset` — never empty records presented as success. A cursor ahead
@@ -202,18 +200,17 @@ impl<'a> ChangeLogReader<'a> {
     /// Returns the error text when metadata or rows cannot be read, or
     /// when the cursor comes from the future relative to the current
     /// epoch.
-    pub fn read_since(&self, cursor: IndexVersion) -> Result<ChangeLogRead, String> {
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|error| error.to_string())?;
-        let epoch = get_meta_u64(&tx, MetaKey::Epoch)
+    pub fn read_since(
+        tx: &rusqlite::Transaction<'_>,
+        cursor: IndexVersion,
+    ) -> Result<ChangeLogRead, String> {
+        let epoch = get_meta_u64(tx, MetaKey::Epoch)
             .map_err(|error| error.to_string())?
             .unwrap_or(1);
-        let generation = get_meta_u64(&tx, MetaKey::Generation)
+        let generation = get_meta_u64(tx, MetaKey::Generation)
             .map_err(|error| error.to_string())?
             .unwrap_or(0);
-        let log_floor = get_meta_u64(&tx, MetaKey::LogFloor)
+        let log_floor = get_meta_u64(tx, MetaKey::LogFloor)
             .map_err(|error| error.to_string())?
             .unwrap_or(0);
         if cursor.epoch != epoch {
@@ -265,29 +262,24 @@ impl<'a> ChangeLogReader<'a> {
             }
             records
         };
-        tx.commit().map_err(|error| error.to_string())?;
         Ok(ChangeLogRead::Delta {
             records,
             to: IndexVersion { epoch, generation },
         })
     }
 
-    /// The current consumer cursor `(epoch, generation)`, read atomically.
+    /// The current consumer cursor `(epoch, generation)` inside the
+    /// caller's read transaction.
     ///
     /// # Errors
     /// Returns the error text when metadata cannot be read.
-    pub fn current_cursor(&self) -> Result<IndexVersion, String> {
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|error| error.to_string())?;
-        let epoch = get_meta_u64(&tx, MetaKey::Epoch)
+    pub fn current_cursor(tx: &rusqlite::Transaction<'_>) -> Result<IndexVersion, String> {
+        let epoch = get_meta_u64(tx, MetaKey::Epoch)
             .map_err(|error| error.to_string())?
             .unwrap_or(1);
-        let generation = get_meta_u64(&tx, MetaKey::Generation)
+        let generation = get_meta_u64(tx, MetaKey::Generation)
             .map_err(|error| error.to_string())?
             .unwrap_or(0);
-        tx.commit().map_err(|error| error.to_string())?;
         Ok(IndexVersion { epoch, generation })
     }
 }

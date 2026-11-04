@@ -247,16 +247,25 @@ impl TantivyBackend {
     /// Replay changed IDs from the typed change feed (§4.3, §6.1.4), then
     /// commit once. A `Reset` outcome (epoch change or floor overrun) is
     /// handled as the contract demands: a full rebuild from a consistent
-    /// SQLite read, never a silent no-op.
+    /// SQLite read, never a silent no-op. The log read and the per-id
+    /// document reads share ONE read transaction (§4.6), so replay can
+    /// never splice a document newer than the generation it is replaying.
     ///
     /// # Errors
     /// Returns an error when the change log cannot be read or replay cannot commit.
     pub fn replay_since(&self, cursor: IndexVersion) -> Result<(), SearchError> {
         let conn = Connection::open(&self.db_path)?;
-        let records = match ChangeLogReader::new(&conn).read_since(cursor) {
+        let tx = conn.unchecked_transaction()?;
+        let records = match ChangeLogReader::read_since(&tx, cursor) {
             Ok(ChangeLogRead::Delta { records, .. }) => records,
-            Ok(ChangeLogRead::Reset { .. }) => return self.rebuild_from_sqlite(),
-            Err(error) => return Err(SearchError::Checkpoint(error)),
+            Ok(ChangeLogRead::Reset { .. }) => {
+                drop(tx);
+                return self.rebuild_from_sqlite();
+            }
+            Err(error) => {
+                drop(tx);
+                return Err(SearchError::Checkpoint(error));
+            }
         };
         // Dedupe (kind, entity_id) per §4.6; the replay only needs the set of
         // note ids whose document content may have moved.
@@ -266,20 +275,40 @@ impl TantivyBackend {
                 ids.insert(record.entity_id);
             }
         }
+        // Collect every document within the one read transaction, then close
+        // it before the tantivy-side writes: the snapshot the replay trusts
+        // ends exactly where the log it replayed ends.
+        let mut documents = Vec::with_capacity(ids.len());
         for id in ids {
-            let current: Option<(String,String)> = conn.query_row("SELECT n.title,COALESCE(s.body_text,'') FROM notes n LEFT JOIN search_docs s USING(note_id) WHERE n.note_id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let current: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT n.title,COALESCE(s.body_text,'') \
+                     FROM notes n LEFT JOIN search_docs s USING(note_id) WHERE n.note_id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
             if let Some((title, body)) = current {
-                let aliases = conn
+                let aliases = tx
                     .prepare("SELECT alias FROM aliases WHERE note_id=?1 ORDER BY alias_key")?
                     .query_map([id], |r| r.get::<_, String>(0))?
                     .collect::<Result<Vec<_>, _>>()?;
-                let tags = conn
+                let tags = tx
                     .prepare("SELECT tag FROM tags WHERE note_id=?1 ORDER BY tag")?
                     .query_map([id], |r| r.get::<_, String>(0))?
                     .collect::<Result<Vec<_>, _>>()?;
-                self.apply_document_full(id, &title, &aliases, &tags, &body)?;
+                documents.push((id, Some((title, aliases, tags, body))));
             } else {
-                self.delete_document(id)?;
+                documents.push((id, None));
+            }
+        }
+        tx.commit()?;
+        for (id, document) in documents {
+            match document {
+                Some((title, aliases, tags, body)) => {
+                    self.apply_document_full(id, &title, &aliases, &tags, &body)?;
+                }
+                None => self.delete_document(id)?,
             }
         }
         self.commit()

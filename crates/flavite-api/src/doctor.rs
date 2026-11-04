@@ -201,6 +201,11 @@ impl DoctorSummary {
 pub struct DoctorChecker {
     vault: ApiVaultRef,
     db: PathBuf,
+    /// Live graph service, when doctor runs inside a process that owns one
+    /// (the facade/tests). The `graph-mirror-parity` check delegates to its
+    /// mirror; without a live mirror the check honestly reports that the
+    /// in-process service guard is the validating authority.
+    graph: Option<std::sync::Arc<crate::graph_service::GraphService>>,
 }
 
 impl DoctorChecker {
@@ -213,12 +218,28 @@ impl DoctorChecker {
             vault.uuid = uuid;
         }
         let db = cache_db_path(vault.uuid);
-        Self { vault, db }
+        Self {
+            vault,
+            db,
+            graph: None,
+        }
+    }
+
+    /// Attach the live graph service so `graph-mirror-parity` can delegate
+    /// to the mirror's §6.5.4 comparison instead of reporting a skip.
+    #[must_use]
+    pub fn with_graph(mut self, graph: std::sync::Arc<crate::graph_service::GraphService>) -> Self {
+        self.graph = Some(graph);
+        self
     }
 
     #[cfg(test)]
     fn with_db_path(vault: ApiVaultRef, db: PathBuf) -> Self {
-        Self { vault, db }
+        Self {
+            vault,
+            db,
+            graph: None,
+        }
     }
 
     /// Check Tantivy generation matches SQLite.
@@ -291,6 +312,10 @@ impl DoctorChecker {
                 "change-log-health",
                 "Index cache is not present; the change feed is created empty",
             ));
+            report.add_check(DoctorCheck::ok(
+                "graph-mirror-parity",
+                "Index cache is not present; the graph mirror is built from the first full index",
+            ));
         } else {
             report.add_check(unresolved_links_check(conn.as_ref()));
             report.add_check(db_count_check(
@@ -303,6 +328,7 @@ impl DoctorChecker {
             report.add_check(attachment_check(conn.as_ref()));
             report.add_check(resolver_parity_check(conn.as_ref()));
             report.add_check(change_log_health_check(conn.as_ref()));
+            report.add_check(self.graph_mirror_parity_check(conn.as_ref()));
         }
         report.add_check(temp_check(&self.vault.root));
         report.add_check(journal_check(&self.vault.root));
@@ -316,6 +342,71 @@ impl DoctorChecker {
         report.add_check(orphan_socket_check());
         report.summary.calculate_total();
         report
+    }
+
+    /// Read-only graph-mirror parity check (RFC-0004 §6.5.4, D8, S6):
+    /// delegates to the live [`GraphService`](crate::graph_service::GraphService)'s
+    /// mirror, which compares itself against a fresh full consistent read —
+    /// never writes, never forces the rebuild here (the service's scheduled
+    /// guard does). A mismatch is a finding; the repair is automatic and
+    /// already owned by the service.
+    fn graph_mirror_parity_check(&self, conn: Option<&Connection>) -> DoctorCheck {
+        let name = "graph-mirror-parity";
+        let Some(service) = self.graph.as_ref() else {
+            return DoctorCheck::ok(
+                name,
+                "No live graph mirror in this process; the service-thread drift guard is the validating authority",
+            )
+            .with_details(String::from(
+                "start the vault's graph service (open the vault) to run the comparison on demand",
+            ));
+        };
+        let Some(conn) = conn else {
+            return DoctorCheck::error(
+                name,
+                "Graph mirror matches the full consistent read",
+                "Index database unavailable".to_string(),
+                "Open the vault once or rebuild its cache".to_string(),
+            );
+        };
+        match service.check_mirror_parity(conn) {
+            Ok(outcome) if outcome.matched() => {
+                let stats = service.metrics();
+                DoctorCheck::ok(
+                    name,
+                    format!(
+                        "Graph mirror matches the full read at epoch {} generation {}",
+                        outcome.version.epoch, outcome.version.generation
+                    ),
+                )
+                .with_details(format!(
+                    "deltas={} resets={} parity_checks={} mismatches={} last_delta_entities={}",
+                    stats.mirror_deltas_total,
+                    stats.mirror_resets_total,
+                    stats.mirror_parity_checks_total,
+                    stats.mirror_mismatches_total,
+                    stats.mirror_last_delta_entities
+                ))
+            }
+            Ok(outcome) => DoctorCheck::error(
+                name,
+                "Graph mirror diverged from the full consistent read",
+                format!(
+                    "epoch {} generation {}: {}",
+                    outcome.version.epoch,
+                    outcome.version.generation,
+                    outcome.findings.join("; ")
+                ),
+                "the graph service forces a full-read rebuild on its next pump; no manual repair is required"
+                    .to_string(),
+            ),
+            Err(error) => DoctorCheck::error(
+                name,
+                "Graph mirror parity comparison failed",
+                error,
+                "re-open the vault (the mirror rebuilds from a full consistent read)".to_string(),
+            ),
+        }
     }
 }
 
@@ -1197,6 +1288,64 @@ mod tests {
         let c = DoctorChecker::with_db_path(vault, db);
         assert!(check(&c, "broken_links").is_ok());
         assert!(check(&c, "ambiguous_links").has_issues());
+    }
+
+    /// RFC-0004 S6 (AC-10): `graph-mirror-parity` delegates to the live
+    /// service mirror — OK on a healthy mirror, a finding once an
+    /// out-of-band write drifts the database away from the feed-derived
+    /// state. The check never repairs; the service guard does.
+    #[test]
+    fn graph_mirror_parity_check_delegates_and_flips_on_seeded_drift() {
+        use crate::graph_service::GraphService;
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("index.sqlite3");
+        drop(flavite_index::open_or_init(&db).unwrap());
+        let mut actor = flavite_index::IndexActor::new(&db, 1).unwrap();
+        actor
+            .apply_saved_note(b"a.md", "a.md", b"# A links [[b]]", 1, 1)
+            .unwrap();
+        actor
+            .apply_saved_note(b"b.md", "b.md", b"# B", 2, 2)
+            .unwrap();
+        let service = GraphService::start(db.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if service
+                .frame()
+                .is_some_and(|frame| frame.publication().generation >= 2)
+            {
+                break;
+            }
+            service.notify_changed();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "graph service did not catch up: {:?}",
+                service.status()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let vault = ApiVaultRef::new(Uuid::new_v4(), root.path().to_path_buf());
+        let checker =
+            DoctorChecker::with_db_path(vault, db.clone()).with_graph(Arc::clone(&service));
+        assert!(
+            check(&checker, "graph-mirror-parity").is_ok(),
+            "healthy mirror must pass the delegated comparison"
+        );
+
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE notes SET title='drifted' WHERE path_native=?1",
+            [b"b.md".as_slice()],
+        )
+        .unwrap();
+        drop(conn);
+        let finding = check(&checker, "graph-mirror-parity");
+        assert!(
+            finding.has_issues(),
+            "the seeded drift must flip the check: {finding:?}"
+        );
+        service.shutdown();
     }
 
     #[test]

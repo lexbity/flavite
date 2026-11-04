@@ -51,6 +51,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 [dev-dependencies]
 # For tests
 tempfile = "3"
+proptest = { workspace = true }
 
 [features]
 # Test-only fault injection (FaultFs) for durability tests; flavite-fs is

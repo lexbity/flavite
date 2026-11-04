@@ -30,6 +30,7 @@ pub mod doctor;
 pub mod documents;
 pub mod event;
 pub mod flavite;
+pub mod graph_mirror;
 pub mod graph_projection;
 pub mod graph_service;
 pub mod recovery;

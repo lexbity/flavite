@@ -483,9 +483,12 @@ fn identity_relevance_short_circuit() {
         .unwrap();
     check_oracle(&index);
     let baseline = index.resolver_diagnostics();
-    let cursor = flavite_index::ChangeLogReader::new(index.writer().conn())
-        .current_cursor()
-        .unwrap();
+    let cursor = {
+        let tx = index.writer().conn().unchecked_transaction().unwrap();
+        let cursor = flavite_index::ChangeLogReader::current_cursor(&tx).unwrap();
+        tx.commit().unwrap();
+        cursor
+    };
 
     // Tags + properties only: same path, stem, aliases, id, no links.
     index

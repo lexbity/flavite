@@ -25,6 +25,26 @@ fn fresh_db() -> (NamedTempFile, Connection) {
     (temp, conn)
 }
 
+/// The consumer contract (§4.6): reads happen inside the consumer's own
+/// read transaction. These helpers model a well-behaved consumer.
+fn read_at(conn: &Connection, cursor: IndexVersion) -> Result<ChangeLogRead, String> {
+    let tx = conn.unchecked_transaction().unwrap();
+    let read = ChangeLogReader::read_since(&tx, cursor);
+    if read.is_ok() {
+        tx.commit().unwrap();
+    } else {
+        drop(tx);
+    }
+    read
+}
+
+fn cursor_at(conn: &Connection) -> IndexVersion {
+    let tx = conn.unchecked_transaction().unwrap();
+    let cursor = ChangeLogReader::current_cursor(&tx).unwrap();
+    tx.commit().unwrap();
+    cursor
+}
+
 /// Case 1: epoch mismatch must be a typed `Reset` — never an empty success.
 #[test]
 fn epoch_mismatch_returns_reset_not_empty_delta() {
@@ -35,12 +55,9 @@ fn epoch_mismatch_returns_reset_not_empty_delta() {
         ChangeLogWriter::record(&tx, 1, ChangeKind::Note, 7).unwrap();
         tx.commit().unwrap();
     }
-    let reader = ChangeLogReader::new(&conn);
     // Even with rows present in the current epoch, a foreign-epoch cursor
     // is a reset instruction, not "no changes".
-    let read = reader
-        .read_since(IndexVersion::new(99, 1))
-        .expect("typed reset is not an error");
+    let read = read_at(&conn, IndexVersion::new(99, 1)).expect("typed reset is not an error");
     assert_eq!(
         read,
         ChangeLogRead::Reset {
@@ -55,9 +72,7 @@ fn floor_overrun_returns_reset() {
     let (_temp, conn) = fresh_db();
     set_meta(&conn, MetaKey::Generation, "5").unwrap();
     set_meta(&conn, MetaKey::LogFloor, "3").unwrap();
-    let read = ChangeLogReader::new(&conn)
-        .read_since(IndexVersion::new(1, 2))
-        .unwrap();
+    let read = read_at(&conn, IndexVersion::new(1, 2)).unwrap();
     assert_eq!(
         read,
         ChangeLogRead::Reset {
@@ -71,8 +86,7 @@ fn floor_overrun_returns_reset() {
 fn future_cursor_is_an_error() {
     let (_temp, conn) = fresh_db();
     set_meta(&conn, MetaKey::Generation, "1").unwrap();
-    let error = ChangeLogReader::new(&conn)
-        .read_since(IndexVersion::new(1, 7))
+    let error = read_at(&conn, IndexVersion::new(1, 7))
         .expect_err("a future cursor must not read as a delta or reset");
     assert!(
         error.contains("cursor from the future"),
@@ -118,9 +132,7 @@ fn note_and_outgoing_same_id_coexist() {
         .unwrap();
     assert_eq!(count, 2);
     tx.commit().unwrap();
-    let read = ChangeLogReader::new(&conn)
-        .read_since(IndexVersion::new(1, 0))
-        .unwrap();
+    let read = read_at(&conn, IndexVersion::new(1, 0)).unwrap();
     match read {
         ChangeLogRead::Delta { records, to } => {
             assert_eq!(
@@ -144,14 +156,13 @@ fn rows_are_invisible_until_the_writer_commits() {
     let path = temp.path().to_path_buf();
     let mut writer = open_or_init(&path).unwrap();
     let reader_conn = Connection::open(&path).unwrap();
-    let reader = ChangeLogReader::new(&reader_conn);
-    let cursor = reader.current_cursor().unwrap();
+    let cursor = cursor_at(&reader_conn);
     assert_eq!(cursor, IndexVersion::new(1, 0));
     {
         let tx = writer.transaction().unwrap();
         set_meta(&tx, MetaKey::Generation, "1").unwrap();
         ChangeLogWriter::record(&tx, 1, ChangeKind::Note, 42).unwrap();
-        let pending = reader.read_since(cursor).unwrap();
+        let pending = read_at(&reader_conn, cursor).unwrap();
         assert_eq!(
             pending,
             ChangeLogRead::Delta {
@@ -162,7 +173,7 @@ fn rows_are_invisible_until_the_writer_commits() {
         );
         tx.commit().unwrap();
     }
-    let after = reader.read_since(cursor).unwrap();
+    let after = read_at(&reader_conn, cursor).unwrap();
     match after {
         ChangeLogRead::Delta { records, to } => {
             assert_eq!(
@@ -218,14 +229,10 @@ fn deleted_note_flip_logs_the_inbound_source() {
         "B's link must target A before the delete"
     );
 
-    let cursor = ChangeLogReader::new(actor.writer().conn())
-        .current_cursor()
-        .unwrap();
+    let cursor = cursor_at(actor.writer().conn());
     assert!(actor.remove_note_path(b"a.md").unwrap());
 
-    let read = ChangeLogReader::new(actor.writer().conn())
-        .read_since(cursor)
-        .unwrap();
+    let read = read_at(actor.writer().conn(), cursor).unwrap();
     let ChangeLogRead::Delta { records, to } = read else {
         panic!("a delete on the current epoch is a delta, not a reset");
     };
@@ -299,9 +306,7 @@ fn prune_honors_min_log_retention() {
     assert_eq!(u64::try_from(retained).unwrap(), MIN_LOG_RETENTION + 1);
 
     // A below-floor cursor is now a typed reset through the real reader.
-    let read = ChangeLogReader::new(&conn)
-        .read_since(IndexVersion::new(1, floor - 1))
-        .unwrap();
+    let read = read_at(&conn, IndexVersion::new(1, floor - 1)).unwrap();
     assert_eq!(
         read,
         ChangeLogRead::Reset {
