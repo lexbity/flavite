@@ -86,6 +86,14 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const MAX_PENDING_SAVE_OPERATIONS: usize = 4096;
+/// Per-buffer journal memo cap (C1). Entries are keyed `(txn_id, item_id)`
+/// inside the buffer's own memo: total memo memory is bounded by
+/// `open_buffers × JOURNAL_MEMO_CAP × entry`, roughly ≤ 800 KiB per open
+/// buffer (NFR-1) instead of the unbounded process-lifetime growth of the
+/// former global maps. Eviction is FIFO by insertion order; a replayed
+/// patch after eviction re-derives safely through the actor's revision
+/// guard (proven by the S5 replay test).
+const JOURNAL_MEMO_CAP: usize = 4096;
 /// Bounded pending cold opens (RFC-0003 §12.1: pending opens ≤128).
 const MAX_PENDING_OPEN_NOTES: usize = 128;
 /// Concurrent cold-open read flights (RFC-0003 §12.1).
@@ -490,6 +498,63 @@ type RenameFlight = (
     crossbeam::channel::Receiver<crate::actor::VaultActorResp>,
 );
 
+/// Per-buffer journal memo (C1). Lives exactly as long as the buffer:
+/// created on first tracked journal interaction, removed by `close_note`,
+/// FIFO-capped at `JOURNAL_MEMO_CAP` keys as a safety net.
+#[derive(Debug, Default)]
+struct BufferJournalMemo {
+    /// Outcome of each journaled patch already applied to this buffer.
+    applied: HashMap<(String, u64), Result<u64, String>>,
+    /// Insertion order of keys held by either substructure below. One
+    /// deque orders both: FIFO eviction of the front key removes it from
+    /// whichever substructure still holds it, so `cancelled` retention is
+    /// bounded too and never outlives the buffer (FR-3).
+    order: VecDeque<(String, u64)>,
+    /// Journal items cancelled by undo on this buffer (redo must refuse).
+    cancelled: HashSet<(String, u64)>,
+}
+
+impl BufferJournalMemo {
+    /// Make room for one fresh key: evict oldest-first until under the cap.
+    fn make_room(&mut self) {
+        while self.order.len() >= JOURNAL_MEMO_CAP {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.applied.remove(&oldest);
+            self.cancelled.remove(&oldest);
+        }
+    }
+
+    /// Record a patch outcome for this buffer. Updating a key that already
+    /// has a slot keeps the slot (no re-ordering, no growth).
+    fn memoize_applied(&mut self, key: (String, u64), result: Result<u64, String>) {
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            self.applied.entry(key.clone())
+        {
+            *entry.get_mut() = result;
+            return;
+        }
+        if !self.cancelled.contains(&key) {
+            self.make_room();
+            self.order.push_back(key.clone());
+        }
+        self.applied.insert(key, result);
+    }
+
+    /// Record an undo-driven cancel for this buffer (redo refuses).
+    fn memoize_cancelled(&mut self, key: (String, u64)) {
+        if self.cancelled.contains(&key) {
+            return;
+        }
+        if !self.applied.contains_key(&key) {
+            self.make_room();
+            self.order.push_back(key.clone());
+        }
+        self.cancelled.insert(key);
+    }
+}
+
 /// Downcast a panic payload through the `&str` / `String` chain with a
 /// debug-format backstop, for containment logging and events.
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -568,8 +633,12 @@ pub struct Session {
     open_jobs: Option<crossbeam::channel::Sender<OpenJob>>,
     /// Completed reads awaiting installation on a Session turn.
     open_results: crossbeam::channel::Receiver<OpenRead>,
-    journal_applied: Mutex<HashMap<(String, u64), Result<u64, String>>>,
-    cancelled_journal_items: Mutex<HashSet<(String, u64)>>,
+    /// Per-buffer journal memos (C1): merged replacement of the former
+    /// ownerless global maps. Keyed by
+    /// `BufferId` so the memo's lifetime is provably the buffer's —
+    /// removed whole by `close_note`, FIFO-capped per buffer at
+    /// `JOURNAL_MEMO_CAP`.
+    journal_memos: Mutex<HashMap<BufferId, BufferJournalMemo>>,
     /// Lossless terminal results. Admission is bounded by the pending-save cap.
     completions: Mutex<VecDeque<OperationCompletion>>,
     /// Pulse channel.
@@ -807,8 +876,7 @@ impl Session {
             save_flights: Mutex::new(HashMap::new()),
             reconcile_flights: Mutex::new(HashMap::new()),
             rename_flights: Mutex::new(HashMap::new()),
-            journal_applied: Mutex::new(HashMap::new()),
-            cancelled_journal_items: Mutex::new(HashSet::new()),
+            journal_memos: Mutex::new(HashMap::new()),
             completions: Mutex::new(VecDeque::new()),
             pulse,
             notice,
@@ -1165,22 +1233,47 @@ impl Session {
     fn pump_buffer_patch_requests(&self) {
         while let Ok(request) = self.actor_buffer_patches.try_recv() {
             let key = (request.txn_id.clone(), request.item_id);
-            if let Some(result) = self.journal_applied.lock_recovering().get(&key).cloned() {
-                let _ = request.reply.send(result);
-                continue;
-            }
-            let result = self.apply_buffer_patch(&request);
-            if let Ok(revision) = result {
-                self.journal_applied
-                    .lock_recovering()
-                    .insert(key, Ok(revision));
-            } else {
-                self.journal_applied
-                    .lock_recovering()
-                    .insert(key, result.clone());
-            }
+            let buffer_id = BufferId::from(request.buffer_id);
+            // One lock on the memoized path (the former code took three).
+            let memoized = self
+                .journal_memos
+                .lock_recovering()
+                .entry(buffer_id)
+                .or_default()
+                .applied
+                .get(&key)
+                .cloned();
+            let result = match memoized {
+                // FR-2: replay the recorded outcome without re-applying.
+                Some(result) => result,
+                None => {
+                    let result = self.apply_buffer_patch(&request);
+                    self.memo_insert(buffer_id, key, result.clone());
+                    result
+                }
+            };
             let _ = request.reply.send(result);
         }
+    }
+
+    /// Record a patch outcome into the buffer's memo, FIFO-evicting at
+    /// `JOURNAL_MEMO_CAP` (C1).
+    fn memo_insert(&self, buffer_id: BufferId, key: (String, u64), result: Result<u64, String>) {
+        self.journal_memos
+            .lock_recovering()
+            .entry(buffer_id)
+            .or_default()
+            .memoize_applied(key, result);
+    }
+
+    /// Record an undo-driven journal cancel into the buffer's memo; redo
+    /// consults the same per-buffer scope.
+    fn memo_cancel(&self, buffer_id: BufferId, key: (String, u64)) {
+        self.journal_memos
+            .lock_recovering()
+            .entry(buffer_id)
+            .or_default()
+            .memoize_cancelled(key);
     }
 
     fn apply_buffer_patch(
@@ -2402,6 +2495,10 @@ impl Session {
             self.shared_snapshots.lock_recovering().remove(&_buffer_id);
 
             self.absent_on_open.lock_recovering().remove(&path);
+            // The buffer's journal memo dies with the buffer (C1): a
+            // re-opened buffer (new id) starts cold, and the close tier
+            // keeps total memo memory bounded by open buffers.
+            self.journal_memos.lock_recovering().remove(&_buffer_id);
 
             SessionResult::Success(CommandResult::NoteClosed)
         } else {
@@ -2829,9 +2926,7 @@ impl Session {
                     {
                         return SessionResult::Error { message };
                     }
-                    self.cancelled_journal_items
-                        .lock_recovering()
-                        .insert((tag.txn_id, tag.item_id));
+                    self.memo_cancel(buffer_id, (tag.txn_id, tag.item_id));
                 }
                 SessionResult::Success(CommandResult::UndoPerformed {
                     buffer_id,
@@ -2862,15 +2957,21 @@ impl Session {
                     actual: buffer.revision(),
                 };
             }
-            if buffer
+            let cancelled_tags: Vec<(String, u64)> = buffer
                 .model()
                 .next_redo_ops()
                 .iter()
                 .filter_map(|op| op.journal.as_ref())
-                .any(|tag| {
-                    self.cancelled_journal_items
-                        .lock_recovering()
-                        .contains(&(tag.txn_id.clone(), tag.item_id))
+                .map(|tag| (tag.txn_id.clone(), tag.item_id))
+                .collect();
+            if self
+                .journal_memos
+                .lock_recovering()
+                .get(&buffer_id)
+                .is_some_and(|memo| {
+                    cancelled_tags
+                        .iter()
+                        .any(|key| memo.cancelled.contains(key))
                 })
             {
                 return SessionResult::Error {
@@ -4406,6 +4507,345 @@ mod tests {
             b"See [[note]] / [[note]] / [[other]]"
         );
         let _ = revision;
+    }
+
+    /// C1 scoping proof: a journal patch memo must never cross buffers.
+    /// Both requests carry the same `(txn_id, item_id)` (the global-memo
+    /// bug: the second buffer gets the first buffer's memoized reply and is
+    /// never patched). On the per-buffer memo each buffer patches itself.
+    #[test]
+    fn journal_memo_is_scoped_per_buffer() {
+        let (session, fs, _temp) = test_session();
+        let path_a = PathBuf::from("/test/vault/links-a.md");
+        let path_b = PathBuf::from("/test/vault/links-b.md");
+        fs.write_new(&path_a, b"See [[note]] and [[other]].")
+            .unwrap();
+        fs.write_new(&path_b, b"Ref [[note]] here.").unwrap();
+        let scan = session
+            .actor
+            .submit_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent)
+            .unwrap();
+        scan.recv_timeout(Duration::from_secs(2)).unwrap();
+        let a_id = match open_to_terminal(&session, path_a.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => buffer_id,
+            other => panic!("expected buffer A to open: {other:?}"),
+        };
+        let b_id = match open_to_terminal(&session, path_b.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => buffer_id,
+            other => panic!("expected buffer B to open: {other:?}"),
+        };
+
+        fn patch_state(
+            session: &Session,
+            buffer_id: flavite_buffer::revision::BufferId,
+        ) -> (u64, [u8; 32], String) {
+            let manager = session.buffer_manager.lock().unwrap();
+            let buffer = manager.get_buffer_by_id(buffer_id).unwrap();
+            (
+                buffer.revision().as_u64(),
+                *blake3::hash(buffer.base_bytes()).as_bytes(),
+                buffer.text().to_string(),
+            )
+        }
+        let request = |txn: &str,
+                       item: u64,
+                       buffer_id: flavite_buffer::revision::BufferId,
+                       expected: u64,
+                       hash: [u8; 32],
+                       _base: &str,
+                       patched: &str,
+                       recovery: &[u8]| {
+            let (reply, receipt) = crossbeam::channel::bounded(1);
+            (
+                crate::actor::ApplyBufferPatchRequest {
+                    txn_id: txn.to_owned(),
+                    item_id: item,
+                    kind: crate::journal::TransactionItemKind::Patch,
+                    buffer_id: buffer_id.as_u64(),
+                    expected_revision: expected,
+                    old_stem: "note".into(),
+                    new_stem: "renamed".into(),
+                    target_key: "note".into(),
+                    indexed_hash: hash,
+                    recovery_key: Some(recovery.to_vec()),
+                    new_base_bytes: patched.as_bytes().to_vec(),
+                    reply,
+                },
+                receipt,
+            )
+        };
+
+        let (rev_a, hash_a, _text_a) = patch_state(&session, a_id);
+        let (req_a, receipt_a) = request(
+            "memo-scope",
+            7,
+            a_id,
+            rev_a,
+            hash_a,
+            "See [[note]] and [[other]].",
+            "See [[renamed]] and [[other]].",
+            b"memo-scope-a",
+        );
+        session
+            .actor
+            .buffer_patch_sender_for_test()
+            .send(req_a)
+            .unwrap();
+        session.pump();
+        let reply_a = receipt_a.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(reply_a.is_ok(), "buffer A patch must succeed: {reply_a:?}");
+
+        // Same (txn_id, item_id), different buffer: must patch B itself.
+        let (rev_b, hash_b, _text_b) = patch_state(&session, b_id);
+        let (req_b, receipt_b) = request(
+            "memo-scope",
+            7,
+            b_id,
+            rev_b,
+            hash_b,
+            "Ref [[note]] here.",
+            "Ref [[renamed]] here.",
+            b"memo-scope-b",
+        );
+        session
+            .actor
+            .buffer_patch_sender_for_test()
+            .send(req_b)
+            .unwrap();
+        session.pump();
+        let reply_b = receipt_b.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(reply_b.is_ok(), "buffer B patch must succeed: {reply_b:?}");
+        assert_eq!(
+            patch_state(&session, b_id).2,
+            "Ref [[renamed]] here.",
+            "a shared (txn_id, item_id) key must not mask buffer B's patch"
+        );
+        assert_eq!(
+            patch_state(&session, a_id).2,
+            "See [[renamed]] and [[other]].",
+            "buffer A keeps its own patched text"
+        );
+    }
+
+    /// S5/Q1 proof obligation — decided by test, not by assumption. Before
+    /// eviction a replayed `(txn_id, item_id)` MUST return the memoized
+    /// outcome without re-applying (FR-2); after FIFO-cap eviction the
+    /// replay MUST go through the actor's revision guard and come back as
+    /// an honest error with text and revision untouched. This is what makes
+    /// the FIFO cap safe to ship; if the final leg failed, the Q1 fallback
+    /// (reject-and-log) would activate instead of trusting eviction.
+    #[test]
+    fn journaled_patch_replay_is_memoized_then_safe_after_eviction() {
+        let (session, fs, _temp) = test_session();
+        let path = PathBuf::from("/test/vault/links.md");
+        fs.write_new(&path, b"See [[note]] and [[other]].").unwrap();
+        let scan = session
+            .actor
+            .submit_reconcile(ReconcileScope::Full, ReconcileMode::VerifyContent)
+            .unwrap();
+        scan.recv_timeout(Duration::from_secs(2)).unwrap();
+        let buffer_id = match open_to_terminal(&session, path.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => buffer_id,
+            other => panic!("expected buffer to open: {other:?}"),
+        };
+
+        let state = |session: &Session| -> (u64, [u8; 32], String) {
+            let manager = session.buffer_manager.lock().unwrap();
+            let buffer = manager.get_buffer_by_id(buffer_id).unwrap();
+            (
+                buffer.revision().as_u64(),
+                *blake3::hash(buffer.base_bytes()).as_bytes(),
+                buffer.text().to_string(),
+            )
+        };
+
+        // Capture the pristine pre-patch expectation once; every request
+        // below carries it, exactly as a journal replay would.
+        let (rev0, hash0, _text0) = state(&session);
+        let make = || {
+            let (tx, receipt) = crossbeam::channel::bounded(1);
+            (
+                crate::actor::ApplyBufferPatchRequest {
+                    txn_id: "memo-proof".into(),
+                    item_id: 9,
+                    kind: crate::journal::TransactionItemKind::Patch,
+                    buffer_id: buffer_id.as_u64(),
+                    expected_revision: rev0,
+                    old_stem: "note".into(),
+                    new_stem: "renamed".into(),
+                    target_key: "note".into(),
+                    indexed_hash: hash0,
+                    recovery_key: Some(b"memo-proof".to_vec()),
+                    new_base_bytes: b"See [[renamed]] and [[other]].".to_vec(),
+                    reply: tx,
+                },
+                receipt,
+            )
+        };
+        let sender = session.actor.buffer_patch_sender_for_test();
+
+        // 1) First application goes through the real patch path.
+        let (req1, receipt1) = make();
+        sender.send(req1).unwrap();
+        session.pump();
+        let reply1 = receipt1.recv_timeout(Duration::from_secs(2)).unwrap();
+        let applied_revision = *reply1.as_ref().expect("first patch must succeed");
+        assert_eq!(state(&session).2, "See [[renamed]] and [[other]].");
+        assert_eq!(state(&session).0, applied_revision);
+
+        // 2) FR-2: identical key replays the memoized outcome without
+        //    re-applying. A re-apply here would hit the revision guard and
+        //    return Err — the identical Ok proves the memo answered.
+        for _ in 0..4 {
+            let (req, receipt) = make();
+            sender.send(req).unwrap();
+            session.pump();
+            let replay = receipt.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(replay, reply1, "replay must return the memoized outcome");
+        }
+        assert_eq!(state(&session).2, "See [[renamed]] and [[other]].");
+
+        // 3) Evict the recorded key via the FIFO cap: push exactly
+        //    JOURNAL_MEMO_CAP newer keys, the oldest (ours) must go, and the
+        //    memo must respect its bound throughout (NFR-1 invariant).
+        {
+            let mut memos = session.journal_memos.lock_recovering();
+            let memo = memos.entry(buffer_id).or_default();
+            for i in 0..JOURNAL_MEMO_CAP {
+                memo.memoize_applied((format!("evict-{i}"), i as u64), Ok(0));
+                assert!(memo.applied.len() <= JOURNAL_MEMO_CAP);
+                assert!(memo.order.len() <= JOURNAL_MEMO_CAP);
+            }
+            assert!(
+                !memo.applied.contains_key(&("memo-proof".to_string(), 9u64)),
+                "FIFO eviction must drop the oldest recorded key"
+            );
+        }
+
+        // 4) Post-eviction replay: memo cold, patch re-attempted against the
+        //    actor's revision guard — honest error, zero corruption, the
+        //    revision did not advance, and no duplicated text.
+        let (req3, receipt3) = make();
+        sender.send(req3).unwrap();
+        session.pump();
+        let after_eviction = receipt3.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            after_eviction.is_err(),
+            "evicted replay must not fabricate success: {after_eviction:?}"
+        );
+        let (rev_now, _, text_now) = state(&session);
+        assert_eq!(
+            text_now, "See [[renamed]] and [[other]].",
+            "no duplicated patch text"
+        );
+        assert_eq!(
+            rev_now, applied_revision,
+            "replay must not advance the revision"
+        );
+    }
+
+    /// NFR-1: per-buffer memo memory is bounded under sustained synthetic
+    /// load — `applied`, `cancelled`, and `order` never exceed the cap, the
+    /// newest entries survive, and buffers stay independent entries.
+    #[test]
+    fn memo_is_bounded_under_sustained_load() {
+        let (session, _fs, _temp) = test_session();
+        let hot = BufferId::new();
+        for i in 0..(2 * JOURNAL_MEMO_CAP) {
+            let key = (format!("txn-{i}"), i as u64);
+            session.memo_insert(hot, key.clone(), Ok(i as u64));
+            session.memo_cancel(hot, key);
+        }
+        let memos = session.journal_memos.lock_recovering();
+        let memo = memos.get(&hot).expect("hot buffer memo exists");
+        assert!(memo.order.len() <= JOURNAL_MEMO_CAP, "order cap");
+        assert!(
+            memo.applied.len() <= JOURNAL_MEMO_CAP,
+            "applied cap: {}",
+            memo.applied.len()
+        );
+        assert!(
+            memo.cancelled.len() <= JOURNAL_MEMO_CAP,
+            "cancelled cap: {}",
+            memo.cancelled.len()
+        );
+        let newest = (
+            format!("txn-{}", 2 * JOURNAL_MEMO_CAP - 1),
+            (2 * JOURNAL_MEMO_CAP - 1) as u64,
+        );
+        assert!(
+            memo.applied.contains_key(&newest),
+            "FIFO keeps newest entries"
+        );
+        let oldest = ("txn-0".to_string(), 0u64);
+        assert!(
+            !memo.applied.contains_key(&oldest) && !memo.cancelled.contains(&oldest),
+            "FIFO drops oldest from both substructures"
+        );
+    }
+
+    /// Close tier (exact): `close_note` removes the buffer's whole memo —
+    /// the memo's lifetime is now provably the buffer's lifetime (FR-1).
+    #[test]
+    fn close_note_clears_the_buffer_memo() {
+        let (session, _fs, _temp) = test_session();
+        let path = PathBuf::from("/test/vault/note.md");
+        let buffer_id = match open_to_terminal(&session, path.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened { buffer_id, .. }) => buffer_id,
+            other => panic!("expected buffer to open: {other:?}"),
+        };
+        session.memo_insert(buffer_id, ("txn-close".into(), 1), Ok(3));
+        session.memo_cancel(buffer_id, ("txn-close".into(), 2));
+        assert!(
+            session
+                .journal_memos
+                .lock_recovering()
+                .contains_key(&buffer_id)
+        );
+
+        let closed = session.execute(SessionCommand::CloseNote {
+            path: path.clone(),
+            retain_recovery: true,
+        });
+        assert!(
+            matches!(closed, SessionResult::Success(CommandResult::NoteClosed)),
+            "{closed:?}"
+        );
+        assert!(
+            session
+                .journal_memos
+                .lock_recovering()
+                .get(&buffer_id)
+                .is_none(),
+            "close_note must evict the buffer's journal memo (C1)"
+        );
+    }
+
+    /// Cancel scope is the buffer that undid, not the journal key's global
+    /// neighborhood: a cancel recorded on one buffer can never make another
+    /// buffer's redo refuse (the false-positive latent in the former
+    /// ownerless set).
+    #[test]
+    fn cancelled_entries_are_scoped_to_their_buffer() {
+        let (session, _fs, _temp) = test_session();
+        let a = BufferId::new();
+        let b = BufferId::new();
+        let key = ("txn-shared".to_string(), 3u64);
+
+        session.memo_cancel(a, key.clone());
+
+        let memos = session.journal_memos.lock_recovering();
+        assert!(
+            memos
+                .get(&a)
+                .is_some_and(|memo| memo.cancelled.contains(&key))
+        );
+        assert!(
+            memos
+                .get(&b)
+                .is_none_or(|memo| !memo.cancelled.contains(&key)),
+            "cancel must never cross buffers"
+        );
     }
 
     #[test]

@@ -320,6 +320,12 @@ pub struct VaultActorHandle {
     receiver: Receiver<VaultActorResp>,
     events: Receiver<VaultActorEvent>,
     buffer_patches: Receiver<ApplyBufferPatchRequest>,
+    /// Test-only clone of the Session-facing patch queue's sender, so
+    /// journal-bridge tests can replay an identical `ApplyBufferPatchRequest`
+    /// through the Session's real pump path (S5 proof obligations). Not part
+    /// of the production surface.
+    #[cfg(test)]
+    buffer_patch_sender: Sender<ApplyBufferPatchRequest>,
     drift_found_total: Arc<std::sync::atomic::AtomicU64>,
     autosave_failures_total: Arc<std::sync::atomic::AtomicU64>,
     rename_items_skipped_total: Arc<std::sync::atomic::AtomicU64>,
@@ -352,6 +358,14 @@ impl VaultActorHandle {
         self.buffer_patches.clone()
     }
 
+    /// Test-only handle to the Session-facing patch queue's sender, so
+    /// bridge tests can replay an identical `ApplyBufferPatchRequest`
+    /// through the real pump path. Mirrors the existing `Receiver` clone
+    /// seam above; not part of the production surface.
+    #[cfg(test)]
+    pub(crate) fn buffer_patch_sender_for_test(&self) -> Sender<ApplyBufferPatchRequest> {
+        self.buffer_patch_sender.clone()
+    }
     /// Request a throttled full verification after the host window gains focus.
     pub fn focus(&self) -> Result<(), VaultActorError> {
         self.try_send(VaultActorMsg::Focus)
@@ -932,6 +946,8 @@ impl VaultActor {
         let (resp_sender, resp_receiver) = unbounded();
         let (event_sender, event_receiver) = unbounded();
         let (buffer_patch_sender, buffer_patch_receiver) = bounded(64);
+        #[cfg(test)]
+        let patch_sender_for_handle = buffer_patch_sender.clone();
         let (startup_ready_sender, startup_ready) = bounded(1);
         let catalog = Arc::clone(&self.catalog);
         let drift_found_total = Arc::clone(&self.drift_found_total);
@@ -960,6 +976,8 @@ impl VaultActor {
             receiver: resp_receiver,
             events: event_receiver,
             buffer_patches: buffer_patch_receiver,
+            #[cfg(test)]
+            buffer_patch_sender: patch_sender_for_handle,
             drift_found_total,
             autosave_failures_total,
             rename_items_skipped_total,
