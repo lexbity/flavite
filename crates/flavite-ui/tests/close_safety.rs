@@ -40,7 +40,7 @@ struct Fixture {
     #[allow(dead_code)]
     cache: tempfile::TempDir,
     /// Held for the whole fixture lifetime: guards the process-global
-    /// `FLAVITE_DATA_DIR` redirection.
+    /// explicit data-dir redirection.
     _guard: MutexGuard<'static, ()>,
 }
 
@@ -48,11 +48,14 @@ fn fixture() -> Fixture {
     // SAFETY: every test holds `DATA_DIR_LOCK` from before this call until
     // the fixture (and the session that captured the directory) drops, so
     // no concurrent reader or writer of the variable exists.
+    // (S8/M3) The recovery store is now rooted by the explicit
+    // `with_data_dir` builder argument below, not by process-global
+    // environment state; the lock exists to keep the redirected-tempdir
+    // pattern of this file honest if any ambient default is ever consulted.
     let guard = DATA_DIR_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let data = tempfile::tempdir().expect("data tempdir");
-    unsafe { std::env::set_var("FLAVITE_DATA_DIR", data.path()) };
     let fs = Arc::new(MemFs::new());
     let root = PathBuf::from("/test/close-safety");
     fs.create_dir_all(&root).expect("vault root");
@@ -80,13 +83,14 @@ fn fixture() -> Fixture {
         autosave_idle_interval: Duration::from_secs(3600),
         ..VaultConfig::default()
     };
-    let session = Session::new(
+    let session = Session::new_with_data_dir(
         identity.clone(),
         actor,
         BufferManager::new(),
         channels.pulse,
         channels.notice,
         config.clone(),
+        Some(data.path().to_path_buf()),
     );
     let flavite = flavite_api::Flavite::open(identity, session, config).expect("facade");
     Fixture {

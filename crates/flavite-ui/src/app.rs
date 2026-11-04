@@ -2871,9 +2871,10 @@ impl App {
                     refresh_catalog = true;
                     // Saved content changed: previews and backlinks re-query.
                     self.contexts.invalidate_all();
-                    // The graph feed polls on a bounded cadence; the pulse
-                    // only wakes it early (§12.1 invalidation hints).
-                    flavite.graph_notify_changed();
+                    // The graph feed is event-driven; this pulse only
+                    // forces a re-evaluation pump for the scope-sensitive
+                    // parts of the projection (RFC-0005 FR-11).
+                    flavite.graph_reevaluate();
                 }
                 // S4: a contained vault-session panic is an operator-grade
                 // signal — warn on stderr (the crate's host-side channel,

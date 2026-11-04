@@ -14,7 +14,7 @@
 //! behind the API's `Fs` while the UI keeps only the in-memory codec and
 //! identity rules (TD-11).
 
-use crate::identity::get_data_dir;
+use crate::identity::resolve_data_dir;
 use flavite_fs::Fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -140,12 +140,30 @@ impl UserStateStore {
     /// exists; the host then reports device persistence as unavailable
     /// instead of failing silently.
     pub fn open(fs: Box<dyn Fs + Send + Sync>, vault_uuid: &str) -> Result<Self, UserStateError> {
-        let data = get_data_dir().ok_or_else(|| {
+        let data = resolve_data_dir(None).ok_or_else(|| {
             UserStateError::Unavailable("no OS data directory is available".into())
         })?;
         Ok(Self::at_root(
             fs,
             data.join("flavite").join("workspace").join(vault_uuid),
+        ))
+    }
+
+    /// Build a store rooted at an explicit data directory (S8/M3):
+    /// `<data>/flavite/workspace/<vault-uuid>`. Libraries never read the
+    /// environment; tests and binaries pass the resolved directory here.
+    ///
+    /// # Errors
+    /// Same `Unavailable` contract as [`UserStateStore::open`] when the OS
+    /// data directory is unavailable.
+    pub fn open_at(
+        fs: Box<dyn Fs + Send + Sync>,
+        data_dir: &Path,
+        vault_uuid: &str,
+    ) -> Result<Self, UserStateError> {
+        Ok(Self::at_root(
+            fs,
+            data_dir.join("flavite").join("workspace").join(vault_uuid),
         ))
     }
 
@@ -162,10 +180,19 @@ impl UserStateStore {
     /// Returns [`UserStateError::Unavailable`] when no OS data directory
     /// exists.
     pub fn open_app_scope(fs: Box<dyn Fs + Send + Sync>) -> Result<Self, UserStateError> {
-        let data = get_data_dir().ok_or_else(|| {
+        let data = resolve_data_dir(None).ok_or_else(|| {
             UserStateError::Unavailable("no OS data directory is available".into())
         })?;
         Ok(Self::at_root(fs, data.join("flavite").join("app")))
+    }
+
+    /// Build the device-wide app-scope store at an explicit data directory
+    /// (S8/M3): `<data>/flavite/app`.
+    pub fn open_app_scope_at(
+        fs: Box<dyn Fs + Send + Sync>,
+        data_dir: &Path,
+    ) -> Result<Self, UserStateError> {
+        Ok(Self::at_root(fs, data_dir.join("flavite").join("app")))
     }
 
     /// The fixed file path for one kind.

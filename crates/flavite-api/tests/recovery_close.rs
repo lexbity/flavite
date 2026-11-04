@@ -3,7 +3,7 @@
 //!
 //! Durability semantics cannot be observed on `MemFs`: retained recovery
 //! copies live in the OS data directory (redirected here to a per-test
-//! tempdir through `FLAVITE_DATA_DIR`) and must survive buffer close,
+//! tempdir through the explicit data-dir builder argument) and must survive buffer close,
 //! process-style crash simulation, and vault reopen. Every test builds a
 //! real `OsFs` stack through `Flavite::open_root` and drives the typed API
 //! commands (`note.close`, `recovery.flush`, `recovery.restore`,
@@ -39,7 +39,7 @@ struct Fixture {
 /// The stack is assembled manually (actor + Session + facade over `OsFs`)
 /// so the vault needs no registry, lock, or IPC state in any data
 /// directory; the recovery store itself is real and lives under
-/// `FLAVITE_DATA_DIR`.
+/// the explicit data-dir builder argument.
 #[must_use]
 fn fixture(notes: &[(&str, &str)]) -> Fixture {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -54,10 +54,6 @@ fn fixture(notes: &[(&str, &str)]) -> Fixture {
     }
     let data = temp.path().join("data");
     std::fs::create_dir_all(&data).expect("data dir");
-    // SAFETY: every test in this binary holds `DATA_DIR_LOCK` from before
-    // this call until every session that captured the directory is dropped,
-    // so no other thread reads or writes the variable concurrently.
-    unsafe { std::env::set_var("FLAVITE_DATA_DIR", &data) };
     let cache = temp.path().join("cache");
     std::fs::create_dir_all(&cache).expect("cache dir");
     let db = cache.join("index.sqlite3");
@@ -77,13 +73,14 @@ fn fixture(notes: &[(&str, &str)]) -> Fixture {
         autosave_idle_interval: Duration::from_secs(3600),
         ..VaultConfig::default()
     };
-    let session = Session::new(
+    let session = Session::new_with_data_dir(
         identity.clone(),
         actor,
         flavite_buffer::manager::BufferManager::new(),
         channels.pulse,
         channels.notice,
         config.clone(),
+        Some(data),
     );
     let mut flavite = Flavite::open(identity, session, config).expect("facade");
     flavite.set_graph_db_path_for_test(db);
@@ -610,8 +607,6 @@ mod fault_injected {
         let temp = tempfile::tempdir().expect("tempdir");
         let data = temp.path().join("data");
         std::fs::create_dir_all(&data).expect("data dir");
-        // SAFETY: `DATA_DIR_LOCK` is held for the whole test body.
-        unsafe { std::env::set_var("FLAVITE_DATA_DIR", &data) };
         let cache = temp.path().join("cache");
         std::fs::create_dir_all(&cache).expect("cache dir");
         let db = cache.join("graph.sqlite3");
@@ -653,13 +648,14 @@ mod fault_injected {
         let channels = ChannelSet::new();
         let mut config = VaultConfig::default();
         config.autosave_idle_interval = Duration::from_secs(3600);
-        let session = Session::new(
+        let session = Session::new_with_data_dir(
             identity.clone(),
             actor,
             flavite_buffer::manager::BufferManager::new(),
             channels.pulse,
             channels.notice,
             config.clone(),
+            Some(data),
         );
         let mut flavite = Flavite::open(identity.clone(), session, config).expect("facade");
         flavite.set_graph_db_path_for_test(db.clone());
@@ -727,13 +723,14 @@ mod fault_injected {
         let channels = ChannelSet::new();
         let mut config = VaultConfig::default();
         config.autosave_idle_interval = Duration::from_secs(3600);
-        let session = Session::new(
+        let session = Session::new_with_data_dir(
             identity.clone(),
             actor,
             flavite_buffer::manager::BufferManager::new(),
             channels.pulse,
             channels.notice,
             config.clone(),
+            Some(data),
         );
         let mut flavite = Flavite::open(identity, session, config).expect("facade reopens");
         flavite.set_graph_db_path_for_test(db);

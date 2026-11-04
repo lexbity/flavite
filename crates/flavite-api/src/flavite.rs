@@ -654,11 +654,38 @@ impl Flavite {
     /// commit sites (FR-1) — and the watch is held by the graph service's
     /// constructor seam.
     pub fn open_root(root: PathBuf, config: VaultConfig) -> Result<Self, FlaviteError> {
+        Self::open_root_with_data_dir_and_signal(root, config, None)
+    }
+
+    /// Open a vault root with an explicit OS data directory (S8/M3); see
+    /// [`Flavite::open_root`] and `flavite_vault::open::Vault::open_with_data_dir`.
+    /// Freshness rides the graph service's sweep (no generation broadcast).
+    pub fn open_root_with_data_dir(
+        root: PathBuf,
+        config: VaultConfig,
+        data_dir: Option<PathBuf>,
+    ) -> Result<Self, FlaviteError> {
+        Self::open_root_with_data_dir_and_signal(root, config, data_dir)
+    }
+
+    /// Open a vault root with an explicit OS data directory *and* the
+    /// writer-side generation broadcast (RFC-0005 S1 + S8/M3 union). The
+    /// broadcast is constructed here (the only place owning both sides):
+    /// the sender is handed into the vault's index actor — every committed
+    /// structural generation publishes from the apply spine's commit sites
+    /// (FR-1) — and the watch is held by the graph service's constructor
+    /// seam.
+    pub fn open_root_with_data_dir_and_signal(
+        root: PathBuf,
+        config: VaultConfig,
+        data_dir: Option<PathBuf>,
+    ) -> Result<Self, FlaviteError> {
         let (generation_signal, generation_watch) = flavite_index::GenerationSignal::new();
-        let vault = Vault::open_with_generation_signal(
+        let vault = Vault::open_with_data_dir_and_generation_signal(
             root,
             Box::new(flavite_fs::OsFs::new()),
             config.clone(),
+            data_dir,
             generation_signal,
         )
         .map_err(|error| FlaviteError::VaultOpenError(error.to_string()))?;

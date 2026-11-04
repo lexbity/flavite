@@ -26,28 +26,83 @@ or your vault.
 - **Local and private** — no network, no accounts, no telemetry. Layouts and
   preferences stay on the device.
 
+See [docs/APP-FEATURES.md](docs/APP-FEATURES.md) for the full feature guide,
+including every keyboard shortcut.
+
+## Two binaries, one codebase
+
+| Binary | Crate | What it is |
+|---|---|---|
+| `flavite` | `crates/flavite-app` | The desktop app (iced/winit GUI). Requires a display server. |
+| `flavite-cli` | `crates/flavite-cli` | Headless vault access: open, init, doctor, query, search, rename, info. No GPU or display needed. |
+
+There is also a demo example (`cargo build -p flavite-ui --example app-demo`)
+that runs the same UI without CLI parsing; it exists for visual testing, not
+daily use.
+
 ## Quick start
 
-Prerequisites: Rust toolchain (see `rust-toolchain.toml`), plus `just`.
+Prerequisites: Rust toolchain (pinned in `rust-toolchain.toml`; rustup picks
+it up automatically) and [`just`](https://github.com/casey/just).
 
 ```sh
 git clone https://github.com/lexbity/flavite
 cd flavite
-cargo build -p flavite-ui --example app-demo
-FLAVITE_VAULT=/path/to/your/vault ./target/debug/examples/app-demo
+
+# Build the desktop app and the CLI
+cargo build -p flavite-app -p flavite-cli
+
+# Run the desktop app on a folder of Markdown notes
+FLAVITE_VAULT=/path/to/your/vault ./target/debug/flavite
+# …or just run it and pick a vault folder on the start screen
+./target/debug/flavite
+
+# Headless: initialize a vault, check its health
+./target/debug/flavite-cli init --path /path/to/your/vault
+./target/debug/flavite-cli doctor --path /path/to/your/vault
 ```
 
-The demo binary opens the vault directory named by the `FLAVITE_VAULT`
-environment variable (the legacy `LATTICE_VAULT` name is deprecated). It never
-seeds sample content; point it at an existing folder of Markdown files to try
-it on real notes.
+Flavite never seeds sample content; point it at an existing folder of Markdown
+files (or an empty folder — it is adopted as a vault on first open). Full
+setup instructions, platform notes, and troubleshooting:
+[docs/SETUP.md](docs/SETUP.md).
 
-For the full check suite:
+## Querying
+
+`flavite-cli query` and `flavite-cli search` accept a query expression:
 
 ```sh
-just gate          # fmt + clippy + tests + arch + fault tests
-just workspace-gate W09
+flavite-cli query "tag:rust AND NOT unresolved" --path /path/to/vault
+flavite-cli search "zettelkasten" --path /path/to/vault
 ```
+
+The expression language (`tag:`, `text:`, `unresolved`, `AND`/`OR`/`NOT`,
+quoting, parentheses) is documented in [docs/QueryLanguage.md](docs/QueryLanguage.md).
+CLI commands and flags: [docs/CLI-FEATURES.md](docs/CLI-FEATURES.md).
+
+## Data locations
+
+Notes stay wherever your vault folder is. Device-local state lives outside the
+vault:
+
+- Workspace layouts / UI preferences: OS data dir under
+  `flavite/workspace/<vault-uuid>/` (`workspace-layouts.json`,
+  `device-preferences.json`), versioned with last-good backups. Override the
+  base directory with `FLAVITE_DATA_DIR`.
+- App-scope state (remembered last vault): `flavite/app/app-launch.json`
+  under the OS data dir.
+- Vault-local user state: `<vault>/.flavite/` — `vault.toml` identity,
+  `graph.json` graph pins, `journal/` recovery journal.
+- Note saves are atomic (temp sibling file, then replace); recovery uses the
+  core journal/safety contracts. Resetting a layout never touches notes.
+
+## Development
+
+- `just setup` — first command after clone: installs components, nightly,
+  cargo tools, and the pre-push hook.
+- `just gate` — fmt + clippy + tests + arch check (≤ 5 min budget).
+- `just ci-gate` — the full CI-level gate (coverage, docs, deny/audit,
+  fuzz smoke, network-denied, MSRV).
 
 Visual (Linux) checks require Xvfb and friends:
 
@@ -56,15 +111,7 @@ just ui-visual-setup
 just workspace-visual read-structure
 ```
 
-## Data locations
-
-- Workspace layouts / UI preferences: OS data dir under
-  `flavite/vaults/<vault-uuid>/ui/` (versioned, with backups).
-- Graph pins: `<vault>/.flavite/graph.json`.
-- Recovery uses the core journal/safety contracts; resetting a layout never
-  touches notes.
-
-## Project layout
+### Project layout
 
 - `crates/flavite-ui` — desktop shell, views, host adapters.
 - `crates/flavite-workspace` — pure layout/context model (IO-free).

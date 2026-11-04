@@ -16,7 +16,7 @@ fn wait(
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         f.flavite.pump();
-        f.flavite.graph_notify_changed();
+        f.flavite.graph_reevaluate();
         if let Some(frame) = f
             .flavite
             .graph_frame()

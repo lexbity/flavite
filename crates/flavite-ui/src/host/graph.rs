@@ -1380,7 +1380,7 @@ pub fn command(app: &mut App, tab: TabId, command: GraphCommand) {
         GraphCommand::RetryService => {
             if let Some(flavite) = app.flavite.as_ref() {
                 flavite.graph_relayout();
-                flavite.graph_notify_changed();
+                flavite.graph_reevaluate();
             }
             app.status = "Graph service retried".into();
         }

@@ -99,7 +99,6 @@ impl OccurrenceSet {
     }
 
     /// Saved occurrences minus dirty sources, then the overlay runs.
-    #[must_use]
     pub fn iter(&self) -> impl Iterator<Item = &LinkOccurrence> {
         self.saved
             .iter()
@@ -403,19 +402,19 @@ pub(crate) fn build(
     let needs_metadata = requests
         .values()
         .any(|request| predicate_needs_metadata(&request.scope.predicate));
-    let merged_metadata = if needs_metadata && (!dirty_metadata.is_empty() || !removed_metadata.is_empty())
-    {
-        let mut merged = (*metadata).clone();
-        for id in &removed_metadata {
-            merged.remove(id);
-        }
-        for (id, note_metadata) in &dirty_metadata {
-            merged.insert(*id, note_metadata.clone());
-        }
-        Some(merged)
-    } else {
-        None
-    };
+    let merged_metadata =
+        if needs_metadata && (!dirty_metadata.is_empty() || !removed_metadata.is_empty()) {
+            let mut merged = (*metadata).clone();
+            for id in &removed_metadata {
+                merged.remove(id);
+            }
+            for (id, note_metadata) in &dirty_metadata {
+                merged.insert(*id, note_metadata.clone());
+            }
+            Some(merged)
+        } else {
+            None
+        };
     let eval_metadata = merged_metadata.as_ref().unwrap_or(metadata.as_ref());
     for (tab, request) in requests {
         let result = (|| {
@@ -426,13 +425,9 @@ pub(crate) fn build(
                 session,
                 &mut queries,
             )?;
-            let mut result = flavite_graph::scope::evaluate(
-                &effective,
-                eval_metadata,
-                &queries,
-                &request.scope,
-            )
-            .map_err(str::to_owned)?;
+            let mut result =
+                flavite_graph::scope::evaluate(&effective, eval_metadata, &queries, &request.scope)
+                    .map_err(str::to_owned)?;
             result.total_base_notes = saved
                 .nodes
                 .iter()

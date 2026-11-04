@@ -55,8 +55,8 @@ use flavite_graph::{
     GraphPublisher, LayoutCommand, LayoutWorker, LayoutWorkerConfig, NodeId, PositionBuffer,
     RenderKey,
 };
-use flavite_index::types::IndexVersion;
 use flavite_index::GenerationWatch;
+use flavite_index::types::IndexVersion;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::graph_mirror::{GraphMirror, MirrorStats, ParityOutcome, ParityPolicy, Synchronize};
@@ -210,7 +210,31 @@ pub struct GraphServiceMetrics {
     pub mirror_snapshots_built_total: u64,
 }
 
-#[derive(Debug)]
+impl std::fmt::Debug for Shared {
+    /// Hand-rolled: the injected clock closure is not `Debug` (its
+    /// presence/absence is all diagnostics ever need).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared")
+            .field("frame", &self.frame.load())
+            .field("status", &self.status)
+            .field("counters", &self.counters)
+            .field("scopes", &self.scopes)
+            .field("retry_layout", &self.retry_layout)
+            .field("mirror", &self.mirror)
+            .field("index_watch", &self.index_watch)
+            .field("buffer_watch", &self.buffer_watch)
+            .field(
+                "mirror_cursor",
+                &(
+                    self.mirror_epoch.load(Ordering::Relaxed),
+                    self.mirror_generation.load(Ordering::Relaxed),
+                ),
+            )
+            .field("clock", &self.clock.is_some())
+            .finish()
+    }
+}
+
 struct Shared {
     frame: ArcSwapOption<GraphFrame>,
     status: std::sync::Mutex<GraphServiceStatus>,
@@ -324,7 +348,14 @@ impl GraphService {
         session: Option<Arc<Session>>,
         index_watch: Option<Arc<GenerationWatch>>,
     ) -> Arc<Self> {
-        Self::start_with_policy(db_path, session, ParityPolicy::default(), index_watch, None, None)
+        Self::start_with_policy(
+            db_path,
+            session,
+            ParityPolicy::default(),
+            index_watch,
+            None,
+            None,
+        )
     }
 
     /// Test/bench seam: same service with a tightened mirror drift guard
@@ -351,7 +382,14 @@ impl GraphService {
         buffer_watch: Option<Arc<BufferWatch>>,
         clock: Option<Arc<dyn Fn() -> std::time::Instant + Send + Sync>>,
     ) -> Arc<Self> {
-        Self::start_with_policy(db_path, session, ParityPolicy::default(), index_watch, buffer_watch, clock)
+        Self::start_with_policy(
+            db_path,
+            session,
+            ParityPolicy::default(),
+            index_watch,
+            buffer_watch,
+            clock,
+        )
     }
 
     fn start_with_policy(
@@ -514,14 +552,6 @@ impl GraphService {
     pub fn relayout(&self) {
         self.shared.retry_layout.store(true, Ordering::Release);
         let _ = self.hints.try_send(Directive::Relayout);
-    }
-
-    /// The service's time source (tests inject a fake clock).
-    fn now(&self) -> std::time::Instant {
-        match &self.shared.clock {
-            Some(clock) => clock(),
-            None => std::time::Instant::now(),
-        }
     }
 
     /// The database path this service reads (diagnostics only; no handle
@@ -811,7 +841,9 @@ fn run_service_attempt(
                     // Record the post-synchronize cursor: the FR-3 skip
                     // compares future wake watermarks against it without
                     // locking the mirror again.
-                    shared.mirror_epoch.store(mirror.cursor().epoch, Ordering::Release);
+                    shared
+                        .mirror_epoch
+                        .store(mirror.cursor().epoch, Ordering::Release);
                     shared
                         .mirror_generation
                         .store(mirror.cursor().generation, Ordering::Release);
@@ -1263,6 +1295,13 @@ impl Flavite {
     /// (worker-panic recovery and the graph view's Retry control).
     pub fn graph_relayout(&self) {
         self.graph.relayout();
+    }
+
+    /// Force the graph service to re-evaluate now (scope changes, test and
+    /// doctor kicks). Never skip-able — scope changes alter output at an
+    /// unchanged index version.
+    pub fn graph_reevaluate(&self) {
+        self.graph.reevaluate();
     }
 
     /// Read the vault's graph-pins document (W07/TD-11).

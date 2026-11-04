@@ -105,15 +105,23 @@ pub enum IdentityError {
 /// Type alias for identity results.
 pub type IdentityResult<T> = Result<T, IdentityError>;
 
-/// Get the OS data directory for Flavite.
-pub fn get_data_dir() -> Option<PathBuf> {
-    // Operational override for isolated runs (visual scenarios, tests):
-    // when set, it replaces the platform data directory entirely.
-    if let Some(override_dir) = std::env::var_os("FLAVITE_DATA_DIR") {
-        let path = PathBuf::from(override_dir);
+/// Resolve the OS data directory for Flavite.
+///
+/// Explicit plumbing (M3): libraries NEVER read the environment. The binary
+/// boundary (`flavite-app` / `flavite-cli`) resolves the data-directory
+/// override before spawning threads and passes it in explicitly. When
+/// `explicit` is `None`, the platform default from `ProjectDirs` is used —
+/// the former environment branch is deleted, so this crate holds no
+/// environment read at all.
+///
+/// The explicit path must be absolute; relative overrides are rejected
+/// (the same validation the former environment branch applied).
+pub fn resolve_data_dir(explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = explicit {
         if path.is_absolute() {
-            return Some(path);
+            return Some(path.to_path_buf());
         }
+        return None;
     }
     ProjectDirs::from("com", "flavite", "Flavite").map(|p| p.data_dir().to_path_buf())
 }
@@ -133,7 +141,7 @@ fn registry_path_in(data_dir: &Path, root_key: &[u8]) -> PathBuf {
 
 /// Get the path to the root ownership guard.
 pub fn root_guard_path(root_key: &[u8]) -> Option<PathBuf> {
-    get_data_dir().map(|data_dir| root_guard_path_in(&data_dir, root_key))
+    resolve_data_dir(None).map(|data_dir| root_guard_path_in(&data_dir, root_key))
 }
 
 fn root_guard_path_in(data_dir: &Path, root_key: &[u8]) -> PathBuf {
@@ -145,7 +153,7 @@ fn root_guard_path_in(data_dir: &Path, root_key: &[u8]) -> PathBuf {
 
 /// Get the path to the UUID instance lock.
 pub fn uuid_lock_path(uuid: Uuid) -> Option<PathBuf> {
-    get_data_dir().map(|data_dir| uuid_lock_path_in(&data_dir, uuid))
+    resolve_data_dir(None).map(|data_dir| uuid_lock_path_in(&data_dir, uuid))
 }
 
 fn uuid_lock_path_in(data_dir: &Path, uuid: Uuid) -> PathBuf {
@@ -435,7 +443,7 @@ impl IdentityManager {
     /// 5. Acquire the UUID lock
     /// 6. Verify and persist identity/binding
     pub fn open(fs: &dyn Fs, root: PathBuf) -> IdentityResult<Self> {
-        let data_dir = get_data_dir().ok_or(IdentityError::NoProjectDirs)?;
+        let data_dir = resolve_data_dir(None).ok_or(IdentityError::NoProjectDirs)?;
         Self::open_in_data_dir(fs, root, &data_dir)
     }
 

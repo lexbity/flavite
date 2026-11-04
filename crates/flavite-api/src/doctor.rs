@@ -1318,7 +1318,7 @@ mod tests {
             {
                 break;
             }
-            service.notify_changed();
+            service.reevaluate();
             assert!(
                 std::time::Instant::now() < deadline,
                 "graph service did not catch up: {:?}",

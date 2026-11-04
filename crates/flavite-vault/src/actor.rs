@@ -771,6 +771,9 @@ pub struct VaultActor {
     index: IndexActor,
     /// Content-addressed local safety history.
     history: Option<HistoryStore>,
+    /// Explicit OS data directory (S8/M3); `None` = resolved platform
+    /// default. Used to root lazy history/recovery stores.
+    data_dir: Option<PathBuf>,
     /// Current index version reported to session clients.
     epoch: Epoch,
     generation: Generation,
@@ -904,6 +907,7 @@ impl VaultActor {
             identity,
             index,
             history: None,
+            data_dir: None,
             epoch: Epoch::new(0),
             generation: Generation::new(0),
             is_running: AtomicBool::new(false),
@@ -1580,7 +1584,7 @@ impl VaultActor {
         let failure_context = request.clone();
         let result: Result<SaveReceipt, SaveFailure> = (|| {
             if self.history.is_none() {
-                let data = crate::identity::get_data_dir()
+                let data = crate::identity::resolve_data_dir(self.data_dir.as_deref())
                     .ok_or_else(|| SaveFailure::from_message("OS data directory is unavailable"))?;
                 let root = data
                     .join("flavite")
@@ -1658,7 +1662,7 @@ impl VaultActor {
 
     fn history_store(&mut self) -> Result<&mut HistoryStore, String> {
         if self.history.is_none() {
-            let data = crate::identity::get_data_dir()
+            let data = crate::identity::resolve_data_dir(self.data_dir.as_deref())
                 .ok_or_else(|| "OS data directory is unavailable".to_owned())?;
             let root = data
                 .join("flavite")
@@ -1834,7 +1838,10 @@ impl VaultActor {
         let __outcomes = result.outcomes.len();
         let out = self.apply_scan_result_timed(context, result);
         if std::env::var("FLAVITE_SCAN_TIMING").is_ok() {
-            eprintln!("apply_scan_result outcomes={__outcomes} wall={:?}", __t.elapsed());
+            eprintln!(
+                "apply_scan_result outcomes={__outcomes} wall={:?}",
+                __t.elapsed()
+            );
         }
         out
     }
@@ -2661,6 +2668,9 @@ pub struct VaultActorBuilder {
     reconcile_result_delay: std::time::Duration,
     reconcile_scan_signal: Option<Sender<()>>,
     watcher_start_failure: Option<String>,
+    /// Explicit OS data directory (S8/M3). When `None`, the resolved
+    /// platform default is used — libraries never read the environment.
+    data_dir: Option<PathBuf>,
 }
 
 impl VaultActorBuilder {
@@ -2688,6 +2698,16 @@ impl VaultActorBuilder {
     #[must_use]
     pub fn with_index(mut self, index: IndexActor) -> Self {
         self.index = Some(index);
+        self
+    }
+
+    /// Set the explicit OS data directory (S8/M3). The actor's lazy stores
+    /// (history, recovery) root here instead of the ambient platform
+    /// default. Libraries never read the data-directory override; binaries
+    /// resolve it before spawning threads and pass it through this builder.
+    #[must_use]
+    pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
+        self.data_dir = Some(data_dir.into());
         self
     }
 
@@ -2751,6 +2771,7 @@ impl VaultActorBuilder {
         actor.reconcile_result_delay = self.reconcile_result_delay;
         actor.reconcile_scan_signal = self.reconcile_scan_signal;
         actor.watcher_start_failure = self.watcher_start_failure;
+        actor.data_dir = self.data_dir;
         Ok(actor)
     }
 }

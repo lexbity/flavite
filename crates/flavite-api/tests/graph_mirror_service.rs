@@ -61,7 +61,7 @@ impl Fixture {
     }
 
     fn settle_once(&self) {
-        self.service.notify_changed();
+        self.service.reevaluate();
         wait(&self.service, || self.service.frame().is_some());
     }
 
@@ -69,7 +69,7 @@ impl Fixture {
         self.actor
             .apply_saved_note(path.as_bytes(), path, body, stamp, stamp)
             .unwrap();
-        self.service.notify_changed();
+        self.service.reevaluate();
     }
 
     /// Wait until the service has published a frame at the index's current
@@ -149,7 +149,7 @@ fn service_flows_through_mirror_deltas() {
     // Deleting a note must remove its node and flip the inbound link:
     // still delta-only.
     fixture.actor.remove_note_path(b"alpha.md").unwrap();
-    fixture.service.notify_changed();
+    fixture.service.reevaluate();
     fixture.wait_current();
     assert_eq!(fixture.note_count(), 1);
     assert_eq!(fixture.service.metrics().mirror_resets_total, 1);
@@ -173,7 +173,7 @@ fn epoch_change_takes_the_reset_path() {
         .conn()
         .execute("UPDATE meta SET value='9' WHERE key='epoch'", [])
         .unwrap();
-    fixture.service.notify_changed();
+    fixture.service.reevaluate();
     wait(&fixture.service, || {
         fixture
             .service
@@ -415,7 +415,7 @@ fn stamp_only_republishes_reuse_the_snapshot_handoff() {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         f.flavite.pump();
-        f.flavite.graph_notify_changed();
+        f.flavite.graph_reevaluate();
         let head = f.flavite.vault_info().expect("vault info").generation;
         let caught_up = f.flavite.graph_frame().is_some_and(|frame| {
             frame.publication().generation >= head && f.flavite.graph_is_current()
@@ -473,7 +473,7 @@ fn stamp_only_republishes_reuse_the_snapshot_handoff() {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             f.flavite.pump();
-            f.flavite.graph_notify_changed();
+            f.flavite.graph_reevaluate();
             let settled = f.flavite.graph_frame().filter(|frame| {
                 f.flavite.graph_is_current()
                     && frame.projection().buffer_stamp.len() == 1
@@ -548,19 +548,19 @@ fn each_delta_window_rebuilds_the_snapshot_exactly_once() {
         "the cold reset window adds its own build on top of the delta set: {busy:?}"
     );
 
-    // Idle cadence pumps (the 250 ms tick keeps waking the pump with
-    // nothing moved): every wake is a cache hit — the counter, the delta
+    // Quiet pumps (the reevaluate kick stands in for the 5 s recovery
+    // sweep, whose period makes a sleep-based assertion impractical) are
+    // UpToDate: every one is a cache hit — the snapshot counter, the delta
     // set, and the reset set all stay flat.
     let before_idle = fixture.service.metrics().mirror_snapshots_built_total;
-    std::thread::sleep(Duration::from_millis(600));
+    for _ in 0..3 {
+        fixture.service.reevaluate();
+        std::thread::sleep(Duration::from_millis(30));
+    }
     let idle = fixture.service.metrics();
-    assert!(
-        idle.polls_total > busy.polls_total,
-        "the cadence must have pumped while idle: {busy:?} -> {idle:?}"
-    );
     assert_eq!(
         idle.mirror_snapshots_built_total, before_idle,
-        "UpToDate pumps must reuse the cached snapshot"
+        "quiet pumps must reuse the cached snapshot: {busy:?} -> {idle:?}"
     );
     assert_eq!(
         idle.mirror_snapshots_built_total,

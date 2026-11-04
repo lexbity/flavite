@@ -220,7 +220,7 @@ fn unicode_corpus() -> MemFs {
         "физика/квант.md".into(),
         "日本語/ノート.md".into(),
         "emoji/📝-note.md".into(),
-        "é/é­-combining.md".into(),
+        "é/é\u{AD}-combining.md".into(),
         "عربي/ملاحظة.md".into(),
         "ko/한글-노트-01.md".into(),
         "dots/...hidden.md".into(),
@@ -331,7 +331,7 @@ fn empty_directories_only_corpus_streams_are_identical_across_modes() {
 /// serial/parallel match.
 #[test]
 fn randomized_orders_three_times_stream_identical() {
-    for seed in [1u64, 0xDeadBeef, 0b1010_1010_1010_1010] {
+    for seed in [1u64, 0xDEAD_BEEF, 0b1010_1010_1010_1010] {
         let fs = typical_corpus(seed.wrapping_mul(7919) | 1);
         assert_all_modes_equal(&fs, &ReconcileScope::Full, &HashSet::new());
         // Nominated subset jobs: the requested-path enumeration order is

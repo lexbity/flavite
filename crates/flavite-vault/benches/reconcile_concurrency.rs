@@ -35,7 +35,9 @@ fn bench_note(id: usize) -> String {
         m1 = id % 97,
         m2 = id % 13,
     ));
-    note.push_str(&format!("# Note {id}\n\nIntro paragraph for note {id}.\n\n"));
+    note.push_str(&format!(
+        "# Note {id}\n\nIntro paragraph for note {id}.\n\n"
+    ));
     for section in 0..6 {
         note.push_str(&format!(
             "## Section {section}\n\n- item alpha\n- item beta\n\n```\ncode {id}-{section}\n```\n\n"
@@ -53,11 +55,9 @@ fn bench_note(id: usize) -> String {
 
 fn main() {
     let temp = tempfile::tempdir().expect("tempdir");
-    // History writes must stay inside this benchmark's disposable directory.
-    // SAFETY: set once, before any actor or benchmark worker thread is started.
-    unsafe {
-        std::env::set_var("XDG_DATA_HOME", temp.path().join("xdg-data"));
-    }
+    // (S8/M3) The history store roots here explicitly, per-builder — the
+    // former `XDG_DATA_HOME` process-global injection is gone.
+    let data_dir = temp.path().join("xdg-data");
 
     let fs = MemFs::new();
     let root = PathBuf::from("/reconcile-bench");
@@ -81,6 +81,7 @@ fn main() {
             root.clone(),
             vec![0x44],
         ))
+        .with_data_dir(data_dir)
         .with_index(IndexActor::new(&db, 2).expect("index actor"))
         .build()
         .expect("vault actor")
@@ -170,8 +171,10 @@ fn main() {
     // Same filesystem, both execution modes of the shared emitter: the
     // streams and results must match exactly (FR-9), and the wall-clock
     // ratio must show the parallel CPU stage pay for itself.
-    let usable = std::thread::available_parallelism()
-        .map_or(1, |n| n.get().min(flavite_vault::reconcile_worker::MAX_SCAN_THREADS));
+    let usable = std::thread::available_parallelism().map_or(1, |n| {
+        n.get()
+            .min(flavite_vault::reconcile_worker::MAX_SCAN_THREADS)
+    });
     let (scan_tx, scan_rx) = crossbeam::channel::bounded::<WorkerMessage>(8192);
     let drain = std::thread::spawn(move || {
         let mut collected = 0usize;

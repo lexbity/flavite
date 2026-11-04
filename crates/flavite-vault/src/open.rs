@@ -92,7 +92,7 @@ impl Vault {
         fs: Box<dyn Fs + Send + Sync>,
         config: VaultConfig,
     ) -> OpenVaultResult<Self> {
-        Self::open_inner(root, fs, config, None)
+        Self::open_inner(root, fs, config, None, None)
     }
 
     /// Open a vault whose index writer publishes every committed structural
@@ -104,13 +104,44 @@ impl Vault {
         config: VaultConfig,
         generation_signal: flavite_index::GenerationSignal,
     ) -> OpenVaultResult<Self> {
-        Self::open_inner(root, fs, config, Some(generation_signal))
+        Self::open_inner(root, fs, config, None, Some(generation_signal))
+    }
+
+    /// Open a vault with an explicit OS data directory (S8/M3). Library
+    /// code never reads the data-directory override; binaries and tests
+    /// pass the resolved directory here. `None` selects the resolved
+    /// platform default. The recovery store and the actor's history store
+    /// root under this directory.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_data_dir(
+        root: PathBuf,
+        fs: Box<dyn Fs + Send + Sync>,
+        config: VaultConfig,
+        data_dir: Option<PathBuf>,
+    ) -> OpenVaultResult<Self> {
+        Self::open_inner(root, fs, config, data_dir, None)
+    }
+
+    /// Open a vault with an explicit OS data directory *and* the writer-side
+    /// generation broadcast (RFC-0005 S1 + S8/M3 union): the recovery store
+    /// and history store root under `data_dir`, and every committed
+    /// structural generation is announced on `generation_signal`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_data_dir_and_generation_signal(
+        root: PathBuf,
+        fs: Box<dyn Fs + Send + Sync>,
+        config: VaultConfig,
+        data_dir: Option<PathBuf>,
+        generation_signal: flavite_index::GenerationSignal,
+    ) -> OpenVaultResult<Self> {
+        Self::open_inner(root, fs, config, data_dir, Some(generation_signal))
     }
 
     fn open_inner(
         root: PathBuf,
         fs: Box<dyn Fs + Send + Sync>,
         config: VaultConfig,
+        data_dir: Option<PathBuf>,
         generation_signal: Option<flavite_index::GenerationSignal>,
     ) -> OpenVaultResult<Self> {
         info!("Opening vault at: {}", root.display());
@@ -137,7 +168,7 @@ impl Vault {
 
         // Journal recovery precedes cache startup: disk is authoritative and
         // interrupted committed renames roll forward before indexing.
-        let recovery_writer = crate::identity::get_data_dir().map(|data| {
+        let recovery_writer = crate::identity::resolve_data_dir(data_dir.as_deref()).map(|data| {
             let dir = data
                 .join("flavite")
                 .join("vaults")
@@ -173,26 +204,31 @@ impl Vault {
         let buffer_manager = BufferManager::new();
 
         // Start the vault actor.
-        let actor = VaultActorBuilder::new()
+        let mut actor_builder = VaultActorBuilder::new()
             .with_fs(fs)
             .with_identity(identity.clone())
             .with_index(index)
             .with_pulse_sender(channels.pulse.sender())
-            .with_runtime_config(config.clone())
-            .build()?
-            .start()?;
+            .with_runtime_config(config.clone());
+        if let Some(data_dir) = &data_dir {
+            actor_builder = actor_builder.with_data_dir(data_dir.clone());
+        }
+        let actor = actor_builder.build()?.start()?;
         actor.wait_until_ready(std::time::Duration::from_secs(120))?;
 
         // Build the session around the actor and channels.
-        let session = SessionBuilder::new()
+        let mut session_builder = SessionBuilder::new()
             .with_identity(identity.clone())
             .with_actor(actor.clone())
             .with_buffer_manager(buffer_manager)
             .with_pulse(channels.pulse.clone())
             .with_notice(channels.notice.clone())
             .with_config(config.clone())
-            .with_recovery_notices(recovery.notice_codes())
-            .build()?;
+            .with_recovery_notices(recovery.notice_codes());
+        if let Some(data_dir) = &data_dir {
+            session_builder = session_builder.with_data_dir(data_dir.clone());
+        }
+        let session = session_builder.build()?;
 
         info!("Vault opened successfully");
 

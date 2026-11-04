@@ -350,9 +350,15 @@ fn w12_crash_child_seeds_and_parks() {
         // Not the child run: nothing to do.
         return;
     };
-    let flavite =
-        flavite_api::Flavite::open_root(root.clone(), flavite_api::VaultConfig::default())
-            .expect("child vault opens");
+    let data = std::env::var_os("FLAVITE_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("child data dir");
+    let flavite = flavite_api::Flavite::open_root_with_data_dir(
+        root.clone(),
+        flavite_api::VaultConfig::default(),
+        Some(data),
+    )
+    .expect("child vault opens");
     let path = root.join("alpha.md");
     let opened = flavite.execute(flavite_api::Invocation::new(
         flavite.command_registry().next_request_id(),
@@ -441,9 +447,10 @@ fn crash_recovery_matches_the_recovered_note_in_the_workspace() {
     std::fs::write(root.join("b.md"), b"# B\n\ntarget body\n").expect("seed b");
     let data = temp.path().join("data");
     std::fs::create_dir_all(&data).expect("data dir");
-    // SAFETY: the test owns its process-wide data-dir env for the whole
-    // crash sequence (child inherits it; this process re-reads it below).
-    unsafe { std::env::set_var("FLAVITE_DATA_DIR", &data) };
+    // (S8/M3) The crash child is a separate OS process whose only channel
+    // for the shared recovery-store location is the environment — so the
+    // redirect is passed as a per-child `Command::env` (safe, scoped to the
+    // spawned process), never as process-global `set_var`.
 
     let test_exe = std::env::current_exe().unwrap();
     let mut child = Command::new(test_exe)
@@ -451,6 +458,7 @@ fn crash_recovery_matches_the_recovered_note_in_the_workspace() {
         .arg("w12_crash_child_seeds_and_parks")
         .arg("--nocapture")
         .env("FLAVITE_W12_CRASH_ROOT", &root)
+        .env("FLAVITE_DATA_DIR", &data)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -479,9 +487,13 @@ fn crash_recovery_matches_the_recovered_note_in_the_workspace() {
 
     // Reopen in-process: the retained recovery copy is offered, restored
     // explicitly, and saved; the recovered link reaches the saved graph.
-    let flavite =
-        flavite_api::Flavite::open_root(root.clone(), flavite_api::VaultConfig::default())
-            .expect("parent vault opens");
+    // The explicit data_dir is the SAME temp store the child wrote under.
+    let flavite = flavite_api::Flavite::open_root_with_data_dir(
+        root.clone(),
+        flavite_api::VaultConfig::default(),
+        Some(data),
+    )
+    .expect("parent vault opens");
     let path = root.join("alpha.md");
     let opened = flavite.execute(flavite_api::Invocation::new(
         flavite.command_registry().next_request_id(),
@@ -603,7 +615,7 @@ fn crash_recovery_matches_the_recovered_note_in_the_workspace() {
     let mut edge_found = false;
     while Instant::now() < edge_deadline && !edge_found {
         flavite.pump();
-        flavite.graph_notify_changed();
+        flavite.graph_reevaluate();
         if let Some(frame) = flavite.graph_frame() {
             // The effective projection batch carries the record-level
             // graph; after the save it equals the saved topology.
