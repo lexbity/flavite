@@ -32,6 +32,8 @@ reason = "Actor shutdown and uncommon journal-recovery branches remain uncovered
 # activates its floor in the same slice (§10.5).
 flavite-fs = "tier1"
 flavite-syntax = "tier1"
+flavite-encoding = "tier1"
+flavite-text-search = "tier1"
 flavite-buffer = "tier1"
 flavite-vault = "tier1"
 flavite-index = "tier1"

@@ -9,6 +9,8 @@
 
 pub mod actor;
 pub mod channels;
+pub mod encoding;
+pub mod text_edit;
 pub mod coalesce;
 pub mod history;
 pub mod identity;

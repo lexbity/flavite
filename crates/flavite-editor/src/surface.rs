@@ -163,6 +163,9 @@ impl EditorAction {
                 buffer_id: buffer_id.into(),
                 revision: flavite_buffer::revision::Revision::new(expected_revision),
                 ops: edits,
+                // Ordinary captured typing: the explicit typing policy keeps
+                // the established coalescing rules (D-06/TD-8).
+                undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             },
             Self::Navigate { .. } | Self::Interaction(_) => {
                 unreachable!("non-mutation editor action has no Session command")

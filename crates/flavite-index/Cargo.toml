@@ -21,6 +21,7 @@ crossbeam = { workspace = true }
 
 # Internal deps
 flavite-syntax = { path = "../flavite-syntax" }
+flavite-encoding = { path = "../flavite-encoding" }
 
 [dev-dependencies]
 tempfile = "3"

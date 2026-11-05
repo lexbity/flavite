@@ -124,6 +124,19 @@ struct ApplyEditsArgs {
     buffer_id: u64,
     revision: u64,
     ops: Vec<EditOpArgs>,
+    /// Undo-unit policy (RFC-0006 D-06/TD-8). Default `Isolated`: general
+    /// clients get one boundary undo unit and cannot silently merge with
+    /// neighboring typing. The editor's captured typing path requests
+    /// `typing` explicitly through its own typed action.
+    undo_policy: Option<UndoPolicyArg>,
+}
+
+/// Wire form of the undo policy (§6.1: explicit snake_case discriminants).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UndoPolicyArg {
+    Isolated,
+    Typing,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -348,10 +361,16 @@ fn handle_edits(session: &Session, invocation: &Invocation) -> Result<SessionRes
             )
         })
         .collect();
+    // Absent field = Isolated (D-06 default).
+    let undo_policy = match args.undo_policy.unwrap_or(UndoPolicyArg::Isolated) {
+        UndoPolicyArg::Isolated => flavite_buffer::undo::UndoPolicy::Isolated,
+        UndoPolicyArg::Typing => flavite_buffer::undo::UndoPolicy::Typing,
+    };
     Ok(session.execute(SessionCommand::ApplyEdits {
         buffer_id: BufferId::from(args.buffer_id),
         revision: Revision::new(args.revision),
         ops,
+        undo_policy,
     }))
 }
 fn handle_undo(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
@@ -854,6 +873,30 @@ impl Flavite {
                 handle_edits,
             ),
             (
+                "note.reopen_encoding",
+                "Reopen note with encoding",
+                ArgSchema::typed::<crate::note_encoding::ReopenEncodingArgs>(),
+                crate::note_encoding::handle_reopen_encoding,
+            ),
+            (
+                "note.convert_encoding",
+                "Convert note encoding",
+                ArgSchema::typed::<crate::note_encoding::ConvertEncodingArgs>(),
+                crate::note_encoding::handle_convert_encoding,
+            ),
+            (
+                "text.prepare_replace",
+                "Prepare literal replacement",
+                ArgSchema::typed::<crate::text_edit::PrepareReplaceArgs>(),
+                crate::text_edit::handle_prepare_replace,
+            ),
+            (
+                "text.apply_replace",
+                "Apply prepared replacement",
+                ArgSchema::typed::<crate::text_edit::ApplyReplaceArgs>(),
+                crate::text_edit::handle_apply_replace,
+            ),
+            (
                 "link.prepare",
                 "Prepare link insertion",
                 ArgSchema::typed::<crate::links::LinkPrepareArgs>(),
@@ -975,7 +1018,14 @@ impl Flavite {
             ),
         ];
         for (id, title, args, handler) in registrations {
-            let spec = if matches!(id, "open_note" | "note.open" | "note.history") {
+            let spec = if matches!(
+        id,
+        "open_note"
+            | "note.open"
+            | "note.history"
+            | "note.reopen_encoding"
+            | "text.prepare_replace"
+    ) {
                 CommandSpec::new(id, title, args).requires(crate::Capability::ReadNotes)
             } else {
                 CommandSpec::new(id, title, args)
@@ -1419,7 +1469,8 @@ impl Flavite {
                 .and_then(|source| source.get("buffer_id"))
                 .and_then(serde_json::Value::as_u64)
                 .map(BufferId::from),
-            "property.set" | "task.toggle" | "apply_edits" | "undo" | "redo" => invocation
+            "property.set" | "task.toggle" | "apply_edits" | "undo" | "redo"
+            | "note.convert_encoding" | "text.apply_replace" => invocation
                 .args
                 .get("buffer_id")
                 .and_then(serde_json::Value::as_u64)
@@ -1450,6 +1501,8 @@ impl Flavite {
                 | "apply_edits"
                 | "undo"
                 | "redo"
+                | "note.convert_encoding"
+                | "text.apply_replace"
         ) {
             return actual_source.and_then(|id| self.session.buffer_path(id));
         }
@@ -1532,6 +1585,15 @@ impl Flavite {
             }
             SessionResult::Success(crate::session::CommandResult::EditsDiscarded { .. }) => {
                 "note.discard_edits"
+            }
+            SessionResult::Success(crate::session::CommandResult::EncodingReopened { .. }) => {
+                "note.reopen_encoding"
+            }
+            SessionResult::Success(crate::session::CommandResult::EncodingConverted { .. }) => {
+                "note.convert_encoding"
+            }
+            SessionResult::Success(crate::session::CommandResult::ReplacePrepared { .. }) => {
+                "text.prepare_replace"
             }
             SessionResult::MergeReady { .. }
             | SessionResult::Conflict { .. }
@@ -1686,6 +1748,35 @@ impl Flavite {
                         "buffer_id": buffer_id.as_u64(),
                         "revision": revision.as_u64(),
                     }),
+                    crate::session::CommandResult::EncodingReopened {
+                        buffer_id,
+                        revision,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "revision": revision.as_u64(),
+                        })
+                    }
+                    crate::session::CommandResult::EncodingConverted {
+                        buffer_id,
+                        new_revision,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "revision": new_revision.as_u64(),
+                        })
+                    }
+                    crate::session::CommandResult::ReplacePrepared {
+                        plan_id,
+                        match_count,
+                        expires_in_ms,
+                    } => {
+                        serde_json::json!({
+                            "plan_id": crate::text_edit::encode_plan_id(plan_id),
+                            "match_count": match_count,
+                            "expires_in_ms": expires_in_ms,
+                        })
+                    }
                     crate::session::CommandResult::EditsDiscarded { buffer_id } => {
                         serde_json::json!({ "buffer_id": buffer_id.as_u64() })
                     }
@@ -1898,6 +1989,7 @@ impl Flavite {
                 .map_or_else(Vec::new, |hash| hash.to_vec()),
             state: snapshot.state,
             path: snapshot.path,
+            source_format: snapshot.source_format,
         })
     }
 
@@ -1928,6 +2020,7 @@ impl Flavite {
                 .map_or_else(Vec::new, |hash| hash.to_vec()),
             state: snapshot.state,
             path: snapshot.path,
+            source_format: snapshot.source_format,
         })
     }
 
@@ -2041,6 +2134,8 @@ pub struct BufferView {
     pub state: crate::BufferStatus,
     /// Vault-relative path used by save and close commands.
     pub path: PathBuf,
+    /// Authoritative save-format descriptor of this revision (§6.10).
+    pub source_format: flavite_encoding::SourceFormat,
 }
 
 /// In-process immutable revision shared by all views of one Session buffer.
@@ -2058,6 +2153,8 @@ pub struct SharedBufferView {
     pub state: crate::BufferStatus,
     /// Vault-relative path.
     pub path: PathBuf,
+    /// Authoritative save-format descriptor of this revision (§6.10).
+    pub source_format: flavite_encoding::SourceFormat,
 }
 
 /// Result of a query.
@@ -2417,6 +2514,7 @@ mod tests {
             base_hash: vec![1, 2, 3],
             state: crate::BufferStatus::Clean,
             path: PathBuf::from("note.md"),
+            source_format: flavite_encoding::SourceFormat::utf8(),
         };
 
         let json = serde_json::to_string(&view).unwrap();

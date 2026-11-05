@@ -8,21 +8,21 @@ fn unicode_separators_and_standalone_cr_are_content_through_edit_undo_and_save()
     let snapshot = flavite_syntax::TextSnapshot::new(source.as_bytes()).unwrap();
     let mut model = EditorModel::from_snapshot(snapshot);
     assert_eq!(model.line_count(), 3);
-    assert_eq!(model.to_source_bytes(), source.as_bytes());
+    assert_eq!(model.try_to_source_bytes().unwrap(), source.as_bytes());
     let at = model.text().find("next").unwrap();
     model.apply_edit_ops(&[EditOp::new(
         Span::new(TextByte(at), TextByte(at)),
         "[[target]]".into(),
     )]);
     assert_eq!(
-        model.to_source_bytes(),
+        model.try_to_source_bytes().unwrap(),
         source.replace("next", "[[target]]next").as_bytes()
     );
     model.undo().unwrap();
-    assert_eq!(model.to_source_bytes(), source.as_bytes());
+    assert_eq!(model.try_to_source_bytes().unwrap(), source.as_bytes());
     model.redo().unwrap();
     assert_eq!(
-        model.to_source_bytes(),
+        model.try_to_source_bytes().unwrap(),
         source.replace("next", "[[target]]next").as_bytes()
     );
 }
@@ -74,16 +74,16 @@ fn coalesced_undo_transform_matches_real_text_and_redo_keeps_mixed_line_endings(
         Span::new(TextByte(0), TextByte(1)),
         "AA".into(),
     )]);
-    let saved = model.to_source_bytes();
+    let saved = model.try_to_source_bytes().unwrap();
     model.seal_undo_group();
     model.apply_edit_ops(&[EditOp::new(
         Span::new(TextByte(0), TextByte(2)),
         "AAA".into(),
     )]);
     model.undo();
-    assert_eq!(model.to_source_bytes(), saved);
+    assert_eq!(model.try_to_source_bytes().unwrap(), saved);
     model.redo();
-    assert_eq!(model.to_source_bytes(), b"AAA\r\nB\nC\r\n");
+    assert_eq!(model.try_to_source_bytes().unwrap(), b"AAA\r\nB\nC\r\n");
     let mut model = EditorModel::from_text("");
     model.insert(TextByte(0), "α");
     model.apply_edit_ops(&[EditOp::new(

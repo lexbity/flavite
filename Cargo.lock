@@ -1489,10 +1489,12 @@ dependencies = [
  "crossbeam",
  "directories 6.0.0",
  "flavite-buffer",
+ "flavite-encoding",
  "flavite-fs",
  "flavite-graph",
  "flavite-index",
  "flavite-syntax",
+ "flavite-text-search",
  "flavite-vault",
  "hex",
  "image",
@@ -1523,6 +1525,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "crossbeam",
+ "flavite-encoding",
  "flavite-syntax",
  "proptest",
  "ropey",
@@ -1537,8 +1540,10 @@ name = "flavite-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "flavite-api",
+ "hex",
  "serde_json",
  "tempfile",
  "tracing",
@@ -1558,6 +1563,14 @@ dependencies = [
  "nucleo-matcher",
  "serde_json",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "flavite-encoding"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
 ]
 
 [[package]]
@@ -1599,6 +1612,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "crossbeam",
+ "flavite-encoding",
  "flavite-syntax",
  "proptest",
  "pulldown-cmark",
@@ -1615,6 +1629,7 @@ dependencies = [
 name = "flavite-syntax"
 version = "0.1.0"
 dependencies = [
+ "flavite-encoding",
  "pulldown-cmark",
  "serde",
  "serde_json",
@@ -1622,6 +1637,15 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-md",
  "unicode-normalization",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "flavite-text-search"
+version = "0.1.0"
+dependencies = [
+ "flavite-syntax",
+ "proptest",
  "unicode-segmentation",
 ]
 
@@ -1663,9 +1687,11 @@ dependencies = [
  "crossbeam",
  "directories 5.0.1",
  "flavite-buffer",
+ "flavite-encoding",
  "flavite-fs",
  "flavite-index",
  "flavite-syntax",
+ "flavite-text-search",
  "hex",
  "proptest",
  "rayon",

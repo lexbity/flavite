@@ -118,6 +118,15 @@ enum Commands {
         strategy: CliRenameStrategy,
     },
 
+    /// Inspect or convert a note's file encoding explicitly (RFC-0006 §6.10).
+    Encoding {
+        /// Vault-relative note path.
+        note: PathBuf,
+
+        #[command(subcommand)]
+        action: EncodingAction,
+    },
+
     /// Show information about the vault.
     Info {
         /// Path to the vault (overrides global --vault).
@@ -134,6 +143,73 @@ enum Commands {
         #[arg(short, long, value_name = "PATH")]
         path: Option<PathBuf>,
     },
+}
+
+/// Encoding inspection/conversion actions (§6.10). Reopen reports/changes the
+/// interpretation of the current bytes; Convert changes the save format and
+/// then performs the guarded save, waiting for source and format receipts.
+#[derive(Subcommand, Debug)]
+enum EncodingAction {
+    /// Reopen the note under an explicit encoding and report the resulting
+    /// format. `auto` opens without an explicit family (BOM/hint rules).
+    Reopen {
+        #[arg(long, value_enum, default_value_t = CliEncoding::Auto)]
+        encoding: CliEncoding,
+
+        #[arg(long, value_enum, default_value_t = CliBom::Auto)]
+        bom: CliBom,
+    },
+    /// Convert the note's save format, then save durably through the core
+    /// command (never a CLI file write). Requires an explicit family.
+    Convert {
+        #[arg(long, value_enum)]
+        encoding: CliEncoding,
+
+        #[arg(long, value_enum, default_value_t = CliBom::Absent)]
+        bom: CliBom,
+    },
+}
+
+/// Encoding family (§6.10): `auto` never guesses BOM-less UTF-16.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum CliEncoding {
+    Auto,
+    Ascii,
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+}
+
+impl CliEncoding {
+    fn code(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Ascii => Some("ascii"),
+            Self::Utf8 => Some("utf8"),
+            Self::Utf16Le => Some("utf16le"),
+            Self::Utf16Be => Some("utf16be"),
+        }
+    }
+}
+
+/// BOM intent (§6.10 CLI contract): auto strips a matching signature for the
+/// requested family and otherwise treats it as absent; present requires it;
+/// absent preserves leading signature-shaped bytes as content.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum CliBom {
+    Auto,
+    Present,
+    Absent,
+}
+
+impl CliBom {
+    fn arg(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Present => "present",
+            Self::Absent => "absent",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -329,6 +405,125 @@ impl CliDriver {
 
     /// Run a query.
     #[allow(clippy::ptr_arg)]
+    /// Inspect or convert a note's encoding through the core commands
+    /// (§6.10). Reopen never discards unsaved text; Convert is followed by
+    /// the guarded save and both wait for real receipts instead of exiting
+    /// after an ephemeral metadata change.
+    fn run_encoding(&self, note: PathBuf, action: EncodingAction) -> Result<()> {
+        let flavite = self
+            .flavite
+            .as_ref()
+            .context("encoding commands require an opened vault")?;
+        let run = |id: &'static str, args: serde_json::Value| -> Result<ExecutionResult> {
+            let request_id = flavite.command_registry().next_request_id();
+            let result = flavite.execute(Invocation::new(request_id, id, args, Origin::Cli));
+            Ok(match result {
+                ExecutionResult::Pending { request_id } => {
+                    flavite.wait_for_operation(request_id)
+                }
+                result => result,
+            })
+        };
+        match action {
+            EncodingAction::Reopen { encoding, bom } => {
+                if let Some(code) = encoding.code() {
+                    // The core re-verifies the raw-hash precondition; a
+                    // change between observation and reopen is a typed
+                    // stale-source refusal, never a decode of unseen bytes.
+                    let abs = flavite.vault_ref().root.join(&note);
+                    let bytes =
+                        std::fs::read(&abs).with_context(|| format!("reading {}", abs.display()))?;
+                    let raw_hash = hex::encode(blake3::hash(&bytes).as_bytes());
+                    let result = run(
+                        "note.reopen_encoding",
+                        serde_json::json!({
+                            "path": note,
+                            "raw_hash": raw_hash,
+                            "encoding": code,
+                            "bom": bom.arg(),
+                        }),
+                    )?;
+                    anyhow::ensure!(result.is_success(), "reopen did not complete: {result:?}");
+                }
+                let open = run("note.open", serde_json::json!({ "path": note }))?;
+                anyhow::ensure!(open.is_success(), "open did not complete: {open:?}");
+                let buffer_id = open
+                    .into_success()
+                    .and_then(|success| success.data.get("buffer_id").and_then(|v| v.as_u64()))
+                    .context("open returned no buffer id")?;
+                let view =
+                    flavite.get_buffer_view(flavite_api::BufferId::from(buffer_id), None)?;
+                let format = view.source_format;
+                let describe = format!(
+                    "{}{}",
+                    format.encoding_code(),
+                    if format.bom() { "+bom" } else { "" }
+                );
+                if self.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "note": note,
+                            "encoding": format.encoding_code(),
+                            "bom": format.bom(),
+                        }))?
+                    );
+                } else {
+                    println!("{}: {describe}", note.display());
+                }
+            }
+            EncodingAction::Convert { encoding, bom } => {
+                let code = encoding
+                    .code()
+                    .context("convert requires an explicit encoding family")?;
+                let open = run("note.open", serde_json::json!({ "path": note }))?;
+                anyhow::ensure!(open.is_success(), "open did not complete: {open:?}");
+                let data = open
+                    .into_success()
+                    .map(|success| success.data)
+                    .context("open returned no data")?;
+                let buffer_id = data
+                    .get("buffer_id")
+                    .and_then(|v| v.as_u64())
+                    .context("open returned no buffer id")?;
+                let revision = data
+                    .get("revision")
+                    .and_then(|v| v.as_u64())
+                    .context("open returned no revision")?;
+                let converted = run(
+                    "note.convert_encoding",
+                    serde_json::json!({
+                        "buffer_id": buffer_id,
+                        "revision": revision,
+                        "encoding": code,
+                        "bom": bom.arg(),
+                    }),
+                )?;
+                anyhow::ensure!(
+                    converted.is_success(),
+                    "conversion was refused: {converted:?}"
+                );
+                let saved = run("note.save", serde_json::json!({ "path": note }))?;
+                anyhow::ensure!(saved.is_success(), "save did not complete: {saved:?}");
+                if self.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "note": note,
+                            "encoding": code,
+                            "bom": bom.arg(),
+                            "converted": true,
+                            "saved": true,
+                        }))?
+                    );
+                } else {
+                    println!("{}: converted to {code}{} and saved", note.display(), bom.arg());
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn run_query(
         &self,
         _vault_path: &Path,
@@ -620,6 +815,11 @@ fn main() -> Result<()> {
             let vault_path = get_vault_path(None, cli.vault);
             driver.open_vault(vault_path, cli.no_watch)?;
             driver.run_rename(from, to, strategy)?;
+        }
+        Commands::Encoding { note, action } => {
+            let vault_path = get_vault_path(None, cli.vault);
+            driver.open_vault(vault_path, cli.no_watch)?;
+            driver.run_encoding(note, action)?;
         }
         Commands::Info { path } => {
             let vault_path = get_vault_path(path, cli.vault);

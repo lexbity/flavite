@@ -60,7 +60,10 @@ fn recovery_checkpoint_survives_writer_process_kill() {
     let recovered = writer
         .read_for_note_key(b"notes/crash.md")
         .expect("durable recovery checkpoint must survive process death");
-    assert_eq!(recovered.to_source_bytes(), b"base plus unsaved edit");
+    assert_eq!(
+        recovered.to_source_bytes().unwrap(),
+        b"base plus unsaved edit"
+    );
 }
 
 fn recovery_child(root: std::path::PathBuf) {

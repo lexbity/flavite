@@ -65,6 +65,8 @@ pub struct App {
     /// Context tool state: bindings, effective sources, and query states.
     pub contexts: ContextRegistry,
     pub reading: crate::host::reading::ReadingHost,
+    /// RFC-0006 §6.10: per-tab pending encoding decisions and repairs.
+    pub encoding: crate::host::encoding::EncodingHost,
     pub input_chains: BTreeMap<TabId, crate::host::input::InputChain>,
     /// Semantic link insertion gestures (W05).
     pub linking: crate::host::linking::LinkIntents,
@@ -221,6 +223,8 @@ pub enum Message {
         input: flavite_editor::input::CapturedInput,
     },
     FindOpen(TabId),
+    /// RFC-0006 §6.10: typed encoding decisions routed to the encoding host.
+    Encoding(crate::host::encoding::EncodingMessage),
     FindClose(TabId),
     FindQuery {
         tab: TabId,
@@ -541,6 +545,7 @@ impl App {
             notes: DocumentRegistry::default(),
             contexts: ContextRegistry::default(),
             reading: crate::host::reading::ReadingHost::default(),
+            encoding: crate::host::encoding::EncodingHost::default(),
             input_chains: BTreeMap::new(),
             linking: crate::host::linking::LinkIntents::default(),
             graph: {
@@ -1343,6 +1348,16 @@ impl App {
 
     /// Shared immutable editor snapshot for a note tab.
     #[must_use]
+    /// The live source-format descriptor for a tab's buffer (§6.10).
+    pub fn note_source_format(&self, tab: TabId) -> Option<flavite_api::SourceFormat> {
+        let buffer = self.notes.state(&tab)?.buffer?;
+        self.flavite
+            .as_ref()?
+            .get_shared_buffer_view(flavite_buffer::BufferId::from(buffer), None)
+            .ok()
+            .map(|view| view.source_format)
+    }
+
     pub fn note_editor_view(&self, tab: TabId) -> Option<EditorView> {
         let buffer = self.notes.state(&tab)?.buffer?;
         let view = self
@@ -1910,8 +1925,20 @@ impl App {
                         self.operations.accept(request_id, "editor mutation");
                         self.status = "Editor mutation pending".into();
                     }
-                    ExecutionResult::ActionRequired { code, .. } => {
+                    ExecutionResult::ActionRequired { code, data, .. } => {
                         self.status = format!("Edit needs attention: {code}");
+                        if code == "encoding-unencodable" {
+                            // §6.10: an unencodable draft stays intact; the
+                            // repair (explicit convert) is offered in view.
+                            let tab = self.workspace.focused_tab();
+                            let path = self
+                                .note_editor_view(tab)
+                                .map(|view| view.path.clone())
+                                .unwrap_or_default();
+                            let payload =
+                                data.as_ref().and_then(serde_json::Value::as_str).map(str::to_owned);
+                            self.encoding.record(tab, code, payload, path);
+                        }
                     }
                     ExecutionResult::Superseded { by_request, .. } => {
                         self.status = format!("Edit superseded by request {by_request}");
@@ -1975,8 +2002,16 @@ impl App {
                     tab,
                 });
             }
-            ExecutionResult::ActionRequired { code, .. } => {
-                self.status = format!("Open needs attention: {code}");
+            ExecutionResult::ActionRequired { code, data, .. } => {
+                // §6.10: an undecodable/ambiguous source is a typed encoding
+                // decision, surfaced per tab instead of a blank editor.
+                if code == "encoding-choice-required" {
+                    let payload = data.as_ref().and_then(serde_json::Value::as_str).map(str::to_owned);
+                    self.encoding.record(tab, code.to_owned(), payload, path);
+                    self.status = "Encoding choice required: pick an explicit format".into();
+                } else {
+                    self.status = format!("Open needs attention: {code}");
+                }
                 self.dispatch_layout(|revision| LayoutAction::NoteLoadFailed {
                     expected_revision: revision,
                     tab,
@@ -2053,6 +2088,11 @@ impl App {
                 incarnation,
                 input,
             } => return crate::host::input::handle(self, tab, incarnation, input),
+            Message::Encoding(message) => {
+                let task = crate::host::encoding::handle(self, message);
+                self.refresh_semantics();
+                return task;
+            }
             message @ (Message::FindOpen(_)
             | Message::FindClose(_)
             | Message::FindQuery { .. }
@@ -3904,6 +3944,7 @@ mod tests {
             notes: DocumentRegistry::default(),
             contexts: ContextRegistry::default(),
             reading: crate::host::reading::ReadingHost::default(),
+            encoding: crate::host::encoding::EncodingHost::default(),
             input_chains: BTreeMap::new(),
             linking: crate::host::linking::LinkIntents::default(),
             graph: {

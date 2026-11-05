@@ -16,7 +16,8 @@
 //! - File operations (rename, delete)
 //! - User resolution actions
 
-use flavite_syntax::text::TextSnapshot;
+use flavite_encoding::{DecodePolicy, SourceFormat};
+use flavite_syntax::text::{TextError, TextSnapshot};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -139,9 +140,27 @@ pub struct Buffer {
     base_hash: Option<BaseHash>,
     /// Exact bytes corresponding to `base_hash`, retained as the merge base.
     base_bytes: Vec<u8>,
+    /// Descriptor the base bytes were encoded under (§6.10: merge decodes
+    /// base/mine/theirs under their own captured descriptors, never a
+    /// current guess).
+    base_format: Option<SourceFormat>,
     /// The disk hash at the time of the last disk check.
     /// Used to detect external changes.
     disk_hash: Option<BaseHash>,
+}
+
+/// Outcome of an external observation that had to be strictly decoded
+/// (RFC-0006 §6.10). A malformed or ambiguous source NEVER replaces existing
+/// buffer text: the typed codec error is exposed for an actionable
+/// `EncodingChoiceRequired`/`InvalidEncoding` presentation instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalDecode {
+    /// Strict decode succeeded; carries the state transition if one occurred.
+    Decoded(Option<StateTransition>),
+    /// Strict decode failed under the applied policy. Buffer state is
+    /// unchanged; the error kind/position is enough for the UI repair flow
+    /// (no bytes are replaced with U+FFFD, FR-22).
+    InvalidEncoding(flavite_encoding::CodecError),
 }
 
 impl Buffer {
@@ -150,12 +169,14 @@ impl Buffer {
     pub fn from_snapshot(snapshot: TextSnapshot) -> Self {
         let model = EditorModel::from_snapshot(snapshot.clone());
         let hash = BaseHash::from_snapshot(&snapshot);
+        let base_format = snapshot.format();
 
         Self {
             model,
             state: BufferState::Clean,
             base_hash: Some(hash),
             base_bytes: snapshot.source().to_vec(),
+            base_format,
             disk_hash: Some(hash),
         }
     }
@@ -204,12 +225,20 @@ impl Buffer {
         &self.base_bytes
     }
 
+    /// Descriptor the current merge base bytes were encoded under.
+    #[must_use]
+    pub const fn base_format(&self) -> Option<SourceFormat> {
+        self.base_format
+    }
+
     /// Record the exact source bytes known to be the current disk base.
     pub fn set_base_snapshot(&mut self, bytes: Vec<u8>) {
         let hash = BaseHash::from_bytes(*blake3::hash(&bytes).as_bytes());
         self.base_hash = Some(hash);
         self.disk_hash = Some(hash);
         self.base_bytes = bytes;
+        // The base carries the buffer's authoritative descriptor.
+        self.base_format = Some(self.model.source_format());
     }
 
     /// Get the disk hash.
@@ -313,6 +342,23 @@ impl Buffer {
 
     /// Apply a validated multi-selection command as one edit and one undo
     /// unit, then update the D7 state in the same transition.
+    /// Apply a batch under an explicit undo policy (RFC-0006 D-06):
+    /// `Isolated` prepares and installs one boundary candidate (invalid
+    /// batches change nothing), `Typing` keeps the existing coalescing
+    /// path. Returns `None` when the batch is invalid — zero state change.
+    pub fn apply_local_edits_with_policy(
+        &mut self,
+        edits: &[crate::undo::EditOp],
+        policy: crate::undo::UndoPolicy,
+    ) -> Option<(Revision, Option<StateTransition>)> {
+        let revision = self.model.try_apply_batch(edits, policy).ok()?;
+        let old_state = self.state;
+        self.state = BufferState::Dirty;
+        let transition = (old_state != BufferState::Dirty)
+            .then(|| StateTransition::new(old_state, BufferState::Dirty, TransitionReason::LocalEdit));
+        Some((revision, transition))
+    }
+
     pub fn apply_local_edits(
         &mut self,
         edits: &[crate::undo::EditOp],
@@ -335,63 +381,76 @@ impl Buffer {
     /// Check for external changes.
     ///
     /// This is called when the watcher detects a change on disk.
-    /// Returns the state transition if one occurred.
-    pub fn check_external_change(&mut self, new_disk_bytes: &[u8]) -> Option<StateTransition> {
+    ///
+    /// The observed bytes are strictly decoded under `policy`: clean buffers
+    /// reload only after a successful decode (adopting an unambiguously new
+    /// source format), and malformed or ambiguous input never replaces the
+    /// existing text — it is exposed as `InvalidEncoding` for an actionable
+    /// choice at the UI (§6.10, FR-22/24).
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn check_external_change(
+        &mut self,
+        new_disk_bytes: &[u8],
+        policy: DecodePolicy,
+    ) -> ExternalDecode {
         let old_state = self.state;
 
-        // Try to create a snapshot from the new disk content
-        if let Ok(new_snapshot) = TextSnapshot::new(new_disk_bytes) {
-            let new_disk_hash = BaseHash::from_snapshot(&new_snapshot);
-            self.disk_hash = Some(new_disk_hash);
+        // Strict decode under the applied policy; failure is typed, never lossy.
+        let new_snapshot = match TextSnapshot::with_policy(new_disk_bytes, policy) {
+            Ok(snapshot) => snapshot,
+            Err(TextError::Codec(codec)) => return ExternalDecode::InvalidEncoding(codec),
+        };
+        let new_disk_hash = BaseHash::from_snapshot(&new_snapshot);
+        self.disk_hash = Some(new_disk_hash);
 
-            // Check if the disk content matches our base hash
-            if let Some(base_hash) = self.base_hash
-                && base_hash == new_disk_hash
-            {
-                // Disk content is the same as what we loaded
-                // This can happen with metadata-only changes
-                return None;
+        // Check if the disk content matches our base hash
+        if let Some(base_hash) = self.base_hash
+            && base_hash == new_disk_hash
+        {
+            // Disk content is the same as what we loaded
+            // This can happen with metadata-only changes
+            return ExternalDecode::Decoded(None);
+        }
+
+        // Disk content has changed
+        let new_state = match old_state {
+            BufferState::Clean => {
+                // A clean buffer has no local edits to protect. Reload the
+                // changed bytes silently and advance its disk base (D7). The
+                // snapshot's descriptor is adopted: an unambiguous format
+                // change may be taken silently only while clean (§6.10).
+                self.model.replace_snapshot(new_snapshot.clone());
+                self.base_hash = Some(new_disk_hash);
+                self.base_bytes = new_disk_bytes.to_vec();
+                self.base_format = new_snapshot.format();
+                BufferState::Clean
             }
-
-            // Disk content has changed
-            let new_state = match old_state {
-                BufferState::Clean => {
-                    // A clean buffer has no local edits to protect. Reload the
-                    // changed bytes silently and advance its disk base (D7).
-                    self.model.replace_snapshot(new_snapshot.clone());
-                    self.base_hash = Some(new_disk_hash);
-                    self.base_bytes = self.model.to_source_bytes();
+            BufferState::Dirty => {
+                // We were dirty, disk changed
+                // Check if our buffer matches the new disk content
+                if self.model.matches_hash(new_disk_hash) {
+                    // Auto-resolve to Clean
                     BufferState::Clean
+                } else {
+                    // Conflict — including a dirty external FORMAT change:
+                    // resolution must decide the output format explicitly
+                    // (merge flow), never silently (D-15).
+                    BufferState::Conflicted
                 }
-                BufferState::Dirty => {
-                    // We were dirty, disk changed
-                    // Check if our buffer matches the new disk content
-                    if self.model.matches_hash(new_disk_hash) {
-                        // Auto-resolve to Clean
-                        BufferState::Clean
-                    } else {
-                        // Conflict
-                        BufferState::Conflicted
-                    }
-                }
-                BufferState::Conflicted | BufferState::Orphaned => {
-                    // Already in a conflicted state
-                    old_state
-                }
-            };
-
-            if new_state != old_state {
-                let transition =
-                    StateTransition::new(old_state, new_state, TransitionReason::ExternalChange);
-                self.state = new_state;
-                Some(transition)
-            } else {
-                None
             }
+            BufferState::Conflicted | BufferState::Orphaned => {
+                // Already in a conflicted state
+                old_state
+            }
+        };
+
+        if new_state != old_state {
+            let transition =
+                StateTransition::new(old_state, new_state, TransitionReason::ExternalChange);
+            self.state = new_state;
+            ExternalDecode::Decoded(Some(transition))
         } else {
-            // Disk content is not valid UTF-8
-            // We can't load it, so mark as conflicted
-            None
+            ExternalDecode::Decoded(None)
         }
     }
 
@@ -411,60 +470,66 @@ impl Buffer {
 
     /// Handle file recreation.
     ///
-    /// Called when a deleted file reappears.
-    /// Returns the state transition.
-    pub fn handle_file_recreated(&mut self, new_bytes: &[u8]) -> Option<StateTransition> {
+    /// Called when a deleted file reappears. Strictly decodes the observed
+    /// bytes; malformed/ambiguous content leaves state untouched and is
+    /// exposed as `InvalidEncoding` (§6.10).
+    pub fn handle_file_recreated(
+        &mut self,
+        new_bytes: &[u8],
+        policy: DecodePolicy,
+    ) -> ExternalDecode {
         let old_state = self.state;
 
-        if let Ok(snapshot) = TextSnapshot::new(new_bytes) {
-            let new_hash = BaseHash::from_snapshot(&snapshot);
-            self.disk_hash = Some(new_hash);
+        let snapshot = match TextSnapshot::with_policy(new_bytes, policy) {
+            Ok(snapshot) => snapshot,
+            Err(TextError::Codec(err)) => return ExternalDecode::InvalidEncoding(err),
+        };
+        let new_hash = BaseHash::from_snapshot(&snapshot);
+        self.disk_hash = Some(new_hash);
 
-            let new_state = if old_state == BufferState::Orphaned {
-                // File was recreated
-                if self.base_hash == Some(new_hash) {
-                    // Recreated with same content as when we loaded
-                    BufferState::Clean
-                } else if self.model.matches_hash(new_hash) {
-                    // Recreated with same content as our buffer
-                    BufferState::Clean
-                } else {
-                    // Recreated with different content
-                    BufferState::Conflicted
-                }
+        let new_state = if old_state == BufferState::Orphaned {
+            // File was recreated
+            if self.base_hash == Some(new_hash) {
+                // Recreated with same content as when we loaded
+                BufferState::Clean
+            } else if self.model.matches_hash(new_hash) {
+                // Recreated with same content as our buffer
+                BufferState::Clean
             } else {
-                old_state
-            };
-
-            if new_state != old_state {
-                let transition =
-                    StateTransition::new(old_state, new_state, TransitionReason::FileRecreated);
-                self.state = new_state;
-                Some(transition)
-            } else {
-                None
+                // Recreated with different content
+                BufferState::Conflicted
             }
         } else {
-            // Invalid UTF-8
-            None
+            old_state
+        };
+
+        if new_state != old_state {
+            let transition =
+                StateTransition::new(old_state, new_state, TransitionReason::FileRecreated);
+            self.state = new_state;
+            ExternalDecode::Decoded(Some(transition))
+        } else {
+            ExternalDecode::Decoded(None)
         }
     }
 
     /// User chose to reload from disk.
     ///
-    /// Replaces the buffer content with the current disk content.
-    /// Returns the state transition.
-    pub fn reload_from_disk(&mut self, disk_bytes: &[u8]) -> Option<StateTransition> {
+    /// Replaces the buffer content with the current disk content, strictly
+    /// decoded under `policy`. A decode failure means NO replacement: the
+    /// existing text is kept (§6.10).
+    pub fn reload_from_disk(&mut self, disk_bytes: &[u8], policy: DecodePolicy) -> Option<StateTransition> {
         let old_state = self.state;
 
-        if let Ok(snapshot) = TextSnapshot::new(disk_bytes) {
+        if let Ok(snapshot) = TextSnapshot::with_policy(disk_bytes, policy) {
             let new_hash = BaseHash::from_snapshot(&snapshot);
 
             // Replace the model
             self.model.replace_snapshot(snapshot);
             self.disk_hash = Some(new_hash);
             self.base_hash = Some(new_hash);
-            self.base_bytes = self.model.to_source_bytes();
+            self.base_bytes = disk_bytes.to_vec();
+            self.base_format = Some(self.model.source_format());
             self.state = BufferState::Clean;
 
             Some(StateTransition::new(
@@ -479,14 +544,22 @@ impl Buffer {
 
     /// Restore dirty text from a validated recovery snapshot while keeping
     /// the current disk bytes as the concurrency and merge base.
+    ///
+    /// The recovered source bytes decode under their recorded descriptor
+    /// (`recovered_policy` — the recovery record's authoritative format),
+    /// never a current guess; the disk base is decoded under its own
+    /// captured descriptor (`disk_policy`). A decode failure on either side
+    /// leaves the buffer untouched (§6.10).
     pub fn restore_recovery(
         &mut self,
         recovered_bytes: &[u8],
+        recovered_policy: DecodePolicy,
         disk_bytes: &[u8],
         recovered_base_hash: Option<BaseHash>,
+        disk_policy: DecodePolicy,
     ) -> Option<StateTransition> {
-        let recovered = TextSnapshot::new(recovered_bytes).ok()?;
-        let disk = TextSnapshot::new(disk_bytes).ok()?;
+        let recovered = TextSnapshot::with_policy(recovered_bytes, recovered_policy).ok()?;
+        let disk = TextSnapshot::with_policy(disk_bytes, disk_policy).ok()?;
         let old_state = self.state;
         let recovered_hash = BaseHash::from_snapshot(&recovered);
         let disk_hash = BaseHash::from_snapshot(&disk);
@@ -494,6 +567,7 @@ impl Buffer {
         self.base_hash = Some(disk_hash);
         self.disk_hash = Some(disk_hash);
         self.base_bytes = disk_bytes.to_vec();
+        self.base_format = disk.format();
         self.state = if recovered_hash == disk_hash {
             BufferState::Clean
         } else if recovered_base_hash.is_some_and(|base| base != disk_hash) {
@@ -506,6 +580,27 @@ impl Buffer {
             self.state,
             TransitionReason::RecoveryRestored,
         ))
+    }
+
+    /// Reopen one shared buffer under a new interpretation of the same disk
+    /// bytes (RFC-0006 §6.10). The caller has already validated the decode:
+    /// the snapshot carries the authoritative descriptor, the buffer keeps
+    /// its identity, selections are remapped, and the Undo tree restarts
+    /// from a clean disk-backed root — never an edit masquerading as
+    /// previously saved text.
+    pub fn reopen_with_snapshot(
+        &mut self,
+        snapshot: TextSnapshot,
+        disk_bytes: &[u8],
+    ) -> StateTransition {
+        let old_state = self.state;
+        self.model.replace_snapshot(snapshot);
+        self.base_hash = self.model.base_hash();
+        self.disk_hash = self.base_hash;
+        self.base_bytes = disk_bytes.to_vec();
+        self.base_format = Some(self.model.source_format());
+        self.state = BufferState::Clean;
+        StateTransition::new(old_state, BufferState::Clean, TransitionReason::Reopened)
     }
 
     /// User chose to keep local changes.
@@ -525,14 +620,20 @@ impl Buffer {
     }
 
     /// Resolve a detected conflict by retaining mine against the exact disk
-    /// bytes observed and snapshotted by the caller.
-    pub fn resolve_keep_local(&mut self, disk_bytes: &[u8]) -> Option<StateTransition> {
+    /// bytes observed and snapshotted by the caller (decoded under
+    /// `disk_policy`; a decode failure performs no transition).
+    pub fn resolve_keep_local(
+        &mut self,
+        disk_bytes: &[u8],
+        disk_policy: DecodePolicy,
+    ) -> Option<StateTransition> {
         let old_state = self.state;
-        let snapshot = TextSnapshot::new(disk_bytes).ok()?;
+        let snapshot = TextSnapshot::with_policy(disk_bytes, disk_policy).ok()?;
         let hash = BaseHash::from_snapshot(&snapshot);
         self.base_hash = Some(hash);
         self.disk_hash = Some(hash);
         self.base_bytes = disk_bytes.to_vec();
+        self.base_format = snapshot.format();
         self.state = BufferState::Dirty;
         Some(StateTransition::new(
             old_state,
@@ -544,21 +645,33 @@ impl Buffer {
     /// Install an explicitly resolved merge against the exact disk snapshot
     /// that was reviewed. The caller must durably snapshot the displaced
     /// buffer and verify the disk hash before invoking this transition.
+    ///
+    /// The merged result is already canonical UTF-8 (`merged_bytes`); the disk
+    /// base is decoded under `disk_policy` so a BOM-less UTF-16 base maps back
+    /// to the right source bytes (§6.10). Returns `None` (no partial write,
+    /// no state change) if either decode fails or the merged result is too
+    /// large.
     pub fn apply_resolved_merge(
         &mut self,
         merged_bytes: &[u8],
         disk_bytes: &[u8],
+        disk_policy: DecodePolicy,
     ) -> Option<Revision> {
         if merged_bytes.len() > 32 * 1024 * 1024 {
             return None;
         }
         let merged = TextSnapshot::new(merged_bytes).ok()?;
-        let disk = TextSnapshot::new(disk_bytes).ok()?;
+        let disk = TextSnapshot::with_policy(disk_bytes, disk_policy).ok()?;
         self.base_hash = Some(BaseHash::from_snapshot(&disk));
         self.disk_hash = self.base_hash;
         self.base_bytes = disk_bytes.to_vec();
+        self.base_format = disk.format();
         let revision = self.model.apply_snapshot_boundary(merged);
-        self.state = if self.model.to_source_bytes() == disk_bytes {
+        self.state = if self
+            .model
+            .try_to_source_bytes()
+            .is_ok_and(|bytes| bytes == disk_bytes)
+        {
             BufferState::Clean
         } else {
             BufferState::Dirty
@@ -568,20 +681,24 @@ impl Buffer {
 
     /// User chose to discard local changes.
     ///
-    /// Discards local changes and reloads from disk (if available).
-    /// Returns the state transition.
-    pub fn discard(&mut self, disk_bytes: Option<&[u8]>) -> StateTransition {
+    /// Discards local changes and reloads from disk (if available and strictly
+    /// decodable under `policy`). A malformed disk source is NOT adopted
+    /// silently: the buffer resets to empty and drops its disk base so the
+    /// caller can present the encoding decision (§6.10).
+    pub fn discard(&mut self, disk_bytes: Option<&[u8]>, policy: DecodePolicy) -> StateTransition {
         let old_state = self.state;
 
         if let Some(bytes) = disk_bytes
-            && let Ok(snapshot) = TextSnapshot::new(bytes)
+            && let Ok(snapshot) = TextSnapshot::with_policy(bytes, policy)
         {
             let new_hash = BaseHash::from_snapshot(&snapshot);
+            let format = snapshot.format();
 
             self.model = EditorModel::from_snapshot(snapshot);
             self.base_hash = Some(new_hash);
             self.disk_hash = Some(new_hash);
-            self.base_bytes = self.model.to_source_bytes();
+            self.base_bytes = bytes.to_vec();
+            self.base_format = format;
             self.state = BufferState::Clean;
 
             return StateTransition::new(old_state, BufferState::Clean, TransitionReason::Discard);
@@ -590,6 +707,7 @@ impl Buffer {
         // No disk content available, just reset to empty
         self.model = EditorModel::new_empty();
         self.base_hash = None;
+        self.base_format = None;
         self.disk_hash = None;
         self.state = BufferState::Clean;
 
@@ -605,7 +723,8 @@ impl Buffer {
 
         // Update base hash to match current content
         self.base_hash = Some(self.content_hash());
-        self.base_bytes = self.model.to_source_bytes();
+        self.base_bytes = self.model.source_bytes_for_hash();
+        self.base_format = Some(self.model.source_format());
         // Disk hash now matches base hash
         self.disk_hash = self.base_hash;
 
@@ -630,6 +749,7 @@ impl Buffer {
         self.base_hash = Some(hash);
         self.disk_hash = Some(hash);
         self.base_bytes = saved_bytes.to_vec();
+        self.base_format = Some(self.model.source_format());
 
         let new_state = if self.model.revision() == saved_revision {
             BufferState::Clean
@@ -647,7 +767,8 @@ impl Buffer {
     pub fn record_replaced_disk_hash(&mut self, hash: BaseHash) {
         self.base_hash = Some(hash);
         self.disk_hash = Some(hash);
-        self.base_bytes = self.model.to_source_bytes();
+        self.base_bytes = self.model.source_bytes_for_hash();
+        self.base_format = Some(self.model.source_format());
     }
 
     /// Record a particular saved revision as the disk base without replacing
@@ -657,6 +778,7 @@ impl Buffer {
         self.base_hash = Some(hash);
         self.disk_hash = Some(hash);
         self.base_bytes = bytes.to_vec();
+        self.base_format = Some(self.model.source_format());
     }
 
     /// Mark a dirty buffer conflicted from a verified disk hash when the
@@ -754,7 +876,7 @@ mod tests {
         let merged = b"mine\r\nkeep\nexternal\r\n";
         let mut buffer = Buffer::from_snapshot(TextSnapshot::new(mine).unwrap());
 
-        let revision = buffer.apply_resolved_merge(merged, theirs).unwrap();
+        let revision = buffer.apply_resolved_merge(merged, theirs, flavite_encoding::DecodePolicy::Auto).unwrap();
 
         assert!(revision > Revision::INITIAL);
         assert_eq!(buffer.model().to_source_bytes(), merged);
@@ -793,10 +915,13 @@ mod tests {
 
         // External change to identical content
         let new_content = b"hello world";
-        let transition = buffer.check_external_change(new_content);
+        let transition = buffer.check_external_change(new_content, flavite_encoding::DecodePolicy::Auto);
 
         // Should auto-resolve to Clean
         assert_eq!(buffer.state(), BufferState::Clean);
+        let ExternalDecode::Decoded(transition) = transition else {
+            panic!("valid UTF-8 must decode");
+        };
         assert_eq!(
             transition,
             Some(StateTransition::new(
@@ -817,9 +942,12 @@ mod tests {
 
         // External change to different content
         let new_content = b"goodbye";
-        let transition = buffer.check_external_change(new_content);
+        let transition = buffer.check_external_change(new_content, flavite_encoding::DecodePolicy::Auto);
 
         assert_eq!(buffer.state(), BufferState::Conflicted);
+        let ExternalDecode::Decoded(transition) = transition else {
+            panic!("valid UTF-8 must decode");
+        };
         assert_eq!(
             transition,
             Some(StateTransition::new(
@@ -846,9 +974,12 @@ mod tests {
         let mut buffer = Buffer::from_text("hello");
         buffer.handle_file_deleted();
 
-        let transition = buffer.handle_file_recreated(b"hello");
+        let transition = buffer.handle_file_recreated(b"hello", flavite_encoding::DecodePolicy::Auto);
         assert_eq!(buffer.state(), BufferState::Clean);
-        assert_eq!(transition.unwrap().to, BufferState::Clean);
+        let ExternalDecode::Decoded(Some(transition)) = transition else {
+            panic!("recreation must transition");
+        };
+        assert_eq!(transition.to, BufferState::Clean);
     }
 
     #[test]
@@ -861,7 +992,7 @@ mod tests {
         buffer.apply_local_edit(edit);
 
         // Reload from disk
-        let _transition = buffer.reload_from_disk(b"hello");
+        let _transition = buffer.reload_from_disk(b"hello", flavite_encoding::DecodePolicy::Auto);
         assert_eq!(buffer.state(), BufferState::Clean);
         assert_eq!(buffer.text(), "hello");
     }
@@ -876,7 +1007,7 @@ mod tests {
         buffer.apply_local_edit(edit);
 
         // External change
-        buffer.check_external_change(b"goodbye");
+        buffer.check_external_change(b"goodbye", flavite_encoding::DecodePolicy::Auto);
         assert_eq!(buffer.state(), BufferState::Conflicted);
 
         // Keep local
@@ -896,7 +1027,7 @@ mod tests {
         buffer.apply_local_edit(edit);
 
         // Discard
-        let _transition = buffer.discard(Some(b"hello"));
+        let _transition = buffer.discard(Some(b"hello"), flavite_encoding::DecodePolicy::Auto);
         assert_eq!(buffer.state(), BufferState::Clean);
         assert_eq!(buffer.text(), "hello");
     }
@@ -924,9 +1055,10 @@ mod tests {
         buffer
             .restore_recovery(
                 b"recovered",
+                flavite_encoding::DecodePolicy::Auto,
                 b"disk",
                 Some(BaseHash::from_bytes(*blake3::hash(b"disk").as_bytes())),
-            )
+            flavite_encoding::DecodePolicy::Auto)
             .expect("valid UTF-8 recovery and disk bytes");
         assert_eq!(buffer.buffer_id(), id);
         assert!(buffer.revision() > revision);
@@ -941,9 +1073,10 @@ mod tests {
         buffer
             .restore_recovery(
                 b"recovered",
+                flavite_encoding::DecodePolicy::Auto,
                 b"disk changed",
                 Some(BaseHash::from_bytes(*blake3::hash(b"disk").as_bytes())),
-            )
+            flavite_encoding::DecodePolicy::Auto)
             .expect("valid snapshots");
         assert_eq!(buffer.state(), BufferState::Conflicted);
         assert_eq!(buffer.base_bytes(), b"disk changed");
@@ -982,7 +1115,7 @@ mod tests {
             Span::new(TextByte(5), TextByte(5)),
             " mine".into(),
         ));
-        buffer.check_external_change(b"goodbye");
+        buffer.check_external_change(b"goodbye", flavite_encoding::DecodePolicy::Auto);
         assert_eq!(buffer.state(), BufferState::Conflicted);
         assert!(!buffer.allows_autosave());
     }
@@ -996,7 +1129,7 @@ mod tests {
             Span::new(TextByte(5), TextByte(5)),
             " mine".into(),
         ));
-        buffer.check_external_change(b"goodbye");
+        buffer.check_external_change(b"goodbye", flavite_encoding::DecodePolicy::Auto);
         assert!(!buffer.allows_manual_save());
 
         // Orphaned
@@ -1013,20 +1146,35 @@ mod tests {
         empty.set_base_snapshot(b"base".to_vec());
         assert_eq!(empty.base_bytes(), b"base");
         assert_eq!(empty.base_hash(), Some(empty.disk_hash().unwrap()));
-        assert!(empty.check_external_change(b"base").is_none());
-        assert!(empty.check_external_change(&[0xff]).is_none());
-        assert!(empty.handle_file_recreated(&[0xff]).is_none());
-        assert!(empty.reload_from_disk(&[0xff]).is_none());
-        assert!(empty.resolve_keep_local(&[0xff]).is_none());
+        assert_eq!(
+            empty.check_external_change(b"base", flavite_encoding::DecodePolicy::Auto),
+            ExternalDecode::Decoded(None)
+        );
+        // Malformed disk bytes are a TYPED invalid-encoding outcome and
+        // never a silent no-op that could later be mistaken for "unchanged".
+        assert!(matches!(
+            empty.check_external_change(&[0xff], flavite_encoding::DecodePolicy::Auto),
+            ExternalDecode::InvalidEncoding(_)
+        ));
+        assert!(matches!(
+            empty.handle_file_recreated(&[0xff], flavite_encoding::DecodePolicy::Auto),
+            ExternalDecode::InvalidEncoding(_)
+        ));
+        assert!(empty.reload_from_disk(&[0xff], flavite_encoding::DecodePolicy::Auto).is_none());
+        assert!(empty.resolve_keep_local(&[0xff], flavite_encoding::DecodePolicy::Auto).is_none());
 
         let mut buffer = Buffer::from_text("base");
         buffer.handle_file_deleted();
         assert!(buffer.is_orphaned());
-        let recreated = buffer.handle_file_recreated(b"other").unwrap();
+        let ExternalDecode::Decoded(Some(recreated)) =
+            buffer.handle_file_recreated(b"other", flavite_encoding::DecodePolicy::Auto)
+        else {
+            panic!("valid UTF-8 recreation must transition");
+        };
         assert_eq!(recreated.to, BufferState::Conflicted);
         assert!(buffer.is_conflicted());
         assert!(buffer.needs_resolution());
-        let resolved = buffer.resolve_keep_local(b"other").unwrap();
+        let resolved = buffer.resolve_keep_local(b"other", flavite_encoding::DecodePolicy::Auto).unwrap();
         assert_eq!(resolved.reason, TransitionReason::KeepLocal);
         assert_eq!(buffer.base_bytes(), b"other");
         assert_eq!(buffer.state(), BufferState::Dirty);
@@ -1068,7 +1216,7 @@ mod tests {
         buffer
             .model_mut()
             .set_primary_selection(crate::model::Selection::caret(TextByte(3)));
-        let _transition = buffer.check_external_change(b"hello world");
+        let _transition = buffer.check_external_change(b"hello world", flavite_encoding::DecodePolicy::Auto);
 
         assert_eq!(buffer.state(), BufferState::Clean);
         assert_eq!(buffer.model().text(), "hello world");
@@ -1095,7 +1243,7 @@ mod tests {
             crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         buffer.apply_local_edit(edit);
 
-        let _transition = buffer.check_external_change(b"goodbye");
+        let _transition = buffer.check_external_change(b"goodbye", flavite_encoding::DecodePolicy::Auto);
         assert_eq!(buffer.state(), BufferState::Conflicted);
     }
 
@@ -1107,7 +1255,7 @@ mod tests {
             crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         buffer.apply_local_edit(edit);
 
-        let _transition = buffer.check_external_change(b"hello world");
+        let _transition = buffer.check_external_change(b"hello world", flavite_encoding::DecodePolicy::Auto);
         assert_eq!(buffer.state(), BufferState::Clean);
     }
 
@@ -1131,7 +1279,7 @@ mod tests {
             Span::new(TextByte(5), TextByte(5)),
             " mine".into(),
         ));
-        buffer.check_external_change(b"goodbye");
+        buffer.check_external_change(b"goodbye", flavite_encoding::DecodePolicy::Auto);
 
         assert!(buffer.is_conflicted());
         assert!(!buffer.allows_autosave());

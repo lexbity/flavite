@@ -15,6 +15,23 @@ use std::time::{Duration, Instant};
 ///
 /// Edits within this window of the previous edit are coalesced.
 pub const DEFAULT_COALESCE_WINDOW: Duration = Duration::from_millis(500);
+
+/// Undo-unit policy for a batch application (RFC-0006 D-06/TD-8).
+///
+/// `Isolated` installs the batch as one boundary node that can never merge
+/// with neighboring typing (Replace next/all, structure edits, history
+/// restore). `Typing` is the ordinary captured-input path and keeps the
+/// existing coalescing rules. The default is `Isolated`: clients cannot
+/// silently bypass boundary isolation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UndoPolicy {
+    /// One isolated boundary — never coalesces with adjacent typing.
+    #[default]
+    Isolated,
+    /// Ordinary typing — existing coalescing rules apply.
+    Typing,
+}
+
 /// An edit operation that can be applied and inverted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EditOp {

@@ -11,6 +11,8 @@ flavite-fs = { path = "../flavite-fs" }
 flavite-syntax = { path = "../flavite-syntax" }
 flavite-index = { path = "../flavite-index" }
 flavite-buffer = { path = "../flavite-buffer" }
+flavite-encoding = { path = "../flavite-encoding" }
+flavite-text-search = { path = "../flavite-text-search" }
 
 # Threading and synchronization (D3: named threads + bounded channels)
 crossbeam = { workspace = true }

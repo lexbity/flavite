@@ -455,13 +455,21 @@ fn non_utf8_note_fails_the_open_instead_of_a_silent_empty_buffer() {
         other => panic!("cold open should be pending, got {other:?}"),
     };
     let result = flavite.wait_for_operation(request_id);
-    let error = result
-        .into_error()
-        .expect("a note the decoder cannot accept must fail the open");
+    // RFC-0006 §6.10: a note the codec contract cannot accept is a typed
+    // encoding-choice request — never a blank editable buffer and never a
+    // raw backend error string.
+    let ExecutionResult::ActionRequired { code, data, .. } = result else {
+        panic!("the open must require an encoding choice, got {result:?}");
+    };
+    assert_eq!(code, "encoding-choice-required");
+    let data = data.expect("the choice request carries its payload");
     assert!(
-        error.message.to_lowercase().contains("utf-8"),
-        "the failure names the encoding cause: {}",
-        error.message
+        data.as_str().is_some_and(|payload| payload.contains("invalid-utf8")),
+        "the typed reason names the encoding cause: {data}"
+    );
+    assert!(
+        data.as_str().is_some_and(|payload| payload.contains("raw_hash")),
+        "the payload carries the observed raw hash so a reopen can be bound to exact bytes"
     );
     assert!(
         !flavite.is_note_open(&path),

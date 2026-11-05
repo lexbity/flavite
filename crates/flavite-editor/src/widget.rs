@@ -2722,6 +2722,7 @@ mod tests {
             base_hash: Vec::new(),
             state: flavite_api::BufferStatus::Clean,
             path: std::path::PathBuf::from("note.md"),
+            source_format: flavite_api::SourceFormat::utf8(),
         }
     }
 

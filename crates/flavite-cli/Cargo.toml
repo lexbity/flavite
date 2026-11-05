@@ -19,6 +19,8 @@ flavite-api = { path = "../flavite-api" }
 clap = { version = "4", features = ["derive", "cargo"] }
 
 # Error handling (binary — anyhow)
+blake3.workspace = true
+hex.workspace = true
 anyhow = "1"
 
 # Logging

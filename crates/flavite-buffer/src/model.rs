@@ -6,11 +6,17 @@
 //! - Multi-selection support
 //! - Undo/redo via an undo tree
 //! - Per-line EOL metadata
+//! - One authoritative [`SourceFormat`] descriptor plus its [`FormatStamp`]
+//!   (RFC-0006 D-15): the save format is buffer state, not EOL-table state
+//!   and not a filesystem guess.
 //!
 //! All editing operations produce `EditOp`s and are applied through
 //! the model. The model maintains revision numbers and can provide
 //! revisioned read views.
 
+use flavite_encoding::{
+    CodecError, DecodePolicy, EncodeLimits, FormatStamp, SourceFormat, encode as codec_encode,
+};
 use flavite_syntax::text::{Span, TextByte, TextSnapshot};
 use ropey::{Rope, RopeSlice};
 use std::collections::HashMap;
@@ -119,6 +125,12 @@ pub struct EditorModel {
     undo_tree: UndoTree,
     /// Per-line EOL information.
     eol_table: EolTable,
+    /// The authoritative save-format descriptor (RFC-0006 D-15). Ordinary
+    /// edits never change it; only explicit conversion or an acknowledged
+    /// reload/reopen does.
+    source_format: SourceFormat,
+    /// Codec/hint provenance for the descriptor.
+    format_stamp: FormatStamp,
     /// Current revision number.
     revision: Revision,
     /// Base hash of the content when last loaded or saved.
@@ -129,13 +141,130 @@ pub struct EditorModel {
     last_transition_ops: Vec<EditOp>,
 }
 
+/// Why a prepared batch was refused (typed, RFC-0006 D-06). The refusal
+/// happens before any state change: Rope, EOL table, revision and the Undo
+/// tree are untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchError {
+    /// The batch contains no edits.
+    Empty,
+    /// A range endpoint is outside the current text.
+    OutOfBounds { at: usize, len: usize },
+    /// A range endpoint is not a UTF-8 scalar boundary.
+    CharBoundary { at: usize },
+    /// Two edits overlap after ordering (or two empty edits share a start).
+    Overlapping { at: usize },
+}
+
+/// A fully prepared batch candidate (D-06/TD-7): the single combined edit
+/// plus the after-state Undo snapshot, both computed off the interactive
+/// turn from immutable state. The install is O(edit) and infallible.
+#[derive(Debug)]
+pub struct PreparedBatch {
+    /// The combined, boundary-isolated edit over the prepare-time text.
+    pub op: EditOp,
+    /// The after-state snapshot recorded as the isolated Undo node, carrying
+    /// text, spliced EOL state and the descriptor.
+    pub undo_snapshot: TextSnapshot,
+}
+
+/// Splice an EOL table from `old_text` to `new_text`: unchanged prefix and
+/// suffix lines keep their recorded endings; changed lines inherit the old
+/// dominant ending; a new final unterminated line stays unterminated. This
+/// is the affected-range splice (§6.9), never a whole-document
+/// reconstruction fallback.
+#[must_use]
+pub fn spliced_eol_table(old: &EolTable, old_text: &str, new_text: &str) -> EolTable {
+    let dominant = match old.dominant_eol() {
+        crate::eol::LineEnding::None => crate::eol::LineEnding::Lf,
+        ending => ending,
+    };
+    let snapshot = TextSnapshot::from_normalized(new_text);
+    let mut new_table = EolTable::from_snapshot(&snapshot);
+    let old_lines = logical_lines(old_text);
+    let new_lines = logical_lines(new_text);
+    let mut prefix = 0;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < old_lines.len().saturating_sub(prefix)
+        && suffix < new_lines.len().saturating_sub(prefix)
+        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let old_middle = old_lines.len() - prefix - suffix;
+    let new_middle = new_lines.len() - prefix - suffix;
+    for (line, ending) in new_table.line_endings.iter_mut().enumerate() {
+        // A replacement line without a newline is authoritative: do not
+        // carry the old file's ending onto the new final unterminated line.
+        if *ending == crate::eol::LineEnding::None {
+            continue;
+        }
+        let old_line = if line < prefix {
+            Some(line)
+        } else if line >= prefix + new_middle {
+            Some(old_lines.len() - (new_lines.len() - line))
+        } else if old_middle == new_middle {
+            Some(line)
+        } else {
+            None
+        };
+        *ending = old_line
+            .and_then(|old_line| old.get(old_line))
+            .unwrap_or(dominant);
+    }
+    new_table
+}
+
+/// The physical-EOL decoded layer for a normalized text plus its EOL table
+/// (pure form of [`EditorModel::decoded_text`]).
+#[must_use]
+pub fn decoded_layer(text: &str, table: &EolTable) -> String {
+    let mut out = String::with_capacity(text.len() + table.line_count());
+    let mut start = 0usize;
+    let breaks: Vec<usize> = if text.ends_with('\n') {
+        text.match_indices('\n').map(|(i, _)| i).collect()
+    } else {
+        let mut v: Vec<usize> = text.match_indices('\n').map(|(i, _)| i).collect();
+        v.push(text.len());
+        v
+    };
+    for (i, &end) in breaks.iter().enumerate() {
+        out.push_str(&text[start..end]);
+        match table.line_endings.get(i) {
+            Some(crate::eol::LineEnding::Lf) => out.push('\n'),
+            Some(crate::eol::LineEnding::Crlf) => out.push_str("\r\n"),
+            // No recorded ending for this line (new/last): keep LF when
+            // the normalized text carries one, otherwise terminate none.
+            _ => {
+                if end < text.len() {
+                    out.push('\n');
+                }
+            }
+        }
+        start = if end < text.len() { end + 1 } else { end };
+    }
+    out
+}
+
 impl EditorModel {
     /// Create a new editor model from a text snapshot.
+    ///
+    /// A disk-backed snapshot contributes its authoritative descriptor; a
+    /// synthetic normalized view defaults to UTF-8 without BOM and never
+    /// claims another format (§6.10).
     #[must_use]
     pub fn from_snapshot(snapshot: TextSnapshot) -> Self {
         let text = snapshot.text().to_string();
         let rope = Rope::from_str(&text);
         let eol_table = EolTable::from_snapshot(&snapshot);
+        let source_format = snapshot.format().unwrap_or_default();
+        let format_stamp = FormatStamp::detected(source_format);
 
         Self {
             buffer_id: BufferId::new(),
@@ -144,6 +273,8 @@ impl EditorModel {
             selections: HashMap::new(),
             undo_tree: UndoTree::new(snapshot.clone()),
             eol_table,
+            source_format,
+            format_stamp,
             revision: Revision::INITIAL,
             base_hash: Some(BaseHash::from_snapshot(&snapshot)),
             is_dirty: false,
@@ -182,24 +313,51 @@ impl EditorModel {
         self.rope = Rope::from_str(snapshot.text());
         self.text = new_text;
         self.eol_table = EolTable::from_snapshot(&snapshot);
+        if let Some(format) = snapshot.format() {
+            self.source_format = format;
+            self.format_stamp = FormatStamp::detected(format);
+        }
         self.undo_tree = UndoTree::new(snapshot.clone());
         self.revision = self.revision.next();
         self.base_hash = Some(BaseHash::from_snapshot(&snapshot));
         self.is_dirty = false;
     }
 
-    /// Create a new empty editor model.
+    /// Create a new empty editor model (UTF-8, no BOM, LF).
     #[must_use]
     pub fn new_empty() -> Self {
         let snapshot = TextSnapshot::new(b"").unwrap();
         Self::from_snapshot(snapshot)
     }
 
-    /// Create a new editor model with plain text (no EOL info, defaults to LF).
+    /// Create a new editor model with plain text (no EOL info, defaults to LF
+    /// and UTF-8 without BOM).
     #[must_use]
     pub fn from_text(text: &str) -> Self {
-        let snapshot = TextSnapshot::new(text.as_bytes()).unwrap();
+        // Valid UTF-8 input cannot fail strict decode under Auto: the UTF-32
+        // BOM prefixes are not valid UTF-8 sequences, so no codec error path
+        // is reachable here.
+        let snapshot = TextSnapshot::new(text.as_bytes())
+            .unwrap_or_else(|_| TextSnapshot::from_normalized(text));
         Self::from_snapshot(snapshot)
+    }
+
+    /// The authoritative save-format descriptor.
+    #[must_use]
+    pub const fn source_format(&self) -> SourceFormat {
+        self.source_format
+    }
+
+    /// Descriptor provenance (codec version, hint generation).
+    #[must_use]
+    pub const fn format_stamp(&self) -> &FormatStamp {
+        &self.format_stamp
+    }
+
+    /// Record hint-generation provenance without touching text or revision
+    /// (used when the buffer was opened under a confirmed hint).
+    pub fn set_format_stamp_generation(&mut self, hint_generation: Option<u64>) {
+        self.format_stamp.hint_generation = hint_generation;
     }
 
     /// Get the buffer identity.
@@ -403,12 +561,102 @@ impl EditorModel {
         self.rope = Rope::from_str(&new_text);
         self.text = new_text;
         self.eol_table = EolTable::from_snapshot(&snapshot);
+        if let Some(format) = snapshot.format() {
+            self.source_format = format;
+            self.format_stamp = FormatStamp::detected(format);
+        }
         self.undo_tree.apply_boundary(edit, snapshot.clone());
         let revision = self.revision.next();
         self.revision = revision;
         self.base_hash = Some(BaseHash::from_snapshot(&snapshot));
         self.is_dirty = true;
         revision
+    }
+
+    /// Serialize the buffer to its exact on-disk source bytes under the
+    /// authoritative descriptor: descriptor BOM, per-line EOL, trailing
+    /// newline state and encoding family all preserved (D-15, FR-22).
+    ///
+    /// # Errors
+    ///
+    /// `CodecError::Unencodable` when a strict-ASCII policy cannot represent
+    /// the current content (checked before any byte effect), or a typed
+    /// `LimitExceeded` when the serialized output exceeds the 32 MiB
+    /// envelope. A failing conversion never returns partial bytes.
+    pub fn try_to_source_bytes(&self) -> Result<Vec<u8>, CodecError> {
+        let decoded = self.decoded_text();
+        codec_encode(
+            &decoded,
+            &self.source_format,
+            &EncodeLimits::default_envelope(),
+            &mut || false,
+        )
+    }
+
+    /// The DECODED UTF-8 layer: normalized text with physical EOLs restored
+    /// and no BOM. This is the internal serialization input — NOT disk
+    /// source bytes; use [`EditorModel::try_to_source_bytes`] for those.
+    #[must_use]
+    pub fn decoded_text(&self) -> String {
+        let text = self.text();
+        let mut out = String::with_capacity(text.len() + self.eol_table.line_count());
+        let mut start = 0usize;
+        let breaks: Vec<usize> = if text.ends_with('\n') {
+            text.match_indices('\n').map(|(i, _)| i).collect()
+        } else {
+            let mut v: Vec<usize> = text.match_indices('\n').map(|(i, _)| i).collect();
+            v.push(text.len());
+            v
+        };
+        for (i, &end) in breaks.iter().enumerate() {
+            out.push_str(&text[start..end]);
+            match self.eol_table.line_endings.get(i) {
+                Some(crate::eol::LineEnding::Lf) => out.push('\n'),
+                Some(crate::eol::LineEnding::Crlf) => out.push_str("\r\n"),
+                // No recorded ending for this line (new/last): keep LF when
+                // the normalized text carries one, otherwise terminate none.
+                _ => {
+                    if end < text.len() {
+                        out.push('\n');
+                    }
+                }
+            }
+            start = if end < text.len() { end + 1 } else { end };
+        }
+        out
+    }
+
+    /// Change the buffer's save format as one isolated, revision-advancing
+    /// Undo boundary without touching disk (FR-25, §6.10).
+    ///
+    /// Even when the byte representation would not change (e.g. ASCII bytes
+    /// kept as UTF-8), the boundary exists and is isolated: plain typing
+    /// coalesces with it, Undo/Redo restore the descriptor as well as text
+    /// and EOL state. Representability of the current content in the target
+    /// is preflighted first, so a refused conversion leaves zero state
+    /// change.
+    ///
+    /// # Errors
+    ///
+    /// `CodecError::Unencodable`/`LimitExceeded` from the preflight check.
+    pub fn try_convert_source_format(&mut self, target: SourceFormat) -> Result<Revision, CodecError> {
+        // Preflight on the exact decoded layer before any state change.
+        codec_encode(
+            &self.decoded_text(),
+            &target,
+            &EncodeLimits::default_envelope(),
+            &mut || false,
+        )?;
+        self.source_format = target;
+        self.format_stamp = FormatStamp::detected(target);
+        // Isolated undo node: the node snapshot carries the NEW descriptor
+        // (its parent keeps the old one), so Redo lands the format change.
+        let snapshot = self.snapshot();
+        let edit = EditOp::new(Span::new(TextByte(0), TextByte(0)), String::new());
+        self.undo_tree.apply_boundary(edit, snapshot);
+        self.revision = self.revision.next();
+        self.is_dirty = true;
+        Ok(self.revision)
     }
 
     /// Apply multiple edit operations as a single atomic edit.
@@ -494,26 +742,142 @@ impl EditorModel {
     /// snapshot and land on valid UTF-8 boundaries.
     #[must_use]
     pub fn edit_ops_valid(&self, edits: &[EditOp]) -> bool {
+        self.batch_error(edits).is_none()
+    }
+
+    /// Typed validation for a batch against the current text: ranges must be
+    /// in-bounds, UTF-8 boundary aligned, and non-overlapping after ordering.
+    /// Used by both the bool validity check and the prepared-candidate path,
+    /// so a batch is either fully installable or fully refused (D-06).
+    fn batch_error(&self, edits: &[EditOp]) -> Option<BatchError> {
         if edits.is_empty() {
-            return true;
+            return Some(BatchError::Empty);
         }
         let text = self.text();
         let mut ordered = edits.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|edit| (edit.range.start.0, edit.range.end.0));
-        if ordered.iter().any(|edit| {
-            edit.range.start.0 > edit.range.end.0
-                || edit.range.end.0 > text.len()
-                || !text.is_char_boundary(edit.range.start.0)
+        for edit in &ordered {
+            if edit.range.start.0 > edit.range.end.0 {
+                return Some(BatchError::OutOfBounds {
+                    at: edit.range.start.0,
+                    len: text.len(),
+                });
+            }
+            if edit.range.end.0 > text.len() {
+                return Some(BatchError::OutOfBounds {
+                    at: edit.range.end.0,
+                    len: text.len(),
+                });
+            }
+            if !text.is_char_boundary(edit.range.start.0)
                 || !text.is_char_boundary(edit.range.end.0)
-        }) {
-            return false;
+            {
+                return Some(BatchError::CharBoundary { at: edit.range.start.0 });
+            }
         }
-        !ordered.windows(2).any(|pair| {
-            pair[1].range.start.0 < pair[0].range.end.0
+        for pair in ordered.windows(2) {
+            if pair[1].range.start.0 < pair[0].range.end.0
                 || (pair[1].range.start.0 == pair[0].range.start.0
                     && pair[0].range.is_empty()
                     && pair[1].range.is_empty())
+            {
+                return Some(BatchError::Overlapping {
+                    at: pair[1].range.start.0,
+                });
+            }
+        }
+        None
+    }
+
+    /// Prepare a batch candidate OFF the interactive turn (D-06/TD-7): all
+    /// validation, the combined edit and the after-state undo snapshot are
+    /// computed from the immutable current state, so the later install is
+    /// O(edit) and can never fail or partially apply. The after-state EOL
+    /// table is spliced (prefix/suffix/dominant), never reconstructed from
+    /// the whole document.
+    ///
+    /// # Errors
+    ///
+    /// [`BatchError`] when the batch is empty, out of bounds, not
+    /// char-boundary aligned, or overlapping — with zero state changes.
+    pub fn prepare_batch(&self, edits: &[EditOp]) -> Result<PreparedBatch, BatchError> {
+        if let Some(error) = self.batch_error(edits) {
+            return Err(error);
+        }
+        let old_text = self.text();
+        let mut ordered = edits.to_vec();
+        ordered.sort_by_key(|edit| (edit.range.start.0, edit.range.end.0));
+        let start = ordered[0].range.start.0;
+        let end = ordered.last().map_or(start, |edit| edit.range.end.0);
+        let mut replacement = String::new();
+        let mut cursor = start;
+        for edit in &ordered {
+            replacement.push_str(&old_text[cursor..edit.range.start.0]);
+            replacement.push_str(&edit.replacement);
+            cursor = edit.range.end.0;
+        }
+        replacement.push_str(&old_text[cursor..end]);
+        let combined = EditOp::new(Span::new(TextByte(start), TextByte(end)), replacement);
+        let after_text = combined.apply(old_text);
+        let after_table = spliced_eol_table(&self.eol_table, old_text, &after_text);
+        let decoded = decoded_layer(&after_text, &after_table);
+        let undo_snapshot = match codec_encode(
+            &decoded,
+            &self.source_format,
+            &EncodeLimits::default_envelope(),
+            &mut || false,
+        ) {
+            Ok(source) => TextSnapshot::with_policy(&source, DecodePolicy::Explicit(self.source_format))
+                .unwrap_or_else(|_| {
+                    TextSnapshot::from_normalized_with_descriptor(&after_text, self.source_format)
+                }),
+            // A strict-ASCII-incompatible after-state still records the
+            // exact text/EOL/format intent so Undo/Redo restore it (§6.10).
+            Err(_) => TextSnapshot::from_normalized_with_descriptor(&after_text, self.source_format),
+        };
+        Ok(PreparedBatch {
+            op: combined,
+            undo_snapshot,
         })
+    }
+
+    /// Install a prepared candidate as one new revision and one isolated
+    /// Undo node (D-06). The install cannot fail: validation and the
+    /// candidate were completed by [`EditorModel::prepare_batch`].
+    pub fn install_prepared(&mut self, batch: PreparedBatch) -> Revision {
+        self.apply_text_edit(&batch.op);
+        self.undo_tree.apply_boundary(batch.op, batch.undo_snapshot);
+        let revision = self.revision.next();
+        self.revision = revision;
+        self.is_dirty = true;
+        revision
+    }
+
+    /// Validate-then-install one batch under `policy` (D-06): `Isolated`
+    /// goes through the prepared candidate (one boundary, no coalescing),
+    /// `Typing` keeps the existing coalescing behavior. Zero state change on
+    /// any validation failure.
+    ///
+    /// # Errors
+    ///
+    /// [`BatchError`] with zero state changes on invalid input.
+    pub fn try_apply_batch(
+        &mut self,
+        edits: &[EditOp],
+        policy: crate::undo::UndoPolicy,
+    ) -> Result<Revision, BatchError> {
+        match policy {
+            crate::undo::UndoPolicy::Isolated => {
+                let batch = self.prepare_batch(edits)?;
+                Ok(self.install_prepared(batch))
+            }
+            crate::undo::UndoPolicy::Typing => {
+                if self.batch_error(edits).is_some() {
+                    return Err(self.batch_error(edits).unwrap_or(BatchError::Empty));
+                }
+                Ok(self.apply_edit_ops(edits))
+            }
+        }
     }
 
     /// Undo the last edit.
@@ -529,6 +893,13 @@ impl EditorModel {
             self.rope = Rope::from_str(&new_text);
             self.text = new_text;
             self.eol_table = EolTable::from_snapshot(&snapshot);
+            // Undo restores the recorded descriptor too, not just text/EOL
+            // (FR-25: format-only boundaries are ordinary isolated undo
+            // units over buffer state).
+            if let Some(format) = snapshot.format() {
+                self.source_format = format;
+                self.format_stamp = FormatStamp::detected(format);
+            }
             self.revision = self.revision.next();
             self.is_dirty = true;
             self.last_transition_ops = transition.into_iter().collect();
@@ -557,6 +928,10 @@ impl EditorModel {
             self.rope = Rope::from_str(&new_text);
             self.text = new_text;
             self.eol_table = EolTable::from_snapshot(&snapshot);
+            if let Some(format) = snapshot.format() {
+                self.source_format = format;
+                self.format_stamp = FormatStamp::detected(format);
+            }
             self.revision = self.revision.next();
             self.is_dirty = true;
             self.last_transition_ops = transition.into_iter().collect();
@@ -638,41 +1013,64 @@ impl EditorModel {
         &mut self.eol_table
     }
 
-    /// Serialize the buffer to bytes with EOL metadata applied.
+    /// Internal content-identity bytes: the serialized source when the
+    /// content encodes under its descriptor; otherwise the normalized text
+    /// (the identity a pending-descriptor synthetic snapshot carries, so
+    /// hashes stay comparable across the unencodable-draft case).
     ///
-    /// This produces the exact source bytes for the current buffer state,
-    /// including BOM (if present in the original), per-line EOL, and
-    /// trailing newline state.
+    /// Disk-facing callers MUST use [`EditorModel::try_to_source_bytes`]
+    /// and handle `Unencodable`/limit errors typed (RFC-0006 D-15); there
+    /// is no silent lossy serialization fallback on any disk path.
+    #[must_use]
+    pub(crate) fn source_bytes_for_hash(&self) -> Vec<u8> {
+        self.try_to_source_bytes()
+            .unwrap_or_else(|_| self.text().as_bytes().to_vec())
+    }
+
+    /// Test-only exact serialization shim (asserts use representable
+    /// content). Production code must use [`EditorModel::try_to_source_bytes`].
+    #[cfg(test)]
     #[must_use]
     pub fn to_source_bytes(&self) -> Vec<u8> {
-        let text = self.text();
-        // Walk the contiguous text once instead of two Rope lookups per
-        // line. A final LF has no synthetic empty source line.
-        let mut line_breaks: Vec<_> = text
-            .match_indices('\n')
-            .map(|(byte, _)| TextByte(byte))
-            .collect();
-        if !text.ends_with('\n') {
-            line_breaks.push(TextByte(text.len()));
-        }
-
-        self.eol_table.serialize(text, &line_breaks)
+        self.try_to_source_bytes()
+            .unwrap_or_else(|_| self.decoded_text().into_bytes())
     }
 
     /// Create a text snapshot of the current buffer state.
     ///
-    /// This creates a snapshot with normalized text (CRLF folded) but
-    /// preserves the EOL metadata separately.
+    /// The snapshot is disk-backed when the content serializes under the
+    /// descriptor (the normal case: byte-accurate source, per-line EOL and
+    /// BOM preserved). For a strict-ASCII draft with non-ASCII content the
+    /// serialization legitimately fails; the snapshot then becomes a pending
+    /// descriptor view so Undo/Redo still restore text, EOL and format
+    /// exactly (§6.10: the draft stays intact and recoverable, saving it
+    /// fails with `Unencodable` before any file effect).
     #[must_use]
     pub fn snapshot(&self) -> TextSnapshot {
-        let source_bytes = self.to_source_bytes();
-        TextSnapshot::new(&source_bytes).unwrap()
+        match self.try_to_source_bytes() {
+            Ok(source_bytes) => {
+                TextSnapshot::with_policy(&source_bytes, DecodePolicy::Explicit(self.source_format))
+                    .unwrap_or_else(|_| {
+                        TextSnapshot::from_normalized_with_descriptor(
+                            self.text(),
+                            self.source_format,
+                        )
+                    })
+            }
+            Err(_) => TextSnapshot::from_normalized_with_descriptor(
+                self.text(),
+                self.source_format,
+            ),
+        }
     }
 
-    /// Get the content hash of the current buffer.
+    /// Get the content hash of the current buffer (serialized source when
+    /// encodable, otherwise the normalized text identity; see
+    /// [`EditorModel::source_bytes_for_hash`] and
+    /// [`EditorModel::snapshot`] for the pending-draft case).
     #[must_use]
     pub fn content_hash(&self) -> BaseHash {
-        let source_bytes = self.to_source_bytes();
+        let source_bytes = self.source_bytes_for_hash();
         let hash = blake3::hash(&source_bytes);
         BaseHash::from_bytes(hash.into())
     }
@@ -719,7 +1117,6 @@ impl EditorModel {
             crate::eol::LineEnding::None => crate::eol::LineEnding::Lf,
             ending => ending,
         };
-        let has_bom = self.eol_table.has_bom();
         let snapshot = TextSnapshot::from_normalized(self.text());
         let mut new_table = EolTable::from_snapshot(&snapshot);
         let old_lines = logical_lines(old_text);
@@ -759,7 +1156,6 @@ impl EditorModel {
                 .and_then(|old_line| self.eol_table.get(old_line))
                 .unwrap_or(dominant);
         }
-        new_table.has_bom = has_bom;
 
         self.eol_table = new_table;
     }
@@ -987,7 +1383,7 @@ mod tests {
 
         assert_eq!(model.text(), "single line");
         assert_eq!(model.eol_table().line_count(), 1);
-        assert!(model.eol_table().has_bom());
+        assert!(model.source_format().bom(), "descriptor owns the BOM");
         assert!(!model.eol_table().has_trailing_newline());
         assert_eq!(model.to_source_bytes(), "\u{FEFF}single line".as_bytes());
         let _ = model.content_hash();

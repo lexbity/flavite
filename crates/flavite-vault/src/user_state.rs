@@ -33,6 +33,10 @@ pub enum UserStateKind {
     /// App-launch memory (W10): the most recently opened vault root on this
     /// device. Lives in the app scope, not under any vault UUID.
     AppLaunch,
+    /// RFC-0006 §6.10: device-local confirmed source-format hints, keyed by
+    /// vault/root/native source identity and bound to the last confirmed raw
+    /// hash. Never stored in the workspace layout; never note content.
+    EncodingHints,
 }
 
 impl UserStateKind {
@@ -43,6 +47,7 @@ impl UserStateKind {
             Self::WorkspaceLayouts => "workspace-layouts.json",
             Self::DevicePreferences => "device-preferences.json",
             Self::AppLaunch => "app-launch.json",
+            Self::EncodingHints => "encoding-hints.json",
         }
     }
 }

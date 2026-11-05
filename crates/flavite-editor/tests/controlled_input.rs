@@ -26,6 +26,7 @@ fn view(text: &str, buffer_id: u64) -> BufferView {
         base_hash: Vec::new(),
         state: BufferStatus::Clean,
         path: std::path::PathBuf::from("note.md"),
+        source_format: flavite_api::SourceFormat::utf8(),
     }
 }
 

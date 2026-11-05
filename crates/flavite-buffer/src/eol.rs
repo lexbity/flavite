@@ -51,14 +51,14 @@ impl From<LineEnding> for SyntaxEol {
 
 /// The EOL side table for a buffer.
 ///
-/// Tracks the line ending style for each line, the BOM presence, and whether
-/// the file has a trailing newline.
+/// Tracks the line ending style for each line and whether the file has a
+/// trailing newline. BOM ownership lives in the buffer's [`SourceFormat`]
+/// descriptor (RFC-0006 §6.10), not here: this table is the EOL map of the
+/// decoded-UTF-8 layer and never carries a format flag.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EolTable {
     /// EOL for each line. The length matches the number of lines in the buffer.
     pub line_endings: Vec<LineEnding>,
-    /// Whether the buffer's source began with a UTF-8 BOM.
-    pub has_bom: bool,
     /// Whether the buffer's source ends with a trailing newline.
     pub has_trailing_newline: bool,
 }
@@ -83,7 +83,6 @@ impl EolTable {
 
         Self {
             line_endings,
-            has_bom: snapshot.has_bom(),
             has_trailing_newline,
         }
     }
@@ -112,12 +111,6 @@ impl EolTable {
     #[must_use]
     pub fn line_count(&self) -> usize {
         self.line_endings.len()
-    }
-
-    /// Whether the buffer has a BOM.
-    #[must_use]
-    pub const fn has_bom(&self) -> bool {
-        self.has_bom
     }
 
     /// Whether the buffer has a trailing newline.
@@ -212,22 +205,22 @@ impl EolTable {
         self.has_trailing_newline = false;
     }
 
-    /// Create a byte-exact serialization of the current text with EOLs applied.
+    /// Create a byte-exact serialization of the current DECODED UTF-8 layer
+    /// with physical EOLs applied (CRLF restored where recorded).
     ///
-    /// This reconstructs the original bytes for unedited content, or applies
-    /// the EOL rules to edited content.
+    /// This reconstructs the decoded source bytes for unedited content, or
+    /// applies the EOL rules to edited content. It does NOT prepend a BOM and
+    /// does NOT perform codec serialization: the buffer's [`SourceFormat`]
+    /// descriptor owns both (RFC-0006 §6.10).
+    ///
+    /// [`SourceFormat`]: flavite_encoding::SourceFormat
     ///
     /// # Arguments
     /// * `text` - The normalized text (CRLF folded to LF, BOM removed)
     /// * `line_breaks` - The TextByte offsets where lines end in the normalized text
     #[must_use]
     pub fn serialize(&self, text: &str, line_breaks: &[TextByte]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(text.len() + self.line_endings.len() * 2 + 3);
-
-        // Add BOM if present
-        if self.has_bom {
-            out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
-        }
+        let mut out = Vec::with_capacity(text.len() + self.line_endings.len() * 2);
 
         let mut start = 0usize;
         for (i, &end_byte) in line_breaks.iter().enumerate() {
@@ -291,8 +284,6 @@ pub struct EolStats {
     pub crlf_count: usize,
     /// Number of lines with no ending (should be 0 or 1 at the end).
     pub none_count: usize,
-    /// Whether the buffer has a BOM.
-    pub has_bom: bool,
     /// Whether the buffer has a trailing newline.
     pub has_trailing_newline: bool,
 }
@@ -317,7 +308,6 @@ impl EolTable {
             lf_count,
             crlf_count,
             none_count,
-            has_bom: self.has_bom,
             has_trailing_newline: self.has_trailing_newline,
         }
     }
@@ -363,7 +353,9 @@ mod tests {
         let snapshot = snap(src);
         let table = EolTable::from_snapshot(&snapshot);
 
-        assert!(table.has_bom());
+        // The EOL table owns only line-ending state; the BOM lives on the
+        // snapshot descriptor (RFC-0006 §6.10).
+        assert!(snapshot.has_bom());
         assert!(table.has_trailing_newline());
     }
 
@@ -376,8 +368,10 @@ mod tests {
         // Build line breaks
         let line_breaks: Vec<TextByte> = snapshot.lines().iter().map(|l| l.text_end).collect();
 
+        // `serialize` produces the DECODED layer (no BOM); the codec re-adds
+        // it per the descriptor.
         let serialized = table.serialize(snapshot.text(), &line_breaks);
-        assert_eq!(serialized, src.as_bytes());
+        assert_eq!(serialized, "hello\r\nworld\n".as_bytes());
     }
 
     #[test]

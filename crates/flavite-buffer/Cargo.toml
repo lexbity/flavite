@@ -13,6 +13,8 @@ ropey = { workspace = true }
 crossbeam = { workspace = true }
 # Text snapshot and coordinate types from flavite-syntax
 flavite-syntax = { path = "../flavite-syntax" }
+# Strict file-content codecs and source-format descriptors (RFC-0006 §6.10)
+flavite-encoding = { path = "../flavite-encoding", features = ["serde"] }
 # Serialization for recovery files
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

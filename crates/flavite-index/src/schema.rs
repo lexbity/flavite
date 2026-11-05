@@ -11,16 +11,16 @@ use std::path::Path;
 /// Current schema major version.
 /// This is used in the cache path: `<os-cache>/flavite/<vault-uuid>/v<schema-major>/`
 /// When this changes, old caches are not mutated and can coexist.
-pub const SCHEMA_MAJOR: u32 = 3;
+///
+/// 4.0 (RFC-0006 S00): the derived index cache is rebuilt under a new epoch
+/// with source encoding/BOM/decode-status columns, a codec-version marker in
+/// meta and regenerated source-span metadata. The old UTF-8-only 3.x cache
+/// is never reused under a compatible minor marker (§6.10).
+pub const SCHEMA_MAJOR: u32 = 4;
 
 /// Current schema minor version for in-place migrations within the same major.
-/// 3.1 (RFC-0004 S2): `links.target_stem` + `links_target_stem` — the
-/// discovery D12 anticipated. The catalog's stem-fallback branch lets any
-/// `dir/key.ext` target resolve through `stem(target)`, a form an
-/// `target_key IN (…)` fetch cannot enumerate; the stored, indexed final-
-/// component stem makes the targeted resolution pass superset-sound (§4.2,
-/// FR-3) with two indexed arms instead of a per-apply walk.
-pub const SCHEMA_MINOR: u32 = 1;
+/// 4.0 is the initial RFC-0006 S00 encoding-aware cache layout.
+pub const SCHEMA_MINOR: u32 = 0;
 
 /// Parser version - used to trigger background reindex when parser changes.
 pub const PARSER_VERSION: u32 = 3;
@@ -47,6 +47,9 @@ impl SchemaVersion {
 pub enum MetaKey {
     /// Schema version (major.minor as "major.minor")
     SchemaVersion,
+    /// Codec version marker (RFC-0006 §6.10): a cache written by a different
+    /// codec generation is derived state and is rebuilt, never reinterpreted.
+    CodecVersion,
     /// Parser version
     ParserVersion,
     /// Vault UUID (string)
@@ -88,6 +91,7 @@ impl MetaKey {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::SchemaVersion => "schema_version",
+            Self::CodecVersion => "codec_version",
             Self::ParserVersion => "parser_version",
             Self::VaultUuid => "vault_uuid",
             Self::Epoch => "epoch",
@@ -249,7 +253,10 @@ pub fn create_schema(conn: &mut Connection) -> Result<()> {
             frontmatter  TEXT,
             preview      TEXT,
             parse_ok     INTEGER NOT NULL DEFAULT 1,
-            generation   INTEGER NOT NULL
+            generation   INTEGER NOT NULL,
+            encoding     TEXT NOT NULL DEFAULT 'utf8',
+            bom          INTEGER NOT NULL DEFAULT 0,
+            decode_status TEXT NOT NULL DEFAULT 'ok'
         )",
     )?;
 
@@ -406,6 +413,17 @@ pub fn create_schema(conn: &mut Connection) -> Result<()> {
         params![MetaKey::ParserVersion.as_str(), PARSER_VERSION.to_string()],
     )?;
 
+    // Codec-version marker (RFC-0006 §6.10): a cache written by a different
+    // codec generation is derived state and must rebuild, never reread/guess
+    // formats differently from open/reconcile.
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+        params![
+            MetaKey::CodecVersion.as_str(),
+            flavite_encoding::CODEC_VERSION.to_string()
+        ],
+    )?;
+
     tx.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)",
         params![MetaKey::Epoch.as_str(), current_epoch.to_string()],
@@ -521,6 +539,20 @@ pub fn open_or_init(path: &Path) -> Result<Connection> {
             && notes_columns
                 .iter()
                 .any(|(name, not_null)| name == "content_hash" && !not_null);
+        // S00: a cache lacking the encoding-aware columns, or written by a
+        // different codec generation, is rebuilt rather than reinterpreted.
+        let has_encoding_columns = notes_columns
+            .iter()
+            .any(|(name, _)| name == "encoding")
+            && notes_columns.iter().any(|(name, _)| name == "bom")
+            && notes_columns
+                .iter()
+                .any(|(name, _)| name == "decode_status");
+        let codec_matches = get_meta(&conn, MetaKey::CodecVersion)
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<u32>().ok())
+            == Some(flavite_encoding::CODEC_VERSION);
         let links_columns = conn
             .prepare("PRAGMA table_info(links)")
             .and_then(|mut statement| {
@@ -529,7 +561,12 @@ pub fn open_or_init(path: &Path) -> Result<Connection> {
             })
             .unwrap_or_default();
         let has_target_stem = links_columns.iter().any(|name| name == "target_stem");
-        major_matches && table_count == 10 && has_schema_three_columns && has_target_stem
+        major_matches
+            && table_count == 10
+            && has_schema_three_columns
+            && has_target_stem
+            && has_encoding_columns
+            && codec_matches
     } else {
         false
     };

@@ -66,6 +66,9 @@ pub struct ReadSnapshot {
     pub buffer: Option<(u64, u64)>,
     pub unsaved: bool,
     pub content_hash: [u8; 32],
+    /// Authoritative save-format descriptor (§6.10): for open buffers the
+    /// live descriptor, for saved-content reads the strictly decoded one.
+    pub source_format: flavite_encoding::SourceFormat,
     pub catalog_version: (u64, u64),
     pub document: ReadDocument,
     /// Source-byte start -> canonical destination; no display path reconstruction.
@@ -169,7 +172,7 @@ fn load_inner(
         .find(|(_, _, candidate, ..)| {
             candidate.strip_prefix(session.root()).unwrap_or(candidate) == path
         });
-    let (text, buffer, unsaved) = if let Some((id, revision, ..)) = open {
+    let (text, buffer, unsaved, source_format) = if let Some((id, revision, ..)) = open {
         if expected.is_some_and(|stamp| stamp != (id.as_u64(), revision.as_u64())) {
             return Err("Source revision changed; refresh reading".into());
         }
@@ -180,6 +183,7 @@ fn load_inner(
             view.text,
             Some((id.as_u64(), revision.as_u64())),
             view.state != flavite_buffer::state::BufferState::Clean,
+            view.source_format,
         )
     } else {
         if expected.is_some() {
@@ -188,11 +192,15 @@ fn load_inner(
         let bytes = session
             .read_content_bounded(path, MAX_READ_BYTES as u64)?
             .ok_or("Missing note")?;
-        (
-            Arc::from(flavite_syntax::read::normalized(&bytes)?),
-            None,
-            false,
-        )
+        // §6.10: saved-content reads decode strictly once (Auto) and carry
+        // the authoritative descriptor; malformed input fails the read — it
+        // never becomes an empty/lossy view.
+        let decoded = flavite_syntax::text::TextSnapshot::new(&bytes)
+            .map_err(|error| format!("undecodable source: {error}"))?;
+        let format = decoded
+            .format()
+            .unwrap_or_else(flavite_encoding::SourceFormat::default);
+        (Arc::from(decoded.text().to_owned()), None, false, format)
     };
     budget.bytes = budget
         .bytes
@@ -316,6 +324,7 @@ fn load_inner(
             text,
             buffer,
             unsaved,
+            source_format,
             document,
             links,
             embeds,

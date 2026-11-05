@@ -29,8 +29,17 @@ use crate::state::Buffer;
 /// Magic bytes at the start of a recovery file.
 const RECOVERY_MAGIC: &[u8; 4] = b"FLVT";
 
-/// Current version of the recovery file format.
-const RECOVERY_VERSION: u8 = 1;
+/// Current version of the recovery file format. v2 accompanies the
+/// canonical UTF-8 text with the authoritative `SourceFormat` descriptor,
+/// its codec stamp, and separately-verifiable decoded/encoded layer
+/// hashes (RFC-0006 §6.10).
+const RECOVERY_VERSION: u8 = 2;
+
+/// Legacy recovery version that remains readable; v1 files are treated as
+/// the supported legacy UTF-8 format with their recorded BOM flag and are
+/// migrated to v2 atomically on the next durable write (the last v1 copy
+/// is retained until the v2 receipt).
+const RECOVERY_VERSION_V1: u8 = 1;
 
 /// Header at the start of every recovery file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -108,7 +117,7 @@ impl RecoveryHeader {
         }
 
         let version = bytes[4];
-        if version != RECOVERY_VERSION {
+        if version != RECOVERY_VERSION && version != RECOVERY_VERSION_V1 {
             return None;
         }
         let buffer_id = u64::from_le_bytes([
@@ -141,45 +150,84 @@ impl RecoveryHeader {
     }
 }
 
+/// v1's persisted EOL JSON shape, kept private for legacy reads only: the
+/// retired authoritative BOM flag lives here just long enough to map the
+/// record onto a UTF-8 `SourceFormat` (its existing BOM semantics).
+#[derive(Deserialize)]
+struct LegacyEolV1 {
+    #[serde(default)]
+    line_endings: Vec<crate::eol::LineEnding>,
+    #[serde(default)]
+    has_bom: bool,
+    #[serde(default)]
+    has_trailing_newline: bool,
+}
+
+/// v2 persisted format block: the descriptor, codec stamp and hint
+/// generation, validated on decode (`SourceFormat::new` rejects
+/// impossible combinations rather than coercing them).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FormatRecord {
+    encoding: flavite_encoding::FileEncoding,
+    bom: bool,
+    codec_version: u32,
+    hint_generation: Option<u64>,
+}
+
 /// Recovery file metadata.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RecoveryFile {
     /// The header.
     pub header: RecoveryHeader,
     /// The EOL table.
     pub eol_table: EolTable,
-    /// The normalized text (CRLF folded).
+    /// The normalized text (CRLF folded). Canonical recovery text remains
+    /// UTF-8 irrespective of the note's on-disk `SourceFormat` (§6.10).
     pub text: String,
-    /// The original source bytes length (for validation).
+    /// Length of the DECODED layer (canonical UTF-8 with physical EOLs, no
+    /// BOM). v2's authoritative validation length.
     pub source_len: usize,
-    /// The content hash of the source bytes.
+    /// Hash of the encoded source bytes when the buffer was encodable at
+    /// checkpoint time; otherwise the decoded-layer hash (a pending
+    /// strict-ASCII draft stays intact/recoverable, saving it fails typed).
     pub content_hash: BaseHash,
     /// The base hash at the time of the last save.
     pub base_hash: Option<BaseHash>,
+    /// Authoritative save-format descriptor at checkpoint time. Restores
+    /// replay this recorded format — never a current guess (§6.10).
+    pub source_format: flavite_encoding::SourceFormat,
+    /// Codec implementation version recorded with the descriptor.
+    pub codec_version: u32,
+    /// Hint generation if the descriptor was hint-bound.
+    pub hint_generation: Option<u64>,
+    /// Exact encoded-source length and hash, when the content was
+    /// encodable at checkpoint time.
+    pub encoded: Option<(u64, BaseHash)>,
+}
+
+/// Line count as the snapshot serializer defines it (LF-based; a file
+/// ending in a newline has no trailing empty line).
+fn expected_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        1
+    } else {
+        let lf = text.bytes().filter(|b| *b == b'\n').count();
+        lf + usize::from(!text.ends_with('\n'))
+    }
 }
 
 impl RecoveryFile {
     /// Create a new recovery file from a buffer.
     #[must_use]
     pub fn from_buffer(buffer: &Buffer, checkpoint_seq: u64, is_checkpoint: bool) -> Self {
-        let text = buffer.text().to_string();
-        let eol_table = buffer.model().eol_table().clone();
-        let content_hash = buffer.content_hash();
-        let base_hash = buffer.base_hash();
-
-        Self {
-            header: RecoveryHeader::new(
-                buffer.buffer_id(),
-                buffer.revision(),
-                checkpoint_seq,
-                is_checkpoint,
-            ),
-            eol_table,
-            text,
-            source_len: buffer.len(),
-            content_hash,
-            base_hash,
-        }
+        Self::from_model(
+            buffer.model(),
+            buffer.buffer_id(),
+            buffer.revision(),
+            checkpoint_seq,
+            is_checkpoint,
+            buffer.base_hash(),
+        )
     }
 
     /// Create a new recovery file from an EditorModel.
@@ -192,21 +240,34 @@ impl RecoveryFile {
         is_checkpoint: bool,
         base_hash: Option<BaseHash>,
     ) -> Self {
+        let header = RecoveryHeader::new(buffer_id, revision, checkpoint_seq, is_checkpoint);
         let text = model.text().to_string();
         let eol_table = model.eol_table().clone();
-        let content_hash = model.content_hash();
-
+        let decoded = eol_serialize(&eol_table, &text);
+        let source_len = decoded.len();
+        let decoded_hash = hash_bytes(&decoded);
+        let (content_hash, encoded) = match model.try_to_source_bytes() {
+            Ok(bytes) => {
+                let hash = hash_bytes(&bytes);
+                (hash, Some((bytes.len() as u64, hash)))
+            }
+            Err(_) => (decoded_hash, None),
+        };
         Self {
-            header: RecoveryHeader::new(buffer_id, revision, checkpoint_seq, is_checkpoint),
+            header,
             eol_table,
             text,
-            source_len: model.len(),
+            source_len,
             content_hash,
             base_hash,
+            source_format: model.source_format(),
+            codec_version: model.format_stamp().codec_version,
+            hint_generation: model.format_stamp().hint_generation,
+            encoded,
         }
     }
 
-    /// Serialize the recovery file to bytes.
+    /// Serialize the recovery file to bytes (v2 layout).
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -214,8 +275,23 @@ impl RecoveryFile {
         // Write header
         bytes.extend_from_slice(&self.header.to_bytes());
 
-        // Write EOL table as JSON
-        let eol_json = serde_json::to_vec(&self.eol_table).unwrap_or_default();
+        // v2 format block (descriptor + codec stamp + hint generation).
+        let record = FormatRecord {
+            encoding: self.source_format.encoding(),
+            bom: self.source_format.bom(),
+            codec_version: self.codec_version,
+            hint_generation: self.hint_generation,
+        };
+        // An impossible descriptor cannot exist in `self`, so serialization
+        // here is infallible by construction.
+        let format_json = serde_json::to_vec(&record).expect("validated descriptor serializes");
+        bytes.extend_from_slice(&(format_json.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&format_json);
+
+        // Write EOL table as JSON. A serde failure here would silently
+        // destroy the EOL state, so it is a hard (documented) stop rather
+        // than the retired `unwrap_or_default()` empty-blob fallback.
+        let eol_json = serde_json::to_vec(&self.eol_table).expect("EolTable is serde-safe");
         bytes.extend_from_slice(&(eol_json.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&eol_json);
 
@@ -223,11 +299,16 @@ impl RecoveryFile {
         bytes.extend_from_slice(&(self.text.len() as u32).to_le_bytes());
         bytes.extend_from_slice(self.text.as_bytes());
 
-        // Write source_len
+        // Decoded-layer length and hash
         bytes.extend_from_slice(&(self.source_len as u64).to_le_bytes());
+        bytes.extend_from_slice(self.decoded_layer_hash().as_slice());
 
-        // Write content_hash
-        bytes.extend_from_slice(self.content_hash.as_slice());
+        // Optional encoded source record
+        bytes.push(self.encoded.is_some() as u8);
+        if let Some((len, hash)) = &self.encoded {
+            bytes.extend_from_slice(&len.to_le_bytes());
+            bytes.extend_from_slice(hash.as_slice());
+        }
 
         // Write base_hash (optional)
         bytes.push(self.base_hash.is_some() as u8);
@@ -238,84 +319,169 @@ impl RecoveryFile {
         bytes
     }
 
-    /// Deserialize a recovery file from bytes.
+    /// The decoded UTF-8 layer (canonical text with physical EOLs restored,
+    /// no BOM): the input to codec serialization.
+    #[must_use]
+    fn decoded_layer(&self) -> Vec<u8> {
+        eol_serialize(&self.eol_table, &self.text)
+    }
+
+    #[must_use]
+    fn decoded_layer_hash(&self) -> BaseHash {
+        hash_bytes(&self.decoded_layer())
+    }
+
+    /// Deserialize a recovery file from bytes, accepting v2 and the legacy
+    /// v1 layout. Verification failures (corruption, impossible descriptors,
+    /// inconsistent layers) return `None`; nothing partial is ever handed
+    /// back for restore.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         // Read header (38 bytes with magic + version + fields)
         if bytes.len() < 38 {
             return None;
         }
         let header = RecoveryHeader::from_bytes(&bytes[..38])?;
-
-        let mut offset = 38;
-
-        // Read EOL table length
-        if offset + 4 > bytes.len() {
-            return None;
+        match header.version {
+            RECOVERY_VERSION => Self::from_bytes_v2(&header, &bytes[38..]),
+            RECOVERY_VERSION_V1 => Self::from_bytes_v1(header, bytes),
+            _ => None,
         }
-        let eol_len = u32::from_le_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-        ]) as usize;
-        offset += 4;
+    }
 
-        // Read EOL table JSON
-        if offset + eol_len > bytes.len() {
-            return None;
-        }
-        let eol_json = &bytes[offset..offset + eol_len];
+    fn from_bytes_v2(header: &RecoveryHeader, rest: &[u8]) -> Option<Self> {
+        let mut offset = 0usize;
+
+        // Format block JSON
+        let format_json = read_len_prefixed(rest, &mut offset, 64 * 1024)?;
+        let record: FormatRecord = serde_json::from_slice(format_json).ok()?;
+        let source_format =
+            flavite_encoding::SourceFormat::new(record.encoding, record.bom).ok()?;
+
+        // EOL table JSON
+        let eol_json = read_len_prefixed(rest, &mut offset, 8 * 1024 * 1024)?;
         let eol_table: EolTable = serde_json::from_slice(eol_json).ok()?;
-        offset += eol_len;
 
-        // Read text length
-        if offset + 4 > bytes.len() {
-            return None;
-        }
-        let text_len = u32::from_le_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-        ]) as usize;
-        offset += 4;
+        // Text
+        let text_bytes = read_len_prefixed(rest, &mut offset, 64 * 1024 * 1024)?;
+        let text = std::str::from_utf8(text_bytes).ok()?.to_owned();
 
-        // Read text
-        if offset + text_len > bytes.len() {
-            return None;
-        }
-        let text = std::str::from_utf8(&bytes[offset..offset + text_len])
-            .ok()?
-            .to_owned();
-        offset += text_len;
-
-        // Read source_len
-        if offset + 8 > bytes.len() {
-            return None;
-        }
-        let source_len = u64::from_le_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-            bytes[offset + 4],
-            bytes[offset + 5],
-            bytes[offset + 6],
-            bytes[offset + 7],
-        ]) as usize;
+        // Decoded-layer length and hash
+        let source_len = read_u64(rest, &mut offset)?;
+        let source_len = usize::try_from(source_len).ok()?;
         if source_len > 64 * 1024 * 1024 {
             return None;
         }
-        offset += 8;
+        let decoded_hash = read_hash(rest, &mut offset)?;
 
-        // Read content_hash
-        if offset + 32 > bytes.len() {
+        // Optional encoded source record
+        let has_encoded = match rest.get(offset).copied()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        offset += 1;
+        let encoded = if has_encoded {
+            let len = read_u64(rest, &mut offset)?;
+            let hash = read_hash(rest, &mut offset)?;
+            Some((len, hash))
+        } else {
+            None
+        };
+
+        // Base hash
+        let has_base_hash = match rest.get(offset).copied()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        offset += 1;
+        let base_hash = if has_base_hash {
+            Some(read_hash(rest, &mut offset)?)
+        } else {
+            None
+        };
+
+        if offset != rest.len() {
             return None;
         }
-        let content_hash = BaseHash::from_slice(&bytes[offset..offset + 32]);
-        offset += 32;
 
-        // Read base_hash
+        let recovery = Self {
+            header: header.clone(),
+            eol_table,
+            text,
+            source_len,
+            content_hash: decoded_hash,
+            base_hash,
+            source_format,
+            codec_version: record.codec_version,
+            hint_generation: record.hint_generation,
+            encoded,
+        };
+
+        // Verification: line count and layer consistency.
+        if recovery.eol_table.line_count() != expected_line_count(&recovery.text) {
+            return None;
+        }
+        let decoded = recovery.decoded_layer();
+        if decoded.len() != recovery.source_len {
+            return None;
+        }
+        if hash_bytes(&decoded) != decoded_hash {
+            return None;
+        }
+        let decoded_str = std::str::from_utf8(&decoded).ok()?;
+        let encoded_attempt = flavite_encoding::encode(
+            decoded_str,
+            &source_format,
+            &flavite_encoding::EncodeLimits {
+                max_input_utf8_bytes: 64 * 1024 * 1024,
+                max_output_bytes: 64 * 1024 * 1024,
+            },
+            &mut || false,
+        );
+        match (&recovery.encoded, encoded_attempt) {
+            (Some((len, hash)), Ok(bytes)) => {
+                if bytes.len() as u64 != *len || hash_bytes(&bytes) != *hash {
+                    return None;
+                }
+            }
+            (None, Err(_)) => {}
+            _ => return None,
+        }
+        let content_hash = match &recovery.encoded {
+            Some((_, hash)) => *hash,
+            None => decoded_hash,
+        };
+        let mut recovery = recovery;
+        recovery.content_hash = content_hash;
+        Some(recovery)
+    }
+
+    /// Legacy v1 reader: canonical UTF-8 with the recorded BOM flag.
+    ///
+    /// v1 wrote `source_len` as the normalized TEXT length while validating
+    /// against the serialized SOURCE length, so BOM/CRLF records could fail
+    /// their own checksum (a latent draft-loss bug this slice retires). The
+    /// v2 reader therefore verifies v1 by content hash only — against the
+    /// encoded source (the old writer's intent) or the decoded layer — and
+    /// keeps every otherwise-valid draft readable instead of discarding it.
+    fn from_bytes_v1(header: RecoveryHeader, bytes: &[u8]) -> Option<Self> {
+        let mut offset = 38usize;
+
+        let eol_json = read_len_prefixed(bytes, &mut offset, 8 * 1024 * 1024)?;
+        let legacy: LegacyEolV1 = serde_json::from_slice(eol_json).ok()?;
+        let eol_table = EolTable {
+            line_endings: legacy.line_endings,
+            has_trailing_newline: legacy.has_trailing_newline,
+        };
+
+        let text_bytes = read_len_prefixed(bytes, &mut offset, 64 * 1024 * 1024)?;
+        let text = std::str::from_utf8(text_bytes).ok()?.to_owned();
+
+        let source_len = read_u64(bytes, &mut offset)?;
+        usize::try_from(source_len).ok()?;
+        let content_hash = read_hash(bytes, &mut offset)?;
+
         let has_base_hash = match bytes.get(offset).copied()? {
             0 => false,
             1 => true,
@@ -324,8 +490,7 @@ impl RecoveryFile {
         offset += 1;
         let base_hash = if has_base_hash {
             if offset + 32 <= bytes.len() {
-                let hash = BaseHash::from_slice(&bytes[offset..offset + 32]);
-                offset += 32;
+                let hash = read_hash(bytes, &mut offset)?;
                 Some(hash)
             } else {
                 None
@@ -341,39 +506,71 @@ impl RecoveryFile {
             header,
             eol_table,
             text,
-            source_len,
+            source_len: 0, // recomputed below from the decoded layer
             content_hash,
             base_hash,
+            source_format: if legacy.has_bom {
+                flavite_encoding::SourceFormat::utf8_with_bom()
+            } else {
+                flavite_encoding::SourceFormat::utf8()
+            },
+            codec_version: flavite_encoding::CODEC_VERSION,
+            hint_generation: None,
+            encoded: None,
         };
-        // `str::split('\n')` counts an extra empty field after a trailing LF,
-        // while TextSnapshot stores that LF on the preceding line. Empty text
-        // still has one logical line in the EOL table.
-        let expected_lines = recovery.text.lines().count().max(1);
-        if recovery.eol_table.line_count() != expected_lines {
+        let decoded = recovery.decoded_layer();
+        let decoded_hash = hash_bytes(&decoded);
+        let source_format = recovery.source_format;
+        let encoded = flavite_encoding::encode(
+            std::str::from_utf8(&decoded).ok()?,
+            &source_format,
+            &flavite_encoding::EncodeLimits {
+                max_input_utf8_bytes: 64 * 1024 * 1024,
+                max_output_bytes: 64 * 1024 * 1024,
+            },
+            &mut || false,
+        )
+        .ok();
+        let mut encoded_record = None;
+        let verified = if let Some(bytes) = &encoded {
+            let hash = hash_bytes(bytes);
+            encoded_record = Some((bytes.len() as u64, hash));
+            hash == content_hash
+        } else {
+            false
+        } || decoded_hash == content_hash;
+        if !verified {
             return None;
         }
-        let source = recovery.to_source_bytes();
-        if source.len() != recovery.source_len
-            || BaseHash::from_bytes(*blake3::hash(&source).as_bytes()) != recovery.content_hash
-        {
-            return None;
-        }
+        // v1 canonical text was snapshot-serialized, so line counts agree
+        // by construction for anything that passes the hash check.
+        let mut recovery = recovery;
+        recovery.source_len = decoded.len();
+        recovery.encoded = encoded_record.filter(|_| encoded.is_some());
         Some(recovery)
     }
 
-    /// Reconstruct the source bytes from the recovery file.
-    #[must_use]
-    pub fn to_source_bytes(&self) -> Vec<u8> {
-        // Use the EOL table to serialize with correct line endings
-        // line_breaks should be the end positions of each line's text (before the newline)
-        let line_breaks: Vec<TextByte> = self
-            .text
-            .char_indices()
-            .filter(|(_, c)| *c == '\n')
-            .map(|(idx, _)| TextByte(idx))
-            .collect();
-
-        self.eol_table.serialize(&self.text, &line_breaks)
+    /// Reconstruct the exact SOURCE bytes of the recorded state by codec
+    /// serialization under the recorded descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Typed codec failure for a pending strict-ASCII draft
+    /// (`Unencodable`) or a bound violation; the caller keeps the recovery
+    /// file as evidence rather than writing substituted bytes.
+    pub fn to_source_bytes(&self) -> Result<Vec<u8>, flavite_encoding::CodecError> {
+        let decoded = self.decoded_layer();
+        let decoded = std::str::from_utf8(&decoded)
+            .map_err(|_| flavite_encoding::CodecError::InvalidUtf8 { source_byte: 0 })?;
+        flavite_encoding::encode(
+            decoded,
+            &self.source_format,
+            &flavite_encoding::EncodeLimits {
+                max_input_utf8_bytes: 64 * 1024 * 1024,
+                max_output_bytes: 64 * 1024 * 1024,
+            },
+            &mut || false,
+        )
     }
 
     /// Check if the recovery file's content hash matches the expected hash.
@@ -381,6 +578,46 @@ impl RecoveryFile {
     pub fn matches_hash(&self, hash: BaseHash) -> bool {
         self.content_hash == hash
     }
+}
+
+/// Serialize the decoded layer (canonical text with physical EOLs restored,
+/// no BOM) from the table. LF offsets are the line breaks; a missing final
+/// LF appends the trailing content.
+fn eol_serialize(table: &EolTable, text: &str) -> Vec<u8> {
+    let line_breaks: Vec<TextByte> = text
+        .char_indices()
+        .filter(|(_, c)| *c == '\n')
+        .map(|(idx, _)| TextByte(idx))
+        .collect();
+    table.serialize(text, &line_breaks)
+}
+
+fn hash_bytes(bytes: &[u8]) -> BaseHash {
+    BaseHash::from_bytes(*blake3::hash(bytes).as_bytes())
+}
+
+fn read_len_prefixed<'a>(bytes: &'a [u8], offset: &mut usize, max: usize) -> Option<&'a [u8]> {
+    let len_raw: [u8; 4] = bytes.get(*offset..*offset + 4)?.try_into().ok()?;
+    let len = u32::from_le_bytes(len_raw) as usize;
+    if len > max {
+        return None;
+    }
+    *offset += 4;
+    let slice = bytes.get(*offset..*offset + len)?;
+    *offset += len;
+    Some(slice)
+}
+
+fn read_u64(bytes: &[u8], offset: &mut usize) -> Option<u64> {
+    let raw: [u8; 8] = bytes.get(*offset..*offset + 8)?.try_into().ok()?;
+    *offset += 8;
+    Some(u64::from_le_bytes(raw))
+}
+
+fn read_hash(bytes: &[u8], offset: &mut usize) -> Option<BaseHash> {
+    let slice = bytes.get(*offset..*offset + 32)?;
+    *offset += 32;
+    Some(BaseHash::from_slice(slice))
 }
 
 /// Recovery writer configuration.
@@ -558,6 +795,9 @@ impl RecoveryWriter {
 
         drop(file);
 
+        // v1→v2 migration receipt before the atomic replace.
+        let retained_v1 = retain_v1_before_write(&path);
+
         // Rename atomically
         if fs::rename(&temp_path, &path).is_err() {
             fs::remove_file(&temp_path).ok();
@@ -570,6 +810,8 @@ impl RecoveryWriter {
         {
             return None;
         }
+
+        retire_v1_copy(retained_v1.as_ref());
 
         // Update last write time
         self.last_write.insert(buffer_id, Instant::now());
@@ -792,11 +1034,58 @@ impl Default for RecoveryWriter {
     }
 }
 
+/// Adjacent retained copy for the v1→v2 migration receipt.
+fn legacy_copy_path(path: &Path) -> PathBuf {
+    path.with_extension("v1-last")
+}
+
+fn is_durable_v1(bytes: &[u8]) -> bool {
+    bytes.len() >= 5 && bytes[..4] == *RECOVERY_MAGIC && bytes[4] == RECOVERY_VERSION_V1
+}
+
+/// v1→v2 migration receipt: when `path` holds a durable v1 file, copy it to
+/// the adjacent retained name *before* the v2 overwrite replaces it, and
+/// only retire the copy after the v2 write is durable (§6.10).
+fn retain_v1_before_write(path: &Path) -> Option<PathBuf> {
+    let existing = fs::read(path).ok()?;
+    if !is_durable_v1(&existing) {
+        return None;
+    }
+    let keep = legacy_copy_path(path);
+    let temp = keep.with_extension("v1tmp");
+    (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)?;
+        file.write_all(&existing)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, &keep)?;
+        if let Some(parent) = keep.parent() {
+            #[cfg(unix)]
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })()
+    .ok()?;
+    Some(keep)
+}
+
+/// Retire the retained v1 copy once the v2 receipt is durable.
+fn retire_v1_copy(keep: Option<&PathBuf>) {
+    if let Some(path) = keep {
+        let _ = fs::remove_file(path);
+    }
+}
+
 fn write_recovery_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("recovery path has no parent"))?;
     fs::create_dir_all(parent)?;
+    let retained_v1 = retain_v1_before_write(path);
     static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nonce = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let timestamp = std::time::SystemTime::now()
@@ -822,6 +1111,8 @@ fn write_recovery_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })();
     if result.is_err() {
         let _ = fs::remove_file(temp);
+    } else {
+        retire_v1_copy(retained_v1.as_ref());
     }
     result
 }
@@ -983,7 +1274,7 @@ mod tests {
         let buffer = Buffer::from_text("hello\nworld");
         let recovery_file = RecoveryFile::from_buffer(&buffer, 1, false);
 
-        let source_bytes = recovery_file.to_source_bytes();
+        let source_bytes = recovery_file.to_source_bytes().unwrap();
         assert_eq!(source_bytes, b"hello\nworld");
     }
 
@@ -1019,7 +1310,7 @@ mod tests {
         assert_ne!(first_process.buffer_id(), second_process.buffer_id());
         let restarted_writer = RecoveryWriter::new(config);
         let recovered = restarted_writer.read_for_note_key(note_key).unwrap();
-        assert_eq!(recovered.to_source_bytes(), b"recovered");
+        assert_eq!(recovered.to_source_bytes().unwrap(), b"recovered");
     }
 
     #[test]
@@ -1027,7 +1318,11 @@ mod tests {
         let buffer = Buffer::from_text("payload");
         let recovery = RecoveryFile::from_buffer(&buffer, 0, false);
         let mut tampered = recovery.to_bytes();
-        let text_start = 38 + 4 + serde_json::to_vec(&recovery.eol_table).unwrap().len() + 4;
+        // v2 framing: header(38) | u32 len + format json | u32 len + eol json
+        // | u32 len + text.
+        let format_len = serde_json::to_vec(&format_record_of(&recovery)).unwrap().len();
+        let eol_len = serde_json::to_vec(&recovery.eol_table).unwrap().len();
+        let text_start = 38 + 4 + format_len + 4 + eol_len + 4;
         tampered[text_start] ^= 1;
         assert!(RecoveryFile::from_bytes(&tampered).is_none());
 
@@ -1040,6 +1335,15 @@ mod tests {
         let mut bytes = invalid.to_bytes();
         bytes[text_start] = 0xff;
         assert!(RecoveryFile::from_bytes(&bytes).is_none());
+    }
+
+    fn format_record_of(recovery: &RecoveryFile) -> FormatRecord {
+        FormatRecord {
+            encoding: recovery.source_format.encoding(),
+            bom: recovery.source_format.bom(),
+            codec_version: recovery.codec_version,
+            hint_generation: recovery.hint_generation,
+        }
     }
 
     #[test]
@@ -1209,7 +1513,7 @@ mod tests {
             .expect("forced checkpoint must be readable");
         assert_eq!(restored.header.revision, buffer.revision());
         assert_eq!(restored.header.checkpoint_seq, 0);
-        assert_eq!(restored.to_source_bytes(), b"base edit");
+        assert_eq!(restored.to_source_bytes().unwrap(), b"base edit");
         assert_eq!(path, writer.recovery_path_for_note_key(b"notes/base.md"));
     }
 

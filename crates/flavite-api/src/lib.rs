@@ -28,6 +28,8 @@ pub mod command;
 pub mod device_preferences;
 pub mod doctor;
 pub mod documents;
+pub mod note_encoding;
+pub mod text_edit;
 pub mod event;
 pub mod flavite;
 pub mod graph_mirror;
@@ -38,6 +40,11 @@ pub use graph_projection::{
     GraphProjection, GraphViewToken, LinkOccurrence, OccurrenceSet, OccurrenceSource, OverlayState,
     ScopeRequest,
 };
+// RFC-0006 §6.10: the facade re-exports the sole source-format descriptor
+// so hosts/DTO consumers keep one spelling without a direct codec edge.
+pub use flavite_encoding::SourceFormat;
+// Buffer identity types used by facade view APIs.
+pub use flavite_buffer::revision::{BufferId, Revision};
 pub mod attachments;
 pub mod links;
 pub mod open;

@@ -9,6 +9,8 @@ description = "Registry, typed commands/results, revisioned views, events, capab
 [dependencies]
 # Core tier dependencies (flavite-vault, flavite-index, flavite-buffer)
 flavite-vault = { path = "../flavite-vault" }
+flavite-encoding = { path = "../flavite-encoding", features = ["serde"] }
+flavite-text-search = { path = "../flavite-text-search" }
 flavite-index = { path = "../flavite-index" }
 flavite-buffer = { path = "../flavite-buffer" }
 flavite-syntax = { path = "../flavite-syntax" }

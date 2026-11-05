@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# RFC-0006 §11 workbench source gates (RFC-0006-knowledge-workbench.md).
+#
+# Usage: check-workbench-contracts.sh <S00|S01|...> [repo-root]
+#
+# The slice argument names the highest completed slice; every gate from S00
+# through that slice runs (cumulative — skipping completed earlier gates is
+# forbidden) and future slice gates are never required early. Presence gates
+# demand nonempty files: a missing source fails the gate
+# (error-on-missing-source semantics), and a textual absence gate succeeds
+# only on rg exit 1, never exit 2. The second argument exists for negative
+# fixtures (xtask/tests/workbench_gates.rs points it at a seeded tree).
+set -euo pipefail
+
+slice="${1:-}"
+root="${2:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+
+if [[ ! -f "$root/scripts/lib/source-gates.sh" ]]; then
+    echo "missing gate library: $root/scripts/lib/source-gates.sh" >&2
+    exit 2
+fi
+# shellcheck source=lib/source-gates.sh
+source "$root/scripts/lib/source-gates.sh"
+
+GATES_RUN=0
+GATES_PASSED=0
+GATES_FAILED=0
+
+# Counted gate invocation: record the outcome and keep scanning so one run
+# reports every failing gate, not only the first.
+gate() {
+    GATES_RUN=$((GATES_RUN + 1))
+    if "$@"; then
+        GATES_PASSED=$((GATES_PASSED + 1))
+    else
+        GATES_FAILED=$((GATES_FAILED + 1))
+    fi
+}
+
+run_s00_gates() {
+    # Completed codec/lifecycle files only — future matcher crates are not
+    # required here (§11: "S00 gates require only its completed codec/lifecycle
+    # files, not future matcher crates"). Absent files fail; no skip logic.
+    local file
+    for file in \
+        crates/flavite-encoding/src/lib.rs \
+        crates/flavite-encoding/src/format.rs \
+        crates/flavite-encoding/src/decode.rs \
+        crates/flavite-encoding/src/encode.rs \
+        crates/flavite-encoding/src/map.rs \
+        crates/flavite-encoding/src/stream.rs \
+        crates/flavite-encoding/tests/roundtrip.rs \
+        crates/flavite-encoding/tests/mapping_properties.rs \
+        crates/flavite-syntax/tests/encoding_maps.rs \
+        crates/flavite-buffer/tests/encoding_roundtrip.rs \
+        crates/flavite-vault/tests/encoding_workflow.rs \
+        crates/flavite-vault/tests/encoding_recovery.rs \
+        crates/flavite-index/tests/encoding_ingest.rs \
+        crates/flavite-api/tests/note_encoding.rs \
+        crates/flavite-ui/tests/file_encoding.rs \
+        crates/flavite-cli/tests/file_encoding.rs \
+        crates/flavite-vault/src/encoding.rs \
+        scripts/lib/source-gates.sh \
+        xtask/tests/workbench_gates.rs \
+        xtask/tests/workbench_ownership.rs; do
+        gate assert_nonempty "$root/$file"
+    done
+    # The codec stays toolkit- and product-crate-free at the source level.
+    gate assert_absent \
+        '^use (flavite_|iced|cosmic_text|ropey|rusqlite|regex)|^extern crate (flavite_|iced)' \
+        "$root/crates/flavite-encoding/src"
+    gate assert_no_dep_named \
+        "$root/crates/flavite-encoding/Cargo.toml" \
+        'flavite-|iced|cosmic-text|ropey|rusqlite|regex|encoding_rs|chardet'
+    # Strict decoding: no IO, no lossy UTF fallbacks inside the codec.
+    gate assert_absent \
+        'std::fs|std::path|std::process|from_utf8_lossy|from_utf16_lossy' \
+        "$root/crates/flavite-encoding/src"
+    # The buffer keeps its own strict UTF-8 validation; no lossy BOM flag.
+    gate assert_absent 'pub has_bom: bool' "$root/crates/flavite-buffer/src/eol.rs"
+    gate assert_absent 'Invalid UTF-8, create empty buffer' \
+        "$root/crates/flavite-buffer/src/manager.rs"
+    # The syntax layer must not rebuild encoded offsets by arithmetic.
+    gate assert_absent \
+        'source_offset = line\.source_start\.0 \+ \(text\.0 - line\.text_start\.0\)' \
+        "$root/crates/flavite-syntax/src/text.rs"
+    # The editor facade holds no direct encoding dependency; the dependency
+    # tables are parsed so the package's own name cannot falsely trip it.
+    gate assert_no_dep_named \
+        "$root/crates/flavite-editor/Cargo.toml" \
+        'flavite-encoding'
+}
+
+run_s01_gates() {
+    # S01 presence: the isolated matcher helper plus its integration seams.
+    local file
+    for file in \
+        crates/flavite-text-search/src/lib.rs \
+        crates/flavite-text-search/src/matcher.rs \
+        crates/flavite-text-search/src/template.rs \
+        crates/flavite-text-search/tests/literal_properties.rs \
+        crates/flavite-vault/src/text_edit.rs \
+        crates/flavite-api/src/text_edit.rs \
+        crates/flavite-ui/src/host/note_search.rs \
+        crates/flavite-buffer/tests/prepared_edits.rs \
+        crates/flavite-api/tests/note_replace.rs \
+        crates/flavite-ui/tests/note_search.rs; do
+        gate assert_nonempty "$root/$file"
+    done
+    # The reading host keeps no private matcher; note search never scans raw
+    # text by hand.
+    gate assert_absent 'fn find_matches|struct FindState' \
+        "$root/crates/flavite-ui/src/host/reading.rs"
+    gate assert_absent 'match_indices\(' \
+        "$root/crates/flavite-ui/src/views/note.rs" \
+        "$root/crates/flavite-ui/src/host/note_search.rs"
+    # The helper stays toolkit-free and below the product crates.
+    gate assert_no_dep_named \
+        "$root/crates/flavite-text-search/Cargo.toml" \
+        'iced|cosmic-text|rusqlite|flavite-(api|buffer|editor|vault|ui|index|fs|workspace)'
+    gate assert_no_dep_named "$root/crates/flavite-editor/Cargo.toml" 'flavite-text-search'
+    gate assert_no_dep_named "$root/crates/flavite-buffer/Cargo.toml" 'flavite-text-search'
+    gate assert_no_dep_named "$root/crates/flavite-syntax/Cargo.toml" 'flavite-text-search'
+    gate assert_no_dep_named "$root/crates/flavite-index/Cargo.toml" 'flavite-text-search'
+    # Position/edit mapping stays in buffer+api; the helper exposes no types.
+    gate assert_absent \
+        'pub (struct|enum) (SourceEdit|SourcePatch|TextEdit|EditOp|Selection|Cursor)\b' \
+        "$root/crates/flavite-text-search/src"
+    gate assert_absent \
+        'fn map_through_(edits|replacement)|fn map_selection_through_edits' \
+        "$root/crates/flavite-text-search/src"
+    gate assert_absent 'std::fs|std::thread::sleep|\.wait_for_operation\(' \
+        "$root/crates/flavite-ui/src/host/note_search.rs"
+}
+
+case "$slice" in
+    S00) run_s00_gates ;;
+    S01) run_s00_gates; run_s01_gates ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: S00 S01)" >&2; exit 2 ;;
+esac
+
+if ((GATES_FAILED > 0)); then
+    echo "workbench gate $slice FAILED: $GATES_PASSED/$GATES_RUN gates passed" >&2
+    exit 1
+fi
+echo "workbench gate $slice passed: $GATES_RUN gates."

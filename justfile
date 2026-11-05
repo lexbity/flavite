@@ -359,6 +359,13 @@ workspace-gate profile="W09":
         just fault-tests
     fi
 
+# RFC-0006 §11 workbench source gates: the cumulative contract checker for
+# the highest completed slice (S00..S11; S01 extends S00 for source-search)
+# plus the xtask gate/ownership tests.
+workbench-gate SLICE:
+    bash scripts/check-workbench-contracts.sh {{SLICE}}
+    cargo test -p xtask --test workbench_gates --test workbench_ownership
+
 workspace-graph-visual backend="canvas":
     bash scripts/workspace-visual-linux.sh --scenario filtered-unsaved-graph --backend {{backend}} --require-backend
 

@@ -1,29 +1,48 @@
-//! Text snapshots and coordinate types (§4.16.1).
+//! Text snapshots and coordinate types (§4.16.1, RFC-0006 §6.10).
 //!
-//! Flavite normalizes CRLF to LF at input and strips a UTF-8 BOM, while
-//! *remembering* exactly what the source bytes were, so that an unedited note
-//! round-trips byte-exactly and a mixed-EOL note is never normalized (§4.8,
-//! R12). Everything downstream — the scanner, both parse glues, the buffer —
-//! works in [`TextByte`] coordinates over [`TextSnapshot::text`] and maps back
-//! to [`SourceByte`] when it needs original bytes.
+//! Flavite decodes strict ASCII/UTF-8/UTF-16 note bytes at the
+//! [`flavite_encoding`] boundary, normalizes CRLF to LF, removes only the BOM
+//! signature selected by the decode policy, and *remembers* exactly what the
+//! source bytes and descriptor were, so that an unedited note round-trips
+//! byte-exactly and a mixed-EOL note is never silently normalized (§4.8,
+//! R12, FR-22/23). Everything downstream — the scanner, both parse glues,
+//! the buffer — works in [`TextByte`] coordinates over [`TextSnapshot::text`]
+//! and maps back to [`SourceByte`] when it needs original encoded bytes.
+//!
+//! The `TextByte ↔ SourceByte` mapping composes two checked layers:
+//!
+//! ```text
+//! SourceByte: original encoded file bytes, including BOM and physical EOLs
+//!        ↕ codec DecodeMap: endian/scalar boundaries, no newline folding
+//! decoded UTF-8 bytes: BOM removed, original CR/LF scalars preserved
+//!        ↕ syntax EOL map (the line table's fold prefixes): CRLF → LF
+//! TextByte: normalized UTF-8 used by editor, scanner, search and buffer edits
+//! ```
 //!
 //! Distinct newtypes keep the coordinate spaces from being mixed up:
 //!
 //! | Type | Meaning |
 //! |---|---|
-//! | [`SourceByte`] | offset into the original source bytes |
+//! | [`SourceByte`] | offset into the original encoded source bytes |
 //! | [`TextByte`] | offset into the normalized text (CRLF → LF, BOM removed) |
 //! | [`ScalarIndex`] | Unicode scalar (code point) index |
 //! | [`GraphemeIndex`] | grapheme-cluster index (cursor movement, §4.16.1) |
-//! | [`Utf16Offset`] | UTF-16 code-unit offset (platform text APIs) |
+//! | [`Utf16Offset`] | UTF-16 code-unit offset for platform text APIs — NOT
+//!   a file offset; it never names bytes of a UTF-16 encoded note (§6.10) |
 //!
 //! Every mapping in this module is total at *legal edit boundaries* and
-//! `None` at illegal ones (the interior of a CRLF pair, inside the BOM, or
-//! outside the buffer): "BOM and CRLF interiors are never edit boundaries"
-//! (§4.16.1).
+//! `None` at illegal ones (the interior of an encoded scalar, a BOM, a
+//! surrogate pair, or a CRLF pair; an odd UTF-16 byte position; or outside
+//! the buffer): "BOM and CRLF interiors are never edit boundaries"
+//! (§4.16.1, §6.10, AC-24). EOF is always a valid paired boundary.
 
 use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
+
+use flavite_encoding::{
+    DecodeLimits, DecodeMap, DecodePolicy, EncodeLimits, SourceFormat, decode as codec_decode,
+    encode as codec_encode,
+};
 
 /// Return the longest prefix of `text` whose UTF-8 byte length is at most
 /// `max_bytes`.
@@ -229,70 +248,141 @@ impl LineInfo {
 }
 
 /// Errors produced while building a [`TextSnapshot`].
+///
+/// Every decode failure is the underlying typed codec error: malformed bytes
+/// are reported with their source position and never replaced by a lossy or
+/// empty fallback (FR-22, §6.10).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TextError {
-    /// Only valid UTF-8 may be edited (§4.16.1). Other encodings are listed
-    /// with a diagnostic and read-only, and never lossy-decoded into a rewrite.
-    #[error("source is not valid UTF-8 (invalid sequence at byte {valid_up_to})")]
-    NotUtf8 {
-        /// Byte offset of the first invalid sequence.
-        valid_up_to: usize,
-    },
+    /// Strict decoding failed under the applied policy.
+    #[error(transparent)]
+    Codec(#[from] flavite_encoding::CodecError),
 }
 
-/// A parsed, normalized view of a note's bytes (§4.16.1).
+/// A parsed, normalized view of a note's bytes (§4.16.1, RFC-0006 §6.10).
 ///
 /// The snapshot is immutable and owns:
 /// * `text` — the normalized text both parse glues and the scanner scan;
-/// * a per-line table mapping `TextByte` ↔ `SourceByte`;
-/// * the BOM flag, so [`TextSnapshot::to_source_bytes`] can reproduce the
+/// * a per-line table mapping `TextByte` ↔ `SourceByte` through the composed
+///   codec + EOL map;
+/// * the [`SourceFormat`] descriptor (encoding + BOM) for disk-backed
+///   snapshots, so [`TextSnapshot::to_source_bytes`] can reproduce the
 ///   original file byte-for-byte when it has not been edited.
+///
+/// Snapshots built by [`TextSnapshot::from_normalized`] are a *synthetic*
+/// UTF-8 view: they carry no disk-decoding claim and MUST NOT determine a
+/// live buffer's save format (§6.10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextSnapshot {
     text: Arc<str>,
     source: Arc<[u8]>,
     lines: Arc<[LineInfo]>,
-    has_bom: bool,
+    /// Per line, the count of CRLF pairs folded before that line's content
+    /// starts. The line's decoded-region byte offset is
+    /// `text_start + fold_prefix[line]`. Always zeros for synthetic views.
+    fold_prefix: Arc<[u32]>,
+    /// Codec boundary map for disk-backed snapshots; `None` for synthetic
+    /// normalized views (whose source is the normalized UTF-8 itself).
+    disk: Option<DecodeMap>,
+    /// Save-format intent on synthetic views (see
+    /// [`TextSnapshot::from_normalized_with_descriptor`]); ignored when a
+    /// disk-backed `map` is present.
+    descriptor_override: Option<SourceFormat>,
 }
 
 impl TextSnapshot {
     /// Build from an existing Session/TextByte string without normalizing it
     /// again. A preserved standalone CR before an LF is content here, and a
     /// leading BOM character may also be real edited content.
+    ///
+    /// The result is a synthetic UTF-8 view: `format()` is `None` and it
+    /// carries no disk-decoding authority (§6.10).
     #[must_use]
     pub fn from_normalized(text: &str) -> Self {
         let source = text.as_bytes().to_vec();
-        let lines = build_lines(text, &source, 0);
+        let lines = build_lines_identity(text, &source, 0);
+        let fold_prefix = vec![0u32; lines.len()];
         Self {
             text: text.into(),
             source: source.into(),
             lines: lines.into(),
-            has_bom: false,
+            fold_prefix: fold_prefix.into(),
+            disk: None,
+            descriptor_override: None,
         }
     }
 
-    /// Build a snapshot from raw file bytes.
+    /// Build a snapshot from raw file bytes with the `Auto` decode policy:
+    /// a recognized BOM signature is accepted and preserved; BOM-less bytes
+    /// must be valid UTF-8. No endianness is ever guessed (§6.10).
     ///
     /// # Errors
     ///
-    /// Returns [`TextError::NotUtf8`] when the bytes are not valid UTF-8.
-    /// Callers MUST NOT fall back to a lossy decode for anything that can be
-    /// written back (§4.16.1).
+    /// Returns the typed [`TextError`] of a strict codec failure. Callers MUST
+    /// NOT fall back to a lossy decode for anything that can be written back
+    /// (§4.16.1, FR-22).
     pub fn new(bytes: &[u8]) -> Result<Self, TextError> {
-        let has_bom = bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
-        let bom_len = if has_bom { 3 } else { 0 };
-        let body = if has_bom { &bytes[3..] } else { bytes };
-        let text_str = std::str::from_utf8(body).map_err(|e| TextError::NotUtf8 {
-            valid_up_to: e.valid_up_to() + bom_len,
-        })?;
-        let text = fold_crlf(text_str);
-        let lines = build_lines(&text, bytes, bom_len);
-        Ok(Self {
-            text: text.into(),
-            source: bytes.into(),
+        Self::with_policy(bytes, DecodePolicy::Auto)
+    }
+
+    /// Build a snapshot from raw file bytes under an explicit policy
+    /// (user-confirmed encoding, or a captured descriptor on reload).
+    ///
+    /// # Errors
+    ///
+    /// Typed strict-decode failure; see [`TextSnapshot::new`].
+    pub fn with_policy(bytes: &[u8], policy: DecodePolicy) -> Result<Self, TextError> {
+        Self::decoding(bytes, policy, &DecodeLimits::default_envelope(), &mut || false)
+    }
+
+    /// [`TextSnapshot::with_policy`] with caller-supplied byte limits and a
+    /// cancellation probe (checked at 64 KiB progress granularity, NFR-19).
+    ///
+    /// # Errors
+    ///
+    /// Typed strict-decode failure or [`flavite_encoding::CodecError::Cancelled`].
+    pub fn decoding(
+        bytes: &[u8],
+        policy: DecodePolicy,
+        limits: &DecodeLimits,
+        cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Self, TextError> {
+        let decoded = codec_decode(bytes, policy, limits, cancel)?;
+        Ok(Self::from_decoded(decoded))
+    }
+
+    /// Wrap an already validated decode. This is the only sanctioned way to
+    /// attach a disk-backed snapshot: the raw bytes are never re-decoded by a
+    /// second normalization pass (§4.1).
+    #[must_use]
+    pub fn from_decoded(decoded: flavite_encoding::DecodedContent) -> Self {
+        let map = decoded.map().clone();
+        let decoded_text = decoded.text();
+        let (lines, fold_prefix) = build_lines_encoded(decoded_text, &map);
+        Self {
+            text: Arc::from(fold_crlf(decoded_text)),
+            source: Arc::clone(decoded.source()),
             lines: lines.into(),
-            has_bom,
-        })
+            fold_prefix: fold_prefix.into(),
+            disk: Some(map),
+            descriptor_override: None,
+        }
+    }
+
+    /// Synthetic normalized view that additionally carries the *save-format
+    /// intent* (descriptor) for the buffer it belongs to.
+    ///
+    /// Used only for undo/redo lineage of drafts that are not currently
+    /// encodable under their descriptor (strict-ASCII policy with non-ASCII
+    /// content): `source()` is the decoded UTF-8 — NOT the serialized form of
+    /// the format — and MUST NOT be treated as evidence of a saved file.
+    /// Saving such a buffer fails with `Unencodable` before any file effect
+    /// (§6.10, FR-22).
+    #[must_use]
+    pub fn from_normalized_with_descriptor(text: &str, format: SourceFormat) -> Self {
+        let mut snapshot = Self::from_normalized(text);
+        snapshot.descriptor_override = Some(format);
+        snapshot
     }
 
     /// The normalized text every parser and the scanner operate on.
@@ -307,10 +397,27 @@ impl TextSnapshot {
         &self.source
     }
 
-    /// Whether the source began with a UTF-8 BOM.
+    /// The authoritative disk descriptor, or `None` for a synthetic
+    /// normalized view (which must not determine a save format, §6.10).
+    /// A pending-encoding draft view reports its save-format intent here.
     #[must_use]
-    pub const fn has_bom(&self) -> bool {
-        self.has_bom
+    pub fn format(&self) -> Option<SourceFormat> {
+        self.disk
+            .as_ref()
+            .map(DecodeMap::format)
+            .or(self.descriptor_override)
+    }
+
+    /// The composed codec boundary map for disk-backed snapshots.
+    #[must_use]
+    pub fn map(&self) -> Option<&DecodeMap> {
+        self.disk.as_ref()
+    }
+
+    /// Whether the source began with a BOM signature (removed at decode).
+    #[must_use]
+    pub fn has_bom(&self) -> bool {
+        self.format().is_some_and(|f| f.bom())
     }
 
     /// The per-line table.
@@ -327,14 +434,45 @@ impl TextSnapshot {
 
     /// Reconstruct the exact source bytes of this (unedited) snapshot.
     ///
-    /// Byte-exact for any input: BOM, per-line LF/CRLF, standalone CR, and a
-    /// missing trailing newline all survive (§4.8, AC-7's unedited half).
+    /// Byte-exact for any input: descriptor BOM, per-line LF/CRLF, standalone
+    /// CR, and a missing trailing newline all survive (§4.8, §6.10, AC-23).
+    /// An unedited disk-backed snapshot's content is, by construction,
+    /// representable under its own descriptor.
+    ///
+    /// # Panics
+    ///
+    /// Only on an internal impossibility: an unedited snapshot failing to
+    /// re-encode under the descriptor it was decoded from.
     #[must_use]
     pub fn to_source_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.source.len());
-        if self.has_bom {
-            out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+        match &self.disk {
+            None => self.reconstruct_identity(&[]),
+            Some(map) => {
+                let format = map.format();
+                if format.encoding().is_utf16() {
+                    let decoded = self.reconstruct_decoded();
+                    codec_encode(
+                        &decoded,
+                        &format,
+                        &EncodeLimits {
+                            max_input_utf8_bytes: u64::MAX,
+                            max_output_bytes: u64::MAX,
+                        },
+                        &mut || false,
+                    )
+                    .expect("an unedited snapshot re-encodes under its own descriptor")
+                } else {
+                    self.reconstruct_identity(format.bom_bytes())
+                }
+            }
         }
+    }
+
+    /// Identity-family (ASCII/UTF-8) reconstruction: content slices plus the
+    /// physical terminator bytes recorded per line.
+    fn reconstruct_identity(&self, bom: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bom.len() + self.source.len());
+        out.extend_from_slice(bom);
         for line in self.lines.iter() {
             out.extend_from_slice(&self.text.as_bytes()[line.text_start.0..line.text_end.0]);
             match line.eol {
@@ -346,10 +484,27 @@ impl TextSnapshot {
         out
     }
 
-    /// Map a normalized offset to its source offset.
+    /// Reassemble the decoded UTF-8 region (BOM absent, physical CR/LF
+    /// scalars restored) from normalized text + per-line EOL kinds.
+    fn reconstruct_decoded(&self) -> String {
+        let mut out = String::with_capacity(self.text.len() + self.fold_prefix.len());
+        for line in self.lines.iter() {
+            out.push_str(&self.text[line.text_start.0..line.text_end.0]);
+            match line.eol {
+                Eol::Lf => out.push('\n'),
+                Eol::Crlf => out.push_str("\r\n"),
+                Eol::None => {}
+            }
+        }
+        out
+    }
+
+    /// Map a normalized offset to its encoded source offset through the
+    /// composed codec + EOL map.
     ///
-    /// Returns `None` when `text` is out of range or lands inside a CRLF pair
-    /// or the BOM — never a legal edit boundary (§4.16.1).
+    /// Returns `None` when `text` is out of range or lands inside an encoded
+    /// scalar, the CRLF pair, or the BOM — never a legal edit boundary
+    /// (§4.16.1, §6.10).
     #[must_use]
     pub fn text_to_source(&self, text: TextByte) -> Option<SourceByte> {
         if text.0 > self.text.len() {
@@ -358,27 +513,27 @@ impl TextSnapshot {
         if text.0 == self.text.len() {
             return Some(SourceByte(self.source.len()));
         }
-        let line = self.line_for_text(text.0)?;
-
-        // Calculate the base source offset
-        let mut source_offset = line.source_start.0 + (text.0 - line.text_start.0);
-
-        // If we're at the line end, we're at the terminator position.
-        // For CRLF, the terminator is "\r\n" at [source_end, source_end+2),
-        // so text_end maps to source_end (the start of the terminator).
-        // For LF, the terminator is "\n" at [source_end, source_end+1),
-        // so text_end maps to source_end.
+        let idx = self.line_index_for_text(text.0)?;
+        let line = &self.lines[idx];
+        // At the line's end we are at the terminator's start position: for
+        // CRLF that is the `\r`; for LF the `\n` itself (the inverse mapping
+        // refuses the LF byte again, as before).
         if text.0 == line.text_end.0 {
-            source_offset = line.source_end.0;
+            return Some(line.source_end);
         }
-
-        Some(SourceByte(source_offset))
+        // Inside line content: fold the text offset to the decoded region,
+        // then map through the codec boundary table.
+        let fold = usize::try_from(self.fold_prefix[idx]).unwrap_or(usize::MAX);
+        let decoded = line.text_start.0.checked_add(fold)?.checked_add(text.0 - line.text_start.0)?;
+        self.decoded_to_source(decoded).map(SourceByte)
     }
 
-    /// Map a source offset to its normalized offset.
+    /// Map an encoded source offset to its normalized offset through the
+    /// composed codec + EOL map.
     ///
-    /// Returns `None` when `source` is out of range, inside the BOM, or inside
-    /// the `\n` of a CRLF pair — never a legal edit boundary (§4.16.1).
+    /// Returns `None` when `source` is out of range, inside the BOM, inside an
+    /// encoded scalar or surrogate pair, at an odd UTF-16 byte, or inside the
+    /// `\n` of a CRLF pair — never a legal edit boundary (§4.16.1, §6.10).
     #[must_use]
     pub fn source_to_text(&self, source: SourceByte) -> Option<TextByte> {
         if source.0 > self.source.len() {
@@ -390,22 +545,30 @@ impl TextSnapshot {
         if source.0 < self.bom_len() {
             return None;
         }
-        let line = self.line_for_source(source.0)?;
-        if source.0 < line.source_end.0 {
-            return Some(TextByte(
-                line.text_start.0 + (source.0 - line.source_start.0),
-            ));
+        let idx = self.line_index_for_source(source.0)?;
+        let line = &self.lines[idx];
+        if source.0 == line.source_end.0 {
+            // Terminator start: the `\r` of a CRLF maps to the folded LF
+            // position in text; the LF byte/unit itself is not addressable.
+            return if line.eol == Eol::Crlf {
+                Some(line.text_end)
+            } else {
+                None
+            };
         }
-        // At or past `source_end`: inside this line's terminator.
-        // For CRLF (2 bytes: \r at source_end, \n at source_end+1), both are illegal
-        // except that \r maps to the \n in text for this line.
-        // For LF (1 byte: \n at source_end), it's illegal.
-        if line.eol == Eol::Crlf && source.0 == line.source_end.0 {
-            // \r at source_end maps to \n at text_end for this line.
-            return Some(TextByte(line.text_end.0));
+        if source.0 > line.source_end.0 {
+            // Inside the terminator (CRLF's LF side) — illegal.
+            return None;
         }
-        // Anything else (LF terminator byte, or CRLF \n) is illegal.
-        None
+        // Line content region.
+        let decoded = self.source_to_decoded(source.0)?;
+        let fold = usize::try_from(self.fold_prefix[idx]).ok()?;
+        let text_pos = decoded.checked_sub(fold)?;
+        // Defensive: the found line must contain the mapped decoded position.
+        if text_pos < line.text_start.0 || text_pos >= line.text_end.0 {
+            return None;
+        }
+        Some(TextByte(text_pos))
     }
 
     /// Map a full span from normalized to source coordinates.
@@ -418,13 +581,13 @@ impl TextSnapshot {
 
         // Check if the span starts at a line end with CRLF, which would include
         // the CRLF interior in the source.
-        if let Some(line) = self.line_for_text(span.start.0)
-            && span.start.0 == line.text_end.0
-            && line.eol == Eol::Crlf
-        {
-            // Starts at a CRLF line end, which means the source span would
-            // include the CRLF bytes, which are illegal.
-            return None;
+        if let Some(idx) = self.line_index_for_text(span.start.0) {
+            let line = &self.lines[idx];
+            if span.start.0 == line.text_end.0 && line.eol == Eol::Crlf {
+                // Starts at a CRLF line end, which means the source span would
+                // include the CRLF bytes, which are illegal.
+                return None;
+            }
         }
 
         Some(Span::new(start_source, end_source))
@@ -485,20 +648,46 @@ impl TextSnapshot {
     }
 
     fn bom_len(&self) -> usize {
-        if self.has_bom { 3 } else { 0 }
+        self.disk
+            .as_ref()
+            .map_or(0, |map| usize::try_from(map.bom_len()).unwrap_or(0))
     }
 
-    fn line_for_text(&self, at: usize) -> Option<&LineInfo> {
-        // `at` < text.len(), so it belongs to the line whose range contains it.
-        self.lines
-            .iter()
-            .find(|l| at >= l.text_start.0 && at <= l.text_end.0)
+    /// `SourceByte ↔ decoded-UTF-8 byte` through the codec map; synthetic
+    /// views are identity on char boundaries and refuse scalar interiors.
+    fn decoded_to_source(&self, decoded: usize) -> Option<usize> {
+        match &self.disk {
+            Some(map) => usize::try_from(map.decoded_utf8_to_source(decoded as u64)?).ok(),
+            None => self.text.is_char_boundary(decoded).then_some(decoded),
+        }
     }
 
-    fn line_for_source(&self, at: usize) -> Option<&LineInfo> {
-        self.lines
-            .iter()
-            .find(|l| at >= l.source_start.0 && at <= l.source_end.0)
+    fn source_to_decoded(&self, source: usize) -> Option<usize> {
+        match &self.disk {
+            Some(map) => usize::try_from(map.source_to_decoded(source as u64)?).ok(),
+            None => (self.text.is_char_boundary(source) || source == self.text.len())
+                .then_some(source),
+        }
+    }
+
+    /// Index of the line whose text range `[text_start, text_end]` contains
+    /// `at`. Binary: the line table is ascending in both coordinate spaces.
+    fn line_index_for_text(&self, at: usize) -> Option<usize> {
+        let lines = &self.lines;
+        debug_assert!(!lines.is_empty());
+        let idx = lines.partition_point(|l| l.text_start.0 <= at).checked_sub(1)?;
+        (at <= lines[idx].text_end.0).then_some(idx)
+    }
+
+    /// Index of the line whose source range `[source_start, source_end]`
+    /// contains `at` (last start ≤ `at`).
+    fn line_index_for_source(&self, at: usize) -> Option<usize> {
+        let lines = &self.lines;
+        debug_assert!(!lines.is_empty());
+        let idx = lines
+            .partition_point(|l| l.source_start.0 <= at)
+            .checked_sub(1)?;
+        (at <= lines[idx].source_end.0).then_some(idx)
     }
 }
 
@@ -575,8 +764,9 @@ fn fold_crlf(text: &str) -> String {
     out
 }
 
-/// Build the per-line table for `text` (CRLF-folded) against `source` bytes.
-fn build_lines(text: &str, source: &[u8], bom_len: usize) -> Vec<LineInfo> {
+/// Build the per-line table for a synthetic normalized view: identity
+/// `text ↔ source` arithmetic with the BOM removed (§4.16.1).
+fn build_lines_identity(text: &str, source: &[u8], bom_len: usize) -> Vec<LineInfo> {
     let mut lines = Vec::new();
     let mut text_start = 0usize;
     let mut source_start = bom_len;
@@ -615,6 +805,82 @@ fn build_lines(text: &str, source: &[u8], bom_len: usize) -> Vec<LineInfo> {
     lines
 }
 
+/// Build the per-line table for a disk-backed snapshot in ONE pass over the
+/// decoded region, advancing the encoded cursor by real scalar widths —
+/// never by affine byte arithmetic within a line (§6.10; the retired
+/// `source_start + (text - text_start)` shortcut is correct only for UTF-8
+/// and is exactly what the composed map replaces).
+///
+/// Returns the line table plus the per-line count of CRLF pairs folded before
+/// that line's content (the `text → decoded` offset correction).
+fn build_lines_encoded(decoded: &str, map: &DecodeMap) -> (Vec<LineInfo>, Vec<u32>) {
+    let bytes = decoded.as_bytes();
+    let utf16 = map.encoding().is_utf16();
+    let mut lines = Vec::new();
+    let mut fold_prefix = Vec::new();
+    let mut dec_i = 0usize;
+    let mut src_i = usize::try_from(map.bom_len()).unwrap_or(0);
+    let mut folded: u32 = 0;
+    while let Some(nl_rel) = bytes[dec_i..].iter().position(|b| *b == b'\n') {
+        let nl = dec_i + nl_rel;
+        let crlf = nl > 0 && bytes[nl - 1] == b'\r';
+        let content_end = if crlf { nl - 1 } else { nl };
+        let src_start = src_i;
+        advance_source(&mut src_i, &decoded[dec_i..content_end], utf16);
+        let src_end = src_i;
+        fold_prefix.push(folded);
+        lines.push(LineInfo {
+            // Content start in text space = decoded start minus folds before
+            // this line (`folded` is the pre-increment count).
+            text_start: TextByte(dec_i - folded as usize),
+            text_end: TextByte(content_end - folded as usize),
+            source_start: SourceByte(src_start),
+            source_end: SourceByte(src_end),
+            eol: if crlf { Eol::Crlf } else { Eol::Lf },
+        });
+        folded += u32::from(crlf);
+        // Step over the physical terminator bytes.
+        src_i += terminator_source_bytes(crlf, utf16);
+        dec_i = nl + 1;
+    }
+    // Tail: unterminated content — or an empty file, which gets one
+    // `Eol::None` line (matching the identity builder).
+    if dec_i < bytes.len() || lines.is_empty() {
+        let src_start = src_i;
+        advance_source(&mut src_i, &decoded[dec_i..], utf16);
+        fold_prefix.push(folded);
+        lines.push(LineInfo {
+            text_start: TextByte(dec_i - folded as usize),
+            text_end: TextByte(bytes.len() - folded as usize),
+            source_start: SourceByte(src_start),
+            source_end: SourceByte(src_i),
+            eol: Eol::None,
+        });
+    }
+    (lines, fold_prefix)
+}
+
+/// Physical width of a line terminator in the encoded space. CR/LF are
+/// always BMP scalars: 1 byte each for the identity families, 2 per code
+/// unit for UTF-16.
+const fn terminator_source_bytes(crlf: bool, utf16: bool) -> usize {
+    match (crlf, utf16) {
+        (true, true) => 4,
+        (true, false) => 2,
+        (false, true) => 2,
+        (false, false) => 1,
+    }
+}
+
+/// Advance an encoded cursor across a decoded region by real scalar widths.
+fn advance_source(src: &mut usize, region: &str, utf16: bool) {
+    if utf16 {
+        *src += region.chars().map(|c| c.len_utf16()).sum::<usize>() * 2;
+    } else {
+        *src += region.len();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,12 +901,17 @@ mod tests {
 
     #[test]
     fn rejects_non_utf8() {
-        let err = TextSnapshot::new(&[0xFF, 0xFE]).expect_err("must reject");
-        assert_eq!(err, TextError::NotUtf8 { valid_up_to: 0 });
+        use flavite_encoding::CodecError;
+        // `FF FE` alone is a valid UTF-16LE BOM signature with empty content;
+        // strict rejection applies to malformed UTF-8 without a recognized BOM.
+        let snapshot = TextSnapshot::new(&[0xFF, 0xFE]).expect("UTF-16LE BOM is accepted");
+        assert_eq!(snapshot.text(), "");
+        let err = TextSnapshot::new(&[0x41, 0xFF, 0x42]).expect_err("must reject");
+        assert_eq!(err, TextError::Codec(CodecError::InvalidUtf8 { source_byte: 1 }));
         // BOM-prefixed invalid data reports the offset in the original bytes.
         let err = TextSnapshot::new(&[0xEF, 0xBB, 0xBF, 0xFF]).expect_err("must reject");
-        assert_eq!(err, TextError::NotUtf8 { valid_up_to: 3 });
-        assert!(err.to_string().contains("not valid UTF-8"));
+        assert_eq!(err, TextError::Codec(CodecError::InvalidUtf8 { source_byte: 3 }));
+        assert!(err.to_string().contains("invalid UTF-8"));
     }
 
     #[test]

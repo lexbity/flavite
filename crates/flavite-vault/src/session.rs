@@ -11,7 +11,9 @@
 
 use crate::actor::VaultActorHandle;
 use crate::channels::{NoticeChannel, PulseChannel};
+use crate::encoding::{ChoiceReason, EncodingHintsState, Resolution, CHOICE_REQUIRED_CODE};
 use crate::save::{DiskPrecondition, DurabilityOutcome, SaveFailureStage, SaveRequest};
+use flavite_encoding::DecodePolicy;
 use crate::sync::MutexExt;
 use crate::sync::WAIT_TICK;
 use crate::types::{
@@ -87,6 +89,13 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const MAX_PENDING_SAVE_OPERATIONS: usize = 4096;
+/// RFC-0006 §6.9: at most 64 unconsumed replacement plans; a 30-second TTL.
+const MAX_UNCONSUMED_TEXT_PLANS: usize = 64;
+const TEXT_PLAN_TTL: Duration = Duration::from_secs(30);
+/// Consumed results are replayable for 10 minutes; at most 2,048 retained.
+const TEXT_PLAN_RESULT_TTL: Duration = Duration::from_secs(600);
+const MAX_RETAINED_TEXT_RESULTS: usize = 2_048;
+const TEXT_PREPARE_WORKERS: usize = 2;
 /// Per-buffer journal memo cap (C1). Entries are keyed `(txn_id, item_id)`
 /// inside the buffer's own memo: total memo memory is bounded by
 /// `open_buffers × JOURNAL_MEMO_CAP × entry`, roughly ≤ 800 KiB per open
@@ -269,6 +278,8 @@ pub struct SharedBufferSnapshot {
     pub base_hash: Option<[u8; 32]>,
     pub state: flavite_buffer::state::BufferState,
     pub path: PathBuf,
+    /// Authoritative save-format descriptor of this revision (§6.10).
+    pub source_format: flavite_encoding::SourceFormat,
 }
 
 /// Failure while acquiring an immutable buffer snapshot.
@@ -307,6 +318,10 @@ pub enum SessionCommand {
         buffer_id: BufferId,
         revision: Revision,
         ops: Vec<EditOp>,
+        /// Undo-unit policy (RFC-0006 D-06): `Isolated` (default) installs
+        /// the batch as one boundary unit; the editor's captured typing path
+        /// requests `Typing` explicitly.
+        undo_policy: flavite_buffer::undo::UndoPolicy,
     },
     /// Apply a user-reviewed three-way merge to the exact buffer and disk
     /// versions represented by its preview.
@@ -378,6 +393,37 @@ pub enum SessionCommand {
     /// Commit a prepared semantic link with one guarded edit (W05).
     LinkInsert {
         intent: crate::link::LinkIntent,
+        plan_id: u128,
+    },
+    /// Reopen a note under an explicit source-format interpretation
+    /// (RFC-0006 §6.10). Refuses a dirty buffer or a pending save with a
+    /// typed action; binds the confirmed hint on success.
+    ReopenEncoding {
+        path: PathBuf,
+        expected_raw_hash: [u8; 32],
+        encoding: flavite_encoding::FileEncoding,
+        bom: crate::encoding::BomMode,
+    },
+    /// Convert an open buffer's save format (§6.10): preserves the current
+    /// decoded text and its Undo lineage as one isolated boundary; disk is
+    /// untouched until the next normal save.
+    ConvertEncoding {
+        buffer_id: BufferId,
+        revision: Revision,
+        target: flavite_encoding::SourceFormat,
+    },
+    /// Prepare a literal replacement plan (RFC-0006 S01/D-05/D-06). The
+    /// match/computation work runs on a bounded worker; admission validates
+    /// the buffer/revision and reserves a plan slot.
+    PrepareReplace {
+        request_id: u64,
+        request: crate::text_edit::ReplaceRequest,
+    },
+    /// Install one prepared replacement as one isolated Undo unit (D-06).
+    /// Consumed plans replay the same result during the retry window.
+    ApplyReplace {
+        buffer_id: BufferId,
+        revision: Revision,
         plan_id: u128,
     },
 }
@@ -525,6 +571,25 @@ pub enum CommandResult {
     NoteHistory {
         path: PathBuf,
         entries: Vec<crate::history::HistoryEntry>,
+    },
+    /// A note was reopened under an explicit source format (§6.10). All
+    /// attached views observe the new revision and descriptor.
+    EncodingReopened {
+        buffer_id: BufferId,
+        revision: Revision,
+    },
+    /// A buffer's save format was converted with one isolated Undo boundary
+    /// (§6.10). Text is unchanged; disk is untouched until the next save.
+    EncodingConverted {
+        buffer_id: BufferId,
+        new_revision: Revision,
+    },
+    /// A literal replacement plan is ready (RFC-0006 S01): core-issued plan
+    /// id, exact match count and the preparation TTL.
+    ReplacePrepared {
+        plan_id: u128,
+        match_count: u64,
+        expires_in_ms: u64,
     },
 }
 
@@ -741,6 +806,22 @@ pub struct Session {
     notice: NoticeChannel,
     /// Journal recovery findings waiting for the first host pump.
     recovery_notices: Mutex<VecDeque<&'static str>>,
+    /// RFC-0006 §6.10: device-local confirmed source-format hints with their
+    /// atomically published immutable view. Open/watch/reconcile workers
+    /// acquire the view; confirmations go through the same Session turn.
+    encoding_hints: EncodingHintsState,
+    /// RFC-0006 S01: core-issued replacement-plan registry (D-06/§6.9).
+    /// Unconsumed plans expire after [`TEXT_PLAN_TTL`]; consumed results are
+    /// replayable for [`TEXT_PLAN_RESULT_TTL`]; both are reclaimed by the
+    /// admission sweep, so long-running sessions never require a restart.
+    text_plans: Mutex<HashMap<u128, TextPlanEntry>>,
+    text_plan_nonce: u64,
+    text_plan_counter: AtomicU64,
+    /// Bounded prepare workers' job queue (D-06: preparation runs off the
+    /// host turn).
+    text_jobs: Option<crossbeam::channel::Sender<TextJob>>,
+    /// Completed preparations awaiting installation on a Session turn.
+    text_results: crossbeam::channel::Receiver<TextOutcomeMessage>,
     /// Semantic link plan store (W05). Plans are process-local capabilities.
     link_plans: std::sync::Arc<Mutex<crate::link::LinkPlanStore>>,
     /// Bounded prepare workers' job queue.
@@ -771,6 +852,49 @@ struct LinkJob {
 struct LinkOutcomeMessage {
     request_id: u64,
     result: SessionResult,
+}
+
+/// One queued replacement-prepare job (RFC-0006 S01/D-06). The immutable
+/// snapshot text rides as a cheap `Arc` clone; the worker never touches the
+/// buffer manager.
+struct TextJob {
+    request_id: u64,
+    text: std::sync::Arc<str>,
+    request: crate::text_edit::ReplaceRequest,
+}
+
+/// One finished replacement preparation awaiting registry installation.
+struct TextOutcomeMessage {
+    request_id: u64,
+    buffer_id: BufferId,
+    revision: Revision,
+    outcome: Result<(Vec<EditOp>, u64, u64), crate::text_edit::PrepareError>,
+}
+
+/// One core-issued replacement plan (D-06/§6.9). `consumed` records the
+/// replayable receipt for the 10-minute retry window.
+struct TextPlanEntry {
+    ops: Vec<EditOp>,
+    match_count: u64,
+    options_digest: u64,
+    buffer_id: BufferId,
+    revision: Revision,
+    created: std::time::Instant,
+    consumed: Option<(std::time::Instant, SessionResult)>,
+}
+
+impl std::fmt::Debug for TextPlanEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The receipt content is never part of diagnostics (§6.7: no
+        // note/query text in logs); only presence is reported.
+        f.debug_struct("TextPlanEntry")
+            .field("match_count", &self.match_count)
+            .field("options_digest", &self.options_digest)
+            .field("buffer_id", &self.buffer_id)
+            .field("revision", &self.revision)
+            .field("consumed", &self.consumed.is_some())
+            .finish()
+    }
 }
 
 impl Session {
@@ -916,6 +1040,25 @@ impl Session {
         let (open_job_sender, open_job_receiver) = crossbeam::channel::unbounded::<OpenJob>();
         let (open_result_sender, open_result_receiver) =
             crossbeam::channel::unbounded::<OpenRead>();
+        // RFC-0006 §6.10: device-local encoding hints. The store lives under
+        // the resolved OS data root, bound to this vault's identity; a store
+        // or record failure is a typed pending state surfaced through the
+        // returned issue string, never a silent reset of confirmed choices.
+        let encoding_hints = {
+            let store = crate::identity::resolve_data_dir(data_dir.as_deref()).and_then(|data| {
+                crate::user_state::UserStateStore::open_at(
+                    Box::new(flavite_fs::OsFs::new()),
+                    &data,
+                    &identity.uuid.to_string(),
+                )
+                .ok()
+            });
+            let (state, issue) = EncodingHintsState::open(store, identity.uuid.to_string());
+            if let Some(issue) = issue {
+                tracing::warn!(vault = %identity.uuid, %issue, "encoding hints unavailable");
+            }
+            state
+        };
         for worker_index in 0..OPEN_READ_WORKERS {
             let jobs = open_job_receiver.clone();
             let results = open_result_sender.clone();
@@ -1031,7 +1174,47 @@ impl Session {
                     .expect("link worker thread creation failed");
             }
         }
+        let (text_job_sender, text_job_receiver) = crossbeam::channel::unbounded::<TextJob>();
+        let (text_result_sender, text_result_receiver) =
+            crossbeam::channel::unbounded::<TextOutcomeMessage>();
+        {
+            for worker_index in 0..TEXT_PREPARE_WORKERS {
+                let jobs = text_job_receiver.clone();
+                let results = text_result_sender.clone();
+                std::thread::Builder::new()
+                    .name(format!("vault-text-{worker_index}"))
+                    .spawn(move || {
+                        // Workers exit when the Session drops the job sender.
+                        while let Ok(job) = jobs.recv() {
+                            let outcome = crate::text_edit::prepare_ops(&job.text, &job.request)
+                                .map(|(ops, count)| {
+                                    let digest = crate::text_edit::options_digest(&job.request);
+                                    (ops, count, digest)
+                                });
+                            // Sending only fails when the Session is gone;
+                            // the result is then unobservable by construction.
+                            let _ = results.send(TextOutcomeMessage {
+                                request_id: job.request_id,
+                                buffer_id: job.request.buffer_id,
+                                revision: job.request.revision,
+                                outcome,
+                            });
+                        }
+                    })
+                    .expect("text prepare worker thread creation failed");
+            }
+        }
+        let text_plan_nonce = u64::from_le_bytes(
+            blake3::hash(identity.uuid.as_bytes()).as_bytes()[..8]
+                .try_into()
+                .expect("fixed-size slice"),
+        );
         Self {
+            text_jobs: Some(text_job_sender),
+            text_results: text_result_receiver,
+            text_plan_nonce,
+            text_plan_counter: AtomicU64::new(0),
+            text_plans: Mutex::new(HashMap::new()),
             driving_turn: Mutex::new(()),
             structure_worker: crate::properties::StructureWorker::new(),
             identity,
@@ -1068,6 +1251,7 @@ impl Session {
             pulse,
             notice,
             recovery_notices: Mutex::new(VecDeque::new()),
+            encoding_hints,
             link_plans,
             link_jobs: Some(link_job_sender),
             link_results: link_result_receiver,
@@ -1187,6 +1371,7 @@ impl Session {
         self.pump_recovery_notices();
         self.pump_structure_completions();
         self.pump_link_completions();
+        self.pump_text_completions();
         self.pump_open_completions();
         self.pump_save_completions();
         self.pump_reconcile_completions();
@@ -1339,12 +1524,23 @@ impl Session {
                         },
                     );
                     let mut manager = self.buffer_manager.lock_recovering();
-                    if manager.get_buffer(&path).is_some_and(|buffer| {
+                    // External bytes are strictly decoded under Auto: an
+                    // unambiguous new format may be adopted only while the
+                    // buffer is clean, and a stale hint never reinterprets
+                    // them silently (§6.10). A decode failure leaves the
+                    // existing text intact and requests an explicit choice.
+                    let decoded = if manager.get_buffer(&path).is_some_and(|buffer| {
                         buffer.state() == flavite_buffer::state::BufferState::Orphaned
                     }) {
-                        manager.notify_file_recreated(&path, &bytes);
+                        manager.notify_file_recreated(&path, &bytes, DecodePolicy::Auto)
                     } else {
-                        manager.notify_external_change(&path, &bytes);
+                        manager.notify_external_change(&path, &bytes, DecodePolicy::Auto)
+                    };
+                    if decoded.is_err() {
+                        self.notice.send(crate::channels::Notice::ActionRequired {
+                            code: CHOICE_REQUIRED_CODE,
+                            note: Some(flavite_buffer::manager::NoteRef::new(path.clone())),
+                        });
                     }
                     self.note_buffer_transition();
                     if manager.get_buffer(&path).is_some_and(|buffer| {
@@ -1581,7 +1777,8 @@ impl Session {
                 buffer_id,
                 revision,
                 ops,
-            } => self.apply_edits(buffer_id, revision, ops),
+                undo_policy,
+            } => self.apply_edits(buffer_id, revision, ops, undo_policy),
             SessionCommand::ApplyMerge {
                 path,
                 buffer_id,
@@ -1606,6 +1803,25 @@ impl Session {
                 self.resolve_conflict(path, resolution)
             }
             SessionCommand::RestoreRecovery { path } => self.restore_recovery(path),
+            SessionCommand::ReopenEncoding {
+                path,
+                expected_raw_hash,
+                encoding,
+                bom,
+            } => self.reopen_encoding(path, expected_raw_hash, encoding, bom),
+            SessionCommand::ConvertEncoding {
+                buffer_id,
+                revision,
+                target,
+            } => self.convert_encoding(buffer_id, revision, target),
+            SessionCommand::PrepareReplace { request_id, request } => {
+                self.prepare_replace(request_id, request)
+            }
+            SessionCommand::ApplyReplace {
+                buffer_id,
+                revision,
+                plan_id,
+            } => self.apply_replace(buffer_id, revision, plan_id),
             SessionCommand::RestoreHistory {
                 path,
                 buffer_id,
@@ -1969,6 +2185,7 @@ impl Session {
             BufferId::from(plan.source.buffer_id),
             Revision::new(plan.source.revision),
             vec![edit],
+            flavite_buffer::undo::UndoPolicy::Isolated,
         );
         let result = match applied {
             SessionResult::Success(CommandResult::EditsApplied {
@@ -2036,6 +2253,7 @@ impl Session {
         let _turn = self.driving_turn.lock_recovering();
         self.pump_structure_completions();
         self.pump_link_completions();
+        self.pump_text_completions();
         self.pump_open_completions();
         self.pump_save_completions();
         self.pump_reconcile_completions();
@@ -2404,12 +2622,25 @@ impl Session {
                 if let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) {
                     buffer.handle_save_completed_revision(revision, &request.bytes);
                 }
+                let source_format = manager
+                    .get_buffer_by_id(buffer_id)
+                    .map(|buffer| buffer.model().source_format());
                 drop(manager);
                 if let Some(writer) = &self.recovery_writer {
                     let mut writer = writer.lock_recovering();
                     writer.retire_covered(buffer_id, revision);
                 }
                 self.absent_on_open.lock_recovering().remove(&path);
+                // §6.10: an own save updates the hint binding with its exact
+                // receipt hash. Plain BOM-less UTF-8 content binds nothing.
+                if let Some(format) = source_format {
+                    self.bind_save_hint(
+                        &path,
+                        format,
+                        *blake3::hash(&request.bytes).as_bytes(),
+                        &request.bytes,
+                    );
+                }
                 SessionResult::Success(CommandResult::NoteSaved {
                     buffer_id,
                     saved_revision: revision,
@@ -2577,24 +2808,72 @@ impl Session {
             return SessionResult::Error { message };
         }
         let content = content.unwrap_or_default();
-        // §4.16.1: a note the decoder cannot accept must fail the open
-        // honestly. Installing the manager's empty fallback would present a
-        // blank editor as a clean, saved note — and an autosave could later
-        // write that emptiness over the real bytes.
-        if let Err(error) = flavite_syntax::text::TextSnapshot::new(&content) {
-            return SessionResult::Error {
-                message: format!("{}: {error}", read.path.display()),
-            };
+        // §6.10: decode once under the central codec contract. Every outcome
+        // is either a strictly decoded snapshot with its authoritative
+        // descriptor, or a typed encoding-choice request — installing the
+        // manager's empty fallback would present a blank editor as a clean,
+        // saved note (and an autosave could later write that emptiness over
+        // the real bytes).
+        let native_key = hex::encode(native_note_key(&read.path, &self.identity.root));
+        let limits = flavite_encoding::DecodeLimits::default_envelope();
+        // An explicitly created note is new UTF-8 content by construction;
+        // a stale hint for a previously deleted path must not block it.
+        let mut explicit = (absent || read.policy == OpenPolicy::CreateNew)
+            .then_some(flavite_syntax::SourceFormat::utf8());
+        let raw_hash: [u8; 32] = *blake3::hash(&content).as_bytes();
+        let hints = self.encoding_hints.view();
+        // §6.10: an unresolved pre-save format-binding intent whose output
+        // hash matches the observed bytes completes here — the source effect
+        // reached disk durably but its metadata binding did not. This is
+        // EncodingMetadataPending resolution, never NotReplaced.
+        if explicit.is_none()
+            && hints
+                .record
+                .intents
+                .get(&native_key)
+                .is_some_and(|intent| intent.output_raw_hash == raw_hash)
+        {
+            if let Some(intent) = hints.record.intents.get(&native_key) {
+                let intent_format = intent.format();
+                self.bind_save_hint(&read.path, intent_format, raw_hash, &content);
+                explicit = Some(intent_format);
+            }
         }
+        let (snapshot, _format, stamp) = match crate::encoding::resolve_source(
+            native_key,
+            &content,
+            &hints,
+            explicit,
+            &limits,
+        ) {
+            Resolution::Resolved(resolved) => (resolved.snapshot, resolved.format, resolved.stamp),
+            Resolution::NeedsChoice { reason, .. } => {
+                return self.encoding_choice_required(&read.path, &reason);
+            }
+        };
         let (buffer_id, revision) = {
             let mut buffer_manager_guard = self.buffer_manager.lock_recovering();
-            let (buffer, _transition) = buffer_manager_guard.open_note(read.path.clone(), &content);
+            let (buffer, _transition) =
+                buffer_manager_guard.open_note_snapshot(read.path.clone(), snapshot);
+            // The format stamp's hint generation is provenance metadata on
+            // the model (§6.10): it rides along with every serialized guard.
+            buffer
+                .model_mut()
+                .set_format_stamp_generation(stamp.hint_generation);
             (buffer.buffer_id(), buffer.revision())
         };
 
         if let Some(recovery) = read.recovery {
-            let recovered = recovery.to_source_bytes();
-            if blake3::hash(&recovered).as_bytes() != blake3::hash(&content).as_bytes() {
+            // The recorded draft differs from the disk bytes: offer it. An
+            // unencodable recorded draft (strict-ASCII violation) can never
+            // prove equality, so it is offered rather than dropped silently.
+            let offer = match recovery.to_source_bytes() {
+                Ok(recovered) => {
+                    blake3::hash(&recovered).as_bytes() != blake3::hash(&content).as_bytes()
+                }
+                Err(_) => true,
+            };
+            if offer {
                 self.notice.send(crate::channels::Notice::RecoveryOffer {
                     note: flavite_buffer::manager::NoteRef::new(read.path.clone()),
                 });
@@ -2619,6 +2898,269 @@ impl Session {
                 buffer_id,
                 revision,
             })
+        }
+    }
+
+    /// Typed outcome for a source that needs an explicit encoding decision
+    /// before it can be attached, indexed or saved (§6.10). The notice and
+    /// the returned result share one stable code; the data payload carries
+    /// the sanitized reason kind — never note content or raw bytes.
+    fn encoding_choice_required(&self, path: &Path, reason: &ChoiceReason) -> SessionResult {
+        self.notice.send(crate::channels::Notice::ActionRequired {
+            code: CHOICE_REQUIRED_CODE,
+            note: Some(flavite_buffer::manager::NoteRef::new(path.to_path_buf())),
+        });
+        SessionResult::ActionRequired {
+            code: CHOICE_REQUIRED_CODE,
+            data: Some(crate::encoding::choice_payload_json(reason)),
+        }
+    }
+
+    /// The published device-local encoding-hints view (§6.10). Workers and
+    /// facades acquire this immutable snapshot instead of querying a label.
+    #[must_use]
+    pub fn encoding_hints(&self) -> Arc<crate::encoding::HintsView> {
+        self.encoding_hints.view()
+    }
+
+    /// Confirm one source's interpretation: stores the hint bound to the
+    /// observed raw hash and publishes the new generation atomically. The
+    /// caller must have verified the descriptor decodes the current bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::encoding::HintsWriteError`] when the device-local store
+    /// cannot durably protect the confirmation.
+    pub fn confirm_encoding_hint(
+        &self,
+        path: &Path,
+        format: flavite_syntax::SourceFormat,
+        observed_raw_hash: [u8; 32],
+        preserve_leading_signature: bool,
+        nul_content_confirmed: bool,
+    ) -> Result<u64, crate::encoding::HintsWriteError> {
+        let native_key = hex::encode(native_note_key(path, &self.identity.root));
+        self.encoding_hints.update(|record| {
+            record.entries.insert(
+                native_key,
+                crate::encoding::HintEntry {
+                    encoding: format.encoding(),
+                    bom: format.bom(),
+                    bound_raw_hash: observed_raw_hash,
+                    preserve_leading_signature,
+                    nul_content_confirmed,
+                },
+            );
+        })
+    }
+
+    /// Core-issued 128-bit plan id: vault-nonce prefix plus a monotonic
+    /// counter (§6.1: unguessable, core-issued).
+    fn next_text_plan_id(&self) -> u128 {
+        let counter = self.text_plan_counter.fetch_add(1, Ordering::Relaxed);
+        (u128::from(self.text_plan_nonce) << 64) | u128::from(counter)
+    }
+
+    /// Reclaim expired plans and over-cap retained receipts (§6.9). Called
+    /// on every admission/apply so years of operation need no restart.
+    fn sweep_text_plans(&self) {
+        let now = std::time::Instant::now();
+        let mut plans = self.text_plans.lock_recovering();
+        plans.retain(|_, entry| match &entry.consumed {
+            Some((at, _)) => now.duration_since(*at) < TEXT_PLAN_RESULT_TTL,
+            None => now.duration_since(entry.created) < TEXT_PLAN_TTL,
+        });
+        let mut consumed_ids: Vec<(std::time::Instant, u128)> = plans
+            .iter()
+            .filter_map(|(id, entry)| entry.consumed.as_ref().map(|(at, _)| (*at, *id)))
+            .collect();
+        if consumed_ids.len() > MAX_RETAINED_TEXT_RESULTS {
+            consumed_ids.sort();
+            let excess = consumed_ids.len() - MAX_RETAINED_TEXT_RESULTS;
+            for (_, id) in consumed_ids.into_iter().take(excess) {
+                plans.remove(&id);
+            }
+        }
+    }
+
+    /// Admit one literal replacement preparation (D-05/D-06): validate the
+    /// buffer/revision, reserve a plan slot, and dispatch the immutable
+    /// snapshot to a bounded prepare worker. Empty queries are Idle, not a
+    /// match-everywhere plan.
+    fn prepare_replace(
+        &self,
+        request_id: u64,
+        request: crate::text_edit::ReplaceRequest,
+    ) -> SessionResult {
+        self.sweep_text_plans();
+        let text = {
+            let manager = self.buffer_manager.lock_recovering();
+            let Some(buffer) = manager.get_buffer_by_id(request.buffer_id) else {
+                return SessionResult::Error {
+                    message: "Buffer not found".into(),
+                };
+            };
+            if buffer.revision() != request.revision {
+                return SessionResult::StaleRevision {
+                    buffer_id: request.buffer_id,
+                    expected: request.revision,
+                    actual: buffer.revision(),
+                };
+            }
+            {
+                let mut cache = self.shared_snapshots.lock_recovering();
+                match cache.get(&request.buffer_id) {
+                    Some((revision, text)) if *revision == request.revision => text.clone(),
+                    _ => {
+                        let text: std::sync::Arc<str> = buffer.text().to_owned().into();
+                        cache.insert(request.buffer_id, (request.revision, text.clone()));
+                        text
+                    }
+                }
+            }
+        };
+        {
+            let plans = self.text_plans.lock_recovering();
+            let unconsumed =
+                plans.values().filter(|entry| entry.consumed.is_none()).count();
+            if unconsumed >= MAX_UNCONSUMED_TEXT_PLANS {
+                return SessionResult::Busy;
+            }
+        }
+        match &self.text_jobs {
+            Some(jobs) if jobs.send(TextJob { request_id, text, request }).is_ok() => {
+                SessionResult::Pending { request_id }
+            }
+            _ => SessionResult::Error {
+                message: "replacement prepare workers are unavailable".into(),
+            },
+        }
+    }
+
+    /// Install one prepared replacement (D-06): the plan id names a
+    /// core-issued candidate; buffer/revision guards re-run at install;
+    /// one isolated Undo unit is recorded; the consumed result replays for
+    /// the retry window. Expired/unknown plans return Gone without effect.
+    fn apply_replace(
+        &self,
+        buffer_id: BufferId,
+        revision: Revision,
+        plan_id: u128,
+    ) -> SessionResult {
+        self.sweep_text_plans();
+        let now = std::time::Instant::now();
+        let entry = {
+            let plans = self.text_plans.lock_recovering();
+            plans.get(&plan_id).map(|entry| (entry.ops.clone(), entry.match_count, entry.options_digest, entry.buffer_id, entry.revision, entry.consumed.as_ref().map(|(at, _)| *at)))
+        };
+        let Some((ops, _match_count, _digest, entry_buffer, entry_revision, consumed_at)) = entry else {
+            return SessionResult::ActionRequired {
+                code: "text-plan-expired",
+                data: None,
+            };
+        };
+        if let Some(receipt) = consumed_at
+            .filter(|at| now.duration_since(*at) < TEXT_PLAN_RESULT_TTL)
+            .and_then(|_| {
+                let plans = self.text_plans.lock_recovering();
+                plans.get(&plan_id).and_then(|entry| entry.consumed.as_ref().map(|(_, receipt)| receipt.clone()))
+            })
+        {
+            return receipt;
+        }
+        let _ = _match_count;
+        let _ = _digest;
+        if entry_buffer != buffer_id {
+            return SessionResult::Error {
+                message: "replacement plan belongs to another buffer".into(),
+            };
+        }
+        if entry_revision != revision {
+            return SessionResult::StaleRevision {
+                buffer_id,
+                expected: entry_revision,
+                actual: revision,
+            };
+        }
+        let result = {
+            let mut manager = self.buffer_manager.lock_recovering();
+            let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
+                return SessionResult::Error {
+                    message: "Buffer no longer open".into(),
+                };
+            };
+            if buffer.revision() != entry_revision {
+                return SessionResult::StaleRevision {
+                    buffer_id,
+                    expected: entry_revision,
+                    actual: buffer.revision(),
+                };
+            }
+            match buffer.apply_local_edits_with_policy(
+                &ops,
+                flavite_buffer::undo::UndoPolicy::Isolated,
+            ) {
+                Some((new_revision, _)) => SessionResult::Success(CommandResult::EditsApplied {
+                    buffer_id,
+                    new_revision,
+                }),
+                None => SessionResult::Error {
+                    message: "prepared batch no longer applies".into(),
+                },
+            }
+        };
+        {
+            let mut plans = self.text_plans.lock_recovering();
+            if let Some(entry) = plans.get_mut(&plan_id) {
+                entry.consumed = Some((now, result.clone()));
+            }
+        }
+        result
+    }
+
+    /// Install finished preparations into the plan registry on a Session
+    /// turn and complete every correlated caller once.
+    fn pump_text_completions(&self) {
+        while let Ok(message) = self.text_results.try_recv() {
+            let result = match message.outcome {
+                Ok((ops, match_count, digest)) => {
+                    let plan_id = self.next_text_plan_id();
+                    let entry = TextPlanEntry {
+                        ops,
+                        match_count,
+                        options_digest: digest,
+                        buffer_id: message.buffer_id,
+                        revision: message.revision,
+                        created: std::time::Instant::now(),
+                        consumed: None,
+                    };
+                    let admitted = {
+                        let mut plans = self.text_plans.lock_recovering();
+                        let unconsumed =
+                            plans.values().filter(|entry| entry.consumed.is_none()).count();
+                        if unconsumed < MAX_UNCONSUMED_TEXT_PLANS {
+                            plans.insert(plan_id, entry);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if admitted {
+                        SessionResult::Success(CommandResult::ReplacePrepared {
+                            plan_id,
+                            match_count,
+                            expires_in_ms: u64::try_from(TEXT_PLAN_TTL.as_millis())
+                                .unwrap_or(u64::MAX),
+                        })
+                    } else {
+                        SessionResult::Busy
+                    }
+                }
+                Err(error) => SessionResult::Error {
+                    message: format!("replacement prepare refused: {error:?}"),
+                },
+            };
+            self.record_completion(message.request_id, result);
         }
     }
 
@@ -2839,7 +3381,7 @@ impl Session {
         let mine = {
             let manager = self.buffer_manager.lock_recovering();
             match manager.get_buffer_by_id(buffer_id) {
-                Some(buffer) => buffer.model().to_source_bytes(),
+                Some(buffer) => history_bytes(buffer),
                 None => {
                     return SessionResult::Error {
                         message: "Buffer not found".into(),
@@ -2860,13 +3402,20 @@ impl Session {
             let mut manager = self.buffer_manager.lock_recovering();
             match manager
                 .get_buffer_by_id_mut(buffer_id)
-                .and_then(|buffer| buffer.reload_from_disk(&theirs))
+                .and_then(|buffer| buffer.reload_from_disk(&theirs, DecodePolicy::Auto))
             {
                 Some(_) => {}
                 None => {
-                    return SessionResult::Error {
-                        message: "disk bytes are not valid UTF-8".into(),
-                    };
+                    // Malformed/undecodable disk bytes are never adopted
+                    // silently; the buffer is untouched and the repair is an
+                    // explicit encoding choice (§6.10).
+                    return self.encoding_choice_required(
+                        &path,
+                        &ChoiceReason::InvalidInput {
+                            kind: crate::encoding::InvalidKind::Other,
+                            observed_raw_hash: *blake3::hash(&theirs).as_bytes(),
+                        },
+                    );
                 }
             }
         }
@@ -2927,6 +3476,7 @@ impl Session {
         buffer_id: BufferId,
         revision: Revision,
         ops: Vec<EditOp>,
+        undo_policy: flavite_buffer::undo::UndoPolicy,
     ) -> SessionResult {
         let mut buffer_manager = self.buffer_manager.lock_recovering();
 
@@ -2942,8 +3492,11 @@ impl Session {
             }
 
             // Validate the command once and apply all positions as one
-            // authoritative Buffer transition/undo unit.
-            let Some((new_revision, _)) = buffer.apply_local_edits(&ops) else {
+            // authoritative Buffer transition/undo unit. `Isolated` (the
+            // default) prepares and installs one boundary candidate; the
+            // explicit typing path keeps ordinary coalescing (D-06/TD-8).
+            let Some((new_revision, _)) = buffer.apply_local_edits_with_policy(&ops, undo_policy)
+            else {
                 return SessionResult::Error {
                     message: "edit ranges overlap, are out of bounds, or split UTF-8".into(),
                 };
@@ -2973,7 +3526,7 @@ impl Session {
                 message: "Buffer not found".to_string(),
             };
         };
-        let (bytes, revision, base_hash, base_bytes, state) = {
+        let (bytes, revision, base_hash, base_bytes, state, source_format, source_text) = {
             let mut manager = self.buffer_manager.lock_recovering();
             let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
                 return SessionResult::Error {
@@ -2981,12 +3534,42 @@ impl Session {
                 };
             };
             buffer.model_mut().seal_undo_group();
+            // Strict descriptor serialization before any stage exists: a
+            // strict-ASCII draft holding non-ASCII content fails here with
+            // zero filesystem effects, the draft stays intact/recoverable,
+            // and autosave pauses with one coalesced actionable error
+            // (§6.10, FR-22). Explicit conversion clears the condition.
+            let bytes = match buffer.model().try_to_source_bytes() {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let unencodable = matches!(
+                        error,
+                        flavite_encoding::CodecError::Unencodable { .. }
+                            | flavite_encoding::CodecError::AsciiViolation { .. }
+                    );
+                    let code = if unencodable {
+                        crate::encoding::UNENCODABLE_CODE
+                    } else {
+                        crate::encoding::OUTPUT_LIMIT_CODE
+                    };
+                    self.notice.send(crate::channels::Notice::ActionRequired {
+                        code,
+                        note: Some(flavite_buffer::manager::NoteRef::new(path.clone())),
+                    });
+                    return SessionResult::ActionRequired {
+                        code,
+                        data: Some(crate::encoding::codec_limit_kind_code(&error).to_owned()),
+                    };
+                }
+            };
             (
-                buffer.model().to_source_bytes(),
+                bytes,
                 buffer.revision(),
                 buffer.base_hash(),
                 buffer.base_bytes().to_vec(),
                 buffer.state(),
+                buffer.model().source_format(),
+                buffer.text().to_owned(),
             )
         };
         if !state.allows_manual_save() {
@@ -3003,6 +3586,40 @@ impl Session {
         };
         let request_id = self.next_request_id();
         let note_key = native_note_key(&path, &self.identity.root);
+        // §6.10: persist the format-binding intent BEFORE a source effect
+        // whose interpretation depends on hint metadata (BOM-less UTF-16,
+        // explicit ASCII, leading signature-shaped content, NUL-bearing
+        // content). The intent cannot be persisted -> the save is refused
+        // typed: an ambiguous source is never advertised as durably
+        // configured, and a green Saved receipt always implies a durably
+        // reachable descriptor.
+        let leading_signature = source_text.starts_with('\u{FEFF}');
+        let nul_content = source_text.contains('\0');
+        let needs_hint = source_format.encoding() != flavite_encoding::FileEncoding::Utf8
+            || source_format.bom()
+            || leading_signature
+            || nul_content;
+        if needs_hint {
+            let hex_key = hex::encode(&note_key);
+            let intent = crate::encoding::BindingIntent {
+                native_key: hex_key.clone(),
+                old_raw_hash: base_hash.map(|hash| hash.as_bytes()).unwrap_or([0u8; 32]),
+                output_raw_hash: *blake3::hash(&bytes).as_bytes(),
+                encoding: source_format.encoding(),
+                bom: source_format.bom(),
+                preserve_leading_signature: leading_signature && !source_format.bom(),
+                nul_content_confirmed: nul_content,
+            };
+            if let Err(error) = self.encoding_hints.update(|record| {
+                record.intents.insert(hex_key, intent);
+            }) {
+                tracing::warn!(path = %path.display(), ?error, "format-binding intent refused");
+                return SessionResult::ActionRequired {
+                    code: crate::encoding::HINT_UNAVAILABLE_CODE,
+                    data: None,
+                };
+            }
+        }
         let request = SaveRequest {
             request_id,
             path,
@@ -3277,12 +3894,22 @@ impl Session {
         let mut manager = self.buffer_manager.lock_recovering();
         match manager
             .get_buffer_by_id_mut(buffer_id)
-            .and_then(|buffer| buffer.resolve_keep_local(&theirs).map(|_| ()))
+            .and_then(|buffer| {
+                buffer
+                    .resolve_keep_local(&theirs, DecodePolicy::Auto)
+                    .map(|_| ())
+            })
         {
             Some(()) => SessionResult::Success(CommandResult::ConflictResolved),
-            None => SessionResult::Error {
-                message: "external bytes are not valid UTF-8".into(),
-            },
+            None => {
+                return self.encoding_choice_required(
+                    &path,
+                    &ChoiceReason::InvalidInput {
+                        kind: crate::encoding::InvalidKind::Other,
+                        observed_raw_hash: *blake3::hash(&theirs).as_bytes(),
+                    },
+                );
+            }
         }
     }
 
@@ -3301,7 +3928,7 @@ impl Session {
         let mine = {
             let manager = self.buffer_manager.lock_recovering();
             match manager.get_buffer_by_id(buffer_id) {
-                Some(buffer) => buffer.model().to_source_bytes(),
+                Some(buffer) => history_bytes(buffer),
                 None => {
                     return SessionResult::Error {
                         message: "Buffer not found".into(),
@@ -3321,12 +3948,18 @@ impl Session {
         let mut manager = self.buffer_manager.lock_recovering();
         match manager
             .get_buffer_by_id_mut(buffer_id)
-            .and_then(|buffer| buffer.reload_from_disk(&theirs))
+            .and_then(|buffer| buffer.reload_from_disk(&theirs, DecodePolicy::Auto))
         {
             Some(_) => SessionResult::Success(CommandResult::ConflictResolved),
-            None => SessionResult::Error {
-                message: "external bytes are not valid UTF-8".into(),
-            },
+            None => {
+                return self.encoding_choice_required(
+                    &path,
+                    &ChoiceReason::InvalidInput {
+                        kind: crate::encoding::InvalidKind::Other,
+                        observed_raw_hash: *blake3::hash(&theirs).as_bytes(),
+                    },
+                );
+            }
         }
     }
 
@@ -3342,13 +3975,14 @@ impl Session {
                 data: Some(path.display().to_string()),
             };
         };
-        let (base, mine, revision) = {
+        let (base, mine, revision, base_format) = {
             let manager = self.buffer_manager.lock_recovering();
             match manager.get_buffer_by_id(buffer_id) {
                 Some(buffer) => (
                     buffer.base_bytes().to_vec(),
-                    buffer.model().to_source_bytes(),
+                    buffer.model().decoded_text().into_bytes(),
                     buffer.revision(),
+                    buffer.base_format(),
                 ),
                 None => {
                     return SessionResult::Error {
@@ -3366,10 +4000,26 @@ impl Session {
                 message: format!("could not snapshot merge input: {error}"),
             };
         }
-        let (Ok(base), Ok(mine), Ok(theirs)) = (
-            std::str::from_utf8(&base),
-            std::str::from_utf8(&mine),
-            std::str::from_utf8(&theirs),
+        // §6.10: decode base/mine/theirs independently under their own
+        // captured descriptors, then merge the decoded layers (physical EOLs
+        // preserved, no BOM). A decode failure is a typed choice request,
+        // never a partial merge or a lossy reinterpretation.
+        let limits = flavite_encoding::DecodeLimits::default_envelope();
+        let decode_layer = |bytes: &[u8],
+                            policy: flavite_encoding::DecodePolicy|
+         -> Result<String, flavite_encoding::CodecError> {
+            flavite_encoding::decode(bytes, policy, &limits, &mut || false)
+                .map(|decoded| decoded.text().to_string())
+        };
+        let base_policy = base_format
+            .map(flavite_encoding::DecodePolicy::Explicit)
+            .unwrap_or(flavite_encoding::DecodePolicy::Auto);
+        let (Ok(base), Ok(mine), Ok(theirs_text)) = (
+            decode_layer(&base, base_policy),
+            String::from_utf8(mine).map_err(|_| flavite_encoding::CodecError::InvalidUtf8 {
+                source_byte: 0,
+            }),
+            decode_layer(&theirs, flavite_encoding::DecodePolicy::Auto),
         ) else {
             return SessionResult::ActionRequired {
                 code: "merge-unsupported-encoding",
@@ -3380,8 +4030,8 @@ impl Session {
             path,
             buffer_id,
             revision,
-            disk_hash: *blake3::hash(theirs.as_bytes()).as_bytes(),
-            result: crate::merge::three_way_merge(base, mine, theirs),
+            disk_hash: *blake3::hash(&theirs).as_bytes(),
+            result: crate::merge::three_way_merge(&base, &mine, &theirs_text),
         }
     }
 
@@ -3432,7 +4082,7 @@ impl Session {
                     actual: buffer.revision(),
                 };
             }
-            buffer.model().to_source_bytes()
+            history_bytes(buffer)
         };
         if let Err(error) = self.actor.snapshot_history(
             native_note_key(&path, &self.identity.root),
@@ -3456,7 +4106,7 @@ impl Session {
                 actual: buffer.revision(),
             };
         }
-        match buffer.apply_resolved_merge(&merged_bytes, &theirs) {
+        match buffer.apply_resolved_merge(&merged_bytes, &theirs, DecodePolicy::Auto) {
             Some(new_revision) => SessionResult::Success(CommandResult::EditsApplied {
                 buffer_id,
                 new_revision,
@@ -3464,6 +4114,216 @@ impl Session {
             None => SessionResult::Error {
                 message: "merge output is invalid UTF-8 or exceeds the note size limit".into(),
             },
+        }
+    }
+
+    /// Reopen one note under an explicit source-format interpretation
+    /// (§6.10). Guards: exact current raw hash, no pending save, and — for
+    /// an open buffer — no unsaved text. A clean reopen reinterprets the
+    /// shared buffer (all views observe the new revision/descriptor), starts
+    /// a fresh Undo root, and binds the confirmed hint to the observed hash.
+    fn reopen_encoding(
+        &self,
+        path: PathBuf,
+        expected_raw_hash: [u8; 32],
+        encoding: flavite_encoding::FileEncoding,
+        bom: crate::encoding::BomMode,
+    ) -> SessionResult {
+        let Some(bytes) = self.actor.read_file(path.clone()).ok().flatten() else {
+            return SessionResult::ActionRequired {
+                code: "file-deleted",
+                data: Some(path.display().to_string()),
+            };
+        };
+        let observed = *blake3::hash(&bytes).as_bytes();
+        if observed != expected_raw_hash {
+            // A stale precondition is a re-read, never a decode under bytes
+            // the caller never saw.
+            return SessionResult::ActionRequired {
+                code: crate::encoding::STALE_SOURCE_CODE,
+                data: None,
+            };
+        }
+        // Resolve the concrete descriptor from the family + BOM intent
+        // against the actual bytes (§6.10): `Auto` strips a matching
+        // signature for the requested family, `Present` requires it,
+        // `Absent` preserves signature-shaped leading bytes as content.
+        let signature: &[u8] = encoding.bom_signature();
+        let format = match bom {
+            crate::encoding::BomMode::Auto if !signature.is_empty() && bytes.starts_with(signature) => {
+                flavite_encoding::SourceFormat::new(encoding, true)
+            }
+            crate::encoding::BomMode::Present => flavite_encoding::SourceFormat::new(encoding, true),
+            _ => flavite_encoding::SourceFormat::new(encoding, false),
+        };
+        let format = match format {
+            Ok(format) => format,
+            // ASCII+BOM is an invalid descriptor combination (§6.10).
+            Err(_) => {
+                return SessionResult::Error {
+                    message: "ascii cannot be combined with a BOM".into(),
+                };
+            }
+        };
+        // Decode once under the explicit descriptor before touching state.
+        let snapshot = match
+            flavite_syntax::text::TextSnapshot::with_policy(&bytes, DecodePolicy::Explicit(format))
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let reason = match &error {
+                    flavite_syntax::text::TextError::Codec(
+                        flavite_encoding::CodecError::BomConflict,
+                    ) => ChoiceReason::BomConflict {
+                        observed_raw_hash: observed,
+                    },
+                    flavite_syntax::text::TextError::Codec(
+                        flavite_encoding::CodecError::UnsupportedOrAmbiguousBom,
+                    ) => ChoiceReason::UnsupportedOrAmbiguousBom {
+                        observed_raw_hash: observed,
+                    },
+                    flavite_syntax::text::TextError::Codec(codec) => ChoiceReason::InvalidInput {
+                        kind: crate::encoding::InvalidKind::from_codec(codec),
+                        observed_raw_hash: observed,
+                    },
+                };
+                return self.encoding_choice_required(&path, &reason);
+            }
+        };
+        let (buffer_id, revision) = {
+            let mut manager = self.buffer_manager.lock_recovering();
+            match manager.get_buffer(&path).map(|buffer| buffer.buffer_id()) {
+                Some(buffer_id) => {
+                    if self
+                        .save_flights
+                        .lock_recovering()
+                        .contains_key(&buffer_id.as_u64())
+                    {
+                        return SessionResult::ActionRequired {
+                            code: crate::encoding::SAVE_PENDING_CODE,
+                            data: None,
+                        };
+                    }
+                    let is_dirty = manager
+                        .get_buffer(&path)
+                        .is_some_and(flavite_buffer::state::Buffer::is_dirty);
+                    if is_dirty {
+                        // DirtyBufferActionRequired: save with the current
+                        // format, convert-then-save, or cancel — never an
+                        // implicit discard of unsaved text (§6.10).
+                        return SessionResult::ActionRequired {
+                            code: crate::encoding::DIRTY_BUFFER_CODE,
+                            data: None,
+                        };
+                    }
+                    manager
+                        .get_buffer_mut(&path)
+                        .expect("buffer presence just checked")
+                        .reopen_with_snapshot(snapshot, &bytes);
+                    let buffer = manager.get_buffer(&path).expect("buffer present");
+                    (buffer.buffer_id(), buffer.revision())
+                }
+                None => {
+                    let (buffer, _transition) = manager.open_note_snapshot(path.clone(), snapshot);
+                    (buffer.buffer_id(), buffer.revision())
+                }
+            }
+        };
+        self.note_buffer_transition();
+        self.bind_save_hint(&path, format, observed, &bytes);
+        let _ = self.pulse.send(crate::channels::Pulse::Invalidate {
+            note: flavite_buffer::manager::NoteRef::new(path),
+        });
+        SessionResult::Success(CommandResult::EncodingReopened {
+            buffer_id,
+            revision,
+        })
+    }
+
+    /// Convert an open buffer's save format (§6.10): validates whole-note
+    /// representability/output limits before installing any metadata, keeps
+    /// the decoded text and Undo lineage, and records one isolated boundary.
+    fn convert_encoding(
+        &self,
+        buffer_id: BufferId,
+        revision: Revision,
+        target: flavite_encoding::SourceFormat,
+    ) -> SessionResult {
+        let mut manager = self.buffer_manager.lock_recovering();
+        let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
+            return SessionResult::Error {
+                message: "Buffer no longer open".into(),
+            };
+        };
+        if buffer.revision() != revision {
+            return SessionResult::StaleRevision {
+                buffer_id,
+                expected: revision,
+                actual: buffer.revision(),
+            };
+        }
+        match buffer.model_mut().try_convert_source_format(target) {
+            Ok(new_revision) => SessionResult::Success(CommandResult::EncodingConverted {
+                buffer_id,
+                new_revision,
+            }),
+            Err(error) => {
+                let code = if matches!(
+                    error,
+                    flavite_encoding::CodecError::Unencodable { .. }
+                        | flavite_encoding::CodecError::AsciiViolation { .. }
+                ) {
+                    crate::encoding::UNENCODABLE_CODE
+                } else {
+                    crate::encoding::OUTPUT_LIMIT_CODE
+                };
+                SessionResult::ActionRequired {
+                    code,
+                    data: Some(crate::encoding::codec_limit_kind_code(&error).to_owned()),
+                }
+            }
+        }
+    }
+
+    /// Bind the confirmed save-format hint for one source when its
+    /// interpretation depends on more than plain BOM-less UTF-8 (§6.10).
+    /// Write failure is logged — the next open re-asks instead of silently
+    /// advertising a durably configured choice.
+    fn bind_save_hint(
+        &self,
+        path: &Path,
+        format: flavite_encoding::SourceFormat,
+        observed_raw_hash: [u8; 32],
+        bytes: &[u8],
+    ) {
+        let leading_signature = bytes.starts_with("\u{FEFF}".as_bytes());
+        let nul_content = bytes.contains(&0);
+        let needs_hint = format.encoding() != flavite_encoding::FileEncoding::Utf8
+            || format.bom()
+            || leading_signature
+            || nul_content;
+        if !needs_hint {
+            return;
+        }
+        match self.confirm_encoding_hint(
+            path,
+            format,
+            observed_raw_hash,
+            leading_signature,
+            nul_content,
+        ) {
+            Ok(_) => {
+                // The binding is durable: retire any pre-save intent for
+                // this source (§6.10 "retire the intent only after that
+                // metadata is durable").
+                let native_key = hex::encode(native_note_key(path, &self.identity.root));
+                let _ = self.encoding_hints.update(|record| {
+                    record.intents.remove(&native_key);
+                });
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), ?error, "encoding hint binding failed");
+            }
         }
     }
 
@@ -3505,12 +4365,33 @@ impl Session {
                 message: "buffer disappeared while restoring recovery".into(),
             };
         };
-        let recovered = recovery.to_source_bytes();
+        let recovered = match recovery.to_source_bytes() {
+            Ok(bytes) => bytes,
+            // The recorded draft is not representable under its own
+            // descriptor; refusing is honest, the draft stays recoverable.
+            Err(error) => {
+                return self.encoding_choice_required(
+                    &path,
+                    &ChoiceReason::InvalidInput {
+                        kind: crate::encoding::InvalidKind::from_codec(&error),
+                        observed_raw_hash: [0u8; 32],
+                    },
+                );
+            }
+        };
         let transition = self
             .buffer_manager
             .lock_recovering()
             .get_buffer_by_id_mut(buffer_id)
-            .and_then(|buffer| buffer.restore_recovery(&recovered, &disk, recovery.base_hash));
+            .and_then(|buffer| {
+                buffer.restore_recovery(
+                    &recovered,
+                    DecodePolicy::Explicit(recovery.source_format),
+                    &disk,
+                    recovery.base_hash,
+                    DecodePolicy::Auto,
+                )
+            });
         if transition.is_none() {
             return SessionResult::Error {
                 message: "recovery snapshot could not be applied".into(),
@@ -3582,10 +4463,27 @@ impl Session {
             Ok(bytes) => bytes,
             Err(message) => return SessionResult::Error { message },
         };
-        let Ok(text) = String::from_utf8(snapshot) else {
-            return SessionResult::Error {
-                message: "history snapshot is not valid UTF-8".into(),
-            };
+        // §6.10: history blobs are raw serialized source bytes with their
+        // recorded provenance. Decode strictly under Auto — UTF-8 and BOM'd
+        // UTF-16 decode; anything ambiguous is a typed choice request, never
+        // a lossy reinterpretation. The BOM is descriptor-owned and is not
+        // re-inserted as content; restored lines inherit the buffer's EOL
+        // policy through the normal edit path.
+        let text = match flavite_syntax::text::TextSnapshot::new(&snapshot) {
+            Ok(decoded) => decoded.text().to_owned(),
+            Err(error) => {
+                return self.encoding_choice_required(
+                    &path,
+                    &ChoiceReason::InvalidInput {
+                        kind: match error {
+                            flavite_syntax::text::TextError::Codec(codec) => {
+                                crate::encoding::InvalidKind::from_codec(&codec)
+                            }
+                        },
+                        observed_raw_hash: *blake3::hash(&snapshot).as_bytes(),
+                    },
+                );
+            }
         };
         let mut manager = self.buffer_manager.lock_recovering();
         let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
@@ -3610,9 +4508,10 @@ impl Session {
             };
         }
         // One undo unit: the full-content replacement never merges with
-        // surrounding typing.
+        // surrounding typing. The range is normalized-text (TextByte)
+        // coordinates; the replacement is normalized UTF-8.
         buffer.model_mut().seal_undo_group();
-        let end = buffer.model().to_source_bytes().len();
+        let end = buffer.model().text().len();
         let mut op = EditOp::new(
             flavite_syntax::text::Span::new(
                 flavite_syntax::text::TextByte(0),
@@ -3765,6 +4664,7 @@ impl Session {
             base_hash: buffer.base_hash().map(|hash| hash.as_bytes()),
             state: buffer.state(),
             path,
+            source_format: buffer.model().source_format(),
         })
     }
 
@@ -3921,6 +4821,19 @@ impl Drop for Session {
             let _ = worker.join();
         }
     }
+}
+
+/// Serialized bytes for a history archive of a buffer's current content.
+///
+/// History archives draft content, not a disk claim: a strict-ASCII draft
+/// holding non-ASCII characters is stored as its decoded UTF-8 layer (its
+/// descriptor forbids the encoded form, §6.10), and saving it still fails
+/// with `Unencodable` before any file effect.
+fn history_bytes(buffer: &flavite_buffer::state::Buffer) -> Vec<u8> {
+    buffer
+        .model()
+        .try_to_source_bytes()
+        .unwrap_or_else(|_| buffer.model().decoded_text().into_bytes())
 }
 
 pub(crate) fn native_note_key(path: &Path, root: &Path) -> Vec<u8> {
@@ -4529,6 +5442,7 @@ mod tests {
                 Span::new(TextByte(5), TextByte(5)),
                 " one".into(),
             )],
+                    undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -4547,6 +5461,7 @@ mod tests {
                 Span::new(TextByte(9), TextByte(9)),
                 " two".into(),
             )],
+                    undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -4564,6 +5479,7 @@ mod tests {
                 Span::new(TextByte(13), TextByte(13)),
                 " three".into(),
             )],
+                    undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -4647,6 +5563,7 @@ mod tests {
             buffer_id,
             revision,
             ops: vec![edit],
+                    undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         });
         assert!(matches!(
             edited,
@@ -4657,7 +5574,8 @@ mod tests {
                 buffer_id,
                 revision,
                 ops: vec![],
-            }),
+                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+        }),
             SessionResult::StaleRevision { .. }
         ));
         let edited_revision = session
@@ -4786,7 +5704,8 @@ mod tests {
                     Span::new(TextByte(5), TextByte(5)),
                     " mine".into()
                 )],
-            }),
+                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+        }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
         let clean_id = match open_to_terminal(&session, clean_path.clone()) {
@@ -4869,7 +5788,8 @@ mod tests {
                 buffer_id,
                 revision,
                 ops: vec![EditOp::new(Span::new(TextByte(5), TextByte(5)), "!".into())],
-            }),
+                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+        }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
         std::thread::sleep(Duration::from_millis(10));
@@ -4904,7 +5824,8 @@ mod tests {
                     Span::new(TextByte(5), TextByte(5)),
                     suffix.into()
                 )],
-            }),
+                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+        }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
     }
@@ -5444,7 +6365,8 @@ mod tests {
                     Span::new(TextByte(0), TextByte("See [[note]]".len())),
                     "No link".into(),
                 )],
-            }),
+                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+        }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
         let rename = session.execute(SessionCommand::RenameNote {
@@ -5705,6 +6627,7 @@ mod tests {
                 Span::new(TextByte(99), TextByte(99)),
                 "x".into(),
             )],
+                    undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         });
         assert!(matches!(bad_edit, SessionResult::Error { .. }));
         assert!(matches!(
@@ -5726,6 +6649,7 @@ mod tests {
             buffer_id,
             revision,
             ops: vec![EditOp::new(Span::new(TextByte(5), TextByte(5)), "!".into())],
+                    undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         });
         let dirty_revision = match changed {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
@@ -5748,7 +6672,8 @@ mod tests {
                 buffer_id,
                 revision,
                 ops: vec![],
-            }),
+                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+        }),
             SessionResult::StaleRevision { .. }
         ));
         assert!(matches!(
@@ -5808,7 +6733,8 @@ mod tests {
                     Span::new(TextByte(5), TextByte(5)),
                     " mine".into()
                 )],
-            }),
+                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+        }),
             SessionResult::Success(_)
         ));
 
@@ -5850,7 +6776,7 @@ mod tests {
                 .get_buffer_by_id(buffer_id)
                 .unwrap()
                 .model()
-                .to_source_bytes(),
+                .try_to_source_bytes().unwrap(),
             b"hello theirs"
         );
     }
@@ -5901,7 +6827,7 @@ mod tests {
                 .get_buffer_by_id(buffer_id)
                 .unwrap()
                 .model()
-                .to_source_bytes(),
+                .try_to_source_bytes().unwrap(),
             b"hello recovered"
         );
         assert!(matches!(
@@ -5948,7 +6874,8 @@ mod tests {
                 buffer_id,
                 revision: Revision::new(revision.as_u64() + 1),
                 ops: vec![],
-            }),
+                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+        }),
             SessionResult::StaleRevision { .. }
         ));
         let request_id = match session.execute(SessionCommand::SaveNote { path: path.clone() }) {
@@ -6009,6 +6936,7 @@ mod tests {
                 Span::new(TextByte(0), TextByte(0)),
                 "mine ".into(),
             )],
+                    undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         });
         session
             .buffer_manager()
@@ -6016,7 +6944,7 @@ mod tests {
             .unwrap()
             .get_buffer_by_id_mut(buffer_id)
             .unwrap()
-            .check_external_change(b"theirs");
+            .check_external_change(b"theirs", DecodePolicy::Auto);
         assert!(matches!(
             session.execute(SessionCommand::ResolveConflict {
                 path: path.clone(),
@@ -6079,6 +7007,7 @@ mod tests {
                 Span::new(TextByte(6), TextByte(6)),
                 " edited".into(),
             )],
+                    undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         });
         let new_revision = match applied {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
@@ -6124,7 +7053,8 @@ mod tests {
                     Span::new(TextByte(13), TextByte(13)),
                     " mine".into(),
                 )],
-            }),
+                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+        }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
         fs.remove(&path).unwrap();
@@ -6212,7 +7142,8 @@ mod tests {
                 buffer_id,
                 revision,
                 ops: vec![EditOp::new(Span::new(TextByte(5), TextByte(5)), "!".into())],
-            }),
+                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+        }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
         assert_eq!(

@@ -33,6 +33,10 @@
       "kind": "workspace"
     },
     {
+      "id": "flavite-encoding",
+      "kind": "workspace"
+    },
+    {
       "id": "flavite-fs",
       "kind": "workspace"
     },
@@ -50,6 +54,10 @@
     },
     {
       "id": "flavite-syntax",
+      "kind": "workspace"
+    },
+    {
+      "id": "flavite-text-search",
       "kind": "workspace"
     },
     {
@@ -142,6 +150,11 @@
     },
     {
       "from": "flavite-api",
+      "to": "flavite-encoding",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-api",
       "to": "flavite-fs",
       "kind": "normal"
     },
@@ -158,6 +171,11 @@
     {
       "from": "flavite-api",
       "to": "flavite-syntax",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-api",
+      "to": "flavite-text-search",
       "kind": "normal"
     },
     {
@@ -197,12 +215,22 @@
     },
     {
       "from": "flavite-buffer",
+      "to": "flavite-encoding",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-buffer",
       "to": "flavite-syntax",
       "kind": "normal"
     },
     {
       "from": "flavite-buffer",
       "to": "ropey",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-cli",
+      "to": "blake3",
       "kind": "normal"
     },
     {
@@ -272,6 +300,11 @@
     },
     {
       "from": "flavite-index",
+      "to": "flavite-encoding",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-index",
       "to": "flavite-syntax",
       "kind": "normal"
     },
@@ -297,12 +330,22 @@
     },
     {
       "from": "flavite-syntax",
+      "to": "flavite-encoding",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-syntax",
       "to": "pulldown-cmark",
       "kind": "normal"
     },
     {
       "from": "flavite-syntax",
       "to": "tree-sitter",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-text-search",
+      "to": "flavite-syntax",
       "kind": "normal"
     },
     {
@@ -382,6 +425,11 @@
     },
     {
       "from": "flavite-vault",
+      "to": "flavite-encoding",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-vault",
       "to": "flavite-fs",
       "kind": "dev"
     },
@@ -398,6 +446,11 @@
     {
       "from": "flavite-vault",
       "to": "flavite-syntax",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-vault",
+      "to": "flavite-text-search",
       "kind": "normal"
     },
     {

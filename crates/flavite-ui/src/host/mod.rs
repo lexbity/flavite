@@ -8,6 +8,7 @@
 pub mod appearance;
 pub mod closing;
 pub mod commands;
+pub mod encoding;
 pub mod context;
 pub mod dialogs;
 pub mod documents;

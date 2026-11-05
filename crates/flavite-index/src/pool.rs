@@ -19,7 +19,7 @@ use crate::search::SearchBackend;
 use crate::signal::GenerationSignal;
 use crate::types::IndexVersion;
 use blake3::Hash;
-use flavite_syntax::{pulldown_glue::parse_note, text::TextSnapshot};
+use flavite_syntax::text::TextSnapshot;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Result, Transaction};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::Path;
@@ -1485,7 +1485,28 @@ impl IndexActor {
                 scan_ns,
             );
         }
-        let Ok(parsed) = parse_note(bytes) else {
+        // §6.10: strict decode under the central codec contract happens here,
+        // exactly once. Malformed or ambiguous input is a failed/unparsed
+        // entry with a typed decode status — never an empty success, never a
+        // lossy reinterpretation.
+        let decoded = flavite_encoding::decode(
+            bytes,
+            flavite_encoding::DecodePolicy::Auto,
+            &flavite_encoding::DecodeLimits::default_envelope(),
+            &mut || false,
+        );
+        let Ok(content) = decoded else {
+            return self.apply_undecodable_note(
+                path_native,
+                display_path,
+                u64::try_from(bytes.len()).map_err(|error| error.to_string())?,
+                mtime_ns,
+                scan_ns,
+            );
+        };
+        let Ok(parsed) =
+            flavite_syntax::pulldown_glue::parse_snapshot(TextSnapshot::from_decoded(content))
+        else {
             return self.apply_degraded_saved_note(
                 path_native,
                 display_path,
@@ -1514,7 +1535,15 @@ impl IndexActor {
         mtime_ns: i64,
         scan_ns: i64,
     ) -> Result<(u64, u64), String> {
-        let snapshot = TextSnapshot::new(bytes).map_err(|error| error.to_string())?;
+        // §6.10: the snapshot decoded exactly once (in `parse_note`/the
+        // reconcile worker) is authoritative — this path never re-decodes,
+        // so source spans map through the same composed codec map that
+        // produced the parse.
+        let snapshot = &parsed.snapshot;
+        let (encoding_code, bom) = snapshot
+            .format()
+            .map(|format| (format.encoding_code(), i64::from(format.bom())))
+            .unwrap_or(("utf8", 0));
         let content_hash = Hash::from_bytes(*blake3::hash(bytes).as_bytes());
         let stem = std::path::Path::new(display_path)
             .file_stem()
@@ -1601,10 +1630,10 @@ impl IndexActor {
                 }
                 reserve_graph_identity(tx, true, true)?;
                 tx.execute(
-                    "INSERT INTO notes(note_id,path,path_native,path_key,stem_key,title,stable_id,stable_id_key,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation)
-                     VALUES((SELECT CAST(value AS INTEGER) FROM meta WHERE key='note_identity_high_water'),?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10,?11,?12,?13,1,?14)
-                     ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,title=excluded.title,stable_id=excluded.stable_id,stable_id_key=excluded.stable_id_key,content_hash=excluded.content_hash,size=excluded.size,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,frontmatter=excluded.frontmatter,preview=excluded.preview,parse_ok=1,generation=excluded.generation",
-                    rusqlite::params![display_path, path_native, path_key, stem_key, title, stable_id, stable_id_key, content_hash.as_bytes(), size, mtime_ns, scan_ns, frontmatter_json, flavite_syntax::text::safe_prefix(parsed.snapshot.text(), 1024), i64::try_from(counters.generation).map_err(|error| error.to_string())?],
+                    "INSERT INTO notes(note_id,path,path_native,path_key,stem_key,title,stable_id,stable_id_key,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation,encoding,bom,decode_status)
+                     VALUES((SELECT CAST(value AS INTEGER) FROM meta WHERE key='note_identity_high_water'),?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10,?11,?12,?13,1,?14,?15,?16,'ok')
+                     ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,title=excluded.title,stable_id=excluded.stable_id,stable_id_key=excluded.stable_id_key,content_hash=excluded.content_hash,size=excluded.size,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,frontmatter=excluded.frontmatter,preview=excluded.preview,parse_ok=1,generation=excluded.generation,encoding=excluded.encoding,bom=excluded.bom,decode_status='ok'",
+                    rusqlite::params![display_path, path_native, path_key, stem_key, title, stable_id, stable_id_key, content_hash.as_bytes(), size, mtime_ns, scan_ns, frontmatter_json, flavite_syntax::text::safe_prefix(parsed.snapshot.text(), 1024), i64::try_from(counters.generation).map_err(|error| error.to_string())?, encoding_code, bom],
                 ).map_err(|error| error.to_string())?;
                 let note_id: i64 = tx
                     .query_row(
@@ -1764,9 +1793,24 @@ impl IndexActor {
         mtime_ns: i64,
         scan_ns: i64,
     ) -> Result<(u64, u64), String> {
-        let preview = TextSnapshot::new(bytes)
-            .ok()
-            .map(|snapshot| flavite_syntax::text::safe_prefix(snapshot.text(), 1024).to_owned());
+        // §6.10: classify the strict decode explicitly. A source that fails
+        // strict decoding is failed/unparsed with a typed decode status —
+        // never an empty success — and carries no decodable preview.
+        let decoded = flavite_encoding::decode(
+            bytes,
+            flavite_encoding::DecodePolicy::Auto,
+            &flavite_encoding::DecodeLimits::default_envelope(),
+            &mut || false,
+        );
+        let (preview, decode_status, encoding_code, bom) = match decoded {
+            Ok(content) => (
+                Some(flavite_syntax::text::safe_prefix(content.text(), 1024).to_owned()),
+                "ok",
+                content.format().encoding_code(),
+                content.format().bom(),
+            ),
+            Err(_) => (None, "undecodable", "unknown", false),
+        };
         self.apply_unparsed_note_inner(
             path_native,
             display_path,
@@ -1774,6 +1818,36 @@ impl IndexActor {
             mtime_ns,
             scan_ns,
             preview.as_deref(),
+            decode_status,
+            encoding_code,
+            bom,
+        )
+    }
+
+    /// Record a note whose bytes failed strict decoding (RFC-0006 §6.10).
+    /// The row remains visible/searchable by title with `decode_status =
+    /// 'undecodable'`; its bytes are never interpreted lossily.
+    ///
+    /// # Errors
+    /// Returns an error when metadata conversion or an SQLite/search update fails.
+    pub fn apply_undecodable_note(
+        &mut self,
+        path_native: &[u8],
+        display_path: &str,
+        size: u64,
+        mtime_ns: i64,
+        scan_ns: i64,
+    ) -> Result<(u64, u64), String> {
+        self.apply_unparsed_note_inner(
+            path_native,
+            display_path,
+            size,
+            mtime_ns,
+            scan_ns,
+            None,
+            "undecodable",
+            "unknown",
+            false,
         )
     }
 
@@ -1790,7 +1864,17 @@ impl IndexActor {
         mtime_ns: i64,
         scan_ns: i64,
     ) -> Result<(u64, u64), String> {
-        self.apply_unparsed_note_inner(path_native, display_path, size, mtime_ns, scan_ns, None)
+        self.apply_unparsed_note_inner(
+            path_native,
+            display_path,
+            size,
+            mtime_ns,
+            scan_ns,
+            None,
+            "not-decoded",
+            "unknown",
+            false,
+        )
     }
 
     fn apply_unparsed_note_inner(
@@ -1801,6 +1885,9 @@ impl IndexActor {
         mtime_ns: i64,
         scan_ns: i64,
         preview: Option<&str>,
+        decode_status: &'static str,
+        encoding_code: &str,
+        bom: bool,
     ) -> Result<(u64, u64), String> {
         let stem = Path::new(display_path)
             .file_stem()
@@ -1811,8 +1898,8 @@ impl IndexActor {
             self.apply_entity_core(true, false, path_native, |tx, _pre, counters, plan| {
                 let unchanged: bool = tx
                     .query_row(
-                        "SELECT parse_ok=0 AND size=?1 AND mtime_ns=?2 FROM notes WHERE path_native=?3",
-                        rusqlite::params![size, mtime_ns, path_native],
+                        "SELECT parse_ok=0 AND size=?1 AND mtime_ns=?2 AND decode_status=?4 FROM notes WHERE path_native=?3",
+                        rusqlite::params![size, mtime_ns, path_native, decode_status],
                         |row| row.get(0),
                     )
                     .optional()
@@ -1827,7 +1914,7 @@ impl IndexActor {
                     return Ok(CoreStep::FastPath);
                 }
                 reserve_graph_identity(tx, true, true)?;
-                tx.execute("INSERT INTO notes(note_id,path,path_native,path_key,stem_key,title,stable_id,stable_id_key,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation) VALUES((SELECT CAST(value AS INTEGER) FROM meta WHERE key='note_identity_high_water'),?1,?2,?3,?4,?5,NULL,NULL,0,NULL,?6,?7,?8,NULL,?9,0,?10) ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,title=excluded.title,stable_id=NULL,stable_id_key=NULL,content_hash=NULL,size=excluded.size,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,frontmatter=NULL,preview=excluded.preview,parse_ok=0,generation=excluded.generation", rusqlite::params![display_path,path_native,flavite_syntax::text::fold_key(display_path),flavite_syntax::text::fold_key(stem),stem,size,mtime_ns,scan_ns,preview,i64::try_from(counters.generation).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
+                tx.execute("INSERT INTO notes(note_id,path,path_native,path_key,stem_key,title,stable_id,stable_id_key,id_conflict,content_hash,size,mtime_ns,scan_ns,frontmatter,preview,parse_ok,generation,encoding,bom,decode_status) VALUES((SELECT CAST(value AS INTEGER) FROM meta WHERE key='note_identity_high_water'),?1,?2,?3,?4,?5,NULL,NULL,0,NULL,?6,?7,?8,NULL,?9,0,?10,?11,?12,?13) ON CONFLICT(path_native) DO UPDATE SET path=excluded.path,path_key=excluded.path_key,stem_key=excluded.stem_key,title=excluded.title,stable_id=NULL,stable_id_key=NULL,content_hash=NULL,size=excluded.size,mtime_ns=excluded.mtime_ns,scan_ns=excluded.scan_ns,frontmatter=NULL,preview=excluded.preview,parse_ok=0,generation=excluded.generation,encoding=excluded.encoding,bom=excluded.bom,decode_status=excluded.decode_status", rusqlite::params![display_path,path_native,flavite_syntax::text::fold_key(display_path),flavite_syntax::text::fold_key(stem),stem,size,mtime_ns,scan_ns,preview,i64::try_from(counters.generation).map_err(|error| error.to_string())?,encoding_code,i64::from(bom),decode_status]).map_err(|error| error.to_string())?;
                 let note_id: i64 = tx
                     .query_row(
                         "SELECT note_id FROM notes WHERE path_native=?1",

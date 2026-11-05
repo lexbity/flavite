@@ -155,8 +155,18 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         Some(flavite_api::BufferStatus::Orphaned) => "Missing on disk — recovery retained",
         None => "Unavailable",
     };
+    // RFC-0006 §6.10: the source-format indicator rides with the save-state
+    // label — one compact, user-facing freshness/format surface.
+    let state = match app.note_source_format(tab) {
+        Some(format) => format!(
+            "{state} · {}{}",
+            format.encoding_code(),
+            if format.bom() { "+bom" } else { "" }
+        ),
+        None => state.to_owned(),
+    };
     let footer = container(
-        text(state.to_owned())
+        text(state)
             .size(metrics.text_sm)
             .style(style::dim_text),
     )
@@ -194,6 +204,9 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         )
     };
     let mut content = column![meta, rule::horizontal(1)];
+    if let Some(banner) = encoding_banner(app, tab, metrics) {
+        content = content.push(banner);
+    }
     if let Some(find) = app.reading.find.get(&tab) {
         let matches = crate::host::reading::find_matches(app, tab);
         content = content.push(
@@ -238,4 +251,85 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+/// The pending encoding banner for a tab, when the core requires a typed
+/// decision (§6.10). Keyboard-accessible buttons share one catalog of
+/// actions; Cancel dismisses without effects.
+fn encoding_banner<'a>(
+    app: &'a App,
+    tab: TabId,
+    metrics: &crate::style::type_scale::Metrics,
+) -> Option<Element<'a, Message>> {
+    let pending = app.encoding.pending(tab)?;
+    let reason = crate::host::encoding::payload_reason(pending.payload.as_ref());
+    let mut row_items = Vec::new();
+    match pending.code.as_str() {
+        "encoding-choice-required" => {
+            row_items.push(text(format!(
+                "Encoding action required ({reason}) — pick an explicit format:"
+            ))
+            .size(metrics.text_sm)
+            .into());
+            for (label, encoding) in [
+                ("UTF-8", "utf8"),
+                ("UTF-16 LE", "utf16le"),
+                ("UTF-16 BE", "utf16be"),
+            ] {
+                row_items.push(
+                    button(text(label).size(metrics.text_sm))
+                        .style(style::action())
+                        .on_press(Message::Encoding(
+                            crate::host::encoding::EncodingMessage::Reopen {
+                                tab,
+                                encoding: encoding.to_owned(),
+                                bom: "auto".to_owned(),
+                            },
+                        ))
+                        .into(),
+                );
+            }
+        }
+        "encoding-unencodable" => {
+            row_items.push(
+                text("This draft cannot be saved under its strict ASCII format — convert to UTF-8?")
+                    .size(metrics.text_sm)
+                    .into(),
+            );
+            row_items.push(
+                button(text("Convert to UTF-8").size(metrics.text_sm))
+                    .style(style::action())
+                    .on_press(Message::Encoding(
+                        crate::host::encoding::EncodingMessage::Convert {
+                            tab,
+                            encoding: "utf8".to_owned(),
+                            bom: "absent".to_owned(),
+                        },
+                    ))
+                    .into(),
+            );
+        }
+        other => {
+            row_items.push(
+                text(format!("Encoding needs attention ({other})"))
+                    .size(metrics.text_sm)
+                    .into(),
+            );
+        }
+    }
+    row_items.push(
+        button(text("Cancel").size(metrics.text_sm))
+            .style(style::action())
+            .on_press(Message::Encoding(
+                crate::host::encoding::EncodingMessage::Dismiss { tab },
+            ))
+            .into(),
+    );
+    Some(
+        container(row(row_items).spacing(8))
+            .padding([6, 12])
+            .width(Length::Fill)
+            .style(style::toolbar)
+            .into(),
+    )
 }
