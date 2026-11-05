@@ -1522,6 +1522,7 @@ name = "flavite-buffer"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "crossbeam",
  "flavite-syntax",
  "ropey",
  "serde",

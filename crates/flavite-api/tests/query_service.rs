@@ -91,10 +91,34 @@ fn reconcile(flavite: &Flavite) {
     }
 }
 
+/// Wait until the event spine has delivered the reconcile to a CURRENT
+/// graph frame (RFC-0005 S5/S6: writer events drive this; under extreme
+/// parallel test load the catch-up pump can lag a query by milliseconds,
+/// and a lagging frame would answer `Missing` where production answers
+/// after settle. Settling first matches the real UI ordering.
+fn settle_graph(flavite: &Flavite) {
+    let head = flavite.vault_info().expect("vault info").generation;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if flavite.graph_frame().is_some_and(|frame| {
+            frame.publication().generation >= head && flavite.graph_is_current()
+        }) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the graph never caught up to the reconcile: {:?}",
+            flavite.graph_status()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn saturated_slots_return_busy_and_saves_still_finish() {
     let (flavite, root, fs, _cache) = fixture();
     reconcile(&flavite);
+    settle_graph(&flavite);
 
     // Hold every worker busy on gated reads of the linking note.
     fs.set_delay(50);
@@ -158,6 +182,7 @@ fn saturated_slots_return_busy_and_saves_still_finish() {
 fn closed_request_tokens_are_drained_and_dropped_without_revival() {
     let (flavite, _root, _fs, _cache) = fixture();
     reconcile(&flavite);
+    settle_graph(&flavite);
 
     // A "tab" submits a preview, then closes: its tokens are drained as
     // plain data. Nothing re-submits or revives a view; the service keeps

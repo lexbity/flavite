@@ -16,14 +16,19 @@ fn wait(
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         f.flavite.pump();
-        // RFC-0005 S5: no manual pump kick — index commits arrive through
-        // the writer-side generation broadcast, and stamp-only rebuilds
-        // converge within one self-verifying sweep (5 s).
-        if let Some(frame) = f
-            .flavite
-            .graph_frame()
-            .filter(|frame| f.flavite.graph_is_current() && predicate(frame))
-        {
+        // RFC-0005 S5/S6: no manual pump kick — index commits arrive
+        // through the writer-side generation broadcast, stamp-only
+        // rebuilds through the debounced buffer wake (sweep-bounded).
+        // A frame only counts when the mirror has CAUGHT UP to the head
+        // (a stamp-current frame can lag one event hop — the retired
+        // relay used to mask that by force-pumping every poll) and is
+        // current and satisfies the content predicate.
+        let head = f.flavite.vault_info().expect("vault info").generation;
+        if let Some(frame) = f.flavite.graph_frame().filter(|frame| {
+            frame.publication().generation >= head
+                && f.flavite.graph_is_current()
+                && predicate(frame)
+        }) {
             return frame;
         }
         assert!(

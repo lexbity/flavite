@@ -81,6 +81,10 @@ lint-arch:
     # and never inside the run_service_attempt pump body.
     check_absent 'Directive::Poll' crates
     check_absent 'GRAPH_POLL_INTERVAL' crates
+    # RFC-0005 S6: the §12.1 UI pulse relay is dead — no host layer kicks
+    # the graph service; the writer broadcast and the stamp watch own
+    # freshness.
+    check_absent 'graph_notify_changed' crates
     test "$(rg -c 'open_with_flags' crates/flavite-api/src/graph_service.rs)" -eq 1
     ! awk '/^fn run_service_attempt\(/,/^}$/' crates/flavite-api/src/graph_service.rs \
         | rg -q 'open_with_flags'

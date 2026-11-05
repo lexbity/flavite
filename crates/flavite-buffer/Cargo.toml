@@ -9,6 +9,8 @@ description = "EditorModel/ropey, undo tree, D7 state machine (§4.1)"
 [dependencies]
 # Pure Rust text buffer
 ropey = { workspace = true }
+# Stamp-transition wakes (RFC-0005 §5.1 BufferSignal): bounded(1) lossy channel
+crossbeam = { workspace = true }
 # Text snapshot and coordinate types from flavite-syntax
 flavite-syntax = { path = "../flavite-syntax" }
 # Serialization for recovery files

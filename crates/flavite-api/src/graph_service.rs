@@ -13,7 +13,9 @@
 //!
 //! # Wake mechanics (RFC-0005 §4.1/§5.2)
 //!
-//! The loop waits on three independent legs, none of which is trusted:
+//! The loop waits on three independent correctness legs, none of which is
+//! trusted, plus the buffer wake source (4) that only ever schedules
+//! debounced work:
 //!
 //! 1. **Events** — every committed structural generation wakes the pump
 //!    via the `GenerationWatch` (bounded(1), latest-wins). The change log
@@ -27,12 +29,21 @@
 //! 3. **The parity guard** (unchanged) — drift detection, orthogonal to
 //!    staleness.
 //!
+//! 4. **Buffer transitions** (S6) — every stamp-relevant buffer change
+//!    wakes the loop through the `BufferWatch`; the rebuild itself is
+//!    trailing-edge **debounced** at 150 ms (FR-4): the first change
+//!    schedules `last_change + 150 ms`, further changes move the deadline,
+//!    the fire rebuilds once over the accumulated stamp. Index wakes
+//!    bypass the window entirely and clear it — saves are never debounced.
+//!    Continuous keystrokes can move the deadline forever; the 5 s sweep
+//!    bounds the starvation by construction (§4.4's written-down policy).
+//!
 //! Host-initiated kicks (scope changes, tests, explicit retries) ride the
 //! control channel; `Directive::Relayout` doubles as the generic wake (its
-//! layout side effect is gated by the `retry_layout` flag). The UI pulse
-//! relay (`graph_notify_changed`) is retired — every vault commit reaches
-//! the service through the writer-side broadcast, and its call sites died
-//! with this slice (the facade symbol is deleted in S6).
+//! layout side effect is gated by the `retry_layout` flag). The §12.1 UI
+//! pulse relay is retired with S6: the writer-side broadcast covers vault
+//! commits and the stamp watch covers typing — no host layer kicks the
+//! graph service any more.
 //!
 //! # Long-lived read connection (RFC-0005 §4.5/FR-6)
 //!
@@ -82,6 +93,15 @@ use std::collections::BTreeMap;
 /// wake loop — never the mechanism. A quiet system wakes at 0.2 Hz, one
 /// meta read per sweep (NFR-1).
 pub const GRAPH_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Trailing-edge debounce window for buffer-triggered overlay rebuilds
+/// (RFC-0005 §4.4/FR-4): the first stamp change schedules a rebuild at
+/// `last_change + 150 ms`; further changes inside the window move the
+/// deadline; the fire rebuilds once over the accumulated stamp. Index
+/// commits are never debounced — they pump immediately and subsume any
+/// pending window. Polling was the accidental debouncer this replaces with
+/// a written-down, measured policy (AC-3).
+pub const GRAPH_BUFFER_DEBOUNCE: Duration = Duration::from_millis(150);
 
 fn workspace_layout_config() -> LayoutWorkerConfig {
     LayoutWorkerConfig {
@@ -186,8 +206,10 @@ pub struct GraphServiceMetrics {
     /// Long-lived read-connection reopens (vault_uuid/inode mismatch or a
     /// revalidation read error; FR-6). The first open is not a reopen.
     pub connection_reopens_total: u64,
-    /// Debounce-deadline stamp rebuilds executed (RFC-0005 §5.2; counted
-    /// from S6's trailing-edge policy — the S5 buffer arm never fires).
+    /// Trailing-edge debounce deadline fires that rebuilt the overlay
+    /// (RFC-0005 §4.4/§5.2, S6): one per stamp-change burst, at
+    /// `last_change + 150 ms`; index wakes bypass and clear the window
+    /// (never counted here).
     pub debounced_rebuilds_total: u64,
     /// Complete batches applied.
     pub batches_total: u64,
@@ -278,9 +300,9 @@ struct Counters {
     sweeps: AtomicU64,
     watermark_skips: AtomicU64,
     connection_reopens: AtomicU64,
-    /// RFC-0005 §5.2: deadline-driven stamp rebuilds. The counter and the
-    /// wake arm are wired in S5; the trailing-edge debounce policy that
-    /// increments it lands in S6 (buffer signal → 150 ms deadline fire).
+    /// RFC-0005 §5.2/§4.4 (S6): stamp-rebuild pumps driven by the
+    /// trailing-edge debounce deadline firing. Index/sweep/host-kick pumps
+    /// subsume the window and are counted in their own terms.
     debounced_rebuilds: AtomicU64,
     batches: AtomicU64,
     resets: AtomicU64,
@@ -553,12 +575,13 @@ impl GraphService {
     }
 
     /// Wake the service after a host-side change the writer broadcast does
-    /// not cover (scope registrations, explicit test kicks). Sends a control
-    /// wake; the retry-layout flag is untouched, so no layout reinstall
-    /// happens. The §12.1 UI pulse relay is fully retired — every vault
-    /// commit reaches this service through the writer-side broadcast
-    /// (RFC-0005 S5); the facade symbol (`Flavite::graph_notify_changed`)
-    /// is removed in S6.
+    /// not cover (scope registrations, explicit test kicks). Sends a
+    /// control wake; the retry-layout flag is untouched, so no layout
+    /// reinstall happens. The §12.1 UI pulse relay is fully retired
+    /// (RFC-0005 S5/S6): vault commits reach this service through the
+    /// generation broadcast, buffer transitions through the stamp watch —
+    /// this call remains only the control-channel host kick that RFC-0005
+    /// §8 keeps by contract.
     pub fn notify_changed(&self) {
         let _ = self.hints.try_send(Directive::Relayout);
     }
@@ -766,6 +789,67 @@ fn db_file_identity(db_path: &Path) -> Result<u64, String> {
     }
 }
 
+/// Trailing-edge debounce policy for buffer wakes (RFC-0005 §4.4, S6).
+///
+/// Policy: the first stamp-change wake schedules a rebuild at
+/// `last_change + window`; further wakes inside the window move the
+/// deadline (trailing edge — never a leading-edge fire); the deadline fire
+/// rebuilds once over the accumulated stamp. Index-delta pumps are never
+/// debounced: any pump reads the current buffer stamp itself, so an index
+/// wake, a sweep, or a host kick subsumes the pending window (`cancel`).
+/// Continuous keystrokes can starve the fire by construction (each wake
+/// moves the deadline past the next keystroke) — the 5 s sweep bounds the
+/// staleness, which is exactly the §4.4 accepted tradeoff.
+///
+/// A pure state machine over an injected `now` so the timing policy is
+/// unit-tested on a simulated timeline (no wall-clock sleeps), while the
+/// service loop drives it with `Instant::now()` at wake frequency.
+#[derive(Debug)]
+struct BufferDebounce {
+    window: Duration,
+    deadline: Option<std::time::Instant>,
+}
+
+impl BufferDebounce {
+    const fn new(window: Duration) -> Self {
+        Self {
+            window,
+            deadline: None,
+        }
+    }
+
+    /// A stamp-relevant wake arrived at `now`: schedule (move) the rebuild.
+    fn note(&mut self, now: std::time::Instant) {
+        self.deadline = Some(now + self.window);
+    }
+
+    /// Whether a rebuild is scheduled but not yet consumed.
+    const fn pending(&self) -> bool {
+        self.deadline.is_some()
+    }
+
+    /// Whether the scheduled rebuild's deadline has arrived.
+    fn due_at(&self, now: std::time::Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Any pump consumes the pending window: the rebuild it performs reads
+    /// the fresh stamp, so the scheduled fire would rebuild identical state.
+    fn cancel(&mut self) {
+        self.deadline = None;
+    }
+
+    /// The next interesting instant for the select timeout: the sooner of
+    /// the sweep deadline and the pending debounce deadline.
+    fn timeout_at(&self, now: std::time::Instant, sweep_at: std::time::Instant) -> Duration {
+        let sweep = sweep_at.saturating_duration_since(now);
+        match self.deadline {
+            Some(deadline) => deadline.saturating_duration_since(now).min(sweep),
+            None => sweep,
+        }
+    }
+}
+
 fn run_service_attempt(
     db_path: &Path,
     shared: &Arc<Shared>,
@@ -779,19 +863,24 @@ fn run_service_attempt(
         let mut layout = LayoutState::default();
         let mut last_signature = None;
         let mut connection = MaybeConnection::new();
-        // RFC-0005 S5 wake sources (§5.2): the generation watch, the buffer
-        // channel (a never-sending stub until S6 adds the debounced stamp
-        // policy — the arm exists so S6 is policy, not plumbing), the
-        // control channel, and stop. Without a watch (CLI/test pools) the
-        // index arm waits on a never-filled stub, so the select shape is
-        // identical in every wiring.
+        // RFC-0005 S5/S6 wake sources (§5.2): the generation watch, the
+        // buffer stamp watch, the control channel, and stop. Absent a
+        // source (watch-less index, session-less service) the arm waits on
+        // a never-filled stub, so the select shape is identical in every
+        // wiring. The buffer arm is real since S6: every stamp-relevant
+        // buffer transition fires it through the manager's choke points.
         let (_index_stub_tx, index_stub_rx) = bounded::<IndexVersion>(1);
         let mut index_rx = shared
             .index_watch
             .as_ref()
             .map(|watch| watch.receiver().clone())
             .unwrap_or_else(|| index_stub_rx.clone());
-        let (_buffer_tx, buffer_rx) = bounded::<()>(1);
+        let (_buffer_stub_tx, buffer_stub_rx) = bounded::<()>(1);
+        let mut buffer_rx = session
+            .map(|session| session.graph_buffer_watch())
+            .map(|watch| watch.receiver())
+            .unwrap_or_else(|| buffer_stub_rx.clone());
+        let mut debounce = BufferDebounce::new(GRAPH_BUFFER_DEBOUNCE);
         // Sweep cadence (RFC-0005 §4.1/§5.2): recovery/external-writer
         // leg, never the mechanism. The first deadline is immediate so a
         // cold service bootstraps without waiting for an event (the old
@@ -801,7 +890,7 @@ fn run_service_attempt(
         // start of the last pump (no session ⇒ trivially unchanged).
         let mut observed_stamp_version = session.map_or(0, |session| session.graph_stamp_version());
         while !stop.load(Ordering::Acquire) {
-            let timeout = next_sweep_at.saturating_duration_since(std::time::Instant::now());
+            let timeout = debounce.timeout_at(std::time::Instant::now(), next_sweep_at);
             let mut index_wake = false;
             let mut buffer_wake = false;
             let mut directive: Option<Directive> = None;
@@ -816,9 +905,17 @@ fn run_service_attempt(
                         Err(_) => { index_rx = index_stub_rx.clone(); }
                     }
                 }
-                // RFC-0005 §5.2: buffer stamp wake. S5 wires the arm inert;
-                // S6 turns this into the trailing-edge 150 ms debounce.
-                recv(buffer_rx) -> _ => { buffer_wake = true; }
+                // RFC-0005 §5.2 (S6): buffer stamp wake — fires the
+                // trailing-edge debounce below, never pumps directly.
+                recv(buffer_rx) -> message => {
+                    match message {
+                        Ok(()) => { buffer_wake = true; }
+                        // The watch is gone (a spy took it / session
+                        // dropped): retire the arm like the index one —
+                        // the sweep bounds the staleness (§4.4).
+                        Err(_) => { buffer_rx = buffer_stub_rx.clone(); }
+                    }
+                }
                 recv(hint_rx) -> message => {
                     match message {
                         Ok(message) => { directive = Some(message); }
@@ -834,6 +931,9 @@ fn run_service_attempt(
             // coalescing leaves at most one meaningful wake per pass.
             while index_rx.try_recv().is_ok() {
                 index_wake = true;
+            }
+            while buffer_rx.try_recv().is_ok() {
+                buffer_wake = true;
             }
             while let Ok(message) = hint_rx.try_recv() {
                 directive = Some(message);
@@ -861,19 +961,34 @@ fn run_service_attempt(
                 layout.relayout(shared);
                 last_signature = None;
             }
+            // Trailing-edge debounce (§4.4, S6): a pure buffer wake never
+            // pumps — it schedules (moves) the rebuild to `now + window`
+            // and the loop waits on the sooner of the debounce and sweep
+            // deadlines. Co-arrival with an index wake or any other forced
+            // reason falls through: the pump below reads the fresh stamp
+            // and consumes the window ("index wakes pump immediately and
+            // clear a pending debounce" — the rebuild covers it).
+            let debounce_due = debounce.due_at(now);
+            let other_forced =
+                sweep_due || directive.is_some() || relayout_requested || debounce_due;
+            if buffer_wake && !index_wake && !other_forced {
+                debounce.note(now);
+                continue;
+            }
             // FR-3: skip a pure index wake when the latest advertised
             // watermark equals the mirror-cursor shadow (no lock), the
-            // mirror is healthy, and no buffer transition moved the stamp
-            // since the last pump — no DB open, no DB read, no mirror lock.
+            // mirror is healthy, no rebuild is already scheduled over a
+            // newer stamp, and no buffer transition moved the stamp since
+            // the last pump — no DB open, no DB read, no mirror lock.
             // Every other wake reason forces the pump, and the sweep always
             // verifies against the database (FR-5), never the channel.
-            let forced = sweep_due || directive.is_some() || relayout_requested || buffer_wake;
-            if index_wake && !forced {
+            if index_wake && !other_forced {
                 let skip = shared.mirror_ready.load(Ordering::Acquire)
                     && shared
                         .index_watch
                         .as_ref()
                         .is_some_and(|watch| shared.cursor_matches(watch.watermark()))
+                    && !debounce.pending()
                     && session.is_none_or(|session| {
                         session.graph_stamp_version() == observed_stamp_version
                     });
@@ -887,12 +1002,23 @@ fn run_service_attempt(
             }
             if index_wake {
                 shared.counters.wakes.fetch_add(1, Ordering::Relaxed);
-            } else if !forced {
-                // The select timed out at a non-sweep deadline (impossible
-                // while the sweep is the only timeout source) or a drained
-                // wake vanished: loop around without touching anything.
+            } else if !other_forced {
+                // Nothing actionable this pass (a drained wake vanished):
+                // loop around without touching anything.
                 continue;
             }
+            if debounce_due {
+                // The trailing-edge fire consumes the keystroke window: one
+                // rebuild over the accumulated stamp (§5.2 counter, AC-3).
+                shared
+                    .counters
+                    .debounced_rebuilds
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            // Any pump subsumes the pending window — this deadline fire,
+            // an index wake, a sweep, or a host kick all rebuild with the
+            // stamp read just below.
+            debounce.cancel();
             // The stamp leg pairs with this capture: whatever the pump
             // builds reflects the buffers as of this read (a transition
             // mid-pump only makes the NEXT skip conservative, never wrong).
@@ -1345,16 +1471,6 @@ impl Flavite {
         self.graph.metrics()
     }
 
-    /// Wake the graph service after an explicit host-side change the
-    /// writer broadcast does not cover (scope registration lives in the
-    /// service itself; RFC-0005 §12.1 relay semantics are retired — index
-    /// commits reach the service through the generation broadcast since
-    /// S5, buffer stamp wakes arrive in S6). All in-tree call sites were
-    /// removed in RFC-0005 S5; the symbol is deleted in S6.
-    pub fn graph_notify_changed(&self) {
-        self.graph.notify_changed();
-    }
-
     /// Explicitly re-install the layout worker from the current base
     /// (worker-panic recovery and the graph view's Retry control).
     pub fn graph_relayout(&self) {
@@ -1464,5 +1580,144 @@ mod tests {
                 && service.status() == GraphServiceStatus::Live
         });
         service.shutdown();
+    }
+
+    // ----- RFC-0005 S6: the trailing-edge debounce policy (§4.4/FR-4) -----
+    //
+    // Pure `Instant` arithmetic lets every schedule below be asserted on a
+    // simulated timeline — no wall-clock sleeps, no racing the service.
+
+    const WINDOW: Duration = GRAPH_BUFFER_DEBOUNCE;
+
+    fn at(base: std::time::Instant, millis: u64) -> std::time::Instant {
+        base + Duration::from_millis(millis)
+    }
+
+    #[test]
+    fn burst_of_stamp_wakes_collapses_into_one_fire_at_last_change_plus_window() {
+        // The §S6 case: ten stamp changes in 20 ms produce exactly ONE
+        // deadline fire — at the LAST change plus 150 ms — and the fire is
+        // consumed once (no refire over the identical stamp).
+        let base = std::time::Instant::now();
+        let mut debounce = BufferDebounce::new(WINDOW);
+        for step in 0..10u64 {
+            let wake = at(base, 2 * step);
+            debounce.note(wake);
+            assert!(!debounce.due_at(wake), "a wake never fires mid-burst");
+        }
+        let last = at(base, 18);
+        assert!(
+            !debounce.due_at(last + Duration::from_millis(149)),
+            "one millisecond short of the window"
+        );
+        assert!(
+            debounce.due_at(last + Duration::from_millis(150)),
+            "fires at last change + one window"
+        );
+        debounce.cancel();
+        assert!(!debounce.pending(), "the fire's pump consumed the window");
+        assert!(!debounce.due_at(at(base, 60_000)), "no phantom refire");
+    }
+
+    #[test]
+    fn deadline_moves_with_every_wake_trailing_edge_never_leading() {
+        // §4.4: "further changes within the window move the deadline".
+        let base = std::time::Instant::now();
+        let mut debounce = BufferDebounce::new(WINDOW);
+        debounce.note(base);
+        assert!(
+            debounce.due_at(base + WINDOW),
+            "an idle burst would fire at +window"
+        );
+        let second = at(base, 100);
+        debounce.note(second);
+        // The naive leading-edge instant is now INSIDE the moved window.
+        assert!(
+            !debounce.due_at(base + WINDOW),
+            "a trailing-edge policy never fires on the first change's clock"
+        );
+        assert!(
+            debounce.due_at(second + WINDOW),
+            "the deadline rides the LAST change"
+        );
+    }
+
+    #[test]
+    fn an_index_pump_clears_the_pending_window_immediately() {
+        // §4.4: index-delta rebuilds are never debounced — the wake pumps
+        // now, reads the fresh stamp, and consumes the scheduled fire.
+        let base = std::time::Instant::now();
+        let mut debounce = BufferDebounce::new(WINDOW);
+        debounce.note(base);
+        debounce.cancel();
+        assert!(!debounce.pending());
+        assert!(
+            !debounce.due_at(at(base, 150)),
+            "the fire was subsumed, not delayed"
+        );
+    }
+
+    #[test]
+    fn continuous_keystroke_stream_starves_the_fire_only_to_the_sweep_bound() {
+        // §4.4's accepted tradeoff, simulated over a 6 s timeline: keystrokes
+        // every 149 ms forever — the deadline never elapses between wakes,
+        // so rebuilds happen only at sweep passes, which bounds the
+        // staleness at one interval (5 s).
+        let base = std::time::Instant::now();
+        let mut debounce = BufferDebounce::new(WINDOW);
+        let mut next_sweep = base;
+        let mut rebuilds: Vec<std::time::Instant> = Vec::new();
+        for step in 0..43u64 {
+            // 43 keystrokes * 149 ms ≈ 6.4 s.
+            let keystroke = at(base, 149 * step);
+            while next_sweep <= keystroke {
+                // The sweep forces a pump; it reads the fresh stamp and
+                // consumes the pending window.
+                rebuilds.push(next_sweep);
+                debounce.cancel();
+                next_sweep += GRAPH_SWEEP_INTERVAL;
+            }
+            debounce.note(keystroke);
+            assert!(
+                !debounce.due_at(keystroke),
+                "149 ms cadence inside a 150 ms window never lets the fire elapse"
+            );
+        }
+        assert!(!rebuilds.is_empty(), "the sweep must bound the starvation");
+        let mut previous = base;
+        for rebuild in &rebuilds {
+            assert!(
+                *rebuild - previous <= GRAPH_SWEEP_INTERVAL + Duration::from_millis(1),
+                "rebuild gap {rebuild:?} exceeded the sweep bound from {previous:?}"
+            );
+            previous = *rebuild;
+        }
+        assert!(
+            rebuilds.len() >= 2,
+            "a 6 s stream crosses at least two sweep passes"
+        );
+    }
+
+    #[test]
+    fn select_timeout_is_the_sooner_of_the_two_deadlines() {
+        let base = std::time::Instant::now();
+        let sweep_at = at(base, 5_000);
+        let mut debounce = BufferDebounce::new(WINDOW);
+        assert_eq!(
+            debounce.timeout_at(base, sweep_at),
+            Duration::from_millis(5_000)
+        );
+        debounce.note(at(base, 40));
+        // A pending window dominates: the select must wake for the fire.
+        assert_eq!(
+            debounce.timeout_at(base, sweep_at),
+            Duration::from_millis(190)
+        );
+        // Past-due arithmetic clamps to zero (wake immediately, force).
+        let late = at(base, 9_000);
+        assert_eq!(
+            debounce.timeout_at(late, late - Duration::from_secs(4)),
+            Duration::ZERO
+        );
     }
 }

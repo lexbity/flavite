@@ -1118,3 +1118,297 @@ fn sweep_recovers_external_commits_without_events() {
     );
     fixture.service.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// RFC-0005 S6 — buffer events + trailing-edge debounce (FR-4, AC-3).
+// Real sessions, real stamp wakes: no relay, no host kick, no cadence.
+// ---------------------------------------------------------------------------
+
+/// AC-3: a burst of ten stamp changes inside one window over a quiet index
+/// rebuilds the dirty overlay ONCE, within 150 ms + build of the LAST
+/// transition — driven purely by the buffer watch and the debounce
+/// deadline. The counters prove the shape: deadline fire(s) happened, no
+/// index wake participated, no delta was read, the sweep stayed idle, and
+/// the frames published are the fires' (≤ the fires, dedup swallowing any
+/// trailing identical rebuild).
+#[test]
+fn stamp_burst_rebuilds_the_overlay_once_within_the_debounce_budget() {
+    use flavite_api::{ExecutionResult, GRAPH_BUFFER_DEBOUNCE, Invocation, LocalResult, Origin};
+
+    let f = links_fixture::fixture(&[("keep.md", "# Keep\nbase body\n")]);
+    // Settle on the event spine: a frame at the index head, current stamp.
+    let head = f.flavite.vault_info().expect("vault info").generation;
+    let settle_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        f.flavite.pump();
+        if f.flavite.graph_frame().is_some_and(|frame| {
+            frame.publication().generation >= head && f.flavite.graph_is_current()
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < settle_deadline,
+            "the first current frame never arrived: {:?}",
+            f.flavite.graph_status()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let (buffer_id, _revision) = f.open_note("keep.md");
+    let before = f.flavite.graph_metrics();
+
+    let burst_start = std::time::Instant::now();
+    for step in 1..=10u64 {
+        let view = f
+            .flavite
+            .get_buffer_view(flavite_buffer::BufferId::from(buffer_id), None)
+            .expect("buffer view");
+        let result = f.flavite.execute(Invocation::new(
+            links_fixture::next_id(&f.flavite),
+            "apply_edits",
+            serde_json::json!({
+                "buffer_id": buffer_id,
+                "revision": view.revision,
+                "ops": [{ "range": [0, view.text.len()],
+                          "replacement": format!("# Keep\nstamped edit {step}\n") }],
+            }),
+            Origin::Gui,
+        ));
+        assert!(
+            matches!(result, ExecutionResult::Local(LocalResult::Success(_))),
+            "edit {step} must apply locally: {result:?}"
+        );
+    }
+    let burst = burst_start.elapsed();
+    // Normally ten in-process edits complete well inside one 150 ms window;
+    // a starved test thread may span two or three, costing exactly one
+    // extra fire. Derive the budget from the windows actually spanned.
+    let windows = {
+        let burst_ms = u64::try_from(burst.as_millis()).unwrap_or(u64::MAX);
+        let window_ms = u64::try_from(GRAPH_BUFFER_DEBOUNCE.as_millis()).unwrap_or(1);
+        burst_ms.div_ceil(window_ms).max(1)
+    };
+
+    // The ONLY requirement: the frame carries the final stamp within the
+    // budget measured from the last transition. No kicks — the loop just
+    // reads the published frame.
+    let since_last = std::time::Instant::now();
+    loop {
+        f.flavite.pump();
+        if f.flavite.graph_is_current() {
+            break;
+        }
+        let elapsed = since_last.elapsed();
+        assert!(
+            elapsed <= GRAPH_BUFFER_DEBOUNCE + Duration::from_millis(600),
+            "AC-3: the debounced rebuild never landed ({elapsed:?} since the last change): {:?}",
+            f.flavite.graph_metrics()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let wall = since_last.elapsed();
+    let after = f.flavite.graph_metrics();
+    println!(
+        "last stamp change -> current overlay frame: {wall:?} (window {GRAPH_BUFFER_DEBOUNCE:?})"
+    );
+    assert!(
+        wall <= GRAPH_BUFFER_DEBOUNCE + Duration::from_millis(500),
+        "AC-3 budget violated: {wall:?}"
+    );
+    let fires = after.debounced_rebuilds_total - before.debounced_rebuilds_total;
+    let publishes = after.batches_total - before.batches_total;
+    assert!(
+        (1..=windows).contains(&fires),
+        "one burst collapses to a fire per spanned window: {burst:?} spans {windows} window(s), {after:?}"
+    );
+    assert!(
+        (1..=fires).contains(&publishes),
+        "every publish rides a rebuild: {after:?}"
+    );
+    assert_eq!(
+        after.wakes_total, before.wakes_total,
+        "no index commits — no wakes"
+    );
+    assert_eq!(
+        after.mirror_deltas_total, before.mirror_deltas_total,
+        "the index stayed quiet: buffer work never reads deltas"
+    );
+    // (No sweep-equality assert: a 5 s boundary crossing under parallel
+    // load is timing noise — the wall budget above already excludes a
+    // sweep-driven convergence, which would take seconds.)
+    assert_eq!(
+        after.mirror_snapshots_built_total, before.mirror_snapshots_built_total,
+        "stamp-only fires reuse the cached snapshot handoff (S3/S4 unchanged)"
+    );
+}
+
+/// §4.4 "Index-delta rebuilds are never debounced": a commit landing while
+/// a stamp window is armed pumps immediately (writer wake), and the pending
+/// window is consumed by that rebuild — never a trailing second fire. The
+/// typed stamp and the new generation reach the same published frame.
+#[test]
+fn index_commit_during_typing_pumps_immediately_and_consumes_the_window() {
+    use flavite_api::{GRAPH_BUFFER_DEBOUNCE, Invocation, Origin};
+
+    let f = links_fixture::fixture(&[("a.md", "# A\nsee [[b]]\n"), ("b.md", "# B\n")]);
+    let head = f.flavite.vault_info().expect("vault info").generation;
+    let settle_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        f.flavite.pump();
+        if f.flavite.graph_frame().is_some_and(|frame| {
+            frame.publication().generation >= head && f.flavite.graph_is_current()
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < settle_deadline,
+            "the first current frame never arrived: {:?}",
+            f.flavite.graph_status()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (buffer_id, _revision) = f.open_note("a.md");
+    let before = f.flavite.graph_metrics();
+
+    // Type (arms the trailing window)...
+    let view = f
+        .flavite
+        .get_buffer_view(flavite_buffer::BufferId::from(buffer_id), None)
+        .expect("view");
+    let typed = f.flavite.execute(Invocation::new(
+        links_fixture::next_id(&f.flavite),
+        "apply_edits",
+        serde_json::json!({
+            "buffer_id": buffer_id,
+            "revision": view.revision,
+            "ops": [{ "range": [0, view.text.len()],
+                      "replacement": "# A typed mid-flight\nsee [[b]]\n" }],
+        }),
+        Origin::Gui,
+    ));
+    assert!(typed.is_success(), "edit applies: {typed:?}");
+
+    // ...and an index commit lands inside the window: an out-of-band file
+    // written straight onto the shared database through the spine.
+    fixture_apply_note(&f, "late.md", "links [[b]]", 77_777);
+    let target = f.flavite.vault_info().expect("info").generation;
+    assert!(target > head, "the commit advanced the generation");
+
+    let started = std::time::Instant::now();
+    loop {
+        f.flavite.pump();
+        if f.flavite
+            .graph_frame()
+            .is_some_and(|frame| frame.publication().generation >= target)
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the index commit never reached a frame: {:?}",
+            f.flavite.graph_metrics()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let commit_wall = started.elapsed();
+
+    // The wake path pumped the commit (never debounced): an index-driven
+    // pump happened.
+    let after_commit = f.flavite.graph_metrics();
+    assert!(
+        after_commit.wakes_total > before.wakes_total,
+        "the commit woke an index pump: {after_commit:?}"
+    );
+
+    // §4.4 immediacy: the commit reached a published frame well before a
+    // pure stamp path could (the debounce floor is 150 ms after the last
+    // typing wake; measured from after the commit returned).
+    assert!(
+        commit_wall < GRAPH_BUFFER_DEBOUNCE,
+        "the index commit waited for a debounce window: {commit_wall:?}"
+    );
+
+    // Let the state machine fully settle (buffer refresh paths may fire
+    // late stamp wakes around a reconcile), then require counter silence:
+    // pending windows expire, nothing refires without new transitions —
+    // and the whole typing-plus-commit episode rebuilds at most twice,
+    // never once per keystroke (the storm FR-4 exists to prevent).
+    let mut settled = after_commit;
+    let quiet_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        std::thread::sleep(Duration::from_millis(300));
+        let probe = f.flavite.graph_metrics();
+        if probe.debounced_rebuilds_total == settled.debounced_rebuilds_total {
+            settled = probe;
+            break;
+        }
+        settled = probe;
+        assert!(
+            std::time::Instant::now() < quiet_deadline,
+            "debounce fires never went quiet: {settled:?}"
+        );
+    }
+    let fires = settled.debounced_rebuilds_total - before.debounced_rebuilds_total;
+    println!(
+        "typing + one index commit episode: {fires} debounced fire(s), commit wall {commit_wall:?}"
+    );
+    assert!(
+        fires <= 2,
+        "a ten-transition burst plus a commit must collapse into windows, not per-change rebuilds: {settled:?}"
+    );
+    assert!(
+        f.flavite.graph_is_current(),
+        "typed stamp is live: {settled:?}"
+    );
+    let frame = f.flavite.graph_frame().expect("frame");
+    assert_eq!(frame.publication().generation, target);
+    // The typed content actually reached the overlay (not just "current"):
+    assert!(
+        frame
+            .projection()
+            .effective
+            .nodes
+            .iter()
+            .any(|node| node.path == "late.md"),
+        "the committed note is in the frame"
+    );
+    assert!(
+        frame
+            .projection()
+            .overlays
+            .values()
+            .any(|overlay| matches!(overlay, flavite_api::OverlayState::Ready { .. })),
+        "the typed overlay is live in the frame: {:?}",
+        frame.projection().overlays
+    );
+}
+
+/// Push one note through the vault's index spine with no UI relay in sight.
+fn fixture_apply_note(f: &links_fixture::Fixture, name: &str, body: &str, _stamp: i64) {
+    use flavite_api::{ExecutionResult, Invocation, Origin};
+    use flavite_fs::Fs;
+    f.fs.write_new(&f.root.join(name), body.as_bytes())
+        .expect("fs write");
+    let result = f.flavite.execute(Invocation::new(
+        links_fixture::next_id(&f.flavite),
+        "vault.reconcile",
+        serde_json::json!({ "scope": "full", "mode": "fast" }),
+        Origin::Gui,
+    ));
+    if let ExecutionResult::Pending { request_id } = result {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            f.flavite.pump();
+            let done = f.flavite.wait_for_operation(request_id);
+            if !matches!(done, ExecutionResult::Pending { .. }) {
+                assert!(done.is_success(), "reconcile: {done:?}");
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reconcile never finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}

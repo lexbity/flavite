@@ -62,7 +62,8 @@ pub use doctor::*;
 pub use event::*;
 pub use flavite::*;
 pub use graph_service::{
-    GRAPH_SWEEP_INTERVAL, GraphFrame, GraphService, GraphServiceMetrics, GraphServiceStatus,
+    GRAPH_BUFFER_DEBOUNCE, GRAPH_SWEEP_INTERVAL, GraphFrame, GraphService, GraphServiceMetrics,
+    GraphServiceStatus,
 };
 pub use queries::*;
 pub use query_service::*;

@@ -111,6 +111,13 @@ pub struct BufferManager {
     /// dirty-overlay until the sweep. S6's `BufferSignal` fires at exactly
     /// these choke points.
     graph_stamp: Arc<AtomicU64>,
+    /// RFC-0005 S6: the lossy stamp-transition wake channel
+    /// (`flavite_vault::session::BufferSignal`'s sending end, installed by
+    /// `Session::new`). Every `touch_graph_stamp` also `try_send`s here:
+    /// bounded(1), drop-on-full — a wake only says "a transition happened";
+    /// consumers re-read the stamp themselves. Absent for bare managers
+    /// (CLI/test pools): the bump alone is the contract.
+    graph_stamp_notifier: Option<crossbeam::channel::Sender<()>>,
 }
 
 impl BufferManager {
@@ -123,6 +130,7 @@ impl BufferManager {
             default_coalesce_window: std::time::Duration::from_millis(500),
             recovery_interval_secs: 2, // Default 2 seconds
             graph_stamp: Arc::new(AtomicU64::new(0)),
+            graph_stamp_notifier: None,
         }
     }
 
@@ -135,6 +143,7 @@ impl BufferManager {
             default_coalesce_window: coalesce_window,
             recovery_interval_secs: recovery_interval,
             graph_stamp: Arc::new(AtomicU64::new(0)),
+            graph_stamp_notifier: None,
         }
     }
 
@@ -146,11 +155,41 @@ impl BufferManager {
         Arc::clone(&self.graph_stamp)
     }
 
-    /// Record a stamp-relevant transition. Conservative: called at every
-    /// manager mutation choke point, including mutable-handle hand-offs
-    /// whose caller may or may not touch the stamp inputs.
+    /// Install the graph-stamp wake notifier (the sending end of
+    /// `BufferSignal`). Called once by `Session::new`; a manager without a
+    /// session (or with the watch taken by a test spy) simply bumps the
+    /// stamp version and fires no wake — lossy by design (RFC-0005 §4.2).
+    pub fn set_graph_stamp_notifier(&mut self, notifier: crossbeam::channel::Sender<()>) {
+        self.graph_stamp_notifier = Some(notifier);
+    }
+
+    /// Test seam (RFC-0005 S6): a manager whose stamp transitions fire an
+    /// externally held watch. The spy receives `()` wakes from the shared
+    /// bounded(1) slot — coalescing under bursts is expected and harmless:
+    /// wakes only advertise, the stamp version carries the truth. (A
+    /// manager wrapped in a `Session` gets the session's own notifier and
+    /// hands its watch out through `Session::graph_buffer_watch`.)
+    #[must_use]
+    pub fn with_buffer_spy() -> (Self, crossbeam::channel::Receiver<()>) {
+        let mut manager = Self::new();
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        manager.graph_stamp_notifier = Some(tx);
+        (manager, rx)
+    }
+
+    /// Record a stamp-relevant transition: bump the version and advertise a
+    /// wake. Conservative by construction — called at every manager
+    /// mutation choke point, including mutable-handle hand-offs whose
+    /// caller may or may not touch the stamp inputs. Over-notifying is
+    /// safe (the consumer's debounce coalesces and the rebuild dedups);
+    /// under-notifying would strand a stale dirty-overlay until the sweep.
     fn touch_graph_stamp(&self) {
         self.graph_stamp.fetch_add(1, Ordering::Relaxed);
+        if let Some(notifier) = &self.graph_stamp_notifier {
+            // Drop-on-full: latest-wins coalescing, exactly the
+            // GenerationSignal discipline (§4.2). Never blocks.
+            let _ = notifier.try_send(());
+        }
     }
 
     /// Get the recovery interval in seconds.
@@ -746,5 +785,58 @@ mod tests {
         manager.clear();
         assert_eq!(manager.buffer_count(), 0);
         assert!(manager.get_buffer_by_id(id).is_none());
+    }
+
+    #[test]
+    fn stamp_transitions_bump_the_version_and_fire_the_spy_watch() {
+        use crate::undo::EditOp;
+        let (mut manager, spy) = BufferManager::with_buffer_spy();
+        let version = manager.graph_stamp_handle();
+        assert_eq!(version.load(Ordering::Relaxed), 0);
+        assert!(spy.try_recv().is_err(), "no wake before any transition");
+
+        let (buffer, _) = manager.open_note(PathBuf::from("s.md"), b"body");
+        let id = buffer.buffer_id();
+        assert_eq!(version.load(Ordering::Relaxed), 1, "open bumps");
+        assert!(spy.recv_timeout(std::time::Duration::from_secs(1)).is_ok());
+
+        manager
+            .apply_edit_by_id(
+                id,
+                EditOp::new(
+                    flavite_syntax::text::Span::new(TextByte(0), TextByte(0)),
+                    "x".into(),
+                ),
+            )
+            .expect("edit applies");
+        assert_eq!(version.load(Ordering::Relaxed), 2, "edit bumps");
+        assert!(spy.recv_timeout(std::time::Duration::from_secs(1)).is_ok());
+
+        // A burst of transitions through the mutable-handle door: the
+        // version keeps climbing, the bounded(1) slot never grows past
+        // one pending wake (latest-wins coalescing, §4.2 discipline).
+        for _ in 0..50 {
+            assert!(manager.get_buffer_by_id_mut(id).is_some());
+        }
+        assert!(version.load(Ordering::Relaxed) > 50);
+        let mut woken = 0;
+        while spy.try_recv().is_ok() {
+            woken += 1;
+        }
+        assert!(woken <= 1, "lossy slot must never queue a backlog: {woken}");
+
+        manager.close_note(&PathBuf::from("s.md"));
+        assert!(
+            spy.recv_timeout(std::time::Duration::from_secs(1)).is_ok(),
+            "close wakes"
+        );
+
+        // A manager without a notifier (bare pool, session-less) still
+        // bumps the version — the counter is the authority, wakes are
+        // latency only.
+        let mut plain = BufferManager::new();
+        let plain_version = plain.graph_stamp_handle();
+        plain.open_note(PathBuf::from("p.md"), b"x");
+        assert_eq!(plain_version.load(Ordering::Relaxed), 1);
     }
 }

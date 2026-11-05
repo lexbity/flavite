@@ -172,6 +172,83 @@ pub type GraphBufferStamp = (
     Option<[u8; 32]>,
 );
 
+/// Writer-side broadcast of buffer-stamp transitions (RFC-0005 §5.1/S6).
+///
+/// The sending half, owned by [`Session`] and installed into the buffer
+/// manager (whose mutation choke points are the audit list from S5's
+/// stamp-version inventory: revision bump, state dirty/clean, path change,
+/// base-hash change, open/close). Lossy by design — `bounded(1)`,
+/// `try_send`, drop-on-full, latest-wins coalescing, exactly the
+/// [`flavite_index::GenerationSignal`] discipline (§4.2): a wake carries no
+/// data, only "a stamp-relevant transition happened"; consumers re-read
+/// [`Session::graph_buffer_stamp`] / the stamp version themselves and the
+/// graph service applies its trailing-edge debounce policy (§4.4). The
+/// manager keeps a sender clone, so the channel stays connected for the
+/// session's lifetime; sends into a watch-less consumer are harmless drops.
+#[derive(Clone, Debug)]
+pub struct BufferSignal {
+    tx: crossbeam::channel::Sender<()>,
+}
+
+/// The receiving half of a [`BufferSignal`]. One logical consumer (the
+/// graph service; its restart attempts hand the receiver along, never
+/// running two simultaneously). Test spies may take the watch — then the
+/// service runs on its inert stub and converges via the sweep.
+#[derive(Clone, Debug)]
+pub struct BufferWatch {
+    rx: crossbeam::channel::Receiver<()>,
+}
+
+impl BufferSignal {
+    /// Queue capacity one: latest-wins coalescing (§4.2) — the graph never
+    /// wants a backlog of keystroke pulses, only "something changed, and
+    /// the newest stamp is what the rebuild will read".
+    const QUEUE: usize = 1;
+
+    /// Create a connected sender/watch pair.
+    #[must_use]
+    pub fn new() -> (Self, BufferWatch) {
+        let (tx, rx) = crossbeam::channel::bounded(Self::QUEUE);
+        (Self { tx }, BufferWatch { rx })
+    }
+
+    /// The sending-end clone for the buffer manager's choke points.
+    #[must_use]
+    pub fn notifier(&self) -> crossbeam::channel::Sender<()> {
+        self.tx.clone()
+    }
+
+    /// Advertise a stamp-relevant transition. Never blocks, never errors:
+    /// a full slot means a wake is already pending (coalescing), a gone
+    /// receiver means no consumer (§4.10 — a send into a dead watch is a
+    /// harmless drop).
+    pub fn notify(&self) {
+        let _ = self.tx.try_send(());
+    }
+}
+
+impl Default for BufferSignal {
+    fn default() -> Self {
+        Self::new().0
+    }
+}
+
+impl BufferWatch {
+    /// The receiver handle the graph service multiplexes in its wake
+    /// select. Cloneable — but only one consumer may actively recv at a
+    /// time (a bounded channel dispatches each wake to one receiver).
+    #[must_use]
+    pub fn receiver(&self) -> crossbeam::channel::Receiver<()> {
+        self.rx.clone()
+    }
+
+    /// Wait up to `timeout` for a wake (`None` on timeout). Test-spy side.
+    #[must_use]
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<()> {
+        self.rx.recv_timeout(timeout).ok()
+    }
+}
+
 /// Immutable shared snapshot for multiple views of the same buffer revision.
 #[derive(Debug, Clone)]
 pub struct SharedBufferSnapshot {
@@ -517,6 +594,11 @@ pub struct Session {
     /// service's wake loop compares it against its last pump — a lock-free,
     /// allocation-free "buffer stamp unchanged" check (FR-3).
     graph_stamp_version: Arc<AtomicU64>,
+    /// RFC-0005 S6: the buffer-transition watch (§5.1). Session constructs
+    /// the pair — the sending end lives in the buffer manager's audited
+    /// choke points — and hands the receiving end to the graph service's
+    /// wake select via [`Self::graph_buffer_watch`].
+    buffer_watch: BufferWatch,
     /// Latest immutable text snapshot per open buffer. Views/workers retain
     /// older revisions through Arc while the cache itself remains bounded to
     /// one revision per buffer.
@@ -583,7 +665,7 @@ impl Session {
     pub fn new(
         identity: VaultIdentity,
         actor: VaultActorHandle,
-        buffer_manager: BufferManager,
+        mut buffer_manager: BufferManager,
         pulse: PulseChannel,
         notice: NoticeChannel,
         config: VaultConfig,
@@ -593,6 +675,14 @@ impl Session {
         // RFC-0005 S5: capture the stamp-version handle before the manager
         // moves into its mutex — the graph service reads it lock-free.
         let graph_stamp_version = buffer_manager.graph_stamp_handle();
+        // RFC-0005 S6: the buffer-transition broadcast. Session constructs
+        // the pair (§5.1); the manager's audited choke points carry the
+        // sending end, and the graph service takes the watch (its wake
+        // select's buffer arm). A taken-by-spy watch (tests) leaves the
+        // service on its inert stub — lossy, recovered by the sweep, never
+        // incorrect.
+        let (buffer_signal, buffer_watch) = BufferSignal::new();
+        buffer_manager.set_graph_stamp_notifier(buffer_signal.notifier());
         let manager = Arc::new(Mutex::new(buffer_manager));
         let recovery_writer = crate::identity::get_data_dir().map(|data| {
             let dir = data
@@ -776,6 +866,7 @@ impl Session {
             rename_strategy: config.rename_strategy,
             buffer_manager: manager,
             graph_stamp_version,
+            buffer_watch,
             shared_snapshots: Mutex::new(HashMap::new()),
             autosave_failures_total: AtomicU64::new(0),
             autosave_requests: Mutex::new(HashSet::new()),
@@ -3276,6 +3367,20 @@ impl Session {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// RFC-0005 S6: the buffer-transition watch handed to consumers of the
+    /// wake channel — the graph service clones its receiver into the wake
+    /// select (the trailing-edge debounce policy lives there, §4.4). One
+    /// logical receiver may actively consume wakes at a time (a channel
+    /// dispatches each wake to exactly one receiver); restart attempts hand
+    /// the receiver along without overlap, and the graph service is the
+    /// only consumer in production. Tests may take a spy watch (§S6 seam)
+    /// — a stolen wake only delays a rebuild to the next wake or the
+    /// self-verifying sweep; correctness never rides the channel.
+    #[must_use]
+    pub fn graph_buffer_watch(&self) -> BufferWatch {
+        self.buffer_watch.clone()
+    }
+
     /// Lightweight current buffer stamp for rejecting obsolete graph publications.
     /// No text copies, database access, or filesystem work.
     pub fn graph_buffer_stamp(&self) -> Vec<GraphBufferStamp> {
@@ -5075,5 +5180,46 @@ mod tests {
             SessionResult::Success(CommandResult::NoteClosed)
         ));
         assert!(session.drain_operation_completions().is_empty());
+    }
+
+    #[test]
+    fn graph_buffer_watch_advertises_stamp_transitions() {
+        // RFC-0005 S6 seam: the session watch is the handle the graph
+        // service's debounced arm reads. The session's internal receiver
+        // never actively waits, so a spy's recv deterministically gets the
+        // next wake.
+        let (session, _fs, _temp) = test_session();
+        let watch = session.graph_buffer_watch();
+        let version = session.graph_stamp_version();
+        assert_eq!(watch.recv_timeout(Duration::from_millis(20)), None);
+
+        let path = PathBuf::from("/test/vault/note.md");
+        let (buffer_id, revision) = match open_to_terminal(&session, path.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            }) => (buffer_id, revision),
+            other => panic!("expected open, got {other:?}"),
+        };
+        assert!(session.graph_stamp_version() > version, "open bumps");
+        assert_eq!(
+            watch.recv_timeout(Duration::from_secs(1)),
+            Some(()),
+            "open wakes"
+        );
+
+        assert!(matches!(
+            session.execute(SessionCommand::ApplyEdits {
+                buffer_id,
+                revision,
+                ops: vec![EditOp::new(Span::new(TextByte(5), TextByte(5)), "!".into())],
+            }),
+            SessionResult::Success(CommandResult::EditsApplied { .. })
+        ));
+        assert_eq!(
+            watch.recv_timeout(Duration::from_secs(1)),
+            Some(()),
+            "the edit wake lands inside the debounce window"
+        );
     }
 }

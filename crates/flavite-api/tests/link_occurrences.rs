@@ -11,12 +11,16 @@ fn wait_graph(f: &Fixture) -> std::sync::Arc<flavite_api::GraphFrame> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         f.flavite.pump();
-        // RFC-0005 S5: writer events drive index commits; stamp-only
-        // transitions converge via the self-verifying sweep.
+        // RFC-0005 S5/S6: writer events drive index commits; stamp-only
+        // transitions converge via the debounced buffer wake (or the sweep
+        // bound). Catch-up AND current — a stamp-matching frame can lag a
+        // just-committed generation by one event hop; the retired relay
+        // used to mask that by force-pumping every poll.
+        let head = f.flavite.vault_info().expect("vault info").generation;
         if let Some(frame) = f
             .flavite
             .graph_frame()
-            .filter(|_| f.flavite.graph_is_current())
+            .filter(|frame| frame.publication().generation >= head && f.flavite.graph_is_current())
         {
             return frame;
         }
