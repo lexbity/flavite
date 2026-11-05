@@ -464,11 +464,19 @@ impl RecoveryWriter {
     /// Returns true if the buffer is dirty and the interval has elapsed.
     #[must_use]
     pub fn should_write(&self, buffer: &Buffer) -> bool {
-        if !buffer.is_dirty() {
+        buffer.is_dirty() && self.should_write_revision(buffer.buffer_id(), buffer.revision())
+    }
+
+    /// Check cheap buffer metadata before copying/hashing a recovery snapshot.
+    #[must_use]
+    pub fn should_write_revision(&self, buffer_id: BufferId, revision: Revision) -> bool {
+        if self
+            .covered_revision
+            .get(&buffer_id)
+            .is_some_and(|covered| *covered >= revision)
+        {
             return false;
         }
-
-        let buffer_id = buffer.buffer_id();
         if let Some(last) = self.last_write.get(&buffer_id) {
             last.elapsed() >= self.interval()
         } else {
@@ -480,9 +488,7 @@ impl RecoveryWriter {
     /// Whether an immutable snapshot is due for a recovery write.
     #[must_use]
     pub fn should_write_snapshot(&self, recovery: &RecoveryFile) -> bool {
-        self.last_write
-            .get(&recovery.header.buffer_id)
-            .is_none_or(|last| last.elapsed() >= self.interval())
+        self.should_write_revision(recovery.header.buffer_id, recovery.header.revision)
     }
 
     /// Write recovery files for all dirty buffers.
@@ -877,6 +883,25 @@ impl Default for RecoveryWriterBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_admission_uses_revision_stamps_before_copying_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer =
+            RecoveryWriter::new(RecoveryConfig::new("stamps".into(), dir.path().into(), 60));
+        let id = BufferId::new();
+        let revision = Revision::new(3);
+        assert!(writer.should_write_revision(id, revision));
+        writer.last_write.insert(id, Instant::now());
+        assert!(!writer.should_write_revision(id, revision));
+        writer
+            .last_write
+            .insert(id, Instant::now() - Duration::from_secs(61));
+        assert!(writer.should_write_revision(id, revision));
+        writer.covered_revision.insert(id, revision);
+        assert!(!writer.should_write_revision(id, revision));
+        assert!(writer.should_write_revision(id, revision.next()));
+    }
     use tempfile::tempdir;
 
     #[test]

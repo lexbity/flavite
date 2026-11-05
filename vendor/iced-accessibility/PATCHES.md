@@ -26,6 +26,9 @@ source revisions are retained in each vendored `Cargo.toml` and
 - `iced_winit`: creates one AccessKit adapter per native window, processes
   platform accessibility events on the winit loop, publishes the program tree
   after redraw, and returns native actions to the usual runtime message path.
+  Tree projection starts on `InitialTreeRequested` and stops on
+  `AccessibilityDeactivated`; redraws without an active client do not call
+  the application's tree builder. Activation still sends a full tree.
 - Existing deprecated `try_next` calls in the touched winit loop were migrated
   to `try_recv` to keep strict warning gates clean.
 

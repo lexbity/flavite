@@ -440,3 +440,57 @@ fn open_flights_admission_is_bounded() {
     }
     panic!("the 129th open should have been refused as Busy");
 }
+
+#[test]
+fn non_utf8_note_fails_the_open_instead_of_a_silent_empty_buffer() {
+    let (fixture, fs) = fixture();
+    let flavite = &fixture.flavite;
+    let path = fixture.root.join("binary.md");
+    fs.write_new(&path, b"# Title\n\ninvalid \xff byte\n")
+        .expect("non-utf8 note");
+
+    let open = open_via_api(flavite, &path, None);
+    let request_id = match open {
+        ExecutionResult::Pending { request_id } => request_id,
+        other => panic!("cold open should be pending, got {other:?}"),
+    };
+    let result = flavite.wait_for_operation(request_id);
+    let error = result
+        .into_error()
+        .expect("a note the decoder cannot accept must fail the open");
+    assert!(
+        error.message.to_lowercase().contains("utf-8"),
+        "the failure names the encoding cause: {}",
+        error.message
+    );
+    assert!(
+        !flavite.is_note_open(&path),
+        "no buffer may be installed for a note that failed to decode"
+    );
+}
+
+#[test]
+fn multi_chunk_note_opens_with_its_full_text() {
+    let (fixture, fs) = fixture();
+    let flavite = &fixture.flavite;
+    let path = fixture.root.join("large.md");
+    // Well past ropey's internal chunk size: the whole-document text read
+    // once silently returned "" for anything spanning more than one chunk.
+    let text = "filler line for the shared-view read test\n".repeat(300);
+    fs.write_new(&path, text.as_bytes()).expect("large note");
+
+    let open = open_via_api(flavite, &path, None);
+    let request_id = match open {
+        ExecutionResult::Pending { request_id } => request_id,
+        other => panic!("cold open should be pending, got {other:?}"),
+    };
+    let result = flavite.wait_for_operation(request_id);
+    let success = result
+        .into_success()
+        .expect("a valid multi-chunk note opens with content");
+    let buffer_id = success.data["buffer_id"].as_u64().expect("buffer id");
+    let view = flavite
+        .get_buffer_view(flavite_buffer::BufferId::from(buffer_id), None)
+        .expect("buffer view");
+    assert_eq!(view.text, text, "the shared view carries the full text");
+}

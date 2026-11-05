@@ -157,7 +157,7 @@ where
         receiver: mpsc::UnboundedReceiver<Control>,
         error: Option<Error>,
         system_theme: Option<oneshot::Sender<theme::Mode>>,
-        accesskit_adapters: Rc<RefCell<HashMap<winit::window::WindowId, (Arc<winit::window::Window>, accesskit_winit::Adapter)>>>,
+        accesskit_adapters: Rc<RefCell<HashMap<winit::window::WindowId, (Arc<winit::window::Window>, accesskit_winit::Adapter, bool)>>>,
         accesskit_proxy: EventLoopProxy<Action<Message>>,
 
         #[cfg(target_arch = "wasm32")]
@@ -215,7 +215,7 @@ where
             window_id: winit::window::WindowId,
             event: winit::event::WindowEvent,
         ) {
-            if let Some((window, adapter)) =
+            if let Some((window, adapter, _)) =
                 self.accesskit_adapters.borrow_mut().get_mut(&window_id)
             {
                 adapter.process_event(window, &event);
@@ -433,7 +433,7 @@ where
                                     );
                                 let _ = self.accesskit_adapters.borrow_mut().insert(
                                     window.id(),
-                                    (window.clone(), accesskit_adapter),
+                                    (window.clone(), accesskit_adapter, false),
                                 );
 
                                 self.process_event(
@@ -537,7 +537,7 @@ async fn run_instance<P>(
     graphics_settings: graphics::Settings,
     default_fonts: Vec<Cow<'static, [u8]>>,
     mut _system_theme: oneshot::Receiver<theme::Mode>,
-    accesskit_adapters: Rc<RefCell<HashMap<winit::window::WindowId, (Arc<winit::window::Window>, accesskit_winit::Adapter)>>>,
+    accesskit_adapters: Rc<RefCell<HashMap<winit::window::WindowId, (Arc<winit::window::Window>, accesskit_winit::Adapter, bool)>>>,
 ) where
     P: Program + 'static,
     P::Theme: theme::Base,
@@ -782,6 +782,19 @@ async fn run_instance<P>(
                     }
                     event::Event::UserEvent(Action::Accessibility(accessibility_event)) => {
                         let window_id = accessibility_event.window_id;
+                        // Activation may arrive before compositor/window
+                        // setup finishes. Remember it before looking up the
+                        // program window so the first redraw can publish the
+                        // pending full tree instead of losing the request.
+                        if let Some((_, _, active)) =
+                            accesskit_adapters.borrow_mut().get_mut(&window_id)
+                        {
+                            match &accessibility_event.window_event {
+                                accesskit_winit::WindowEvent::InitialTreeRequested => *active = true,
+                                accesskit_winit::WindowEvent::AccessibilityDeactivated => *active = false,
+                                accesskit_winit::WindowEvent::ActionRequested(_) => {}
+                            }
+                        }
                         let Some((program_id, _)) = window_manager
                             .iter_mut()
                             .find(|(_, window)| window.raw.id() == window_id)
@@ -791,7 +804,7 @@ async fn run_instance<P>(
                         match accessibility_event.window_event {
                             accesskit_winit::WindowEvent::InitialTreeRequested => {
                                 if let Some(update) = program.accessibility_tree(program_id) {
-                                    if let Some((_, adapter)) =
+                                    if let Some((_, adapter, _)) =
                                         accesskit_adapters.borrow_mut().get_mut(&window_id)
                                     {
                                         adapter.update_if_active(|| update);
@@ -1011,9 +1024,12 @@ async fn run_instance<P>(
                         };
                         interact_span.finish();
 
-                        if let Some(update) = program.accessibility_tree(id)
-                            && let Some((_, adapter)) =
+                        // Construct the semantic tree only while a native
+                        // client has requested it. The adapter's lazy update
+                        // cannot help if the program tree was built first.
+                        if let Some((_, adapter, true)) =
                                 accesskit_adapters.borrow_mut().get_mut(&window.raw.id())
+                            && let Some(update) = program.accessibility_tree(id)
                         {
                             adapter.update_if_active(|| update);
                         }

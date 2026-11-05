@@ -141,7 +141,7 @@ impl TextMask {
             return out;
         }
         let mut cursor = span.start;
-        for r in &self.ranges {
+        for r in &self.ranges[self.index_of(cursor)..] {
             if r.start >= span.end {
                 break;
             }
@@ -277,6 +277,15 @@ fn is_blank_line_end(content: &str, pos: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_partial_windows_skip_earlier_exclusions() {
+        let mask = TextMask::new(vec![0..5, 10..15, 20..30], 40);
+        assert_eq!(mask.unmasked(&(12..25)), vec![15..20]);
+        assert_eq!(mask.unmasked(&(30..40)), vec![30..40]);
+        assert!(mask.unmasked(&(21..29)).is_empty());
+        assert!(mask.unmasked(&(15..15)).is_empty());
+    }
 
     #[test]
     fn merges_overlapping_and_unsorted_ranges() {

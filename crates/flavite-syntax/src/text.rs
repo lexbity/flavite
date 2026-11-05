@@ -22,6 +22,7 @@
 //! outside the buffer): "BOM and CRLF interiors are never edit boundaries"
 //! (§4.16.1).
 
+use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Return the longest prefix of `text` whose UTF-8 byte length is at most
@@ -248,9 +249,9 @@ pub enum TextError {
 ///   original file byte-for-byte when it has not been edited.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextSnapshot {
-    text: String,
-    source: Vec<u8>,
-    lines: Vec<LineInfo>,
+    text: Arc<str>,
+    source: Arc<[u8]>,
+    lines: Arc<[LineInfo]>,
     has_bom: bool,
 }
 
@@ -264,8 +265,8 @@ impl TextSnapshot {
         let lines = build_lines(text, &source, 0);
         Self {
             text: text.into(),
-            source,
-            lines,
+            source: source.into(),
+            lines: lines.into(),
             has_bom: false,
         }
     }
@@ -287,9 +288,9 @@ impl TextSnapshot {
         let text = fold_crlf(text_str);
         let lines = build_lines(&text, bytes, bom_len);
         Ok(Self {
-            text,
-            source: bytes.to_vec(),
-            lines,
+            text: text.into(),
+            source: bytes.into(),
+            lines: lines.into(),
             has_bom,
         })
     }
@@ -334,7 +335,7 @@ impl TextSnapshot {
         if self.has_bom {
             out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
         }
-        for line in &self.lines {
+        for line in self.lines.iter() {
             out.extend_from_slice(&self.text.as_bytes()[line.text_start.0..line.text_end.0]);
             match line.eol {
                 Eol::Lf => out.push(b'\n'),
@@ -617,6 +618,16 @@ fn build_lines(text: &str, source: &[u8], bom_len: usize) -> Vec<LineInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloning_a_snapshot_shares_immutable_text_source_and_coordinates() {
+        let snapshot = TextSnapshot::new("\u{feff}é\r\nsecond\n".as_bytes()).unwrap();
+        let cloned = snapshot.clone();
+        assert!(Arc::ptr_eq(&snapshot.text, &cloned.text));
+        assert!(Arc::ptr_eq(&snapshot.source, &cloned.source));
+        assert!(Arc::ptr_eq(&snapshot.lines, &cloned.lines));
+        assert_eq!(cloned.to_source_bytes(), snapshot.source());
+    }
 
     fn snap(src: &str) -> TextSnapshot {
         TextSnapshot::new(src.as_bytes()).expect("utf-8")

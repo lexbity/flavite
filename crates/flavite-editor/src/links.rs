@@ -77,10 +77,18 @@ pub enum LinkResolution {
 /// editor-only interpretation of link syntax.
 #[must_use]
 pub fn scan_links(text: &str) -> Vec<LinkSpan> {
+    scan_note(text).0
+}
+
+/// Scan links and decorations in one pass. The two views share the same
+/// canonical parse; running [`scan_links`] and [`scan_decorations`]
+/// separately parsed every keystroke's revision twice on the UI thread.
+#[must_use]
+pub fn scan_note(text: &str) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
     let Ok(parsed) = flavite_syntax::pulldown_glue::parse_normalized(text) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
-    parsed
+    let links = parsed
         .links
         .into_iter()
         .map(|link| LinkSpan {
@@ -98,7 +106,9 @@ pub fn scan_links(text: &str) -> Vec<LinkSpan> {
                 LinkResolution::Unresolved
             },
         })
-        .collect()
+        .collect();
+    let decorations = scan_masked(&parsed.snapshot, &parsed.mask);
+    (links, decorations)
 }
 
 /// Use the index's verdict for a scanned link. Candidate ranking belongs to
@@ -114,10 +124,7 @@ pub fn resolve_link(span: &LinkSpan, verdict: Option<LinkResolution>) -> LinkRes
 /// Shared-scanner spans for editor decorations; code/math/HTML are excluded.
 #[must_use]
 pub fn scan_decorations(text: &str) -> Vec<ScannedSpan> {
-    let Ok(parsed) = flavite_syntax::pulldown_glue::parse_normalized(text) else {
-        return Vec::new();
-    };
-    scan_masked(&parsed.snapshot, &parsed.mask)
+    scan_note(text).1
 }
 
 fn scan_masked(snapshot: &TextSnapshot, mask: &TextMask) -> Vec<ScannedSpan> {
@@ -166,6 +173,18 @@ pub fn match_candidates<'a>(
 mod tests {
     use super::*;
     use flavite_syntax::SpanKind;
+
+    #[test]
+    fn scan_note_matches_the_individual_scans() {
+        // The combined pass exists so a keystroke parses the document once;
+        // it must return exactly what the two single-purpose scans return.
+        let text = "[[Ideas]] `[[code]]`\n\n```md\n[[fence]]\n```\n\n$[[math]]$ ![[diagram.png]] #topic ^block\n\n*emphasis* and **strong** with [[Another]]".repeat(20);
+        let (links, decorations) = scan_note(&text);
+        assert_eq!(links, scan_links(&text));
+        assert_eq!(decorations, scan_decorations(&text));
+        assert!(!links.is_empty());
+        assert!(!decorations.is_empty());
+    }
 
     #[test]
     fn links_and_decorations_use_shared_scanner_and_exclusions() {

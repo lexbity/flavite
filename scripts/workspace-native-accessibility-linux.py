@@ -13,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 import time
+import subprocess
 
 import gi
 
@@ -48,13 +49,26 @@ def apps():
     return list(children(desktop)) if desktop is not None else []
 
 
+def has_role(node, name):
+    # AT-SPI's human-readable names vary by library version and locale
+    # (e.g. "tab list" / "page tab list", "push button" / "button").
+    roles = {
+        "tab list": Atspi.Role.PAGE_TAB_LIST,
+        "tab": Atspi.Role.PAGE_TAB,
+        "push button": Atspi.Role.PUSH_BUTTON,
+        "dialog": Atspi.Role.DIALOG,
+        "list item": Atspi.Role.LIST_ITEM,
+    }
+    return node.get_role() == roles[name]
+
+
 def shell_application():
     return next(
         (
             app
             for app in apps()
             if app.get_name() == "app-demo"
-            and any((node.get_role_name() or "") == "tab list" for node in walk(app))
+            and any(has_role(node, "tab list") for node in walk(app))
         ),
         None,
     )
@@ -63,7 +77,7 @@ def shell_application():
 def find_nodes(app, role_name, name_contains=None):
     found = []
     for node in walk(app):
-        if (node.get_role_name() or "") != role_name:
+        if not has_role(node, role_name):
             continue
         if name_contains is not None:
             label = node.get_name() or ""
@@ -75,17 +89,20 @@ def find_nodes(app, role_name, name_contains=None):
 
 def node_text(node):
     """Read a text-capable node's full text through AT-SPI."""
-    count = node.get_character_count()
+    count = Atspi.Text.get_character_count(node)
     if not count:
         return ""
-    return node.get_text(0, count) or ""
+    # Accessible.get_text() returns the text interface in newer GI bindings;
+    # call the Text interface explicitly to avoid that method-name collision.
+    return Atspi.Text.get_text(node, 0, count) or ""
 
 
 def source_text_nodes(app):
     found = []
     for node in walk(app):
-        role = node.get_role_name() or ""
-        if role in ("document", "text", "paragraph"):
+        role = node.get_role()
+        if role in (Atspi.Role.DOCUMENT_FRAME, Atspi.Role.DOCUMENT_TEXT,
+                    Atspi.Role.TEXT, Atspi.Role.PARAGRAPH, Atspi.Role.ENTRY):
             if "Native bridge note" in node_text(node):
                 found.append(node)
     return found
@@ -101,7 +118,18 @@ def main() -> int:
         "the boot Empty tab",
     )
 
-    # The wrapper opened alpha.md through the picker with real OS input;
+    # Drive real OS input only after native semantics are ready. Waiting for
+    # the actual picker and its catalog results avoids startup races hidden
+    # by fixed sleeps (especially during portal/accessibility activation).
+    if len(sys.argv) > 2:
+        subprocess.run(["xdotool", "windowfocus", "--sync", sys.argv[2]], check=True)
+    subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+p"], check=True)
+    wait_for(lambda: find_nodes(app, "dialog", "Quick switch"), "the quick switch dialog")
+    subprocess.run(["xdotool", "type", "--clearmodifiers", "--delay", "25", "alpha"], check=True)
+    wait_for(lambda: find_nodes(app, "list item"), "the picker's indexed note results")
+    subprocess.run(["xdotool", "key", "--clearmodifiers", "Return"], check=True)
+
+    # OS input opened alpha.md through the picker;
     # the semantic tree must now expose its tab and its source text.
     wait_for(
         lambda: find_nodes(app, "tab", name_contains="alpha"),
@@ -123,7 +151,6 @@ def main() -> int:
     if not text_node.set_caret_offset(caret):
         raise RuntimeError("AT-SPI text-selection action was rejected")
     wait_for(lambda: text_node.get_caret_offset() == caret, "native caret acknowledgement")
-    import subprocess
     subprocess.run(["xdotool", "type", "--clearmodifiers", "--delay", "100", "native-caret-marker"], check=True)
     subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+s"], check=True)
     expected = exposed[:caret] + "native-caret-marker" + exposed[caret:]

@@ -150,6 +150,7 @@ pub struct App {
     window_size: iced::Size,
     /// Accessibility node routing map, rebuilt after every commit.
     pub a11y_nodes: BTreeMap<accesskit::NodeId, crate::accessibility::NodeTarget>,
+    pub(crate) a11y_text_cache: std::cell::RefCell<crate::accessibility::text::EditorTextCache>,
 }
 
 /// Host messages. Widget events surface here and reduce through the
@@ -595,6 +596,7 @@ impl App {
             reconcile_progress: None,
             window_size: iced::Size::new(1180.0, 760.0),
             a11y_nodes: BTreeMap::new(),
+            a11y_text_cache: std::cell::RefCell::default(),
             workspace,
         }
     }
@@ -3085,6 +3087,9 @@ impl App {
                         tab,
                     });
                 }
+                // A flight with a locator would otherwise swallow the reason;
+                // the failed note view says "unavailable" but not why.
+                self.status = crate::operation::describe_completion(&completion);
             }
         }
         if locator.is_none() {
@@ -3954,6 +3959,7 @@ mod tests {
             reconcile_progress: None,
             window_size: iced::Size::new(1180.0, 760.0),
             a11y_nodes: BTreeMap::new(),
+            a11y_text_cache: std::cell::RefCell::default(),
             workspace,
         }
     }

@@ -94,215 +94,108 @@ pub fn parse_snapshot(snapshot: TextSnapshot) -> Result<ParsedNote, String> {
     if text.contains('\0') {
         return Err("markdown contains an embedded NUL byte".into());
     }
-
-    // Build the exclusion mask from code spans/blocks, raw HTML, and math.
-    let (mask, _body_start) = build_mask(text);
-
-    // Collect headings and extract inline spans from text events.
-    let mut links = Vec::new();
-    let mut tags = Vec::new();
-    let mut block_ids = Vec::new();
+    let mut excluded = Vec::new();
+    if text.starts_with("---\n")
+        && let Some(close) = find_frontmatter_close(text)
+    {
+        excluded.push(0..close);
+    }
+    let opts = Options::ENABLE_TABLES
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS;
     let mut headings = Vec::new();
+    let mut heading_level = None;
+    let mut heading_text = String::new();
+    let mut code_start = None;
+    let mut pending = 0..0;
+    let mut scan_ranges = Vec::new();
 
-    // Parse with pulldown-cmark.
-    let mut opts = Options::empty();
-    opts.insert(Options::ENABLE_TABLES);
-    opts.insert(Options::ENABLE_FOOTNOTES);
-    opts.insert(Options::ENABLE_STRIKETHROUGH);
-    opts.insert(Options::ENABLE_TASKLISTS);
-
-    let parser = Parser::new_ext(text, opts);
-
-    let mut current_heading_level: Option<HeadingLevel> = None;
-    let mut current_heading_text = String::new();
-    let mut in_code_block = false;
-    let mut text_buffer = String::new();
-    let mut text_start = 0usize;
-
-    for (event, range) in parser.into_offset_iter() {
+    // One CommonMark event pass supplies both exclusion ranges and the
+    // canonical prose windows. Keep byte ranges instead of copying prose
+    // into a String only to recover its length for the inline scanner.
+    for (event, range) in Parser::new_ext(text, opts).into_offset_iter() {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
-                // Flush any buffered text before the heading
-                if !text_buffer.is_empty() {
-                    scan_buffer(
-                        &snapshot,
-                        &mask,
-                        &text_buffer,
-                        text_start,
-                        &mut links,
-                        &mut tags,
-                        &mut block_ids,
-                    );
-                    text_buffer.clear();
-                }
-                current_heading_level = Some(level);
-                current_heading_text.clear();
+                flush_scan_range(&mut scan_ranges, &mut pending);
+                heading_level = Some(level);
+                heading_text.clear();
             }
             Event::End(TagEnd::Heading(_)) => {
-                if let Some(level) = current_heading_level.take()
-                    && !current_heading_text.is_empty()
+                if let Some(level) = heading_level.take()
+                    && !heading_text.is_empty()
                 {
-                    headings.push((level, current_heading_text.clone()));
+                    headings.push((level, std::mem::take(&mut heading_text)));
                 }
-                // Heading text participates in the same canonical extension scan.
-                if !text_buffer.is_empty() {
-                    scan_buffer(
-                        &snapshot,
-                        &mask,
-                        &text_buffer,
-                        text_start,
-                        &mut links,
-                        &mut tags,
-                        &mut block_ids,
-                    );
-                }
-                text_buffer.clear();
-                text_start = range.end;
+                flush_scan_range(&mut scan_ranges, &mut pending);
+                pending = range.end..range.end;
             }
             Event::Start(Tag::CodeBlock(_)) => {
-                // Flush any buffered text before the code block
-                if !text_buffer.is_empty() {
-                    scan_buffer(
-                        &snapshot,
-                        &mask,
-                        &text_buffer,
-                        text_start,
-                        &mut links,
-                        &mut tags,
-                        &mut block_ids,
-                    );
-                    text_buffer.clear();
-                }
-                in_code_block = true;
+                flush_scan_range(&mut scan_ranges, &mut pending);
+                code_start = Some(range.start);
             }
             Event::End(TagEnd::CodeBlock) => {
-                in_code_block = false;
-                text_buffer.clear();
-                text_start = range.end;
-            }
-            Event::Start(Tag::Paragraph) => {
-                // A paragraph boundary's structural newlines appear in no
-                // text event. Flush before the block so the buffer never
-                // spans one: a buffer that skips the separator bytes no
-                // longer matches `snapshot[buffer_start..]`, and the
-                // truncated scan range silently hid every link after the
-                // first paragraph (the same failure mode the SoftBreak arm
-                // below fixes for line breaks).
-                if !text_buffer.is_empty() {
-                    scan_buffer(
-                        &snapshot,
-                        &mask,
-                        &text_buffer,
-                        text_start,
-                        &mut links,
-                        &mut tags,
-                        &mut block_ids,
-                    );
-                    text_buffer.clear();
+                if let Some(start) = code_start.take() {
+                    excluded.push(start..range.end);
                 }
-                text_start = range.start;
+                pending = range.end..range.end;
             }
-            Event::End(TagEnd::Paragraph) => {
-                // Flush at the block end and re-anchor to it: the next
-                // paragraph's first text event re-anchors from its own
-                // start, so each paragraph scans aligned bytes.
-                if !text_buffer.is_empty() {
-                    scan_buffer(
-                        &snapshot,
-                        &mask,
-                        &text_buffer,
-                        text_start,
-                        &mut links,
-                        &mut tags,
-                        &mut block_ids,
-                    );
-                    text_buffer.clear();
-                }
-                text_start = range.end;
+            Event::Start(Tag::Paragraph) | Event::End(TagEnd::Paragraph) => {
+                flush_scan_range(&mut scan_ranges, &mut pending);
+                let at = if matches!(event, Event::Start(_)) {
+                    range.start
+                } else {
+                    range.end
+                };
+                pending = at..at;
             }
             Event::Text(_) => {
-                // Skip text in code blocks
-                if in_code_block {
-                    text_buffer.clear();
+                if code_start.is_some() {
+                    pending.end = pending.start;
                     continue;
                 }
-
-                // Get the text from the snapshot
-                let text_content = &text[range.start..range.end];
-
-                // Collect heading text
-                if current_heading_level.is_some() {
-                    current_heading_text.push_str(text_content);
+                if heading_level.is_some() {
+                    heading_text.push_str(&text[range.clone()]);
                 }
-
-                // Buffer text for scanning (to handle split wikilinks).
-                // The buffer must stay byte-identical to
-                // `snapshot[text_start..]`: structural bytes the event
-                // stream drops (paragraph separators, emphasis markers,
-                // soft/hard breaks) are filled in from the snapshot, so
-                // every scan range covers exactly the bytes it names. A
-                // buffer that skipped them desynchronized the scan window
-                // and silently hid links after the first dropped byte.
-                let expected_start = text_start + text_buffer.len();
-                if range.start > expected_start {
-                    text_buffer.push_str(&text[expected_start..range.start]);
+                // Preserve the original scan windows across omitted source
+                // delimiters, emphasis, and soft/hard line breaks. Scanning
+                // decoded event text would change offsets and link syntax.
+                let buffered = pending.len() + range.start.saturating_sub(pending.end);
+                if buffered == 0 {
+                    pending.start = range.start;
                 }
-                if text_buffer.is_empty() {
-                    text_start = range.start;
-                }
-                text_buffer.push_str(text_content);
+                pending.end = pending.start + buffered + range.len();
             }
-            Event::Code(_) => {
-                // Inline code span - flush buffer and mark as excluded
-                if !text_buffer.is_empty() {
-                    scan_buffer(
-                        &snapshot,
-                        &mask,
-                        &text_buffer,
-                        text_start,
-                        &mut links,
-                        &mut tags,
-                        &mut block_ids,
-                    );
-                    text_buffer.clear();
-                }
-                text_buffer.clear();
-                text_start = range.end;
+            Event::Code(_) | Event::Html(_) | Event::InlineHtml(_) => {
+                flush_scan_range(&mut scan_ranges, &mut pending);
+                excluded.push(range.clone());
+                pending = range.end..range.end;
             }
-            Event::Html(_) | Event::InlineHtml(_) => {
-                // HTML - flush buffer
-                if !text_buffer.is_empty() {
-                    scan_buffer(
-                        &snapshot,
-                        &mask,
-                        &text_buffer,
-                        text_start,
-                        &mut links,
-                        &mut tags,
-                        &mut block_ids,
-                    );
-                    text_buffer.clear();
-                }
-                text_buffer.clear();
-                text_start = range.end;
-            }
+            Event::InlineMath(_) | Event::DisplayMath(_) => excluded.push(range),
             _ => {}
         }
     }
-
-    // Flush any remaining buffered text
-    if !text_buffer.is_empty() {
-        scan_buffer(
-            &snapshot,
-            &mask,
-            &text_buffer,
-            text_start,
-            &mut links,
-            &mut tags,
-            &mut block_ids,
-        );
+    flush_scan_range(&mut scan_ranges, &mut pending);
+    excluded.extend(math_ranges(text, &excluded));
+    let mask = TextMask::new(excluded, text.len());
+    let mut links = Vec::new();
+    let mut tags = Vec::new();
+    let mut block_ids = Vec::new();
+    for prose in scan_ranges {
+        for range in mask.unmasked(&prose) {
+            for span in scan_inline(&snapshot, range) {
+                match span.kind {
+                    SpanKind::Link | SpanKind::Embed => {
+                        if let Some(link) = Link::from_scanned(span) {
+                            links.push(link);
+                        }
+                    }
+                    SpanKind::Tag => tags.push(span.span),
+                    SpanKind::BlockId => block_ids.push(span.span),
+                }
+            }
+        }
     }
-
     Ok(ParsedNote {
         snapshot,
         links,
@@ -313,104 +206,11 @@ pub fn parse_snapshot(snapshot: TextSnapshot) -> Result<ParsedNote, String> {
     })
 }
 
-/// Scan a buffered text region and extract spans.
-fn scan_buffer(
-    snapshot: &TextSnapshot,
-    mask: &TextMask,
-    buffer: &str,
-    buffer_start: usize,
-    links: &mut Vec<Link>,
-    tags: &mut Vec<Span<TextByte>>,
-    block_ids: &mut Vec<Span<TextByte>>,
-) {
-    let buffer_end = buffer_start + buffer.len();
-    let buffer_range = buffer_start..buffer_end;
-
-    // A masked prefix must not discard valid prose later in the same parser
-    // text buffer (for example, a wikilink after inline math). Scan each
-    // unmasked interval with the one shared inline grammar.
-    for range in mask.unmasked(&buffer_range) {
-        for span in scan_inline(snapshot, range) {
-            match span.kind {
-                SpanKind::Link | SpanKind::Embed => {
-                    if let Some(link) = Link::from_scanned(span) {
-                        links.push(link);
-                    }
-                }
-                SpanKind::Tag => tags.push(span.span),
-                SpanKind::BlockId => block_ids.push(span.span),
-            }
-        }
+fn flush_scan_range(ranges: &mut Vec<Range<usize>>, pending: &mut Range<usize>) {
+    if pending.start < pending.end {
+        ranges.push(pending.clone());
+        pending.end = pending.start;
     }
-}
-
-/// Build the exclusion mask from code spans/blocks, raw HTML, and math.
-///
-/// Returns the mask and the byte offset where the body (prose) content starts
-/// (after frontmatter if present).
-fn build_mask(text: &str) -> (TextMask, usize) {
-    let mut excluded: Vec<Range<usize>> = Vec::new();
-    let mut body_start = 0usize;
-
-    // Check for frontmatter delimiter.
-    if text.starts_with("---\n") {
-        // Find the closing --- or ...
-        if let Some(close) = find_frontmatter_close(text) {
-            excluded.push(0..close);
-            body_start = close;
-        }
-    }
-
-    // Parse to collect code/HTML regions in a single pass.
-    let mut opts = Options::empty();
-    opts.insert(Options::ENABLE_TABLES);
-    opts.insert(Options::ENABLE_FOOTNOTES);
-    opts.insert(Options::ENABLE_STRIKETHROUGH);
-    opts.insert(Options::ENABLE_TASKLISTS);
-
-    let parser = Parser::new_ext(text, opts);
-    let mut code_block_start: Option<usize> = None;
-
-    for (event, range) in parser.into_offset_iter() {
-        match event {
-            Event::Start(Tag::CodeBlock(_)) => {
-                code_block_start = Some(range.start);
-            }
-            Event::End(TagEnd::CodeBlock) => {
-                if let Some(start) = code_block_start.take() {
-                    // Include everything from start to end of the code block
-                    excluded.push(start..range.end);
-                }
-            }
-            Event::Code(_) => {
-                // Inline code span - exclude this range
-                excluded.push(range.clone());
-            }
-            Event::Html(_) | Event::InlineHtml(_) => {
-                // HTML block or inline - exclude this range
-                excluded.push(range.clone());
-            }
-            Event::InlineMath(_) => {
-                // Inline math (if enabled by pulldown)
-                excluded.push(range.clone());
-            }
-            Event::DisplayMath(_) => {
-                // Display math (if enabled by pulldown)
-                excluded.push(range.clone());
-            }
-            _ => {}
-        }
-    }
-
-    // Add math ranges (they're not natively supported by pulldown-cmark without extensions).
-    // We scan the full text (excluding already-masked regions).
-    let math_ranges = math_ranges(text, &excluded);
-    excluded.extend(math_ranges);
-
-    // Merge and sort.
-    excluded.sort_by_key(|a| a.start);
-
-    (TextMask::new(excluded, text.len()), body_start)
 }
 
 /// Find the closing `---` or `...` delimiter for frontmatter.
@@ -432,6 +232,19 @@ fn find_frontmatter_close(text: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn many_excluded_paragraphs_keep_visible_links_and_exact_unicode_offsets() {
+        let text = "# é\n\n".to_owned() + &"`[[hidden]]` **é** $x$ [[visible|é]]\n\n".repeat(256);
+        let parsed = parse_normalized(&text).unwrap();
+        assert_eq!(parsed.links.len(), 256);
+        assert_eq!(parsed.headings, vec![(HeadingLevel::H1, "é".into())]);
+        for link in parsed.links {
+            assert_eq!(link.target_raw, "visible");
+            assert_eq!(&text[link.span.start.0..link.span.end.0], "[[visible|é]]");
+            assert!(!parsed.mask.is_masked(link.span.start.0));
+        }
+    }
 
     #[test]
     fn parses_basic_note() {

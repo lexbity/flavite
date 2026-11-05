@@ -106,6 +106,11 @@ pub struct EditorModel {
     /// Unique identity for this buffer instance.
     buffer_id: BufferId,
     /// The text content (normalized, CRLF folded to LF).
+    text: String,
+    /// The same content as [`Self::text`], for byte/line mapping. The rope is
+    /// only an index: `RopeSlice::as_str` is `None` for any slice spanning
+    /// more than one internal chunk, so text must never be read back
+    /// through the rope.
     rope: Rope,
     /// Multi-selection: map from selection index to selection.
     /// The "primary" selection is always at index 0.
@@ -134,6 +139,7 @@ impl EditorModel {
 
         Self {
             buffer_id: BufferId::new(),
+            text,
             rope,
             selections: HashMap::new(),
             undo_tree: UndoTree::new(snapshot.clone()),
@@ -174,6 +180,7 @@ impl EditorModel {
             );
         }
         self.rope = Rope::from_str(snapshot.text());
+        self.text = new_text;
         self.eol_table = EolTable::from_snapshot(&snapshot);
         self.undo_tree = UndoTree::new(snapshot.clone());
         self.revision = self.revision.next();
@@ -222,14 +229,10 @@ impl EditorModel {
     /// Get the text content as a string slice.
     #[must_use]
     pub fn text(&self) -> &str {
-        // Rope::slice(..) returns a RopeSlice which can be converted to &str
-        // We use the Display trait which RopeSlice implements, but we need a &'static str
-        // Actually, Rope has a method to get the full string
-        // For now, we'll convert via String
-        // This is not ideal for performance but works for now
-        // A better approach would be to store the normalized text separately
-        // or use ropey's chunk access
-        self.rope.slice(..).as_str().unwrap_or("")
+        // The mirrored `text` field is the read path: `RopeSlice::as_str`
+        // returns `None` for any slice spanning more than one rope chunk,
+        // which silently presented every multi-chunk buffer as empty.
+        &self.text
     }
 
     /// Get the text length in bytes.
@@ -259,10 +262,9 @@ impl EditorModel {
     /// Get a slice of text as a string.
     #[must_use]
     pub fn slice_str(&self, range: Span<TextByte>) -> &str {
-        self.rope
-            .byte_slice(range.start.0..range.end.0)
-            .as_str()
-            .unwrap_or("")
+        // Byte offsets always land on char boundaries (edits are char-safe),
+        // and the mirrored text is the read path — see [`Self::text`].
+        &self.text[range.start.0..range.end.0]
     }
 
     /// Get the line count.
@@ -319,14 +321,7 @@ impl EditorModel {
             return self.revision;
         }
 
-        // Count newlines in the inserted text
-        let newlines = text.chars().filter(|&c| c == '\n').count();
-
         let edit = EditOp::new(Span::new(pos, pos), text.to_string());
-
-        // Update EOL metadata
-        self.update_eol_for_insert(pos, newlines);
-
         self.apply_edit_op(edit)
     }
 
@@ -338,16 +333,7 @@ impl EditorModel {
             return self.revision;
         }
 
-        // Count newlines in the deleted range
-        let start_line = self.line_at(range.start);
-        let end_line = self.line_at(range.end);
-        let newlines_deleted = end_line.saturating_sub(start_line);
-
         let edit = EditOp::new(range, String::new());
-
-        // Update EOL metadata
-        self.update_eol_for_delete(range, newlines_deleted);
-
         self.apply_edit_op(edit)
     }
 
@@ -360,10 +346,7 @@ impl EditorModel {
         }
 
         let edit = EditOp::new(range, replacement.to_string());
-        let old_text = self.text().to_string();
-        let revision = self.apply_edit_op(edit);
-        self.rebuild_eol_table(&old_text);
-        revision
+        self.apply_edit_op(edit)
     }
 
     /// Apply an edit operation.
@@ -371,10 +354,7 @@ impl EditorModel {
     /// This is the core method that applies an edit, updates the rope,
     /// handles undo history, and advances the revision.
     pub fn apply_edit_op(&mut self, edit: EditOp) -> Revision {
-        // Apply to rope
-        let old_text = self.text().to_string();
-        let new_text = edit.apply(&old_text);
-        self.rope = Rope::from_str(&new_text);
+        self.apply_text_edit(&edit);
 
         // Apply to undo tree
         let snapshot = self.snapshot();
@@ -411,7 +391,7 @@ impl EditorModel {
         snapshot: TextSnapshot,
         journal: Option<crate::undo::JournalTag>,
     ) -> Revision {
-        let old_text = self.text().to_string();
+        let old_text = self.text();
         let new_text = snapshot.text().to_string();
         let mut edit = EditOp::new(
             Span::new(TextByte(0), TextByte(old_text.len())),
@@ -421,6 +401,7 @@ impl EditorModel {
             edit = edit.with_journal(tag);
         }
         self.rope = Rope::from_str(&new_text);
+        self.text = new_text;
         self.eol_table = EolTable::from_snapshot(&snapshot);
         self.undo_tree.apply_boundary(edit, snapshot.clone());
         let revision = self.revision.next();
@@ -460,7 +441,7 @@ impl EditorModel {
         if edits.is_empty() {
             return self.revision;
         }
-        let old_text = self.text().to_string();
+        let old_text = self.text();
         let mut ordered = edits.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|edit| (edit.range.start.0, edit.range.end.0));
         if ordered.iter().any(|edit| {
@@ -496,10 +477,7 @@ impl EditorModel {
         if let Some(tag) = journal {
             combined = combined.with_journal(tag);
         }
-        let old_text = self.text().to_string();
-        let new_text = combined.apply(&old_text);
-        self.rope = Rope::from_str(&new_text);
-        self.rebuild_eol_table(&old_text);
+        self.apply_text_edit(&combined);
         let snapshot = self.snapshot();
         if is_journal {
             self.undo_tree.apply_boundary(combined, snapshot)
@@ -549,6 +527,7 @@ impl EditorModel {
         if let Some((_node_rev, Some(snapshot))) = result {
             let new_text = snapshot.text().to_string();
             self.rope = Rope::from_str(&new_text);
+            self.text = new_text;
             self.eol_table = EolTable::from_snapshot(&snapshot);
             self.revision = self.revision.next();
             self.is_dirty = true;
@@ -576,6 +555,7 @@ impl EditorModel {
         if let Some((_node_rev, Some(snapshot))) = result {
             let new_text = snapshot.text().to_string();
             self.rope = Rope::from_str(&new_text);
+            self.text = new_text;
             self.eol_table = EolTable::from_snapshot(&snapshot);
             self.revision = self.revision.next();
             self.is_dirty = true;
@@ -665,30 +645,15 @@ impl EditorModel {
     /// trailing newline state.
     #[must_use]
     pub fn to_source_bytes(&self) -> Vec<u8> {
-        // Get the normalized text
         let text = self.text();
-
-        // Build line_breaks as the end of each line (excluding the newline)
-        let mut line_breaks = Vec::new();
-        // The side table follows source lines, while Ropey's `len_lines`
-        // includes a synthetic empty line after a final LF. That synthetic
-        // line has no source EOL entry and must not be serialized separately.
-        for line in 0..self.eol_table.line_count() {
-            let _line_start = self.line_start(line);
-            let line_end = self.line_end(line);
-
-            // line_end is the start of the next line (after the newline)
-            // If this line has an EOL (not None), subtract 1 to exclude the newline
-            let eol = self.eol_table.get(line);
-            let break_pos = if eol.is_some_and(|eol| eol != crate::eol::LineEnding::None) {
-                // This line has an EOL, so line_end is after the newline
-                // Subtract 1 to get the position before the newline
-                TextByte(line_end.0 - 1)
-            } else {
-                // No EOL, line_end is the end of the line
-                line_end
-            };
-            line_breaks.push(break_pos);
+        // Walk the contiguous text once instead of two Rope lookups per
+        // line. A final LF has no synthetic empty source line.
+        let mut line_breaks: Vec<_> = text
+            .match_indices('\n')
+            .map(|(byte, _)| TextByte(byte))
+            .collect();
+        if !text.ends_with('\n') {
+            line_breaks.push(TextByte(text.len()));
         }
 
         self.eol_table.serialize(text, &line_breaks)
@@ -718,33 +683,31 @@ impl EditorModel {
         self.content_hash() == hash
     }
 
-    /// Update EOL metadata for an insert operation.
-    fn update_eol_for_insert(&mut self, pos: TextByte, newlines: usize) {
-        let line_idx = self.line_at(pos);
-        let dominant = self.eol_table.dominant_eol();
-
-        // For newly inserted lines, use the dominant EOL
-        for i in 0..newlines {
-            self.eol_table.insert(line_idx + 1 + i, dominant);
-        }
-
-        // If we inserted a newline, the current line now has an EOL
-        // (but we don't change existing lines)
-        if newlines > 0 {
-            // The line we inserted into might now have content after pos
-            // We don't change its EOL unless we're inserting at the end
-        }
-    }
-
-    /// Update EOL metadata for a delete operation.
-    fn update_eol_for_delete(&mut self, range: Span<TextByte>, newlines: usize) {
-        let start_line = self.line_at(range.start);
-
-        // Remove the EOL entries for deleted lines
-        for _ in 0..newlines {
-            if start_line + 1 < self.eol_table.line_count() {
-                self.eol_table.remove(start_line + 1);
-            }
+    /// Update text and its Rope index without rebuilding either document.
+    /// Ordinary character edits keep every line's EOL metadata unchanged.
+    fn apply_text_edit(&mut self, edit: &EditOp) {
+        let range = edit.range.start.0..edit.range.end.0;
+        let changes_lines =
+            self.text[range.clone()].contains('\n') || edit.replacement.contains('\n');
+        let old_text = changes_lines.then(|| self.text.clone());
+        let ended_with_lf = self.text.ends_with('\n');
+        let start = self.rope.byte_to_char(range.start);
+        let end = self.rope.byte_to_char(range.end);
+        self.rope.remove(start..end);
+        self.rope.insert(start, &edit.replacement);
+        self.text.replace_range(range, &edit.replacement);
+        if let Some(old_text) = old_text {
+            self.rebuild_eol_table(&old_text);
+        } else if ended_with_lf && !self.text.ends_with('\n') {
+            // Typing in the synthetic empty Rope line creates a real,
+            // unterminated source line; it inherits no terminator.
+            self.eol_table
+                .line_endings
+                .push(crate::eol::LineEnding::None);
+            self.eol_table.has_trailing_newline = false;
+        } else if !ended_with_lf && self.text.ends_with('\n') {
+            self.eol_table.line_endings.pop();
+            self.eol_table.has_trailing_newline = true;
         }
     }
 
@@ -752,7 +715,10 @@ impl EditorModel {
     ///
     /// This is called when we can't easily update the EOL table incrementally.
     fn rebuild_eol_table(&mut self, old_text: &str) {
-        let dominant = self.eol_table.dominant_eol();
+        let dominant = match self.eol_table.dominant_eol() {
+            crate::eol::LineEnding::None => crate::eol::LineEnding::Lf,
+            ending => ending,
+        };
         let has_bom = self.eol_table.has_bom();
         let snapshot = TextSnapshot::from_normalized(self.text());
         let mut new_table = EolTable::from_snapshot(&snapshot);
@@ -935,6 +901,48 @@ mod tests {
     }
 
     #[test]
+    fn text_reads_multi_chunk_documents() {
+        // Ropey splits its internal chunks well below this size; a text read
+        // through `RopeSlice::as_str` silently returns "" for any slice
+        // spanning more than one chunk, which once blanked every note over
+        // ~1KB (and serialized that emptiness on save).
+        let text = "filler line for the chunk-boundary test\n".repeat(300);
+        let model = EditorModel::from_text(&text);
+        assert_eq!(model.text(), text);
+        assert_eq!(model.len(), text.len());
+
+        // Reads stay correct across every path that rebuilds the rope.
+        let mut model = model;
+        let replacement = "replaced\n".repeat(400);
+        model.replace_snapshot(TextSnapshot::new(replacement.as_bytes()).unwrap());
+        assert_eq!(model.text(), replacement);
+
+        let mut model = model;
+        model.apply_edit_op(EditOp::new(
+            Span::new(TextByte(0), TextByte(9)),
+            "EDITED".into(),
+        ));
+        assert!(model.text().starts_with("EDITED"));
+        assert!(model.text().contains("replaced"));
+
+        let mut model = model;
+        model.undo();
+        assert_eq!(model.text(), replacement);
+
+        let mut model = model;
+        model.redo();
+        assert!(model.text().starts_with("EDITED"));
+
+        // A slice spanning many chunks reads back byte-exact too.
+        let start = TextByte(8);
+        let end = TextByte(8 + 500);
+        assert_eq!(
+            model.slice_str(Span::new(start, end)),
+            &model.text()[8..508]
+        );
+    }
+
+    #[test]
     fn from_str() {
         let model = EditorModel::from_text("hello\nworld");
         assert_eq!(model.text(), "hello\nworld");
@@ -983,6 +991,80 @@ mod tests {
         assert!(!model.eol_table().has_trailing_newline());
         assert_eq!(model.to_source_bytes(), "\u{FEFF}single line".as_bytes());
         let _ = model.content_hash();
+    }
+
+    #[test]
+    fn character_edits_preserve_mixed_endings_and_terminal_line_history() {
+        let mut model = EditorModel::from_snapshot(
+            TextSnapshot::new("\u{feff}one\r\ntwo\n".as_bytes()).unwrap(),
+        );
+        let initial = model.eol_table().clone();
+        model.apply_edit_ops(&[EditOp::new(
+            Span::new(TextByte(1), TextByte(2)),
+            "🧑🏽‍💻".into(),
+        )]);
+        assert_eq!(model.eol_table(), &initial);
+        assert_eq!(model.to_source_bytes(), "\u{feff}o🧑🏽‍💻e\r\ntwo\n".as_bytes());
+        model.seal_undo_group();
+        let end = model.len();
+        model.apply_edit_ops(&[EditOp::new(
+            Span::new(TextByte(end), TextByte(end)),
+            "é".into(),
+        )]);
+        assert_eq!(model.eol_table().line_count(), 3);
+        assert!(!model.eol_table().has_trailing_newline());
+        assert_eq!(model.to_source_bytes(), "\u{feff}o🧑🏽‍💻e\r\ntwo\né".as_bytes());
+        assert_eq!(model.line_at(TextByte(end)), 2);
+        model.seal_undo_group();
+        model.apply_edit_ops(&[EditOp::new(
+            Span::new(TextByte(end), TextByte(model.len())),
+            String::new(),
+        )]);
+        assert_eq!(model.eol_table(), &initial);
+        assert!(model.undo().is_some());
+        assert!(model.text().ends_with('é'));
+        assert_eq!(model.snapshot().to_source_bytes(), model.to_source_bytes());
+        assert!(model.redo().is_some());
+        assert_eq!(model.eol_table(), &initial);
+    }
+
+    #[test]
+    fn newline_insertion_at_eof_uses_one_eol_update_for_all_edit_apis() {
+        for (source, expected) in [("", "\n"), ("a", "a\n"), ("a\r\n", "a\r\n\r\n")] {
+            for batch in [false, true] {
+                let mut model =
+                    EditorModel::from_snapshot(TextSnapshot::new(source.as_bytes()).unwrap());
+                let end = TextByte(model.len());
+                if batch {
+                    model.apply_edit_ops(&[EditOp::new(Span::new(end, end), "\n".into())]);
+                } else {
+                    model.insert(end, "\n");
+                }
+                assert_eq!(model.to_source_bytes(), expected.as_bytes());
+                assert_eq!(model.snapshot().text(), model.text());
+                assert!(model.undo().is_some());
+                assert_eq!(model.to_source_bytes(), source.as_bytes());
+                assert!(model.redo().is_some());
+                assert_eq!(model.to_source_bytes(), expected.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn edits_keep_the_rope_index_in_sync_across_chunks_and_unicode() {
+        let mut model = EditorModel::from_text(&"aé\n".repeat(3000));
+        for line in [0, 300, 2000, 3000] {
+            let at = model.line_start(line).0;
+            let before = model.revision();
+            model.apply_edit_ops(&[EditOp::new(
+                Span::new(TextByte(at), TextByte(at)),
+                "🧑🏽‍💻".into(),
+            )]);
+            assert!(model.revision() > before);
+            assert_eq!(model.rope.to_string(), model.text());
+            assert_eq!(model.snapshot().text(), model.text());
+            assert_eq!(model.to_source_bytes(), model.text().as_bytes());
+        }
     }
 
     #[test]

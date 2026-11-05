@@ -315,3 +315,6 @@ fn blur_acknowledgements_preserve_only_an_unchanged_authorized_caret() {
     });
     assert!(app.workspace.writing_target().is_none());
 }
+
+#[path = "support/editor_latency.rs"]
+mod editor_latency;

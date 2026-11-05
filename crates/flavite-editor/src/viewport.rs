@@ -71,6 +71,33 @@ pub fn accessible_characters(text: &str) -> Vec<std::ops::Range<usize>> {
     ranges
 }
 
+/// AccessKit's character byte lengths without allocating an intermediate
+/// range for every character. ASCII's only multi-byte grapheme is CRLF.
+#[must_use]
+pub fn accessible_character_lengths(text: &str) -> Vec<u8> {
+    if text.is_ascii() {
+        let mut lengths = vec![1; text.len()];
+        if text.contains("\r\n") {
+            lengths.clear();
+            let mut bytes = text.bytes().peekable();
+            while let Some(byte) = bytes.next() {
+                if byte == b'\r' && bytes.peek() == Some(&b'\n') {
+                    bytes.next();
+                    lengths.push(2);
+                } else {
+                    lengths.push(1);
+                }
+            }
+        }
+        lengths
+    } else {
+        accessible_characters(text)
+            .into_iter()
+            .map(|range| u8::try_from(range.len()).expect("accessible character fits in u8"))
+            .collect()
+    }
+}
+
 /// Previous extended grapheme boundary, including combining and emoji sequences.
 #[must_use]
 pub fn previous_grapheme_boundary(text: &str, byte: usize) -> usize {
@@ -90,4 +117,28 @@ pub fn next_grapheme_boundary(text: &str, byte: usize) -> usize {
         .map(|(index, grapheme)| index + grapheme.len())
         .find(|end| *end > byte)
         .unwrap_or(text.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_character_lengths_match_unicode_segmentation() {
+        let huge_cluster = format!("a{}", "\u{301}".repeat(300));
+        for text in [
+            "",
+            "ordinary ASCII\n",
+            "\r\n\r\n",
+            "a\rb\nc\r\n",
+            "é e\u{301} 🧑🏽‍💻\n",
+            &huge_cluster,
+        ] {
+            let expected: Vec<_> = accessible_characters(text)
+                .into_iter()
+                .map(|range| u8::try_from(range.len()).unwrap())
+                .collect();
+            assert_eq!(accessible_character_lengths(text), expected, "{text:?}");
+        }
+    }
 }

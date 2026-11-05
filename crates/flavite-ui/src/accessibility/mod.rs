@@ -2,6 +2,7 @@
 
 pub mod program;
 pub mod reading;
+pub(crate) mod text;
 pub mod tree;
 
 pub use tree::NodeTarget;

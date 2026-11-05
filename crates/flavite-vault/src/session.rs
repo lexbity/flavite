@@ -859,10 +859,38 @@ impl Session {
                 .name("vault-recovery".into())
                 .spawn(move || {
                     while !stop.load(Ordering::Acquire) {
+                        // Decide admission from tiny stamps before copying
+                        // text or hashing a document. Never wait for the
+                        // recovery writer's disk work while holding the
+                        // buffer manager needed by interactive edits.
+                        let candidates = {
+                            let manager = manager.lock_recovering();
+                            manager
+                                .dirty_buffers()
+                                .into_iter()
+                                .map(|(_, buffer)| (buffer.buffer_id(), buffer.revision()))
+                                .collect::<Vec<_>>()
+                        };
+                        let due = {
+                            let writer = writer.lock_recovering();
+                            candidates
+                                .into_iter()
+                                .filter(|(id, revision)| {
+                                    writer.should_write_revision(*id, *revision)
+                                })
+                                .map(|(id, _)| id)
+                                .collect::<Vec<_>>()
+                        };
                         let buffer_manager = manager.lock_recovering();
-                        let dirty = buffer_manager
-                            .dirty_buffers()
+                        let dirty = due
                             .into_iter()
+                            .filter_map(|id| {
+                                let buffer = buffer_manager.get_buffer_by_id(id)?;
+                                if !buffer.is_dirty() {
+                                    return None;
+                                }
+                                Some((buffer_manager.path_for_id(id)?, buffer))
+                            })
                             .map(|(path, buffer)| {
                                 (
                                     native_note_key(path, &root),
@@ -2549,6 +2577,15 @@ impl Session {
             return SessionResult::Error { message };
         }
         let content = content.unwrap_or_default();
+        // §4.16.1: a note the decoder cannot accept must fail the open
+        // honestly. Installing the manager's empty fallback would present a
+        // blank editor as a clean, saved note — and an autosave could later
+        // write that emptiness over the real bytes.
+        if let Err(error) = flavite_syntax::text::TextSnapshot::new(&content) {
+            return SessionResult::Error {
+                message: format!("{}: {error}", read.path.display()),
+            };
+        }
         let (buffer_id, revision) = {
             let mut buffer_manager_guard = self.buffer_manager.lock_recovering();
             let (buffer, _transition) = buffer_manager_guard.open_note(read.path.clone(), &content);

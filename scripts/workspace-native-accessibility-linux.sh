@@ -55,7 +55,7 @@ for _ in $(seq 1 100); do
         cat "$run_root/app.log" >&2
         exit 1
     fi
-    window_id="$(xdotool search --onlyvisible --name '^Flavite$' 2>/dev/null | head -n 1 || true)"
+    window_id="$(xdotool search --onlyvisible --pid "$app_pid" --name '^Flavite$' 2>/dev/null | head -n 1 || true)"
     [[ -n "$window_id" ]] && break
     sleep 0.1
 done
@@ -65,16 +65,11 @@ if [[ -z "$window_id" ]]; then
     exit 1
 fi
 
-xdotool windowactivate --sync "$window_id"
+# Xvfb has no window manager to implement EWMH activation. Direct X11
+# focus is still required and sufficient for the OS input checks below.
+xdotool windowactivate --sync "$window_id" 2>/dev/null || true
 xdotool windowfocus --sync "$window_id"
-xdotool key --clearmodifiers ctrl+p
-sleep 0.5
-xdotool type --delay 25 "alpha"
-sleep 0.3
-xdotool key --clearmodifiers Return
-sleep 0.5
-
-if ! python3 scripts/workspace-native-accessibility-linux.py "$vault_root"; then
+if ! python3 scripts/workspace-native-accessibility-linux.py "$vault_root" "$window_id"; then
     echo "native AT-SPI runner failed; app log: $run_root/app.log" >&2
     cat "$run_root/app.log" >&2
     exit 1

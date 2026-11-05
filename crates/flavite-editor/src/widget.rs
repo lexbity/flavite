@@ -2,8 +2,7 @@
 
 use crate::keymap::KeyAction;
 use crate::links::{
-    LinkResolution, LinkSpan, NoteCandidate, match_candidates, resolve_link, scan_decorations,
-    scan_links,
+    LinkResolution, LinkSpan, NoteCandidate, match_candidates, resolve_link, scan_note,
 };
 use crate::surface::{EditorAction, EditorSurface, EditorView, LinkNavigation};
 use crate::viewport::{
@@ -31,6 +30,30 @@ const FONT_SIZE: f32 = 16.0;
 const LINE_HEIGHT: f32 = 22.0;
 const PAD_X: f32 = 12.0;
 const PAD_Y: f32 = 10.0;
+/// Scrollbar thumb width in logical pixels.
+const SCROLLBAR_WIDTH: f32 = 8.0;
+/// Hit-test gutter at the pane's right edge (thumb + click slop).
+const SCROLLBAR_GUTTER: f32 = 16.0;
+
+/// Scrollbar geometry for a pane of `height`: track top, track height,
+/// thumb top, thumb height, and the maximum `first_line` (the viewport
+/// stays full — the last page bounds the scroll).
+fn scrollbar_geometry(
+    height: f32,
+    total_lines: usize,
+    visible_lines: usize,
+    first_line: usize,
+) -> (f32, f32, f32, f32, usize) {
+    let track_y = PAD_Y;
+    let track_height = (height - PAD_Y * 2.0).max(1.0);
+    let shown = visible_lines.min(total_lines).max(1);
+    let max_first = total_lines.saturating_sub(shown);
+    let thumb_height =
+        (track_height * shown as f32 / total_lines.max(1) as f32).clamp(24.0, track_height);
+    let travel = (track_height - thumb_height).max(1.0);
+    let thumb_y = track_y + travel * (first_line.min(max_first) as f32 / max_first.max(1) as f32);
+    (track_y, track_height, thumb_y, thumb_height, max_first)
+}
 
 /// The editor's type settings: font size in logical pixels and the derived
 /// line height. The host sets these from its interface preferences (W11);
@@ -530,6 +553,11 @@ pub struct EditorState {
     revision: Option<u64>,
     link_spans: Vec<LinkSpan>,
     decorations: Vec<flavite_syntax::ScannedSpan>,
+    /// Source line lookup shared by caret mapping and viewport extraction.
+    line_starts: Vec<usize>,
+    line_text_addr: usize,
+    line_text_len: usize,
+    resolutions_present: bool,
     caret: usize,
     anchor: usize,
     focused: bool,
@@ -550,6 +578,20 @@ pub struct EditorState {
     last_publish: Option<Instant>,
     /// The active type settings, synced from the widget in `diff` (W11).
     type_metrics: TypeMetrics,
+    /// The caret byte offset at which [`EditorState::ensure_caret_visible`]
+    /// last ran. Re-running it every frame would snap the viewport back to
+    /// the caret, cancelling wheel/scrollbar scrolling away from it.
+    last_ensured_caret: usize,
+    /// Live scrollbar-thumb drag, with the pointer's grab offset inside the
+    /// thumb. `Some` while the left button holds the thumb.
+    scroll_drag: Option<ScrollDrag>,
+}
+
+/// One active scrollbar-thumb drag.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScrollDrag {
+    /// Pointer offset from the thumb's top edge when the drag started.
+    grab_offset: f32,
 }
 
 /// Identity of one shaped viewport: the same revision, text allocation,
@@ -875,6 +917,7 @@ impl EditorState {
         if self.focused {
             self.ensure_caret_visible(text);
         }
+        self.last_ensured_caret = self.caret;
     }
 
     /// Feed one platform input-method event through the controlled
@@ -971,27 +1014,49 @@ impl EditorState {
         }
         self.buffer_id = Some(view.buffer_id);
         if self.revision != Some(view.revision) {
-            self.link_spans = scan_links(&view.text);
-            self.decorations = scan_decorations(&view.text);
+            let (link_spans, decorations) = scan_note(&view.text);
+            self.link_spans = link_spans;
+            self.decorations = decorations;
+            self.line_starts.clear();
+            self.line_starts.push(0);
+            self.line_starts
+                .extend(view.text.match_indices('\n').map(|(byte, _)| byte + 1));
+            self.line_text_addr = view.text.as_ptr() as usize;
+            self.line_text_len = view.text.len();
             self.revision = Some(view.revision);
         }
-        for span in &mut self.link_spans {
-            let key = flavite_syntax::text::fold_key(&span.payload.target_raw);
-            span.resolution = resolve_link(span, link_resolutions.get(&key).copied());
+        if !link_resolutions.is_empty() || self.resolutions_present {
+            for span in &mut self.link_spans {
+                let key = flavite_syntax::text::fold_key(&span.payload.target_raw);
+                span.resolution = resolve_link(span, link_resolutions.get(&key).copied());
+            }
         }
+        self.resolutions_present = !link_resolutions.is_empty();
         self.caret = clamp_char_boundary(&view.text, self.caret);
         self.anchor = clamp_char_boundary(&view.text, self.anchor);
         self.viewport.line_height = self.type_metrics.line_height;
         self.viewport.first_line = self
             .viewport
             .first_line
-            .min(logical_line_count(&view.text).saturating_sub(1));
-        self.ensure_caret_visible(&view.text);
+            .min(self.source_line_count(&view.text).saturating_sub(1));
+        // Only re-anchor the viewport when the caret moved. Running this
+        // every frame would snap the view back to the caret and cancel any
+        // wheel or scrollbar scroll away from it.
+        if self.caret != self.last_ensured_caret {
+            self.ensure_caret_visible(&view.text);
+            self.last_ensured_caret = self.caret;
+        }
     }
 
     fn ensure_caret_visible(&mut self, text: &str) {
         let caret = self.caret.min(text.len());
-        let line = text[..caret].bytes().filter(|byte| *byte == b'\n').count();
+        let line = if self.has_line_index(text) {
+            self.line_starts
+                .partition_point(|start| *start <= caret)
+                .saturating_sub(1)
+        } else {
+            text[..caret].bytes().filter(|byte| *byte == b'\n').count()
+        };
         if line < self.viewport.first_line {
             self.viewport.first_line = line;
         } else if line
@@ -1002,6 +1067,35 @@ impl EditorState {
         {
             self.viewport.first_line = line + 1 - self.viewport.visible_lines.max(1);
         }
+    }
+
+    fn has_line_index(&self, text: &str) -> bool {
+        !self.line_starts.is_empty()
+            && self.line_text_addr == text.as_ptr() as usize
+            && self.line_text_len == text.len()
+    }
+
+    fn source_line_count(&self, text: &str) -> usize {
+        if self.has_line_index(text) {
+            self.line_starts.len()
+        } else {
+            logical_line_count(text)
+        }
+    }
+
+    fn visible_text(&self, text: &str, viewport: Viewport) -> (String, usize) {
+        if !self.has_line_index(text) {
+            return visible_text(text, viewport);
+        }
+        let first = viewport.first_line.min(self.line_starts.len() - 1);
+        let end_line = first.saturating_add(viewport.visible_lines.max(1));
+        let start = self.line_starts[first];
+        let end = self
+            .line_starts
+            .get(end_line)
+            .copied()
+            .unwrap_or(text.len());
+        (text[start..end].to_owned(), start)
     }
 
     /// Pointer selection against shaped text: places or extends the
@@ -1037,7 +1131,7 @@ impl EditorState {
             self.type_metrics,
         );
         if self.shaping.as_ref().is_none_or(|cache| cache.key != key) {
-            let (visible, source_start) = visible_text(text, viewport);
+            let (visible, source_start) = self.visible_text(text, viewport);
             let buffer = shape_text(&visible, width, self.type_metrics);
             self.shaping = Some(ShapingCache {
                 key,
@@ -1082,10 +1176,14 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
 
     fn layout(&mut self, tree: &mut Tree, _renderer: &iced::Renderer, limits: &Limits) -> Node {
         let size = limits.resolve(self.width, self.height, Size::new(640.0, 480.0));
-        tree.state
-            .downcast_mut::<EditorState>()
-            .viewport
-            .set_height(size.height - PAD_Y * 2.0);
+        let state = tree.state.downcast_mut::<EditorState>();
+        state.viewport.set_height(size.height - PAD_Y * 2.0);
+        state.shaped(
+            &self.view.text,
+            self.view.revision,
+            state.viewport,
+            self.text_wrap_width(size.width),
+        );
         Node::new(size)
     }
 
@@ -1238,6 +1336,56 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             self.colors.text,
             clip,
         );
+        // Scrollbar: only when the document overflows the viewport. The
+        // wheel and gutter-drag share this geometry.
+        let total_lines = state.source_line_count(&self.view.text);
+        if total_lines > state.viewport.visible_lines.max(1) {
+            let (track_y, track_height, thumb_y, thumb_height, _max_first) = scrollbar_geometry(
+                bounds.height,
+                total_lines,
+                state.viewport.visible_lines.max(1),
+                state.viewport.first_line,
+            );
+            let text = self.colors.text;
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: Rectangle::new(
+                        Point::new(
+                            bounds.x + bounds.width - SCROLLBAR_GUTTER,
+                            bounds.y + track_y,
+                        ),
+                        Size::new(SCROLLBAR_GUTTER, track_height),
+                    ),
+                    border: Border::default(),
+                    ..renderer::Quad::default()
+                },
+                Background::Color(Color::from_rgba(text.r, text.g, text.b, 0.06)),
+            );
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: Rectangle::new(
+                        Point::new(
+                            bounds.x + bounds.width - SCROLLBAR_GUTTER
+                                + (SCROLLBAR_GUTTER - SCROLLBAR_WIDTH) / 2.0,
+                            bounds.y + thumb_y,
+                        ),
+                        Size::new(SCROLLBAR_WIDTH, thumb_height),
+                    ),
+                    border: Border::default(),
+                    ..renderer::Quad::default()
+                },
+                Background::Color(Color::from_rgba(
+                    text.r,
+                    text.g,
+                    text.b,
+                    if state.scroll_drag.is_some() {
+                        0.75
+                    } else {
+                        0.45
+                    },
+                )),
+            );
+        }
         if let Some(composition) = &state.composition
             && !composition.preedit.is_empty()
             && composition.start >= source_start
@@ -1562,34 +1710,68 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             }
             iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(position) = cursor.position_in(layout.bounds()) {
-                    let width = (layout.bounds().width - PAD_X * 2.0).max(1.0);
-                    let byte = state.hit_test_cached(
-                        &self.view.text,
-                        self.view.revision,
-                        state.viewport,
-                        position.x - PAD_X,
-                        position.y - PAD_Y,
-                        width,
-                    );
-                    // A click on a link navigates (point-and-click contract);
-                    // modifier clicks take the same path.
-                    if let Some(action) = link_action_at(&self.view, &state.link_spans, byte) {
-                        self.emit(shell, action);
-                        shell.capture_event();
-                        shell.request_redraw();
-                        return;
+                    let bounds = layout.bounds();
+                    let total_lines = state.source_line_count(&self.view.text);
+                    let visible_lines = state.viewport.visible_lines.max(1);
+                    if total_lines > visible_lines && position.x >= bounds.width - SCROLLBAR_GUTTER
+                    {
+                        // A press in the scrollbar gutter grabs the thumb (or
+                        // jumps to the pressed position) and never starts a
+                        // text selection.
+                        let (track_y, track_height, thumb_y, thumb_height, max_first) =
+                            scrollbar_geometry(
+                                bounds.height,
+                                total_lines,
+                                visible_lines,
+                                state.viewport.first_line,
+                            );
+                        let local_y = (position.y - bounds.y - track_y).clamp(0.0, track_height);
+                        let thumb_top = thumb_y - track_y;
+                        if local_y >= thumb_top && local_y <= thumb_top + thumb_height {
+                            state.scroll_drag = Some(ScrollDrag {
+                                grab_offset: local_y - thumb_top,
+                            });
+                        } else {
+                            let ratio = ((local_y - thumb_height / 2.0)
+                                / (track_height - thumb_height).max(1.0))
+                            .clamp(0.0, 1.0);
+                            state.viewport.first_line = (ratio * max_first as f32).round() as usize;
+                            state.scroll_drag = Some(ScrollDrag {
+                                grab_offset: thumb_height / 2.0,
+                            });
+                        }
+                        state.focused = true;
+                        state.ime_active = true;
+                    } else {
+                        let width = self.text_wrap_width(layout.bounds().width);
+                        let byte = state.hit_test_cached(
+                            &self.view.text,
+                            self.view.revision,
+                            state.viewport,
+                            position.x - PAD_X,
+                            position.y - PAD_Y,
+                            width,
+                        );
+                        // A click on a link navigates (point-and-click contract);
+                        // modifier clicks take the same path.
+                        if let Some(action) = link_action_at(&self.view, &state.link_spans, byte) {
+                            self.emit(shell, action);
+                            shell.capture_event();
+                            shell.request_redraw();
+                            return;
+                        }
+                        state.focused = true;
+                        state.ime_active = true;
+                        state.selecting = true;
+                        state.place_caret_from_point(
+                            &self.view.text,
+                            self.view.revision,
+                            position.x - PAD_X,
+                            position.y - PAD_Y,
+                            width,
+                            false,
+                        );
                     }
-                    state.focused = true;
-                    state.ime_active = true;
-                    state.selecting = true;
-                    state.place_caret_from_point(
-                        &self.view.text,
-                        self.view.revision,
-                        position.x - PAD_X,
-                        position.y - PAD_Y,
-                        width,
-                        false,
-                    );
                     shell.capture_event();
                     shell.request_redraw();
                 } else {
@@ -1599,6 +1781,33 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     state.composition = None;
                 }
             }
+            iced::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.scroll_drag.is_some() => {
+                if let (Some(position), Some(drag)) =
+                    (cursor.position_in(layout.bounds()), state.scroll_drag)
+                {
+                    let bounds = layout.bounds();
+                    let total_lines = state.source_line_count(&self.view.text);
+                    let visible_lines = state.viewport.visible_lines.max(1);
+                    if total_lines > visible_lines {
+                        let (track_y, track_height, _thumb_y, thumb_height, max_first) =
+                            scrollbar_geometry(
+                                bounds.height,
+                                total_lines,
+                                visible_lines,
+                                state.viewport.first_line,
+                            );
+                        let travel = (track_height - thumb_height).max(1.0);
+                        let local_y =
+                            (position.y - bounds.y - track_y - drag.grab_offset).clamp(0.0, travel);
+                        let target = (local_y / travel * max_first as f32).round() as usize;
+                        if target != state.viewport.first_line {
+                            state.viewport.first_line = target;
+                            shell.request_redraw();
+                        }
+                    }
+                }
+                shell.capture_event();
+            }
             iced::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.selecting => {
                 if let Some(position) = cursor.position_in(layout.bounds()) {
                     state.place_caret_from_point(
@@ -1606,7 +1815,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                         self.view.revision,
                         position.x - PAD_X,
                         position.y - PAD_Y,
-                        (layout.bounds().width - PAD_X * 2.0).max(1.0),
+                        self.text_wrap_width(layout.bounds().width),
                         true,
                     );
                     shell.capture_event();
@@ -1621,6 +1830,10 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     shell.capture_event();
                 }
                 state.selecting = false;
+                if state.scroll_drag.take().is_some() {
+                    shell.capture_event();
+                    shell.request_redraw();
+                }
             }
             iced::Event::Mouse(mouse::Event::WheelScrolled { delta })
                 if cursor.position_in(layout.bounds()).is_some() =>
@@ -1629,20 +1842,26 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     mouse::ScrollDelta::Lines { y, .. } => *y,
                     mouse::ScrollDelta::Pixels { y, .. } => *y / self.type_metrics.line_height,
                 };
-                let last_line = logical_line_count(&self.view.text).saturating_sub(1);
+                let total_lines = state.source_line_count(&self.view.text);
+                let visible_lines = state.viewport.visible_lines.max(1);
+                // The viewport stays full: the last page bounds the scroll,
+                // matching the scrollbar thumb's travel. Wheel-up arrives as
+                // a positive y delta and scrolls toward the document start.
+                let max_first = total_lines.saturating_sub(visible_lines.min(total_lines));
                 if lines > 0.0 {
                     state.viewport.first_line = state
                         .viewport
                         .first_line
-                        .saturating_add(lines.ceil() as usize)
-                        .min(last_line);
+                        .saturating_sub(lines.ceil() as usize);
                 } else {
                     state.viewport.first_line = state
                         .viewport
                         .first_line
-                        .saturating_sub(lines.abs().ceil() as usize);
+                        .saturating_add(lines.abs().ceil() as usize)
+                        .min(max_first);
                 }
                 shell.capture_event();
+                shell.request_redraw();
             }
             iced::Event::Mouse(mouse::Event::ButtonPressed(_)) => {}
             iced::Event::Keyboard(keyboard::Event::KeyPressed {
@@ -1659,7 +1878,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             _ => {}
         }
         if self.input_enabled && state.focused && state.ime_active {
-            let width = (layout.bounds().width - PAD_X * 2.0).max(1.0);
+            let width = self.text_wrap_width(layout.bounds().width);
             let caret_byte = state.caret;
             let (x, y) = {
                 let (buffer, visible, source_start) =
@@ -1716,7 +1935,14 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         _renderer: &iced::Renderer,
     ) -> mouse::Interaction {
         if cursor.is_over(layout.bounds()) {
-            mouse::Interaction::Text
+            if cursor
+                .position_in(layout.bounds())
+                .is_some_and(|position| position.x >= layout.bounds().width - SCROLLBAR_GUTTER)
+            {
+                mouse::Interaction::Grabbing
+            } else {
+                mouse::Interaction::Text
+            }
         } else {
             mouse::Interaction::default()
         }
@@ -1913,8 +2139,107 @@ fn caret_position(runs: &[cosmic_text::LayoutRun<'_>], text: &str, byte: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flavite_api::BufferStatus;
     use flavite_syntax::text::{Span, TextByte};
     use iced::advanced::widget::Operation as _;
+
+    fn long_view(lines: usize) -> EditorView {
+        let mut text = String::new();
+        for index in 0..lines {
+            text.push_str(&format!("line {index}\n"));
+        }
+        EditorView {
+            buffer_id: 1,
+            revision: 1,
+            text: text.into(),
+            path: std::path::PathBuf::from("long.md"),
+            state: BufferStatus::Clean,
+        }
+    }
+
+    #[test]
+    fn reconcile_keeps_a_user_scroll_that_leaves_the_caret() {
+        let view = long_view(200);
+        let mut state = EditorState::default();
+        state.reconcile(&view, &HashMap::new());
+        assert_eq!(state.last_ensured_caret, 0);
+
+        // The user wheels away from the caret at line 0; the very next
+        // reconcile (same caret) must not snap the viewport back.
+        state.viewport.first_line = 100;
+        state.reconcile(&view, &HashMap::new());
+        assert_eq!(state.viewport.first_line, 100);
+
+        // Moving the caret re-anchors around the caret again.
+        state.caret = "line 150\n".len() * 150;
+        state.reconcile(&view, &HashMap::new());
+        assert!(state.viewport.first_line >= 140);
+        assert_eq!(state.last_ensured_caret, state.caret);
+    }
+
+    #[test]
+    fn indexed_viewports_match_source_slices_after_reload_and_empty_lines() {
+        let mut state = EditorState::default();
+        for (revision, text) in ["", "é\n\n🧑🏽‍💻\n", "no newline", "a\rb\nc\r\n"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut view = long_view(0);
+            view.revision = revision as u64;
+            view.text = text.into();
+            state.reconcile(&view, &HashMap::new());
+            assert_eq!(
+                state.source_line_count(&view.text),
+                logical_line_count(text)
+            );
+            for first_line in [0, 1, 3, 999] {
+                for visible_lines in [0, 1, 3] {
+                    let viewport = Viewport {
+                        first_line,
+                        visible_lines,
+                        ..Viewport::default()
+                    };
+                    assert_eq!(
+                        state.visible_text(&view.text, viewport),
+                        visible_text(text, viewport)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clearing_link_verdicts_invalidates_previous_resolutions() {
+        let mut view = long_view(0);
+        view.text = "[[target]]".into();
+        let mut state = EditorState::default();
+        state.reconcile(
+            &view,
+            &HashMap::from([("target".into(), LinkResolution::Resolved)]),
+        );
+        assert_eq!(state.link_spans[0].resolution, LinkResolution::Resolved);
+        state.reconcile(&view, &HashMap::new());
+        assert_eq!(state.link_spans[0].resolution, LinkResolution::Unresolved);
+        state.reconcile(&view, &HashMap::new());
+        assert_eq!(state.link_spans[0].resolution, LinkResolution::Unresolved);
+    }
+
+    #[test]
+    fn scrollbar_geometry_maps_first_line_across_the_track() {
+        let (track_y, track_height, thumb_y, thumb_height, max_first) =
+            scrollbar_geometry(500.0, 200, 20, 0);
+        assert_eq!(max_first, 180);
+        assert_eq!(thumb_y, track_y);
+        assert!(thumb_height >= 24.0);
+        assert!(thumb_height < track_height);
+        let (_ty, _th, bottom_y, _bh, _mf) = scrollbar_geometry(500.0, 200, 20, 180);
+        assert!(bottom_y > thumb_y);
+        // The thumb always stays inside the track.
+        assert!(bottom_y + thumb_height <= track_y + track_height + 0.01);
+        // Out-of-range first lines clamp.
+        let (_, _, _, _, clamped_max) = scrollbar_geometry(500.0, 200, 20, 999);
+        assert_eq!(clamped_max, 180);
+    }
 
     fn key_press() -> iced::Event {
         iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
@@ -2291,7 +2616,7 @@ mod tests {
     #[test]
     fn link_activation_emits_target_syntax_and_never_opens_embeds_as_notes() {
         let text = "[[Ideas#Plan|Ideas]] ![[diagram.png]]";
-        let spans = scan_links(text);
+        let spans = crate::links::scan_links(text);
         let view = EditorView {
             buffer_id: 88,
             revision: 15,

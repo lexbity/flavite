@@ -7,7 +7,7 @@
 
 use crate::app::App;
 use accesskit::{Action, Node, NodeId, Rect, Role, TreeId, TreeInfo, TreeUpdate};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// What a native action on a semantic node routes to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,6 +447,8 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
     let window_size = app.window_size();
     let mut nodes: Vec<(NodeId, Node)> = Vec::new();
     let mut window_children: Vec<NodeId> = Vec::new();
+    let mut text_cache = app.a11y_text_cache.borrow_mut();
+    let mut mounted_buffers = BTreeSet::new();
 
     let mut root = Node::new(Role::Window);
     root.set_label("Flavite workspace");
@@ -631,24 +633,28 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
                     editor.set_bounds(semantic_bounds(*rect));
                 }
                 let mut runs = Vec::new();
-                for (i, (_, line)) in text_lines(&view.text).into_iter().enumerate() {
+                mounted_buffers.insert(view.buffer_id);
+                let projection = text_cache.project(view.buffer_id, &view.text);
+                for (i, line) in projection.lines.iter().enumerate() {
                     let run = run_id(id, view.revision, i);
                     let mut node = Node::new(Role::TextRun);
-                    node.set_value(line);
-                    node.set_character_lengths(
-                        flavite_editor::viewport::accessible_characters(line)
-                            .into_iter()
-                            .map(|range| u8::try_from(range.len()).unwrap_or(4))
-                            .collect::<Vec<_>>(),
-                    );
+                    node.set_value(&view.text[line.start..line.end]);
+                    node.set_character_lengths(line.lengths.to_vec());
                     nodes.push((run, node));
                     runs.push(run);
                 }
                 editor.set_children(runs);
                 if let Some(snapshot) = app.editor_interaction_snapshot(tab) {
+                    let position = |byte| {
+                        let (line, character_index) = projection.position(byte);
+                        accesskit::TextPosition {
+                            node: run_id(id, view.revision, line),
+                            character_index,
+                        }
+                    };
                     editor.set_text_selection(accesskit::TextSelection {
-                        anchor: text_position(app, tab, &view.text, snapshot.selection.0),
-                        focus: text_position(app, tab, &view.text, snapshot.selection.1),
+                        anchor: position(snapshot.selection.0),
+                        focus: position(snapshot.selection.1),
                     });
                     if snapshot.focused {
                         focus = id;
@@ -741,6 +747,7 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
     }
 
     root.set_children(window_children);
+    text_cache.retain(&mounted_buffers);
     nodes.insert(0, (ROOT, root));
 
     TreeUpdate {
