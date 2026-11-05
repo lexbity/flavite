@@ -432,12 +432,12 @@ impl RecoveryFile {
         let decoded_str = std::str::from_utf8(&decoded).ok()?;
         let encoded_attempt = flavite_encoding::encode(
             decoded_str,
-            &source_format,
+            source_format,
             &flavite_encoding::EncodeLimits {
                 max_input_utf8_bytes: 64 * 1024 * 1024,
                 max_output_bytes: 64 * 1024 * 1024,
             },
-            &mut || false,
+            &flavite_encoding::NOT_CANCELLED,
         );
         match (&recovery.encoded, encoded_attempt) {
             (Some((len, hash)), Ok(bytes)) => {
@@ -523,12 +523,12 @@ impl RecoveryFile {
         let source_format = recovery.source_format;
         let encoded = flavite_encoding::encode(
             std::str::from_utf8(&decoded).ok()?,
-            &source_format,
+            source_format,
             &flavite_encoding::EncodeLimits {
                 max_input_utf8_bytes: 64 * 1024 * 1024,
                 max_output_bytes: 64 * 1024 * 1024,
             },
-            &mut || false,
+            &flavite_encoding::NOT_CANCELLED,
         )
         .ok();
         let mut encoded_record = None;
@@ -564,12 +564,12 @@ impl RecoveryFile {
             .map_err(|_| flavite_encoding::CodecError::InvalidUtf8 { source_byte: 0 })?;
         flavite_encoding::encode(
             decoded,
-            &self.source_format,
+            self.source_format,
             &flavite_encoding::EncodeLimits {
                 max_input_utf8_bytes: 64 * 1024 * 1024,
                 max_output_bytes: 64 * 1024 * 1024,
             },
-            &mut || false,
+            &flavite_encoding::NOT_CANCELLED,
         )
     }
 
@@ -1320,7 +1320,9 @@ mod tests {
         let mut tampered = recovery.to_bytes();
         // v2 framing: header(38) | u32 len + format json | u32 len + eol json
         // | u32 len + text.
-        let format_len = serde_json::to_vec(&format_record_of(&recovery)).unwrap().len();
+        let format_len = serde_json::to_vec(&format_record_of(&recovery))
+            .unwrap()
+            .len();
         let eol_len = serde_json::to_vec(&recovery.eol_table).unwrap().len();
         let text_start = 38 + 4 + format_len + 4 + eol_len + 4;
         tampered[text_start] ^= 1;

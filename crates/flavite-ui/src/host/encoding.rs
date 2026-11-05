@@ -10,8 +10,8 @@
 
 use std::collections::BTreeMap;
 
-use flavite_api::command::Invocation;
 use flavite_api::Origin;
+use flavite_api::command::Invocation;
 use flavite_workspace::TabId;
 
 use crate::app::{App, Message};
@@ -145,7 +145,10 @@ fn reopen(app: &mut App, tab: TabId, encoding: &str, bom: &str) -> iced::Task<Me
         }
         flavite_api::ExecutionResult::Local(flavite_api::LocalResult::Success(success)) => {
             app.encoding.clear(tab);
-            let buffer = success.data.get("buffer_id").and_then(serde_json::Value::as_u64);
+            let buffer = success
+                .data
+                .get("buffer_id")
+                .and_then(serde_json::Value::as_u64);
             app.notes.ready(tab, buffer);
             app.status = format!(
                 "Reopened as {encoding}{}",

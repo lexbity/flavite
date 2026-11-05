@@ -11,9 +11,8 @@
 
 use crate::actor::VaultActorHandle;
 use crate::channels::{NoticeChannel, PulseChannel};
-use crate::encoding::{ChoiceReason, EncodingHintsState, Resolution, CHOICE_REQUIRED_CODE};
+use crate::encoding::{CHOICE_REQUIRED_CODE, ChoiceReason, EncodingHintsState, Resolution};
 use crate::save::{DiskPrecondition, DurabilityOutcome, SaveFailureStage, SaveRequest};
-use flavite_encoding::DecodePolicy;
 use crate::sync::MutexExt;
 use crate::sync::WAIT_TICK;
 use crate::types::{
@@ -24,6 +23,7 @@ use flavite_buffer::manager::{BufferManager, BufferStateChanged};
 use flavite_buffer::recovery::{RecoveryConfig, RecoveryWriter};
 use flavite_buffer::revision::{BaseHash, BufferId, Revision};
 use flavite_buffer::undo::EditOp;
+use flavite_encoding::DecodePolicy;
 use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -1186,11 +1186,7 @@ impl Session {
                     .spawn(move || {
                         // Workers exit when the Session drops the job sender.
                         while let Ok(job) = jobs.recv() {
-                            let outcome = crate::text_edit::prepare_ops(&job.text, &job.request)
-                                .map(|(ops, count)| {
-                                    let digest = crate::text_edit::options_digest(&job.request);
-                                    (ops, count, digest)
-                                });
+                            let outcome = crate::text_edit::prepare_ops(&job.text, &job.request);
                             // Sending only fails when the Session is gone;
                             // the result is then unobservable by construction.
                             let _ = results.send(TextOutcomeMessage {
@@ -1814,9 +1810,10 @@ impl Session {
                 revision,
                 target,
             } => self.convert_encoding(buffer_id, revision, target),
-            SessionCommand::PrepareReplace { request_id, request } => {
-                self.prepare_replace(request_id, request)
-            }
+            SessionCommand::PrepareReplace {
+                request_id,
+                request,
+            } => self.prepare_replace(request_id, request),
             SessionCommand::ApplyReplace {
                 buffer_id,
                 revision,
@@ -2826,25 +2823,20 @@ impl Session {
         // hash matches the observed bytes completes here — the source effect
         // reached disk durably but its metadata binding did not. This is
         // EncodingMetadataPending resolution, never NotReplaced.
+        let pending_intent = hints
+            .record
+            .intents
+            .get(&native_key)
+            .filter(|intent| intent.output_raw_hash == raw_hash);
         if explicit.is_none()
-            && hints
-                .record
-                .intents
-                .get(&native_key)
-                .is_some_and(|intent| intent.output_raw_hash == raw_hash)
+            && let Some(intent) = pending_intent
         {
-            if let Some(intent) = hints.record.intents.get(&native_key) {
-                let intent_format = intent.format();
-                self.bind_save_hint(&read.path, intent_format, raw_hash, &content);
-                explicit = Some(intent_format);
-            }
+            let intent_format = intent.format();
+            self.bind_save_hint(&read.path, intent_format, raw_hash, &content);
+            explicit = Some(intent_format);
         }
         let (snapshot, _format, stamp) = match crate::encoding::resolve_source(
-            native_key,
-            &content,
-            &hints,
-            explicit,
-            &limits,
+            native_key, &content, &hints, explicit, &limits,
         ) {
             Resolution::Resolved(resolved) => (resolved.snapshot, resolved.format, resolved.stamp),
             Resolution::NeedsChoice { reason, .. } => {
@@ -3021,14 +3013,24 @@ impl Session {
         };
         {
             let plans = self.text_plans.lock_recovering();
-            let unconsumed =
-                plans.values().filter(|entry| entry.consumed.is_none()).count();
+            let unconsumed = plans
+                .values()
+                .filter(|entry| entry.consumed.is_none())
+                .count();
             if unconsumed >= MAX_UNCONSUMED_TEXT_PLANS {
                 return SessionResult::Busy;
             }
         }
         match &self.text_jobs {
-            Some(jobs) if jobs.send(TextJob { request_id, text, request }).is_ok() => {
+            Some(jobs)
+                if jobs
+                    .send(TextJob {
+                        request_id,
+                        text,
+                        request,
+                    })
+                    .is_ok() =>
+            {
                 SessionResult::Pending { request_id }
             }
             _ => SessionResult::Error {
@@ -3051,9 +3053,19 @@ impl Session {
         let now = std::time::Instant::now();
         let entry = {
             let plans = self.text_plans.lock_recovering();
-            plans.get(&plan_id).map(|entry| (entry.ops.clone(), entry.match_count, entry.options_digest, entry.buffer_id, entry.revision, entry.consumed.as_ref().map(|(at, _)| *at)))
+            plans.get(&plan_id).map(|entry| {
+                (
+                    entry.ops.clone(),
+                    entry.match_count,
+                    entry.options_digest,
+                    entry.buffer_id,
+                    entry.revision,
+                    entry.consumed.as_ref().map(|(at, _)| *at),
+                )
+            })
         };
-        let Some((ops, _match_count, _digest, entry_buffer, entry_revision, consumed_at)) = entry else {
+        let Some((ops, _match_count, _digest, entry_buffer, entry_revision, consumed_at)) = entry
+        else {
             return SessionResult::ActionRequired {
                 code: "text-plan-expired",
                 data: None,
@@ -3063,7 +3075,9 @@ impl Session {
             .filter(|at| now.duration_since(*at) < TEXT_PLAN_RESULT_TTL)
             .and_then(|_| {
                 let plans = self.text_plans.lock_recovering();
-                plans.get(&plan_id).and_then(|entry| entry.consumed.as_ref().map(|(_, receipt)| receipt.clone()))
+                plans
+                    .get(&plan_id)
+                    .and_then(|entry| entry.consumed.as_ref().map(|(_, receipt)| receipt.clone()))
             })
         {
             return receipt;
@@ -3096,10 +3110,9 @@ impl Session {
                     actual: buffer.revision(),
                 };
             }
-            match buffer.apply_local_edits_with_policy(
-                &ops,
-                flavite_buffer::undo::UndoPolicy::Isolated,
-            ) {
+            match buffer
+                .apply_local_edits_with_policy(&ops, flavite_buffer::undo::UndoPolicy::Isolated)
+            {
                 Some((new_revision, _)) => SessionResult::Success(CommandResult::EditsApplied {
                     buffer_id,
                     new_revision,
@@ -3136,8 +3149,10 @@ impl Session {
                     };
                     let admitted = {
                         let mut plans = self.text_plans.lock_recovering();
-                        let unconsumed =
-                            plans.values().filter(|entry| entry.consumed.is_none()).count();
+                        let unconsumed = plans
+                            .values()
+                            .filter(|entry| entry.consumed.is_none())
+                            .count();
                         if unconsumed < MAX_UNCONSUMED_TEXT_PLANS {
                             plans.insert(plan_id, entry);
                             true
@@ -3542,11 +3557,8 @@ impl Session {
             let bytes = match buffer.model().try_to_source_bytes() {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    let unencodable = matches!(
-                        error,
-                        flavite_encoding::CodecError::Unencodable { .. }
-                            | flavite_encoding::CodecError::AsciiViolation { .. }
-                    );
+                    let unencodable =
+                        matches!(error, flavite_encoding::CodecError::Unencodable { .. });
                     let code = if unencodable {
                         crate::encoding::UNENCODABLE_CODE
                     } else {
@@ -3892,24 +3904,19 @@ impl Session {
             };
         }
         let mut manager = self.buffer_manager.lock_recovering();
-        match manager
-            .get_buffer_by_id_mut(buffer_id)
-            .and_then(|buffer| {
-                buffer
-                    .resolve_keep_local(&theirs, DecodePolicy::Auto)
-                    .map(|_| ())
-            })
-        {
+        match manager.get_buffer_by_id_mut(buffer_id).and_then(|buffer| {
+            buffer
+                .resolve_keep_local(&theirs, DecodePolicy::Auto)
+                .map(|_| ())
+        }) {
             Some(()) => SessionResult::Success(CommandResult::ConflictResolved),
-            None => {
-                return self.encoding_choice_required(
-                    &path,
-                    &ChoiceReason::InvalidInput {
-                        kind: crate::encoding::InvalidKind::Other,
-                        observed_raw_hash: *blake3::hash(&theirs).as_bytes(),
-                    },
-                );
-            }
+            None => self.encoding_choice_required(
+                &path,
+                &ChoiceReason::InvalidInput {
+                    kind: crate::encoding::InvalidKind::Other,
+                    observed_raw_hash: *blake3::hash(&theirs).as_bytes(),
+                },
+            ),
         }
     }
 
@@ -3951,15 +3958,13 @@ impl Session {
             .and_then(|buffer| buffer.reload_from_disk(&theirs, DecodePolicy::Auto))
         {
             Some(_) => SessionResult::Success(CommandResult::ConflictResolved),
-            None => {
-                return self.encoding_choice_required(
-                    &path,
-                    &ChoiceReason::InvalidInput {
-                        kind: crate::encoding::InvalidKind::Other,
-                        observed_raw_hash: *blake3::hash(&theirs).as_bytes(),
-                    },
-                );
-            }
+            None => self.encoding_choice_required(
+                &path,
+                &ChoiceReason::InvalidInput {
+                    kind: crate::encoding::InvalidKind::Other,
+                    observed_raw_hash: *blake3::hash(&theirs).as_bytes(),
+                },
+            ),
         }
     }
 
@@ -4008,7 +4013,7 @@ impl Session {
         let decode_layer = |bytes: &[u8],
                             policy: flavite_encoding::DecodePolicy|
          -> Result<String, flavite_encoding::CodecError> {
-            flavite_encoding::decode(bytes, policy, &limits, &mut || false)
+            flavite_encoding::decode(bytes, policy, &limits, &flavite_encoding::NOT_CANCELLED)
                 .map(|decoded| decoded.text().to_string())
         };
         let base_policy = base_format
@@ -4016,9 +4021,8 @@ impl Session {
             .unwrap_or(flavite_encoding::DecodePolicy::Auto);
         let (Ok(base), Ok(mine), Ok(theirs_text)) = (
             decode_layer(&base, base_policy),
-            String::from_utf8(mine).map_err(|_| flavite_encoding::CodecError::InvalidUtf8 {
-                source_byte: 0,
-            }),
+            String::from_utf8(mine)
+                .map_err(|_| flavite_encoding::CodecError::InvalidUtf8 { source_byte: 0 }),
             decode_layer(&theirs, flavite_encoding::DecodePolicy::Auto),
         ) else {
             return SessionResult::ActionRequired {
@@ -4148,12 +4152,16 @@ impl Session {
         // against the actual bytes (§6.10): `Auto` strips a matching
         // signature for the requested family, `Present` requires it,
         // `Absent` preserves signature-shaped leading bytes as content.
-        let signature: &[u8] = encoding.bom_signature();
+        let signature: &[u8] = encoding.signature();
         let format = match bom {
-            crate::encoding::BomMode::Auto if !signature.is_empty() && bytes.starts_with(signature) => {
+            crate::encoding::BomMode::Auto
+                if !signature.is_empty() && bytes.starts_with(signature) =>
+            {
                 flavite_encoding::SourceFormat::new(encoding, true)
             }
-            crate::encoding::BomMode::Present => flavite_encoding::SourceFormat::new(encoding, true),
+            crate::encoding::BomMode::Present => {
+                flavite_encoding::SourceFormat::new(encoding, true)
+            }
             _ => flavite_encoding::SourceFormat::new(encoding, false),
         };
         let format = match format {
@@ -4166,9 +4174,10 @@ impl Session {
             }
         };
         // Decode once under the explicit descriptor before touching state.
-        let snapshot = match
-            flavite_syntax::text::TextSnapshot::with_policy(&bytes, DecodePolicy::Explicit(format))
-        {
+        let snapshot = match flavite_syntax::text::TextSnapshot::with_policy(
+            &bytes,
+            DecodePolicy::Explicit(format),
+        ) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 let reason = match &error {
@@ -4268,11 +4277,7 @@ impl Session {
                 new_revision,
             }),
             Err(error) => {
-                let code = if matches!(
-                    error,
-                    flavite_encoding::CodecError::Unencodable { .. }
-                        | flavite_encoding::CodecError::AsciiViolation { .. }
-                ) {
+                let code = if matches!(error, flavite_encoding::CodecError::Unencodable { .. }) {
                     crate::encoding::UNENCODABLE_CODE
                 } else {
                     crate::encoding::OUTPUT_LIMIT_CODE
@@ -5442,7 +5447,7 @@ mod tests {
                 Span::new(TextByte(5), TextByte(5)),
                 " one".into(),
             )],
-                    undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -5461,7 +5466,7 @@ mod tests {
                 Span::new(TextByte(9), TextByte(9)),
                 " two".into(),
             )],
-                    undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -5479,7 +5484,7 @@ mod tests {
                 Span::new(TextByte(13), TextByte(13)),
                 " three".into(),
             )],
-                    undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -5563,7 +5568,7 @@ mod tests {
             buffer_id,
             revision,
             ops: vec![edit],
-                    undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         });
         assert!(matches!(
             edited,
@@ -5574,8 +5579,8 @@ mod tests {
                 buffer_id,
                 revision,
                 ops: vec![],
-                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
-        }),
+                undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            }),
             SessionResult::StaleRevision { .. }
         ));
         let edited_revision = session
@@ -5704,8 +5709,8 @@ mod tests {
                     Span::new(TextByte(5), TextByte(5)),
                     " mine".into()
                 )],
-                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
-        }),
+                undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
         let clean_id = match open_to_terminal(&session, clean_path.clone()) {
@@ -5788,8 +5793,8 @@ mod tests {
                 buffer_id,
                 revision,
                 ops: vec![EditOp::new(Span::new(TextByte(5), TextByte(5)), "!".into())],
-                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
-        }),
+                undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
         std::thread::sleep(Duration::from_millis(10));
@@ -5824,8 +5829,8 @@ mod tests {
                     Span::new(TextByte(5), TextByte(5)),
                     suffix.into()
                 )],
-                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
-        }),
+                undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
     }
@@ -6365,8 +6370,8 @@ mod tests {
                     Span::new(TextByte(0), TextByte("See [[note]]".len())),
                     "No link".into(),
                 )],
-                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
-        }),
+                undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
         let rename = session.execute(SessionCommand::RenameNote {
@@ -6627,7 +6632,7 @@ mod tests {
                 Span::new(TextByte(99), TextByte(99)),
                 "x".into(),
             )],
-                    undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         });
         assert!(matches!(bad_edit, SessionResult::Error { .. }));
         assert!(matches!(
@@ -6649,7 +6654,7 @@ mod tests {
             buffer_id,
             revision,
             ops: vec![EditOp::new(Span::new(TextByte(5), TextByte(5)), "!".into())],
-                    undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         });
         let dirty_revision = match changed {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
@@ -6672,8 +6677,8 @@ mod tests {
                 buffer_id,
                 revision,
                 ops: vec![],
-                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
-        }),
+                undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            }),
             SessionResult::StaleRevision { .. }
         ));
         assert!(matches!(
@@ -6733,8 +6738,8 @@ mod tests {
                     Span::new(TextByte(5), TextByte(5)),
                     " mine".into()
                 )],
-                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
-        }),
+                undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            }),
             SessionResult::Success(_)
         ));
 
@@ -6776,7 +6781,8 @@ mod tests {
                 .get_buffer_by_id(buffer_id)
                 .unwrap()
                 .model()
-                .try_to_source_bytes().unwrap(),
+                .try_to_source_bytes()
+                .unwrap(),
             b"hello theirs"
         );
     }
@@ -6827,7 +6833,8 @@ mod tests {
                 .get_buffer_by_id(buffer_id)
                 .unwrap()
                 .model()
-                .try_to_source_bytes().unwrap(),
+                .try_to_source_bytes()
+                .unwrap(),
             b"hello recovered"
         );
         assert!(matches!(
@@ -6874,8 +6881,8 @@ mod tests {
                 buffer_id,
                 revision: Revision::new(revision.as_u64() + 1),
                 ops: vec![],
-                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
-        }),
+                undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            }),
             SessionResult::StaleRevision { .. }
         ));
         let request_id = match session.execute(SessionCommand::SaveNote { path: path.clone() }) {
@@ -6936,7 +6943,7 @@ mod tests {
                 Span::new(TextByte(0), TextByte(0)),
                 "mine ".into(),
             )],
-                    undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         });
         session
             .buffer_manager()
@@ -7007,7 +7014,7 @@ mod tests {
                 Span::new(TextByte(6), TextByte(6)),
                 " edited".into(),
             )],
-                    undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         });
         let new_revision = match applied {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
@@ -7053,8 +7060,8 @@ mod tests {
                     Span::new(TextByte(13), TextByte(13)),
                     " mine".into(),
                 )],
-                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
-        }),
+                undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
         fs.remove(&path).unwrap();
@@ -7142,8 +7149,8 @@ mod tests {
                 buffer_id,
                 revision,
                 ops: vec![EditOp::new(Span::new(TextByte(5), TextByte(5)), "!".into())],
-                        undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
-        }),
+                undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
         assert_eq!(

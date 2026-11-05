@@ -8,13 +8,10 @@
 
 use flavite_buffer::{Buffer, BufferManager, EditOp};
 use flavite_encoding::{
-    CodecError, DecodePolicy, EncodeLimits, FileEncoding, SourceFormat, decode, encode,
+    CodecError, DecodeLimits, DecodePolicy, EncodeLimits, FileEncoding, NOT_CANCELLED,
+    SourceFormat, decode, encode,
 };
 use flavite_syntax::text::{Span, TextByte, TextSnapshot};
-
-fn no_cancel() -> impl FnMut() -> bool {
-    move || false
-}
 
 /// Independent std-only reference encoder for one descriptor. Used to derive
 /// expected output bytes without going through `flavite_encoding::encode`.
@@ -85,8 +82,8 @@ fn fixtures() -> Vec<Fixture> {
         Fixture {
             name: "utf16le+bom",
             bytes: &[
-                0xFF, 0xFE, b'A', 0, 0x3D, 0xD8, 0x00, 0xDE, b'\r', 0, b'\n', 0, b's', 0, b'e',
-                0, b'c', 0, 0x6F, 0, b'n', 0, b'd', 0, b'\n', 0,
+                0xFF, 0xFE, b'A', 0, 0x3D, 0xD8, 0x00, 0xDE, b'\r', 0, b'\n', 0, b's', 0, b'e', 0,
+                b'c', 0, 0x6F, 0, b'n', 0, b'd', 0, b'\n', 0,
             ],
             policy: DecodePolicy::Auto,
             format: SourceFormat::utf16le_with_bom(),
@@ -106,7 +103,9 @@ fn fixtures() -> Vec<Fixture> {
         },
         Fixture {
             name: "utf16le bom-less",
-            bytes: &[b'o', 0, b'n', 0, b'e', 0, b'\n', 0, b't', 0, b'w', 0, b'o', 0],
+            bytes: &[
+                b'o', 0, b'n', 0, b'e', 0, b'\n', 0, b't', 0, b'w', 0, b'o', 0,
+            ],
             policy: DecodePolicy::Explicit(SourceFormat::utf16le()),
             format: SourceFormat::utf16le(),
             decoded: "one\ntwo",
@@ -190,7 +189,12 @@ fn open_edit_serialize_redecode_round_trips_every_format() {
         let expected_normalized = fold_crlf(&expected_decoded);
 
         // The normalized layer saw exactly the edit.
-        assert_eq!(buffer.text(), expected_normalized, "fixture {} text", fixture.name);
+        assert_eq!(
+            buffer.text(),
+            expected_normalized,
+            "fixture {} text",
+            fixture.name
+        );
 
         // Serialization preserves descriptor, BOM and physical EOL bytes.
         let serialized = buffer
@@ -209,11 +213,25 @@ fn open_edit_serialize_redecode_round_trips_every_format() {
         );
 
         // Re-decode under the same descriptor: the edited text round-trips.
-        let redecoded =
-            decode(&serialized, fixture.policy, &Default::default(), &mut no_cancel())
-                .unwrap_or_else(|e| panic!("fixture {} re-decode failed: {e}", fixture.name));
-        assert_eq!(redecoded.text(), expected_decoded, "fixture {} re-decode", fixture.name);
-        assert_eq!(redecoded.format(), fixture.format, "fixture {} format kept", fixture.name);
+        let redecoded = decode(
+            &serialized,
+            fixture.policy,
+            &DecodeLimits::default_envelope(),
+            &NOT_CANCELLED,
+        )
+        .unwrap_or_else(|e| panic!("fixture {} re-decode failed: {e}", fixture.name));
+        assert_eq!(
+            redecoded.text(),
+            expected_decoded,
+            "fixture {} re-decode",
+            fixture.name
+        );
+        assert_eq!(
+            redecoded.format(),
+            fixture.format,
+            "fixture {} format kept",
+            fixture.name
+        );
     }
 }
 
@@ -230,17 +248,17 @@ fn golden_utf16_bytes_for_supplementary_scalar() {
     let text = "A😀\r\n";
     let le = encode(
         text,
-        &SourceFormat::utf16le_with_bom(),
+        SourceFormat::utf16le_with_bom(),
         &EncodeLimits::default_envelope(),
-        &mut no_cancel(),
+        &NOT_CANCELLED,
     )
     .expect("LE encode");
     assert_eq!(le, LE_WITH_BOM);
     let be = encode(
         text,
-        &SourceFormat::utf16be_with_bom(),
+        SourceFormat::utf16be_with_bom(),
         &EncodeLimits::default_envelope(),
-        &mut no_cancel(),
+        &NOT_CANCELLED,
     )
     .expect("BE encode");
     assert_eq!(be, BE_WITH_BOM);
@@ -250,8 +268,13 @@ fn golden_utf16_bytes_for_supplementary_scalar() {
         (LE_WITH_BOM, SourceFormat::utf16le_with_bom()),
         (BE_WITH_BOM, SourceFormat::utf16be_with_bom()),
     ] {
-        let decoded = decode(bytes, DecodePolicy::Auto, &Default::default(), &mut no_cancel())
-            .expect("golden decodes");
+        let decoded = decode(
+            bytes,
+            DecodePolicy::Auto,
+            &DecodeLimits::default_envelope(),
+            &NOT_CANCELLED,
+        )
+        .expect("golden decodes");
         assert_eq!(decoded.text(), text);
         assert_eq!(decoded.format(), format);
     }
@@ -276,7 +299,10 @@ fn format_only_convert_is_isolated_undo_boundary() {
         SourceFormat::utf16le_with_bom()
     );
     let converted = buffer.model().try_to_source_bytes().expect("utf16 encode");
-    assert_eq!(converted, reference_encode("hello world\n", SourceFormat::utf16le_with_bom()));
+    assert_eq!(
+        converted,
+        reference_encode("hello world\n", SourceFormat::utf16le_with_bom())
+    );
 
     // Undo restores the old descriptor too (FR-25).
     let r2 = buffer.model_mut().undo().expect("undo of format boundary");
@@ -294,7 +320,10 @@ fn format_only_convert_is_isolated_undo_boundary() {
         buffer.model().source_format(),
         SourceFormat::utf16le_with_bom()
     );
-    assert_eq!(buffer.model().try_to_source_bytes().expect("utf16 encode"), converted);
+    assert_eq!(
+        buffer.model().try_to_source_bytes().expect("utf16 encode"),
+        converted
+    );
 }
 
 /// A synthetic normalized view can never reset a live disk descriptor, and a
@@ -302,13 +331,13 @@ fn format_only_convert_is_isolated_undo_boundary() {
 #[test]
 fn normalized_views_do_not_reset_live_descriptor() {
     let mut buffer = Buffer::from_snapshot(
-        TextSnapshot::with_policy(
-            &[0xFF, 0xFE, b'o', 0, b'k', 0],
-            DecodePolicy::Auto,
-        )
-        .expect("utf16le+bom"),
+        TextSnapshot::with_policy(&[0xFF, 0xFE, b'o', 0, b'k', 0], DecodePolicy::Auto)
+            .expect("utf16le+bom"),
     );
-    assert_eq!(buffer.model().source_format(), SourceFormat::utf16le_with_bom());
+    assert_eq!(
+        buffer.model().source_format(),
+        SourceFormat::utf16le_with_bom()
+    );
 
     // A plain synthetic view carries no format authority: the live
     // descriptor survives the snapshot replacement.
@@ -322,9 +351,12 @@ fn normalized_views_do_not_reset_live_descriptor() {
     );
 
     // An explicitly tagged draft view does carry its save-format intent.
-    buffer.model_mut().replace_snapshot(
-        TextSnapshot::from_normalized_with_descriptor("tagged", SourceFormat::ascii()),
-    );
+    buffer
+        .model_mut()
+        .replace_snapshot(TextSnapshot::from_normalized_with_descriptor(
+            "tagged",
+            SourceFormat::ascii(),
+        ));
     assert_eq!(buffer.model().source_format(), SourceFormat::ascii());
 }
 
@@ -339,15 +371,16 @@ fn unencodable_ascii_conversion_leaves_draft_intact() {
         .try_convert_source_format(SourceFormat::ascii())
         .expect_err("emoji is unencodable as strict ASCII");
     assert!(
-        matches!(
-            error,
-            CodecError::Unencodable { .. } | CodecError::AsciiViolation { .. }
-        ),
+        matches!(error, CodecError::Unencodable { .. }),
         "typed unencodable error, got {error:?}"
     );
     assert_eq!(buffer.text(), "emoji 😀 here\n", "content intact");
     assert_eq!(buffer.model().source_format(), SourceFormat::utf8());
-    assert_eq!(buffer.revision(), revision, "refused conversion changes nothing");
+    assert_eq!(
+        buffer.revision(),
+        revision,
+        "refused conversion changes nothing"
+    );
 }
 
 /// The manager's no-empty-fallback contract: malformed bytes produce a typed
@@ -362,7 +395,10 @@ fn manager_never_creates_a_buffer_from_malformed_bytes() {
         .open_note(path.clone(), b"\xff\xfe\x00", DecodePolicy::Auto)
         .expect_err("truncated code unit is malformed");
     assert_eq!(error, CodecError::OddUtf16ByteCount);
-    assert!(manager.get_buffer(&path).is_none(), "no empty fallback buffer");
+    assert!(
+        manager.get_buffer(&path).is_none(),
+        "no empty fallback buffer"
+    );
 
     // Invalid UTF-8 is a typed error with its source position.
     let error = manager
@@ -390,8 +426,8 @@ fn manager_never_creates_a_buffer_from_malformed_bytes() {
     );
 
     // A pre-validated snapshot attaches without a second decode.
-    let snapshot = TextSnapshot::with_policy(b"already decoded\n", DecodePolicy::Auto)
-        .expect("valid utf8");
+    let snapshot =
+        TextSnapshot::with_policy(b"already decoded\n", DecodePolicy::Auto).expect("valid utf8");
     let (attached, _transition) = manager.open_note_snapshot(path.with_extension("md2"), snapshot);
     assert_eq!(attached.text(), "already decoded\n");
 }

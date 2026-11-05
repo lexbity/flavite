@@ -5,18 +5,21 @@
 //! registry and installs candidates only when the buffer, incarnation and
 //! revision still match. One prepared replacement is one revision-guarded
 //! batch and one isolated Undo unit; invalid preparation has zero note
-//! effects. Regex capability is absent until S03 — this module is literal
-//! only and says so.
+//! effects. Matching semantics are the canonical `flavite-text-search`
+//! matcher (Unicode simple folding, UAX #29 whole-word, frozen scope);
+//! regex capability is absent until S03 — this module is literal only and
+//! says so.
 
 use flavite_buffer::revision::{BufferId, Revision};
 use flavite_buffer::undo::EditOp;
 use flavite_syntax::text::{Span, TextByte};
-use flavite_text_search::matcher::{MatchMode, MatchOptions, find_matches_checked};
+use flavite_text_search::matcher::{MatchLimits, MatchMode, MatchOptions, Matcher};
+use flavite_text_search::template::{ReplacementTemplate, TemplateGrammar};
 
 /// NFR-8: at most one million matches per job.
-pub const MAX_MATCHES_PER_JOB: u64 = 1_000_000;
+pub const MAX_MATCHES_PER_JOB: usize = flavite_text_search::matcher::DEFAULT_MAX_MATCHES;
 /// NFR-8/NFR-19: per-note normalized replacement output bound.
-pub const MAX_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 /// D-05: an empty query is Idle, not "match everywhere".
 pub const IDLE_QUERY: &str = "query is empty: find is idle";
 
@@ -37,14 +40,14 @@ pub struct ReplaceRequest {
 }
 
 /// Typed preparation failure (never a partial or lossy outcome).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum PrepareError {
-    /// The query is empty (Idle) or exceeds the 8 KiB bound (NFR-8).
+    /// The query is empty (Idle) or exceeds the pattern bound (NFR-8).
     InvalidQuery(&'static str),
-    /// The frozen scope is out of bounds or not char-boundary aligned.
-    InvalidScope,
-    /// The matcher refused the options.
+    /// The matcher refused the options/pattern.
     Matcher(flavite_text_search::matcher::MatchError),
+    /// The replacement template was refused before any edit exists.
+    Template(flavite_text_search::template::TemplateError),
     /// More matches than the job bound; never silently truncated.
     MatchLimitExceeded,
     /// The serialized output would exceed the per-note bound (NFR-8/19).
@@ -53,8 +56,8 @@ pub enum PrepareError {
 
 /// The pure prepare step, executed on a prepare worker against the exact
 /// immutable snapshot text. Returns ascending, non-overlapping edit
-/// operations over the ORIGINAL text plus the match count; the combined
-/// output bound is checked before any edit exists.
+/// operations over the ORIGINAL text plus the match count and the plan
+/// digest; the combined output bound is checked before any edit exists.
 ///
 /// # Errors
 ///
@@ -62,91 +65,89 @@ pub enum PrepareError {
 pub fn prepare_ops(
     text: &str,
     request: &ReplaceRequest,
-) -> Result<(Vec<EditOp>, u64), PrepareError> {
-    if request.query.is_empty() {
-        return Err(PrepareError::InvalidQuery(IDLE_QUERY));
-    }
-    if request.query.len() > flavite_text_search::matcher::MAX_QUERY_BYTES {
-        return Err(PrepareError::InvalidQuery(
-            "query exceeds the 8 KiB bound",
-        ));
-    }
-    let (scope_start, scope_text) = match request.scope {
-        Some((start, end)) => {
-            if start > end || end > text.len() {
-                return Err(PrepareError::InvalidScope);
-            }
-            let Some(scope_text) = text.get(start..end) else {
-                return Err(PrepareError::InvalidScope);
-            };
-            (start, scope_text)
-        }
-        None => (0usize, text),
-    };
+) -> Result<(Vec<EditOp>, u64, u64), PrepareError> {
     let options = MatchOptions {
         mode: MatchMode::Literal,
-        query: request.query.clone(),
         case_sensitive: request.case_sensitive,
         whole_word: request.whole_word,
     };
-    let result = find_matches_checked(scope_text, &options, MAX_MATCHES_PER_JOB)
-        .map_err(PrepareError::Matcher)?;
-    if result.truncated {
-        // Counting may be pending in the UI, but a prepared batch must be
-        // exact: exceeding the bound refuses instead of silently stopping.
+    let matcher = Matcher::new(
+        &request.query,
+        options,
+        MatchLimits {
+            max_matches: MAX_MATCHES_PER_JOB,
+        },
+    )
+    .map_err(|error| match error {
+        flavite_text_search::matcher::MatchError::EmptyQuery => {
+            PrepareError::InvalidQuery(IDLE_QUERY)
+        }
+        flavite_text_search::matcher::MatchError::PatternTooLong { .. } => {
+            PrepareError::InvalidQuery("query exceeds the 8 KiB pattern bound")
+        }
+        other => PrepareError::Matcher(other),
+    })?;
+    let template = ReplacementTemplate::new(&request.replacement, TemplateGrammar::Literal)
+        .map_err(|error| match error {
+            // NFR-8: the replacement itself exceeds the 64 KiB bound —
+            // refused before any edit exists.
+            flavite_text_search::template::TemplateError::TooLong { .. } => {
+                PrepareError::OutputLimitExceeded
+            }
+            other => PrepareError::Template(other),
+        })?;
+    let scope = request
+        .scope
+        .map(|(start, end)| Span::new(TextByte(start), TextByte(end)));
+    let hits = matcher.find_in(text, scope).map_err(|error| match error {
+        flavite_text_search::matcher::MatchError::LimitExceeded { .. } => {
+            PrepareError::MatchLimitExceeded
+        }
+        other => PrepareError::Matcher(other),
+    })?;
+    // Counting may be pending in the UI, but a prepared batch must be
+    // exact: exceeding the bound refuses instead of silently stopping.
+    if hits.len() >= MAX_MATCHES_PER_JOB {
         return Err(PrepareError::MatchLimitExceeded);
     }
-    let mut ops = Vec::with_capacity(result.matches.len());
-    let mut match_bytes = 0u64;
-    for hit in &result.matches {
-        let start = scope_start + hit.range.start.0;
-        let end = scope_start + hit.range.start.0 + hit.length;
-        if end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
-            return Err(PrepareError::InvalidScope);
-        }
-        match_bytes = match_bytes
-            .checked_add(hit.length as u64)
-            .ok_or(PrepareError::OutputLimitExceeded)?;
-        ops.push(EditOp::new(
-            Span::new(TextByte(start), TextByte(end)),
-            request.replacement.clone(),
-        ));
-    }
-    let output_len = flavite_text_search::template::expanded_output_len(
-        text.len() as u64,
-        &request.replacement,
-        ops.len() as u64,
-        match_bytes,
-    )
-    .ok_or(PrepareError::OutputLimitExceeded)?;
-    if output_len > MAX_OUTPUT_BYTES {
-        return Err(PrepareError::OutputLimitExceeded);
-    }
-    let count = ops.len() as u64;
-    Ok((ops, count))
+    // Exact output bound before any edit exists (D-06/§6.2).
+    template
+        .total_output_len(text.len(), &matcher, &hits, MAX_OUTPUT_BYTES)
+        .map_err(|error| match error {
+            flavite_text_search::template::TemplateError::LengthOverflow => {
+                PrepareError::OutputLimitExceeded
+            }
+            flavite_text_search::template::TemplateError::OutputTooLarge { .. } => {
+                PrepareError::OutputLimitExceeded
+            }
+            other => PrepareError::Template(other),
+        })?;
+    // Literal replacement treats `$` verbatim: every match expands to the
+    // raw template text (D-05). Regex capture expansion is S03's grammar.
+    let replacement = template.raw().to_owned();
+    let ops = hits
+        .iter()
+        .map(|hit| EditOp::new(hit.span, replacement.clone()))
+        .collect();
+    let count = hits.len() as u64;
+    Ok((ops, count, plan_digest(request, &options, &template)))
 }
 
-/// FNV-1a 64 over the canonical options encoding: the digest is part of the
-/// plan identity (D-05: scope and options are part of the plan digest).
-#[must_use]
-pub fn options_digest(request: &ReplaceRequest) -> u64 {
-    let mut canonical = String::new();
-    canonical.push_str("literal\u{1}");
-    canonical.push_str(&request.query);
-    canonical.push('\u{1}');
-    canonical.push_str(&request.replacement);
-    canonical.push('\u{1}');
-    canonical.push_str(if request.case_sensitive { "cs" } else { "ci" });
-    canonical.push_str(if request.whole_word { "ww" } else { "" });
+/// Plan digest (D-05: scope and options are part of the plan identity).
+/// Composed from the canonical matcher/template digests plus the frozen
+/// scope — never a second matching-semantics system.
+fn plan_digest(
+    request: &ReplaceRequest,
+    options: &MatchOptions,
+    template: &ReplacementTemplate,
+) -> u64 {
+    let mut hash = options.digest() ^ template.digest();
     if let Some((start, end)) = request.scope {
-        canonical.push_str(&format!("\u{1}{start}..{end}"));
+        for byte in format!("{start}..{end}").as_bytes() {
+            hash = hash.rotate_left(8) ^ u64::from(*byte);
+        }
     }
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in canonical.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    hash ^ u64::from(request.scope.is_some())
 }
 
 #[cfg(test)]
@@ -168,7 +169,7 @@ mod tests {
     #[test]
     fn prepare_finds_ascending_non_overlapping_matches() {
         let text = "aa bb aa";
-        let (ops, count) = prepare_ops(text, &request("aa", "X")).expect("prepare");
+        let (ops, count, _digest) = prepare_ops(text, &request("aa", "X")).expect("prepare");
         assert_eq!(count, 2);
         assert_eq!(ops[0].range.start.0, 0);
         assert_eq!(ops[1].range.start.0, 6);
@@ -177,11 +178,11 @@ mod tests {
 
     #[test]
     fn empty_query_is_idle_and_limits_are_typed() {
-        assert_eq!(
-            prepare_ops("text", &request("", "X")),
-            Err(PrepareError::InvalidQuery(IDLE_QUERY))
-        );
-        let long = "a".repeat(flavite_text_search::matcher::MAX_QUERY_BYTES + 1);
+        match prepare_ops("text", &request("", "X")) {
+            Err(PrepareError::InvalidQuery(message)) => assert_eq!(message, IDLE_QUERY),
+            other => panic!("expected idle query, got {other:?}"),
+        }
+        let long = "a".repeat(flavite_text_search::matcher::PATTERN_MAX_BYTES + 1);
         assert!(matches!(
             prepare_ops("text", &request(&long, "X")),
             Err(PrepareError::InvalidQuery(_))
@@ -189,10 +190,22 @@ mod tests {
     }
 
     #[test]
-    fn scope_is_frozen_and_output_bound_checked() {
-        let (ops, count) = prepare_ops("aa|aa", &request("aa", "X")).expect("full");
+    fn case_insensitive_uses_simple_folding() {
+        // D-05: Unicode SIMPLE folding — ß never equals ss; accents fold
+        // through the canonical matcher engine.
+        let (ops, count, _) =
+            prepare_ops("Straße STRASSE École", &request("straße", "X")).expect("prepare");
+        assert_eq!(count, 1);
+        assert_eq!(ops[0].range.start.0, 0);
+        let (_, count, _) = prepare_ops("école ÉCOLE", &request("école", "X")).expect("prepare");
         assert_eq!(count, 2);
-        let (scoped, count) = prepare_ops(
+    }
+
+    #[test]
+    fn scope_is_frozen_and_output_bound_checked() {
+        let (_ops, count, _) = prepare_ops("aa|aa", &request("aa", "X")).expect("full");
+        assert_eq!(count, 2);
+        let (scoped, count, _) = prepare_ops(
             "aa|aa",
             &ReplaceRequest {
                 scope: Some((3, 5)),
@@ -204,11 +217,10 @@ mod tests {
         assert_eq!(scoped[0].range.start.0, 3);
 
         let huge = "a".repeat(64 * 1024 * 1024);
-        let text = "match".to_owned();
         let mut req = request("match", "X");
         req.replacement = huge;
         assert!(matches!(
-            prepare_ops(&text, &req),
+            prepare_ops("match", &req),
             Err(PrepareError::OutputLimitExceeded)
         ));
     }

@@ -9,7 +9,9 @@
 use blake3::hash;
 use flavite_buffer::undo::UndoPolicy;
 use flavite_buffer::{BufferId, BufferManager, EditOp, Revision};
-use flavite_encoding::{DecodePolicy, FileEncoding, SourceFormat, decode};
+use flavite_encoding::{
+    DecodeLimits, DecodePolicy, FileEncoding, NOT_CANCELLED, SourceFormat, decode,
+};
 use flavite_fs::{Fs, MemFs};
 use flavite_index::{IndexActor, open_or_init};
 use flavite_syntax::text::{Span, TextByte};
@@ -22,10 +24,6 @@ use flavite_vault::types::{VaultConfig, VaultIdentity};
 use flavite_vault::{VaultActorBuilder, VaultActorHandle};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-fn no_cancel() -> impl FnMut() -> bool {
-    move || false
-}
 
 /// Independent std-only UTF-16 reference encoder (never the codec under test).
 fn reference_utf16(text: &str, le: bool, bom: bool) -> Vec<u8> {
@@ -129,10 +127,7 @@ fn expect_success(result: SessionResult, what: &str) -> CommandResult {
 
 fn expect_action_required(result: SessionResult, code: &'static str) -> Option<String> {
     match result {
-        SessionResult::ActionRequired {
-            code: got,
-            data,
-        } if got == code => data,
+        SessionResult::ActionRequired { code: got, data } if got == code => data,
         other => panic!("expected ActionRequired({code}), got {other:?}"),
     }
 }
@@ -149,10 +144,7 @@ fn open_to_terminal(session: &Session, path: PathBuf) -> SessionResult {
 }
 
 fn save_to_terminal(session: &Session, path: PathBuf) -> SessionResult {
-    wait_terminal(
-        session,
-        session.execute(SessionCommand::SaveNote { path }),
-    )
+    wait_terminal(session, session.execute(SessionCommand::SaveNote { path }))
 }
 
 fn opened_id_revision(result: &CommandResult) -> (BufferId, Revision) {
@@ -168,10 +160,7 @@ fn opened_id_revision(result: &CommandResult) -> (BufferId, Revision) {
 /// Open a note and return its (buffer id, revision, normalized text, format).
 #[track_caller]
 fn open_note(session: &Session, path: &Path) -> (BufferId, Revision, String, SourceFormat) {
-    let opened = expect_success(
-        open_to_terminal(session, path.to_path_buf()),
-        "note.open",
-    );
+    let opened = expect_success(open_to_terminal(session, path.to_path_buf()), "note.open");
     let (buffer_id, revision) = opened_id_revision(&opened);
     let snapshot = session
         .shared_buffer_snapshot(buffer_id, None)
@@ -213,27 +202,32 @@ fn utf16le_bom_open_edit_save_preserves_descriptor_and_bytes() {
     };
 
     let saved = expect_success(save_to_terminal(&h.session, path.clone()), "save");
-    let CommandResult::NoteSaved { hash: saved_hash, .. } = saved else {
+    let CommandResult::NoteSaved {
+        hash: saved_hash, ..
+    } = saved
+    else {
         panic!("expected NoteSaved, got {saved:?}");
     };
     assert_eq!(
         saved_hash,
-        hash(&reference_utf16("A😀\r\nXecond\n", true, true)).as_bytes().to_vec()
+        hash(&reference_utf16("A😀\r\nXecond\n", true, true))
+            .as_bytes()
+            .to_vec()
     );
 
     // The disk bytes are UTF-16LE with BOM and carry exactly the edit.
-    let on_disk = h
-        .fs
-        .read_if_exists(&path)
-        .expect("read")
-        .expect("note exists after save");
-    assert_eq!(
-        &on_disk[..2],
-        &[0xFF, 0xFE],
-        "BOM preserved byte-exactly"
-    );
-    let redecoded = decode(&on_disk, DecodePolicy::Auto, &Default::default(), &mut no_cancel())
-        .expect("saved bytes decode");
+    let on_disk =
+        h.fs.read_if_exists(&path)
+            .expect("read")
+            .expect("note exists after save");
+    assert_eq!(&on_disk[..2], &[0xFF, 0xFE], "BOM preserved byte-exactly");
+    let redecoded = decode(
+        &on_disk,
+        DecodePolicy::Auto,
+        &DecodeLimits::default_envelope(),
+        &NOT_CANCELLED,
+    )
+    .expect("saved bytes decode");
     assert_eq!(redecoded.text(), "A😀\r\nXecond\n");
     assert_eq!(redecoded.format(), SourceFormat::utf16le_with_bom());
     assert!(redecoded.text().contains("\r\n"), "CRLF preserved");
@@ -285,7 +279,11 @@ fn reopen_encoding_binds_hint_and_preserves_text() {
         .session
         .shared_buffer_snapshot(buffer_id, None)
         .expect("snapshot after reopen");
-    assert_eq!(snapshot.text.to_string(), "bom note body\n", "text unchanged");
+    assert_eq!(
+        snapshot.text.to_string(),
+        "bom note body\n",
+        "text unchanged"
+    );
     // `auto` strips the matching signature for the requested family.
     assert_eq!(snapshot.source_format, SourceFormat::utf8_with_bom());
 
@@ -314,7 +312,10 @@ fn reopen_encoding_refuses_dirty_buffer() {
     let result = h.session.execute(SessionCommand::ApplyEdits {
         buffer_id,
         revision,
-        ops: vec![EditOp::new(Span::new(TextByte(0), TextByte(0)), "draft ".to_owned())],
+        ops: vec![EditOp::new(
+            Span::new(TextByte(0), TextByte(0)),
+            "draft ".to_owned(),
+        )],
         undo_policy: UndoPolicy::Isolated,
     });
     expect_success(result, "apply edits");
@@ -336,10 +337,10 @@ fn reopen_encoding_refuses_dirty_buffer() {
     assert_eq!(snapshot.text.to_string(), "draft saved base\n");
     let view = h.session.encoding_hints();
     assert!(
-        view.record
+        !view
+            .record
             .entries
-            .get(&hex::encode(native_note_key(&path, &h.root)))
-            .is_none(),
+            .contains_key(&hex::encode(native_note_key(&path, &h.root))),
         "a refused reopen binds no hint"
     );
 }
@@ -370,7 +371,8 @@ fn reopen_encoding_refuses_stale_source() {
 fn convert_encoding_then_save_writes_utf16be_bom() {
     let h = harness();
     let path = h.root.join("convert.md");
-    h.fs.write_new(&path, b"# converted\n\nbody\n").expect("seed");
+    h.fs.write_new(&path, b"# converted\n\nbody\n")
+        .expect("seed");
     let (buffer_id, revision, text, format) = open_note(&h.session, &path);
     assert_eq!(format, SourceFormat::utf8());
     assert_eq!(text, "# converted\n\nbody\n");
@@ -395,18 +397,26 @@ fn convert_encoding_then_save_writes_utf16be_bom() {
         .session
         .shared_buffer_snapshot(buffer_id, None)
         .expect("snapshot after convert");
-    assert_eq!(snapshot.text.to_string(), text, "text unchanged by conversion");
+    assert_eq!(
+        snapshot.text.to_string(),
+        text,
+        "text unchanged by conversion"
+    );
     assert_eq!(snapshot.source_format, SourceFormat::utf16be_with_bom());
 
     expect_success(save_to_terminal(&h.session, path.clone()), "save");
-    let on_disk = h
-        .fs
-        .read_if_exists(&path)
-        .expect("read")
-        .expect("note exists");
+    let on_disk =
+        h.fs.read_if_exists(&path)
+            .expect("read")
+            .expect("note exists");
     assert_eq!(&on_disk[..2], &[0xFE, 0xFF], "UTF-16BE BOM on disk");
-    let redecoded = decode(&on_disk, DecodePolicy::Auto, &Default::default(), &mut no_cancel())
-        .expect("saved bytes decode");
+    let redecoded = decode(
+        &on_disk,
+        DecodePolicy::Auto,
+        &DecodeLimits::default_envelope(),
+        &NOT_CANCELLED,
+    )
+    .expect("saved bytes decode");
     assert_eq!(redecoded.text(), "# converted\n\nbody\n");
     assert_eq!(redecoded.format(), SourceFormat::utf16be_with_bom());
 }
@@ -418,7 +428,8 @@ fn malformed_open_requires_choice_and_installs_nothing() {
     let h = harness();
     let malformed: &[u8] = b"plain \xff bytes\n";
     let path = h.root.join("broken.md");
-    h.fs.write_new(&path, malformed).expect("seed malformed note");
+    h.fs.write_new(&path, malformed)
+        .expect("seed malformed note");
 
     let result = open_to_terminal(&h.session, path.clone());
     let data = expect_action_required(result, "encoding-choice-required");

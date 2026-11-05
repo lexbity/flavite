@@ -10,7 +10,6 @@ use std::{
 #[derive(Default)]
 pub struct ReadingHost {
     pub notes: BTreeMap<TabId, ReadEntry>,
-    pub find: BTreeMap<TabId, FindState>,
     pub navigation: BTreeMap<flavite_workspace::NoteLocator, String>,
     pub anchor_requests: BTreeMap<RequestToken, TabId>,
     pub attachment_opens: BTreeMap<RequestToken, (TabId, Arc<ReadSnapshot>)>,
@@ -23,13 +22,6 @@ pub struct ReadingHost {
     pub scroll: BTreeMap<TabId, f32>,
     pub pending_anchor: BTreeMap<TabId, usize>,
 }
-#[derive(Default)]
-pub struct FindState {
-    pub focused: bool,
-    pub query: String,
-    pub index: usize,
-}
-
 pub struct ReadEntry {
     pub stamp: (u64, u64, u64),
     pub pending: Option<RequestToken>,
@@ -216,9 +208,6 @@ pub fn sync(app: &mut App) {
         .blocks
         .retain(|(tab, _), _| app.workspace.tab(tab).is_some());
     app.reading
-        .find
-        .retain(|tab, _| app.workspace.tab(tab).is_some());
-    app.reading
         .property_drafts
         .retain(|(tab, _), _| app.workspace.tab(tab).is_some());
     app.reading
@@ -395,48 +384,6 @@ pub fn bound_navigation(app: &App, tab: TabId, doc: &Arc<ReadSnapshot>) -> bool 
 pub fn handle(app: &mut App, message: crate::app::Message) -> iced::Task<crate::app::Message> {
     use crate::app::Message;
     match message {
-        Message::FindOpen(tab) => {
-            if is_edit(app, tab)
-                && let Some(view) = app.note_editor_view(tab)
-                && let Some(session) = app.workspace.tab(&tab)
-            {
-                let mut input = session.interaction().clone();
-                input.buffer_id = Some(view.buffer_id);
-                input.revision = view.revision;
-                input.sequence = input.sequence.saturating_add(1);
-                input.focused = false;
-                let _ = app.workspace.acknowledge_interaction(input, &view.text);
-            }
-            app.reading.find.entry(tab).or_default().focused = true;
-            app.refresh_semantics();
-            return iced::widget::operation::focus(find_id(tab));
-        }
-        Message::FindClose(tab) => {
-            app.reading.find.remove(&tab);
-        }
-        Message::FindQuery { tab, query } => {
-            if query.len() <= 8192
-                && let Some(find) = app.reading.find.get_mut(&tab)
-            {
-                find.focused = true;
-                find.query = query;
-                find.index = 0;
-                navigate_find(app, tab);
-            }
-        }
-        Message::FindNext { tab, forward } => {
-            let count = find_matches(app, tab).len();
-            if count > 0
-                && let Some(find) = app.reading.find.get_mut(&tab)
-            {
-                find.index = if forward {
-                    (find.index + 1) % count
-                } else {
-                    (find.index + count - 1) % count
-                };
-                navigate_find(app, tab);
-            }
-        }
         Message::ToggleNoteMode(tab) => {
             if app.has_composition() || !app.is_tab_visible(tab) {
                 return iced::Task::none();
@@ -882,38 +829,6 @@ pub fn scroll_pending(app: &mut App) -> iced::Task<crate::app::Message> {
     }
     iced::Task::batch(tasks)
 }
-pub fn find_matches(app: &App, tab: TabId) -> Vec<usize> {
-    let Some(find) = app.reading.find.get(&tab) else {
-        return Vec::new();
-    };
-    if find.query.is_empty() {
-        return Vec::new();
-    }
-    app.note_editor_view(tab).map_or_else(Vec::new, |view| {
-        view.text
-            .match_indices(&find.query)
-            .map(|(at, _)| at)
-            .take(10_000)
-            .collect()
-    })
-}
-fn navigate_find(app: &mut App, tab: TabId) {
-    let matches = find_matches(app, tab);
-    if let Some(find) = app.reading.find.get(&tab)
-        && let Some(at) = matches.get(find.index % matches.len().max(1)).copied()
-        && let Some(view) = app.note_editor_view(tab)
-    {
-        let _ = app.workspace.set_display_selection(
-            tab,
-            at,
-            at + find.query.len(),
-            view.revision,
-            &view.text,
-        );
-        app.reading.pending_anchor.insert(tab, at);
-    }
-}
-
 pub fn observe_control<'a>(
     tab: TabId,
     doc: &Arc<ReadSnapshot>,
@@ -931,8 +846,4 @@ pub fn observe_control<'a>(
             rect,
         }
     })
-}
-
-pub fn find_id(tab: TabId) -> iced::widget::Id {
-    iced::widget::Id::from(format!("find-current-{}", tab.raw()))
 }

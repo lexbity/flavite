@@ -418,9 +418,7 @@ impl CliDriver {
             let request_id = flavite.command_registry().next_request_id();
             let result = flavite.execute(Invocation::new(request_id, id, args, Origin::Cli));
             Ok(match result {
-                ExecutionResult::Pending { request_id } => {
-                    flavite.wait_for_operation(request_id)
-                }
+                ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
                 result => result,
             })
         };
@@ -431,8 +429,8 @@ impl CliDriver {
                     // change between observation and reopen is a typed
                     // stale-source refusal, never a decode of unseen bytes.
                     let abs = flavite.vault_ref().root.join(&note);
-                    let bytes =
-                        std::fs::read(&abs).with_context(|| format!("reading {}", abs.display()))?;
+                    let bytes = std::fs::read(&abs)
+                        .with_context(|| format!("reading {}", abs.display()))?;
                     let raw_hash = hex::encode(blake3::hash(&bytes).as_bytes());
                     let result = run(
                         "note.reopen_encoding",
@@ -451,8 +449,7 @@ impl CliDriver {
                     .into_success()
                     .and_then(|success| success.data.get("buffer_id").and_then(|v| v.as_u64()))
                     .context("open returned no buffer id")?;
-                let view =
-                    flavite.get_buffer_view(flavite_api::BufferId::from(buffer_id), None)?;
+                let view = flavite.get_buffer_view(flavite_api::BufferId::from(buffer_id), None)?;
                 let format = view.source_format;
                 let describe = format!(
                     "{}{}",
@@ -503,7 +500,7 @@ impl CliDriver {
                     converted.is_success(),
                     "conversion was refused: {converted:?}"
                 );
-                let saved = run("note.save", serde_json::json!({ "path": note }))?;
+                let saved = run("note.save", serde_json::json!(note))?;
                 anyhow::ensure!(saved.is_success(), "save did not complete: {saved:?}");
                 if self.json {
                     println!(
@@ -517,7 +514,11 @@ impl CliDriver {
                         }))?
                     );
                 } else {
-                    println!("{}: converted to {code}{} and saved", note.display(), bom.arg());
+                    println!(
+                        "{}: converted to {code}{} and saved",
+                        note.display(),
+                        bom.arg()
+                    );
                 }
             }
         }

@@ -8,14 +8,15 @@
 pub mod appearance;
 pub mod closing;
 pub mod commands;
-pub mod encoding;
 pub mod context;
 pub mod dialogs;
 pub mod documents;
+pub mod encoding;
 pub mod env;
 pub mod graph;
 pub mod linking;
 pub mod navigation;
+pub mod note_search;
 pub mod occurrences;
 pub mod persistence;
 pub mod shell;

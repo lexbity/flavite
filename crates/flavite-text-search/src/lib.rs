@@ -1,38 +1,45 @@
 #![forbid(unsafe_code)]
-
-//! Tier 1 — source matching (RFC-0006 §4.1, D-05, §6.2).
+//! Pure source matching for note and vault Find/Replace (RFC-0006 §4.1,
+//! §6.2, D-05).
 //!
-//! This crate owns **exactly** the source-matching domain from the §4.1
-//! extraction contract: literal (and, from S03, regex) source matches, match
-//! options, capture data and replacement-template expansion, plus the checked
-//! output-length arithmetic used before any replacement is built. It owns no
-//! editor or buffer authority: no revisions, no Undo, no position maps, no
-//! mutation grants, no caret/selection model and no UI. Callers convert match
-//! spans into edits through the existing buffer/API boundaries
-//! (`flavite-vault`/`flavite-api` adapt them to `EditOp`; this crate never
-//! does).
+//! Ownership boundary: this crate owns [`matcher::MatchOptions`],
+//! [`template::ReplacementTemplate`], match pages, capture metadata and
+//! replacement-template expansion **only**. It does not own edits, cursors,
+//! selection models, position maps, Markdown commands, revisions or any
+//! mutation authority, and it must never gain a dependency on editor,
+//! buffer, API, vault, index, Fs, workspace or iced (§4 architecture
+//! configuration is authoritative).
 //!
-//! The matcher **borrows** already-normalized UTF-8 (`&str`) from an existing
-//! [`flavite_syntax::text::TextSnapshot`] (typically
-//! [`flavite_syntax::text::TextSnapshot::from_normalized`] or
-//! `.text()`). It never normalizes input again, never copies the text into a
-//! second container and never allocates an owned snapshot of its own.
-//! Matches are returned as [`flavite_syntax::Span`] ranges of
-//! [`flavite_syntax::text::TextByte`] — the canonical normalized-text
-//! coordinates — so callers map them back to source bytes with the same
-//! snapshot they borrowed (`TextSnapshot::span_to_source`). There is no
-//! second offset model in this crate.
+//! The matcher borrows immutable normalized UTF-8 (an existing
+//! `TextSnapshot`'s text); it never creates a competing text container.
+//! Runtime matches use `flavite-syntax::Span<TextByte>`, and capture values
+//! are slices of the same source lifetime.
 //!
-//! S01 scope is **literal only** ([`matcher::MatchMode::Literal`]): case
-//! folding approximates Rust-regex Unicode *simple* folding, whole-word
-//! filtering uses UAX #29 word segments (pinned `unicode-segmentation`), and
-//! replacement templates are taken verbatim (`$` is literal, D-05). The
-//! regex mode arrives with the S03 helper process; nothing in this crate
-//! registers regex capability today.
+//! Semantics pinned by D-05:
 //!
-//! Per the S01 source gates, this crate spells `flavite_syntax` paths out
-//! fully instead of `use flavite_*` imports, and its dependency list is
-//! limited to `flavite-syntax` plus the pinned segmentation crate.
+//! * Literal/regex operate on serialized Markdown source; a literal empty
+//!   query is Idle (no matches), while zero-length regex matches are
+//!   allowed at UTF-8 scalar boundaries and emitted once per location in
+//!   ascending order.
+//! * Case-insensitive literal matching is Rust regex Unicode **simple**
+//!   folding — no accent stripping and no canonical normalization (`ß`
+//!   does not equal `ss`; composed/decomposed accents remain distinct).
+//!   Regex mode is the Rust `regex` language with Unicode on, multiline
+//!   anchors on and dot-newline off unless inline flags request it; inline
+//!   flags override the case option.
+//! * Whole word requires both match endpoints to be UAX #29 word-segment
+//!   boundaries (shared primitives in `flavite-syntax::text`).
+//! * Replacement syntax is literal when regex is off; with the dollar
+//!   grammar, `$0`/`$1`/`${name}`/`$$` are recognized and unknown groups,
+//!   dangling `$` and malformed braces are validation errors before any
+//!   edit.
 
 pub mod matcher;
 pub mod template;
+
+pub use matcher::{
+    DEFAULT_MAX_MATCHES, MATCH_SEMANTICS_VERSION, Match, MatchError, MatchLimits, MatchMode,
+    MatchOptions, MatchPage, Matcher, PATTERN_MAX_BYTES, REGEX_MAX_GROUPS, REGEX_SIZE_LIMIT_BYTES,
+    select_ordinals,
+};
+pub use template::{ReplacementTemplate, TEMPLATE_MAX_BYTES, TemplateError, TemplateGrammar};

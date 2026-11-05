@@ -1,23 +1,21 @@
 [package]
 name = "flavite-encoding"
-description = "Strict ASCII/UTF-8/UTF-16 codecs, source-format descriptors and encoded↔decoded byte maps (RFC-0006 D-15). Std-only, IO-free."
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-
-[lints]
-workspace = true
+description = "Strict ASCII/UTF-8/UTF-16 codecs, SourceFormat descriptor and encoded↔decoded byte maps; pure, IO-free (RFC-0006 §6.10, D-15)"
 
 [features]
-default = []
-# Optional serialization derives for persisted descriptors only. The codec
-# operation itself stays standard-library-only (RFC-0006 §2 D-15).
+# Optional validated serialization of SourceFormat using the existing
+# workspace serde. Contains no codec behavior (§6.10).
 serde = ["dep:serde"]
 
 [dependencies]
 serde = { workspace = true, optional = true }
 
 [dev-dependencies]
-proptest.workspace = true
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -57,7 +57,7 @@ pub fn project(app: &App) -> Projection {
         .tabs()
         .filter(|(t, _)| app.is_tab_visible(**t))
     {
-        if let Some(find) = app.reading.find.get(tab) {
+        if let Some(find) = app.note_search.finds.get(tab) {
             let id = node_id("find-query", tab.raw());
             let mut node = Node::new(Role::TextInput);
             node.set_label("Find in current note, including unsaved changes");
@@ -85,6 +85,39 @@ pub fn project(app: &App) -> Projection {
                     },
                 ),
                 ("find-close", "Close find", NodeTarget::FindClose(*tab)),
+            ] {
+                let id = node_id(role, tab.raw());
+                let mut node = Node::new(Role::Button);
+                node.set_label(label);
+                node.add_action(Action::Click);
+                out.actions.insert(id, target);
+                out.push(id, node);
+                out.roots.push(id);
+            }
+        }
+        if let Some(replace) = app.note_search.replaces.get(tab) {
+            // RFC-0006 S01: replacement controls ride the same catalog, so
+            // native input and AT act on exactly the mounted rows.
+            let id = node_id("replace-input", tab.raw());
+            let mut node = Node::new(Role::TextInput);
+            node.set_label("Replace with");
+            node.set_value(replace.replacement.clone());
+            node.add_action(Action::Focus);
+            node.add_action(Action::SetValue);
+            out.actions.insert(id, NodeTarget::ReplaceInput(*tab));
+            out.push(id, node);
+            out.roots.push(id);
+            for (role, label, target) in [
+                (
+                    "replace-next",
+                    "Replace next match",
+                    NodeTarget::ReplaceNext(*tab),
+                ),
+                (
+                    "replace-all",
+                    "Replace all matches",
+                    NodeTarget::ReplaceAll(*tab),
+                ),
             ] {
                 let id = node_id(role, tab.raw());
                 let mut node = Node::new(Role::Button);

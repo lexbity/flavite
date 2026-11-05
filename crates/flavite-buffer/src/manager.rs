@@ -266,10 +266,9 @@ impl BufferManager {
     ) -> Result<(&Buffer, Option<StateTransition>), flavite_encoding::CodecError> {
         // Decode before touching any state: an existing buffer is never
         // replaced on decode failure and a new one is never half-created.
-        let snapshot = TextSnapshot::with_policy(content, policy)
-            .map_err(|error| match error {
-                TextError::Codec(err) => err,
-            })?;
+        let snapshot = TextSnapshot::with_policy(content, policy).map_err(|error| match error {
+            TextError::Codec(err) => err,
+        })?;
         self.touch_graph_stamp();
         // Use entry API to avoid borrow issues
         let entry = self.buffers.entry(note_path.clone());
@@ -606,7 +605,9 @@ mod tests {
         let path = PathBuf::from("test.md");
 
         // Open the note
-        let (buffer, _) = manager.open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto).unwrap();
+        let (buffer, _) = manager
+            .open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
 
         // Check buffer text immediately
         assert_eq!(buffer.text(), "hello");
@@ -624,7 +625,13 @@ mod tests {
         let mut manager = BufferManager::new();
         let from = PathBuf::from("old.md");
         let to = PathBuf::from("new.md");
-        let (buffer, _) = manager.open_note(from.clone(), b"content", flavite_encoding::DecodePolicy::Auto).unwrap();
+        let (buffer, _) = manager
+            .open_note(
+                from.clone(),
+                b"content",
+                flavite_encoding::DecodePolicy::Auto,
+            )
+            .unwrap();
         let id = buffer.buffer_id();
         assert!(manager.rename_buffer(&from, to.clone()));
         assert!(!manager.has_buffer(&from));
@@ -637,7 +644,9 @@ mod tests {
         let mut manager = BufferManager::new();
 
         let path = PathBuf::from("test.md");
-        manager.open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto).unwrap();
+        manager
+            .open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
 
         let edit = EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
 
@@ -653,14 +662,18 @@ mod tests {
         let mut manager = BufferManager::new();
 
         let path = PathBuf::from("test.md");
-        manager.open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto).unwrap();
+        manager
+            .open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
         manager.apply_edit(
             &path,
             crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " mine".into()),
         );
 
         // External change
-        let transitions = manager.notify_external_change(&path, b"goodbye", flavite_encoding::DecodePolicy::Auto).unwrap();
+        let transitions = manager
+            .notify_external_change(&path, b"goodbye", flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
         assert_eq!(transitions.len(), 1);
         assert_eq!(transitions[0].to, BufferState::Conflicted);
     }
@@ -670,7 +683,9 @@ mod tests {
         let mut manager = BufferManager::new();
 
         let path = PathBuf::from("test.md");
-        manager.open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto).unwrap();
+        manager
+            .open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
 
         // Make it dirty
         let edit = EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
@@ -687,7 +702,9 @@ mod tests {
         let mut manager = BufferManager::new();
 
         let path = PathBuf::from("test.md");
-        manager.open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto).unwrap();
+        manager
+            .open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
 
         let transitions = manager.notify_file_deleted(&path);
         assert_eq!(transitions.len(), 1);
@@ -699,10 +716,14 @@ mod tests {
         let mut manager = BufferManager::new();
 
         let path = PathBuf::from("test.md");
-        manager.open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto).unwrap();
+        manager
+            .open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
         manager.notify_file_deleted(&path);
 
-        let transitions = manager.notify_file_recreated(&path, b"hello", flavite_encoding::DecodePolicy::Auto).unwrap();
+        let transitions = manager
+            .notify_file_recreated(&path, b"hello", flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
         assert_eq!(transitions.len(), 1);
         assert_eq!(transitions[0].to, BufferState::Clean);
     }
@@ -714,8 +735,20 @@ mod tests {
         let path1 = PathBuf::from("test1.md");
         let path2 = PathBuf::from("test2.md");
 
-        manager.open_note(path1.clone(), b"hello", flavite_encoding::DecodePolicy::Auto).unwrap();
-        manager.open_note(path2.clone(), b"world", flavite_encoding::DecodePolicy::Auto).unwrap();
+        manager
+            .open_note(
+                path1.clone(),
+                b"hello",
+                flavite_encoding::DecodePolicy::Auto,
+            )
+            .unwrap();
+        manager
+            .open_note(
+                path2.clone(),
+                b"world",
+                flavite_encoding::DecodePolicy::Auto,
+            )
+            .unwrap();
 
         // Make one dirty
         let edit = EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
@@ -731,7 +764,9 @@ mod tests {
         let mut manager = BufferManager::new();
 
         let path = PathBuf::from("test.md");
-        let (buffer, _) = manager.open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto).unwrap();
+        let (buffer, _) = manager
+            .open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
         let buffer_id = buffer.buffer_id();
 
         let retrieved = manager.get_buffer_by_id(buffer_id);
@@ -750,10 +785,14 @@ mod tests {
         let mut manager = BufferManager::new();
 
         let path = PathBuf::from("test.md");
-        manager.open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto).unwrap();
+        manager
+            .open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
 
         // Open again
-        let (buffer, _) = manager.open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto).unwrap();
+        let (buffer, _) = manager
+            .open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
         assert_eq!(buffer.text(), "hello");
         assert_eq!(manager.buffer_count(), 1);
     }
@@ -763,7 +802,9 @@ mod tests {
         let mut manager = BufferManager::new();
 
         let path = PathBuf::from("test.md");
-        manager.open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto).unwrap();
+        manager
+            .open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
 
         assert!(!manager.has_buffers_needing_resolution());
 
@@ -772,7 +813,9 @@ mod tests {
             &path,
             crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " mine".into()),
         );
-        manager.notify_external_change(&path, b"goodbye", flavite_encoding::DecodePolicy::Auto).unwrap();
+        manager
+            .notify_external_change(&path, b"goodbye", flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
         assert!(manager.has_buffers_needing_resolution());
     }
 
@@ -783,8 +826,20 @@ mod tests {
         let path1 = PathBuf::from("test1.md");
         let path2 = PathBuf::from("test2.md");
 
-        manager.open_note(path1.clone(), b"hello", flavite_encoding::DecodePolicy::Auto).unwrap();
-        manager.open_note(path2.clone(), b"world", flavite_encoding::DecodePolicy::Auto).unwrap();
+        manager
+            .open_note(
+                path1.clone(),
+                b"hello",
+                flavite_encoding::DecodePolicy::Auto,
+            )
+            .unwrap();
+        manager
+            .open_note(
+                path2.clone(),
+                b"world",
+                flavite_encoding::DecodePolicy::Auto,
+            )
+            .unwrap();
 
         let buffers = manager.all_buffers();
         assert_eq!(buffers.len(), 2);
@@ -797,8 +852,20 @@ mod tests {
         let path1 = PathBuf::from("test1.md");
         let path2 = PathBuf::from("test2.md");
 
-        manager.open_note(path1.clone(), b"hello", flavite_encoding::DecodePolicy::Auto).unwrap();
-        manager.open_note(path2.clone(), b"world", flavite_encoding::DecodePolicy::Auto).unwrap();
+        manager
+            .open_note(
+                path1.clone(),
+                b"hello",
+                flavite_encoding::DecodePolicy::Auto,
+            )
+            .unwrap();
+        manager
+            .open_note(
+                path2.clone(),
+                b"world",
+                flavite_encoding::DecodePolicy::Auto,
+            )
+            .unwrap();
 
         let paths = manager.open_notes();
         assert_eq!(paths.len(), 2);
@@ -808,7 +875,9 @@ mod tests {
     fn open_paths_returns_path_and_buffer_identity() {
         let mut manager = BufferManager::new();
         let path = PathBuf::from("note.md");
-        let (buffer, _) = manager.open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto).unwrap();
+        let (buffer, _) = manager
+            .open_note(path.clone(), b"hello", flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
         let id = buffer.buffer_id();
         assert_eq!(manager.open_paths(), vec![(path, id)]);
     }
@@ -822,7 +891,10 @@ mod tests {
         let err = manager
             .open_note(path.clone(), &[0xff], flavite_encoding::DecodePolicy::Auto)
             .expect_err("malformed bytes must not install a buffer");
-        assert!(matches!(err, flavite_encoding::CodecError::InvalidUtf8 { .. }));
+        assert!(matches!(
+            err,
+            flavite_encoding::CodecError::InvalidUtf8 { .. }
+        ));
         assert!(manager.get_buffer(&path).is_none());
         assert_eq!(manager.buffer_count(), 0);
 
@@ -845,7 +917,12 @@ mod tests {
         assert_eq!(manager.dirty_buffers().len(), 1);
         assert!(
             manager
-                .notify_external_change(&PathBuf::from("missing.md"), b"x", flavite_encoding::DecodePolicy::Auto).unwrap()
+                .notify_external_change(
+                    &PathBuf::from("missing.md"),
+                    b"x",
+                    flavite_encoding::DecodePolicy::Auto
+                )
+                .unwrap()
                 .is_empty()
         );
         assert!(
@@ -855,7 +932,12 @@ mod tests {
         );
         assert!(
             manager
-                .notify_file_recreated(&PathBuf::from("missing.md"), b"x", flavite_encoding::DecodePolicy::Auto).unwrap()
+                .notify_file_recreated(
+                    &PathBuf::from("missing.md"),
+                    b"x",
+                    flavite_encoding::DecodePolicy::Auto
+                )
+                .unwrap()
                 .is_empty()
         );
         assert!(
@@ -880,7 +962,13 @@ mod tests {
             format!("{manager}"),
             "BufferManager(buffers=0, dirty=0, conflicted=0, orphaned=0)"
         );
-        manager.open_note(PathBuf::from("clear.md"), b"x", flavite_encoding::DecodePolicy::Auto).unwrap();
+        manager
+            .open_note(
+                PathBuf::from("clear.md"),
+                b"x",
+                flavite_encoding::DecodePolicy::Auto,
+            )
+            .unwrap();
         manager.clear();
         assert_eq!(manager.buffer_count(), 0);
         assert!(manager.get_buffer_by_id(id).is_none());
@@ -894,7 +982,13 @@ mod tests {
         assert_eq!(version.load(Ordering::Relaxed), 0);
         assert!(spy.try_recv().is_err(), "no wake before any transition");
 
-        let (buffer, _) = manager.open_note(PathBuf::from("s.md"), b"body", flavite_encoding::DecodePolicy::Auto).unwrap();
+        let (buffer, _) = manager
+            .open_note(
+                PathBuf::from("s.md"),
+                b"body",
+                flavite_encoding::DecodePolicy::Auto,
+            )
+            .unwrap();
         let id = buffer.buffer_id();
         assert_eq!(version.load(Ordering::Relaxed), 1, "open bumps");
         assert!(spy.recv_timeout(std::time::Duration::from_secs(1)).is_ok());
@@ -935,7 +1029,13 @@ mod tests {
         // latency only.
         let mut plain = BufferManager::new();
         let plain_version = plain.graph_stamp_handle();
-        plain.open_note(PathBuf::from("p.md"), b"x", flavite_encoding::DecodePolicy::Auto).unwrap();
+        plain
+            .open_note(
+                PathBuf::from("p.md"),
+                b"x",
+                flavite_encoding::DecodePolicy::Auto,
+            )
+            .unwrap();
         assert_eq!(plain_version.load(Ordering::Relaxed), 1);
     }
 }

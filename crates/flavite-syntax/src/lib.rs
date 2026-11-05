@@ -20,9 +20,7 @@ pub use frontmatter::{Frontmatter, PropertyValue};
 pub use mask::TextMask;
 // Canonical owner of the source-format descriptor is `flavite-encoding`
 // (RFC-0006 §6.10); re-export so core layers keep one spelling.
-pub use flavite_encoding::{
-    CodecError, DecodePolicy, FileEncoding, FormatStamp, SourceFormat,
-};
+pub use flavite_encoding::{CodecError, DecodePolicy, FileEncoding, FormatStamp, SourceFormat};
 pub use pulldown_glue::{Link, ParsedNote};
 pub use scanner::{LinkPayload, ScannedSpan, SpanKind};
 pub use text::{Eol, LineInfo, SourceByte, Span, TextByte, TextError, TextSnapshot};

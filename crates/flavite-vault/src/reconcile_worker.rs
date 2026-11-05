@@ -4,7 +4,7 @@
 //! immutable filesystem observations; the VaultActor applies them after the
 //! per-path save-watermark check.
 //!
-//! # Parallel scan structure (§6.6)
+//! #[derive(Debug, Default, Clone, PartialEq)]Parallel scan structure (§6.6)
 //!
 //! Three phases, in exactly the pre-S7 order:
 //!
@@ -71,7 +71,8 @@ pub struct ScanJob<'a> {
     pub nominated: &'a HashSet<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // the parsed note rides with its bytes by design (§6.6)
 pub enum ScanOutcome {
     Note {
         path: PathBuf,
@@ -95,7 +96,7 @@ pub enum ScanOutcome {
     Missing(PathBuf),
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct ScanResult {
     pub outcomes: Vec<ScanOutcome>,
     pub present_notes: HashSet<Vec<u8>>,
@@ -114,7 +115,7 @@ pub struct ScanProgress {
     pub total: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WorkerMessage {
     Progress(ScanProgress),
     Batch {
@@ -276,7 +277,7 @@ pub fn scan(
 /// One path's contribution to the scan, produced without touching any
 /// shared state: the serial loop and the parallel segments feed identical
 /// observations into the identical emitter.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum PathObservation {
     /// A directory, symlink, or an extension neither note nor attachment —
     /// nothing is emitted and nothing is incomplete.

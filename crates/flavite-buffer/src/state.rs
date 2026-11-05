@@ -354,8 +354,9 @@ impl Buffer {
         let revision = self.model.try_apply_batch(edits, policy).ok()?;
         let old_state = self.state;
         self.state = BufferState::Dirty;
-        let transition = (old_state != BufferState::Dirty)
-            .then(|| StateTransition::new(old_state, BufferState::Dirty, TransitionReason::LocalEdit));
+        let transition = (old_state != BufferState::Dirty).then(|| {
+            StateTransition::new(old_state, BufferState::Dirty, TransitionReason::LocalEdit)
+        });
         Some((revision, transition))
     }
 
@@ -518,7 +519,11 @@ impl Buffer {
     /// Replaces the buffer content with the current disk content, strictly
     /// decoded under `policy`. A decode failure means NO replacement: the
     /// existing text is kept (§6.10).
-    pub fn reload_from_disk(&mut self, disk_bytes: &[u8], policy: DecodePolicy) -> Option<StateTransition> {
+    pub fn reload_from_disk(
+        &mut self,
+        disk_bytes: &[u8],
+        policy: DecodePolicy,
+    ) -> Option<StateTransition> {
         let old_state = self.state;
 
         if let Ok(snapshot) = TextSnapshot::with_policy(disk_bytes, policy) {
@@ -876,7 +881,9 @@ mod tests {
         let merged = b"mine\r\nkeep\nexternal\r\n";
         let mut buffer = Buffer::from_snapshot(TextSnapshot::new(mine).unwrap());
 
-        let revision = buffer.apply_resolved_merge(merged, theirs, flavite_encoding::DecodePolicy::Auto).unwrap();
+        let revision = buffer
+            .apply_resolved_merge(merged, theirs, flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
 
         assert!(revision > Revision::INITIAL);
         assert_eq!(buffer.model().to_source_bytes(), merged);
@@ -915,7 +922,8 @@ mod tests {
 
         // External change to identical content
         let new_content = b"hello world";
-        let transition = buffer.check_external_change(new_content, flavite_encoding::DecodePolicy::Auto);
+        let transition =
+            buffer.check_external_change(new_content, flavite_encoding::DecodePolicy::Auto);
 
         // Should auto-resolve to Clean
         assert_eq!(buffer.state(), BufferState::Clean);
@@ -942,7 +950,8 @@ mod tests {
 
         // External change to different content
         let new_content = b"goodbye";
-        let transition = buffer.check_external_change(new_content, flavite_encoding::DecodePolicy::Auto);
+        let transition =
+            buffer.check_external_change(new_content, flavite_encoding::DecodePolicy::Auto);
 
         assert_eq!(buffer.state(), BufferState::Conflicted);
         let ExternalDecode::Decoded(transition) = transition else {
@@ -974,7 +983,8 @@ mod tests {
         let mut buffer = Buffer::from_text("hello");
         buffer.handle_file_deleted();
 
-        let transition = buffer.handle_file_recreated(b"hello", flavite_encoding::DecodePolicy::Auto);
+        let transition =
+            buffer.handle_file_recreated(b"hello", flavite_encoding::DecodePolicy::Auto);
         assert_eq!(buffer.state(), BufferState::Clean);
         let ExternalDecode::Decoded(Some(transition)) = transition else {
             panic!("recreation must transition");
@@ -1058,7 +1068,8 @@ mod tests {
                 flavite_encoding::DecodePolicy::Auto,
                 b"disk",
                 Some(BaseHash::from_bytes(*blake3::hash(b"disk").as_bytes())),
-            flavite_encoding::DecodePolicy::Auto)
+                flavite_encoding::DecodePolicy::Auto,
+            )
             .expect("valid UTF-8 recovery and disk bytes");
         assert_eq!(buffer.buffer_id(), id);
         assert!(buffer.revision() > revision);
@@ -1076,7 +1087,8 @@ mod tests {
                 flavite_encoding::DecodePolicy::Auto,
                 b"disk changed",
                 Some(BaseHash::from_bytes(*blake3::hash(b"disk").as_bytes())),
-            flavite_encoding::DecodePolicy::Auto)
+                flavite_encoding::DecodePolicy::Auto,
+            )
             .expect("valid snapshots");
         assert_eq!(buffer.state(), BufferState::Conflicted);
         assert_eq!(buffer.base_bytes(), b"disk changed");
@@ -1160,8 +1172,16 @@ mod tests {
             empty.handle_file_recreated(&[0xff], flavite_encoding::DecodePolicy::Auto),
             ExternalDecode::InvalidEncoding(_)
         ));
-        assert!(empty.reload_from_disk(&[0xff], flavite_encoding::DecodePolicy::Auto).is_none());
-        assert!(empty.resolve_keep_local(&[0xff], flavite_encoding::DecodePolicy::Auto).is_none());
+        assert!(
+            empty
+                .reload_from_disk(&[0xff], flavite_encoding::DecodePolicy::Auto)
+                .is_none()
+        );
+        assert!(
+            empty
+                .resolve_keep_local(&[0xff], flavite_encoding::DecodePolicy::Auto)
+                .is_none()
+        );
 
         let mut buffer = Buffer::from_text("base");
         buffer.handle_file_deleted();
@@ -1174,7 +1194,9 @@ mod tests {
         assert_eq!(recreated.to, BufferState::Conflicted);
         assert!(buffer.is_conflicted());
         assert!(buffer.needs_resolution());
-        let resolved = buffer.resolve_keep_local(b"other", flavite_encoding::DecodePolicy::Auto).unwrap();
+        let resolved = buffer
+            .resolve_keep_local(b"other", flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
         assert_eq!(resolved.reason, TransitionReason::KeepLocal);
         assert_eq!(buffer.base_bytes(), b"other");
         assert_eq!(buffer.state(), BufferState::Dirty);
@@ -1216,7 +1238,8 @@ mod tests {
         buffer
             .model_mut()
             .set_primary_selection(crate::model::Selection::caret(TextByte(3)));
-        let _transition = buffer.check_external_change(b"hello world", flavite_encoding::DecodePolicy::Auto);
+        let _transition =
+            buffer.check_external_change(b"hello world", flavite_encoding::DecodePolicy::Auto);
 
         assert_eq!(buffer.state(), BufferState::Clean);
         assert_eq!(buffer.model().text(), "hello world");
@@ -1243,7 +1266,8 @@ mod tests {
             crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         buffer.apply_local_edit(edit);
 
-        let _transition = buffer.check_external_change(b"goodbye", flavite_encoding::DecodePolicy::Auto);
+        let _transition =
+            buffer.check_external_change(b"goodbye", flavite_encoding::DecodePolicy::Auto);
         assert_eq!(buffer.state(), BufferState::Conflicted);
     }
 
@@ -1255,7 +1279,8 @@ mod tests {
             crate::undo::EditOp::new(Span::new(TextByte(5), TextByte(5)), " world".to_string());
         buffer.apply_local_edit(edit);
 
-        let _transition = buffer.check_external_change(b"hello world", flavite_encoding::DecodePolicy::Auto);
+        let _transition =
+            buffer.check_external_change(b"hello world", flavite_encoding::DecodePolicy::Auto);
         assert_eq!(buffer.state(), BufferState::Clean);
     }
 

@@ -1019,13 +1019,13 @@ impl Flavite {
         ];
         for (id, title, args, handler) in registrations {
             let spec = if matches!(
-        id,
-        "open_note"
-            | "note.open"
-            | "note.history"
-            | "note.reopen_encoding"
-            | "text.prepare_replace"
-    ) {
+                id,
+                "open_note"
+                    | "note.open"
+                    | "note.history"
+                    | "note.reopen_encoding"
+                    | "text.prepare_replace"
+            ) {
                 CommandSpec::new(id, title, args).requires(crate::Capability::ReadNotes)
             } else {
                 CommandSpec::new(id, title, args)
@@ -1469,8 +1469,13 @@ impl Flavite {
                 .and_then(|source| source.get("buffer_id"))
                 .and_then(serde_json::Value::as_u64)
                 .map(BufferId::from),
-            "property.set" | "task.toggle" | "apply_edits" | "undo" | "redo"
-            | "note.convert_encoding" | "text.apply_replace" => invocation
+            "property.set"
+            | "task.toggle"
+            | "apply_edits"
+            | "undo"
+            | "redo"
+            | "note.convert_encoding"
+            | "text.apply_replace" => invocation
                 .args
                 .get("buffer_id")
                 .and_then(serde_json::Value::as_u64)
@@ -2590,6 +2595,7 @@ mod tests {
                 ),
                 "!".into(),
             )],
+            undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         });
         assert!(matches!(
             flavite.get_buffer_view(buffer_id, Some(Revision::new(initial.revision))),
@@ -2725,6 +2731,7 @@ mod tests {
                 ),
                 " mine".into(),
             )],
+            undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
         });
         fs.write_new(&root.join(".external"), b"external").unwrap();
         fs.rename_replace(&root.join(".external"), &root.join("note.md"))

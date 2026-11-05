@@ -65,6 +65,8 @@ pub struct App {
     /// Context tool state: bindings, effective sources, and query states.
     pub contexts: ContextRegistry,
     pub reading: crate::host::reading::ReadingHost,
+    /// RFC-0006 S01: per-view literal find/replace state and match pages.
+    pub note_search: crate::host::note_search::NoteSearchHost,
     /// RFC-0006 §6.10: per-tab pending encoding decisions and repairs.
     pub encoding: crate::host::encoding::EncodingHost,
     pub input_chains: BTreeMap<TabId, crate::host::input::InputChain>,
@@ -234,6 +236,8 @@ pub enum Message {
         tab: TabId,
         forward: bool,
     },
+    /// RFC-0006 S01: literal find/replace host messages.
+    NoteSearch(crate::host::note_search::NoteSearchMessage),
     ToggleNoteMode(TabId),
     RetryReading(TabId),
     ToggleSourcePreview(TabId),
@@ -545,6 +549,7 @@ impl App {
             notes: DocumentRegistry::default(),
             contexts: ContextRegistry::default(),
             reading: crate::host::reading::ReadingHost::default(),
+            note_search: crate::host::note_search::NoteSearchHost::default(),
             encoding: crate::host::encoding::EncodingHost::default(),
             input_chains: BTreeMap::new(),
             linking: crate::host::linking::LinkIntents::default(),
@@ -1795,10 +1800,13 @@ impl App {
                 {
                     self.status = format!("Editor state was not accepted: {error}");
                 } else {
-                    if snapshot.focused
-                        && let Some(find) = self.reading.find.get_mut(&tab)
-                    {
-                        find.focused = false;
+                    if snapshot.focused {
+                        if let Some(find) = self.note_search.finds.get_mut(&tab) {
+                            find.focused = false;
+                        }
+                        if let Some(replace) = self.note_search.replaces.get_mut(&tab) {
+                            replace.focused = false;
+                        }
                     }
                     // Context tools resolve by anchor identity: a caret or
                     // selection move within the same buffer does not change
@@ -1935,8 +1943,10 @@ impl App {
                                 .note_editor_view(tab)
                                 .map(|view| view.path.clone())
                                 .unwrap_or_default();
-                            let payload =
-                                data.as_ref().and_then(serde_json::Value::as_str).map(str::to_owned);
+                            let payload = data
+                                .as_ref()
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned);
                             self.encoding.record(tab, code, payload, path);
                         }
                     }
@@ -2006,7 +2016,10 @@ impl App {
                 // §6.10: an undecodable/ambiguous source is a typed encoding
                 // decision, surfaced per tab instead of a blank editor.
                 if code == "encoding-choice-required" {
-                    let payload = data.as_ref().and_then(serde_json::Value::as_str).map(str::to_owned);
+                    let payload = data
+                        .as_ref()
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
                     self.encoding.record(tab, code.to_owned(), payload, path);
                     self.status = "Encoding choice required: pick an explicit format".into();
                 } else {
@@ -2093,11 +2106,34 @@ impl App {
                 self.refresh_semantics();
                 return task;
             }
-            message @ (Message::FindOpen(_)
-            | Message::FindClose(_)
-            | Message::FindQuery { .. }
-            | Message::FindNext { .. }
-            | Message::ToggleNoteMode(_)
+            Message::NoteSearch(message) => {
+                return crate::host::note_search::handle(self, message);
+            }
+            Message::FindOpen(tab) => {
+                return crate::host::note_search::handle(
+                    self,
+                    crate::host::note_search::NoteSearchMessage::FindOpen(tab),
+                );
+            }
+            Message::FindClose(tab) => {
+                return crate::host::note_search::handle(
+                    self,
+                    crate::host::note_search::NoteSearchMessage::FindClose(tab),
+                );
+            }
+            Message::FindQuery { tab, query } => {
+                return crate::host::note_search::handle(
+                    self,
+                    crate::host::note_search::NoteSearchMessage::FindQuery { tab, query },
+                );
+            }
+            Message::FindNext { tab, forward } => {
+                return crate::host::note_search::handle(
+                    self,
+                    crate::host::note_search::NoteSearchMessage::FindNext { tab, forward },
+                );
+            }
+            message @ (Message::ToggleNoteMode(_)
             | Message::RetryReading(_)
             | Message::ToggleSourcePreview(_)
             | Message::ReadControlBounds { .. }
@@ -3010,6 +3046,7 @@ impl App {
         self.completion_backlog = queue;
         self.reconcile_contexts();
         crate::host::reading::sync(self);
+        crate::host::note_search::sync(self);
         self.persist_workspace_layout();
         if let Some(target) = self.workspace.writing_target() {
             let remains_current = self.valid_writing_target().is_some();
@@ -3039,6 +3076,9 @@ impl App {
             return;
         }
         if crate::host::occurrences::completion(self, &completion) {
+            return;
+        }
+        if crate::host::note_search::completion(self, &completion) {
             return;
         }
         if self.linking.handles(completion.request_id) {
@@ -3121,15 +3161,44 @@ impl App {
                 }
             }
             _ => {
+                // §6.10: a cold open completing with a typed encoding
+                // decision records the per-tab pending choice — the
+                // synchronous arm in `open_note_tab` cannot see async
+                // flight completions.
+                let encoding_choice = match &completion.result {
+                    ExecutionResult::ActionRequired { code, data, .. }
+                        if code == "encoding-choice-required" =>
+                    {
+                        Some((code.clone(), data.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some((code, data)) = encoding_choice {
+                    let payload = data
+                        .as_ref()
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    let path = locator
+                        .as_ref()
+                        .map(|loc| loc.to_path(&self.root))
+                        .unwrap_or_default();
+                    for tab in &tabs {
+                        self.encoding
+                            .record(*tab, code.clone(), payload.clone(), path.clone());
+                    }
+                    self.status = "Encoding choice required: pick an explicit format".into();
+                } else {
+                    // A flight with a locator would otherwise swallow the
+                    // reason; the failed note view says "unavailable" but
+                    // not why.
+                    self.status = crate::operation::describe_completion(&completion);
+                }
                 for tab in tabs {
                     self.dispatch_layout(|revision| LayoutAction::NoteLoadFailed {
                         expected_revision: revision,
                         tab,
                     });
                 }
-                // A flight with a locator would otherwise swallow the reason;
-                // the failed note view says "unavailable" but not why.
-                self.status = crate::operation::describe_completion(&completion);
             }
         }
         if locator.is_none() {
@@ -3944,6 +4013,7 @@ mod tests {
             notes: DocumentRegistry::default(),
             contexts: ContextRegistry::default(),
             reading: crate::host::reading::ReadingHost::default(),
+            note_search: crate::host::note_search::NoteSearchHost::default(),
             encoding: crate::host::encoding::EncodingHost::default(),
             input_chains: BTreeMap::new(),
             linking: crate::host::linking::LinkIntents::default(),

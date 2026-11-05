@@ -62,8 +62,8 @@ fn utf16le_bom_note_ingests_source_spans_and_decoded_body() {
     // The link's stored span is in SOURCE bytes: every character before the
     // link is ASCII, so the source offset is exactly BOM + 2x the UTF-8 text
     // offset — and decisively NOT the UTF-8 text offsets.
-    let text_start = text.find("[[target]]").unwrap() as i64;
-    let text_end = text_start + "[[target]]".len() as i64;
+    let text_start = i64::try_from(text.find("[[target]]").unwrap()).unwrap();
+    let text_end = text_start + i64::try_from("[[target]]".len()).unwrap();
     let (span_start, span_end): (i64, i64) = actor
         .writer()
         .conn()
@@ -74,7 +74,11 @@ fn utf16le_bom_note_ingests_source_spans_and_decoded_body() {
         )
         .expect("links row");
     assert_eq!(span_start, 2 + 2 * text_start, "source span start");
-    assert_eq!(span_end, span_start + 2 * (text_end - text_start), "source span end");
+    assert_eq!(
+        span_end,
+        span_start + 2 * (text_end - text_start),
+        "source span end"
+    );
     assert!(
         span_start > text_start && span_end > text_end,
         "source spans must not be the UTF-8 text offsets ({span_start},{span_end}) vs ({text_start},{text_end})"
@@ -146,7 +150,10 @@ fn malformed_bytes_ingest_as_undecodable_not_empty_success() {
         )
         .optional()
         .unwrap();
-    assert!(body.is_none(), "undecodable source is never silently indexed");
+    assert!(
+        body.is_none(),
+        "undecodable source is never silently indexed"
+    );
     let links: i64 = actor
         .writer()
         .conn()

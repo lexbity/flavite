@@ -216,7 +216,14 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                             "outline": doc.document.outline.iter().map(|h|serde_json::json!({"title":h.title,"byte":h.byte,"level":h.level,"bounds":app.reading.blocks.get(&(*tab,h.byte)).map(|r|[r.x,r.y,r.width,r.height])})).collect::<Vec<_>>(),
                             "controls": app.reading.controls.iter().filter(|((t, source, _, _),_)| t == tab && *source == std::sync::Arc::as_ptr(doc) as usize).map(|((_,_,role,byte),r)|serde_json::json!({"role":role,"byte":byte,"bounds":[r.x,r.y,r.width,r.height]})).collect::<Vec<_>>()
                         })),
-                        "find": app.reading.find.get(tab).map(|find|serde_json::json!({"query":find.query,"matches":crate::host::reading::find_matches(app,*tab).len()})),
+                        "find": app.note_search.finds.get(tab).map(|find|serde_json::json!({"query":find.query,"matches":crate::host::note_search::matches(app,*tab).map_or(0,|page|page.spans.len())})),
+                        "replace": app.note_search.replaces.get(tab).map(|replace|serde_json::json!({
+                            "query": replace.query,
+                            "matches": crate::host::note_search::matches(app,*tab).map_or(0,|page|page.spans.len()),
+                            "replace_open": true,
+                            "match_count": replace.match_count,
+                            "error": replace.last_error,
+                        })),
                         "viewport_anchor": interaction.viewport_anchor,
                         "active": *tab == state.active(),
                         "buffer": buffer_view.as_ref().map(|view| view.buffer_id),

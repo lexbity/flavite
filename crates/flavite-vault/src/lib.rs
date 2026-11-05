@@ -9,9 +9,8 @@
 
 pub mod actor;
 pub mod channels;
-pub mod encoding;
-pub mod text_edit;
 pub mod coalesce;
+pub mod encoding;
 pub mod history;
 pub mod identity;
 pub mod instance;
@@ -25,6 +24,7 @@ pub mod rename;
 pub mod save;
 pub mod session;
 pub mod sync;
+pub mod text_edit;
 pub mod tokens;
 pub mod types;
 pub mod user_state;

@@ -43,7 +43,7 @@ fn edits_become_revision_guarded_session_commands() {
             revision,
             ops,
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
-    } => {
+        } => {
             assert_eq!(buffer_id.as_u64(), 42);
             assert_eq!(revision.as_u64(), 7);
             assert_eq!(ops[0].range, Span::new(TextByte(5), TextByte(5)));

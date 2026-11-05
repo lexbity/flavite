@@ -54,8 +54,7 @@ impl HintEntry {
     pub fn format(&self) -> SourceFormat {
         // Validation only rejects ASCII+BOM; a hostile record combining them
         // falls back to UTF-8 instead of panicking on untrusted disk input.
-        SourceFormat::new(self.encoding, self.bom)
-            .unwrap_or_else(|_| SourceFormat::utf8())
+        SourceFormat::new(self.encoding, self.bom).unwrap_or_else(|_| SourceFormat::utf8())
     }
 }
 
@@ -84,7 +83,6 @@ impl BindingIntent {
         SourceFormat::new(self.encoding, self.bom).unwrap_or_else(|_| SourceFormat::utf8())
     }
 }
-
 
 /// The whole device-local hints record (payload of `encoding-hints.json`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,7 +212,7 @@ impl EncodingHintsState {
             },
             None => None,
         };
-        let view = view.unwrap_or_else(|| HintsView {
+        let view = view.unwrap_or(HintsView {
             generation: None,
             record: fallback,
         });
@@ -247,10 +245,7 @@ impl EncodingHintsState {
     ///
     /// [`HintsWriteError`] when no store is available, the mutation payload
     /// cannot be serialized, or the compare-and-set write fails.
-    pub fn update(
-        &self,
-        mutate: impl FnOnce(&mut HintsRecord),
-    ) -> Result<u64, HintsWriteError> {
+    pub fn update(&self, mutate: impl FnOnce(&mut HintsRecord)) -> Result<u64, HintsWriteError> {
         let store = self.store.as_ref().ok_or(HintsWriteError::NoStore)?;
         let mut store = store
             .lock()
@@ -296,9 +291,7 @@ pub enum HintsWriteError {
 pub enum ChoiceReason {
     /// A previously confirmed hint no longer matches the observed raw hash
     /// (external rewrite): the new interpretation must be re-confirmed.
-    StaleHint {
-        observed_raw_hash: RawHash,
-    },
+    StaleHint { observed_raw_hash: RawHash },
     /// Strict decoding failed outright.
     InvalidInput {
         /// Typed codec failure kind (never raw backend exception text).
@@ -306,19 +299,13 @@ pub enum ChoiceReason {
         observed_raw_hash: RawHash,
     },
     /// A BOM was required by the confirmed descriptor but is not present.
-    BomConflict {
-        observed_raw_hash: RawHash,
-    },
+    BomConflict { observed_raw_hash: RawHash },
     /// A longer unsupported signature (UTF-32 family) or the documented
     /// `FF FE 00 00` ambiguity was detected under Auto.
-    UnsupportedOrAmbiguousBom {
-        observed_raw_hash: RawHash,
-    },
+    UnsupportedOrAmbiguousBom { observed_raw_hash: RawHash },
     /// BOM-less decoded content contains NUL scalars: ambiguous/binary
     /// input requires an explicit choice at the core policy boundary.
-    NulBearingContent {
-        observed_raw_hash: RawHash,
-    },
+    NulBearingContent { observed_raw_hash: RawHash },
     /// The recorded hint itself cannot be applied (corrupt combination).
     HintUnusable,
 }
@@ -342,7 +329,7 @@ impl InvalidKind {
     #[must_use]
     pub const fn from_codec(error: &CodecError) -> Self {
         match error {
-            CodecError::InvalidUtf8 { .. } | CodecError::AsciiViolation { .. } => Self::InvalidUtf8,
+            CodecError::InvalidUtf8 { .. } => Self::InvalidUtf8,
             CodecError::InvalidUtf16 { .. } => Self::InvalidUtf16,
             CodecError::OddUtf16ByteCount => Self::OddUtf16ByteCount,
             CodecError::LimitExceeded { .. } => Self::LimitExceeded,
@@ -409,7 +396,6 @@ pub const HINT_UNAVAILABLE_CODE: &str = "encoding-hint-unavailable";
 #[must_use]
 pub const fn codec_limit_kind_code(error: &CodecError) -> &'static str {
     match error {
-        CodecError::AsciiViolation { .. } => "ascii-violation",
         CodecError::Unencodable { .. } => "unencodable",
         CodecError::LimitExceeded { .. } => "limit-exceeded",
         CodecError::Cancelled => "cancelled",
@@ -490,8 +476,12 @@ pub fn resolve_source(
 
     // A user-confirmed current choice always wins and must match exactly.
     if let Some(format) = explicit {
-        return match TextSnapshot::decoding(bytes, DecodePolicy::Explicit(format), limits, &mut || false)
-        {
+        return match TextSnapshot::decoding(
+            bytes,
+            DecodePolicy::Explicit(format),
+            limits,
+            &flavite_encoding::NOT_CANCELLED,
+        ) {
             Ok(snapshot) => Resolution::Resolved(ResolvedSource {
                 snapshot,
                 format,
@@ -520,7 +510,8 @@ pub fn resolve_source(
         let format = entry.format();
         // An exact hint uses Explicit, not a second Auto pass (§6.10).
         let policy = DecodePolicy::Explicit(format);
-        return match TextSnapshot::decoding(bytes, policy, limits, &mut || false) {
+        return match TextSnapshot::decoding(bytes, policy, limits, &flavite_encoding::NOT_CANCELLED)
+        {
             Ok(snapshot) => Resolution::Resolved(ResolvedSource {
                 snapshot,
                 format,
@@ -547,7 +538,12 @@ pub fn resolve_source(
     }
 
     // Auto: recognized BOM or valid UTF-8 only.
-    match TextSnapshot::decoding(bytes, DecodePolicy::Auto, limits, &mut || false) {
+    match TextSnapshot::decoding(
+        bytes,
+        DecodePolicy::Auto,
+        limits,
+        &flavite_encoding::NOT_CANCELLED,
+    ) {
         Ok(snapshot) => {
             let format = snapshot
                 .format()
@@ -628,7 +624,9 @@ impl ChoiceReason {
     pub const fn observed_raw_hash(&self) -> RawHash {
         match self {
             Self::StaleHint { observed_raw_hash }
-            | Self::InvalidInput { observed_raw_hash, .. }
+            | Self::InvalidInput {
+                observed_raw_hash, ..
+            }
             | Self::BomConflict { observed_raw_hash }
             | Self::UnsupportedOrAmbiguousBom { observed_raw_hash }
             | Self::NulBearingContent { observed_raw_hash } => *observed_raw_hash,
@@ -730,7 +728,13 @@ mod tests {
             generation: None,
             record: record(),
         };
-        let res = resolve_source("k".into(), &[0xff, 0xfe, 0x00, 0x00, 0x41], &hints, None, &DecodeLimits::default());
+        let res = resolve_source(
+            "k".into(),
+            &[0xff, 0xfe, 0x00, 0x00, 0x41],
+            &hints,
+            None,
+            &DecodeLimits::default(),
+        );
         assert!(matches!(
             res,
             Resolution::NeedsChoice {
@@ -738,7 +742,13 @@ mod tests {
                 ..
             }
         ));
-        let res = resolve_source("k".into(), &[0x41, 0xff], &hints, None, &DecodeLimits::default());
+        let res = resolve_source(
+            "k".into(),
+            &[0x41, 0xff],
+            &hints,
+            None,
+            &DecodeLimits::default(),
+        );
         assert!(matches!(
             res,
             Resolution::NeedsChoice {
@@ -750,7 +760,13 @@ mod tests {
             }
         ));
         // BOM-less content with a NUL scalar requires a confirmed choice.
-        let res = resolve_source("k".into(), b"a\x00b", &hints, None, &DecodeLimits::default());
+        let res = resolve_source(
+            "k".into(),
+            b"a\x00b",
+            &hints,
+            None,
+            &DecodeLimits::default(),
+        );
         assert!(matches!(
             res,
             Resolution::NeedsChoice {
@@ -758,10 +774,11 @@ mod tests {
                 ..
             }
         ));
-        // The same bytes via explicit UTF-16LE confirm cleanly.
+        // The same content via explicit UTF-16LE (even code-unit count)
+        // confirms cleanly: the explicit choice overrides the NUL gate.
         let res = resolve_source(
             "k".into(),
-            b"a\x00b",
+            b"a\x00b\x00",
             &hints,
             Some(SourceFormat::utf16le()),
             &DecodeLimits::default(),

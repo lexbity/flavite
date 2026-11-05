@@ -5,9 +5,7 @@
 #[path = "support/links.rs"]
 mod support;
 
-use flavite_api::{
-    ExecutionResult, Flavite, LocalResult, Origin, command::Invocation,
-};
+use flavite_api::{ExecutionResult, Flavite, LocalResult, Origin, command::Invocation};
 use flavite_buffer::revision::BufferId;
 
 fn prepare(
@@ -16,7 +14,7 @@ fn prepare(
     revision: u64,
     query: &str,
     replacement: &str,
-    scope: Option<(usize, usize)>,
+    _scope: Option<(usize, usize)>,
 ) -> ExecutionResult {
     let request_id = flavite.command_registry().next_request_id();
     let result = flavite.execute(Invocation::new(
@@ -107,9 +105,8 @@ fn prepare_and_apply_replace_all_in_one_isolated_batch() {
 fn duplicate_apply_replays_the_same_receipt() {
     let fixture = support::fixture(&[("notes/a.md", "one one\n")]);
     let flavite = &fixture.flavite;
-    fixture.open_note("notes/a.md");
     let buffer_id = fixture.open_note("notes/a.md").0;
-    let (text, revision) = view(flavite, buffer_id);
+    let (_text, revision) = view(flavite, buffer_id);
     let (plan_id, _count) = prepared_plan(&prepare(flavite, buffer_id, revision, "one", "1", None));
     let first = apply(flavite, buffer_id, revision, &plan_id);
     assert!(first.is_success(), "first apply succeeds");
@@ -120,13 +117,11 @@ fn duplicate_apply_replays_the_same_receipt() {
         first.into_success().map(|success| success.data),
         replay.clone().into_success().map(|success| success.data)
     );
-    assert!(replay.is_success(), "replay succeeds with the stored receipt");
+    assert!(
+        replay.is_success(),
+        "replay succeeds with the stored receipt"
+    );
     let (replayed_text, _) = view(flavite, buffer_id);
-    assert_eq!(replayed_text.replace('\n', "").replace("1", "1"), {
-        let mut expected = text.replace("one", "1");
-        expected.pop();
-        expected
-    });
     assert_eq!(replayed_text, "1 1\n", "no double replacement");
 }
 
@@ -134,16 +129,10 @@ fn duplicate_apply_replays_the_same_receipt() {
 fn stale_revision_across_the_worker_barrier_has_zero_effect() {
     let fixture = support::fixture(&[("notes/a.md", "target target\n")]);
     let flavite = &fixture.flavite;
-    fixture.open_note("notes/a.md");
     let buffer_id = fixture.open_note("notes/a.md").0;
     let (_, revision) = view(flavite, buffer_id);
     let (plan_id, _count) = prepared_plan(&prepare(
-        flavite,
-        buffer_id,
-        revision,
-        "target",
-        "hit",
-        None,
+        flavite, buffer_id, revision, "target", "hit", None,
     ));
     // Change the revision while the plan exists (the worker barrier ran).
     let request_id = flavite.command_registry().next_request_id();
@@ -181,7 +170,10 @@ fn unknown_or_foreign_plan_ids_have_zero_effect() {
     let (plan_id, _count) = prepared_plan(&prepare(flavite, a, revision, "x", "y", None));
     // A plan applied against another buffer is refused outright.
     let foreign = apply(flavite, b, revision, &plan_id);
-    assert!(!foreign.is_success(), "foreign buffer is refused: {foreign:?}");
+    assert!(
+        !foreign.is_success(),
+        "foreign buffer is refused: {foreign:?}"
+    );
     // A fabricated id is Gone, never "match nothing".
     let unknown = apply(flavite, a, revision, &"0".repeat(32));
     let ExecutionResult::ActionRequired { code, .. } = unknown else {
@@ -198,7 +190,6 @@ fn unknown_or_foreign_plan_ids_have_zero_effect() {
 fn empty_query_is_idle_and_invalid_scopes_are_refused_with_zero_effect() {
     let fixture = support::fixture(&[("notes/a.md", "abc\n")]);
     let flavite = &fixture.flavite;
-    fixture.open_note("notes/a.md");
     let buffer_id = fixture.open_note("notes/a.md").0;
     let (_, revision) = view(flavite, buffer_id);
     let result = prepare(flavite, buffer_id, revision, "", "X", None);

@@ -13,7 +13,6 @@ fn le(bytes: &[&[u8]]) -> Vec<u8> {
     v
 }
 
-
 #[test]
 fn utf16_snapshot_preserves_text_and_descriptor() {
     // "A😀\r\nsecon\r\n" in UTF-16LE + BOM.
@@ -26,7 +25,11 @@ fn utf16_snapshot_preserves_text_and_descriptor() {
     assert!(snap.has_bom());
     // Normalized text: CRLF folded to LF.
     assert_eq!(snap.text(), "A😀\nsecon\n");
-    assert_eq!(snap.to_source_bytes(), bytes, "byte-exact unedited round trip");
+    assert_eq!(
+        snap.to_source_bytes(),
+        bytes,
+        "byte-exact unedited round trip"
+    );
     assert_eq!(snap.line_count(), 2);
     assert_eq!(snap.lines()[0].eol, Eol::Crlf);
     assert_eq!(snap.lines()[1].eol, Eol::Crlf);
@@ -42,9 +45,15 @@ fn utf16_line_table_uses_real_scalar_widths() {
     // Layout: BOM(2) | 'A'(2) | pair(4) | CR(2) LF(2) | "secon"(10) | CR LF(4)
     // Line 0: content starts at 2, ends (CR start) at 8; line 1: 12..22; EOF 26.
     let l0 = &snap.lines()[0];
-    assert_eq!((l0.source_start, l0.source_end), (SourceByte(2), SourceByte(8)));
+    assert_eq!(
+        (l0.source_start, l0.source_end),
+        (SourceByte(2), SourceByte(8))
+    );
     let l1 = &snap.lines()[1];
-    assert_eq!((l1.source_start, l1.source_end), (SourceByte(12), SourceByte(22)));
+    assert_eq!(
+        (l1.source_start, l1.source_end),
+        (SourceByte(12), SourceByte(22))
+    );
     // Text coordinates are UTF-8 bytes of the normalized text.
     assert_eq!(l0.text_start, TextByte(0));
     assert_eq!(l0.text_end, TextByte(5)); // "A" + 4-byte emoji
@@ -123,9 +132,9 @@ fn standalone_cr_and_leading_content_feff_survive_utf16_and_utf8() {
     for format in [SourceFormat::utf8(), SourceFormat::utf16le_with_bom()] {
         let bytes = flavite_encoding::encode(
             src,
-            &format,
+            format,
             &flavite_encoding::EncodeLimits::default_envelope(),
-            &mut || false,
+            &flavite_encoding::NOT_CANCELLED,
         )
         .unwrap();
         let snap = TextSnapshot::with_policy(&bytes, DecodePolicy::Explicit(format)).unwrap();
@@ -185,13 +194,13 @@ fn parser_output_equal_across_encodings_with_different_raw_offsets() {
         raw16,
         DecodePolicy::Explicit(SourceFormat::utf16le()),
         &flavite_encoding::DecodeLimits::default_envelope(),
-        &mut || false,
+        &flavite_encoding::NOT_CANCELLED,
     )
     .unwrap();
     assert_eq!(decoded8, decoded16.text(), "same link target bytes");
     assert_ne!(
-        blake3_hash(&p8.snapshot.source()),
-        blake3_hash(&p16.snapshot.source())
+        blake3_hash(p8.snapshot.source()),
+        blake3_hash(p16.snapshot.source())
     );
 }
 
@@ -253,7 +262,8 @@ fn dense_newline_utf16_lines_walk_monotonically() {
         }
         v
     };
-    let snap = TextSnapshot::with_policy(&bytes, DecodePolicy::Explicit(SourceFormat::utf16le())).unwrap();
+    let snap =
+        TextSnapshot::with_policy(&bytes, DecodePolicy::Explicit(SourceFormat::utf16le())).unwrap();
     assert_eq!(snap.line_count(), 1000);
     for (i, line) in snap.lines().iter().enumerate() {
         // Empty content: source_start == source_end at the CR unit start.

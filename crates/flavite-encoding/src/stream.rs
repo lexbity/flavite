@@ -1,597 +1,918 @@
-//! Incremental (streaming) codec state machines.
+//! Incremental streaming codecs (RFC-0006 §6.10, S00).
 //!
-//! The streaming decoder handles partial BOM signatures, partial UTF-16 code
-//! units, split surrogate pairs and split UTF-8 sequences across chunk
-//! boundaries, and reports incomplete suffixes only at explicit `finish()` —
-//! never as a lossy substitution (RFC-0006 §6.10). `decode` in the parent
-//! module feeds whole buffers through this same state machine in 64 KiB
-//! pieces so cancellation is always honored at that granularity (NFR-19).
+//! Decoder/encoder state handles partial BOM, code-unit, surrogate and
+//! UTF-8 chunks; incomplete suffixes are reported only at explicit
+//! [`StreamingDecoder::finish`]. There is no IO trait and no lossy
+//! fallback. Streaming decode yields text and the resolved
+//! [`SourceFormat`]; the checked byte map is built by the one-shot
+//! [`decode`](crate::decode) over whole sources.
 
+use crate::decode::LONGER_UNSUPPORTED_SIGNATURES;
 use crate::format::{
-    CodecError, CodecLimitKind, DecodeLimits, DecodePolicy, EncodeLimits, FileEncoding,
-    SourceFormat,
+    CANCEL_CHECK_BYTES, CancelToken, CodecError, CodecLimitKind, DecodeLimits, DecodePolicy,
+    EncodeLimits, FileEncoding, SourceFormat, check_limit,
 };
-use crate::map::{Checkpoint, MAX_CHECKPOINT_SCALAR_GAP};
 
-/// Progress granularity: cancellation and limit checks happen at least this
-/// often while streaming bytes (NFR-19).
-pub(crate) const CHECK_INTERVAL: u64 = 64 * 1024;
+/// Byte prefixes that can begin a recognized signature (Auto waits for
+/// these leads before deciding, up to the longest signature length).
+const SIGNATURE_LEADS: [u8; 8] = [0xEF, 0xFF, 0xFE, 0xF7, 0xDD, 0x0E, 0x2B, 0x00];
 
-/// Result metadata of a completed [`Decoder::finish`].
+/// Longest signature prefix Auto must be able to observe (UTF-32LE
+/// `FF FE 00 00` vs UTF-16LE `FF FE`).
+const MAX_SIGNATURE_LEN: usize = 4;
+
+/// Decoded text and resolved descriptor from a streaming decode.
 #[derive(Debug, Clone)]
-pub struct DecodedMeta {
-    /// The descriptor that was applied (detected under `Auto`).
-    pub format: SourceFormat,
-    /// Bytes of BOM signature removed from the source (0, 2 or 3).
-    pub bom_len: u64,
-    /// Total raw bytes fed.
-    pub source_len: u64,
-    /// Total decoded UTF-8 bytes produced.
-    pub decoded_len: u64,
-    /// Sparse scalar-boundary checkpoints for UTF-16 sources; empty for
-    /// ASCII/UTF-8 (whose mapping is the BOM offset).
-    pub checkpoints: Vec<Checkpoint>,
+pub struct StreamDecoded {
+    text: String,
+    format: SourceFormat,
 }
 
-/// One streaming decode session.
-///
-/// The policy is fixed at construction; chunks may arrive at any byte
-/// boundary. Output is appended to a `String` sink, which therefore always
-/// holds valid UTF-8 with original CR/LF scalars preserved (no newline
-/// folding here — that is `flavite-syntax`'s EOL map).
+impl StreamDecoded {
+    /// The decoded UTF-8 text.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The resolved descriptor the bytes were decoded under.
+    #[must_use]
+    pub const fn format(&self) -> SourceFormat {
+        self.format
+    }
+
+    /// Consume into the decoded UTF-8 text.
+    #[must_use]
+    pub fn into_text(self) -> String {
+        self.text
+    }
+}
+
 #[derive(Debug)]
-pub struct Decoder {
+enum Phase {
+    /// Signature not yet resolved; the first bytes are buffered.
+    Sig {
+        pending: Vec<u8>,
+    },
+    Active(ActiveState),
+}
+
+#[derive(Debug)]
+enum ActiveState {
+    Ascii,
+    Utf8(Utf8Incremental),
+    Utf16(Utf16Incremental),
+}
+
+/// Incremental decoder for byte chunks of unknown boundaries.
+#[derive(Debug)]
+pub struct StreamingDecoder {
     policy: DecodePolicy,
     limits: DecodeLimits,
-    /// Resolved encoding family after BOM sniff (pre-resolution: provisional).
-    encoding: FileEncoding,
-    /// Number of signature bytes consumed as BOM at the start of the stream.
-    bom_len: u64,
-    resolved: bool,
-    prefix: Vec<u8>,
-    prefix_target: usize,
-    /// Raw bytes accepted so far (absolute file positions).
-    next_raw: u64,
-    /// UTF-8 partial sequence buffer (≤3 bytes).
-    utf8_pending: Vec<u8>,
-    utf8_pending_start: u64,
-    /// UTF-16 partial code unit (1 byte seen).
-    unit_pending: Option<u8>,
-    unit_start: u64,
-    /// UTF-16 pending high surrogate awaiting its low unit.
-    high_pending: Option<(u16, u64)>,
-    decoded_len: u64,
-    next_scalar_source: u64,
-    scalars_since_cp: usize,
-    checkpoints: Vec<Checkpoint>,
+    raw_total: usize,
+    text: String,
+    format: Option<SourceFormat>,
+    phase: Phase,
 }
 
-impl Decoder {
-    /// Start a decode session for one raw source stream under `policy`.
+impl StreamingDecoder {
+    /// A decoder for `policy` under `limits`.
     #[must_use]
     pub fn new(policy: DecodePolicy, limits: DecodeLimits) -> Self {
-        let (encoding, prefix_target) = match policy {
-            DecodePolicy::Auto => (FileEncoding::Utf8, 4),
-            DecodePolicy::Explicit(f) => (f.encoding(), if f.bom() { f.bom_len() } else { 0 }),
-        };
-        let mut decoder = Self {
+        Self {
             policy,
             limits,
-            encoding,
-            bom_len: 0,
-            resolved: matches!(policy, DecodePolicy::Explicit(_)) && prefix_target == 0,
-            prefix: Vec::with_capacity(4),
-            prefix_target,
-            next_raw: 0,
-            utf8_pending: Vec::new(),
-            utf8_pending_start: 0,
-            unit_pending: None,
-            unit_start: 0,
-            high_pending: None,
-            decoded_len: 0,
-            next_scalar_source: 0,
-            scalars_since_cp: 0,
-            checkpoints: Vec::new(),
-        };
-        // An explicit no-BOM UTF-16 policy resolves at construction: seed the
-        // checkpoint table the same way `resolve_prefix` does for the sniffing
-        // paths.
-        if decoder.resolved && encoding.is_utf16() {
-            decoder.checkpoints.push(Checkpoint {
-                decoded_utf8: 0,
-                source: 0,
-            });
-            decoder.next_scalar_source = 0;
-        }
-        decoder
-    }
-
-    /// The encoding family once resolved; provisional value before.
-    #[must_use]
-    pub const fn resolved_encoding(&self) -> Option<FileEncoding> {
-        if self.resolved {
-            Some(self.encoding)
-        } else {
-            None
+            raw_total: 0,
+            text: String::new(),
+            format: None,
+            phase: Phase::Sig {
+                pending: Vec::new(),
+            },
         }
     }
 
-    /// Feed one raw chunk, appending decoded UTF-8 to `sink`.
+    /// Feed the next source chunk. Partial signatures, code units, UTF-8
+    /// sequences and surrogate pairs are held across pushes.
     ///
     /// # Errors
     ///
-    /// Returns a typed [`CodecError`] on malformed input, BOM conflict,
-    /// limit exceedance or cancellation. On error the session must be
-    /// discarded; partial sink contents carry no authority.
-    pub fn feed(&mut self, chunk: &[u8], sink: &mut String) -> Result<(), CodecError> {
-        let mut cursor = 0usize;
-        if !self.resolved {
-            let need = self.prefix_target - self.prefix.len();
-            if chunk.len() >= need {
-                self.prefix.extend_from_slice(&chunk[..need]);
-                cursor = need;
-                self.next_raw += need as u64;
-                let body_start = self.resolve_prefix(sink)?;
-                // `resolve_prefix` consumed the signature and may have left
-                // remaining prefix bytes for body processing.
-                let carried = std::mem::take(&mut self.prefix);
-                if !carried[body_start..].is_empty() {
-                    let base = self.next_raw - carried.len() as u64 + body_start as u64;
-                    self.feed_body(&carried[body_start..], base, sink)?;
-                }
-            } else {
-                self.prefix.extend_from_slice(chunk);
-                self.next_raw += chunk.len() as u64;
-                return Ok(());
+    /// [`CodecError`] for malformed input (first invalid sequence with its
+    /// source byte), exceeded limits and cancellation.
+    pub fn push(&mut self, chunk: &[u8], cancel: &CancelToken) -> Result<(), CodecError> {
+        if cancel.is_cancelled() {
+            return Err(CodecError::Cancelled);
+        }
+        let new_total =
+            self.raw_total
+                .checked_add(chunk.len())
+                .ok_or(CodecError::LimitExceeded {
+                    kind: CodecLimitKind::RawBytes,
+                    observed: u64::MAX,
+                    limit: self.limits.max_raw_bytes,
+                })?;
+        check_limit(
+            new_total,
+            self.limits.max_raw_bytes,
+            CodecLimitKind::RawBytes,
+        )?;
+        let base = self.raw_total;
+        self.raw_total = new_total;
+        for (offset, sub) in chunk.chunks(CANCEL_CHECK_BYTES).enumerate() {
+            if cancel.is_cancelled() {
+                return Err(CodecError::Cancelled);
             }
+            self.absorb(sub, base + offset * CANCEL_CHECK_BYTES)?;
         }
-        if cursor < chunk.len() {
-            let base = self.next_raw;
-            self.feed_body(&chunk[cursor..], base, sink)?;
-            self.next_raw += (chunk.len() - cursor) as u64;
-        }
-        self.check_progress()?;
         Ok(())
     }
 
-    /// Complete the stream.
+    /// Finish the stream, reporting incomplete suffixes only here.
     ///
     /// # Errors
     ///
-    /// A truncated sequence at explicit end-of-input produces the matching
-    /// typed error (`InvalidUtf8`, `OddUtf16ByteCount`, `InvalidUtf16`,
-    /// `BomConflict` for an unterminated required signature, or
-    /// `UnsupportedOrAmbiguousBom`); never a U+FFFD replacement.
-    pub fn finish(&mut self, sink: &mut String) -> Result<DecodedMeta, CodecError> {
-        if !self.resolved {
-            let body_start = self.resolve_prefix(sink)?;
-            let carried = std::mem::take(&mut self.prefix);
-            if !carried[body_start..].is_empty() {
-                let base = self.next_raw - carried.len() as u64 + body_start as u64;
-                self.feed_body(&carried[body_start..], base, sink)?;
-            }
+    /// [`CodecError::InvalidUtf8`] / [`CodecError::InvalidUtf16`] /
+    /// [`CodecError::OddUtf16ByteCount`] for truncated sequences and
+    /// [`CodecError::BomConflict`] for truncated explicit signatures.
+    pub fn finish(mut self) -> Result<StreamDecoded, CodecError> {
+        if let Phase::Sig { pending } = &mut self.phase {
+            let pending = std::mem::take(pending);
+            self.resolve_at_end_of_input(&pending)?;
         }
-        // Flush residual partial state as EOF errors.
-        match self.encoding {
-            FileEncoding::Utf8 | FileEncoding::Ascii => {
-                if !self.utf8_pending.is_empty() {
-                    return Err(CodecError::InvalidUtf8 {
-                        source_byte: self.utf8_pending_start,
-                    });
-                }
-            }
-            FileEncoding::Utf16Le | FileEncoding::Utf16Be => {
-                if let Some((_, pos)) = self.high_pending {
-                    return Err(CodecError::InvalidUtf16 { source_byte: pos });
-                }
-                if self.unit_pending.is_some() {
-                    return Err(CodecError::OddUtf16ByteCount);
-                }
-            }
+        match &self.phase {
+            Phase::Sig { .. } => unreachable!("finish resolves the signature phase"),
+            Phase::Active(ActiveState::Ascii) => {}
+            Phase::Active(ActiveState::Utf8(state)) => state.finish()?,
+            Phase::Active(ActiveState::Utf16(state)) => state.finish()?,
         }
-        let format = match self.policy {
-            DecodePolicy::Explicit(f) => f,
-            DecodePolicy::Auto => SourceFormat::new(self.encoding, self.bom_len > 0)
-                .map_err(|_| CodecError::BomConflict)?,
-        };
-        Ok(DecodedMeta {
+        let format = self.format.unwrap_or_else(|| {
+            // No bytes were ever pushed: an empty Auto-decoded file.
+            SourceFormat::new_unchecked(FileEncoding::Utf8, false)
+        });
+        Ok(StreamDecoded {
+            text: self.text,
             format,
-            bom_len: self.bom_len,
-            source_len: self.next_raw,
-            decoded_len: self.decoded_len,
-            checkpoints: std::mem::take(&mut self.checkpoints),
         })
     }
 
-    /// Resolve the BOM signature from the collected prefix. Returns the index
-    /// within `self.prefix` where body bytes begin.
-    fn resolve_prefix(&mut self, _sink: &mut String) -> Result<usize, CodecError> {
-        let bytes = &self.prefix;
-        let (encoding, bom_len) = match self.policy {
-            DecodePolicy::Auto => {
-                if bytes.len() >= 4 {
-                    let four: [u8; 4] = [bytes[0], bytes[1], bytes[2], bytes[3]];
-                    // Longer unsupported signatures first (UTF-32 LE/BE).
-                    if four == [0xFF, 0xFE, 0x00, 0x00] || four == [0x00, 0x00, 0xFE, 0xFF] {
-                        return Err(CodecError::UnsupportedOrAmbiguousBom);
-                    }
-                }
-                if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-                    (FileEncoding::Utf8, 3usize)
-                } else if bytes.starts_with(&[0xFF, 0xFE]) {
-                    (FileEncoding::Utf16Le, 2)
-                } else if bytes.starts_with(&[0xFE, 0xFF]) {
-                    (FileEncoding::Utf16Be, 2)
-                } else {
-                    // ASCII-visible bytes are valid UTF-8; Auto never marks a
-                    // strict-ASCII policy and never guesses UTF-16 (§6.10).
-                    (FileEncoding::Utf8, 0)
-                }
-            }
-            DecodePolicy::Explicit(f) => {
-                if f.bom() {
-                    let sig = f.encoding().bom_signature();
-                    if bytes.len() < sig.len() {
-                        if sig.starts_with(bytes) {
-                            // Incomplete signature at EOF: required BOM is
-                            // absent as a full signature.
-                            return Err(CodecError::BomConflict);
-                        }
-                        return Err(CodecError::BomConflict);
-                    }
-                    if bytes[..sig.len()] != *sig {
-                        return Err(CodecError::BomConflict);
-                    }
-                    (f.encoding(), sig.len())
-                } else {
-                    // No-BOM explicit: never strips signature-shaped bytes;
-                    // a leading U+FEFF is content.
-                    (f.encoding(), 0)
-                }
-            }
-        };
-        self.encoding = encoding;
-        self.bom_len = bom_len as u64;
-        self.resolved = true;
-        if encoding.is_utf16() {
-            // First scalar starts right after the (possibly zero-length) BOM.
-            self.checkpoints.push(Checkpoint {
-                decoded_utf8: 0,
-                source: self.bom_len as u32,
-            });
-            self.next_scalar_source = self.bom_len;
+    fn absorb(&mut self, chunk: &[u8], base: usize) -> Result<(), CodecError> {
+        if matches!(self.phase, Phase::Sig { .. }) {
+            let pending = match &mut self.phase {
+                Phase::Sig { pending } => pending,
+                Phase::Active(_) => unreachable!("checked above"),
+            };
+            pending.extend_from_slice(chunk);
+            return self.try_resolve();
         }
-        Ok(bom_len)
+        self.absorb_active(chunk, base)
     }
 
-    fn feed_body(&mut self, data: &[u8], base: u64, sink: &mut String) -> Result<(), CodecError> {
-        match self.encoding {
-            FileEncoding::Utf8 => self.feed_utf8(data, base, sink),
-            FileEncoding::Ascii => self.feed_ascii(data, base, sink),
-            FileEncoding::Utf16Le | FileEncoding::Utf16Be => self.feed_utf16(data, base, sink),
-        }
-    }
-
-    fn feed_utf8(&mut self, data: &[u8], base: u64, sink: &mut String) -> Result<(), CodecError> {
-        if self.utf8_pending.is_empty() {
-            // Fast path: whole-chunk strict validation.
-            match std::str::from_utf8(data) {
-                Ok(s) => {
-                    sink.push_str(s);
-                    self.decoded_len += s.len() as u64;
-                    return Ok(());
-                }
-                Err(err) => {
-                    let valid = err.valid_up_to();
-                    if err.error_len().is_some() {
-                        return Err(CodecError::InvalidUtf8 {
-                            source_byte: base + valid as u64,
-                        });
-                    }
-                    if valid > 0 {
-                        let head = std::str::from_utf8(&data[..valid])
-                            .map_err(|_| CodecError::InvalidUtf8 { source_byte: base })?;
-                        sink.push_str(head);
-                        self.decoded_len += head.len() as u64;
-                    }
-                    self.utf8_pending_start = base + valid as u64;
-                    self.utf8_pending.extend_from_slice(&data[valid..]);
-                    return Ok(());
-                }
-            }
-        }
-        // Continuation path: prepend the pending partial sequence.
-        let mut buf = std::mem::take(&mut self.utf8_pending);
-        buf.extend_from_slice(data);
-        let merged_start = self.utf8_pending_start;
-        match std::str::from_utf8(&buf) {
-            Ok(s) => {
-                sink.push_str(s);
-                self.decoded_len += s.len() as u64;
-                self.utf8_pending_start = base + data.len() as u64;
-                Ok(())
-            }
-            Err(err) => {
-                let valid = err.valid_up_to();
-                if err.error_len().is_some() {
+    fn absorb_active(&mut self, chunk: &[u8], base: usize) -> Result<(), CodecError> {
+        match &mut self.phase {
+            Phase::Sig { .. } => unreachable!("resolved before active absorb"),
+            Phase::Active(ActiveState::Ascii) => {
+                if let Some(idx) = chunk.iter().position(|b| *b >= 0x80) {
                     return Err(CodecError::InvalidUtf8 {
-                        source_byte: merged_start + valid as u64,
+                        source_byte: base + idx,
                     });
                 }
-                if valid > 0 {
-                    let head = std::str::from_utf8(&buf[..valid]).map_err(|_| {
-                        CodecError::InvalidUtf8 {
-                            source_byte: merged_start,
-                        }
-                    })?;
-                    sink.push_str(head);
-                    self.decoded_len += head.len() as u64;
-                }
-                self.utf8_pending_start = merged_start + valid as u64;
-                self.utf8_pending.extend_from_slice(&buf[valid..]);
+                check_limit(
+                    self.text.len() + chunk.len(),
+                    self.limits.max_decoded_utf8_bytes,
+                    CodecLimitKind::DecodedUtf8Bytes,
+                )?;
+                // All-ASCII bytes are valid UTF-8.
+                let text = std::str::from_utf8(chunk).unwrap_or_default();
+                self.text.push_str(text);
                 Ok(())
             }
-        }
-    }
-
-    fn feed_ascii(&mut self, data: &[u8], base: u64, sink: &mut String) -> Result<(), CodecError> {
-        if let Some(idx) = data.iter().position(|b| *b >= 0x80) {
-            return Err(CodecError::AsciiViolation {
-                source_byte: base + idx as u64,
-            });
-        }
-        let s =
-            std::str::from_utf8(data).map_err(|_| CodecError::InvalidUtf8 { source_byte: base })?;
-        sink.push_str(s);
-        self.decoded_len += s.len() as u64;
-        Ok(())
-    }
-
-    fn feed_utf16(&mut self, data: &[u8], base: u64, sink: &mut String) -> Result<(), CodecError> {
-        let le = self.encoding == FileEncoding::Utf16Le;
-        let mut i = 0usize;
-        while i < data.len() {
-            let abs = base + i as u64;
-            if let Some(hi_byte) = self.unit_pending.take() {
-                // Combine the parked leading byte with the current byte; the
-                // byte order in memory is (earlier, later) for both families.
-                let bytes = [hi_byte, data[i]];
-                let unit = if le {
-                    u16::from_le_bytes(bytes)
-                } else {
-                    u16::from_be_bytes(bytes)
-                };
-                let start = self.unit_start;
-                i += 1;
-                self.process_unit(unit, start, sink)?;
-            } else if i + 1 < data.len() {
-                let bytes = [data[i], data[i + 1]];
-                let unit = if le {
-                    u16::from_le_bytes(bytes)
-                } else {
-                    u16::from_be_bytes(bytes)
-                };
-                let start = abs;
-                i += 2;
-                self.process_unit(unit, start, sink)?;
-            } else {
-                // Trailing half unit: park it; EOF decides OddUtf16ByteCount.
-                self.unit_pending = Some(data[i]);
-                self.unit_start = abs;
-                i += 1;
+            Phase::Active(ActiveState::Utf8(state)) => {
+                let max_decoded = self.limits.max_decoded_utf8_bytes;
+                for (idx, byte) in chunk.iter().enumerate() {
+                    state.feed(*byte, base + idx, &mut self.text, max_decoded)?;
+                }
+                Ok(())
+            }
+            Phase::Active(ActiveState::Utf16(state)) => {
+                let max_decoded = self.limits.max_decoded_utf8_bytes;
+                state.feed(chunk, base, &mut self.text, max_decoded)
             }
         }
-        Ok(())
     }
 
-    fn process_unit(&mut self, unit: u16, start: u64, sink: &mut String) -> Result<(), CodecError> {
-        if (0xD800..0xDC00).contains(&unit) {
-            if let Some((_, pos)) = self.high_pending.take() {
-                // A high surrogate not followed by a low one is invalid at the
-                // *first* unit.
-                return Err(CodecError::InvalidUtf16 { source_byte: pos });
-            }
-            self.high_pending = Some((unit, start));
+    fn try_resolve(&mut self) -> Result<(), CodecError> {
+        let pending = match &mut self.phase {
+            Phase::Sig { pending } => std::mem::take(pending),
+            Phase::Active(_) => return Ok(()),
+        };
+        if pending.is_empty() {
+            self.phase = Phase::Sig { pending };
             return Ok(());
         }
-        let ch = if (0xDC00..0xE000).contains(&unit) {
-            if let Some((high, high_pos)) = self.high_pending.take() {
-                // Combine the surrogate pair into one supplementary scalar.
-                let value =
-                    0x1_0000 + ((u32::from(high) - 0xD800) << 10) + (u32::from(unit) - 0xDC00);
-                char::from_u32(value).ok_or(CodecError::InvalidUtf16 {
-                    source_byte: high_pos,
-                })?
-            } else {
-                return Err(CodecError::InvalidUtf16 { source_byte: start });
+        match self.policy {
+            DecodePolicy::Explicit(format) => {
+                let sig = format.encoding().signature();
+                if !format.has_bom() {
+                    // Explicit BOM-less never strips signatures.
+                    self.activate(format, 0, &pending)
+                } else if pending.starts_with(sig) {
+                    self.activate(format, sig.len(), &pending)
+                } else if pending.len() >= sig.len() {
+                    Err(CodecError::BomConflict)
+                } else {
+                    // Still a strict prefix of the required signature.
+                    self.phase = Phase::Sig { pending };
+                    Ok(())
+                }
             }
-        } else {
-            if let Some((_, high_pos)) = self.high_pending.take() {
-                return Err(CodecError::InvalidUtf16 {
-                    source_byte: high_pos,
-                });
-            }
-            char::from_u32(u32::from(unit))
-                .ok_or(CodecError::InvalidUtf16 { source_byte: start })?
-        };
-        sink.push(ch);
-        self.decoded_len += ch.len_utf8() as u64;
-        if self.decoded_len > self.limits.max_decoded_utf8_bytes {
-            return Err(CodecError::limit(
-                CodecLimitKind::DecodedUtf8,
-                self.decoded_len,
-                self.limits.max_decoded_utf8_bytes,
-            ));
+            DecodePolicy::Auto => self.resolve_auto(pending),
         }
-        // The scalar just completed ends two bytes after the unit that closed
-        // it (the low unit of a pair, or the sole BMP unit).
-        self.next_scalar_source = start + 2;
-        self.scalars_since_cp += 1;
-        if self.scalars_since_cp >= MAX_CHECKPOINT_SCALAR_GAP {
-            self.scalars_since_cp = 0;
-            let decoded_u32 = u32::try_from(self.decoded_len).map_err(|_| {
-                CodecError::limit(
-                    CodecLimitKind::DecodedUtf8,
-                    self.decoded_len,
-                    u64::from(u32::MAX),
+    }
+
+    fn resolve_auto(&mut self, pending: Vec<u8>) -> Result<(), CodecError> {
+        if !SIGNATURE_LEADS.contains(&pending[0]) {
+            return self.activate(
+                SourceFormat::new_unchecked(FileEncoding::Utf8, false),
+                0,
+                &pending,
+            );
+        }
+        // Longer unsupported signatures are checked before the UTF-16
+        // prefixes (§6.10) so UTF-32 is diagnosed, not misdecoded.
+        for sig in &LONGER_UNSUPPORTED_SIGNATURES {
+            if pending.starts_with(sig) {
+                return Err(CodecError::UnsupportedOrAmbiguousBom);
+            }
+        }
+        if pending.starts_with(FileEncoding::Utf8.signature()) {
+            return self.activate(
+                SourceFormat::new_unchecked(FileEncoding::Utf8, true),
+                3,
+                &pending,
+            );
+        }
+        if pending.starts_with(FileEncoding::Utf16Le.signature()) {
+            // FF FE is also the prefix of the UTF-32LE signature: wait for
+            // the fourth byte before committing (§6.10 ambiguity rule).
+            if pending.len() >= MAX_SIGNATURE_LEN {
+                return self.activate(
+                    SourceFormat::new_unchecked(FileEncoding::Utf16Le, true),
+                    2,
+                    &pending,
+                );
+            }
+            self.phase = Phase::Sig { pending };
+            return Ok(());
+        }
+        if pending.starts_with(FileEncoding::Utf16Be.signature()) {
+            return self.activate(
+                SourceFormat::new_unchecked(FileEncoding::Utf16Be, true),
+                2,
+                &pending,
+            );
+        }
+        if pending.len() >= MAX_SIGNATURE_LEN {
+            return self.activate(
+                SourceFormat::new_unchecked(FileEncoding::Utf8, false),
+                0,
+                &pending,
+            );
+        }
+        // Could still become a longer signature; keep buffering.
+        self.phase = Phase::Sig { pending };
+        Ok(())
+    }
+
+    fn resolve_at_end_of_input(&mut self, pending: &[u8]) -> Result<(), CodecError> {
+        match self.policy {
+            DecodePolicy::Explicit(format) => {
+                let sig = format.encoding().signature();
+                if !format.has_bom() {
+                    return self.activate(format, 0, pending);
+                }
+                if pending == sig {
+                    // Exactly the required signature and nothing else.
+                    return self.activate(format, sig.len(), pending);
+                }
+                Err(CodecError::BomConflict)
+            }
+            DecodePolicy::Auto => {
+                if pending == FileEncoding::Utf16Le.signature() {
+                    return self.activate(
+                        SourceFormat::new_unchecked(FileEncoding::Utf16Le, true),
+                        2,
+                        pending,
+                    );
+                }
+                if pending == FileEncoding::Utf16Be.signature() {
+                    return self.activate(
+                        SourceFormat::new_unchecked(FileEncoding::Utf16Be, true),
+                        2,
+                        pending,
+                    );
+                }
+                if pending == FileEncoding::Utf8.signature() {
+                    return self.activate(
+                        SourceFormat::new_unchecked(FileEncoding::Utf8, true),
+                        3,
+                        pending,
+                    );
+                }
+                // Not a complete signature: strict UTF-8 (invalid bytes
+                // surface with their source position).
+                self.activate(
+                    SourceFormat::new_unchecked(FileEncoding::Utf8, false),
+                    0,
+                    pending,
                 )
-            })?;
-            let source_u32 = u32::try_from(self.next_scalar_source).map_err(|_| {
-                CodecError::limit(
-                    CodecLimitKind::RawInput,
-                    self.next_scalar_source,
-                    u64::from(u32::MAX),
-                )
-            })?;
-            self.checkpoints.push(Checkpoint {
-                decoded_utf8: decoded_u32,
-                source: source_u32,
+            }
+        }
+    }
+
+    fn activate(
+        &mut self,
+        format: SourceFormat,
+        sig_len: usize,
+        pending: &[u8],
+    ) -> Result<(), CodecError> {
+        self.format = Some(format);
+        self.phase = Phase::Active(match format.encoding() {
+            FileEncoding::Ascii => ActiveState::Ascii,
+            FileEncoding::Utf8 => ActiveState::Utf8(Utf8Incremental::new()),
+            FileEncoding::Utf16Le | FileEncoding::Utf16Be => ActiveState::Utf16(
+                Utf16Incremental::new(format.encoding() == FileEncoding::Utf16Le),
+            ),
+        });
+        self.absorb_active(&pending[sig_len..], sig_len)
+    }
+}
+
+/// Incremental strict UTF-8 validator/pusher.
+#[derive(Debug)]
+struct Utf8Incremental {
+    /// Absolute source byte where the current scalar started.
+    scalar_start: usize,
+    /// Continuation bytes still expected.
+    need: usize,
+    /// Accumulated payload bits of the current scalar.
+    acc: u32,
+    /// Allowed range for the next continuation byte (overlong/surrogate
+    /// guards).
+    next_min: u8,
+    next_max: u8,
+}
+
+impl Utf8Incremental {
+    fn new() -> Self {
+        Self {
+            scalar_start: 0,
+            need: 0,
+            acc: 0,
+            next_min: 0x80,
+            next_max: 0xBF,
+        }
+    }
+
+    fn feed(
+        &mut self,
+        byte: u8,
+        pos: usize,
+        out: &mut String,
+        max_decoded: u64,
+    ) -> Result<(), CodecError> {
+        if self.need == 0 {
+            self.scalar_start = pos;
+            match byte {
+                0x00..=0x7F => {
+                    push_scalar(out, char::from(byte), max_decoded)?;
+                    return Ok(());
+                }
+                0xC2..=0xDF => {
+                    self.need = 1;
+                    self.acc = u32::from(byte & 0x1F);
+                    self.next_min = 0x80;
+                    self.next_max = 0xBF;
+                }
+                0xE0 => {
+                    self.need = 2;
+                    self.acc = 0;
+                    self.next_min = 0xA0;
+                    self.next_max = 0xBF;
+                }
+                0xE1..=0xEC | 0xEE..=0xEF => {
+                    self.need = 2;
+                    self.acc = u32::from(byte & 0x0F);
+                    self.next_min = 0x80;
+                    self.next_max = 0xBF;
+                }
+                0xED => {
+                    self.need = 2;
+                    self.acc = u32::from(byte & 0x0F);
+                    self.next_min = 0x80;
+                    self.next_max = 0x9F;
+                }
+                0xF0 => {
+                    self.need = 3;
+                    self.acc = 0;
+                    self.next_min = 0x90;
+                    self.next_max = 0xBF;
+                }
+                0xF1..=0xF3 => {
+                    self.need = 3;
+                    self.acc = u32::from(byte & 0x07);
+                    self.next_min = 0x80;
+                    self.next_max = 0xBF;
+                }
+                0xF4 => {
+                    self.need = 3;
+                    self.acc = u32::from(byte & 0x07);
+                    self.next_min = 0x80;
+                    self.next_max = 0x8F;
+                }
+                _ => return Err(CodecError::InvalidUtf8 { source_byte: pos }),
+            }
+            return Ok(());
+        }
+        if byte < self.next_min || byte > self.next_max {
+            return Err(CodecError::InvalidUtf8 {
+                source_byte: self.scalar_start,
             });
+        }
+        self.acc = (self.acc << 6) | u32::from(byte & 0x3F);
+        self.next_min = 0x80;
+        self.next_max = 0xBF;
+        self.need -= 1;
+        if self.need == 0 {
+            // The range guards above guarantee validity.
+            match char::from_u32(self.acc) {
+                Some(scalar) => push_scalar(out, scalar, max_decoded)?,
+                None => {
+                    return Err(CodecError::InvalidUtf8 {
+                        source_byte: self.scalar_start,
+                    });
+                }
+            }
         }
         Ok(())
     }
 
-    fn check_progress(&mut self) -> Result<(), CodecError> {
-        if self.decoded_len > self.limits.max_decoded_utf8_bytes {
-            return Err(CodecError::limit(
-                CodecLimitKind::DecodedUtf8,
-                self.decoded_len,
-                self.limits.max_decoded_utf8_bytes,
-            ));
+    fn finish(&self) -> Result<(), CodecError> {
+        if self.need > 0 {
+            return Err(CodecError::InvalidUtf8 {
+                source_byte: self.scalar_start,
+            });
         }
         Ok(())
     }
 }
 
-/// One streaming encode session: UTF-8 in, strict bytes out, under an exact
-/// descriptor. Output size is enforced as it is produced; use
-/// [`crate::encode`] to validate the full output bound before any write.
+fn push_scalar(out: &mut String, scalar: char, max_decoded: u64) -> Result<(), CodecError> {
+    check_limit(
+        out.len() + scalar.len_utf8(),
+        max_decoded,
+        CodecLimitKind::DecodedUtf8Bytes,
+    )?;
+    out.push(scalar);
+    Ok(())
+}
+
+/// Incremental strict UTF-16 decoder holding odd trailing bytes and pending
+/// high surrogates across pushes.
 #[derive(Debug)]
-pub struct Encoder {
+struct Utf16Incremental {
+    le: bool,
+    pending_byte: Option<u8>,
+    pending_high: Option<(u16, usize)>,
+}
+
+impl Utf16Incremental {
+    fn new(le: bool) -> Self {
+        Self {
+            le,
+            pending_byte: None,
+            pending_high: None,
+        }
+    }
+
+    /// Assemble a unit from its bytes in stream order (LE: low first,
+    /// BE: high first).
+    fn read_unit(&self, first: u8, second: u8) -> u16 {
+        if self.le {
+            u16::from_le_bytes([first, second])
+        } else {
+            u16::from_be_bytes([first, second])
+        }
+    }
+
+    fn feed(
+        &mut self,
+        chunk: &[u8],
+        base: usize,
+        out: &mut String,
+        max_decoded: u64,
+    ) -> Result<(), CodecError> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let mut idx = 0usize;
+        if let Some(held) = self.pending_byte.take() {
+            let unit = self.read_unit(held, chunk[0]);
+            self.process_unit(unit, base.saturating_sub(1), out, max_decoded)?;
+            idx = 1;
+        }
+        while idx + 1 < chunk.len() {
+            let unit = self.read_unit(chunk[idx], chunk[idx + 1]);
+            self.process_unit(unit, base + idx, out, max_decoded)?;
+            idx += 2;
+        }
+        if idx < chunk.len() {
+            self.pending_byte = Some(chunk[chunk.len() - 1]);
+        }
+        Ok(())
+    }
+
+    fn process_unit(
+        &mut self,
+        unit: u16,
+        source_byte: usize,
+        out: &mut String,
+        max_decoded: u64,
+    ) -> Result<(), CodecError> {
+        if let Some((high, high_source_byte)) = self.pending_high {
+            if (0xDC00..=0xDFFF).contains(&unit) {
+                self.pending_high = None;
+                let combined =
+                    0x1_0000 + ((u32::from(high) - 0xD800) << 10) + (u32::from(unit) - 0xDC00);
+                let scalar = char::from_u32(combined).ok_or(CodecError::InvalidUtf16 {
+                    source_byte: high_source_byte,
+                })?;
+                push_scalar(out, scalar, max_decoded)?;
+                return Ok(());
+            }
+            return Err(CodecError::InvalidUtf16 {
+                source_byte: high_source_byte,
+            });
+        }
+        if (0xD800..=0xDBFF).contains(&unit) {
+            self.pending_high = Some((unit, source_byte));
+        } else if (0xDC00..=0xDFFF).contains(&unit) {
+            return Err(CodecError::InvalidUtf16 { source_byte });
+        } else {
+            let scalar =
+                char::from_u32(u32::from(unit)).ok_or(CodecError::InvalidUtf16 { source_byte })?;
+            push_scalar(out, scalar, max_decoded)?;
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<(), CodecError> {
+        if self.pending_byte.is_some() {
+            return Err(CodecError::OddUtf16ByteCount);
+        }
+        if let Some((_, source_byte)) = self.pending_high {
+            return Err(CodecError::InvalidUtf16 { source_byte });
+        }
+        Ok(())
+    }
+}
+
+/// Incremental encoder producing bytes for the descriptor's format.
+#[derive(Debug)]
+pub struct StreamingEncoder {
     format: SourceFormat,
     limits: EncodeLimits,
     written: u64,
-    input: u64,
+    input_pos: usize,
+    signature_written: bool,
 }
 
-impl Encoder {
-    /// Start an encode session for `format`.
+impl StreamingEncoder {
+    /// An encoder for `format` under `limits`.
     #[must_use]
-    pub const fn new(format: SourceFormat, limits: EncodeLimits) -> Self {
+    pub fn new(format: SourceFormat, limits: EncodeLimits) -> Self {
         Self {
             format,
             limits,
             written: 0,
-            input: 0,
+            input_pos: 0,
+            signature_written: false,
         }
     }
 
-    /// The BOM bytes to emit first for this descriptor (possibly empty).
-    #[must_use]
-    pub fn header(&self) -> &'static [u8] {
-        self.format.bom_bytes()
-    }
-
-    /// Encode one UTF-8 chunk, appending bytes to `out`.
+    /// Encode the next text chunk into `out`. The requested signature is
+    /// written once before the first content bytes.
     ///
     /// # Errors
     ///
-    /// `Unencodable` for strict-ASCII violations (before the chunk is
-    /// emitted), `LimitExceeded` for input/output bound violations.
-    pub fn encode(&mut self, chunk: &str, out: &mut Vec<u8>) -> Result<(), CodecError> {
-        self.input = self
-            .input
-            .checked_add(chunk.len() as u64)
-            .ok_or(CodecError::limit(
-                CodecLimitKind::EncodeInput,
-                self.input.saturating_add(chunk.len() as u64),
-                self.limits.max_input_utf8_bytes,
-            ))?;
-        if self.input > self.limits.max_input_utf8_bytes {
-            return Err(CodecError::limit(
-                CodecLimitKind::EncodeInput,
-                self.input,
-                self.limits.max_input_utf8_bytes,
-            ));
+    /// [`CodecError::Unencodable`] under strict ASCII,
+    /// [`CodecError::LimitExceeded`] for input/output budgets and
+    /// [`CodecError::Cancelled`] when the token fires. On error, `out`
+    /// retains only what was written before it.
+    pub fn push(
+        &mut self,
+        text: &str,
+        out: &mut Vec<u8>,
+        cancel: &CancelToken,
+    ) -> Result<(), CodecError> {
+        if cancel.is_cancelled() {
+            return Err(CodecError::Cancelled);
         }
-        match self.format.encoding() {
-            FileEncoding::Ascii => {
-                if let Some((byte_idx, _)) = chunk.char_indices().find(|(_, c)| !c.is_ascii()) {
-                    return Err(CodecError::Unencodable {
-                        text_byte: self.input - chunk.len() as u64 + byte_idx as u64,
-                    });
-                }
-                out.extend_from_slice(chunk.as_bytes());
-                self.written = self
-                    .written
-                    .checked_add(chunk.len() as u64)
-                    .ok_or_else(|| {
-                        CodecError::limit(
-                            CodecLimitKind::EncodeOutput,
-                            self.written.saturating_add(chunk.len() as u64),
-                            self.limits.max_output_bytes,
-                        )
-                    })?;
-            }
-            FileEncoding::Utf8 => {
-                out.extend_from_slice(chunk.as_bytes());
-                self.written = self
-                    .written
-                    .checked_add(chunk.len() as u64)
-                    .ok_or_else(|| {
-                        CodecError::limit(
-                            CodecLimitKind::EncodeOutput,
-                            self.written.saturating_add(chunk.len() as u64),
-                            self.limits.max_output_bytes,
-                        )
-                    })?;
-            }
-            FileEncoding::Utf16Le | FileEncoding::Utf16Be => {
-                let le = self.format.encoding() == FileEncoding::Utf16Le;
-                let mut buf = [0u16; 2];
-                for c in chunk.chars() {
-                    let count = c.encode_utf16(&mut buf).len();
-                    for u in &buf[..count] {
-                        let bytes = if le { u.to_le_bytes() } else { u.to_be_bytes() };
-                        out.extend_from_slice(&bytes);
-                    }
-                    self.written =
-                        self.written
-                            .checked_add((count * 2) as u64)
-                            .ok_or(CodecError::limit(
-                                CodecLimitKind::EncodeOutput,
-                                u64::MAX,
-                                self.limits.max_output_bytes,
-                            ))?;
-                    if self.written > self.limits.max_output_bytes {
-                        return Err(CodecError::limit(
-                            CodecLimitKind::EncodeOutput,
-                            self.written,
-                            self.limits.max_output_bytes,
-                        ));
-                    }
-                }
+        let new_pos = self
+            .input_pos
+            .checked_add(text.len())
+            .ok_or(CodecError::LimitExceeded {
+                kind: CodecLimitKind::InputUtf8Bytes,
+                observed: u64::MAX,
+                limit: self.limits.max_input_utf8_bytes,
+            })?;
+        check_limit(
+            new_pos,
+            self.limits.max_input_utf8_bytes,
+            CodecLimitKind::InputUtf8Bytes,
+        )?;
+        if !self.signature_written {
+            self.signature_written = true;
+            if self.format.has_bom() {
+                let sig = self.format.encoding().signature();
+                self.write_bytes(sig, out)?;
             }
         }
-        if self.written > self.limits.max_output_bytes {
-            return Err(CodecError::limit(
-                CodecLimitKind::EncodeOutput,
-                self.written,
-                self.limits.max_output_bytes,
-            ));
+        for sub in chunk_at_char_boundary(text, CANCEL_CHECK_BYTES) {
+            if cancel.is_cancelled() {
+                return Err(CodecError::Cancelled);
+            }
+            self.push_sub(sub, out)?;
         }
+        self.input_pos = new_pos;
         Ok(())
     }
 
-    /// Total bytes produced so far.
+    fn push_sub(&mut self, text: &str, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        match self.format.encoding() {
+            FileEncoding::Ascii => {
+                if let Some(idx) = text.as_bytes().iter().position(|b| *b >= 0x80) {
+                    return Err(CodecError::Unencodable {
+                        text_byte: self.input_pos + idx,
+                    });
+                }
+                self.write_bytes(text.as_bytes(), out)
+            }
+            FileEncoding::Utf8 => self.write_bytes(text.as_bytes(), out),
+            FileEncoding::Utf16Le | FileEncoding::Utf16Be => {
+                let le = self.format.encoding() == FileEncoding::Utf16Le;
+                for ch in text.chars() {
+                    let mut units = [0u16; 2];
+                    let count = ch.encode_utf16(&mut units).len();
+                    let encoded = count * 2;
+                    self.check_output(encoded)?;
+                    for unit in &units[..count] {
+                        let bytes = if le {
+                            unit.to_le_bytes()
+                        } else {
+                            unit.to_be_bytes()
+                        };
+                        out.extend_from_slice(&bytes);
+                    }
+                    self.record_written(encoded);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Checked-then-written byte append (check precedes any growth).
+    fn write_bytes(&mut self, bytes: &[u8], out: &mut Vec<u8>) -> Result<(), CodecError> {
+        self.check_output(bytes.len())?;
+        out.extend_from_slice(bytes);
+        self.record_written(bytes.len());
+        Ok(())
+    }
+
+    fn check_output(&self, extra: usize) -> Result<(), CodecError> {
+        let extra64 = u64::try_from(extra).unwrap_or(u64::MAX);
+        match self.written.checked_add(extra64) {
+            Some(next) if next <= self.limits.max_output_bytes => Ok(()),
+            Some(next) => Err(CodecError::LimitExceeded {
+                kind: CodecLimitKind::OutputBytes,
+                observed: next,
+                limit: self.limits.max_output_bytes,
+            }),
+            None => Err(CodecError::LimitExceeded {
+                kind: CodecLimitKind::OutputBytes,
+                observed: u64::MAX,
+                limit: self.limits.max_output_bytes,
+            }),
+        }
+    }
+
+    fn record_written(&mut self, extra: usize) {
+        self.written = self
+            .written
+            .saturating_add(u64::try_from(extra).unwrap_or(u64::MAX));
+    }
+
+    /// Finish the stream; all supported formats encode per scalar, so only
+    /// the total byte count remains.
+    ///
+    /// # Errors
+    ///
+    /// Never fails for correctly pushed streams; kept for API symmetry with
+    /// [`StreamingDecoder::finish`].
+    pub fn finish(self) -> Result<u64, CodecError> {
+        Ok(self.written)
+    }
+
+    /// Output bytes written so far.
     #[must_use]
     pub const fn written(&self) -> u64 {
         self.written
     }
+}
 
-    /// Finish the stream and return the exact byte count.
-    #[must_use]
-    pub const fn finish(&self) -> u64 {
-        self.written
+/// Split `text` into slices of at most `max_bytes`, each ending on a char
+/// boundary.
+fn chunk_at_char_boundary(text: &str, max_bytes: usize) -> Vec<&str> {
+    let mut slices = Vec::new();
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    while start < bytes.len() {
+        let mut end = bytes.len().min(start + max_bytes);
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            // A single scalar larger than max_bytes; take it whole.
+            end = start
+                + text[start..]
+                    .chars()
+                    .next()
+                    .map_or(bytes.len() - start, char::len_utf8);
+        }
+        slices.push(&text[start..end]);
+        start = end;
+    }
+    slices
+}
+
+/// Streaming encode convenience: encode `text` in one push.
+///
+/// # Errors
+///
+/// Same as [`StreamingEncoder::push`].
+pub fn encode_stream(
+    text: &str,
+    format: SourceFormat,
+    limits: &EncodeLimits,
+    cancel: &CancelToken,
+) -> Result<Vec<u8>, CodecError> {
+    let mut encoder = StreamingEncoder::new(format, *limits);
+    let mut out = Vec::new();
+    encoder.push(text, &mut out, cancel)?;
+    let total = encoder.finish()?;
+    debug_assert_eq!(u64::try_from(out.len()).unwrap_or(u64::MAX), total);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encode::encode;
+
+    #[test]
+    fn utf8_validator_matches_the_known_sequence_classes() {
+        let cases: [(&[u8], Option<&str>); 9] = [
+            (b"a", Some("a")),
+            ("é".as_bytes(), Some("é")),
+            ("€".as_bytes(), Some("€")),
+            ("\u{1F600}".as_bytes(), Some("\u{1F600}")),
+            (&[0xC0, 0x80], None),             // overlong
+            (&[0xED, 0xA0, 0x80], None),       // surrogate
+            (&[0xF4, 0x90, 0x80, 0x80], None), // > U+10FFFF
+            (&[0x80], None),                   // lone continuation
+            (&[0xC2], None),                   // truncated
+        ];
+        for (bytes, expected) in cases {
+            let mut decoder = StreamingDecoder::new(DecodePolicy::Auto, DecodeLimits::default());
+            let result = decoder
+                .push(bytes, &CancelToken::new())
+                .and_then(|()| decoder.finish());
+            match expected {
+                Some(text) => assert_eq!(result.expect("decodes").text(), text),
+                None => assert!(result.is_err(), "bytes {bytes:?} must fail"),
+            }
+        }
+    }
+
+    #[test]
+    fn utf16_pair_and_odd_trailing_byte() {
+        let mut decoder = StreamingDecoder::new(DecodePolicy::Auto, DecodeLimits::default());
+        // BOM + high surrogate D83D split across pushes + low surrogate DE00.
+        decoder
+            .push(&[0xFF, 0xFE, 0x3D, 0xD8], &CancelToken::new())
+            .unwrap();
+        decoder.push(&[0x00], &CancelToken::new()).unwrap();
+        decoder.push(&[0xDE], &CancelToken::new()).unwrap();
+        let outcome = decoder.finish().unwrap();
+        assert_eq!(outcome.text(), "\u{1F600}");
+        assert!(outcome.format().has_bom());
+
+        let mut decoder = StreamingDecoder::new(DecodePolicy::Auto, DecodeLimits::default());
+        decoder
+            .push(&[0xFF, 0xFE, 0x41, 0x00, 0x42], &CancelToken::new())
+            .unwrap();
+        assert_eq!(
+            decoder.finish().expect_err("odd trailing byte"),
+            CodecError::OddUtf16ByteCount
+        );
+    }
+
+    #[test]
+    fn auto_waits_for_the_fourth_byte_before_committing_utf16le() {
+        let mut decoder = StreamingDecoder::new(DecodePolicy::Auto, DecodeLimits::default());
+        // FF FE 00 alone must not yet resolve as UTF-16LE...
+        decoder
+            .push(&[0xFF, 0xFE, 0x00], &CancelToken::new())
+            .unwrap();
+        // ...and FF FE 00 00 is the UTF-32LE signature, not UTF-16LE:
+        // diagnosed as soon as the fourth byte arrives.
+        let err = decoder
+            .push(&[0x00], &CancelToken::new())
+            .expect_err("utf-32le signature");
+        assert_eq!(err, CodecError::UnsupportedOrAmbiguousBom);
+
+        let mut decoder = StreamingDecoder::new(DecodePolicy::Auto, DecodeLimits::default());
+        decoder
+            .push(&[0xFF, 0xFE, 0x00], &CancelToken::new())
+            .unwrap();
+        decoder
+            .push(&[0x05, 0x00, 0x00], &CancelToken::new())
+            .unwrap();
+        let outcome = decoder.finish().unwrap();
+        assert_eq!(outcome.text(), "\u{0500}\u{0}");
+        assert_eq!(outcome.format().encoding(), FileEncoding::Utf16Le);
+    }
+
+    #[test]
+    fn encoder_streams_the_same_bytes_as_one_shot() {
+        let text = "héllo\r\n\u{1F600}\r\nwörld";
+        let format = SourceFormat::new(FileEncoding::Utf16Le, true).unwrap();
+        let limits = EncodeLimits::default();
+        let one_shot = encode(text, format, &limits, &CancelToken::new()).expect("one-shot");
+        let streamed = encode_stream(text, format, &limits, &CancelToken::new()).expect("streamed");
+        assert_eq!(streamed, one_shot);
+        assert_eq!(streamed.len() % 2, 0);
+    }
+
+    #[test]
+    fn streaming_encoder_enforces_the_output_budget() {
+        let format = SourceFormat::new(FileEncoding::Utf8, false).unwrap();
+        let limits = EncodeLimits {
+            max_input_utf8_bytes: u64::MAX,
+            max_output_bytes: 2,
+        };
+        let mut encoder = StreamingEncoder::new(format, limits);
+        let mut out = Vec::new();
+        encoder.push("ab", &mut out, &CancelToken::new()).unwrap();
+        let err = encoder
+            .push("cdef", &mut out, &CancelToken::new())
+            .expect_err("over output budget");
+        assert!(matches!(err, CodecError::LimitExceeded { .. }));
+        assert_eq!(out.len(), 2, "only admitted bytes were written");
+        assert_eq!(encoder.written(), 2);
+    }
+
+    #[test]
+    fn chunk_at_char_boundary_respects_scalars() {
+        let text = "a\u{1F600}b";
+        let slices = chunk_at_char_boundary(text, 2);
+        let joined: String = slices.iter().copied().collect();
+        assert_eq!(joined, text);
+        let mut offset = 0usize;
+        for slice in &slices {
+            assert!(text.is_char_boundary(offset));
+            offset += slice.len();
+            assert!(text.is_char_boundary(offset));
+        }
+        assert_eq!(offset, text.len());
+    }
+
+    #[test]
+    fn explicit_bom_only_and_bom_conflict_at_finish() {
+        // Exactly the required signature and nothing else: empty content.
+        let policy = DecodePolicy::Explicit(SourceFormat::new(FileEncoding::Utf8, true).unwrap());
+        let mut decoder = StreamingDecoder::new(policy, DecodeLimits::default());
+        decoder
+            .push(&[0xEF, 0xBB, 0xBF], &CancelToken::new())
+            .unwrap();
+        let outcome = decoder.finish().unwrap();
+        assert_eq!(outcome.text(), "");
+        assert!(outcome.format().has_bom());
+
+        // Truncated signature at finish is a conflict, not a guess.
+        let mut decoder = StreamingDecoder::new(policy, DecodeLimits::default());
+        decoder.push(&[0xEF, 0xBB], &CancelToken::new()).unwrap();
+        assert_eq!(
+            decoder.finish().expect_err("truncated signature"),
+            CodecError::BomConflict
+        );
     }
 }

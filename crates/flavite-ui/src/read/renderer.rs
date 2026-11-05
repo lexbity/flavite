@@ -206,8 +206,8 @@ fn inline<'a>(
 ) -> Element<'a, Message> {
     let mut spans: Vec<iced::widget::text::Span<'a, Message>> = Vec::new();
     let query = app
-        .reading
-        .find
+        .note_search
+        .finds
         .get(&tab)
         .map(|find| find.query.as_str())
         .filter(|query| !query.is_empty());
@@ -362,20 +362,22 @@ fn collect_spans<'a>(
         }
         if let Some(query) = format.query {
             // Find highlights use semantic palette tokens and the same dirty
-            // snapshot as the editor; links keep their original action.
+            // snapshot as the editor; links keep their original action. The
+            // per-node scan folds exactly like the note search host so the
+            // read view highlights what the find bar counts (D-05 default).
             let mut at = 0;
-            for (found, _) in content.match_indices(query) {
+            for (found, end) in crate::host::note_search::scan(&content, query, false).0 {
                 if at < found {
                     let mut fragment = s.clone();
                     fragment.text = content[at..found].to_owned().into();
                     spans.push(fragment);
                 }
                 let mut highlight = s.clone();
-                highlight.text = content[found..found + query.len()].to_owned().into();
+                highlight.text = content[found..end].to_owned().into();
                 let theme = style::theme(format.scheme);
                 highlight = highlight.background(theme.extended_palette().primary.weak.color);
                 spans.push(highlight);
-                at = found + query.len();
+                at = end;
             }
             if at < content.len() {
                 s.text = content[at..].to_owned().into();

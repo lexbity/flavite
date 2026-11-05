@@ -74,8 +74,8 @@ mod tests {
     #[test]
     fn test_crate_compiles() {
         // This is just a sanity check that all modules compile
-        assert_eq!(SCHEMA_MAJOR, 3);
-        assert_eq!(SCHEMA_MINOR, 1);
+        assert_eq!(SCHEMA_MAJOR, 4);
+        assert_eq!(SCHEMA_MINOR, 0);
         assert_eq!(PARSER_VERSION, 3);
         assert_eq!(INITIAL_EPOCH, 1);
         assert_eq!(MAX_NOTE_BYTES, 32 * 1024 * 1024);

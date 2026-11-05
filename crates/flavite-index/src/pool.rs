@@ -1493,7 +1493,7 @@ impl IndexActor {
             bytes,
             flavite_encoding::DecodePolicy::Auto,
             &flavite_encoding::DecodeLimits::default_envelope(),
-            &mut || false,
+            &flavite_encoding::NOT_CANCELLED,
         );
         let Ok(content) = decoded else {
             return self.apply_undecodable_note(
@@ -1540,10 +1540,9 @@ impl IndexActor {
         // so source spans map through the same composed codec map that
         // produced the parse.
         let snapshot = &parsed.snapshot;
-        let (encoding_code, bom) = snapshot
-            .format()
-            .map(|format| (format.encoding_code(), i64::from(format.bom())))
-            .unwrap_or(("utf8", 0));
+        let (encoding_code, bom) = snapshot.format().map_or(("utf8", 0), |format| {
+            (format.encoding_code(), i64::from(format.bom()))
+        });
         let content_hash = Hash::from_bytes(*blake3::hash(bytes).as_bytes());
         let stem = std::path::Path::new(display_path)
             .file_stem()
@@ -1800,7 +1799,7 @@ impl IndexActor {
             bytes,
             flavite_encoding::DecodePolicy::Auto,
             &flavite_encoding::DecodeLimits::default_envelope(),
-            &mut || false,
+            &flavite_encoding::NOT_CANCELLED,
         );
         let (preview, decode_status, encoding_code, bom) = match decoded {
             Ok(content) => (
@@ -1877,6 +1876,7 @@ impl IndexActor {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // decode-status/encoding columns ride along (§6.10)
     fn apply_unparsed_note_inner(
         &mut self,
         path_native: &[u8],

@@ -7,7 +7,7 @@
 //! outcome below is a real typed core result, never a UI label.
 
 use flavite_api::{ExecutionResult, Flavite, Invocation, LocalResult, Origin, VaultConfig};
-use flavite_encoding::{DecodePolicy, SourceFormat, decode};
+use flavite_encoding::{DecodeLimits, DecodePolicy, NOT_CANCELLED, SourceFormat, decode};
 use flavite_fs::OsFs;
 use flavite_vault::actor::VaultActorBuilder;
 use flavite_vault::channels::ChannelSet;
@@ -34,7 +34,8 @@ fn fixture() -> Fixture {
     std::fs::create_dir_all(&cache).expect("cache dir");
     let db = cache.join("encoding-index.sqlite3");
     drop(flavite_index::open_or_init(&db).expect("index database"));
-    let identity = flavite_api::VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![3, 1, 4]);
+    let identity =
+        flavite_api::VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![3, 1, 4]);
     let actor = VaultActorBuilder::new()
         .with_fs(Box::new(OsFs::new()) as Box<dyn flavite_fs::Fs + Send + Sync>)
         .with_identity(identity.clone())
@@ -60,7 +61,11 @@ fn fixture() -> Fixture {
         .expect("session");
     let mut flavite = Flavite::open(identity, session, config).expect("facade");
     flavite.set_graph_db_path_for_test(db);
-    Fixture { flavite, root, temp }
+    Fixture {
+        flavite,
+        root,
+        temp,
+    }
 }
 
 fn write_note(f: &Fixture, name: &str, bytes: &[u8]) -> PathBuf {
@@ -117,7 +122,9 @@ fn open_note(flavite: &Flavite, path: &Path) -> (u64, u64) {
         serde_json::json!({ "path": path, "policy": "existing_only" }),
     );
     let data = match result {
-        ExecutionResult::Pending { request_id } => success_data(wait_for(flavite, request_id), "note.open"),
+        ExecutionResult::Pending { request_id } => {
+            success_data(wait_for(flavite, request_id), "note.open")
+        }
         ExecutionResult::Local(LocalResult::Success(success)) => success.data,
         other => panic!("note.open was not admitted: {other:?}"),
     };
@@ -222,8 +229,13 @@ fn convert_to_utf16le_bom_then_save_writes_bommed_bytes() {
         &[0xFF, 0xFE],
         "saved bytes are UTF-16LE with a BOM"
     );
-    let redecoded = decode(&on_disk, DecodePolicy::Auto, &Default::default(), &mut || false)
-        .expect("saved bytes decode");
+    let redecoded = decode(
+        &on_disk,
+        DecodePolicy::Auto,
+        &DecodeLimits::default_envelope(),
+        &NOT_CANCELLED,
+    )
+    .expect("saved bytes decode");
     assert_eq!(redecoded.text(), "convert me\n");
     assert_eq!(redecoded.format(), SourceFormat::utf16le_with_bom());
 }
@@ -267,8 +279,7 @@ fn reopen_with_dirty_buffer_is_refused_typed() {
     assert!(edit.is_success(), "apply_edits: {edit:?}");
     let _ = revision;
 
-    let raw_hash =
-        hex::encode(blake3::hash(b"dirty base\n").as_bytes());
+    let raw_hash = hex::encode(blake3::hash(b"dirty base\n").as_bytes());
     let result = wait_for_terminal_reopen(
         &f,
         serde_json::json!({

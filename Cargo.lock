@@ -1646,7 +1646,9 @@ version = "0.1.0"
 dependencies = [
  "flavite-syntax",
  "proptest",
- "unicode-segmentation",
+ "regex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

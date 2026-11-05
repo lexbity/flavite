@@ -2,7 +2,7 @@
 //! acknowledged edits may consume captures made before the next redraw.
 use crate::{
     app::{App, Message},
-    host::reading,
+    host::{note_search, reading},
 };
 use flavite_editor::{
     input::{CapturedInput, PreparedInput},
@@ -28,7 +28,7 @@ pub fn handle(
         || app.picker.open
         || app.palette_open
         || app.strip_menu.is_some()
-        || app.reading.find.get(&tab).is_some_and(|find| find.focused)
+        || note_search::blocks_typing(app, &tab)
         || app.notes.incarnation(tab) != Some(incarnation)
     {
         return iced::Task::none();
@@ -157,8 +157,11 @@ pub fn handle(
             sequence: input.sequence,
         },
     );
-    if let Some(find) = app.reading.find.get_mut(&tab) {
+    if let Some(find) = app.note_search.finds.get_mut(&tab) {
         find.focused = false;
+    }
+    if let Some(replace) = app.note_search.replaces.get_mut(&tab) {
+        replace.focused = false;
     }
     app.status = if matches!(input.action, KeyAction::Copy) {
         "Copied selection".into()

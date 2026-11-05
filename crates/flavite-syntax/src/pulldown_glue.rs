@@ -16,7 +16,7 @@ use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use std::ops::Range;
 
 /// A parsed note with all extracted structure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ParsedNote {
     /// The text snapshot (normalized bytes + source mapping).
     pub snapshot: TextSnapshot,
@@ -33,7 +33,7 @@ pub struct ParsedNote {
 }
 
 /// A resolved link from scanning.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Link {
     /// Span in normalized text coordinates.
     pub span: Span<TextByte>,

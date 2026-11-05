@@ -17,7 +17,10 @@ fn model_with(text: &str) -> EditorModel {
 }
 
 fn op(start: usize, end: usize, replacement: &str) -> EditOp {
-    EditOp::new(Span::new(TextByte(start), TextByte(end)), replacement.to_owned())
+    EditOp::new(
+        Span::new(TextByte(start), TextByte(end)),
+        replacement.to_owned(),
+    )
 }
 
 #[test]
@@ -39,9 +42,17 @@ fn prepared_batch_applies_all_matches_and_installs_one_boundary() {
         .expect("typing applies");
     let typing_revision = model.revision();
     model.undo();
-    assert_eq!(model.text(), "X bb X cc X", "typing undo does not touch the batch");
+    assert_eq!(
+        model.text(),
+        "X bb X cc X",
+        "typing undo does not touch the batch"
+    );
     model.undo();
-    assert_eq!(model.text(), "aa bb aa cc aa", "one undo removes the whole batch");
+    assert_eq!(
+        model.text(),
+        "aa bb aa cc aa",
+        "one undo removes the whole batch"
+    );
     let _ = typing_revision; // every undo also advances the revision (§4.5.2)
     model.redo();
     assert_eq!(model.text(), "X bb X cc X", "redo replays the whole batch");
@@ -95,7 +106,10 @@ fn invalid_batch_after_valid_earlier_ranges_changes_nothing() {
     let mut multibyte = model_with("aé😀b");
     let emoji_start = "aé".len();
     let error = multibyte
-        .try_apply_batch(&[op(emoji_start + 1, emoji_start + 3, "X")], UndoPolicy::Isolated)
+        .try_apply_batch(
+            &[op(emoji_start + 1, emoji_start + 3, "X")],
+            UndoPolicy::Isolated,
+        )
         .expect_err("mid-scalar range refused");
     assert!(matches!(error, BatchError::CharBoundary { .. }));
     // Undo history is unchanged: undo after the refusals returns to the

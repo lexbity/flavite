@@ -1,378 +1,362 @@
-//! Boundary maps between encoded source bytes and decoded UTF-8 bytes.
+//! Checked encoded↔decoded byte mapping (RFC-0006 §6.10).
 //!
-//! `SourceByte` positions count the original encoded file bytes (including a
-//! BOM and physical EOL bytes); decoded positions count UTF-8 bytes after the
-//! BOM was removed, with original CR/LF scalars preserved. Folding CRLF to LF
-//! belongs to `flavite-syntax`'s EOL map, which composes on top of this map —
-//! this crate performs no newline normalization.
-//!
-//! The map never copies the whole decoded file: ASCII/UTF-8 mapping is a BOM
-//! offset with direct byte-boundary inspection, and UTF-16 uses sparse
-//! scalar-boundary checkpoints at most [`MAX_CHECKPOINT_SCALAR_GAP`] scalars
-//! apart. A query binary-searches the checkpoint table and then decodes at
-//! most 255 scalars locally (NFR-18).
+//! The map shares the immutable original bytes; it never retains an
+//! independent mutable document and never copies the file per lookup. For
+//! UTF-16 sources it keeps sparse scalar-boundary checkpoints at most
+//! [`CHECKPOINT_SCALARS`] apart and binary-searches them, decoding at most
+//! 255 scalars locally per query (NFR-18). Mapping is total and invertible
+//! on the legal boundary domain and rejects the interiors of BOMs, encoded
+//! scalars/surrogate pairs, CRLF pairs and UTF-8 continuations.
 
 use std::sync::Arc;
 
-use crate::format::{FileEncoding, SourceFormat};
+use crate::decode::decode_scalar_at;
+use crate::format::{CodecError, CodecLimitKind, FileEncoding, SourceFormat, check_limit};
 
-/// Maximum scalar distance between two checkpoints. A local remap therefore
-/// decodes at most this many scalars after the binary search.
-pub const MAX_CHECKPOINT_SCALAR_GAP: usize = 255;
+/// Maximum scalar distance between adjacent checkpoints (§6.10, NFR-18).
+pub const CHECKPOINT_SCALARS: usize = 255;
 
-/// One recorded scalar boundary: absolute decoded-UTF-8 and source byte
-/// positions. Offsets fit `u32` because decode limits are bounded well below
-/// 4 GiB (NFR-19) and enforced at construction with checked arithmetic.
+/// One sparse scalar-boundary checkpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Checkpoint {
-    /// Decoded UTF-8 byte offset at a scalar boundary.
-    pub decoded_utf8: u32,
-    /// Encoded source byte offset of the same boundary.
-    pub source: u32,
+struct Checkpoint {
+    source_byte: usize,
+    decoded_byte: usize,
 }
 
-/// Checked `SourceByte ↔ decoded UTF-8 byte` mapping for one immutable
-/// encoded source. Cheap to clone: the original bytes are shared, not copied.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Maps byte positions of the original encoded source to byte positions of
+/// the decoded UTF-8 content and back.
+///
+/// Valid source boundaries are scalar starts (before/after an LF
+/// terminator's scalars, the beginning/end of CRLF, and the position after a
+/// BOM); EOF is always a valid paired boundary on both sides. No constant
+/// multiplication by two is ever used for UTF-16.
+#[derive(Debug, Clone)]
 pub struct DecodeMap {
-    inner: Arc<Inner>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct Inner {
-    encoding: FileEncoding,
-    /// The full validated descriptor this map was built under.
-    format: SourceFormat,
-    /// Byte length of the removed BOM signature (0, 2 or 3).
-    bom_len: u32,
-    /// Total encoded source byte length (including BOM).
-    source_len: u64,
-    /// Decoded UTF-8 byte length.
-    decoded_len: u64,
-    /// The original encoded bytes, shared with the snapshot owner.
     source: Arc<[u8]>,
-    /// Sparse scalar-boundary table; empty for ASCII/UTF-8 (identity).
-    checkpoints: Vec<Checkpoint>,
-}
-
-/// One scalar's size on each side of the map.
-#[derive(Debug, Clone, Copy)]
-struct Scalar {
-    decoded_bytes: u32,
-    source_bytes: u32,
-}
-
-/// Public scalar-size view returned by [`DecodeMap::scalar_size_at_source`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScalarSize {
-    /// Bytes this scalar occupies in the decoded UTF-8 stream.
-    pub decoded_bytes: u32,
-    /// Bytes this scalar occupies in the encoded source.
-    pub source_bytes: u32,
+    format: SourceFormat,
+    bom_len: usize,
+    decoded_len: usize,
+    /// Sparse checkpoints for UTF-16 only; UTF-8/ASCII decode is a pure
+    /// offset translation.
+    checkpoints: Arc<[Checkpoint]>,
 }
 
 impl DecodeMap {
-    /// Build an ASCII/UTF-8 (identity-offset) map.
-    #[allow(clippy::missing_panics_doc)] // constructor never panics; debug asserts are preconditions
-    pub(crate) fn identity(
-        encoding: FileEncoding,
-        format: SourceFormat,
+    pub(crate) fn build(
         source: Arc<[u8]>,
-        bom_len: u32,
-        decoded_len: u64,
-    ) -> Self {
-        debug_assert!(!encoding.is_utf16());
-        debug_assert_eq!(encoding, format.encoding());
-        Self {
-            inner: Arc::new(Inner {
-                encoding,
-                format,
-                bom_len,
-                source_len: source.len() as u64,
-                decoded_len,
-                source,
-                checkpoints: Vec::new(),
-            }),
-        }
-    }
-
-    /// Build a UTF-16 map from a recorded checkpoint table. `checkpoints` must
-    /// start at `(0, bom_len)` and be ascending on both axes with gaps of at
-    /// most [`MAX_CHECKPOINT_SCALAR_GAP`] scalars.
-    pub(crate) fn utf16(
-        encoding: FileEncoding,
         format: SourceFormat,
-        source: Arc<[u8]>,
-        bom_len: u32,
-        decoded_len: u64,
-        checkpoints: Vec<Checkpoint>,
-    ) -> Self {
-        debug_assert!(encoding.is_utf16());
-        debug_assert_eq!(
-            checkpoints.first(),
-            Some(&Checkpoint {
-                decoded_utf8: 0,
-                source: bom_len
-            })
-        );
-        Self {
-            inner: Arc::new(Inner {
-                encoding,
-                format,
-                bom_len,
-                source_len: source.len() as u64,
-                decoded_len,
-                source,
-                checkpoints,
-            }),
-        }
-    }
-
-    /// The validated descriptor the source was decoded under.
-    #[must_use]
-    pub fn format(&self) -> SourceFormat {
-        self.inner.format
-    }
-
-    #[must_use]
-    pub fn encoding(&self) -> FileEncoding {
-        self.inner.encoding
-    }
-
-    /// Byte length of the removed BOM signature.
-    #[must_use]
-    pub fn bom_len(&self) -> u64 {
-        u64::from(self.inner.bom_len)
-    }
-
-    /// Total encoded source length, including the BOM.
-    #[must_use]
-    pub fn source_len(&self) -> u64 {
-        self.inner.source_len
-    }
-
-    /// Decoded UTF-8 length (BOM removed, physical CR/LF preserved).
-    #[must_use]
-    pub fn decoded_len(&self) -> u64 {
-        self.inner.decoded_len
-    }
-
-    /// The shared original bytes.
-    #[must_use]
-    pub fn source_bytes(&self) -> &Arc<[u8]> {
-        &self.inner.source
-    }
-
-    /// Recorded checkpoint table (for tests/inspection).
-    #[must_use]
-    pub fn checkpoints(&self) -> &[Checkpoint] {
-        &self.inner.checkpoints
-    }
-
-    /// Approximate heap overhead of the map itself (NFR-18 accounting).
-    #[must_use]
-    pub fn map_bytes(&self) -> usize {
-        self.inner.checkpoints.len() * std::mem::size_of::<Checkpoint>()
-    }
-
-    /// Map an encoded source offset to its decoded UTF-8 offset.
-    ///
-    /// Returns `None` for positions inside the BOM, inside an encoded scalar
-    /// or surrogate pair, odd UTF-16 byte positions, and non-scalar UTF-8
-    /// continuation positions. EOF is always a valid paired boundary.
-    #[must_use]
-    pub fn source_to_decoded(&self, source: u64) -> Option<u64> {
-        let inner = &self.inner;
-        if source > inner.source_len {
-            return None;
-        }
-        if source == inner.source_len {
-            // EOF is always the valid pair of decoded EOF.
-            return Some(inner.decoded_len);
-        }
-        if source < u64::from(inner.bom_len) {
-            // Before or inside the BOM signature: no decoded meaning.
-            return None;
-        }
-        if !inner.encoding.is_utf16() {
-            let d = source - u64::from(inner.bom_len);
-            if d == inner.decoded_len {
-                return Some(d);
-            }
-            if is_utf8_continuation(inner.source[d as usize + inner.bom_len as usize]) {
-                return None;
-            }
-            return Some(d);
-        }
-        self.walk_source_to_decoded(source)
-    }
-
-    /// Map a decoded UTF-8 offset to its encoded source offset.
-    ///
-    /// Returns `None` for out-of-range positions and for offsets inside an
-    /// encoded scalar (UTF-8 continuation positions never occur because the
-    /// decoded domain is produced by strict decoding; the check exists for
-    /// callers composing with their own folded offsets).
-    #[must_use]
-    pub fn decoded_utf8_to_source(&self, decoded: u64) -> Option<u64> {
-        let inner = &self.inner;
-        if decoded > inner.decoded_len {
-            return None;
-        }
-        if decoded == inner.decoded_len {
-            return Some(inner.source_len);
-        }
-        if !inner.encoding.is_utf16() {
-            let s = decoded + u64::from(inner.bom_len);
-            if is_utf8_continuation(inner.source[s as usize]) {
-                return None;
-            }
-            return Some(s);
-        }
-        self.walk_decoded_to_source(decoded)
-    }
-
-    /// Whether a source offset is a legal boundary (BOM end, scalar start,
-    /// terminator start, or EOF).
-    #[must_use]
-    pub fn is_valid_source_boundary(&self, source: u64) -> bool {
-        self.source_to_decoded(source).is_some()
-    }
-
-    /// Whether a decoded offset is a legal scalar boundary.
-    #[must_use]
-    pub fn is_valid_decoded_boundary(&self, decoded: u64) -> bool {
-        self.decoded_utf8_to_source(decoded).is_some()
-    }
-
-    fn walk_source_to_decoded(&self, target: u64) -> Option<u64> {
-        let inner = &self.inner;
-        let start = self
-            .checkpoint_for(target, |c| c.source)
-            .copied()
-            .unwrap_or(Checkpoint {
-                decoded_utf8: 0,
-                source: inner.bom_len,
-            });
-        if u64::from(start.source) > target {
-            return None;
-        }
-        let mut pos = u64::from(start.source);
-        let mut dec = u64::from(start.decoded_utf8);
-        while pos < target {
-            let scalar = self.scalar_at_source(pos)?;
-            pos = pos.checked_add(u64::from(scalar.source_bytes))?;
-            dec = dec.checked_add(u64::from(scalar.decoded_bytes))?;
-        }
-        if pos == target {
-            Some(dec)
+        max_map_bytes: u64,
+    ) -> Result<Self, CodecError> {
+        let bom_len = if format.has_bom() {
+            format.encoding().signature().len()
         } else {
-            // Overshot: `target` is inside a scalar (or an odd byte).
-            None
-        }
-    }
-
-    fn walk_decoded_to_source(&self, target: u64) -> Option<u64> {
-        let inner = &self.inner;
-        let start = self
-            .checkpoint_for(target, |c| c.decoded_utf8)
-            .copied()
-            .unwrap_or(Checkpoint {
-                decoded_utf8: 0,
-                source: inner.bom_len,
-            });
-        if u64::from(start.decoded_utf8) > target {
-            return None;
-        }
-        let mut pos = u64::from(start.source);
-        let mut dec = u64::from(start.decoded_utf8);
-        while dec < target {
-            let scalar = self.scalar_at_source(pos)?;
-            pos = pos.checked_add(u64::from(scalar.source_bytes))?;
-            dec = dec.checked_add(u64::from(scalar.decoded_bytes))?;
-        }
-        if dec == target { Some(pos) } else { None }
-    }
-
-    /// Largest checkpoint with `key(checkpoint) <= target`.
-    fn checkpoint_for(&self, target: u64, key: impl Fn(&Checkpoint) -> u32) -> Option<&Checkpoint> {
-        let cps = &self.inner.checkpoints;
-        if cps.is_empty() {
-            return None;
-        }
-        // partition_point: first index where key > target.
-        let idx = cps.partition_point(|c| u64::from(key(c)) <= target);
-        if idx == 0 { None } else { Some(&cps[idx - 1]) }
-    }
-
-    /// Size of one scalar starting at an absolute source position, for
-    /// consumers (like `flavite-syntax`'s composed line walk) that advance a
-    /// decoded region in single passes. `None` marks a position that is not a
-    /// scalar start (or is out of range).
-    #[must_use]
-    pub fn scalar_size_at_source(&self, pos: u64) -> Option<ScalarSize> {
-        self.scalar_at_source(pos).map(|s| ScalarSize {
-            decoded_bytes: s.decoded_bytes,
-            source_bytes: s.source_bytes,
-        })
-    }
-
-    /// Size of one scalar starting at an absolute source position. The source
-    /// was strictly decoded, so surrogate pairs are well-formed here.
-    fn scalar_at_source(&self, pos: u64) -> Option<Scalar> {
-        let inner = &self.inner;
-        let bytes = &inner.source;
-        let p = usize::try_from(pos).ok()?;
-        if !inner.encoding.is_utf16() {
-            // Identity family: decoded and source widths are equal.
-            if p == inner.source.len() {
-                return None; // EOF is not a scalar start
-            }
-            let lead = bytes[p];
-            if is_utf8_continuation(lead) {
-                return None;
-            }
-            let len = match lead {
-                0x00..=0x7F => 1,
-                0xC0..=0xDF => 2,
-                0xE0..=0xEF => 3,
-                _ => 4,
-            };
-            if p + len > bytes.len() {
-                return None;
-            }
-            return Some(Scalar {
-                decoded_bytes: len as u32,
-                source_bytes: len as u32,
-            });
-        }
-        let unit = |at: usize| -> Option<u16> {
-            let pair = bytes.get(at..at + 2)?;
-            Some(if inner.encoding == FileEncoding::Utf16Le {
-                u16::from_le_bytes([pair[0], pair[1]])
-            } else {
-                u16::from_be_bytes([pair[0], pair[1]])
-            })
+            0
         };
-        let u = unit(p)?;
-        if (0xD800..0xDC00).contains(&u) {
-            // High surrogate: the pair is one scalar (4 source bytes,
-            // 4 decoded UTF-8 bytes).
-            let _low = unit(p + 2)?;
-            return Some(Scalar {
-                decoded_bytes: 4,
-                source_bytes: 4,
-            });
+        match format.encoding() {
+            FileEncoding::Ascii | FileEncoding::Utf8 => {
+                let decoded_len = source.len() - bom_len;
+                Ok(Self {
+                    source,
+                    format,
+                    bom_len,
+                    decoded_len,
+                    checkpoints: Arc::from([]),
+                })
+            }
+            FileEncoding::Utf16Le | FileEncoding::Utf16Be => {
+                let checkpoints = build_utf16_checkpoints(&source, format.encoding(), bom_len)?;
+                check_limit(
+                    checkpoints.len() * std::mem::size_of::<Checkpoint>(),
+                    max_map_bytes,
+                    CodecLimitKind::MapBytes,
+                )?;
+                let decoded_len = utf16_decoded_len(&source, format.encoding(), bom_len)?;
+                Ok(Self {
+                    source,
+                    format,
+                    bom_len,
+                    decoded_len,
+                    checkpoints: Arc::from(checkpoints),
+                })
+            }
         }
-        let ch = char::from_u32(u32::from(u))?;
-        Some(Scalar {
-            decoded_bytes: ch.len_utf8() as u32,
-            source_bytes: 2,
-        })
+    }
+
+    /// The descriptor the map was built for.
+    #[must_use]
+    pub const fn format(&self) -> SourceFormat {
+        self.format
+    }
+
+    /// The immutable original encoded bytes the map was built from.
+    pub(crate) const fn source_bytes(&self) -> &std::sync::Arc<[u8]> {
+        &self.source
+    }
+
+    /// BOM length in the original source (explicit EOF/BOM metadata).
+    #[must_use]
+    pub const fn bom_len(&self) -> usize {
+        self.bom_len
+    }
+
+    /// Length of the original encoded source bytes.
+    #[must_use]
+    pub fn source_len(&self) -> usize {
+        self.source.len()
+    }
+
+    /// Length of the decoded UTF-8 content bytes.
+    #[must_use]
+    pub const fn decoded_len(&self) -> usize {
+        self.decoded_len
+    }
+
+    /// Map an original source byte offset to the decoded UTF-8 byte offset.
+    ///
+    /// Returns `None` out of range, inside the BOM, at an odd UTF-16 byte
+    /// position, inside a surrogate pair, or inside a UTF-8 continuation
+    /// sequence. EOF maps to EOF.
+    #[must_use]
+    pub fn source_to_decoded(&self, source_byte: usize) -> Option<usize> {
+        let total = self.source.len();
+        if source_byte > total {
+            return None;
+        }
+        if source_byte == total {
+            return Some(self.decoded_len);
+        }
+        if source_byte < self.bom_len {
+            return None; // BOM interior
+        }
+        match self.format.encoding() {
+            FileEncoding::Ascii | FileEncoding::Utf8 => Some(source_byte - self.bom_len),
+            FileEncoding::Utf16Le | FileEncoding::Utf16Be => {
+                self.utf16_source_to_decoded(source_byte)
+            }
+        }
+    }
+
+    /// Map a decoded UTF-8 byte offset back to the original source byte
+    /// offset. UTF-8 continuation positions are rejected; EOF maps to EOF.
+    #[must_use]
+    pub fn decoded_to_source(&self, decoded_byte: usize) -> Option<usize> {
+        if decoded_byte > self.decoded_len {
+            return None;
+        }
+        if decoded_byte == self.decoded_len {
+            return Some(self.source.len());
+        }
+        match self.format.encoding() {
+            FileEncoding::Ascii | FileEncoding::Utf8 => Some(decoded_byte + self.bom_len),
+            FileEncoding::Utf16Le | FileEncoding::Utf16Be => {
+                self.utf16_decoded_to_source(decoded_byte)
+            }
+        }
+    }
+
+    fn utf16_source_to_decoded(&self, source_byte: usize) -> Option<usize> {
+        if !(source_byte - self.bom_len).is_multiple_of(2) {
+            return None; // odd code-unit position
+        }
+        let idx = self
+            .checkpoints
+            .partition_point(|cp| cp.source_byte <= source_byte);
+        let cp = *self.checkpoints.get(idx.checked_sub(1)?)?;
+        if cp.source_byte == source_byte {
+            return Some(cp.decoded_byte);
+        }
+        // Walk forward at most CHECKPOINT_SCALARS scalars from the
+        // checkpoint.
+        let mut cur_src = cp.source_byte;
+        let mut cur_dec = cp.decoded_byte;
+        let mut steps = 0;
+        while cur_src < source_byte {
+            if steps > CHECKPOINT_SCALARS {
+                return None; // defensive bound; never reached for valid maps
+            }
+            let (scalar, pair_len) = decode_scalar_at(
+                &self.source[self.bom_len..],
+                self.format.encoding(),
+                (cur_src - self.bom_len) / 2,
+                self.bom_len,
+            )
+            .ok()?;
+            let next_src = cur_src + pair_len;
+            if source_byte < next_src {
+                return None; // scalar/surrogate-pair interior
+            }
+            cur_src = next_src;
+            cur_dec += scalar.len_utf8();
+            if cur_src == source_byte {
+                return Some(cur_dec);
+            }
+            steps += 1;
+        }
+        None
+    }
+
+    fn utf16_decoded_to_source(&self, decoded_byte: usize) -> Option<usize> {
+        let idx = self
+            .checkpoints
+            .partition_point(|cp| cp.decoded_byte <= decoded_byte);
+        let cp = *self.checkpoints.get(idx.checked_sub(1)?)?;
+        if cp.decoded_byte == decoded_byte {
+            return Some(cp.source_byte);
+        }
+        let mut cur_dec = cp.decoded_byte;
+        let mut cur_src = cp.source_byte;
+        let mut steps = 0;
+        while cur_dec < decoded_byte {
+            if steps > CHECKPOINT_SCALARS {
+                return None;
+            }
+            let (scalar, pair_len) = decode_scalar_at(
+                &self.source[self.bom_len..],
+                self.format.encoding(),
+                (cur_src - self.bom_len) / 2,
+                self.bom_len,
+            )
+            .ok()?;
+            let next_dec = cur_dec + scalar.len_utf8();
+            if decoded_byte < next_dec {
+                return None; // UTF-8 continuation interior
+            }
+            cur_dec = next_dec;
+            cur_src += pair_len;
+            if cur_dec == decoded_byte {
+                return Some(cur_src);
+            }
+            steps += 1;
+        }
+        None
     }
 }
 
-/// UTF-8 continuation byte test (`10xx_xxxx`).
-pub(crate) const fn is_utf8_continuation(byte: u8) -> bool {
-    byte & 0xC0 == 0x80
+fn build_utf16_checkpoints(
+    source: &[u8],
+    encoding: FileEncoding,
+    bom_len: usize,
+) -> Result<Vec<Checkpoint>, CodecError> {
+    let body = &source[bom_len..];
+    let unit_count = body.len() / 2;
+    let mut checkpoints = Vec::new();
+    let mut src = bom_len;
+    let mut dec = 0usize;
+    let mut since_last = 0usize;
+    checkpoints.push(Checkpoint {
+        source_byte: src,
+        decoded_byte: dec,
+    });
+    let mut unit_index = 0;
+    while unit_index < unit_count {
+        let (scalar, pair_len) = decode_scalar_at(body, encoding, unit_index, bom_len)?;
+        src += pair_len;
+        dec += scalar.len_utf8();
+        unit_index += pair_len / 2;
+        since_last += 1;
+        if since_last == CHECKPOINT_SCALARS {
+            checkpoints.push(Checkpoint {
+                source_byte: src,
+                decoded_byte: dec,
+            });
+            since_last = 0;
+        }
+    }
+    Ok(checkpoints)
+}
+
+fn utf16_decoded_len(
+    source: &[u8],
+    encoding: FileEncoding,
+    bom_len: usize,
+) -> Result<usize, CodecError> {
+    let body = &source[bom_len..];
+    let unit_count = body.len() / 2;
+    let mut dec = 0usize;
+    let mut unit_index = 0;
+    while unit_index < unit_count {
+        let (scalar, pair_len) = decode_scalar_at(body, encoding, unit_index, bom_len)?;
+        dec += scalar.len_utf8();
+        unit_index += pair_len / 2;
+    }
+    Ok(dec)
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::format::{CancelToken, DecodeLimits, DecodePolicy};
+
+    fn decode_auto(source: &[u8]) -> crate::decode::DecodedContent {
+        crate::decode::decode(
+            source,
+            DecodePolicy::Auto,
+            &DecodeLimits::default(),
+            &CancelToken::new(),
+        )
+        .expect("decodes")
+    }
+
+    #[test]
+    fn utf8_map_is_identity_past_the_bom() {
+        let source = [0xEF, 0xBB, 0xBF, b'a', b'\r', b'\n', b'b'];
+        let decoded = decode_auto(&source);
+        let map = decoded.map();
+        assert_eq!(map.bom_len(), 3);
+        assert_eq!(map.source_len(), 7);
+        assert_eq!(map.decoded_len(), 4);
+        // BOM interior is illegal; position after the BOM is legal.
+        assert_eq!(map.source_to_decoded(0), None);
+        assert_eq!(map.source_to_decoded(2), None);
+        assert_eq!(map.source_to_decoded(3), Some(0));
+        // The CR of a CRLF pair is a legal scalar boundary.
+        assert_eq!(map.source_to_decoded(4), Some(1));
+        assert_eq!(map.decoded_to_source(0), Some(3));
+        assert_eq!(map.decoded_to_source(1), Some(4));
+        // EOF pairs on both sides.
+        assert_eq!(map.source_to_decoded(7), Some(4));
+        assert_eq!(map.decoded_to_source(4), Some(7));
+    }
+
+    #[test]
+    fn utf16_map_rejects_odd_and_surrogate_interiors() {
+        // BOM + "a" + U+1F600 (surrogate pair) + "b"
+        let text = "a\u{1F600}b";
+        let mut source = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            source.extend_from_slice(&unit.to_le_bytes());
+        }
+        let decoded = decode_auto(&source);
+        let map = decoded.map();
+        // source: BOM(0..2) + a(2..4) + pair(4..8) + b(8..10)
+        assert_eq!(map.source_to_decoded(1), None, "odd position");
+        assert_eq!(map.source_to_decoded(2), Some(0), "start of 'a'");
+        assert_eq!(map.source_to_decoded(3), None, "odd position");
+        assert_eq!(map.source_to_decoded(4), Some(1), "start of pair");
+        assert_eq!(map.source_to_decoded(6), None, "surrogate interior");
+        assert_eq!(map.source_to_decoded(8), Some(5), "start of 'b'");
+        // decoded: a(0..1) + U+1F600(1..5) + b(5..6)
+        assert_eq!(map.decoded_to_source(2), None, "utf-8 continuation");
+        assert_eq!(map.decoded_to_source(1), Some(4));
+        assert_eq!(map.decoded_to_source(5), Some(8));
+        assert_eq!(map.decoded_to_source(6), Some(10), "EOF");
+        assert_eq!(map.source_to_decoded(10), Some(6));
+    }
+
+    #[test]
+    fn checkpoint_spacing_stays_within_255_scalars() {
+        let text = "x".repeat(600);
+        let mut source = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            source.extend_from_slice(&unit.to_le_bytes());
+        }
+        let decoded = decode_auto(&source);
+        let map = decoded.map();
+        // Every 100th scalar must invert exactly through the sparse table.
+        for scalar in 0..600 {
+            let src = 2 + 2 * scalar;
+            let dec = map.source_to_decoded(src).expect("legal boundary");
+            assert_eq!(map.decoded_to_source(dec), Some(src));
+        }
+    }
 }

@@ -480,6 +480,7 @@ pub fn create_schema(conn: &mut Connection) -> Result<()> {
 ///
 /// Returns a SQLite error when the database cannot be opened or created,
 /// its PRAGMAs cannot be applied, or a fresh schema cannot be written.
+#[allow(clippy::too_many_lines)] // the codec/marker drift checks extend the existing validation chain
 pub fn open_or_init(path: &Path) -> Result<Connection> {
     let mut conn = Connection::open_with_flags(
         path,
@@ -541,9 +542,7 @@ pub fn open_or_init(path: &Path) -> Result<Connection> {
                 .any(|(name, not_null)| name == "content_hash" && !not_null);
         // S00: a cache lacking the encoding-aware columns, or written by a
         // different codec generation, is rebuilt rather than reinterpreted.
-        let has_encoding_columns = notes_columns
-            .iter()
-            .any(|(name, _)| name == "encoding")
+        let has_encoding_columns = notes_columns.iter().any(|(name, _)| name == "encoding")
             && notes_columns.iter().any(|(name, _)| name == "bom")
             && notes_columns
                 .iter()

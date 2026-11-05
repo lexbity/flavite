@@ -15,6 +15,7 @@ use iced::keyboard::{self, Modifiers};
 /// the default for that command id only.
 pub const DEFAULT_CHORDS: &[(&str, &str)] = &[
     ("workspace.find", "Mod+F"),
+    ("workspace.replace", "Mod+H"),
     ("workspace.note_mode", "Mod+E"),
     ("workspace.quick_switch", "Mod+P"),
     ("workspace.command_palette", "Mod+Shift+P"),
@@ -145,6 +146,10 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     UiCommand {
         id: "workspace.find",
         title: "Find in current note (includes unsaved text)",
+    },
+    UiCommand {
+        id: "workspace.replace",
+        title: "Replace in current note (literal)",
     },
     UiCommand {
         id: "context.source_preview",
@@ -588,6 +593,7 @@ fn keyboard_command_message(app: &App, id: &'static str) -> Option<Message> {
     let revision = app.workspace.revision();
     match id {
         "workspace.find"
+        | "workspace.replace"
         | "workspace.note_mode"
         | "workspace.new_tab"
         | "workspace.close_tab"
@@ -1077,6 +1083,13 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
         "workspace.find" => {
             return app.update(Message::FindOpen(app.workspace.focused_tab()));
         }
+        "workspace.replace" => {
+            return app.update(Message::NoteSearch(
+                crate::host::note_search::NoteSearchMessage::ReplaceOpen(
+                    app.workspace.focused_tab(),
+                ),
+            ));
+        }
         "context.source_preview" => {
             return app.update(Message::ToggleSourcePreview(app.workspace.focused_tab()));
         }
@@ -1153,7 +1166,9 @@ pub fn available(app: &App, id: &str) -> bool {
         return false;
     };
     match id {
-        "workspace.find" => app.note_editor_view(app.workspace.focused_tab()).is_some(),
+        "workspace.find" | "workspace.replace" => {
+            app.note_editor_view(app.workspace.focused_tab()).is_some()
+        }
         "context.source_preview" => matches!(
             app.workspace
                 .tab(&app.workspace.focused_tab())

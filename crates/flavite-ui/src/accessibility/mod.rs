@@ -23,7 +23,7 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
     let target = app.a11y_nodes.get(&request.target_node)?.clone();
     match target {
         NodeTarget::FindQuery(tab)
-            if app.is_tab_visible(tab) && app.reading.find.contains_key(&tab) =>
+            if app.is_tab_visible(tab) && app.note_search.finds.contains_key(&tab) =>
         {
             match (request.action, request.data) {
                 (Action::SetValue, Some(ActionData::Value(value))) => Some(Message::FindQuery {
@@ -43,6 +43,36 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
             if request.action == Action::Click && app.is_tab_visible(tab) =>
         {
             Some(Message::FindClose(tab))
+        }
+        NodeTarget::ReplaceInput(tab)
+            if app.is_tab_visible(tab) && app.note_search.replaces.contains_key(&tab) =>
+        {
+            match (request.action, request.data) {
+                (Action::SetValue, Some(ActionData::Value(value))) => Some(Message::NoteSearch(
+                    crate::host::note_search::NoteSearchMessage::ReplaceText {
+                        tab,
+                        text: value.into(),
+                    },
+                )),
+                (Action::Focus, _) => Some(Message::NoteSearch(
+                    crate::host::note_search::NoteSearchMessage::ReplaceOpen(tab),
+                )),
+                _ => None,
+            }
+        }
+        NodeTarget::ReplaceNext(tab)
+            if request.action == Action::Click && app.is_tab_visible(tab) =>
+        {
+            Some(Message::NoteSearch(
+                crate::host::note_search::NoteSearchMessage::ReplaceNext(tab),
+            ))
+        }
+        NodeTarget::ReplaceAll(tab)
+            if request.action == Action::Click && app.is_tab_visible(tab) =>
+        {
+            Some(Message::NoteSearch(
+                crate::host::note_search::NoteSearchMessage::ReplaceAll(tab),
+            ))
         }
 
         NodeTarget::NoteMode(tab) if request.action == Action::Click && !app.has_composition() => {

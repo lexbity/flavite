@@ -24,7 +24,7 @@ fn markdown_language() -> Language {
 }
 
 /// A parsed note with all extracted structure from tree-sitter.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TsParsedNote {
     /// The text snapshot (normalized bytes + source mapping).
     pub snapshot: TextSnapshot,

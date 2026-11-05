@@ -1,20 +1,19 @@
 [package]
 name = "flavite-text-search"
-description = "Literal (and, from S03, regex) source matching, match options, captures and replacement-template expansion over borrowed normalized text (RFC-0006 D-05/§4.1/§6.2, S01 literal-only)"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-
-[lints]
-workspace = true
+description = "Pure literal/regex source matching, capture metadata and replacement-template expansion (RFC-0006 §4.1, D-05)"
 
 [dependencies]
 flavite-syntax = { path = "../flavite-syntax" }
-# Pinned whole-word segmentation (D-05: UAX #29 word segments; the workspace
-# version is the pin). No other external dependency is permitted in S01.
-unicode-segmentation = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
-proptest.workspace = true
+proptest = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

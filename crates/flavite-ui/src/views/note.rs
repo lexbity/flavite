@@ -111,7 +111,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         .with_type_metrics(app.appearance.metrics().editor_type())
         .with_max_line_width(app.appearance.metrics().editor_max_line_width())
         .with_colors(crate::style::tokens::editor_colors(app.appearance.scheme()))
-        .with_keyboard_enabled(!app.reading.find.get(&tab).is_some_and(|find| find.focused))
+        .with_keyboard_enabled(!crate::host::note_search::blocks_typing(app, &tab))
         .with_input_intents(move |input| Message::EditorInput {
             tab,
             incarnation,
@@ -165,13 +165,9 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         ),
         None => state.to_owned(),
     };
-    let footer = container(
-        text(state)
-            .size(metrics.text_sm)
-            .style(style::dim_text),
-    )
-    .height(24)
-    .padding([4, 12]);
+    let footer = container(text(state).size(metrics.text_sm).style(style::dim_text))
+        .height(24)
+        .padding([4, 12]);
     let editor: Element<'a, Message> = if mode == flavite_workspace::NoteMode::Edit {
         bounds::observe(
             editor.width(Length::Fill).height(Length::Fill),
@@ -207,42 +203,132 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
     if let Some(banner) = encoding_banner(app, tab, metrics) {
         content = content.push(banner);
     }
-    if let Some(find) = app.reading.find.get(&tab) {
-        let matches = crate::host::reading::find_matches(app, tab);
+    if let Some(find) = app.note_search.finds.get(&tab) {
+        let page = crate::host::note_search::matches(app, tab);
+        let total = page.as_ref().map_or(0, |page| page.spans.len());
+        let truncated = page.as_ref().is_some_and(|page| page.truncated);
+        // Empty query is Idle (D-05): no counts are presented at all.
+        let counts = if find.query.is_empty() {
+            String::new()
+        } else if truncated {
+            format!(
+                "{} / 10,000+",
+                if total == 0 {
+                    0
+                } else {
+                    find.index % total + 1
+                }
+            )
+        } else {
+            format!(
+                "{} / {}",
+                if total == 0 {
+                    0
+                } else {
+                    find.index % total + 1
+                },
+                total
+            )
+        };
+        let replace_open = app.note_search.replaces.contains_key(&tab);
         content = content.push(
             container(
                 row![
                     text_input("Find in current note", &find.query)
-                        .id(crate::host::reading::find_id(tab))
-                        .on_input(move |query| Message::FindQuery { tab, query })
-                        .on_submit(Message::FindNext { tab, forward: true }),
-                    text(format!(
-                        "{} / {}",
-                        if matches.is_empty() {
-                            0
-                        } else {
-                            find.index % matches.len() + 1
-                        },
-                        matches.len()
-                    ))
-                    .size(12),
+                        .id(crate::host::note_search::find_id(tab))
+                        .on_input(move |query| {
+                            Message::NoteSearch(
+                                crate::host::note_search::NoteSearchMessage::FindQuery {
+                                    tab,
+                                    query,
+                                },
+                            )
+                        })
+                        .on_submit(Message::NoteSearch(
+                            crate::host::note_search::NoteSearchMessage::FindNext {
+                                tab,
+                                forward: true,
+                            },
+                        )),
+                    text(counts).size(12),
                     button("Previous")
                         .style(style::ghost())
-                        .on_press(Message::FindNext {
-                            tab,
-                            forward: false
-                        }),
+                        .on_press(Message::NoteSearch(
+                            crate::host::note_search::NoteSearchMessage::FindNext {
+                                tab,
+                                forward: false,
+                            },
+                        )),
                     button("Next")
                         .style(style::ghost())
-                        .on_press(Message::FindNext { tab, forward: true }),
+                        .on_press(Message::NoteSearch(
+                            crate::host::note_search::NoteSearchMessage::FindNext {
+                                tab,
+                                forward: true,
+                            },
+                        )),
+                    button(if replace_open {
+                        "Hide replace"
+                    } else {
+                        "Replace…"
+                    })
+                    .style(style::ghost())
+                    .on_press(Message::NoteSearch(if replace_open {
+                        crate::host::note_search::NoteSearchMessage::ReplaceClose(tab)
+                    } else {
+                        crate::host::note_search::NoteSearchMessage::ReplaceOpen(tab)
+                    })),
                     button("Close find")
                         .style(style::ghost())
-                        .on_press(Message::FindClose(tab))
+                        .on_press(Message::NoteSearch(
+                            crate::host::note_search::NoteSearchMessage::FindClose(tab)
+                        )),
                 ]
                 .spacing(8),
             )
             .padding(8),
         );
+        if let Some(replace) = app.note_search.replaces.get(&tab) {
+            let status = if let Some(error) = &replace.last_error {
+                error.clone()
+            } else if replace.pending.is_some() {
+                "Preparing replacement…".to_owned()
+            } else if let Some(count) = replace.match_count {
+                format!(
+                    "{count} match{} in the prepared plan",
+                    if count == 1 { "" } else { "es" }
+                )
+            } else {
+                String::new()
+            };
+            content = content.push(
+                container(
+                    row![
+                        text_input("Replace with", &replace.replacement)
+                            .id(crate::host::note_search::replace_id(tab))
+                            .on_input(move |value| Message::NoteSearch(
+                                crate::host::note_search::NoteSearchMessage::ReplaceText {
+                                    tab,
+                                    text: value,
+                                },
+                            )),
+                        button("Replace next").style(style::ghost()).on_press_maybe(
+                            replace.pending.is_none().then_some(Message::NoteSearch(
+                                crate::host::note_search::NoteSearchMessage::ReplaceNext(tab),
+                            ),)
+                        ),
+                        button("Replace all").style(style::ghost()).on_press_maybe(
+                            replace.pending.is_none().then_some(Message::NoteSearch(
+                                crate::host::note_search::NoteSearchMessage::ReplaceAll(tab),
+                            ),)
+                        ),
+                        text(status).size(12),
+                    ]
+                    .spacing(8),
+                )
+                .padding(8),
+            );
+        }
     }
     content
         .push(editor)
@@ -266,11 +352,13 @@ fn encoding_banner<'a>(
     let mut row_items = Vec::new();
     match pending.code.as_str() {
         "encoding-choice-required" => {
-            row_items.push(text(format!(
-                "Encoding action required ({reason}) — pick an explicit format:"
-            ))
-            .size(metrics.text_sm)
-            .into());
+            row_items.push(
+                text(format!(
+                    "Encoding action required ({reason}) — pick an explicit format:"
+                ))
+                .size(metrics.text_sm)
+                .into(),
+            );
             for (label, encoding) in [
                 ("UTF-8", "utf8"),
                 ("UTF-16 LE", "utf16le"),
@@ -292,9 +380,11 @@ fn encoding_banner<'a>(
         }
         "encoding-unencodable" => {
             row_items.push(
-                text("This draft cannot be saved under its strict ASCII format — convert to UTF-8?")
-                    .size(metrics.text_sm)
-                    .into(),
+                text(
+                    "This draft cannot be saved under its strict ASCII format — convert to UTF-8?",
+                )
+                .size(metrics.text_sm)
+                .into(),
             );
             row_items.push(
                 button(text("Convert to UTF-8").size(metrics.text_sm))

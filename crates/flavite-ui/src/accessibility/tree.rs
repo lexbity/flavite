@@ -18,6 +18,10 @@ pub enum NodeTarget {
         forward: bool,
     },
     FindClose(flavite_workspace::TabId),
+    /// RFC-0006 S01: replacement controls from the same catalog.
+    ReplaceInput(flavite_workspace::TabId),
+    ReplaceNext(flavite_workspace::TabId),
+    ReplaceAll(flavite_workspace::TabId),
     NoteMode(flavite_workspace::TabId),
     ContextBinding {
         tab: flavite_workspace::TabId,
@@ -665,8 +669,8 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
             }
         }
         if app
-            .reading
-            .find
+            .note_search
+            .finds
             .get(&app.workspace.focused_tab())
             .is_some_and(|find| find.focused)
         {

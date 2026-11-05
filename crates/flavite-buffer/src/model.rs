@@ -587,9 +587,9 @@ impl EditorModel {
         let decoded = self.decoded_text();
         codec_encode(
             &decoded,
-            &self.source_format,
+            self.source_format,
             &EncodeLimits::default_envelope(),
-            &mut || false,
+            &flavite_encoding::NOT_CANCELLED,
         )
     }
 
@@ -639,13 +639,16 @@ impl EditorModel {
     /// # Errors
     ///
     /// `CodecError::Unencodable`/`LimitExceeded` from the preflight check.
-    pub fn try_convert_source_format(&mut self, target: SourceFormat) -> Result<Revision, CodecError> {
+    pub fn try_convert_source_format(
+        &mut self,
+        target: SourceFormat,
+    ) -> Result<Revision, CodecError> {
         // Preflight on the exact decoded layer before any state change.
         codec_encode(
             &self.decoded_text(),
-            &target,
+            target,
             &EncodeLimits::default_envelope(),
-            &mut || false,
+            &flavite_encoding::NOT_CANCELLED,
         )?;
         self.source_format = target;
         self.format_stamp = FormatStamp::detected(target);
@@ -772,7 +775,9 @@ impl EditorModel {
             if !text.is_char_boundary(edit.range.start.0)
                 || !text.is_char_boundary(edit.range.end.0)
             {
-                return Some(BatchError::CharBoundary { at: edit.range.start.0 });
+                return Some(BatchError::CharBoundary {
+                    at: edit.range.start.0,
+                });
             }
         }
         for pair in ordered.windows(2) {
@@ -823,17 +828,24 @@ impl EditorModel {
         let decoded = decoded_layer(&after_text, &after_table);
         let undo_snapshot = match codec_encode(
             &decoded,
-            &self.source_format,
+            self.source_format,
             &EncodeLimits::default_envelope(),
-            &mut || false,
+            &flavite_encoding::NOT_CANCELLED,
         ) {
-            Ok(source) => TextSnapshot::with_policy(&source, DecodePolicy::Explicit(self.source_format))
-                .unwrap_or_else(|_| {
-                    TextSnapshot::from_normalized_with_descriptor(&after_text, self.source_format)
-                }),
+            Ok(source) => {
+                TextSnapshot::with_policy(&source, DecodePolicy::Explicit(self.source_format))
+                    .unwrap_or_else(|_| {
+                        TextSnapshot::from_normalized_with_descriptor(
+                            &after_text,
+                            self.source_format,
+                        )
+                    })
+            }
             // A strict-ASCII-incompatible after-state still records the
             // exact text/EOL/format intent so Undo/Redo restore it (§6.10).
-            Err(_) => TextSnapshot::from_normalized_with_descriptor(&after_text, self.source_format),
+            Err(_) => {
+                TextSnapshot::from_normalized_with_descriptor(&after_text, self.source_format)
+            }
         };
         Ok(PreparedBatch {
             op: combined,
@@ -1057,10 +1069,9 @@ impl EditorModel {
                         )
                     })
             }
-            Err(_) => TextSnapshot::from_normalized_with_descriptor(
-                self.text(),
-                self.source_format,
-            ),
+            Err(_) => {
+                TextSnapshot::from_normalized_with_descriptor(self.text(), self.source_format)
+            }
         }
     }
 

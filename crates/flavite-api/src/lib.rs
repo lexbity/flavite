@@ -28,14 +28,14 @@ pub mod command;
 pub mod device_preferences;
 pub mod doctor;
 pub mod documents;
-pub mod note_encoding;
-pub mod text_edit;
 pub mod event;
 pub mod flavite;
 pub mod graph_mirror;
 pub mod graph_projection;
 pub mod graph_service;
+pub mod note_encoding;
 pub mod recovery;
+pub mod text_edit;
 pub use graph_projection::{
     GraphProjection, GraphViewToken, LinkOccurrence, OccurrenceSet, OccurrenceSource, OverlayState,
     ScopeRequest,

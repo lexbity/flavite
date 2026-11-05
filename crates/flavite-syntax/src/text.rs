@@ -40,8 +40,8 @@ use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 
 use flavite_encoding::{
-    DecodeLimits, DecodeMap, DecodePolicy, EncodeLimits, SourceFormat, decode as codec_decode,
-    encode as codec_encode,
+    CancelToken, DecodeLimits, DecodeMap, DecodePolicy, EncodeLimits, SourceFormat,
+    decode as codec_decode, encode as codec_encode,
 };
 
 /// Return the longest prefix of `text` whose UTF-8 byte length is at most
@@ -272,7 +272,7 @@ pub enum TextError {
 /// Snapshots built by [`TextSnapshot::from_normalized`] are a *synthetic*
 /// UTF-8 view: they carry no disk-decoding claim and MUST NOT determine a
 /// live buffer's save format (§6.10).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TextSnapshot {
     text: Arc<str>,
     source: Arc<[u8]>,
@@ -288,6 +288,19 @@ pub struct TextSnapshot {
     /// [`TextSnapshot::from_normalized_with_descriptor`]); ignored when a
     /// disk-backed `map` is present.
     descriptor_override: Option<SourceFormat>,
+}
+
+impl PartialEq for TextSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        // The decode map is a pure function of source + descriptor; the
+        // observed state is the text, source bytes, line table, fold
+        // prefixes and descriptor.
+        self.text == other.text
+            && self.source == other.source
+            && self.lines == other.lines
+            && self.fold_prefix == other.fold_prefix
+            && self.format() == other.format()
+    }
 }
 
 impl TextSnapshot {
@@ -332,7 +345,12 @@ impl TextSnapshot {
     ///
     /// Typed strict-decode failure; see [`TextSnapshot::new`].
     pub fn with_policy(bytes: &[u8], policy: DecodePolicy) -> Result<Self, TextError> {
-        Self::decoding(bytes, policy, &DecodeLimits::default_envelope(), &mut || false)
+        Self::decoding(
+            bytes,
+            policy,
+            &DecodeLimits::default_envelope(),
+            &CancelToken::new(),
+        )
     }
 
     /// [`TextSnapshot::with_policy`] with caller-supplied byte limits and a
@@ -345,7 +363,7 @@ impl TextSnapshot {
         bytes: &[u8],
         policy: DecodePolicy,
         limits: &DecodeLimits,
-        cancel: &mut dyn FnMut() -> bool,
+        cancel: &CancelToken,
     ) -> Result<Self, TextError> {
         let decoded = codec_decode(bytes, policy, limits, cancel)?;
         Ok(Self::from_decoded(decoded))
@@ -453,12 +471,12 @@ impl TextSnapshot {
                     let decoded = self.reconstruct_decoded();
                     codec_encode(
                         &decoded,
-                        &format,
+                        format,
                         &EncodeLimits {
                             max_input_utf8_bytes: u64::MAX,
                             max_output_bytes: u64::MAX,
                         },
-                        &mut || false,
+                        &flavite_encoding::CancelToken::new(),
                     )
                     .expect("an unedited snapshot re-encodes under its own descriptor")
                 } else {
@@ -524,7 +542,11 @@ impl TextSnapshot {
         // Inside line content: fold the text offset to the decoded region,
         // then map through the codec boundary table.
         let fold = usize::try_from(self.fold_prefix[idx]).unwrap_or(usize::MAX);
-        let decoded = line.text_start.0.checked_add(fold)?.checked_add(text.0 - line.text_start.0)?;
+        let decoded = line
+            .text_start
+            .0
+            .checked_add(fold)?
+            .checked_add(text.0 - line.text_start.0)?;
         self.decoded_to_source(decoded).map(SourceByte)
     }
 
@@ -648,25 +670,24 @@ impl TextSnapshot {
     }
 
     fn bom_len(&self) -> usize {
-        self.disk
-            .as_ref()
-            .map_or(0, |map| usize::try_from(map.bom_len()).unwrap_or(0))
+        self.disk.as_ref().map_or(0, |map| map.bom_len())
     }
 
     /// `SourceByte ↔ decoded-UTF-8 byte` through the codec map; synthetic
     /// views are identity on char boundaries and refuse scalar interiors.
     fn decoded_to_source(&self, decoded: usize) -> Option<usize> {
         match &self.disk {
-            Some(map) => usize::try_from(map.decoded_utf8_to_source(decoded as u64)?).ok(),
+            Some(map) => map.decoded_to_source(decoded),
             None => self.text.is_char_boundary(decoded).then_some(decoded),
         }
     }
 
     fn source_to_decoded(&self, source: usize) -> Option<usize> {
         match &self.disk {
-            Some(map) => usize::try_from(map.source_to_decoded(source as u64)?).ok(),
-            None => (self.text.is_char_boundary(source) || source == self.text.len())
-                .then_some(source),
+            Some(map) => map.source_to_decoded(source),
+            None => {
+                (self.text.is_char_boundary(source) || source == self.text.len()).then_some(source)
+            }
         }
     }
 
@@ -675,7 +696,9 @@ impl TextSnapshot {
     fn line_index_for_text(&self, at: usize) -> Option<usize> {
         let lines = &self.lines;
         debug_assert!(!lines.is_empty());
-        let idx = lines.partition_point(|l| l.text_start.0 <= at).checked_sub(1)?;
+        let idx = lines
+            .partition_point(|l| l.text_start.0 <= at)
+            .checked_sub(1)?;
         (at <= lines[idx].text_end.0).then_some(idx)
     }
 
@@ -744,6 +767,33 @@ pub fn next_grapheme_boundary(text: &str, at: TextByte) -> TextByte {
 pub fn fold_key(s: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     s.to_lowercase().nfc().collect::<String>()
+}
+
+/// UAX #29 default word-segment boundaries of `text`, ascending, including
+/// `0` and `text.len()`.
+///
+/// Shared primitive so whole-word matching (flavite-text-search) and
+/// navigation agree without a buffer↔search dependency (RFC-0006 §6.2,
+/// D-05). A whole-word match requires **both** endpoints to be boundaries
+/// of word segments; punctuation-only matches qualify when both endpoints
+/// are boundaries.
+#[must_use]
+pub fn word_boundaries(text: &str) -> Vec<usize> {
+    let mut boundaries = Vec::new();
+    let mut offset = 0usize;
+    for segment in text.split_word_bounds() {
+        boundaries.push(offset);
+        offset += segment.len();
+    }
+    boundaries.push(offset);
+    boundaries
+}
+
+/// Whether `at` is one of the UAX #29 word-segment boundaries produced by
+/// [`word_boundaries`]. Binary search; out-of-range is not a boundary.
+#[must_use]
+pub fn is_word_boundary(boundaries: &[usize], at: usize) -> bool {
+    boundaries.binary_search(&at).is_ok()
 }
 
 /// Replace CRLF with LF, leaving standalone CR bytes untouched (§4.8, R12).
@@ -815,11 +865,11 @@ fn build_lines_identity(text: &str, source: &[u8], bom_len: usize) -> Vec<LineIn
 /// that line's content (the `text → decoded` offset correction).
 fn build_lines_encoded(decoded: &str, map: &DecodeMap) -> (Vec<LineInfo>, Vec<u32>) {
     let bytes = decoded.as_bytes();
-    let utf16 = map.encoding().is_utf16();
+    let utf16 = map.format().encoding().is_utf16();
     let mut lines = Vec::new();
     let mut fold_prefix = Vec::new();
     let mut dec_i = 0usize;
-    let mut src_i = usize::try_from(map.bom_len()).unwrap_or(0);
+    let mut src_i = map.bom_len();
     let mut folded: u32 = 0;
     while let Some(nl_rel) = bytes[dec_i..].iter().position(|b| *b == b'\n') {
         let nl = dec_i + nl_rel;
@@ -907,11 +957,19 @@ mod tests {
         let snapshot = TextSnapshot::new(&[0xFF, 0xFE]).expect("UTF-16LE BOM is accepted");
         assert_eq!(snapshot.text(), "");
         let err = TextSnapshot::new(&[0x41, 0xFF, 0x42]).expect_err("must reject");
-        assert_eq!(err, TextError::Codec(CodecError::InvalidUtf8 { source_byte: 1 }));
+        assert_eq!(
+            err,
+            TextError::Codec(CodecError::InvalidUtf8 { source_byte: 1 })
+        );
         // BOM-prefixed invalid data reports the offset in the original bytes.
         let err = TextSnapshot::new(&[0xEF, 0xBB, 0xBF, 0xFF]).expect_err("must reject");
-        assert_eq!(err, TextError::Codec(CodecError::InvalidUtf8 { source_byte: 3 }));
-        assert!(err.to_string().contains("invalid UTF-8"));
+        assert_eq!(
+            err,
+            TextError::Codec(CodecError::InvalidUtf8 { source_byte: 3 })
+        );
+        // Canonical codec diagnostics name the kind, offset and size — never
+        // note content (§6.10).
+        assert!(err.to_string().contains("invalid sequence"));
     }
 
     #[test]
@@ -1054,6 +1112,28 @@ mod tests {
         assert_eq!(fold_key("café"), fold_key("cafe\u{0301}"));
         // §4.8: default folding — Turkish dotted/dotless I do not shift.
         assert_eq!(fold_key("İ"), fold_key("i\u{0307}"));
+    }
+
+    #[test]
+    fn word_boundaries_follow_uax29_segments() {
+        assert_eq!(word_boundaries(""), vec![0]);
+        assert_eq!(word_boundaries("case"), vec![0, 4]);
+        assert_eq!(word_boundaries("hello world"), vec![0, 5, 6, 11]);
+        // MidLetter apostrophe keeps "can't" one segment (D-05).
+        assert_eq!(word_boundaries("can't stop"), vec![0, 5, 6, 10]);
+        // ExtendNumLet underscore joins segments.
+        assert_eq!(word_boundaries("a_b"), vec![0, 3]);
+        // Punctuation forms its own segment, so punctuation-only matches
+        // can qualify as whole words when both endpoints are boundaries.
+        assert_eq!(word_boundaries("a!b"), vec![0, 1, 2, 3]);
+
+        let boundaries = word_boundaries("hello world");
+        assert!(is_word_boundary(&boundaries, 0));
+        assert!(is_word_boundary(&boundaries, 5));
+        assert!(is_word_boundary(&boundaries, 11));
+        assert!(!is_word_boundary(&boundaries, 2));
+        assert!(!is_word_boundary(&boundaries, 99));
+        assert!(is_word_boundary(&word_boundaries(""), 0));
     }
 
     #[test]

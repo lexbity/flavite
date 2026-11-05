@@ -8,8 +8,8 @@
 
 use blake3::hash;
 use flavite_buffer::undo::UndoPolicy;
-use flavite_buffer::{BufferId, BufferManager, EditOp, Revision};
-use flavite_encoding::{DecodePolicy, SourceFormat, decode};
+use flavite_buffer::{BufferManager, EditOp};
+use flavite_encoding::{DecodeLimits, DecodePolicy, NOT_CANCELLED, SourceFormat, decode};
 use flavite_fs::{Fs, MemFs};
 use flavite_index::{IndexActor, open_or_init};
 use flavite_syntax::text::{Span, TextByte};
@@ -22,10 +22,6 @@ use flavite_vault::session::{
 use flavite_vault::types::{VaultConfig, VaultIdentity};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-fn no_cancel() -> impl FnMut() -> bool {
-    move || false
-}
 
 /// Independent std-only UTF-16LE reference encoder (never the codec under test).
 fn reference_utf16le(text: &str, bom: bool) -> Vec<u8> {
@@ -152,10 +148,7 @@ fn utf16_dirty_draft_recovery_replays_recorded_format() {
 
     // Session A: open, edit (dirty), durably checkpoint the recovery.
     let session_a = h.session();
-    let opened = expect_success(
-        open_to_terminal(&session_a, path.clone()),
-        "first open",
-    );
+    let opened = expect_success(open_to_terminal(&session_a, path.clone()), "first open");
     let (buffer_id, revision) = match opened {
         CommandResult::NoteOpened {
             buffer_id,
@@ -166,7 +159,10 @@ fn utf16_dirty_draft_recovery_replays_recorded_format() {
     let result = session_a.execute(SessionCommand::ApplyEdits {
         buffer_id,
         revision,
-        ops: vec![EditOp::new(Span::new(TextByte(0), TextByte(0)), "DIRTY DRAFT ".to_owned())],
+        ops: vec![EditOp::new(
+            Span::new(TextByte(0), TextByte(0)),
+            "DIRTY DRAFT ".to_owned(),
+        )],
         undo_policy: UndoPolicy::Isolated,
     });
     expect_success(result, "apply draft edit");
@@ -233,7 +229,10 @@ fn utf16_dirty_draft_recovery_replays_recorded_format() {
         panic!("expected RecoveryRestored, got {restored:?}");
     };
     assert_eq!(restored_id, fresh_id);
-    assert!(restored_revision > fresh_revision, "restore is a new revision");
+    assert!(
+        restored_revision > fresh_revision,
+        "restore is a new revision"
+    );
 
     let snapshot = session_b
         .shared_buffer_snapshot(restored_id, None)
@@ -252,8 +251,13 @@ fn utf16_dirty_draft_recovery_replays_recorded_format() {
 
     // The restored draft still serializes under its recorded descriptor.
     let expected = reference_utf16le("DIRTY DRAFT saved base\r\nsecond line\n", true);
-    let redecoded = decode(&expected, DecodePolicy::Auto, &Default::default(), &mut no_cancel())
-        .expect("expected bytes decode");
+    let redecoded = decode(
+        &expected,
+        DecodePolicy::Auto,
+        &DecodeLimits::default_envelope(),
+        &NOT_CANCELLED,
+    )
+    .expect("expected bytes decode");
     assert_eq!(redecoded.text(), "DIRTY DRAFT saved base\r\nsecond line\n");
 }
 
@@ -263,8 +267,7 @@ fn utf16_dirty_draft_recovery_replays_recorded_format() {
 fn utf16_save_retires_intent_and_binds_saved_hash() {
     let h = Harness::new();
     let path = h.root.join("intent.md");
-    h.fs
-        .write_new(&path, &reference_utf16le("intent base\n", true))
+    h.fs.write_new(&path, &reference_utf16le("intent base\n", true))
         .expect("seed utf16le note");
 
     let session = h.session();
@@ -279,30 +282,38 @@ fn utf16_save_retires_intent_and_binds_saved_hash() {
     let result = session.execute(SessionCommand::ApplyEdits {
         buffer_id,
         revision,
-        ops: vec![EditOp::new(Span::new(TextByte(11), TextByte(11)), "more".to_owned())],
+        ops: vec![EditOp::new(
+            Span::new(TextByte(11), TextByte(11)),
+            "more".to_owned(),
+        )],
         undo_policy: UndoPolicy::Isolated,
     });
     expect_success(result, "apply edit");
 
     let saved = expect_success(
-        wait_terminal(&session, session.execute(SessionCommand::SaveNote { path: path.clone() })),
+        wait_terminal(
+            &session,
+            session.execute(SessionCommand::SaveNote { path: path.clone() }),
+        ),
         "save",
     );
-    let CommandResult::NoteSaved { hash: saved_hash, .. } = saved else {
+    let CommandResult::NoteSaved {
+        hash: saved_hash, ..
+    } = saved
+    else {
         panic!("expected NoteSaved, got {saved:?}");
     };
 
-    let on_disk = h
-        .fs
-        .read_if_exists(&path)
-        .expect("read")
-        .expect("note exists after save");
+    let on_disk =
+        h.fs.read_if_exists(&path)
+            .expect("read")
+            .expect("note exists after save");
     let hex_key = hex::encode(native_note_key(&path, &h.root));
     let view = session.encoding_hints();
 
     // The pre-save binding intent was resolved: nothing stale remains.
     assert!(
-        view.record.intents.get(&hex_key).is_none(),
+        !view.record.intents.contains_key(&hex_key),
         "stale intent must be retired after the durable save, got {:?}",
         view.record.intents.get(&hex_key)
     );

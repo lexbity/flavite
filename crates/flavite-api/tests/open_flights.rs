@@ -464,11 +464,13 @@ fn non_utf8_note_fails_the_open_instead_of_a_silent_empty_buffer() {
     assert_eq!(code, "encoding-choice-required");
     let data = data.expect("the choice request carries its payload");
     assert!(
-        data.as_str().is_some_and(|payload| payload.contains("invalid-utf8")),
+        data.as_str()
+            .is_some_and(|payload| payload.contains("invalid-utf8")),
         "the typed reason names the encoding cause: {data}"
     );
     assert!(
-        data.as_str().is_some_and(|payload| payload.contains("raw_hash")),
+        data.as_str()
+            .is_some_and(|payload| payload.contains("raw_hash")),
         "the payload carries the observed raw hash so a reopen can be bound to exact bytes"
     );
     assert!(
