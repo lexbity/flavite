@@ -603,7 +603,9 @@ fn crash_recovery_matches_the_recovered_note_in_the_workspace() {
     let mut edge_found = false;
     while Instant::now() < edge_deadline && !edge_found {
         flavite.pump();
-        flavite.graph_notify_changed();
+        // RFC-0005 S5: the save's index commit reaches the service through
+        // the writer-side broadcast — no relay pulse (this now proves the
+        // end-to-end wiring).
         if let Some(frame) = flavite.graph_frame() {
             // The effective projection batch carries the record-level
             // graph; after the save it equals the saved topology.

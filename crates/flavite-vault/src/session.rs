@@ -512,6 +512,11 @@ pub struct Session {
     rename_strategy: RenameStrategy,
     /// Buffer manager.
     buffer_manager: Arc<Mutex<BufferManager>>,
+    /// RFC-0005 S5: monotonic graph-stamp version shared with the buffer
+    /// manager (bumped at every stamp-relevant transition). The graph
+    /// service's wake loop compares it against its last pump — a lock-free,
+    /// allocation-free "buffer stamp unchanged" check (FR-3).
+    graph_stamp_version: Arc<AtomicU64>,
     /// Latest immutable text snapshot per open buffer. Views/workers retain
     /// older revisions through Arc while the cache itself remains bounded to
     /// one revision per buffer.
@@ -585,6 +590,9 @@ impl Session {
     ) -> Self {
         let actor_events = actor.events();
         let actor_buffer_patches = actor.buffer_patch_requests();
+        // RFC-0005 S5: capture the stamp-version handle before the manager
+        // moves into its mutex — the graph service reads it lock-free.
+        let graph_stamp_version = buffer_manager.graph_stamp_handle();
         let manager = Arc::new(Mutex::new(buffer_manager));
         let recovery_writer = crate::identity::get_data_dir().map(|data| {
             let dir = data
@@ -767,6 +775,7 @@ impl Session {
             autosave_idle_interval: config.autosave_idle_interval,
             rename_strategy: config.rename_strategy,
             buffer_manager: manager,
+            graph_stamp_version,
             shared_snapshots: Mutex::new(HashMap::new()),
             autosave_failures_total: AtomicU64::new(0),
             autosave_requests: Mutex::new(HashSet::new()),
@@ -3252,6 +3261,19 @@ impl Session {
     /// Worker-only decode through the exact vault filesystem identity codec.
     pub fn decode_graph_paths(&self, keys: Vec<Vec<u8>>) -> Result<Vec<PathBuf>, String> {
         self.actor.decode_graph_paths(keys)
+    }
+
+    /// RFC-0005 S5 (FR-3): the lock-free buffer-stamp version. Bumped at
+    /// every transition that can change [`Self::graph_buffer_stamp`] output
+    /// (revision, state, path, base hash, the open set). A consumer compares
+    /// it against the value observed at its last rebuild: `==` proves no
+    /// buffer transition happened in between, so a wake may skip the stamp
+    /// read entirely; `!=` is conservative (one extra rebuild). Read without
+    /// the manager lock and without an actor hop.
+    #[must_use]
+    pub fn graph_stamp_version(&self) -> u64 {
+        self.graph_stamp_version
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Lightweight current buffer stamp for rejecting obsolete graph publications.

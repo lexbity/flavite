@@ -169,6 +169,16 @@ impl GenerationWatch {
     pub fn recv_timeout(&self, timeout: Duration) -> Option<IndexVersion> {
         self.rx.recv_timeout(timeout).ok()
     }
+
+    /// The underlying receiver handle. Consumers that multiplex this watch
+    /// with other channels in one wait — the graph service's wake loop
+    /// (`crossbeam::select!` over the index watch, the control channel, and
+    /// the next deadline) — use this accessor. The watch's watermark
+    /// atomics remain the authority for the *latest* advertised version.
+    #[must_use]
+    pub fn receiver(&self) -> &Receiver<IndexVersion> {
+        &self.rx
+    }
 }
 
 impl fmt::Debug for GenerationSignal {

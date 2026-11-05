@@ -11,7 +11,8 @@ fn wait_graph(f: &Fixture) -> std::sync::Arc<flavite_api::GraphFrame> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         f.flavite.pump();
-        f.flavite.graph_notify_changed();
+        // RFC-0005 S5: writer events drive index commits; stamp-only
+        // transitions converge via the self-verifying sweep.
         if let Some(frame) = f
             .flavite
             .graph_frame()

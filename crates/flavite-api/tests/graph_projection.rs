@@ -16,7 +16,9 @@ fn wait(
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         f.flavite.pump();
-        f.flavite.graph_notify_changed();
+        // RFC-0005 S5: no manual pump kick — index commits arrive through
+        // the writer-side generation broadcast, and stamp-only rebuilds
+        // converge within one self-verifying sweep (5 s).
         if let Some(frame) = f
             .flavite
             .graph_frame()

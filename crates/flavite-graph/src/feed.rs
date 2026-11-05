@@ -195,8 +195,17 @@ impl GraphPublisher {
         {
             return Arc::clone(&self.publication);
         }
-        // Stale within the same epoch, or from an epoch already retired.
-        if self.initialized
+        // Stale within the same epoch, or from an epoch already retired —
+        // but never a forced-reset batch. A reset re-anchors the model from
+        // the consumer's full consistent read (§4.14/§6.5.2), and the
+        // DB-recreate shape (RFC-0005 §4.9, AC-8) legitimately rewinds the
+        // generation at an unchanged epoch: `open_or_init` reseeds
+        // INITIAL_EPOCH on every fresh file, so the epoch alone cannot
+        // distinguish it. The pump's read-connection revalidation
+        // (FR-6 — uuid + inode) is what proves the handle is fresh; once
+        // the mirror resets, its rebuild IS the authoritative current.
+        if !reset
+            && self.initialized
             && (batch.epoch < self.epoch
                 || (batch.epoch == self.epoch && batch.generation < self.generation))
         {

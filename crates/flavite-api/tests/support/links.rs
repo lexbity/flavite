@@ -105,10 +105,16 @@ pub fn fixture(notes: &[(&str, &str)]) -> Fixture {
     let db = cache.path().join("semantic-index.sqlite3");
     drop(flavite_index::open_or_init(&db).expect("index"));
     let identity = flavite_api::VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![11]);
+    // RFC-0005 S5: the fixture rides the production event spine — the
+    // actor publishes every committed generation and the graph service
+    // watches, so test pumps are driven by writer events, not relays.
+    let (generation_signal, generation_watch) = flavite_index::GenerationSignal::new();
     let actor = VaultActorBuilder::new()
         .with_fs(Box::new(SharedFs(fs.clone())) as Box<dyn Fs + Send + Sync>)
         .with_identity(identity.clone())
-        .with_index(IndexActor::new(&db, 1).expect("index actor"))
+        .with_index(
+            IndexActor::with_generation_signal(&db, 1, generation_signal).expect("index actor"),
+        )
         .build()
         .expect("actor")
         .start()
@@ -126,7 +132,7 @@ pub fn fixture(notes: &[(&str, &str)]) -> Fixture {
         },
     );
     let mut flavite = Flavite::open(identity, session, VaultConfig::default()).expect("facade");
-    flavite.set_graph_db_path_for_test(db);
+    flavite.set_graph_service_for_test(db, Some(std::sync::Arc::new(generation_watch)));
     reconcile(&flavite);
     let client = flavite.new_link_client();
     Fixture {

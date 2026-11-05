@@ -274,7 +274,9 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "pins_loaded": app.graph.pins.loaded(),
         "stale_discards": app.graph.stale_discards_total,
         "metrics": app.graph.metrics.map(|metrics| serde_json::json!({
-            "polls": metrics.polls_total,
+            "wakes": metrics.wakes_total,
+            "sweeps": metrics.sweeps_total,
+            "watermarkSkips": metrics.watermark_skips_total,
             "batches": metrics.batches_total,
             "resets": metrics.resets_total,
         })),

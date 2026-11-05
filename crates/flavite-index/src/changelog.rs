@@ -160,6 +160,14 @@ pub enum ResetReason {
     /// The cursor's generation predates the retained log floor (pruning
     /// outran the consumer).
     BelowLogFloor,
+    /// Same epoch, but the cursor's generation is ahead of the current
+    /// head (RFC-0005 §4.9): only possible when the database was
+    /// recreated under a live consumer whose connection reopened. The
+    /// change-log reader itself keeps refusing such cursors (a raw future
+    /// cursor stays an error, never a silent empty success); a consumer
+    /// that has *proven* the reopen via identity revalidation maps the
+    /// case to this contractual rebuild — "drop, never invert" (§4.7).
+    Recreated,
 }
 
 /// A typed change-log read outcome: either an incremental delta plus the

@@ -2871,9 +2871,9 @@ impl App {
                     refresh_catalog = true;
                     // Saved content changed: previews and backlinks re-query.
                     self.contexts.invalidate_all();
-                    // The graph feed polls on a bounded cadence; the pulse
-                    // only wakes it early (§12.1 invalidation hints).
-                    flavite.graph_notify_changed();
+                    // No graph pulse: the writer-side generation broadcast
+                    // (RFC-0005 S1/S5) wakes the feed service directly —
+                    // the UI relay retired with the poll cadence.
                 }
                 events.push(format!("{}: {event:?}", event.event_type()));
                 if let Some(id) = delivery.notice_id {

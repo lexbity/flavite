@@ -74,7 +74,17 @@ lint-arch:
     check_absent '\.note_catalog\(' crates/flavite-ui/src
     check_absent 'INSERT INTO changes\(' crates/flavite-index/src
     check_absent 'UPDATE notes SET id_conflict=CASE' crates/flavite-index/src/pool.rs
-    echo "lint-arch passed (RFC-0002 debt gates)."
+    # RFC-0005 S5 grep gates: the 250 ms poll cadence is dead (the event
+    # spine owns freshness; the 5 s sweep is recovery only), and the graph
+    # pump holds ONE revalidated long-lived connection — the read-only open
+    # appears exactly once in graph_service.rs (inside MaybeConnection)
+    # and never inside the run_service_attempt pump body.
+    check_absent 'Directive::Poll' crates
+    check_absent 'GRAPH_POLL_INTERVAL' crates
+    test "$(rg -c 'open_with_flags' crates/flavite-api/src/graph_service.rs)" -eq 1
+    ! awk '/^fn run_service_attempt\(/,/^}$/' crates/flavite-api/src/graph_service.rs \
+        | rg -q 'open_with_flags'
+    echo "lint-arch passed (RFC-0002 debt gates + RFC-0004/0005 greps)."
 
 # S3 watcher-truth probe (PLAN-C C1, §9 S3-1): per-OS watcher evidence with a
 # D5 nomination-property self-check. CI runs scenarios 1–3 on Linux headless.

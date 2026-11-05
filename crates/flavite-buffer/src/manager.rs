@@ -14,6 +14,8 @@ use flavite_syntax::text::TextSnapshot;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::revision::{BufferId, Revision};
 use crate::state::{Buffer, BufferState, StateTransition};
@@ -100,6 +102,15 @@ pub struct BufferManager {
     default_coalesce_window: std::time::Duration,
     /// Recovery interval in seconds.
     recovery_interval_secs: u64,
+    /// RFC-0005 S5: monotonic counter bumped on every transition that can
+    /// change the graph buffer stamp (revision, state, path, base hash, the
+    /// open set). Consumers (the graph service's wake loop) compare it
+    /// against a value captured at their last pump — cheap, lock-free
+    /// "stamp unchanged" without materializing the stamp. Over-bumping is
+    /// safe (one extra pump at worst); never bumping would strand a stale
+    /// dirty-overlay until the sweep. S6's `BufferSignal` fires at exactly
+    /// these choke points.
+    graph_stamp: Arc<AtomicU64>,
 }
 
 impl BufferManager {
@@ -111,6 +122,7 @@ impl BufferManager {
             buffer_ids: HashMap::new(),
             default_coalesce_window: std::time::Duration::from_millis(500),
             recovery_interval_secs: 2, // Default 2 seconds
+            graph_stamp: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -122,7 +134,23 @@ impl BufferManager {
             buffer_ids: HashMap::new(),
             default_coalesce_window: coalesce_window,
             recovery_interval_secs: recovery_interval,
+            graph_stamp: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// The shared graph-stamp counter handle. `Session` clones this once at
+    /// construction so stamp-version reads never need the manager lock
+    /// (RFC-0005 §5.2's "read without an actor hop").
+    #[must_use]
+    pub fn graph_stamp_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.graph_stamp)
+    }
+
+    /// Record a stamp-relevant transition. Conservative: called at every
+    /// manager mutation choke point, including mutable-handle hand-offs
+    /// whose caller may or may not touch the stamp inputs.
+    fn touch_graph_stamp(&self) {
+        self.graph_stamp.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get the recovery interval in seconds.
@@ -148,9 +176,12 @@ impl BufferManager {
         self.buffers.get(note_path)
     }
 
-    /// Get a buffer for a note mutably.
+    /// Get a buffer for a note mutably. Handing out a mutable reference is
+    /// itself a stamp-relevant event (RFC-0005 S5 audit: every workspace
+    /// mutation of a `Buffer` enters through this door).
     #[must_use]
     pub fn get_buffer_mut(&mut self, note_path: &PathBuf) -> Option<&mut Buffer> {
+        self.touch_graph_stamp();
         self.buffers.get_mut(note_path)
     }
 
@@ -167,9 +198,11 @@ impl BufferManager {
         self.buffer_ids.get(&buffer_id)
     }
 
-    /// Get a buffer by buffer ID mutably.
+    /// Get a buffer by buffer ID mutably. Stamp-relevant hand-off, same door
+    /// contract as [`Self::get_buffer_mut`].
     #[must_use]
     pub fn get_buffer_by_id_mut(&mut self, buffer_id: BufferId) -> Option<&mut Buffer> {
+        self.touch_graph_stamp();
         let path = self.buffer_ids.get(&buffer_id)?;
         self.buffers.get_mut(path)
     }
@@ -185,6 +218,7 @@ impl BufferManager {
         note_path: PathBuf,
         content: &[u8],
     ) -> (&Buffer, Option<StateTransition>) {
+        self.touch_graph_stamp();
         // Use entry API to avoid borrow issues
         let entry = self.buffers.entry(note_path.clone());
 
@@ -211,7 +245,8 @@ impl BufferManager {
                 // Get buffer_id
                 let buffer_id = buffer.buffer_id();
 
-                // Insert into both maps
+                // Insert into both maps (the open-set change stamped at
+                // the top of this method).
                 self.buffer_ids.insert(buffer_id, vacant.key().clone());
                 let buffer_ref = vacant.insert(buffer);
                 (buffer_ref, None)
@@ -227,6 +262,7 @@ impl BufferManager {
     /// Returns the closed buffer, if any.
     pub fn close_note(&mut self, note_path: &PathBuf) -> Option<Buffer> {
         if let Some(buffer) = self.buffers.remove(note_path) {
+            self.touch_graph_stamp();
             self.buffer_ids.remove(&buffer.buffer_id());
             Some(buffer)
         } else {
@@ -246,6 +282,7 @@ impl BufferManager {
         note_path: &PathBuf,
         edit: EditOp,
     ) -> Option<(Revision, BufferState, Option<StateTransition>)> {
+        self.touch_graph_stamp();
         let buffer = self.buffers.get_mut(note_path)?;
         let (rev, transition) = buffer.apply_local_edit(edit);
         Some((rev, buffer.state(), transition))
@@ -272,6 +309,7 @@ impl BufferManager {
     ) -> Vec<StateTransition> {
         let mut transitions = Vec::new();
 
+        self.touch_graph_stamp();
         if let Some(buffer) = self.buffers.get_mut(note_path)
             && let Some(transition) = buffer.check_external_change(new_content)
         {
@@ -285,6 +323,7 @@ impl BufferManager {
     pub fn notify_file_deleted(&mut self, note_path: &PathBuf) -> Vec<StateTransition> {
         let mut transitions = Vec::new();
 
+        self.touch_graph_stamp();
         if let Some(buffer) = self.buffers.get_mut(note_path) {
             let transition = buffer.handle_file_deleted();
             transitions.push(transition);
@@ -301,6 +340,7 @@ impl BufferManager {
     ) -> Vec<StateTransition> {
         let mut transitions = Vec::new();
 
+        self.touch_graph_stamp();
         if let Some(buffer) = self.buffers.get_mut(note_path)
             && let Some(transition) = buffer.handle_file_recreated(new_content)
         {
@@ -320,6 +360,7 @@ impl BufferManager {
             return false;
         };
         let id = buffer.buffer_id();
+        self.touch_graph_stamp();
         self.buffer_ids.insert(id, to.clone());
         self.buffers.insert(to, buffer);
         true
@@ -329,6 +370,7 @@ impl BufferManager {
     pub fn notify_save_completed(&mut self, note_path: &PathBuf) -> Vec<StateTransition> {
         let mut transitions = Vec::new();
 
+        self.touch_graph_stamp();
         if let Some(buffer) = self.buffers.get_mut(note_path) {
             let transition = buffer.handle_save_completed();
             transitions.push(transition);
@@ -401,6 +443,7 @@ impl BufferManager {
 
     /// Clear all buffers.
     pub fn clear(&mut self) {
+        self.touch_graph_stamp();
         self.buffers.clear();
         self.buffer_ids.clear();
     }

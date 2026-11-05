@@ -1125,6 +1125,23 @@ impl IndexActor {
         }
     }
 
+    /// Record the vault identity in the index `meta` table (RFC-0005
+    /// FR-6): the graph service revalidates its long-lived read connection
+    /// against this value on every wake and reopens on mismatch — the
+    /// DB-recreate detector. Idempotent, and never a generation bump (no
+    /// `publish_generation`; the graph is not notified).
+    ///
+    /// # Errors
+    /// Returns the SQLite error text when the meta write fails.
+    pub fn ensure_vault_uuid(&self, uuid: &str) -> Result<(), String> {
+        crate::schema::set_meta(
+            self.writer().conn(),
+            crate::schema::MetaKey::VaultUuid,
+            uuid,
+        )
+        .map_err(|error| error.to_string())
+    }
+
     /// The single apply spine (§6.2 "How"): pre-image → mutate → post →
     /// generation bump → group-scoped `id_conflict` → resolution (targeted
     /// against the staged overlay, or the whole-vault backstop walk at D13

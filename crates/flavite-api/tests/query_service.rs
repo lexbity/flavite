@@ -40,10 +40,16 @@ fn fixture() -> (Flavite, PathBuf, std::sync::Arc<GateFs>, tempfile::TempDir) {
     let db = cache.path().join("query-index.sqlite3");
     drop(flavite_index::open_or_init(&db).expect("index"));
     let identity = flavite_api::VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![9]);
+    // RFC-0005 S5: the fixture rides the writer-side broadcast — index
+    // commits (reconcile) wake the feed service at event latency instead
+    // of a poll cadence that no longer exists.
+    let (generation_signal, generation_watch) = flavite_index::GenerationSignal::new();
     let actor = VaultActorBuilder::new()
         .with_fs(Box::new(SharedGateFs { inner: fs.clone() }) as Box<dyn Fs + Send + Sync>)
         .with_identity(identity.clone())
-        .with_index(IndexActor::new(&db, 1).expect("index actor"))
+        .with_index(
+            IndexActor::with_generation_signal(&db, 1, generation_signal).expect("index actor"),
+        )
         .build()
         .expect("actor")
         .start()
@@ -58,7 +64,7 @@ fn fixture() -> (Flavite, PathBuf, std::sync::Arc<GateFs>, tempfile::TempDir) {
         VaultConfig::default(),
     );
     let mut flavite = Flavite::open(identity, session, VaultConfig::default()).expect("facade");
-    flavite.set_graph_db_path_for_test(db);
+    flavite.set_graph_service_for_test(db, Some(std::sync::Arc::new(generation_watch)));
     (flavite, root, fs, cache)
 }
 
