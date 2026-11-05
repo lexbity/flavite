@@ -11,11 +11,16 @@ fn wait_graph(f: &Fixture) -> std::sync::Arc<flavite_api::GraphFrame> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         f.flavite.pump();
+        // The reevaluate kick forces a pump (never skip-able) so the wait
+        // stays deterministic instead of racing the 5 s sweep. Catch-up
+        // AND current — a stamp-matching frame can lag a just-committed
+        // generation by one event hop, so the head check stays regardless.
         f.flavite.graph_reevaluate();
+        let head = f.flavite.vault_info().expect("vault info").generation;
         if let Some(frame) = f
             .flavite
             .graph_frame()
-            .filter(|_| f.flavite.graph_is_current())
+            .filter(|frame| frame.publication().generation >= head && f.flavite.graph_is_current())
         {
             return frame;
         }

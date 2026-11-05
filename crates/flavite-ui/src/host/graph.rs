@@ -1377,8 +1377,10 @@ pub fn command(app: &mut App, tab: TabId, command: GraphCommand) {
         }
         GraphCommand::RetryService => {
             if let Some(flavite) = app.flavite.as_ref() {
+                // The relayout directive both wakes the service and
+                // reinstalls the layout worker; the retired §12.1 pulse
+                // relay is not needed (RFC-0005 S5).
                 flavite.graph_relayout();
-                flavite.graph_reevaluate();
             }
             app.status = "Graph service retried".into();
         }

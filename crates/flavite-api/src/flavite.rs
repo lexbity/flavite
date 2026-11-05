@@ -533,15 +533,21 @@ pub struct Flavite {
     /// Monotonic sequence for the reserved catalog context (RFC-0004 D9):
     /// every `submit_catalog` ticket supersedes the previous pending one.
     pub(crate) catalog_sequence: AtomicU64,
+    /// RFC-0005 S1: the watch half of the writer-side generation broadcast,
+    /// held for the graph service's S5 event loop. Stored here so test
+    /// seams that recreate the service (`set_graph_db_path_for_test`)
+    /// rewire the same watch.
+    pub(crate) generation_watch: Option<Arc<flavite_index::GenerationWatch>>,
 }
 
 /// Build the per-vault attached services shared by every constructor.
 ///
-/// RFC-0005 S1: `index_watch` is the watch half of the writer-side
+/// RFC-0005 S5: `index_watch` is the watch half of the writer-side
 /// generation broadcast when the vault was opened with
 /// [`flavite_vault::Vault::open_with_generation_signal`] (the
-/// [`Flavite::open_root`] production path). The graph service stores it for
-/// its S5 event loop; until then it only keeps the channel open.
+/// [`Flavite::open_root`] production path). The graph service's wake loop
+/// consumes it; a `None` watch falls back to control-channel + sweep wakes
+/// (headless fixtures, CLI pools).
 fn attach_services(
     uuid: uuid::Uuid,
     root: &std::path::Path,
@@ -611,6 +617,9 @@ impl Flavite {
             .ok(),
             vault_user_state,
             graph,
+            // Headless constructors own no writer-side signal; their graph
+            // services wake on control kicks and the sweep (RFC-0005 §5.3).
+            generation_watch: None,
         };
 
         // Register built-in commands
@@ -660,6 +669,9 @@ impl Flavite {
             .ok(),
             vault_user_state,
             graph,
+            // Headless constructor: no writer-side signal owned here; the
+            // graph service wakes on control kicks and the sweep.
+            generation_watch: None,
         };
 
         flavite.register_builtin_commands()?;
@@ -690,6 +702,7 @@ impl Flavite {
     ) -> Result<Self, FlaviteError> {
         let vault_uuid = identity.uuid.to_string();
         let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
+        let generation_watch = index_watch.clone();
         let (vault_user_state, graph) =
             attach_services(vault_ref.uuid, &identity.root, &session, index_watch);
         let queries = crate::query_service::QueryService::new(
@@ -719,6 +732,9 @@ impl Flavite {
             vault_ref,
             read_only: false,
             owned_vault: None,
+            // RFC-0005 S5: keep the watch for seams that recreate the
+            // service (`set_graph_db_path_for_test` rewires the same one).
+            generation_watch,
         };
 
         flavite.register_builtin_commands()?;

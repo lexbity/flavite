@@ -2871,10 +2871,9 @@ impl App {
                     refresh_catalog = true;
                     // Saved content changed: previews and backlinks re-query.
                     self.contexts.invalidate_all();
-                    // The graph feed is event-driven; this pulse only
-                    // forces a re-evaluation pump for the scope-sensitive
-                    // parts of the projection (RFC-0005 FR-11).
-                    flavite.graph_reevaluate();
+                    // No graph pulse: the writer-side generation broadcast
+                    // (RFC-0005 S1/S5) wakes the feed service directly —
+                    // the UI relay retired with the poll cadence.
                 }
                 // S4: a contained vault-session panic is an operator-grade
                 // signal — warn on stderr (the crate's host-side channel,

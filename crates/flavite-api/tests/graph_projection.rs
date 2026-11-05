@@ -16,12 +16,18 @@ fn wait(
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         f.flavite.pump();
+        // The reevaluate kick forces a pump (never skip-able) so the wait
+        // stays deterministic instead of racing the 5 s sweep; the
+        // catch-up head check keeps the retired relay's correctness — a
+        // frame only counts when the mirror has CAUGHT UP to the committed
+        // generation, not merely when a stamp-current frame exists.
         f.flavite.graph_reevaluate();
-        if let Some(frame) = f
-            .flavite
-            .graph_frame()
-            .filter(|frame| f.flavite.graph_is_current() && predicate(frame))
-        {
+        let head = f.flavite.vault_info().expect("vault info").generation;
+        if let Some(frame) = f.flavite.graph_frame().filter(|frame| {
+            frame.publication().generation >= head
+                && f.flavite.graph_is_current()
+                && predicate(frame)
+        }) {
             return frame;
         }
         assert!(

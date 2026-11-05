@@ -170,10 +170,13 @@ impl GenerationWatch {
         self.rx.recv_timeout(timeout).ok()
     }
 
-    /// The underlying receiver, for select loops (RFC-0005 S5). The watch
-    /// is `Arc`-shared across service restarts; sending into a dead
-    /// attempt's receiver is a `try_send` drop.
-    #[doc(hidden)]
+    /// The underlying receiver handle. Consumers that multiplex this watch
+    /// with other channels in one wait — the graph service's wake loop
+    /// (`crossbeam::select!` over the index watch, the control channel, and
+    /// the next deadline) — use this accessor. The watch's watermark
+    /// atomics remain the authority for the *latest* advertised version.
+    /// The watch is `Arc`-shared across service restarts; sending into a
+    /// dead attempt's receiver is a `try_send` drop.
     #[must_use]
     pub fn receiver(&self) -> &Receiver<IndexVersion> {
         &self.rx

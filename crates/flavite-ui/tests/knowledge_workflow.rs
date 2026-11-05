@@ -615,6 +615,9 @@ fn crash_recovery_matches_the_recovered_note_in_the_workspace() {
     let mut edge_found = false;
     while Instant::now() < edge_deadline && !edge_found {
         flavite.pump();
+        // The save's index commit reaches the service through the
+        // writer-side broadcast; the reevaluate kick keeps the wait
+        // deterministic instead of racing the 5 s sweep bound.
         flavite.graph_reevaluate();
         if let Some(frame) = flavite.graph_frame() {
             // The effective projection batch carries the record-level

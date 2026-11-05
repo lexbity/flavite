@@ -40,10 +40,16 @@ fn fixture() -> (Flavite, PathBuf, std::sync::Arc<GateFs>, tempfile::TempDir) {
     let db = cache.path().join("query-index.sqlite3");
     drop(flavite_index::open_or_init(&db).expect("index"));
     let identity = flavite_api::VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![9]);
+    // RFC-0005 S5: the fixture rides the writer-side broadcast — index
+    // commits (reconcile) wake the feed service at event latency instead
+    // of a poll cadence that no longer exists.
+    let (generation_signal, generation_watch) = flavite_index::GenerationSignal::new();
     let actor = VaultActorBuilder::new()
         .with_fs(Box::new(SharedGateFs { inner: fs.clone() }) as Box<dyn Fs + Send + Sync>)
         .with_identity(identity.clone())
-        .with_index(IndexActor::new(&db, 1).expect("index actor"))
+        .with_index(
+            IndexActor::with_generation_signal(&db, 1, generation_signal).expect("index actor"),
+        )
         .build()
         .expect("actor")
         .start()
@@ -58,7 +64,7 @@ fn fixture() -> (Flavite, PathBuf, std::sync::Arc<GateFs>, tempfile::TempDir) {
         VaultConfig::default(),
     );
     let mut flavite = Flavite::open(identity, session, VaultConfig::default()).expect("facade");
-    flavite.set_graph_db_path_for_test(db);
+    flavite.set_graph_service_for_test(db, Some(std::sync::Arc::new(generation_watch)));
     (flavite, root, fs, cache)
 }
 
@@ -85,10 +91,34 @@ fn reconcile(flavite: &Flavite) {
     }
 }
 
+/// Wait until the event spine has delivered the reconcile to a CURRENT
+/// graph frame (RFC-0005 S5/S6: writer events drive this; under extreme
+/// parallel test load the catch-up pump can lag a query by milliseconds,
+/// and a lagging frame would answer `Missing` where production answers
+/// after settle. Settling first matches the real UI ordering.
+fn settle_graph(flavite: &Flavite) {
+    let head = flavite.vault_info().expect("vault info").generation;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if flavite.graph_frame().is_some_and(|frame| {
+            frame.publication().generation >= head && flavite.graph_is_current()
+        }) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the graph never caught up to the reconcile: {:?}",
+            flavite.graph_status()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn saturated_slots_return_busy_and_saves_still_finish() {
     let (flavite, root, fs, _cache) = fixture();
     reconcile(&flavite);
+    settle_graph(&flavite);
 
     // Hold every worker busy on gated reads of the linking note.
     fs.set_delay(50);
@@ -152,6 +182,7 @@ fn saturated_slots_return_busy_and_saves_still_finish() {
 fn closed_request_tokens_are_drained_and_dropped_without_revival() {
     let (flavite, _root, _fs, _cache) = fixture();
     reconcile(&flavite);
+    settle_graph(&flavite);
 
     // A "tab" submits a preview, then closes: its tokens are drained as
     // plain data. Nothing re-submits or revives a view; the service keeps

@@ -977,6 +977,17 @@ impl GraphMirror {
             drop(tx);
             return Ok(Synchronize::UpToDate);
         }
+        if self.cursor.generation > current.generation {
+            // RFC-0005 §4.9: a same-epoch cursor ahead of the head is the
+            // DB-recreate shape — the pump's `vault_uuid`/inode revalidation
+            // (FR-6) proves this handle is fresh, and the change log alone
+            // cannot explain a rewound generation. Rebuild from the full
+            // consistent read; the raw reader still refuses such cursors.
+            drop(tx);
+            return Ok(Synchronize::Reset {
+                reason: ResetReason::Recreated,
+            });
+        }
         let ChangeLogRead::Delta { records, to } = ChangeLogReader::read_since(&tx, self.cursor)?
         else {
             drop(tx);

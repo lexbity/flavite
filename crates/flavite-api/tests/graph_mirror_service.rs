@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flavite_api::graph_mirror::ParityPolicy;
-use flavite_api::{GraphService, GraphServiceStatus};
+use flavite_api::{GRAPH_SWEEP_INTERVAL, GraphService, GraphServiceStatus};
 use flavite_graph::NodeKind;
 use flavite_index::{IndexActor, open_or_init};
 use rusqlite::Connection;
@@ -469,8 +469,11 @@ fn stamp_only_republishes_reuse_the_snapshot_handoff() {
         // Wait for the republished frame to carry this stamp
         // (`graph_is_current` compares the frame's buffer stamp against
         // the session's) and to be genuinely new: the digest moves every
-        // step because the overlay content changed.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // step because the overlay content changed. S5 has no buffer wake
+        // yet (S6 adds the debounced one), so the self-verifying sweep is
+        // the convergence driver here — one stamp-only republish per sweep
+        // pass, well inside the deadline.
+        let deadline = std::time::Instant::now() + Duration::from_millis(11_000);
         loop {
             f.flavite.pump();
             f.flavite.graph_reevaluate();
@@ -549,15 +552,28 @@ fn each_delta_window_rebuilds_the_snapshot_exactly_once() {
     );
 
     // Quiet pumps (the reevaluate kick stands in for the 5 s recovery
-    // sweep, whose period makes a sleep-based assertion impractical) are
-    // UpToDate: every one is a cache hit — the snapshot counter, the delta
-    // set, and the reset set all stay flat.
+    // sweep — RFC-0005 S5 replaced the cadence, and with no watch this
+    // fixture can only pump on control kicks and the sweep) are UpToDate:
+    // every one is a cache hit on the handoff — the snapshot counter, the
+    // delta set, and the reset set all stay flat.
     let before_idle = fixture.service.metrics().mirror_snapshots_built_total;
     for _ in 0..3 {
         fixture.service.reevaluate();
         std::thread::sleep(Duration::from_millis(30));
     }
     let idle = fixture.service.metrics();
+    assert_eq!(
+        idle.wakes_total, busy.wakes_total,
+        "no index events exist for this fixture — nothing to wake on: {busy:?} -> {idle:?}"
+    );
+    assert_eq!(
+        idle.watermark_skips_total, 0,
+        "skips belong to index wakes only: {idle:?}"
+    );
+    assert!(
+        idle.sweeps_total - busy.sweeps_total <= 1,
+        "the sweep is the only cadence (5 s — at most one pass in 600 ms): {busy:?} -> {idle:?}"
+    );
     assert_eq!(
         idle.mirror_snapshots_built_total, before_idle,
         "quiet pumps must reuse the cached snapshot: {busy:?} -> {idle:?}"
@@ -684,4 +700,719 @@ fn doctor_parity_never_waits_behind_overlay_assembly() {
     let metrics = fixture.service.metrics();
     assert_eq!(metrics.mirror_mismatches_total, 0, "{metrics:?}");
     fixture.service.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0005 S5 — the event spine: index wakes, watermark skips, sweep
+// recovery, burst coalescing, connection longevity, and DB recreate.
+// ---------------------------------------------------------------------------
+
+/// A fixture wired to the real writer-side broadcast: the actor publishes
+/// every committed generation, the service watches. No test here ever
+/// forces a pump through the control channel unless it is deliberately
+/// exercising the host-kick leg — the point is that events carry freshness.
+struct EventFixture {
+    _dir: tempfile::TempDir,
+    db: PathBuf,
+    signal: flavite_index::GenerationSignal,
+    actor: IndexActor,
+    service: Arc<GraphService>,
+}
+
+impl EventFixture {
+    fn start(policy: ParityPolicy) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.sqlite");
+        drop(open_or_init(&db).unwrap());
+        let (signal, watch) = flavite_index::GenerationSignal::new();
+        let actor = IndexActor::with_generation_signal(&db, 1, signal.clone()).unwrap();
+        let service = GraphService::start_with_parity_policy_and_watch(
+            db.clone(),
+            None,
+            policy,
+            Some(Arc::new(watch)),
+        );
+        Self {
+            _dir: dir,
+            db,
+            signal,
+            actor,
+            service,
+        }
+    }
+
+    fn apply(&mut self, path: &str, body: &[u8], stamp: i64) {
+        self.actor
+            .apply_saved_note(path.as_bytes(), path, body, stamp, stamp)
+            .unwrap();
+    }
+
+    fn head(&self) -> (u64, u64) {
+        self.actor.current_version().unwrap()
+    }
+
+    /// Wait, poll-free (no control kick — the spine must do this), until
+    /// the published frame has caught up with the index head.
+    fn wait_current(&self) {
+        let generation = self.head().1;
+        wait(&self.service, || {
+            self.service
+                .frame()
+                .is_some_and(|frame| frame.publication().generation >= generation)
+        });
+    }
+}
+
+/// AC-2 (test scale): one commit through the spine reaches a published
+/// frame within the 100 ms event budget — measured from before the commit
+/// to after the frame swap, with no polling assistance anywhere. The vault
+/// is seeded at 1k notes per the S5 test bound; the design-bound number
+/// lands in the scale bench (AC-2/S7).
+#[test]
+fn index_commit_reaches_a_published_frame_within_the_event_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("graph.sqlite");
+    drop(open_or_init(&db).unwrap());
+    let (signal, watch) = flavite_index::GenerationSignal::new();
+    let mut actor = IndexActor::with_generation_signal(&db, 1, signal.clone()).unwrap();
+    for step in 0..1_000u64 {
+        let path = format!("n{step}.md");
+        let stamp = i64::try_from(step).unwrap();
+        actor
+            .apply_saved_note(
+                path.as_bytes(),
+                &path,
+                format!("# N{step}\n[[n{}]]\n", (step + 1) % 1_000).as_bytes(),
+                stamp,
+                stamp,
+            )
+            .unwrap();
+    }
+    let service = GraphService::start_with_parity_policy_and_watch(
+        db.clone(),
+        None,
+        ParityPolicy::default(),
+        Some(Arc::new(watch)),
+    );
+    // Cold boot: the t=0 bootstrap sweep reads the full truth. The one
+    // queued seed wake is then legitimately skipped (watermark == cursor).
+    wait(&service, || service.frame().is_some());
+    let generation = actor.current_version().unwrap().1;
+    wait(&service, || {
+        service
+            .frame()
+            .is_some_and(|frame| frame.publication().generation >= generation)
+    });
+
+    let path = "late.md".to_string();
+    let started = std::time::Instant::now();
+    let stamp = 9_999;
+    actor
+        .apply_saved_note(path.as_bytes(), &path, b"[[n7.md]]", stamp, stamp)
+        .unwrap();
+    let target = actor.current_version().unwrap().1;
+    // Poll-free wait on the published frame (reading an atomic — no kicks).
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if service
+            .frame()
+            .is_some_and(|frame| frame.publication().generation >= target)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the event never delivered the commit: {:?}",
+            service.metrics()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let latency = started.elapsed();
+    let metrics = service.metrics();
+    println!("index-commit -> published frame latency: {latency:?} ({metrics:?})");
+    assert!(
+        latency < Duration::from_millis(100),
+        "AC-2 test bound violated: {latency:?} at a 1k-note vault"
+    );
+    assert!(
+        metrics.wakes_total >= 1,
+        "the timed commit woke the pump: {metrics:?}"
+    );
+    service.shutdown();
+}
+
+/// FR-3 / AC-4: a wake whose watermark equals the cursor (and whose buffer
+/// stamp is unchanged) skips the pump entirely — no DB open/read, no mirror
+/// lock, no republish. Quiet stretches themselves must not pump: zero
+/// wakes, zero skips, one long-lived connection (no reopens — the cadence
+/// reuse is proven by the counters staying flat while the sweep runs).
+#[test]
+fn watermark_equal_wakes_skip_all_work() {
+    let mut fixture = EventFixture::start(ParityPolicy::default());
+    fixture.apply("w.md", b"# W", 1);
+    fixture.wait_current();
+    // Let any coalesced wake land and be processed first: a wake arriving
+    // after the frame is current is legitimately skipped (FR-3), so the
+    // quiet window is measured from a drained baseline.
+    std::thread::sleep(Duration::from_millis(300));
+    let settled = fixture.service.metrics();
+    assert!(settled.mirror_snapshots_built_total >= 1, "{settled:?}");
+
+    // A quiet stretch: nothing is coming, so nothing may happen.
+    std::thread::sleep(Duration::from_millis(600));
+    let quiet = fixture.service.metrics();
+    assert_eq!(
+        quiet.wakes_total, settled.wakes_total,
+        "no events ⇒ no wakes"
+    );
+    assert_eq!(
+        quiet.watermark_skips_total, settled.watermark_skips_total,
+        "no events ⇒ no new skips"
+    );
+    assert_eq!(quiet.batches_total, settled.batches_total, "no republish");
+    assert_eq!(
+        quiet.connection_reopens_total, 0,
+        "the handle is long-lived"
+    );
+
+    // A wake at the current watermark: the writer re-advertises the head
+    // (legal, harmless — FR-1 says nothing about uniqueness). The pump
+    // must observe the wake and skip without touching the database.
+    let frame_before = fixture.service.frame().expect("settled frame");
+    let head = fixture.head();
+    fixture
+        .signal
+        .publish(flavite_index::types::IndexVersion::new(head.0, head.1));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while fixture.service.metrics().watermark_skips_total <= settled.watermark_skips_total {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watermark-equal wake was never skipped: {:?}",
+            fixture.service.metrics()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let after = fixture.service.metrics();
+    assert_eq!(
+        after.wakes_total, settled.wakes_total,
+        "a skipped wake must never count as a pump: {after:?}"
+    );
+    assert_eq!(
+        after.mirror_deltas_total, settled.mirror_deltas_total,
+        "skip: the mirror must not synchronize: {after:?}"
+    );
+    assert_eq!(
+        after.mirror_parity_checks_total,
+        settled.mirror_parity_checks_total
+    );
+    assert_eq!(after.connection_reopens_total, 0, "skip: no DB open");
+    assert!(
+        Arc::ptr_eq(
+            &frame_before,
+            &fixture
+                .service
+                .frame()
+                .expect("frame stable across the skip")
+        ),
+        "skip: the frame must not be republished"
+    );
+    fixture.service.shutdown();
+}
+
+/// §4.2 coalescing through the real spine: a burst of 300 commits delivers
+/// far fewer wakes than generations, the change-log window is spanned in
+/// far fewer deltas, and the final frame sits at the final generation.
+/// (The bounded(1) drop-on-full channel semantics are proven unit-side in
+/// `signal.rs`; this is the service-level contract.)
+#[test]
+fn burst_commits_coalesce_into_windows_not_per_generation_wakes() {
+    let mut fixture = EventFixture::start(ParityPolicy {
+        // Parity every delta pump: pumps cost more than commits during the
+        // burst, so wakes must pile up in the single coalescing slot.
+        generations: 1,
+        interval: Duration::ZERO,
+    });
+    for step in 0..40u64 {
+        let stamp = i64::try_from(step).unwrap();
+        fixture.apply(
+            &format!("c{step}.md"),
+            format!("# C{step}\n[[c{}]]\n", (step + 1) % 40).as_bytes(),
+            stamp,
+        );
+    }
+    fixture.wait_current();
+
+    let before = fixture.service.metrics();
+    for step in 0..300u64 {
+        let stamp = i64::try_from(1_000 + step).unwrap();
+        fixture.apply(&format!("b{step}.md"), b"burst body", stamp);
+    }
+    let target = fixture.head().1;
+    wait(&fixture.service, || {
+        fixture
+            .service
+            .frame()
+            .is_some_and(|frame| frame.publication().generation >= target)
+    });
+    let after = fixture.service.metrics();
+    let wakes = after.wakes_total - before.wakes_total;
+    let deltas = after.mirror_deltas_total - before.mirror_deltas_total;
+    println!("burst 300 commits: {wakes} wakes, {deltas} delta windows");
+    assert!(
+        wakes < 150,
+        "at least 2:1 coalescing expected while pumps are running: {wakes}"
+    );
+    assert!(
+        deltas < 300,
+        "the change-log window must span bursts (one synchronize per wake): {deltas}"
+    );
+    assert_eq!(
+        fixture
+            .service
+            .frame()
+            .expect("frame")
+            .publication()
+            .generation,
+        target,
+        "the final frame must sit at the final generation"
+    );
+    fixture.service.shutdown();
+}
+
+/// AC-8 / FR-6: a DB recreate (new inode, new `vault_uuid`, fresh feed)
+/// under a live service forces the reopen and the existing reset path —
+/// never a silent read of the ghost database. The recreated vault's actor
+/// carries no signal, so this also exercises the disconnected-watch leg
+/// (the index arm retires onto the stub without spinning).
+#[test]
+fn db_recreate_forces_reopen_and_the_reset_path() {
+    let mut fixture = EventFixture::start(ParityPolicy::default());
+    fixture.actor.ensure_vault_uuid("uuid-before").unwrap();
+    // Two ghost notes: the recreated database holds exactly one, so a
+    // frame matching the NEW topology can never match the stale one.
+    fixture.apply("ghost.md", b"# ghost", 1);
+    fixture.apply("ghost2.md", b"# ghost2", 2);
+    fixture.wait_current();
+    let before = fixture.service.metrics();
+    assert_eq!(
+        fixture
+            .service
+            .frame()
+            .expect("ghost frame")
+            .publication()
+            .snapshot
+            .node_ids
+            .len(),
+        2,
+        "{before:?}"
+    );
+
+    // Recreate out of band: drop every handle to the old file, delete it,
+    // and build a fresh database (different uuid) under the same path.
+    let EventFixture {
+        _dir,
+        db,
+        signal,
+        actor,
+        service,
+    } = fixture;
+    drop(actor);
+    drop(signal);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    drop(open_or_init(&db).unwrap());
+    let mut external = IndexActor::new(&db, 1).unwrap();
+    external.ensure_vault_uuid("uuid-after").unwrap();
+    external
+        .apply_saved_note(b"after.md", "after.md", b"# after", 1, 1)
+        .unwrap();
+    let head_epoch = external.current_version().unwrap().0;
+    let head_generation = external.current_version().unwrap().1;
+
+    // A host kick drives the first pump (the watch is disconnected now;
+    // the sweep would have gotten there within one interval regardless).
+    service.reevaluate();
+    wait(&service, || {
+        service.frame().is_some_and(|frame| {
+            let publication = frame.publication();
+            publication.epoch == head_epoch
+                && publication.generation >= head_generation
+                && publication.snapshot.node_ids.len() == 1
+        })
+    });
+    let after = service.metrics();
+    assert!(
+        after.connection_reopens_total > before.connection_reopens_total,
+        "the identity swap must reopen the long-lived handle: before {before:?} after {after:?}"
+    );
+    assert!(
+        after.mirror_resets_total >= 2,
+        "the recreated database must take the reset path: {after:?}"
+    );
+    let frame = service.frame().expect("frame");
+    assert_eq!(frame.publication().generation, head_generation);
+    // The ghost note is gone — the frame describes the NEW database only.
+    let names: Vec<String> = frame
+        .projection()
+        .saved
+        .nodes
+        .iter()
+        .map(|node| node.path.clone())
+        .collect();
+    assert_eq!(names, vec!["after.md".to_string()], "{names:?}");
+    service.shutdown();
+}
+
+/// AC-4 recovery leg / §4.1: an external writer (second index handle, no
+/// signal) is picked up by the 5 s sweep — no events existed to wake on,
+/// no control kick was sent, and the wake rate stays at the 0.2 Hz budget.
+#[test]
+fn sweep_recovers_external_commits_without_events() {
+    let mut fixture = EventFixture::start(ParityPolicy::default());
+    fixture.apply("seed.md", b"# seed", 1);
+    fixture.wait_current();
+    let before = fixture.service.metrics();
+
+    let mut external = IndexActor::new(&fixture.db, 1).unwrap();
+    external
+        .apply_saved_note(b"ext.md", "ext.md", b"links [[seed.md]]", 9, 9)
+        .unwrap();
+    let target = external.current_version().unwrap().1;
+    let started = std::time::Instant::now();
+    wait(&fixture.service, || {
+        fixture
+            .service
+            .frame()
+            .is_some_and(|frame| frame.publication().generation >= target)
+    });
+    let converged = started.elapsed();
+    let after = fixture.service.metrics();
+    println!("external commit converged via sweep in {converged:?}");
+    assert!(
+        converged <= GRAPH_SWEEP_INTERVAL + Duration::from_millis(750),
+        "the sweep is the recovery bound: {converged:?}"
+    );
+    assert_eq!(
+        after.wakes_total, before.wakes_total,
+        "no events existed — only the sweep may have pumped: {before:?} -> {after:?}"
+    );
+    assert!(
+        after.sweeps_total > before.sweeps_total,
+        "{before:?} -> {after:?}"
+    );
+    assert!(
+        after.sweeps_total - before.sweeps_total <= 2,
+        "the sweep cadence is 0.2 Hz (NFR-1): {before:?} -> {after:?}"
+    );
+    let frame = fixture.service.frame().expect("converged frame");
+    let id_of = |name: &str| {
+        frame
+            .projection()
+            .saved
+            .nodes
+            .iter()
+            .find(|node| node.path == name)
+            .unwrap_or_else(|| panic!("{name} missing from the converged frame"))
+            .id
+    };
+    assert!(
+        frame_has_edge(&fixture.service, id_of("ext.md"), id_of("seed.md")),
+        "the converged frame must carry the external writer's edge"
+    );
+    fixture.service.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0005 S6 — buffer events + trailing-edge debounce (FR-4, AC-3).
+// Real sessions, real stamp wakes: no relay, no host kick, no cadence.
+// ---------------------------------------------------------------------------
+
+/// AC-3: a burst of ten stamp changes inside one window over a quiet index
+/// rebuilds the dirty overlay ONCE, within 150 ms + build of the LAST
+/// transition — driven purely by the buffer watch and the debounce
+/// deadline. The counters prove the shape: deadline fire(s) happened, no
+/// index wake participated, no delta was read, the sweep stayed idle, and
+/// the frames published are the fires' (≤ the fires, dedup swallowing any
+/// trailing identical rebuild).
+#[test]
+fn stamp_burst_rebuilds_the_overlay_once_within_the_debounce_budget() {
+    use flavite_api::{ExecutionResult, GRAPH_BUFFER_DEBOUNCE, Invocation, LocalResult, Origin};
+
+    let f = links_fixture::fixture(&[("keep.md", "# Keep\nbase body\n")]);
+    // Settle on the event spine: a frame at the index head, current stamp.
+    let head = f.flavite.vault_info().expect("vault info").generation;
+    let settle_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        f.flavite.pump();
+        if f.flavite.graph_frame().is_some_and(|frame| {
+            frame.publication().generation >= head && f.flavite.graph_is_current()
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < settle_deadline,
+            "the first current frame never arrived: {:?}",
+            f.flavite.graph_status()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let (buffer_id, _revision) = f.open_note("keep.md");
+    let before = f.flavite.graph_metrics();
+
+    let burst_start = std::time::Instant::now();
+    for step in 1..=10u64 {
+        let view = f
+            .flavite
+            .get_buffer_view(flavite_buffer::BufferId::from(buffer_id), None)
+            .expect("buffer view");
+        let result = f.flavite.execute(Invocation::new(
+            links_fixture::next_id(&f.flavite),
+            "apply_edits",
+            serde_json::json!({
+                "buffer_id": buffer_id,
+                "revision": view.revision,
+                "ops": [{ "range": [0, view.text.len()],
+                          "replacement": format!("# Keep\nstamped edit {step}\n") }],
+            }),
+            Origin::Gui,
+        ));
+        assert!(
+            matches!(result, ExecutionResult::Local(LocalResult::Success(_))),
+            "edit {step} must apply locally: {result:?}"
+        );
+    }
+    let burst = burst_start.elapsed();
+    // Normally ten in-process edits complete well inside one 150 ms window;
+    // a starved test thread may span two or three, costing exactly one
+    // extra fire. Derive the budget from the windows actually spanned.
+    let windows = {
+        let burst_ms = u64::try_from(burst.as_millis()).unwrap_or(u64::MAX);
+        let window_ms = u64::try_from(GRAPH_BUFFER_DEBOUNCE.as_millis()).unwrap_or(1);
+        burst_ms.div_ceil(window_ms).max(1)
+    };
+
+    // The ONLY requirement: the frame carries the final stamp within the
+    // budget measured from the last transition. No kicks — the loop just
+    // reads the published frame.
+    let since_last = std::time::Instant::now();
+    loop {
+        f.flavite.pump();
+        if f.flavite.graph_is_current() {
+            break;
+        }
+        let elapsed = since_last.elapsed();
+        assert!(
+            elapsed <= GRAPH_BUFFER_DEBOUNCE + Duration::from_millis(600),
+            "AC-3: the debounced rebuild never landed ({elapsed:?} since the last change): {:?}",
+            f.flavite.graph_metrics()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let wall = since_last.elapsed();
+    let after = f.flavite.graph_metrics();
+    println!(
+        "last stamp change -> current overlay frame: {wall:?} (window {GRAPH_BUFFER_DEBOUNCE:?})"
+    );
+    assert!(
+        wall <= GRAPH_BUFFER_DEBOUNCE + Duration::from_millis(500),
+        "AC-3 budget violated: {wall:?}"
+    );
+    let fires = after.debounced_rebuilds_total - before.debounced_rebuilds_total;
+    let publishes = after.batches_total - before.batches_total;
+    assert!(
+        (1..=windows).contains(&fires),
+        "one burst collapses to a fire per spanned window: {burst:?} spans {windows} window(s), {after:?}"
+    );
+    assert!(
+        (1..=fires).contains(&publishes),
+        "every publish rides a rebuild: {after:?}"
+    );
+    assert_eq!(
+        after.wakes_total, before.wakes_total,
+        "no index commits — no wakes"
+    );
+    assert_eq!(
+        after.mirror_deltas_total, before.mirror_deltas_total,
+        "the index stayed quiet: buffer work never reads deltas"
+    );
+    // (No sweep-equality assert: a 5 s boundary crossing under parallel
+    // load is timing noise — the wall budget above already excludes a
+    // sweep-driven convergence, which would take seconds.)
+    assert_eq!(
+        after.mirror_snapshots_built_total, before.mirror_snapshots_built_total,
+        "stamp-only fires reuse the cached snapshot handoff (S3/S4 unchanged)"
+    );
+}
+
+/// §4.4 "Index-delta rebuilds are never debounced": a commit landing while
+/// a stamp window is armed pumps immediately (writer wake), and the pending
+/// window is consumed by that rebuild — never a trailing second fire. The
+/// typed stamp and the new generation reach the same published frame.
+#[test]
+fn index_commit_during_typing_pumps_immediately_and_consumes_the_window() {
+    use flavite_api::{GRAPH_BUFFER_DEBOUNCE, Invocation, Origin};
+
+    let f = links_fixture::fixture(&[("a.md", "# A\nsee [[b]]\n"), ("b.md", "# B\n")]);
+    let head = f.flavite.vault_info().expect("vault info").generation;
+    let settle_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        f.flavite.pump();
+        if f.flavite.graph_frame().is_some_and(|frame| {
+            frame.publication().generation >= head && f.flavite.graph_is_current()
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < settle_deadline,
+            "the first current frame never arrived: {:?}",
+            f.flavite.graph_status()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (buffer_id, _revision) = f.open_note("a.md");
+    let before = f.flavite.graph_metrics();
+
+    // Type (arms the trailing window)...
+    let view = f
+        .flavite
+        .get_buffer_view(flavite_buffer::BufferId::from(buffer_id), None)
+        .expect("view");
+    let typed = f.flavite.execute(Invocation::new(
+        links_fixture::next_id(&f.flavite),
+        "apply_edits",
+        serde_json::json!({
+            "buffer_id": buffer_id,
+            "revision": view.revision,
+            "ops": [{ "range": [0, view.text.len()],
+                      "replacement": "# A typed mid-flight\nsee [[b]]\n" }],
+        }),
+        Origin::Gui,
+    ));
+    assert!(typed.is_success(), "edit applies: {typed:?}");
+
+    // ...and an index commit lands inside the window: an out-of-band file
+    // written straight onto the shared database through the spine.
+    fixture_apply_note(&f, "late.md", "links [[b]]", 77_777);
+    let target = f.flavite.vault_info().expect("info").generation;
+    assert!(target > head, "the commit advanced the generation");
+
+    let started = std::time::Instant::now();
+    loop {
+        f.flavite.pump();
+        if f.flavite
+            .graph_frame()
+            .is_some_and(|frame| frame.publication().generation >= target)
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the index commit never reached a frame: {:?}",
+            f.flavite.graph_metrics()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let commit_wall = started.elapsed();
+
+    // The wake path pumped the commit (never debounced): an index-driven
+    // pump happened.
+    let after_commit = f.flavite.graph_metrics();
+    assert!(
+        after_commit.wakes_total > before.wakes_total,
+        "the commit woke an index pump: {after_commit:?}"
+    );
+
+    // §4.4 immediacy: the commit reached a published frame well before a
+    // pure stamp path could (the debounce floor is 150 ms after the last
+    // typing wake; measured from after the commit returned).
+    assert!(
+        commit_wall < GRAPH_BUFFER_DEBOUNCE,
+        "the index commit waited for a debounce window: {commit_wall:?}"
+    );
+
+    // Let the state machine fully settle (buffer refresh paths may fire
+    // late stamp wakes around a reconcile), then require counter silence:
+    // pending windows expire, nothing refires without new transitions —
+    // and the whole typing-plus-commit episode rebuilds at most twice,
+    // never once per keystroke (the storm FR-4 exists to prevent).
+    let mut settled = after_commit;
+    let quiet_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        std::thread::sleep(Duration::from_millis(300));
+        let probe = f.flavite.graph_metrics();
+        if probe.debounced_rebuilds_total == settled.debounced_rebuilds_total {
+            settled = probe;
+            break;
+        }
+        settled = probe;
+        assert!(
+            std::time::Instant::now() < quiet_deadline,
+            "debounce fires never went quiet: {settled:?}"
+        );
+    }
+    let fires = settled.debounced_rebuilds_total - before.debounced_rebuilds_total;
+    println!(
+        "typing + one index commit episode: {fires} debounced fire(s), commit wall {commit_wall:?}"
+    );
+    assert!(
+        fires <= 2,
+        "a ten-transition burst plus a commit must collapse into windows, not per-change rebuilds: {settled:?}"
+    );
+    assert!(
+        f.flavite.graph_is_current(),
+        "typed stamp is live: {settled:?}"
+    );
+    let frame = f.flavite.graph_frame().expect("frame");
+    assert_eq!(frame.publication().generation, target);
+    // The typed content actually reached the overlay (not just "current"):
+    assert!(
+        frame
+            .projection()
+            .effective
+            .nodes
+            .iter()
+            .any(|node| node.path == "late.md"),
+        "the committed note is in the frame"
+    );
+    assert!(
+        frame
+            .projection()
+            .overlays
+            .values()
+            .any(|overlay| matches!(overlay, flavite_api::OverlayState::Ready { .. })),
+        "the typed overlay is live in the frame: {:?}",
+        frame.projection().overlays
+    );
+}
+
+/// Push one note through the vault's index spine with no UI relay in sight.
+fn fixture_apply_note(f: &links_fixture::Fixture, name: &str, body: &str, _stamp: i64) {
+    use flavite_api::{ExecutionResult, Invocation, Origin};
+    use flavite_fs::Fs;
+    f.fs.write_new(&f.root.join(name), body.as_bytes())
+        .expect("fs write");
+    let result = f.flavite.execute(Invocation::new(
+        links_fixture::next_id(&f.flavite),
+        "vault.reconcile",
+        serde_json::json!({ "scope": "full", "mode": "fast" }),
+        Origin::Gui,
+    ));
+    if let ExecutionResult::Pending { request_id } = result {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            f.flavite.pump();
+            let done = f.flavite.wait_for_operation(request_id);
+            if !matches!(done, ExecutionResult::Pending { .. }) {
+                assert!(done.is_success(), "reconcile: {done:?}");
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reconcile never finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }

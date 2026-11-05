@@ -993,6 +993,16 @@ impl VaultActor {
     /// The main actor loop.
     fn run(&mut self, is_running: Arc<AtomicBool>) {
         is_running.store(true, Ordering::SeqCst);
+        // Record the vault identity in the index meta table. The graph
+        // service revalidates its long-lived read connection against it
+        // (RFC-0005 FR-6): a recreated index file with a different vault
+        // uuid forces the service to reopen and take the reset path.
+        if let Err(error) = self
+            .index
+            .ensure_vault_uuid(&self.identity.uuid.to_string())
+        {
+            tracing::warn!(%error, "failed to record the vault uuid in the index meta");
+        }
         for (key, counter) in [
             (
                 flavite_index::schema::MetaKey::DriftFoundTotal,
