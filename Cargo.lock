@@ -1561,6 +1561,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flavite-encoding"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+]
+
+[[package]]
 name = "flavite-fs"
 version = "0.1.0"
 dependencies = [
@@ -1623,6 +1631,17 @@ dependencies = [
  "tree-sitter-md",
  "unicode-normalization",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "flavite-text-search"
+version = "0.1.0"
+dependencies = [
+ "flavite-syntax",
+ "proptest",
+ "regex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

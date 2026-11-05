@@ -33,6 +33,10 @@
       "kind": "workspace"
     },
     {
+      "id": "flavite-encoding",
+      "kind": "workspace"
+    },
+    {
       "id": "flavite-fs",
       "kind": "workspace"
     },
@@ -50,6 +54,10 @@
     },
     {
       "id": "flavite-syntax",
+      "kind": "workspace"
+    },
+    {
+      "id": "flavite-text-search",
       "kind": "workspace"
     },
     {
@@ -303,6 +311,11 @@
     {
       "from": "flavite-syntax",
       "to": "tree-sitter",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-text-search",
+      "to": "flavite-syntax",
       "kind": "normal"
     },
     {

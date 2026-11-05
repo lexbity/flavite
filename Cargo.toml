@@ -29,6 +29,8 @@ tree-sitter = "0.27"
 tree-sitter-md = "0.5"
 unicode-segmentation = "1"
 nucleo-matcher = "0.3"
+# Source matching (RFC-0006 §4.1: flavite-text-search → regex)
+regex = "1"
 blake3 = "1"
 zstd = "0.14"
 tracing = "0.1"

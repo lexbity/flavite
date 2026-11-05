@@ -10,6 +10,8 @@
 # RFC-0003 adds flavite-workspace: the IO-free layout model carries
 # durability-adjacent invariants and holds the 90% floor.
 tier1 = [
+    "flavite-encoding",
+    "flavite-text-search",
     "flavite-fs",
     "flavite-syntax",
     "flavite-buffer",
@@ -26,6 +28,8 @@ tier3 = ["flavite-cli", "flavite-editor", "flavite-ui", "flavite-app"]
 [responsibilities]
 flavite-graph-protocol = "IO-free bounded durable graph scope value types shared by core and workspace (RFC-0003 W08)"
 flavite-fs = "Fs trait, atomic_write, watcher, path safety; FaultFs behind feature \"fault\" (§4.1)"
+flavite-encoding = "Strict ASCII/UTF-8/UTF-16 codecs, SourceFormat descriptor and encoded↔decoded byte maps; pure, IO-free, std-only deps (RFC-0006 §6.10, D-15)"
+flavite-text-search = "Pure literal/regex source matching, capture metadata and replacement-template expansion; no editor/buffer authority (RFC-0006 §4.1, D-05)"
 flavite-syntax = "Scanner, frontmatter patcher, pulldown glue — pure, IO-free (§4.1)"
 flavite-index = "SQLite, tantivy, resolver, query exec (§4.1)"
 flavite-buffer = "EditorModel/ropey, undo tree, D7 state machine (§4.1)"
@@ -68,6 +72,9 @@ active = [
     { from = "flavite-ui", to = "flavite-graph" },
     { from = "flavite-index", to = "flavite-syntax" },
     { from = "flavite-buffer", to = "flavite-syntax" },
+    # RFC-0006 S01 — the source matcher borrows syntax Span/TextByte types
+    # (§4.1: no reverse edge; encoding has no internal edges).
+    { from = "flavite-text-search", to = "flavite-syntax" },
     # flavite-vault dependencies
     { from = "flavite-vault", to = "flavite-buffer" },
     { from = "flavite-vault", to = "flavite-fs" },
@@ -104,6 +111,8 @@ active = [
 # Core-tier crates whose transitive closure of normal+build deps MUST NOT
 # contain any forbidden crate (§10.2 check 3).
 core_tier = [
+    "flavite-encoding",
+    "flavite-text-search",
     "flavite-fs",
     "flavite-syntax",
     "flavite-index",

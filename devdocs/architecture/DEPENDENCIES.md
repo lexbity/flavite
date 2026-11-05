@@ -13,11 +13,13 @@ Generated from `cargo metadata --format-version 1 --all-features`.
 | `flavite-buffer` | 1 | EditorModel/ropey, undo tree, D7 state machine (§4.1) |
 | `flavite-cli` | 3 | Headless CLI; consumes flavite-api (D16 dogfood) (§4.1) |
 | `flavite-editor` | 3 | iced widget over EditorModel (iced permitted here and in flavite-ui only) (§4.1) |
+| `flavite-encoding` | 1 | Strict ASCII/UTF-8/UTF-16 codecs, SourceFormat descriptor and encoded↔decoded byte maps; pure, IO-free, std-only deps (RFC-0006 §6.10, D-15) |
 | `flavite-fs` | 1 | Fs trait, atomic_write, watcher, path safety; FaultFs behind feature "fault" (§4.1) |
 | `flavite-graph` | 2 | Layout, spatial — CPU only (§4.1) |
 | `flavite-graph-protocol` | 1 | IO-free bounded durable graph scope value types shared by core and workspace (RFC-0003 W08) |
 | `flavite-index` | 1 | SQLite, tantivy, resolver, query exec (§4.1) |
 | `flavite-syntax` | 1 | Scanner, frontmatter patcher, pulldown glue — pure, IO-free (§4.1) |
+| `flavite-text-search` | 1 | Pure literal/regex source matching, capture metadata and replacement-template expansion; no editor/buffer authority (RFC-0006 §4.1, D-05) |
 | `flavite-ui` | 3 | iced shell library: views, host catalog, adapters (§4.1; no binary) |
 | `flavite-vault` | 1 | Session/BufferManager ownership + actors, journal, history, recovery (§4.1) |
 | `flavite-workspace` | 1 | IO-free workspace model: layout tree, tab groups, typed transactions, geometry (RFC-0003 D-02) |
@@ -73,6 +75,10 @@ Normal/build:
 - `iced` (normal)
 - `nucleo-matcher` (normal)
 
+### `flavite-encoding`
+
+No dependencies.
+
 ### `flavite-fs`
 
 Normal/build:
@@ -111,6 +117,12 @@ Normal/build:
 
 - `pulldown-cmark` (normal)
 - `tree-sitter` (normal)
+
+### `flavite-text-search`
+
+Normal/build:
+
+- `flavite-syntax` (normal)
 
 ### `flavite-ui`
 
@@ -191,7 +203,7 @@ Normal/build:
 
 ## Layering rules (§10.2)
 
-Core-tier crates: flavite-fs, flavite-syntax, flavite-index, flavite-buffer, flavite-vault, flavite-api, flavite-graph, flavite-graph-protocol, flavite-workspace, flavite-cli
+Core-tier crates: flavite-encoding, flavite-text-search, flavite-fs, flavite-syntax, flavite-index, flavite-buffer, flavite-vault, flavite-api, flavite-graph, flavite-graph-protocol, flavite-workspace, flavite-cli
 
 Forbidden in core-tier transitive closure (normal+build): iced, iced_*, winit, wgpu, cosmic-text
 
@@ -201,7 +213,7 @@ UI crates (may depend on forbidden): flavite-editor, flavite-ui
 
 | Tier | Crates | Floor |
 |---|---|---|
-| 1 — durability-critical | flavite-fs, flavite-syntax, flavite-buffer, flavite-vault, flavite-index, flavite-workspace, flavite-graph-protocol | ≥ 90% line |
+| 1 — durability-critical | flavite-encoding, flavite-text-search, flavite-fs, flavite-syntax, flavite-buffer, flavite-vault, flavite-index, flavite-workspace, flavite-graph-protocol | ≥ 90% line |
 | 2 | flavite-api, flavite-graph | ≥ 80% line |
 | 3 — measured, not gating | flavite-cli, flavite-editor, flavite-ui, flavite-app | reported only |
 

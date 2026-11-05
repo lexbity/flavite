@@ -30,6 +30,8 @@ reason = "Actor shutdown and uncommon journal-recovery branches remain uncovered
 # Crate → tier mapping. A crate with zero executable lines reports N/A
 # and is inactive for floors; the first executable implementation
 # activates its floor in the same slice (§10.5).
+flavite-encoding = "tier1"
+flavite-text-search = "tier1"
 flavite-fs = "tier1"
 flavite-syntax = "tier1"
 flavite-buffer = "tier1"

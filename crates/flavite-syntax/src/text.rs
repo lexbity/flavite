@@ -557,6 +557,33 @@ pub fn fold_key(s: &str) -> String {
     s.to_lowercase().nfc().collect::<String>()
 }
 
+/// UAX #29 default word-segment boundaries of `text`, ascending, including
+/// `0` and `text.len()`.
+///
+/// Shared primitive so whole-word matching (flavite-text-search) and
+/// navigation agree without a buffer↔search dependency (RFC-0006 §6.2,
+/// D-05). A whole-word match requires **both** endpoints to be boundaries
+/// of word segments; punctuation-only matches qualify when both endpoints
+/// are boundaries.
+#[must_use]
+pub fn word_boundaries(text: &str) -> Vec<usize> {
+    let mut boundaries = Vec::new();
+    let mut offset = 0usize;
+    for segment in text.split_word_bounds() {
+        boundaries.push(offset);
+        offset += segment.len();
+    }
+    boundaries.push(offset);
+    boundaries
+}
+
+/// Whether `at` is one of the UAX #29 word-segment boundaries produced by
+/// [`word_boundaries`]. Binary search; out-of-range is not a boundary.
+#[must_use]
+pub fn is_word_boundary(boundaries: &[usize], at: usize) -> bool {
+    boundaries.binary_search(&at).is_ok()
+}
+
 /// Replace CRLF with LF, leaving standalone CR bytes untouched (§4.8, R12).
 fn fold_crlf(text: &str) -> String {
     if !text.contains('\r') {
@@ -783,6 +810,28 @@ mod tests {
         assert_eq!(fold_key("café"), fold_key("cafe\u{0301}"));
         // §4.8: default folding — Turkish dotted/dotless I do not shift.
         assert_eq!(fold_key("İ"), fold_key("i\u{0307}"));
+    }
+
+    #[test]
+    fn word_boundaries_follow_uax29_segments() {
+        assert_eq!(word_boundaries(""), vec![0]);
+        assert_eq!(word_boundaries("case"), vec![0, 4]);
+        assert_eq!(word_boundaries("hello world"), vec![0, 5, 6, 11]);
+        // MidLetter apostrophe keeps "can't" one segment (D-05).
+        assert_eq!(word_boundaries("can't stop"), vec![0, 5, 6, 10]);
+        // ExtendNumLet underscore joins segments.
+        assert_eq!(word_boundaries("a_b"), vec![0, 3]);
+        // Punctuation forms its own segment, so punctuation-only matches
+        // can qualify as whole words when both endpoints are boundaries.
+        assert_eq!(word_boundaries("a!b"), vec![0, 1, 2, 3]);
+
+        let boundaries = word_boundaries("hello world");
+        assert!(is_word_boundary(&boundaries, 0));
+        assert!(is_word_boundary(&boundaries, 5));
+        assert!(is_word_boundary(&boundaries, 11));
+        assert!(!is_word_boundary(&boundaries, 2));
+        assert!(!is_word_boundary(&boundaries, 99));
+        assert!(is_word_boundary(&word_boundaries(""), 0));
     }
 
     #[test]
