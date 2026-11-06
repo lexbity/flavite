@@ -140,7 +140,7 @@ impl App {
         }
     }
 
-    fn split_fits(
+    pub(crate) fn split_fits(
         &self,
         tab: TabId,
         group: flavite_workspace::GroupId,

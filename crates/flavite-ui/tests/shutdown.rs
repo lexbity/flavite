@@ -88,9 +88,10 @@ fn pump_to_exit(app: &mut App, what: &str) -> iced::Task<Message> {
 
 fn open_note(app: &mut App, name: &str) -> TabId {
     let group = app.focused_group().unwrap();
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator: NoteLocator::from_components([name]).unwrap(),
-        group: Some(group),
+        group,
     });
     wait_ready(app);
     app.workspace.focused_tab()

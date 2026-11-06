@@ -23,10 +23,12 @@ fn wait(app: &mut App, predicate: impl Fn(&App) -> bool) {
     }
 }
 fn open(app: &mut App, path: &str) -> TabId {
-    let _ = app.update(Message::OpenNote {
-        locator: NoteLocator::from_components([path]).unwrap(),
-        group: None,
-    });
+    let _ = app.update(Message::OpenIntent(
+        flavite_ui::host::open_intents::OpenIntent::reuse(
+            NoteLocator::from_components([path]).unwrap(),
+            None,
+        ),
+    ));
     wait(app, |app| !app.notes.any_pending());
     app.workspace.focused_tab()
 }

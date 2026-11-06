@@ -121,6 +121,9 @@ pub struct GraphTabState {
     /// Observed widget bounds (logical window coordinates) for
     /// screen-space harness reporting.
     pub bounds: Option<Rectangle>,
+    /// Observed bounds of the activation-contract notice row, when the
+    /// first-launch explanation is still owed (D-02).
+    pub notice_bounds: Option<Rectangle>,
     /// Last seen base epoch (epoch resets clear transient entity state).
     pub last_epoch: u64,
     /// The user took the camera with a pan/zoom gesture; auto-fit and
@@ -168,6 +171,7 @@ impl GraphTabState {
             geometry_generation: 0,
             stale: false,
             bounds: None,
+            notice_bounds: None,
             last_epoch: 0,
             user_camera_moved: false,
             last_layout_active: None,
@@ -534,6 +538,9 @@ pub enum GraphCommand {
     Open(NodeId),
     /// Insert one node by identity (list row action).
     Insert(NodeId),
+    /// Open every multi-selected note in its own tab (D-03: `Open selected
+    /// in tabs`; native-key order, 20-view limit per invocation).
+    OpenSelectedInTabs,
 }
 
 /// Resolve a node identity to its record within the current base
@@ -693,9 +700,10 @@ pub fn pump(app: &mut App) {
                 state.frozen_nodes.clear();
             }
             state.last_epoch = publication.epoch;
-            // Crossing a frame version clears the pending double-click
-            // candidate (§9.3).
-            state.arbiter.invalidate_frame(&key);
+            // D-02/S04: the navigation pair survives layout/overlay
+            // generation movement inside its bounded hold; only a newer
+            // identity epoch cancels it.
+            state.arbiter.invalidate_epoch(publication.epoch);
         }
 
         let scheme = app.appearance.scheme();
@@ -1105,7 +1113,13 @@ pub fn handle_message(app: &mut App, tab: TabId, message: GraphMessage) {
                     }
                 }
                 ReleaseKind::Click => {
-                    let Some(key) = app.graph.state(tab).and_then(|state| state.geometry_key)
+                    // Pairing key: identity epoch (D-02), not the render
+                    // generation; the router already validated the frame.
+                    let Some(epoch) = app
+                        .graph
+                        .state(tab)
+                        .and_then(|state| state.geometry_key)
+                        .map(|key| key.epoch)
                     else {
                         return;
                     };
@@ -1113,7 +1127,7 @@ pub fn handle_message(app: &mut App, tab: TabId, message: GraphMessage) {
                     let Some(state) = app.graph.state_mut(tab) else {
                         return;
                     };
-                    let outcome = state.arbiter.click(now, node, world, &key, zoom);
+                    let outcome = state.arbiter.click(now, node, world, epoch, zoom);
                     match outcome {
                         GestureOutcome::Select(hit) => {
                             state.selection = Some(hit);
@@ -1124,10 +1138,13 @@ pub fn handle_message(app: &mut App, tab: TabId, message: GraphMessage) {
                             state.selected_nodes.clear();
                             publish_empty(app, tab);
                         }
-                        GestureOutcome::InsertLink(hit) => {
+                        GestureOutcome::ActivateNode(hit) => {
+                            // D-02: a completed pair activates (opens) the
+                            // node — it never mutates text. Insertion stays
+                            // with the explicit Insert commands.
                             state.selection = Some(hit);
                             publish_selection(app, tab, hit);
-                            request_node_link(app, tab, hit);
+                            open_node(app, Some(tab), hit.id);
                         }
                     }
                 }
@@ -1181,9 +1198,10 @@ pub(crate) fn publish_empty(app: &mut App, tab: TabId) {
     app.reconcile_contexts();
 }
 
-/// The double-click insert path: explicit refusal with repair guidance
-/// when there is no valid writing target — never navigation, never a
-/// manufactured caret, never a fallback editor (D-05).
+/// The *explicit* insert path (`Insert` command, Ctrl/Cmd+Enter): refusal
+/// with repair guidance when there is no valid writing target — never
+/// navigation, never a manufactured caret, never a fallback editor (D-02:
+/// activation and insertion are distinct intents).
 fn request_node_link(app: &mut App, tab: TabId, hit: HitNode) {
     let Some(record) = record_for(app, hit.id) else {
         app.status = "Selected node left the current frame; choose it again".into();
@@ -1348,7 +1366,7 @@ pub fn command(app: &mut App, tab: TabId, command: GraphCommand) {
                 return;
             };
             if command == GraphCommand::OpenSelected {
-                open_node(app, hit.id);
+                open_node(app, Some(tab), hit.id);
             } else {
                 request_node_link(app, tab, hit);
             }
@@ -1399,7 +1417,7 @@ pub fn command(app: &mut App, tab: TabId, command: GraphCommand) {
             }
             publish_selection(app, tab, hit);
         }
-        GraphCommand::Open(node) => open_node(app, node),
+        GraphCommand::Open(node) => open_node(app, Some(tab), node),
         GraphCommand::Insert(node) => {
             let Some(record) = record_for(app, node) else {
                 return;
@@ -1414,14 +1432,53 @@ pub fn command(app: &mut App, tab: TabId, command: GraphCommand) {
             }
             app.request_link_insert(locator);
         }
+        GraphCommand::OpenSelectedInTabs => {
+            let selected = app
+                .graph
+                .state(tab)
+                .map(|state| state.selected_nodes.clone())
+                .unwrap_or_default();
+            if selected.is_empty() {
+                app.status = "Select nodes first (click a dot, a list row, or drag a box)".into();
+                return;
+            }
+            // Deterministic native-key order (D-03): byte order of the
+            // native path identity, then entity id for identical paths.
+            let mut records: Vec<GraphNodeRecord> = selected
+                .iter()
+                .filter_map(|id| record_for(app, *id))
+                .filter(|record| locator_for(record).is_some())
+                .collect();
+            records.sort_by(|a, b| {
+                a.path_native
+                    .cmp(&b.path_native)
+                    .then_with(|| a.id.id.cmp(&b.id.id))
+            });
+            if records.len() > crate::host::open_intents::MAX_MULTI_OPEN {
+                app.status = format!(
+                    "{} notes selected — open at most {} per invocation; reduce the selection first",
+                    records.len(),
+                    crate::host::open_intents::MAX_MULTI_OPEN
+                );
+                return;
+            }
+            let count = records.len();
+            for record in records {
+                // checked above
+                let locator = locator_for(&record).expect("filtered above");
+                app.open_intent(crate::host::open_intents::OpenIntent::new_tab(locator));
+            }
+            app.status =
+                format!("Opened {count} tabs (NewTab bypasses view dedup; buffers shared)");
+        }
     }
     app.refresh_semantics();
 }
 
-/// Explicit navigation for one node (D-05: Open is its own action and
-/// never mutates documents; canonical routing activates an existing tab,
-/// else opens in the focused group).
-fn open_node(app: &mut App, node: NodeId) {
+/// Explicit navigation for one node (D-02/D-03: Open is its own action and
+/// never mutates documents; activation routes the typed open intent through
+/// the shared destination policy, never an accidental global destination).
+pub(crate) fn open_node(app: &mut App, source: Option<TabId>, node: NodeId) {
     let Some(record) = record_for(app, node) else {
         app.status = "That node is no longer in the current frame".into();
         return;
@@ -1434,8 +1491,9 @@ fn open_node(app: &mut App, node: NodeId) {
         };
         return;
     };
-    let group = app.focused_group();
-    app.request_open(locator, group);
+    app.open_intent(crate::host::open_intents::OpenIntent::reuse(
+        locator, source,
+    ));
 }
 
 /// Ensure every mounted graph tab is attached (covers restore/layout

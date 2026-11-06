@@ -19,6 +19,9 @@ pub enum PreferenceMessage {
     SetLineWidth(LineWidth),
     /// Enable or disable reduced motion.
     SetReducedMotion(bool),
+    /// RFC-0006 S04 (D-02): acknowledge the changed graph gesture contract
+    /// (double-click activates; Insert is explicit). Persisted once.
+    AcknowledgeGraphActivation,
     /// Set or clear one command's chord override.
     SetShortcut {
         /// The command id.
@@ -217,6 +220,24 @@ impl AppearanceHost {
         true
     }
 
+    /// Acknowledge the changed graph gesture contract (RFC-0006 S04/D-02).
+    /// Persisted with the device preferences; the dismissible first-launch
+    /// explanation never reappears after this.
+    pub fn acknowledge_graph_activation(&mut self) -> bool {
+        if self.prefs.graph_activation_acknowledged {
+            return false;
+        }
+        self.prefs.graph_activation_acknowledged = true;
+        true
+    }
+
+    /// Whether the graph gesture-contract explanation still owes the user
+    /// its first-launch dismissal (D-02).
+    #[must_use]
+    pub const fn graph_activation_notice_pending(&self) -> bool {
+        !self.prefs.graph_activation_acknowledged
+    }
+
     /// Set or clear one command's chord override. Validation refuses
     /// unreadable chords, collisions with other commands, and
     /// OS-reserved chords with a named owner.
@@ -391,6 +412,9 @@ impl crate::app::App {
             PreferenceMessage::RestoreShortcuts => {
                 self.appearance.restore_default_shortcuts();
                 true
+            }
+            PreferenceMessage::AcknowledgeGraphActivation => {
+                self.appearance.acknowledge_graph_activation()
             }
         };
         if !changed {

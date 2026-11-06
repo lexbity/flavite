@@ -19,7 +19,7 @@ fn filter_id(tab: TabId) -> iced::widget::Id {
 }
 
 /// Render the Notes list for one tab. `group` is where picked notes open.
-pub fn view(app: &App, tab: TabId, group: flavite_workspace::GroupId) -> Element<'_, Message> {
+pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
     let metrics = app.appearance.metrics();
     if let Some(error) = app.catalog_error() {
         return container(
@@ -103,7 +103,7 @@ pub fn view(app: &App, tab: TabId, group: flavite_workspace::GroupId) -> Element
                 }),
             );
         }
-        list = list.push(note_row(*metrics, candidate, group));
+        list = list.push(note_row(*metrics, candidate));
         rendered += 1;
     }
     if shown > rendered {
@@ -164,7 +164,6 @@ pub fn view(app: &App, tab: TabId, group: flavite_workspace::GroupId) -> Element
 fn note_row(
     metrics: crate::style::Metrics,
     candidate: &picker::NoteCandidate,
-    group: flavite_workspace::GroupId,
 ) -> Element<'static, Message> {
     button(
         row![
@@ -183,9 +182,8 @@ fn note_row(
         right: 10.0,
     })
     .style(style::list_row(false))
-    .on_press(Message::OpenNote {
-        locator: candidate.locator.clone(),
-        group: Some(group),
-    })
+    .on_press(Message::OpenIntent(
+        crate::host::open_intents::OpenIntent::reuse(candidate.locator.clone(), None),
+    ))
     .into()
 }

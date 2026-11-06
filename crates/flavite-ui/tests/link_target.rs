@@ -51,9 +51,10 @@ fn reconcile(app: &mut App) {
 
 fn open_note(app: &mut App, name: &str) -> TabId {
     let group = app.focused_group().unwrap();
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator: NoteLocator::from_components([name]).unwrap(),
-        group: Some(group),
+        group,
     });
     wait_for(app, "note ready", |app| !app.notes.any_pending());
     let tab = app.workspace.focused_tab();

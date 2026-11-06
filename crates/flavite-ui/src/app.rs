@@ -80,6 +80,9 @@ pub struct App {
     pub history: crate::views::history::HistoryHost,
     /// Per-view back/forward navigation (W10).
     pub nav: crate::host::navigation::NavHost,
+    /// RFC-0006 S04: session-local open-destination memory (D-03). Never
+    /// persisted; restore recomputes from acknowledged document focus.
+    pub open_memory: crate::host::open_intents::OpenMemory,
     /// One modal dialog, when open (W10).
     pub dialog: Option<crate::host::dialogs::Dialog>,
     /// No-vault start screen state (FR-22, W13-compatible).
@@ -318,11 +321,9 @@ pub enum Message {
     ConfirmLinkInsert,
     /// Cancel the pending/confirmed semantic link gesture.
     CancelLinkInsert,
-    /// Open (or focus) a note, optionally in a specific group.
-    OpenNote {
-        locator: NoteLocator,
-        group: Option<GroupId>,
-    },
+    /// Open (or focus) a note through the typed D-03 open-intent policy
+    /// (RFC-0006 S04). One intent type controls every navigation surface.
+    OpenIntent(crate::host::open_intents::OpenIntent),
     /// One typed graph widget message for an exact view incarnation (W07).
     GraphAction {
         tab: TabId,
@@ -343,6 +344,9 @@ pub enum Message {
     },
     /// Observed bounds of a mounted graph surface (hit + harness mapping).
     GraphBounds(TabId, iced::Rectangle),
+    /// Observed bounds of the graph activation-contract notice row (D-02
+    /// dismissible explanation; harness/native input reachability).
+    GraphNoticeBounds(TabId, iced::Rectangle),
     GraphFilterBounds {
         tab: TabId,
         field: crate::graph::filters::FilterField,
@@ -561,6 +565,7 @@ impl App {
             search: crate::views::search::SearchHost::default(),
             history: crate::views::history::HistoryHost::default(),
             nav: crate::host::navigation::NavHost::default(),
+            open_memory: crate::host::open_intents::OpenMemory::default(),
             dialog: None,
             start: crate::host::dialogs::StartState::default(),
             notes_filters: BTreeMap::new(),
@@ -1249,7 +1254,9 @@ impl App {
             return;
         };
         match NoteLocator::from_relative(relative) {
-            Ok(locator) => self.request_open(locator, None),
+            Ok(locator) => {
+                self.open_intent(crate::host::open_intents::OpenIntent::reuse(locator, None))
+            }
             Err(error) => self.status = format!("Cannot open that file: {error}"),
         }
     }
@@ -1511,6 +1518,10 @@ impl App {
         match outcome {
             Outcome::Committed(commit) => {
                 self.workspace = commit.state;
+                // Session-local destination memory observes every commit:
+                // dead group/tab references drop here (merge/close/restore)
+                // and focus recency updates (D-03).
+                self.open_memory.observe(&self.workspace);
                 self.adapter.reconcile(&self.workspace);
                 self.project_geometry();
                 let effects = commit.effects;
@@ -1584,12 +1595,35 @@ impl App {
             self.status = "Ignored input from a replaced graph view".into();
             return;
         }
-        if self.graph.state(tab).is_none_or(|s| {
-            s.filter.expanded || s.updating || s.stale || s.geometry_key != Some(key)
-        }) || self
-            .flavite
-            .as_ref()
-            .is_none_or(|api| !api.graph_is_current())
+        // D-02 (S04): navigation pairing is keyed by view incarnation,
+        // identity epoch and entity — not every overlay/generation
+        // revision. A `Click` release therefore survives a geometry
+        // rebuild of the *same* epoch (a click pair may span one), while
+        // insertion and drag authorities keep exact frame pairing.
+        let navigation_click = matches!(
+            &message,
+            crate::graph::renderer::GraphMessage::Released {
+                kind: crate::graph::renderer::ReleaseKind::Click,
+                ..
+            }
+        );
+        let key_current = self.graph.state(tab).is_some_and(|s| {
+            s.geometry_key.is_some_and(|current| {
+                if navigation_click {
+                    key.epoch == current.epoch && key.generation <= current.generation
+                } else {
+                    key == current
+                }
+            })
+        });
+        if self
+            .graph
+            .state(tab)
+            .is_none_or(|s| s.filter.expanded || s.updating || s.stale || !key_current)
+            || self
+                .flavite
+                .as_ref()
+                .is_none_or(|api| !api.graph_is_current())
         {
             self.graph.stale_discards_total += 1;
             return;
@@ -1869,7 +1903,15 @@ impl App {
                         .and_then(|path| NoteLocator::from_relative(&path))
                 });
                 match opened {
-                    Some(Ok(locator)) => self.request_open(locator, self.group_of(tab)),
+                    Some(Ok(locator)) => {
+                        // D-03: edit-link navigation shares the default
+                        // destination policy; this tab is only the origin
+                        // for the last-resort fallback.
+                        self.open_intent(crate::host::open_intents::OpenIntent::reuse(
+                            locator,
+                            Some(tab),
+                        ));
+                    }
                     Some(Err(error)) => {
                         self.status =
                             format!("Edit link: the resolved path cannot be opened here: {error}");
@@ -2046,35 +2088,11 @@ impl App {
         }
     }
 
-    /// Route an open request canonically: focus an existing tab of the same
-    /// note, otherwise open into `group` (default: the focused group).
-    pub(crate) fn request_open(&mut self, locator: NoteLocator, group: Option<GroupId>) {
-        let existing = self
-            .workspace
-            .tabs()
-            .find_map(|(tab, session)| match session.kind() {
-                flavite_workspace::ViewKind::Note(note) if note.locator() == &locator => Some(*tab),
-                _ => None,
-            });
-        if let Some(tab) = existing {
-            self.dispatch_layout(|revision| LayoutAction::ActivateTab {
-                expected_revision: revision,
-                tab,
-            });
-            return;
-        }
-        let Some(group) = group
-            .or_else(|| self.focused_group())
-            .or_else(|| self.workspace.first_group())
-        else {
-            self.status = "Open a group before opening notes".into();
-            return;
-        };
-        self.dispatch_layout(|revision| LayoutAction::OpenNote {
-            expected_revision: revision,
-            locator,
-            group,
-        });
+    /// Route one typed open intent through the D-03 destination policy
+    /// (RFC-0006 S04): the single navigation authority, shared by every
+    /// surface. There is no global first-map-match open anymore.
+    pub fn open_intent(&mut self, intent: crate::host::open_intents::OpenIntent) {
+        crate::host::open_intents::open(self, intent);
     }
 
     /// Apply one host event.
@@ -2418,7 +2436,7 @@ impl App {
                     });
                 }
             }
-            Message::OpenNote { locator, group } => self.request_open(locator, group),
+            Message::OpenIntent(intent) => self.open_intent(intent),
             Message::GraphAction {
                 tab,
                 incarnation,
@@ -2477,6 +2495,11 @@ impl App {
             Message::GraphBounds(tab, rect) => {
                 if let Some(state) = self.graph.state_mut(tab) {
                     state.bounds = Some(rect);
+                }
+            }
+            Message::GraphNoticeBounds(tab, rect) => {
+                if let Some(state) = self.graph.state_mut(tab) {
+                    state.notice_bounds = Some(rect);
                 }
             }
             Message::GroupMenu(group, menu) => {
@@ -2794,9 +2817,11 @@ impl App {
                 self.contexts.detach(tab);
                 self.reconcile_contexts();
             }
-            Message::OpenNoteFromContext { locator } => self.request_open(locator, None),
+            Message::OpenNoteFromContext { locator } => {
+                self.open_intent(crate::host::open_intents::OpenIntent::reuse(locator, None));
+            }
             Message::EditSourceFromContext { locator } => {
-                self.request_open(locator, None);
+                self.open_intent(crate::host::open_intents::OpenIntent::reuse(locator, None));
                 let tab = self.workspace.focused_tab();
                 if matches!(self.workspace.tab(&tab).map(|s| s.kind()), Some(flavite_workspace::ViewKind::Note(note)) if note.mode() == flavite_workspace::NoteMode::Read)
                 {
@@ -3109,7 +3134,7 @@ impl App {
         {
             self.status = format!("Created {}", locator.components().join("/"));
             self.request_catalog_refresh();
-            self.request_open(locator, None);
+            self.open_intent(crate::host::open_intents::OpenIntent::reuse(locator, None));
             return;
         }
         if is_rename
@@ -3622,30 +3647,12 @@ impl App {
             return Task::none();
         };
         if let Some(tab) = replace {
-            // Open in this tab (W10): same TabId/mode, old note to Back.
-            if let Some(previous) = self.note_locator(tab) {
-                if previous == locator {
-                    self.status = "This tab already shows that note".into();
-                    return Task::none();
-                }
-                let anchor = self
-                    .workspace
-                    .tab(&tab)
-                    .map(|session| session.interaction().viewport_anchor);
-                let previous_clone = previous.clone();
-                let committed = self.dispatch_layout_result(|revision| LayoutAction::NavigateTab {
-                    expected_revision: revision,
-                    tab,
-                    locator: locator.clone(),
-                });
-                if committed {
-                    self.nav
-                        .record_replacement(tab, previous_clone, anchor, locator);
-                }
-                return Task::none();
-            }
+            // Explicit same-tab intent (W10): the shared D-03 helper owns
+            // the in-tab navigation/close-safety contract.
+            crate::host::open_intents::replace_tab(self, tab, locator);
+            return Task::none();
         }
-        self.request_open(locator, None);
+        self.open_intent(crate::host::open_intents::OpenIntent::reuse(locator, None));
         Task::none()
     }
 
@@ -4025,6 +4032,7 @@ mod tests {
             search: crate::views::search::SearchHost::default(),
             history: crate::views::history::HistoryHost::default(),
             nav: crate::host::navigation::NavHost::default(),
+            open_memory: crate::host::open_intents::OpenMemory::default(),
             dialog: None,
             start: crate::host::dialogs::StartState::default(),
             notes_filters: BTreeMap::new(),
@@ -4148,9 +4156,10 @@ mod tests {
         let mut app = empty_app();
         let group = app.workspace.first_group().expect("group");
         let locator = NoteLocator::from_components(["a.md"]).expect("locator");
-        let _ = app.update(Message::OpenNote {
+        app.dispatch_layout(|revision| LayoutAction::OpenNote {
+            expected_revision: revision,
             locator,
-            group: Some(group),
+            group,
         });
         assert_eq!(app.workspace.tabs().count(), 2);
         let focused = app.workspace.focused_tab();
@@ -4168,9 +4177,10 @@ mod tests {
         let mut app = empty_app();
         let group = app.workspace.first_group().expect("group");
         let locator = NoteLocator::from_components(["a.md"]).expect("locator");
-        let _ = app.update(Message::OpenNote {
+        app.dispatch_layout(|revision| LayoutAction::OpenNote {
+            expected_revision: revision,
             locator,
-            group: Some(group),
+            group,
         });
         let tab = app.workspace.focused_tab();
         let _ = app.update(Message::TabPressed(tab));

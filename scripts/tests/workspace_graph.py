@@ -64,6 +64,18 @@ def capture(name):
     assert width>=640 and height>=480 and colors>=16
     checks.append({"id":name,"outcome":"pass","artifact":name})
 
+def ready_graph():
+    """The graph snapshot of a *current* frame: readiness first, identity
+    renewed (S04 — never retain coordinates across frames)."""
+    return wait(lambda s:(g:=graph(s)) and g.get("graph",{}).get("bounds")
+                and g["graph"].get("nodes",0)>0 and not g["graph"]["updating"],
+                "current graph frame")
+
+def node_by_title(title):
+    """Fresh lookup of one node's OS-input center from the newest frame."""
+    value=ready_graph()
+    return next(n for n in graph(value)["graph"]["screen_nodes"] if n["title"]==title)
+
 def assert_painted_node(node):
     # A semantic hit table alone cannot prove the shader painted at that point.
     # Colored node pixels must occupy the same logical center used by OS input.
@@ -95,35 +107,58 @@ value=wait(lambda s:graph(s).get("graph",{}).get("nodes",0)>=3 and not graph(s)[
 assert graph(value)["graph"]["backend"]==backend
 palette("Freeze graph layout");palette("Fit graph to view")
 value=wait(lambda s:graph(s).get("graph",{}).get("frozen"),"freeze")
-node=next(n for n in graph(value)["graph"]["screen_nodes"] if n["title"]=="Beta")
+# AC-4 (S04/D-02): a selection changes the canvas bounds by exactly zero.
+bounds_before=graph(value)["graph"]["bounds"]
+node=node_by_title("Beta")
 point(node["x"],node["y"]);run("xdotool","click","1")
 value=wait(lambda s:graph(s).get("graph",{}).get("selection") is not None,"single-click selection")
+assert graph(value)["graph"]["bounds"]==bounds_before, "selection moved the canvas"
 assert "[[beta]]" not in next(t for t in tabs(value) if t["tab"]==source["tab"])["buffer_text"]
-# A separate double-click gesture starts after the OS pair interval.
-time.sleep(.6)
 retained=value["writing_target"]
-assert_painted_node(node)
-# Each pair is an explicit new OS gesture. Busy is a zero-mutation admission
-# refusal; the runner exercises its displayed repair with another pair. It never
-# retries a stale plan or a successful edit.
+# Selection emphasis may repaint, but the hit center is renewed from the
+# current frame before the painted-pixel proof (S04 retained-coordinate fix).
+assert_painted_node(node_by_title("Beta"))
+checks.append({"id":"AC-4-selection-zero-bounds","outcome":"pass","artifact":"harness.jsonl"})
+# D-02: insertion is the explicit Insert command (Ctrl+Enter), never a
+# double click. Each attempt is a new OS gesture; Busy is a zero-mutation
+# admission refusal whose displayed repair is exercised with another gesture.
+time.sleep(.6)
+focus_graph()
 for attempt in range(3):
     previous_sequence=value["graph_service"]["publishing"]["sequence"]
-    node=next(n for n in graph(value)["graph"]["screen_nodes"] if n["title"]=="Beta")
-    point(node["x"],node["y"]);run("xdotool","click","--repeat","2","--delay","100","1")
-    value=wait(lambda s:"[[beta]]" in (next(t for t in tabs(s) if t["tab"]==source["tab"]).get("buffer_text") or "") or (s["graph_service"].get("publishing",{}).get("sequence",0)>=previous_sequence+2 and "link.busy" in s.get("status","") and s["pending_operations"]==0),"graph insertion or explicit Busy refusal")
+    node=node_by_title("Beta")
+    point(node["x"],node["y"]);run("xdotool","click","1")
+    value=wait(lambda s:graph(s).get("graph",{}).get("selection") is not None,f"selection restored (attempt {attempt})")
+    focus_graph()
+    key("ctrl+Return")
+    value=wait(lambda s:"[[beta]]" in (next(t for t in tabs(s) if t["tab"]==source["tab"]).get("buffer_text") or "") or (s["graph_service"].get("publishing",{}).get("sequence",0)>=previous_sequence+2 and "link.busy" in s.get("status","") and s["pending_operations"]==0),"explicit insertion or Busy refusal")
     current=next(t for t in tabs(value) if t["tab"]==source["tab"])["buffer_text"]
     if "[[beta]]" in current:
         assert current.count("[[beta]]")==1
         break
     assert current==source["buffer_text"], "Busy must not mutate source text"
     checks.append({"id":f"busy-repair-new-os-gesture-{attempt}","outcome":"pass","artifact":"harness.jsonl"})
-    time.sleep(.6)
+    time.sleep(.4)
 else:
     raise AssertionError("Catalog stayed Busy across three explicit gestures")
 assert (value["writing_target"]["buffer"] if "buffer" in value["writing_target"] else value["writing_target"].get("buffer_id")) == (retained["buffer"] if "buffer" in retained else retained.get("buffer_id"))
 wait(lambda s:graph(s).get("graph",{}).get("overlay_sources",0)>0 and not graph(s)["graph"]["updating"],"unsaved edge publication")
 capture("graph-unsaved.png")
-checks.append({"id":"AC-W04-os-double-click-exact-link","outcome":"pass","artifact":"harness.jsonl"})
+checks.append({"id":"AC-W04-os-explicit-insert-exact-link","outcome":"pass","artifact":"harness.jsonl"})
+# D-02: a double click now ACTIVATES the node — it opens the note through
+# the shared destination policy and never mutates text. The source graph
+# keeps its own group visible, and a user-held camera stays unchanged.
+node=node_by_title("Gamma")
+point(node["x"],node["y"]);run("xdotool","click","1")
+value=wait(lambda s:graph(s).get("graph",{}).get("selection") is not None,"gamma selected")
+time.sleep(.6)
+node=node_by_title("Gamma")
+point(node["x"],node["y"]);run("xdotool","click","--repeat","2","--delay","90","1")
+value=wait(lambda s:any(t["title"]=="gamma" and t["load"]=="ready" for t in tabs(s)),"double-click activation opened gamma")
+assert "[[gamma]]" not in next(t for t in tabs(value) if t["tab"]==source["tab"])["buffer_text"], "activation mutated the source note"
+assert any(t["load"]=="graph" for t in tabs(value)), "the graph view disappeared"
+capture("graph-activation-open.png")
+checks.append({"id":"AC-4-activation-opens-without-insert","outcome":"pass","artifact":"harness.jsonl"})
 focus_graph()
 palette("Show graph filters")
 value=wait(lambda s:"Path" in graph(s).get("graph",{}).get("filter_bounds",{}),"real filter input mounted")

@@ -133,10 +133,36 @@ run_s01_gates() {
         "$root/crates/flavite-ui/src/host/note_search.rs"
 }
 
+run_s04_gates() {
+    # S04 presence: the typed open-intent policy, the reworked gesture
+    # arbiter, the workbench-loop evidence, and the native runner pieces.
+    local file
+    for file in \
+        crates/flavite-ui/src/host/open_intents.rs \
+        crates/flavite-ui/tests/open_intents.rs \
+        crates/flavite-ui/tests/workbench_loop.rs \
+        scripts/workbench-visual-linux.sh \
+        scripts/tests/workbench/common.py \
+        scripts/tests/workbench/graph_editor_loop.py; do
+        gate assert_nonempty "$root/$file"
+    done
+    # D-02: activation is the pair outcome; explicit Insert is a distinct
+    # command path — the old implicit-insert gesture outcome stays dead.
+    gate assert_absent 'GestureOutcome::InsertLink' \
+        "$root/crates/flavite-ui/src/graph/events.rs" \
+        "$root/crates/flavite-ui/src/host/graph.rs"
+    # D-03: one typed intent controls every navigation surface; the global
+    # first-map-match open is deleted, and graph commands never reach for
+    # an accidental global destination (the focused group).
+    gate assert_absent 'fn request_open\(' "$root/crates/flavite-ui/src/app.rs"
+    gate assert_absent 'app\.focused_group\(' "$root/crates/flavite-ui/src/host/graph.rs"
+}
+
 case "$slice" in
     S00) run_s00_gates ;;
     S01) run_s00_gates; run_s01_gates ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: S00 S01)" >&2; exit 2 ;;
+    S04) run_s00_gates; run_s01_gates; run_s04_gates ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: S00 S01 S04)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then

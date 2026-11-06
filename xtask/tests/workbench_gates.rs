@@ -114,6 +114,24 @@ fn seed_s01_inputs(root: &Path) {
     }
 }
 
+fn seed_s04_inputs(root: &Path) {
+    seed_s01_inputs(root);
+    for relative in [
+        "crates/flavite-ui/src/host/open_intents.rs",
+        "crates/flavite-ui/tests/open_intents.rs",
+        "crates/flavite-ui/tests/workbench_loop.rs",
+        "scripts/workbench-visual-linux.sh",
+        "scripts/tests/workbench/common.py",
+        "scripts/tests/workbench/graph_editor_loop.py",
+        // rg targets of the S04 absence gates.
+        "crates/flavite-ui/src/graph/events.rs",
+        "crates/flavite-ui/src/host/graph.rs",
+        "crates/flavite-ui/src/app.rs",
+    ] {
+        seed_file(root, relative);
+    }
+}
+
 #[test]
 fn workbench_gate_rejects_unknown_slice() {
     let temp = tempfile::tempdir().unwrap();
@@ -239,5 +257,59 @@ fn s01_gate_rejects_forbidden_search_pattern() {
         String::from_utf8_lossy(&rejected.stderr).contains("forbidden production pattern"),
         "{}",
         String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
+fn s04_gate_passes_clean_tree_and_rejects_forbidden_patterns() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_s04_inputs(temp.path());
+    let clean = run_gate(temp.path(), "S04");
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // The implicit-insert gesture outcome is dead in both gesture and host
+    // code; resurfacing it fails the gate with the named pattern.
+    let events = temp.path().join("crates/flavite-ui/src/graph/events.rs");
+    fs::write(&events, "let outcome = GestureOutcome::InsertLink(hit);\n").unwrap();
+    let rejected = run_gate(temp.path(), "S04");
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("GestureOutcome::InsertLink"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    fs::write(&events, "implementation\n").unwrap();
+
+    // The global first-map-match open must stay deleted from app.rs.
+    let app = temp.path().join("crates/flavite-ui/src/app.rs");
+    fs::write(&app, "fn request_open(&mut self) {}\n").unwrap();
+    assert!(!run_gate(temp.path(), "S04").status.success());
+    fs::write(&app, "implementation\n").unwrap();
+
+    // Graph commands use an explicit source identity, never the focused
+    // group as an accidental destination.
+    let graph = temp.path().join("crates/flavite-ui/src/host/graph.rs");
+    fs::write(&graph, "let group = app.focused_group();\n").unwrap();
+    let rejected = run_gate(temp.path(), "S04");
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("focused_group"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    fs::write(&graph, "implementation\n").unwrap();
+
+    // S04 requires S00+S01 files too: removing one fails cumulatively.
+    fs::remove_file(temp.path().join("crates/flavite-text-search/src/lib.rs")).unwrap();
+    let cumulative = run_gate(temp.path(), "S04");
+    assert!(!cumulative.status.success());
+    assert!(
+        String::from_utf8_lossy(&cumulative.stderr).contains("missing/empty"),
+        "{}",
+        String::from_utf8_lossy(&cumulative.stderr)
     );
 }

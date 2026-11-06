@@ -172,12 +172,12 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
             NodeTarget::CloseTab(tab) if request.action == Action::Click => {
                 Some(Message::CloseTab(tab))
             }
-            NodeTarget::OpenNote(path) if request.action == Action::Click => {
-                Some(Message::OpenNote {
-                    locator: flavite_workspace::NoteLocator::from_relative(&path).ok()?,
-                    group: None,
-                })
-            }
+            NodeTarget::OpenNote(path) if request.action == Action::Click => Some(
+                Message::OpenIntent(crate::host::open_intents::OpenIntent::reuse(
+                    flavite_workspace::NoteLocator::from_relative(&path).ok()?,
+                    None,
+                )),
+            ),
             NodeTarget::OpenPicker => Some(Message::PickerOpen),
             NodeTarget::OpenPalette => Some(Message::PaletteOpen),
             NodeTarget::MenuClose => Some(Message::MenuClose),

@@ -94,6 +94,10 @@ pub struct Preferences {
     pub line_width: LineWidth,
     /// Reduce motion: gate animated transitions and camera easing.
     pub reduced_motion: bool,
+    /// RFC-0006 S04 (D-02): the user acknowledged the changed graph
+    /// gesture contract (double-click now activates; insertion is the
+    /// explicit Insert command). Persisted once, dismissible thereafter.
+    pub graph_activation_acknowledged: bool,
     /// Command-id → chord-string overrides for remappable commands.
     pub shortcuts: BTreeMap<String, String>,
     /// Unknown additive fields, preserved verbatim on save.
@@ -134,6 +138,7 @@ impl Preferences {
             editor_font_size: 16,
             line_width: LineWidth::Full,
             reduced_motion: false,
+            graph_activation_acknowledged: false,
             shortcuts: BTreeMap::new(),
             unknown: BTreeMap::new(),
         }
@@ -193,6 +198,7 @@ impl Preferences {
                     | "editor_font_size"
                     | "line_width"
                     | "reduced_motion"
+                    | "graph_activation_acknowledged"
                     | "shortcuts"
             ) {
                 unknown.insert(key.clone(), value.clone());
@@ -258,6 +264,14 @@ impl Preferences {
                 false
             }
         };
+        let graph_activation_acknowledged = match map.get("graph_activation_acknowledged") {
+            None => false,
+            Some(Value::Bool(flag)) => *flag,
+            Some(_) => {
+                warnings.push("graph_activation_acknowledged must be true or false".into());
+                false
+            }
+        };
         let shortcuts = match map.get("shortcuts") {
             None => BTreeMap::new(),
             Some(Value::Object(entries)) => {
@@ -285,6 +299,7 @@ impl Preferences {
                 editor_font_size,
                 line_width,
                 reduced_motion,
+                graph_activation_acknowledged,
                 shortcuts,
                 unknown,
             },
@@ -314,6 +329,10 @@ impl Preferences {
             },
         );
         map.insert("reduced_motion".into(), Value::from(self.reduced_motion));
+        map.insert(
+            "graph_activation_acknowledged".into(),
+            Value::from(self.graph_activation_acknowledged),
+        );
         let shortcuts = self
             .shortcuts
             .iter()

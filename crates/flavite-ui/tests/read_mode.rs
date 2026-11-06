@@ -34,10 +34,12 @@ fn fixture() -> (
     (App::from_flavite(f.flavite), f.fs, f.root, f.cache)
 }
 fn open(app: &mut App) -> flavite_workspace::TabId {
-    let _ = app.update(Message::OpenNote {
-        locator: NoteLocator::from_components(["a.md"]).unwrap(),
-        group: None,
-    });
+    let _ = app.update(Message::OpenIntent(
+        flavite_ui::host::open_intents::OpenIntent::reuse(
+            NoteLocator::from_components(["a.md"]).unwrap(),
+            None,
+        ),
+    ));
     wait(app, |a| !a.notes.any_pending());
     app.workspace.focused_tab()
 }

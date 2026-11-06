@@ -31,10 +31,23 @@ fn fixture(notes: &[(&str, &str)]) -> App {
 
 fn open(app: &mut App, locator: &NoteLocator, group: Option<flavite_workspace::GroupId>) -> TabId {
     let before: Vec<TabId> = app.workspace.tabs().map(|(tab, _)| *tab).collect();
-    let _ = app.update(Message::OpenNote {
-        locator: locator.clone(),
-        group,
-    });
+    match group {
+        // Fixture setup with an explicit group target dispatches the typed
+        // layout action directly.
+        Some(group) => {
+            app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+                expected_revision: revision,
+                locator: locator.clone(),
+                group,
+            });
+        }
+        // The default navigation surface routes the typed D-03 intent.
+        None => {
+            let _ = app.update(Message::OpenIntent(
+                flavite_ui::host::open_intents::OpenIntent::reuse(locator.clone(), None),
+            ));
+        }
+    }
     wait(app, |a| !a.notes.any_pending());
     app.workspace
         .tabs()
@@ -294,10 +307,9 @@ fn close_while_preparation_runs_drops_the_stale_completion_without_effects() {
         "the pending mapping was dropped"
     );
     // Reopen: the plan never applied to the buffer.
-    let _ = app.update(Message::OpenNote {
-        locator,
-        group: None,
-    });
+    let _ = app.update(Message::OpenIntent(
+        flavite_ui::host::open_intents::OpenIntent::reuse(locator, None),
+    ));
     wait(&mut app, |a| !a.notes.any_pending());
     let reopened = app.workspace.focused_tab();
     assert_eq!(app.note_state_text(reopened).unwrap(), original);

@@ -48,10 +48,12 @@ pub fn view<'a>(
                     button(text("Retry"))
                         .padding(tab_strip::chip_padding())
                         .style(style::action())
-                        .on_press(Message::OpenNote {
-                            locator: locator.clone(),
-                            group: app.group_of(tab),
-                        }),
+                        .on_press(Message::OpenIntent(
+                            crate::host::open_intents::OpenIntent::reuse(
+                                locator.clone(),
+                                Some(tab),
+                            ),
+                        )),
                     button(text("Close tab"))
                         .padding(tab_strip::chip_padding())
                         .style(style::ghost())

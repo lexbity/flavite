@@ -144,8 +144,11 @@ pub fn confirm(app: &mut App, tab: TabId, sequence: u64) {
     };
     workflow.stage = RemovalStage::Opening(detail);
     // Explicit removal opens its source so the user can inspect/undo the edit
-    // and the document has a normal retained view lease.
-    app.request_open(locator, None);
+    // and the document has a normal retained view lease (D-03 intent).
+    app.open_intent(crate::host::open_intents::OpenIntent::reuse(
+        locator,
+        Some(tab),
+    ));
 }
 
 pub fn pump(app: &mut App) {

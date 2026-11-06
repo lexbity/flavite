@@ -63,9 +63,10 @@ fn fixture() -> Fixture {
 fn open_note(app: &mut App, name: &str) -> (TabId, u64) {
     let group = app.focused_group().unwrap();
     let locator = flavite_workspace::NoteLocator::from_components([name]).unwrap();
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator,
-        group: Some(group),
+        group,
     });
     wait_ready(app);
     let tab = app.workspace.focused_tab();
@@ -322,9 +323,10 @@ fn missing_notes_render_an_actionable_failed_state() {
     let Fixture { mut app, .. } = fixture();
     let group = app.focused_group().unwrap();
     let locator = flavite_workspace::NoteLocator::from_components(["ghost.md"]).unwrap();
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator,
-        group: Some(group),
+        group,
     });
     wait_ready(&mut app);
     let tab = app.workspace.focused_tab();

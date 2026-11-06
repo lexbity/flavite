@@ -181,10 +181,28 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                                 "filter_bounds": state.filter_bounds.iter().map(|(field,r)|(format!("{field:?}"),vec![r.x,r.y,r.width,r.height])).collect::<std::collections::BTreeMap<_,_>>(),
                                 "nodes": state.geometry.as_ref().map_or(0, |g| g.node_count()),
                                 "edges": state.geometry.as_ref().map_or(0, |g| g.edge_count()),
+                                // S04: the paired geometry key identifies the
+                                // exact frame the visual evidence refers to
+                                // (epoch/generation/topology/scope); opaque
+                                // identity only — never private token values.
+                                "geometry_key": state.geometry_key.map(|key| serde_json::json!({
+                                    "epoch": key.epoch,
+                                    "generation": key.generation,
+                                    "topology": key.topology_version,
+                                    "overlay_digest": key.overlay_digest,
+                                    "scope_sequence": key.scope_sequence,
+                                })),
                                 "epoch": publication.as_ref().map(|p| p.epoch),
                                 "generation": publication.as_ref().map(|p| p.generation),
                                 "topology": publication.as_ref().map(|p| p.topology_version),
                                 "selection": state.selection.map(|hit| hit.display()),
+                                "selected_ids": state.selected_nodes.iter().map(|id| format!("{}:{}", format!("{:?}", id.kind).to_lowercase(), id.id)).collect::<Vec<_>>(),
+                                // Gesture-freeze reporting (D-02): the
+                                // bounded click-pair hold and its epoch.
+                                "gesture_candidate": state.arbiter.has_candidate(),
+                                "gesture_epoch": state.arbiter.candidate_epoch(),
+                                "activation_notice_pending": app.appearance.graph_activation_notice_pending(),
+                                "notice_bounds": state.notice_bounds.map(|r| [r.x, r.y, r.width, r.height]),
                                 "frozen": state.frozen,
                                 "list_mode": state.list_mode,
                                 "stale": state.stale,

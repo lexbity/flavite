@@ -519,7 +519,10 @@ pub fn handle(app: &mut App, message: crate::app::Message) -> iced::Task<crate::
             match doc.links.get(&start).cloned() {
                 Some(flavite_api::ReadLink::Note { path, anchor }) => {
                     if let Ok(locator) = flavite_workspace::NoteLocator::from_relative(&path) {
-                        app.request_open(locator.clone(), None);
+                        app.open_intent(crate::host::open_intents::OpenIntent::reuse(
+                            locator.clone(),
+                            Some(tab),
+                        ));
                         if let Some(anchor) = anchor {
                             app.reading.navigation.insert(locator, anchor);
                             sync(app);
@@ -596,7 +599,10 @@ pub fn handle(app: &mut App, message: crate::app::Message) -> iced::Task<crate::
                     app.reading.pending_anchor.insert(target, byte);
                 }
             } else if let Ok(locator) = flavite_workspace::NoteLocator::from_relative(&doc.path) {
-                app.request_open(locator, None);
+                app.open_intent(crate::host::open_intents::OpenIntent::reuse(
+                    locator,
+                    Some(tab),
+                ));
             }
         }
         Message::StructureEdit {

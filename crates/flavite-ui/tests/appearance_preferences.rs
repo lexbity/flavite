@@ -35,9 +35,10 @@ fn pump_all(app: &mut App) {
 fn open_note(app: &mut App) {
     let group = app.focused_group().unwrap();
     let locator = flavite_workspace::NoteLocator::from_components([NOTE]).unwrap();
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator,
-        group: Some(group),
+        group,
     });
     wait_ready(app);
 }

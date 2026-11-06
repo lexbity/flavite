@@ -126,9 +126,10 @@ fn pump_until(app: &mut App, what: &str, predicate: impl Fn(&App) -> bool) {
 
 fn open_note(app: &mut App, name: &str) -> TabId {
     let group = app.focused_group().expect("a focused group");
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator: NoteLocator::from_components([name]).expect("locator"),
-        group: Some(group),
+        group,
     });
     wait_ready(app);
     let tab = app.workspace.focused_tab();
@@ -405,9 +406,10 @@ fn group_close_closes_clean_tabs_and_queues_dirty_decisions() {
     let Fixture { mut app, fs, .. } = fixture();
     let group = app.focused_group().expect("the boot group");
     let clean = open_note(&mut app, "alpha.md");
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator: NoteLocator::from_components(["beta.md"]).expect("locator"),
-        group: Some(group),
+        group,
     });
     wait_ready(&mut app);
     let dirty = app.workspace.focused_tab();
@@ -467,9 +469,10 @@ fn layout_switch_with_retained_dirty_document() {
     // a beta duplicate, so the move below has a real destination group.
     let group_a = app.focused_group().expect("the boot group");
     let alpha = open_note(&mut app, "alpha.md");
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator: NoteLocator::from_components(["beta.md"]).expect("locator"),
-        group: Some(group_a),
+        group: group_a,
     });
     wait_ready(&mut app);
     run_host(&mut app, "workspace.split_right");

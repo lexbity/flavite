@@ -52,9 +52,10 @@ fn running_shell_program_publishes_the_workspace_and_routes_actions() {
     // Open the note through the shell and settle its open flight.
     let group = app.workspace.first_group().unwrap();
     let locator = flavite_workspace::NoteLocator::from_components(["note.md"]).unwrap();
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator,
-        group: Some(group),
+        group,
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
