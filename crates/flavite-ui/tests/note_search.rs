@@ -80,6 +80,13 @@ fn find(app: &mut App, tab: TabId, query: &str) {
         tab,
         query: query.to_owned(),
     }));
+    wait(app, |app| {
+        app.note_search
+            .finds
+            .get(&tab)
+            .is_some_and(|find| find.pending.is_none())
+            && note_search::matches(app, tab).is_some()
+    });
 }
 
 #[test]
@@ -98,6 +105,7 @@ fn duplicate_views_keep_independent_find_state_and_rescan_after_edits() {
         tab: first,
         query: "alpha".into(),
     });
+    wait(&mut app, |app| spans(app, first).len() == 3);
     find(&mut app, second, "beta");
     assert_eq!(spans(&app, first).len(), 3);
     assert_eq!(spans(&app, second).len(), 1);
@@ -131,7 +139,7 @@ fn duplicate_views_keep_independent_find_state_and_rescan_after_edits() {
         ))
         .is_success()
     );
-    assert_eq!(spans(&app, first).len(), 4, "first view rescans new text");
+    wait(&mut app, |app| spans(app, first).len() == 4);
     assert_eq!(spans(&app, second).len(), 1, "second view unchanged");
 }
 
@@ -175,6 +183,52 @@ fn match_page_reports_230_matches_once_and_cycles_the_index() {
         forward: false,
     }));
     assert_eq!(app.note_search.finds[&tab].index, 229);
+}
+
+#[test]
+fn find_next_and_previous_continue_across_large_match_sets() {
+    let body = "ab ".repeat(600);
+    let mut app = fixture(&[("many.md", &body)]);
+    let tab = open(
+        &mut app,
+        &NoteLocator::from_components(["many.md"]).unwrap(),
+        None,
+    );
+    find(&mut app, tab, "ab");
+    let page = note_search::matches(&app, tab).expect("first page");
+    assert_eq!(page.spans.len(), 256);
+    assert_eq!(page.offset, 0);
+    assert_eq!(page.next_offset, Some(256));
+    assert_eq!(page.total_matches, 600);
+
+    for _ in 0..255 {
+        let _ = app.update(Message::NoteSearch(NoteSearchMessage::FindNext {
+            tab,
+            forward: true,
+        }));
+    }
+    assert_eq!(app.note_search.finds[&tab].index, 255);
+    let _ = app.update(Message::NoteSearch(NoteSearchMessage::FindNext {
+        tab,
+        forward: true,
+    }));
+    wait(&mut app, |app| {
+        note_search::matches(app, tab).is_some_and(|page| page.offset == 256)
+    });
+    assert_eq!(app.note_search.finds[&tab].index, 0);
+    assert_eq!(
+        note_search::matches(&app, tab).unwrap().spans[0],
+        (768, 770)
+    );
+
+    let _ = app.update(Message::NoteSearch(NoteSearchMessage::FindNext {
+        tab,
+        forward: false,
+    }));
+    wait(&mut app, |app| {
+        note_search::matches(app, tab).is_some_and(|page| page.offset == 0)
+    });
+    assert_eq!(app.note_search.finds[&tab].index, 255);
 }
 
 #[test]
@@ -336,7 +390,7 @@ fn empty_query_is_idle_without_counts_or_navigation() {
         None,
     );
     find(&mut app, tab, "");
-    let page = note_search::matches(&app, tab).expect("find bar open");
+    let page = note_search::matches(&app, tab).expect("empty query page");
     assert!(
         page.spans.is_empty(),
         "empty query is Idle, not match-everywhere"

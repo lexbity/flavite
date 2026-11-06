@@ -796,6 +796,54 @@ pub fn is_word_boundary(boundaries: &[usize], at: usize) -> bool {
     boundaries.binary_search(&at).is_ok()
 }
 
+/// UAX #29 word-segment boundaries as a byte-position bitset.
+///
+/// Same boundary set as [`word_boundaries`] with one bit per source byte
+/// instead of one machine word per boundary (≤ 4 MiB for a 32 MiB note,
+/// NFR-7), so whole-word filtering of a full-corpus-sized match set cannot
+/// itself exhaust the search worker's memory. Built in one segmentation
+/// pass; queries are O(1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WordBoundarySet {
+    words: Vec<u64>,
+    len: usize,
+}
+
+const WORDS_PER_SLOT: u64 = u64::BITS as u64;
+
+impl WordBoundarySet {
+    /// Compute the boundary set of `text`.
+    #[must_use]
+    pub fn compute(text: &str) -> Self {
+        let len = text.len() + 1;
+        let mut words = vec![0u64; len.div_ceil(WORDS_PER_SLOT as usize)];
+        let mut offset = 0usize;
+        for segment in text.split_word_bounds() {
+            Self::set_bit(&mut words, offset);
+            offset += segment.len();
+        }
+        Self::set_bit(&mut words, text.len());
+        Self { words, len }
+    }
+
+    fn set_bit(words: &mut [u64], at: usize) {
+        let (word, bit) = (at / WORDS_PER_SLOT as usize, at as u64 % WORDS_PER_SLOT);
+        if let Some(slot) = words.get_mut(word) {
+            *slot |= 1u64 << bit;
+        }
+    }
+
+    /// Whether byte offset `at` is a word-segment boundary.
+    #[must_use]
+    pub fn contains(&self, at: usize) -> bool {
+        at < self.len
+            && self
+                .words
+                .get(at / WORDS_PER_SLOT as usize)
+                .is_some_and(|word| (word >> (at as u64 % WORDS_PER_SLOT)) & 1 == 1)
+    }
+}
+
 /// Replace CRLF with LF, leaving standalone CR bytes untouched (§4.8, R12).
 fn fold_crlf(text: &str) -> String {
     if !text.contains('\r') {

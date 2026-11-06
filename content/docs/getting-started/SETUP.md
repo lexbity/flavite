@@ -27,15 +27,23 @@ Headless use (`flavite-cli`) needs none of the display/GPU requirements.
 ```sh
 git clone https://github.com/lexbity/flavite
 cd flavite
-cargo build -p flavite-app -p flavite-cli
+cargo build -p flavite-app -p flavite-cli -p flavite-text-search-worker
 ```
 
 This produces two binaries in `target/debug/`:
 
 - `flavite` — the desktop app (crate `flavite-app`).
 - `flavite-cli` — the headless CLI (crate `flavite-cli`).
+- `flavite-text-search-worker` — the isolated regex helper. Keep this binary
+  in the same directory as the desktop and CLI binaries; the applications
+  resolve that exact sibling and never search `PATH` or accept a configured
+  executable path. If it is absent or has a mismatched protocol version,
+  regex Find/Replace reports that state and literal matching remains usable.
 
-For a faster daily-driver build use `cargo build --release`.
+For a faster daily-driver build use
+`cargo build --release -p flavite-app -p flavite-cli -p flavite-text-search-worker`.
+When installing the executables manually, install the helper into the same
+`bin` directory as both Flavite binaries.
 
 ## Developer setup (one command after clone)
 

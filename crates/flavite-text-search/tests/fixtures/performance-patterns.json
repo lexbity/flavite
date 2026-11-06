@@ -1,0 +1,14 @@
+[
+  {"id":"ascii-literal","mode":"literal","pattern":"flavite","case_sensitive":false,"whole_word":false},
+  {"id":"whole-word-literal","mode":"literal","pattern":"idea","case_sensitive":false,"whole_word":true},
+  {"id":"unicode-simple-fold","mode":"literal","pattern":"straße","case_sensitive":false,"whole_word":false},
+  {"id":"composed-accent","mode":"literal","pattern":"café","case_sensitive":false,"whole_word":false},
+  {"id":"anchored-lines","mode":"regex","pattern":"(?m)^#+\\s+[^\\n]+$","case_sensitive":false,"whole_word":false},
+  {"id":"optional-captures","mode":"regex","pattern":"\\[\\[([^]|#]+)(?:\\|([^]]+))?\\]\\]","case_sensitive":false,"whole_word":false},
+  {"id":"multiline-task","mode":"regex","pattern":"(?m)^- \\[([ xX])\\] ([^\\n]+)$","case_sensitive":false,"whole_word":false},
+  {"id":"multiline-link","mode":"regex","pattern":"(?m)^.*\\[\\[([^]]+)\\]\\].*$","case_sensitive":false,"whole_word":false},
+  {"id":"empty-anchor","mode":"regex","pattern":"(?m)^","case_sensitive":false,"whole_word":false},
+  {"id":"zero-width-scalar","mode":"regex","pattern":"\\b","case_sensitive":false,"whole_word":false},
+  {"id":"no-match-literal","mode":"literal","pattern":"not-in-this-fixture","case_sensitive":true,"whole_word":false},
+  {"id":"no-match-regex","mode":"regex","pattern":"\\b(?:absent|missing)\\b","case_sensitive":false,"whole_word":false}
+]

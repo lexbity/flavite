@@ -23,7 +23,12 @@ use std::io::{Read, Write};
 use crate::matcher::{MATCH_SEMANTICS_VERSION, MatchMode};
 
 /// Version of this wire protocol; bump on any framing/message change.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Version 3 adds a match-ordinal continuation offset to S03 pages; older
+/// helpers are a typed protocol refusal, never a reinterpretation.
+/// Version 2 added the S03 request-kind, frozen selection scope, report cap
+/// and per-request output bound to `ToHelper::Begin`; a version-1 helper
+/// is a typed protocol refusal, never a reinterpretation of old frames.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Hard frame bound: length prefix excluded, payload never exceeds this.
 /// Parent frames and helper frames obey the same bound (§6.2).
@@ -57,6 +62,55 @@ pub struct WireMatch {
     pub expansion: Vec<u8>,
 }
 
+fn put_wire_match(out: &mut Vec<u8>, hit: &WireMatch) -> Result<(), FrameError> {
+    put_u64(out, hit.start);
+    put_u64(out, hit.end);
+    put_u32(
+        out,
+        u32::try_from(hit.groups.len()).map_err(|_| FrameError::Oversize {
+            observed: hit.groups.len(),
+        })?,
+    );
+    for group in &hit.groups {
+        match group {
+            Some((start, end)) => {
+                put_u8(out, 1);
+                put_u64(out, *start);
+                put_u64(out, *end);
+            }
+            None => put_u8(out, 0),
+        }
+    }
+    put_bytes(out, &hit.expansion);
+    Ok(())
+}
+
+fn read_wire_match(reader: &mut Reader<'_>) -> Result<WireMatch, FrameError> {
+    let start = reader.u64()?;
+    let end = reader.u64()?;
+    let group_count = reader.u32()? as usize;
+    if group_count > crate::matcher::REGEX_MAX_GROUPS {
+        return Err(FrameError::Malformed);
+    }
+    let mut groups = Vec::with_capacity(group_count);
+    for _ in 0..group_count {
+        match reader.u8()? {
+            0 => groups.push(None),
+            1 => {
+                let start = reader.u64()?;
+                groups.push(Some((start, reader.u64()?)));
+            }
+            _ => return Err(FrameError::Malformed),
+        }
+    }
+    Ok(WireMatch {
+        start,
+        end,
+        groups,
+        expansion: reader.bytes()?.to_vec(),
+    })
+}
+
 /// Why a helper refused or failed one request. Codes are stable and
 /// redacted: no pattern, source or expansion text ever travels back
 /// (§6.7 — default logs and IPC carry typed codes only).
@@ -75,6 +129,21 @@ pub enum FailureCode {
     Source,
     /// The request was cancelled by the parent.
     Cancelled,
+}
+
+/// What kind of work one helper request performs (§6.2: the helper is a
+/// pure matcher — matching only, with or without template expansion).
+///
+/// [`RequestKind::Find`] streams span pages with empty expansions and
+/// requires no `Template` frame; [`RequestKind::Replace`] additionally
+/// expands the declared template for every reported match and checks the
+/// declared output bound before any page ships.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestKind {
+    /// Report match spans (expansions empty); exact total still counted.
+    Find,
+    /// Report match spans with per-match template expansions (replacement).
+    Replace,
 }
 
 impl FailureCode {
@@ -99,14 +168,26 @@ pub enum ToHelper {
         protocol_version: u32,
         engine_version: u32,
     },
-    /// Begin one match request. The pattern rides here (≤ 8 KiB); the
-    /// template (≤ 64 KiB) arrives in its own frame next.
+    /// Begin one match request. The pattern rides here (≤ 8 KiB); with
+    /// [`RequestKind::Replace`] the template (≤ 64 KiB) arrives in its own
+    /// frame next. `scope` is the frozen selection range: matching happens
+    /// against the FULL streamed source (so whole-word boundaries use the
+    /// whole-text semantics, D-05) but only matches fully contained in the
+    /// scope are reported, never clipped. `report_matches` caps the matches
+    /// that ship in pages while the exact total is still counted; `0` means
+    /// "report every match". `max_output` bounds the expanded replacement
+    /// output before anything ships (checked arithmetic, §6.2).
     Begin {
         request_id: u64,
+        kind: RequestKind,
         mode: MatchMode,
         case_sensitive: bool,
         whole_word: bool,
         max_matches: u64,
+        report_matches: u64,
+        skip_matches: u64,
+        max_output: u64,
+        scope: Option<(u64, u64)>,
         source_total: u64,
         pattern: Vec<u8>,
     },
@@ -129,12 +210,32 @@ pub enum ToHelper {
 pub enum FromHelper {
     /// Handshake result; `Err` carries a stable reason code.
     HandshakeReply(Result<(u32, u32), FailureCode>),
-    /// The request was admitted.
+    /// The request was admitted and the helper is streaming replies.
+    /// Distinct from "the pattern compiled": pattern/template refusals
+    /// arrive as typed `Failed` frames after this point, so admission
+    /// alone is never a completed match.
     Accepted { request_id: u64 },
     /// One page of matches (ascending, non-overlapping).
     Page {
         request_id: u64,
         matches: Vec<WireMatch>,
+    },
+    /// Start one replacement result. The expansion follows in bounded
+    /// `ExpansionChunk` frames, allowing a single expansion up to the note
+    /// output limit without violating the 64 KiB frame bound.
+    MatchStart {
+        request_id: u64,
+        index: u64,
+        matched: WireMatch,
+        expansion_len: u64,
+    },
+    /// Contiguous chunk of one match expansion. The receiver checks the
+    /// ordinal and offset before appending and publishes only at Done.
+    ExpansionChunk {
+        request_id: u64,
+        index: u64,
+        offset: u64,
+        bytes: Vec<u8>,
     },
     /// Terminal proof for one request: exact total and checked output
     /// length (the sum the parent must reproduce).
@@ -242,7 +343,9 @@ pub fn read_request(reader: &mut dyn Read) -> Result<ToHelper, FrameError> {
 
 fn read_frame(reader: &mut dyn Read) -> Result<Vec<u8>, FrameError> {
     let mut prefix = [0u8; 4];
-    reader.read_exact(&mut prefix).map_err(|_| FrameError::Truncated)?;
+    reader
+        .read_exact(&mut prefix)
+        .map_err(|_| FrameError::Truncated)?;
     let len = u32::from_le_bytes(prefix);
     if u64::from(len) > FRAME_MAX_BYTES as u64 {
         return Err(FrameError::PeerOversize {
@@ -250,7 +353,9 @@ fn read_frame(reader: &mut dyn Read) -> Result<Vec<u8>, FrameError> {
         });
     }
     let mut payload = vec![0u8; len as usize];
-    reader.read_exact(&mut payload).map_err(|_| FrameError::Truncated)?;
+    reader
+        .read_exact(&mut payload)
+        .map_err(|_| FrameError::Truncated)?;
     Ok(payload)
 }
 
@@ -336,6 +441,8 @@ const TAG_ACCEPTED: u8 = 0x82;
 const TAG_PAGE: u8 = 0x83;
 const TAG_DONE: u8 = 0x84;
 const TAG_FAILED: u8 = 0x85;
+const TAG_MATCH_START: u8 = 0x86;
+const TAG_EXPANSION_CHUNK: u8 = 0x87;
 
 fn encode_to_helper(message: &ToHelper) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
@@ -350,19 +457,42 @@ fn encode_to_helper(message: &ToHelper) -> Vec<u8> {
         }
         ToHelper::Begin {
             request_id,
+            kind,
             mode,
             case_sensitive,
             whole_word,
             max_matches,
+            report_matches,
+            skip_matches,
+            max_output,
+            scope,
             source_total,
             pattern,
         } => {
             put_u8(&mut out, TAG_BEGIN);
             put_u64(&mut out, *request_id);
+            put_u8(
+                &mut out,
+                match kind {
+                    RequestKind::Find => 0,
+                    RequestKind::Replace => 1,
+                },
+            );
             put_u8(&mut out, u8::from(matches!(mode, MatchMode::Regex)));
             put_u8(&mut out, u8::from(*case_sensitive));
             put_u8(&mut out, u8::from(*whole_word));
             put_u64(&mut out, *max_matches);
+            put_u64(&mut out, *report_matches);
+            put_u64(&mut out, *skip_matches);
+            put_u64(&mut out, *max_output);
+            match scope {
+                None => put_u8(&mut out, 0),
+                Some((start, end)) => {
+                    put_u8(&mut out, 1);
+                    put_u64(&mut out, *start);
+                    put_u64(&mut out, *end);
+                }
+            }
             put_u64(&mut out, *source_total);
             put_bytes(&mut out, pattern);
         }
@@ -398,13 +528,18 @@ fn encode_to_helper(message: &ToHelper) -> Vec<u8> {
 
 fn decode_to_helper(bytes: &[u8]) -> Result<ToHelper, FrameError> {
     let mut reader = Reader { bytes };
-    match reader.u8()? {
-        TAG_HANDSHAKE => Ok(ToHelper::Handshake {
+    let message = match reader.u8()? {
+        TAG_HANDSHAKE => ToHelper::Handshake {
             protocol_version: reader.u32()?,
             engine_version: reader.u32()?,
-        }),
+        },
         TAG_BEGIN => {
             let request_id = reader.u64()?;
+            let kind = match reader.u8()? {
+                0 => RequestKind::Find,
+                1 => RequestKind::Replace,
+                _ => return Err(FrameError::Malformed),
+            };
             let mode = match reader.u8()? {
                 0 => MatchMode::Literal,
                 1 => MatchMode::Regex,
@@ -415,41 +550,69 @@ fn decode_to_helper(bytes: &[u8]) -> Result<ToHelper, FrameError> {
             if case > 1 || word > 1 {
                 return Err(FrameError::Malformed);
             }
-            let message = ToHelper::Begin {
+            let max_matches = reader.u64()?;
+            let report_matches = reader.u64()?;
+            let skip_matches = reader.u64()?;
+            let max_output = reader.u64()?;
+            let scope = match reader.u8()? {
+                0 => None,
+                1 => {
+                    let start = reader.u64()?;
+                    let end = reader.u64()?;
+                    if end < start {
+                        return Err(FrameError::Malformed);
+                    }
+                    Some((start, end))
+                }
+                _ => return Err(FrameError::Malformed),
+            };
+            ToHelper::Begin {
                 request_id,
+                kind,
                 mode,
                 case_sensitive: case == 1,
                 whole_word: word == 1,
-                max_matches: reader.u64()?,
+                max_matches,
+                report_matches,
+                skip_matches,
+                max_output,
+                scope,
                 source_total: reader.u64()?,
                 pattern: reader.bytes()?.to_vec(),
-            };
-            Ok(message)
+            }
         }
         TAG_TEMPLATE => {
             let request_id = reader.u64()?;
-            Ok(ToHelper::Template {
+            ToHelper::Template {
                 request_id,
                 template: reader.bytes()?.to_vec(),
-            })
+            }
         }
         TAG_SOURCE_CHUNK => {
             let request_id = reader.u64()?;
             let offset = reader.u64()?;
-            Ok(ToHelper::SourceChunk {
+            ToHelper::SourceChunk {
                 request_id,
                 offset,
                 bytes: reader.bytes()?.to_vec(),
-            })
+            }
         }
-        TAG_END_OF_SOURCE => Ok(ToHelper::EndOfSource {
+        TAG_END_OF_SOURCE => ToHelper::EndOfSource {
             request_id: reader.u64()?,
-        }),
-        TAG_CANCEL => Ok(ToHelper::Cancel {
+        },
+        TAG_CANCEL => ToHelper::Cancel {
             request_id: reader.u64()?,
-        }),
-        _ => Err(FrameError::Malformed),
+        },
+        _ => return Err(FrameError::Malformed),
+    };
+    // Strict framing: a message must consume its entire frame. Trailing
+    // bytes mean a foreign or forged layout and are a typed refusal, never
+    // silently ignored (§6.2: reject unrecognized frames before allocation
+    // or interpretation).
+    if !reader.bytes.is_empty() {
+        return Err(FrameError::Malformed);
     }
+    Ok(message)
 }
 
 fn encode_from_helper(message: &FromHelper) -> Result<Vec<u8>, FrameError> {
@@ -476,32 +639,39 @@ fn encode_from_helper(message: &FromHelper) -> Result<Vec<u8>, FrameError> {
         } => {
             put_u8(&mut out, TAG_PAGE);
             put_u64(&mut out, *request_id);
-            put_u32(&mut out, u32::try_from(matches.len()).map_err(|_| {
-                FrameError::Oversize {
+            put_u32(
+                &mut out,
+                u32::try_from(matches.len()).map_err(|_| FrameError::Oversize {
                     observed: matches.len(),
-                }
-            })?);
+                })?,
+            );
             for hit in matches {
-                put_u64(&mut out, hit.start);
-                put_u64(&mut out, hit.end);
-                put_u32(
-                    &mut out,
-                    u32::try_from(hit.groups.len()).map_err(|_| FrameError::Oversize {
-                        observed: hit.groups.len(),
-                    })?,
-                );
-                for group in &hit.groups {
-                    match group {
-                        Some((start, end)) => {
-                            put_u8(&mut out, 1);
-                            put_u64(&mut out, *start);
-                            put_u64(&mut out, *end);
-                        }
-                        None => put_u8(&mut out, 0),
-                    }
-                }
-                put_bytes(&mut out, &hit.expansion);
+                put_wire_match(&mut out, hit)?;
             }
+        }
+        FromHelper::MatchStart {
+            request_id,
+            index,
+            matched,
+            expansion_len,
+        } => {
+            put_u8(&mut out, TAG_MATCH_START);
+            put_u64(&mut out, *request_id);
+            put_u64(&mut out, *index);
+            put_wire_match(&mut out, matched)?;
+            put_u64(&mut out, *expansion_len);
+        }
+        FromHelper::ExpansionChunk {
+            request_id,
+            index,
+            offset,
+            bytes,
+        } => {
+            put_u8(&mut out, TAG_EXPANSION_CHUNK);
+            put_u64(&mut out, *request_id);
+            put_u64(&mut out, *index);
+            put_u64(&mut out, *offset);
+            put_bytes(&mut out, bytes);
         }
         FromHelper::Done {
             request_id,
@@ -550,68 +720,71 @@ fn failure_from_tag(tag: u8) -> Result<FailureCode, FrameError> {
 
 fn decode_from_helper(bytes: &[u8]) -> Result<FromHelper, FrameError> {
     let mut reader = Reader { bytes };
-    match reader.u8()? {
+    let message = match reader.u8()? {
         TAG_HANDSHAKE_REPLY => {
             let ok = reader.u8()?;
             if ok == 1 {
-                Ok(FromHelper::HandshakeReply(Ok((
-                    reader.u32()?,
-                    reader.u32()?,
-                ))))
+                FromHelper::HandshakeReply(Ok((reader.u32()?, reader.u32()?)))
             } else {
-                Ok(FromHelper::HandshakeReply(Err(failure_from_tag(
-                    reader.u8()?,
-                )?)))
+                FromHelper::HandshakeReply(Err(failure_from_tag(reader.u8()?)?))
             }
         }
-        TAG_ACCEPTED => Ok(FromHelper::Accepted {
+        TAG_ACCEPTED => FromHelper::Accepted {
             request_id: reader.u64()?,
-        }),
+        },
         TAG_PAGE => {
             let request_id = reader.u64()?;
             let count = reader.u32()? as usize;
             let mut matches = Vec::with_capacity(count.min(MATCHES_PER_PAGE));
             for _ in 0..count {
-                let start = reader.u64()?;
-                let end = reader.u64()?;
-                let group_count = reader.u32()? as usize;
-                if group_count > crate::matcher::REGEX_MAX_GROUPS {
-                    return Err(FrameError::Malformed);
-                }
-                let mut groups = Vec::with_capacity(group_count);
-                for _ in 0..group_count {
-                    match reader.u8()? {
-                        0 => groups.push(None),
-                        1 => {
-                            let start = reader.u64()?;
-                            groups.push(Some((start, reader.u64()?)));
-                        }
-                        _ => return Err(FrameError::Malformed),
-                    }
-                }
-                matches.push(WireMatch {
-                    start,
-                    end,
-                    groups,
-                    expansion: reader.bytes()?.to_vec(),
-                });
+                matches.push(read_wire_match(&mut reader)?);
             }
-            Ok(FromHelper::Page {
+            FromHelper::Page {
                 request_id,
                 matches,
-            })
+            }
         }
-        TAG_DONE => Ok(FromHelper::Done {
+        TAG_MATCH_START => {
+            let request_id = reader.u64()?;
+            let index = reader.u64()?;
+            let matched = read_wire_match(&mut reader)?;
+            if !matched.expansion.is_empty() {
+                return Err(FrameError::Malformed);
+            }
+            let expansion_len = reader.u64()?;
+            if expansion_len > SOURCE_MAX_BYTES {
+                return Err(FrameError::Malformed);
+            }
+            FromHelper::MatchStart {
+                request_id,
+                index,
+                matched,
+                expansion_len,
+            }
+        }
+        TAG_EXPANSION_CHUNK => FromHelper::ExpansionChunk {
+            request_id: reader.u64()?,
+            index: reader.u64()?,
+            offset: reader.u64()?,
+            bytes: reader.bytes()?.to_vec(),
+        },
+        TAG_DONE => FromHelper::Done {
             request_id: reader.u64()?,
             total_matches: reader.u64()?,
             output_len: reader.u64()?,
-        }),
-        TAG_FAILED => Ok(FromHelper::Failed {
+        },
+        TAG_FAILED => FromHelper::Failed {
             request_id: reader.u64()?,
             failure: failure_from_tag(reader.u8()?)?,
-        }),
-        _ => Err(FrameError::Malformed),
+        },
+        _ => return Err(FrameError::Malformed),
+    };
+    // The parent's decoder is as strict as the helper's: trailing bytes in
+    // any reply frame are a typed protocol refusal.
+    if !reader.bytes.is_empty() {
+        return Err(FrameError::Malformed);
     }
+    Ok(message)
 }
 
 #[cfg(test)]
@@ -634,12 +807,31 @@ mod tests {
             },
             ToHelper::Begin {
                 request_id: 7,
+                kind: RequestKind::Replace,
                 mode: MatchMode::Regex,
                 case_sensitive: true,
                 whole_word: true,
                 max_matches: 1_000,
+                report_matches: 50,
+                skip_matches: 25,
+                max_output: 4096,
+                scope: Some((12, 4096)),
                 source_total: 32 * 1024 * 1024,
                 pattern: b"a(b)?c".to_vec(),
+            },
+            ToHelper::Begin {
+                request_id: 8,
+                kind: RequestKind::Find,
+                mode: MatchMode::Regex,
+                case_sensitive: false,
+                whole_word: false,
+                max_matches: 1_000_000,
+                report_matches: 0,
+                skip_matches: 256,
+                max_output: u64::MAX,
+                scope: None,
+                source_total: 10,
+                pattern: b"ab".to_vec(),
             },
             ToHelper::Template {
                 request_id: 7,
@@ -688,6 +880,23 @@ mod tests {
             FromHelper::HandshakeReply(Err(FailureCode::Protocol)),
             FromHelper::Accepted { request_id: 3 },
             page.clone(),
+            FromHelper::MatchStart {
+                request_id: 3,
+                index: 7,
+                matched: WireMatch {
+                    start: 0,
+                    end: 1,
+                    groups: vec![Some((0, 1))],
+                    expansion: Vec::new(),
+                },
+                expansion_len: 70_000,
+            },
+            FromHelper::ExpansionChunk {
+                request_id: 3,
+                index: 7,
+                offset: 32_768,
+                bytes: vec![b'x'; 32 * 1024],
+            },
             FromHelper::Done {
                 request_id: 3,
                 total_matches: 2,
@@ -712,9 +921,12 @@ mod tests {
             offset: 0,
             bytes: vec![0u8; FRAME_MAX_BYTES + 1],
         };
-        assert_eq!(encode(&big), Err(FrameError::Oversize {
-            observed: FRAME_MAX_BYTES + 1 + 8 + 8 + 1 + 8
-        }));
+        assert_eq!(
+            encode(&big),
+            Err(FrameError::Oversize {
+                observed: FRAME_MAX_BYTES + 1 + 8 + 8 + 1 + 8
+            })
+        );
         // A hostile length prefix is rejected before reading the payload.
         let mut hostile = Vec::new();
         put_u32(&mut hostile, HOSTILE_PREFIX);
@@ -733,6 +945,64 @@ mod tests {
         assert_eq!(read_reply(&mut short), Err(FrameError::Truncated));
         assert_eq!(decode(&[0xFF, 0]), Err(FrameError::Malformed));
         // Unknown failure tag and unknown mode byte are malformed, not panics.
-        assert_eq!(decode(&[0x02, 0, 0, 0, 0, 0, 0, 0, 0, 7]), Err(FrameError::Malformed));
+        assert_eq!(
+            decode(&[0x02, 0, 0, 0, 0, 0, 0, 0, 0, 7]),
+            Err(FrameError::Malformed)
+        );
+    }
+
+    #[test]
+    fn trailing_bytes_are_malformed_both_directions() {
+        // A valid frame plus one forged extension byte: the strict decoder
+        // refuses instead of silently ignoring the unknown tail.
+        let mut frame = encode(&ToHelper::EndOfSource { request_id: 3 }).expect("frame");
+        frame.push(0x7F);
+        let payload = &frame[4..];
+        assert_eq!(decode(payload), Err(FrameError::Malformed));
+        let mut reply = encode_reply(&FromHelper::Accepted { request_id: 3 }).expect("reply frame");
+        reply.push(0x00);
+        assert_eq!(decode_reply(&reply[4..]), Err(FrameError::Malformed));
+    }
+
+    #[test]
+    fn begin_kind_scope_and_bounds_round_trip_both_kinds() {
+        for (kind, scope) in [
+            (RequestKind::Find, None),
+            (RequestKind::Replace, Some((3u64, 9u64))),
+        ] {
+            let message = ToHelper::Begin {
+                request_id: 5,
+                kind,
+                mode: MatchMode::Regex,
+                case_sensitive: false,
+                whole_word: true,
+                max_matches: 1_000_000,
+                report_matches: 10,
+                skip_matches: 512,
+                max_output: 2048,
+                scope,
+                source_total: 64,
+                pattern: b"a(b)".to_vec(),
+            };
+            let frame = encode(&message).expect("within bounds");
+            assert_eq!(decode(&frame[4..]).expect("decodes"), message);
+        }
+        // A descending scope pair is malformed, never a silent empty range.
+        let mut out = vec![0x02u8];
+        out.extend_from_slice(&1u64.to_le_bytes()); // request id
+        out.push(1); // kind: replace
+        out.push(1); // mode: regex
+        out.push(0); // case
+        out.push(0); // word
+        out.extend_from_slice(&10u64.to_le_bytes()); // max matches
+        out.extend_from_slice(&10u64.to_le_bytes()); // report
+        out.extend_from_slice(&0u64.to_le_bytes()); // skip
+        out.extend_from_slice(&1024u64.to_le_bytes()); // max output
+        out.push(1); // scope present
+        out.extend_from_slice(&9u64.to_le_bytes()); // start
+        out.extend_from_slice(&3u64.to_le_bytes()); // end < start
+        out.extend_from_slice(&0u64.to_le_bytes()); // source total
+        out.extend_from_slice(&0u64.to_le_bytes()); // pattern length
+        assert_eq!(decode(&out), Err(FrameError::Malformed));
     }
 }

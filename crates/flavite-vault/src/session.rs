@@ -96,6 +96,9 @@ const TEXT_PLAN_TTL: Duration = Duration::from_secs(30);
 const TEXT_PLAN_RESULT_TTL: Duration = Duration::from_secs(600);
 const MAX_RETAINED_TEXT_RESULTS: usize = 2_048;
 const TEXT_PREPARE_WORKERS: usize = 2;
+/// NFR-10: at most this many queued text prepare/find admissions before
+/// new admissions are refused with an explicit Busy (never unbounded).
+const TEXT_QUEUE_MAX: usize = 16;
 /// Per-buffer journal memo cap (C1). Entries are keyed `(txn_id, item_id)`
 /// inside the buffer's own memo: total memo memory is bounded by
 /// `open_buffers × JOURNAL_MEMO_CAP × entry`, roughly ≤ 800 KiB per open
@@ -419,6 +422,16 @@ pub enum SessionCommand {
         request_id: u64,
         request: crate::text_edit::ReplaceRequest,
     },
+    /// Find matches in the current buffer (RFC-0006 S03/D-05/FR-2): the
+    /// same canonical matcher semantics as replacement, reported as
+    /// revision-bound span pages. Literal matches run on a bounded worker;
+    /// regex matches run in the isolated helper (D-14). Read-only: no plan,
+    /// no mutation, and late completions are correlation-dropped by the
+    /// caller when the query, revision or view has moved on.
+    FindMatches {
+        request_id: u64,
+        request: crate::text_edit::FindRequest,
+    },
     /// Install one prepared replacement as one isolated Undo unit (D-06).
     /// Consumed plans replay the same result during the retry window.
     ApplyReplace {
@@ -590,6 +603,19 @@ pub enum CommandResult {
         plan_id: u128,
         match_count: u64,
         expires_in_ms: u64,
+    },
+    /// A note find page is ready (RFC-0006 S03/D-05): revision-bound
+    /// ascending spans over the snapshot the request was admitted at, the
+    /// exact match total, and the honest page-cap flag. Read-only — no
+    /// mutation authority and no plan slot.
+    Found {
+        buffer_id: BufferId,
+        revision: Revision,
+        spans: Vec<(u64, u64)>,
+        offset: u64,
+        total_matches: u64,
+        next_offset: Option<u64>,
+        truncated: bool,
     },
 }
 
@@ -820,6 +846,9 @@ pub struct Session {
     /// Bounded prepare workers' job queue (D-06: preparation runs off the
     /// host turn).
     text_jobs: Option<crossbeam::channel::Sender<TextJob>>,
+    /// Queue-depth view for bounded admission (NFR-10). Observes the same
+    /// channel the workers pull from; len() counts pending jobs.
+    text_queue: Option<crossbeam::channel::Receiver<TextJob>>,
     /// Completed preparations awaiting installation on a Session turn.
     text_results: crossbeam::channel::Receiver<TextOutcomeMessage>,
     /// Semantic link plan store (W05). Plans are process-local capabilities.
@@ -854,21 +883,36 @@ struct LinkOutcomeMessage {
     result: SessionResult,
 }
 
-/// One queued replacement-prepare job (RFC-0006 S01/D-06). The immutable
-/// snapshot text rides as a cheap `Arc` clone; the worker never touches the
-/// buffer manager.
+/// One queued replacement-prepare or find job (RFC-0006 S01/S03/D-06). The
+/// immutable snapshot text rides as a cheap `Arc` clone; the worker never
+/// touches the buffer manager.
 struct TextJob {
     request_id: u64,
     text: std::sync::Arc<str>,
-    request: crate::text_edit::ReplaceRequest,
+    work: TextWork,
 }
 
-/// One finished replacement preparation awaiting registry installation.
-struct TextOutcomeMessage {
-    request_id: u64,
-    buffer_id: BufferId,
-    revision: Revision,
-    outcome: Result<(Vec<EditOp>, u64, u64), crate::text_edit::PrepareError>,
+/// Which prepare computation a queued job performs.
+enum TextWork {
+    Prepare(crate::text_edit::ReplaceRequest),
+    Find(crate::text_edit::FindRequest),
+}
+
+/// One finished preparation awaiting registry installation or completion
+/// routing.
+enum TextOutcomeMessage {
+    Prepare {
+        request_id: u64,
+        buffer_id: BufferId,
+        revision: Revision,
+        outcome: Result<(Vec<EditOp>, u64, u64), crate::text_edit::PrepareError>,
+    },
+    Find {
+        request_id: u64,
+        buffer_id: BufferId,
+        revision: Revision,
+        outcome: Result<crate::text_edit::FindOutcome, crate::text_edit::PrepareError>,
+    },
 }
 
 /// One core-issued replacement plan (D-06/§6.9). `consumed` records the
@@ -1186,15 +1230,23 @@ impl Session {
                     .spawn(move || {
                         // Workers exit when the Session drops the job sender.
                         while let Ok(job) = jobs.recv() {
-                            let outcome = crate::text_edit::prepare_ops(&job.text, &job.request);
+                            let message = match job.work {
+                                TextWork::Prepare(request) => TextOutcomeMessage::Prepare {
+                                    request_id: job.request_id,
+                                    buffer_id: request.buffer_id,
+                                    revision: request.revision,
+                                    outcome: crate::text_edit::prepare_ops(&job.text, &request),
+                                },
+                                TextWork::Find(request) => TextOutcomeMessage::Find {
+                                    request_id: job.request_id,
+                                    buffer_id: request.buffer_id,
+                                    revision: request.revision,
+                                    outcome: crate::text_edit::prepare_find(&job.text, &request),
+                                },
+                            };
                             // Sending only fails when the Session is gone;
                             // the result is then unobservable by construction.
-                            let _ = results.send(TextOutcomeMessage {
-                                request_id: job.request_id,
-                                buffer_id: job.request.buffer_id,
-                                revision: job.request.revision,
-                                outcome,
-                            });
+                            let _ = results.send(message);
                         }
                     })
                     .expect("text prepare worker thread creation failed");
@@ -1207,6 +1259,7 @@ impl Session {
         );
         Self {
             text_jobs: Some(text_job_sender),
+            text_queue: Some(text_job_receiver),
             text_results: text_result_receiver,
             text_plan_nonce,
             text_plan_counter: AtomicU64::new(0),
@@ -1814,6 +1867,10 @@ impl Session {
                 request_id,
                 request,
             } => self.prepare_replace(request_id, request),
+            SessionCommand::FindMatches {
+                request_id,
+                request,
+            } => self.text_find(request_id, request),
             SessionCommand::ApplyReplace {
                 buffer_id,
                 revision,
@@ -2975,7 +3032,7 @@ impl Session {
         }
     }
 
-    /// Admit one literal replacement preparation (D-05/D-06): validate the
+    /// Admit one replacement preparation (D-05/D-06): validate the
     /// buffer/revision, reserve a plan slot, and dispatch the immutable
     /// snapshot to a bounded prepare worker. Empty queries are Idle, not a
     /// match-everywhere plan.
@@ -2985,41 +3042,16 @@ impl Session {
         request: crate::text_edit::ReplaceRequest,
     ) -> SessionResult {
         self.sweep_text_plans();
-        let text = {
-            let manager = self.buffer_manager.lock_recovering();
-            let Some(buffer) = manager.get_buffer_by_id(request.buffer_id) else {
-                return SessionResult::Error {
-                    message: "Buffer not found".into(),
-                };
-            };
-            if buffer.revision() != request.revision {
-                return SessionResult::StaleRevision {
-                    buffer_id: request.buffer_id,
-                    expected: request.revision,
-                    actual: buffer.revision(),
-                };
-            }
-            {
-                let mut cache = self.shared_snapshots.lock_recovering();
-                match cache.get(&request.buffer_id) {
-                    Some((revision, text)) if *revision == request.revision => text.clone(),
-                    _ => {
-                        let text: std::sync::Arc<str> = buffer.text().to_owned().into();
-                        cache.insert(request.buffer_id, (request.revision, text.clone()));
-                        text
-                    }
-                }
-            }
+        if self.text_plans_full() {
+            return SessionResult::Busy;
+        }
+        let buffer_id = request.buffer_id;
+        let text = match self.snapshot_for_revision(buffer_id, request.revision) {
+            Ok(text) => text,
+            Err(result) => return result,
         };
-        {
-            let plans = self.text_plans.lock_recovering();
-            let unconsumed = plans
-                .values()
-                .filter(|entry| entry.consumed.is_none())
-                .count();
-            if unconsumed >= MAX_UNCONSUMED_TEXT_PLANS {
-                return SessionResult::Busy;
-            }
+        if self.text_queue_full() {
+            return SessionResult::Busy;
         }
         match &self.text_jobs {
             Some(jobs)
@@ -3027,7 +3059,7 @@ impl Session {
                     .send(TextJob {
                         request_id,
                         text,
-                        request,
+                        work: TextWork::Prepare(request),
                     })
                     .is_ok() =>
             {
@@ -3037,6 +3069,93 @@ impl Session {
                 message: "replacement prepare workers are unavailable".into(),
             },
         }
+    }
+
+    /// Admit one buffer find (S03): the same snapshot admission as
+    /// replacement, the same bounded worker pool, no plan slot (a find is
+    /// read-only). An empty query is Idle and never dispatched.
+    fn text_find(&self, request_id: u64, request: crate::text_edit::FindRequest) -> SessionResult {
+        if request.query.is_empty()
+            && request.mode == flavite_text_search::matcher::MatchMode::Literal
+        {
+            return SessionResult::Error {
+                message: crate::text_edit::IDLE_QUERY.to_owned(),
+            };
+        }
+        let buffer_id = request.buffer_id;
+        let text = match self.snapshot_for_revision(buffer_id, request.revision) {
+            Ok(text) => text,
+            Err(result) => return result,
+        };
+        if self.text_queue_full() {
+            return SessionResult::Busy;
+        }
+        match &self.text_jobs {
+            Some(jobs)
+                if jobs
+                    .send(TextJob {
+                        request_id,
+                        text,
+                        work: TextWork::Find(request),
+                    })
+                    .is_ok() =>
+            {
+                SessionResult::Pending { request_id }
+            }
+            _ => SessionResult::Error {
+                message: "find workers are unavailable".into(),
+            },
+        }
+    }
+
+    /// Shared admission guard: at most [`TEXT_QUEUE_MAX`] text jobs may be
+    /// queued across both workers (NFR-10); beyond that the caller gets an
+    /// explicit Busy instead of unbounded queue growth.
+    fn text_queue_full(&self) -> bool {
+        self.text_queue
+            .as_ref()
+            .is_some_and(|queue| queue.len() >= TEXT_QUEUE_MAX)
+    }
+
+    fn text_plans_full(&self) -> bool {
+        let plans = self.text_plans.lock_recovering();
+        plans
+            .values()
+            .filter(|entry| entry.consumed.is_none())
+            .count()
+            >= MAX_UNCONSUMED_TEXT_PLANS
+    }
+
+    /// Fetch (or populate) the shared immutable snapshot for a revision,
+    /// with the buffer/revision guards both text admissions require.
+    #[allow(clippy::result_large_err)] // SessionResult is the existing typed facade outcome.
+    fn snapshot_for_revision(
+        &self,
+        buffer_id: BufferId,
+        revision: Revision,
+    ) -> Result<std::sync::Arc<str>, SessionResult> {
+        let manager = self.buffer_manager.lock_recovering();
+        let Some(buffer) = manager.get_buffer_by_id(buffer_id) else {
+            return Err(SessionResult::Error {
+                message: "Buffer not found".into(),
+            });
+        };
+        if buffer.revision() != revision {
+            return Err(SessionResult::StaleRevision {
+                buffer_id,
+                expected: revision,
+                actual: buffer.revision(),
+            });
+        }
+        let mut cache = self.shared_snapshots.lock_recovering();
+        Ok(match cache.get(&buffer_id) {
+            Some((cached, text)) if *cached == revision => text.clone(),
+            _ => {
+                let text: std::sync::Arc<str> = buffer.text().to_owned().into();
+                cache.insert(buffer_id, (revision, text.clone()));
+                text
+            }
+        })
     }
 
     /// Install one prepared replacement (D-06): the plan id names a
@@ -3131,52 +3250,109 @@ impl Session {
         result
     }
 
-    /// Install finished preparations into the plan registry on a Session
-    /// turn and complete every correlated caller once.
+    /// Install finished preparations and read-only finds into their
+    /// destinations on a Session turn, completing every correlated caller
+    /// once.
     fn pump_text_completions(&self) {
         while let Ok(message) = self.text_results.try_recv() {
-            let result = match message.outcome {
-                Ok((ops, match_count, digest)) => {
-                    let plan_id = self.next_text_plan_id();
-                    let entry = TextPlanEntry {
-                        ops,
-                        match_count,
-                        options_digest: digest,
-                        buffer_id: message.buffer_id,
-                        revision: message.revision,
-                        created: std::time::Instant::now(),
-                        consumed: None,
-                    };
-                    let admitted = {
-                        let mut plans = self.text_plans.lock_recovering();
-                        let unconsumed = plans
-                            .values()
-                            .filter(|entry| entry.consumed.is_none())
-                            .count();
-                        if unconsumed < MAX_UNCONSUMED_TEXT_PLANS {
-                            plans.insert(plan_id, entry);
-                            true
-                        } else {
-                            false
+            let (request_id, result) = match message {
+                TextOutcomeMessage::Prepare {
+                    request_id,
+                    buffer_id,
+                    revision,
+                    outcome,
+                } => {
+                    let result = match outcome {
+                        Ok((ops, match_count, digest)) => {
+                            let plan_id = self.next_text_plan_id();
+                            let entry = TextPlanEntry {
+                                ops,
+                                match_count,
+                                options_digest: digest,
+                                buffer_id,
+                                revision,
+                                created: std::time::Instant::now(),
+                                consumed: None,
+                            };
+                            let admitted = {
+                                let mut plans = self.text_plans.lock_recovering();
+                                if !self.text_plans_full_locked(&plans) {
+                                    plans.insert(plan_id, entry);
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if admitted {
+                                SessionResult::Success(CommandResult::ReplacePrepared {
+                                    plan_id,
+                                    match_count,
+                                    expires_in_ms: u64::try_from(TEXT_PLAN_TTL.as_millis())
+                                        .unwrap_or(u64::MAX),
+                                })
+                            } else {
+                                SessionResult::Busy
+                            }
                         }
+                        // Typed, redacted refusal: never `{:?}` — a regex
+                        // parse error's Debug text can quote pattern
+                        // fragments (NFR-17/§6.7).
+                        Err(error) => SessionResult::Error {
+                            message: error.message(),
+                        },
                     };
-                    if admitted {
-                        SessionResult::Success(CommandResult::ReplacePrepared {
-                            plan_id,
-                            match_count,
-                            expires_in_ms: u64::try_from(TEXT_PLAN_TTL.as_millis())
-                                .unwrap_or(u64::MAX),
-                        })
-                    } else {
-                        SessionResult::Busy
-                    }
+                    (request_id, result)
                 }
-                Err(error) => SessionResult::Error {
-                    message: format!("replacement prepare refused: {error:?}"),
-                },
+                TextOutcomeMessage::Find {
+                    request_id,
+                    buffer_id,
+                    revision,
+                    outcome,
+                } => {
+                    let result = match outcome {
+                        Ok(found) => {
+                            let spans = found
+                                .spans
+                                .into_iter()
+                                .map(|(start, end)| {
+                                    (
+                                        u64::try_from(start).unwrap_or(u64::MAX),
+                                        u64::try_from(end).unwrap_or(u64::MAX),
+                                    )
+                                })
+                                .collect();
+                            SessionResult::Success(CommandResult::Found {
+                                buffer_id,
+                                revision,
+                                spans,
+                                offset: found.offset,
+                                total_matches: found.total_matches,
+                                next_offset: found.next_offset,
+                                truncated: found.truncated,
+                            })
+                        }
+                        Err(error) => SessionResult::Error {
+                            message: error.message(),
+                        },
+                    };
+                    (request_id, result)
+                }
             };
-            self.record_completion(message.request_id, result);
+            self.record_completion(request_id, result);
         }
+    }
+
+    /// Plan-cap check against an already-held lock (the pump must not
+    /// re-take the mutex it holds).
+    fn text_plans_full_locked(
+        &self,
+        plans: &std::collections::HashMap<u128, TextPlanEntry>,
+    ) -> bool {
+        plans
+            .values()
+            .filter(|entry| entry.consumed.is_none())
+            .count()
+            >= MAX_UNCONSUMED_TEXT_PLANS
     }
 
     fn pump_open_completions(&self) {

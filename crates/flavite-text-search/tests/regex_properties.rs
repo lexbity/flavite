@@ -8,6 +8,16 @@ use flavite_text_search::{
     TemplateError,
 };
 use proptest::prelude::*;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct PerformancePattern {
+    id: String,
+    mode: String,
+    pattern: String,
+    case_sensitive: bool,
+    whole_word: bool,
+}
 
 fn regex(pattern: &str) -> Matcher {
     regex_with(pattern, MatchOptions::default())
@@ -160,6 +170,40 @@ fn group_count_is_bounded() {
         err,
         flavite_text_search::MatchError::RegexTooManyGroups { .. }
     ));
+}
+
+#[test]
+fn committed_performance_pattern_corpus_is_valid_and_stable() {
+    let corpus: Vec<PerformancePattern> =
+        serde_json::from_str(include_str!("fixtures/performance-patterns.json"))
+            .expect("the fixed S01/S03 reference pattern corpus is valid JSON");
+    assert_eq!(corpus.len(), 12);
+    let source = "# Flavite\n\nAn idea about café and Straße.\n- [ ] capture this task\nSee [[target|a visible link]].\nαβ\n";
+    let mut ids = std::collections::BTreeSet::new();
+    for entry in corpus {
+        assert!(ids.insert(entry.id.clone()), "duplicate case {}", entry.id);
+        let mode = match entry.mode.as_str() {
+            "literal" => MatchMode::Literal,
+            "regex" => MatchMode::Regex,
+            other => panic!("unknown corpus mode {other:?}"),
+        };
+        let matcher = Matcher::new(
+            &entry.pattern,
+            MatchOptions {
+                mode,
+                case_sensitive: entry.case_sensitive,
+                whole_word: entry.whole_word,
+            },
+            MatchLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("{} does not compile: {error}", entry.id));
+        let found = matcher.find(source).expect("bounded fixture search");
+        if entry.id.starts_with("no-match-") {
+            assert!(found.is_empty(), "{} unexpectedly matches", entry.id);
+        } else {
+            assert!(!found.is_empty(), "{} has no fixture match", entry.id);
+        }
+    }
 }
 
 #[test]

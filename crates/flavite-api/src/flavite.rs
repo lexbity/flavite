@@ -891,6 +891,12 @@ impl Flavite {
                 crate::text_edit::handle_prepare_replace,
             ),
             (
+                "text.find",
+                "Find matches in the current buffer",
+                ArgSchema::typed::<crate::text_edit::FindArgs>(),
+                crate::text_edit::handle_find,
+            ),
+            (
                 "text.apply_replace",
                 "Apply prepared replacement",
                 ArgSchema::typed::<crate::text_edit::ApplyReplaceArgs>(),
@@ -1025,6 +1031,7 @@ impl Flavite {
                     | "note.history"
                     | "note.reopen_encoding"
                     | "text.prepare_replace"
+                    | "text.find"
             ) {
                 CommandSpec::new(id, title, args).requires(crate::Capability::ReadNotes)
             } else {
@@ -1600,6 +1607,7 @@ impl Flavite {
             SessionResult::Success(crate::session::CommandResult::ReplacePrepared { .. }) => {
                 "text.prepare_replace"
             }
+            SessionResult::Success(crate::session::CommandResult::Found { .. }) => "text.find",
             SessionResult::MergeReady { .. }
             | SessionResult::Conflict { .. }
             | SessionResult::ActionRequired { .. } => "resolve_conflict",
@@ -1780,6 +1788,28 @@ impl Flavite {
                             "plan_id": crate::text_edit::encode_plan_id(plan_id),
                             "match_count": match_count,
                             "expires_in_ms": expires_in_ms,
+                        })
+                    }
+                    crate::session::CommandResult::Found {
+                        buffer_id,
+                        revision,
+                        spans,
+                        offset,
+                        total_matches,
+                        next_offset,
+                        truncated,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "revision": revision.as_u64(),
+                            "spans": spans
+                                .into_iter()
+                                .map(|(start, end)| [start, end])
+                                .collect::<Vec<[u64; 2]>>(),
+                            "offset": offset,
+                            "total_matches": total_matches,
+                            "next_offset": next_offset,
+                            "truncated": truncated,
                         })
                     }
                     crate::session::CommandResult::EditsDiscarded { buffer_id } => {

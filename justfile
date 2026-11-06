@@ -199,7 +199,7 @@ fuzz-smoke:
     cd fuzz
     smoke_root="$(mktemp -d)"
     trap 'rm -rf "$smoke_root"' EXIT
-    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore graph_scope read_structure"
+    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore graph_scope read_structure text_match text_worker_protocol"
     failed=0
     for target in $targets; do
         corpus_dir="$smoke_root/$target"
@@ -222,7 +222,7 @@ fuzz-smoke-ci:
     cd fuzz
     smoke_root="$(mktemp -d)"
     trap 'rm -rf "$smoke_root"' EXIT
-    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore graph_scope read_structure"
+    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore graph_scope read_structure text_match text_worker_protocol"
     failed=0
     for target in $targets; do
         corpus_dir="$smoke_root/$target"

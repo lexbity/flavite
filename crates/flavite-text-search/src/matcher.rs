@@ -96,6 +96,18 @@ pub struct Match {
 }
 
 impl Match {
+    /// Construct one match from its whole span and capture-group spans
+    /// (group 0 included). Cross-crate oracle tests build matches without
+    /// going through the engine, proving the consumer-facing shape is not
+    /// engine-private.
+    #[must_use]
+    pub fn new(span: Span<TextByte>, groups: Vec<Option<Span<TextByte>>>) -> Self {
+        Self {
+            span,
+            groups: groups.into(),
+        }
+    }
+
     /// Number of capture groups including group 0.
     #[must_use]
     pub fn group_count(&self) -> usize {
@@ -180,12 +192,10 @@ impl std::fmt::Display for MatchError {
             Self::LimitExceeded { observed, limit } => {
                 write!(f, "match count {observed} exceeds limit {limit}")
             }
-            Self::OrdinalOutOfRange { ordinal, total } => {
-                write!(
-                    f,
-                    "match ordinal {ordinal} is out of range for {total} matches"
-                )
-            }
+            Self::OrdinalOutOfRange { ordinal, total } => write!(
+                f,
+                "match ordinal {ordinal} is out of range for {total} matches"
+            ),
         }
     }
 }
@@ -329,6 +339,10 @@ impl Matcher {
     /// non-overlapping. A match straddling a scope edge is excluded, never
     /// clipped (D-05: the selected-text scope is frozen to exact ranges).
     ///
+    /// Whole-word filtering is evaluated against the FULL text's UAX #29
+    /// boundaries, never the scope slice's — the scope restricts which
+    /// matches are reported, not what a match means.
+    ///
     /// # Errors
     ///
     /// [`MatchError::LimitExceeded`] and [`MatchError::InvalidScope`].
@@ -337,59 +351,219 @@ impl Matcher {
         text: &str,
         scope: Option<Span<TextByte>>,
     ) -> Result<Vec<Match>, MatchError> {
+        self.iter_matches(text, scope)?.collect()
+    }
+
+    /// Streaming match iterator with a monotonic source cursor (§6.2).
+    /// The helper and the collect-all [`Matcher::find_in`] consume this one
+    /// semantic path: the literal walk, simple-fold case matching, UAX #29
+    /// whole-word endpoints and the checked match budget live exactly here,
+    /// never re-implemented elsewhere.
+    ///
+    /// The iterator yields ascending, non-overlapping matches. Exceeding
+    /// [`MatchLimits::max_matches`] is a yielded
+    /// [`MatchError::LimitExceeded`] item — the consumer decides how to
+    /// report it — and the iterator terminates after that item.
+    ///
+    /// # Errors
+    ///
+    /// [`MatchError::InvalidScope`] if a scope endpoint is out of bounds,
+    /// reversed, or mid-scalar.
+    pub fn iter_matches<'t>(
+        &'t self,
+        text: &'t str,
+        scope: Option<Span<TextByte>>,
+    ) -> Result<MatchIter<'t>, MatchError> {
         let scope = validate_scope(text, scope)?;
-        let mut matches = Vec::new();
-        match &self.engine {
-            Engine::LiteralBytes { pattern } => {
-                let haystack = &text[scope.start.0..scope.end.0];
-                for (idx, segment) in haystack.match_indices(pattern.as_ref()) {
-                    if matches.len() >= self.limits.max_matches {
-                        return Err(limit_error(self.limits.max_matches));
-                    }
-                    let start = scope.start.0 + idx;
-                    let span = Span::new(TextByte(start), TextByte(start + segment.len()));
-                    matches.push(Match {
-                        span,
-                        groups: Arc::from([Some(span)]),
-                    });
-                }
-            }
+        let boundaries = if self.options.whole_word {
+            Some(flavite_syntax::text::WordBoundarySet::compute(text))
+        } else {
+            None
+        };
+        let inner = match &self.engine {
+            Engine::LiteralBytes { pattern } => InnerIter::Literal {
+                haystack: &text[scope.start.0..scope.end.0],
+                pattern: pattern.clone(),
+                cursor: 0,
+                base: scope.start.0,
+            },
             Engine::LiteralFolded(compiled) | Engine::RegexMode(compiled) => {
-                let haystack = &text[scope.start.0..scope.end.0];
-                for caps in compiled.captures_iter(haystack) {
-                    if matches.len() >= self.limits.max_matches {
-                        return Err(limit_error(self.limits.max_matches));
-                    }
-                    let Some(whole) = caps.get(0) else {
-                        continue;
-                    };
-                    let mut groups = Vec::with_capacity(caps.len());
-                    for group in caps.iter() {
-                        groups.push(group.map(|m| {
-                            Span::new(
-                                TextByte(scope.start.0 + m.start()),
-                                TextByte(scope.start.0 + m.end()),
-                            )
-                        }));
-                    }
-                    matches.push(Match {
-                        span: Span::new(
-                            TextByte(scope.start.0 + whole.start()),
-                            TextByte(scope.start.0 + whole.end()),
-                        ),
-                        groups: Arc::from(groups),
-                    });
+                // Keep our own scalar cursor rather than `captures_iter`:
+                // Rust's iterator suppresses an empty match immediately
+                // after a non-empty match. D-05 requires the empty match at
+                // that same boundary, then scalar progress after the empty
+                // match (including exactly one end-of-document match).
+                InnerIter::Regex {
+                    regex: compiled,
+                    haystack: &text[scope.start.0..scope.end.0],
+                    cursor: 0,
+                    base: scope.start.0,
                 }
             }
+        };
+        Ok(MatchIter {
+            limits: self.limits,
+            text,
+            boundaries,
+            inner,
+            emitted: 0,
+            done: false,
+        })
+    }
+}
+
+enum InnerIter<'t> {
+    /// Case-sensitive literal walk: leftmost, non-overlapping, ascending.
+    Literal {
+        haystack: &'t str,
+        pattern: Box<str>,
+        cursor: usize,
+        base: usize,
+    },
+    /// Regex/folded-literal captures over the scope slice, offsets rebased
+    /// to the full text.
+    Regex {
+        regex: &'t Regex,
+        haystack: &'t str,
+        cursor: usize,
+        base: usize,
+    },
+}
+
+/// Borrowed streaming match iterator (see [`Matcher::iter_matches`]).
+pub struct MatchIter<'t> {
+    limits: MatchLimits,
+    text: &'t str,
+    boundaries: Option<flavite_syntax::text::WordBoundarySet>,
+    inner: InnerIter<'t>,
+    emitted: usize,
+    done: bool,
+}
+
+impl Iterator for MatchIter<'_> {
+    type Item = Result<Match, MatchError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
         }
-        if self.options.whole_word {
-            let boundaries = flavite_syntax::text::word_boundaries(text);
-            matches.retain(|m| {
-                flavite_syntax::text::is_word_boundary(&boundaries, m.span.start.0)
-                    && flavite_syntax::text::is_word_boundary(&boundaries, m.span.end.0)
-            });
+        loop {
+            let candidate = match &mut self.inner {
+                InnerIter::Literal {
+                    haystack,
+                    pattern,
+                    cursor,
+                    base,
+                } => {
+                    if *cursor > haystack.len() {
+                        self.done = true;
+                        return None;
+                    }
+                    let tail = &haystack[*cursor..];
+                    let relative = if pattern.is_empty() {
+                        0
+                    } else if let Some(at) = tail.find(&**pattern) {
+                        at
+                    } else {
+                        self.done = true;
+                        return None;
+                    };
+                    let start = *base + *cursor + relative;
+                    let end = start + pattern.len();
+                    // Non-overlap: advance past the whole match. Zero-length
+                    // literal patterns still move the cursor (the EmptyQuery
+                    // guard makes this unreachable for the UI, but the walk
+                    // must never loop on one position).
+                    *cursor = (end - *base).max(*cursor + 1);
+                    let span = Span::new(TextByte(start), TextByte(end));
+                    Ok(Match::new(span, vec![Some(span)]))
+                }
+                InnerIter::Regex {
+                    regex,
+                    haystack,
+                    cursor,
+                    base,
+                } => {
+                    if let Some(candidate) = next_regex_candidate(regex, haystack, cursor, *base) {
+                        candidate
+                    } else {
+                        self.done = true;
+                        return None;
+                    }
+                }
+            };
+            let Ok(hit) = candidate else {
+                self.done = true;
+                return Some(candidate);
+            };
+            if let Some(boundaries) = &self.boundaries {
+                // Whole word requires BOTH endpoints to be UAX #29 word
+                // boundaries of the whole text (§6.2).
+                if !boundaries.contains(hit.span.start.0) || !boundaries.contains(hit.span.end.0) {
+                    continue;
+                }
+            }
+            if self.emitted >= self.limits.max_matches {
+                self.done = true;
+                return Some(Err(MatchError::LimitExceeded {
+                    observed: self.emitted + 1,
+                    limit: self.limits.max_matches,
+                }));
+            }
+            self.emitted += 1;
+            return Some(Ok(hit));
         }
-        Ok(matches)
+    }
+}
+
+fn next_regex_candidate(
+    regex: &Regex,
+    haystack: &str,
+    cursor: &mut usize,
+    base: usize,
+) -> Option<Result<Match, MatchError>> {
+    if *cursor > haystack.len() {
+        return None;
+    }
+    let caps = regex.captures_at(haystack, *cursor)?;
+    let whole = caps.get(0)?;
+    if whole.start() == whole.end() {
+        // The sentinel len + 1 prevents a second EOF match. Otherwise
+        // advance one Unicode scalar so a location appears only once.
+        *cursor = if whole.end() == haystack.len() {
+            haystack.len().saturating_add(1)
+        } else {
+            whole.end()
+                + haystack[whole.end()..]
+                    .chars()
+                    .next()
+                    .map_or(0, char::len_utf8)
+        };
+    } else {
+        // Re-search at a non-EOF endpoint so a zero-width match at that
+        // boundary is observable, as D-05 requires.
+        *cursor = if whole.end() == haystack.len() {
+            haystack.len().saturating_add(1)
+        } else {
+            whole.end()
+        };
+    }
+    let groups = caps
+        .iter()
+        .map(|group| group.map(|m| Span::new(TextByte(base + m.start()), TextByte(base + m.end()))))
+        .collect();
+    Some(Ok(Match::new(
+        Span::new(TextByte(base + whole.start()), TextByte(base + whole.end())),
+        groups,
+    )))
+}
+
+/// Borrowed text the iterator searches (exposed for consumer-side
+/// capture-text checks without cloning).
+impl<'t> MatchIter<'t> {
+    #[must_use]
+    pub const fn text(&self) -> &'t str {
+        self.text
     }
 }
 
@@ -409,13 +583,6 @@ fn validate_scope(text: &str, scope: Option<Span<TextByte>>) -> Result<Span<Text
             }
             Ok(scope)
         }
-    }
-}
-
-fn limit_error(limit: usize) -> MatchError {
-    MatchError::LimitExceeded {
-        observed: limit + 1,
-        limit,
     }
 }
 
@@ -520,10 +687,29 @@ mod tests {
         for (index, m) in found.iter().enumerate() {
             assert_eq!(
                 m.span,
-                Span::new(TextByte(2 * index), TextByte(2 * index + 2))
+                Span::new(TextByte(2 * index), TextByte(4 + 2 * index - 2))
             );
-            assert_eq!(m.group_count(), 1);
         }
+        assert_eq!(found[0].group_count(), 1);
+    }
+
+    #[test]
+    fn case_sensitive_literal_handles_multi_byte() {
+        // "é" is two bytes; spans are measured in the searched text, never
+        // derived from pattern length.
+        let matcher = Matcher::new(
+            "éé",
+            MatchOptions {
+                case_sensitive: true,
+                ..MatchOptions::default()
+            },
+            MatchLimits::default(),
+        )
+        .unwrap();
+        let found = matcher.find("xéééé").unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].span, Span::new(TextByte(1), TextByte(5)));
+        assert_eq!(found[1].span, Span::new(TextByte(5), TextByte(9)));
     }
 
     #[test]
@@ -547,6 +733,84 @@ mod tests {
             .find_in("éa", Some(Span::new(TextByte(1), TextByte(3))))
             .expect_err("mid-scalar scope start");
         assert!(matches!(err, MatchError::InvalidScope { offset: 1 }));
+    }
+
+    #[test]
+    fn scoped_regex_whole_word_uses_whole_text_boundaries() {
+        // The scope slice must not redefine word boundaries: "world"
+        // starting inside "helloworld" is never a whole word, even though
+        // the scope slice starts at its own offset zero.
+        let options = MatchOptions {
+            mode: MatchMode::Regex,
+            whole_word: true,
+            ..MatchOptions::default()
+        };
+        let matcher = Matcher::new("world", options, MatchLimits::default()).unwrap();
+        let found = matcher
+            .find_in("helloworld", Some(Span::new(TextByte(5), TextByte(10))))
+            .unwrap();
+        assert!(found.is_empty(), "edge-of-word inside a larger word");
+        let found = matcher
+            .find_in("hello world", Some(Span::new(TextByte(6), TextByte(11))))
+            .unwrap();
+        assert_eq!(found.len(), 1, "same slice content, real boundary");
+    }
+
+    #[test]
+    fn streaming_iterator_and_collect_agree() {
+        let matcher = Matcher::new(
+            "a*",
+            MatchOptions {
+                mode: MatchMode::Regex,
+                ..MatchOptions::default()
+            },
+            MatchLimits::default(),
+        )
+        .unwrap();
+        let text = "ab aca a";
+        let streamed: Vec<(usize, usize)> = matcher
+            .iter_matches(text, None)
+            .unwrap()
+            .map(|item| item.expect("within budget"))
+            .map(|m| (m.span.start.0, m.span.end.0))
+            .collect();
+        let collected: Vec<(usize, usize)> = matcher
+            .find(text)
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.span.start.0, m.span.end.0))
+            .collect();
+        assert_eq!(streamed, collected);
+        assert!(!streamed.is_empty(), "a* always produces empty matches");
+    }
+
+    #[test]
+    fn iterator_budget_is_a_typed_item_then_terminates() {
+        let matcher = Matcher::new(
+            "aa",
+            MatchOptions {
+                case_sensitive: true,
+                ..MatchOptions::default()
+            },
+            MatchLimits { max_matches: 2 },
+        )
+        .unwrap();
+        let items: Vec<_> = matcher.iter_matches("aaaaaa", None).unwrap().collect();
+        assert_eq!(items.len(), 3);
+        assert!(items[0].is_ok() && items[1].is_ok());
+        assert!(matches!(
+            items[2],
+            Err(MatchError::LimitExceeded {
+                observed: 3,
+                limit: 2,
+            })
+        ));
+        // Terminated: no further items after the budget failure.
+        let mut iter = matcher.iter_matches("aaaaaa", None).unwrap();
+        for _ in 0..3 {
+            assert!(iter.next().is_some());
+        }
+        assert!(iter.next().is_none());
     }
 
     #[test]
@@ -625,6 +889,17 @@ mod tests {
                     ..MatchOptions::default()
                 },
                 MatchLimits::default(),
+            )
+            .unwrap()
+            .digest()
+        );
+        // Limits are part of the identity: old plans never change bound.
+        assert_ne!(
+            base,
+            Matcher::new(
+                "abc",
+                MatchOptions::default(),
+                MatchLimits { max_matches: 9 }
             )
             .unwrap()
             .digest()

@@ -6,7 +6,7 @@
 //! is proven against reality, not mocks. This binary is development test
 //! material and is never packaged or installed.
 
-use std::io::{Read, Write, stdout};
+use std::io::{Write, stdout};
 
 use flavite_text_search::protocol::{
     self, FromHelper, ToHelper, encode_reply, read_request, write_frame,
@@ -29,6 +29,7 @@ fn main() {
             )));
             let frame = encode_reply(&reply).expect("small reply");
             let _ = write_frame(&mut out, &frame);
+            let _ = out.flush();
             loop {
                 // Keep serving frames so the parent sees the refusal path.
                 if read_request(&mut reader).is_err() {
@@ -46,7 +47,8 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_secs(3600));
             }
         }
-        // Completes the handshake, accepts, then dies mid-operation.
+        // Completes the handshake, accepts the (validly framed) begin, then
+        // dies mid-operation.
         "die-after-accept" => {
             let message = read_request(&mut reader).expect("handshake");
             assert!(matches!(message, ToHelper::Handshake { .. }));
@@ -57,8 +59,12 @@ fn main() {
             let frame = encode_reply(&reply).expect("small reply");
             let _ = write_frame(&mut out, &frame);
             let _ = out.flush();
-            let _ = read_request(&mut reader).expect("begin");
-            let accepted = FromHelper::Accepted { request_id: 1 };
+            let message = read_request(&mut reader).expect("begin");
+            let request_id = match message {
+                ToHelper::Begin { request_id, .. } => request_id,
+                _ => panic!("die-after-accept expects Begin after handshake"),
+            };
+            let accepted = FromHelper::Accepted { request_id };
             let frame = encode_reply(&accepted).expect("small reply");
             let _ = write_frame(&mut out, &frame);
             let _ = out.flush();

@@ -1,4 +1,4 @@
-//! Literal note Find/Replace host (RFC-0006 S01).
+//! Note Find/Replace host (RFC-0006 S01/S03).
 //!
 //! One host owns the per-view find state, the revision-keyed match pages,
 //! and the replacement flow through the core: every replacement prepares a
@@ -7,35 +7,64 @@
 //! Undo unit. The host never writes text itself; stale or expired plans
 //! surface as user-visible errors without effects.
 //!
-//! S01 keeps the find-side match computation as a bounded host-local
-//! leftmost scan over the open buffer snapshot (the API exposes no
-//! find-spans command yet and the UI must not reach into the
-//! source-search crate). S03 replaces this scan with the
-//! flavite-text-search matcher over the worker protocol; until then the
-//! loop below preserves the same leftmost, non-overlapping walk the
-//! retired `str::match_indices` scan performed, with per-character simple
-//! case folding for the default case-insensitive mode (D-05).
+//! Match computation is admitted through `text.find`; the host keeps only
+//! immutable revision-bound results and never scans or compiles patterns
+//! during a UI update/render turn. Regex work is isolated in the sibling
+//! helper by the vault service (D-14).
 
 use crate::app::App;
 use flavite_api::{ExecutionResult, Invocation, LocalResult, OperationCompletion, Origin};
 use flavite_workspace::TabId;
 use std::collections::BTreeMap;
 
-/// Maximum spans kept per find page; the UI reports the cap honestly.
-pub const MATCH_CAP: usize = 10_000;
-/// S01 literal matching is case-insensitive by default (D-05).
-const CASE_SENSITIVE: bool = false;
+/// S01/S03 default matching is literal and case-insensitive (D-05).
+const DEFAULT_MODE: &str = "literal";
 /// Typed find/replace inputs are bounded like every other host draft.
 const INPUT_LIMIT: usize = 8192;
+/// Must match the core's bounded `text.find` page size.
+const FIND_PAGE_SIZE: u64 = 256;
 /// Shown when a prepared plan can no longer apply (stale/expired).
 const STALE_MESSAGE: &str = "Source changed — search again";
 
 /// Per-view find bar state (the shape the reading host used to own).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct FindState {
     pub focused: bool,
     pub query: String,
     pub index: usize,
+    /// First match ordinal in the currently displayed page.
+    pub page_offset: u64,
+    pub mode: String,
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub pending: Option<u64>,
+    pending_revision: Option<u64>,
+    pending_offset: Option<u64>,
+    pub last_error: Option<String>,
+    /// Scope captured from the editor selection before Find takes focus.
+    /// It is display-only and bound to the revision at capture.
+    pub selection_scope: Option<(u64, usize, usize)>,
+    pub use_selection_scope: bool,
+}
+
+impl Default for FindState {
+    fn default() -> Self {
+        Self {
+            focused: false,
+            query: String::new(),
+            index: 0,
+            page_offset: 0,
+            mode: DEFAULT_MODE.to_owned(),
+            case_sensitive: false,
+            whole_word: false,
+            pending: None,
+            pending_revision: None,
+            pending_offset: None,
+            last_error: None,
+            selection_scope: None,
+            use_selection_scope: false,
+        }
+    }
 }
 
 /// Per-view replace row state. `pending` holds the request id of the
@@ -59,9 +88,27 @@ pub struct CachedMatches {
     pub revision: u64,
     pub query: String,
     pub case_sensitive: bool,
+    pub mode: String,
+    pub whole_word: bool,
+    pub scope: Option<(usize, usize)>,
     pub spans: Vec<(usize, usize)>,
-    /// The scan stopped at [`MATCH_CAP`] because a further match exists.
+    pub offset: u64,
+    /// Exact total proved by the matcher; `spans` contains the returned page.
+    pub total_matches: u64,
+    pub next_offset: Option<u64>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FindSnapshot {
+    buffer_id: u64,
+    revision: u64,
+    query: String,
+    mode: String,
+    case_sensitive: bool,
+    whole_word: bool,
+    scope: Option<(usize, usize)>,
+    offset: u64,
 }
 
 /// Host state: find bars, replace rows, cached match pages, and the
@@ -72,6 +119,8 @@ pub struct NoteSearchHost {
     pub replaces: BTreeMap<TabId, ReplaceState>,
     /// `text.prepare_replace` request ids awaiting completion, per tab.
     pub preparations: BTreeMap<u64, TabId>,
+    /// `text.find` request ids awaiting completion, per tab.
+    pub searches: BTreeMap<u64, TabId>,
     pub matches: BTreeMap<TabId, CachedMatches>,
 }
 
@@ -80,6 +129,7 @@ impl NoteSearchHost {
         self.finds.remove(tab);
         self.replaces.remove(tab);
         self.matches.remove(tab);
+        self.searches.retain(|_, owner| owner != tab);
         self.preparations.retain(|_, owner| owner != tab);
     }
 
@@ -101,6 +151,10 @@ pub enum NoteSearchMessage {
     ReplaceClose(TabId),
     ReplaceQuery { tab: TabId, query: String },
     ReplaceText { tab: TabId, text: String },
+    SetMode { tab: TabId, mode: String },
+    ToggleCaseSensitive(TabId),
+    ToggleWholeWord(TabId),
+    ToggleSelectionScope(TabId),
     ReplaceNext(TabId),
     ReplaceAll(TabId),
 }
@@ -122,7 +176,22 @@ pub fn handle(app: &mut App, message: NoteSearchMessage) -> iced::Task<crate::ap
                 input.focused = false;
                 let _ = app.workspace.acknowledge_interaction(input, &view.text);
             }
-            app.note_search.finds.entry(tab).or_default().focused = true;
+            let captured_scope = app.note_editor_view(tab).and_then(|view| {
+                app.workspace
+                    .tab(&tab)
+                    .and_then(|session| session.interaction().selections.first().copied())
+                    .filter(|selection| selection.anchor != selection.head)
+                    .map(|selection| {
+                        (
+                            view.revision,
+                            selection.anchor.min(selection.head),
+                            selection.anchor.max(selection.head),
+                        )
+                    })
+            });
+            let find = app.note_search.finds.entry(tab).or_default();
+            find.focused = true;
+            find.selection_scope = captured_scope;
             app.refresh_semantics();
             return iced::widget::operation::focus(find_id(tab));
         }
@@ -139,6 +208,11 @@ pub fn handle(app: &mut App, message: NoteSearchMessage) -> iced::Task<crate::ap
                 find.focused = true;
                 find.query = query.clone();
                 find.index = 0;
+                find.page_offset = 0;
+                find.pending = None;
+                find.pending_revision = None;
+                find.pending_offset = None;
+                find.last_error = None;
                 if let Some(replace) = app.note_search.replaces.get_mut(&tab) {
                     replace.query = query;
                     replace.match_count = None;
@@ -149,22 +223,8 @@ pub fn handle(app: &mut App, message: NoteSearchMessage) -> iced::Task<crate::ap
             }
         }
         NoteSearchMessage::FindNext { tab, forward } => {
-            refresh_matches(app, tab);
-            let count = app
-                .note_search
-                .matches
-                .get(&tab)
-                .map_or(0, |cached| cached.spans.len());
-            if count > 0
-                && let Some(find) = app.note_search.finds.get_mut(&tab)
-            {
-                find.index = if forward {
-                    (find.index + 1) % count
-                } else {
-                    (find.index + count - 1) % count
-                };
-                navigate(app, tab);
-            }
+            request_find(app, tab);
+            advance_find(app, tab, forward);
         }
         NoteSearchMessage::ReplaceOpen(tab) => {
             if crate::host::reading::is_edit(app, tab)
@@ -203,6 +263,10 @@ pub fn handle(app: &mut App, message: NoteSearchMessage) -> iced::Task<crate::ap
                 if let Some(find) = app.note_search.finds.get_mut(&tab) {
                     find.query = query;
                     find.index = 0;
+                    find.page_offset = 0;
+                    find.pending = None;
+                    find.pending_revision = None;
+                    find.pending_offset = None;
                 }
                 navigate(app, tab);
             }
@@ -213,6 +277,61 @@ pub fn handle(app: &mut App, message: NoteSearchMessage) -> iced::Task<crate::ap
             {
                 replace.replacement = text;
                 replace.last_error = None;
+            }
+        }
+        NoteSearchMessage::SetMode { tab, mode } => {
+            if matches!(mode.as_str(), "literal" | "regex")
+                && let Some(find) = app.note_search.finds.get_mut(&tab)
+            {
+                find.mode = mode;
+                find.index = 0;
+                find.page_offset = 0;
+                find.pending = None;
+                find.pending_revision = None;
+                find.pending_offset = None;
+                find.last_error = None;
+                if let Some(replace) = app.note_search.replaces.get_mut(&tab) {
+                    replace.plan_id = None;
+                    replace.match_count = None;
+                    replace.last_error = None;
+                }
+                request_find(app, tab);
+            }
+        }
+        NoteSearchMessage::ToggleCaseSensitive(tab) => {
+            if let Some(find) = app.note_search.finds.get_mut(&tab) {
+                find.case_sensitive = !find.case_sensitive;
+                find.index = 0;
+                find.page_offset = 0;
+                find.pending = None;
+                find.pending_revision = None;
+                find.pending_offset = None;
+                find.last_error = None;
+                request_find(app, tab);
+            }
+        }
+        NoteSearchMessage::ToggleWholeWord(tab) => {
+            if let Some(find) = app.note_search.finds.get_mut(&tab) {
+                find.whole_word = !find.whole_word;
+                find.index = 0;
+                find.page_offset = 0;
+                find.pending = None;
+                find.pending_revision = None;
+                find.pending_offset = None;
+                find.last_error = None;
+                request_find(app, tab);
+            }
+        }
+        NoteSearchMessage::ToggleSelectionScope(tab) => {
+            if let Some(find) = app.note_search.finds.get_mut(&tab) {
+                find.use_selection_scope = !find.use_selection_scope;
+                find.pending = None;
+                find.pending_revision = None;
+                find.pending_offset = None;
+                find.index = 0;
+                find.page_offset = 0;
+                find.last_error = None;
+                request_find(app, tab);
             }
         }
         NoteSearchMessage::ReplaceNext(tab) => prepare(app, tab, false),
@@ -230,29 +349,49 @@ pub fn handle(app: &mut App, message: NoteSearchMessage) -> iced::Task<crate::ap
 pub fn matches(app: &App, tab: TabId) -> Option<CachedMatches> {
     let find = app.note_search.finds.get(&tab)?;
     let view = app.note_editor_view(tab)?;
+    let scope = if find.use_selection_scope {
+        let (scope_revision, start, end) = find.selection_scope?;
+        if scope_revision != view.revision {
+            return None;
+        }
+        Some((start, end))
+    } else {
+        None
+    };
     if let Some(cached) = app.note_search.matches.get(&tab)
         && cached.revision == view.revision
         && cached.query == find.query
-        && cached.case_sensitive == CASE_SENSITIVE
+        && cached.case_sensitive == find.case_sensitive
+        && cached.mode == find.mode
+        && cached.whole_word == find.whole_word
+        && cached.scope == scope
+        && cached.offset == find.page_offset
     {
         return Some(cached.clone());
     }
-    let (spans, truncated) = scan(&view.text, &find.query, CASE_SENSITIVE);
-    Some(CachedMatches {
-        revision: view.revision,
-        query: find.query.clone(),
-        case_sensitive: CASE_SENSITIVE,
-        spans,
-        truncated,
-    })
+    None
 }
 
-/// Recompute and store the match page for the tab's current find state.
-fn refresh_matches(app: &mut App, tab: TabId) {
+/// Admit the current find request through the bounded core worker. An old
+/// completion is accepted only while query/options/revision still match.
+fn request_find(app: &mut App, tab: TabId) {
     let Some(view) = app.note_editor_view(tab) else {
         app.note_search.matches.remove(&tab);
         return;
     };
+    if app
+        .note_search
+        .matches
+        .get(&tab)
+        .is_some_and(|cached| cached.revision != view.revision)
+        && let Some(find) = app.note_search.finds.get_mut(&tab)
+    {
+        find.page_offset = 0;
+        find.index = 0;
+        find.pending = None;
+        find.pending_revision = None;
+        find.pending_offset = None;
+    }
     let Some(query) = app
         .note_search
         .finds
@@ -261,36 +400,368 @@ fn refresh_matches(app: &mut App, tab: TabId) {
     else {
         return;
     };
-    let (spans, truncated) = scan(&view.text, &query, CASE_SENSITIVE);
-    app.note_search.matches.insert(
-        tab,
-        CachedMatches {
-            revision: view.revision,
-            query,
-            case_sensitive: CASE_SENSITIVE,
-            spans,
-            truncated,
-        },
-    );
+    let Some((
+        mode,
+        case_sensitive,
+        whole_word,
+        pending,
+        pending_revision,
+        pending_offset,
+        page_offset,
+        selection_scope,
+        use_selection_scope,
+    )) = app.note_search.finds.get(&tab).map(|find| {
+        (
+            find.mode.clone(),
+            find.case_sensitive,
+            find.whole_word,
+            find.pending,
+            find.pending_revision,
+            find.pending_offset,
+            find.page_offset,
+            find.selection_scope,
+            find.use_selection_scope,
+        )
+    })
+    else {
+        return;
+    };
+    let scope = if use_selection_scope {
+        let Some((scope_revision, start, end)) = selection_scope else {
+            if let Some(find) = app.note_search.finds.get_mut(&tab) {
+                find.last_error =
+                    Some("Select text before opening Find to scope the search".into());
+            }
+            return;
+        };
+        if scope_revision != view.revision {
+            if let Some(find) = app.note_search.finds.get_mut(&tab) {
+                find.last_error =
+                    Some("The selected source changed; reopen Find to refresh its scope".into());
+            }
+            return;
+        }
+        Some((start, end))
+    } else {
+        None
+    };
+    if query.is_empty() && mode == "literal" {
+        app.note_search.matches.insert(
+            tab,
+            CachedMatches {
+                revision: view.revision,
+                query,
+                case_sensitive,
+                mode,
+                whole_word,
+                scope,
+                spans: Vec::new(),
+                offset: 0,
+                total_matches: 0,
+                next_offset: None,
+                truncated: false,
+            },
+        );
+        if let Some(find) = app.note_search.finds.get_mut(&tab) {
+            find.pending = None;
+            find.pending_revision = None;
+            find.pending_offset = None;
+            find.last_error = None;
+        }
+        return;
+    }
+    if let Some(cached) = app.note_search.matches.get(&tab)
+        && cached.revision == view.revision
+        && cached.query == query
+        && cached.mode == mode
+        && cached.case_sensitive == case_sensitive
+        && cached.whole_word == whole_word
+        && cached.scope == scope
+        && cached.offset == page_offset
+    {
+        return;
+    }
+    if pending.is_some() {
+        if pending_revision == Some(view.revision) && pending_offset == Some(page_offset) {
+            return;
+        }
+        if let Some(find) = app.note_search.finds.get_mut(&tab) {
+            find.pending = None;
+            find.pending_revision = None;
+            find.pending_offset = None;
+        }
+    }
+    let Some(api) = app.flavite.as_ref() else {
+        return;
+    };
+    let request_id = api.command_registry().next_request_id();
+    let result = api.execute(Invocation::new(
+        request_id,
+        "text.find",
+        serde_json::json!({
+            "buffer_id": view.buffer_id,
+            "revision": view.revision,
+            "query": query,
+            "mode": mode,
+            "case_sensitive": case_sensitive,
+            "whole_word": whole_word,
+            "scope": scope,
+            "offset": page_offset,
+        }),
+        Origin::Gui,
+    ));
+    match result {
+        ExecutionResult::Pending { request_id } => {
+            app.operations.accept(request_id, "note.find");
+            app.note_search.searches.insert(request_id, tab);
+            if let Some(find) = app.note_search.finds.get_mut(&tab) {
+                find.pending = Some(request_id);
+                find.pending_revision = Some(view.revision);
+                find.pending_offset = Some(page_offset);
+            }
+        }
+        ExecutionResult::Local(LocalResult::Success(success)) => {
+            install_find_result(
+                app,
+                tab,
+                &FindSnapshot {
+                    buffer_id: view.buffer_id,
+                    revision: view.revision,
+                    query: query.clone(),
+                    mode: mode.clone(),
+                    case_sensitive,
+                    whole_word,
+                    scope,
+                    offset: page_offset,
+                },
+                &success.data,
+            );
+        }
+        ExecutionResult::Local(LocalResult::Error(error)) => {
+            if let Some(find) = app.note_search.finds.get_mut(&tab) {
+                find.last_error = Some(error.message.clone());
+            }
+        }
+        ExecutionResult::Rejected(rejected) => {
+            if let Some(find) = app.note_search.finds.get_mut(&tab) {
+                find.last_error = Some(rejection_message(
+                    rejected.reason == flavite_api::RejectionReason::StaleRevision,
+                    rejected.message.as_deref(),
+                ));
+            }
+        }
+        _ => {
+            if let Some(find) = app.note_search.finds.get_mut(&tab) {
+                find.last_error = Some("Find could not be admitted; retry".into());
+            }
+        }
+    }
 }
 
-/// Navigation selects a display range through the workspace (never an
-/// editor write) and records a content anchor for read-mode scrolling.
-fn navigate(app: &mut App, tab: TabId) {
-    refresh_matches(app, tab);
+fn install_find_result(
+    app: &mut App,
+    tab: TabId,
+    request: &FindSnapshot,
+    data: &serde_json::Value,
+) {
     let Some(view) = app.note_editor_view(tab) else {
         return;
     };
     let Some(find) = app.note_search.finds.get(&tab) else {
         return;
     };
-    let Some(cached) = app.note_search.matches.get(&tab) else {
+    let current_scope = if find.use_selection_scope {
+        find.selection_scope.map(|(_, start, end)| (start, end))
+    } else {
+        None
+    };
+    if view.buffer_id != request.buffer_id
+        || view.revision != request.revision
+        || find.query != request.query
+        || find.mode != request.mode
+        || find.case_sensitive != request.case_sensitive
+        || find.whole_word != request.whole_word
+        || find.page_offset != request.offset
+        || current_scope != request.scope
+        || data.get("buffer_id").and_then(serde_json::Value::as_u64) != Some(request.buffer_id)
+        || data.get("revision").and_then(serde_json::Value::as_u64) != Some(request.revision)
+    {
+        return;
+    }
+    let Some(raw_spans) = data.get("spans").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let mut spans = Vec::with_capacity(raw_spans.len());
+    for raw in raw_spans {
+        let Some(pair) = raw.as_array() else {
+            return;
+        };
+        if pair.len() != 2 {
+            return;
+        }
+        let (Some(start), Some(end)) = (pair[0].as_u64(), pair[1].as_u64()) else {
+            return;
+        };
+        let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
+            return;
+        };
+        if start > end
+            || end > view.text.len()
+            || !view.text.is_char_boundary(start)
+            || !view.text.is_char_boundary(end)
+            || spans
+                .last()
+                .is_some_and(|(_, previous_end)| *previous_end > start)
+        {
+            return;
+        }
+        spans.push((start, end));
+    }
+    let Some(total_matches) = data
+        .get("total_matches")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return;
+    };
+    let Some(offset) = data.get("offset").and_then(serde_json::Value::as_u64) else {
+        return;
+    };
+    let next_offset = match data.get("next_offset") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(value) => value.as_u64(),
+    };
+    let Some(next_offset_value) = next_offset else {
+        if !data
+            .get("next_offset")
+            .is_some_and(serde_json::Value::is_null)
+        {
+            return;
+        }
+        if offset != request.offset || offset > total_matches {
+            return;
+        }
+        let end = offset.saturating_add(u64::try_from(spans.len()).unwrap_or(u64::MAX));
+        let expected_next = (end < total_matches).then_some(end);
+        if expected_next.is_some()
+            || data.get("truncated").and_then(serde_json::Value::as_bool) != Some(false)
+        {
+            return;
+        }
+        app.note_search.matches.insert(
+            tab,
+            CachedMatches {
+                revision: request.revision,
+                query: request.query.clone(),
+                case_sensitive: request.case_sensitive,
+                mode: request.mode.clone(),
+                whole_word: request.whole_word,
+                scope: request.scope,
+                spans,
+                offset,
+                total_matches,
+                next_offset: None,
+                truncated: false,
+            },
+        );
+        if let Some(find) = app.note_search.finds.get_mut(&tab) {
+            find.last_error = None;
+        }
+        return;
+    };
+    let end = offset.saturating_add(u64::try_from(spans.len()).unwrap_or(u64::MAX));
+    let truncated = true;
+    if offset != request.offset
+        || end > total_matches
+        || next_offset_value != end
+        || data.get("truncated").and_then(serde_json::Value::as_bool) != Some(truncated)
+    {
+        return;
+    }
+    app.note_search.matches.insert(
+        tab,
+        CachedMatches {
+            revision: request.revision,
+            query: request.query.clone(),
+            case_sensitive: request.case_sensitive,
+            mode: request.mode.clone(),
+            whole_word: request.whole_word,
+            scope: request.scope,
+            spans,
+            offset,
+            total_matches,
+            next_offset: Some(next_offset_value),
+            truncated,
+        },
+    );
+    if let Some(find) = app.note_search.finds.get_mut(&tab) {
+        find.last_error = None;
+    }
+}
+
+/// Navigation selects a display range through the workspace (never an
+/// editor write) and records a content anchor for read-mode scrolling.
+fn advance_find(app: &mut App, tab: TabId, forward: bool) {
+    let Some(page) = matches(app, tab) else {
+        return;
+    };
+    if page.spans.is_empty() {
+        return;
+    }
+    let Some(find) = app.note_search.finds.get_mut(&tab) else {
+        return;
+    };
+    if forward && find.index + 1 < page.spans.len() {
+        find.index += 1;
+        navigate(app, tab);
+        return;
+    }
+    if !forward && find.index > 0 {
+        find.index -= 1;
+        navigate(app, tab);
+        return;
+    }
+
+    if forward {
+        if let Some(next) = page.next_offset {
+            find.page_offset = next;
+            find.index = 0;
+        } else {
+            find.page_offset = 0;
+            find.index = 0;
+        }
+    } else if page.offset > 0 {
+        find.page_offset = page.offset.saturating_sub(FIND_PAGE_SIZE);
+        find.index = usize::try_from(FIND_PAGE_SIZE.saturating_sub(1)).unwrap_or(usize::MAX);
+    } else {
+        let last_ordinal = page.total_matches.saturating_sub(1);
+        find.page_offset = last_ordinal / FIND_PAGE_SIZE * FIND_PAGE_SIZE;
+        find.index =
+            usize::try_from(last_ordinal.saturating_sub(find.page_offset)).unwrap_or(usize::MAX);
+    }
+    find.pending = None;
+    find.pending_revision = None;
+    find.pending_offset = None;
+    request_find(app, tab);
+    navigate(app, tab);
+}
+
+fn navigate(app: &mut App, tab: TabId) {
+    request_find(app, tab);
+    let Some(view) = app.note_editor_view(tab) else {
+        return;
+    };
+    let Some(find) = app.note_search.finds.get(&tab) else {
+        return;
+    };
+    let Some(cached) = matches(app, tab) else {
         return;
     };
     if cached.spans.is_empty() {
         return;
     }
-    let (at, end) = cached.spans[find.index % cached.spans.len()];
+    let Some(&(at, end)) = cached.spans.get(find.index) else {
+        return;
+    };
     let _ = app
         .workspace
         .set_display_selection(tab, at, end, view.revision, &view.text);
@@ -318,21 +789,34 @@ fn prepare(app: &mut App, tab: TabId, all: bool) {
     else {
         return;
     };
-    if query.is_empty() {
+    let replacement = state.replacement.clone();
+    request_find(app, tab);
+    let options = app.note_search.finds.get(&tab).cloned().unwrap_or_default();
+    if query.is_empty() && options.mode == "literal" {
         app.status = "Type text to find before replacing".into();
         return;
     }
-    let replacement = state.replacement.clone();
-    refresh_matches(app, tab);
-    let mut scope: Option<(usize, usize)> = None;
+    let mut scope = options
+        .use_selection_scope
+        .then(|| options.selection_scope.map(|(_, start, end)| (start, end)))
+        .flatten();
+    if options.use_selection_scope
+        && options
+            .selection_scope
+            .is_none_or(|(scope_revision, _, _)| scope_revision != view.revision)
+    {
+        app.status = "The selected source changed; reopen Find to refresh its scope".into();
+        return;
+    }
     if !all {
         let caret = app
             .workspace
             .tab(&tab)
             .and_then(|session| session.interaction().selections.first().copied())
             .map_or(0, |selection| selection.anchor.min(selection.head));
-        let cached = app.note_search.matches.get(&tab);
+        let cached = matches(app, tab);
         let next = cached
+            .as_ref()
             .and_then(|cached| {
                 cached
                     .spans
@@ -340,9 +824,17 @@ fn prepare(app: &mut App, tab: TabId, all: bool) {
                     .copied()
                     .find(|(start, _)| *start >= caret)
             })
-            .or_else(|| cached.and_then(|cached| cached.spans.first().copied()));
+            .or_else(|| {
+                cached
+                    .as_ref()
+                    .and_then(|cached| cached.spans.first().copied())
+            });
         let Some(span) = next else {
-            app.status = format!("No matches for \"{query}\"");
+            app.status = if options.pending.is_some() {
+                "Waiting for current find results…".into()
+            } else {
+                format!("No matches for \"{query}\"")
+            };
             return;
         };
         scope = Some(span);
@@ -359,8 +851,9 @@ fn prepare(app: &mut App, tab: TabId, all: bool) {
             "revision": view.revision,
             "query": query,
             "replacement": replacement,
-            "case_sensitive": CASE_SENSITIVE,
-            "whole_word": false,
+            "mode": options.mode,
+            "case_sensitive": options.case_sensitive,
+            "whole_word": options.whole_word,
             "scope": scope,
         }),
         Origin::Gui,
@@ -503,6 +996,69 @@ fn apply_plan(app: &mut App, tab: TabId, prepared: &serde_json::Value) {
 /// the still-mounted view, or is dropped without effects when the row
 /// closed or the tab disappeared while the worker ran.
 pub fn completion(app: &mut App, completion: &OperationCompletion) -> bool {
+    if let Some(tab) = app.note_search.searches.remove(&completion.request_id) {
+        if app.workspace.tab(&tab).is_none() {
+            return true;
+        }
+        let Some(find) = app.note_search.finds.get_mut(&tab) else {
+            return true;
+        };
+        if find.pending != Some(completion.request_id) {
+            return true;
+        }
+        let pending_offset = find.pending_offset;
+        find.pending = None;
+        find.pending_revision = None;
+        find.pending_offset = None;
+        match &completion.result {
+            ExecutionResult::Local(LocalResult::Success(success)) => {
+                let Some(view) = app.note_editor_view(tab) else {
+                    return true;
+                };
+                let Some(find) = app.note_search.finds.get(&tab).cloned() else {
+                    return true;
+                };
+                install_find_result(
+                    app,
+                    tab,
+                    &FindSnapshot {
+                        buffer_id: view.buffer_id,
+                        revision: view.revision,
+                        query: find.query,
+                        mode: find.mode,
+                        case_sensitive: find.case_sensitive,
+                        whole_word: find.whole_word,
+                        scope: find
+                            .use_selection_scope
+                            .then(|| find.selection_scope.map(|(_, start, end)| (start, end)))
+                            .flatten(),
+                        offset: pending_offset.unwrap_or(find.page_offset),
+                    },
+                    &success.data,
+                );
+                navigate(app, tab);
+            }
+            ExecutionResult::Local(LocalResult::Error(error)) => {
+                if let Some(find) = app.note_search.finds.get_mut(&tab) {
+                    find.last_error = Some(error.message.clone());
+                }
+            }
+            ExecutionResult::Rejected(rejected) => {
+                if let Some(find) = app.note_search.finds.get_mut(&tab) {
+                    find.last_error = Some(rejection_message(
+                        rejected.reason == flavite_api::RejectionReason::StaleRevision,
+                        rejected.message.as_deref(),
+                    ));
+                }
+            }
+            _ => {
+                if let Some(find) = app.note_search.finds.get_mut(&tab) {
+                    find.last_error = Some("Find result is stale; search again".into());
+                }
+            }
+        }
+        return true;
+    }
     let Some(&tab) = app.note_search.preparations.get(&completion.request_id) else {
         return false;
     };
@@ -572,6 +1128,13 @@ pub fn sync(app: &mut App) {
     app.note_search
         .preparations
         .retain(|_, tab| app.workspace.tab(tab).is_some());
+    app.note_search
+        .searches
+        .retain(|_, tab| app.workspace.tab(tab).is_some());
+    let tabs: Vec<TabId> = app.note_search.finds.keys().copied().collect();
+    for tab in tabs {
+        request_find(app, tab);
+    }
 }
 
 /// Whether a find or replace input owns typing: the editor keyboard is
@@ -614,124 +1177,5 @@ fn plan_error(code: &str) -> String {
         format!("{STALE_MESSAGE} (the prepared plan expired)")
     } else {
         format!("Replacement needs attention ({code})")
-    }
-}
-
-/// One bounded leftmost literal scan over the snapshot text. The loop
-/// preserves the leftmost, non-overlapping walk of the retired
-/// `str::match_indices` scan; spans are recorded in original text bytes
-/// (case folding can change byte widths, so span ends are never derived
-/// from the query length). Also drives the read view's find highlights so
-/// both surfaces fold identically.
-pub(crate) fn scan(text: &str, query: &str, case_sensitive: bool) -> (Vec<(usize, usize)>, bool) {
-    let mut spans = Vec::new();
-    if query.is_empty() {
-        return (spans, false);
-    }
-    if case_sensitive {
-        let mut start = 0;
-        while let Some(at) = text[start..].find(query) {
-            let at = start + at;
-            let end = at + query.len();
-            if spans.len() == MATCH_CAP {
-                return (spans, true);
-            }
-            spans.push((at, end));
-            start = end;
-        }
-        return (spans, false);
-    }
-    let query_chars: Vec<char> = query.chars().collect();
-    let mut start = 0;
-    while start < text.len() {
-        let mut at = start;
-        let mut matched = true;
-        for &expected in &query_chars {
-            let Some(actual) = text[at..].chars().next() else {
-                matched = false;
-                break;
-            };
-            if !fold_eq(actual, expected) {
-                matched = false;
-                break;
-            }
-            at += actual.len_utf8();
-        }
-        if matched {
-            if spans.len() == MATCH_CAP {
-                return (spans, true);
-            }
-            spans.push((start, at));
-            start = at;
-        } else {
-            start += text[start..].chars().next().map_or(1, char::len_utf8);
-        }
-    }
-    (spans, false)
-}
-
-/// Simple case folding equality for one character pair.
-fn fold_eq(actual: char, expected: char) -> bool {
-    let mut actual_folded = actual.to_lowercase();
-    let mut expected_folded = expected.to_lowercase();
-    loop {
-        match (actual_folded.next(), expected_folded.next()) {
-            (None, None) => return true,
-            (Some(a), Some(b)) if a == b => continue,
-            _ => return false,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scan_is_leftmost_non_overlapping_in_byte_offsets() {
-        let (spans, truncated) = scan("ab ab ab", "ab", true);
-        assert_eq!(spans, vec![(0, 2), (3, 5), (6, 8)]);
-        assert!(!truncated);
-        // Overlapping candidates never repeat: "aa" in "aaa" matches once.
-        let (spans, _) = scan("aaa", "aa", true);
-        assert_eq!(spans, vec![(0, 2)]);
-        // Non-overlap advance is by match length, not one char.
-        let (spans, _) = scan("aaaa", "aa", true);
-        assert_eq!(spans, vec![(0, 2), (2, 4)]);
-    }
-
-    #[test]
-    fn scan_folds_case_and_keeps_original_byte_widths() {
-        // Simple folding folds each char; ß never equals "ss" (D-05). The
-        // second span starts at byte 9: "Straße" is 7 bytes (ß is 2), so
-        // span ends are original text bytes, not query-derived.
-        let (spans, _) = scan("Straße STRASSE", "TRA", false);
-        assert_eq!(spans, vec![(1, 4), (9, 12)]);
-        let (spans, _) = scan("Straße", "strasse", false);
-        assert!(spans.is_empty(), "ß does not fold to ss");
-        let (spans, _) = scan("Héllo héllo", "HÉLLO", false);
-        assert_eq!(spans, vec![(0, 6), (7, 13)], "é is 2 bytes");
-        // Composed vs decomposed accents stay distinct (no normalization).
-        let (spans, _) = scan("e\u{301}l", "é", false);
-        assert!(spans.is_empty());
-    }
-
-    #[test]
-    fn scan_reports_truncation_honestly_at_the_cap() {
-        let text = "x".repeat(MATCH_CAP + 1);
-        let (spans, truncated) = scan(&text, "x", true);
-        assert_eq!(spans.len(), MATCH_CAP);
-        assert!(truncated);
-        let text = "x".repeat(MATCH_CAP);
-        let (spans, truncated) = scan(&text, "x", true);
-        assert_eq!(spans.len(), MATCH_CAP);
-        assert!(!truncated, "exactly the cap is not a truncation");
-    }
-
-    #[test]
-    fn scan_empty_query_is_idle() {
-        let (spans, truncated) = scan("anything", "", true);
-        assert!(spans.is_empty());
-        assert!(!truncated);
     }
 }

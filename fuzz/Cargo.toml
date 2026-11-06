@@ -31,6 +31,7 @@ flavite-vault = { path = "../crates/flavite-vault" }
 flavite-workspace = { path = "../crates/flavite-workspace" }
 flavite-graph = { path = "../crates/flavite-graph" }
 flavite-encoding = { path = "../crates/flavite-encoding" }
+flavite-text-search = { path = "../crates/flavite-text-search" }
 serde_json = "1"
 
 [[bin]]
@@ -40,6 +41,14 @@ path = "fuzz_targets/parser.rs"
 [[bin]]
 name = "encoding"
 path = "fuzz_targets/encoding.rs"
+
+[[bin]]
+name = "text_match"
+path = "fuzz_targets/text_match.rs"
+
+[[bin]]
+name = "text_worker_protocol"
+path = "fuzz_targets/text_worker_protocol.rs"
 
 [[bin]]
 name = "image_limits"

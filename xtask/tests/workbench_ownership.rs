@@ -60,7 +60,8 @@ fn workspace_edges(metadata: &serde_json::Value) -> Edges {
 fn ownership_violations(edges: &Edges) -> Vec<String> {
     let mut violations = Vec::new();
     // Canonical consumers: encoding sits below syntax/buffer/vault/api/index;
-    // source-search is consumed only by vault and the api facade (§4).
+    // Source-search is consumed by the vault/API facade and the isolated
+    // matcher helper (§4 and §6.2).
     let encoding_consumers = [
         "flavite-syntax",
         "flavite-buffer",
@@ -68,7 +69,7 @@ fn ownership_violations(edges: &Edges) -> Vec<String> {
         "flavite-api",
         "flavite-index",
     ];
-    let search_consumers = ["flavite-vault", "flavite-api"];
+    let search_consumers = ["flavite-vault", "flavite-api", "flavite-text-search-worker"];
     for (from, to) in edges {
         for target in to {
             match (target.as_str(), from.as_str()) {

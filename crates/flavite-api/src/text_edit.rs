@@ -1,12 +1,14 @@
-//! Typed replacement commands (RFC-0006 S01; §6.1 v2 protocol):
-//! `text.prepare_replace` and `text.apply_replace`.
+//! Typed replacement and find commands (RFC-0006 S01/S03; §6.1 v2
+//! protocol): `text.find`, `text.prepare_replace` and `text.apply_replace`.
 //!
 //! The public API accepts a match plan/token, never client-supplied
 //! "trusted" offsets from a previous preview. Prepare is a bounded
 //! read-only computation (ReadNotes) returning a core-issued plan bound to
 //! the exact buffer revision; apply is WriteNotes on the actual source and
 //! installs the plan as one revision-guarded, isolated Undo batch (D-06).
-//! Regex capability is absent until S03; the mode is literal only.
+//! `text.find` (S03) is the read-only span page for the current buffer:
+//! the same case/word/regex options as replacement, literal in-process and
+//! regex in the isolated helper (D-14), revision-bound results.
 
 use crate::command::Invocation;
 use crate::flavite::decode;
@@ -33,6 +35,31 @@ pub struct PrepareReplaceArgs {
     pub case_sensitive: bool,
     #[serde(default)]
     pub whole_word: bool,
+    /// Optional frozen scope as half-open `TextByte` offsets at `revision`.
+    pub scope: Option<(usize, usize)>,
+}
+
+/// Arguments for `text.find` (S03).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FindArgs {
+    pub buffer_id: u64,
+    /// The exact revision the page is bound to; results never mix
+    /// revisions (D-05/D-06).
+    pub revision: u64,
+    /// Literal or regex query. An empty query is Idle (D-05) and refused
+    /// as a typed no-effect error.
+    pub query: String,
+    /// Match mode: `literal` (default) or `regex`.
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub whole_word: bool,
+    /// Zero-based continuation ordinal returned by the previous page.
+    /// Omitted for the first page.
+    #[serde(default)]
+    pub offset: u64,
     /// Optional frozen scope as half-open `TextByte` offsets at `revision`.
     pub scope: Option<(usize, usize)>,
 }
@@ -70,6 +97,29 @@ pub(crate) fn handle_prepare_replace(
     }))
 }
 
+/// `text.find` (ReadNotes): no mutation; the page is computed on a bounded
+/// worker against the exact revision and completed through the normal
+/// pending-result routing.
+pub(crate) fn handle_find(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: FindArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::FindMatches {
+        request_id: invocation.request_id,
+        request: flavite_vault::text_edit::FindRequest {
+            buffer_id: BufferId::from(args.buffer_id),
+            revision: Revision::new(args.revision),
+            query: args.query,
+            mode: decode_mode(args.mode.as_deref())?,
+            case_sensitive: args.case_sensitive,
+            whole_word: args.whole_word,
+            offset: args.offset,
+            scope: args.scope,
+        },
+    }))
+}
+
 /// `text.apply_replace` (WriteNotes on source): installs the prepared
 /// candidate once, under the exact revision precondition, as one isolated
 /// Undo unit. Duplicate requests replay the same receipt (§6.9).
@@ -91,9 +141,7 @@ fn decode_mode(value: Option<&str>) -> Result<flavite_text_search::matcher::Matc
     match value.unwrap_or("literal") {
         "literal" => Ok(flavite_text_search::matcher::MatchMode::Literal),
         "regex" => Ok(flavite_text_search::matcher::MatchMode::Regex),
-        other => Err(format!(
-            "mode must be `literal` or `regex`, got {other}"
-        )),
+        other => Err(format!("mode must be `literal` or `regex`, got {other}")),
     }
 }
 

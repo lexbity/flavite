@@ -38,14 +38,19 @@ pub mod matcher;
 pub mod protocol;
 pub mod template;
 
+// Canonical coordinate types are re-exported so consumers (the helper and
+// the core adapters) use the SAME `flavite-syntax` span types instead of
+// reaching for a direct syntax dependency or inventing offsets (§4.1).
+pub use flavite_syntax::{Span, TextByte};
+
 pub use matcher::{
-    DEFAULT_MAX_MATCHES, MATCH_SEMANTICS_VERSION, Match, MatchError, MatchLimits, MatchMode,
-    MatchOptions, MatchPage, Matcher, PATTERN_MAX_BYTES, REGEX_MAX_GROUPS, REGEX_SIZE_LIMIT_BYTES,
-    select_ordinals,
+    DEFAULT_MAX_MATCHES, MATCH_SEMANTICS_VERSION, Match, MatchError, MatchIter, MatchLimits,
+    MatchMode, MatchOptions, MatchPage, Matcher, PATTERN_MAX_BYTES, REGEX_MAX_GROUPS,
+    REGEX_SIZE_LIMIT_BYTES, select_ordinals,
 };
 pub use protocol::{
-    FRAME_MAX_BYTES, FailureCode, FromHelper, FrameError, SOURCE_MAX_BYTES, ToHelper, WireMatch,
-    decode, decode_reply, encode, encode_reply, engine_version, read_reply, read_request,
-    write_frame,
+    FRAME_MAX_BYTES, FailureCode, FrameError, FromHelper, PROTOCOL_VERSION, RequestKind,
+    SOURCE_MAX_BYTES, ToHelper, WireMatch, decode, decode_reply, encode, encode_reply,
+    engine_version, read_reply, read_request, write_frame,
 };
 pub use template::{ReplacementTemplate, TEMPLATE_MAX_BYTES, TemplateError, TemplateGrammar};

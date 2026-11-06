@@ -44,7 +44,16 @@ while keeping independent carets, selections, and scroll positions.
   and a footer showing buffer state: Saved / Unsaved changes / Conflict /
   Missing on disk.
 - **Find within note** (Mod+F): query field, match counter, previous/next;
-  editor input is disabled while find is focused.
+  editor input is disabled while find is focused. Find defaults to literal,
+  case-insensitive matching; the Regex control enables Rust-regex syntax and
+  capture replacements (`$0`, `$1`, `${name}`, `$$`). Whole-word and frozen
+  selection-scope controls apply to either mode. Match pages continue across
+  the full note instead of stopping at the first page.
+- **Replace** expands the Find bar with Replace next and Replace all. A
+  replacement is prepared against the current buffer revision and becomes one
+  Undo step. Regex work requires the `flavite-text-search-worker` executable
+  beside `flavite`/`flavite-cli`; if it is missing or incompatible, Regex shows
+  an actionable availability error while literal Find remains available.
 - Links: clicking a wikilink opens the target, creating the note if it does
   not exist (pre-filled from the link).
 - Saving: Mod+S saves; saves are atomic (temp file + replace) through the
@@ -161,6 +170,7 @@ Remappable in Preferences.
 | Mod+S | Save note |
 | Mod+E | Toggle Edit/Read |
 | Mod+F | Find in current note |
+| Mod+H | Open Find/Replace in current note |
 | Mod+P | Quick switch (open note) |
 | Mod+Shift+P | Command palette |
 | Mod+N | New note… |

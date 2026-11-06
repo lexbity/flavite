@@ -206,30 +206,34 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
     if let Some(find) = app.note_search.finds.get(&tab) {
         let page = crate::host::note_search::matches(app, tab);
         let total = page.as_ref().map_or(0, |page| page.spans.len());
-        let truncated = page.as_ref().is_some_and(|page| page.truncated);
+        let total_matches = page.as_ref().map_or(0, |page| page.total_matches);
         // Empty query is Idle (D-05): no counts are presented at all.
         let counts = if find.query.is_empty() {
             String::new()
-        } else if truncated {
+        } else if find.pending.is_some() {
+            "Searching…".to_owned()
+        } else if let Some(page) = &page {
+            let current = if total == 0 {
+                0
+            } else {
+                page.offset
+                    .saturating_add(find.index as u64)
+                    .saturating_add(1)
+            };
+            let first = page.offset.saturating_add(1);
+            let last = page.offset.saturating_add(total as u64);
             format!(
-                "{} / 10,000+",
-                if total == 0 {
-                    0
+                "{current} / {total_matches} · page {first}–{last}{}",
+                if page.next_offset.is_some() {
+                    " · Next continues"
                 } else {
-                    find.index % total + 1
+                    ""
                 }
             )
         } else {
-            format!(
-                "{} / {}",
-                if total == 0 {
-                    0
-                } else {
-                    find.index % total + 1
-                },
-                total
-            )
+            format!("0 / {total_matches}")
         };
+        let find_status = find.last_error.as_deref().unwrap_or("");
         let replace_open = app.note_search.replaces.contains_key(&tab);
         content = content.push(
             container(
@@ -251,6 +255,46 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                             },
                         )),
                     text(counts).size(12),
+                    button(if find.mode == "regex" {
+                        "Regex"
+                    } else {
+                        "Literal"
+                    })
+                    .style(style::ghost())
+                    .on_press(Message::NoteSearch(
+                        crate::host::note_search::NoteSearchMessage::SetMode {
+                            tab,
+                            mode: if find.mode == "regex" {
+                                "literal"
+                            } else {
+                                "regex"
+                            }
+                            .into(),
+                        },
+                    )),
+                    button(if find.case_sensitive { "Aa" } else { "aA" })
+                        .style(style::ghost())
+                        .on_press(Message::NoteSearch(
+                            crate::host::note_search::NoteSearchMessage::ToggleCaseSensitive(tab),
+                        )),
+                    button(if find.whole_word {
+                        "Whole word ✓"
+                    } else {
+                        "Whole word"
+                    })
+                    .style(style::ghost())
+                    .on_press(Message::NoteSearch(
+                        crate::host::note_search::NoteSearchMessage::ToggleWholeWord(tab),
+                    )),
+                    button(if find.use_selection_scope {
+                        "Selection only ✓"
+                    } else {
+                        "Selection only"
+                    })
+                    .style(style::ghost())
+                    .on_press(Message::NoteSearch(
+                        crate::host::note_search::NoteSearchMessage::ToggleSelectionScope(tab),
+                    )),
                     button("Previous")
                         .style(style::ghost())
                         .on_press(Message::NoteSearch(
@@ -288,6 +332,9 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             )
             .padding(8),
         );
+        if !find_status.is_empty() {
+            content = content.push(text(find_status).size(12));
+        }
         if let Some(replace) = app.note_search.replaces.get(&tab) {
             let status = if let Some(error) = &replace.last_error {
                 error.clone()

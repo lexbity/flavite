@@ -205,12 +205,6 @@ fn inline<'a>(
     bold: bool,
 ) -> Element<'a, Message> {
     let mut spans: Vec<iced::widget::text::Span<'a, Message>> = Vec::new();
-    let query = app
-        .note_search
-        .finds
-        .get(&tab)
-        .map(|find| find.query.as_str())
-        .filter(|query| !query.is_empty());
     if nodes.iter().any(contains_embed) {
         let mut flow = EmbedFlow {
             app,
@@ -227,7 +221,6 @@ fn inline<'a>(
                 italic: false,
                 strike: false,
                 link: None,
-                query,
                 scheme: app.appearance.scheme(),
             },
         );
@@ -244,7 +237,6 @@ fn inline<'a>(
                 italic: false,
                 strike: false,
                 link: None,
-                query,
                 scheme: app.appearance.scheme(),
             },
             &mut spans,
@@ -259,12 +251,11 @@ fn inline<'a>(
         .into()
 }
 #[derive(Clone, Copy)]
-struct InlineStyle<'q> {
+struct InlineStyle {
     bold: bool,
     italic: bool,
     strike: bool,
     link: Option<usize>,
-    query: Option<&'q str>,
     /// The active scheme, so highlights derive from the live palette.
     scheme: crate::style::Scheme,
 }
@@ -295,7 +286,7 @@ impl<'a> EmbedFlow<'a> {
             );
         }
     }
-    fn walk(&mut self, nodes: &'a [ReadNode], style: InlineStyle<'_>) {
+    fn walk(&mut self, nodes: &'a [ReadNode], style: InlineStyle) {
         for node in nodes {
             if matches!(node.kind, ReadKind::Link { embed: true, .. }) {
                 self.flush();
@@ -313,7 +304,6 @@ impl<'a> EmbedFlow<'a> {
                         } else {
                             style.link
                         },
-                        query: style.query,
                         scheme: self.app.appearance.scheme(),
                     },
                 );
@@ -327,7 +317,7 @@ fn collect_spans<'a>(
     tab: TabId,
     doc: &'a Arc<ReadSnapshot>,
     n: &'a ReadNode,
-    format: InlineStyle<'_>,
+    format: InlineStyle,
     spans: &mut Vec<iced::widget::text::Span<'a, Message>>,
 ) {
     let mut font = Font::DEFAULT;
@@ -360,32 +350,7 @@ fn collect_spans<'a>(
                 start,
             });
         }
-        if let Some(query) = format.query {
-            // Find highlights use semantic palette tokens and the same dirty
-            // snapshot as the editor; links keep their original action. The
-            // per-node scan folds exactly like the note search host so the
-            // read view highlights what the find bar counts (D-05 default).
-            let mut at = 0;
-            for (found, end) in crate::host::note_search::scan(&content, query, false).0 {
-                if at < found {
-                    let mut fragment = s.clone();
-                    fragment.text = content[at..found].to_owned().into();
-                    spans.push(fragment);
-                }
-                let mut highlight = s.clone();
-                highlight.text = content[found..end].to_owned().into();
-                let theme = style::theme(format.scheme);
-                highlight = highlight.background(theme.extended_palette().primary.weak.color);
-                spans.push(highlight);
-                at = end;
-            }
-            if at < content.len() {
-                s.text = content[at..].to_owned().into();
-                spans.push(s);
-            }
-        } else {
-            spans.push(s);
-        }
+        spans.push(s);
     }
     for child in &n.children {
         collect_spans(
@@ -401,7 +366,6 @@ fn collect_spans<'a>(
                 } else {
                     format.link
                 },
-                query: format.query,
                 scheme: format.scheme,
             },
             spans,

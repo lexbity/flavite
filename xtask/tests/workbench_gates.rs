@@ -242,7 +242,6 @@ fn s01_gate_rejects_forbidden_search_pattern() {
     );
 }
 
-
 /// Seed the S03 helper-crate surfaces. The S03 absence gates target the
 /// helper sources and the UI search host, so the seeded placeholders are
 /// clean and the negative tests inject each forbidden pattern.
@@ -283,10 +282,7 @@ fn s03_gate_passes_clean_tree() {
 #[test]
 fn s03_gate_rejects_shell_and_worker_path_hijacks() {
     for (needle, description) in [
-        (
-            r#"Command::new("sh").arg("-c").spawn();"#,
-            "shell spawn",
-        ),
+        (r#"Command::new("sh").arg("-c").spawn();"#, "shell spawn"),
         (
             r#"let p = env::var("FLAVITE_WORKER_PATH").unwrap();"#,
             "worker path override",
@@ -300,10 +296,7 @@ fn s03_gate_rejects_shell_and_worker_path_hijacks() {
         )
         .unwrap();
         let rejected = run_gate(temp.path(), "S03");
-        assert!(
-            !rejected.status.success(),
-            "{description} must be rejected"
-        );
+        assert!(!rejected.status.success(), "{description} must be rejected");
         assert!(
             String::from_utf8_lossy(&rejected.stderr).contains("forbidden production pattern"),
             "{}",
@@ -318,7 +311,8 @@ fn s03_gate_rejects_regex_compilation_and_helper_product_edges() {
     let temp = tempfile::tempdir().unwrap();
     seed_s03_inputs(temp.path());
     fs::write(
-        temp.path().join("crates/flavite-ui/src/host/note_search.rs"),
+        temp.path()
+            .join("crates/flavite-ui/src/host/note_search.rs"),
         "let compiled = Regex::new(pattern)?;
 ",
     )
