@@ -41,14 +41,14 @@ impl StripMenu {
     #[must_use]
     pub const fn bar_x(self) -> f32 {
         match self {
-            Self::File => 148.0,
-            Self::Edit => 196.0,
-            Self::Selection => 240.0,
-            Self::View => 312.0,
-            Self::Go => 360.0,
-            Self::Graph => 400.0,
-            Self::Tools => 460.0,
-            _ => 148.0,
+            Self::File => 40.0,
+            Self::Edit => 86.0,
+            Self::Selection => 130.0,
+            Self::View => 208.0,
+            Self::Go => 256.0,
+            Self::Graph => 296.0,
+            Self::Tools => 354.0,
+            _ => 40.0,
         }
     }
 
@@ -142,6 +142,7 @@ fn tab_view(app: &App, tab: TabId, active: bool, width: f32) -> Element<'_, Mess
     let metrics = app.appearance.metrics();
     let kind = match view.kind() {
         ViewKind::Notes => Icon::Notes,
+        ViewKind::Graph(_) => Icon::Graph,
         _ => Icon::Note,
     };
     let label = view.title();
@@ -163,7 +164,8 @@ fn tab_view(app: &App, tab: TabId, active: bool, width: f32) -> Element<'_, Mess
     let title = mouse_area(title)
         .on_press(Message::TabPressed(tab))
         .interaction(iced::mouse::Interaction::Pointer);
-    container(row![
+    let focused = active && app.workspace.focused_tab() == tab;
+    let tab: Element<'_, Message> = container(row![
         title,
         chrome::icon_button(
             *metrics,
@@ -175,7 +177,24 @@ fn tab_view(app: &App, tab: TabId, active: bool, width: f32) -> Element<'_, Mess
     .width(width)
     .height(metrics.tab_height)
     .style(move |theme| style::tab(theme, active))
-    .into()
+    .into();
+    if focused {
+        iced::widget::stack![
+            tab,
+            container(
+                container(Space::new().width(Length::Fill).height(style::FOCUS_WIDTH))
+                    .style(style::tab_focus)
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_y(alignment::Vertical::Bottom)
+        ]
+        .width(width)
+        .height(metrics.tab_height)
+        .into()
+    } else {
+        tab
+    }
 }
 
 pub fn chip_padding() -> iced::Padding {
@@ -301,6 +320,8 @@ pub fn menu_entries(app: &App, group: GroupId, menu: StripMenu) -> Vec<MenuEntry
         })
         .collect(),
         StripMenu::View => [
+            ("Writing layout", "workspace.writing_layout"),
+            ("Toggle notes sidebar", "workspace.toggle_sidebar"),
             ("Notes list", "workspace.open_notes_view"),
             ("Search", "workspace.open_search_view"),
             ("Graph", "workspace.open_graph"),

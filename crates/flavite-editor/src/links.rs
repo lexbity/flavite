@@ -1,6 +1,6 @@
 //! Scanner-backed link semantics and in-memory autocomplete for the editor.
 
-use flavite_syntax::{LinkPayload, ScannedSpan, TextMask, TextSnapshot, scanner::scan_inline};
+use flavite_syntax::{LinkPayload, ScannedSpan, SpanKind};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use std::ops::Range;
@@ -65,6 +65,24 @@ pub fn scan_note(text: &str) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
     let Ok(parsed) = flavite_syntax::pulldown_glue::parse_normalized(text) else {
         return (Vec::new(), Vec::new());
     };
+    // The canonical parse already scanned every prose window. Reusing its
+    // tag/block spans avoids scanning the full note a second time and
+    // allocating duplicate link payloads that drawing never uses.
+    let mut decorations: Vec<_> = parsed
+        .tags
+        .into_iter()
+        .map(|span| ScannedSpan {
+            span,
+            kind: SpanKind::Tag,
+            payload: None,
+        })
+        .chain(parsed.block_ids.into_iter().map(|span| ScannedSpan {
+            span,
+            kind: SpanKind::BlockId,
+            payload: None,
+        }))
+        .collect();
+    decorations.sort_unstable_by_key(|span| span.span.start.0);
     let links = parsed
         .links
         .into_iter()
@@ -84,7 +102,6 @@ pub fn scan_note(text: &str) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
             },
         })
         .collect();
-    let decorations = scan_masked(&parsed.snapshot, &parsed.mask);
     (links, decorations)
 }
 
@@ -98,17 +115,11 @@ pub fn resolve_link(span: &LinkSpan, verdict: Option<LinkResolution>) -> LinkRes
     verdict.unwrap_or(LinkResolution::Unresolved)
 }
 
-/// Shared-scanner spans for editor decorations; code/math/HTML are excluded.
+/// Canonical tag/block-ID decorations; links are supplied by [`scan_links`].
+/// Code, math, HTML, and frontmatter are excluded by the shared parser.
 #[must_use]
 pub fn scan_decorations(text: &str) -> Vec<ScannedSpan> {
     scan_note(text).1
-}
-
-fn scan_masked(snapshot: &TextSnapshot, mask: &TextMask) -> Vec<ScannedSpan> {
-    mask.unmasked(&(0..snapshot.text().len()))
-        .into_iter()
-        .flat_map(|range| scan_inline(snapshot, range))
-        .collect()
 }
 
 /// Rank a bounded in-memory candidate list by subsequence match. The host
@@ -164,6 +175,27 @@ pub fn match_candidates<'a>(
 mod tests {
     use super::*;
     use flavite_syntax::SpanKind;
+
+    #[test]
+    fn decorations_match_canonical_structure_without_rescanning_links() {
+        let text = "---\ntitle: '#hidden'\n---\n# Heading\n\n[[a*b*|label]] #visible ^block\n\n`#code`\n\n$#math$\n\n<div>#html</div>\n";
+        let parsed = flavite_syntax::pulldown_glue::parse_normalized(text).unwrap();
+        let (links, decorations) = scan_note(text);
+        assert_eq!(links.len(), parsed.links.len());
+        let tags: Vec<_> = decorations
+            .iter()
+            .filter(|span| span.kind == SpanKind::Tag)
+            .map(|span| span.span)
+            .collect();
+        let blocks: Vec<_> = decorations
+            .iter()
+            .filter(|span| span.kind == SpanKind::BlockId)
+            .map(|span| span.span)
+            .collect();
+        assert_eq!(tags, parsed.tags);
+        assert_eq!(blocks, parsed.block_ids);
+        assert!(decorations.iter().all(|span| span.payload.is_none()));
+    }
 
     #[test]
     fn suggestions_remain_bounded_and_ordered_at_catalog_limit() {

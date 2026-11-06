@@ -15,6 +15,23 @@ pub fn observe<'a>(
         on_bounds: Box::new(on_bounds),
         split_hits: Vec::new(),
         resizing: false,
+        identity: None,
+    })
+}
+
+/// Dynamic rows must acknowledge geometry again when their identity changes,
+/// even when their new rectangle happens to equal the previous row's.
+pub fn observe_named<'a>(
+    content: impl Into<Element<'a, Message>>,
+    identity: String,
+    on_bounds: impl Fn(Rectangle) -> Message + 'a,
+) -> Element<'a, Message> {
+    Element::new(Bounds {
+        content: content.into(),
+        on_bounds: Box::new(on_bounds),
+        split_hits: Vec::new(),
+        resizing: false,
+        identity: Some(identity),
     })
 }
 
@@ -26,6 +43,7 @@ pub fn workspace<'a>(content: impl Into<Element<'a, Message>>, app: &App) -> Ele
         on_bounds: Box::new(Message::WorkspaceBounds),
         split_hits: app.split_hits(),
         resizing: app.resizing_split.is_some(),
+        identity: None,
     })
 }
 
@@ -38,19 +56,34 @@ struct Bounds<'a> {
         iced::widget::pane_grid::Axis,
     )>,
     resizing: bool,
+    identity: Option<String>,
+}
+
+#[derive(Default)]
+struct BoundsState {
+    identity: Option<String>,
+    rect: Option<Rectangle>,
 }
 
 impl Widget<Message, Theme, Renderer> for Bounds<'_> {
     fn tag(&self) -> widget::tree::Tag {
-        widget::tree::Tag::of::<Option<Rectangle>>()
+        widget::tree::Tag::of::<BoundsState>()
     }
     fn state(&self) -> widget::tree::State {
-        widget::tree::State::new(None::<Rectangle>)
+        widget::tree::State::new(BoundsState {
+            identity: self.identity.clone(),
+            rect: None,
+        })
     }
     fn children(&self) -> Vec<widget::Tree> {
         vec![widget::Tree::new(&self.content)]
     }
     fn diff(&self, tree: &mut widget::Tree) {
+        let state = tree.state.downcast_mut::<BoundsState>();
+        if state.identity != self.identity {
+            state.identity.clone_from(&self.identity);
+            state.rect = None;
+        }
         tree.diff_children(&[&self.content]);
     }
     fn size(&self) -> iced::Size<Length> {
@@ -106,9 +139,9 @@ impl Widget<Message, Theme, Renderer> for Bounds<'_> {
             event,
             Event::Window(iced::window::Event::RedrawRequested(_))
         ) {
-            let previous = tree.state.downcast_mut::<Option<Rectangle>>();
-            if *previous != Some(layout.bounds()) {
-                *previous = Some(layout.bounds());
+            let state = tree.state.downcast_mut::<BoundsState>();
+            if state.rect != Some(layout.bounds()) {
+                state.rect = Some(layout.bounds());
                 shell.publish((self.on_bounds)(layout.bounds()));
             }
         }

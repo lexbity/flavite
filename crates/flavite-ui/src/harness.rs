@@ -201,7 +201,8 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                                 // bounded click-pair hold and its epoch.
                                 "gesture_candidate": state.arbiter.has_candidate(),
                                 "gesture_epoch": state.arbiter.candidate_epoch(),
-                                "activation_notice_pending": app.appearance.graph_activation_notice_pending(),
+                                "activation_notice_pending": state.controls_open && state.display_controls_open && app.appearance.graph_activation_notice_pending(),
+                                "controls_open": state.controls_open,
                                 "notice_bounds": state.notice_bounds.map(|r| [r.x, r.y, r.width, r.height]),
                                 "frozen": state.frozen,
                                 // S04 AC-6: camera authority. A user-held
@@ -327,7 +328,7 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
             "target": selection.target.as_ref().map(|target| target.components().join("/")),
         })),
     });
-    serde_json::json!({
+    let mut snapshot = serde_json::json!({
         "event": "workspace",
         "revision": app.workspace.revision(),
         "status": app.status_text(),
@@ -391,5 +392,15 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "interface_scale_pct": app.appearance.prefs.interface_scale_pct,
         "editor_font_size": app.appearance.prefs.editor_font_size,
         "reduced_motion": app.appearance.prefs.reduced_motion,
-    })
+    });
+    snapshot["menu_bar_visible"] = app.menu_bar_visible.into();
+    snapshot["sidebar_open"] = app.sidebar_open.into();
+    snapshot["sidebar_filter"] = app.sidebar_filter.clone().into();
+    snapshot["sidebar_bounds"] = serde_json::json!(
+        app.sidebar_bounds
+            .iter()
+            .map(|(key, r)| (key, [r.x, r.y, r.width, r.height]))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    );
+    snapshot
 }

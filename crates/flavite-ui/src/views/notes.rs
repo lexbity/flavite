@@ -20,6 +20,34 @@ fn filter_id(tab: TabId) -> iced::widget::Id {
 
 /// Render the Notes list for one tab. `group` is where picked notes open.
 pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
+    content(
+        app,
+        app.notes_filter(tab).to_owned(),
+        filter_id(tab),
+        move |value| Message::NotesFilter { tab, value },
+        Some(tab),
+    )
+}
+
+/// The same catalog and note-opening intents in the collapsible navigator.
+pub fn sidebar(app: &App) -> Element<'_, Message> {
+    content(
+        app,
+        app.sidebar_filter.clone(),
+        iced::widget::Id::new("sidebar-notes-filter"),
+        Message::SidebarFilter,
+        None,
+    )
+}
+
+fn content<'a>(
+    app: &'a App,
+    filter: String,
+    id: iced::widget::Id,
+    on_input: impl Fn(String) -> Message + 'a,
+    tab: Option<TabId>,
+) -> Element<'a, Message> {
+    let compact = tab.is_none();
     let metrics = app.appearance.metrics();
     if let Some(error) = app.catalog_error() {
         return container(
@@ -60,7 +88,6 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
         .style(style::content)
         .into();
     }
-    let filter = app.notes_filter(tab).to_owned();
     let candidates = app.note_candidates();
     let total = candidates.all().len();
     let matched: std::sync::Arc<[crate::picker::NoteCandidate]> = candidates.matches(&filter);
@@ -85,7 +112,7 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
             current_folder = Some(folder.clone());
             list = list.push(
                 row![
-                    text("📁").size(metrics.text_sm),
+                    crate::workspace::chrome::icon(*metrics, crate::workspace::chrome::Icon::Notes),
                     text(if folder.is_empty() {
                         "Vault root".to_owned()
                     } else {
@@ -103,7 +130,7 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
                 }),
             );
         }
-        list = list.push(note_row(*metrics, candidate));
+        list = list.push(note_row(*metrics, candidate, compact, &filter));
         rendered += 1;
     }
     if shown > rendered {
@@ -124,31 +151,55 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
         );
     }
 
+    let mut heading = row![
+        text(format!("{total} notes")).size(metrics.text_lg),
+        Space::new().width(Length::Fill),
+        button(text("Refresh"))
+            .padding(tab_strip::chip_padding())
+            .style(style::ghost())
+            .on_press(Message::RefreshCatalog)
+    ]
+    .spacing(metrics.spacing)
+    .align_y(alignment::Vertical::Center);
+    if let Some(tab) = tab {
+        heading = heading.push(crate::workspace::chrome::icon_button(
+            *metrics,
+            crate::workspace::chrome::Icon::Sidebar,
+            "Move Notes into the sidebar",
+            Some(Message::NotesToSidebar(tab)),
+        ));
+    }
+    let input: Element<'a, Message> = text_input("Filter notes…", &filter)
+        .id(id)
+        .on_input(on_input)
+        .padding(tab_strip::chip_padding())
+        .size(metrics.text_sm)
+        .into();
+    let input = if compact {
+        crate::workspace::bounds::observe(input, |rect| {
+            Message::SidebarControlBounds("filter".into(), rect)
+        })
+    } else {
+        input
+    };
     container(
         column![
-            row![
-                text(format!("{total} notes")).size(metrics.text_lg),
-                Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
-                button(text("Refresh"))
-                    .padding(tab_strip::chip_padding())
-                    .style(style::ghost())
-                    .on_press(Message::RefreshCatalog),
-            ]
-            .spacing(metrics.spacing)
-            .align_y(alignment::Vertical::Center),
-            text_input("Filter notes…", &filter)
-                .id(filter_id(tab))
-                .on_input(move |value| Message::NotesFilter { tab, value })
-                .padding(tab_strip::chip_padding())
-                .size(metrics.text_sm),
-            text("Pick a note to open it in this group")
-                .size(metrics.text_sm)
-                .style(style::dim_text),
+            heading,
+            input,
+            iced::Element::from(if compact {
+                Space::new().height(0).into()
+            } else {
+                Element::from(
+                    text("Pick a note to open it")
+                        .size(metrics.text_sm)
+                        .style(style::dim_text),
+                )
+            }),
             container(scrollable(list).height(Length::Fill))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .padding(metrics.spacing_sm)
-                .style(style::card),
+                .style(style::content),
         ]
         .spacing(metrics.spacing_sm),
     )
@@ -164,26 +215,43 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
 fn note_row(
     metrics: crate::style::Metrics,
     candidate: &picker::NoteCandidate,
+    compact: bool,
+    filter: &str,
 ) -> Element<'static, Message> {
-    button(
+    let label: Element<'static, Message> = if compact {
+        text(candidate.title().to_owned())
+            .size(metrics.text)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into()
+    } else {
         row![
             text(candidate.title().to_owned()).width(Length::Fill),
             text(candidate.path().to_string())
                 .size(metrics.text_sm)
-                .style(style::dim_text),
+                .style(style::dim_text)
         ]
-        .spacing(metrics.spacing),
-    )
-    .width(Length::Fill)
-    .padding(iced::Padding {
-        top: 6.0,
-        bottom: 6.0,
-        left: 10.0,
-        right: 10.0,
-    })
-    .style(style::list_row(false))
-    .on_press(Message::OpenIntent(
-        crate::host::open_intents::OpenIntent::reuse(candidate.locator.clone(), None),
-    ))
-    .into()
+        .spacing(metrics.spacing)
+        .into()
+    };
+    let element: Element<'static, Message> = button(label)
+        .width(Length::Fill)
+        .padding(iced::Padding {
+            top: 6.0,
+            bottom: 6.0,
+            left: 10.0,
+            right: 10.0,
+        })
+        .style(style::list_row(false))
+        .on_press(Message::OpenIntent(
+            crate::host::open_intents::OpenIntent::reuse(candidate.locator.clone(), None),
+        ))
+        .into();
+    if compact {
+        let key = format!("note:{}", candidate.path());
+        crate::workspace::bounds::observe_named(element, format!("{key}:{filter}"), move |rect| {
+            Message::SidebarControlBounds(key.clone(), rect)
+        })
+    } else {
+        element
+    }
 }

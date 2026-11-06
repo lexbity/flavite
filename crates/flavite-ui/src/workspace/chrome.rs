@@ -8,6 +8,15 @@ use iced::{Background, Border, Element, Length, Rectangle, Renderer, Size, Theme
 
 #[derive(Debug, Clone, Copy)]
 pub enum Icon {
+    Menu,
+    Sidebar,
+    Search,
+    Commands,
+    Back,
+    Forward,
+    Graph,
+    Read,
+    Edit,
     Note,
     Notes,
     Add,
@@ -96,6 +105,74 @@ impl Widget<Message, Theme, Renderer> for Glyph {
             );
         };
         match self.kind {
+            Icon::Menu => {
+                for y in [3.0, 7.5, 12.0] {
+                    line(2.0, y, 12.0, 1.0);
+                }
+            }
+            Icon::Sidebar => {
+                line(1.0, 2.0, 14.0, 1.0);
+                line(1.0, 13.0, 14.0, 1.0);
+                for x in [1.0, 5.0, 14.0] {
+                    line(x, 2.0, 1.0, 12.0);
+                }
+            }
+            Icon::Search => {
+                for (x, y, w, h) in [
+                    (3.0, 2.0, 7.0, 1.0),
+                    (2.0, 3.0, 1.0, 6.0),
+                    (10.0, 3.0, 1.0, 6.0),
+                    (3.0, 9.0, 7.0, 1.0),
+                ] {
+                    line(x, y, w, h);
+                }
+                for i in 0_u16..5 {
+                    let at = f32::from(i);
+                    line(9.0 + at, 9.0 + at, 1.5, 1.5);
+                }
+            }
+            Icon::Commands => {
+                for i in 0_u16..5 {
+                    let at = f32::from(i);
+                    line(2.0 + at, 3.0 + at, 1.0, 1.0);
+                    line(6.0 - at, 7.0 + at, 1.0, 1.0);
+                }
+                line(9.0, 11.0, 5.0, 1.0);
+            }
+            Icon::Back | Icon::Forward => {
+                line(2.0, 7.0, 12.0, 1.0);
+                for i in 0_u16..6 {
+                    let at = f32::from(i);
+                    let x = if matches!(self.kind, Icon::Back) {
+                        2.0 + at
+                    } else {
+                        13.0 - at
+                    };
+                    line(x, 7.0 - at, 1.0, 1.0);
+                    line(x, 7.0 + at, 1.0, 1.0);
+                }
+            }
+            Icon::Graph => {
+                line(3.0, 2.0, 3.0, 3.0);
+                line(10.0, 10.0, 3.0, 3.0);
+                line(1.0, 11.0, 3.0, 3.0);
+                line(4.0, 4.0, 1.0, 8.0);
+                line(4.0, 10.0, 7.0, 1.0);
+            }
+            Icon::Read => {
+                for x in [1.0, 7.5, 14.0] {
+                    line(x, 3.0, 1.0, 10.0);
+                }
+                line(1.0, 3.0, 14.0, 1.0);
+                line(1.0, 12.0, 14.0, 1.0);
+            }
+            Icon::Edit => {
+                for i in 0_u16..11 {
+                    let at = f32::from(i);
+                    line(2.0 + at, 13.0 - at, 2.0, 2.0);
+                }
+                line(1.0, 14.0, 4.0, 1.0);
+            }
             Icon::Add => {
                 line(7.25, 2.0, 1.5, 12.0);
                 line(2.0, 7.25, 12.0, 1.5);

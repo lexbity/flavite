@@ -129,6 +129,12 @@ pub struct App {
     /// Named layouts carried for the next layout save (W06).
     pub named_layouts: Vec<flavite_workspace::NamedLayout>,
     pub picker: Picker,
+    /// Presentation state for the collapsible vault navigator and app menus.
+    pub sidebar_open: bool,
+    pub sidebar_filter: String,
+    pub sidebar_bounds: BTreeMap<String, iced::Rectangle>,
+    pub menu_bar_visible: bool,
+    use_workbench_default: bool,
     pub palette_open: bool,
     pub palette_query: String,
     pub palette_selected: usize,
@@ -174,6 +180,11 @@ pub struct App {
 /// workspace model or the host catalog.
 #[derive(Debug, Clone)]
 pub enum Message {
+    ToggleSidebar,
+    SidebarToTab,
+    NotesToSidebar(TabId),
+    SidebarFilter(String),
+    SidebarControlBounds(String, iced::Rectangle),
     Keyboard(keyboard::Event),
     WorkspaceBounds(iced::Rectangle),
     GroupBounds(GroupId, iced::Rectangle),
@@ -511,6 +522,7 @@ impl App {
     #[must_use]
     pub fn boot_from_root(root: PathBuf) -> Self {
         let mut app = Self::empty_at(root.clone());
+        app.use_workbench_default = true;
         // Fixture-only knob: the visual harness stretches the autosave idle
         // window so a crash lands between the recovery checkpoint and the
         // autosave. Production execution never reads this variable.
@@ -588,6 +600,11 @@ impl App {
             shutdown: None,
             named_layouts: Vec::new(),
             picker: Picker::default(),
+            sidebar_open: false,
+            sidebar_filter: String::new(),
+            sidebar_bounds: BTreeMap::new(),
+            menu_bar_visible: false,
+            use_workbench_default: false,
             palette_open: false,
             palette_query: String::new(),
             palette_selected: 0,
@@ -698,7 +715,10 @@ impl App {
         let stored = match flavite.read_user_state(UserStateKind::WorkspaceLayouts) {
             Ok(Some(stored)) => stored,
             Ok(None) => {
-                self.status = "Vault ready (no saved workspace layout)".into();
+                if self.use_workbench_default {
+                    self.use_writing_layout();
+                }
+                self.status = "Vault ready".into();
                 return;
             }
             Err(error) => {
@@ -778,6 +798,65 @@ impl App {
             report.push_str(&format!("; {dropped} entries dropped"));
         }
         self.status = report;
+    }
+
+    /// Arrange the document area on the left and a graph on the right,
+    /// retaining every tab and document buffer. Also used for a fresh vault.
+    pub fn use_writing_layout(&mut self) {
+        use flavite_workspace::{Arrangement, LayoutNode, Side, TabDropTarget, ViewKind};
+        let Some(document_group) = self.navigation_group() else {
+            return;
+        };
+        let has_document = self.workspace.group(&document_group).is_some_and(|group| {
+            group.tabs().iter().any(|tab| {
+                self.workspace
+                    .tab(tab)
+                    .is_some_and(|view| !matches!(view.kind(), ViewKind::Graph(_)))
+            })
+        });
+        if !has_document {
+            self.dispatch_layout(|expected_revision| LayoutAction::OpenEmpty {
+                expected_revision,
+                group: document_group,
+            });
+        }
+        let existing = self
+            .workspace
+            .tabs()
+            .find_map(|(tab, view)| matches!(view.kind(), ViewKind::Graph(_)).then_some(*tab));
+        let graph = if let Some(tab) = existing {
+            tab
+        } else {
+            self.dispatch_layout(|expected_revision| LayoutAction::OpenGraph {
+                expected_revision,
+                group: document_group,
+            });
+            self.workspace.focused_tab()
+        };
+        let on_right = self.workspace.group_of(graph).is_some_and(|graph_group| {
+            matches!(self.workspace.tree(), LayoutNode::Split { arrangement: Arrangement::SideBySide, first, second, .. }
+                if first.contains_group(document_group) && second.contains_group(graph_group))
+        });
+        if !on_right {
+            self.dispatch_layout(|expected_revision| LayoutAction::MoveTab {
+                expected_revision,
+                tab: graph,
+                target: TabDropTarget::SplitFrom {
+                    group: document_group,
+                    arrangement: Arrangement::SideBySide,
+                    side: Side::Second,
+                },
+            });
+        }
+        self.dispatch_layout(|expected_revision| LayoutAction::ActivateTab {
+            expected_revision,
+            tab: graph,
+        });
+        self.dispatch_layout(|expected_revision| LayoutAction::FocusGroup {
+            expected_revision,
+            group: document_group,
+        });
+        self.sidebar_open = false;
     }
 
     /// Save the workspace layout immediately (W06: explicit flush with a
@@ -1411,6 +1490,24 @@ impl App {
     #[must_use]
     pub fn focused_group(&self) -> Option<GroupId> {
         self.workspace.focused_group()
+    }
+
+    /// Navigation tools belong beside the graph, in the document area.
+    pub fn navigation_group(&self) -> Option<GroupId> {
+        self.workspace
+            .document_anchor()
+            .and_then(|tab| self.workspace.group_of(tab))
+            .or_else(|| {
+                self.workspace.group_order().into_iter().find(|group| {
+                    self.workspace
+                        .group(group)
+                        .and_then(|g| self.workspace.tab(&g.active()))
+                        .is_some_and(|tab| {
+                            !matches!(tab.kind(), flavite_workspace::ViewKind::Graph(_))
+                        })
+                })
+            })
+            .or_else(|| self.focused_group())
     }
 
     /// The manually maximized group.
@@ -2090,9 +2187,10 @@ impl App {
         // must not rebuild the accessibility map; the editor widget
         // redraws its own selection.
         let pointer_only = matches!(message, Message::Mouse(_));
+        let geometry_only = matches!(message, Message::SidebarControlBounds(..));
         self.pointer_feedback = false;
         let task = self.update_inner(message);
-        if !pointer_only || self.pointer_feedback {
+        if !geometry_only && (!pointer_only || self.pointer_feedback) {
             self.refresh_semantics();
         }
         #[cfg(feature = "ui-test-support")]
@@ -2131,12 +2229,9 @@ impl App {
                 // Opening a menu disables editor input; never interrupt an
                 // active composition (D-03). Entry availability is rechecked
                 // by the shared command resolver (D-16).
-                if !self.has_composition()
-                    && let Some(group) = self
-                        .focused_group()
-                        .or_else(|| self.workspace.group_order().first().copied())
-                {
-                    self.strip_menu = Some((group, crate::workspace::StripMenu::App));
+                if !self.has_composition() {
+                    self.menu_bar_visible = !self.menu_bar_visible;
+                    self.strip_menu = None;
                     self.menu_selected = 0;
                 }
             }
@@ -2162,6 +2257,51 @@ impl App {
                 }
             }
             Message::MenuClose => self.strip_menu = None,
+            Message::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
+            Message::SidebarFilter(value) => {
+                self.sidebar_filter = value;
+                self.sidebar_bounds
+                    .retain(|key, _| !key.starts_with("note:"));
+            }
+            Message::SidebarControlBounds(key, rect) => {
+                self.sidebar_bounds.insert(key, rect);
+            }
+            Message::SidebarToTab => {
+                if let Some(group) = self.navigation_group() {
+                    self.dispatch_layout(|expected_revision| LayoutAction::OpenNotes {
+                        expected_revision,
+                        group,
+                    });
+                    self.notes_filters
+                        .insert(self.workspace.focused_tab(), self.sidebar_filter.clone());
+                    self.sidebar_open = false;
+                }
+            }
+            Message::NotesToSidebar(tab) => {
+                if self
+                    .workspace
+                    .tab(&tab)
+                    .is_some_and(|view| matches!(view.kind(), flavite_workspace::ViewKind::Notes))
+                    && let Some(group) = self.workspace.group_of(tab)
+                {
+                    self.sidebar_filter = self.notes_filter(tab).to_owned();
+                    if self
+                        .workspace
+                        .group(&group)
+                        .is_some_and(|group| group.tabs().len() == 1)
+                    {
+                        self.dispatch_layout(|expected_revision| LayoutAction::OpenEmpty {
+                            expected_revision,
+                            group,
+                        });
+                    }
+                    self.dispatch_layout(|expected_revision| LayoutAction::CloseTab {
+                        expected_revision,
+                        tab,
+                    });
+                    self.sidebar_open = true;
+                }
+            }
             Message::CancelGesture => {
                 self.gesture.cancel();
                 self.drag_revision = None;
@@ -4231,6 +4371,11 @@ mod tests {
             shutdown: None,
             named_layouts: Vec::new(),
             picker: Picker::default(),
+            sidebar_open: false,
+            sidebar_filter: String::new(),
+            sidebar_bounds: BTreeMap::new(),
+            menu_bar_visible: false,
+            use_workbench_default: false,
             palette_open: false,
             palette_query: String::new(),
             palette_selected: 0,

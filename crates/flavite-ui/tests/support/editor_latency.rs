@@ -91,6 +91,7 @@ fn editor_latency_probe() {
                     text: "x".into(),
                     extend: false,
                     document_boundary: false,
+                    vertical: None,
                 },
             }));
             assert!(

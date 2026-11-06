@@ -7,6 +7,7 @@
 pub mod input;
 pub mod keymap;
 pub mod links;
+pub mod navigation;
 pub mod surface;
 pub mod viewport;
 pub mod widget;

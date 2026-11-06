@@ -321,3 +321,175 @@ fn blur_acknowledgements_preserve_only_an_unchanged_authorized_caret() {
 
 #[path = "support/editor_latency.rs"]
 mod editor_latency;
+
+#[test]
+fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() {
+    use flavite_editor::{
+        TypeMetrics, input::CapturedInput, keymap::KeyAction, navigation::VerticalMotion,
+    };
+    let (mut app, fs, _cache) = fixture();
+    let group = app.focused_group().unwrap();
+    app.dispatch_layout(|revision| LayoutAction::OpenNote {
+        expected_revision: revision,
+        locator: flavite_workspace::NoteLocator::from_components(["note.md"]).unwrap(),
+        group,
+    });
+    wait_for_open(&mut app);
+    let tab = app.workspace.focused_tab();
+    acknowledge_caret(&mut app, tab, 0, 100);
+    let source = app.note_editor_view(tab).unwrap();
+    let incarnation = app.notes.incarnation(tab).unwrap();
+    // All these captures saw the same widget snapshot. Each must be
+    // interpreted against the previous acknowledgement, never that old caret.
+    for (sequence, action, rows, expected) in [
+        (101, KeyAction::Down, 1, 6),
+        (102, KeyAction::Down, 1, 11),
+        (103, KeyAction::Up, -1, 6),
+    ] {
+        let _ = app.update(Message::EditorInput {
+            tab,
+            incarnation,
+            input: CapturedInput {
+                buffer: source.buffer_id,
+                observed_revision: source.revision,
+                sequence,
+                action,
+                text: String::new(),
+                extend: false,
+                document_boundary: false,
+                vertical: Some(VerticalMotion {
+                    rows,
+                    width: 500.0,
+                    metrics: TypeMetrics::default(),
+                    preferred_x: Some(0.0),
+                }),
+            },
+        });
+        assert_eq!(
+            app.workspace.tab(&tab).unwrap().interaction().selections,
+            vec![Selection::caret(expected)]
+        );
+        assert_eq!(
+            app.note_editor_view(tab).unwrap().revision,
+            source.revision,
+            "navigation cannot mutate text"
+        );
+    }
+    let _ = app.update(Message::EditorInput {
+        tab,
+        incarnation,
+        input: CapturedInput {
+            buffer: source.buffer_id,
+            observed_revision: source.revision,
+            sequence: 104,
+            action: KeyAction::DeleteWord,
+            text: String::new(),
+            extend: false,
+            document_boundary: false,
+            vertical: None,
+        },
+    });
+    assert_eq!(
+        app.note_editor_view(tab).unwrap().text.as_ref(),
+        "alpha\n\n"
+    );
+    let _ = app.update(Message::EditorInput {
+        tab,
+        incarnation,
+        input: CapturedInput {
+            buffer: source.buffer_id,
+            observed_revision: source.revision,
+            sequence: 105,
+            action: KeyAction::Insert,
+            text: "雪".into(),
+            extend: false,
+            document_boundary: false,
+            vertical: None,
+        },
+    });
+    assert_eq!(
+        app.note_editor_view(tab).unwrap().text.as_ref(),
+        "alpha\n雪\n"
+    );
+    assert_eq!(
+        fs.read_if_exists(&app.root().join("note.md"))
+            .unwrap()
+            .unwrap(),
+        source.text.as_bytes()
+    );
+    let current = app.note_editor_view(tab).unwrap();
+    let _ = app.update(Message::EditorAction {
+        tab,
+        incarnation,
+        action: EditorAction::history(&current, false),
+    });
+    assert!(
+        !app.note_editor_view(tab).unwrap().text.contains('雪'),
+        "undo remains Session-owned"
+    );
+}
+
+#[test]
+fn home_then_vertical_keys_ignore_the_widgets_old_column_before_redraw() {
+    use flavite_editor::{
+        TypeMetrics, input::CapturedInput, keymap::KeyAction, navigation::VerticalMotion,
+    };
+    let (mut app, _fs, _cache) = fixture();
+    let group = app.focused_group().unwrap();
+    app.dispatch_layout(|expected_revision| LayoutAction::OpenNote {
+        expected_revision,
+        group,
+        locator: flavite_workspace::NoteLocator::from_components(["note.md"]).unwrap(),
+    });
+    wait_for_open(&mut app);
+    let tab = app.workspace.focused_tab();
+    let view = app.note_editor_view(tab).unwrap();
+    let incarnation = app.notes.incarnation(tab).unwrap();
+    acknowledge_caret(&mut app, tab, view.text.len(), 100);
+    let _ = app.update(Message::EditorInput {
+        tab,
+        incarnation,
+        input: CapturedInput {
+            buffer: view.buffer_id,
+            observed_revision: view.revision,
+            sequence: 101,
+            action: KeyAction::Home,
+            text: String::new(),
+            extend: false,
+            document_boundary: true,
+            vertical: None,
+        },
+    });
+    for (sequence, action, rows, expected) in [
+        (102, KeyAction::Down, 1, 6),
+        (103, KeyAction::Down, 1, 11),
+        (104, KeyAction::Up, -1, 6),
+    ] {
+        let _ = app.update(Message::EditorInput {
+            tab,
+            incarnation,
+            input: CapturedInput {
+                buffer: view.buffer_id,
+                observed_revision: view.revision,
+                sequence,
+                action,
+                text: String::new(),
+                extend: false,
+                document_boundary: false,
+                // Deliberately stale widget geometry: Home's new caret was not
+                // yet drawn when these events were captured.
+                vertical: Some(VerticalMotion {
+                    rows,
+                    width: 500.0,
+                    metrics: TypeMetrics::default(),
+                    preferred_x: Some(1000.0),
+                }),
+            },
+        });
+        assert_eq!(
+            app.workspace.tab(&tab).unwrap().interaction().selections,
+            vec![Selection::caret(expected)]
+        );
+        assert_eq!(app.note_editor_view(tab).unwrap().text, view.text);
+    }
+}

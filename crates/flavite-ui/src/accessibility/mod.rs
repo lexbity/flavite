@@ -151,6 +151,12 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
             Action::Focus => Some(Message::MenuFocus(index)),
             _ => None,
         },
+        NodeTarget::SidebarFilter => match (request.action, request.data) {
+            (Action::SetValue, Some(ActionData::Value(value))) => {
+                Some(Message::SidebarFilter(value.into()))
+            }
+            _ => None,
+        },
         NodeTarget::OverlayQuery => match (request.action, request.data) {
             (Action::SetValue, Some(ActionData::Value(value))) => Some(if app.picker.open {
                 Message::PickerQuery(value.into())
@@ -190,6 +196,8 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
                 )),
             ),
             NodeTarget::OpenPicker => Some(Message::PickerOpen),
+            NodeTarget::ToggleSidebar => Some(Message::ToggleSidebar),
+            NodeTarget::SidebarToTab => Some(Message::SidebarToTab),
             NodeTarget::OpenPalette => Some(Message::PaletteOpen),
             NodeTarget::MenuClose => Some(Message::MenuClose),
             NodeTarget::GroupMenu(group, menu) => Some(Message::GroupMenu(group, menu)),

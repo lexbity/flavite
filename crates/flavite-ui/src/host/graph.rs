@@ -110,6 +110,9 @@ pub struct GraphTabState {
     pub frozen_nodes: BTreeMap<NodeId, [f32; 2]>,
     /// Accessible list mode (also the keyboard/AT graph equivalent).
     pub list_mode: bool,
+    pub controls_open: bool,
+    pub layout_controls_open: bool,
+    pub display_controls_open: bool,
     /// Mounted geometry and the exact signature it was built from (§10.3).
     pub geometry: Option<Arc<RenderGeometry>>,
     pub signature: Option<FrameSignature>,
@@ -131,6 +134,7 @@ pub struct GraphTabState {
     /// The user took the camera with a pan/zoom gesture; auto-fit and
     /// follow stop until the tab is recreated.
     pub user_camera_moved: bool,
+    pub auto_fit_settled: bool,
     /// Layout activity seen at the previous pump (settle detection).
     last_layout_active: Option<bool>,
     pub scope: flavite_graph::GraphScope,
@@ -167,6 +171,9 @@ impl GraphTabState {
             frozen: false,
             frozen_nodes: BTreeMap::new(),
             list_mode: false,
+            controls_open: true,
+            layout_controls_open: false,
+            display_controls_open: false,
             geometry: None,
             signature: None,
             geometry_key: None,
@@ -176,6 +183,7 @@ impl GraphTabState {
             notice_bounds: None,
             last_epoch: 0,
             user_camera_moved: false,
+            auto_fit_settled: false,
             last_layout_active: None,
             scope: view.scope().clone(),
             scope_sequence: 1,
@@ -523,6 +531,9 @@ impl GraphHost {
 /// accessibility list rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphCommand {
+    ToggleControls,
+    ToggleLayoutControls,
+    ToggleDisplayControls,
     /// Toggle the force-layout freeze.
     ToggleFreeze,
     /// Toggle the accessible/keyboard list presentation.
@@ -1017,6 +1028,7 @@ pub fn pump(app: &mut App) {
                 height: 600.0,
             });
             if !state.user_camera_moved
+                && !state.auto_fit_settled
                 // D-02: while a pair hold is pending, the camera keeps the
                 // frozen hit geometry stable; the fit catches up after the
                 // bounded hold ends.
@@ -1030,6 +1042,7 @@ pub fn pump(app: &mut App) {
                 state.camera = camera;
                 state.camera_pending = None;
                 if !layout_active {
+                    state.auto_fit_settled = state.bounds.is_some();
                     // Settled: persist the fitted camera once. While the
                     // simulation runs, the camera stays ephemeral so
                     // following it does not spam layout transactions.
@@ -1179,6 +1192,9 @@ pub fn handle_message(app: &mut App, tab: TabId, message: GraphMessage) {
             if let Some(state) = app.graph.state_mut(tab) {
                 state.selected_nodes = selected;
                 state.selection = primary.map(|id| HitNode::new(id, id.kind));
+                if state.selection.is_some() {
+                    state.controls_open = false;
+                }
                 state.box_preview = None;
                 state.arbiter.cancel();
             }
@@ -1306,6 +1322,7 @@ pub fn handle_message(app: &mut App, tab: TabId, message: GraphMessage) {
                     match outcome {
                         GestureOutcome::Select(hit) => {
                             state.selection = Some(hit);
+                            state.controls_open = false;
                             publish_selection(app, tab, hit);
                         }
                         GestureOutcome::PublishEmptySelection => {
@@ -1318,6 +1335,7 @@ pub fn handle_message(app: &mut App, tab: TabId, message: GraphMessage) {
                             // node — it never mutates text. Insertion stays
                             // with the explicit Insert commands.
                             state.selection = Some(hit);
+                            state.controls_open = false;
                             publish_selection(app, tab, hit);
                             open_node(app, Some(tab), hit.id);
                         }
@@ -1428,6 +1446,19 @@ pub fn command(app: &mut App, tab: TabId, command: GraphCommand) {
         return;
     }
     match command {
+        GraphCommand::ToggleControls
+        | GraphCommand::ToggleLayoutControls
+        | GraphCommand::ToggleDisplayControls => {
+            if let Some(state) = app.graph.state_mut(tab) {
+                match command {
+                    GraphCommand::ToggleControls => state.controls_open = !state.controls_open,
+                    GraphCommand::ToggleLayoutControls => {
+                        state.layout_controls_open = !state.layout_controls_open
+                    }
+                    _ => state.display_controls_open = !state.display_controls_open,
+                }
+            }
+        }
         GraphCommand::NextListPage
         | GraphCommand::PreviousListPage
         | GraphCommand::NextOccurrences
@@ -1591,6 +1622,7 @@ pub fn command(app: &mut App, tab: TabId, command: GraphCommand) {
             let hit = HitNode::new(node, record.id.kind);
             if let Some(state) = app.graph.state_mut(tab) {
                 state.selection = Some(hit);
+                state.controls_open = false;
             }
             publish_selection(app, tab, hit);
         }

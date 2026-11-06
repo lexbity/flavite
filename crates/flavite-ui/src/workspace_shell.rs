@@ -6,8 +6,12 @@
 
 use crate::app::{App, Message};
 use crate::style;
-use crate::workspace::{bounds, tab_strip};
-use flavite_workspace::{GroupId, LayoutAction, NoteLoad, TabId, ViewKind};
+use crate::workspace::{
+    bounds,
+    chrome::{self, Icon},
+    tab_strip,
+};
+use flavite_workspace::{GroupId, LayoutAction, TabId, ViewKind};
 use iced::widget::{
     Space, button, column, container, opaque, pane_grid, row, rule, scrollable, stack, text,
     text_input,
@@ -72,7 +76,7 @@ fn shell(app: &App) -> Element<'_, Message> {
     let workspace = column![
         top_bar(app),
         rule::horizontal(1),
-        bounds::workspace(workspace_region(app), app),
+        workspace_with_navigation(app),
         rule::horizontal(1),
         status_bar(app),
     ]
@@ -98,44 +102,100 @@ fn shell(app: &App) -> Element<'_, Message> {
 }
 
 fn top_bar(app: &App) -> Element<'_, Message> {
-    let metrics = app.appearance.metrics();
+    let metrics = *app.appearance.metrics();
     let vault_name = app.root().file_name().map_or_else(
         || app.root().display().to_string(),
         |name| name.to_string_lossy().to_string(),
     );
+    let title: Element<'_, Message> = if app.menu_bar_visible {
+        menu_bar(app)
+    } else {
+        text(vault_name)
+            .size(metrics.text)
+            .style(style::dim_text)
+            .into()
+    };
     container(
         row![
-            button(text("Flavite").size(metrics.brand))
-                .padding(tab_strip::chip_padding())
-                .style(style::ghost())
-                .on_press(Message::AppMenu),
-            text(vault_name)
-                .size(metrics.text_sm)
-                .style(style::dim_text),
-            Space::new()
-                .width(Length::Fixed(8.0))
-                .height(Length::Fixed(0.0)),
-            menu_bar(app),
-            Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
-            button(text("Quick switch").size(metrics.text_sm))
-                .padding(tab_strip::chip_padding())
-                .style(style::ghost())
-                .on_press(Message::PickerOpen),
-            button(text("Commands").size(metrics.text_sm))
-                .padding(tab_strip::chip_padding())
-                .style(style::ghost())
-                .on_press(Message::PaletteOpen),
+            chrome::icon_button(
+                metrics,
+                Icon::Menu,
+                "Application menu",
+                Some(Message::AppMenu)
+            ),
+            title,
+            Space::new().width(Length::Fill),
+            chrome::icon_button(
+                metrics,
+                Icon::Search,
+                "Quick switch · Ctrl+P",
+                Some(Message::PickerOpen)
+            ),
+            chrome::icon_button(
+                metrics,
+                Icon::Commands,
+                "Commands · Ctrl+Shift+P",
+                Some(Message::PaletteOpen)
+            ),
         ]
-        .spacing(metrics.spacing)
+        .spacing(metrics.spacing_sm)
         .align_y(alignment::Vertical::Center),
     )
     .width(Length::Fill)
-    .padding(Padding {
-        top: 6.0,
-        bottom: 6.0,
-        left: metrics.spacing_lg,
-        right: metrics.spacing_lg,
-    })
+    .height(36.0 * metrics.scale)
+    .padding([0, 8])
+    .style(style::toolbar)
+    .into()
+}
+
+fn workspace_with_navigation(app: &App) -> Element<'_, Message> {
+    let panes = bounds::workspace(workspace_region(app), app);
+    if !app.sidebar_open {
+        return panes;
+    }
+    let metrics = *app.appearance.metrics();
+    let navigator = column![
+        container(
+            row![
+                text("Notes").size(metrics.text),
+                Space::new().width(Length::Fill),
+                chrome::icon_button(
+                    metrics,
+                    Icon::Add,
+                    "New note · Ctrl+N",
+                    Some(Message::RunHostCommand("workspace.new_note"))
+                ),
+                bounds::observe(
+                    chrome::icon_button(
+                        metrics,
+                        Icon::SplitRight,
+                        "Open notes as a tab",
+                        Some(Message::SidebarToTab)
+                    ),
+                    |rect| Message::SidebarControlBounds("detach".into(), rect)
+                ),
+                chrome::icon_button(
+                    metrics,
+                    Icon::Close,
+                    "Close sidebar · Ctrl+B",
+                    Some(Message::ToggleSidebar)
+                ),
+            ]
+            .align_y(alignment::Vertical::Center)
+        )
+        .height(metrics.tab_height)
+        .padding([0, 8]),
+        rule::horizontal(1),
+        crate::views::notes::sidebar(app),
+    ]
+    .width(metrics.sidebar_width + 40.0 * metrics.scale)
+    .height(Length::Fill);
+    row![
+        container(navigator).style(style::toolbar),
+        rule::vertical(1),
+        panes
+    ]
+    .height(Length::Fill)
     .into()
 }
 
@@ -345,6 +405,8 @@ fn menu_overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Me
     let width = 256.0_f32.min(app.window_size().width);
     let (x, y) = if menu == crate::workspace::StripMenu::App {
         (metrics.spacing_lg, 36.0)
+    } else if menu.is_top_menu() {
+        (menu.bar_x() * metrics.scale, 36.0 * metrics.scale)
     } else {
         let rect = app
             .group_bounds
@@ -361,12 +423,34 @@ fn menu_overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Me
         .into_iter()
         .enumerate()
     {
+        let command = match &entry.action {
+            Some(Message::RunHostCommand(id) | Message::RunCoreCommand(id)) => Some(*id),
+            Some(Message::NewNoteDialog) => Some("workspace.new_note"),
+            Some(Message::OpenNoteDialog) => Some("workspace.open_note_dialog"),
+            Some(Message::PickerOpen) => Some("workspace.quick_switch"),
+            Some(Message::PaletteOpen) => Some("workspace.command_palette"),
+            _ => None,
+        };
+        let shortcut = command
+            .and_then(|id| {
+                crate::host::commands::resolved_chord(id, &app.appearance.prefs.shortcuts)
+            })
+            .map(|chord| crate::palette::chord_label(&chord))
+            .unwrap_or_default();
         entries = entries.push(
-            button(text(entry.label).size(metrics.text))
-                .width(Length::Fill)
-                .padding([7, 10])
-                .style(style::list_row(i == app.menu_selected))
-                .on_press_maybe(entry.action.map(|_| Message::MenuPick(i))),
+            button(
+                row![
+                    text(entry.label).size(metrics.text),
+                    Space::new().width(Length::Fill),
+                    text(shortcut).size(metrics.text_sm).style(style::dim_text)
+                ]
+                .spacing(16)
+                .align_y(alignment::Vertical::Center),
+            )
+            .width(Length::Fill)
+            .padding([7, 10])
+            .style(style::list_row(i == app.menu_selected))
+            .on_press_maybe(entry.action.map(|_| Message::MenuPick(i))),
         );
     }
     let card = container(scrollable(entries).height(Length::Shrink))
@@ -392,11 +476,7 @@ fn active_view(app: &App, tab: TabId) -> Element<'_, Message> {
         return crate::views::empty_state(metrics, "Empty", "This tab has no content.");
     };
     match session.kind() {
-        ViewKind::Empty => crate::views::empty_state(
-            metrics,
-            "Empty",
-            "Open a note with Quick switch (Ctrl+P) or add a Notes list.",
-        ),
+        ViewKind::Empty => new_tab(app),
         ViewKind::Notes => crate::views::notes::view(app, tab),
         ViewKind::Search => crate::views::search::view(app, tab),
         ViewKind::History(locator) => crate::views::history::view(app, tab, locator),
@@ -409,77 +489,103 @@ fn active_view(app: &App, tab: TabId) -> Element<'_, Message> {
     }
 }
 
-fn status_bar(app: &App) -> Element<'_, Message> {
-    let metrics = app.appearance.metrics();
-    let mut right = row![].spacing(metrics.spacing_sm);
-    right = right.push(
-        container(text(app.writing_target_label()).size(metrics.text_sm))
-            .style(|theme| style::chip(theme, style::Tone::Primary))
-            .padding(tab_strip::chip_padding()),
-    );
-    if let Some(state) = focused_note_state(app) {
-        right = right.push(
-            container(text(state).size(metrics.text_sm))
-                .style(move |theme| style::chip(theme, style::Tone::Neutral))
-                .padding(tab_strip::chip_padding()),
-        );
-    }
-    let pending = app.pending_operations();
-    if pending > 0 {
-        right = right.push(
-            container(text(format!("{pending} in flight")).size(metrics.text_sm))
-                .style(|theme| style::chip(theme, style::Tone::Warning))
-                .padding(tab_strip::chip_padding()),
-        );
-    }
-    let displaced = app.operation_history_overflowed();
-    if displaced > 0 {
-        right = right.push(
-            container(
-                text(format!("{displaced} older outcomes outside history")).size(metrics.text_sm),
-            )
-            .style(|theme| style::chip(theme, style::Tone::Warning))
-            .padding(tab_strip::chip_padding()),
-        );
-    }
-    if let Some((done, total)) = app.reconcile_progress() {
-        right = right.push(
-            container(text(format!("Indexing {done}/{total}")).size(metrics.text_sm))
-                .style(|theme| style::chip(theme, style::Tone::Warning))
-                .padding(tab_strip::chip_padding()),
-        );
-    }
+fn new_tab(app: &App) -> Element<'_, Message> {
+    let metrics = *app.appearance.metrics();
+    let action = |icon, title: &'static str, keys: &'static str, message| {
+        button(
+            row![
+                chrome::icon(metrics, icon),
+                text(title).size(metrics.text_lg),
+                Space::new().width(Length::Fill),
+                text(keys).size(metrics.text_sm).style(style::dim_text)
+            ]
+            .spacing(12)
+            .align_y(alignment::Vertical::Center),
+        )
+        .width(260.0 * metrics.scale)
+        .padding([12, 16])
+        .style(style::launch_action)
+        .on_press(message)
+    };
     container(
-        row![
-            text(app.status_text())
-                .size(metrics.text_sm)
-                .width(Length::Fill),
-            right,
+        column![
+            action(
+                Icon::Edit,
+                "New note",
+                "Ctrl+N",
+                Message::RunHostCommand("workspace.new_note")
+            ),
+            action(Icon::Search, "Go to note", "Ctrl+P", Message::PickerOpen),
+            action(
+                Icon::Notes,
+                "Browse notes",
+                "Ctrl+B",
+                Message::ToggleSidebar
+            ),
+            action(
+                Icon::Search,
+                "Search all notes",
+                "",
+                Message::RunHostCommand("workspace.open_search_view")
+            ),
         ]
-        .spacing(metrics.spacing),
+        .spacing(8),
     )
     .width(Length::Fill)
-    .padding(Padding {
-        top: 6.0,
-        bottom: 6.0,
-        left: metrics.spacing_lg,
-        right: metrics.spacing_lg,
-    })
-    .style(style::status_bar)
+    .height(Length::Fill)
+    .center(Length::Fill)
+    .style(style::content)
     .into()
 }
 
-fn focused_note_state(app: &App) -> Option<&'static str> {
-    let tab = app.workspace.focused_tab();
-    let session = app.workspace.tab(&tab)?;
-    let ViewKind::Note(note) = session.kind() else {
-        return None;
-    };
-    match note.load() {
-        NoteLoad::Reserved => Some("Opening"),
-        NoteLoad::Ready => Some("Source"),
-        NoteLoad::Failed => Some("Unavailable"),
+fn status_bar(app: &App) -> Element<'_, Message> {
+    let metrics = *app.appearance.metrics();
+    let status = app.status_text();
+    let quiet = status.starts_with("Editing current")
+        || status.starts_with("Vault ready")
+        || status.starts_with("Workspace layout restored")
+        || status.starts_with("Copied selection");
+    let mut items = row![
+        chrome::icon_button(
+            metrics,
+            Icon::Sidebar,
+            "Toggle notes sidebar · Ctrl+B",
+            Some(Message::ToggleSidebar)
+        ),
+        chrome::icon_button(
+            metrics,
+            Icon::Search,
+            "Search all notes",
+            Some(Message::RunHostCommand("workspace.open_search_view"))
+        ),
+        text(if quiet { "" } else { status })
+            .size(metrics.text_sm)
+            .style(style::dim_text)
+            .width(Length::Fill),
+    ]
+    .spacing(metrics.spacing_sm)
+    .align_y(alignment::Vertical::Center);
+    if let Some((done, total)) = app.reconcile_progress() {
+        items = items.push(
+            text(format!("Indexing {done}/{total}"))
+                .size(metrics.text_sm)
+                .style(style::dim_text),
+        );
     }
+    if app.pending_operations() > 0 {
+        items = items.push(
+            text(format!("{} in progress", app.pending_operations()))
+                .size(metrics.text_sm)
+                .style(style::dim_text),
+        );
+    }
+    container(items)
+        .height(28.0 * metrics.scale)
+        .width(Length::Fill)
+        .padding([0, 8])
+        .clip(true)
+        .style(style::status_bar)
+        .into()
 }
 
 /// The floating command palette card (core + host commands).

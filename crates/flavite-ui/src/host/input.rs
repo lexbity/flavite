@@ -16,12 +16,13 @@ pub struct InputChain {
     base: u64,
     revision: u64,
     sequence: u64,
+    preferred_x: Option<f32>,
 }
 pub fn handle(
     app: &mut App,
     tab: TabId,
     incarnation: u64,
-    input: CapturedInput,
+    mut input: CapturedInput,
 ) -> iced::Task<Message> {
     if !app.is_tab_visible(tab)
         || !reading::is_edit(app, tab)
@@ -58,6 +59,16 @@ pub fn handle(
         return iced::Task::none();
     }
     let selection = interaction.selections.first().copied().unwrap_or_default();
+    if let Some(motion) = input.vertical.as_mut() {
+        // Geometry is captured by the widget, but the sticky column belongs
+        // to the acknowledged input chain. A preceding Home/Left/edit may
+        // not have redrawn yet, so the widget's old caret is not authority.
+        motion.preferred_x = app
+            .input_chains
+            .get(&tab)
+            .filter(|chain| own_chain && chain.sequence == interaction.sequence)
+            .and_then(|chain| chain.preferred_x);
+    }
     let prepared =
         match flavite_editor::input::prepare(&view, (selection.anchor, selection.head), &input) {
             Ok(prepared) => prepared,
@@ -69,6 +80,7 @@ pub fn handle(
     let mut clipboard = None;
     let mut mutation = None;
     let mut history = false;
+    let mut preferred_x = None;
     match prepared {
         PreparedInput::Edit {
             action,
@@ -85,6 +97,14 @@ pub fn handle(
         }
         PreparedInput::Selection { anchor, head } => {
             interaction.selections = vec![Selection::new(anchor, head)]
+        }
+        PreparedInput::VerticalSelection {
+            anchor,
+            head,
+            preferred_x: x,
+        } => {
+            interaction.selections = vec![Selection::new(anchor, head)];
+            preferred_x = Some(x);
         }
         PreparedInput::Copy(copied) => clipboard = Some(copied),
     }
@@ -155,6 +175,7 @@ pub fn handle(
             base,
             revision: current.revision,
             sequence: input.sequence,
+            preferred_x,
         },
     );
     if let Some(find) = app.note_search.finds.get_mut(&tab) {

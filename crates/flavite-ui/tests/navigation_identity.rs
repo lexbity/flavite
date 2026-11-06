@@ -23,9 +23,11 @@ fn wait(app: &mut App, done: impl Fn(&App) -> bool) {
     }
 }
 
-fn fixture(notes: &[(&str, &str)]) -> App {
+fn fixture(notes: &[(&str, &str)]) -> (App, tempfile::TempDir) {
     let f = support::fixture(notes);
-    App::from_flavite(f.flavite)
+    let mut app = App::from_flavite(f.flavite);
+    wait(&mut app, |a| a.note_candidates().all().len() == notes.len());
+    (app, f.cache)
 }
 
 fn open(app: &mut App, path: &str) -> TabId {
@@ -53,7 +55,7 @@ fn note_tab(app: &App, path: &str) -> Option<TabId> {
 
 #[test]
 fn same_titled_notes_stay_distinct_by_native_path() {
-    let mut app = fixture(&[
+    let (mut app, _cache) = fixture(&[
         ("2024/journal.md", "2024 entry\n"),
         ("2025/journal.md", "2025 entry\n"),
     ]);
@@ -83,7 +85,7 @@ fn same_titled_notes_stay_distinct_by_native_path() {
 
 #[test]
 fn in_tab_navigation_to_same_note_is_rejected_without_state_change() {
-    let mut app = fixture(&[("a.md", "body\n")]);
+    let (mut app, _cache) = fixture(&[("a.md", "body\n")]);
     let tab = open(&mut app, "a.md");
     let revision = app.workspace.revision();
     app.dispatch_layout(|revision| LayoutAction::NavigateTab {
@@ -97,7 +99,7 @@ fn in_tab_navigation_to_same_note_is_rejected_without_state_change() {
 
 #[test]
 fn per_view_history_is_bounded() {
-    let mut app = fixture(&[("a.md", "a\n"), ("b.md", "b\n"), ("c.md", "c\n")]);
+    let (mut app, _cache) = fixture(&[("a.md", "a\n"), ("b.md", "b\n"), ("c.md", "c\n")]);
     let tab = open(&mut app, "a.md");
     let anchor = app
         .workspace
@@ -146,7 +148,7 @@ fn per_view_history_is_bounded() {
 
 #[test]
 fn foreign_vault_paths_are_refused_not_guessed() {
-    let mut app = fixture(&[("a.md", "body\n")]);
+    let (mut app, _cache) = fixture(&[("a.md", "body\n")]);
     let foreign = std::path::PathBuf::from("/elsewhere/vault/a.md");
     app.open_picked_note(Some(foreign));
     assert!(
@@ -159,7 +161,7 @@ fn foreign_vault_paths_are_refused_not_guessed() {
 
 #[test]
 fn rename_collision_is_refused_by_validation() {
-    let mut app = fixture(&[("a.md", "a\n"), ("b.md", "b\n")]);
+    let (mut app, _cache) = fixture(&[("a.md", "a\n"), ("b.md", "b\n")]);
     let _tab = open(&mut app, "a.md");
     // Destination exists: the dialog validation refuses submit.
     let dialog = Dialog::Rename {
@@ -185,7 +187,7 @@ fn rename_collision_is_refused_by_validation() {
 
 #[test]
 fn authoritative_rename_relocates_views_bindings_and_history() {
-    let mut app = fixture(&[("a.md", "a\n"), ("folder/b.md", "b\n")]);
+    let (mut app, _cache) = fixture(&[("a.md", "a\n"), ("folder/b.md", "b\n")]);
     let tab = open(&mut app, "folder/b.md");
     // Build nav history in this tab, then rename the current note.
     app.picker = Picker {
@@ -261,7 +263,7 @@ fn authoritative_rename_relocates_views_bindings_and_history() {
 
 #[test]
 fn create_dialog_offers_canonical_path_and_survives_collision() {
-    let mut app = fixture(&[("a.md", "a\n")]);
+    let (mut app, _cache) = fixture(&[("a.md", "a\n")]);
     // Unresolved-link activation pre-fills the canonical .md path.
     let dialog = dialogs::offer_create_for_link("systems/feedback");
     match &dialog {

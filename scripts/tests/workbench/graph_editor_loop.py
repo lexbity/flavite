@@ -109,21 +109,12 @@ def main():
     wait(lambda s: s.get("writing_target") is not None, "caret acknowledged")
     # Split: the duplicate editor anchors the second group; the graph then
     # opens into the focused group beside it.
-    key("ctrl+alt+Right")
-    wait(lambda s: len(s["groups"]) >= 2, "real split")
-    common.palette(harness, "Open graph view")
+    if not common.graph(snap()):
+        key("ctrl+alt+Right")
+        wait(lambda s: len(s["groups"]) >= 2, "real split")
+        common.palette(harness, "Open graph view")
     ready_graph()
-    # Hand focus back to the editing note: its group becomes the preferred
-    # document destination (D-01/D-03), independent of graph focus.
-    key("shift+F6")
-    wait(
-        lambda s: any(
-            t["title"] == "alpha" and t["active"] and g.get("focused")
-            for g in s["groups"]
-            for t in g["tabs"]
-        ),
-        "editor group refocused",
-    )
+    common.focus_tab(harness, "alpha", "ready")
     editor = next(
         t
         for t in tabs(snap())
@@ -304,6 +295,41 @@ def main():
         == gamma_before
     ), "activation or editing modified gamma on disk"
     checks.append({"id": "undo-local-and-disks-untouched", "outcome": "pass"})
+
+    # Editor input regression: drive physical keys through the ordered host
+    # path, then verify source text and pointer-selected word/line ranges.
+    beta_id = beta_tab["tab"]
+
+    def beta_editor(value):
+        return next(t for t in tabs(value) if t["tab"] == beta_id)
+
+    key("ctrl+a")
+    type_text("first word")
+    key("Return")
+    type_text("second line")
+    key("Return")
+    type_text("third row")
+    wait(lambda s: beta_editor(s)["buffer_text"] == "first word\nsecond line\nthird row", "editor input fixture")
+    key("ctrl+Home")
+    key("Down")
+    wait(lambda s: beta_editor(s)["selection"] == [11, 11], "Down moves one visual row")
+    key("ctrl+shift+Right")
+    wait(lambda s: beta_editor(s)["selection"] == [11, 17], "word extension keeps anchor")
+    type_text("changed")
+    wait(lambda s: beta_editor(s)["buffer_text"] == "first word\nchanged line\nthird row", "word replacement")
+    key("Up")
+    key("Home")
+    wait(lambda s: beta_editor(s)["selection"] == [0, 0], "Up returns to first row")
+    editor_bounds = beta_editor(snap())["editor_bounds"]
+    x, y, _, _ = editor_bounds
+    # Interior of the first word at the configured 16px monospace metrics.
+    common.point(window, harness, x + 35, y + 21)
+    common.run("xdotool", "click", "--repeat", "2", "--delay", "120", "1")
+    wait(lambda s: beta_editor(s)["selection"] == [0, 5], "double click selects a word")
+    common.run("xdotool", "click", "1")
+    wait(lambda s: beta_editor(s)["selection"] == [0, 11], "triple click selects the source line")
+    common.capture(window, output, "05-editor-word-selection.png", checks)
+    checks.append({"id": "editor-native-vertical-word-and-click-selection", "outcome": "pass"})
 
     common.finish(output, checks, backend)
 

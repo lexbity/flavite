@@ -158,6 +158,13 @@ fn back_and_forward_restore_place_within_one_tab() {
         replace_tab: Some(tab),
     };
     let _ = app.update(Message::PickerQuery("b".into()));
+    // Note loading and catalog acquisition are independent async flights.
+    // Submit only once the target is selectable, as the visible picker does.
+    wait(app, |a| {
+        a.picker_matches()
+            .first()
+            .is_some_and(|entry| entry.path == std::path::Path::new("b.md"))
+    });
     let _ = app.update(Message::PickerSubmit);
     wait(app, |a| {
         tab_of(a, "b.md") == Some(tab)

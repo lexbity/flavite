@@ -72,13 +72,13 @@ pub fn tab(theme: &Theme, active: bool) -> container::Style {
             .into(),
         ),
         border: Border {
-            color: if active {
-                ext.primary.base.color
-            } else {
-                Color::TRANSPARENT
+            color: ext.background.strong.color,
+            width: if active { 1.0 } else { 0.0 },
+            radius: border::Radius {
+                top_left: 6.0,
+                top_right: 6.0,
+                ..border::Radius::default()
             },
-            width: 1.0,
-            ..Border::default()
         },
         ..container::Style::default()
     }
@@ -336,6 +336,14 @@ pub fn action() -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
     }
 }
 
+/// A quiet outlined action for the new-tab launcher.
+pub fn launch_action(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = ghost()(theme, status);
+    style.border.width = 1.0;
+    style.border.radius = 28.0.into();
+    style
+}
+
 /// Button style: a quiet secondary action.
 pub fn ghost() -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
     move |theme, status| {
@@ -351,7 +359,7 @@ pub fn ghost() -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
             text_color: theme.palette().text,
             border: Border {
                 color: ext.background.strong.color,
-                width: 1.0,
+                width: 0.0,
                 radius: border::Radius::from(RADIUS),
             },
             shadow: Shadow::default(),
@@ -444,30 +452,25 @@ pub fn accent_text(theme: &Theme) -> text::Style {
     }
 }
 
-/// Container style: one tab-group pane; the focused group carries a
-/// visible non-color border.
+/// Neutral group boundaries keep focus chrome out of document content.
+/// The active tab carries the keyboard-focus indicator.
 #[must_use]
-pub fn pane(theme: &Theme, focused: bool) -> container::Style {
-    let ext = theme.extended_palette();
-    let border = if focused {
-        Border {
-            color: ext.primary.base.color,
-            width: FOCUS_WIDTH,
-            radius: border::Radius::from(0.0),
-        }
-    } else {
-        Border {
-            color: ext.background.strong.color,
-            width: 1.0,
-            radius: border::Radius::from(0.0),
-        }
-    };
+pub fn pane(theme: &Theme, _focused: bool) -> container::Style {
     container::Style {
-        text_color: None,
-        background: Some(Background::Color(theme.palette().background)),
-        border,
-        shadow: Shadow::default(),
-        snap: false,
+        background: Some(theme.palette().background.into()),
+        border: Border {
+            color: theme.extended_palette().background.strong.color,
+            width: 1.0,
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
+
+pub fn tab_focus(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(theme.palette().primary.into()),
+        ..container::Style::default()
     }
 }
 

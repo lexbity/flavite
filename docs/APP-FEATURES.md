@@ -208,9 +208,14 @@ Remappable in Preferences.
 | ArrowUp/Down + Enter (menus, palette, picker) | Navigate + run |
 
 Editor keys: standard select-all/copy/cut/paste, Undo (Mod+Z) / Redo
-(Mod+Shift+Z or Mod+Y), line/document Home/End, arrow movement, Backspace/
-Delete, Enter. IME composition is supported (Edit/Read toggle is disabled
-while composing).
+(Mod+Shift+Z or Mod+Y), line/document Home/End, grapheme Left/Right,
+wrapped-row Up/Down, Page Up/Down, Backspace/Delete, Enter. Vertical movement
+retains the horizontal position through short and empty lines. Ctrl+Left/Right
+and Ctrl+Backspace/Delete move/delete by Unicode word (Option on macOS).
+Shift extends keyboard selections; Shift-click extends from the existing
+anchor. Double-click selects a word and triple-click selects a source line;
+dragging afterward extends by the selected unit. IME composition is supported
+(Edit/Read toggle is disabled while composing).
 
 ## Data locations
 

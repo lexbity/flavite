@@ -14,6 +14,7 @@ use iced::keyboard::{self, Modifiers};
 /// `Mod` is the platform command modifier. A preference override replaces
 /// the default for that command id only.
 pub const DEFAULT_CHORDS: &[(&str, &str)] = &[
+    ("workspace.toggle_sidebar", "Mod+B"),
     ("workspace.find", "Mod+F"),
     ("workspace.replace", "Mod+H"),
     ("workspace.note_mode", "Mod+E"),
@@ -132,6 +133,14 @@ pub struct UiCommand {
 /// All UI commands, in palette order. A capability absent from a stage
 /// build is absent here (RFC §16.1): no placeholder rows.
 pub const UI_COMMANDS: &[UiCommand] = &[
+    UiCommand {
+        id: "workspace.writing_layout",
+        title: "Use writing layout",
+    },
+    UiCommand {
+        id: "workspace.toggle_sidebar",
+        title: "Toggle notes sidebar",
+    },
     UiCommand {
         id: "note.find_regex",
         title: "Toggle regex matching",
@@ -619,7 +628,8 @@ fn keyboard_command_message(app: &App, id: &'static str) -> Option<Message> {
     let layout = |action: LayoutAction| Some(Message::Layout(action));
     let revision = app.workspace.revision();
     match id {
-        "workspace.find"
+        "workspace.toggle_sidebar"
+        | "workspace.find"
         | "workspace.replace"
         | "workspace.note_mode"
         | "workspace.new_tab"
@@ -922,8 +932,10 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
                 });
             }
         }
+        "workspace.writing_layout" => app.use_writing_layout(),
+        "workspace.toggle_sidebar" => app.sidebar_open = !app.sidebar_open,
         "workspace.open_notes_view" => {
-            if let Some(group) = focused_group {
+            if let Some(group) = app.navigation_group() {
                 app.dispatch_layout(|revision| LayoutAction::OpenNotes {
                     expected_revision: revision,
                     group,
@@ -932,7 +944,7 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
         }
         // ---- W10 ----
         "workspace.open_search_view" => {
-            if let Some(group) = focused_group {
+            if let Some(group) = app.navigation_group() {
                 app.dispatch_layout(|revision| LayoutAction::OpenSearch {
                     expected_revision: revision,
                     group,

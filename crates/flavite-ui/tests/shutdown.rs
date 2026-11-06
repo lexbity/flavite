@@ -21,14 +21,23 @@ use std::time::{Duration, Instant};
 use support::UiFixture;
 
 fn fixture() -> UiFixture {
-    support::ui_fixture(
+    let mut fixture = support::ui_fixture(
         17,
         "/test/shutdown",
         &[support::SeedNote {
             components: &["alpha.md"],
             body: "# Alpha\n\nalpha body\n",
         }],
-    )
+    );
+    // Finish startup restoration before injecting generation faults. A late
+    // catalog reply would otherwise load the injected file as startup state.
+    pump_until(&mut fixture.app, "startup catalog", |app| {
+        matches!(
+            app.catalog_status(),
+            flavite_ui::app::CatalogStatus::Ready { .. }
+        )
+    });
+    fixture
 }
 
 fn wait_ready(app: &mut App) {
@@ -127,6 +136,7 @@ fn type_into(app: &mut App, tab: TabId, text: &str) {
             text: text.to_owned(),
             extend: false,
             document_boundary: false,
+            vertical: None,
         },
     });
 }
@@ -164,7 +174,11 @@ fn poison_layout_generation(app: &mut App) {
 
 #[test]
 fn clean_quit_flushes_layout_and_reports_no_pending_work() {
-    let UiFixture { mut app, fs, .. } = fixture();
+    let UiFixture {
+        mut app,
+        fs,
+        cache: _cache,
+    } = fixture();
     let alpha = open_note(&mut app, "alpha.md");
     // A layout change the quit must flush durably.
     let _ = app.update(Message::RunHostCommand("workspace.split_right"));
@@ -216,7 +230,11 @@ fn clean_quit_flushes_layout_and_reports_no_pending_work() {
 
 #[test]
 fn quit_with_dirty_note_requires_a_decision_first() {
-    let UiFixture { mut app, .. } = fixture();
+    let UiFixture {
+        mut app,
+        cache: _cache,
+        ..
+    } = fixture();
     let alpha = open_note(&mut app, "alpha.md");
     type_into(&mut app, alpha, " unsaved edit");
     assert_eq!(
@@ -262,7 +280,11 @@ fn quit_with_dirty_note_requires_a_decision_first() {
 
 #[test]
 fn quit_after_save_decision_saves_and_exits() {
-    let UiFixture { mut app, fs, .. } = fixture();
+    let UiFixture {
+        mut app,
+        fs,
+        cache: _cache,
+    } = fixture();
     let alpha = open_note(&mut app, "alpha.md");
     type_into(&mut app, alpha, " unsaved edit");
 
@@ -297,7 +319,11 @@ fn quit_after_save_decision_saves_and_exits() {
 
 #[test]
 fn quit_stops_layout_mutations_while_active() {
-    let UiFixture { mut app, .. } = fixture();
+    let UiFixture {
+        mut app,
+        cache: _cache,
+        ..
+    } = fixture();
     let alpha = open_note(&mut app, "alpha.md");
     type_into(&mut app, alpha, " dirty");
     let _ = app.update(Message::WindowEvent(iced::window::Event::CloseRequested));
@@ -332,7 +358,11 @@ fn quit_stops_layout_mutations_while_active() {
 
 #[test]
 fn layout_flush_failure_offers_quit_with_unsaved_layout() {
-    let UiFixture { mut app, fs, .. } = fixture();
+    let UiFixture {
+        mut app,
+        fs,
+        cache: _cache,
+    } = fixture();
     let alpha = open_note(&mut app, "alpha.md");
     poison_layout_generation(&mut app);
 
@@ -373,7 +403,11 @@ fn layout_flush_failure_offers_quit_with_unsaved_layout() {
 
 #[test]
 fn pending_save_timeout_offers_truthful_choices() {
-    let UiFixture { mut app, .. } = fixture();
+    let UiFixture {
+        mut app,
+        cache: _cache,
+        ..
+    } = fixture();
     // One accepted operation that will never reach terminal state in this
     // process (white-box staging: no real operation can be stalled
     // deterministically headlessly).
@@ -427,7 +461,11 @@ fn pending_save_timeout_offers_truthful_choices() {
 
 #[test]
 fn pending_save_timeout_can_be_cancelled() {
-    let UiFixture { mut app, .. } = fixture();
+    let UiFixture {
+        mut app,
+        cache: _cache,
+        ..
+    } = fixture();
     app.operations.accept(9999, "fake stalled save");
     stage_awaiting_operations(&mut app, Duration::from_secs(6));
     let _ = app.update(Message::Pump);
@@ -449,7 +487,11 @@ fn pending_save_timeout_can_be_cancelled() {
 
 #[test]
 fn composition_blocks_quit() {
-    let UiFixture { mut app, .. } = fixture();
+    let UiFixture {
+        mut app,
+        cache: _cache,
+        ..
+    } = fixture();
     let alpha = open_note(&mut app, "alpha.md");
     let view = app.note_editor_view(alpha).expect("the editor view");
     let incarnation = app.notes.incarnation(alpha).unwrap();

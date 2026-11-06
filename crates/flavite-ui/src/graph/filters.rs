@@ -309,21 +309,13 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
     };
     let mut content = column![
         row![
-            action(
-                if state.filter.expanded {
-                    "Hide filters"
-                } else {
-                    "Filters"
-                },
-                GraphCommand::ToggleFilters
-            ),
-            action("Clear filters", GraphCommand::ClearFilters),
-            action("Undo filters", GraphCommand::UndoFilters),
-            action("Explore selection", GraphCommand::ExploreSelected)
+            action("Reset", GraphCommand::ClearFilters),
+            action("Undo", GraphCommand::UndoFilters),
+            action("Neighborhood", GraphCommand::ExploreSelected),
         ]
         .spacing(4)
     ]
-    .spacing(4);
+    .spacing(8);
     if state.filter.expanded {
         let input =
             move |placeholder: &'static str, value: &'a str, field| {

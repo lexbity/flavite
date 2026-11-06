@@ -9,6 +9,22 @@ pub enum KeyAction {
     Previous,
     /// Move to next grapheme.
     Next,
+    /// Move to the previous word boundary.
+    PreviousWord,
+    /// Move to the next word boundary.
+    NextWord,
+    /// Move up one visual row.
+    Up,
+    /// Move down one visual row.
+    Down,
+    /// Move up one viewport.
+    PageUp,
+    /// Move down one viewport.
+    PageDown,
+    /// Delete to the previous word boundary.
+    BackspaceWord,
+    /// Delete to the next word boundary.
+    DeleteWord,
     /// Move to start of document.
     Home,
     /// Move to end of document.

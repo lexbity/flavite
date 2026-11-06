@@ -102,10 +102,9 @@ pub fn accessible_character_lengths(text: &str) -> Vec<u8> {
 #[must_use]
 pub fn previous_grapheme_boundary(text: &str, byte: usize) -> usize {
     let byte = clamp_char_boundary(text, byte);
-    text.grapheme_indices(true)
-        .map(|(index, _)| index)
-        .take_while(|index| *index < byte)
-        .last()
+    unicode_segmentation::GraphemeCursor::new(byte, text.len(), true)
+        .prev_boundary(text, 0)
+        .expect("complete text supplies grapheme context")
         .unwrap_or(0)
 }
 
@@ -113,15 +112,98 @@ pub fn previous_grapheme_boundary(text: &str, byte: usize) -> usize {
 #[must_use]
 pub fn next_grapheme_boundary(text: &str, byte: usize) -> usize {
     let byte = clamp_char_boundary(text, byte);
-    text.grapheme_indices(true)
-        .map(|(index, grapheme)| index + grapheme.len())
-        .find(|end| *end > byte)
+    unicode_segmentation::GraphemeCursor::new(byte, text.len(), true)
+        .next_boundary(text, 0)
+        .expect("complete text supplies grapheme context")
         .unwrap_or(text.len())
+}
+
+/// Clamp shaped glyph offsets to an extended grapheme boundary. Shapers can
+/// expose scalar offsets inside combining/emoji sequences.
+#[must_use]
+pub fn clamp_grapheme_boundary(text: &str, byte: usize) -> usize {
+    let byte = clamp_char_boundary(text, byte);
+    let mut cursor = unicode_segmentation::GraphemeCursor::new(byte, text.len(), true);
+    if cursor
+        .is_boundary(text, 0)
+        .expect("complete text supplies grapheme context")
+    {
+        byte
+    } else {
+        cursor
+            .prev_boundary(text, 0)
+            .expect("complete text supplies grapheme context")
+            .unwrap_or(0)
+    }
+}
+
+/// Start of the preceding Unicode word, skipping intervening punctuation.
+#[must_use]
+pub fn previous_word_boundary(text: &str, byte: usize) -> usize {
+    let byte = clamp_char_boundary(text, byte);
+    text[..byte]
+        .unicode_word_indices()
+        .next_back()
+        .map_or(0, |(at, _)| at)
+}
+
+/// End of the next Unicode word, skipping intervening punctuation.
+#[must_use]
+pub fn next_word_boundary(text: &str, byte: usize) -> usize {
+    let byte = clamp_char_boundary(text, byte);
+    text[byte..]
+        .unicode_word_indices()
+        .next()
+        .map_or(text.len(), |(at, word)| byte + at + word.len())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grapheme_cursors_match_whole_text_segmentation_at_every_scalar_boundary() {
+        for text in ["", "a\r\nb", "e\u{301} 🧑🏽‍💻 🇨🇦🇺🇸", "a\u{301}\u{301}\u{301}z"]
+        {
+            let boundaries: Vec<_> = text
+                .grapheme_indices(true)
+                .map(|(at, _)| at)
+                .chain([text.len()])
+                .collect();
+            for byte in text.char_indices().map(|(at, _)| at).chain([text.len()]) {
+                let previous = boundaries
+                    .iter()
+                    .copied()
+                    .rfind(|at| *at < byte)
+                    .unwrap_or(0);
+                let next = boundaries
+                    .iter()
+                    .copied()
+                    .find(|at| *at > byte)
+                    .unwrap_or(text.len());
+                let clamped = boundaries
+                    .iter()
+                    .copied()
+                    .rfind(|at| *at <= byte)
+                    .unwrap_or(0);
+                assert_eq!(
+                    previous_grapheme_boundary(text, byte),
+                    previous,
+                    "previous {text:?} {byte}"
+                );
+                assert_eq!(
+                    next_grapheme_boundary(text, byte),
+                    next,
+                    "next {text:?} {byte}"
+                );
+                assert_eq!(
+                    clamp_grapheme_boundary(text, byte),
+                    clamped,
+                    "clamp {text:?} {byte}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn native_character_lengths_match_unicode_segmentation() {

@@ -23,10 +23,14 @@ use crate::graph::renderer::{GraphMessage, GraphProgram};
 use crate::host::graph::{self, GraphCommand, GraphTabState};
 use crate::style;
 use crate::views::empty_state;
-use crate::workspace::{bounds as bounds_obs, tab_strip};
+use crate::workspace::{
+    bounds as bounds_obs,
+    chrome::{self, Icon},
+    tab_strip,
+};
 use flavite_api::GraphServiceStatus;
-use flavite_workspace::{Direction, TabId, ViewKind};
-use iced::widget::{button, column, container, pick_list, row, scrollable, text};
+use flavite_workspace::{TabId, ViewKind};
+use iced::widget::{button, column, container, row, scrollable, text};
 use iced::{Element, Length, Padding, alignment};
 
 /// Rows rendered in list/accessibility mode before truncation is noted.
@@ -51,59 +55,41 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         return empty_state(metrics, "Graph", "The graph view is starting…");
     };
 
-    let header = header(app, tab, state);
-    // AC-4 (D-02): selecting, deselecting, and inspecting occurrence
-    // details change the canvas bounds by zero logical pixels. Selection
-    // actions and occurrence details are overlays pinned *over* the
-    // canvas (D-02's sanctioned overlay band), so the canvas geometry is
-    // structurally independent of their content.
-    let mut activity_overlay = column![
-        container(selection_band(app, tab, state))
+    let mut activity = column![].spacing(8);
+    if state.selection.is_some() {
+        activity = activity.push(
+            container(
+                column![
+                    selection_band(app, tab, state),
+                    target_banner(app),
+                    scrollable(crate::host::occurrences::view(app, tab)).height(Length::Shrink)
+                ]
+                .spacing(8),
+            )
             .width(Length::Fill)
-            .style(style::toolbar),
-        container(
-            scrollable(crate::host::occurrences::view(app, tab))
-                .width(Length::Fill)
-                .height(Length::Fixed(band_row_height(metrics) * 3.0)),
-        )
-        .width(Length::Fill)
-        .style(style::toolbar),
-    ]
-    .width(Length::Fill);
-    // D-02: the first upgraded launch explains the changed gesture exactly
-    // once, dismissibly, inside the same overlay — the network never
-    // moves for it.
-    if app.appearance.graph_activation_notice_pending() {
-        activity_overlay = activity_overlay.push(activation_notice(app, tab));
+            .padding(12)
+            .style(style::palette_card),
+        );
     }
-    let body: Element<'a, Message> = if state.filter.expanded {
-        scrollable(crate::graph::filters::view(app, tab))
-            .height(Length::Fill)
-            .into()
-    } else {
-        match &state.geometry {
-            None => unavailable(app, tab, state),
-            Some(geometry) if state.list_mode => list_body(app, tab, state, geometry),
-            Some(geometry) => visual_body(
-                app,
-                tab,
-                incarnation,
-                state,
-                geometry,
-                Some(activity_overlay.into()),
-            ),
-        }
+    let body = match &state.geometry {
+        None => unavailable(app, tab, state),
+        Some(geometry) if state.list_mode => list_body(app, tab, state, geometry),
+        Some(geometry) => visual_body(
+            app,
+            tab,
+            incarnation,
+            state,
+            geometry,
+            state.selection.map(|_| Element::from(activity)),
+        ),
     };
     column![
-        header,
-        target_banner(app),
+        header(app, tab, state),
         container(body).width(Length::Fill).height(Length::Fill),
-        // AC-4: the footer sits in a fixed clipped line — its text may
-        // change with selection/scope, its height may never.
         container(footer(app, tab, state))
             .width(Length::Fill)
-            .height(Length::Fixed(band_row_height(metrics)))
-            .clip(true),
+            .height(20.0 * metrics.scale)
+            .clip(true)
     ]
     .width(Length::Fill)
     .height(Length::Fill)
@@ -117,7 +103,7 @@ fn activation_notice<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
     container(bounds_obs::observe(
         container(row![
             text(
-                "Changed: double-click now opens a note. Inserting a link is explicit — press Ctrl+Enter or use Insert.",
+                "Double-click a node to open its note. Ctrl+Enter inserts a link into the writing note.",
             )
             .size(metrics.text_sm)
             .width(Length::Fill),
@@ -146,227 +132,173 @@ fn activation_notice<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
 
 /// One overlay row height: a compact action row that never changes with
 /// its content (AC-4). Deterministic in the metrics.
-fn band_row_height(metrics: crate::style::Metrics) -> f32 {
-    metrics.text_sm * 1.5 + metrics.spacing_sm
-}
-
-/// The persistent writing-target affordance (D-05): the insertion
-/// destination is visible before it happens; a missing target gets an
-/// explanation, never a hidden fallback. D-02 (S04): double-click opens;
-/// insertion is only the explicit Ctrl+Enter/Insert intent.
 fn target_banner<'a>(app: &'a App) -> Element<'a, Message> {
     let metrics = app.appearance.metrics();
-    let banner: Element<'a, Message> = if let Some((tab, ..)) = app.valid_writing_target() {
-        let title = app
-            .notes
-            .locator_of(tab)
-            .map_or_else(|| "the current note".into(), |l| l.title().to_owned());
-        row![
-            text("Insert links into:").size(metrics.text_sm),
-            text(title).size(metrics.text_sm).style(style::dim_text),
-            text("— Ctrl+Enter or Insert places a link; double-click opens the node")
-                .size(metrics.text_sm)
-                .style(style::dim_text),
-        ]
-        .spacing(4)
-        .align_y(alignment::Vertical::Center)
-        .into()
-    } else {
-        text("No insertion target — click in an editor to place the cursor; explicit insertion is disabled (double-click opens, it never inserts)")
-            .size(metrics.text_sm)
-            .style(style::dim_text)
-            .into()
-    };
-    container(banner)
-        .width(Length::Fill)
-        .padding(Padding {
-            top: 2.0,
-            bottom: 2.0,
-            left: metrics.spacing,
-            right: metrics.spacing,
-        })
-        .style(style::toolbar)
+    let label = app.valid_writing_target().map_or_else(
+        || "Place the caret in a note to insert a link.".to_owned(),
+        |(tab, ..)| {
+            format!(
+                "Insert into: {}",
+                app.notes
+                    .locator_of(tab)
+                    .map_or_else(|| "note".to_owned(), |note| note.title().to_owned())
+            )
+        },
+    );
+    text(label)
+        .size(metrics.text_sm)
+        .style(style::dim_text)
         .into()
 }
 
-/// One status/hint line under the canvas: staleness, scope status, what
-/// publishes to context, provenance, and the keyboard hint.
-fn footer<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Message> {
+fn footer<'a>(app: &'a App, _tab: TabId, state: &GraphTabState) -> Element<'a, Message> {
     let metrics = app.appearance.metrics();
-    let state_text = if state.stale {
-        "Frame stale — insertion disabled".to_owned()
+    let label = if state.stale {
+        "Graph is out of date · refresh before inserting".to_owned()
     } else if state.updating {
         "Updating…".to_owned()
     } else {
-        // D-04: a *source* view shows what it publishes, not a binding
-        // label (the graph has no follow-binding of its own).
-        match app.workspace.exploration() {
-            Some(selection) if selection.source_tab == tab => match &selection.target {
-                Some(target) => format!("Publishing to context: {}", target.title()),
-                None => "Publishing to context: no selection".into(),
-            },
-            _ => "Publishing to context: not publishing".into(),
-        }
+        state
+            .geometry
+            .as_ref()
+            .map_or_else(String::new, |geometry| {
+                format!("{} nodes", geometry.node_count())
+            })
     };
-    let scope_status = if state.scope_result.as_ref().is_some_and(|s| s.excluded_root) {
-        "Root excluded — clear filters"
-    } else if state.scope_result.as_ref().is_some_and(|s| s.missing_root) {
-        "Neighborhood root is missing"
-    } else if state
-        .scope_result
-        .as_ref()
-        .is_some_and(|s| s.nodes.is_empty())
-    {
-        "No matching notes — clear filters"
-    } else {
-        ""
-    };
-    row![
-        text(state_text)
-            .size(metrics.text_sm)
-            .style(style::dim_text),
-        text(scope_status)
-            .size(metrics.text_sm)
-            .style(style::dim_text),
-        iced::widget::Space::new()
-            .width(Length::Fill)
-            .height(Length::Fixed(0.0)),
-        text(crate::graph::provenance::label(state))
-            .size(metrics.text_sm)
-            .style(style::dim_text),
-        text("Enter opens · Ctrl+Enter inserts")
-            .size(metrics.text_sm)
-            .style(style::dim_text),
-    ]
-    .spacing(metrics.spacing)
-    .align_y(alignment::Vertical::Center)
+    container(text(label).size(metrics.text_sm).style(style::dim_text))
+        .width(Length::Fill)
+        .padding([0, 12])
+        .align_x(alignment::Horizontal::Right)
+        .into()
+}
+
+fn header<'a>(app: &'a App, tab: TabId, _state: &GraphTabState) -> Element<'a, Message> {
+    let metrics = *app.appearance.metrics();
+    container(
+        row![
+            text("Graph view").size(metrics.text).style(style::dim_text),
+            iced::widget::Space::new().width(Length::Fill),
+            chrome::icon_button(
+                metrics,
+                Icon::More,
+                "Graph controls",
+                Some(Message::GraphCommand {
+                    tab,
+                    command: GraphCommand::ToggleControls
+                })
+            )
+        ]
+        .align_y(alignment::Vertical::Center),
+    )
+    .height(38.0 * metrics.scale)
+    .padding([0, 12])
+    .width(Length::Fill)
     .into()
 }
 
-/// Toolbar: compact counts, neighborhood controls, and the view's real
-/// controls on one hug-content row; selection actions appear only when a
-/// selection exists.
-fn header<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Message> {
-    let metrics = app.appearance.metrics();
-    let counts = state
-        .scope_result
-        .as_ref()
-        .map(|scope| {
-            let rendered = state.geometry.as_ref().map_or(0, |g| g.node_count());
-            let omitted = scope.nodes.len().saturating_sub(rendered);
-            if omitted > 0 {
-                format!(
-                    "{} / {} notes · {} omitted",
-                    scope.matching_notes, scope.total_base_notes, omitted
-                )
-            } else {
-                format!(
-                    "{} / {} notes",
-                    scope.matching_notes, scope.total_base_notes
-                )
-            }
-        })
-        .unwrap_or_else(|| "Updating…".into());
-    let chip = |label: &'static str, command: GraphCommand, enabled: bool| {
-        button(text(label).size(metrics.text_sm))
-            .padding(tab_strip::chip_padding())
-            .style(style::ghost())
-            .on_press_maybe(enabled.then_some(Message::GraphCommand { tab, command }))
-    };
-    let mut toolbar = row![]
-        .spacing(metrics.spacing)
-        .align_y(alignment::Vertical::Center);
-    toolbar = toolbar.push(text(counts).size(metrics.text_sm));
-    // Neighborhood controls live on the toolbar (concept 01), not buried
-    // in the filter panel; depth/direction only apply to a neighborhood
-    // scope.
-    if let Some(neighborhood) = &state.scope.neighborhood {
-        let direction = match neighborhood.direction {
-            Direction::In => "In",
-            Direction::Out => "Out",
-            Direction::Both => "Both",
-        };
-        toolbar = toolbar
-            .push(text("Depth").size(metrics.text_sm).style(style::dim_text))
-            .push(pick_list(
-                vec![0u8, 1, 2, 3, 4, 5, 6],
-                Some(neighborhood.depth),
-                move |depth| Message::GraphCommand {
-                    tab,
-                    command: GraphCommand::Depth(depth),
-                },
-            ))
-            .push(pick_list(
-                vec!["In", "Out", "Both"],
-                Some(direction),
-                move |direction| Message::GraphCommand {
-                    tab,
-                    command: GraphCommand::Direction(match direction {
-                        "In" => Direction::In,
-                        "Out" => Direction::Out,
-                        _ => Direction::Both,
-                    }),
-                },
-            ));
-    }
-    toolbar = toolbar
-        .push(
-            iced::widget::Space::new()
-                .width(Length::Fill)
-                .height(Length::Fixed(0.0)),
+fn controls_panel<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Message> {
+    let metrics = *app.appearance.metrics();
+    let section = |title: &'static str, open: bool, command| {
+        button(
+            row![
+                text(if open { "⌄" } else { "›" }).size(metrics.text),
+                text(title).size(metrics.text)
+            ]
+            .spacing(12)
+            .align_y(alignment::Vertical::Center),
         )
-        .push(chip(
-            if state.filter.expanded {
-                "Close filters"
-            } else {
-                "Filters"
-            },
-            GraphCommand::ToggleFilters,
-            true,
-        ))
-        .push(chip("Clear filters", GraphCommand::ClearFilters, true))
-        .push(chip(
-            "Undo filters",
-            GraphCommand::UndoFilters,
-            state.previous_scope.is_some(),
-        ))
-        .push(chip(
-            "Neighborhood",
-            GraphCommand::ExploreSelected,
-            state.selection.is_some(),
-        ))
-        .push(chip(
-            if state.frozen {
-                "Resume layout"
-            } else {
-                "Freeze layout"
-            },
-            GraphCommand::ToggleFreeze,
-            true,
-        ))
-        .push(chip(
-            if state.list_mode {
-                "Show graph"
-            } else {
-                "Show list"
-            },
-            GraphCommand::ToggleList,
-            true,
-        ))
-        .push(chip(
-            "Retry",
-            GraphCommand::RetryService,
-            matches!(app.graph.status, Some(GraphServiceStatus::Failed { .. })),
-        ));
-    container(toolbar)
         .width(Length::Fill)
-        .padding(Padding {
-            top: 4.0,
-            bottom: 4.0,
-            left: metrics.spacing,
-            right: metrics.spacing,
-        })
-        .style(style::toolbar)
+        .padding([12, 14])
+        .style(style::ghost())
+        .on_press(Message::GraphCommand { tab, command })
+    };
+    let action = |title: &'static str, command| {
+        button(text(title).size(metrics.text_sm))
+            .padding([6, 10])
+            .style(style::ghost())
+            .on_press(Message::GraphCommand { tab, command })
+    };
+    let mut card = column![
+        row![
+            iced::widget::Space::new().width(Length::Fill),
+            chrome::icon_button(
+                metrics,
+                Icon::Close,
+                "Hide graph controls",
+                Some(Message::GraphCommand {
+                    tab,
+                    command: GraphCommand::ToggleControls
+                })
+            )
+        ],
+        section(
+            "Filters",
+            state.filter.expanded,
+            GraphCommand::ToggleFilters
+        ),
+    ];
+    if state.filter.expanded {
+        card = card.push(container(crate::graph::filters::view(app, tab)).padding(12));
+    }
+    card = card.push(iced::widget::rule::horizontal(1));
+    card = card.push(section(
+        "Display",
+        state.display_controls_open,
+        GraphCommand::ToggleDisplayControls,
+    ));
+    if state.display_controls_open {
+        card = card.push(
+            container(
+                column![
+                    action(
+                        if state.list_mode {
+                            "Show graph"
+                        } else {
+                            "Show list"
+                        },
+                        GraphCommand::ToggleList
+                    ),
+                    text(crate::graph::provenance::label(state))
+                        .size(metrics.text_sm)
+                        .style(style::dim_text),
+                ]
+                .spacing(8),
+            )
+            .padding(12),
+        );
+        if app.appearance.graph_activation_notice_pending() {
+            card = card.push(activation_notice(app, tab));
+        }
+    }
+    card = card.push(iced::widget::rule::horizontal(1));
+    card = card.push(section(
+        "Layout",
+        state.layout_controls_open,
+        GraphCommand::ToggleLayoutControls,
+    ));
+    if state.layout_controls_open {
+        card = card.push(
+            container(
+                column![
+                    action(
+                        if state.frozen {
+                            "Resume layout"
+                        } else {
+                            "Freeze layout"
+                        },
+                        GraphCommand::ToggleFreeze
+                    ),
+                    action("Fit to view", GraphCommand::FitView),
+                ]
+                .spacing(6),
+            )
+            .padding(12),
+        );
+    }
+    container(scrollable(card).height(Length::Shrink))
+        .width(290.0 * metrics.scale)
+        .max_height(540.0 * metrics.scale)
+        .style(style::palette_card)
         .into()
 }
 
@@ -386,34 +318,7 @@ fn selection_band<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Elemen
     let record = graph::record_for(app, hit.id);
     let selection = record
         .as_ref()
-        .map(|record| {
-            let kind = match record.id.kind {
-                flavite_graph::NodeKind::Note => "note",
-                flavite_graph::NodeKind::Attachment => "attachment",
-                flavite_graph::NodeKind::Unresolved => "unresolved",
-            };
-            format!(
-                "Selected: {} [{}] · {}{}",
-                record.title,
-                kind,
-                record.path,
-                if state
-                    .scope_result
-                    .as_ref()
-                    .is_some_and(|scope| !scope.nodes.contains(&hit.id))
-                {
-                    " · outside current scope"
-                } else {
-                    ""
-                }
-            )
-        })
-        .unwrap_or_else(|| "Selected".into());
-    let summary = if state.selection_summary.is_empty() {
-        format!("{} selected", state.selected_nodes.len())
-    } else {
-        state.selection_summary.clone()
-    };
+        .map_or_else(|| "Selection".to_owned(), |record| record.title.clone());
     let chip = |label: &'static str, command: GraphCommand, enabled: bool| {
         button(text(label).size(metrics.text_sm))
             .padding(tab_strip::chip_padding())
@@ -427,41 +332,29 @@ fn selection_band<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Elemen
             .on_press_maybe(enabled.then_some(message))
     };
     let locator = record.as_ref().and_then(graph::locator_for);
-    let mut band = row![
-        text(selection).size(metrics.text_sm).style(style::dim_text),
-        text(summary).size(metrics.text_sm).style(style::dim_text),
-        iced::widget::Space::new()
-            .width(Length::Fill)
-            .height(Length::Fixed(0.0)),
-    ]
-    .spacing(metrics.spacing)
-    .align_y(alignment::Vertical::Center);
+    let mut actions = row![].spacing(6);
     // D-02: every node kind gets its own explicit intent and nothing else
     // is offered — a resolved note opens (and can be inserted into), an
     // attachment activates the existing local inspector, and an unresolved
     // target offers Create-or-Locate without ever creating implicitly.
     match record.as_ref().map(|record| record.id.kind) {
         Some(flavite_graph::NodeKind::Note) if locator.is_some() => {
-            band = band
-                .push(chip("Open (Enter)", GraphCommand::OpenSelected, true))
+            actions = actions
+                .push(chip("Open", GraphCommand::OpenSelected, true))
                 .push(chip(
-                    "Insert link (Ctrl+Enter)",
+                    "Insert link",
                     GraphCommand::InsertSelected,
                     graph::insert_available(app, tab),
                 ));
         }
         Some(flavite_graph::NodeKind::Attachment) => {
-            band = band.push(chip(
-                "Open attachment (Enter)",
-                GraphCommand::OpenSelected,
-                true,
-            ));
+            actions = actions.push(chip("Open attachment", GraphCommand::OpenSelected, true));
         }
         Some(flavite_graph::NodeKind::Unresolved) => {
             let representable = record
                 .as_ref()
                 .is_some_and(graph::unresolved_is_representable);
-            band = band
+            actions = actions
                 .push(action_chip(
                     "Create note…",
                     Message::CreateFromNode(tab),
@@ -475,20 +368,28 @@ fn selection_band<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Elemen
         }
         _ => {}
     }
-    band = band
-        .push(chip(
-            "Open in tabs",
-            GraphCommand::OpenSelectedInTabs,
-            state.selected_nodes.len() > 1,
-        ))
-        .push(chip("Unpin", GraphCommand::UnpinSelected, record.is_some()))
-        .push(chip(
-            "Reveal",
-            GraphCommand::RevealSelected,
-            record.is_some(),
-        ))
-        .push(chip("Clear", GraphCommand::ClearSelection, true));
-    band.into()
+    if state.selected_nodes.len() > 1 {
+        actions = actions.push(chip("Open in tabs", GraphCommand::OpenSelectedInTabs, true));
+    }
+    column![
+        row![
+            text(selection).size(metrics.text),
+            iced::widget::Space::new().width(Length::Fill),
+            chip("Clear", GraphCommand::ClearSelection, true)
+        ],
+        actions,
+        row![
+            chip(
+                "Neighborhood",
+                GraphCommand::ExploreSelected,
+                record.is_some()
+            ),
+            chip("Unpin", GraphCommand::UnpinSelected, record.is_some())
+        ]
+        .spacing(6)
+    ]
+    .spacing(8)
+    .into()
 }
 
 /// Honest loading/error states before any frame exists (§13.4). The graph
@@ -681,12 +582,51 @@ fn visual_body<'a>(
     // over the top of the canvas: their content changes never touch the
     // canvas bounds (AC-4).
     let surface: Element<'a, Message> = if let Some(overlay) = activity_overlay {
-        let pinned = container(overlay)
+        let selected_y = state
+            .selection
+            .and_then(|selected| {
+                geometry
+                    .nodes()
+                    .iter()
+                    .enumerate()
+                    .find(|(index, _)| geometry.node_id(*index) == Some(selected.id))
+            })
+            .and_then(|(_, node)| {
+                state.bounds.map(|bounds| {
+                    (
+                        state.camera.world_to_screen(
+                            node.center,
+                            [0.0, 0.0],
+                            [bounds.width, bounds.height],
+                        )[1],
+                        bounds.height,
+                    )
+                })
+            });
+        let pinned = container(iced::widget::opaque(
+            container(overlay).max_width(360.0 * metrics.scale),
+        ))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(12)
+        .align_x(alignment::Horizontal::Left)
+        .align_y(if selected_y.is_some_and(|(y, height)| y < height * 0.5) {
+            alignment::Vertical::Bottom
+        } else {
+            alignment::Vertical::Top
+        });
+        iced::widget::stack![surface, pinned].into()
+    } else {
+        surface
+    };
+    let surface: Element<'a, Message> = if state.controls_open {
+        let panel = container(iced::widget::opaque(controls_panel(app, tab, state)))
             .width(Length::Fill)
             .height(Length::Fill)
-            .align_x(alignment::Horizontal::Center)
+            .padding(16)
+            .align_x(alignment::Horizontal::Right)
             .align_y(alignment::Vertical::Top);
-        iced::widget::stack![surface, pinned].into()
+        iced::widget::stack![surface, panel].into()
     } else {
         surface
     };

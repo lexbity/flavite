@@ -329,6 +329,7 @@ fn rapid_captured_input_is_interpreted_in_order_without_replaying_after_another_
                 text: text.into(),
                 extend: false,
                 document_boundary: false,
+                vertical: None,
             },
         });
     }
@@ -355,6 +356,7 @@ fn rapid_captured_input_is_interpreted_in_order_without_replaying_after_another_
             text: "must not appear".into(),
             extend: false,
             document_boundary: false,
+            vertical: None,
         },
     });
     assert_eq!(app.note_state_text(tab).unwrap(), before);

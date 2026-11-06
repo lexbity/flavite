@@ -454,7 +454,7 @@ impl ViewSession {
     #[must_use]
     pub fn title(&self) -> String {
         match &self.kind {
-            ViewKind::Empty => "Empty".into(),
+            ViewKind::Empty => "New tab".into(),
             ViewKind::Notes => "Notes".into(),
             ViewKind::Search => "Search".into(),
             ViewKind::History(locator) => format!("History: {}", locator.title()),
@@ -518,6 +518,6 @@ mod tests {
         assert!(empty.duplicate().is_none());
         let notes = ViewSession::new(empty.tab(), ViewKind::Notes);
         assert_eq!(notes.duplicate(), Some(ViewKind::Notes));
-        assert_eq!(empty.title(), "Empty");
+        assert_eq!(empty.title(), "New tab");
     }
 }

@@ -52,23 +52,30 @@ fn candidate_text(spec: &CommandSpec) -> String {
 /// Render the command's declared keybinding for display.
 #[must_use]
 pub fn keybinding(spec: &CommandSpec) -> Option<String> {
-    spec.keys.first().map(|chord| {
-        let mut parts = Vec::new();
-        if chord.modifiers & flavite_api::command::modifiers::CTRL != 0 {
-            parts.push("Ctrl");
-        }
-        if chord.modifiers & flavite_api::command::modifiers::SHIFT != 0 {
-            parts.push("Shift");
-        }
-        if chord.modifiers & flavite_api::command::modifiers::ALT != 0 {
-            parts.push("Alt");
-        }
-        if chord.modifiers & flavite_api::command::modifiers::SUPER != 0 {
-            parts.push("Super");
-        }
-        parts.push(chord.key.as_str());
-        parts.join("+")
-    })
+    spec.keys.first().map(chord_label)
+}
+
+/// Human-readable text for one effective command binding.
+pub fn chord_label(chord: &flavite_api::Chord) -> String {
+    let mut parts = Vec::new();
+    if chord.modifiers & flavite_api::command::modifiers::CTRL != 0 {
+        parts.push(if cfg!(target_os = "macos") {
+            "Cmd"
+        } else {
+            "Ctrl"
+        });
+    }
+    if chord.modifiers & flavite_api::command::modifiers::SHIFT != 0 {
+        parts.push("Shift");
+    }
+    if chord.modifiers & flavite_api::command::modifiers::ALT != 0 {
+        parts.push("Alt");
+    }
+    if chord.modifiers & flavite_api::command::modifiers::SUPER != 0 {
+        parts.push("Super");
+    }
+    parts.push(chord.key.as_str());
+    parts.join("+")
 }
 
 #[cfg(test)]

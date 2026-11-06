@@ -157,12 +157,13 @@ fn selected_and_focused_states_have_non_color_cues() {
             active.border.width > 0.0,
             "{scheme:?} active tab has a border cue"
         );
-        assert_ne!(active.border.color, inactive.border.color);
-        // The focused pane carries the full focus-ring width border.
+        assert!(active.border.width > inactive.border.width);
+        // Keyboard focus is a two-pixel tab underline, rather than a
+        // document-sized frame. Pane geometry stays identical on focus.
         let focused = flavite_ui::style::pane(&theme, true);
         let unfocused = flavite_ui::style::pane(&theme, false);
-        assert!(focused.border.width >= 2.0, "{scheme:?} focused pane ring");
-        assert!(focused.border.width > unfocused.border.width);
+        assert_eq!(focused.border.width, unfocused.border.width);
+        assert!(flavite_ui::style::tab_focus(&theme).background.is_some());
         // Selected list rows differ in fill AND remain bordered text
         // containers; the disabled state dims text instead of relying on
         // hue alone.

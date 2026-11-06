@@ -4,13 +4,13 @@ use flavite_api::CompletionCandidate;
 
 use crate::keymap::KeyAction;
 use crate::links::{LinkResolution, LinkSpan, match_candidates, resolve_link, scan_note};
+use crate::navigation::{VerticalMotion, vertical_target};
 use crate::surface::{EditorAction, EditorSurface, EditorView, LinkNavigation};
 use crate::viewport::{
     Viewport, clamp_char_boundary, next_grapheme_boundary, previous_grapheme_boundary,
 };
 use cosmic_text::{Attrs, Buffer as ShapingBuffer, FontSystem, Metrics, Shaping};
 use flavite_api::BufferView;
-use flavite_syntax::SpanKind;
 use iced::advanced::input_method::InputMethod;
 use iced::advanced::{
     Clipboard, Layout, Renderer as AdvancedRenderer, Shell, Widget, input_method,
@@ -49,8 +49,9 @@ fn scrollbar_geometry(
     let track_height = (height - PAD_Y * 2.0).max(1.0);
     let shown = visible_lines.min(total_lines).max(1);
     let max_first = total_lines.saturating_sub(shown);
-    let thumb_height =
-        (track_height * shown as f32 / total_lines.max(1) as f32).clamp(24.0, track_height);
+    let thumb_height = (track_height * shown as f32 / total_lines.max(1) as f32)
+        .max(24.0)
+        .min(track_height);
     let travel = (track_height - thumb_height).max(1.0);
     let thumb_y = track_y + travel * (first_line.min(max_first) as f32 / max_first.max(1) as f32);
     (track_y, track_height, thumb_y, thumb_height, max_first)
@@ -337,6 +338,54 @@ impl<'a, Message> EditorWidget<'a, Message> {
         shell.publish((self.on_action)(action));
     }
 
+    fn synchronize(&self, state: &mut EditorState) {
+        if state.view_key != self.view_key
+            || state.buffer_id.is_some_and(|id| id != self.view.buffer_id)
+        {
+            *state = EditorState::default();
+            state.view_key = self.view_key;
+        }
+        if state.type_metrics != self.type_metrics {
+            state.type_metrics = self.type_metrics;
+            state.viewport.line_height = self.type_metrics.line_height;
+            state.shaping = None;
+            state.preferred_x = None;
+        }
+        // Resolver verdicts are immutable snapshots. Reuse them on focus and
+        // selection redraws; a new source revision always reapplies verdicts.
+        let same_resolutions = state
+            .resolution_snapshot
+            .as_ref()
+            .is_some_and(|previous| Arc::ptr_eq(previous, &self.link_resolutions));
+        let refresh = !same_resolutions || state.revision != Some(self.view.revision);
+        state.reconcile_view(&self.view, &self.link_resolutions, refresh);
+        state.resolution_snapshot = Some(self.link_resolutions.clone());
+        if let Some(interaction) = self.initial_interaction {
+            if self.on_input_intent.is_some()
+                && state.controlled_pending
+                && interaction.sequence > state.controlled_ack
+            {
+                let captured_sequence = state.interaction_sequence;
+                state.interaction_sequence = interaction.sequence.saturating_sub(1);
+                state.restore_interaction(&self.view.text, interaction);
+                state.interaction_sequence = state.interaction_sequence.max(captured_sequence);
+                state.controlled_ack = interaction.sequence;
+                state.controlled_pending = interaction.sequence < captured_sequence;
+                if self
+                    .view
+                    .text
+                    .get(..state.caret)
+                    .is_some_and(|text| text.ends_with("[["))
+                {
+                    state.open_autocomplete(state.caret - 2);
+                }
+            } else {
+                state.restore_interaction(&self.view.text, interaction);
+            }
+        }
+        state.refresh_completion(&self.view.text);
+    }
+
     /// Headless key dispatch through the real keymap; used by the runtime
     /// event loop and by controlled-input tests.
     pub fn execute_key(
@@ -412,6 +461,18 @@ impl<'a, Message> EditorWidget<'a, Message> {
             }
         }
         let action = key_action(key, modifiers, text);
+        if matches!(
+            action,
+            KeyAction::Up | KeyAction::Down | KeyAction::PageUp | KeyAction::PageDown
+        ) {
+            let motion = state.vertical_motion(action, state.text_width);
+            let (at, x) = vertical_target(&self.view.text, state.caret, motion);
+            state.preferred_x = Some(x);
+            state.move_to(at, modifiers.shift());
+            state.ensure_caret_visible(&self.view.text);
+            return true;
+        }
+        state.preferred_x = None;
         let range = state.selection();
         let (start, end) = range;
         let mut emitted = false;
@@ -444,13 +505,24 @@ impl<'a, Message> EditorWidget<'a, Message> {
                     emitted = true;
                 }
             }
-            KeyAction::Previous | KeyAction::Next | KeyAction::Home | KeyAction::End => {
+            KeyAction::Previous
+            | KeyAction::Next
+            | KeyAction::PreviousWord
+            | KeyAction::NextWord
+            | KeyAction::Home
+            | KeyAction::End => {
                 let selected = start != end;
                 let target = match action {
                     KeyAction::Previous if selected && !modifiers.shift() => start,
                     KeyAction::Next if selected && !modifiers.shift() => end,
                     KeyAction::Previous => previous_grapheme_boundary(&self.view.text, state.caret),
                     KeyAction::Next => next_grapheme_boundary(&self.view.text, state.caret),
+                    KeyAction::PreviousWord => {
+                        crate::viewport::previous_word_boundary(&self.view.text, state.caret)
+                    }
+                    KeyAction::NextWord => {
+                        crate::viewport::next_word_boundary(&self.view.text, state.caret)
+                    }
                     KeyAction::Home if modifiers.command() || modifiers.control() => 0,
                     KeyAction::End if modifiers.command() || modifiers.control() => {
                         self.view.text.len()
@@ -462,10 +534,23 @@ impl<'a, Message> EditorWidget<'a, Message> {
                 state.move_to(target, modifiers.shift());
                 emitted = true;
             }
-            KeyAction::Backspace | KeyAction::Delete => {
+            KeyAction::Backspace
+            | KeyAction::Delete
+            | KeyAction::BackspaceWord
+            | KeyAction::DeleteWord => {
                 emitted = true;
                 let (from, to) = if start != end {
                     (start, end)
+                } else if action == KeyAction::BackspaceWord {
+                    (
+                        crate::viewport::previous_word_boundary(&self.view.text, state.caret),
+                        state.caret,
+                    )
+                } else if action == KeyAction::DeleteWord {
+                    (
+                        state.caret,
+                        crate::viewport::next_word_boundary(&self.view.text, state.caret),
+                    )
                 } else if action == KeyAction::Backspace {
                     (
                         previous_grapheme_boundary(&self.view.text, state.caret),
@@ -537,6 +622,9 @@ impl<'a, Message> EditorWidget<'a, Message> {
                 emitted = true;
             }
             KeyAction::Ignore => {}
+            KeyAction::Up | KeyAction::Down | KeyAction::PageUp | KeyAction::PageDown => {
+                unreachable!("handled vertical motion")
+            }
         }
         if emitted {
             state.ensure_caret_visible(&self.view.text);
@@ -558,6 +646,7 @@ pub struct EditorState {
     line_text_addr: usize,
     line_text_len: usize,
     resolutions_present: bool,
+    resolution_snapshot: Option<Arc<HashMap<String, LinkResolution>>>,
     caret: usize,
     anchor: usize,
     focused: bool,
@@ -586,6 +675,20 @@ pub struct EditorState {
     /// Live scrollbar-thumb drag, with the pointer's grab offset inside the
     /// thumb. `Some` while the left button holds the thumb.
     scroll_drag: Option<ScrollDrag>,
+    /// Sticky visual column for consecutive vertical movements.
+    preferred_x: Option<f32>,
+    text_width: f32,
+    last_click: Option<mouse::Click>,
+    selection_unit: SelectionUnit,
+    selection_origin: (usize, usize),
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+enum SelectionUnit {
+    #[default]
+    Character,
+    Word,
+    Line,
 }
 
 #[derive(Debug)]
@@ -872,6 +975,82 @@ struct Composition {
 }
 
 impl EditorState {
+    fn selection_bounds(text: &str, byte: usize, unit: SelectionUnit) -> (usize, usize) {
+        use unicode_segmentation::UnicodeSegmentation;
+        match unit {
+            SelectionUnit::Character => (byte, byte),
+            SelectionUnit::Word => {
+                // A drag near the end of a large note must not segment all
+                // preceding paragraphs on every pointer event.
+                let (line_start, line_end) = line_bounds(text, byte);
+                if byte == line_end && byte < text.len() {
+                    return (byte, byte + 1);
+                }
+                text[line_start..line_end]
+                    .split_word_bound_indices()
+                    .find(|(start, word)| {
+                        line_start + start <= byte && byte < line_start + start + word.len()
+                    })
+                    .map_or((byte, byte), |(start, word)| {
+                        (line_start + start, line_start + start + word.len())
+                    })
+            }
+            SelectionUnit::Line => {
+                let (start, end) = line_bounds(text, byte);
+                (start, if end < text.len() { end + 1 } else { end })
+            }
+        }
+    }
+
+    fn select_click(&mut self, text: &str, byte: usize, kind: mouse::click::Kind, extend: bool) {
+        self.preferred_x = None;
+        self.close_autocomplete();
+        self.selection_unit = match kind {
+            mouse::click::Kind::Single => SelectionUnit::Character,
+            mouse::click::Kind::Double => SelectionUnit::Word,
+            mouse::click::Kind::Triple => SelectionUnit::Line,
+        };
+        let (start, end) = Self::selection_bounds(text, byte, self.selection_unit);
+        if extend {
+            self.move_to(byte, true);
+            self.selection_unit = SelectionUnit::Character;
+            self.selection_origin = (self.anchor, self.anchor);
+        } else {
+            self.anchor = start;
+            self.caret = end;
+            self.selection_origin = (start, end);
+        }
+    }
+
+    fn extend_pointer_selection(&mut self, text: &str, byte: usize) {
+        let (start, end) = Self::selection_bounds(text, byte, self.selection_unit);
+        let (origin_start, origin_end) = self.selection_origin;
+        if byte < origin_start {
+            self.anchor = origin_end;
+            self.caret = start;
+        } else {
+            self.anchor = origin_start;
+            self.caret = end;
+        }
+    }
+
+    fn vertical_motion(&self, action: KeyAction, width: f32) -> VerticalMotion {
+        let page = self.viewport.visible_lines.saturating_sub(2).max(1) as i32;
+        let rows = match action {
+            KeyAction::Up => -1,
+            KeyAction::Down => 1,
+            KeyAction::PageUp => -page,
+            KeyAction::PageDown => page,
+            _ => unreachable!("vertical action"),
+        };
+        VerticalMotion {
+            rows,
+            width,
+            metrics: self.type_metrics,
+            preferred_x: self.preferred_x,
+        }
+    }
+
     fn candidate_matches(
         &self,
         candidates: &Arc<[CompletionCandidate]>,
@@ -953,7 +1132,10 @@ impl EditorState {
         self.focused = interaction.focused;
         self.ime_active = interaction.focused;
         self.interaction_sequence = interaction.sequence;
-        if self.focused {
+        // A reparented editor has not measured its viewport yet. Preserve
+        // the host's scroll anchor instead of treating the default one-row
+        // height as a reason to scroll the caret to the top.
+        if self.focused && self.text_width > 0.0 {
             self.ensure_caret_visible(text);
         }
         self.last_ensured_caret = self.caret;
@@ -1031,6 +1213,23 @@ impl EditorState {
         self.autocomplete_selected = 0;
     }
 
+    fn refresh_completion(&mut self, text: &str) {
+        let Some(start) = self.autocomplete_start else {
+            return;
+        };
+        let query = text
+            .get(start..self.caret)
+            .and_then(|prefix| prefix.strip_prefix("[["));
+        if self.anchor == self.caret
+            && let Some(query) = query
+            && !query.contains(['[', ']', '\n', '\r', '|', '#'])
+        {
+            self.autocomplete_query = query.into();
+        } else {
+            self.close_autocomplete();
+        }
+    }
+
     fn move_to(&mut self, byte: usize, extend: bool) {
         self.caret = byte;
         if !extend {
@@ -1044,6 +1243,15 @@ impl EditorState {
         &mut self,
         view: &EditorView,
         link_resolutions: &HashMap<String, LinkResolution>,
+    ) {
+        self.reconcile_view(view, link_resolutions, true);
+    }
+
+    fn reconcile_view(
+        &mut self,
+        view: &EditorView,
+        link_resolutions: &HashMap<String, LinkResolution>,
+        refresh_resolutions: bool,
     ) {
         if self
             .buffer_id
@@ -1064,7 +1272,7 @@ impl EditorState {
             self.line_text_len = view.text.len();
             self.revision = Some(view.revision);
         }
-        if !link_resolutions.is_empty() || self.resolutions_present {
+        if refresh_resolutions && (!link_resolutions.is_empty() || self.resolutions_present) {
             for span in &mut self.link_spans {
                 let key = flavite_syntax::text::fold_key(&span.payload.target_raw);
                 span.resolution = resolve_link(span, link_resolutions.get(&key).copied());
@@ -1148,6 +1356,7 @@ impl EditorState {
         width: f32,
         extend: bool,
     ) {
+        self.preferred_x = None;
         let byte = self.hit_test_cached(text, revision, self.viewport, x, y, width);
         self.move_to(byte, extend);
     }
@@ -1203,7 +1412,8 @@ impl EditorState {
             };
             let line_start = line_start_byte(visible, cursor.line);
             source_start
-                + clamp_char_boundary(visible, line_start + cursor.index).min(visible.len())
+                + crate::viewport::clamp_grapheme_boundary(visible, line_start + cursor.index)
+                    .min(visible.len())
         }
     }
 }
@@ -1217,6 +1427,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         let size = limits.resolve(self.width, self.height, Size::new(640.0, 480.0));
         let state = tree.state.downcast_mut::<EditorState>();
         state.viewport.set_height(size.height - PAD_Y * 2.0);
+        state.text_width = self.text_wrap_width(size.width);
         state.shaped(
             &self.view.text,
             self.view.revision,
@@ -1306,20 +1517,23 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         for run in &runs {
             let line_start = source_start + line_start_byte(visible_text, run.line_i);
             let line_end = line_bounds(&self.view.text, line_start).1;
-            let active_links: Vec<&LinkSpan> = state
+            // Scanner spans are source-ordered and non-overlapping. Jump
+            // directly to this paragraph instead of scanning every link in
+            // the note and allocating two vectors for each painted row.
+            let first = state
                 .link_spans
-                .iter()
-                .filter(|span| span.span.start < line_end && span.span.end > line_start)
-                .collect();
-            let active_decorations: Vec<&flavite_syntax::ScannedSpan> = state
+                .partition_point(|span| span.span.end <= line_start);
+            let last = state
+                .link_spans
+                .partition_point(|span| span.span.start < line_end);
+            let active_links = &state.link_spans[first..last];
+            let first = state
                 .decorations
-                .iter()
-                .filter(|span| {
-                    matches!(span.kind, SpanKind::Tag | SpanKind::BlockId)
-                        && span.span.start.0 < line_end
-                        && span.span.end.0 > line_start
-                })
-                .collect();
+                .partition_point(|span| span.span.end.0 <= line_start);
+            let last = state
+                .decorations
+                .partition_point(|span| span.span.start.0 < line_end);
+            let active_decorations = &state.decorations[first..last];
             for glyph in run.glyphs {
                 let glyph_start = line_start + glyph.start;
                 let glyph_end = line_start + glyph.end;
@@ -1357,10 +1571,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         renderer.fill_text(
             text::Text {
                 content: visible_text.to_owned(),
-                bounds: Size::new(
-                    (bounds.width - PAD_X * 2.0).max(1.0),
-                    (bounds.height - PAD_Y * 2.0).max(1.0),
-                ),
+                bounds: Size::new(text_width, (bounds.height - PAD_Y * 2.0).max(1.0)),
                 size: iced::Pixels(self.type_metrics.font_size),
                 line_height: text::LineHeight::Absolute(iced::Pixels(
                     self.type_metrics.line_height,
@@ -1577,84 +1788,13 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
     }
 
     fn state(&self) -> iced::advanced::widget::tree::State {
-        let mut state = EditorState {
-            view_key: self.view_key,
-            ..EditorState::default()
-        };
-        state.reconcile(&self.view, &self.link_resolutions);
-        if let Some(interaction) = self.initial_interaction {
-            if self.on_input_intent.is_some()
-                && state.controlled_pending
-                && interaction.sequence > state.controlled_ack
-            {
-                let captured_sequence = state.interaction_sequence;
-                state.interaction_sequence = interaction.sequence.saturating_sub(1);
-                state.restore_interaction(&self.view.text, interaction);
-                state.interaction_sequence = state.interaction_sequence.max(captured_sequence);
-                state.controlled_ack = interaction.sequence;
-                state.controlled_pending = interaction.sequence < captured_sequence;
-                if self
-                    .view
-                    .text
-                    .get(..state.caret)
-                    .is_some_and(|text| text.ends_with("[["))
-                {
-                    state.open_autocomplete(state.caret - 2);
-                }
-                if let Some(start) = state.autocomplete_start
-                    && let Some(query) = self.view.text.get(start + 2..state.caret)
-                {
-                    state.autocomplete_query = query.into();
-                }
-            } else {
-                state.restore_interaction(&self.view.text, interaction);
-            }
-        }
+        let mut state = EditorState::default();
+        self.synchronize(&mut state);
         iced::advanced::widget::tree::State::new(state)
     }
 
     fn diff(&self, tree: &mut Tree) {
-        let state = tree.state.downcast_mut::<EditorState>();
-        // Host type preferences (W11) apply on the next frame; dropping the
-        // shaping cache forces one reshape with the new metrics.
-        if state.type_metrics != self.type_metrics {
-            state.type_metrics = self.type_metrics;
-            state.viewport.line_height = self.type_metrics.line_height;
-            state.shaping = None;
-        }
-        if state.view_key != self.view_key {
-            *state = EditorState::default();
-            state.view_key = self.view_key;
-        }
-        state.reconcile(&self.view, &self.link_resolutions);
-        if let Some(interaction) = self.initial_interaction {
-            if self.on_input_intent.is_some()
-                && state.controlled_pending
-                && interaction.sequence > state.controlled_ack
-            {
-                let captured_sequence = state.interaction_sequence;
-                state.interaction_sequence = interaction.sequence.saturating_sub(1);
-                state.restore_interaction(&self.view.text, interaction);
-                state.interaction_sequence = state.interaction_sequence.max(captured_sequence);
-                state.controlled_ack = interaction.sequence;
-                state.controlled_pending = interaction.sequence < captured_sequence;
-                if self
-                    .view
-                    .text
-                    .get(..state.caret)
-                    .is_some_and(|text| text.ends_with("[["))
-                {
-                    state.open_autocomplete(state.caret - 2);
-                }
-                if let Some(start) = state.autocomplete_start
-                    && let Some(query) = self.view.text.get(start + 2..state.caret)
-                {
-                    state.autocomplete_query = query.into();
-                }
-            } else {
-                state.restore_interaction(&self.view.text, interaction);
-            }
-        }
+        self.synchronize(tree.state.downcast_mut::<EditorState>());
     }
 
     fn operate(
@@ -1707,6 +1847,21 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     Key::Named(Named::Enter | Named::ArrowUp | Named::ArrowDown | Named::Escape)
                 );
             if action != KeyAction::Ignore && !completion_control {
+                if !matches!(
+                    action,
+                    KeyAction::Insert | KeyAction::Backspace | KeyAction::Delete | KeyAction::Paste
+                ) {
+                    state.close_autocomplete();
+                }
+                let vertical = if matches!(
+                    action,
+                    KeyAction::Up | KeyAction::Down | KeyAction::PageUp | KeyAction::PageDown
+                ) {
+                    Some(state.vertical_motion(action, self.text_wrap_width(layout.bounds().width)))
+                } else {
+                    state.preferred_x = None;
+                    None
+                };
                 let committed = if action == KeyAction::Paste {
                     clipboard
                         .read(iced::advanced::clipboard::Kind::Standard)
@@ -1724,6 +1879,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     text: committed,
                     extend: modifiers.shift(),
                     document_boundary: modifiers.command() || modifiers.control(),
+                    vertical,
                 }));
                 shell.capture_event();
                 shell.request_redraw();
@@ -1764,7 +1920,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                                 visible_lines,
                                 state.viewport.first_line,
                             );
-                        let local_y = (position.y - bounds.y - track_y).clamp(0.0, track_height);
+                        let local_y = (position.y - track_y).clamp(0.0, track_height);
                         let thumb_top = thumb_y - track_y;
                         if local_y >= thumb_top && local_y <= thumb_top + thumb_height {
                             state.scroll_drag = Some(ScrollDrag {
@@ -1802,13 +1958,14 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                         state.focused = true;
                         state.ime_active = true;
                         state.selecting = true;
-                        state.place_caret_from_point(
+                        let click =
+                            mouse::Click::new(position, mouse::Button::Left, state.last_click);
+                        state.last_click = Some(click);
+                        state.select_click(
                             &self.view.text,
-                            self.view.revision,
-                            position.x - PAD_X,
-                            position.y - PAD_Y,
-                            width,
-                            false,
+                            byte,
+                            click.kind(),
+                            state.modifiers.shift(),
                         );
                     }
                     shell.capture_event();
@@ -1836,8 +1993,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                                 state.viewport.first_line,
                             );
                         let travel = (track_height - thumb_height).max(1.0);
-                        let local_y =
-                            (position.y - bounds.y - track_y - drag.grab_offset).clamp(0.0, travel);
+                        let local_y = (position.y - track_y - drag.grab_offset).clamp(0.0, travel);
                         let target = (local_y / travel * max_first as f32).round() as usize;
                         if target != state.viewport.first_line {
                             state.viewport.first_line = target;
@@ -1849,14 +2005,15 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             }
             iced::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.selecting => {
                 if let Some(position) = cursor.position_in(layout.bounds()) {
-                    state.place_caret_from_point(
+                    let byte = state.hit_test_cached(
                         &self.view.text,
                         self.view.revision,
+                        state.viewport,
                         position.x - PAD_X,
                         position.y - PAD_Y,
                         self.text_wrap_width(layout.bounds().width),
-                        true,
                     );
+                    state.extend_pointer_selection(&self.view.text, byte);
                     shell.capture_event();
                     // The selection highlight must be visible on the next
                     // frame, not only after the host acknowledgement round
@@ -1939,13 +2096,16 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         } else {
             shell.request_input_method::<&str>(&InputMethod::Disabled);
         }
+        // Modifier/unsupported key presses do not acknowledge a caret.
+        // While captured edits await redraw their snapshot may still have
+        // the old revision, which would break the host's ordered input chain.
         let explicit_interaction = matches!(
             event,
             iced::Event::Mouse(
                 mouse::Event::ButtonPressed(mouse::Button::Left)
                     | mouse::Event::ButtonReleased(mouse::Button::Left)
                     | mouse::Event::WheelScrolled { .. }
-            ) | iced::Event::Keyboard(keyboard::Event::KeyPressed { .. })
+            )
         );
         let publish_due = !state.selecting
             || state
@@ -2008,6 +2168,22 @@ impl<'a, Message: 'static> From<EditorWidget<'a, Message>>
 }
 
 fn key_action(key: &Key, modifiers: Modifiers, text: Option<&str>) -> KeyAction {
+    // Alt on macOS and Ctrl elsewhere are word motions. Command remains
+    // available for the document/application command bindings.
+    let word = if cfg!(target_os = "macos") {
+        modifiers.alt() && !modifiers.control() && !modifiers.command()
+    } else {
+        modifiers.control() && !modifiers.alt() && !modifiers.logo()
+    };
+    if word {
+        match key {
+            Key::Named(Named::ArrowLeft) => return KeyAction::PreviousWord,
+            Key::Named(Named::ArrowRight) => return KeyAction::NextWord,
+            Key::Named(Named::Backspace) => return KeyAction::BackspaceWord,
+            Key::Named(Named::Delete) => return KeyAction::DeleteWord,
+            _ => {}
+        }
+    }
     if modifiers.command() || modifiers.control() {
         return match key {
             Key::Named(Named::Home) => KeyAction::Home,
@@ -2025,6 +2201,10 @@ fn key_action(key: &Key, modifiers: Modifiers, text: Option<&str>) -> KeyAction 
         };
     }
     match key {
+        Key::Named(Named::ArrowUp) => KeyAction::Up,
+        Key::Named(Named::ArrowDown) => KeyAction::Down,
+        Key::Named(Named::PageUp) => KeyAction::PageUp,
+        Key::Named(Named::PageDown) => KeyAction::PageDown,
         Key::Named(Named::ArrowLeft) => KeyAction::Previous,
         Key::Named(Named::ArrowRight) => KeyAction::Next,
         Key::Named(Named::Home) => KeyAction::Home,
@@ -2069,7 +2249,7 @@ pub fn shape_for_test(text: &str, width: f32) -> ShapingBuffer {
     shape_text(text, width, TypeMetrics::default())
 }
 
-fn shape_text(text: &str, width: f32, metrics: TypeMetrics) -> ShapingBuffer {
+pub(crate) fn shape_text(text: &str, width: f32, metrics: TypeMetrics) -> ShapingBuffer {
     FONT_SYSTEM.with(|font_system| {
         let mut font_system = font_system.borrow_mut();
         let mut buffer = ShapingBuffer::new(
@@ -2077,6 +2257,7 @@ fn shape_text(text: &str, width: f32, metrics: TypeMetrics) -> ShapingBuffer {
             Metrics::new(metrics.font_size, metrics.line_height),
         );
         buffer.set_size(&mut font_system, Some(width), None);
+        buffer.set_wrap(&mut font_system, cosmic_text::Wrap::WordOrGlyph);
         buffer.set_text(
             &mut font_system,
             text,
@@ -2150,11 +2331,28 @@ fn line_start_byte(text: &str, line: usize) -> usize {
     text.split_inclusive('\n').take(line).map(str::len).sum()
 }
 
-fn caret_position(runs: &[cosmic_text::LayoutRun<'_>], text: &str, byte: usize) -> (f32, f32) {
-    for run in runs {
+pub(crate) fn caret_position(
+    runs: &[cosmic_text::LayoutRun<'_>],
+    text: &str,
+    byte: usize,
+) -> (f32, f32) {
+    for (index, run) in runs.iter().enumerate() {
         let line_start = line_start_byte(text, run.line_i);
         let line_end = line_start + run.text.len();
         if byte < line_start || byte > line_end {
+            continue;
+        }
+        // `run.text` covers the entire source paragraph, including rows
+        // after this one. A caret on a wrapped row must skip earlier rows.
+        if runs.get(index + 1).is_some_and(|next| {
+            next.line_i == run.line_i
+                && next
+                    .glyphs
+                    .iter()
+                    .map(|glyph| glyph.start)
+                    .min()
+                    .is_some_and(|start| byte >= line_start + start)
+        }) {
             continue;
         }
         for glyph in run.glyphs {
@@ -2181,6 +2379,143 @@ mod tests {
     use flavite_buffer::state::BufferState;
     use flavite_syntax::text::{Span, TextByte};
     use iced::advanced::widget::Operation as _;
+
+    #[test]
+    fn word_and_line_clicks_extend_as_units_in_both_directions() {
+        let text = "one café three\nnext line\n";
+        let mut state = EditorState::default();
+        state.select_click(text, 6, mouse::click::Kind::Double, false);
+        assert_eq!(state.selection(), (4, 9));
+        state.extend_pointer_selection(text, 11);
+        assert_eq!(state.selection(), (4, 15));
+        state.extend_pointer_selection(text, 1);
+        assert_eq!(state.selection(), (0, 9));
+        state.select_click(text, 6, mouse::click::Kind::Triple, false);
+        assert_eq!(state.selection(), (0, 16));
+        state.extend_pointer_selection(text, 18);
+        assert_eq!(state.selection(), (0, text.len()));
+        state.select_click(text, 2, mouse::click::Kind::Single, false);
+        state.select_click(text, 18, mouse::click::Kind::Single, true);
+        assert_eq!(state.selection(), (2, 18));
+    }
+
+    #[test]
+    fn completion_dismisses_when_its_source_prefix_or_selection_changes() {
+        let mut state = EditorState::default();
+        for text in [
+            "first word",
+            "[[target]]",
+            "[[target\nnext",
+            "[[target|label",
+            "[[target#heading",
+        ] {
+            state.open_autocomplete(0);
+            state.caret = text.len();
+            state.anchor = state.caret;
+            state.refresh_completion(text);
+            assert!(state.autocomplete_start.is_none(), "{text:?}");
+        }
+        state.open_autocomplete(0);
+        state.caret = 5;
+        state.anchor = 5;
+        state.refresh_completion("[[café");
+        // A caret at a UTF-8 scalar boundary inside the target remains valid.
+        assert_eq!(state.autocomplete_query, "caf");
+        state.anchor = 0;
+        state.refresh_completion("[[café");
+        assert!(state.autocomplete_start.is_none());
+    }
+
+    #[test]
+    fn editor_keymap_covers_vertical_and_word_actions() {
+        // Workspace splitting uses Ctrl+Alt+arrows and must reach the shell.
+        assert_eq!(
+            key_action(
+                &Key::Named(Named::ArrowRight),
+                Modifiers::CTRL | Modifiers::ALT,
+                None
+            ),
+            KeyAction::Ignore
+        );
+        for (key, expected) in [
+            (Named::ArrowUp, KeyAction::Up),
+            (Named::ArrowDown, KeyAction::Down),
+            (Named::PageUp, KeyAction::PageUp),
+            (Named::PageDown, KeyAction::PageDown),
+        ] {
+            assert_eq!(
+                key_action(&Key::Named(key), Modifiers::SHIFT, None),
+                expected
+            );
+        }
+        let word = if cfg!(target_os = "macos") {
+            Modifiers::ALT
+        } else {
+            Modifiers::CTRL
+        };
+        for (key, expected) in [
+            (Named::ArrowLeft, KeyAction::PreviousWord),
+            (Named::ArrowRight, KeyAction::NextWord),
+            (Named::Backspace, KeyAction::BackspaceWord),
+            (Named::Delete, KeyAction::DeleteWord),
+        ] {
+            assert_eq!(
+                key_action(&Key::Named(key), word | Modifiers::SHIFT, None),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn synchronization_preserves_metrics_and_resolver_snapshot_until_changed() {
+        let view = EditorView::from(&test_view("[[target]]", 7));
+        let verdicts = Arc::new(HashMap::from([("target".into(), LinkResolution::Resolved)]));
+        let widget = EditorWidget::from_view(view.clone(), |action| action)
+            .with_view_key(77, 1)
+            .with_type_metrics(TypeMetrics::for_font_size(24.0))
+            .with_link_resolutions(verdicts.clone());
+        let mut state = EditorState::default();
+        widget.synchronize(&mut state);
+        assert_eq!(state.type_metrics.font_size, 24.0);
+        assert_eq!(state.link_spans[0].resolution, LinkResolution::Resolved);
+        for _ in 0..10 {
+            widget.synchronize(&mut state);
+            assert!(Arc::ptr_eq(
+                state.resolution_snapshot.as_ref().unwrap(),
+                &verdicts
+            ));
+            assert_eq!(state.link_spans[0].resolution, LinkResolution::Resolved);
+        }
+        let empty = EditorWidget::from_view(view, |action| action).with_view_key(77, 1);
+        empty.synchronize(&mut state);
+        assert_eq!(state.link_spans[0].resolution, LinkResolution::Unresolved);
+    }
+
+    #[test]
+    fn restoring_an_unmeasured_editor_preserves_the_host_scroll_anchor() {
+        let view = long_view(40);
+        let mut state = EditorState::default();
+        state.reconcile(&view, &HashMap::new());
+        let caret = view.text.find("line 8").unwrap();
+        state.restore_interaction(
+            &view.text,
+            EditorInteractionSnapshot {
+                sequence: 1,
+                buffer_id: view.buffer_id,
+                revision: view.revision,
+                caret,
+                selection: (caret, caret),
+                viewport_anchor: 0,
+                focused: true,
+                composing: false,
+            },
+        );
+        assert_eq!(
+            state.viewport.first_line, 0,
+            "sidebar docking must not scroll a fresh one-row viewport to the caret"
+        );
+        assert_eq!(state.caret(), caret);
+    }
 
     fn long_view(lines: usize) -> EditorView {
         let mut text = String::new();

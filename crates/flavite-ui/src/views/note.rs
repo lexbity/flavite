@@ -7,7 +7,11 @@
 use crate::app::{App, Message};
 use crate::style;
 use crate::views::empty_state;
-use crate::workspace::{bounds, tab_strip};
+use crate::workspace::{
+    bounds,
+    chrome::{self, Icon},
+    tab_strip,
+};
 use flavite_workspace::{LayoutAction, NoteLoad, TabId};
 use iced::widget::{button, column, container, row, rule, text, text_editor};
 use iced::{Element, Length, alignment};
@@ -84,6 +88,10 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             "The note view needs to be reopened.",
         );
     };
+    let path_label = view
+        .path
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
     let source_buffer = view.buffer_id;
     let source_revision = view.revision;
     let Some(incarnation) = app.notes.incarnation(tab) else {
@@ -140,24 +148,49 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
     }
     let meta = container(
         row![
-            button(
-                text(if mode == flavite_workspace::NoteMode::Edit {
-                    "Edit"
+            chrome::icon_button(
+                *metrics,
+                Icon::Back,
+                "Back",
+                app.nav.can_go_back(tab).then_some(Message::NavigateBack)
+            ),
+            chrome::icon_button(
+                *metrics,
+                Icon::Forward,
+                "Forward",
+                app.nav
+                    .can_go_forward(tab)
+                    .then_some(Message::NavigateForward)
+            ),
+            text(path_label).size(metrics.text).style(style::dim_text),
+            iced::widget::Space::new().width(Length::Fill),
+            chrome::icon_button(
+                *metrics,
+                Icon::Search,
+                "Find in note · Ctrl+F",
+                Some(Message::RunHostCommand("workspace.find"))
+            ),
+            chrome::icon_button(
+                *metrics,
+                if mode == flavite_workspace::NoteMode::Edit {
+                    Icon::Read
                 } else {
-                    "Read"
-                })
-                .size(metrics.text_sm)
-            )
-            .style(style::action())
-            .on_press_maybe((!app.has_composition()).then_some(Message::ToggleNoteMode(tab)))
+                    Icon::Edit
+                },
+                if mode == flavite_workspace::NoteMode::Edit {
+                    "Reading view · Ctrl+E"
+                } else {
+                    "Edit source · Ctrl+E"
+                },
+                (!app.has_composition()).then_some(Message::ToggleNoteMode(tab))
+            ),
         ]
-        .spacing(8)
+        .spacing(4)
         .align_y(alignment::Vertical::Center),
     )
-    .height(metrics.tab_height)
-    .padding([0, 12])
-    .align_y(alignment::Vertical::Center)
-    .style(style::toolbar);
+    .height(38.0 * metrics.scale)
+    .padding([0, 8])
+    .width(Length::Fill);
     let state = match app.note_buffer_state(tab) {
         Some(flavite_buffer::state::BufferState::Clean) => "Saved",
         Some(flavite_buffer::state::BufferState::Dirty) => "Unsaved changes",
