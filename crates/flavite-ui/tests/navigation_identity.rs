@@ -161,6 +161,16 @@ fn foreign_vault_paths_are_refused_not_guessed() {
 fn rename_collision_is_refused_by_validation() {
     let mut app = fixture(&[("a.md", "a\n"), ("b.md", "b\n")]);
     let _tab = open(&mut app, "a.md");
+    // The dialog's collision guard reads the catalog host's snapshot; a
+    // submit before the first snapshot lands would dispatch past the guard
+    // (the core rename remains the authoritative refusal) — wait for the
+    // catalog, as a real user's submit timing does.
+    wait(&mut app, |a| {
+        a.note_candidates()
+            .all()
+            .iter()
+            .any(|candidate| candidate.path().to_string() == "b.md")
+    });
     // Destination exists: the dialog validation refuses submit.
     let dialog = Dialog::Rename {
         from: NoteLocator::from_components(["a.md"]).unwrap(),
@@ -188,6 +198,15 @@ fn authoritative_rename_relocates_views_bindings_and_history() {
     let mut app = fixture(&[("a.md", "a\n"), ("folder/b.md", "b\n")]);
     let tab = open(&mut app, "folder/b.md");
     // Build nav history in this tab, then rename the current note.
+    // The picker matches against the catalog host's snapshot; submit
+    // before the first snapshot lands matches nothing and opens nothing
+    // (a real user cannot submit a picker with no matches either).
+    wait(&mut app, |a| {
+        a.note_candidates()
+            .all()
+            .iter()
+            .any(|candidate| candidate.path().to_string() == "a.md")
+    });
     app.picker = Picker {
         open: true,
         query: String::new(),
