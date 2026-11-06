@@ -426,25 +426,18 @@ pub fn parse_chord(text: &str) -> Option<Chord> {
 fn canonical_key(token: &str) -> Option<()> {
     const NAMED: &[&str] = &[
         "Enter",
-        "Return",
         "Tab",
         "Escape",
-        "Esc",
         "Backspace",
         "Delete",
-        "Del",
         "Home",
         "End",
         "PageUp",
         "PageDown",
         "ArrowUp",
-        "Up",
         "ArrowDown",
-        "Down",
         "ArrowLeft",
-        "Left",
         "ArrowRight",
-        "Right",
     ];
     if NAMED.contains(&token) {
         return Some(());
@@ -594,14 +587,19 @@ pub fn intern_chords(chords: &[Chord]) -> &'static [Chord] {
 ///
 /// # Errors
 /// [`ShortcutError`] naming the offending command and chord.
-pub fn validate_shortcuts(shortcuts: &BTreeMap<String, String>) -> Result<(), ShortcutError> {
+pub fn validate_shortcuts(
+    shortcuts: &BTreeMap<String, String>,
+    owned_defaults: &BTreeMap<String, String>,
+) -> Result<(), ShortcutError> {
     let mut resolved: std::collections::HashMap<Chord, String> = std::collections::HashMap::new();
     for (command, text) in shortcuts {
         let chord = parse_chord(text).ok_or_else(|| ShortcutError::UnreadableChord {
             command: command.clone(),
             chord: text.clone(),
         })?;
-        if let Some(owner) = os_reserved(&chord) {
+        if let Some(owner) = os_reserved(&chord)
+            && owned_defaults.get(command) != Some(text)
+        {
             return Err(ShortcutError::OsReserved {
                 chord: chord_string(&chord),
                 owner,

@@ -27,8 +27,9 @@ const FIND_PAGE_SIZE: u64 = 256;
 const STALE_MESSAGE: &str = "Source changed — search again";
 
 /// Per-view find bar state (the shape the reading host used to own).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FindState {
+    pub query_input: iced::widget::text_editor::Content,
     pub focused: bool,
     pub query: String,
     pub index: usize,
@@ -47,9 +48,31 @@ pub struct FindState {
     pub use_selection_scope: bool,
 }
 
+impl Clone for FindState {
+    fn clone(&self) -> Self {
+        Self {
+            query_input: iced::widget::text_editor::Content::with_text(&self.query),
+            focused: self.focused,
+            query: self.query.clone(),
+            index: self.index,
+            page_offset: self.page_offset,
+            mode: self.mode.clone(),
+            case_sensitive: self.case_sensitive,
+            whole_word: self.whole_word,
+            pending: self.pending,
+            pending_revision: self.pending_revision,
+            pending_offset: self.pending_offset,
+            last_error: self.last_error.clone(),
+            selection_scope: self.selection_scope,
+            use_selection_scope: self.use_selection_scope,
+        }
+    }
+}
+
 impl Default for FindState {
     fn default() -> Self {
         Self {
+            query_input: iced::widget::text_editor::Content::new(),
             focused: false,
             query: String::new(),
             index: 0,
@@ -70,8 +93,9 @@ impl Default for FindState {
 /// Per-view replace row state. `pending` holds the request id of the
 /// in-flight `text.prepare_replace`; `match_count`/`plan_id` record the
 /// last prepared plan; `last_error` carries the stale/expired refusal.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct ReplaceState {
+    pub replacement_input: iced::widget::text_editor::Content,
     pub focused: bool,
     pub query: String,
     pub replacement: String,
@@ -142,15 +166,35 @@ impl NoteSearchHost {
 /// Messages owned and handled by the note search host.
 #[derive(Debug, Clone)]
 pub enum NoteSearchMessage {
+    DraftAction {
+        tab: TabId,
+        replacement: bool,
+        action: iced::widget::text_editor::Action,
+    },
     FindOpen(TabId),
     FindClose(TabId),
-    FindQuery { tab: TabId, query: String },
-    FindNext { tab: TabId, forward: bool },
+    FindQuery {
+        tab: TabId,
+        query: String,
+    },
+    FindNext {
+        tab: TabId,
+        forward: bool,
+    },
     ReplaceOpen(TabId),
     ReplaceClose(TabId),
-    ReplaceQuery { tab: TabId, query: String },
-    ReplaceText { tab: TabId, text: String },
-    SetMode { tab: TabId, mode: String },
+    ReplaceQuery {
+        tab: TabId,
+        query: String,
+    },
+    ReplaceText {
+        tab: TabId,
+        text: String,
+    },
+    SetMode {
+        tab: TabId,
+        mode: String,
+    },
     ToggleCaseSensitive(TabId),
     ToggleWholeWord(TabId),
     ToggleSelectionScope(TabId),
@@ -161,6 +205,46 @@ pub enum NoteSearchMessage {
 /// Handle one note search message.
 pub fn handle(app: &mut App, message: NoteSearchMessage) -> iced::Task<crate::app::Message> {
     match message {
+        NoteSearchMessage::DraftAction {
+            tab,
+            replacement,
+            action,
+        } => {
+            let limit = if replacement { 64 * 1024 } else { INPUT_LIMIT };
+            let input = if replacement {
+                let Some(state) = app.note_search.replaces.get_mut(&tab) else {
+                    return iced::Task::none();
+                };
+                &mut state.replacement_input
+            } else {
+                let Some(state) = app.note_search.finds.get_mut(&tab) else {
+                    return iced::Task::none();
+                };
+                &mut state.query_input
+            };
+            let before = input.text();
+            if let iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Paste(
+                value,
+            )) = &action
+                && value.len() > limit
+            {
+                return iced::Task::none();
+            }
+            input.perform(action);
+            let text = input.text();
+            if text.len() > limit {
+                *input = iced::widget::text_editor::Content::with_text(&before);
+                return iced::Task::none();
+            }
+            return handle(
+                app,
+                if replacement {
+                    NoteSearchMessage::ReplaceText { tab, text }
+                } else {
+                    NoteSearchMessage::FindQuery { tab, query: text }
+                },
+            );
+        }
         NoteSearchMessage::FindOpen(tab) => {
             // The editor widget yields keyboard focus to the find input by
             // acknowledging a blurred interaction first (as before S01).
@@ -199,12 +283,30 @@ pub fn handle(app: &mut App, message: NoteSearchMessage) -> iced::Task<crate::ap
             // replacement acts on the find query, and any in-flight
             // preparation is dropped without effects.
             app.note_search.clear_tab(&tab);
+            if let Some(view) = app.note_editor_view(tab)
+                && let Some(bounds) = app.editor_bounds.get(&tab).copied()
+            {
+                return iced::advanced::widget::operate(
+                    iced::advanced::widget::operation::focusable::unfocus(),
+                )
+                .chain(
+                    iced::advanced::widget::operate(flavite_editor::focus_editor(
+                        view.buffer_id,
+                        view.revision,
+                        Some(bounds),
+                    ))
+                    .map(|_| crate::app::Message::Pump),
+                );
+            }
         }
         NoteSearchMessage::FindQuery { tab, query } => {
             if query.len() <= INPUT_LIMIT
                 && let Some(find) = app.note_search.finds.get_mut(&tab)
             {
                 find.focused = true;
+                if find.query_input.text() != query {
+                    find.query_input = iced::widget::text_editor::Content::with_text(&query);
+                }
                 find.query = query.clone();
                 find.index = 0;
                 find.page_offset = 0;
@@ -271,9 +373,13 @@ pub fn handle(app: &mut App, message: NoteSearchMessage) -> iced::Task<crate::ap
             }
         }
         NoteSearchMessage::ReplaceText { tab, text } => {
-            if text.len() <= INPUT_LIMIT
+            if text.len() <= 64 * 1024
                 && let Some(replace) = app.note_search.replaces.get_mut(&tab)
             {
+                if replace.replacement_input.text() != text {
+                    replace.replacement_input =
+                        iced::widget::text_editor::Content::with_text(&text);
+                }
                 replace.replacement = text;
                 replace.last_error = None;
             }
@@ -1177,4 +1283,41 @@ fn plan_error(code: &str) -> String {
     } else {
         format!("Replacement needs attention ({code})")
     }
+}
+
+/// Find and Replace share native multiline input semantics.
+pub fn draft_binding(
+    tab: TabId,
+    replacement: bool,
+    key: iced::widget::text_editor::KeyPress,
+) -> Option<iced::widget::text_editor::Binding<crate::app::Message>> {
+    use iced::keyboard::{Key, key::Named};
+    use iced::widget::text_editor::Binding;
+    if !matches!(
+        key.status,
+        iced::widget::text_editor::Status::Focused { .. }
+    ) {
+        return None;
+    }
+    if key.key == Key::Named(Named::Enter) {
+        if key.modifiers.alt() {
+            return Some(Binding::Enter);
+        }
+        return Some(Binding::Custom(crate::app::Message::NoteSearch(
+            if replacement {
+                NoteSearchMessage::ReplaceNext(tab)
+            } else {
+                NoteSearchMessage::FindNext {
+                    tab,
+                    forward: !key.modifiers.shift(),
+                }
+            },
+        )));
+    }
+    if key.key == Key::Named(Named::Escape) {
+        return Some(Binding::Custom(crate::app::Message::NoteSearch(
+            NoteSearchMessage::FindClose(tab),
+        )));
+    }
+    Binding::from_key_press(key)
 }

@@ -29,7 +29,7 @@ fn flavite_vault_identity(fs: &OsFs, root: PathBuf) -> Result<flavite_api::open:
 /// The CLI is headless and drives the vault's Session through flavite-api.
 /// All commands work without a GPU or display.
 #[derive(Parser, Debug)]
-#[command(name = "flavite")]
+#[command(name = "flavite-cli")]
 #[command(author = "Flavite Contributors")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "Local-first plain-text knowledge vault", long_about = None)]

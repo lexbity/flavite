@@ -57,7 +57,16 @@ impl NoteCandidate {
 /// A bounded, pre-resolved candidate snapshot of the current catalog.
 #[derive(Debug, Clone, Default)]
 pub struct NoteCandidates {
-    candidates: Vec<NoteCandidate>,
+    candidates: std::sync::Arc<[NoteCandidate]>,
+    entries: std::sync::Arc<[NoteCatalogEntry]>,
+    cache: std::cell::RefCell<Option<MatchSnapshot>>,
+}
+
+#[derive(Debug, Clone)]
+struct MatchSnapshot {
+    query: String,
+    candidates: std::sync::Arc<[NoteCandidate]>,
+    entries: std::sync::Arc<[NoteCatalogEntry]>,
 }
 
 impl NoteCandidates {
@@ -65,7 +74,7 @@ impl NoteCandidates {
     /// paths cannot form a locator (they are unopenable by construction).
     #[must_use]
     pub fn from_catalog(entries: &[NoteCatalogEntry]) -> Self {
-        let candidates = entries
+        let candidates: std::sync::Arc<[NoteCandidate]> = entries
             .iter()
             .filter_map(|entry| {
                 Some(NoteCandidate {
@@ -75,7 +84,16 @@ impl NoteCandidates {
                 })
             })
             .collect();
-        Self { candidates }
+        let entries = candidates
+            .iter()
+            .map(|candidate| candidate.entry.clone())
+            .collect::<Vec<_>>()
+            .into();
+        Self {
+            candidates,
+            entries,
+            cache: std::cell::RefCell::new(None),
+        }
     }
 
     /// All candidates in canonical path order.
@@ -87,10 +105,18 @@ impl NoteCandidates {
     /// Fuzzy-match candidates against title and path (§4.7). An empty
     /// query returns every candidate in canonical order.
     #[must_use]
-    pub fn matches(&self, query: &str) -> Vec<NoteCandidate> {
+    pub fn matches(&self, query: &str) -> std::sync::Arc<[NoteCandidate]> {
         let needle = query.trim();
         if needle.is_empty() {
             return self.candidates.clone();
+        }
+        if let Some(cached) = self
+            .cache
+            .borrow()
+            .as_ref()
+            .filter(|cached| cached.query == needle)
+        {
+            return cached.candidates.clone();
         }
         let pattern = Pattern::parse(needle, CaseMatching::Smart, Normalization::Smart);
         let haystacks: Vec<&str> = self
@@ -105,9 +131,35 @@ impl NoteCandidates {
             .filter_map(|(matched, _)| haystacks.iter().position(|candidate| *candidate == matched))
             .collect();
         drop(matcher);
-        matched_indexes
+        let candidates: std::sync::Arc<[NoteCandidate]> = matched_indexes
             .into_iter()
             .map(|index| self.candidates[index].clone())
-            .collect()
+            .collect::<Vec<_>>()
+            .into();
+        let entries = candidates
+            .iter()
+            .map(|candidate| candidate.entry.clone())
+            .collect::<Vec<_>>()
+            .into();
+        *self.cache.borrow_mut() = Some(MatchSnapshot {
+            query: needle.into(),
+            candidates: candidates.clone(),
+            entries,
+        });
+        candidates
+    }
+
+    /// The same cached match order as facade rows, shared across picker frames.
+    pub fn matching_entries(&self, query: &str) -> std::sync::Arc<[NoteCatalogEntry]> {
+        if query.trim().is_empty() {
+            return self.entries.clone();
+        }
+        let _ = self.matches(query);
+        self.cache
+            .borrow()
+            .as_ref()
+            .expect("match snapshot")
+            .entries
+            .clone()
     }
 }

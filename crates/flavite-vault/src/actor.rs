@@ -184,6 +184,7 @@ pub enum VaultActorMsg {
     /// Read a bounded native-identity note catalog for workspace shells.
     NoteCatalog {
         limit: usize,
+        after: Option<flavite_index::NoteCatalogCursor>,
         reply: Sender<VaultActorResp>,
     },
     /// Decode a bounded graph catalog through this vault's exact Fs codec.
@@ -591,10 +592,18 @@ impl VaultActorHandle {
     }
 
     /// Read a bounded native-identity note catalog page.
-    pub fn note_catalog(&self, limit: usize) -> Result<flavite_index::NoteCatalogPage, String> {
+    pub fn note_catalog(
+        &self,
+        limit: usize,
+        after: Option<flavite_index::NoteCatalogCursor>,
+    ) -> Result<flavite_index::NoteCatalogPage, String> {
         let (reply, response) = crossbeam::channel::bounded(1);
         self.sender
-            .send(VaultActorMsg::NoteCatalog { limit, reply })
+            .send(VaultActorMsg::NoteCatalog {
+                limit,
+                after,
+                reply,
+            })
             .map_err(|error| error.to_string())?;
         match response.recv().map_err(|error| error.to_string())? {
             VaultActorResp::NoteCatalog(result) => result,
@@ -1378,8 +1387,12 @@ impl VaultActor {
                     .unwrap_or_else(|e| VaultActorResp::Error(e.to_string()));
                 let _ = reply.try_send(response);
             }
-            VaultActorMsg::NoteCatalog { limit, reply } => {
-                let response = VaultActorResp::NoteCatalog(self.index.note_catalog(limit));
+            VaultActorMsg::NoteCatalog {
+                limit,
+                after,
+                reply,
+            } => {
+                let response = VaultActorResp::NoteCatalog(self.index.note_catalog(limit, after));
                 let _ = reply.try_send(response);
             }
             VaultActorMsg::DecodeGraphPaths { keys, reply } => {

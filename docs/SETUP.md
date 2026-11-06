@@ -22,7 +22,7 @@ cd flavite
 cargo build -p flavite-app -p flavite-cli -p flavite-text-search-worker
 ```
 
-This produces two binaries in `target/debug/`:
+This produces three binaries in `target/debug/`:
 
 - `flavite` — the desktop app (crate `flavite-app`).
 - `flavite-cli` — the headless CLI (crate `flavite-cli`).
@@ -171,3 +171,14 @@ kill processes or inject UI faults.
 - [APP-FEATURES.md](APP-FEATURES.md) — desktop app guide and shortcuts.
 - [CLI-FEATURES.md](CLI-FEATURES.md) — full CLI reference.
 - [QueryLanguage.md](QueryLanguage.md) — query expression syntax.
+
+### Source-search platform boundary
+
+The regex helper currently enforces process-group and address-space limits on
+Unix. Other platforms explicitly refuse regex execution until their required
+resource isolation is implemented; literal Find/Replace remains available.
+A bare child process without resource limits is not a supported fallback.
+
+Shortcut names use canonical named keys such as `Enter`, `Escape`, `Delete`
+and `ArrowUp/ArrowDown/ArrowLeft/ArrowRight`. Removed spellings
+`Return/Esc/Del/Up/Down/Left/Right` must be changed explicitly in overrides.

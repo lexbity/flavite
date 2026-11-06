@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeTarget {
     FindQuery(flavite_workspace::TabId),
+    NoteSearchCommand(flavite_workspace::TabId, &'static str),
     FindNext {
         tab: flavite_workspace::TabId,
         forward: bool,
@@ -519,7 +520,11 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
         nodes.push((query_id, query));
         let mut children = vec![query_id];
         let labels: Vec<String> = if app.picker.open {
-            app.picker_matches().into_iter().map(|e| e.title).collect()
+            app.picker_matches()
+                .iter()
+                .take(50)
+                .map(|e| e.title.clone())
+                .collect()
         } else {
             app.palette_snapshot()
                 .into_iter()

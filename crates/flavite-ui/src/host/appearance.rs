@@ -261,10 +261,14 @@ impl AppearanceHost {
                 .iter()
                 .map(|(id, chord)| ((*id).to_owned(), (*chord).to_owned()))
                 .collect();
+        // Host-owned defaults are already declared bindings. OS-reserved
+        // validation applies to overrides; collision checks still cover
+        // the entire effective table using canonical key names.
+        let owned_defaults = effective.clone();
         for (id, text) in &next {
             effective.insert(id.clone(), text.clone());
         }
-        if let Err(error) = preferences::validate_shortcuts(&effective) {
+        if let Err(error) = preferences::validate_shortcuts(&effective, &owned_defaults) {
             self.shortcut_error = Some(error.to_string());
             return;
         }

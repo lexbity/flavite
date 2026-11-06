@@ -280,6 +280,7 @@ fn handle_link_prepare(
         expected_target: Some(args.expected_target),
         stable_link_policy: policy,
         removal: None,
+        completion: args.completion,
     };
     Ok(session.execute(SessionCommand::LinkPrepare {
         request,
@@ -308,6 +309,7 @@ fn handle_link_prepare_remove(
             target_path: args.target_path,
             expected_target: None,
             stable_link_policy: flavite_vault::link::StableLinkPolicy::Disabled,
+            completion: None,
             removal: Some(flavite_vault::link::RemovalRequest {
                 start: args.start,
                 end: args.end,

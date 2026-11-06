@@ -5,44 +5,20 @@ use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use std::ops::Range;
 
-/// A note the host has already obtained from the vault's indexed title list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NoteCandidate {
-    /// Link target, normally a vault-relative note path without `.md`.
-    pub target: String,
-    /// Indexed title.
-    pub title: String,
-    /// Indexed aliases.
-    pub aliases: Vec<String>,
-    /// Unconflicted stable ID, when available.
-    pub stable_id: Option<String>,
-}
+use flavite_api::CompletionCandidate;
 
-impl NoteCandidate {
-    /// Construct a candidate with no aliases or stable ID.
-    #[must_use]
-    pub fn new(target: impl Into<String>, title: impl Into<String>) -> Self {
-        Self {
-            target: target.into(),
-            title: title.into(),
-            aliases: Vec::new(),
-            stable_id: None,
-        }
-    }
-
-    fn score(
-        &self,
-        pattern: &Pattern,
-        matcher: &mut Matcher,
-        utf32: &mut Vec<char>,
-    ) -> Option<u32> {
-        [self.title.as_str(), self.target.as_str()]
-            .into_iter()
-            .chain(self.aliases.iter().map(String::as_str))
-            .chain(self.stable_id.iter().map(String::as_str))
-            .filter_map(|candidate| pattern.score(Utf32Str::new(candidate, utf32), matcher))
-            .max()
-    }
+fn candidate_score(
+    candidate: &CompletionCandidate,
+    pattern: &Pattern,
+    matcher: &mut Matcher,
+    utf32: &mut Vec<char>,
+) -> Option<u32> {
+    [candidate.title.as_str(), candidate.target.as_str()]
+        .into_iter()
+        .chain(candidate.aliases.iter().map(String::as_str))
+        .chain(candidate.stable_id.iter().map(String::as_str))
+        .filter_map(|text| pattern.score(Utf32Str::new(text, utf32), matcher))
+        .max()
 }
 
 /// Link scan output tied to one immutable editor view.
@@ -139,41 +115,73 @@ fn scan_masked(snapshot: &TextSnapshot, mask: &TextMask) -> Vec<ScannedSpan> {
 /// supplies the indexed title/alias list once; this function performs no I/O.
 #[must_use]
 pub fn match_candidates<'a>(
-    candidates: &'a [NoteCandidate],
+    candidates: &'a [CompletionCandidate],
     query: &str,
     limit: usize,
-) -> Vec<&'a NoteCandidate> {
+) -> Vec<&'a CompletionCandidate> {
     let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
     let mut matcher = Matcher::new(Config::DEFAULT);
     let mut utf32 = Vec::new();
-    let mut ranked = candidates
-        .iter()
-        .filter_map(|candidate| {
-            let score = if query.is_empty() {
-                Some(0)
-            } else {
-                candidate.score(&pattern, &mut matcher, &mut utf32)
-            }?;
-            Some((score, candidate))
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|(score_a, a), (score_b, b)| {
+    let limit = limit.min(8);
+    if limit == 0 {
+        return Vec::new();
+    }
+    let compare = |(score_a, a): &(u32, &CompletionCandidate),
+                   (score_b, b): &(u32, &CompletionCandidate)| {
         score_b
             .cmp(score_a)
-            .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+            .then_with(|| {
+                a.title
+                    .chars()
+                    .flat_map(char::to_lowercase)
+                    .cmp(b.title.chars().flat_map(char::to_lowercase))
+            })
             .then_with(|| a.target.cmp(&b.target))
-    });
-    ranked
-        .into_iter()
-        .take(limit)
-        .map(|(_, candidate)| candidate)
-        .collect()
+    };
+    // Keep only visible suggestions. Scanning 50k candidates must not
+    // allocate/sort a 50k-row result vector on every widget rebuild.
+    let mut ranked = Vec::with_capacity(limit);
+    for candidate in candidates {
+        let score = if query.is_empty() {
+            Some(0)
+        } else {
+            candidate_score(candidate, &pattern, &mut matcher, &mut utf32)
+        };
+        let Some(score) = score else { continue };
+        let item = (score, candidate);
+        let at = ranked.partition_point(|existing| compare(existing, &item).is_le());
+        if at < limit {
+            if ranked.len() == limit {
+                ranked.pop();
+            }
+            ranked.insert(at, item);
+        }
+    }
+    ranked.into_iter().map(|(_, candidate)| candidate).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use flavite_syntax::SpanKind;
+
+    #[test]
+    fn suggestions_remain_bounded_and_ordered_at_catalog_limit() {
+        let candidates = (0..50_000)
+            .rev()
+            .map(|n| CompletionCandidate::new(format!("notes/{n:05}"), format!("Title {n:05}")))
+            .collect::<Vec<_>>();
+        let results = match_candidates(&candidates, "", usize::MAX);
+        assert_eq!(results.len(), 8);
+        assert_eq!(
+            results
+                .iter()
+                .map(|c| c.target.as_str())
+                .collect::<Vec<_>>(),
+            (0..8).map(|n| format!("notes/{n:05}")).collect::<Vec<_>>()
+        );
+        assert!(match_candidates(&candidates, "", 0).is_empty());
+    }
 
     #[test]
     fn scan_note_matches_the_individual_scans() {
@@ -215,9 +223,9 @@ mod tests {
 
     #[test]
     fn candidates_match_titles_targets_and_aliases_deterministically() {
-        let mut first = NoteCandidate::new("notes/ideas", "Ideas");
+        let mut first = CompletionCandidate::new("notes/ideas", "Ideas");
         first.aliases.push("Brainstorm".into());
-        let second = NoteCandidate::new("notes/inbox", "Inbox");
+        let second = CompletionCandidate::new("notes/inbox", "Inbox");
         let candidates = [second, first];
         let found = match_candidates(&candidates, "bra", 8);
         assert_eq!(found[0].title, "Ideas");
@@ -226,7 +234,7 @@ mod tests {
 
     #[test]
     fn completion_can_match_unconflicted_stable_ids() {
-        let mut candidate = NoteCandidate::new("notes/target", "Target note");
+        let mut candidate = CompletionCandidate::new("notes/target", "Target note");
         candidate.stable_id = Some("01JABCDEF".into());
         assert_eq!(match_candidates(&[candidate], "01JABC", 8).len(), 1);
     }

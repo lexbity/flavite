@@ -1,9 +1,9 @@
 //! Custom iced editor widget over a revisioned, immutable API view.
 
+use flavite_api::CompletionCandidate;
+
 use crate::keymap::KeyAction;
-use crate::links::{
-    LinkResolution, LinkSpan, NoteCandidate, match_candidates, resolve_link, scan_note,
-};
+use crate::links::{LinkResolution, LinkSpan, match_candidates, resolve_link, scan_note};
 use crate::surface::{EditorAction, EditorSurface, EditorView, LinkNavigation};
 use crate::viewport::{
     Viewport, clamp_char_boundary, next_grapheme_boundary, previous_grapheme_boundary,
@@ -150,7 +150,7 @@ thread_local! {
 /// this widget never mutates a buffer or accesses the filesystem itself.
 pub struct EditorWidget<'a, Message> {
     view: EditorView,
-    candidates: Arc<[NoteCandidate]>,
+    candidates: Arc<[CompletionCandidate]>,
     link_resolutions: Arc<HashMap<String, LinkResolution>>,
     stable_links: bool,
     on_action: Box<dyn Fn(EditorAction) -> Message + 'a>,
@@ -237,7 +237,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
 
     /// Supply an indexed title/alias snapshot for in-memory autocomplete.
     #[must_use]
-    pub fn with_candidates(mut self, candidates: Arc<[NoteCandidate]>) -> Self {
+    pub fn with_candidates(mut self, candidates: Arc<[CompletionCandidate]>) -> Self {
         self.candidates = candidates;
         self
     }
@@ -367,21 +367,20 @@ impl<'a, Message> EditorWidget<'a, Message> {
                     return true;
                 }
                 Key::Named(Named::Enter) => {
-                    let matches = match_candidates(&self.candidates, &state.autocomplete_query, 8);
+                    let matches = state.candidate_matches(&self.candidates);
                     if let Some(candidate) = matches.get(state.autocomplete_selected) {
                         let start = state.autocomplete_start.unwrap_or(state.caret);
-                        let inserted = flavite_syntax::link_format::format_candidate_link(
-                            &candidate.target,
-                            &candidate.title,
-                            candidate.stable_id.as_deref(),
-                            self.stable_links,
-                        );
                         self.emit(
                             shell,
-                            EditorAction::replace(&self.view, start, state.caret, inserted.clone()),
+                            EditorAction::Complete {
+                                buffer_id: self.view.buffer_id,
+                                expected_revision: self.view.revision,
+                                start,
+                                end: state.caret,
+                                prefix: self.view.text[start..state.caret].to_owned(),
+                                candidate: (*candidate).clone(),
+                            },
                         );
-                        state.caret = start + inserted.len();
-                        state.anchor = state.caret;
                     } else if state.autocomplete_selected == matches.len()
                         && !state.autocomplete_query.trim().is_empty()
                     {
@@ -568,6 +567,7 @@ pub struct EditorState {
     autocomplete_start: Option<usize>,
     autocomplete_query: String,
     autocomplete_selected: usize,
+    autocomplete_matches: std::cell::RefCell<Option<CompletionCache>>,
     viewport: Viewport,
     composition: Option<Composition>,
     interaction_sequence: u64,
@@ -586,6 +586,13 @@ pub struct EditorState {
     /// Live scrollbar-thumb drag, with the pointer's grab offset inside the
     /// thumb. `Some` while the left button holds the thumb.
     scroll_drag: Option<ScrollDrag>,
+}
+
+#[derive(Debug)]
+struct CompletionCache {
+    candidates: Arc<[CompletionCandidate]>,
+    query: String,
+    matches: Arc<[CompletionCandidate]>,
 }
 
 /// One active scrollbar-thumb drag.
@@ -797,10 +804,12 @@ pub fn set_focused_editor_selection(
 pub fn focus_editor(
     expected_buffer_id: u64,
     expected_revision: u64,
+    expected_bounds: Option<Rectangle>,
 ) -> impl iced::advanced::widget::Operation<Option<EditorInteractionSnapshot>> {
     struct FocusEditor {
         expected_buffer_id: u64,
         expected_revision: u64,
+        expected_bounds: Option<Rectangle>,
         result: Option<EditorInteractionSnapshot>,
     }
 
@@ -819,13 +828,16 @@ pub fn focus_editor(
         fn custom(
             &mut self,
             _id: Option<&iced::advanced::widget::Id>,
-            _bounds: Rectangle,
+            bounds: Rectangle,
             state: &mut dyn std::any::Any,
         ) {
             let Some(state) = state.downcast_mut::<EditorState>() else {
                 return;
             };
-            if state.is_composing()
+            if self
+                .expected_bounds
+                .is_some_and(|expected| !bounds.contains(expected.center()))
+                || state.is_composing()
                 || state.buffer_id != Some(self.expected_buffer_id)
                 || state.revision != Some(self.expected_revision)
             {
@@ -846,6 +858,7 @@ pub fn focus_editor(
     FocusEditor {
         expected_buffer_id,
         expected_revision,
+        expected_bounds,
         result: None,
     }
 }
@@ -859,6 +872,31 @@ struct Composition {
 }
 
 impl EditorState {
+    fn candidate_matches(
+        &self,
+        candidates: &Arc<[CompletionCandidate]>,
+    ) -> Arc<[CompletionCandidate]> {
+        let mut cache = self.autocomplete_matches.borrow_mut();
+        if let Some(cached) = cache.as_ref()
+            && cached.query == self.autocomplete_query
+            && Arc::ptr_eq(&cached.candidates, candidates)
+        {
+            return cached.matches.clone();
+        }
+        let matches: Arc<[CompletionCandidate]> =
+            match_candidates(candidates, &self.autocomplete_query, 8)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .into();
+        *cache = Some(CompletionCache {
+            candidates: candidates.clone(),
+            query: self.autocomplete_query.clone(),
+            matches: matches.clone(),
+        });
+        matches
+    }
+
     /// Caret byte offset.
     #[must_use]
     pub fn caret(&self) -> usize {
@@ -1440,7 +1478,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             );
         }
         if state.autocomplete_start.is_some() {
-            let matches = match_candidates(&self.candidates, &state.autocomplete_query, 8);
+            let matches = state.candidate_matches(&self.candidates);
             let has_create = !state.autocomplete_query.trim().is_empty();
             if !matches.is_empty() || has_create {
                 let row_count = matches.len() + usize::from(has_create);
@@ -1951,7 +1989,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
 }
 
 fn autocomplete_count<Message>(widget: &EditorWidget<'_, Message>, state: &EditorState) -> usize {
-    match_candidates(&widget.candidates, &state.autocomplete_query, 8).len()
+    state.candidate_matches(&widget.candidates).len()
         + usize::from(!state.autocomplete_query.trim().is_empty())
 }
 
@@ -2476,7 +2514,7 @@ mod tests {
             focused: false,
             ..EditorState::default()
         };
-        let mut stale = focus_editor(view.buffer_id, view.revision + 1);
+        let mut stale = focus_editor(view.buffer_id, view.revision + 1, None);
         stale.custom(None, Rectangle::with_size(Size::ZERO), &mut state);
         assert!(!state.focused);
         assert!(matches!(
@@ -2484,7 +2522,7 @@ mod tests {
             iced::advanced::widget::operation::Outcome::Some(None)
         ));
 
-        let mut current = focus_editor(view.buffer_id, view.revision);
+        let mut current = focus_editor(view.buffer_id, view.revision, None);
         current.custom(None, Rectangle::with_size(Size::ZERO), &mut state);
         assert!(state.focused);
         assert!(state.ime_active);
@@ -2516,8 +2554,8 @@ mod tests {
     fn autocomplete_selection_emits_revision_guarded_link_insert() {
         let view = test_view("[[In", 97);
         let widget = EditorWidget::new(&view, |action| action).with_candidates(Arc::from([
-            NoteCandidate::new("notes/inbox", "Inbox"),
-            NoteCandidate::new("Ideas", "Ideas"),
+            CompletionCandidate::new("notes/inbox", "Inbox"),
+            CompletionCandidate::new("Ideas", "Ideas"),
         ]));
         let mut state = EditorState {
             caret: view.text.len(),
@@ -2539,27 +2577,15 @@ mod tests {
         ));
         drop(shell);
         assert_eq!(messages.len(), 1);
-        assert!(matches!(
-            messages[0],
-            EditorAction::Edit {
-                expected_revision: 11,
-                ..
-            }
-        ));
-        let (_, _, edits) = messages[0].as_edit().expect("edit action");
-        assert_eq!(edits[0].range, Span::new(TextByte(0), TextByte(4)));
-        assert_eq!(edits[0].replacement, "[[notes/inbox|Inbox]]");
-        let invocation = messages[0]
-            .clone()
-            .into_invocation(88)
-            .expect("registry invocation");
-        assert_eq!(invocation.command_id, "apply_edits");
-        assert_eq!(invocation.args["ops"][0]["range"][0], 0);
+        assert!(matches!(&messages[0], EditorAction::Complete {
+            buffer_id: 97, expected_revision: 11, start: 0, end: 4,
+            prefix, candidate,
+        } if prefix == "[[In" && candidate.target == "notes/inbox"));
         assert_eq!(
-            invocation.args["ops"][0]["replacement"],
-            "[[notes/inbox|Inbox]]"
+            state.caret(),
+            4,
+            "completion waits for the semantic acknowledgement"
         );
-        assert_eq!(state.caret(), "[[notes/inbox|Inbox]]".len());
         assert!(state.autocomplete_start.is_none());
     }
 
@@ -2567,7 +2593,7 @@ mod tests {
     fn autocomplete_create_row_opens_unresolved_note_for_creation() {
         let view = test_view("[[New", 103);
         let widget = EditorWidget::new(&view, |action| action)
-            .with_candidates(Arc::from([NoteCandidate::new("Ideas", "Ideas")]));
+            .with_candidates(Arc::from([CompletionCandidate::new("Ideas", "Ideas")]));
         let mut state = EditorState {
             caret: view.text.len(),
             anchor: view.text.len(),
@@ -2600,9 +2626,9 @@ mod tests {
 
     #[test]
     fn link_insert_supports_readable_aliases_and_opt_in_stable_form() {
-        let mut candidate = NoteCandidate::new("notes/concepts", "Concepts");
+        let mut candidate = CompletionCandidate::new("notes/concepts", "Concepts");
         candidate.stable_id = Some("01J9ZK".into());
-        let format = |candidate: &NoteCandidate, stable: bool| {
+        let format = |candidate: &CompletionCandidate, stable: bool| {
             flavite_syntax::link_format::format_candidate_link(
                 &candidate.target,
                 &candidate.title,

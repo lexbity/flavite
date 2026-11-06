@@ -7,7 +7,7 @@ import subprocess
 import sys
 import time
 
-window, harness, output, vault = sys.argv[1:]
+window, harness, output, vault = sys.argv[1:5]
 output, vault = Path(output), Path(vault)
 checks = []
 
@@ -45,10 +45,11 @@ def wait(predicate, label, seconds=25):
 def key(chord):
     run("xdotool", "windowfocus", "--sync", window)
     run("xdotool", "key", "--clearmodifiers", chord)
+    time.sleep(0.2)
 
 
 def type_text(value):
-    run("xdotool", "type", "--clearmodifiers", "--delay", "8", value)
+    run("xdotool", "type", "--clearmodifiers", "--delay", "45", value)
 
 
 def tabs(chord, count):
@@ -73,11 +74,14 @@ assert before == b"# Alpha\n\ncat scatter cat\n\ncatapult CAT\n", before
 key("ctrl+f")
 wait(lambda state: alpha(state).get("find") is not None, "find row mounted")
 capture("regex-find-literal.png")
-# Ctrl+F focuses the Find field. The first tab stop is the visible Regex
-# control; activate the same native keyboard action a user can reach.
-key("Tab")
-key("Return")
-wait(lambda state: (alpha(state).get("find") or {}).get("mode") == "regex", "visible regex mode control")
+# The option command is available through the same user-visible palette as AT.
+def command(title):
+    key("ctrl+shift+p")
+    type_text(title)
+    key("Return")
+
+command("Toggle regex matching")
+wait(lambda state: (alpha(state).get("find") or {}).get("mode") == "regex", "regex command")
 key("ctrl+f")
 type_text(r"\b(cat)\b")
 state = wait(
@@ -90,29 +94,25 @@ before_find = alpha(state)["buffer_text"]
 capture("regex-find-matches.png")
 assert alpha(snapshot())["buffer_text"] == before_find, "Find must not edit source"
 
-# Find input -> Regex, Aa, Whole word, Selection only, Previous, Next,
-# Replace. Every action is delivered through the native focus ring.
-key("ctrl+f")
-tabs("Tab", 7)
-key("Return")
+key("ctrl+h")
 wait(lambda state: (alpha(state).get("replace") or {}).get("replace_open"), "replacement row mounted")
-# The next focus stops are Close Find, then the newly mounted replacement
-# field. Typing is therefore still directed through the real text widget.
-tabs("Tab", 2)
+type_text("$missing")
+command("Replace all matches")
+wait(lambda state: (alpha(state).get("replace") or {}).get("error"), "invalid capture template is refused")
+assert alpha(snapshot())["buffer_text"] == before_find
+key("ctrl+h")
+key("ctrl+a")
 type_text("<$1>")
-state = wait(lambda state: (alpha(state).get("replace") or {}).get("query") == r"\b(cat)\b", "replacement draft retained")
-assert alpha(state)["buffer_text"] == before_find
 capture("regex-replace-row.png")
-
-# Replacement field -> Replace next -> Replace all.
-tabs("Tab", 2)
-key("Return")
+command("Replace all matches")
 expected = b"# Alpha\n\n<cat> scatter <cat>\n\ncatapult <CAT>\n"
 state = wait(lambda state: alpha(state).get("buffer_text", "").encode() == expected, "one regex Replace all edit")
 assert alpha(state)["buffer_text"].encode() == expected
 assert alpha(state)["buffer"] is not None
 assert (vault / "alpha.md").read_bytes() == before, "Replace all must remain an unsaved buffer edit"
 
+key("Escape")
+wait(lambda state: alpha(state).get("find") is None, "Find closes before editor Undo")
 key("ctrl+z")
 wait(lambda state: alpha(state).get("buffer_text", "").encode() == before, "one isolated Undo restores original text")
 key("ctrl+y")
@@ -120,6 +120,30 @@ wait(lambda state: alpha(state).get("buffer_text", "").encode() == expected, "Re
 key("ctrl+s")
 wait(lambda state: state["pending_operations"] == 0 and (vault / "alpha.md").read_bytes() == expected, "save writes exact replacement source")
 assert hashlib.sha256((vault / "alpha.md").read_bytes()).hexdigest() == hashlib.sha256(expected).hexdigest()
+
+# Actual multiline source query and replacement, entered through Alt+Enter.
+key("ctrl+f")
+key("ctrl+a")
+type_text("scatter <cat>")
+key("alt+Return")
+key("alt+Return")
+type_text("catapult")
+wait(lambda state: (alpha(state).get("find") or {}).get("query") == "scatter <cat>\n\ncatapult"
+     and alpha(state)["find"].get("total_matches") == 1, "multiline source match")
+key("ctrl+h")
+key("ctrl+a")
+type_text("joined")
+key("alt+Return")
+type_text("line")
+command("Replace all matches")
+multiline = b"# Alpha\n\n<cat> joined\nline <CAT>\n"
+wait(lambda state: alpha(state).get("buffer_text", "").encode() == multiline, "multiline capture replacement")
+key("Escape")
+key("ctrl+z")
+wait(lambda state: alpha(state).get("buffer_text", "").encode() == expected, "multiline replacement is one Undo")
+key("ctrl+y")
+key("ctrl+s")
+wait(lambda state: (vault / "alpha.md").read_bytes() == multiline, "multiline source bytes saved")
 
 capture("regex-replace.png")
 checks.extend(

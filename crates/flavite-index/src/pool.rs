@@ -195,9 +195,19 @@ pub struct NoteCatalogEntry {
     pub stable_id: Option<String>,
 }
 
+/// Continuation bound to one immutable catalog version and native ordering.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NoteCatalogCursor {
+    pub epoch: u64,
+    pub generation: u64,
+    pub native_path: Vec<u8>,
+    pub note_id: i64,
+}
+
 /// A bounded catalog page with the index generation it came from.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NoteCatalogPage {
+    pub next: Option<NoteCatalogCursor>,
     /// Entries in canonical path order, at most the requested limit.
     pub items: Vec<NoteCatalogEntry>,
     /// Index epoch.
@@ -2089,7 +2099,12 @@ impl IndexActor {
     ///
     /// # Errors
     /// Returns the underlying error text when SQLite cannot be read.
-    pub fn note_catalog(&self, limit: usize) -> Result<NoteCatalogPage, String> {
+    #[allow(clippy::too_many_lines)] // One read transaction binds metadata, page and aliases.
+    pub fn note_catalog(
+        &self,
+        limit: usize,
+        after: Option<NoteCatalogCursor>,
+    ) -> Result<NoteCatalogPage, String> {
         let conn = self
             .read_pool
             .get(Some(Duration::from_secs(2)))
@@ -2101,35 +2116,64 @@ impl IndexActor {
         let generation = crate::schema::get_meta_u64(&tx, crate::schema::MetaKey::Generation)
             .map_err(|e| e.to_string())?
             .unwrap_or(0);
+        if !(1..=500).contains(&limit) {
+            return Err("catalog page limit must be 1..=500".into());
+        }
+        if let Some(cursor) = &after {
+            if cursor.native_path.len() > 16 * 1024 {
+                return Err("catalog cursor exceeds native-key limit".into());
+            }
+            if (cursor.epoch, cursor.generation) != (epoch, generation) {
+                return Err("catalog reset required".into());
+            }
+        }
         let total: i64 = tx
             .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
         let mut statement = tx
-            .prepare("SELECT note_id, path, path_native, title, stable_id, id_conflict FROM notes ORDER BY path_key, path LIMIT ?1")
+            .prepare("SELECT note_id, path, path_native, title, stable_id, id_conflict FROM notes WHERE ?1 OR (path_native, note_id) > (?2, ?3) ORDER BY path_native, note_id LIMIT ?4")
             .map_err(|e| e.to_string())?;
         let bounded_limit =
             i64::try_from(limit).map_err(|_| "note catalog limit does not fit i64".to_owned())?;
+        let (first, native_path, note_id) = after.map_or((true, Vec::new(), 0), |cursor| {
+            (false, cursor.native_path, cursor.note_id)
+        });
         let rows = statement
-            .query_map([bounded_limit], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    NoteCatalogEntry {
-                        path: row.get(1)?,
-                        path_native: row.get(2)?,
-                        title: row.get(3)?,
-                        aliases: Vec::new(),
-                        stable_id: if row.get::<_, bool>(5)? {
-                            None
-                        } else {
-                            row.get(4)?
+            .query_map(
+                rusqlite::params![first, native_path, note_id, bounded_limit + 1],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        NoteCatalogEntry {
+                            path: row.get(1)?,
+                            path_native: row.get(2)?,
+                            title: row.get(3)?,
+                            aliases: Vec::new(),
+                            stable_id: if row.get::<_, bool>(5)? {
+                                None
+                            } else {
+                                row.get(4)?
+                            },
                         },
-                    },
-                ))
-            })
+                    ))
+                },
+            )
             .map_err(|e| e.to_string())?;
         let mut indexed = rows
             .map(|row| row.map_err(|e| e.to_string()))
             .collect::<Result<Vec<_>, _>>()?;
+        let has_more = indexed.len() > limit;
+        indexed.truncate(limit);
+        let next = if has_more {
+            indexed.last().map(|(id, entry)| NoteCatalogCursor {
+                epoch,
+                generation,
+                native_path: entry.path_native.clone(),
+                note_id: *id,
+            })
+        } else {
+            None
+        };
         drop(statement);
         let note_ids = indexed.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         let mut aliases = std::collections::HashMap::<i64, Vec<String>>::new();
@@ -2165,6 +2209,7 @@ impl IndexActor {
             .collect();
         tx.commit().map_err(|e| e.to_string())?;
         Ok(NoteCatalogPage {
+            next,
             items,
             epoch,
             generation,
@@ -2551,6 +2596,68 @@ mod tests {
     }
 
     #[test]
+    fn catalog_keyset_pages_replay_and_reject_changed_versions() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("catalog.sqlite3");
+        drop(crate::schema::open_or_init(&db).unwrap());
+        let mut index = IndexActor::new(&db, 1).unwrap();
+        for ordinal in (0..603).rev() {
+            let path = format!("note-{ordinal:04}.md");
+            index
+                .apply_saved_note(
+                    path.as_bytes(),
+                    &path,
+                    b"---
+aliases: [Alias]
+---
+body",
+                    1,
+                    1,
+                )
+                .unwrap();
+        }
+        assert!(index.note_catalog(0, None).is_err());
+        assert!(index.note_catalog(501, None).is_err());
+        let first = index.note_catalog(500, None).unwrap();
+        assert_eq!(first.items.len(), 500);
+        let cursor = first.next.unwrap();
+        let second = index.note_catalog(500, Some(cursor.clone())).unwrap();
+        let replay = index.note_catalog(500, Some(cursor.clone())).unwrap();
+        assert_eq!(second.items.len(), 103);
+        assert!(second.next.is_none());
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|e| &e.path_native)
+                .collect::<Vec<_>>(),
+            replay
+                .items
+                .iter()
+                .map(|e| &e.path_native)
+                .collect::<Vec<_>>()
+        );
+        assert!(second.items.iter().all(|e| e.aliases == ["Alias"]));
+        let all = first
+            .items
+            .iter()
+            .chain(&second.items)
+            .map(|e| e.path_native.clone())
+            .collect::<Vec<_>>();
+        assert!(all.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(all.len(), 603);
+        index
+            .apply_saved_note(b"new.md", "new.md", b"new", 2, 2)
+            .unwrap();
+        assert!(
+            index
+                .note_catalog(500, Some(cursor))
+                .unwrap_err()
+                .contains("reset required")
+        );
+    }
+
+    #[test]
     fn saved_note_updates_structure_search_cache_and_generation_atomically() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("index.sqlite3");
@@ -2561,7 +2668,7 @@ mod tests {
             .apply_saved_note(b"notes/a.md", "notes/a.md", original, 98, 99)
             .unwrap();
         assert_eq!((epoch, generation), (1, 1));
-        let catalog = index.note_catalog(50).unwrap();
+        let catalog = index.note_catalog(50, None).unwrap();
         assert_eq!(catalog.items.len(), 1);
         assert_eq!(catalog.items[0].path, "notes/a.md");
         assert_eq!(catalog.items[0].title, "Alpha");

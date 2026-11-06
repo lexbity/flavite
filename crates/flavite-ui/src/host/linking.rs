@@ -13,6 +13,7 @@ use flavite_workspace::TabId;
 /// The acknowledged source caret a gesture is bound to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GestureSource {
+    pub replacement_start: Option<usize>,
     /// The tab owning the writing target.
     pub tab: TabId,
     /// View incarnation at gesture time.
@@ -327,6 +328,7 @@ mod tests {
 
     fn source() -> GestureSource {
         GestureSource {
+            replacement_start: None,
             tab: TabId::from_raw(3),
             incarnation: 1,
             buffer_id: 12,

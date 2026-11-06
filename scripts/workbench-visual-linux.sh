@@ -27,9 +27,9 @@ case "$backend" in
     *) echo "backend must be gpu or canvas (got: $backend)" >&2; exit 2 ;;
 esac
 case "$scenario" in
-    graph-editor-loop) ;;
-    "") echo "missing --scenario (implemented: graph-editor-loop)" >&2; exit 2 ;;
-    *) echo "unsupported scenario: $scenario (implemented: graph-editor-loop)" >&2; exit 2 ;;
+    graph-editor-loop|note-regex-replace|link-completion) ;;
+    "") echo "missing --scenario (implemented: graph-editor-loop note-regex-replace link-completion)" >&2; exit 2 ;;
+    *) echo "unsupported scenario: $scenario (implemented: graph-editor-loop note-regex-replace link-completion)" >&2; exit 2 ;;
 esac
 if [[ "$(uname -s)" != Linux ]]; then
     echo "workbench visual runner is Linux-only" >&2
@@ -86,6 +86,12 @@ printf '# Alpha\n\nalpha body\n' >"$vault_dir/alpha.md"
 printf '# Beta\n\nbeta body\n' >"$vault_dir/beta.md"
 printf '# Gamma\n\ngamma body\n' >"$vault_dir/Systems/gamma.md"
 
+if [[ "$scenario" == "note-regex-replace" ]]; then
+    printf '# Alpha\n\ncat scatter cat\n\ncatapult CAT\n' >"$vault_dir/alpha.md"
+elif [[ "$scenario" == "link-completion" ]]; then
+    printf '%s\n' '---' 'title: Beta' 'aliases: [Rocket]' '---' '# Beta' '' 'beta body' >"$vault_dir/beta.md"
+fi
+
 python3 - "$vault_dir" "$run_dir/expected-fixture.json" <<'PY'
 import hashlib,json,pathlib,sys
 root=pathlib.Path(sys.argv[1])
@@ -99,6 +105,10 @@ p=pathlib.Path(sys.argv[1]); doc=json.loads(p.read_text()); doc["scenario"]=sys.
 PY
 
 cargo build -p flavite-ui --example app-demo --features ui-test-support
+if [[ "$scenario" == "note-regex-replace" ]]; then
+    cargo build -p flavite-text-search-worker
+    cp "$target_dir/debug/flavite-text-search-worker" "$target_dir/debug/examples/flavite-text-search-worker"
+fi
 
 harness_log="$run_dir/harness.jsonl"
 : >"$harness_log"

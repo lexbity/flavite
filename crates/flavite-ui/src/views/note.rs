@@ -9,7 +9,7 @@ use crate::style;
 use crate::views::empty_state;
 use crate::workspace::{bounds, tab_strip};
 use flavite_workspace::{LayoutAction, NoteLoad, TabId};
-use iced::widget::{button, column, container, row, rule, text, text_input};
+use iced::widget::{button, column, container, row, rule, text, text_editor};
 use iced::{Element, Length, alignment};
 
 /// Render one note tab for the active view slot.
@@ -220,7 +220,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         let total = page.as_ref().map_or(0, |page| page.spans.len());
         let total_matches = page.as_ref().map_or(0, |page| page.total_matches);
         // Empty query is Idle (D-05): no counts are presented at all.
-        let counts = if find.query.is_empty() {
+        let counts = if find.query.is_empty() && find.mode == "literal" {
             String::new()
         } else if find.pending.is_some() {
             "Searching…".to_owned()
@@ -250,21 +250,19 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         content = content.push(
             container(
                 row![
-                    text_input("Find in current note", &find.query)
+                    text_editor(&find.query_input)
                         .id(crate::host::note_search::find_id(tab))
-                        .on_input(move |query| {
-                            Message::NoteSearch(
-                                crate::host::note_search::NoteSearchMessage::FindQuery {
-                                    tab,
-                                    query,
-                                },
-                            )
-                        })
-                        .on_submit(Message::NoteSearch(
-                            crate::host::note_search::NoteSearchMessage::FindNext {
+                        .placeholder("Find source · Alt+Enter inserts a newline")
+                        .height(64)
+                        .on_action(move |action| Message::NoteSearch(
+                            crate::host::note_search::NoteSearchMessage::DraftAction {
                                 tab,
-                                forward: true,
-                            },
+                                replacement: false,
+                                action
+                            }
+                        ))
+                        .key_binding(move |key| crate::host::note_search::draft_binding(
+                            tab, false, key
                         )),
                     text(counts).size(12),
                     button(if find.mode == "regex" {
@@ -363,13 +361,19 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             content = content.push(
                 container(
                     row![
-                        text_input("Replace with", &replace.replacement)
+                        text_editor(&replace.replacement_input)
                             .id(crate::host::note_search::replace_id(tab))
-                            .on_input(move |value| Message::NoteSearch(
-                                crate::host::note_search::NoteSearchMessage::ReplaceText {
+                            .placeholder("Replace source · Alt+Enter inserts a newline")
+                            .height(64)
+                            .on_action(move |action| Message::NoteSearch(
+                                crate::host::note_search::NoteSearchMessage::DraftAction {
                                     tab,
-                                    text: value,
-                                },
+                                    replacement: true,
+                                    action
+                                }
+                            ))
+                            .key_binding(move |key| crate::host::note_search::draft_binding(
+                                tab, true, key
                             )),
                         button("Replace next").style(style::ghost()).on_press_maybe(
                             replace.pending.is_none().then_some(Message::NoteSearch(

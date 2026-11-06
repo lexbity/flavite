@@ -1903,8 +1903,12 @@ impl Session {
 
     /// Read a bounded native-identity note catalog snapshot for workspace
     /// shells and pickers. Read-only; errors surface as retryable states.
-    pub fn note_catalog(&self, limit: usize) -> Result<flavite_index::NoteCatalogPage, String> {
-        self.actor.note_catalog(limit)
+    pub fn note_catalog(
+        &self,
+        limit: usize,
+        after: Option<flavite_index::NoteCatalogCursor>,
+    ) -> Result<flavite_index::NoteCatalogPage, String> {
+        self.actor.note_catalog(limit, after)
     }
 
     /// Resolve a target through the shared index resolver for editor

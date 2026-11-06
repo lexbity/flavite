@@ -38,6 +38,9 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
                 _ => None,
             }
         }
+        NodeTarget::NoteSearchCommand(tab, command) if request.action == Action::Click => {
+            crate::host::commands::note_search_command(app, tab, command)
+        }
         NodeTarget::FindNext { tab, forward }
             if request.action == Action::Click && app.is_tab_visible(tab) =>
         {

@@ -6,6 +6,7 @@
 //! workspace; core commands stay `Invocation`s through `flavite-api`.
 
 pub mod appearance;
+pub mod catalog;
 pub mod closing;
 pub mod commands;
 pub mod context;

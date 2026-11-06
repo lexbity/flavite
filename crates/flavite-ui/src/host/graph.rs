@@ -1414,7 +1414,7 @@ fn request_node_link(app: &mut App, tab: TabId, hit: HitNode) {
             entity_id: record.id.id,
             native_path: record.path_native.clone(),
         });
-    app.request_link_insert_expected(locator, expected);
+    app.request_link_insert_expected(locator, expected, None);
 }
 
 /// Handle one graph command (keyboard/palette/menu/a11y row).

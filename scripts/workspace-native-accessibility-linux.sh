@@ -5,6 +5,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+if [[ "${FLAVITE_NATIVE_PRIVATE:-0}" != 1 ]]; then
+    exec dbus-run-session -- xvfb-run -a -s '-screen 0 1440x900x24' env FLAVITE_NATIVE_PRIVATE=1 bash "$0"
+fi
+gdbus call --session --dest org.a11y.Bus --object-path /org/a11y/bus \
+    --method org.freedesktop.DBus.Properties.Set org.a11y.Status IsEnabled '<true>' >/dev/null
 if [[ "$(uname -s)" != Linux ]]; then
     echo "native AT-SPI smoke is Linux-only" >&2
     exit 2
@@ -29,6 +34,7 @@ fi
 target_dir="${CARGO_TARGET_DIR:-target}"
 run_root="$(mktemp -d "$target_dir/workspace-native-atspi.XXXXXX")"
 vault_root="$run_root/vault"
+device_dir="$(mktemp -d /tmp/fa.XXXXXX)"
 mkdir -p "$vault_root" "$run_root/data" "$run_root/config" "$run_root/cache"
 cp crates/flavite-ui/tests/fixtures/native-accessibility.md "$vault_root/alpha.md"
 cargo build -p flavite-ui --example app-demo
@@ -36,7 +42,8 @@ cargo build -p flavite-ui --example app-demo
 env -u WAYLAND_DISPLAY \
     WINIT_UNIX_BACKEND=x11 \
     FLAVITE_VAULT="$vault_root" \
-    XDG_DATA_HOME="$run_root/data" \
+    FLAVITE_DATA_DIR="$device_dir" \
+    XDG_DATA_HOME="$device_dir/d" \
     XDG_CONFIG_HOME="$run_root/config" \
     XDG_CACHE_HOME="$run_root/cache" \
     "$target_dir/debug/examples/app-demo" \
@@ -45,6 +52,7 @@ app_pid=$!
 cleanup() {
     kill "$app_pid" 2>/dev/null || true
     wait "$app_pid" 2>/dev/null || true
+    rm -rf "$device_dir"
 }
 trap cleanup EXIT
 
@@ -69,7 +77,7 @@ fi
 # focus is still required and sufficient for the OS input checks below.
 xdotool windowactivate --sync "$window_id" 2>/dev/null || true
 xdotool windowfocus --sync "$window_id"
-if ! python3 scripts/workspace-native-accessibility-linux.py "$vault_root" "$window_id"; then
+if ! python3 scripts/workspace-native-accessibility-linux.py "$vault_root" "$window_id" "$app_pid"; then
     echo "native AT-SPI runner failed; app log: $run_root/app.log" >&2
     cat "$run_root/app.log" >&2
     exit 1

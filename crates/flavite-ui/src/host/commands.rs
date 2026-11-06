@@ -26,13 +26,16 @@ pub const DEFAULT_CHORDS: &[(&str, &str)] = &[
     ("workspace.previous_tab", "Mod+Shift+Tab"),
     ("workspace.next_group", "F6"),
     ("workspace.previous_group", "Shift+F6"),
-    ("workspace.split_right", "Mod+Alt+Right"),
-    ("workspace.split_down", "Mod+Alt+Down"),
-    ("workspace.move_tab_next_group", "Mod+Alt+Shift+Right"),
-    ("workspace.move_tab_previous_group", "Mod+Alt+Shift+Left"),
+    ("workspace.split_right", "Mod+Alt+ArrowRight"),
+    ("workspace.split_down", "Mod+Alt+ArrowDown"),
+    ("workspace.move_tab_next_group", "Mod+Alt+Shift+ArrowRight"),
+    (
+        "workspace.move_tab_previous_group",
+        "Mod+Alt+Shift+ArrowLeft",
+    ),
     ("workspace.maximize_group", "Mod+Shift+M"),
-    ("workspace.navigate_back", "Alt+Left"),
-    ("workspace.navigate_forward", "Alt+Shift+Right"),
+    ("workspace.navigate_back", "Alt+ArrowLeft"),
+    ("workspace.navigate_forward", "Alt+Shift+ArrowRight"),
     ("workspace.new_note", "Mod+N"),
     ("workspace.open_note_dialog", "Mod+O"),
     ("workspace.group_actions", "Shift+F10"),
@@ -71,7 +74,7 @@ pub fn key_token(key: &keyboard::Key) -> Option<String> {
                 _ => None,
             }
         }
-        keyboard::Key::Named(named) => named_token(*named).map(str::to_owned),
+        keyboard::Key::Named(named) => named_token(*named).map(str::to_uppercase),
         keyboard::Key::Unidentified => None,
     }
 }
@@ -80,20 +83,6 @@ pub fn key_token(key: &keyboard::Key) -> Option<String> {
 #[must_use]
 pub fn chord_key_token(key: &str) -> Option<String> {
     let token = key.trim();
-    const NAMED: &[(&str, &str)] = &[
-        ("Return", "Enter"),
-        ("Esc", "Escape"),
-        ("Del", "Delete"),
-        ("Up", "ArrowUp"),
-        ("Down", "ArrowDown"),
-        ("Left", "ArrowLeft"),
-        ("Right", "ArrowRight"),
-    ];
-    for (alias, canonical) in NAMED {
-        if token.eq_ignore_ascii_case(alias) {
-            return Some((*canonical).to_owned());
-        }
-    }
     Some(token.to_uppercase())
 }
 
@@ -144,12 +133,36 @@ pub struct UiCommand {
 /// build is absent here (RFC §16.1): no placeholder rows.
 pub const UI_COMMANDS: &[UiCommand] = &[
     UiCommand {
+        id: "note.find_regex",
+        title: "Toggle regex matching",
+    },
+    UiCommand {
+        id: "note.find_case",
+        title: "Toggle case sensitive matching",
+    },
+    UiCommand {
+        id: "note.find_word",
+        title: "Toggle whole word matching",
+    },
+    UiCommand {
+        id: "note.find_selection",
+        title: "Toggle selected source scope",
+    },
+    UiCommand {
+        id: "note.replace_next",
+        title: "Replace next match",
+    },
+    UiCommand {
+        id: "note.replace_all",
+        title: "Replace all matches",
+    },
+    UiCommand {
         id: "workspace.find",
         title: "Find in current note (includes unsaved text)",
     },
     UiCommand {
         id: "workspace.replace",
-        title: "Replace in current note (literal)",
+        title: "Replace in current note",
     },
     UiCommand {
         id: "context.source_preview",
@@ -517,6 +530,12 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
         && !app.palette_open
         && !app.picker.open
     {
+        let tab = app.workspace.focused_tab();
+        if app.note_search.finds.contains_key(&tab) {
+            return Some(Message::NoteSearch(
+                crate::host::note_search::NoteSearchMessage::FindClose(tab),
+            ));
+        }
         return Some(Message::CancelGesture);
     }
     if app.strip_menu.is_some() {
@@ -1097,6 +1116,17 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
         "graph.locate_node" => {
             return app.update(Message::LocateFromNode(app.workspace.focused_tab()));
         }
+        "note.find_regex"
+        | "note.find_case"
+        | "note.find_word"
+        | "note.find_selection"
+        | "note.replace_next"
+        | "note.replace_all" => {
+            let tab = app.workspace.focused_tab();
+            if let Some(message) = note_search_command(app, tab, id) {
+                return app.update(message);
+            }
+        }
         "workspace.find" => {
             return app.update(Message::NoteSearch(
                 crate::host::note_search::NoteSearchMessage::FindOpen(app.workspace.focused_tab()),
@@ -1185,6 +1215,19 @@ pub fn available(app: &App, id: &str) -> bool {
         return false;
     };
     match id {
+        "note.find_regex" | "note.find_case" | "note.find_word" | "note.find_selection" => {
+            app.note_search
+                .finds
+                .contains_key(&app.workspace.focused_tab())
+                && !app.has_composition()
+        }
+        "note.replace_next" | "note.replace_all" => {
+            app.note_search
+                .replaces
+                .get(&app.workspace.focused_tab())
+                .is_some_and(|state| state.pending.is_none())
+                && !app.has_composition()
+        }
         "workspace.find" | "workspace.replace" => {
             app.note_editor_view(app.workspace.focused_tab()).is_some()
         }
@@ -1349,4 +1392,34 @@ fn graph_action_tab(app: &App) -> Option<TabId> {
 #[must_use]
 pub fn focused_group_or_first(app: &App) -> Option<GroupId> {
     app.focused_group().or_else(|| app.workspace.first_group())
+}
+
+/// Canonical option/replace command interpretation shared by palette and native AT.
+pub fn note_search_command(app: &App, tab: TabId, id: &str) -> Option<Message> {
+    use crate::host::note_search::NoteSearchMessage as Search;
+    if !app.is_tab_visible(tab) || app.has_composition() {
+        return None;
+    }
+    let find = app.note_search.finds.get(&tab)?;
+    Some(Message::NoteSearch(match id {
+        "note.find_regex" => Search::SetMode {
+            tab,
+            mode: if find.mode == "regex" {
+                "literal"
+            } else {
+                "regex"
+            }
+            .into(),
+        },
+        "note.find_case" => Search::ToggleCaseSensitive(tab),
+        "note.find_word" => Search::ToggleWholeWord(tab),
+        "note.find_selection" => Search::ToggleSelectionScope(tab),
+        "note.replace_next" if app.note_search.replaces.get(&tab)?.pending.is_none() => {
+            Search::ReplaceNext(tab)
+        }
+        "note.replace_all" if app.note_search.replaces.get(&tab)?.pending.is_none() => {
+            Search::ReplaceAll(tab)
+        }
+        _ => return None,
+    }))
 }

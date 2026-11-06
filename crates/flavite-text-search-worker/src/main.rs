@@ -54,7 +54,10 @@ fn apply_memory_ceiling() {
 }
 
 #[cfg(not(unix))]
-fn apply_memory_ceiling() {}
+fn apply_memory_ceiling() {
+    // Never evaluate regex without the required platform resource boundary.
+    exit(2);
+}
 
 fn main() {
     apply_memory_ceiling();

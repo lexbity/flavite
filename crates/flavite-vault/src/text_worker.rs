@@ -687,7 +687,10 @@ impl SpawnWithGroup for Command {
 #[cfg(not(unix))]
 impl SpawnWithGroup for Command {
     fn spawn_with_group(&mut self) -> std::io::Result<Child> {
-        self.spawn()
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "regex process isolation is unavailable on this platform",
+        ))
     }
 }
 

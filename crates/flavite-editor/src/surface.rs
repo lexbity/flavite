@@ -68,6 +68,15 @@ pub enum HistoryDirection {
 /// and input acknowledgements cannot masquerade as document mutations.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditorAction {
+    /// Complete an exact source prefix using an indexed entity identity.
+    Complete {
+        buffer_id: u64,
+        expected_revision: u64,
+        start: usize,
+        end: usize,
+        prefix: String,
+        candidate: flavite_api::CompletionCandidate,
+    },
     /// Apply a revision-guarded edit batch through Session.
     Edit {
         /// Buffer instance identity.
@@ -167,7 +176,7 @@ impl EditorAction {
                 // the established coalescing rules (D-06/TD-8).
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             },
-            Self::Navigate { .. } | Self::Interaction(_) => {
+            Self::Complete { .. } | Self::Navigate { .. } | Self::Interaction(_) => {
                 unreachable!("non-mutation editor action has no Session command")
             }
         }
@@ -288,7 +297,7 @@ impl EditorAction {
                     serde_json::json!({ "buffer_id": buffer_id, "revision": expected_revision }),
                 )
             }
-            Self::Navigate { .. } | Self::Interaction(_) => return None,
+            Self::Complete { .. } | Self::Navigate { .. } | Self::Interaction(_) => return None,
         };
         Some(flavite_api::Invocation::with_preconditions(
             request_id,

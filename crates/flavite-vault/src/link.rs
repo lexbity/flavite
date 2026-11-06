@@ -72,6 +72,16 @@ pub struct LinkPrepareRequest {
     pub stable_link_policy: StableLinkPolicy,
     /// Present only for a guarded occurrence-removal prepare.
     pub removal: Option<RemovalRequest>,
+    pub completion: Option<CompletionRequest>,
+}
+
+/// The exact incomplete link prefix being completed at an acknowledged caret.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionRequest {
+    pub start: usize,
+    pub end: usize,
+    pub prefix: String,
 }
 
 /// Exact normalized scanner occurrence selected by the user.
@@ -328,21 +338,8 @@ pub(crate) enum CommitAdmission {
 }
 
 fn fingerprint_prepare(request: &LinkPrepareRequest) -> Fingerprint {
-    let mut state: u64 = 0xcbf2_9ce4_8422_2325;
-    let payload = [
-        request.buffer_id.to_le_bytes().as_slice(),
-        request.revision.to_le_bytes().as_slice(),
-        request.caret.to_le_bytes().as_slice(),
-        request.target_path.as_bytes(),
-        &[request.stable_link_policy.discriminant()],
-        request.intent.sequence.to_le_bytes().as_slice(),
-    ]
-    .concat();
-    for byte in payload.iter() {
-        state ^= u64::from(*byte);
-        state = state.wrapping_mul(0x1000_0000_01b3);
-    }
-    u128::from(state)
+    let hash = blake3::hash(format!("{request:?}").as_bytes());
+    u128::from_le_bytes(hash.as_bytes()[..16].try_into().expect("fixed hash length"))
 }
 
 /// The commit payload fingerprint (plan ID) used by the Session.
@@ -353,15 +350,6 @@ pub fn fingerprint_insert_public(plan_id: u128) -> Fingerprint {
 
 fn fingerprint_insert(plan_id: u128) -> Fingerprint {
     plan_id
-}
-
-impl StableLinkPolicy {
-    const fn discriminant(self) -> u8 {
-        match self {
-            Self::Disabled => 0,
-            Self::PreferStable => 1,
-        }
-    }
 }
 
 impl LinkPlanStore {
@@ -614,6 +602,9 @@ pub(crate) fn prepare_work(
         return Err(LinkInsertionError::CaretOutOfBounds);
     }
 
+    if request.removal.is_some() && request.completion.is_some() {
+        return Err(LinkInsertionError::InvalidIntent);
+    }
     if let Some(removal) = &request.removal {
         return prepare_removal_work(context, request, removal, &text, &source_path);
     }
@@ -668,7 +659,7 @@ pub(crate) fn prepare_work(
         .collect::<Result<_, _>>()?;
     let serialized = match (request.stable_link_policy, stable_id) {
         (StableLinkPolicy::PreferStable, Some(id)) => serialize_stable_link(id, title),
-        _ => serialize_link(&components, None),
+        _ => serialize_link(&components, request.completion.as_ref().map(|_| title)),
     }
     .map_err(|error| LinkInsertionError::UnrepresentableTarget(error.to_string()))?;
     let round_trip = catalog.resolve(
@@ -684,8 +675,25 @@ pub(crate) fn prepare_work(
     {
         return Err(LinkInsertionError::TargetRetargeted);
     }
+    let mut completion_text;
+    let (proof_text, proof_caret) = if let Some(completion) = &request.completion {
+        if completion.end != request.caret
+            || completion.start > completion.end
+            || completion.prefix.len() > 8192
+            || !completion.prefix.starts_with("[[")
+            || completion.prefix.contains("]]")
+            || text.get(completion.start..completion.end) != Some(completion.prefix.as_str())
+        {
+            return Err(LinkInsertionError::CaretNotLinkable);
+        }
+        completion_text = text.clone();
+        completion_text.replace_range(completion.start..completion.end, "");
+        (completion_text.as_str(), completion.start)
+    } else {
+        (text.as_str(), request.caret)
+    };
     let proof =
-        prove_insertion(&text, request.caret, &serialized).map_err(
+        prove_insertion(proof_text, proof_caret, &serialized).map_err(
             |rejection| match rejection {
                 ProofRejection::CaretOutOfBounds => LinkInsertionError::CaretOutOfBounds,
                 ProofRejection::CaretNotLinkable => LinkInsertionError::CaretNotLinkable,
@@ -714,7 +722,11 @@ pub(crate) fn prepare_work(
         intent: request.intent,
         source: prepared.source.clone(),
         target_entity_id: note.note_id,
-        edit: (proof.start, proof.end, proof.replacement),
+        edit: (
+            proof.start,
+            request.completion.as_ref().map_or(proof.end, |c| c.end),
+            proof.replacement,
+        ),
         removal: false,
         target_raw: serialized.payload.target_raw,
         target_is_attachment: false,
@@ -847,6 +859,7 @@ mod tests {
             stable_link_policy: StableLinkPolicy::Disabled,
             expected_target: None,
             removal: None,
+            completion: None,
         }
     }
 

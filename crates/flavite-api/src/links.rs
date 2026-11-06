@@ -34,6 +34,7 @@ pub struct LinkSourceArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinkPrepareArgs {
+    pub completion: Option<flavite_vault::link::CompletionRequest>,
     /// Gesture identity.
     pub intent: LinkIntentArgs,
     /// Source binding.

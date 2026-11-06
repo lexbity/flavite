@@ -24,7 +24,7 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
-if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" && "$scenario" != "context" && "$scenario" != "semantic-link" && "$scenario" != "restore" && "$scenario" != "read-structure" && "$scenario" != "filtered-unsaved-graph" && "$scenario" != "develop-connected-note" && "$scenario" != "appearance-matrix" && "$scenario" != "conflict-recovery" && "$scenario" != "note-regex-replace" ]]; then
+if [[ "$scenario" != "layout" && "$scenario" != "shared-editors" && "$scenario" != "shell-foundation" && "$scenario" != "context" && "$scenario" != "semantic-link" && "$scenario" != "restore" && "$scenario" != "read-structure" && "$scenario" != "filtered-unsaved-graph" && "$scenario" != "develop-connected-note" && "$scenario" != "appearance-matrix" && "$scenario" != "conflict-recovery" ]]; then
     echo "unsupported scenario: $scenario" >&2
     exit 2
 fi
@@ -86,9 +86,10 @@ import sys
 root=Path(sys.argv[1])
 (root/"alpha.md").write_text("---\ntitle: 'Alpha' # preserve this comment\ncount: 2\n---\n# Alpha\n\nA **bold** paragraph with *emphasis* and [[beta|a note link]].\n\n- [ ] First task\n\n| Column A | Column B |\n|---|---|\n| One | Two |\n\n> A quotation\n\n```rust\nlet literal = \"[[not a link]]\";\n```\n\n**Before ![[beta]] after**\n\n## More detail\n\nFurther reading.\n")
 PYFIXTURE
-elif [[ "$scenario" == "note-regex-replace" ]]; then
-    printf '# Alpha\n\ncat scatter cat\n\ncatapult CAT\n' >"$vault_dir/alpha.md"
+
 fi
+
+
 
 python3 - "$vault_dir" "$run_dir/expected-fixture.json" <<'PY'
 import hashlib,json,pathlib,sys
@@ -98,10 +99,7 @@ pathlib.Path(sys.argv[2]).write_text(json.dumps({'schema':1,'fixture_seed':31008
 PY
 
 cargo build -p flavite-ui --example app-demo --features ui-test-support
-if [[ "$scenario" == "note-regex-replace" ]]; then
-    cargo build -p flavite-text-search-worker
-    cp "$target_dir/debug/flavite-text-search-worker" "$target_dir/debug/examples/flavite-text-search-worker"
-fi
+
 
 harness_log="$run_dir/harness.jsonl"
 : >"$harness_log"
@@ -220,10 +218,7 @@ harness_wait "boot with the catalog loaded" \
 capture "$run_dir/01-boot.png"
 record "boot-single-group-catalog" "01-boot.png"
 
-if [[ "$scenario" == "note-regex-replace" ]]; then
-    python3 scripts/tests/workspace_note_regex.py "$window_id" "$harness_log" "$run_dir" "$vault_dir"
-    record "s03-regex-replace-os-input-undo-save" "regex-checks.json"
-elif [[ "$scenario" == "read-structure" ]]; then
+if [[ "$scenario" == "read-structure" ]]; then
     python3 scripts/tests/workspace_reading.py "$window_id" "$harness_log" "$run_dir" "$vault_dir"
     record "reading-os-input-mode-task-undo-properties" "reading-checks.json"
 elif [[ "$scenario" == "filtered-unsaved-graph" ]]; then

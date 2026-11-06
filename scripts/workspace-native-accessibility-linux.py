@@ -67,7 +67,7 @@ def shell_application():
         (
             app
             for app in apps()
-            if app.get_name() == "app-demo"
+            if app.get_process_id() == int(sys.argv[3])
             and any(has_role(node, "tab list") for node in walk(app))
         ),
         None,
@@ -156,6 +156,31 @@ def main() -> int:
     expected = exposed[:caret] + "native-caret-marker" + exposed[caret:]
     vault = Path(sys.argv[1])
     wait_for(lambda: (vault / "alpha.md").read_text() == expected, "native caret edit saved at the exact source position")
+
+    # Operate the real Find controls through AT-SPI, not facade messages.
+    subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+f"], check=True)
+    query = wait_for(lambda: next((node for node in walk(app)
+        if (node.get_name() or "") == "Find in current note, including unsaved changes"), None), "native Find draft")
+    if not Atspi.EditableText.set_text_contents(query, "Native bridge note"):
+        raise RuntimeError("native Find SetValue rejected")
+    wait_for(lambda: any((node.get_name() or "") == "Find results: 1 matches"
+                        for node in walk(app)), "native Find match count")
+    case = wait_for(lambda: (find_nodes(app, "push button", "Toggle case sensitive matching") or [None])[0], "case control")
+    if not case.do_action(0):
+        raise RuntimeError("native case action rejected")
+    if not Atspi.EditableText.set_text_contents(query, "native bridge note"):
+        raise RuntimeError("native Find query update rejected")
+    wait_for(lambda: any((node.get_name() or "") == "Find results: 0 matches"
+                        for node in walk(app)), "native case-sensitive refusal")
+    if not case.do_action(0):
+        raise RuntimeError("native case reset rejected")
+    wait_for(lambda: any((node.get_name() or "") == "Find results: 1 matches"
+                        for node in walk(app)), "native case reset")
+    close_find = wait_for(lambda: (find_nodes(app, "push button", "Close find") or [None])[0], "close Find")
+    if not close_find.do_action(0):
+        raise RuntimeError("native close Find rejected")
+    wait_for(lambda: not any((node.get_name() or "") == "Find in current note, including unsaved changes"
+                            for node in walk(app)), "native Find removed")
 
     # Dispatch a native Click action on the Empty tab; the workspace routes
     # it through the ordinary message path and the tab becomes active.

@@ -77,6 +77,7 @@ fn ticketed_catalog_returns_rich_native_identity_metadata() {
         provenance,
         total,
         truncated,
+        ..
     } = result
     else {
         panic!("expected a catalog page, got {result:?}");
@@ -246,22 +247,58 @@ fn saturation_is_typed_busy_and_recovery_serves_every_accepted_ticket() {
 }
 
 #[test]
-fn truncation_flag_is_honest_at_tight_bounds() {
+fn incomplete_catalog_is_refused_instead_of_publishing_a_prefix() {
     let f = fixture();
-    let service = f.flavite.query_service();
-    let token = service
-        .submit(
-            CATALOG_CONTEXT_TAB,
-            9,
-            9,
-            QueryPayload::Catalog { limit: 2 },
-        )
-        .expect("admitted");
-    let outcomes = served(&f.flavite, Instant::now() + Duration::from_secs(10));
+    for limit in [0, 2] {
+        let token = f
+            .flavite
+            .query_service()
+            .submit(
+                CATALOG_CONTEXT_TAB,
+                9,
+                limit,
+                QueryPayload::Catalog { limit },
+            )
+            .expect("admitted");
+        let outcomes = served(&f.flavite, Instant::now() + Duration::from_secs(10));
+        let outcome = outcomes
+            .iter()
+            .find(|outcome| outcome.token == token)
+            .unwrap();
+        assert!(
+            matches!(&outcome.result, ContextQueryResult::Failed { message }
+            if message.contains("limit exceeded"))
+        );
+    }
+}
+
+#[test]
+fn catalog_acquires_more_than_one_page_without_loss() {
+    let notes = (0..603)
+        .map(|n| {
+            (
+                format!("n{n:04}.md"),
+                format!(
+                    "---
+title: N{n}
+aliases: [Alias{n}]
+---
+body"
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let borrowed = notes
+        .iter()
+        .map(|(path, body)| (path.as_str(), body.as_str()))
+        .collect::<Vec<_>>();
+    let f = support::fixture(&borrowed);
+    let token = f.flavite.submit_catalog().unwrap();
+    let outcomes = served(&f.flavite, Instant::now() + Duration::from_secs(30));
     let outcome = outcomes
         .iter()
         .find(|outcome| outcome.token == token)
-        .expect("page served");
+        .unwrap();
     let ContextQueryResult::Catalog {
         entries,
         total,
@@ -269,34 +306,17 @@ fn truncation_flag_is_honest_at_tight_bounds() {
         ..
     } = &outcome.result
     else {
-        panic!("expected catalog page");
+        panic!("expected complete catalog: {:?}", outcome.result)
     };
-    assert_eq!(entries.len(), 2);
-    assert_eq!(*total, 3);
-    assert!(*truncated, "2 of 3 must flag truncation (R9)");
-
-    // The service clamps `0` up to the smallest honest page, never zero.
-    let zero = service
-        .submit(
-            CATALOG_CONTEXT_TAB,
-            10,
-            10,
-            QueryPayload::Catalog { limit: 0 },
-        )
-        .expect("admitted");
-    let outcomes = served(&f.flavite, Instant::now() + Duration::from_secs(10));
-    let outcome = outcomes
-        .iter()
-        .find(|o| o.token == zero)
-        .expect("clamped page served");
-    let ContextQueryResult::Catalog {
-        entries, truncated, ..
-    } = &outcome.result
-    else {
-        panic!("expected catalog page");
-    };
-    assert_eq!(entries.len(), 1, "limit 0 clamps to 1");
-    assert!(*truncated);
+    assert_eq!(entries.len(), 603);
+    assert_eq!(*total, 603);
+    assert!(!truncated);
+    assert!(
+        entries
+            .windows(2)
+            .all(|w| w[0].native_path < w[1].native_path)
+    );
+    assert!(entries.iter().all(|e| e.aliases.len() == 1));
 }
 
 #[test]
@@ -331,5 +351,34 @@ fn submit_p99_is_microseconds_not_a_vault_read() {
     }
     panic!(
         "AC-6: submit_catalog p99 must be < 100µs (host turn pays an admission only), best of three {best:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unsupported_native_path_never_becomes_a_lossy_catalog_target() {
+    use flavite_fs::Fs;
+    use std::os::unix::ffi::OsStringExt;
+    let f = support::fixture(&[("ordinary.md", "ordinary")]);
+    let name = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"native-\xff.md".to_vec()));
+    f.fs.write_new(&f.root.join(&name), b"# Native").unwrap();
+    support::reconcile(&f.flavite);
+    let token = f.flavite.submit_catalog().unwrap();
+    let outcomes = served(&f.flavite, Instant::now() + Duration::from_secs(10));
+    let outcome = outcomes.iter().find(|o| o.token == token).unwrap();
+    let ContextQueryResult::Catalog { entries, .. } = &outcome.result else {
+        panic!("expected catalog: {:?}", outcome.result);
+    };
+    // The current Fs codec explicitly refuses this name. It must never
+    // redirect it to the lossy display spelling or mutate the source.
+    assert!(f.fs.encode_path_key(&name).is_err());
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.path != std::path::Path::new("native-�.md"))
+    );
+    assert_eq!(
+        f.fs.read_if_exists(&f.root.join(&name)).unwrap().unwrap(),
+        b"# Native"
     );
 }

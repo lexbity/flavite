@@ -6,7 +6,7 @@
 //! or superseded sequences never overwrite newer ones, and no SQLite,
 //! index, or vault types cross this boundary.
 
-use crate::queries::{MAX_NOTE_CATALOG_LIMIT, NoteCatalogEntry};
+use crate::queries::NoteCatalogEntry;
 use flavite_vault::session::Session;
 use flavite_vault::sync::MutexExt;
 use std::collections::BTreeMap;
@@ -209,6 +209,7 @@ pub enum ContextQueryResult {
     /// `Arc`-shared so hosts swap snapshots wholesale; stale snapshots
     /// are dropped by provenance, never merged (D9/§4.7 UI trust).
     Catalog {
+        candidates: Arc<[crate::CompletionCandidate]>,
         /// Entries in canonical path order.
         entries: Arc<[NoteCatalogEntry]>,
         /// Index provenance of the served snapshot.
@@ -558,7 +559,7 @@ fn execute(
         QueryPayload::Preview { path } => execute_preview(session, path),
         QueryPayload::Backlinks { path } => execute_backlinks(session, graph, path),
         QueryPayload::Search { text, limit } => execute_search(session, text, *limit),
-        QueryPayload::Catalog { limit } => execute_catalog(session, *limit),
+        QueryPayload::Catalog { limit } => crate::catalog_service::execute_catalog(session, *limit),
         QueryPayload::LinkVerdicts {
             buffer_id,
             revision,
@@ -633,38 +634,6 @@ fn execute_link_verdicts(
 /// and backpressure semantics are identical to Search. The provenance is
 /// stamped with the snapshot so hosts can drop stale pages by version
 /// (§4.7 UI trust boundary); no caller-chosen path is involved (§22 rule).
-fn execute_catalog(session: &Arc<Session>, limit: u64) -> ContextQueryResult {
-    let limit = limit.clamp(1, u64::try_from(MAX_NOTE_CATALOG_LIMIT).unwrap_or(u64::MAX));
-    let bound = usize::try_from(limit).unwrap_or(MAX_NOTE_CATALOG_LIMIT);
-    match session.note_catalog(bound) {
-        Ok(page) => {
-            let entries: Arc<[NoteCatalogEntry]> = Arc::from(
-                page.items
-                    .into_iter()
-                    .map(|item| NoteCatalogEntry {
-                        path: PathBuf::from(item.path),
-                        native_path: item.path_native,
-                        title: item.title,
-                        aliases: item.aliases,
-                        stable_id: item.stable_id,
-                    })
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            );
-            ContextQueryResult::Catalog {
-                truncated: page.total > entries.len() as u64,
-                total: page.total,
-                provenance: Provenance {
-                    epoch: page.epoch,
-                    generation: page.generation,
-                },
-                entries,
-            }
-        }
-        Err(message) => ContextQueryResult::Failed { message },
-    }
-}
-
 fn inspect_occurrence(
     session: &Arc<Session>,
     graph: &Arc<crate::GraphService>,
@@ -750,7 +719,7 @@ fn root_path(session: &Arc<Session>, components: &[String]) -> PathBuf {
 }
 
 fn provenance(session: &Arc<Session>) -> Result<(u64, u64), String> {
-    let page = session.note_catalog(1)?;
+    let page = session.note_catalog(1, None)?;
     Ok((page.epoch, page.generation))
 }
 

@@ -59,7 +59,7 @@ pub fn project(app: &App) -> Projection {
     {
         if let Some(find) = app.note_search.finds.get(tab) {
             let id = node_id("find-query", tab.raw());
-            let mut node = Node::new(Role::TextInput);
+            let mut node = Node::new(Role::MultilineTextInput);
             node.set_label("Find in current note, including unsaved changes");
             node.set_value(find.query.clone());
             node.add_action(Action::Focus);
@@ -67,6 +67,44 @@ pub fn project(app: &App) -> Projection {
             out.actions.insert(id, NodeTarget::FindQuery(*tab));
             out.push(id, node);
             out.roots.push(id);
+            for (command, label) in [
+                ("note.find_regex", "Toggle regex matching"),
+                ("note.find_case", "Toggle case sensitive matching"),
+                ("note.find_word", "Toggle whole word matching"),
+                ("note.find_selection", "Toggle selected source scope"),
+            ] {
+                let id = node_id(command, tab.raw());
+                let mut node = Node::new(Role::Button);
+                node.set_label(label);
+                let active = match command {
+                    "note.find_regex" => find.mode == "regex",
+                    "note.find_case" => find.case_sensitive,
+                    "note.find_word" => find.whole_word,
+                    "note.find_selection" => find.use_selection_scope,
+                    _ => false,
+                };
+                node.set_toggled(accesskit::Toggled::from(active));
+                node.add_action(Action::Click);
+                out.actions
+                    .insert(id, NodeTarget::NoteSearchCommand(*tab, command));
+                out.push(id, node);
+                out.roots.push(id);
+            }
+            let status_id = node_id("find-status", tab.raw());
+            let mut status = Node::new(Role::Label);
+            status.set_label(if let Some(error) = &find.last_error {
+                format!("Find error: {error}")
+            } else if find.pending.is_some() {
+                "Find results: searching".into()
+            } else {
+                format!(
+                    "Find results: {} matches",
+                    crate::host::note_search::matches(app, *tab)
+                        .map_or(0, |page| page.total_matches)
+                )
+            });
+            out.push(status_id, status);
+            out.roots.push(status_id);
             for (role, label, target) in [
                 (
                     "find-prev",
@@ -99,7 +137,7 @@ pub fn project(app: &App) -> Projection {
             // RFC-0006 S01: replacement controls ride the same catalog, so
             // native input and AT act on exactly the mounted rows.
             let id = node_id("replace-input", tab.raw());
-            let mut node = Node::new(Role::TextInput);
+            let mut node = Node::new(Role::MultilineTextInput);
             node.set_label("Replace with");
             node.set_value(replace.replacement.clone());
             node.add_action(Action::Focus);

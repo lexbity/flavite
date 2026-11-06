@@ -99,3 +99,8 @@ pub const API_VERSION_MAX: &str = "0.2.0";
 pub const API_VERSION_MIN: &str = "0.1.0";
 
 pub use flavite_vault::link::LinkTargetIdentity;
+
+pub use flavite_vault::link::CompletionRequest;
+
+pub mod catalog_service;
+pub use catalog_service::CompletionCandidate;

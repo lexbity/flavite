@@ -55,7 +55,7 @@ pub struct NoticePresentation {
 }
 
 #[derive(Debug, Clone)]
-struct LinkVerdictSnapshot {
+pub(crate) struct LinkVerdictSnapshot {
     incarnation: u64,
     buffer_id: u64,
     revision: u64,
@@ -74,6 +74,7 @@ pub struct App {
     pub contexts: ContextRegistry,
     pub reading: crate::host::reading::ReadingHost,
     /// RFC-0006 S01: per-view literal find/replace state and match pages.
+    pub(crate) catalog_host: crate::host::catalog::CatalogHost,
     pub note_search: crate::host::note_search::NoteSearchHost,
     /// RFC-0006 §6.10: per-tab pending encoding decisions and repairs.
     pub encoding: crate::host::encoding::EncodingHost,
@@ -102,14 +103,12 @@ pub struct App {
     /// focus exactly once per tab.
     search_focus_tried: BTreeSet<TabId>,
     /// Unified candidate snapshot, rebuilt with the catalog (W10).
-    note_candidates: crate::picker::NoteCandidates,
     /// Shared rich candidate snapshot for all editor widgets (RFC-0006 S05).
-    editor_candidates: std::sync::Arc<[flavite_editor::NoteCandidate]>,
     /// Last admitted (buffer, revision, sequence) resolver query per view.
-    link_verdict_requests: BTreeMap<TabId, (u64, u64, u64, u64)>,
+    pub(crate) link_verdict_requests: BTreeMap<TabId, (u64, u64, u64, u64)>,
     link_verdict_sequences: BTreeMap<TabId, u64>,
     /// Exact resolver snapshot per view and source revision.
-    link_verdicts: BTreeMap<TabId, LinkVerdictSnapshot>,
+    pub(crate) link_verdicts: BTreeMap<TabId, LinkVerdictSnapshot>,
     /// Device-local workspace persistence (W06).
     pub persistence: crate::host::persistence::PersistenceHost,
     /// Interface appearance: theme, scale, editor type, reduced motion,
@@ -150,15 +149,11 @@ pub struct App {
     /// Set when the window/workspace bounds changed; gates the geometry
     /// re-solve that used to run on every message.
     pub(crate) window_geometry_dirty: bool,
-    catalog: Vec<NoteCatalogEntry>,
     /// Ticketed acquisition state machine (RFC-0004 §6.4, D9).
-    catalog_status: CatalogStatus,
     /// Saved-layout restore waits for the first terminal catalog outcome
     /// (W-D): `plan_restore` validates membership against the catalog,
     /// which is no longer synchronously available on the attach turn.
     restore_pending: bool,
-    catalog_last_submit: Option<Instant>,
-    catalog_retry_due: bool,
     settings: Settings,
     settings_valid: bool,
     pub operations: OperationPump,
@@ -564,6 +559,7 @@ impl App {
             notes: DocumentRegistry::default(),
             contexts: ContextRegistry::default(),
             reading: crate::host::reading::ReadingHost::default(),
+            catalog_host: crate::host::catalog::CatalogHost::default(),
             note_search: crate::host::note_search::NoteSearchHost::default(),
             encoding: crate::host::encoding::EncodingHost::default(),
             input_chains: BTreeMap::new(),
@@ -581,8 +577,6 @@ impl App {
             start: crate::host::dialogs::StartState::default(),
             notes_filters: BTreeMap::new(),
             search_focus_tried: BTreeSet::new(),
-            note_candidates: crate::picker::NoteCandidates::default(),
-            editor_candidates: std::sync::Arc::from([]),
             link_verdict_requests: BTreeMap::new(),
             link_verdict_sequences: BTreeMap::new(),
             link_verdicts: BTreeMap::new(),
@@ -612,10 +606,6 @@ impl App {
             drag_revision: None,
             pointer_feedback: false,
             window_geometry_dirty: true,
-            catalog: Vec::new(),
-            catalog_status: CatalogStatus::Empty,
-            catalog_last_submit: None,
-            catalog_retry_due: false,
             restore_pending: false,
             settings: Settings::default(),
             settings_valid: true,
@@ -725,7 +715,8 @@ impl App {
             }
         };
         let catalog: std::collections::BTreeSet<String> = self
-            .catalog
+            .catalog_host
+            .entries
             .iter()
             .filter_map(|entry| entry.path.to_str().map(str::to_owned))
             .collect();
@@ -892,138 +883,12 @@ impl App {
         }
     }
 
-    /// Request a catalog refresh (replaces the pre-S5 blocking load): the
-    /// whole read goes out as a QueryService ticket, so this turn pays only
-    /// an admission (NFR-4). Results apply in the pump drain path.
-    /// Explicit triggers (startup, vault-open completion, create/rename
-    /// completions, retry) submit even while a ticket is in flight — the
-    /// newest ticket supersedes, so responding to an event can never be
-    /// swallowed by an older read that started before the event landed.
-    pub(crate) fn request_catalog_refresh(&mut self) {
-        self.try_submit_catalog_ticket();
-    }
-
-    /// A `VaultChanged` pulse refreshes at most once per throttle window
-    /// (§6.4: ≥ 1 s); later pulses coalesce into one retry.
-    pub(crate) fn note_vault_changed_pulse(&mut self) {
-        if self
-            .catalog_last_submit
-            .is_none_or(|when| when.elapsed() >= CATALOG_REFRESH_THROTTLE)
-        {
-            self.try_submit_catalog_ticket();
-        } else {
-            self.catalog_retry_due = true;
-        }
-    }
-
-    fn try_submit_catalog_ticket(&mut self) {
-        let Some(flavite) = self.flavite.as_ref() else {
-            return;
-        };
-        match flavite.submit_catalog() {
-            Ok(_token) => {
-                self.catalog_status = CatalogStatus::Loading;
-                self.catalog_last_submit = Some(Instant::now());
-                self.catalog_retry_due = false;
-            }
-            Err(flavite_api::QuerySubmitError::Busy) => {
-                // No silent loss: keep the last status and snapshot, retry
-                // from the pump once the throttle window has passed.
-                self.catalog_retry_due = true;
-            }
-        }
-    }
-
-    /// Apply one drained catalog outcome. `Loading` and `Failed` never
-    /// clear the existing snapshot (picker keeps serving candidates, no
-    /// flicker); `Failed` surfaces visible retryable text.
-    pub(crate) fn apply_catalog_outcome(&mut self, result: &flavite_api::ContextQueryResult) {
-        match result {
-            flavite_api::ContextQueryResult::Catalog {
-                entries,
-                provenance,
-                truncated,
-                ..
-            } => {
-                self.catalog = entries.to_vec();
-                // One candidate snapshot feeds the picker, Notes view,
-                // dialogs, and open-in-tab flows (W10 de-duplication).
-                self.note_candidates = crate::picker::NoteCandidates::from_catalog(&self.catalog);
-                self.editor_candidates = std::sync::Arc::from(
-                    self.catalog
-                        .iter()
-                        // Link targets are UTF-8. Keep native identity in the
-                        // catalog, but never make a lossy target fallback.
-                        .filter_map(|entry| {
-                            let path = entry.path.to_str()?;
-                            let target = path.strip_suffix(".md").unwrap_or(path).to_owned();
-                            Some(flavite_editor::NoteCandidate {
-                                target,
-                                title: entry.title.clone(),
-                                aliases: entry.aliases.clone(),
-                                stable_id: entry.stable_id.clone(),
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice(),
-                );
-                self.link_verdict_requests.clear();
-                self.link_verdicts.clear();
-                self.catalog_status = CatalogStatus::Ready {
-                    epoch: provenance.epoch,
-                    generation: provenance.generation,
-                    truncated: *truncated,
-                };
-            }
-            flavite_api::ContextQueryResult::Failed { message } => {
-                self.catalog_status = CatalogStatus::Failed {
-                    message: message.clone(),
-                };
-            }
-            other => {
-                self.catalog_status = CatalogStatus::Failed {
-                    message: format!("unexpected catalog outcome: {other:?}"),
-                };
-            }
-        }
-        // The first terminal outcome (page served or honest failure)
-        // unblocks the deferred workspace restore.
-        self.run_pending_restore();
-    }
-
-    fn run_pending_restore(&mut self) {
+    pub(crate) fn run_pending_restore(&mut self) {
         if !self.restore_pending {
             return;
         }
         self.restore_pending = false;
         self.restore_workspace_layout();
-    }
-
-    /// Consume a coalesced retry once the previous ticket has settled and
-    /// the throttle window has passed.
-    pub(crate) fn catalog_retry_tick(&mut self) {
-        if !self.catalog_retry_due
-            || matches!(self.catalog_status, CatalogStatus::Loading)
-            || !self
-                .catalog_last_submit
-                .is_some_and(|when| when.elapsed() >= CATALOG_REFRESH_THROTTLE)
-        {
-            return;
-        }
-        self.catalog_retry_due = false;
-        self.try_submit_catalog_ticket();
-    }
-
-    /// The unified note-candidate snapshot (W10 matcher service).
-    #[must_use]
-    pub fn note_candidates(&self) -> &crate::picker::NoteCandidates {
-        &self.note_candidates
-    }
-
-    /// Rich immutable alias/ID candidates shared with editor widgets.
-    #[must_use]
-    pub fn editor_candidates(&self) -> &std::sync::Arc<[flavite_editor::NoteCandidate]> {
-        &self.editor_candidates
     }
 
     /// Exact resolver decorations matching the editor's buffer revision.
@@ -1391,7 +1256,7 @@ impl App {
     /// The note catalog snapshot for views and the picker.
     #[must_use]
     pub fn catalog(&self) -> &[NoteCatalogEntry] {
-        &self.catalog
+        &self.catalog_host.entries
     }
 
     /// The group displaying a tab, if any.
@@ -1518,7 +1383,7 @@ impl App {
     /// backed by the ticketed status machine).
     #[must_use]
     pub fn catalog_error(&self) -> Option<&str> {
-        match &self.catalog_status {
+        match &self.catalog_host.catalog_status {
             CatalogStatus::Failed { message } => Some(message),
             _ => None,
         }
@@ -1527,7 +1392,7 @@ impl App {
     /// The catalog acquisition state (ticketed; RFC-0004 §6.4).
     #[must_use]
     pub const fn catalog_status(&self) -> &CatalogStatus {
-        &self.catalog_status
+        &self.catalog_host.catalog_status
     }
 
     /// The vault root (locators join against it).
@@ -1875,6 +1740,40 @@ impl App {
             return;
         }
         match action {
+            EditorAction::Complete {
+                buffer_id,
+                expected_revision,
+                start,
+                end,
+                prefix,
+                candidate,
+            } => {
+                let valid = self.valid_writing_target().is_some_and(
+                    |(source_tab, source_incarnation, buffer, revision, caret)| {
+                        (source_tab, source_incarnation, buffer, revision, caret)
+                            == (tab, incarnation, buffer_id, expected_revision, end)
+                    },
+                );
+                let Some(view) = self.note_editor_view(tab) else {
+                    return;
+                };
+                if !valid || view.text.get(start..end) != Some(prefix.as_str()) {
+                    self.status =
+                        "Completion source changed; place the caret and choose again".into();
+                    return;
+                }
+                let Ok(locator) =
+                    NoteLocator::from_relative(std::path::Path::new(&candidate.target))
+                else {
+                    self.status = "Completion target cannot be represented".into();
+                    return;
+                };
+                self.request_link_insert_expected(
+                    locator,
+                    candidate.identity,
+                    Some(flavite_api::CompletionRequest { start, end, prefix }),
+                );
+            }
             EditorAction::Interaction(snapshot) => {
                 let Some(current) = self.note_editor_view(tab) else {
                     return;
@@ -2019,7 +1918,9 @@ impl App {
                 let buffer_matches = match &edit_or_history {
                     EditorAction::Edit { buffer_id, .. }
                     | EditorAction::History { buffer_id, .. } => *buffer_id == expected_buffer,
-                    EditorAction::Navigate { .. } | EditorAction::Interaction(_) => false,
+                    EditorAction::Complete { .. }
+                    | EditorAction::Navigate { .. }
+                    | EditorAction::Interaction(_) => false,
                 };
                 if !buffer_matches {
                     self.status = "Editor action targeted a different buffer".into();
@@ -2671,7 +2572,7 @@ impl App {
                     selected: 0,
                     replace_tab: None,
                 };
-                if self.catalog.is_empty() {
+                if self.catalog_host.entries.is_empty() {
                     self.request_catalog_refresh();
                 }
                 return iced::widget::operation::focus(crate::workspace_shell::PICKER_INPUT_ID);
@@ -3041,6 +2942,7 @@ impl App {
     /// Process vault events and completions on the host pump. Presentation
     /// never gates core progress (FR-28).
     fn pump(&mut self) {
+        crate::host::catalog::poll(self);
         self.admit_link_verdict_queries();
         let drained = {
             let Some(flavite) = &self.flavite else {
@@ -3542,6 +3444,10 @@ impl App {
         display: String,
     ) {
         let expected = self.workspace.writing_target();
+        let replacement_start = self
+            .linking
+            .pending_source()
+            .and_then(|s| s.replacement_start);
         let same_source = self.linking.pending_source().is_some_and(|source| {
             self.valid_writing_target()
                 == Some((
@@ -3588,7 +3494,9 @@ impl App {
             ExecutionResult::Local(LocalResult::Success(success)) => {
                 if let Some(target) = expected
                     && let Some(revision) = success.data["revision"].as_u64()
-                    && let Some(caret) = target.caret_text_byte.checked_add(serialized.len())
+                    && let Some(caret) = replacement_start
+                        .unwrap_or(target.caret_text_byte)
+                        .checked_add(serialized.len())
                     && let Some(view) = self.note_editor_view(target.tab)
                     && view.revision == revision
                     && self
@@ -3668,13 +3576,14 @@ impl App {
             api.link_target_identity(&locator.components().join("/"))
                 .ok()
         });
-        self.request_link_insert_expected(locator, expected);
+        self.request_link_insert_expected(locator, expected, None);
     }
 
     pub(crate) fn request_link_insert_expected(
         &mut self,
         locator: NoteLocator,
         expected: Option<flavite_api::LinkTargetIdentity>,
+        completion: Option<flavite_api::CompletionRequest>,
     ) {
         let Some(expected) = expected else {
             self.status = "Target identities are updating or missing; choose the note again".into();
@@ -3701,6 +3610,7 @@ impl App {
         let target_path = locator.components().join("/");
         let target_display = locator.title().to_owned();
         let source = crate::host::linking::GestureSource {
+            replacement_start: completion.as_ref().map(|value| value.start),
             tab,
             incarnation,
             buffer_id,
@@ -3734,6 +3644,7 @@ impl App {
                 "intent": { "client": client, "sequence": sequence },
                 "source": { "buffer_id": buffer_id, "revision": revision, "caret": caret },
                 "target_path": target_path.clone(),
+                "completion": completion,
                 "expected_target": expected,
                 "stable_link_policy": if self.appearance.prefs.prefer_stable_links {
                     "prefer_stable"
@@ -3880,12 +3791,10 @@ impl App {
 
     /// Fuzzy-matched catalog entries for the picker.
     #[must_use]
-    pub fn picker_matches(&self) -> Vec<NoteCatalogEntry> {
-        self.note_candidates
-            .matches(&self.picker.query)
-            .into_iter()
-            .map(|candidate| candidate.entry)
-            .collect()
+    pub fn picker_matches(&self) -> std::sync::Arc<[NoteCatalogEntry]> {
+        self.catalog_host
+            .note_candidates
+            .matching_entries(&self.picker.query)
     }
 
     fn run_picker_selection(&mut self, index: usize) -> Task<Message> {
@@ -4139,6 +4048,7 @@ mod tests {
             entries
                 .iter()
                 .map(|(path, title)| NoteCatalogEntry {
+                    identity: None,
                     path: PathBuf::from(path),
                     native_path: path.as_bytes().to_vec(),
                     title: (*title).to_owned(),
@@ -4149,6 +4059,7 @@ mod tests {
                 .into_boxed_slice(),
         );
         flavite_api::ContextQueryResult::Catalog {
+            candidates: std::sync::Arc::from([]),
             entries,
             provenance: flavite_api::Provenance { epoch, generation },
             total,
@@ -4161,6 +4072,14 @@ mod tests {
     /// retryable text on failure, and propagates the 50k truncation flag.
     #[test]
     fn catalog_status_machine_preserves_snapshots_and_flags() {
+        fn settle(app: &mut App, count: usize) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.catalog().len() != count {
+                crate::host::catalog::poll(app);
+                assert!(Instant::now() < deadline, "catalog preparation timed out");
+                std::thread::yield_now();
+            }
+        }
         let mut app = empty_app();
         assert_eq!(*app.catalog_status(), CatalogStatus::Empty);
         assert_eq!(app.catalog_error(), None);
@@ -4172,6 +4091,7 @@ mod tests {
             true,
             50_001,
         ));
+        settle(&mut app, 2);
         assert_eq!(
             *app.catalog_status(),
             CatalogStatus::Ready {
@@ -4206,6 +4126,7 @@ mod tests {
 
         // A fresh Ready replaces both the text and the snapshot wholesale.
         app.apply_catalog_outcome(&catalog_page(&[("gamma.md", "Gamma")], 2, 9, false, 1));
+        settle(&mut app, 1);
         assert_eq!(
             *app.catalog_status(),
             CatalogStatus::Ready {
@@ -4236,15 +4157,18 @@ mod tests {
     #[test]
     fn vault_pulse_throttle_coalesces_into_one_retry() {
         let mut app = empty_app();
-        app.catalog_status = CatalogStatus::Ready {
+        app.catalog_host.catalog_status = CatalogStatus::Ready {
             epoch: 1,
             generation: 9,
             truncated: false,
         };
-        app.catalog_last_submit = Some(Instant::now());
+        app.catalog_host.catalog_last_submit = Some(Instant::now());
 
         app.note_vault_changed_pulse();
-        assert!(app.catalog_retry_due, "in-window pulse must coalesce");
+        assert!(
+            app.catalog_host.catalog_retry_due,
+            "in-window pulse must coalesce"
+        );
         assert!(matches!(
             app.catalog_status(),
             CatalogStatus::Ready { generation: 9, .. }
@@ -4253,17 +4177,17 @@ mod tests {
         // Retry tick respects the window while it is open.
         app.catalog_retry_tick();
         assert!(
-            app.catalog_retry_due,
+            app.catalog_host.catalog_retry_due,
             "tick before the window keeps the retry"
         );
 
         let long_ago = Instant::now()
             .checked_sub(Duration::from_secs(2))
             .expect("test clock started more than two seconds ago");
-        app.catalog_last_submit = Some(long_ago);
+        app.catalog_host.catalog_last_submit = Some(long_ago);
         app.catalog_retry_tick();
         assert!(
-            !app.catalog_retry_due,
+            !app.catalog_host.catalog_retry_due,
             "expired window consumes the single coalesced retry"
         );
     }
@@ -4278,6 +4202,7 @@ mod tests {
             notes: DocumentRegistry::default(),
             contexts: ContextRegistry::default(),
             reading: crate::host::reading::ReadingHost::default(),
+            catalog_host: crate::host::catalog::CatalogHost::default(),
             note_search: crate::host::note_search::NoteSearchHost::default(),
             encoding: crate::host::encoding::EncodingHost::default(),
             input_chains: BTreeMap::new(),
@@ -4295,8 +4220,6 @@ mod tests {
             start: crate::host::dialogs::StartState::default(),
             notes_filters: BTreeMap::new(),
             search_focus_tried: BTreeSet::new(),
-            note_candidates: crate::picker::NoteCandidates::default(),
-            editor_candidates: std::sync::Arc::from([]),
             link_verdict_requests: BTreeMap::new(),
             link_verdict_sequences: BTreeMap::new(),
             link_verdicts: BTreeMap::new(),
@@ -4326,10 +4249,6 @@ mod tests {
             drag_revision: None,
             pointer_feedback: false,
             window_geometry_dirty: true,
-            catalog: Vec::new(),
-            catalog_status: CatalogStatus::Empty,
-            catalog_last_submit: None,
-            catalog_retry_due: false,
             restore_pending: false,
             settings: Settings::default(),
             settings_valid: true,
@@ -4398,6 +4317,7 @@ mod tests {
     fn picker_matching_ranks_titles_and_paths() {
         let entries = vec![
             NoteCatalogEntry {
+                identity: None,
                 path: PathBuf::from("Systems/Feedback loops.md"),
                 native_path: b"Systems/Feedback loops.md".to_vec(),
                 title: "Feedback loops".into(),
@@ -4405,6 +4325,7 @@ mod tests {
                 stable_id: None,
             },
             NoteCatalogEntry {
+                identity: None,
                 path: PathBuf::from("Sources/archive.md"),
                 native_path: b"Sources/archive.md".to_vec(),
                 title: "Archive".into(),

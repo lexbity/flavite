@@ -134,7 +134,7 @@ fn focused_editor_operations_respect_buffer_and_revision() {
     state.restore_interaction("text", snapshot(12, 11, 2, 4, false));
 
     // Stale revision focus is refused; current revision focus works.
-    let mut stale = focus_editor(12, 12);
+    let mut stale = focus_editor(12, 12, None);
     stale.custom(
         None,
         iced::Rectangle::with_size(iced::Size::ZERO),
@@ -146,7 +146,7 @@ fn focused_editor_operations_respect_buffer_and_revision() {
         iced::advanced::widget::operation::Outcome::Some(None)
     ));
 
-    let mut current = focus_editor(12, 11);
+    let mut current = focus_editor(12, 11, None);
     current.custom(
         None,
         iced::Rectangle::with_size(iced::Size::ZERO),

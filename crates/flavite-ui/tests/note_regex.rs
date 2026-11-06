@@ -95,3 +95,48 @@ fn selection_scope_uses_the_pre_find_selection_and_does_not_widen() {
     assert_eq!(found.spans, vec![(12, 15)]);
     assert_eq!(found.total_matches, 1);
 }
+
+#[test]
+fn find_options_share_palette_and_runtime_accessibility_commands() {
+    use accesskit::{Action, ActionRequest};
+    use flavite_ui::accessibility::{route_action, tree};
+    let mut app = App::from_flavite(support::fixture(&[("a.md", "cat Cat\n")]).flavite);
+    let tab = open(&mut app);
+    let _ = app.update(Message::NoteSearch(NoteSearchMessage::FindOpen(tab)));
+    for command in [
+        "note.find_regex",
+        "note.find_case",
+        "note.find_word",
+        "note.find_selection",
+    ] {
+        assert!(flavite_ui::host::commands::available(&app, command));
+        let map = tree::build_node_map(&app);
+        let node = *map
+            .iter()
+            .find(|(_, target)| **target == tree::NodeTarget::NoteSearchCommand(tab, command))
+            .unwrap()
+            .0;
+        let message = route_action(
+            &app,
+            ActionRequest {
+                action: Action::Click,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: node,
+                data: None,
+            },
+        )
+        .expect("mounted option is actionable");
+        let _ = app.update(message);
+    }
+    let find = &app.note_search.finds[&tab];
+    assert_eq!(find.mode, "regex");
+    assert!(find.case_sensitive && find.whole_word);
+    let _ = app.update(Message::NoteSearch(NoteSearchMessage::FindClose(tab)));
+    assert!(!flavite_ui::host::commands::available(
+        &app,
+        "note.find_regex"
+    ));
+    assert!(
+        flavite_ui::host::commands::note_search_command(&app, tab, "note.find_regex").is_none()
+    );
+}

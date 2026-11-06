@@ -7,8 +7,8 @@
 use crate::Flavite;
 use std::path::PathBuf;
 
-/// Largest catalog page the facade admits (NFR-02: quick switch over 50k
-/// titles). Callers page beyond this bound.
+/// Maximum complete completion snapshot. Acquisition uses native-key pages
+/// of at most 500; a larger corpus returns an error, never a prefix.
 pub const MAX_NOTE_CATALOG_LIMIT: usize = 50_000;
 
 /// Reserved requesting-context identity for ticketed catalog acquisition
@@ -21,6 +21,7 @@ pub const CATALOG_CONTEXT_TAB: u128 = u128::MAX;
 /// One indexed note with native path identity preserved.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NoteCatalogEntry {
+    pub identity: Option<crate::LinkTargetIdentity>,
     /// Portable vault-relative path.
     pub path: PathBuf,
     /// Exact native path bytes as stored by the index (authoritative

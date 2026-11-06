@@ -63,7 +63,7 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
     let filter = app.notes_filter(tab).to_owned();
     let candidates = app.note_candidates();
     let total = candidates.all().len();
-    let matched: Vec<crate::picker::NoteCandidate> = candidates.matches(&filter);
+    let matched: std::sync::Arc<[crate::picker::NoteCandidate]> = candidates.matches(&filter);
     let shown = matched.len();
 
     // Group by parent directory in canonical path order; the catalog is
@@ -72,7 +72,7 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
     let mut current_folder: Option<String> = None;
     const MAX_ROWS: usize = 500;
     let mut rendered = 0usize;
-    for candidate in &matched {
+    for candidate in matched.iter() {
         if rendered >= MAX_ROWS {
             break;
         }
