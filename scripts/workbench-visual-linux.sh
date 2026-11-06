@@ -178,4 +178,42 @@ done
 python3 "scripts/tests/workbench/${scenario//-/_}.py" \
     "$window_id" "$harness_log" "$run_dir" "$vault_dir" "$backend"
 
+# Evidence manifest (§11): HEAD, lock hash and the dirty-source digest using
+# the existing visual-runner algorithm, stamped on pass only.
+python3 - "$run_dir" "$scenario" "$backend" <<'PY'
+import hashlib, json, pathlib, subprocess, sys
+run_dir, scenario, backend = sys.argv[1:4]
+h = hashlib.sha256()
+paths = set(subprocess.check_output(["git", "ls-files", "-co", "--exclude-standard", "-z"]).split(b"\0"))
+for raw in sorted(p for p in paths if p):
+    path = pathlib.Path(raw.decode())
+    if not path.is_file() or not (
+        str(path).startswith(("crates/", "vendor/", "scripts/", ".github/"))
+        or str(path) in ("Cargo.lock", "Cargo.toml", "justfile")
+    ):
+        continue
+    data = path.read_bytes()
+    h.update(raw + b"\0" + str(len(data)).encode() + b"\0" + data)
+build = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+lock = subprocess.check_output(["cargo", "xtask", "blake3", "Cargo.lock"], text=True)
+lock = [line for line in lock.split() if len(line.strip()) == 64][-1].strip()
+pathlib.Path(run_dir, "provenance.json").write_text(
+    json.dumps(
+        {
+            "schema": 1,
+            "build": build,
+            "lock_blake3": lock,
+            "worktree_sha256": h.hexdigest(),
+            "scenario": scenario,
+            "platform": "linux",
+            "render_backend": backend,
+            "input_evidence": "rendered_os_input",
+            "fixture_seed": 6006,
+        },
+        indent=2,
+    )
+    + "\n"
+)
+PY
+
 echo "workbench scenario $scenario ($backend) passed: $run_dir"

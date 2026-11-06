@@ -342,6 +342,12 @@ pub enum Message {
         tab: TabId,
         command: crate::host::graph::GraphCommand,
     },
+    /// D-02: create the selected unresolved graph node's note through the
+    /// explicit, validated new-note dialog (never implicit creation).
+    CreateFromNode(TabId),
+    /// D-02: locate a note for the selected unresolved graph node through
+    /// the picker, prefilled with the link target.
+    LocateFromNode(TabId),
     /// Observed bounds of a mounted graph surface (hit + harness mapping).
     GraphBounds(TabId, iced::Rectangle),
     /// Observed bounds of the graph activation-contract notice row (D-02
@@ -668,6 +674,10 @@ impl App {
         // catalog) defers to the first terminal acquisition outcome.
         self.restore_pending = true;
         self.request_catalog_refresh();
+        // D-03: destination memory is session- and vault-local. A new vault
+        // drops every remembered group/tab reference before the restore's
+        // layout transactions repopulate it from acknowledged document focus.
+        self.open_memory.reset();
         crate::host::graph::sync_hosts(self);
         self.refresh_semantics();
         // Device-local launch memory (W10): best effort, never a gate for
@@ -1616,6 +1626,26 @@ impl App {
                 }
             })
         });
+        if navigation_click {
+            // D-02 (S04): the hit geometry is frozen for the pair's bounded
+            // hold, so a newer semantic frame stays *pending for
+            // presentation* (labelled "Updating") instead of discarding the
+            // gesture. Navigation pairing keys only on the mounted
+            // geometry's identity epoch and the validated incarnation; the
+            // activation itself resolves against the current records, so a
+            // removed node fails honestly against them. Insertion and drag
+            // authorities keep the exact current-frame pairing below.
+            if self
+                .graph
+                .state(tab)
+                .is_some_and(|s| key_current && !s.filter.expanded)
+            {
+                crate::host::graph::handle_message(self, tab, message);
+            } else {
+                self.graph.stale_discards_total += 1;
+            }
+            return;
+        }
         if self
             .graph
             .state(tab)
@@ -2449,23 +2479,61 @@ impl App {
                 key,
                 command,
             } => {
-                if self
+                // D-02 (S04): the accessible list and the visual renderers
+                // share one pairing rule — navigation keys on the mounted
+                // geometry's identity epoch (the hit geometry is frozen for
+                // the gesture hold while a newer semantic frame stays
+                // pending as "Updating"); Insert and every mutating
+                // authority keep the exact current-frame pairing.
+                let navigation = matches!(
+                    command,
+                    crate::host::graph::GraphCommand::Open(_)
+                        | crate::host::graph::GraphCommand::Select(_)
+                        | crate::host::graph::GraphCommand::ToggleSelected(_)
+                        | crate::host::graph::GraphCommand::NextListPage
+                        | crate::host::graph::GraphCommand::PreviousListPage
+                        | crate::host::graph::GraphCommand::NextOccurrences
+                        | crate::host::graph::GraphCommand::PreviousOccurrences
+                );
+                let incarnation_ok = self
                     .workspace
                     .tab(&tab)
-                    .is_some_and(|s| s.interaction().incarnation == incarnation)
-                    && self
-                        .graph
-                        .state(tab)
-                        .is_some_and(|s| !s.updating && !s.stale && s.geometry_key == Some(key))
-                    && self
+                    .is_some_and(|s| s.interaction().incarnation == incarnation);
+                let gate_ok = self.graph.state(tab).is_some_and(|s| {
+                    let key_current = s.geometry_key.is_some_and(|current| {
+                        if navigation {
+                            key.epoch == current.epoch && key.generation <= current.generation
+                        } else {
+                            key == current
+                        }
+                    });
+                    if navigation {
+                        key_current && !s.filter.expanded
+                    } else {
+                        key_current && !s.updating && !s.stale
+                    }
+                }) && (navigation
+                    || self
                         .flavite
                         .as_ref()
-                        .is_some_and(flavite_api::Flavite::graph_is_current)
-                {
+                        .is_some_and(flavite_api::Flavite::graph_is_current));
+                if incarnation_ok && gate_ok {
                     crate::host::graph::command(self, tab, command);
                 } else {
                     self.graph.stale_discards_total += 1;
                 }
+            }
+            Message::CreateFromNode(tab) => {
+                if self.picker.open || self.palette_open || self.strip_menu.is_some() {
+                    return Task::none();
+                }
+                return crate::host::graph::create_from_selected(self, tab);
+            }
+            Message::LocateFromNode(tab) => {
+                if self.picker.open || self.palette_open || self.strip_menu.is_some() {
+                    return Task::none();
+                }
+                return crate::host::graph::locate_from_selected(self, tab);
             }
             Message::GraphCommand { tab, command } => {
                 if self.picker.open || self.palette_open || self.strip_menu.is_some() {

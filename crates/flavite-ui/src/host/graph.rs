@@ -17,7 +17,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use flavite_api::{GraphServiceMetrics, GraphServiceStatus, StoredUserState};
+use flavite_api::{
+    GraphServiceMetrics, GraphServiceStatus, QueryPayload, RequestToken, StoredUserState,
+};
 use flavite_graph::{
     GraphNodeRecord, GraphPublication, LayoutState, NodeId, NodeKind, PositionFrame, RenderKey,
 };
@@ -187,6 +189,16 @@ impl GraphTabState {
             failed_overlay_count: 0,
             occurrences: Arc::new(flavite_api::OccurrenceSet::default()),
         }
+    }
+
+    /// Whether the mounted frame signature already carries at least one
+    /// shared pin (the frozen-hold receipts check the catch-up applied the
+    /// deferred entity frame).
+    #[must_use]
+    pub fn pins_in_signature(&self) -> bool {
+        self.signature
+            .as_ref()
+            .is_some_and(|signature| signature.pins_count > 0)
     }
 }
 
@@ -408,6 +420,10 @@ pub struct GraphHost {
     pub removal: Option<crate::host::occurrences::RemovalWorkflow>,
     pub removal_sequence: u64,
     pub removal_client: Option<u128>,
+    /// D-02: graph-activated attachment inspector requests, keyed by the
+    /// core-issued token. The reading outcome router consumes them; an
+    /// unknown or replaced-tab completion drops without effects.
+    pub attachment_opens: BTreeMap<RequestToken, TabId>,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -424,6 +440,7 @@ impl Default for GraphHost {
             removal: None,
             removal_sequence: 0,
             removal_client: None,
+            attachment_opens: BTreeMap::new(),
         }
     }
 }
@@ -449,6 +466,18 @@ impl GraphHost {
     #[must_use]
     pub fn state_mut(&mut self, tab: TabId) -> Option<&mut GraphTabState> {
         self.tabs.get_mut(&tab)
+    }
+
+    /// Consume one completed attachment-open token (called by the query
+    /// outcome router). An unknown token is a no-op.
+    pub fn take_attachment_open(&mut self, token: &RequestToken) -> Option<TabId> {
+        self.attachment_opens.remove(token)
+    }
+
+    /// Whether this tab already has an outstanding inspector request.
+    #[must_use]
+    pub fn attachment_open_pending(&self, tab: TabId) -> bool {
+        self.attachment_opens.values().any(|owner| *owner == tab)
     }
 
     #[must_use]
@@ -562,6 +591,133 @@ pub fn locator_for(record: &GraphNodeRecord) -> Option<NoteLocator> {
         return None;
     }
     NoteLocator::from_relative(&record.native_path).ok()
+}
+
+/// D-02 freeze rule: with a click-pair hold pending, only a purely
+/// emphasis change (selection, writing-target accent, palette) may rebuild
+/// the mounted geometry. Anything that can move or add/remove entities —
+/// base publication, position ticks, pins, node visibility, or a drag
+/// preview — waits out the bounded hold, so the hit geometry the user is
+/// clicking on stays exactly where it was drawn.
+#[must_use]
+pub fn emphasis_only_change(old: Option<&FrameSignature>, next: &FrameSignature) -> bool {
+    old.is_some_and(|old| {
+        old.base == next.base
+            && old.positions_generation == next.positions_generation
+            && old.pins_count == next.pins_count
+            && old.node_count == next.node_count
+            && old.drag == next.drag
+    })
+}
+
+/// The selected record of one graph tab, resolved against the *current*
+/// publication (never a remembered copy, D-02).
+#[must_use]
+pub fn selected_record(app: &App, tab: TabId) -> Option<GraphNodeRecord> {
+    let hit = app.graph.state(tab).and_then(|state| state.selection)?;
+    record_for(app, hit.id)
+}
+
+/// D-02/FR-15: the one predicate that decides whether explicit insertion
+/// is available. Toolbar chip, palette, keyboard and the executing command
+/// all agree: a resolvable note node, an acknowledged writing target, and
+/// a current (not stale, not `Updating`) frame — insertion keeps the
+/// current-paired-frame requirement even while navigation geometry is
+/// frozen for the gesture hold.
+#[must_use]
+pub fn insert_available(app: &App, tab: TabId) -> bool {
+    app.valid_writing_target().is_some()
+        && selected_record(app, tab)
+            .as_ref()
+            .and_then(locator_for)
+            .is_some()
+        && app
+            .graph
+            .state(tab)
+            .is_some_and(|state| !state.stale && !state.updating)
+}
+
+/// FR-15: the unresolved note node (if any) that the band and the palette
+/// offer explicit Create/Locate for.
+#[must_use]
+pub fn selected_unresolved(app: &App, tab: TabId) -> Option<GraphNodeRecord> {
+    selected_record(app, tab).filter(|record| record.id.kind == NodeKind::Unresolved)
+}
+
+/// The raw link target an unresolved record stands for. The mirror labels
+/// unresolved nodes as `[[target]] (unresolved)` with an empty path; the
+/// explicit offers operate on the target text, never the label.
+#[must_use]
+pub fn unresolved_target_raw(record: &GraphNodeRecord) -> Option<&str> {
+    let label = record
+        .title
+        .strip_prefix("[[")?
+        .strip_suffix("]] (unresolved)")?;
+    (!label.is_empty()).then_some(label)
+}
+
+/// The canonical prefilled create path for an unresolved target (the same
+/// helper the editor's unresolved-link activation uses), or `None` when it
+/// cannot be represented as a note.
+#[must_use]
+pub fn unresolved_create_path(record: &GraphNodeRecord) -> Option<String> {
+    let raw = unresolved_target_raw(record)?;
+    let crate::host::dialogs::Dialog::NewNote { path } =
+        crate::host::dialogs::offer_create_for_link(raw)
+    else {
+        return None;
+    };
+    NoteLocator::from_components(path.split('/'))
+        .is_ok()
+        .then_some(path)
+}
+
+/// Whether an unresolved record's target can be represented as a note at
+/// all (the Create offer's precondition; the dialog re-validates).
+#[must_use]
+pub fn unresolved_is_representable(record: &GraphNodeRecord) -> bool {
+    unresolved_create_path(record).is_some()
+}
+
+/// D-02: an unresolved node offers explicit Create through the existing
+/// new-note dialog (validated, user-confirmed). Navigation never creates
+/// the note itself (FR-19).
+pub fn create_from_selected(app: &mut App, tab: TabId) -> iced::Task<crate::app::Message> {
+    let Some(record) = selected_unresolved(app, tab) else {
+        app.status = "Select an unresolved note node first".into();
+        return iced::Task::none();
+    };
+    let Some(path) = unresolved_create_path(&record) else {
+        app.status = "This unresolved path cannot be represented as a note".into();
+        return iced::Task::none();
+    };
+    if app.has_composition() {
+        return iced::Task::none();
+    }
+    app.dialog = Some(crate::host::dialogs::Dialog::NewNote { path });
+    iced::widget::operation::focus(crate::host::dialogs::NEW_NOTE_INPUT_ID)
+}
+
+/// D-02: an unresolved node offers Locate through the note picker,
+/// prefilled with the link target so the user can find the intended note.
+pub fn locate_from_selected(app: &mut App, tab: TabId) -> iced::Task<crate::app::Message> {
+    let Some(record) = selected_unresolved(app, tab) else {
+        app.status = "Select an unresolved note node first".into();
+        return iced::Task::none();
+    };
+    let query = unresolved_target_raw(&record)
+        .map(str::to_owned)
+        .unwrap_or_else(|| record.title.clone());
+    app.picker = crate::app::Picker {
+        open: true,
+        query,
+        selected: 0,
+        replace_tab: None,
+    };
+    if app.catalog().is_empty() {
+        app.request_catalog_refresh();
+    }
+    iced::widget::operation::focus(crate::workspace_shell::PICKER_INPUT_ID)
 }
 
 /// The writing target's note node in the current publication, for the
@@ -691,6 +847,10 @@ pub fn pump(app: &mut App) {
         // Epoch resets clear transient entity state (selection/hit
         // candidates); durable locators re-resolve (§10.3).
         if let Some(state) = app.graph.state_mut(tab) {
+            // D-02: the hit-geometry hold is bounded by the same interval
+            // that completes the pair; an expired candidate releases the
+            // frozen presentation on this pump.
+            state.arbiter.expire(now);
             if publication.epoch != state.last_epoch && state.last_epoch != 0 {
                 state.selection = None;
                 state.selected_nodes.clear();
@@ -762,6 +922,16 @@ pub fn pump(app: &mut App) {
             .graph
             .state(tab)
             .is_some_and(|state| state.signature.as_ref() != Some(&signature) || stale_now);
+        // D-02: while a click-pair hold is pending, the hit geometry is
+        // frozen: entity-moving frames (base, positions, pins, node count,
+        // drag) defer until the bounded hold ends; emphasis-only changes
+        // still update. An accepted newer frame stays pending for
+        // presentation (labelled "Updating") rather than discarding the
+        // gesture.
+        let hold_defers = app.graph.state(tab).is_some_and(|state| {
+            state.arbiter.has_candidate()
+                && !emphasis_only_change(state.signature.as_ref(), &signature)
+        });
         let frozen_same = app.graph.state(tab).is_some_and(|state| {
             state.frozen
                 && state.signature.as_ref().is_some_and(|old| {
@@ -776,6 +946,7 @@ pub fn pump(app: &mut App) {
         });
         if rebuild
             && !frozen_same
+            && !hold_defers
             && app
                 .graph
                 .state(tab)
@@ -846,6 +1017,10 @@ pub fn pump(app: &mut App) {
                 height: 600.0,
             });
             if !state.user_camera_moved
+                // D-02: while a pair hold is pending, the camera keeps the
+                // frozen hit geometry stable; the fit catches up after the
+                // bounded hold ends.
+                && !state.arbiter.has_candidate()
                 && let Some(geometry) = state.geometry.clone()
                 && ((!had_geometry && state.geometry.is_some())
                     || layout_active
@@ -1179,11 +1354,10 @@ fn publish_selection(app: &mut App, tab: TabId, hit: HitNode) {
         None => {
             // Attachments and unrepresentable paths publish the deliberate
             // empty selection: sinks show "No selection" instead of
-            // silently keeping a stale source (D-04).
+            // silently keeping a stale source (D-04). The reserved band
+            // carries the node's own explicit actions (open attachment,
+            // create/locate for an unresolved target).
             publish_empty(app, tab);
-            if hit.kind == NodeKind::Attachment {
-                app.status = "Attachment selected — attachment open/embed arrives with W09".into();
-            }
         }
     }
 }
@@ -1209,7 +1383,9 @@ fn request_node_link(app: &mut App, tab: TabId, hit: HitNode) {
     };
     let Some(locator) = locator_for(&record) else {
         app.status = if record.id.kind == NodeKind::Attachment {
-            "Attachments embed with ![[…]]; embed insertion arrives with W09".into()
+            "Attachments open in the inspector; they are not link-insertion targets".into()
+        } else if record.id.kind == NodeKind::Unresolved {
+            "Unresolved targets offer Create or Locate, not insertion".into()
         } else {
             "This note's path cannot be serialized as a wikilink target".into()
         };
@@ -1225,7 +1401,8 @@ fn request_node_link(app: &mut App, tab: TabId, hit: HitNode) {
         return;
     }
     if app.valid_writing_target().is_none() {
-        app.status = "Choose an editor and place the cursor — then double-click again".into();
+        app.status =
+            "Choose an editor and place the cursor — then use Insert or press Ctrl+Enter".into();
         return;
     }
     let expected = app
@@ -1463,13 +1640,23 @@ pub fn command(app: &mut App, tab: TabId, command: GraphCommand) {
                 return;
             }
             let count = records.len();
+            let tabs_before = app.workspace.tabs().count();
             for record in records {
                 // checked above
                 let locator = locator_for(&record).expect("filtered above");
                 app.open_intent(crate::host::open_intents::OpenIntent::new_tab(locator));
             }
-            app.status =
-                format!("Opened {count} tabs (NewTab bypasses view dedup; buffers shared)");
+            // Honest accounting: a refused destination (no live group)
+            // never inflates the opened count.
+            let opened = app.workspace.tabs().count().saturating_sub(tabs_before);
+            app.status = if opened == count {
+                format!("Opened {count} tabs (NewTab bypasses view dedup; buffers shared)")
+            } else {
+                format!(
+                    "Opened {opened} of {count} selected notes; {}/{count} destinations refused (no room for a document group)",
+                    count - opened
+                )
+            };
         }
     }
     app.refresh_semantics();
@@ -1478,22 +1665,80 @@ pub fn command(app: &mut App, tab: TabId, command: GraphCommand) {
 /// Explicit navigation for one node (D-02/D-03: Open is its own action and
 /// never mutates documents; activation routes the typed open intent through
 /// the shared destination policy, never an accidental global destination).
+/// Activation resolves the *current* record: a removed node fails here even
+/// if its old dot is still painted in the frozen hold geometry.
 pub(crate) fn open_node(app: &mut App, source: Option<TabId>, node: NodeId) {
     let Some(record) = record_for(app, node) else {
         app.status = "That node is no longer in the current frame".into();
         return;
     };
-    let Some(locator) = locator_for(&record) else {
-        app.status = if record.id.kind == NodeKind::Attachment {
-            "Attachment open/inspect arrives with the reading slice (W09)".into()
-        } else {
-            "This path cannot be opened as a note".into()
-        };
+    if let Some(locator) = locator_for(&record) {
+        app.open_intent(crate::host::open_intents::OpenIntent::reuse(
+            locator, source,
+        ));
+        return;
+    }
+    // D-02: each non-note target has its own explicit intent — an
+    // attachment opens the existing local inspector, an unresolved note
+    // offers Create-or-Locate, and nothing is ever created or opened by
+    // guessing (FR-19).
+    match record.id.kind {
+        NodeKind::Attachment => {
+            if let Some(tab) = source {
+                open_attachment(app, tab, &record);
+            } else {
+                app.status = "Select the attachment in a graph view first".into();
+            }
+        }
+        NodeKind::Unresolved => {
+            app.status = if unresolved_is_representable(&record) {
+                "Unresolved link target — use Create note or Locate in the selection band; navigation never creates notes".into()
+            } else {
+                "Unresolved link target — its path cannot be represented as a note".into()
+            };
+        }
+        NodeKind::Note => {
+            app.status = if record.binding_blocked {
+                "Another file now owns this path (rename conflict) — resolve it before opening"
+                    .into()
+            } else {
+                "This path cannot be opened as a note".into()
+            };
+        }
+    }
+}
+
+/// D-02: activating an attachment node opens the existing local attachment
+/// inspector — the same core-validated open primitive the reading surface
+/// uses. Never a note open, never a guessed target; the OS launch only
+/// happens after the core validation returns a contained path.
+fn open_attachment(app: &mut App, tab: TabId, record: &GraphNodeRecord) {
+    if app.graph.attachment_open_pending(tab) {
+        app.status = "An attachment is already opening".into();
+        return;
+    }
+    let Some(api) = app.flavite.as_ref() else {
+        app.status = "No vault is open".into();
         return;
     };
-    app.open_intent(crate::host::open_intents::OpenIntent::reuse(
-        locator, source,
-    ));
+    let incarnation = app
+        .workspace
+        .tab(&tab)
+        .map_or(0, |session| session.interaction().incarnation);
+    match api.query_service().submit(
+        tab.raw(),
+        incarnation,
+        0,
+        QueryPayload::AttachmentOpen {
+            path: record.native_path.clone(),
+        },
+    ) {
+        Ok(token) => {
+            app.graph.attachment_opens.insert(token, tab);
+            app.status = "Opening local attachment…".into();
+        }
+        Err(_) => app.status = "Attachment service busy; try again".into(),
+    }
 }
 
 /// Ensure every mounted graph tab is attached (covers restore/layout

@@ -129,6 +129,24 @@ impl GestureArbiter {
         self.candidate = None;
     }
 
+    /// D-02: the hit-geometry hold is bounded by the same interval that
+    /// completes the pair. A candidate whose window elapsed (the second
+    /// release never arrived) is dropped, releasing any presentation the
+    /// host froze for it. Returns whether a candidate was discarded.
+    pub fn expire(&mut self, now: Instant) -> bool {
+        match self.candidate {
+            Some(candidate)
+                if now
+                    .checked_duration_since(candidate.at)
+                    .is_some_and(|elapsed| elapsed > self.config.double_click_interval) =>
+            {
+                self.candidate = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The identity epoch moved: any pending candidate is cancelled rather
     /// than acting against obsolete entities (D-02). Mere layout/overlay
     /// generation movement does **not** cancel a navigation pair. Returns
@@ -373,6 +391,31 @@ mod tests {
             arbiter.click(clock(reference, 10), Some(hit(1)), [0.0, 0.0], 1, 1.0),
             GestureOutcome::Select(hit(1))
         );
+    }
+
+    /// D-02: the bounded hold. A candidate whose interval elapsed is
+    /// expired (releasing any frozen presentation); a fresh one is kept.
+    #[test]
+    fn expire_drops_only_the_bounded_hold() {
+        let reference = Instant::now();
+        let mut arbiter = GestureArbiter::new();
+        // No candidate yet: expiry is a no-op.
+        assert!(!arbiter.expire(clock(reference, 0)));
+        let _ = arbiter.click(clock(reference, 0), Some(hit(1)), [0.0, 0.0], 1, 1.0);
+        assert!(arbiter.has_candidate());
+        // Inside the window the hold stays: the pair may still complete.
+        assert!(!arbiter.expire(clock(reference, 499)));
+        assert!(arbiter.has_candidate());
+        // Past the bounded interval the second release never arrived: the
+        // hold is dropped.
+        assert!(arbiter.expire(clock(reference, 501)));
+        assert!(!arbiter.has_candidate());
+        // A new click after expiry starts a fresh candidate again.
+        assert_eq!(
+            arbiter.click(clock(reference, 600), Some(hit(1)), [0.0, 0.0], 1, 1.0),
+            GestureOutcome::Select(hit(1))
+        );
+        assert!(arbiter.has_candidate());
     }
 
     #[test]

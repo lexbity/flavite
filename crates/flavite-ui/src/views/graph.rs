@@ -8,9 +8,11 @@
 //! set, so a capture on either backend proves the same behavior.
 //!
 //! Persistent affordances (§13.1/D-05): the header always shows the base
-//! counts, provenance, and the writing-target line, so a double-click's
-//! destination is visible before it happens. A missing target gets an
-//! explanation and a repair action, never a hidden fallback.
+//! counts, provenance, and the writing-target line, so an explicit
+//! insertion's destination is visible before it happens. D-02: a
+//! double-click **opens** a node; only Ctrl+Enter/Insert places a link.
+//! A missing target gets an explanation and a repair action, never a
+//! hidden fallback.
 
 use std::sync::Arc;
 
@@ -82,7 +84,14 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         match &state.geometry {
             None => unavailable(app, tab, state),
             Some(geometry) if state.list_mode => list_body(app, tab, state, geometry),
-            Some(geometry) => visual_body(app, tab, incarnation, state, geometry, Some(activity_overlay.into())),
+            Some(geometry) => visual_body(
+                app,
+                tab,
+                incarnation,
+                state,
+                geometry,
+                Some(activity_overlay.into()),
+            ),
         }
     };
     column![
@@ -95,7 +104,7 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             .width(Length::Fill)
             .height(Length::Fixed(band_row_height(metrics)))
             .clip(true),
-        ]
+    ]
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
@@ -141,9 +150,10 @@ fn band_row_height(metrics: crate::style::Metrics) -> f32 {
     metrics.text_sm * 1.5 + metrics.spacing_sm
 }
 
-/// The persistent writing-target affordance (D-05): the double-click
+/// The persistent writing-target affordance (D-05): the insertion
 /// destination is visible before it happens; a missing target gets an
-/// explanation, never a hidden fallback.
+/// explanation, never a hidden fallback. D-02 (S04): double-click opens;
+/// insertion is only the explicit Ctrl+Enter/Insert intent.
 fn target_banner<'a>(app: &'a App) -> Element<'a, Message> {
     let metrics = app.appearance.metrics();
     let banner: Element<'a, Message> = if let Some((tab, ..)) = app.valid_writing_target() {
@@ -154,7 +164,7 @@ fn target_banner<'a>(app: &'a App) -> Element<'a, Message> {
         row![
             text("Insert links into:").size(metrics.text_sm),
             text(title).size(metrics.text_sm).style(style::dim_text),
-            text("— double-click a note node to insert its link")
+            text("— Ctrl+Enter or Insert places a link; double-click opens the node")
                 .size(metrics.text_sm)
                 .style(style::dim_text),
         ]
@@ -162,7 +172,7 @@ fn target_banner<'a>(app: &'a App) -> Element<'a, Message> {
         .align_y(alignment::Vertical::Center)
         .into()
     } else {
-        text("No insertion target — click in an editor to place the cursor; double-click insertion is disabled")
+        text("No insertion target — click in an editor to place the cursor; explicit insertion is disabled (double-click opens, it never inserts)")
             .size(metrics.text_sm)
             .style(style::dim_text)
             .into()
@@ -362,7 +372,9 @@ fn header<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Me
 
 /// The reserved selection band (AC-4): identity, summary, and the typed
 /// actions. Empty with a stable height when nothing is selected — the
-/// canvas geometry never notices a selection change (D-02).
+/// canvas geometry never notices a selection change (D-02). Chip
+/// availability comes from the same predicates the commands enforce
+/// (FR-15), so no surface can offer what the core would refuse.
 fn selection_band<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Message> {
     let metrics = app.appearance.metrics();
     let Some(hit) = state.selection else {
@@ -371,16 +383,19 @@ fn selection_band<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Elemen
             .height(Length::Fixed(0.0))
             .into();
     };
-    let selection = graph::record_for(app, hit.id)
+    let record = graph::record_for(app, hit.id);
+    let selection = record
+        .as_ref()
         .map(|record| {
+            let kind = match record.id.kind {
+                flavite_graph::NodeKind::Note => "note",
+                flavite_graph::NodeKind::Attachment => "attachment",
+                flavite_graph::NodeKind::Unresolved => "unresolved",
+            };
             format!(
                 "Selected: {} [{}] · {}{}",
                 record.title,
-                if hit.kind == flavite_graph::NodeKind::Attachment {
-                    "attachment"
-                } else {
-                    "note"
-                },
+                kind,
                 record.path,
                 if state
                     .scope_result
@@ -405,30 +420,75 @@ fn selection_band<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Elemen
             .style(style::ghost())
             .on_press_maybe(enabled.then_some(Message::GraphCommand { tab, command }))
     };
-    row![
+    let action_chip = |label: &'static str, message: Message, enabled: bool| {
+        button(text(label).size(metrics.text_sm))
+            .padding(tab_strip::chip_padding())
+            .style(style::ghost())
+            .on_press_maybe(enabled.then_some(message))
+    };
+    let locator = record.as_ref().and_then(graph::locator_for);
+    let mut band = row![
         text(selection).size(metrics.text_sm).style(style::dim_text),
         text(summary).size(metrics.text_sm).style(style::dim_text),
         iced::widget::Space::new()
             .width(Length::Fill)
             .height(Length::Fixed(0.0)),
-        chip("Open (Enter)", GraphCommand::OpenSelected, true),
-        chip(
-            "Insert link (Ctrl+Enter)",
-            GraphCommand::InsertSelected,
-            true,
-        ),
-        chip(
+    ]
+    .spacing(metrics.spacing)
+    .align_y(alignment::Vertical::Center);
+    // D-02: every node kind gets its own explicit intent and nothing else
+    // is offered — a resolved note opens (and can be inserted into), an
+    // attachment activates the existing local inspector, and an unresolved
+    // target offers Create-or-Locate without ever creating implicitly.
+    match record.as_ref().map(|record| record.id.kind) {
+        Some(flavite_graph::NodeKind::Note) if locator.is_some() => {
+            band = band
+                .push(chip("Open (Enter)", GraphCommand::OpenSelected, true))
+                .push(chip(
+                    "Insert link (Ctrl+Enter)",
+                    GraphCommand::InsertSelected,
+                    graph::insert_available(app, tab),
+                ));
+        }
+        Some(flavite_graph::NodeKind::Attachment) => {
+            band = band.push(chip(
+                "Open attachment (Enter)",
+                GraphCommand::OpenSelected,
+                true,
+            ));
+        }
+        Some(flavite_graph::NodeKind::Unresolved) => {
+            let representable = record
+                .as_ref()
+                .is_some_and(graph::unresolved_is_representable);
+            band = band
+                .push(action_chip(
+                    "Create note…",
+                    Message::CreateFromNode(tab),
+                    representable,
+                ))
+                .push(action_chip(
+                    "Locate note",
+                    Message::LocateFromNode(tab),
+                    true,
+                ));
+        }
+        _ => {}
+    }
+    band = band
+        .push(chip(
             "Open in tabs",
             GraphCommand::OpenSelectedInTabs,
             state.selected_nodes.len() > 1,
-        ),
-        chip("Unpin", GraphCommand::UnpinSelected, true),
-        chip("Reveal", GraphCommand::RevealSelected, true),
-        chip("Clear", GraphCommand::ClearSelection, true),
-    ]
-    .spacing(metrics.spacing)
-    .align_y(alignment::Vertical::Center)
-    .into()
+        ))
+        .push(chip("Unpin", GraphCommand::UnpinSelected, record.is_some()))
+        .push(chip(
+            "Reveal",
+            GraphCommand::RevealSelected,
+            record.is_some(),
+        ))
+        .push(chip("Clear", GraphCommand::ClearSelection, true));
+    band.into()
 }
 
 /// Honest loading/error states before any frame exists (§13.4). The graph
@@ -715,14 +775,22 @@ fn list_body<'a>(
             button(text("Open").size(metrics.text_sm))
                 .padding(tab_strip::chip_padding())
                 .style(style::action())
-                .on_press_maybe((record.id.kind == flavite_graph::NodeKind::Note).then_some(
-                    Message::GraphNodeCommand {
+                // D-02: every node kind's Open does something honest — a
+                // resolved note navigates, an attachment opens the local
+                // inspector, an unresolved target presents Create/Locate.
+                // A blocked or unrepresentable path gets no dead control.
+                .on_press_maybe(
+                    (locator.is_some()
+                        || record.id.kind == flavite_graph::NodeKind::Attachment
+                        || (record.id.kind == flavite_graph::NodeKind::Unresolved
+                            && graph::unresolved_is_representable(record)))
+                    .then_some(Message::GraphNodeCommand {
                         tab,
                         incarnation,
                         key,
                         command: GraphCommand::Open(id),
-                    }
-                ),),
+                    }),
+                ),
             button(text("Insert").size(metrics.text_sm))
                 .padding(tab_strip::chip_padding())
                 .style(style::action())
@@ -745,7 +813,7 @@ fn list_body<'a>(
         )
     } else {
         format!(
-            "{} current nodes · double-click or Insert places a link at the writing target",
+            "{} current nodes · Enter/double-click opens · Ctrl+Enter or Insert places a link at the writing target",
             geometry.node_count()
         )
     };

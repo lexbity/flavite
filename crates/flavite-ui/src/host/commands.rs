@@ -360,6 +360,14 @@ pub const UI_COMMANDS: &[UiCommand] = &[
         title: "Insert a link to the selected graph note at the caret",
     },
     UiCommand {
+        id: "graph.create_from_node",
+        title: "Create the unresolved graph note (explicit dialog)",
+    },
+    UiCommand {
+        id: "graph.locate_node",
+        title: "Locate a note for the unresolved graph link",
+    },
+    UiCommand {
         id: "workspace.open_preview",
         title: "Open preview of the followed note",
     },
@@ -1080,6 +1088,15 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
             };
             return app.update(Message::GraphCommand { tab, command });
         }
+        // D-02: the unresolved node's explicit Create/Locate offers. The
+        // palette, band chips and any keyboard route share these exact
+        // messages, availability predicates, and destination policy.
+        "graph.create_from_node" => {
+            return app.update(Message::CreateFromNode(app.workspace.focused_tab()));
+        }
+        "graph.locate_node" => {
+            return app.update(Message::LocateFromNode(app.workspace.focused_tab()));
+        }
         "workspace.find" => {
             return app.update(Message::FindOpen(app.workspace.focused_tab()));
         }
@@ -1223,8 +1240,14 @@ pub fn available(app: &App, id: &str) -> bool {
             .is_some_and(|view| matches!(view.kind(), ViewKind::Graph(_))),
         "graph.open_selected" => graph_action_tab(app).is_some(),
         "graph.insert_selected" => {
-            graph_action_tab(app).is_some() && app.valid_writing_target().is_some()
+            graph_action_tab(app).is_some_and(|tab| crate::host::graph::insert_available(app, tab))
         }
+        "graph.create_from_node" => graph_action_tab(app).is_some_and(|tab| {
+            crate::host::graph::selected_unresolved(app, tab)
+                .is_some_and(|record| crate::host::graph::unresolved_is_representable(&record))
+        }),
+        "graph.locate_node" => graph_action_tab(app)
+            .is_some_and(|tab| crate::host::graph::selected_unresolved(app, tab).is_some()),
         "context.follow_document" => {
             crate::views::context_header::is_context_tab(app, app.workspace.focused_tab())
         }

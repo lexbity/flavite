@@ -291,8 +291,29 @@ pub fn observe(app: &mut App, outcome: &QueryOutcome) -> bool {
     }
 
     if let QueryPayload::AttachmentOpen { .. } = &outcome.payload {
-        if let Some((tab, doc)) = app.reading.attachment_opens.remove(&outcome.token)
-            && bound(app, tab, &doc)
+        if let Some((tab, doc)) = app.reading.attachment_opens.remove(&outcome.token) {
+            if bound(app, tab, &doc) {
+                match &outcome.result {
+                    ContextQueryResult::AttachmentOpen(Ok(path)) => {
+                        app.status = if spawn_os(path.as_os_str()).is_ok() {
+                            "Opened local attachment".into()
+                        } else {
+                            "Local attachment could not be opened".into()
+                        };
+                    }
+                    _ => {
+                        app.status = "Attachment unavailable; locate a supported local file".into()
+                    }
+                }
+            }
+            return true;
+        }
+        // D-02: a graph-activated attachment inspector reports on its
+        // owning graph tab; a replaced/removed tab drops silently.
+        if let Some(tab) = app.graph.take_attachment_open(&outcome.token)
+            && app.workspace.tab(&tab).is_some_and(|session| {
+                session.interaction().incarnation == outcome.token.incarnation
+            })
         {
             match &outcome.result {
                 ContextQueryResult::AttachmentOpen(Ok(path)) => {

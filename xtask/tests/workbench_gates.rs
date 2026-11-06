@@ -127,6 +127,7 @@ fn seed_s04_inputs(root: &Path) {
         "crates/flavite-ui/src/graph/events.rs",
         "crates/flavite-ui/src/host/graph.rs",
         "crates/flavite-ui/src/app.rs",
+        "crates/flavite-ui/src/views/graph.rs",
     ] {
         seed_file(root, relative);
     }
@@ -302,6 +303,35 @@ fn s04_gate_passes_clean_tree_and_rejects_forbidden_patterns() {
         String::from_utf8_lossy(&rejected.stderr)
     );
     fs::write(&graph, "implementation\n").unwrap();
+
+    // The retired implicit-insert gesture copy stays dead in the chrome,
+    // and deferred non-note activation cannot come back as a hint.
+    let views = temp.path().join("crates/flavite-ui/src/views/graph.rs");
+    fs::write(
+        &views,
+        "text(\"— double-click a note node to insert its link\")\n",
+    )
+    .unwrap();
+    let rejected = run_gate(temp.path(), "S04");
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("double-click a note node to insert"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    fs::write(&views, "text(\"Attachment open arrives with W09\")\n").unwrap();
+    let rejected = run_gate(temp.path(), "S04");
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("arrives with W09"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    fs::write(&views, "implementation\n").unwrap();
+    assert!(
+        run_gate(temp.path(), "S04").status.success(),
+        "the restored fixture must pass again"
+    );
 
     // S04 requires S00+S01 files too: removing one fails cumulatively.
     fs::remove_file(temp.path().join("crates/flavite-text-search/src/lib.rs")).unwrap();

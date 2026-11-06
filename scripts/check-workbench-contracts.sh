@@ -156,6 +156,16 @@ run_s04_gates() {
     # an accidental global destination (the focused group).
     gate assert_absent 'fn request_open\(' "$root/crates/flavite-ui/src/app.rs"
     gate assert_absent 'app\.focused_group\(' "$root/crates/flavite-ui/src/host/graph.rs"
+    # D-02: the retired implicit-insert gesture copy must not be re-adopted
+    # by the graph chrome (banner/list hints), and deferred non-note
+    # activation ("arrives with W09") is replaced by the explicit
+    # inspector and Create-or-Locate intents.
+    gate assert_absent \
+        'double-click a note node to insert|double-click or Insert places' \
+        "$root/crates/flavite-ui/src/views/graph.rs"
+    gate assert_absent 'arrives with W09|arrives with the reading slice' \
+        "$root/crates/flavite-ui/src/host/graph.rs" \
+        "$root/crates/flavite-ui/src/views/graph.rs"
 }
 
 case "$slice" in

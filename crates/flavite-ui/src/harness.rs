@@ -204,6 +204,11 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                                 "activation_notice_pending": app.appearance.graph_activation_notice_pending(),
                                 "notice_bounds": state.notice_bounds.map(|r| [r.x, r.y, r.width, r.height]),
                                 "frozen": state.frozen,
+                                // S04 AC-6: camera authority. A user-held
+                                // camera (pan/zoom taken) stops auto-follow;
+                                // the scenario must hold it before asserting
+                                // screen-position stability.
+                                "user_camera_moved": state.user_camera_moved,
                                 "list_mode": state.list_mode,
                                 "stale": state.stale,
                                 "updating": state.updating,

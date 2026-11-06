@@ -162,6 +162,11 @@ def main():
     common.palette(harness, "Freeze graph layout")
     common.palette(harness, "Fit graph to view")
     value = wait(lambda s: graph(s)["graph"].get("frozen"), "layout frozen")
+    # AC-6 is a USER-HELD-camera claim: take the camera with a real
+    # background drag pan. This stops auto-follow; the layout is frozen;
+    # every later screen-position is then stable by contract, not by luck
+    # of a settled simulation.
+    value = common.pan(window, harness, 30, -20)
 
     # ---- AC-4: selection changes bounds by zero and keeps painted nodes.
     bounds_before = graph(value)["graph"]["bounds"]

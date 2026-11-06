@@ -51,8 +51,11 @@ def palette(title):
     wait(lambda s:not s.get("palette_open"),"palette dispatched")
 def focus_graph():
     value=snapshot()
-    group=next(g for g in value["groups"] if any(t["load"]=="graph" and t["active"] for t in g["tabs"]))
-    tab=next(t for t in group["tabs"] if t["load"]=="graph" and t["active"])
+    # The graph tab may have lost the group's active slot when a note was
+    # opened (D-03 activation lands in the same document group). Click its
+    # strip slot regardless of active state, then require it focused.
+    group=next(g for g in value["groups"] if any(t["load"]=="graph" for t in g["tabs"]))
+    tab=next(t for t in group["tabs"] if t["load"]=="graph")
     x,y,w,_=group["bounds"]
     point(x+min(w-12,tab["slot_index"]*group["tab_width"]+35),y+16)
     run("xdotool","click","1")

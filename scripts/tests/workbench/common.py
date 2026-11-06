@@ -99,6 +99,60 @@ def click_rect(window, harness, rect):
     run("xdotool", "click", "1")
 
 
+def pan(window, harness, dx, dy):
+    """One real background drag that takes the camera (distinguishes pan
+    from click past the gesture threshold). Returns the newest snapshot
+    only after the screen projection is stable: the OS event queue may
+    still be draining the drag when mouseup returns."""
+    value = snapshot(harness)
+    g = next(
+        t
+        for t in tabs(value)
+        if t["load"] == "graph" and t.get("active")
+    )["graph"]
+    x, y, w, h = g["bounds"]
+    occupied = [(n["x"], n["y"]) for n in g.get("screen_nodes", [])]
+    # Start at the canvas lower-left, clear of every node by 30 px.
+    sx, sy = x + 24.0, y + h - 24.0
+    while any(abs(sx - nx) < 30 and abs(sy - ny) < 30 for nx, ny in occupied):
+        sy -= 12.0
+    point(window, harness, sx, sy)
+    run("xdotool", "mousedown", "1")
+    steps = max(3, abs(dx) // 12)
+    for i in range(1, steps + 1):
+        point(window, harness, sx + dx * i / steps, sy + dy * i / steps)
+    run("xdotool", "mouseup", "1")
+    wait(
+        harness,
+        lambda s: (
+            v := next(
+                (t for t in tabs(s) if t["load"] == "graph" and t.get("active")), None
+            )
+        )
+        and v["graph"].get("user_camera_moved"),
+        "camera taken by the user pan",
+    )
+    # Two consecutive snapshots with identical screen projection prove the
+    # queued drag events are fully consumed.
+    end = time.monotonic() + 10
+    last = None
+    while time.monotonic() < end:
+        value = snapshot(harness)
+        graph_tab = next(
+            (t for t in tabs(value) if t["load"] == "graph" and t.get("active")), None
+        )
+        nodes = (
+            tuple(sorted((n["title"], n["x"], n["y"]) for n in graph_tab["graph"]["screen_nodes"]))
+            if graph_tab and graph_tab["graph"].get("screen_nodes")
+            else None
+        )
+        if nodes is not None and nodes == last:
+            return value
+        last = nodes
+        time.sleep(0.05)
+    raise AssertionError("screen projection still moving after the pan")
+
+
 def palette(harness, title):
     palette_run, *_ = argv()
     key("ctrl+shift+p")
