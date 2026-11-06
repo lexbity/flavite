@@ -63,9 +63,10 @@ fn editor_latency_probe() {
         let api = Flavite::open(identity, session, VaultConfig::default()).unwrap();
         let mut app = App::from_flavite(api);
         let group = app.focused_group().unwrap();
-        let _ = app.update(Message::OpenNote {
+        app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+            expected_revision: revision,
             locator: flavite_workspace::NoteLocator::from_components(["note.md"]).unwrap(),
-            group: Some(group),
+            group,
         });
         let deadline = Instant::now() + Duration::from_secs(10);
         while app.notes.any_pending() {

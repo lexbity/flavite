@@ -44,10 +44,12 @@ fn app_with_bytes(name: &str, bytes: &[u8]) -> App {
 }
 
 fn open_note(app: &mut App, name: &str) -> flavite_workspace::TabId {
-    let _ = app.update(Message::OpenNote {
-        locator: NoteLocator::from_components([name]).unwrap(),
-        group: None,
-    });
+    let _ = app.update(Message::OpenIntent(
+        flavite_ui::host::open_intents::OpenIntent::reuse(
+            NoteLocator::from_components([name]).unwrap(),
+            None,
+        ),
+    ));
     wait(app, |a| !a.notes.any_pending());
     app.workspace.focused_tab()
 }

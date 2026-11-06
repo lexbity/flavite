@@ -273,7 +273,7 @@ fn group_panel(app: &App, group: GroupId, _focused: bool) -> Element<'_, Message
     let panel: Element<'_, Message> = column![
         tab_strip::view(app, group),
         rule::horizontal(1),
-        active_view(app, group, g.active())
+        active_view(app, g.active())
     ]
     .width(Length::Fill)
     .height(Length::Fill)
@@ -386,7 +386,7 @@ fn menu_overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Me
     .into()
 }
 
-fn active_view(app: &App, group: GroupId, tab: TabId) -> Element<'_, Message> {
+fn active_view(app: &App, tab: TabId) -> Element<'_, Message> {
     let metrics = *app.appearance.metrics();
     let Some(session) = app.workspace.tab(&tab) else {
         return crate::views::empty_state(metrics, "Empty", "This tab has no content.");
@@ -397,7 +397,7 @@ fn active_view(app: &App, group: GroupId, tab: TabId) -> Element<'_, Message> {
             "Empty",
             "Open a note with Quick switch (Ctrl+P) or add a Notes list.",
         ),
-        ViewKind::Notes => crate::views::notes::view(app, tab, group),
+        ViewKind::Notes => crate::views::notes::view(app, tab),
         ViewKind::Search => crate::views::search::view(app, tab),
         ViewKind::History(locator) => crate::views::history::view(app, tab, locator),
         ViewKind::Note(note) => crate::views::note::view(app, tab, note.load(), note.locator()),

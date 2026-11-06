@@ -18,7 +18,7 @@ pub struct EditorView {
     /// Vault-relative path.
     pub path: PathBuf,
     /// State-machine label.
-    pub state: flavite_api::BufferStatus,
+    pub state: flavite_buffer::state::BufferState,
 }
 
 /// A note candidate offered while completing a wikilink.
@@ -277,9 +277,9 @@ impl EditorAction {
                 direction,
             } => {
                 let command = if direction == HistoryDirection::Undo {
-                    "undo"
+                    "buffer.undo"
                 } else {
-                    "redo"
+                    "buffer.redo"
                 };
                 (
                     command,

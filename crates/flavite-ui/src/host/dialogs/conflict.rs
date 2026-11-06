@@ -6,7 +6,7 @@
 use crate::app::{App, Message};
 use crate::style;
 use crate::workspace::tab_strip;
-use flavite_api::BufferStatus as BufferState;
+use flavite_buffer::state::BufferState;
 use iced::Element;
 use iced::widget::{button, column, row, text};
 

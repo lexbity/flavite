@@ -10,10 +10,12 @@ use flavite_ui::{
 use flavite_workspace::{NoteLocator, TabId};
 
 fn open(app: &mut App) -> TabId {
-    let _ = app.update(Message::OpenNote {
-        locator: NoteLocator::from_components(["a.md"]).unwrap(),
-        group: None,
-    });
+    let _ = app.update(Message::OpenIntent(
+        flavite_ui::host::open_intents::OpenIntent::reuse(
+            NoteLocator::from_components(["a.md"]).unwrap(),
+            None,
+        ),
+    ));
     let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let _ = app.update(Message::Pump);

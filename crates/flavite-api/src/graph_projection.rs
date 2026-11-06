@@ -297,10 +297,9 @@ pub fn assemble(
             .strip_prefix(session.expect("snapshot needs session").root())
             .unwrap_or(&snapshot.path)
             .to_path_buf();
-        let indexed = saved
-            .nodes
-            .iter()
-            .find(|n| n.native_path == path && snapshot.state != crate::BufferStatus::Orphaned);
+        let indexed = saved.nodes.iter().find(|n| {
+            n.native_path == path && snapshot.state != flavite_buffer::state::BufferState::Orphaned
+        });
         let id = indexed.map_or_else(
             || NodeId::note(u64::MAX - snapshot.buffer_id.as_u64()),
             |n| n.id,
@@ -325,11 +324,11 @@ pub fn assemble(
                 .as_ref()
                 .is_some_and(|h| h.as_slice() == hash)
                 && snapshot.text.as_ref() == text
-                && snapshot.state == crate::BufferStatus::Clean
+                && snapshot.state == flavite_buffer::state::BufferState::Clean
         }) {
             continue;
         }
-        if snapshot.state == crate::BufferStatus::Orphaned {
+        if snapshot.state == flavite_buffer::state::BufferState::Orphaned {
             for record in effective
                 .nodes
                 .iter_mut()
@@ -380,7 +379,7 @@ pub fn assemble(
         overlay_metadata.insert(id, Some(current_metadata));
         if let Some(record) = effective.nodes.iter_mut().find(|r| r.id == id) {
             let frontmatter = flavite_syntax::frontmatter::parse_frontmatter(&parsed.snapshot);
-            record.missing_on_disk = snapshot.state == crate::BufferStatus::Orphaned;
+            record.missing_on_disk = snapshot.state == flavite_buffer::state::BufferState::Orphaned;
             record.title = flavite_syntax::wellknown::derive_title(
                 frontmatter.as_ref().and_then(|f| f.title.as_deref()),
                 parsed.headings.first().map(|(_, text)| text.as_str()),
@@ -389,7 +388,7 @@ pub fn assemble(
                     .unwrap_or("Unsaved note"),
             );
         }
-        if snapshot.state == crate::BufferStatus::Orphaned
+        if snapshot.state == flavite_buffer::state::BufferState::Orphaned
             && let Some(record) = effective.nodes.iter_mut().find(|r| r.id == id)
         {
             record.title.push_str(" (missing on disk)");

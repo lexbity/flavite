@@ -31,10 +31,23 @@ fn fixture(notes: &[(&str, &str)]) -> App {
 
 fn open(app: &mut App, locator: &NoteLocator, group: Option<flavite_workspace::GroupId>) -> TabId {
     let before: Vec<TabId> = app.workspace.tabs().map(|(tab, _)| *tab).collect();
-    let _ = app.update(Message::OpenNote {
-        locator: locator.clone(),
-        group,
-    });
+    match group {
+        // Fixture setup with an explicit group target dispatches the typed
+        // layout action directly.
+        Some(group) => {
+            app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+                expected_revision: revision,
+                locator: locator.clone(),
+                group,
+            });
+        }
+        // The default navigation surface routes the typed D-03 intent.
+        None => {
+            let _ = app.update(Message::OpenIntent(
+                flavite_ui::host::open_intents::OpenIntent::reuse(locator.clone(), None),
+            ));
+        }
+    }
     wait(app, |a| !a.notes.any_pending());
     app.workspace
         .tabs()
@@ -99,12 +112,11 @@ fn duplicate_views_keep_independent_find_state_and_rescan_after_edits() {
         app.note_editor_view(second).unwrap().buffer_id,
         "both views share one buffer"
     );
-    // The legacy Message::Find* variants route into the same host.
-    let _ = app.update(Message::FindOpen(first));
-    let _ = app.update(Message::FindQuery {
+    let _ = app.update(Message::NoteSearch(NoteSearchMessage::FindOpen(first)));
+    let _ = app.update(Message::NoteSearch(NoteSearchMessage::FindQuery {
         tab: first,
         query: "alpha".into(),
-    });
+    }));
     wait(&mut app, |app| spans(app, first).len() == 3);
     find(&mut app, second, "beta");
     assert_eq!(spans(&app, first).len(), 3);
@@ -259,8 +271,10 @@ fn find_navigation_sets_display_selection_without_editor_edits() {
         app.workspace.writing_target().is_none(),
         "find navigation never authorizes writing"
     );
-    // Legacy FindNext message keeps the same contract.
-    let _ = app.update(Message::FindNext { tab, forward: true });
+    let _ = app.update(Message::NoteSearch(NoteSearchMessage::FindNext {
+        tab,
+        forward: true,
+    }));
     let selection = app
         .workspace
         .tab(&tab)
@@ -314,7 +328,7 @@ fn replace_all_prepares_through_the_core_and_updates_both_views() {
 
 fn crate_replace_visible(app: &App, tab: TabId) -> bool {
     app.note_editor_view(tab).is_some_and(|view| {
-        app.note_buffer_state(tab) == Some(flavite_api::BufferStatus::Dirty)
+        app.note_buffer_state(tab) == Some(flavite_buffer::state::BufferState::Dirty)
             || view.text.contains("zz")
     })
 }
@@ -348,10 +362,9 @@ fn close_while_preparation_runs_drops_the_stale_completion_without_effects() {
         "the pending mapping was dropped"
     );
     // Reopen: the plan never applied to the buffer.
-    let _ = app.update(Message::OpenNote {
-        locator,
-        group: None,
-    });
+    let _ = app.update(Message::OpenIntent(
+        flavite_ui::host::open_intents::OpenIntent::reuse(locator, None),
+    ));
     wait(&mut app, |a| !a.notes.any_pending());
     let reopened = app.workspace.focused_tab();
     assert_eq!(app.note_state_text(reopened).unwrap(), original);

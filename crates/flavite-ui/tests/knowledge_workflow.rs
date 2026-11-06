@@ -44,10 +44,12 @@ fn fixture() -> Workflow {
 }
 
 fn open(app: &mut App, name: &str) -> TabId {
-    let _ = app.update(Message::OpenNote {
-        locator: NoteLocator::from_components([name]).unwrap(),
-        group: None,
-    });
+    let _ = app.update(Message::OpenIntent(
+        flavite_ui::host::open_intents::OpenIntent::reuse(
+            NoteLocator::from_components([name]).unwrap(),
+            None,
+        ),
+    ));
     wait(app, |a| !a.notes.any_pending());
     app.workspace.focused_tab()
 }
@@ -130,10 +132,12 @@ fn search_view_finds_saved_content_and_opens_results() {
     assert!(results[0].excerpt.contains("Original"));
 
     // Opening a result routes canonically into the shell.
-    let _ = app.update(Message::OpenNote {
-        locator: NoteLocator::from_components(["b.md"]).unwrap(),
-        group: None,
-    });
+    let _ = app.update(Message::OpenIntent(
+        flavite_ui::host::open_intents::OpenIntent::reuse(
+            NoteLocator::from_components(["b.md"]).unwrap(),
+            None,
+        ),
+    ));
     wait(app, |a| !a.notes.any_pending());
     assert!(tab_of(app, "b.md").is_some());
 }
@@ -227,13 +231,13 @@ fn history_lists_snapshots_and_restore_is_undoable_without_disk_write() {
     let _ = app.update(Message::RunCoreCommand("note.save"));
     wait(app, |a| {
         a.note_editor_view(tab)
-            .is_some_and(|view| matches!(view.state, flavite_api::BufferStatus::Clean))
+            .is_some_and(|view| matches!(view.state, flavite_buffer::state::BufferState::Clean))
     });
     edit_buffer(app, tab, "# B\nThird body\n");
     let _ = app.update(Message::RunCoreCommand("note.save"));
     wait(app, |a| {
         a.note_editor_view(tab)
-            .is_some_and(|view| matches!(view.state, flavite_api::BufferStatus::Clean))
+            .is_some_and(|view| matches!(view.state, flavite_buffer::state::BufferState::Clean))
     });
 
     // Open the history view for this note and load it.

@@ -90,9 +90,10 @@ fn split_views_share_revision_text_and_history_but_keep_independent_carets() {
     let (mut app, fs, _cache) = fixture();
     let group = app.focused_group().unwrap();
     let locator = flavite_workspace::NoteLocator::from_components(["note.md"]).unwrap();
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator,
-        group: Some(group),
+        group,
     });
     wait_for_open(&mut app);
     let first = app.workspace.focused_tab();
@@ -254,9 +255,10 @@ fn editor_link_navigation_resolves_through_the_api_catalog() {
     }
     let group = app.focused_group().unwrap();
     let locator = flavite_workspace::NoteLocator::from_components(["source.md"]).unwrap();
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator,
-        group: Some(group),
+        group,
     });
     wait_for_open(&mut app);
     let source = app.workspace.focused_tab();
@@ -281,9 +283,10 @@ fn editor_link_navigation_resolves_through_the_api_catalog() {
 fn blur_acknowledgements_preserve_only_an_unchanged_authorized_caret() {
     let (mut app, _fs, _cache) = fixture();
     let group = app.focused_group().unwrap();
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator: flavite_workspace::NoteLocator::from_components(["note.md"]).unwrap(),
-        group: Some(group),
+        group,
     });
     wait_for_open(&mut app);
     let tab = app.workspace.focused_tab();

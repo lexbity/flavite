@@ -78,7 +78,7 @@ fn prepare_commit_undo_redo_and_target_immutability() {
     // One undo removes it; redo restores it.
     let undo = fixture.flavite.execute(Invocation::new(
         next_id(&fixture.flavite),
-        "undo",
+        "buffer.undo",
         serde_json::json!({ "buffer_id": buffer_id, "revision": new_revision }),
         Origin::Gui,
     ));
@@ -90,7 +90,7 @@ fn prepare_commit_undo_redo_and_target_immutability() {
         .expect("view");
     let redo = fixture.flavite.execute(Invocation::new(
         next_id(&fixture.flavite),
-        "redo",
+        "buffer.redo",
         serde_json::json!({ "buffer_id": buffer_id, "revision": view.revision }),
         Origin::Gui,
     ));

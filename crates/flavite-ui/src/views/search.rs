@@ -306,9 +306,8 @@ fn result_row(
     tab: TabId,
 ) -> Element<'static, Message> {
     let locator = flavite_workspace::NoteLocator::from_relative(std::path::Path::new(&result.path));
-    let open = locator.ok().map(|locator| Message::OpenNote {
-        locator,
-        group: None,
+    let open = locator.ok().map(|locator| {
+        Message::OpenIntent(crate::host::open_intents::OpenIntent::reuse(locator, None))
     });
     let mut body = column![
         text(result.title.clone()),

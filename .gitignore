@@ -6,6 +6,9 @@
 
 scratch-devdocs/
 
+# Python bytecode caches (regenerable test-runner output).
+__pycache__/
+
 # Build output (workspace + fuzz workspace).
 /target
 /fuzz/target/

@@ -39,6 +39,7 @@ impl NoteCandidate {
         [self.title.as_str(), self.target.as_str()]
             .into_iter()
             .chain(self.aliases.iter().map(String::as_str))
+            .chain(self.stable_id.iter().map(String::as_str))
             .filter_map(|candidate| pattern.score(Utf32Str::new(candidate, utf32), matcher))
             .max()
     }
@@ -221,6 +222,13 @@ mod tests {
         let found = match_candidates(&candidates, "bra", 8);
         assert_eq!(found[0].title, "Ideas");
         assert!(match_candidates(&candidates, "zzz", 8).is_empty());
+    }
+
+    #[test]
+    fn completion_can_match_unconflicted_stable_ids() {
+        let mut candidate = NoteCandidate::new("notes/target", "Target note");
+        candidate.stable_id = Some("01JABCDEF".into());
+        assert_eq!(match_candidates(&[candidate], "01JABC", 8).len(), 1);
     }
 
     #[test]

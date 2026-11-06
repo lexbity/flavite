@@ -35,7 +35,9 @@ fn backlinks_follow_move_pin_and_never_repaint_from_stale_queries() {
     let (mut app, _fs, _cache) = fixture();
     // Index needs the link graph; reconcile then refresh the catalog.
     let _ = app.update(Message::RunCoreCommand("vault.reconcile"));
-    wait_for(&mut app, "reconcile", |app| app.pending_operations() == 0);
+    wait_for(&mut app, "vault.reconcile", |app| {
+        app.pending_operations() == 0
+    });
     let _ = app.update(Message::RefreshCatalog);
 
     // Anchor on target.md, then open Backlinks following the document:

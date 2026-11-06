@@ -6,19 +6,13 @@
 //! or superseded sequences never overwrite newer ones, and no SQLite,
 //! index, or vault types cross this boundary.
 
-use crate::queries::MAX_NOTE_CATALOG_LIMIT;
+use crate::queries::{MAX_NOTE_CATALOG_LIMIT, NoteCatalogEntry};
 use flavite_vault::session::Session;
 use flavite_vault::sync::MutexExt;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-
-/// The catalog acquisition ticket answers with exactly this entry shape;
-/// re-exported so the result type has one definition (RFC-0004 §6.4 — the
-/// `queries::NoteCatalogEntry` debt is resolved by re-export, not a second
-/// struct).
-pub use crate::queries::NoteCatalogEntry as CatalogEntry;
 
 /// Live query slots the service admits (RFC §20: saturating 64 slots yields
 /// typed `Busy`, never unbounded queueing).
@@ -39,6 +33,8 @@ pub enum QueryPurpose {
     Search,
     /// Ticketed note-catalog acquisition (RFC-0004 W-D/D9).
     Catalog,
+    /// Exact link-resolution verdicts for one immutable editor revision.
+    LinkVerdicts,
 }
 
 /// Caller-correlated identity of one context query (§7.1). The service
@@ -108,6 +104,12 @@ pub enum QueryPayload {
     Catalog {
         /// Catalog bound (the service clamps to `1..=MAX_NOTE_CATALOG_LIMIT`).
         limit: u64,
+    },
+    /// Resolve links from one exact shared-buffer revision on a query worker.
+    LinkVerdicts {
+        buffer_id: u64,
+        revision: u64,
+        source_path: PathBuf,
     },
 }
 
@@ -208,13 +210,20 @@ pub enum ContextQueryResult {
     /// are dropped by provenance, never merged (D9/§4.7 UI trust).
     Catalog {
         /// Entries in canonical path order.
-        entries: Arc<[CatalogEntry]>,
+        entries: Arc<[NoteCatalogEntry]>,
         /// Index provenance of the served snapshot.
         provenance: Provenance,
         /// Total indexed notes (may exceed `entries.len()`).
         total: u64,
         /// True when the 50k bound truncated the catalog.
         truncated: bool,
+    },
+    /// Canonical resolver verdicts for one editor source revision.
+    LinkVerdicts {
+        buffer_id: u64,
+        revision: u64,
+        provenance: Provenance,
+        verdicts: Arc<[LinkVerdict]>,
     },
     /// The requested note does not exist in the saved vault.
     Missing,
@@ -223,6 +232,24 @@ pub enum ContextQueryResult {
         /// Bounded, redacted failure text.
         message: String,
     },
+}
+
+/// Resolver result used only for link decoration; insertion still validates
+/// its own target identity and source guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkVerdictState {
+    Resolved,
+    Ambiguous,
+    Unresolved,
+    NotApplicable,
+}
+
+/// One canonical link verdict, keyed by the scanner's exact raw target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkVerdict {
+    pub target_raw: String,
+    pub target_key: String,
+    pub state: LinkVerdictState,
 }
 
 /// Read-only chooser data, never a write capability. Commit still requires a
@@ -388,6 +415,7 @@ impl QueryService {
                 QueryPayload::Occurrence { .. } => QueryPurpose::Occurrence,
                 QueryPayload::Search { .. } => QueryPurpose::Search,
                 QueryPayload::Catalog { .. } => QueryPurpose::Catalog,
+                QueryPayload::LinkVerdicts { .. } => QueryPurpose::LinkVerdicts,
                 _ => QueryPurpose::Context,
             },
             context_tab,
@@ -531,6 +559,72 @@ fn execute(
         QueryPayload::Backlinks { path } => execute_backlinks(session, graph, path),
         QueryPayload::Search { text, limit } => execute_search(session, text, *limit),
         QueryPayload::Catalog { limit } => execute_catalog(session, *limit),
+        QueryPayload::LinkVerdicts {
+            buffer_id,
+            revision,
+            source_path,
+        } => execute_link_verdicts(session, *buffer_id, *revision, source_path),
+    }
+}
+
+fn execute_link_verdicts(
+    session: &Arc<Session>,
+    buffer_id: u64,
+    revision: u64,
+    source_path: &std::path::Path,
+) -> ContextQueryResult {
+    let source = match session.shared_buffer_snapshot(
+        buffer_id.into(),
+        Some(flavite_buffer::Revision::new(revision)),
+    ) {
+        Ok(source) => source,
+        Err(_) => return ContextQueryResult::Updating,
+    };
+    let Ok(parsed) = flavite_syntax::pulldown_glue::parse_normalized(&source.text) else {
+        return ContextQueryResult::Failed {
+            message: "Current note links are unavailable".into(),
+        };
+    };
+    let catalog = match session.resolver_catalog() {
+        Ok(catalog) => catalog,
+        Err(_) => return ContextQueryResult::Updating,
+    };
+    let verdicts = parsed
+        .links
+        .into_iter()
+        .map(|link| {
+            let state = if link.is_embed {
+                LinkVerdictState::NotApplicable
+            } else {
+                let resolution = catalog.resolve_at_path(
+                    &flavite_syntax::text::fold_key(&link.target_raw),
+                    &link.target_raw,
+                    false,
+                    Some(source_path),
+                );
+                if resolution.is_ambiguous {
+                    LinkVerdictState::Ambiguous
+                } else if resolution.is_unresolved {
+                    LinkVerdictState::Unresolved
+                } else {
+                    LinkVerdictState::Resolved
+                }
+            };
+            LinkVerdict {
+                target_key: flavite_syntax::text::fold_key(&link.target_raw),
+                target_raw: link.target_raw,
+                state,
+            }
+        })
+        .collect::<Vec<_>>();
+    ContextQueryResult::LinkVerdicts {
+        buffer_id,
+        revision,
+        provenance: Provenance {
+            epoch: catalog.epoch,
+            generation: catalog.generation,
+        },
+        verdicts: Arc::from(verdicts.into_boxed_slice()),
     }
 }
 
@@ -544,13 +638,15 @@ fn execute_catalog(session: &Arc<Session>, limit: u64) -> ContextQueryResult {
     let bound = usize::try_from(limit).unwrap_or(MAX_NOTE_CATALOG_LIMIT);
     match session.note_catalog(bound) {
         Ok(page) => {
-            let entries: Arc<[CatalogEntry]> = Arc::from(
+            let entries: Arc<[NoteCatalogEntry]> = Arc::from(
                 page.items
                     .into_iter()
-                    .map(|item| CatalogEntry {
+                    .map(|item| NoteCatalogEntry {
                         path: PathBuf::from(item.path),
                         native_path: item.path_native,
                         title: item.title,
+                        aliases: item.aliases,
+                        stable_id: item.stable_id,
                     })
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),

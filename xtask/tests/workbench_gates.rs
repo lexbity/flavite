@@ -114,6 +114,48 @@ fn seed_s01_inputs(root: &Path) {
     }
 }
 
+fn seed_s04_inputs(root: &Path) {
+    seed_s03_inputs(root);
+    for relative in [
+        "crates/flavite-ui/src/host/open_intents.rs",
+        "crates/flavite-ui/tests/open_intents.rs",
+        "crates/flavite-ui/tests/workbench_loop.rs",
+        "scripts/workbench-visual-linux.sh",
+        "scripts/tests/workbench/common.py",
+        "scripts/tests/workbench/graph_editor_loop.py",
+        // rg targets of the S04 absence gates.
+        "crates/flavite-ui/src/graph/events.rs",
+        "crates/flavite-ui/src/host/graph.rs",
+        "crates/flavite-ui/src/app.rs",
+        "crates/flavite-ui/src/views/graph.rs",
+    ] {
+        seed_file(root, relative);
+    }
+}
+
+fn seed_s05_inputs(root: &Path) {
+    seed_s04_inputs(root);
+    for relative in [
+        "crates/flavite-index/src/pool.rs",
+        "crates/flavite-index/src/types.rs",
+        "crates/flavite-api/src/queries.rs",
+        "crates/flavite-api/src/query_service.rs",
+        "crates/flavite-api/src/flavite.rs",
+        "crates/flavite-api/src/lib.rs",
+        "crates/flavite-vault/src/actor.rs",
+        "crates/flavite-vault/src/session.rs",
+        "crates/flavite-api/tests/catalog_tickets.rs",
+        "crates/flavite-editor/src/links.rs",
+        "crates/flavite-editor/src/widget.rs",
+        "crates/flavite-ui/src/app.rs",
+        "crates/flavite-ui/src/views/note.rs",
+        "crates/flavite-ui/tests/catalog_acquisition.rs",
+        "crates/flavite-api/src/device_preferences.rs",
+    ] {
+        seed_file(root, relative);
+    }
+}
+
 #[test]
 fn workbench_gate_rejects_unknown_slice() {
     let temp = tempfile::tempdir().unwrap();
@@ -242,6 +284,143 @@ fn s01_gate_rejects_forbidden_search_pattern() {
     );
 }
 
+#[test]
+fn s04_gate_passes_clean_tree_and_rejects_forbidden_patterns() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_s04_inputs(temp.path());
+    let clean = run_gate(temp.path(), "S04");
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // The implicit-insert gesture outcome is dead in both gesture and host
+    // code; resurfacing it fails the gate with the named pattern.
+    let events = temp.path().join("crates/flavite-ui/src/graph/events.rs");
+    fs::write(&events, "let outcome = GestureOutcome::InsertLink(hit);\n").unwrap();
+    let rejected = run_gate(temp.path(), "S04");
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("GestureOutcome::InsertLink"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    fs::write(&events, "implementation\n").unwrap();
+
+    // The global first-map-match open must stay deleted from app.rs.
+    let app = temp.path().join("crates/flavite-ui/src/app.rs");
+    fs::write(&app, "fn request_open(&mut self) {}\n").unwrap();
+    assert!(!run_gate(temp.path(), "S04").status.success());
+    fs::write(&app, "implementation\n").unwrap();
+
+    // Graph commands use an explicit source identity, never the focused
+    // group as an accidental destination.
+    let graph = temp.path().join("crates/flavite-ui/src/host/graph.rs");
+    fs::write(&graph, "let group = app.focused_group();\n").unwrap();
+    let rejected = run_gate(temp.path(), "S04");
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("focused_group"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    fs::write(&graph, "implementation\n").unwrap();
+
+    // The retired implicit-insert gesture copy stays dead in the chrome,
+    // and deferred non-note activation cannot come back as a hint.
+    let views = temp.path().join("crates/flavite-ui/src/views/graph.rs");
+    fs::write(
+        &views,
+        "text(\"— double-click a note node to insert its link\")\n",
+    )
+    .unwrap();
+    let rejected = run_gate(temp.path(), "S04");
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("double-click a note node to insert"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    fs::write(&views, "text(\"Attachment open arrives with W09\")\n").unwrap();
+    let rejected = run_gate(temp.path(), "S04");
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("arrives with W09"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    fs::write(&views, "implementation\n").unwrap();
+    assert!(
+        run_gate(temp.path(), "S04").status.success(),
+        "the restored fixture must pass again"
+    );
+
+    // S04 requires S00+S01 files too: removing one fails cumulatively.
+    fs::remove_file(temp.path().join("crates/flavite-text-search/src/lib.rs")).unwrap();
+    let cumulative = run_gate(temp.path(), "S04");
+    assert!(!cumulative.status.success());
+    assert!(
+        String::from_utf8_lossy(&cumulative.stderr).contains("missing/empty"),
+        "{}",
+        String::from_utf8_lossy(&cumulative.stderr)
+    );
+}
+
+#[test]
+fn s05_gate_requires_the_rich_ticketed_catalog_path() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_s05_inputs(temp.path());
+    let clean = run_gate(temp.path(), "S05");
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    let query_service = temp.path().join("crates/flavite-api/src/query_service.rs");
+    fs::write(
+        &query_service,
+        "pub use crate::queries::NoteCatalogEntry as CatalogEntry;\n",
+    )
+    .unwrap();
+    let alias = run_gate(temp.path(), "S05");
+    assert!(!alias.status.success());
+    assert!(
+        String::from_utf8_lossy(&alias.stderr).contains("forbidden production pattern"),
+        "{}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    fs::write(&query_service, "implementation\n").unwrap();
+
+    let app_source = temp.path().join("crates/flavite-ui/src/app.rs");
+    fs::write(&app_source, "Message::FindOpen(tab)\n").unwrap();
+    let shim = run_gate(temp.path(), "S05");
+    assert!(!shim.status.success());
+    assert!(
+        String::from_utf8_lossy(&shim.stderr).contains("forbidden production pattern"),
+        "{}",
+        String::from_utf8_lossy(&shim.stderr)
+    );
+    fs::write(&app_source, "implementation\n").unwrap();
+
+    let ui = temp.path().join("crates/flavite-ui/src/app.rs");
+    fs::write(&ui, "flavite.note_catalog(50_000);\n").unwrap();
+    let rejected = run_gate(temp.path(), "S05");
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("\\.note_catalog"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+
+    fs::write(&ui, "implementation\n").unwrap();
+    fs::remove_file(temp.path().join("crates/flavite-api/src/query_service.rs")).unwrap();
+    let missing = run_gate(temp.path(), "S05");
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("missing/empty"));
+}
+
 /// Seed the S03 helper-crate surfaces. The S03 absence gates target the
 /// helper sources and the UI search host, so the seeded placeholders are
 /// clean and the negative tests inject each forbidden pattern.
@@ -338,4 +517,34 @@ fn s03_gate_rejects_regex_compilation_and_helper_product_edges() {
         "{}",
         String::from_utf8_lossy(&rejected.stderr)
     );
+}
+
+#[test]
+fn later_slices_require_s03_helper_and_isolation_guards() {
+    for slice in ["S04", "S05"] {
+        let temp = tempfile::tempdir().unwrap();
+        seed_s05_inputs(temp.path());
+        assert!(run_gate(temp.path(), slice).status.success());
+        let worker = temp.path().join("crates/flavite-vault/src/text_worker.rs");
+        fs::write(&worker, r#"Command::new("sh").spawn();"#).unwrap();
+        assert!(
+            !run_gate(temp.path(), slice).status.success(),
+            "{slice} must retain S03 isolation checks"
+        );
+        fs::write(
+            &worker,
+            "implementation
+",
+        )
+        .unwrap();
+        fs::remove_file(
+            temp.path()
+                .join("crates/flavite-text-search/src/protocol.rs"),
+        )
+        .unwrap();
+        assert!(
+            !run_gate(temp.path(), slice).status.success(),
+            "{slice} must require S03 protocol"
+        );
+    }
 }

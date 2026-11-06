@@ -73,7 +73,8 @@ pub fn can_edit(app: &App, doc: &ReadSnapshot) -> bool {
                 && api.open_source_view(&doc.path).is_some_and(|view| {
                     matches!(
                         view.state,
-                        flavite_api::BufferStatus::Clean | flavite_api::BufferStatus::Dirty
+                        flavite_buffer::state::BufferState::Clean
+                            | flavite_buffer::state::BufferState::Dirty
                     )
                 })
         })
@@ -89,7 +90,7 @@ pub fn unsaved(app: &App, doc: &ReadSnapshot) -> bool {
         .as_ref()
         .and_then(|api| api.open_source_view(&doc.path))
         .map_or(doc.unsaved, |view| {
-            view.state != flavite_api::BufferStatus::Clean
+            view.state != flavite_buffer::state::BufferState::Clean
         })
 }
 /// A save/index publication may replace a rendering without changing source
@@ -291,8 +292,29 @@ pub fn observe(app: &mut App, outcome: &QueryOutcome) -> bool {
     }
 
     if let QueryPayload::AttachmentOpen { .. } = &outcome.payload {
-        if let Some((tab, doc)) = app.reading.attachment_opens.remove(&outcome.token)
-            && bound(app, tab, &doc)
+        if let Some((tab, doc)) = app.reading.attachment_opens.remove(&outcome.token) {
+            if bound(app, tab, &doc) {
+                match &outcome.result {
+                    ContextQueryResult::AttachmentOpen(Ok(path)) => {
+                        app.status = if spawn_os(path.as_os_str()).is_ok() {
+                            "Opened local attachment".into()
+                        } else {
+                            "Local attachment could not be opened".into()
+                        };
+                    }
+                    _ => {
+                        app.status = "Attachment unavailable; locate a supported local file".into()
+                    }
+                }
+            }
+            return true;
+        }
+        // D-02: a graph-activated attachment inspector reports on its
+        // owning graph tab; a replaced/removed tab drops silently.
+        if let Some(tab) = app.graph.take_attachment_open(&outcome.token)
+            && app.workspace.tab(&tab).is_some_and(|session| {
+                session.interaction().incarnation == outcome.token.incarnation
+            })
         {
             match &outcome.result {
                 ContextQueryResult::AttachmentOpen(Ok(path)) => {
@@ -519,7 +541,10 @@ pub fn handle(app: &mut App, message: crate::app::Message) -> iced::Task<crate::
             match doc.links.get(&start).cloned() {
                 Some(flavite_api::ReadLink::Note { path, anchor }) => {
                     if let Ok(locator) = flavite_workspace::NoteLocator::from_relative(&path) {
-                        app.request_open(locator.clone(), None);
+                        app.open_intent(crate::host::open_intents::OpenIntent::reuse(
+                            locator.clone(),
+                            Some(tab),
+                        ));
                         if let Some(anchor) = anchor {
                             app.reading.navigation.insert(locator, anchor);
                             sync(app);
@@ -596,7 +621,10 @@ pub fn handle(app: &mut App, message: crate::app::Message) -> iced::Task<crate::
                     app.reading.pending_anchor.insert(target, byte);
                 }
             } else if let Ok(locator) = flavite_workspace::NoteLocator::from_relative(&doc.path) {
-                app.request_open(locator, None);
+                app.open_intent(crate::host::open_intents::OpenIntent::reuse(
+                    locator,
+                    Some(tab),
+                ));
             }
         }
         Message::StructureEdit {

@@ -8,8 +8,8 @@
 
 use crate::app::{App, Message};
 use crate::host::dialogs::Dialog;
-use flavite_api::BufferStatus as BufferState;
 use flavite_api::ExecutionResult;
+use flavite_buffer::state::BufferState;
 use flavite_workspace::{LayoutAction, TabId};
 use iced::Task;
 

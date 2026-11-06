@@ -98,3 +98,36 @@ fn vault_changed_pulses_coalesce_and_converge_to_a_fresh_page() {
         ) && app.catalog().len() == 4
     });
 }
+
+#[test]
+fn rich_candidates_and_link_verdicts_reach_the_matching_editor_revision() {
+    let (mut app, _fs, _cache) = fixture_with(&[
+        ("source.md", "[[Target alias]] and [[missing]].\n"),
+        (
+            "target.md",
+            "---\ntitle: Target\naliases: [Target alias]\n---\nTarget body.\n",
+        ),
+    ]);
+    let _ = app.update(Message::RunCoreCommand("vault.reconcile"));
+    wait_for(&mut app, "initial reconciliation", |app| {
+        app.pending_operations() == 0
+    });
+    let _ = app.update(Message::RefreshCatalog);
+    wait_for(&mut app, "rich catalog", |app| {
+        matches!(app.catalog_status(), CatalogStatus::Ready { .. })
+    });
+    assert!(app.editor_candidates().iter().any(|candidate| {
+        candidate
+            .aliases
+            .iter()
+            .any(|alias| alias == "Target alias")
+    }));
+    let tab = open_note(&mut app, "source.md");
+    let incarnation = app.notes.incarnation(tab).unwrap();
+    let view = app.note_editor_view(tab).unwrap();
+    wait_for(&mut app, "canonical editor link verdicts", |app| {
+        let verdicts = app.editor_link_resolutions(tab, incarnation, view.buffer_id, view.revision);
+        verdicts.get("target alias") == Some(&flavite_editor::LinkResolution::Resolved)
+            && verdicts.get("missing") == Some(&flavite_editor::LinkResolution::Unresolved)
+    });
+}

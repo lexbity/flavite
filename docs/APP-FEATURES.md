@@ -116,18 +116,34 @@ The graph view is a first-class workspace tab over the note-link network:
   geometry. Backend selection: [SETUP.md → Graph backend](SETUP.md#graph-backend).
 - **Camera**: pan and cursor-anchored wheel zoom (clamped); the camera
   follows auto-layout until you take control with a pan/zoom.
-- **Click semantics**: single click selects; double-click on the same node
-  opens it — or inserts a link to it at the remembered caret, per the
-  writing target; background click clears selection.
+- **Click semantics** (amended by RFC-0006 D-02): single click selects and
+  shows the node's actions in a reserved overlay band — the canvas never
+  shifts for selecting, deselecting, or inspecting occurrences;
+  double-click on the same node or Enter **opens** it through the shared
+  destination policy (a visible matching view is reused, otherwise a new
+  tab lands in the last-used document group and the graph stays visible
+  when geometry permits); Ctrl+Enter or Insert is the only link-insertion
+  path, always at the acknowledged caret; background click clears
+  selection; node drags move spatially and never open or insert;
+  multi-selected notes offer Open-in-tabs (max 20 per invocation, native
+  key order).
 - **Node drag** with a drag preview; **pins** are vault user state, shared
   across graph views, persisted in `<vault>/.flavite/graph.json`.
 - **Filters**: neighborhood depth, direction, attachments, unresolved,
   embeds, match-any, negate — with Apply / Clear / Undo.
 - **List mode** (`graph.list`): the same graph as keyboard-navigable rows,
-  truncated with a notice past 50 rows.
+  with the same Open/Insert intents as the pointer, truncated with a
+  notice past 50 rows.
+- **Non-note targets**: activating an attachment node drives the existing
+  local attachment inspector (core-validated open; an unsupported file
+  types its refusal); an unresolved link offers explicit Create (the
+  prefilled new-note dialog) or Locate (the prefilled picker) — navigation
+  never creates a note.
 - **Provenance**: the header shows base counts and the writing-target line
-  before any double-click insertion; the footer reports staleness
-  ("Frame stale — insertion disabled") and scope problems.
+  before any explicit insertion; the footer labels a pending frame
+  "Updating" (navigation survives the gesture hold; insertion waits for
+  the paired frame), reports staleness ("Frame stale — insertion
+  disabled") and scope problems.
 - **Link removal**: inspect an occurrence, choose, open, prepare, confirm —
   always showing source→target and Saved/Unsaved provenance.
 

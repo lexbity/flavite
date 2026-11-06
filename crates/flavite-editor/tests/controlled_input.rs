@@ -6,7 +6,8 @@
 //! tab role. The host owns acknowledged state; a stale runtime event can
 //! never overwrite a newer host acknowledgement or move document text.
 
-use flavite_api::{BufferStatus, BufferView};
+use flavite_api::BufferView;
+use flavite_buffer::state::BufferState;
 use flavite_editor::{
     EditorAction, EditorInteractionSnapshot as Snapshot, EditorView, EditorWidget, focus_editor,
     inspect_focused_editor, set_focused_editor_selection,
@@ -24,7 +25,7 @@ fn view(text: &str, buffer_id: u64) -> BufferView {
         revision: 11,
         text: text.to_owned(),
         base_hash: Vec::new(),
-        state: BufferStatus::Clean,
+        state: BufferState::Clean,
         path: std::path::PathBuf::from("note.md"),
         source_format: flavite_api::SourceFormat::utf8(),
     }

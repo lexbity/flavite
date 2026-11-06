@@ -13,15 +13,27 @@ use flavite_workspace::{NoteLocator, TabId, ViewKind};
 use std::time::{Duration, Instant};
 
 pub fn fixture() -> (App, MemFs, tempfile::TempDir) {
+    fixture_with(&[
+        ("source.md", "See [[target]] here.\n"),
+        ("other.md", "See [[target]] too.\n"),
+        ("target.md", "Target note.\n"),
+    ])
+}
+
+/// The same real UI/Session/index fixture over caller-supplied notes.
+pub fn fixture_with(notes: &[(&str, &str)]) -> (App, MemFs, tempfile::TempDir) {
     let fs = MemFs::new();
     let root = std::path::PathBuf::from("/test/context-routing");
     fs.create_dir_all(&root).unwrap();
-    fs.write_new(&root.join("source.md"), b"See [[target]] here.\n")
-        .unwrap();
-    fs.write_new(&root.join("other.md"), b"See [[target]] too.\n")
-        .unwrap();
-    fs.write_new(&root.join("target.md"), b"Target note.\n")
-        .unwrap();
+    for (name, body) in notes {
+        let path = root.join(name);
+        if let Some(parent) = path.parent()
+            && parent != root
+        {
+            fs.create_dir_all(parent).unwrap();
+        }
+        fs.write_new(&path, body.as_bytes()).unwrap();
+    }
     let cache = tempfile::tempdir().unwrap();
     let db = cache.path().join("context-index.sqlite3");
     drop(flavite_index::open_or_init(&db).unwrap());
@@ -80,9 +92,10 @@ pub fn wait_for(app: &mut App, what: &str, predicate: impl Fn(&App) -> bool) {
 
 pub fn open_note(app: &mut App, name: &str) -> TabId {
     let group = app.focused_group().unwrap();
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator: NoteLocator::from_components([name]).unwrap(),
-        group: Some(group),
+        group,
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     while app.notes.any_pending() && Instant::now() < deadline {

@@ -8,9 +8,11 @@
 //! set, so a capture on either backend proves the same behavior.
 //!
 //! Persistent affordances (§13.1/D-05): the header always shows the base
-//! counts, provenance, and the writing-target line, so a double-click's
-//! destination is visible before it happens. A missing target gets an
-//! explanation and a repair action, never a hidden fallback.
+//! counts, provenance, and the writing-target line, so an explicit
+//! insertion's destination is visible before it happens. D-02: a
+//! double-click **opens** a node; only Ctrl+Enter/Insert places a link.
+//! A missing target gets an explanation and a repair action, never a
+//! hidden fallback.
 
 use std::sync::Arc;
 
@@ -50,6 +52,30 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
     };
 
     let header = header(app, tab, state);
+    // AC-4 (D-02): selecting, deselecting, and inspecting occurrence
+    // details change the canvas bounds by zero logical pixels. Selection
+    // actions and occurrence details are overlays pinned *over* the
+    // canvas (D-02's sanctioned overlay band), so the canvas geometry is
+    // structurally independent of their content.
+    let mut activity_overlay = column![
+        container(selection_band(app, tab, state))
+            .width(Length::Fill)
+            .style(style::toolbar),
+        container(
+            scrollable(crate::host::occurrences::view(app, tab))
+                .width(Length::Fill)
+                .height(Length::Fixed(band_row_height(metrics) * 3.0)),
+        )
+        .width(Length::Fill)
+        .style(style::toolbar),
+    ]
+    .width(Length::Fill);
+    // D-02: the first upgraded launch explains the changed gesture exactly
+    // once, dismissibly, inside the same overlay — the network never
+    // moves for it.
+    if app.appearance.graph_activation_notice_pending() {
+        activity_overlay = activity_overlay.push(activation_notice(app, tab));
+    }
     let body: Element<'a, Message> = if state.filter.expanded {
         scrollable(crate::graph::filters::view(app, tab))
             .height(Length::Fill)
@@ -58,24 +84,76 @@ pub fn view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         match &state.geometry {
             None => unavailable(app, tab, state),
             Some(geometry) if state.list_mode => list_body(app, tab, state, geometry),
-            Some(geometry) => visual_body(app, tab, incarnation, state, geometry),
+            Some(geometry) => visual_body(
+                app,
+                tab,
+                incarnation,
+                state,
+                geometry,
+                Some(activity_overlay.into()),
+            ),
         }
     };
     column![
         header,
         target_banner(app),
-        crate::host::occurrences::view(app, tab),
         container(body).width(Length::Fill).height(Length::Fill),
-        footer(app, tab, state),
+        // AC-4: the footer sits in a fixed clipped line — its text may
+        // change with selection/scope, its height may never.
+        container(footer(app, tab, state))
+            .width(Length::Fill)
+            .height(Length::Fixed(band_row_height(metrics)))
+            .clip(true),
     ]
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
 }
 
-/// The persistent writing-target affordance (D-05): the double-click
+/// The dismissible D-02 gesture-contract explanation: the first upgraded
+/// launch shows it once; acknowledging persists the device preference.
+fn activation_notice<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
+    let metrics = app.appearance.metrics();
+    container(bounds_obs::observe(
+        container(row![
+            text(
+                "Changed: double-click now opens a note. Inserting a link is explicit — press Ctrl+Enter or use Insert.",
+            )
+            .size(metrics.text_sm)
+            .width(Length::Fill),
+            button(text("Got it").size(metrics.text_sm))
+                .padding(tab_strip::chip_padding())
+                .style(style::action())
+                .on_press(Message::Preferences(
+                    crate::host::appearance::PreferenceMessage::AcknowledgeGraphActivation,
+                )),
+        ]
+        .spacing(metrics.spacing)
+        .align_y(alignment::Vertical::Center))
+        .width(Length::Fill)
+        .padding(Padding {
+            top: 4.0,
+            bottom: 4.0,
+            left: metrics.spacing,
+            right: metrics.spacing,
+        })
+        .style(style::toolbar),
+        move |rect| Message::GraphNoticeBounds(tab, rect),
+    ))
+    .width(Length::Fill)
+    .into()
+}
+
+/// One overlay row height: a compact action row that never changes with
+/// its content (AC-4). Deterministic in the metrics.
+fn band_row_height(metrics: crate::style::Metrics) -> f32 {
+    metrics.text_sm * 1.5 + metrics.spacing_sm
+}
+
+/// The persistent writing-target affordance (D-05): the insertion
 /// destination is visible before it happens; a missing target gets an
-/// explanation, never a hidden fallback.
+/// explanation, never a hidden fallback. D-02 (S04): double-click opens;
+/// insertion is only the explicit Ctrl+Enter/Insert intent.
 fn target_banner<'a>(app: &'a App) -> Element<'a, Message> {
     let metrics = app.appearance.metrics();
     let banner: Element<'a, Message> = if let Some((tab, ..)) = app.valid_writing_target() {
@@ -86,7 +164,7 @@ fn target_banner<'a>(app: &'a App) -> Element<'a, Message> {
         row![
             text("Insert links into:").size(metrics.text_sm),
             text(title).size(metrics.text_sm).style(style::dim_text),
-            text("— double-click a note node to insert its link")
+            text("— Ctrl+Enter or Insert places a link; double-click opens the node")
                 .size(metrics.text_sm)
                 .style(style::dim_text),
         ]
@@ -94,7 +172,7 @@ fn target_banner<'a>(app: &'a App) -> Element<'a, Message> {
         .align_y(alignment::Vertical::Center)
         .into()
     } else {
-        text("No insertion target — click in an editor to place the cursor; double-click insertion is disabled")
+        text("No insertion target — click in an editor to place the cursor; explicit insertion is disabled (double-click opens, it never inserts)")
             .size(metrics.text_sm)
             .style(style::dim_text)
             .into()
@@ -280,71 +358,137 @@ fn header<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Me
             GraphCommand::RetryService,
             matches!(app.graph.status, Some(GraphServiceStatus::Failed { .. })),
         ));
-    let mut chrome = column![
-        container(toolbar)
+    container(toolbar)
+        .width(Length::Fill)
+        .padding(Padding {
+            top: 4.0,
+            bottom: 4.0,
+            left: metrics.spacing,
+            right: metrics.spacing,
+        })
+        .style(style::toolbar)
+        .into()
+}
+
+/// The reserved selection band (AC-4): identity, summary, and the typed
+/// actions. Empty with a stable height when nothing is selected — the
+/// canvas geometry never notices a selection change (D-02). Chip
+/// availability comes from the same predicates the commands enforce
+/// (FR-15), so no surface can offer what the core would refuse.
+fn selection_band<'a>(app: &'a App, tab: TabId, state: &GraphTabState) -> Element<'a, Message> {
+    let metrics = app.appearance.metrics();
+    let Some(hit) = state.selection else {
+        return iced::widget::Space::new()
             .width(Length::Fill)
-            .padding(Padding {
-                top: 4.0,
-                bottom: 4.0,
-                left: metrics.spacing,
-                right: metrics.spacing,
-            })
-            .style(style::toolbar)
+            .height(Length::Fixed(0.0))
+            .into();
+    };
+    let record = graph::record_for(app, hit.id);
+    let selection = record
+        .as_ref()
+        .map(|record| {
+            let kind = match record.id.kind {
+                flavite_graph::NodeKind::Note => "note",
+                flavite_graph::NodeKind::Attachment => "attachment",
+                flavite_graph::NodeKind::Unresolved => "unresolved",
+            };
+            format!(
+                "Selected: {} [{}] · {}{}",
+                record.title,
+                kind,
+                record.path,
+                if state
+                    .scope_result
+                    .as_ref()
+                    .is_some_and(|scope| !scope.nodes.contains(&hit.id))
+                {
+                    " · outside current scope"
+                } else {
+                    ""
+                }
+            )
+        })
+        .unwrap_or_else(|| "Selected".into());
+    let summary = if state.selection_summary.is_empty() {
+        format!("{} selected", state.selected_nodes.len())
+    } else {
+        state.selection_summary.clone()
+    };
+    let chip = |label: &'static str, command: GraphCommand, enabled: bool| {
+        button(text(label).size(metrics.text_sm))
+            .padding(tab_strip::chip_padding())
+            .style(style::ghost())
+            .on_press_maybe(enabled.then_some(Message::GraphCommand { tab, command }))
+    };
+    let action_chip = |label: &'static str, message: Message, enabled: bool| {
+        button(text(label).size(metrics.text_sm))
+            .padding(tab_strip::chip_padding())
+            .style(style::ghost())
+            .on_press_maybe(enabled.then_some(message))
+    };
+    let locator = record.as_ref().and_then(graph::locator_for);
+    let mut band = row![
+        text(selection).size(metrics.text_sm).style(style::dim_text),
+        text(summary).size(metrics.text_sm).style(style::dim_text),
+        iced::widget::Space::new()
+            .width(Length::Fill)
+            .height(Length::Fixed(0.0)),
     ]
-    .spacing(2);
-    if state.selection.is_some() {
-        let selection = state
-            .selection
-            .and_then(|hit| graph::record_for(app, hit.id).map(|record| (hit, record)))
-            .map(|(hit, record)| {
-                format!(
-                    "Selected: {} [{}] · {}{}",
-                    record.title,
-                    if hit.kind == flavite_graph::NodeKind::Attachment {
-                        "attachment"
-                    } else {
-                        "note"
-                    },
-                    record.path,
-                    if state
-                        .scope_result
-                        .as_ref()
-                        .is_some_and(|scope| !scope.nodes.contains(&hit.id))
-                    {
-                        " · outside current scope"
-                    } else {
-                        ""
-                    }
-                )
-            })
-            .unwrap_or_else(|| "Selected".into());
-        let summary = if state.selection_summary.is_empty() {
-            format!("{} selected", state.selected_nodes.len())
-        } else {
-            state.selection_summary.clone()
-        };
-        chrome = chrome.push(
-            row![
-                text(selection).size(metrics.text_sm).style(style::dim_text),
-                text(summary).size(metrics.text_sm).style(style::dim_text),
-                iced::widget::Space::new()
-                    .width(Length::Fill)
-                    .height(Length::Fixed(0.0)),
-                chip("Open (Enter)", GraphCommand::OpenSelected, true),
-                chip(
+    .spacing(metrics.spacing)
+    .align_y(alignment::Vertical::Center);
+    // D-02: every node kind gets its own explicit intent and nothing else
+    // is offered — a resolved note opens (and can be inserted into), an
+    // attachment activates the existing local inspector, and an unresolved
+    // target offers Create-or-Locate without ever creating implicitly.
+    match record.as_ref().map(|record| record.id.kind) {
+        Some(flavite_graph::NodeKind::Note) if locator.is_some() => {
+            band = band
+                .push(chip("Open (Enter)", GraphCommand::OpenSelected, true))
+                .push(chip(
                     "Insert link (Ctrl+Enter)",
                     GraphCommand::InsertSelected,
-                    true
-                ),
-                chip("Unpin", GraphCommand::UnpinSelected, true),
-                chip("Reveal", GraphCommand::RevealSelected, true),
-                chip("Clear", GraphCommand::ClearSelection, true),
-            ]
-            .spacing(metrics.spacing)
-            .align_y(alignment::Vertical::Center),
-        );
+                    graph::insert_available(app, tab),
+                ));
+        }
+        Some(flavite_graph::NodeKind::Attachment) => {
+            band = band.push(chip(
+                "Open attachment (Enter)",
+                GraphCommand::OpenSelected,
+                true,
+            ));
+        }
+        Some(flavite_graph::NodeKind::Unresolved) => {
+            let representable = record
+                .as_ref()
+                .is_some_and(graph::unresolved_is_representable);
+            band = band
+                .push(action_chip(
+                    "Create note…",
+                    Message::CreateFromNode(tab),
+                    representable,
+                ))
+                .push(action_chip(
+                    "Locate note",
+                    Message::LocateFromNode(tab),
+                    true,
+                ));
+        }
+        _ => {}
     }
-    chrome.into()
+    band = band
+        .push(chip(
+            "Open in tabs",
+            GraphCommand::OpenSelectedInTabs,
+            state.selected_nodes.len() > 1,
+        ))
+        .push(chip("Unpin", GraphCommand::UnpinSelected, record.is_some()))
+        .push(chip(
+            "Reveal",
+            GraphCommand::RevealSelected,
+            record.is_some(),
+        ))
+        .push(chip("Clear", GraphCommand::ClearSelection, true));
+    band.into()
 }
 
 /// Honest loading/error states before any frame exists (§13.4). The graph
@@ -421,6 +565,7 @@ fn visual_body<'a>(
     incarnation: u64,
     state: &GraphTabState,
     geometry: &Arc<RenderGeometry>,
+    activity_overlay: Option<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     let metrics = app.appearance.metrics();
     let key = state.geometry_key.expect("mounted geometry has a version");
@@ -532,6 +677,19 @@ fn visual_body<'a>(
     .align_x(alignment::Horizontal::Right)
     .align_y(alignment::Vertical::Bottom);
     let surface: Element<'a, Message> = iced::widget::stack![surface, fit_control].into();
+    // Selection actions, occurrence details, and the D-02 notice float
+    // over the top of the canvas: their content changes never touch the
+    // canvas bounds (AC-4).
+    let surface: Element<'a, Message> = if let Some(overlay) = activity_overlay {
+        let pinned = container(overlay)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(alignment::Horizontal::Center)
+            .align_y(alignment::Vertical::Top);
+        iced::widget::stack![surface, pinned].into()
+    } else {
+        surface
+    };
     bounds_obs::observe(
         container(surface).width(Length::Fill).height(Length::Fill),
         move |rect| Message::GraphBounds(tab, rect),
@@ -617,14 +775,22 @@ fn list_body<'a>(
             button(text("Open").size(metrics.text_sm))
                 .padding(tab_strip::chip_padding())
                 .style(style::action())
-                .on_press_maybe((record.id.kind == flavite_graph::NodeKind::Note).then_some(
-                    Message::GraphNodeCommand {
+                // D-02: every node kind's Open does something honest — a
+                // resolved note navigates, an attachment opens the local
+                // inspector, an unresolved target presents Create/Locate.
+                // A blocked or unrepresentable path gets no dead control.
+                .on_press_maybe(
+                    (locator.is_some()
+                        || record.id.kind == flavite_graph::NodeKind::Attachment
+                        || (record.id.kind == flavite_graph::NodeKind::Unresolved
+                            && graph::unresolved_is_representable(record)))
+                    .then_some(Message::GraphNodeCommand {
                         tab,
                         incarnation,
                         key,
                         command: GraphCommand::Open(id),
-                    }
-                ),),
+                    }),
+                ),
             button(text("Insert").size(metrics.text_sm))
                 .padding(tab_strip::chip_padding())
                 .style(style::action())
@@ -647,7 +813,7 @@ fn list_body<'a>(
         )
     } else {
         format!(
-            "{} current nodes · double-click or Insert places a link at the writing target",
+            "{} current nodes · Enter/double-click opens · Ctrl+Enter or Insert places a link at the writing target",
             geometry.node_count()
         )
     };

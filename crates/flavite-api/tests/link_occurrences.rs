@@ -119,7 +119,7 @@ fn removes_one_saved_crlf_occurrence_keeps_other_occurrences_prose_and_reciproca
         f.flavite
             .execute(Invocation::new(
                 next_id(&f.flavite),
-                "undo",
+                "buffer.undo",
                 serde_json::json!({"buffer_id":id,"revision":view.revision}),
                 Origin::Gui
             ))
@@ -203,7 +203,7 @@ fn insertion_and_removal_are_independent_undo_units_amid_adjacent_typing() {
         f.flavite
             .execute(Invocation::new(
                 next_id(&f.flavite),
-                "undo",
+                "buffer.undo",
                 serde_json::json!({"buffer_id":id,"revision":revision}),
                 Origin::Gui
             ))

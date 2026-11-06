@@ -26,23 +26,31 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
             if app.is_tab_visible(tab) && app.note_search.finds.contains_key(&tab) =>
         {
             match (request.action, request.data) {
-                (Action::SetValue, Some(ActionData::Value(value))) => Some(Message::FindQuery {
-                    tab,
-                    query: value.into(),
-                }),
-                (Action::Focus, _) => Some(Message::FindOpen(tab)),
+                (Action::SetValue, Some(ActionData::Value(value))) => Some(Message::NoteSearch(
+                    crate::host::note_search::NoteSearchMessage::FindQuery {
+                        tab,
+                        query: value.into(),
+                    },
+                )),
+                (Action::Focus, _) => Some(Message::NoteSearch(
+                    crate::host::note_search::NoteSearchMessage::FindOpen(tab),
+                )),
                 _ => None,
             }
         }
         NodeTarget::FindNext { tab, forward }
             if request.action == Action::Click && app.is_tab_visible(tab) =>
         {
-            Some(Message::FindNext { tab, forward })
+            Some(Message::NoteSearch(
+                crate::host::note_search::NoteSearchMessage::FindNext { tab, forward },
+            ))
         }
         NodeTarget::FindClose(tab)
             if request.action == Action::Click && app.is_tab_visible(tab) =>
         {
-            Some(Message::FindClose(tab))
+            Some(Message::NoteSearch(
+                crate::host::note_search::NoteSearchMessage::FindClose(tab),
+            ))
         }
         NodeTarget::ReplaceInput(tab)
             if app.is_tab_visible(tab) && app.note_search.replaces.contains_key(&tab) =>
@@ -172,12 +180,12 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
             NodeTarget::CloseTab(tab) if request.action == Action::Click => {
                 Some(Message::CloseTab(tab))
             }
-            NodeTarget::OpenNote(path) if request.action == Action::Click => {
-                Some(Message::OpenNote {
-                    locator: flavite_workspace::NoteLocator::from_relative(&path).ok()?,
-                    group: None,
-                })
-            }
+            NodeTarget::OpenNote(path) if request.action == Action::Click => Some(
+                Message::OpenIntent(crate::host::open_intents::OpenIntent::reuse(
+                    flavite_workspace::NoteLocator::from_relative(&path).ok()?,
+                    None,
+                )),
+            ),
             NodeTarget::OpenPicker => Some(Message::PickerOpen),
             NodeTarget::OpenPalette => Some(Message::PaletteOpen),
             NodeTarget::MenuClose => Some(Message::MenuClose),

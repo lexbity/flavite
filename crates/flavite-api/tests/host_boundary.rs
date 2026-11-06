@@ -7,10 +7,11 @@
 //! for unrelated buffers.
 
 use flavite_api::{
-    BufferStatus, ExecutionResult, Flavite, Invocation, LocalResult, Origin, Preconditions,
-    RejectionReason, VaultConfig,
+    ExecutionResult, Flavite, Invocation, LocalResult, Origin, Preconditions, RejectionReason,
+    VaultConfig,
 };
 use flavite_buffer::manager::BufferManager;
+use flavite_buffer::state::BufferState;
 use flavite_fs::Fs;
 
 mod support;
@@ -116,7 +117,7 @@ fn typed_status_and_read_only_policy_reject_misleading_callers() {
         .flavite
         .get_buffer_view(flavite_buffer::BufferId::from(buffer_id), None)
         .expect("view");
-    assert!(matches!(view.state, BufferStatus::Clean));
+    assert!(matches!(view.state, BufferState::Clean));
 
     // The write policy is a vault property: a read-only vault rejects every
     // write even when the caller omits `requires_write` or spoofs other
@@ -182,7 +183,7 @@ fn typed_status_and_read_only_policy_reject_misleading_callers() {
         .get_buffer_view(flavite_buffer::BufferId::from(buffer_id), None)
         .expect("view");
     assert_eq!(view.text, "hello");
-    assert!(matches!(view.state, BufferStatus::Clean));
+    assert!(matches!(view.state, BufferState::Clean));
 }
 
 #[test]
@@ -299,7 +300,7 @@ fn stalled_open_reader_does_not_block_unrelated_edits_undo_and_saves() {
     );
     let undo = Invocation::new(
         7,
-        "undo",
+        "buffer.undo",
         serde_json::json!({ "buffer_id": buffer_a, "revision": revision_a + 1 }),
         Origin::Gui,
     );
@@ -312,7 +313,7 @@ fn stalled_open_reader_does_not_block_unrelated_edits_undo_and_saves() {
 
     let redo = Invocation::new(
         8,
-        "redo",
+        "buffer.redo",
         serde_json::json!({ "buffer_id": buffer_a, "revision": revision_a + 2 }),
         Origin::Gui,
     );

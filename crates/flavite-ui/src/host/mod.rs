@@ -18,6 +18,7 @@ pub mod linking;
 pub mod navigation;
 pub mod note_search;
 pub mod occurrences;
+pub mod open_intents;
 pub mod persistence;
 pub mod shell;
 pub mod shutdown;

@@ -88,9 +88,10 @@ fn pump_to_exit(app: &mut App, what: &str) -> iced::Task<Message> {
 
 fn open_note(app: &mut App, name: &str) -> TabId {
     let group = app.focused_group().unwrap();
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator: NoteLocator::from_components([name]).unwrap(),
-        group: Some(group),
+        group,
     });
     wait_ready(app);
     app.workspace.focused_tab()
@@ -220,7 +221,7 @@ fn quit_with_dirty_note_requires_a_decision_first() {
     type_into(&mut app, alpha, " unsaved edit");
     assert_eq!(
         app.note_buffer_state(alpha),
-        Some(flavite_api::BufferStatus::Dirty),
+        Some(flavite_buffer::state::BufferState::Dirty),
         "the edit dirtied the buffer"
     );
     let revision = app.workspace.revision();
@@ -254,7 +255,7 @@ fn quit_with_dirty_note_requires_a_decision_first() {
     );
     assert_eq!(
         app.note_buffer_state(alpha),
-        Some(flavite_api::BufferStatus::Dirty),
+        Some(flavite_buffer::state::BufferState::Dirty),
         "the unsaved edit is intact"
     );
 }

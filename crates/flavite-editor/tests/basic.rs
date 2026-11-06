@@ -19,7 +19,7 @@ fn view() -> EditorView {
         revision: 7,
         text: "hello".into(),
         path: PathBuf::from("note.md"),
-        state: flavite_api::BufferStatus::Dirty,
+        state: flavite_buffer::state::BufferState::Dirty,
     }
 }
 

@@ -50,7 +50,7 @@ fn guarded_property_patch_preserves_crlf_bom_comments_quotes_and_standalone_undo
     assert!(
         edit(
             &f,
-            "undo",
+            "buffer.undo",
             serde_json::json!({"buffer_id":id,"revision":revision})
         )
         .is_success()
@@ -60,7 +60,7 @@ fn guarded_property_patch_preserves_crlf_bom_comments_quotes_and_standalone_undo
     assert!(
         edit(
             &f,
-            "redo",
+            "buffer.redo",
             serde_json::json!({"buffer_id":id,"revision":revision})
         )
         .is_success()

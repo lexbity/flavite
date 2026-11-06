@@ -13,7 +13,7 @@
 //! stable-ID pin keys. Conflicted notes use native path pins.
 
 use crate::channels::{Notice, NoticeChannel};
-use flavite_index::types::NoteRef as IndexNoteRef;
+use flavite_index::types::NoteRef;
 use std::collections::{HashMap, HashSet};
 
 /// Information about a duplicate stable ID conflict.
@@ -22,9 +22,9 @@ pub struct DuplicateIdInfo {
     /// The conflicting stable ID.
     pub stable_id: String,
     /// All index notes that share this stable ID.
-    pub index_notes: Vec<IndexNoteRef>,
+    pub index_notes: Vec<NoteRef>,
     /// The deterministic winner (lowest native PathKey in byte order).
-    pub winner: IndexNoteRef,
+    pub winner: NoteRef,
     /// Whether this conflict is new (just detected).
     pub is_new: bool,
 }
@@ -35,9 +35,9 @@ pub struct DuplicateIdResolution {
     /// The stable ID that was resolved.
     pub stable_id: String,
     /// The old notes that had this ID.
-    pub old_notes: Vec<IndexNoteRef>,
+    pub old_notes: Vec<NoteRef>,
     /// The new note that got a fresh ID.
-    pub new_note: IndexNoteRef,
+    pub new_note: NoteRef,
     /// The newly minted stable ID.
     pub new_stable_id: String,
 }
@@ -48,7 +48,7 @@ pub struct DuplicateIdManager {
     /// Track which stable IDs are currently in conflict.
     conflicted_ids: HashSet<String>,
     /// Track which stable IDs map to which index notes.
-    stable_id_notes: HashMap<String, Vec<IndexNoteRef>>,
+    stable_id_notes: HashMap<String, Vec<NoteRef>>,
 }
 
 impl DuplicateIdManager {
@@ -67,7 +67,7 @@ impl DuplicateIdManager {
 
         for note in notes {
             if let Some(stable_id) = &note.stable_id {
-                let note_ref = IndexNoteRef::new(note.note_id, note.path_native.clone());
+                let note_ref = NoteRef::new(note.note_id, note.path_native.clone());
 
                 // Track stable_id -> notes
                 self.stable_id_notes
@@ -89,7 +89,7 @@ impl DuplicateIdManager {
     ///
     /// Returns a map from each conflicting stable ID to its list of notes.
     #[must_use]
-    pub fn detect_duplicates(&self) -> HashMap<String, Vec<IndexNoteRef>> {
+    pub fn detect_duplicates(&self) -> HashMap<String, Vec<NoteRef>> {
         let mut result = HashMap::new();
 
         for (stable_id, notes) in &self.stable_id_notes {
@@ -106,7 +106,7 @@ impl DuplicateIdManager {
     /// The winner is the note with the lowest native PathKey in deterministic
     /// byte order. This rule is rebuild-stable.
     #[must_use]
-    pub fn get_winner(&self, stable_id: &str) -> Option<IndexNoteRef> {
+    pub fn get_winner(&self, stable_id: &str) -> Option<NoteRef> {
         self.stable_id_notes.get(stable_id).and_then(|notes| {
             if notes.len() > 1 {
                 // Find the note with the lowest path_native in byte order
@@ -161,7 +161,7 @@ impl DuplicateIdManager {
     pub fn resolve_duplicate(
         &mut self,
         stable_id: &str,
-        note_to_fix: &IndexNoteRef,
+        note_to_fix: &NoteRef,
         notice_channel: &NoticeChannel,
     ) -> Option<DuplicateIdResolution> {
         // Check if this is actually a conflict
@@ -205,7 +205,7 @@ impl DuplicateIdManager {
         // Send a notice about the resolution
         notice_channel.send(Notice::ActionRequired {
             code: "duplicate_id_resolved",
-            note: None, // We don't have a buffer NoteRef here, using index NoteRef
+            note: None, // We don't have a buffer NoteRef here, using an indexed note reference
         });
 
         Some(resolution)
@@ -361,8 +361,8 @@ mod tests {
         ));
     }
 
-    fn one_ref(note_id: i64) -> IndexNoteRef {
-        IndexNoteRef::new(note_id, format!("{note_id}.md").into_bytes())
+    fn one_ref(note_id: i64) -> NoteRef {
+        NoteRef::new(note_id, format!("{note_id}.md").into_bytes())
     }
 
     #[test]

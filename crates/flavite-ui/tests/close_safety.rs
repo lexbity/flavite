@@ -3,8 +3,9 @@
 //! queues, decision survival across layout moves, and the never-lose-work
 //! rule when a save fails (AC-W13).
 
-use flavite_api::{BufferStatus, VaultConfig};
+use flavite_api::VaultConfig;
 use flavite_buffer::manager::BufferManager;
+use flavite_buffer::state::BufferState;
 use flavite_editor::EditorAction;
 use flavite_fs::{Fs, MemFs};
 use flavite_index::IndexActor;
@@ -126,9 +127,10 @@ fn pump_until(app: &mut App, what: &str, predicate: impl Fn(&App) -> bool) {
 
 fn open_note(app: &mut App, name: &str) -> TabId {
     let group = app.focused_group().expect("a focused group");
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator: NoteLocator::from_components([name]).expect("locator"),
-        group: Some(group),
+        group,
     });
     wait_ready(app);
     let tab = app.workspace.focused_tab();
@@ -154,7 +156,7 @@ fn edit_note(app: &mut App, tab: TabId, suffix: &str) {
     });
     assert_eq!(
         app.note_buffer_state(tab),
-        Some(BufferStatus::Dirty),
+        Some(BufferState::Dirty),
         "the edit made the buffer dirty"
     );
 }
@@ -386,7 +388,7 @@ fn close_cancellation_keeps_the_workspace() {
     assert!(app.closing.is_none(), "the close plan was cancelled");
     assert_eq!(
         app.note_buffer_state(tab),
-        Some(BufferStatus::Dirty),
+        Some(BufferState::Dirty),
         "the buffer state is unchanged"
     );
     assert_eq!(
@@ -405,9 +407,10 @@ fn group_close_closes_clean_tabs_and_queues_dirty_decisions() {
     let Fixture { mut app, fs, .. } = fixture();
     let group = app.focused_group().expect("the boot group");
     let clean = open_note(&mut app, "alpha.md");
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator: NoteLocator::from_components(["beta.md"]).expect("locator"),
-        group: Some(group),
+        group,
     });
     wait_ready(&mut app);
     let dirty = app.workspace.focused_tab();
@@ -467,9 +470,10 @@ fn layout_switch_with_retained_dirty_document() {
     // a beta duplicate, so the move below has a real destination group.
     let group_a = app.focused_group().expect("the boot group");
     let alpha = open_note(&mut app, "alpha.md");
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator: NoteLocator::from_components(["beta.md"]).expect("locator"),
-        group: Some(group_a),
+        group: group_a,
     });
     wait_ready(&mut app);
     run_host(&mut app, "workspace.split_right");
@@ -577,7 +581,7 @@ fn failed_save_never_closes_the_final_view() {
     );
     assert_eq!(
         app.note_buffer_state(tab),
-        Some(BufferStatus::Conflicted),
+        Some(BufferState::Conflicted),
         "the buffer reports the disk conflict"
     );
 }

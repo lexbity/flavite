@@ -10,7 +10,7 @@ use flavite_ui::app::{App, Message};
 
 mod support;
 
-use support::{SeedNote, reconcile as support_reconcile, vault_stack};
+use support::{SeedNote, reconcile, vault_stack};
 
 use std::path::Path;
 
@@ -34,6 +34,7 @@ fn fixture() -> (App, std::sync::Arc<MemFs>, tempfile::TempDir) {
             },
         ],
     );
+    reconcile(&flavite);
     (App::from_flavite(flavite), fs, cache)
 }
 use flavite_workspace::TabId;
@@ -62,13 +63,18 @@ fn fixture_with_identity(
             },
         ],
     );
+    reconcile(&flavite);
     (App::from_flavite(flavite), fs, cache)
 }
 
 fn wait_for(app: &mut App, what: &str, predicate: impl Fn(&App) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !predicate(app) {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}; catalog status={:?}",
+            app.catalog_status()
+        );
         let _ = app.update(Message::Pump);
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -76,9 +82,10 @@ fn wait_for(app: &mut App, what: &str, predicate: impl Fn(&App) -> bool) {
 
 fn open_note(app: &mut App, name: &str) -> TabId {
     let group = app.focused_group().unwrap();
-    let _ = app.update(Message::OpenNote {
+    app.dispatch_layout(|revision| flavite_workspace::LayoutAction::OpenNote {
+        expected_revision: revision,
         locator: NoteLocator::from_components([name]).unwrap(),
-        group: Some(group),
+        group,
     });
     wait_for(app, "note ready", |app| !app.notes.any_pending());
     app.workspace.focused_tab()
@@ -126,7 +133,7 @@ fn restart_restores_groups_tabs_and_reports_missing_notes() {
         vec![4, 4, 4],
     ));
     let _ = restarted.update(Message::RunCoreCommand("vault.reconcile"));
-    wait_for(&mut restarted, "reconcile", |app| {
+    wait_for(&mut restarted, "vault.reconcile", |app| {
         app.pending_operations() == 0
     });
     let _ = restarted.update(Message::RefreshCatalog);
@@ -161,7 +168,7 @@ fn restart_restores_groups_tabs_and_reports_missing_notes() {
             },
         ],
     );
-    support_reconcile(&pre_attach);
+    reconcile(&pre_attach);
     pre_attach
         .write_user_state(UserStateKind::WorkspaceLayouts, 0, &stored.payload)
         .expect("seeded");

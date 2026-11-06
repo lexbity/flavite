@@ -139,8 +139,7 @@ impl NoteSearchHost {
     }
 }
 
-/// Messages for the note search host. The legacy `Message::Find*` variants
-/// map onto the `Find*` variants here at the routing site.
+/// Messages owned and handled by the note search host.
 #[derive(Debug, Clone)]
 pub enum NoteSearchMessage {
     FindOpen(TabId),

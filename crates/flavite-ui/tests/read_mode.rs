@@ -34,10 +34,12 @@ fn fixture() -> (
     (App::from_flavite(f.flavite), f.fs, f.root, f.cache)
 }
 fn open(app: &mut App) -> flavite_workspace::TabId {
-    let _ = app.update(Message::OpenNote {
-        locator: NoteLocator::from_components(["a.md"]).unwrap(),
-        group: None,
-    });
+    let _ = app.update(Message::OpenIntent(
+        flavite_ui::host::open_intents::OpenIntent::reuse(
+            NoteLocator::from_components(["a.md"]).unwrap(),
+            None,
+        ),
+    ));
     wait(app, |a| !a.notes.any_pending());
     app.workspace.focused_tab()
 }
@@ -85,7 +87,7 @@ fn same_tab_read_mode_current_dirty_text_guarded_task_undo_and_independent_dupli
     assert!(
         api.execute(flavite_api::Invocation::new(
             api.command_registry().next_request_id(),
-            "undo",
+            "buffer.undo",
             serde_json::json!({"buffer_id":now.buffer_id,"revision":now.revision}),
             flavite_api::Origin::Gui
         ))
