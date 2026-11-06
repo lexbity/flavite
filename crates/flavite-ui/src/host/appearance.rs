@@ -1,10 +1,13 @@
 //! Interface appearance host (RFC-0003 W11, D-11, D-15): device-local
-//! preferences, the resolved color scheme, scale-aware metrics, and
-//! preference persistence through the API user-state service.
+//! preferences, the resolved color scheme, scale-aware metrics, theme
+//! packages, and preference persistence through the API user-state
+//! service.
 
 use crate::preferences::{self, LineWidth, Preferences, ThemeChoice};
 use crate::style::{self, Metrics, Scheme};
-use flavite_api::{Flavite, UserStateKind};
+use flavite_api::{Flavite, InstalledTheme, UserStateKind};
+use flavite_theme::{SemanticTheme, ThemeImage};
+use std::time::Instant;
 
 /// Preference edit messages, routed through the host catalog (D-16).
 #[derive(Debug, Clone)]
@@ -42,6 +45,16 @@ pub enum PreferenceMessage {
     },
     /// Clear every chord override.
     RestoreShortcuts,
+    /// Select an installed theme package (`None` restores the built-in
+    /// palettes). The selection is a device preference like `theme`.
+    SetThemePackage(Option<String>),
+    /// Open the native file dialog to pick a standard `.xpi` package.
+    ThemeInstallPick,
+    /// Convert and install the package at this path (the dialog result or
+    /// an explicitly typed path).
+    ThemeInstallFromPath(std::path::PathBuf),
+    /// Remove an installed theme package.
+    ThemeUninstall(String),
 }
 
 /// The resolved appearance state for the shell.
@@ -66,7 +79,107 @@ pub struct AppearanceHost {
     /// The resolved chord table: default chords with any validated
     /// overrides applied. Rebuilt on every preference refresh.
     pub shortcuts: Vec<(flavite_api::Chord, &'static str)>,
+    /// The loaded theme package, when one is selected and loads.
+    pub theme_package: Option<ThemePackage>,
+    /// The installed theme packages, for the preferences surface.
+    pub installed_themes: Vec<InstalledTheme>,
+    /// The last theme load/install/uninstall failure, surfaced in the
+    /// status line.
+    pub theme_error: Option<String>,
+    /// The animation frame index into the active theme frame sequence.
+    frame_index: usize,
+    /// When the current animation frame was first painted.
+    frame_started: Option<Instant>,
     metrics: Metrics,
+}
+
+/// A loaded theme package: both scheme variants and the decoded header
+/// images, with the image handles built once per load.
+#[derive(Debug, Clone)]
+pub struct ThemePackage {
+    /// The theme identity.
+    pub id: String,
+    /// The theme display name.
+    pub name: String,
+    /// The base (light) mapping.
+    pub light: SemanticTheme,
+    /// The `dark_theme` mapping, when the package supplies one.
+    pub dark: Option<SemanticTheme>,
+    /// The header frames (base variant), with iced handles.
+    pub frames: Option<ThemeFrames>,
+    /// The header frames (dark variant), when the package supplies them.
+    pub dark_frames: Option<ThemeFrames>,
+    /// The conversion warnings of the loaded package (dropped keys and
+    /// parse fallbacks), surfaced in the preferences dialog.
+    pub warnings: Vec<String>,
+}
+
+/// Decoded header frames plus the iced image handles for them.
+#[derive(Debug, Clone)]
+pub struct ThemeFrames {
+    /// Frame size in pixels (all frames share it).
+    pub width: u32,
+    /// Frame height in pixels.
+    pub height: u32,
+    /// Per-frame delay in milliseconds.
+    pub delays_ms: Vec<u32>,
+    /// One handle per frame, in display order.
+    handles: Vec<iced::widget::image::Handle>,
+}
+
+impl ThemeFrames {
+    /// Build handles from a decoded theme image. The pixel buffers are
+    /// owned by the handle (`Bytes::from_owner`), so the decoded image
+    /// can be dropped.
+    #[must_use]
+    pub fn from_image(image: &ThemeImage) -> Self {
+        let (width, height, delays_ms, buffers): (u32, u32, Vec<u32>, Vec<std::sync::Arc<[u8]>>) =
+            match image {
+                ThemeImage::Static {
+                    width,
+                    height,
+                    rgba,
+                } => (*width, *height, vec![0], vec![rgba.clone()]),
+                ThemeImage::Animated {
+                    width,
+                    height,
+                    frames,
+                } => (
+                    *width,
+                    *height,
+                    frames.iter().map(|frame| frame.delay_ms).collect(),
+                    frames.iter().map(|frame| frame.rgba.clone()).collect(),
+                ),
+            };
+        let handles = buffers
+            .into_iter()
+            .map(|pixels| {
+                iced::widget::image::Handle::from_rgba(
+                    width,
+                    height,
+                    iced::advanced::graphics::core::Bytes::from_owner(pixels),
+                )
+            })
+            .collect();
+        Self {
+            width,
+            height,
+            delays_ms,
+            handles,
+        }
+    }
+
+    /// The handle for one frame index (wrapping).
+    #[must_use]
+    pub fn handle(&self, index: usize) -> &iced::widget::image::Handle {
+        &self.handles[index % self.handles.len()]
+    }
+
+    /// Whether more than one frame exists.
+    #[must_use]
+    pub fn is_animated(&self) -> bool {
+        self.handles.len() > 1
+    }
 }
 
 impl AppearanceHost {
@@ -84,6 +197,11 @@ impl AppearanceHost {
             last_error: None,
             shortcut_error: None,
             shortcuts: Vec::new(),
+            theme_package: None,
+            installed_themes: Vec::new(),
+            theme_error: None,
+            frame_index: 0,
+            frame_started: None,
             metrics,
         };
         host.refresh();
@@ -138,10 +256,119 @@ impl AppearanceHost {
         }
     }
 
-    /// The resolved iced theme for the current scheme.
+    /// The resolved iced theme for the current scheme, with the selected
+    /// theme package's slots overlaid when one is loaded.
     #[must_use]
     pub fn theme(&self) -> iced::Theme {
-        style::theme(self.scheme())
+        style::theme_resolved(self.scheme(), self.theme_semantic())
+    }
+
+    /// The theme package's semantic slots for the current scheme: the
+    /// dark variant when the package supplies one and the scheme is dark.
+    #[must_use]
+    pub fn theme_semantic(&self) -> Option<&SemanticTheme> {
+        let package = self.theme_package.as_ref()?;
+        match self.scheme() {
+            Scheme::Dark => package.dark.as_ref().or(Some(&package.light)),
+            Scheme::Light => Some(&package.light),
+        }
+    }
+
+    /// The theme package header frames for the current scheme.
+    #[must_use]
+    pub fn theme_frames(&self) -> Option<&ThemeFrames> {
+        let package = self.theme_package.as_ref()?;
+        match self.scheme() {
+            Scheme::Dark => package.dark_frames.as_ref().or(package.frames.as_ref()),
+            Scheme::Light => package.frames.as_ref(),
+        }
+    }
+
+    /// The header handle for the current animation frame, `None` when no
+    /// package header is loaded for this scheme.
+    #[must_use]
+    pub fn theme_frame_handle(&self) -> Option<&iced::widget::image::Handle> {
+        let frames = self.theme_frames()?;
+        Some(frames.handle(self.frame_index))
+    }
+
+    /// Advance the header animation when its frame delay has elapsed.
+    /// Honors `reduced_motion` by never advancing; returns true when the
+    /// frame changed so the shell repaints.
+    pub fn tick_theme_animation(&mut self) -> bool {
+        let Some(frames) = self.theme_frames() else {
+            return false;
+        };
+        if !frames.is_animated() || self.prefs.reduced_motion {
+            return false;
+        }
+        let index = self.frame_index % frames.delays_ms.len();
+        let delay = frames.delays_ms[index];
+        let started = self.frame_started.unwrap_or_else(Instant::now);
+        if started.elapsed() < std::time::Duration::from_millis(u64::from(delay)) {
+            return false;
+        }
+        self.frame_index = (self.frame_index + 1) % frames.handles.len();
+        self.frame_started = Some(Instant::now());
+        true
+    }
+
+    /// Load the installed-theme list for the preferences surface.
+    pub fn reload_installed_themes(&mut self, flavite: &Flavite) {
+        self.installed_themes = flavite
+            .themes()
+            .map(|store| store.list().unwrap_or_default())
+            .unwrap_or_default();
+    }
+
+    /// Load the selected theme package. A missing or broken package is an
+    /// honest `theme_error` with the built-in palettes kept; the
+    /// selection itself is never cleared by a failed load, so a transient
+    /// store problem does not silently reset the preference (D-12 spirit).
+    pub fn reload_theme_package(&mut self, flavite: &Flavite) {
+        self.theme_error = None;
+        self.frame_index = 0;
+        self.frame_started = None;
+        let Some(id) = self.prefs.theme_package.clone() else {
+            self.theme_package = None;
+            return;
+        };
+        let Some(store) = flavite.themes() else {
+            self.theme_error =
+                Some("Theme packages are unavailable (no device data directory)".into());
+            return;
+        };
+        match store.load(&id) {
+            Ok(loaded) => {
+                let converted = &loaded.converted;
+                let dark = converted.dark.as_ref().map(|dark| dark.semantic);
+                self.theme_package = Some(ThemePackage {
+                    id: converted.id.clone(),
+                    name: converted.report.name.clone(),
+                    light: converted.light.semantic,
+                    dark,
+                    frames: converted.theme_frame.as_ref().map(ThemeFrames::from_image),
+                    dark_frames: converted
+                        .dark_theme_frame
+                        .as_ref()
+                        .map(ThemeFrames::from_image),
+                    warnings: converted.report.warnings.clone(),
+                });
+            }
+            Err(error) => {
+                self.theme_package = None;
+                self.theme_error = Some(format!("Theme {id:?} could not be loaded: {error}"));
+            }
+        }
+    }
+
+    /// Apply a theme-package selection; returns true when it changed.
+    pub fn set_theme_package(&mut self, id: Option<String>) -> bool {
+        if self.prefs.theme_package == id {
+            return false;
+        }
+        self.prefs.theme_package = id;
+        true
     }
 
     /// The scale-aware metrics for the current preferences.
@@ -365,6 +592,7 @@ impl crate::app::App {
         &mut self,
         update: PreferenceMessage,
     ) -> iced::Task<crate::app::Message> {
+        let selecting_package = matches!(update, PreferenceMessage::SetThemePackage(_));
         let changed = match update {
             PreferenceMessage::SetTheme(theme) => self.appearance.set_theme(theme),
             PreferenceMessage::SetScale(percent) => match self.appearance.set_scale(percent) {
@@ -430,11 +658,26 @@ impl crate::app::App {
             PreferenceMessage::AcknowledgeGraphActivation => {
                 self.appearance.acknowledge_graph_activation()
             }
+            PreferenceMessage::SetThemePackage(id) => self.appearance.set_theme_package(id),
+            PreferenceMessage::ThemeInstallPick => {
+                return crate::host::dialogs::pick_theme_file();
+            }
+            PreferenceMessage::ThemeInstallFromPath(path) => {
+                return self.install_theme_package(path);
+            }
+            PreferenceMessage::ThemeUninstall(id) => {
+                return self.uninstall_theme_package(id);
+            }
         };
         if !changed {
             return iced::Task::none();
         }
         self.appearance.refresh();
+        // A theme-package selection reloads the decoded package before
+        // persisting, so the very next frame paints with it.
+        if selecting_package && let Some(flavite) = self.flavite.as_ref() {
+            self.appearance.reload_theme_package(flavite);
+        }
         self.window_geometry_dirty = true;
         if let Some(flavite) = self.flavite.as_mut() {
             self.appearance.persist(flavite);
@@ -445,5 +688,90 @@ impl crate::app::App {
             self.status = "Preferences saved".into();
         }
         iced::Task::none()
+    }
+
+    /// Convert and install a standard theme package, then surface the
+    /// conversion outcome. Runs through the `theme.install` command so
+    /// the capability gate and typed results apply.
+    fn install_theme_package(
+        &mut self,
+        path: std::path::PathBuf,
+    ) -> iced::Task<crate::app::Message> {
+        let Some(flavite) = self.flavite.as_ref() else {
+            self.status = "Attach a vault before installing themes".into();
+            return iced::Task::none();
+        };
+        let result = flavite.execute(flavite_api::Invocation::new(
+            flavite.command_registry().next_request_id(),
+            "theme.install",
+            serde_json::json!({ "path": path.display().to_string() }),
+            flavite_api::Origin::Gui,
+        ));
+        self.report_theme_result(result, "Theme installed");
+        iced::Task::none()
+    }
+
+    /// Remove an installed theme package through the command bus, then
+    /// clear the selection when the removed theme was active.
+    fn uninstall_theme_package(&mut self, id: String) -> iced::Task<crate::app::Message> {
+        let Some(flavite) = self.flavite.as_ref() else {
+            self.status = "Attach a vault before managing themes".into();
+            return iced::Task::none();
+        };
+        let result = flavite.execute(flavite_api::Invocation::new(
+            flavite.command_registry().next_request_id(),
+            "theme.uninstall",
+            serde_json::json!({ "id": id }),
+            flavite_api::Origin::Gui,
+        ));
+        let removed = result.is_success();
+        self.report_theme_result(result, "Theme removed");
+        if removed && self.appearance.prefs.theme_package.as_deref() == Some(id.as_str()) {
+            self.appearance.set_theme_package(None);
+            if let Some(flavite) = self.flavite.as_ref() {
+                self.appearance.reload_theme_package(flavite);
+            }
+            self.appearance.refresh();
+            if let Some(flavite) = self.flavite.as_mut() {
+                self.appearance.persist(flavite);
+            }
+        }
+        self.appearance
+            .reload_installed_themes(self.flavite.as_ref().expect("vault present above"));
+        iced::Task::none()
+    }
+
+    /// Translate a theme command result into a status line and refresh
+    /// the installed-theme list.
+    fn report_theme_result(&mut self, result: flavite_api::ExecutionResult, ok_status: &str) {
+        match result {
+            flavite_api::ExecutionResult::Local(flavite_api::LocalResult::Success(success)) => {
+                self.status = ok_status.to_owned();
+                if success.command_id == "theme.install"
+                    && let Some(theme) = success.data.get("theme")
+                    && let Ok(installed) =
+                        serde_json::from_value::<flavite_api::InstalledTheme>(theme.clone())
+                {
+                    self.appearance
+                        .set_theme_package(Some(installed.id.clone()));
+                    if let Some(flavite) = self.flavite.as_ref() {
+                        self.appearance.reload_theme_package(flavite);
+                    }
+                    self.appearance.refresh();
+                    if let Some(flavite) = self.flavite.as_mut() {
+                        self.appearance.persist(flavite);
+                    }
+                }
+            }
+            flavite_api::ExecutionResult::Local(flavite_api::LocalResult::Error(error)) => {
+                self.status = format!("Theme operation failed: {}", error.message);
+            }
+            other => {
+                self.status = format!("Theme operation did not complete: {other:?}");
+            }
+        }
+        if let Some(flavite) = self.flavite.as_ref() {
+            self.appearance.reload_installed_themes(flavite);
+        }
     }
 }

@@ -452,6 +452,8 @@ fn preferences_body(app: &App, metrics: style::Metrics) -> Element<'_, Message> 
                 ),
             ],
         ),
+        text("Theme packages").size(metrics.text_lg),
+        theme_package_section(app, metrics),
         text("Keyboard shortcuts").size(metrics.text_lg),
     ]
     .spacing(metrics.spacing_sm);
@@ -483,6 +485,83 @@ fn preferences_body(app: &App, metrics: style::Metrics) -> Element<'_, Message> 
         );
     }
     dialog_card(metrics, body)
+}
+
+/// The theme-package section (xpi themes): the installed list with
+/// per-theme select/remove, the install button (native dialog), and the
+/// conversion warnings of the active package.
+fn theme_package_section<'a>(app: &App, metrics: style::Metrics) -> Element<'a, Message> {
+    use crate::host::appearance::PreferenceMessage as P;
+    let appearance = &app.appearance;
+    let mut section = column![].spacing(metrics.spacing_sm);
+    section = section.push(
+        row![
+            button(text("Install theme (.xpi)…").size(metrics.text_sm))
+                .padding(tab_strip::chip_padding())
+                .style(style::ghost())
+                .on_press(Message::Preferences(P::ThemeInstallPick)),
+            button(text("Built-in palettes").size(metrics.text_sm))
+                .padding(tab_strip::chip_padding())
+                .style(action_or_ghost(appearance.prefs.theme_package.is_none()))
+                .on_press(Message::Preferences(P::SetThemePackage(None))),
+        ]
+        .spacing(metrics.spacing_sm),
+    );
+    if appearance.installed_themes.is_empty() {
+        section = section.push(
+            text("No theme packages installed. Convert a browser theme with `flavite theme convert`, or install a standard .xpi directly.")
+                .size(metrics.text_sm)
+                .style(style::dim_text),
+        );
+    }
+    for theme in &appearance.installed_themes {
+        let active = appearance.prefs.theme_package.as_deref() == Some(theme.id.as_str());
+        let mut row = row![
+            text(if theme.name.is_empty() {
+                theme.id.clone()
+            } else {
+                theme.name.clone()
+            })
+            .size(metrics.text),
+            text(if theme.animated_frame { "animated" } else { "" })
+                .size(metrics.text_sm)
+                .style(style::dim_text),
+        ]
+        .spacing(metrics.spacing_sm)
+        .align_y(iced::alignment::Vertical::Center);
+        row = row.push(
+            button(text(if active { "Active" } else { "Use" }).size(metrics.text_sm))
+                .padding(tab_strip::chip_padding())
+                .style(action_or_ghost(active))
+                .on_press(Message::Preferences(P::SetThemePackage(Some(
+                    theme.id.clone(),
+                )))),
+        );
+        row = row.push(
+            button(text("Remove").size(metrics.text_sm))
+                .padding(tab_strip::chip_padding())
+                .style(style::ghost())
+                .on_press(Message::Preferences(P::ThemeUninstall(theme.id.clone()))),
+        );
+        section = section.push(row);
+    }
+    if let Some(package) = appearance.theme_package.as_ref()
+        && !package.warnings.is_empty()
+    {
+        section = section.push(
+            text(package.warnings.join("; "))
+                .size(metrics.text_sm)
+                .style(style::dim_text),
+        );
+    }
+    if let Some(error) = &appearance.theme_error {
+        section = section.push(
+            text(error.clone())
+                .size(metrics.text_sm)
+                .style(style::dim_text),
+        );
+    }
+    section.into()
 }
 
 /// The pressed (action) or quiet (ghost) style, chosen at call time so
@@ -629,6 +708,21 @@ pub fn pick_note_file() -> iced::Task<Message> {
                 .and_then(|handle| handle.path().to_path_buf().into())
         },
         Message::NotePicked,
+    )
+}
+
+/// Open the native file dialog for a standard theme package (xpi themes).
+/// The task resolves into [`crate::app::Message::ThemePackagePicked`].
+pub fn pick_theme_file() -> iced::Task<Message> {
+    iced::Task::perform(
+        async move {
+            rfd::AsyncFileDialog::new()
+                .add_filter("Theme package", &["xpi", "zip"])
+                .pick_file()
+                .await
+                .and_then(|handle| handle.path().to_path_buf().into())
+        },
+        crate::app::Message::ThemePackagePicked,
     )
 }
 

@@ -43,6 +43,9 @@ pub use graph_projection::{
 // RFC-0006 §6.10: the facade re-exports the sole source-format descriptor
 // so hosts/DTO consumers keep one spelling without a direct codec edge.
 pub use flavite_encoding::SourceFormat;
+// XPI themes: the facade re-exports the pure theme-package codec so hosts
+// (the CLI converter especially) keep one spelling without a codec edge.
+pub use flavite_theme;
 // Buffer identity types used by facade view APIs.
 pub use flavite_buffer::revision::{BufferId, Revision};
 pub mod attachments;
@@ -56,6 +59,7 @@ pub use properties::*;
 pub mod queries;
 pub mod query_service;
 pub mod result;
+pub mod themes;
 pub mod types;
 pub mod user_state;
 pub use user_state::{
@@ -75,6 +79,7 @@ pub use graph_service::{
 pub use queries::*;
 pub use query_service::*;
 pub use result::*;
+pub use themes::{InstalledTheme, LoadedTheme, ThemeStore, ThemeStoreError};
 pub use types::*;
 
 // Re-export Query AST from flavite-index (D13)

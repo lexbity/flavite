@@ -65,6 +65,10 @@
       "kind": "workspace"
     },
     {
+      "id": "flavite-theme",
+      "kind": "workspace"
+    },
+    {
       "id": "flavite-ui",
       "kind": "workspace"
     },
@@ -137,6 +141,10 @@
       "kind": "workspace"
     },
     {
+      "id": "zip",
+      "kind": "external"
+    },
+    {
       "id": "zstd",
       "kind": "external"
     }
@@ -184,6 +192,11 @@
     },
     {
       "from": "flavite-api",
+      "to": "flavite-theme",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-api",
       "to": "flavite-vault",
       "kind": "normal"
     },
@@ -201,6 +214,11 @@
       "from": "flavite-api",
       "to": "tracing",
       "kind": "normal"
+    },
+    {
+      "from": "flavite-api",
+      "to": "zip",
+      "kind": "dev"
     },
     {
       "from": "flavite-app",
@@ -358,6 +376,21 @@
       "kind": "normal"
     },
     {
+      "from": "flavite-theme",
+      "to": "blake3",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-theme",
+      "to": "image",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-theme",
+      "to": "zip",
+      "kind": "normal"
+    },
+    {
       "from": "flavite-ui",
       "to": "accesskit",
       "kind": "normal"
@@ -391,6 +424,11 @@
       "from": "flavite-ui",
       "to": "flavite-index",
       "kind": "dev"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "flavite-theme",
+      "kind": "normal"
     },
     {
       "from": "flavite-ui",

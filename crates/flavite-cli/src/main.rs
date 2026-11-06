@@ -118,6 +118,13 @@ enum Commands {
         strategy: CliRenameStrategy,
     },
 
+    /// Convert browser theme packages and manage this vault's installed
+    /// themes (xpi themes).
+    Theme {
+        #[command(subcommand)]
+        action: ThemeAction,
+    },
+
     /// Inspect or convert a note's file encoding explicitly (RFC-0006 §6.10).
     Encoding {
         /// Vault-relative note path.
@@ -230,6 +237,40 @@ impl CliRenameStrategy {
 }
 
 /// CLI driver that uses flavite-api for all operations.
+/// Theme package actions (xpi themes). `Convert` is an offline tool that
+/// needs no vault; the other actions manage the device-local theme store
+/// through the facade's typed `theme.*` commands.
+#[derive(Subcommand, Debug)]
+enum ThemeAction {
+    /// Convert a standard browser theme package into a `.flavite.xpi`.
+    Convert {
+        /// Path to the standard `.xpi` (or zip) theme package.
+        input: PathBuf,
+
+        /// Output path (default: `<input>.flavite.xpi` beside the input).
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
+    /// Convert and install a standard `.xpi` into this vault's device
+    /// theme store.
+    Install {
+        /// Path to the standard `.xpi` theme package.
+        path: PathBuf,
+    },
+    /// List installed themes.
+    List,
+    /// Select an installed theme, or clear the selection with `none`.
+    Select {
+        /// The theme id, or `none` for the built-in palettes.
+        id: String,
+    },
+    /// Remove an installed theme.
+    Uninstall {
+        /// The theme id.
+        id: String,
+    },
+}
+
 struct CliDriver {
     /// Flavite facade from flavite-api
     flavite: Option<Flavite>,
@@ -409,6 +450,158 @@ impl CliDriver {
     /// (§6.10). Reopen never discards unsaved text; Convert is followed by
     /// the guarded save and both wait for real receipts instead of exiting
     /// after an ephemeral metadata change.
+    /// Convert a standard theme package into a `.flavite.xpi` and print
+    /// the conversion report (mapped slots, dropped keys, warnings).
+    fn convert_theme(&self, input: PathBuf, output: Option<PathBuf>) -> Result<()> {
+        let package =
+            std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
+        let converted = flavite_api::flavite_theme::convert_xpi(&package)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let output = output.unwrap_or_else(|| {
+            let mut name = input.file_name().map_or_else(
+                || std::ffi::OsString::from("theme.flavite.xpi"),
+                std::ffi::OsString::from,
+            );
+            name.push(".flavite.xpi");
+            input.with_file_name(name)
+        });
+        let file = std::fs::File::create(&output)
+            .with_context(|| format!("creating {}", output.display()))?;
+        flavite_api::flavite_theme::write_package(&converted.files, file)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let report = &converted.report;
+        if self.json {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "output": output,
+                    "report": report,
+                }))?
+            );
+        } else {
+            println!("Converted: {}", report.name);
+            println!("Theme id: {}", report.theme_id);
+            println!("Output: {}", output.display());
+            println!(
+                "Mapped {} color keys; dropped {}; animated header: {}; dark variant: {}",
+                report.mapped.len(),
+                report.dropped.len(),
+                report.animated_frame,
+                report.supports_dark_variant,
+            );
+            for dropped in &report.dropped {
+                println!("  dropped {}: {}", dropped.key, dropped.reason);
+            }
+            for warning in &report.warnings {
+                println!("  warning: {warning}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Run one facade `theme.*` command and print its typed result.
+    fn run_theme_command(&self, id: &'static str, args: serde_json::Value) -> Result<()> {
+        let flavite = self
+            .flavite
+            .as_ref()
+            .context("theme commands require an opened vault")?;
+        let request_id = flavite.command_registry().next_request_id();
+        let result = flavite.execute(Invocation::new(request_id, id, args, Origin::Cli));
+        let result = match result {
+            ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
+            result => result,
+        };
+        let success = result
+            .into_success()
+            .with_context(|| format!("{id} did not complete"))?;
+        if self.json {
+            println!("{}", serde_json::to_string(&success.data)?);
+        } else if id == "theme.list" {
+            match success
+                .data
+                .get("themes")
+                .and_then(serde_json::Value::as_array)
+            {
+                Some(themes) if themes.is_empty() => println!("No themes installed."),
+                Some(themes) => {
+                    for theme in themes {
+                        println!(
+                            "{} — {}",
+                            theme
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("?"),
+                            theme
+                                .get("name")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("?"),
+                        );
+                    }
+                }
+                None => println!("{}", serde_json::to_string(&success.data)?),
+            }
+        } else if id == "theme.install" {
+            println!(
+                "Installed: {}",
+                success
+                    .data
+                    .get("theme")
+                    .and_then(|theme| theme.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?")
+            );
+        } else {
+            println!("{id}: ok");
+        }
+        Ok(())
+    }
+
+    /// Select (or clear, with `none`) the installed theme in the device
+    /// preferences. The write goes through the facade's compare-and-set
+    /// user-state service — never a direct file write.
+    fn select_theme(&mut self, id: &str) -> Result<()> {
+        let selection = (id != "none").then(|| id.to_owned());
+        let (generation, document) = {
+            let flavite = self
+                .flavite
+                .as_ref()
+                .context("theme selection requires an opened vault")?;
+            if let Some(selected) = &selection {
+                let installed = flavite
+                    .themes()
+                    .context("theme storage is unavailable on this device")?
+                    .list()?;
+                anyhow::ensure!(
+                    installed.iter().any(|theme| &theme.id == selected),
+                    "theme {selected:?} is not installed (see `flavite theme list`)"
+                );
+            }
+            let stored = flavite.read_user_state(flavite_api::UserStateKind::DevicePreferences)?;
+            let generation = stored.as_ref().map_or(0, |stored| stored.generation);
+            let text = stored
+                .as_ref()
+                .map(|stored| String::from_utf8(stored.payload.clone()))
+                .transpose()
+                .ok()
+                .flatten();
+            let parsed = flavite_api::device_preferences::Preferences::parse(text.as_deref())?;
+            let mut preferences = parsed.preferences;
+            preferences.theme_package = selection;
+            (generation, preferences.to_stored())
+        };
+        let flavite = self
+            .flavite
+            .as_mut()
+            .context("theme selection requires an opened vault")?;
+        flavite.write_user_state(
+            flavite_api::UserStateKind::DevicePreferences,
+            generation,
+            document.as_bytes(),
+        )?;
+        println!("Theme selection saved: {}", id);
+        Ok(())
+    }
+
     fn run_encoding(&self, note: PathBuf, action: EncodingAction) -> Result<()> {
         let flavite = self
             .flavite
@@ -822,6 +1015,35 @@ fn main() -> Result<()> {
             driver.open_vault(vault_path, cli.no_watch)?;
             driver.run_encoding(note, action)?;
         }
+        Commands::Theme { action } => match action {
+            // The converter is an offline artifact tool: no vault needed.
+            ThemeAction::Convert { input, output } => driver.convert_theme(input, output)?,
+            ThemeAction::Install { path } => {
+                let vault_path = get_vault_path(None, cli.vault);
+                driver.open_vault(vault_path, cli.no_watch)?;
+                driver.run_theme_command(
+                    "theme.install",
+                    serde_json::json!({
+                        "path": path.display().to_string(),
+                    }),
+                )?;
+            }
+            ThemeAction::List => {
+                let vault_path = get_vault_path(None, cli.vault);
+                driver.open_vault(vault_path, cli.no_watch)?;
+                driver.run_theme_command("theme.list", serde_json::json!({}))?;
+            }
+            ThemeAction::Select { id } => {
+                let vault_path = get_vault_path(None, cli.vault);
+                driver.open_vault(vault_path, cli.no_watch)?;
+                driver.select_theme(&id)?;
+            }
+            ThemeAction::Uninstall { id } => {
+                let vault_path = get_vault_path(None, cli.vault);
+                driver.open_vault(vault_path, cli.no_watch)?;
+                driver.run_theme_command("theme.uninstall", serde_json::json!({ "id": id }))?;
+            }
+        },
         Commands::Info { path } => {
             let vault_path = get_vault_path(path, cli.vault);
             driver.open_vault(vault_path.clone(), cli.no_watch)?;

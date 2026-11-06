@@ -1,0 +1,16 @@
+[package]
+name = "flavite-theme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Theme package codec: parse browser .xpi themes, map them onto flavite's semantic surface, decode theme images (Tier 2)"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+zip = { workspace = true }
+png = "0.18"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+blake3 = { workspace = true }

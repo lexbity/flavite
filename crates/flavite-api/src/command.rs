@@ -199,22 +199,13 @@ impl Invocation {
         args: serde_json::Value,
         origin: Origin,
     ) -> Self {
-        let capabilities = match origin {
-            Origin::Plugin => Vec::new(),
-            _ => vec![
-                Capability::ReadNotes,
-                Capability::WriteNotes {
-                    scope: crate::capability::WriteScope::Vault,
-                },
-            ],
-        };
         Self {
             request_id,
             command_id,
             args,
             origin,
             preconditions: Preconditions::new(),
-            capabilities,
+            capabilities: Self::builtin_grants(origin),
         }
     }
 
@@ -227,22 +218,30 @@ impl Invocation {
         origin: Origin,
         preconditions: Preconditions,
     ) -> Self {
-        let capabilities = match origin {
-            Origin::Plugin => Vec::new(),
-            _ => vec![
-                Capability::ReadNotes,
-                Capability::WriteNotes {
-                    scope: crate::capability::WriteScope::Vault,
-                },
-            ],
-        };
         Self {
             request_id,
             command_id,
             args,
             origin,
             preconditions,
-            capabilities,
+            capabilities: Self::builtin_grants(origin),
+        }
+    }
+
+    /// The grants built-in hosts receive. Plugin callers get nothing
+    /// unless granted explicitly (D16).
+    fn builtin_grants(origin: Origin) -> Vec<Capability> {
+        match origin {
+            Origin::Plugin => Vec::new(),
+            _ => vec![
+                Capability::ReadNotes,
+                Capability::WriteNotes {
+                    scope: crate::capability::WriteScope::Vault,
+                },
+                // Device-local theme management rides the same host trust
+                // level as device preferences, not the vault write scope.
+                Capability::Themes,
+            ],
         }
     }
 

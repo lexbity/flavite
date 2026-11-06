@@ -21,7 +21,7 @@ tier1 = [
     "flavite-graph-protocol",
 ]
 # Tier 2 (§10.5: ≥ 80% line coverage floor).
-tier2 = ["flavite-api", "flavite-graph"]
+tier2 = ["flavite-api", "flavite-graph", "flavite-theme"]
 # Tier 3 — measured, not gating until Phase 6 (§10.5).
 tier3 = ["flavite-cli", "flavite-editor", "flavite-ui", "flavite-app"]
 # The isolated source-matching helper is a packaged binary (RFC-0006 §6.2/
@@ -40,6 +40,7 @@ flavite-buffer = "EditorModel/ropey, undo tree, D7 state machine (§4.1)"
 flavite-vault = "Session/BufferManager ownership + actors, journal, history, recovery (§4.1)"
 flavite-api = "Registry, typed commands/results, revisioned views, events, capabilities (§4.1)"
 flavite-graph = "Layout, spatial — CPU only (§4.1)"
+flavite-theme = "Theme package codec: parse browser .xpi themes, map them onto the semantic surface, bounded image/APNG decode — pure, IO-free"
 flavite-cli = "Headless CLI; consumes flavite-api (D16 dogfood) (§4.1)"
 flavite-workspace = "IO-free workspace model: layout tree, tab groups, typed transactions, geometry (RFC-0003 D-02)"
 flavite-editor = "iced widget over EditorModel (iced permitted here and in flavite-ui only) (§4.1)"
@@ -101,6 +102,11 @@ active = [
     { from = "flavite-api", to = "flavite-buffer" },
     { from = "flavite-api", to = "flavite-syntax" },
     { from = "flavite-api", to = "flavite-fs" },
+    # XPI themes: the facade owns installed-theme storage and typed theme
+    # commands over the pure package codec; the shell consumes the codec's
+    # semantic model and decoded images for rendering.
+    { from = "flavite-api", to = "flavite-theme" },
+    { from = "flavite-ui", to = "flavite-theme" },
     # C14 - CLI consumes flavite-api only (D16 dogfood - fully migrated)
     { from = "flavite-cli", to = "flavite-api" },
     # B7 - Card layer uses API and buffer for production wiring
@@ -137,6 +143,7 @@ core_tier = [
     "flavite-graph",
     "flavite-graph-protocol",
     "flavite-workspace",
+    "flavite-theme",
     "flavite-cli",
 ]
 # Forbidden in core-tier transitive closure (normal+build deps only;
@@ -169,4 +176,5 @@ names = [
     "image",
     "tracing",
     "similar",
+    "zip",
 ]

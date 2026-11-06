@@ -1491,6 +1491,15 @@ impl Flavite {
             .map_err(FlaviteError::UserState)
     }
 
+    /// Test-only seam: point the theme store at an explicit root so
+    /// integration fixtures stay hermetic (the production store resolves
+    /// the OS data directory, which tests must never touch). Never part
+    /// of the production path.
+    #[doc(hidden)]
+    pub fn set_theme_store_for_test(&mut self, store: crate::themes::ThemeStore) {
+        self.themes = Some(store);
+    }
+
     /// Test-only seam: point the graph feed at an explicit cache database
     /// so integration fixtures with an injected index actor are exercised
     /// end-to-end. Never part of the production path.

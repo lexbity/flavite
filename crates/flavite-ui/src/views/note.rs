@@ -114,7 +114,10 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         .with_view_key(tab.raw(), incarnation)
         .with_type_metrics(app.appearance.metrics().editor_type())
         .with_max_line_width(app.appearance.metrics().editor_max_line_width())
-        .with_colors(crate::style::tokens::editor_colors(app.appearance.scheme()))
+        .with_colors(crate::style::tokens::editor_colors_resolved(
+            app.appearance.scheme(),
+            app.appearance.theme_semantic(),
+        ))
         .with_candidates(app.editor_candidates().clone())
         .with_stable_links(app.appearance.prefs.prefer_stable_links)
         .with_link_resolutions(app.editor_link_resolutions(

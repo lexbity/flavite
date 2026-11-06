@@ -9,6 +9,7 @@ pub mod tokens;
 pub mod type_scale;
 
 pub use tokens::Scheme;
+pub use tokens::theme_resolved;
 pub use type_scale::Metrics;
 
 use iced::widget::{button, container, text};
@@ -42,6 +43,10 @@ pub const HEADING: f32 = 20.0;
 pub const BRAND: f32 = 19.0;
 /// Tab strip height (§13.1: tab height 32 px).
 pub const TAB_HEIGHT: f32 = 32.0;
+/// Top toolbar strip height. The bar is fixed-height so a theme package's
+/// `theme_frame` image can layer exactly behind it (xpi themes); the row
+/// content is vertically centered within it.
+pub const TOP_BAR_HEIGHT: f32 = 44.0;
 /// Splitter thickness at 100% scale (§7.5). Single source: the workspace
 /// model owns the value; the layout solver divides by exactly this width.
 pub const SPLITTER_WIDTH: f32 = flavite_workspace::SPLITTER_WIDTH;

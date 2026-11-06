@@ -6,6 +6,8 @@
 //! Graph data colors map onto these token roles instead of hand-picking
 //! literals in the graph modules.
 
+use super::contrast;
+use flavite_theme::SemanticTheme;
 use iced::Theme;
 
 /// Which semantic token set is active.
@@ -70,6 +72,164 @@ pub fn theme(scheme: Scheme) -> Theme {
         Scheme::Dark => Theme::custom("Flavite Dark", dark_palette()),
         Scheme::Light => Theme::custom("Flavite Light", light_palette()),
     }
+}
+
+/// The iced theme for one scheme with an optional theme-package overlay.
+/// Themed slots composite over the built-in palette and pass through the
+/// contrast solver, so an arbitrary package can never paint unreadable
+/// text; surfaces the package never speaks to keep the built-in colors.
+#[must_use]
+pub fn theme_resolved(scheme: Scheme, themed: Option<&SemanticTheme>) -> Theme {
+    let Some(themed) = themed else {
+        return theme(scheme);
+    };
+    let name = match scheme {
+        Scheme::Dark => "Flavite Dark (theme)",
+        Scheme::Light => "Flavite Light (theme)",
+    };
+    Theme::custom(name, resolved_palette(scheme, Some(themed)))
+}
+
+/// The built-in palette for one scheme with themed slots overlaid.
+#[must_use]
+pub fn resolved_palette(scheme: Scheme, themed: Option<&SemanticTheme>) -> iced::theme::Palette {
+    let mut palette = match scheme {
+        Scheme::Dark => dark_palette(),
+        Scheme::Light => light_palette(),
+    };
+    let Some(themed) = themed else {
+        return palette;
+    };
+    let slots = themed_slots(scheme, themed);
+    if let Some(background) = slots.window_background {
+        palette.background = background;
+    }
+    if let Some(text) = slots
+        .window_text
+        .filter(|text| contrast::ratio(*text, palette.background) >= 4.5)
+    {
+        palette.text = text;
+    }
+    if let Some(accent) = slots
+        .accent
+        .filter(|accent| contrast::ratio(*accent, palette.background) >= 3.0)
+    {
+        palette.primary = accent;
+    }
+    palette
+}
+
+/// The top-bar surface colors (background, text) for one scheme: themed
+/// frame colors made effective over the resolved window backdrop and
+/// contrast-repaired, or `None` slots keeping the shell default.
+#[must_use]
+pub fn top_bar_colors(
+    scheme: Scheme,
+    themed: Option<&SemanticTheme>,
+) -> (Option<iced::Color>, Option<iced::Color>) {
+    let Some(themed) = themed else {
+        return (None, None);
+    };
+    let slots = themed_slots(scheme, themed);
+    let default = match scheme {
+        Scheme::Dark => dark_palette(),
+        Scheme::Light => light_palette(),
+    };
+    let text = match (slots.top_bar_text, slots.top_bar_background) {
+        (Some(text), Some(background)) if contrast::ratio(text, background) >= 4.5 => Some(text),
+        // The theme wanted a frame tint but its text is unreadable on it:
+        // keep the package's tint, repair the text from the built-ins.
+        (_, Some(background)) if contrast::ratio(default.text, background) >= 4.5 => {
+            Some(default.text)
+        }
+        (Some(text), None) if contrast::ratio(text, default.background) >= 4.5 => Some(text),
+        _ => None,
+    };
+    (slots.top_bar_background, text)
+}
+
+/// The editor chrome colors for one scheme with the theme-package
+/// overlay: the editor surface follows the package's field slot (falling
+/// back to its window slot), text is contrast-repaired, and the derived
+/// selection/link roles stay computed from the resolved palette.
+#[must_use]
+pub fn editor_colors_resolved(
+    scheme: Scheme,
+    themed: Option<&SemanticTheme>,
+) -> flavite_editor::EditorColors {
+    let mut colors = editor_colors(scheme);
+    let Some(themed) = themed else {
+        return colors;
+    };
+    let slots = themed_slots(scheme, themed);
+    let Some(background) = slots.editor_background.or(slots.window_background) else {
+        return colors;
+    };
+    let palette = resolved_palette(scheme, Some(themed));
+    let text = slots
+        .editor_text
+        .filter(|text| contrast::ratio(*text, background) >= 4.5)
+        .unwrap_or(palette.text);
+    colors.text = text;
+    // Autocomplete surfaces ride the editor background.
+    colors.autocomplete_background = contrast::blend(
+        background,
+        palette.text,
+        if scheme == Scheme::Dark { 0.08 } else { 0.35 },
+    );
+    colors.autocomplete_text = text;
+    colors
+}
+
+/// The themed slots the shell paints with, resolved to their effective
+/// opaque colors: translucent theme colors composite over the resolved
+/// window backdrop (itself composited over the built-in palette when the
+/// package left it unset), so every consumer sees exactly what paints.
+#[must_use]
+pub fn themed_slots(scheme: Scheme, themed: &SemanticTheme) -> ThemedSlots {
+    let builtin = match scheme {
+        Scheme::Dark => dark_palette(),
+        Scheme::Light => light_palette(),
+    };
+    let window_background = themed
+        .window_background
+        .map(|color| contrast::over(to_color(color), builtin.background));
+    let backdrop = window_background.unwrap_or(builtin.background);
+    let composite = |color: Option<flavite_theme::Rgba>| {
+        color.map(|color| contrast::over(to_color(color), backdrop))
+    };
+    ThemedSlots {
+        window_background,
+        window_text: composite(themed.window_text),
+        accent: composite(themed.accent),
+        editor_background: composite(themed.editor_background),
+        editor_text: composite(themed.editor_text),
+        top_bar_background: composite(themed.top_bar_background),
+        top_bar_text: composite(themed.top_bar_text),
+    }
+}
+
+/// The effective themed slots for one scheme.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ThemedSlots {
+    /// The general window background.
+    pub window_background: Option<iced::Color>,
+    /// The general window text.
+    pub window_text: Option<iced::Color>,
+    /// The primary accent.
+    pub accent: Option<iced::Color>,
+    /// The editor surface.
+    pub editor_background: Option<iced::Color>,
+    /// The editor text.
+    pub editor_text: Option<iced::Color>,
+    /// The top-bar frame background.
+    pub top_bar_background: Option<iced::Color>,
+    /// The top-bar frame text.
+    pub top_bar_text: Option<iced::Color>,
+}
+
+fn to_color(color: flavite_theme::Rgba) -> iced::Color {
+    iced::Color::from_rgba8(color.r, color.g, color.b, f32::from(color.a) / 255.0)
 }
 
 /// Graph data colors mapped onto token roles (D-01: data colors are

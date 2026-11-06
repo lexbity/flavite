@@ -8,7 +8,7 @@
 
 use super::{
     BRAND, HEADING, PALETTE_WIDTH, SIDEBAR_WIDTH, SPACING, SPACING_LG, SPACING_SM, TAB_HEIGHT,
-    TEXT, TEXT_LG, TEXT_SM,
+    TEXT, TEXT_LG, TEXT_SM, TOP_BAR_HEIGHT,
 };
 use crate::preferences::{LineWidth, Preferences};
 
@@ -34,6 +34,8 @@ pub struct Metrics {
     pub brand: f32,
     /// Tab strip height.
     pub tab_height: f32,
+    /// Top toolbar strip height (theme_frame backdrop, xpi themes).
+    pub top_bar_height: f32,
     /// Tab-strip action controls reserve width.
     pub controls_width: f32,
     /// Sidebar width.
@@ -76,6 +78,7 @@ impl Metrics {
             heading: scaled(HEADING),
             brand: scaled(BRAND),
             tab_height: scaled(TAB_HEIGHT),
+            top_bar_height: scaled(TOP_BAR_HEIGHT),
             controls_width: scaled(CONTROLS_WIDTH),
             sidebar_width: scaled(SIDEBAR_WIDTH),
             palette_width: scaled(PALETTE_WIDTH),

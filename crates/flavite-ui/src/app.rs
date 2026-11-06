@@ -203,6 +203,8 @@ pub enum Message {
     SystemTheme(iced::theme::Mode),
     /// A device-preference edit (W11).
     Preferences(crate::host::appearance::PreferenceMessage),
+    /// The native theme-package dialog resolved (xpi themes).
+    ThemePackagePicked(Option<std::path::PathBuf>),
     /// Begin a close for one tab (W12): decide or close.
     RequestCloseTab(TabId),
     /// Begin a close for a whole group (W12): plan per tab.
@@ -647,6 +649,14 @@ impl App {
         self.appearance.load(&flavite);
         if let Some(note) = self.appearance.status_note() {
             self.status = format!("{} — {}", self.status, note);
+        }
+        // XPI themes: the selected package and the installed list load
+        // once the facade exists; a broken package keeps the built-in
+        // palettes and reports honestly.
+        self.appearance.reload_theme_package(&flavite);
+        self.appearance.reload_installed_themes(&flavite);
+        if let Some(error) = &self.appearance.theme_error {
+            self.status = format!("{} — {}", self.status, error);
         }
         self.flavite = Some(flavite);
         if self.settings_valid && conflicts.is_empty() && self.appearance.last_error.is_none() {
@@ -2315,6 +2325,9 @@ impl App {
                 self.pump();
                 self.catalog_retry_tick();
                 self.refresh_semantics();
+                // XPI themes: the header animation advances with the pump,
+                // honoring its own per-frame delays.
+                self.appearance.tick_theme_animation();
                 // W12: the quit schedule advances with the pump; the exit
                 // task closes the window only from ReadyToExit.
                 if let Some(task) = self.shutdown_step() {
@@ -2709,6 +2722,13 @@ impl App {
             }
             Message::NotePicked(picked) => {
                 self.open_picked_note(picked);
+            }
+            Message::ThemePackagePicked(picked) => {
+                if let Some(path) = picked {
+                    return self.update_preferences(
+                        crate::host::appearance::PreferenceMessage::ThemeInstallFromPath(path),
+                    );
+                }
             }
             // ---- W10: start screen ----
             Message::VaultDialog => {

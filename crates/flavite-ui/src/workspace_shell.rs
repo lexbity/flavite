@@ -9,7 +9,7 @@ use crate::style;
 use crate::workspace::{bounds, tab_strip};
 use flavite_workspace::{GroupId, LayoutAction, NoteLoad, TabId, ViewKind};
 use iced::widget::{
-    Space, button, column, container, opaque, pane_grid, row, rule, scrollable, stack, text,
+    Space, button, column, container, image, opaque, pane_grid, row, rule, scrollable, stack, text,
     text_input,
 };
 use iced::{Element, Length, Padding, alignment};
@@ -103,40 +103,55 @@ fn top_bar(app: &App) -> Element<'_, Message> {
         || app.root().display().to_string(),
         |name| name.to_string_lossy().to_string(),
     );
-    container(
-        row![
-            button(text("Flavite").size(metrics.brand))
-                .padding(tab_strip::chip_padding())
-                .style(style::ghost())
-                .on_press(Message::AppMenu),
-            text(vault_name)
-                .size(metrics.text_sm)
-                .style(style::dim_text),
-            Space::new()
-                .width(Length::Fixed(8.0))
-                .height(Length::Fixed(0.0)),
-            menu_bar(app),
-            Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
-            button(text("Quick switch").size(metrics.text_sm))
-                .padding(tab_strip::chip_padding())
-                .style(style::ghost())
-                .on_press(Message::PickerOpen),
-            button(text("Commands").size(metrics.text_sm))
-                .padding(tab_strip::chip_padding())
-                .style(style::ghost())
-                .on_press(Message::PaletteOpen),
+    let row = row![
+        button(text("Flavite").size(metrics.brand))
+            .padding(tab_strip::chip_padding())
+            .style(style::ghost())
+            .on_press(Message::AppMenu),
+        text(vault_name)
+            .size(metrics.text_sm)
+            .style(style::dim_text),
+        Space::new()
+            .width(Length::Fixed(8.0))
+            .height(Length::Fixed(0.0)),
+        menu_bar(app),
+        Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
+        button(text("Quick switch").size(metrics.text_sm))
+            .padding(tab_strip::chip_padding())
+            .style(style::ghost())
+            .on_press(Message::PickerOpen),
+        button(text("Commands").size(metrics.text_sm))
+            .padding(tab_strip::chip_padding())
+            .style(style::ghost())
+            .on_press(Message::PaletteOpen),
+    ]
+    .spacing(metrics.spacing)
+    .align_y(alignment::Vertical::Center);
+    // XPI themes: a package `theme_frame` layers exactly behind the bar.
+    // The bar is fixed-height so the image fills it without disturbing
+    // layout; without a frame the bar keeps the shell's plain surface.
+    let content: Element<'_, Message> = match app.appearance.theme_frame_handle() {
+        Some(handle) => stack![
+            image(handle.clone())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .content_fit(iced::ContentFit::Cover),
+            row
         ]
-        .spacing(metrics.spacing)
-        .align_y(alignment::Vertical::Center),
-    )
-    .width(Length::Fill)
-    .padding(Padding {
-        top: 6.0,
-        bottom: 6.0,
-        left: metrics.spacing_lg,
-        right: metrics.spacing_lg,
-    })
-    .into()
+        .into(),
+        None => row.into(),
+    };
+    container(content)
+        .width(Length::Fill)
+        .height(Length::Fixed(metrics.top_bar_height))
+        .align_y(alignment::Vertical::Center)
+        .padding(Padding {
+            top: 6.0,
+            bottom: 6.0,
+            left: metrics.spacing_lg,
+            right: metrics.spacing_lg,
+        })
+        .into()
 }
 
 /// The standard sorted menu bar (W10): every entry resolves through the
