@@ -133,10 +133,46 @@ run_s01_gates() {
         "$root/crates/flavite-ui/src/host/note_search.rs"
 }
 
+run_s03_gates() {
+    # S03 presence: the helper crate, protocol, worker seam and the test
+    # surfaces that prove isolation (§6.2/D-14).
+    local file
+    for file in \
+        crates/flavite-text-search/src/protocol.rs \
+        crates/flavite-text-search-worker/Cargo.toml \
+        crates/flavite-text-search-worker/src/main.rs \
+        crates/flavite-text-search/tests/regex_properties.rs \
+        crates/flavite-vault/src/text_worker.rs \
+        crates/flavite-vault/tests/text_worker.rs \
+        crates/flavite-ui/tests/note_regex.rs \
+        crates/flavite-api/tests/note_regex.rs \
+        fuzz/fuzz_targets/text_match.rs \
+        fuzz/fuzz_targets/text_worker_protocol.rs; do
+        gate assert_nonempty "$root/$file"
+    done
+    # The helper wraps only the matcher: no product crates, no toolkit.
+    gate assert_no_dep_named \
+        "$root/crates/flavite-text-search-worker/Cargo.toml" \
+        'flavite-(vault|api|index|ui|buffer|editor|fs|workspace|syntax)|iced|cosmic-text|rusqlite'
+    # The parent never reaches for a shell or an overridable worker path
+    # (§6.2: sibling-only discovery, no note/preference/env override).
+    gate assert_absent 'Command::new\("(sh|bash|python|python3)"\)|env::var\(".*WORKER.*PATH' \
+        "$root/crates/flavite-vault/src/text_worker.rs"
+    # The UI never compiles or splits patterns itself: mode/options ride
+    # the typed API, matches come back revision-bound (TD-1/TD-2 discipline).
+    gate assert_absent 'Regex::new|RegexBuilder|split_whitespace' \
+        "$root/crates/flavite-ui/src/host/note_search.rs" \
+        "$root/crates/flavite-ui/src/views/note.rs"
+    # The helper binary declares no filesystem/network surface of its own.
+    gate assert_absent 'std::fs|std::net|TcpStream|UdpSocket|File::open|fs::write' \
+        "$root/crates/flavite-text-search-worker/src/main.rs"
+}
+
 case "$slice" in
     S00) run_s00_gates ;;
     S01) run_s00_gates; run_s01_gates ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: S00 S01)" >&2; exit 2 ;;
+    S03) run_s00_gates; run_s01_gates; run_s03_gates ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: S00 S01 S03)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then

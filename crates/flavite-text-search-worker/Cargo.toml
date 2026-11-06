@@ -1,0 +1,26 @@
+[package]
+name = "flavite-text-search-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Isolated source-matching helper: pure regex/literal match and template-expansion pages over framed stdin/stdout (RFC-0006 §6.2, D-14)"
+
+[[bin]]
+name = "flavite-text-search-worker"
+path = "src/main.rs"
+
+# Test-only misbehavior variants for the parent's real-subprocess
+# verification (never packaged or installed).
+[[bin]]
+name = "misbehaving_helper"
+path = "src/bin/misbehaving_helper.rs"
+
+[dependencies]
+flavite-text-search = { path = "../flavite-text-search" }
+
+# Self-imposed memory ceiling at startup (Unix RLIMIT_AS); the parent
+# additionally owns the wall-clock deadline and process-group kill.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

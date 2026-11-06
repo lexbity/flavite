@@ -21,9 +21,13 @@ pub struct PrepareReplaceArgs {
     pub buffer_id: u64,
     /// The exact revision the caller observed; the plan binds to it.
     pub revision: u64,
-    /// Literal query. An empty query is Idle (D-05), not "match everywhere".
+    /// Literal or regex query. An empty literal query is Idle (D-05), not
+    /// "match everywhere". Regex runs in the isolated helper (D-14).
     pub query: String,
-    /// Literal replacement text: `$` is verbatim in literal mode.
+    /// Match mode: `literal` (default) or `regex`.
+    pub mode: Option<String>,
+    /// Replacement text: `$` is verbatim in literal mode; the dollar
+    /// capture grammar applies in regex mode (D-05).
     pub replacement: String,
     #[serde(default)]
     pub case_sensitive: bool,
@@ -60,6 +64,7 @@ pub(crate) fn handle_prepare_replace(
             replacement: args.replacement,
             case_sensitive: args.case_sensitive,
             whole_word: args.whole_word,
+            mode: decode_mode(args.mode.as_deref())?,
             scope: args.scope,
         },
     }))
@@ -79,6 +84,17 @@ pub(crate) fn handle_apply_replace(
         revision: Revision::new(args.revision),
         plan_id,
     }))
+}
+
+/// Parse the wire match mode (§6.1 explicit snake_case discriminants).
+fn decode_mode(value: Option<&str>) -> Result<flavite_text_search::matcher::MatchMode, String> {
+    match value.unwrap_or("literal") {
+        "literal" => Ok(flavite_text_search::matcher::MatchMode::Literal),
+        "regex" => Ok(flavite_text_search::matcher::MatchMode::Regex),
+        other => Err(format!(
+            "mode must be `literal` or `regex`, got {other}"
+        )),
+    }
 }
 
 /// Parse the hex-encoded 128-bit core-issued plan id (§6.1).

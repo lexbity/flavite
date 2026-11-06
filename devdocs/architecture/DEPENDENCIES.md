@@ -20,6 +20,7 @@ Generated from `cargo metadata --format-version 1 --all-features`.
 | `flavite-index` | 1 | SQLite, tantivy, resolver, query exec (§4.1) |
 | `flavite-syntax` | 1 | Scanner, frontmatter patcher, pulldown glue — pure, IO-free (§4.1) |
 | `flavite-text-search` | 1 | Literal/regex source matches, match options, captures and replacement-template expansion over borrowed normalized UTF-8 — no editor/buffer authority (RFC-0006 §4.1) |
+| `flavite-text-search-worker` | ? | Isolated source-matching helper binary: framed match/template pages only, self-limited memory, no IO beyond stdin/stdout (RFC-0006 §6.2, D-14) |
 | `flavite-ui` | 3 | iced shell library: views, host catalog, adapters (§4.1; no binary) |
 | `flavite-vault` | 1 | Session/BufferManager ownership + actors, journal, history, recovery (§4.1) |
 | `flavite-workspace` | 1 | IO-free workspace model: layout tree, tab groups, typed transactions, geometry (RFC-0003 D-02) |
@@ -129,6 +130,12 @@ Normal/build:
 Normal/build:
 
 - `flavite-syntax` (normal)
+
+### `flavite-text-search-worker`
+
+Normal/build:
+
+- `flavite-text-search` (normal)
 
 ### `flavite-ui`
 

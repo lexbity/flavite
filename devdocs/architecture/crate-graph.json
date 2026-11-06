@@ -61,6 +61,10 @@
       "kind": "workspace"
     },
     {
+      "id": "flavite-text-search-worker",
+      "kind": "workspace"
+    },
+    {
       "id": "flavite-ui",
       "kind": "workspace"
     },
@@ -346,6 +350,11 @@
     {
       "from": "flavite-text-search",
       "to": "flavite-syntax",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-text-search-worker",
+      "to": "flavite-text-search",
       "kind": "normal"
     },
     {

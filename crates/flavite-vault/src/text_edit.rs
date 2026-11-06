@@ -29,11 +29,14 @@ pub struct ReplaceRequest {
     pub buffer_id: BufferId,
     pub revision: Revision,
     pub query: String,
-    /// Literal replacement text: `$` is verbatim (D-05); regex templates
-    /// arrive with S03's typed grammar.
+    /// Replacement text: `$` is verbatim in literal mode; the dollar
+    /// capture grammar applies in regex mode (D-05).
     pub replacement: String,
     pub case_sensitive: bool,
     pub whole_word: bool,
+    /// Literal (in-process, always available) or regex (isolated helper,
+    /// D-14 — never a silent in-process fallback).
+    pub mode: MatchMode,
     /// Frozen selection scope at the current revision (`TextByte` range,
     /// half-open); `None` means the whole note.
     pub scope: Option<(usize, usize)>,
@@ -52,6 +55,15 @@ pub enum PrepareError {
     MatchLimitExceeded,
     /// The serialized output would exceed the per-note bound (NFR-8/19).
     OutputLimitExceeded,
+    /// The frozen scope or a helper-reported span is out of bounds or
+    /// not char-boundary aligned.
+    InvalidScope,
+    /// Regex work requires the isolated helper (D-14) and it is missing,
+    /// incompatible, late or over-queued. Literal matching stays
+    /// available; there is no in-process regex fallback.
+    RegexUnavailable {
+        reason: String,
+    },
 }
 
 /// The pure prepare step, executed on a prepare worker against the exact
@@ -63,6 +75,122 @@ pub enum PrepareError {
 ///
 /// [`PrepareError`] with zero effects; callers never see partial matches.
 pub fn prepare_ops(
+    text: &str,
+    request: &ReplaceRequest,
+) -> Result<(Vec<EditOp>, u64, u64), PrepareError> {
+    match request.mode {
+        // D-14: regex runs in the isolated helper process; literal stays
+        // in-process and never depends on helper availability.
+        MatchMode::Regex => prepare_regex(text, request),
+        MatchMode::Literal => prepare_literal(text, request),
+    }
+}
+
+/// Regex preparation through the isolated helper. The helper returns
+/// spans + expansions; the parent re-derives the output length from those
+/// spans and cross-checks the helper's terminal proof, so a buggy or
+/// hostile helper cannot hand back an unsound candidate.
+fn prepare_regex(
+    text: &str,
+    request: &ReplaceRequest,
+) -> Result<(Vec<EditOp>, u64, u64), PrepareError> {
+    // Local template validation first: typed and exact, before any
+    // helper work (the helper re-validates its own copy, §6.2).
+    let template = ReplacementTemplate::new(&request.replacement, TemplateGrammar::Dollar)
+        .map_err(|error| match error {
+            flavite_text_search::template::TemplateError::TooLong { .. } => {
+                PrepareError::OutputLimitExceeded
+            }
+            other => PrepareError::Template(other),
+        })?;
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let run = crate::text_worker::run_match(
+        text,
+        &request.query,
+        MatchMode::Regex,
+        request.case_sensitive,
+        request.whole_word,
+        MAX_MATCHES_PER_JOB,
+        &request.replacement,
+        &cancelled,
+    )
+    .map_err(|error| match error {
+        crate::text_worker::TextWorkerError::Failure(
+            flavite_text_search::protocol::FailureCode::Pattern,
+        ) => PrepareError::InvalidQuery("pattern refused by the matcher"),
+        crate::text_worker::TextWorkerError::Failure(
+            flavite_text_search::protocol::FailureCode::Limit,
+        ) => PrepareError::MatchLimitExceeded,
+        crate::text_worker::TextWorkerError::Deadline => PrepareError::MatchLimitExceeded,
+        other => PrepareError::RegexUnavailable {
+            reason: match other {
+                crate::text_worker::TextWorkerError::Unavailable { reason } => reason.to_owned(),
+                crate::text_worker::TextWorkerError::Busy => "busy".to_owned(),
+                crate::text_worker::TextWorkerError::Cancelled => "cancelled".to_owned(),
+                crate::text_worker::TextWorkerError::Deadline => "deadline".to_owned(),
+                crate::text_worker::TextWorkerError::HelperDied => "helper-died".to_owned(),
+                crate::text_worker::TextWorkerError::Failure(code) => code.code().to_owned(),
+                crate::text_worker::TextWorkerError::Frame(_) => "frame".to_owned(),
+            },
+        },
+    })?;
+    // The validated template is the authority for the grammar semantics;
+    // its digest (plus options/scope) forms the plan identity.
+    let mut ops = Vec::with_capacity(run.matches.len());
+    let mut output_len = text.len() as u64;
+    let mut match_count = 0u64;
+    for hit in &run.matches {
+        let start = usize::try_from(hit.start).map_err(|_| PrepareError::InvalidScope)?;
+        let end = usize::try_from(hit.end).map_err(|_| PrepareError::InvalidScope)?;
+        if end < start || end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end)
+        {
+            return Err(PrepareError::InvalidScope);
+        }
+        let expansion = String::from_utf8(hit.expansion.clone())
+            .map_err(|_| PrepareError::InvalidQuery("expansion was not UTF-8"))?;
+        output_len = output_len
+            .checked_sub((end - start) as u64)
+            .and_then(|rest| rest.checked_add(expansion.len() as u64))
+            .ok_or(PrepareError::OutputLimitExceeded)?;
+        ops.push(EditOp::new(
+            Span::new(TextByte(start), TextByte(end)),
+            expansion,
+        ));
+        match_count += 1;
+    }
+    // Cross-check the helper's terminal proof against the parent's own
+    // arithmetic over the returned spans (§6.2 soundness).
+    if output_len > MAX_OUTPUT_BYTES as u64
+        || run.output_len != output_len
+        || run.total_matches != match_count
+    {
+        return Err(PrepareError::RegexUnavailable {
+            reason: "unsound-helper-proof".to_owned(),
+        });
+    }
+    let digest = template.digest() ^ scope_digest(request);
+    Ok((ops, match_count, digest))
+}
+
+/// Scope/options contribution to the plan digest (D-05: scope and options
+/// are part of the plan identity) — composed with the canonical
+/// matcher/template digests, never a second semantics system.
+fn scope_digest(request: &ReplaceRequest) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in format!(
+        "{}{}:{}",
+        request.case_sensitive, request.whole_word,
+        request.scope.map_or_else(String::new, |(start, end)| format!("{start}..{end}"))
+    )
+    .as_bytes()
+    {
+        hash = hash.rotate_left(8) ^ u64::from(*byte);
+    }
+    hash
+}
+
+/// Literal preparation in-process (unchanged from S01).
+fn prepare_literal(
     text: &str,
     request: &ReplaceRequest,
 ) -> Result<(Vec<EditOp>, u64, u64), PrepareError> {
@@ -162,6 +290,7 @@ mod tests {
             replacement: replacement.to_owned(),
             case_sensitive: false,
             whole_word: false,
+            mode: MatchMode::Literal,
             scope: None,
         }
     }

@@ -25,6 +25,7 @@ pub mod save;
 pub mod session;
 pub mod sync;
 pub mod text_edit;
+pub mod text_worker;
 pub mod tokens;
 pub mod types;
 pub mod user_state;

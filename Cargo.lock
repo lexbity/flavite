@@ -1652,6 +1652,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flavite-text-search-worker"
+version = "0.1.0"
+dependencies = [
+ "flavite-text-search",
+ "libc",
+]
+
+[[package]]
 name = "flavite-ui"
 version = "0.1.0"
 dependencies = [

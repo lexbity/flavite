@@ -241,3 +241,107 @@ fn s01_gate_rejects_forbidden_search_pattern() {
         String::from_utf8_lossy(&rejected.stderr)
     );
 }
+
+
+/// Seed the S03 helper-crate surfaces. The S03 absence gates target the
+/// helper sources and the UI search host, so the seeded placeholders are
+/// clean and the negative tests inject each forbidden pattern.
+fn seed_s03_inputs(root: &Path) {
+    seed_s01_inputs(root);
+    for relative in [
+        "crates/flavite-text-search/src/protocol.rs",
+        "crates/flavite-text-search-worker/src/main.rs",
+        "crates/flavite-text-search/tests/regex_properties.rs",
+        "crates/flavite-vault/src/text_worker.rs",
+        "crates/flavite-vault/tests/text_worker.rs",
+        "crates/flavite-ui/tests/note_regex.rs",
+        "crates/flavite-api/tests/note_regex.rs",
+        "fuzz/fuzz_targets/text_match.rs",
+        "fuzz/fuzz_targets/text_worker_protocol.rs",
+    ] {
+        seed_file(root, relative);
+    }
+    fs::write(
+        root.join("crates/flavite-text-search-worker/Cargo.toml"),
+        "[package]\nname = \"flavite-text-search-worker\"\n\n[dependencies]\n",
+    )
+    .expect("S03 manifest");
+}
+
+#[test]
+fn s03_gate_passes_clean_tree() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_s03_inputs(temp.path());
+    let clean = run_gate(temp.path(), "S03");
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+}
+
+#[test]
+fn s03_gate_rejects_shell_and_worker_path_hijacks() {
+    for (needle, description) in [
+        (
+            r#"Command::new("sh").arg("-c").spawn();"#,
+            "shell spawn",
+        ),
+        (
+            r#"let p = env::var("FLAVITE_WORKER_PATH").unwrap();"#,
+            "worker path override",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        seed_s03_inputs(temp.path());
+        fs::write(
+            temp.path().join("crates/flavite-vault/src/text_worker.rs"),
+            needle,
+        )
+        .unwrap();
+        let rejected = run_gate(temp.path(), "S03");
+        assert!(
+            !rejected.status.success(),
+            "{description} must be rejected"
+        );
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("forbidden production pattern"),
+            "{}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+}
+
+#[test]
+fn s03_gate_rejects_regex_compilation_and_helper_product_edges() {
+    // UI-side regex compilation (TD discipline: matches come from the API).
+    let temp = tempfile::tempdir().unwrap();
+    seed_s03_inputs(temp.path());
+    fs::write(
+        temp.path().join("crates/flavite-ui/src/host/note_search.rs"),
+        "let compiled = Regex::new(pattern)?;
+",
+    )
+    .unwrap();
+    assert!(!run_gate(temp.path(), "S03").status.success());
+
+    // The helper cannot declare a product-crate dependency.
+    let temp = tempfile::tempdir().unwrap();
+    seed_s03_inputs(temp.path());
+    fs::write(
+        temp.path()
+            .join("crates/flavite-text-search-worker/Cargo.toml"),
+        "[package]\nname = \"flavite-text-search-worker\"\n\n[dependencies]\nflavite-vault = { path = \"../flavite-vault\" }\n",
+    )
+    .unwrap();
+    let rejected = run_gate(temp.path(), "S03");
+    assert!(
+        !rejected.status.success(),
+        "helper → vault dependency must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("forbidden dependency"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}

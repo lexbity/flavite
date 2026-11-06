@@ -24,6 +24,9 @@ tier1 = [
 tier2 = ["flavite-api", "flavite-graph"]
 # Tier 3 — measured, not gating until Phase 6 (§10.5).
 tier3 = ["flavite-cli", "flavite-editor", "flavite-ui", "flavite-app"]
+# The isolated source-matching helper is a packaged binary (RFC-0006 §6.2/
+# D-14): pure matching over framed IPC, measured not floor-gated (§10.5).
+tier3_helper = ["flavite-text-search-worker"]
 
 [responsibilities]
 flavite-graph-protocol = "IO-free bounded durable graph scope value types shared by core and workspace (RFC-0003 W08)"
@@ -31,6 +34,7 @@ flavite-fs = "Fs trait, atomic_write, watcher, path safety; FaultFs behind featu
 flavite-syntax = "Scanner, frontmatter patcher, pulldown glue — pure, IO-free (§4.1)"
 flavite-encoding = "Strict ASCII/UTF-8/UTF-16 codecs, source-format descriptors, encoded↔decoded byte maps — std-only, IO-free (RFC-0006 §6.10)"
 flavite-text-search = "Literal/regex source matches, match options, captures and replacement-template expansion over borrowed normalized UTF-8 — no editor/buffer authority (RFC-0006 §4.1)"
+flavite-text-search-worker = "Isolated source-matching helper binary: framed match/template pages only, self-limited memory, no IO beyond stdin/stdout (RFC-0006 §6.2, D-14)"
 flavite-index = "SQLite, tantivy, resolver, query exec (§4.1)"
 flavite-buffer = "EditorModel/ropey, undo tree, D7 state machine (§4.1)"
 flavite-vault = "Session/BufferManager ownership + actors, journal, history, recovery (§4.1)"
@@ -81,6 +85,9 @@ active = [
     { from = "flavite-api", to = "flavite-encoding" },
     { from = "flavite-index", to = "flavite-encoding" },
     { from = "flavite-text-search", to = "flavite-syntax" },
+    # S03/D-14: the helper wraps only the matcher; the parent locates the
+    # installed sibling by path, never a dependency inversion.
+    { from = "flavite-text-search-worker", to = "flavite-text-search" },
     { from = "flavite-vault", to = "flavite-text-search" },
     { from = "flavite-api", to = "flavite-text-search" },
     # flavite-vault dependencies

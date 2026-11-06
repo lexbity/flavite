@@ -35,11 +35,17 @@
 //!   edit.
 
 pub mod matcher;
+pub mod protocol;
 pub mod template;
 
 pub use matcher::{
     DEFAULT_MAX_MATCHES, MATCH_SEMANTICS_VERSION, Match, MatchError, MatchLimits, MatchMode,
     MatchOptions, MatchPage, Matcher, PATTERN_MAX_BYTES, REGEX_MAX_GROUPS, REGEX_SIZE_LIMIT_BYTES,
     select_ordinals,
+};
+pub use protocol::{
+    FRAME_MAX_BYTES, FailureCode, FromHelper, FrameError, SOURCE_MAX_BYTES, ToHelper, WireMatch,
+    decode, decode_reply, encode, encode_reply, engine_version, read_reply, read_request,
+    write_frame,
 };
 pub use template::{ReplacementTemplate, TEMPLATE_MAX_BYTES, TemplateError, TemplateGrammar};
