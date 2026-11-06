@@ -118,7 +118,7 @@ fn dirty_replacement_survives_unrelated_generation_save_later_edit_and_undo() {
         f.flavite
             .execute(Invocation::new(
                 next_id(&f.flavite),
-                "undo",
+                "buffer.undo",
                 serde_json::json!({"buffer_id":id,"revision":view.revision}),
                 Origin::Gui
             ))

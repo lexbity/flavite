@@ -4,7 +4,7 @@
 //! consumes these typed snapshots through the facade. Snapshot failures are
 //! real loading/retry states, not silent empty results.
 
-use crate::{Flavite, FlaviteError};
+use crate::Flavite;
 use std::path::PathBuf;
 
 /// Largest catalog page the facade admits (NFR-02: quick switch over 50k
@@ -28,57 +28,13 @@ pub struct NoteCatalogEntry {
     pub native_path: Vec<u8>,
     /// Indexed title.
     pub title: String,
-}
-
-/// A bounded note catalog page with the index generation it came from.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct NoteCatalog {
-    /// Entries in canonical path order.
-    pub entries: Vec<NoteCatalogEntry>,
-    /// Index epoch backing this page.
-    pub epoch: u64,
-    /// Index generation backing this page.
-    pub generation: u64,
-    /// Total indexed notes; may exceed `entries.len()`.
-    pub total: u64,
+    /// Indexed aliases used by editor completion.
+    pub aliases: Vec<String>,
+    /// Stable ID, omitted when conflicted.
+    pub stable_id: Option<String>,
 }
 
 impl Flavite {
-    /// Read a bounded native-identity note catalog page for the Notes view
-    /// and the note picker.
-    ///
-    /// # Blocking contract
-    /// Blocks the calling thread for a bounded catalog read (a 50k-row
-    /// round trip through the vault actor). MUST NOT be called from a UI
-    /// host turn — hosts use [`Flavite::submit_catalog`] and apply the
-    /// drained outcome; a `just gate` grep enforces this in
-    /// `crates/flavite-ui/src`. Retained for CLI and tests.
-    ///
-    /// # Errors
-    /// Returns [`FlaviteError::IndexError`] while the index is rebuilding
-    /// or unavailable; hosts render a retry state, not an empty vault.
-    pub fn note_catalog(&self, limit: usize) -> Result<NoteCatalog, FlaviteError> {
-        let limit = limit.min(MAX_NOTE_CATALOG_LIMIT);
-        let page = self
-            .session
-            .note_catalog(limit)
-            .map_err(FlaviteError::IndexError)?;
-        Ok(NoteCatalog {
-            entries: page
-                .items
-                .into_iter()
-                .map(|item| NoteCatalogEntry {
-                    path: PathBuf::from(item.path),
-                    native_path: item.path_native,
-                    title: item.title,
-                })
-                .collect(),
-            epoch: page.epoch,
-            generation: page.generation,
-            total: page.total,
-        })
-    }
-
     /// Submit the bounded note catalog as a query-service ticket
     /// (RFC-0004 W-D, D9). The whole read runs on a query worker; the host
     /// turn pays only the admission. Outcomes arrive through
@@ -103,6 +59,30 @@ impl Flavite {
             binding_sequence,
             crate::QueryPayload::Catalog {
                 limit: MAX_NOTE_CATALOG_LIMIT as u64,
+            },
+        )
+    }
+
+    /// Submit canonical link resolution for an exact shared-buffer revision.
+    /// The parse/resolution work runs on the query service, and superseded
+    /// results are correlated by the requesting view identity.
+    pub fn submit_link_verdicts(
+        &self,
+        context_tab: u128,
+        incarnation: u64,
+        binding_sequence: u64,
+        buffer_id: u64,
+        revision: u64,
+        source_path: PathBuf,
+    ) -> Result<crate::RequestToken, crate::QuerySubmitError> {
+        self.queries.submit(
+            context_tab,
+            incarnation,
+            binding_sequence,
+            crate::QueryPayload::LinkVerdicts {
+                buffer_id,
+                revision,
+                source_path,
             },
         )
     }

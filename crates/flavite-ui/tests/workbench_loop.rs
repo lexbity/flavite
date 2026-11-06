@@ -35,7 +35,9 @@ fn loop_fixture() -> (App, tempfile::TempDir) {
     // The graph needs a real publication pipeline: reconcile, then mount a
     // graph view in a second group (the graph stays visible, AC-5).
     let _ = app.update(Message::RunCoreCommand("vault.reconcile"));
-    wait_for(&mut app, "reconcile", |app| app.pending_operations() == 0);
+    wait_for(&mut app, "vault.reconcile", |app| {
+        app.pending_operations() == 0
+    });
     let _ = app.update(Message::RunHostCommand("workspace.split_right"));
     let _ = app.update(Message::NewViewInFocused(ViewKind::Graph(GraphView::new(
         GraphCamera::centered(),
@@ -154,7 +156,7 @@ fn edit_publishes_to_graph_and_loop_keeps_identity_camera_scope_preview() {
     let revision_before = append_text(&mut app, a_tab, "\nsee [[c]] too\n");
     assert_eq!(
         app.note_buffer_state(a_tab),
-        Some(flavite_api::BufferStatus::Dirty),
+        Some(flavite_buffer::state::BufferState::Dirty),
         "the appended link made the buffer dirty"
     );
 
@@ -302,7 +304,7 @@ fn edit_publishes_to_graph_and_loop_keeps_identity_camera_scope_preview() {
     // a.md's dirty draft survived the loop untouched.
     assert_eq!(
         app.note_buffer_state(a_tab),
-        Some(flavite_api::BufferStatus::Dirty),
+        Some(flavite_buffer::state::BufferState::Dirty),
     );
     assert_eq!(app.notes.buffer(&a_tab), Some(a_buffer));
     assert_eq!(
@@ -422,7 +424,9 @@ fn pair_activates_while_newer_frame_pending_and_insert_refuses() {
         ("b.md", "# B\n\nb body\n"),
     ]);
     let _ = app.update(Message::RunCoreCommand("vault.reconcile"));
-    wait_for(&mut app, "reconcile", |app| app.pending_operations() == 0);
+    wait_for(&mut app, "vault.reconcile", |app| {
+        app.pending_operations() == 0
+    });
     let _ = app.update(Message::RunHostCommand("workspace.split_right"));
     let _ = app.update(Message::NewViewInFocused(ViewKind::Graph(GraphView::new(
         GraphCamera::centered(),
@@ -595,7 +599,9 @@ fn unresolved_activation_offers_create_or_locate_and_never_creates() {
         graph_fixture::fixture_with(&[("a.md", "# A\n\nsee [[ghost]] here.\n")]);
     let root = std::path::PathBuf::from("/test/context-routing");
     let _ = app.update(Message::RunCoreCommand("vault.reconcile"));
-    wait_for(&mut app, "reconcile", |app| app.pending_operations() == 0);
+    wait_for(&mut app, "vault.reconcile", |app| {
+        app.pending_operations() == 0
+    });
     let _ = app.update(Message::RunHostCommand("workspace.split_right"));
     let _ = app.update(Message::NewViewInFocused(ViewKind::Graph(GraphView::new(
         GraphCamera::centered(),
@@ -692,7 +698,9 @@ fn attachment_activation_uses_the_local_inspector_not_a_note_open() {
         ("img/movie.mkv", "fake-matroska-bytes"),
     ]);
     let _ = app.update(Message::RunCoreCommand("vault.reconcile"));
-    wait_for(&mut app, "reconcile", |app| app.pending_operations() == 0);
+    wait_for(&mut app, "vault.reconcile", |app| {
+        app.pending_operations() == 0
+    });
     let _ = app.update(Message::RunHostCommand("workspace.split_right"));
     let _ = app.update(Message::NewViewInFocused(ViewKind::Graph(GraphView::new(
         GraphCamera::centered(),
@@ -757,7 +765,9 @@ fn entity_frames_freeze_for_the_pair_hold_while_emphasis_updates() {
         ("c.md", "# C\n\nc body\n"),
     ]);
     let _ = app.update(Message::RunCoreCommand("vault.reconcile"));
-    wait_for(&mut app, "reconcile", |app| app.pending_operations() == 0);
+    wait_for(&mut app, "vault.reconcile", |app| {
+        app.pending_operations() == 0
+    });
     let _ = app.update(Message::RunHostCommand("workspace.split_right"));
     let _ = app.update(Message::NewViewInFocused(ViewKind::Graph(GraphView::new(
         GraphCamera::centered(),

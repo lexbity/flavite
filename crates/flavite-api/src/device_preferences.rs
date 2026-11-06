@@ -94,6 +94,8 @@ pub struct Preferences {
     pub line_width: LineWidth,
     /// Reduce motion: gate animated transitions and camera easing.
     pub reduced_motion: bool,
+    /// Prefer unconflicted stable-ID syntax when the editor inserts links.
+    pub prefer_stable_links: bool,
     /// RFC-0006 S04 (D-02): the user acknowledged the changed graph
     /// gesture contract (double-click now activates; insertion is the
     /// explicit Insert command). Persisted once, dismissible thereafter.
@@ -138,6 +140,7 @@ impl Preferences {
             editor_font_size: 16,
             line_width: LineWidth::Full,
             reduced_motion: false,
+            prefer_stable_links: false,
             graph_activation_acknowledged: false,
             shortcuts: BTreeMap::new(),
             unknown: BTreeMap::new(),
@@ -198,6 +201,7 @@ impl Preferences {
                     | "editor_font_size"
                     | "line_width"
                     | "reduced_motion"
+                    | "prefer_stable_links"
                     | "graph_activation_acknowledged"
                     | "shortcuts"
             ) {
@@ -272,6 +276,14 @@ impl Preferences {
                 false
             }
         };
+        let prefer_stable_links = match map.get("prefer_stable_links") {
+            None => false,
+            Some(Value::Bool(flag)) => *flag,
+            Some(_) => {
+                warnings.push("prefer_stable_links must be true or false".into());
+                false
+            }
+        };
         let shortcuts = match map.get("shortcuts") {
             None => BTreeMap::new(),
             Some(Value::Object(entries)) => {
@@ -299,6 +311,7 @@ impl Preferences {
                 editor_font_size,
                 line_width,
                 reduced_motion,
+                prefer_stable_links,
                 graph_activation_acknowledged,
                 shortcuts,
                 unknown,
@@ -329,6 +342,10 @@ impl Preferences {
             },
         );
         map.insert("reduced_motion".into(), Value::from(self.reduced_motion));
+        map.insert(
+            "prefer_stable_links".into(),
+            Value::from(self.prefer_stable_links),
+        );
         map.insert(
             "graph_activation_acknowledged".into(),
             Value::from(self.graph_activation_acknowledged),
@@ -476,6 +493,34 @@ pub fn chord_string(chord: &Chord) -> String {
     }
     parts.push(&chord.key);
     parts.join("+")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stable_link_preference_round_trips_and_defaults_to_readable_targets() {
+        let mut preferences = Preferences::defaults();
+        assert!(!preferences.prefer_stable_links);
+        preferences.prefer_stable_links = true;
+        let encoded = preferences.to_json().to_string();
+        let parsed = Preferences::parse(Some(&encoded)).unwrap();
+        assert!(parsed.preferences.prefer_stable_links);
+    }
+
+    #[test]
+    fn malformed_stable_link_preference_falls_back_with_a_warning() {
+        let parsed =
+            Preferences::parse(Some(r#"{"schema":1,"prefer_stable_links":"yes"}"#)).unwrap();
+        assert!(!parsed.preferences.prefer_stable_links);
+        assert!(
+            parsed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("prefer_stable_links"))
+        );
+    }
 }
 
 /// Why a shortcut map was refused.

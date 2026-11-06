@@ -1098,7 +1098,9 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
             return app.update(Message::LocateFromNode(app.workspace.focused_tab()));
         }
         "workspace.find" => {
-            return app.update(Message::FindOpen(app.workspace.focused_tab()));
+            return app.update(Message::NoteSearch(
+                crate::host::note_search::NoteSearchMessage::FindOpen(app.workspace.focused_tab()),
+            ));
         }
         "workspace.replace" => {
             return app.update(Message::NoteSearch(

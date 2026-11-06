@@ -231,13 +231,13 @@ fn history_lists_snapshots_and_restore_is_undoable_without_disk_write() {
     let _ = app.update(Message::RunCoreCommand("note.save"));
     wait(app, |a| {
         a.note_editor_view(tab)
-            .is_some_and(|view| matches!(view.state, flavite_api::BufferStatus::Clean))
+            .is_some_and(|view| matches!(view.state, flavite_buffer::state::BufferState::Clean))
     });
     edit_buffer(app, tab, "# B\nThird body\n");
     let _ = app.update(Message::RunCoreCommand("note.save"));
     wait(app, |a| {
         a.note_editor_view(tab)
-            .is_some_and(|view| matches!(view.state, flavite_api::BufferStatus::Clean))
+            .is_some_and(|view| matches!(view.state, flavite_buffer::state::BufferState::Clean))
     });
 
     // Open the history view for this note and load it.

@@ -180,7 +180,7 @@ pub struct SearchNote {
 const EXCERPT_MAX_CHARS: usize = 160;
 
 /// One catalog entry: the portable path string, the raw native path bytes
-/// (authoritative identity), and the indexed title.
+/// (authoritative identity), and bounded indexed completion metadata.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NoteCatalogEntry {
     /// Portable vault-relative path (display and join purposes).
@@ -189,6 +189,10 @@ pub struct NoteCatalogEntry {
     pub path_native: Vec<u8>,
     /// Indexed note title.
     pub title: String,
+    /// Indexed aliases, in canonical alias-key order.
+    pub aliases: Vec<String>,
+    /// Stable ID, omitted when conflicted.
+    pub stable_id: Option<String>,
 }
 
 /// A bounded catalog page with the index generation it came from.
@@ -817,61 +821,6 @@ impl IndexActor {
             .map_err(|error| error.to_string())?
             .unwrap_or(0);
         Ok((epoch, generation))
-    }
-
-    /// Read the indexed note title/alias snapshot for editor autocomplete.
-    ///
-    /// # Errors
-    /// Returns a pool or SQLite error when the read connection is unavailable.
-    pub fn completion_candidates(&self) -> Result<Vec<crate::types::CompletionCandidate>, String> {
-        let connection = self
-            .read_pool
-            .get(Some(std::time::Duration::from_secs(2)))
-            .map_err(|error| error.to_string())?;
-        let mut aliases_by_note = std::collections::HashMap::<i64, Vec<String>>::new();
-        {
-            let mut statement = connection
-                .prepare("SELECT note_id, alias FROM aliases ORDER BY note_id, alias_key")
-                .map_err(|error| error.to_string())?;
-            let aliases = statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|error| error.to_string())?;
-            for alias in aliases {
-                let (note_id, value) = alias.map_err(|error| error.to_string())?;
-                aliases_by_note.entry(note_id).or_default().push(value);
-            }
-        }
-        let mut statement = connection
-            .prepare(
-                "SELECT note_id, path, title, stable_id, id_conflict FROM notes ORDER BY path_key, path",
-            )
-            .map_err(|error| error.to_string())?;
-        let note_rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, bool>(4)?,
-                ))
-            })
-            .map_err(|error| error.to_string())?;
-        let mut candidates = Vec::new();
-        for row in note_rows {
-            let (note_id, path, title, stable_id, id_conflict) =
-                row.map_err(|error| error.to_string())?;
-            let target = path.strip_suffix(".md").unwrap_or(&path).to_owned();
-            candidates.push(crate::types::CompletionCandidate {
-                target,
-                title,
-                aliases: aliases_by_note.remove(&note_id).unwrap_or_default(),
-                stable_id: (!id_conflict).then_some(stable_id).flatten(),
-            });
-        }
-        Ok(candidates)
     }
 
     /// Resolve one editor link through the same resolver used by ingestion.
@@ -2145,32 +2094,76 @@ impl IndexActor {
             .read_pool
             .get(Some(Duration::from_secs(2)))
             .map_err(|e| e.to_string())?;
-        let epoch = crate::schema::get_meta_u64(&conn, crate::schema::MetaKey::Epoch)
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let epoch = crate::schema::get_meta_u64(&tx, crate::schema::MetaKey::Epoch)
             .map_err(|e| e.to_string())?
             .unwrap_or(1);
-        let generation = crate::schema::get_meta_u64(&conn, crate::schema::MetaKey::Generation)
+        let generation = crate::schema::get_meta_u64(&tx, crate::schema::MetaKey::Generation)
             .map_err(|e| e.to_string())?
             .unwrap_or(0);
-        let total: i64 = conn
+        let total: i64 = tx
             .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
-        let mut statement = conn
-            .prepare("SELECT path, path_native, title FROM notes ORDER BY path_key, path LIMIT ?1")
+        let mut statement = tx
+            .prepare("SELECT note_id, path, path_native, title, stable_id, id_conflict FROM notes ORDER BY path_key, path LIMIT ?1")
             .map_err(|e| e.to_string())?;
         let bounded_limit =
             i64::try_from(limit).map_err(|_| "note catalog limit does not fit i64".to_owned())?;
         let rows = statement
             .query_map([bounded_limit], |row| {
-                Ok(NoteCatalogEntry {
-                    path: row.get(0)?,
-                    path_native: row.get(1)?,
-                    title: row.get(2)?,
-                })
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    NoteCatalogEntry {
+                        path: row.get(1)?,
+                        path_native: row.get(2)?,
+                        title: row.get(3)?,
+                        aliases: Vec::new(),
+                        stable_id: if row.get::<_, bool>(5)? {
+                            None
+                        } else {
+                            row.get(4)?
+                        },
+                    },
+                ))
             })
             .map_err(|e| e.to_string())?;
-        let items = rows
+        let mut indexed = rows
             .map(|row| row.map_err(|e| e.to_string()))
             .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let note_ids = indexed.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let mut aliases = std::collections::HashMap::<i64, Vec<String>>::new();
+        // Alias lookup remains bounded to this page and keeps parameter
+        // batches below SQLite's variable limit.
+        for chunk in note_ids.chunks(900) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT note_id, alias FROM aliases WHERE note_id IN ({placeholders}) ORDER BY note_id, alias_key"
+            );
+            let mut statement = tx.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let (note_id, alias) = row.map_err(|e| e.to_string())?;
+                aliases.entry(note_id).or_default().push(alias);
+            }
+        }
+        let items = indexed
+            .drain(..)
+            .map(|(note_id, mut entry)| {
+                entry.aliases = aliases.remove(&note_id).unwrap_or_default();
+                entry
+            })
+            .collect();
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(NoteCatalogPage {
             items,
             epoch,
@@ -2568,11 +2561,12 @@ mod tests {
             .apply_saved_note(b"notes/a.md", "notes/a.md", original, 98, 99)
             .unwrap();
         assert_eq!((epoch, generation), (1, 1));
-        let candidates = index.completion_candidates().unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].target, "notes/a");
-        assert_eq!(candidates[0].title, "Alpha");
-        assert_eq!(candidates[0].aliases, ["A", "B"]);
+        let catalog = index.note_catalog(50).unwrap();
+        assert_eq!(catalog.items.len(), 1);
+        assert_eq!(catalog.items[0].path, "notes/a.md");
+        assert_eq!(catalog.items[0].title, "Alpha");
+        assert_eq!(catalog.items[0].aliases, ["A", "B"]);
+        assert_eq!(catalog.items[0].stable_id, None);
 
         {
             let conn = index.writer().conn();

@@ -259,7 +259,8 @@ impl ContextRegistry {
             QueryResult::Occurrence(_)
             | QueryResult::AttachmentOpen(_)
             | QueryResult::Anchor { .. }
-            | QueryResult::Catalog { .. } => return false,
+            | QueryResult::Catalog { .. }
+            | QueryResult::LinkVerdicts { .. } => return false,
             QueryResult::Updating => {
                 tool.invalidated = true;
                 if matches!(tool.state, ToolState::Ready(_) | ToolState::NoBacklinks) {

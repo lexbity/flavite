@@ -436,6 +436,22 @@ fn preferences_body(app: &App, metrics: style::Metrics) -> Element<'_, Message> 
                 ),
             ],
         ),
+        choice_row(
+            metrics,
+            "Stable-ID links",
+            &[
+                (
+                    "Readable",
+                    !appearance.prefs.prefer_stable_links,
+                    Message::Preferences(P::SetStableLinks(false)),
+                ),
+                (
+                    "Stable",
+                    appearance.prefs.prefer_stable_links,
+                    Message::Preferences(P::SetStableLinks(true)),
+                ),
+            ],
+        ),
         text("Keyboard shortcuts").size(metrics.text_lg),
     ]
     .spacing(metrics.spacing_sm);

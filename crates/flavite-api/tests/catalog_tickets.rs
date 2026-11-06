@@ -16,7 +16,10 @@ mod support;
 
 fn fixture() -> support::Fixture {
     let notes = [
-        ("a.md", "Alpha\n"),
+        (
+            "a.md",
+            "---\ntitle: Alpha\naliases: [First alias]\n---\nAlpha\n",
+        ),
         ("b.md", "Beta\n"),
         ("folder/c.md", "Gamma\n"),
     ];
@@ -47,9 +50,8 @@ fn catalog_of(outcomes: &[flavite_api::QueryOutcome]) -> Vec<flavite_api::QueryO
 }
 
 #[test]
-fn submit_roundtrip_matches_the_sync_path_exactly() {
+fn ticketed_catalog_returns_rich_native_identity_metadata() {
     let f = fixture();
-    let sync = f.flavite.note_catalog(MAX_NOTE_CATALOG_LIMIT).unwrap();
     let token = f.flavite.submit_catalog().expect("ticket admitted");
     assert_eq!(token.purpose, QueryPurpose::Catalog);
     assert_eq!(token.context_tab, CATALOG_CONTEXT_TAB);
@@ -79,14 +81,72 @@ fn submit_roundtrip_matches_the_sync_path_exactly() {
     else {
         panic!("expected a catalog page, got {result:?}");
     };
-    // Contents equality: the ticketed path IS the sync path.
-    assert_eq!(entries.to_vec(), sync.entries);
-    assert_eq!(
-        (provenance.epoch, provenance.generation),
-        (sync.epoch, sync.generation)
-    );
-    assert_eq!(total, sync.total);
+    assert_eq!(entries.len(), 3);
+    assert!(!entries[0].native_path.is_empty());
+    assert_eq!(provenance.epoch, 1);
+    assert!(provenance.generation >= 1);
+    assert_eq!(total, 3);
     assert!(!truncated, "three notes cannot hit the 50k bound");
+    let alpha = entries.iter().find(|entry| entry.title == "Alpha").unwrap();
+    assert_eq!(alpha.aliases, ["First alias"]);
+    assert_eq!(alpha.stable_id, None);
+}
+
+#[test]
+fn link_verdict_ticket_uses_exact_buffer_revision_and_canonical_resolver() {
+    let f = support::fixture(&[
+        ("a.md", "[[b]] [[missing]] ![[image.png]]\n"),
+        ("b.md", "Beta\n"),
+    ]);
+    let (buffer_id, revision) = f.open_note("a.md");
+    let token = f
+        .flavite
+        .submit_link_verdicts(
+            44,
+            7,
+            1,
+            buffer_id,
+            revision,
+            std::path::PathBuf::from("a.md"),
+        )
+        .expect("verdict query admitted");
+    assert_eq!(token.purpose, QueryPurpose::LinkVerdicts);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let result = loop {
+        assert!(Instant::now() < deadline, "verdict query never served");
+        f.flavite.pump();
+        if let Some(outcome) = f
+            .flavite
+            .query_service()
+            .drain()
+            .into_iter()
+            .find(|outcome| outcome.token == token)
+        {
+            break outcome.result;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let ContextQueryResult::LinkVerdicts {
+        buffer_id: served_buffer,
+        revision: served_revision,
+        verdicts,
+        ..
+    } = result
+    else {
+        panic!("expected exact link verdicts, got {result:?}");
+    };
+    assert_eq!(served_buffer, buffer_id);
+    assert_eq!(served_revision, revision);
+    let states = verdicts
+        .iter()
+        .map(|verdict| (verdict.target_raw.as_str(), verdict.state))
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(states["b"], flavite_api::LinkVerdictState::Resolved);
+    assert_eq!(states["missing"], flavite_api::LinkVerdictState::Unresolved);
+    assert_eq!(
+        states["image.png"],
+        flavite_api::LinkVerdictState::NotApplicable
+    );
 }
 
 fn flavite_pump(f: &support::Fixture) {

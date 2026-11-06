@@ -274,7 +274,7 @@ impl CliDriver {
         let request_id = flavite.command_registry().next_request_id();
         let result = flavite.execute(Invocation::new(
             request_id,
-            "reconcile",
+            "vault.reconcile",
             serde_json::json!({ "scope": "full", "mode": "verify" }),
             Origin::Cli,
         ));

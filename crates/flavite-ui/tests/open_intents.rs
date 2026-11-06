@@ -302,7 +302,7 @@ fn dirty_same_tab_quick_switch_keeps_tab_identity_and_history() {
     });
     assert_eq!(
         app.note_buffer_state(dup_a),
-        Some(flavite_api::BufferStatus::Dirty),
+        Some(flavite_buffer::state::BufferState::Dirty),
     );
     let original_buffer = app.notes.buffer(&dup_a).expect("buffer attached");
 

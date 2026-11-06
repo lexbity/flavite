@@ -16,7 +16,7 @@ fn save(flavite: &Flavite, path: &str) {
     let request_id = flavite.command_registry().next_request_id();
     let invocation = Invocation::new(
         request_id,
-        "save_note",
+        "note.save",
         serde_json::json!(flavite.vault_ref().root.join(path)),
         flavite_api::Origin::Gui,
     );

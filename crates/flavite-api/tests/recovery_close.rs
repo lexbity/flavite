@@ -364,7 +364,7 @@ fn discard_edits_requires_the_disk_file_and_keeps_history() {
     let reloaded = view(flavite, buffer_id);
     assert_eq!(reloaded.text, "disk body\n");
     assert!(
-        matches!(reloaded.state, flavite_api::BufferStatus::Clean),
+        matches!(reloaded.state, flavite_buffer::state::BufferState::Clean),
         "the reloaded buffer is clean"
     );
     assert_eq!(

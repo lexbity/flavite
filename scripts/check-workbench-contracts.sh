@@ -168,11 +168,59 @@ run_s04_gates() {
         "$root/crates/flavite-ui/src/views/graph.rs"
 }
 
+run_s05_gates() {
+    # S05 rich catalog, shared editor candidates, and exact asynchronous
+    # resolver verdicts. Completion data enters through the ticketed API;
+    # hosts must not revive either synchronous index-backed read.
+    local file
+    for file in \
+        crates/flavite-index/src/pool.rs \
+        crates/flavite-index/src/types.rs \
+        crates/flavite-api/src/queries.rs \
+        crates/flavite-api/src/query_service.rs \
+        crates/flavite-api/src/flavite.rs \
+        crates/flavite-api/src/lib.rs \
+        crates/flavite-vault/src/actor.rs \
+        crates/flavite-vault/src/session.rs \
+        crates/flavite-api/tests/catalog_tickets.rs \
+        crates/flavite-editor/src/links.rs \
+        crates/flavite-editor/src/widget.rs \
+        crates/flavite-ui/src/app.rs \
+        crates/flavite-ui/src/views/note.rs \
+        crates/flavite-ui/tests/catalog_acquisition.rs \
+        crates/flavite-api/src/device_preferences.rs; do
+        gate assert_nonempty "$root/$file"
+    done
+    gate assert_absent '\.completion_candidates\(|\.note_catalog\(' \
+        "$root/crates/flavite-ui/src"
+    gate assert_absent 'pub fn with_candidates\([^)]*Vec' \
+        "$root/crates/flavite-editor/src/widget.rs"
+    gate assert_absent 'pub use crate::queries::NoteCatalogEntry as CatalogEntry' \
+        "$root/crates/flavite-api/src/query_service.rs"
+    gate assert_absent ' as (BufferStatus|IndexCursor|IndexNoteRef|CatalogEntry)' \
+        "$root/crates/flavite-api/src/lib.rs" \
+        "$root/crates/flavite-api/src/query_service.rs"
+    gate assert_absent 'pub fn note_catalog\(' \
+        "$root/crates/flavite-api/src/queries.rs"
+    gate assert_absent 'pub fn completion_candidates|CompletionCandidates' \
+        "$root/crates/flavite-index/src/pool.rs" \
+        "$root/crates/flavite-index/src/types.rs" \
+        "$root/crates/flavite-api/src/flavite.rs" \
+        "$root/crates/flavite-api/src/lib.rs" \
+        "$root/crates/flavite-vault/src/actor.rs" \
+        "$root/crates/flavite-vault/src/session.rs"
+    gate assert_absent 'legacy dotted alias|pre-date the naming cleanup|Both ids resolve' \
+        "$root/crates/flavite-api/src/flavite.rs"
+    gate assert_absent 'Message::Find(Open|Close|Query|Next)|^[[:space:]]*Find(Open|Close|Query|Next)\(' \
+        "$root/crates/flavite-ui/src/app.rs"
+}
+
 case "$slice" in
     S00) run_s00_gates ;;
     S01) run_s00_gates; run_s01_gates ;;
     S04) run_s00_gates; run_s01_gates; run_s04_gates ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: S00 S01 S04)" >&2; exit 2 ;;
+    S05) run_s00_gates; run_s01_gates; run_s04_gates; run_s05_gates ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: S00 S01 S04 S05)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then

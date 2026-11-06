@@ -84,6 +84,8 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             "The note view needs to be reopened.",
         );
     };
+    let source_buffer = view.buffer_id;
+    let source_revision = view.revision;
     let Some(incarnation) = app.notes.incarnation(tab) else {
         return empty_state(
             *metrics,
@@ -113,6 +115,14 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         .with_type_metrics(app.appearance.metrics().editor_type())
         .with_max_line_width(app.appearance.metrics().editor_max_line_width())
         .with_colors(crate::style::tokens::editor_colors(app.appearance.scheme()))
+        .with_candidates(app.editor_candidates().clone())
+        .with_stable_links(app.appearance.prefs.prefer_stable_links)
+        .with_link_resolutions(app.editor_link_resolutions(
+            tab,
+            incarnation,
+            source_buffer,
+            source_revision,
+        ))
         .with_keyboard_enabled(!crate::host::note_search::blocks_typing(app, &tab))
         .with_input_intents(move |input| Message::EditorInput {
             tab,
@@ -149,12 +159,12 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
     .align_y(alignment::Vertical::Center)
     .style(style::toolbar);
     let state = match app.note_buffer_state(tab) {
-        Some(flavite_api::BufferStatus::Clean) => "Saved",
-        Some(flavite_api::BufferStatus::Dirty) => "Unsaved changes",
-        Some(flavite_api::BufferStatus::Conflicted) => {
+        Some(flavite_buffer::state::BufferState::Clean) => "Saved",
+        Some(flavite_buffer::state::BufferState::Dirty) => "Unsaved changes",
+        Some(flavite_buffer::state::BufferState::Conflicted) => {
             "Conflict — resolve before editing structure"
         }
-        Some(flavite_api::BufferStatus::Orphaned) => "Missing on disk — recovery retained",
+        Some(flavite_buffer::state::BufferState::Orphaned) => "Missing on disk — recovery retained",
         None => "Unavailable",
     };
     // RFC-0006 §6.10: the source-format indicator rides with the save-state

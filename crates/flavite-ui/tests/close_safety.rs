@@ -3,8 +3,9 @@
 //! queues, decision survival across layout moves, and the never-lose-work
 //! rule when a save fails (AC-W13).
 
-use flavite_api::{BufferStatus, VaultConfig};
+use flavite_api::VaultConfig;
 use flavite_buffer::manager::BufferManager;
+use flavite_buffer::state::BufferState;
 use flavite_editor::EditorAction;
 use flavite_fs::{Fs, MemFs};
 use flavite_index::IndexActor;
@@ -155,7 +156,7 @@ fn edit_note(app: &mut App, tab: TabId, suffix: &str) {
     });
     assert_eq!(
         app.note_buffer_state(tab),
-        Some(BufferStatus::Dirty),
+        Some(BufferState::Dirty),
         "the edit made the buffer dirty"
     );
 }
@@ -387,7 +388,7 @@ fn close_cancellation_keeps_the_workspace() {
     assert!(app.closing.is_none(), "the close plan was cancelled");
     assert_eq!(
         app.note_buffer_state(tab),
-        Some(BufferStatus::Dirty),
+        Some(BufferState::Dirty),
         "the buffer state is unchanged"
     );
     assert_eq!(
@@ -580,7 +581,7 @@ fn failed_save_never_closes_the_final_view() {
     );
     assert_eq!(
         app.note_buffer_state(tab),
-        Some(BufferStatus::Conflicted),
+        Some(BufferState::Conflicted),
         "the buffer reports the disk conflict"
     );
 }

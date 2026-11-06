@@ -133,6 +133,29 @@ fn seed_s04_inputs(root: &Path) {
     }
 }
 
+fn seed_s05_inputs(root: &Path) {
+    seed_s04_inputs(root);
+    for relative in [
+        "crates/flavite-index/src/pool.rs",
+        "crates/flavite-index/src/types.rs",
+        "crates/flavite-api/src/queries.rs",
+        "crates/flavite-api/src/query_service.rs",
+        "crates/flavite-api/src/flavite.rs",
+        "crates/flavite-api/src/lib.rs",
+        "crates/flavite-vault/src/actor.rs",
+        "crates/flavite-vault/src/session.rs",
+        "crates/flavite-api/tests/catalog_tickets.rs",
+        "crates/flavite-editor/src/links.rs",
+        "crates/flavite-editor/src/widget.rs",
+        "crates/flavite-ui/src/app.rs",
+        "crates/flavite-ui/src/views/note.rs",
+        "crates/flavite-ui/tests/catalog_acquisition.rs",
+        "crates/flavite-api/src/device_preferences.rs",
+    ] {
+        seed_file(root, relative);
+    }
+}
+
 #[test]
 fn workbench_gate_rejects_unknown_slice() {
     let temp = tempfile::tempdir().unwrap();
@@ -342,4 +365,58 @@ fn s04_gate_passes_clean_tree_and_rejects_forbidden_patterns() {
         "{}",
         String::from_utf8_lossy(&cumulative.stderr)
     );
+}
+
+#[test]
+fn s05_gate_requires_the_rich_ticketed_catalog_path() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_s05_inputs(temp.path());
+    let clean = run_gate(temp.path(), "S05");
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    let query_service = temp.path().join("crates/flavite-api/src/query_service.rs");
+    fs::write(
+        &query_service,
+        "pub use crate::queries::NoteCatalogEntry as CatalogEntry;\n",
+    )
+    .unwrap();
+    let alias = run_gate(temp.path(), "S05");
+    assert!(!alias.status.success());
+    assert!(
+        String::from_utf8_lossy(&alias.stderr).contains("forbidden production pattern"),
+        "{}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    fs::write(&query_service, "implementation\n").unwrap();
+
+    let app_source = temp.path().join("crates/flavite-ui/src/app.rs");
+    fs::write(&app_source, "Message::FindOpen(tab)\n").unwrap();
+    let shim = run_gate(temp.path(), "S05");
+    assert!(!shim.status.success());
+    assert!(
+        String::from_utf8_lossy(&shim.stderr).contains("forbidden production pattern"),
+        "{}",
+        String::from_utf8_lossy(&shim.stderr)
+    );
+    fs::write(&app_source, "implementation\n").unwrap();
+
+    let ui = temp.path().join("crates/flavite-ui/src/app.rs");
+    fs::write(&ui, "flavite.note_catalog(50_000);\n").unwrap();
+    let rejected = run_gate(temp.path(), "S05");
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("\\.note_catalog"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+
+    fs::write(&ui, "implementation\n").unwrap();
+    fs::remove_file(temp.path().join("crates/flavite-api/src/query_service.rs")).unwrap();
+    let missing = run_gate(temp.path(), "S05");
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("missing/empty"));
 }

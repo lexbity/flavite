@@ -19,6 +19,8 @@ pub enum PreferenceMessage {
     SetLineWidth(LineWidth),
     /// Enable or disable reduced motion.
     SetReducedMotion(bool),
+    /// Prefer stable IDs when inserting links to notes that have one.
+    SetStableLinks(bool),
     /// RFC-0006 S04 (D-02): acknowledge the changed graph gesture contract
     /// (double-click activates; Insert is explicit). Persisted once.
     AcknowledgeGraphActivation,
@@ -380,6 +382,14 @@ impl crate::app::App {
             PreferenceMessage::SetLineWidth(width) => self.appearance.set_line_width(width),
             PreferenceMessage::SetReducedMotion(reduced) => {
                 self.appearance.set_reduced_motion(reduced)
+            }
+            PreferenceMessage::SetStableLinks(enabled) => {
+                if self.appearance.prefs.prefer_stable_links == enabled {
+                    false
+                } else {
+                    self.appearance.prefs.prefer_stable_links = enabled;
+                    true
+                }
             }
             PreferenceMessage::SetShortcut { command, chord } => {
                 self.appearance.set_shortcut(&command, chord);

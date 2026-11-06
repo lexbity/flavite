@@ -181,8 +181,6 @@ pub enum VaultActorMsg {
         max: u64,
         reply: Sender<VaultActorResp>,
     },
-    /// Read the indexed title/alias snapshot for editor autocomplete.
-    CompletionCandidates { reply: Sender<VaultActorResp> },
     /// Read a bounded native-identity note catalog for workspace shells.
     NoteCatalog {
         limit: usize,
@@ -277,8 +275,6 @@ pub enum VaultActorResp {
     Error(String),
     /// File bytes, or `None` when absent.
     File(Option<Vec<u8>>),
-    /// Indexed note completion candidates.
-    CompletionCandidates(Result<Vec<flavite_index::types::CompletionCandidate>, String>),
     NoteCatalog(Result<flavite_index::NoteCatalogPage, String>),
     /// Canonical link resolution verdict.
     ResolveTarget(Result<flavite_index::resolver::Resolution, String>),
@@ -604,21 +600,6 @@ impl VaultActorHandle {
             VaultActorResp::NoteCatalog(result) => result,
             VaultActorResp::Error(error) => Err(error),
             _ => Err("unexpected note-catalog response".to_owned()),
-        }
-    }
-
-    /// Read indexed note title and alias candidates.
-    pub fn completion_candidates(
-        &self,
-    ) -> Result<Vec<flavite_index::types::CompletionCandidate>, String> {
-        let (reply, response) = crossbeam::channel::bounded(1);
-        self.sender
-            .send(VaultActorMsg::CompletionCandidates { reply })
-            .map_err(|error| error.to_string())?;
-        match response.recv().map_err(|error| error.to_string())? {
-            VaultActorResp::CompletionCandidates(result) => result,
-            VaultActorResp::Error(error) => Err(error),
-            _ => Err("unexpected completion-candidate response".to_owned()),
         }
     }
 
@@ -1395,11 +1376,6 @@ impl VaultActor {
                     .read_if_exists(&path)
                     .map(VaultActorResp::File)
                     .unwrap_or_else(|e| VaultActorResp::Error(e.to_string()));
-                let _ = reply.try_send(response);
-            }
-            VaultActorMsg::CompletionCandidates { reply } => {
-                let response =
-                    VaultActorResp::CompletionCandidates(self.index.completion_candidates());
                 let _ = reply.try_send(response);
             }
             VaultActorMsg::NoteCatalog { limit, reply } => {

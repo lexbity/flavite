@@ -185,7 +185,8 @@ pub fn pump(app: &mut App) {
             revision,
         } => *buffer_id == view.buffer_id && *revision == view.revision,
         OccurrenceSource::Saved { content_hash } => {
-            view.state == flavite_api::BufferStatus::Clean && &view.base_hash == content_hash
+            view.state == flavite_buffer::state::BufferState::Clean
+                && &view.base_hash == content_hash
         }
     };
     if !valid || view.text.get(detail.start..detail.end) != Some(detail.exact_source.as_str()) {

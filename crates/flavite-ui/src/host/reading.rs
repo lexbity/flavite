@@ -73,7 +73,8 @@ pub fn can_edit(app: &App, doc: &ReadSnapshot) -> bool {
                 && api.open_source_view(&doc.path).is_some_and(|view| {
                     matches!(
                         view.state,
-                        flavite_api::BufferStatus::Clean | flavite_api::BufferStatus::Dirty
+                        flavite_buffer::state::BufferState::Clean
+                            | flavite_buffer::state::BufferState::Dirty
                     )
                 })
         })
@@ -89,7 +90,7 @@ pub fn unsaved(app: &App, doc: &ReadSnapshot) -> bool {
         .as_ref()
         .and_then(|api| api.open_source_view(&doc.path))
         .map_or(doc.unsaved, |view| {
-            view.state != flavite_api::BufferStatus::Clean
+            view.state != flavite_buffer::state::BufferState::Clean
         })
 }
 /// A save/index publication may replace a rendering without changing source

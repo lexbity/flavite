@@ -105,12 +105,11 @@ fn duplicate_views_keep_independent_find_state_and_rescan_after_edits() {
         app.note_editor_view(second).unwrap().buffer_id,
         "both views share one buffer"
     );
-    // The legacy Message::Find* variants route into the same host.
-    let _ = app.update(Message::FindOpen(first));
-    let _ = app.update(Message::FindQuery {
+    let _ = app.update(Message::NoteSearch(NoteSearchMessage::FindOpen(first)));
+    let _ = app.update(Message::NoteSearch(NoteSearchMessage::FindQuery {
         tab: first,
         query: "alpha".into(),
-    });
+    }));
     find(&mut app, second, "beta");
     assert_eq!(spans(&app, first).len(), 3);
     assert_eq!(spans(&app, second).len(), 1);
@@ -218,8 +217,10 @@ fn find_navigation_sets_display_selection_without_editor_edits() {
         app.workspace.writing_target().is_none(),
         "find navigation never authorizes writing"
     );
-    // Legacy FindNext message keeps the same contract.
-    let _ = app.update(Message::FindNext { tab, forward: true });
+    let _ = app.update(Message::NoteSearch(NoteSearchMessage::FindNext {
+        tab,
+        forward: true,
+    }));
     let selection = app
         .workspace
         .tab(&tab)
@@ -273,7 +274,7 @@ fn replace_all_prepares_through_the_core_and_updates_both_views() {
 
 fn crate_replace_visible(app: &App, tab: TabId) -> bool {
     app.note_editor_view(tab).is_some_and(|view| {
-        app.note_buffer_state(tab) == Some(flavite_api::BufferStatus::Dirty)
+        app.note_buffer_state(tab) == Some(flavite_buffer::state::BufferState::Dirty)
             || view.text.contains("zz")
     })
 }

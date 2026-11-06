@@ -54,6 +54,14 @@ pub struct NoticePresentation {
     pub event: flavite_api::Event,
 }
 
+#[derive(Debug, Clone)]
+struct LinkVerdictSnapshot {
+    incarnation: u64,
+    buffer_id: u64,
+    revision: u64,
+    values: std::sync::Arc<std::collections::HashMap<String, flavite_editor::LinkResolution>>,
+}
+
 /// Run-ready application state. `Flavite` owns the only Session and buffer
 /// authority; the workspace model owns layout truth.
 pub struct App {
@@ -85,7 +93,7 @@ pub struct App {
     pub open_memory: crate::host::open_intents::OpenMemory,
     /// One modal dialog, when open (W10).
     pub dialog: Option<crate::host::dialogs::Dialog>,
-    /// No-vault start screen state (FR-22, W13-compatible).
+    /// No-vault start screen state (FR-22).
     pub start: crate::host::dialogs::StartState,
     /// Notes view filter text per tab.
     notes_filters: BTreeMap<TabId, String>,
@@ -95,6 +103,13 @@ pub struct App {
     search_focus_tried: BTreeSet<TabId>,
     /// Unified candidate snapshot, rebuilt with the catalog (W10).
     note_candidates: crate::picker::NoteCandidates,
+    /// Shared rich candidate snapshot for all editor widgets (RFC-0006 S05).
+    editor_candidates: std::sync::Arc<[flavite_editor::NoteCandidate]>,
+    /// Last admitted (buffer, revision, sequence) resolver query per view.
+    link_verdict_requests: BTreeMap<TabId, (u64, u64, u64, u64)>,
+    link_verdict_sequences: BTreeMap<TabId, u64>,
+    /// Exact resolver snapshot per view and source revision.
+    link_verdicts: BTreeMap<TabId, LinkVerdictSnapshot>,
     /// Device-local workspace persistence (W06).
     pub persistence: crate::host::persistence::PersistenceHost,
     /// Interface appearance: theme, scale, editor type, reduced motion,
@@ -227,18 +242,8 @@ pub enum Message {
         incarnation: u64,
         input: flavite_editor::input::CapturedInput,
     },
-    FindOpen(TabId),
     /// RFC-0006 §6.10: typed encoding decisions routed to the encoding host.
     Encoding(crate::host::encoding::EncodingMessage),
-    FindClose(TabId),
-    FindQuery {
-        tab: TabId,
-        query: String,
-    },
-    FindNext {
-        tab: TabId,
-        forward: bool,
-    },
     /// RFC-0006 S01: literal find/replace host messages.
     NoteSearch(crate::host::note_search::NoteSearchMessage),
     ToggleNoteMode(TabId),
@@ -577,6 +582,10 @@ impl App {
             notes_filters: BTreeMap::new(),
             search_focus_tried: BTreeSet::new(),
             note_candidates: crate::picker::NoteCandidates::default(),
+            editor_candidates: std::sync::Arc::from([]),
+            link_verdict_requests: BTreeMap::new(),
+            link_verdict_sequences: BTreeMap::new(),
+            link_verdicts: BTreeMap::new(),
             persistence: crate::host::persistence::PersistenceHost::default(),
             appearance: crate::host::appearance::AppearanceHost::boot(),
             shortcut_capture: None,
@@ -940,6 +949,26 @@ impl App {
                 // One candidate snapshot feeds the picker, Notes view,
                 // dialogs, and open-in-tab flows (W10 de-duplication).
                 self.note_candidates = crate::picker::NoteCandidates::from_catalog(&self.catalog);
+                self.editor_candidates = std::sync::Arc::from(
+                    self.catalog
+                        .iter()
+                        // Link targets are UTF-8. Keep native identity in the
+                        // catalog, but never make a lossy target fallback.
+                        .filter_map(|entry| {
+                            let path = entry.path.to_str()?;
+                            let target = path.strip_suffix(".md").unwrap_or(path).to_owned();
+                            Some(flavite_editor::NoteCandidate {
+                                target,
+                                title: entry.title.clone(),
+                                aliases: entry.aliases.clone(),
+                                stable_id: entry.stable_id.clone(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                );
+                self.link_verdict_requests.clear();
+                self.link_verdicts.clear();
                 self.catalog_status = CatalogStatus::Ready {
                     epoch: provenance.epoch,
                     generation: provenance.generation,
@@ -989,6 +1018,34 @@ impl App {
     #[must_use]
     pub fn note_candidates(&self) -> &crate::picker::NoteCandidates {
         &self.note_candidates
+    }
+
+    /// Rich immutable alias/ID candidates shared with editor widgets.
+    #[must_use]
+    pub fn editor_candidates(&self) -> &std::sync::Arc<[flavite_editor::NoteCandidate]> {
+        &self.editor_candidates
+    }
+
+    /// Exact resolver decorations matching the editor's buffer revision.
+    #[must_use]
+    pub fn editor_link_resolutions(
+        &self,
+        tab: TabId,
+        incarnation: u64,
+        buffer_id: u64,
+        revision: u64,
+    ) -> std::sync::Arc<std::collections::HashMap<String, flavite_editor::LinkResolution>> {
+        self.link_verdicts
+            .get(&tab)
+            .filter(|snapshot| {
+                snapshot.incarnation == incarnation
+                    && snapshot.buffer_id == buffer_id
+                    && snapshot.revision == revision
+            })
+            .map_or_else(
+                || std::sync::Arc::new(std::collections::HashMap::new()),
+                |snapshot| snapshot.values.clone(),
+            )
     }
 
     /// The Notes view filter text for one tab.
@@ -1410,7 +1467,7 @@ impl App {
 
     /// The buffer state chip label for a note tab ("Clean"/"Dirty"/…).
     #[must_use]
-    pub fn note_buffer_state(&self, tab: TabId) -> Option<flavite_api::BufferStatus> {
+    pub fn note_buffer_state(&self, tab: TabId) -> Option<flavite_buffer::state::BufferState> {
         self.note_editor_view(tab).map(|view| view.state)
     }
 
@@ -2156,30 +2213,6 @@ impl App {
             }
             Message::NoteSearch(message) => {
                 return crate::host::note_search::handle(self, message);
-            }
-            Message::FindOpen(tab) => {
-                return crate::host::note_search::handle(
-                    self,
-                    crate::host::note_search::NoteSearchMessage::FindOpen(tab),
-                );
-            }
-            Message::FindClose(tab) => {
-                return crate::host::note_search::handle(
-                    self,
-                    crate::host::note_search::NoteSearchMessage::FindClose(tab),
-                );
-            }
-            Message::FindQuery { tab, query } => {
-                return crate::host::note_search::handle(
-                    self,
-                    crate::host::note_search::NoteSearchMessage::FindQuery { tab, query },
-                );
-            }
-            Message::FindNext { tab, forward } => {
-                return crate::host::note_search::handle(
-                    self,
-                    crate::host::note_search::NoteSearchMessage::FindNext { tab, forward },
-                );
             }
             message @ (Message::ToggleNoteMode(_)
             | Message::RetryReading(_)
@@ -3008,6 +3041,7 @@ impl App {
     /// Process vault events and completions on the host pump. Presentation
     /// never gates core progress (FR-28).
     fn pump(&mut self) {
+        self.admit_link_verdict_queries();
         let drained = {
             let Some(flavite) = &self.flavite else {
                 return;
@@ -3106,6 +3140,9 @@ impl App {
                     self.apply_catalog_outcome(&outcome.result);
                     continue;
                 }
+                if self.observe_link_verdicts(&outcome) {
+                    continue;
+                }
                 if crate::host::reading::observe(self, &outcome)
                     || crate::host::occurrences::observe(self, &outcome)
                     || self.search.observe(&outcome)
@@ -3154,6 +3191,153 @@ impl App {
         // Graph frames, pins, geometry pairing, and camera commits (§W07).
         crate::host::graph::pump(self);
         crate::host::occurrences::pump(self);
+    }
+
+    fn admit_link_verdict_queries(&mut self) {
+        let Some(flavite) = self.flavite.as_ref() else {
+            return;
+        };
+        let live_tabs = self
+            .workspace
+            .tabs()
+            .map(|(tab, _)| *tab)
+            .collect::<BTreeSet<_>>();
+        self.link_verdict_requests
+            .retain(|tab, _| live_tabs.contains(tab));
+        self.link_verdict_sequences
+            .retain(|tab, _| live_tabs.contains(tab));
+        self.link_verdicts.retain(|tab, _| live_tabs.contains(tab));
+        let requests = self
+            .workspace
+            .tabs()
+            .filter_map(|(tab, session)| {
+                if !matches!(session.kind(), flavite_workspace::ViewKind::Note(_)) {
+                    return None;
+                }
+                let incarnation = session.interaction().incarnation;
+                let view = self.note_editor_view(*tab)?;
+                let current = (view.buffer_id, view.revision);
+                let previous = self.link_verdict_requests.get(tab).copied();
+                if previous.is_some_and(|(old_incarnation, buffer, revision, _)| {
+                    old_incarnation == incarnation && (buffer, revision) == current
+                }) || self.link_verdicts.get(tab).is_some_and(|snapshot| {
+                    snapshot.incarnation == incarnation
+                        && (snapshot.buffer_id, snapshot.revision) == current
+                }) {
+                    return None;
+                }
+                let sequence = self
+                    .link_verdict_sequences
+                    .get(tab)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                let source_path = view
+                    .path
+                    .strip_prefix(&self.root)
+                    .unwrap_or(&view.path)
+                    .to_path_buf();
+                Some((
+                    *tab,
+                    incarnation,
+                    sequence,
+                    view.buffer_id,
+                    view.revision,
+                    source_path,
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (tab, incarnation, sequence, buffer_id, revision, source_path) in requests {
+            match flavite.submit_link_verdicts(
+                tab.raw(),
+                incarnation,
+                sequence,
+                buffer_id,
+                revision,
+                source_path,
+            ) {
+                Ok(_) => {
+                    self.link_verdict_requests
+                        .insert(tab, (incarnation, buffer_id, revision, sequence));
+                    self.link_verdict_sequences.insert(tab, sequence);
+                    self.link_verdicts.remove(&tab);
+                }
+                Err(flavite_api::QuerySubmitError::Busy) => {}
+            }
+        }
+    }
+
+    fn observe_link_verdicts(&mut self, outcome: &flavite_api::QueryOutcome) -> bool {
+        if outcome.token.purpose != flavite_api::QueryPurpose::LinkVerdicts {
+            return false;
+        }
+        let tab = TabId::from_raw(outcome.token.context_tab);
+        let Some((incarnation, buffer_id, revision, sequence)) =
+            self.link_verdict_requests.get(&tab).copied()
+        else {
+            return true;
+        };
+        if sequence != outcome.token.binding_sequence
+            || incarnation != outcome.token.incarnation
+            || self.workspace.tab(&tab).is_none_or(|session| {
+                session.interaction().incarnation != outcome.token.incarnation
+            })
+        {
+            return true;
+        }
+        let matches_current = self
+            .note_editor_view(tab)
+            .is_some_and(|view| view.buffer_id == buffer_id && view.revision == revision);
+        if !matches_current {
+            self.link_verdict_requests.remove(&tab);
+            return true;
+        }
+        match &outcome.result {
+            flavite_api::ContextQueryResult::LinkVerdicts {
+                buffer_id: result_buffer,
+                revision: result_revision,
+                verdicts,
+                ..
+            } if *result_buffer == buffer_id && *result_revision == revision => {
+                let mapped = verdicts
+                    .iter()
+                    .map(|verdict| {
+                        let state = match verdict.state {
+                            flavite_api::LinkVerdictState::Resolved => {
+                                flavite_editor::LinkResolution::Resolved
+                            }
+                            flavite_api::LinkVerdictState::Ambiguous => {
+                                flavite_editor::LinkResolution::MultipleCandidates
+                            }
+                            flavite_api::LinkVerdictState::Unresolved => {
+                                flavite_editor::LinkResolution::Unresolved
+                            }
+                            flavite_api::LinkVerdictState::NotApplicable => {
+                                flavite_editor::LinkResolution::NotApplicable
+                            }
+                        };
+                        (verdict.target_key.clone(), state)
+                    })
+                    .collect();
+                self.link_verdicts.insert(
+                    tab,
+                    LinkVerdictSnapshot {
+                        incarnation,
+                        buffer_id,
+                        revision,
+                        values: std::sync::Arc::new(mapped),
+                    },
+                );
+            }
+            flavite_api::ContextQueryResult::Updating
+            | flavite_api::ContextQueryResult::Failed { .. } => {
+                self.link_verdict_requests.remove(&tab);
+            }
+            _ => {
+                self.link_verdict_requests.remove(&tab);
+            }
+        }
+        true
     }
 
     /// Route one completion to its document flight, independent of which
@@ -3551,7 +3735,11 @@ impl App {
                 "source": { "buffer_id": buffer_id, "revision": revision, "caret": caret },
                 "target_path": target_path.clone(),
                 "expected_target": expected,
-                "stable_link_policy": "disabled",
+                "stable_link_policy": if self.appearance.prefs.prefer_stable_links {
+                    "prefer_stable"
+                } else {
+                    "disabled"
+                },
             }),
             Origin::Gui,
             flavite_api::Preconditions::new()
@@ -3781,7 +3969,7 @@ impl App {
         let request_id = flavite.command_registry().next_request_id();
         let invocation = flavite_api::Invocation::new(
             request_id,
-            "resolve_conflict",
+            "conflict.resolve",
             serde_json::json!({ "path": path, "resolution": resolution }),
             flavite_api::Origin::Gui,
         );
@@ -3954,6 +4142,8 @@ mod tests {
                     path: PathBuf::from(path),
                     native_path: path.as_bytes().to_vec(),
                     title: (*title).to_owned(),
+                    aliases: Vec::new(),
+                    stable_id: None,
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -4106,6 +4296,10 @@ mod tests {
             notes_filters: BTreeMap::new(),
             search_focus_tried: BTreeSet::new(),
             note_candidates: crate::picker::NoteCandidates::default(),
+            editor_candidates: std::sync::Arc::from([]),
+            link_verdict_requests: BTreeMap::new(),
+            link_verdict_sequences: BTreeMap::new(),
+            link_verdicts: BTreeMap::new(),
             persistence: crate::host::persistence::PersistenceHost::default(),
             appearance: crate::host::appearance::AppearanceHost::boot(),
             shortcut_capture: None,
@@ -4207,11 +4401,15 @@ mod tests {
                 path: PathBuf::from("Systems/Feedback loops.md"),
                 native_path: b"Systems/Feedback loops.md".to_vec(),
                 title: "Feedback loops".into(),
+                aliases: Vec::new(),
+                stable_id: None,
             },
             NoteCatalogEntry {
                 path: PathBuf::from("Sources/archive.md"),
                 native_path: b"Sources/archive.md".to_vec(),
                 title: "Archive".into(),
+                aliases: Vec::new(),
+                stable_id: None,
             },
         ];
         let matched = crate::picker::NoteCandidates::from_catalog(&entries).matches("feedback");

@@ -24,6 +24,7 @@ use iced::{Background, Border, Color, Length, Point, Rectangle, Size, Theme};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const FONT_SIZE: f32 = 16.0;
@@ -149,8 +150,8 @@ thread_local! {
 /// this widget never mutates a buffer or accesses the filesystem itself.
 pub struct EditorWidget<'a, Message> {
     view: EditorView,
-    candidates: Vec<NoteCandidate>,
-    link_resolutions: HashMap<String, LinkResolution>,
+    candidates: Arc<[NoteCandidate]>,
+    link_resolutions: Arc<HashMap<String, LinkResolution>>,
     stable_links: bool,
     on_action: Box<dyn Fn(EditorAction) -> Message + 'a>,
     on_interaction: Option<Box<dyn Fn(EditorInteractionSnapshot) -> Message + 'a>>,
@@ -182,8 +183,8 @@ impl<'a, Message> EditorWidget<'a, Message> {
     pub fn from_view(view: EditorView, on_action: impl Fn(EditorAction) -> Message + 'a) -> Self {
         Self {
             view,
-            candidates: Vec::new(),
-            link_resolutions: HashMap::new(),
+            candidates: Arc::from([]),
+            link_resolutions: Arc::new(HashMap::new()),
             stable_links: false,
             on_action: Box::new(on_action),
             on_interaction: None,
@@ -236,7 +237,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
 
     /// Supply an indexed title/alias snapshot for in-memory autocomplete.
     #[must_use]
-    pub fn with_candidates(mut self, candidates: Vec<NoteCandidate>) -> Self {
+    pub fn with_candidates(mut self, candidates: Arc<[NoteCandidate]>) -> Self {
         self.candidates = candidates;
         self
     }
@@ -244,11 +245,11 @@ impl<'a, Message> EditorWidget<'a, Message> {
     /// Supply resolver verdicts keyed by the folded raw link target. Verdicts
     /// come from the index snapshot API; the editor does not rank candidates.
     #[must_use]
-    pub fn with_link_resolutions(mut self, resolutions: HashMap<String, LinkResolution>) -> Self {
-        self.link_resolutions = resolutions
-            .into_iter()
-            .map(|(target, verdict)| (flavite_syntax::text::fold_key(&target), verdict))
-            .collect();
+    pub fn with_link_resolutions(
+        mut self,
+        resolutions: Arc<HashMap<String, LinkResolution>>,
+    ) -> Self {
+        self.link_resolutions = resolutions;
         self
     }
 
@@ -2139,7 +2140,7 @@ fn caret_position(runs: &[cosmic_text::LayoutRun<'_>], text: &str, byte: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flavite_api::BufferStatus;
+    use flavite_buffer::state::BufferState;
     use flavite_syntax::text::{Span, TextByte};
     use iced::advanced::widget::Operation as _;
 
@@ -2153,7 +2154,7 @@ mod tests {
             revision: 1,
             text: text.into(),
             path: std::path::PathBuf::from("long.md"),
-            state: BufferStatus::Clean,
+            state: BufferState::Clean,
         }
     }
 
@@ -2514,10 +2515,10 @@ mod tests {
     #[test]
     fn autocomplete_selection_emits_revision_guarded_link_insert() {
         let view = test_view("[[In", 97);
-        let widget = EditorWidget::new(&view, |action| action).with_candidates(vec![
+        let widget = EditorWidget::new(&view, |action| action).with_candidates(Arc::from([
             NoteCandidate::new("notes/inbox", "Inbox"),
             NoteCandidate::new("Ideas", "Ideas"),
-        ]);
+        ]));
         let mut state = EditorState {
             caret: view.text.len(),
             anchor: view.text.len(),
@@ -2566,7 +2567,7 @@ mod tests {
     fn autocomplete_create_row_opens_unresolved_note_for_creation() {
         let view = test_view("[[New", 103);
         let widget = EditorWidget::new(&view, |action| action)
-            .with_candidates(vec![NoteCandidate::new("Ideas", "Ideas")]);
+            .with_candidates(Arc::from([NoteCandidate::new("Ideas", "Ideas")]));
         let mut state = EditorState {
             caret: view.text.len(),
             anchor: view.text.len(),
@@ -2622,7 +2623,7 @@ mod tests {
             revision: 15,
             text: text.into(),
             path: std::path::PathBuf::from("source.md"),
-            state: flavite_api::BufferStatus::Clean,
+            state: flavite_buffer::state::BufferState::Clean,
         };
         let action = link_action_at(&view, &spans, 4).expect("link activation");
         assert!(matches!(
@@ -2720,7 +2721,7 @@ mod tests {
             revision: 11,
             text: text.to_owned(),
             base_hash: Vec::new(),
-            state: flavite_api::BufferStatus::Clean,
+            state: flavite_buffer::state::BufferState::Clean,
             path: std::path::PathBuf::from("note.md"),
             source_format: flavite_api::SourceFormat::utf8(),
         }
@@ -2892,7 +2893,7 @@ mod tests {
             revision: 2,
             text: "long text".into(),
             path: std::path::PathBuf::from("one.md"),
-            state: flavite_api::BufferStatus::Dirty,
+            state: flavite_buffer::state::BufferState::Dirty,
         };
         let mut state = EditorState {
             buffer_id: Some(old.buffer_id),

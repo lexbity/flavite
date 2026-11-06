@@ -221,7 +221,7 @@ fn quit_with_dirty_note_requires_a_decision_first() {
     type_into(&mut app, alpha, " unsaved edit");
     assert_eq!(
         app.note_buffer_state(alpha),
-        Some(flavite_api::BufferStatus::Dirty),
+        Some(flavite_buffer::state::BufferState::Dirty),
         "the edit dirtied the buffer"
     );
     let revision = app.workspace.revision();
@@ -255,7 +255,7 @@ fn quit_with_dirty_note_requires_a_decision_first() {
     );
     assert_eq!(
         app.note_buffer_state(alpha),
-        Some(flavite_api::BufferStatus::Dirty),
+        Some(flavite_buffer::state::BufferState::Dirty),
         "the unsaved edit is intact"
     );
 }

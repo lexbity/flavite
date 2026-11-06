@@ -818,18 +818,9 @@ impl Flavite {
 
     /// Register built-in commands.
     ///
-    /// Each handler is registered under its bare id and, where consumers
-    /// (editor widget, UI shell, palette) predate the naming cleanup, under
-    /// the legacy dotted alias as well. Both ids resolve to the same handler
-    /// and schema.
+    /// Every command has one canonical ID, schema, and handler.
     fn register_builtin_commands(&self) -> Result<(), FlaviteError> {
         let registrations: Vec<HandlerRegistration> = vec![
-            (
-                "open_note",
-                "Open note",
-                ArgSchema::typed::<OpenArgs>(),
-                handle_open,
-            ),
             (
                 "note.open",
                 "Open note",
@@ -841,12 +832,6 @@ impl Flavite {
                 "Close note",
                 ArgSchema::typed::<crate::documents::CloseArgs>(),
                 handle_close,
-            ),
-            (
-                "save_note",
-                "Save note",
-                ArgSchema::typed::<PathBuf>(),
-                handle_save,
             ),
             (
                 "note.save",
@@ -921,22 +906,10 @@ impl Flavite {
                 handle_link_insert,
             ),
             (
-                "undo",
-                "Undo",
-                ArgSchema::typed::<BufferRevisionArgs>(),
-                handle_undo,
-            ),
-            (
                 "buffer.undo",
                 "Undo",
                 ArgSchema::typed::<BufferRevisionArgs>(),
                 handle_undo,
-            ),
-            (
-                "redo",
-                "Redo",
-                ArgSchema::typed::<BufferRevisionArgs>(),
-                handle_redo,
             ),
             (
                 "buffer.redo",
@@ -945,14 +918,8 @@ impl Flavite {
                 handle_redo,
             ),
             (
-                "reconcile",
-                "Reconcile vault",
-                ArgSchema::typed::<ReconcileArgs>(),
-                handle_reconcile,
-            ),
-            (
                 "vault.reconcile",
-                "Refresh vault",
+                "Reconcile vault",
                 ArgSchema::typed::<ReconcileArgs>(),
                 handle_reconcile,
             ),
@@ -963,7 +930,7 @@ impl Flavite {
                 handle_rename,
             ),
             (
-                "resolve_conflict",
+                "conflict.resolve",
                 "Resolve conflict",
                 ArgSchema::typed::<ResolveArgs>(),
                 handle_resolve,
@@ -1020,11 +987,7 @@ impl Flavite {
         for (id, title, args, handler) in registrations {
             let spec = if matches!(
                 id,
-                "open_note"
-                    | "note.open"
-                    | "note.history"
-                    | "note.reopen_encoding"
-                    | "text.prepare_replace"
+                "note.open" | "note.history" | "note.reopen_encoding" | "text.prepare_replace"
             ) {
                 CommandSpec::new(id, title, args).requires(crate::Capability::ReadNotes)
             } else {
@@ -1237,14 +1200,6 @@ impl Flavite {
     #[must_use]
     pub fn drift_found_total(&self) -> u64 {
         self.session.drift_found_total()
-    }
-
-    /// Return a revision-independent snapshot of indexed note titles, aliases,
-    /// and unconflicted stable IDs for autocomplete consumers.
-    pub fn completion_candidates(&self) -> Result<Vec<crate::CompletionCandidate>, FlaviteError> {
-        self.session
-            .completion_candidates()
-            .map_err(FlaviteError::IndexError)
     }
 
     /// Resolve an editor link using the vault index's canonical resolver.
@@ -1472,8 +1427,8 @@ impl Flavite {
             "property.set"
             | "task.toggle"
             | "apply_edits"
-            | "undo"
-            | "redo"
+            | "buffer.undo"
+            | "buffer.redo"
             | "note.convert_encoding"
             | "text.apply_replace" => invocation
                 .args
@@ -1504,8 +1459,8 @@ impl Flavite {
                 | "property.set"
                 | "task.toggle"
                 | "apply_edits"
-                | "undo"
-                | "redo"
+                | "buffer.undo"
+                | "buffer.redo"
                 | "note.convert_encoding"
                 | "text.apply_replace"
         ) {
@@ -1549,7 +1504,7 @@ impl Flavite {
         request_id: RequestId,
     ) -> ExecutionResult {
         let command_id = match &result {
-            SessionResult::Success(crate::session::CommandResult::NoteOpened { .. }) => "open_note",
+            SessionResult::Success(crate::session::CommandResult::NoteOpened { .. }) => "note.open",
             SessionResult::Success(crate::session::CommandResult::NoteCreated { .. }) => {
                 "note.create"
             }
@@ -1559,7 +1514,7 @@ impl Flavite {
             SessionResult::Success(crate::session::CommandResult::HistoryRestored { .. }) => {
                 "note.restore_history"
             }
-            SessionResult::Success(crate::session::CommandResult::NoteClosed) => "close_note",
+            SessionResult::Success(crate::session::CommandResult::NoteClosed) => "note.close",
             SessionResult::Success(crate::session::CommandResult::EditsApplied { .. }) => {
                 "apply_edits"
             }
@@ -1570,17 +1525,21 @@ impl Flavite {
                 "link.insert"
             }
             SessionResult::LinkRejected { .. } => "link.insert",
-            SessionResult::Success(crate::session::CommandResult::NoteSaved { .. }) => "save_note",
+            SessionResult::Success(crate::session::CommandResult::NoteSaved { .. }) => "note.save",
             SessionResult::Success(crate::session::CommandResult::ReconcileComplete { .. }) => {
-                "reconcile"
+                "vault.reconcile"
             }
             SessionResult::Success(crate::session::CommandResult::NoteRenamed { .. }) => {
-                "rename_note"
+                "note.rename"
             }
-            SessionResult::Success(crate::session::CommandResult::UndoPerformed { .. }) => "undo",
-            SessionResult::Success(crate::session::CommandResult::RedoPerformed { .. }) => "redo",
+            SessionResult::Success(crate::session::CommandResult::UndoPerformed { .. }) => {
+                "buffer.undo"
+            }
+            SessionResult::Success(crate::session::CommandResult::RedoPerformed { .. }) => {
+                "buffer.redo"
+            }
             SessionResult::Success(crate::session::CommandResult::ConflictResolved) => {
-                "resolve_conflict"
+                "conflict.resolve"
             }
             SessionResult::Success(crate::session::CommandResult::RecoveryRestored { .. }) => {
                 "recovery.restore"
@@ -1602,7 +1561,7 @@ impl Flavite {
             }
             SessionResult::MergeReady { .. }
             | SessionResult::Conflict { .. }
-            | SessionResult::ActionRequired { .. } => "resolve_conflict",
+            | SessionResult::ActionRequired { .. } => "conflict.resolve",
             SessionResult::Pending { .. }
             | SessionResult::Busy
             | SessionResult::StaleRevision { .. }
@@ -2136,7 +2095,7 @@ pub struct BufferView {
     /// The base hash.
     pub base_hash: Vec<u8>,
     /// Current state.
-    pub state: crate::BufferStatus,
+    pub state: flavite_buffer::state::BufferState,
     /// Vault-relative path used by save and close commands.
     pub path: PathBuf,
     /// Authoritative save-format descriptor of this revision (§6.10).
@@ -2155,7 +2114,7 @@ pub struct SharedBufferView {
     /// Base hash.
     pub base_hash: Vec<u8>,
     /// Typed canonical buffer state.
-    pub state: crate::BufferStatus,
+    pub state: flavite_buffer::state::BufferState,
     /// Vault-relative path.
     pub path: PathBuf,
     /// Authoritative save-format descriptor of this revision (§6.10).
@@ -2483,6 +2442,35 @@ mod tests {
     }
 
     #[test]
+    fn built_in_commands_have_only_canonical_ids() {
+        let (flavite, _root, _temp) = test_flavite();
+        let registry = flavite.command_registry();
+        for canonical in [
+            "note.open",
+            "note.save",
+            "buffer.undo",
+            "buffer.redo",
+            "vault.reconcile",
+            "note.rename",
+            "conflict.resolve",
+        ] {
+            assert!(registry.get_spec(canonical).is_some(), "{canonical}");
+        }
+        for retired in [
+            "open_note",
+            "save_note",
+            "undo",
+            "redo",
+            "reconcile",
+            "rename_note",
+            "close_note",
+            "resolve_conflict",
+        ] {
+            assert!(registry.get_spec(retired).is_none(), "{retired}");
+        }
+    }
+
+    #[test]
     fn notice_acknowledgement_ledger_is_bounded_and_ackable() {
         let (flavite, _root, _temp) = test_flavite();
         for _ in 0..(MAX_NOTICE_ACKS + 5) {
@@ -2517,7 +2505,7 @@ mod tests {
             revision: 1,
             text: "test content".to_string(),
             base_hash: vec![1, 2, 3],
-            state: crate::BufferStatus::Clean,
+            state: flavite_buffer::state::BufferState::Clean,
             path: PathBuf::from("note.md"),
             source_format: flavite_encoding::SourceFormat::utf8(),
         };
@@ -2583,7 +2571,7 @@ mod tests {
         let initial = flavite.get_buffer_view(buffer_id, None).unwrap();
         assert_eq!(initial.text, "hello");
         assert_eq!(initial.path, root.join("note.md"));
-        assert_eq!(initial.state, crate::BufferStatus::Clean);
+        assert_eq!(initial.state, flavite_buffer::state::BufferState::Clean);
 
         flavite.session.execute(SessionCommand::ApplyEdits {
             buffer_id,
@@ -2603,7 +2591,7 @@ mod tests {
         ));
         let current = flavite.get_buffer_view(buffer_id, None).unwrap();
         assert_eq!(current.text, "hello!");
-        assert_eq!(current.state, crate::BufferStatus::Dirty);
+        assert_eq!(current.state, flavite_buffer::state::BufferState::Dirty);
     }
 
     #[test]
@@ -2790,7 +2778,7 @@ mod tests {
         let scoped_denial = flavite.execute(
             Invocation::new(
                 10,
-                "save_note",
+                "note.save",
                 serde_json::json!("outside.md"),
                 Origin::Plugin,
             )
@@ -2808,7 +2796,7 @@ mod tests {
         ));
         let rejected = flavite.execute(Invocation::new(
             1,
-            "write:save_note",
+            "write:note.save",
             serde_json::Value::Null,
             Origin::Gui,
         ));
@@ -2823,7 +2811,7 @@ mod tests {
         flavite.set_read_only(true);
         let rejected = flavite.execute(Invocation::new(
             2,
-            "save_note",
+            "note.save",
             serde_json::to_value(root.join("note.md")).unwrap(),
             Origin::Gui,
         ));
@@ -2838,7 +2826,7 @@ mod tests {
 
         let invalid = flavite.execute(Invocation::new(
             3,
-            "open_note",
+            "note.open",
             serde_json::json!({"bad": true}),
             Origin::Cli,
         ));
@@ -2868,7 +2856,7 @@ mod tests {
 
         let opened = match flavite.execute(Invocation::new(
             5,
-            "open_note",
+            "note.open",
             serde_json::to_value(root.join("note.md")).unwrap(),
             Origin::Gui,
         )) {
@@ -2899,7 +2887,7 @@ mod tests {
         let (flavite, root, _temp) = test_flavite();
         let opened = match flavite.execute(Invocation::new(
             10,
-            "open_note",
+            "note.open",
             serde_json::to_value(root.join("note.md")).unwrap(),
             Origin::Gui,
         )) {
@@ -2926,7 +2914,7 @@ mod tests {
 
         let undone = flavite.execute(Invocation::new(
             12,
-            "undo",
+            "buffer.undo",
             serde_json::json!({ "buffer_id": id, "revision": applied["revision"] }),
             Origin::Gui,
         ));
@@ -2941,7 +2929,7 @@ mod tests {
 
         let redone = flavite.execute(Invocation::new(
             13,
-            "redo",
+            "buffer.redo",
             serde_json::json!({ "buffer_id": id, "revision": undone["revision"] }),
             Origin::Gui,
         ));
@@ -2956,7 +2944,7 @@ mod tests {
 
         let reconciled = flavite.execute(Invocation::new(
             14,
-            "reconcile",
+            "vault.reconcile",
             serde_json::json!({"scope": "full", "mode": "verify"}),
             Origin::Cli,
         ));
@@ -2966,7 +2954,7 @@ mod tests {
         ));
         let terminal = flavite.wait_for_operation(14);
         assert!(
-            matches!(terminal, ExecutionResult::Local(LocalResult::Success(LocalSuccess { request_id: 14, command_id, .. })) if command_id == "reconcile")
+            matches!(terminal, ExecutionResult::Local(LocalResult::Success(LocalSuccess { request_id: 14, command_id, .. })) if command_id == "vault.reconcile")
         );
     }
 
@@ -2986,7 +2974,7 @@ mod tests {
 
         let request_id = match flavite.execute(Invocation::new(
             45,
-            "reconcile",
+            "vault.reconcile",
             serde_json::json!({"scope": "full", "mode": "verify"}),
             Origin::Cli,
         )) {
@@ -3101,7 +3089,7 @@ mod tests {
         use crate::types::Origin;
         let request_id = match flavite.execute(Invocation::new(
             46,
-            "reconcile",
+            "vault.reconcile",
             serde_json::json!({"scope": "full", "mode": "verify"}),
             Origin::Cli,
         )) {
@@ -3160,7 +3148,7 @@ mod tests {
 
         let opened = match flavite.execute(Invocation::new(
             50,
-            "open_note",
+            "note.open",
             serde_json::to_value(&note).unwrap(),
             Origin::Gui,
         )) {
@@ -3177,7 +3165,7 @@ mod tests {
         for id in 51..=53 {
             match flavite.execute(Invocation::new(
                 id,
-                "save_note",
+                "note.save",
                 note_value.clone(),
                 Origin::Gui,
             )) {

@@ -46,7 +46,7 @@ fn wait_for(app: &mut App, what: &str, predicate: impl Fn(&App) -> bool) {
 
 fn reconcile(app: &mut App) {
     let _ = app.update(Message::RunCoreCommand("vault.reconcile"));
-    wait_for(app, "reconcile", |app| app.pending_operations() == 0);
+    wait_for(app, "vault.reconcile", |app| app.pending_operations() == 0);
 }
 
 fn open_note(app: &mut App, name: &str) -> TabId {
