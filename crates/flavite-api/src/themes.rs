@@ -1,13 +1,12 @@
-//! Installed theme packages: device-local storage and the typed command
+//! Installed theme packages: vault-local storage and the typed command
 //! payloads.
 //!
-//! Themes are device state, never note truth: a converted package is
-//! stored under the OS data directory (`<data>/flavite/themes/<id>/`),
-//! one directory per theme holding the converted `.flavite.xpi` plus a
-//! small metadata document. The store follows the user-state pattern —
-//! injected [`Fs`], atomic writes, symlink guards, hard size bounds — and
-//! the pure conversion lives in flavite-theme, so this module only owns
-//! locations and durability.
+//! Themes are vault state: a converted package is stored under the vault
+//! directory (`<vault>/.flavite/themes/<id>/`), one directory per theme
+//! holding the converted `.flavite.xpi` plus a small metadata document.
+//! The store follows the user-state pattern — injected [`Fs`], atomic
+//! writes, symlink guards, hard size bounds — and the pure conversion
+//! lives in flavite-theme, so this module only owns locations and durability.
 
 use crate::FlaviteError;
 use flavite_fs::{Fs, atomic_write};
@@ -44,6 +43,8 @@ pub enum ThemeStoreError {
     Corrupt(String),
     /// The underlying filesystem failed.
     Fs(String),
+    /// The vault is read-only, theme writes are not allowed.
+    ReadOnly,
     /// The source package at a host-authorized path could not be read.
     SourceRead(String),
 }
@@ -62,6 +63,7 @@ impl std::fmt::Display for ThemeStoreError {
             Self::Corrupt(message) => write!(f, "theme metadata is corrupt: {message}"),
             Self::Fs(message) => write!(f, "theme filesystem error: {message}"),
             Self::SourceRead(message) => write!(f, "theme source unreadable: {message}"),
+            Self::ReadOnly => write!(f, "theme storage is read-only"),
         }
     }
 }
@@ -111,16 +113,13 @@ impl std::fmt::Debug for ThemeStore {
 }
 
 impl ThemeStore {
-    /// Build the store rooted at `<data>/flavite/themes`.
-    ///
-    /// # Errors
-    /// [`ThemeStoreError::Unavailable`] when no OS data directory exists;
-    /// the host reports theme persistence as unavailable honestly.
-    pub fn open(fs: Box<dyn Fs + Send + Sync>) -> Result<Self, ThemeStoreError> {
-        let data = flavite_vault::identity::resolve_data_dir(None).ok_or_else(|| {
-            ThemeStoreError::Unavailable("no OS data directory is available".into())
-        })?;
-        Ok(Self::at_root(fs, data.join("flavite").join("themes")))
+    /// Build the store at an explicit vault root (`.flavite/themes`).
+    #[must_use]
+    pub fn at_vault(fs: Box<dyn Fs + Send + Sync>, vault_root: &Path) -> Self {
+        let mut root = PathBuf::from(vault_root);
+        root.push(".flavite");
+        root.push("themes");
+        Self { fs, root }
     }
 
     /// Build the store at an explicit root (tests and fault injection).
@@ -289,6 +288,83 @@ impl ThemeStore {
         }
         Ok(())
     }
+
+    /// Migrate themes from the legacy device store to the vault store.
+    /// Copies theme directories from `<data>/flavite/themes/` to `<vault>/.flavite/themes/`,
+    /// skipping ids already present. Runs once per vault, idempotent.
+    ///
+    /// # Errors
+    /// Filesystem failures during copy operations.
+    pub fn migrate_from_device(
+        &self,
+        device_themes_root: &Path,
+    ) -> Result<usize, ThemeStoreError> {
+        // Ensure vault themes directory exists
+        self.fs
+            .create_dir_all(&self.root)
+            .map_err(|error| ThemeStoreError::Fs(error.to_string()))?;
+
+        // Check if device themes directory exists
+        if !self
+            .fs
+            .exists(device_themes_root)
+            .map_err(|error| ThemeStoreError::Fs(error.to_string()))?
+        {
+            return Ok(0);
+        }
+
+        let mut copied = 0;
+        for entry in self
+            .fs
+            .read_dir(device_themes_root)
+            .map_err(|error| ThemeStoreError::Fs(error.to_string()))?
+        {
+            if !entry.is_dir {
+                continue;
+            }
+            // Extract theme id from directory name (reverse the sanitization is not needed
+            // since we're just copying the directory as-is)
+            let theme_dir_name = entry
+                .path
+                .file_name()
+                .ok_or_else(|| ThemeStoreError::Fs("invalid theme directory name".into()))?;
+            let theme_dir_name = theme_dir_name
+                .to_str()
+                .ok_or_else(|| ThemeStoreError::Fs("non-utf8 theme directory name".into()))?;
+
+            let device_theme_dir = device_themes_root.join(theme_dir_name);
+            let vault_theme_dir = self.root.join(theme_dir_name);
+
+            // Skip if already exists in vault
+            if self
+                .fs
+                .exists(&vault_theme_dir)
+                .map_err(|error| ThemeStoreError::Fs(error.to_string()))?
+            {
+                continue;
+            }
+
+            // Copy the theme directory (package and metadata)
+            for file_entry in [PACKAGE_ENTRY, META_ENTRY] {
+                let src = device_theme_dir.join(file_entry);
+                let dst = vault_theme_dir.join(file_entry);
+                if self.fs.exists(&src).map_err(|e| ThemeStoreError::Fs(e.to_string()))? {
+                    self.fs
+                        .create_dir_all(&vault_theme_dir)
+                        .map_err(|error| ThemeStoreError::Fs(error.to_string()))?;
+                    let bytes = self
+                        .fs
+                        .read_if_exists(&src)
+                        .map_err(|error| ThemeStoreError::Fs(error.to_string()))?
+                        .ok_or_else(|| ThemeStoreError::Fs(format!("cannot read {}", src.display())))?;
+                    atomic_write(self.fs.as_ref(), &dst, &bytes)
+                        .map_err(|error| ThemeStoreError::Fs(error.to_string()))?;
+                }
+            }
+            copied += 1;
+        }
+        Ok(copied)
+    }
 }
 
 /// Filesystem-safe directory stem for a theme id: case-folded, restricted
@@ -371,11 +447,18 @@ pub(crate) fn execute_theme_command(
     let Some(store) = flavite.themes.as_ref() else {
         return ExecutionResult::Rejected(
             RejectedResult::with_request(RejectionReason::Unavailable, invocation.request_id)
-                .with_message("theme storage is unavailable (no device data directory)"),
+                .with_message("theme storage is unavailable"),
         );
     };
     let outcome = match invocation.command_id {
         "theme.install" => {
+            if flavite.is_read_only() {
+                return ExecutionResult::Local(LocalResult::Error(LocalError::with_request(
+                    "theme_read_only",
+                    "theme storage is read-only",
+                    invocation.request_id,
+                )));
+            }
             let Ok(args) = serde_json::from_value::<InstallThemeArgs>(invocation.args.clone())
             else {
                 return ExecutionResult::Rejected(
@@ -407,6 +490,13 @@ pub(crate) fn execute_theme_command(
             )
         }),
         "theme.uninstall" => {
+            if flavite.is_read_only() {
+                return ExecutionResult::Local(LocalResult::Error(LocalError::with_request(
+                    "theme_read_only",
+                    "theme storage is read-only",
+                    invocation.request_id,
+                )));
+            }
             let Ok(args) = serde_json::from_value::<UninstallThemeArgs>(invocation.args.clone())
             else {
                 return ExecutionResult::Rejected(
@@ -477,6 +567,7 @@ pub(crate) fn theme_error_code(error: &ThemeStoreError) -> &'static str {
         ThemeStoreError::InvalidPackage(_) => "theme_invalid_package",
         ThemeStoreError::NotFound { .. } => "theme_not_found",
         ThemeStoreError::Corrupt(_) => "theme_corrupt",
+        ThemeStoreError::ReadOnly => "theme_read_only",
     }
 }
 

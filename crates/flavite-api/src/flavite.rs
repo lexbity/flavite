@@ -632,6 +632,53 @@ fn attach_services(
         }
     }
     
+    // Migrate themes from device store to vault (RFC-0007 S5)
+    if let Some(data_dir) = data_dir {
+        let device_themes_root = data_dir.join("flavite").join("themes");
+        let vault_themes_root = root.join(".flavite").join("themes");
+        
+        if device_themes_root.exists()
+            && !vault_themes_root.exists()
+            && let Ok(entries) = std::fs::read_dir(&device_themes_root)
+            && std::fs::create_dir_all(&vault_themes_root).is_ok()
+        {
+            let mut copied = 0;
+            for entry in entries.flatten() {
+                if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                    continue;
+                }
+                let theme_dir_name = entry.file_name();
+                let src_dir = device_themes_root.join(&theme_dir_name);
+                let dst_dir = vault_themes_root.join(&theme_dir_name);
+                
+                // Skip if already exists in vault
+                if dst_dir.exists() {
+                    continue;
+                }
+                
+                // Copy theme files
+                for file_name in ["theme.flavite.xpi", "theme.json"] {
+                    let src_file = src_dir.join(file_name);
+                    let dst_file = dst_dir.join(file_name);
+                    if src_file.exists()
+                        && let Ok(bytes) = std::fs::read(&src_file)
+                        && std::fs::create_dir_all(&dst_dir).is_ok()
+                    {
+                        let _ = std::fs::write(&dst_file, &bytes);
+                    }
+                }
+                copied += 1;
+            }
+            if copied > 0 {
+                eprintln!(
+                    "Migrated {copied} theme(s) from {} to {}",
+                    device_themes_root.display(),
+                    vault_themes_root.display()
+                );
+            }
+        }
+    }
+    
     (vault_user_state, graph, settings_store)
 }
 
@@ -681,7 +728,10 @@ impl Flavite {
                 &vault_uuid,
             )
             .ok(),
-            themes: crate::themes::ThemeStore::open(Box::new(flavite_fs::OsFs::new())).ok(),
+            themes: Some(crate::themes::ThemeStore::at_vault(
+                Box::new(flavite_fs::OsFs::new()),
+                &identity.root,
+            )),
             vault_user_state,
             graph,
             settings_store,
@@ -707,13 +757,18 @@ impl Flavite {
         _config: VaultConfig,
     ) -> Result<Self, FlaviteError> {
         let vault_uuid = vault_ref.uuid.to_string();
+        let vault_root = vault_ref.root.clone();
         let session = Arc::new(session);
         let (vault_user_state, graph, settings_store) =
-            attach_services(vault_ref.uuid, &vault_ref.root, &session, None, None);
+            attach_services(vault_ref.uuid, &vault_root, &session, None, None);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
             uuid::Uuid::now_v7().as_u128(),
             Arc::clone(&graph),
+        );
+        let theme_store = crate::themes::ThemeStore::at_vault(
+            Box::new(flavite_fs::OsFs::new()),
+            &vault_root,
         );
         let flavite = Self {
             session,
@@ -735,7 +790,7 @@ impl Flavite {
                 &vault_uuid,
             )
             .ok(),
-            themes: crate::themes::ThemeStore::open(Box::new(flavite_fs::OsFs::new())).ok(),
+            themes: Some(theme_store),
             vault_user_state,
             graph,
             settings_store,
@@ -795,7 +850,10 @@ impl Flavite {
                 &vault_uuid,
             )
             .ok(),
-            themes: crate::themes::ThemeStore::open(Box::new(flavite_fs::OsFs::new())).ok(),
+            themes: Some(crate::themes::ThemeStore::at_vault(
+                Box::new(flavite_fs::OsFs::new()),
+                &identity.root,
+            )),
             vault_user_state,
             graph,
             settings_store,
@@ -1092,9 +1150,14 @@ impl Flavite {
         ];
         for (id, title, args, handler) in registrations {
             let spec = if id.starts_with("theme.") {
-                // Theme commands write device state, not the vault: they
-                // stay available on read-only vaults and gate on Themes.
-                CommandSpec::new(id, title, args).requires(crate::Capability::Themes)
+                // Theme commands write vault state; install/uninstall are gated
+                // on read-only vaults in the command handler, but still require
+                // the Themes capability.
+                if matches!(id, "theme.install" | "theme.uninstall") {
+                    CommandSpec::new(id, title, args).write().requires(crate::Capability::Themes)
+                } else {
+                    CommandSpec::new(id, title, args).requires(crate::Capability::Themes)
+                }
             } else if id.starts_with("settings.") {
                 // Settings commands gate on Settings capability
                 if matches!(id, "settings.set" | "settings.reset") {
