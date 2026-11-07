@@ -97,6 +97,20 @@ pub enum QueryPayload {
         /// Page size (bounded by the service).
         limit: u64,
     },
+    /// Start (or refresh) a materialized search session (RFC-0006 S06).
+    /// Executed on a query worker; the result carries the sealed first page
+    /// and continuation token.
+    SearchStart {
+        options: crate::search_sessions::SearchQueryOptions,
+    },
+    /// Fetch one session page by continuation token (idempotent replay).
+    SearchPage {
+        token: crate::search_sessions::PageToken,
+    },
+    /// Explicitly close one search session and drop its spool.
+    SearchClose {
+        session: crate::search_sessions::SearchSessionId,
+    },
     /// Bounded note-catalog acquisition (RFC-0004 W-D): the whole
     /// `MAX_NOTE_CATALOG_LIMIT` read runs on a query worker, never on a
     /// host turn. A newer request sequence supersedes an older pending
@@ -153,7 +167,7 @@ pub struct SearchResultRow {
 }
 
 /// Typed outcome of one query slot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ContextQueryResult {
     Anchor {
         buffer_id: u64,
@@ -205,6 +219,20 @@ pub enum ContextQueryResult {
         /// The parsed page size this result was served for.
         limit: u64,
     },
+    /// One materialized search-session page (RFC-0006 S06): sealed rows,
+    /// frozen snapshot provenance, exact total and continuation token.
+    SearchStarted {
+        page: Arc<crate::search_sessions::SearchPageMaterialized>,
+        /// First page size actually served (echoes the requested bound).
+        page_size: u64,
+    },
+    SearchPaged {
+        page: Arc<crate::search_sessions::SearchPageMaterialized>,
+        /// The ordinal this page begins at (host appends once by ordinal).
+        ordinal: u64,
+    },
+    SearchClosed,
+
     /// A complete bounded note catalog with provenance (RFC-0004 W-D).
     /// `Arc`-shared so hosts swap snapshots wholesale; stale snapshots
     /// are dropped by provenance, never merged (D9/§4.7 UI trust).
@@ -266,7 +294,7 @@ pub struct OccurrenceDetail {
 }
 
 /// A completed query slot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct QueryOutcome {
     /// The token this outcome answers.
     pub token: RequestToken,
@@ -288,11 +316,22 @@ struct Job {
     payload: QueryPayload,
 }
 
+/// Routes capture handshakes through the vault actor's generation-order
+/// gate (D-07).
+struct SessionCaptureProvider(Arc<Session>);
+
+impl crate::search_sessions::SearchCaptureProvider for SessionCaptureProvider {
+    fn begin(&self) -> Result<flavite_vault::search_capture::SearchCaptureHandshake, String> {
+        self.0.begin_search_capture()
+    }
+}
+
 /// Bounded async query service owned by the facade.
 pub struct QueryService {
     // Manual `Debug` below: worker handles and locks are not meaningful in
     // diagnostics and must not leak identities.
     jobs: crossbeam::channel::Sender<Job>,
+    search_sessions: Arc<crate::search_sessions::SearchSessionService>,
     graph: Arc<arc_swap::ArcSwap<crate::GraphService>>,
     ready: Arc<Mutex<BTreeMap<RequestToken, (QueryPayload, ContextQueryResult)>>>,
     in_flight: Arc<AtomicUsize>,
@@ -326,6 +365,19 @@ impl QueryService {
             Arc::new(Mutex::new(BTreeMap::new()));
         let in_flight = Arc::new(AtomicUsize::new(0));
         let read_resources = Arc::new(crate::reading::ReadResources::default());
+        // One bounded search-session registry per Session (RFC-0006 S06);
+        // capture goes through the vault actor's ordered handshake.
+        let search_sessions = Arc::new(crate::search_sessions::SearchSessionService::new(
+            crate::doctor::cache_db_path(session.vault_uuid()),
+            crate::doctor::cache_db_path(session.vault_uuid())
+                .parent()
+                .map_or_else(
+                    || std::env::temp_dir().join("flavite-search-sessions"),
+                    |dir| dir.join("search-sessions"),
+                ),
+            Arc::new(SessionCaptureProvider(Arc::clone(&session))),
+            Arc::new(crate::search_sessions::SystemClock),
+        ));
         let mut workers = Vec::new();
         for worker_index in 0..2 {
             let read_resources = read_resources.clone();
@@ -334,6 +386,7 @@ impl QueryService {
             let graph = Arc::clone(&graph);
             let ready = Arc::clone(&ready);
             let in_flight = Arc::clone(&in_flight);
+            let search_sessions = Arc::clone(&search_sessions);
             workers.push(
                 std::thread::Builder::new()
                     .name(format!("flavite-query-{worker_index}"))
@@ -346,6 +399,7 @@ impl QueryService {
                                         &graph.load_full(),
                                         &job.payload,
                                         &read_resources,
+                                        &search_sessions,
                                     )
                                 }))
                                 .unwrap_or(
@@ -361,6 +415,7 @@ impl QueryService {
         }
         Self {
             jobs,
+            search_sessions,
             graph,
             ready,
             in_flight,
@@ -369,6 +424,18 @@ impl QueryService {
             read_resources,
             _workers: workers,
         }
+    }
+
+    /// The bounded materialized search-session registry (RFC-0006 S06).
+    #[must_use]
+    pub fn search_sessions(&self) -> &Arc<crate::search_sessions::SearchSessionService> {
+        &self.search_sessions
+    }
+
+    /// Rebind the search snapshot database path (test hosts with injected
+    /// index databases; production derives the vault cache path).
+    pub fn set_search_db_path(&self, path: std::path::PathBuf) {
+        self.search_sessions.set_db_path(path);
     }
 
     /// Conservative outstanding reading/attachment reservation, including
@@ -414,7 +481,10 @@ impl QueryService {
                     ..
                 } => QueryPurpose::NoteRead,
                 QueryPayload::Occurrence { .. } => QueryPurpose::Occurrence,
-                QueryPayload::Search { .. } => QueryPurpose::Search,
+                QueryPayload::Search { .. }
+                | QueryPayload::SearchStart { .. }
+                | QueryPayload::SearchPage { .. }
+                | QueryPayload::SearchClose { .. } => QueryPurpose::Search,
                 QueryPayload::Catalog { .. } => QueryPurpose::Catalog,
                 QueryPayload::LinkVerdicts { .. } => QueryPurpose::LinkVerdicts,
                 _ => QueryPurpose::Context,
@@ -503,6 +573,7 @@ fn execute(
     graph: &Arc<crate::GraphService>,
     payload: &QueryPayload,
     read_resources: &Arc<crate::reading::ReadResources>,
+    search_sessions: &Arc<crate::search_sessions::SearchSessionService>,
 ) -> ContextQueryResult {
     match payload {
         QueryPayload::Anchor {
@@ -558,7 +629,35 @@ fn execute(
         }
         QueryPayload::Preview { path } => execute_preview(session, path),
         QueryPayload::Backlinks { path } => execute_backlinks(session, graph, path),
-        QueryPayload::Search { text, limit } => execute_search(session, text, *limit),
+        QueryPayload::Search { text, limit } => execute_search(search_sessions, text, *limit),
+        QueryPayload::SearchStart { options } => match search_sessions.start(options.clone()) {
+            Ok(page) => {
+                let page_size = u64::try_from(page.rows.len()).unwrap_or(0);
+                ContextQueryResult::SearchStarted {
+                    page: Arc::new(page),
+                    page_size,
+                }
+            }
+            Err(error) => ContextQueryResult::Failed {
+                message: error.to_string(),
+            },
+        },
+        QueryPayload::SearchPage { token } => {
+            let ordinal = token.next_ordinal;
+            match search_sessions.page(token) {
+                Ok(page) => ContextQueryResult::SearchPaged {
+                    page: Arc::new(page),
+                    ordinal,
+                },
+                Err(error) => ContextQueryResult::Failed {
+                    message: error.to_string(),
+                },
+            }
+        }
+        QueryPayload::SearchClose { session } => {
+            let _ = search_sessions.close(*session);
+            ContextQueryResult::SearchClosed
+        }
         QueryPayload::Catalog { limit } => crate::catalog_service::execute_catalog(session, *limit),
         QueryPayload::LinkVerdicts {
             buffer_id,
@@ -756,64 +855,60 @@ fn execute_preview(session: &Arc<Session>, path: &[String]) -> ContextQueryResul
     }
 }
 
-/// Run one bounded saved-content search page (W10). Runs on the query
-/// worker pool, never under the driving turn. The parsed query must be
-/// non-empty; parse failures and invalid limits are retryable failures.
-fn execute_search(session: &Arc<Session>, text: &str, limit: u64) -> ContextQueryResult {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return ContextQueryResult::Failed {
-            message: "Enter a search term".into(),
-        };
-    }
-    let limit = limit.clamp(1, 200);
-    // Free-text search input: whitespace-separated terms AND together.
-    // Structured terms (tag:, prop:, links-to:, …) parse individually
-    // through the canonical parser; no new query grammar is introduced.
-    let mut parsed = Vec::new();
-    for term in trimmed.split_whitespace() {
-        match crate::Query::parse(term) {
-            Ok(query) => parsed.push(query),
-            Err(message) => return ContextQueryResult::Failed { message },
-        }
-    }
-    let query = match parsed.len() {
-        0 => {
+/// Legacy saved-content search adapter (W10): one explicit snapshot start
+/// plus a bounded first page, reporting `has_more`/total, with the session
+/// closed after the slice (§6.1 legacy behavior: continuation is a resubmit
+/// for this payload). Runs on the query worker pool, never under the
+/// driving turn. Plain full-text mode is the legacy default: whitespace
+/// means AND and punctuation is text (D-07) — the mode parser in
+/// [`crate::search_sessions`] owns that grammar.
+fn execute_search(
+    search_sessions: &Arc<crate::search_sessions::SearchSessionService>,
+    text: &str,
+    limit: u64,
+) -> ContextQueryResult {
+    let page_size = limit.clamp(
+        crate::search_sessions::MIN_PAGE_SIZE,
+        crate::search_sessions::MAX_PAGE_SIZE,
+    );
+    let options = crate::search_sessions::SearchQueryOptions {
+        mode: crate::search_sessions::SearchMode::FullText,
+        text: text.to_owned(),
+        page_size,
+    };
+    let page = match search_sessions.start(options) {
+        Ok(page) => page,
+        Err(error) => {
             return ContextQueryResult::Failed {
-                message: "Enter a search term".into(),
+                message: error.to_string(),
             };
         }
-        1 => parsed.remove(0),
-        _ => crate::Query::And(parsed),
     };
-    let page = match session.search_notes(query, limit as usize + 1) {
-        Ok(page) => page,
-        Err(message) => return ContextQueryResult::Failed { message },
+    let provenance = Provenance {
+        epoch: page.epoch,
+        generation: page.generation,
     };
-    // §4.4: consume the pool's explicit sentinel and truncate once. The
-    // items-length leg covers the service's own `limit+1` probe; the OR is
-    // exactly "a `limit+1`'th result exists" (D11 semantics end-to-end —
-    // the pre-fix pool double-truncate made both legs dead).
-    let has_more = page.has_more || page.items.len() as u64 > limit;
+    let total = page.total;
     let items = page
-        .items
-        .into_iter()
-        .take(limit as usize)
+        .rows
+        .iter()
         .map(|row| SearchResultRow {
             note_id: row.note_id,
-            path: row.path,
-            title: row.title,
-            excerpt: row.excerpt,
+            path: row.path.clone(),
+            title: row.title.clone(),
+            excerpt: row.excerpt.clone(),
         })
         .collect();
+    let served = u64::try_from(page.rows.len()).unwrap_or(0);
+    let session = page.session;
+    // The legacy payload has no continuation token: close the session so
+    // the bounded registry admits the next submission (§6.1 adapter).
+    let _ = search_sessions.close(session);
     ContextQueryResult::Search {
         items,
-        provenance: Provenance {
-            epoch: page.epoch,
-            generation: page.generation,
-        },
-        has_more,
-        limit,
+        provenance,
+        has_more: served < total,
+        limit: page_size,
     }
 }
 

@@ -260,7 +260,10 @@ impl ContextRegistry {
             | QueryResult::AttachmentOpen(_)
             | QueryResult::Anchor { .. }
             | QueryResult::Catalog { .. }
-            | QueryResult::LinkVerdicts { .. } => return false,
+            | QueryResult::LinkVerdicts { .. }
+            | QueryResult::SearchStarted { .. }
+            | QueryResult::SearchPaged { .. }
+            | QueryResult::SearchClosed => return false,
             QueryResult::Updating => {
                 tool.invalidated = true;
                 if matches!(tool.state, ToolState::Ready(_) | ToolState::NoBacklinks) {

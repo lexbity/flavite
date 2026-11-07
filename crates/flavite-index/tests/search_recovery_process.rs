@@ -38,7 +38,12 @@ fn uncommitted_search_changes_replay_after_sigkill() {
     let db = temp.path().join("index.sqlite3");
     let mut reopened = IndexActor::new(&db, 1).unwrap();
     let page = reopened
-        .search_notes(&Query::Text("crashreplaytoken".into()), 10)
+        .evaluate_saved_search(
+            &Query::Text(flavite_index::query::TextLeaf::all_fields(
+                "crashreplaytoken",
+            )),
+            10,
+        )
         .unwrap();
     assert_eq!(page.generation, 1);
     assert_eq!(page.items.len(), 1);

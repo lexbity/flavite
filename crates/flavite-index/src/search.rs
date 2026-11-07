@@ -1,78 +1,65 @@
-//! Search backend abstraction and Tantivy implementation (§4.3, D12).
+//! Search read side and Tantivy implementation (§4.3, RFC-0006 S06).
 //!
-//! This module provides the persistent Tantivy implementation, D12 tokenizers,
-//! and `SearchBackend` abstraction. The stub backend remains a lightweight test
-//! double; `IndexActor` uses `TantivyBackend` in production.
+//! This module provides the persistent Tantivy index read side, the D12
+//! tokenizers, and the captured-searcher leaf evaluation used by the search
+//! session evaluator (§6.3). All writes go through the single ordered
+//! writer owner in [`crate::search_writer`]; this module never mutates the
+//! index and never commits synchronously before a search (D-07: the old
+//! commit-before-search contract is deleted).
 
-use crate::changelog::{ChangeKind, ChangeLogRead, ChangeLogReader};
-use crate::query::Query as QueryAst;
-use crate::schema::{MetaKey, get_meta_u64, set_meta};
-use crate::types::IndexVersion;
-use rusqlite::{Connection, OptionalExtension};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use crate::query::{TextField, TextLeaf};
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, Occur, QueryParser, TermSetQuery};
+use tantivy::query::{BooleanQuery, Occur, PhraseQuery, Query as TantivyQuery, TermQuery};
 use tantivy::schema::{
     Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value,
 };
 use tantivy::tokenizer::{
     AsciiFoldingFilter, LowerCaser, TextAnalyzer, Token, TokenStream, Tokenizer,
 };
-use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, doc};
+use tantivy::{Index, IndexReader, TantivyDocument, Term};
 use thiserror::Error;
 
-/// Maximum number of note IDs to pass to search as a filter (D12).
-pub const MAX_TANTIVY_FILTER_SIZE: usize = 10_000;
-
-/// Default deferred commit interval in seconds (D12, R4).
-pub const DEFAULT_COMMIT_INTERVAL_SECS: u64 = 5;
-
-/// Persistent Tantivy index. The SQLite connection is used only for the
-/// authoritative generation mirror; structural data remains in SQLite.
-pub struct TantivyBackend {
-    index: Index,
-    reader: IndexReader,
-    writer: Mutex<IndexWriter>,
-    fields: SearchFields,
-    db_path: PathBuf,
-    index_dir: PathBuf,
-    committed_generation: Mutex<u64>,
-    dirty: Mutex<bool>,
-}
-
-impl std::fmt::Debug for TantivyBackend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TantivyBackend")
-            .field("index_dir", &self.index_dir)
-            .field("committed_generation", &self.committed_generation())
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Clone, Copy)]
-struct SearchFields {
-    id: Field,
-    title: Field,
-    aliases: Field,
-    tags: Field,
-    body: Field,
-}
-
-/// One scored text-search hit (RFC-0004 §6.3). The score is Tantivy-internal
-/// and relative-only (D11): never persisted, never compared across queries.
+/// One scored text-search hit. The score is Tantivy-internal and
+/// relative-only (D11): never persisted, never compared across queries.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Hit {
     pub note_id: i64,
     pub score: f32,
 }
 
+/// Read side of the persistent Tantivy index. Structural data remains in
+/// SQLite; the search index is a derived view owned by the writer thread.
+#[derive(Clone)]
+pub struct TantivyBackend {
+    index: Index,
+    reader: IndexReader,
+    fields: SearchFields,
+    index_dir: std::path::PathBuf,
+}
+
+impl std::fmt::Debug for TantivyBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TantivyBackend")
+            .field("index_dir", &self.index_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct SearchFields {
+    pub id: Field,
+    pub title: Field,
+    pub aliases: Field,
+    pub tags: Field,
+    pub body: Field,
+}
+
 impl TantivyBackend {
     /// Open or create a persistent Tantivy index below `cache_dir/tantivy`.
     ///
     /// # Errors
-    /// Returns an error when SQLite or Tantivy cannot be opened.
-    pub fn open(db_path: &Path, cache_dir: &Path) -> Result<Self, SearchError> {
+    /// Returns an error when Tantivy cannot be opened.
+    pub fn open(cache_dir: &std::path::Path) -> Result<Self, SearchError> {
         let index_dir = cache_dir.join("tantivy");
         std::fs::create_dir_all(&index_dir)?;
         let index = if index_dir.join("meta.json").exists() {
@@ -83,401 +70,61 @@ impl TantivyBackend {
         };
         register_search_tokenizers(&index);
         let fields = search_fields(&index.schema())?;
+        // Manual reload policy: the single ordered writer thread is the
+        // only reload trigger (right after each commit, so a completed
+        // capture is stamped exactly at the generation it waited for).
+        // The OnCommit default would run a background reload that races
+        // the writer's own reload on the shared reader.
         let reader = index
-            .reader()
-            .map_err(|e| SearchError::Tantivy(e.to_string()))?;
-        let writer = index
-            .writer(50_000_000)
-            .map_err(|e| SearchError::Tantivy(e.to_string()))?;
-        let conn = Connection::open(db_path)?;
-        let committed = get_meta_u64(&conn, MetaKey::TantivyCommittedGeneration)?.unwrap_or(0);
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::Manual)
+            .try_into()
+            .map_err(|e: tantivy::TantivyError| SearchError::Tantivy(e.to_string()))?;
         Ok(Self {
             index,
             reader,
-            writer: Mutex::new(writer),
             fields,
-            db_path: db_path.to_path_buf(),
             index_dir,
-            committed_generation: Mutex::new(committed),
-            dirty: Mutex::new(false),
         })
     }
 
-    /// Add or replace a document, including well-known metadata fields.
+    /// Create the writer handed to the single ordered writer thread. Only
+    /// [`crate::search_writer::spawn_search_writer`] may call this.
     ///
     /// # Errors
-    /// Returns an error when Tantivy cannot apply the document.
-    pub fn apply_document_full(
-        &self,
-        note_id: i64,
-        title: &str,
-        aliases: &[String],
-        tags: &[String],
-        body: &str,
-    ) -> Result<(), SearchError> {
-        let writer = self
-            .writer
-            .lock()
-            .map_err(|_| SearchError::Tantivy("writer lock poisoned".into()))?;
-        writer.delete_term(tantivy::Term::from_field_u64(
-            self.fields.id,
-            note_id.cast_unsigned(),
-        ));
-        let mut document = doc!(self.fields.id => note_id.cast_unsigned(), self.fields.title => title, self.fields.body => body);
-        for value in aliases {
-            document.add_text(self.fields.aliases, value);
-        }
-        for value in tags {
-            document.add_text(self.fields.tags, value);
-        }
-        writer
-            .add_document(document)
-            .map_err(|e| SearchError::Tantivy(e.to_string()))?;
-        *self
-            .dirty
-            .lock()
-            .map_err(|_| SearchError::Tantivy("dirty lock poisoned".into()))? = true;
-        Ok(())
+    /// Returns an error when the Tantivy writer cannot be created.
+    pub fn create_writer(&self) -> Result<tantivy::IndexWriter, SearchError> {
+        self.index
+            .writer(50_000_000)
+            .map_err(|e| SearchError::Tantivy(e.to_string()))
     }
 
-    /// Add or replace a degraded note's title-only search document.
-    ///
-    /// Degraded rows intentionally have no body, aliases, or tags in the
-    /// search index, both incrementally and after a rebuild.
+    /// The shared reader. The writer thread reloads it after every commit;
+    /// every searcher derived from this reader observes committed state.
+    #[must_use]
+    pub fn reader(&self) -> IndexReader {
+        self.reader.clone()
+    }
+
+    #[must_use]
+    pub const fn fields(&self) -> SearchFields {
+        self.fields
+    }
+
+    /// The pinned analyzer for term/phrase leaves.
+    #[must_use]
+    pub fn analyzer(&self) -> Option<TextAnalyzer> {
+        self.index.tokenizers().get("flavite")
+    }
+
+    /// Publish the search checkpoint atomically (same format as before:
+    /// `epoch:generation`). Called by the SQL owner after a committed
+    /// acknowledgement, never by the writer thread.
     ///
     /// # Errors
-    /// Returns an error when Tantivy cannot apply the document.
-    pub fn apply_title_only_document(&self, note_id: i64, title: &str) -> Result<(), SearchError> {
-        let writer = self
-            .writer
-            .lock()
-            .map_err(|_| SearchError::Tantivy("writer lock poisoned".into()))?;
-        writer.delete_term(tantivy::Term::from_field_u64(
-            self.fields.id,
-            note_id.cast_unsigned(),
-        ));
-        writer
-            .add_document(
-                doc!(self.fields.id => note_id.cast_unsigned(), self.fields.title => title),
-            )
-            .map_err(|error| SearchError::Tantivy(error.to_string()))?;
-        *self
-            .dirty
-            .lock()
-            .map_err(|_| SearchError::Tantivy("dirty lock poisoned".into()))? = true;
-        Ok(())
-    }
-
-    /// Rebuild the search index from the authoritative current search-doc cache.
-    ///
-    /// # Errors
-    /// Returns an error when SQLite cannot be read or the Tantivy index cannot be rebuilt.
-    pub fn rebuild_from_sqlite(&self) -> Result<(), SearchError> {
-        let conn = Connection::open(&self.db_path)?;
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| SearchError::Tantivy("writer lock poisoned".into()))?;
-        writer
-            .delete_all_documents()
-            .map_err(|e| SearchError::Tantivy(e.to_string()))?;
-        let mut stmt = conn.prepare("SELECT n.note_id,n.title,COALESCE(s.body_text,''),n.parse_ok FROM notes n LEFT JOIN search_docs s USING(note_id)")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, bool>(3)?,
-            ))
-        })?;
-        let mut documents = Vec::new();
-        for row in rows {
-            let (id, title, body, parse_ok) = row?;
-            documents.push((id, title, body, parse_ok));
-        }
-        for (id, title, body, parse_ok) in documents {
-            if !parse_ok {
-                writer
-                    .add_document(doc!(self.fields.id=>id.cast_unsigned(),self.fields.title=>title))
-                    .map_err(|error| SearchError::Tantivy(error.to_string()))?;
-                continue;
-            }
-            let aliases = conn
-                .prepare("SELECT alias FROM aliases WHERE note_id=?1 ORDER BY alias_key")?
-                .query_map([id], |r| r.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            let tags = conn
-                .prepare("SELECT tag FROM tags WHERE note_id=?1 ORDER BY tag")?
-                .query_map([id], |r| r.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut document = doc!(self.fields.id=>id.cast_unsigned(),self.fields.title=>title,self.fields.body=>body);
-            for alias in aliases {
-                document.add_text(self.fields.aliases, alias);
-            }
-            for tag in tags {
-                document.add_text(self.fields.tags, tag);
-            }
-            writer
-                .add_document(document)
-                .map_err(|e| SearchError::Tantivy(e.to_string()))?;
-        }
-        writer
-            .commit()
-            .map_err(|e| SearchError::Tantivy(e.to_string()))?;
-        self.reader
-            .reload()
-            .map_err(|e| SearchError::Tantivy(e.to_string()))?;
-        let generation = get_meta_u64(&conn, MetaKey::Generation)?.unwrap_or(0);
-        set_meta(
-            &conn,
-            MetaKey::TantivyCommittedGeneration,
-            &generation.to_string(),
-        )?;
-        *self
-            .committed_generation
-            .lock()
-            .map_err(|_| SearchError::Tantivy("generation lock poisoned".into()))? = generation;
-        *self
-            .dirty
-            .lock()
-            .map_err(|_| SearchError::Tantivy("dirty lock poisoned".into()))? = false;
-        Ok(())
-    }
-
-    /// Replay changed IDs from the typed change feed (§4.3, §6.1.4), then
-    /// commit once. A `Reset` outcome (epoch change or floor overrun) is
-    /// handled as the contract demands: a full rebuild from a consistent
-    /// SQLite read, never a silent no-op. The log read and the per-id
-    /// document reads share ONE read transaction (§4.6), so replay can
-    /// never splice a document newer than the generation it is replaying.
-    ///
-    /// # Errors
-    /// Returns an error when the change log cannot be read or replay cannot commit.
-    pub fn replay_since(&self, cursor: IndexVersion) -> Result<(), SearchError> {
-        let conn = Connection::open(&self.db_path)?;
-        let tx = conn.unchecked_transaction()?;
-        let records = match ChangeLogReader::read_since(&tx, cursor) {
-            Ok(ChangeLogRead::Delta { records, .. }) => records,
-            Ok(ChangeLogRead::Reset { .. }) => {
-                drop(tx);
-                return self.rebuild_from_sqlite();
-            }
-            Err(error) => {
-                drop(tx);
-                return Err(SearchError::Checkpoint(error));
-            }
-        };
-        // Dedupe (kind, entity_id) per §4.6; the replay only needs the set of
-        // note ids whose document content may have moved.
-        let mut ids = std::collections::BTreeSet::new();
-        for record in records {
-            if matches!(record.kind, ChangeKind::Note | ChangeKind::Outgoing) {
-                ids.insert(record.entity_id);
-            }
-        }
-        // Collect every document within the one read transaction, then close
-        // it before the tantivy-side writes: the snapshot the replay trusts
-        // ends exactly where the log it replayed ends.
-        let mut documents = Vec::with_capacity(ids.len());
-        for id in ids {
-            let current: Option<(String, String)> = tx
-                .query_row(
-                    "SELECT n.title,COALESCE(s.body_text,'') \
-                     FROM notes n LEFT JOIN search_docs s USING(note_id) WHERE n.note_id=?1",
-                    [id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            if let Some((title, body)) = current {
-                let aliases = tx
-                    .prepare("SELECT alias FROM aliases WHERE note_id=?1 ORDER BY alias_key")?
-                    .query_map([id], |r| r.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                let tags = tx
-                    .prepare("SELECT tag FROM tags WHERE note_id=?1 ORDER BY tag")?
-                    .query_map([id], |r| r.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                documents.push((id, Some((title, aliases, tags, body))));
-            } else {
-                documents.push((id, None));
-            }
-        }
-        tx.commit()?;
-        for (id, document) in documents {
-            match document {
-                Some((title, aliases, tags, body)) => {
-                    self.apply_document_full(id, &title, &aliases, &tags, &body)?;
-                }
-                None => self.delete_document(id)?,
-            }
-        }
-        self.commit()
-    }
-
-    /// Current generation in SQLite.
-    ///
-    /// # Errors
-    /// Returns an error when generation metadata cannot be read.
-    pub fn sqlite_generation(&self) -> Result<u64, SearchError> {
-        Ok(get_meta_u64(&Connection::open(&self.db_path)?, MetaKey::Generation)?.unwrap_or(0))
-    }
-
-    /// Whether uncommitted Tantivy operations exist.
-    pub fn is_dirty(&self) -> bool {
-        *self
-            .dirty
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Search documents matching text, optionally intersecting a structural
-    /// ID set, keeping Tantivy relevance scores.
-    ///
-    /// Scores are Tantivy-internal and relative-only (D11): never persisted,
-    /// never compared across queries or index versions. Order is score-desc
-    /// (`TopDocs::order_by_score`), so assembling `Hit` vectors preserves rank.
-    ///
-    /// The oversized-filter branch (> [`MAX_TANTIVY_FILTER_SIZE`] ids) fetches
-    /// up to 100k scored hits and post-filters with a hash set; `retain`
-    /// preserves score order, and the 100k `TopDocs` bound is the documented
-    /// ceiling of one Tantivy fetch.
-    ///
-    /// # Errors
-    /// Returns an error when commit-before-search or query execution fails.
-    pub fn search_hits(
-        &self,
-        query: &str,
-        note_ids: &[i64],
-        limit: usize,
-    ) -> Result<Vec<Hit>, SearchError> {
-        if self.is_dirty() {
-            self.commit()?;
-        }
-        if note_ids.len() <= MAX_TANTIVY_FILTER_SIZE {
-            search_reader(
-                &self.index,
-                &self.reader,
-                self.fields,
-                query,
-                note_ids,
-                limit,
-            )
-        } else {
-            let mut hits =
-                search_reader(&self.index, &self.reader, self.fields, query, &[], 100_000)?;
-            let allowed = note_ids
-                .iter()
-                .copied()
-                .collect::<std::collections::HashSet<_>>();
-            hits.retain(|hit| allowed.contains(&hit.note_id));
-            hits.truncate(limit);
-            Ok(hits)
-        }
-    }
-
-    /// Thin ID-only wrapper for degraded/title-only callers that never see
-    /// scores. Text search stays behind this API for those paths (D-08).
-    ///
-    /// # Errors
-    /// Returns an error when commit-before-search or query execution fails.
-    pub fn search_text(
-        &self,
-        query: &str,
-        note_ids: &[i64],
-        limit: usize,
-    ) -> Result<Vec<i64>, SearchError> {
-        Ok(self
-            .search_hits(query, note_ids, limit)?
-            .into_iter()
-            .map(|hit| hit.note_id)
-            .collect())
-    }
-}
-
-impl SearchBackend for TantivyBackend {
-    fn apply_document(&self, note_id: i64, title: &str, body: &str) -> Result<(), SearchError> {
-        self.apply_document_full(note_id, title, &[], &[], body)
-    }
-    fn delete_document(&self, note_id: i64) -> Result<(), SearchError> {
-        self.writer
-            .lock()
-            .map_err(|_| SearchError::Tantivy("writer lock poisoned".into()))?
-            .delete_term(tantivy::Term::from_field_u64(
-                self.fields.id,
-                note_id.cast_unsigned(),
-            ));
-        *self
-            .dirty
-            .lock()
-            .map_err(|_| SearchError::Tantivy("dirty lock poisoned".into()))? = true;
-        Ok(())
-    }
-    fn commit(&self) -> Result<(), SearchError> {
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| SearchError::Tantivy("writer lock poisoned".into()))?;
-        writer
-            .commit()
-            .map_err(|e| SearchError::Tantivy(e.to_string()))?;
-        self.reader
-            .reload()
-            .map_err(|e| SearchError::Tantivy(e.to_string()))?;
-        let conn = Connection::open(&self.db_path)?;
-        let generation = get_meta_u64(&conn, MetaKey::Generation)?.unwrap_or(0);
-        set_meta(
-            &conn,
-            MetaKey::TantivyCommittedGeneration,
-            &generation.to_string(),
-        )?;
-        *self
-            .committed_generation
-            .lock()
-            .map_err(|_| SearchError::Tantivy("generation lock poisoned".into()))? = generation;
-        *self
-            .dirty
-            .lock()
-            .map_err(|_| SearchError::Tantivy("dirty lock poisoned".into()))? = false;
-        self.publish_checkpoint(
-            get_meta_u64(&conn, MetaKey::Epoch)?.unwrap_or(1),
-            generation,
-        )?;
-        Ok(())
-    }
-    fn committed_generation(&self) -> u64 {
-        *self
-            .committed_generation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-    fn set_committed_generation(&self, generation: u64) -> Result<(), SearchError> {
-        let conn = Connection::open(&self.db_path)?;
-        set_meta(
-            &conn,
-            MetaKey::TantivyCommittedGeneration,
-            &generation.to_string(),
-        )?;
-        *self
-            .committed_generation
-            .lock()
-            .map_err(|_| SearchError::Tantivy("generation lock poisoned".into()))? = generation;
-        Ok(())
-    }
-    fn checkpoint(&self) -> Result<SearchCheckpoint, SearchError> {
-        let conn = Connection::open(&self.db_path)?;
-        let epoch = get_meta_u64(&conn, MetaKey::Epoch)?.unwrap_or(1);
-        let generation = self.committed_generation();
-        let payload = std::fs::read(self.index_dir.join("checkpoint")).unwrap_or_default();
-        Ok(SearchCheckpoint {
-            epoch,
-            generation,
-            payload,
-        })
-    }
-    fn load_checkpoint(&mut self) -> Result<SearchCheckpoint, SearchError> {
-        self.checkpoint()
-    }
-    fn publish_checkpoint(&self, epoch: u64, generation: u64) -> Result<(), SearchError> {
+    /// Returns an error when the checkpoint file cannot be written or
+    /// synced.
+    pub fn publish_checkpoint(&self, epoch: u64, generation: u64) -> Result<(), SearchError> {
         use std::io::Write;
         let path = self.index_dir.join("checkpoint");
         let temp = self.index_dir.join("checkpoint.tmp");
@@ -487,105 +134,132 @@ impl SearchBackend for TantivyBackend {
         std::fs::rename(temp, path)?;
         Ok(())
     }
-    fn search(
-        &self,
-        query: &QueryAst,
-        note_ids: &[i64],
-        limit: usize,
-    ) -> Result<Vec<i64>, SearchError> {
-        match query {
-            QueryAst::Text(text) => self.search_text(text, note_ids, limit),
-            _ => Ok(Vec::new()),
-        }
-    }
-    fn searcher(&self) -> Result<Box<dyn SearcherTrait>, SearchError> {
-        if self.is_dirty() {
-            self.commit()?;
-        }
-        Ok(Box::new(TantivySearcher {
-            index: self.index.clone(),
-            reader: self.reader.clone(),
-            fields: self.fields,
-        }))
+
+    /// Read the durable checkpoint payload, if any.
+    ///
+    /// # Errors
+    /// Returns an error when the checkpoint file cannot be read.
+    pub fn checkpoint(&self) -> Result<Vec<u8>, SearchError> {
+        Ok(std::fs::read(self.index_dir.join("checkpoint")).unwrap_or_default())
     }
 }
 
-struct TantivySearcher {
-    index: Index,
-    reader: IndexReader,
-    fields: SearchFields,
+/// A searcher captured by the ordered writer, stamped with the generation
+/// whose envelope was last committed. Immutable and clonable: every
+/// evaluation against it observes exactly the same index state (D-07).
+#[derive(Clone)]
+pub struct CapturedSearcher {
+    pub(crate) searcher: tantivy::Searcher,
+    pub(crate) fields: SearchFields,
 }
 
-impl SearcherTrait for TantivySearcher {
-    fn search(
-        &self,
-        query: &QueryAst,
-        note_ids: &[i64],
-        limit: usize,
-    ) -> Result<Vec<i64>, SearchError> {
-        match query {
-            QueryAst::Text(text) => Ok(search_reader(
-                &self.index,
-                &self.reader,
-                self.fields,
-                text,
-                note_ids,
-                limit,
-            )?
-            .into_iter()
-            .map(|hit| hit.note_id)
-            .collect()),
-            _ => Ok(Vec::new()),
-        }
+impl std::fmt::Debug for CapturedSearcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapturedSearcher")
+            .field("num_docs", &self.searcher.num_docs())
+            .finish_non_exhaustive()
     }
 }
 
-fn search_reader(
-    index: &Index,
-    reader: &IndexReader,
-    fields: SearchFields,
-    query: &str,
-    note_ids: &[i64],
-    limit: usize,
-) -> Result<Vec<Hit>, SearchError> {
-    let parser = QueryParser::for_index(
-        index,
-        vec![fields.title, fields.aliases, fields.tags, fields.body],
-    );
-    let (parsed, _) = parser.parse_query_lenient(query);
-    let parsed: Box<dyn tantivy::query::Query> = if note_ids.is_empty() {
-        parsed
-    } else {
-        let terms = note_ids
-            .iter()
-            .map(|id| tantivy::Term::from_field_u64(fields.id, id.cast_unsigned()));
-        let id_filter = TermSetQuery::new(terms);
-        Box::new(BooleanQuery::new(vec![
-            (Occur::Must, parsed),
-            (Occur::Must, Box::new(id_filter)),
-        ]))
-    };
-    let searcher = reader.searcher();
-    let top = searcher
-        .search(&parsed, &TopDocs::with_limit(100_000).order_by_score())
-        .map_err(|e| SearchError::Tantivy(e.to_string()))?;
-    let mut hits = Vec::new();
-    for (score, addr) in top {
-        let document: TantivyDocument = searcher
-            .doc(addr)
+impl CapturedSearcher {
+    /// Evaluate one typed text leaf (§6.3): explicit field scope, pinned
+    /// analyzer, term or phrase input. There is no lenient query parser
+    /// here: the term is tokenized by the pinned analyzer; a phrase leaf —
+    /// or any term that tokenizes to more than one token — must match the
+    /// token sequence positionally. Membership is complete up to `limit`
+    /// (the evaluator passes the snapshot's document bound, never a fixed
+    /// top-hit approximation).
+    ///
+    /// # Errors
+    /// Returns an error when the query or collection fails.
+    pub fn leaf_hits(&self, leaf: &TextLeaf, limit: usize) -> Result<Vec<Hit>, SearchError> {
+        if leaf.term.is_empty() {
+            // Literal empty query matches nothing (D-05: Idle, not "match
+            // everywhere").
+            return Ok(Vec::new());
+        }
+        let Some(mut analyzer) = self.searcher.index().tokenizers().get("flavite") else {
+            return Err(SearchError::Tantivy("flavite analyzer missing".into()));
+        };
+        let tokens = tokenize_terms(&mut analyzer, &leaf.term);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fields: Vec<Field> = if leaf.fields.is_empty() {
+            vec![
+                self.fields.title,
+                self.fields.aliases,
+                self.fields.tags,
+                self.fields.body,
+            ]
+        } else {
+            leaf.fields
+                .iter()
+                .map(|field| match field {
+                    TextField::Title => self.fields.title,
+                    TextField::Aliases => self.fields.aliases,
+                    TextField::Tags => self.fields.tags,
+                    TextField::Body => self.fields.body,
+                })
+                .collect()
+        };
+        let mut clauses: Vec<(Occur, Box<dyn TantivyQuery>)> = Vec::new();
+        for field in fields {
+            let clause: Box<dyn TantivyQuery> = if leaf.phrase || tokens.len() > 1 {
+                let terms: Vec<Term> = tokens
+                    .iter()
+                    .map(|token| Term::from_field_text(field, token))
+                    .collect();
+                Box::new(PhraseQuery::new(terms))
+            } else {
+                Box::new(TermQuery::new(
+                    Term::from_field_text(field, &tokens[0]),
+                    IndexRecordOption::WithFreqsAndPositions,
+                ))
+            };
+            clauses.push((Occur::Should, clause));
+        }
+        let query: Box<dyn TantivyQuery> = if clauses.len() == 1 {
+            clauses.remove(0).1
+        } else {
+            Box::new(BooleanQuery::new(clauses))
+        };
+        let top = self
+            .searcher
+            .search(&*query, &TopDocs::with_limit(limit).order_by_score())
             .map_err(|e| SearchError::Tantivy(e.to_string()))?;
-        if let Some(id) = document
-            .get_first(fields.id)
-            .and_then(|value| value.as_u64())
-            .and_then(|value| i64::try_from(value).ok())
-        {
-            hits.push(Hit { note_id: id, score });
-            if hits.len() >= limit {
-                break;
+        let mut hits = Vec::new();
+        for (score, addr) in top {
+            if !score.is_finite() {
+                return Err(SearchError::Tantivy("non-finite score".into()));
+            }
+            let document: TantivyDocument = self
+                .searcher
+                .doc(addr)
+                .map_err(|e| SearchError::Tantivy(e.to_string()))?;
+            if let Some(id) = document
+                .get_first(self.fields.id)
+                .and_then(|value| value.as_u64())
+                .and_then(|value| i64::try_from(value).ok())
+            {
+                hits.push(Hit { note_id: id, score });
+                if hits.len() >= limit {
+                    break;
+                }
             }
         }
+        Ok(hits)
     }
-    Ok(hits)
+}
+
+/// Tokenize query text with the pinned analyzer.
+fn tokenize_terms(analyzer: &mut TextAnalyzer, text: &str) -> Vec<String> {
+    let mut stream = analyzer.token_stream(text);
+    let mut tokens = Vec::new();
+    while stream.advance() {
+        tokens.push(stream.token().text.clone());
+    }
+    tokens
 }
 
 fn search_schema() -> Schema {
@@ -602,6 +276,7 @@ fn search_schema() -> Schema {
     b.add_text_field("body", opts);
     b.build()
 }
+
 fn search_fields(schema: &Schema) -> Result<SearchFields, SearchError> {
     Ok(SearchFields {
         id: schema
@@ -621,6 +296,7 @@ fn search_fields(schema: &Schema) -> Result<SearchFields, SearchError> {
             .map_err(|e| SearchError::Tantivy(e.to_string()))?,
     })
 }
+
 fn register_search_tokenizers(index: &Index) {
     index.tokenizers().register(
         "flavite",
@@ -713,112 +389,6 @@ fn is_cjk(c: char) -> bool {
     matches!(c as u32,0x3040..=0x30ff|0x3400..=0x4dbf|0x4e00..=0x9fff|0xf900..=0xfaff|0x20000..=0x2fa1f|0xac00..=0xd7af|0x1100..=0x11ff|0x3130..=0x318f|0xff66..=0xff9f)
 }
 
-/// Search backend trait.
-///
-/// This trait allows swapping the search implementation (e.g., to SQLite FTS5)
-/// without changing the rest of the index.
-pub trait SearchBackend: Send + Sync {
-    /// Apply a document to the index (add or update).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SearchError`] when the backend cannot record the change
-    /// (a failed write or an inaccessible index).
-    fn apply_document(&self, note_id: i64, title: &str, body: &str) -> Result<(), SearchError>;
-
-    /// Delete a document from the index.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SearchError`] when the backend cannot record the deletion.
-    fn delete_document(&self, note_id: i64) -> Result<(), SearchError>;
-
-    /// Commit pending changes to the search index.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SearchError`] when the commit or its checkpoint
-    /// publication fails.
-    fn commit(&self) -> Result<(), SearchError>;
-
-    /// Get the current committed generation.
-    fn committed_generation(&self) -> u64;
-
-    /// Set the committed generation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SearchError`] when the generation cannot be persisted.
-    fn set_committed_generation(&self, generation: u64) -> Result<(), SearchError>;
-
-    /// Get the checkpoint metadata (epoch, generation, payload).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SearchError`] when the metadata or the checkpoint payload
-    /// cannot be read.
-    fn checkpoint(&self) -> Result<SearchCheckpoint, SearchError>;
-
-    /// Load the checkpoint from durable storage.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SearchError`] when the durable checkpoint cannot be read.
-    fn load_checkpoint(&mut self) -> Result<SearchCheckpoint, SearchError>;
-
-    /// Publish a new checkpoint atomically.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SearchError`] when the checkpoint file cannot be written,
-    /// synced, or renamed into place.
-    fn publish_checkpoint(&self, epoch: u64, generation: u64) -> Result<(), SearchError>;
-
-    /// Search using a query with optional note ID filter.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SearchError`] when the backend cannot evaluate the query.
-    fn search(
-        &self,
-        query: &QueryAst,
-        note_ids: &[i64],
-        limit: usize,
-    ) -> Result<Vec<i64>, SearchError>;
-
-    /// Get a searcher for reading the index.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SearchError`] when no searcher can be acquired (for
-    /// example, [`SearchError::NotInitialized`]).
-    fn searcher(&self) -> Result<Box<dyn SearcherTrait>, SearchError>;
-}
-
-/// Checkpoint for search durability.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SearchCheckpoint {
-    pub epoch: u64,
-    pub generation: u64,
-    /// Opaque payload that represents the durable state.
-    pub payload: Vec<u8>,
-}
-
-/// Trait for searcher to allow mocking.
-pub trait SearcherTrait: Send + Sync {
-    /// Search using a query with optional note ID filter.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SearchError`] when the query cannot be evaluated.
-    fn search(
-        &self,
-        query: &QueryAst,
-        note_ids: &[i64],
-        limit: usize,
-    ) -> Result<Vec<i64>, SearchError>;
-}
-
 /// Search error type.
 #[derive(Debug, Error)]
 pub enum SearchError {
@@ -828,315 +398,9 @@ pub enum SearchError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Checkpoint error: {0}")]
-    Checkpoint(String),
-
     #[error("Index not initialized")]
     NotInitialized,
 
     #[error("Tantivy error: {0}")]
     Tantivy(String),
-}
-
-/// In-memory behavior stub for tests that only exercise commit coordination.
-pub struct StubSearchBackend {
-    conn: Arc<Mutex<Connection>>,
-    cache_dir: PathBuf,
-    committed_generation: Arc<Mutex<u64>>,
-    dirty: Arc<Mutex<bool>>,
-}
-
-impl StubSearchBackend {
-    /// Build a stub backend over `conn`, recovering the committed
-    /// generation from the index metadata.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SearchError::Sqlite`] when the metadata row cannot be read.
-    pub fn new(conn: Connection, cache_dir: &Path) -> Result<Self, SearchError> {
-        let committed_gen = get_meta_u64(&conn, MetaKey::TantivyCommittedGeneration)?.unwrap_or(0);
-
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            cache_dir: cache_dir.to_path_buf(),
-            committed_generation: Arc::new(Mutex::new(committed_gen)),
-            dirty: Arc::new(Mutex::new(false)),
-        })
-    }
-
-    fn checkpoint_path(&self, epoch: u64, generation: u64) -> PathBuf {
-        self.cache_dir
-            .join("checkpoints")
-            .join(format!("checkpoint-{epoch}-{generation}"))
-    }
-}
-
-impl SearchBackend for StubSearchBackend {
-    fn apply_document(&self, _note_id: i64, _title: &str, _body: &str) -> Result<(), SearchError> {
-        *self
-            .dirty
-            .lock()
-            .map_err(|_| SearchError::Tantivy("Lock poisoned".into()))? = true;
-        Ok(())
-    }
-
-    fn delete_document(&self, _note_id: i64) -> Result<(), SearchError> {
-        *self
-            .dirty
-            .lock()
-            .map_err(|_| SearchError::Tantivy("Lock poisoned".into()))? = true;
-        Ok(())
-    }
-
-    fn commit(&self) -> Result<(), SearchError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| SearchError::Tantivy("Lock poisoned".into()))?;
-        let generation_val = get_meta_u64(&conn, MetaKey::Generation)?.unwrap_or(0);
-
-        // Update committed generation
-        set_meta(
-            &conn,
-            MetaKey::TantivyCommittedGeneration,
-            &generation_val.to_string(),
-        )?;
-        *self
-            .committed_generation
-            .lock()
-            .map_err(|_| SearchError::Tantivy("Lock poisoned".into()))? = generation_val;
-        *self
-            .dirty
-            .lock()
-            .map_err(|_| SearchError::Tantivy("Lock poisoned".into()))? = false;
-
-        // Publish checkpoint
-        self.publish_checkpoint(
-            get_meta_u64(&conn, MetaKey::Epoch)?.unwrap_or(1),
-            generation_val,
-        )?;
-
-        Ok(())
-    }
-
-    fn committed_generation(&self) -> u64 {
-        *self.committed_generation.lock().unwrap()
-    }
-
-    fn set_committed_generation(&self, generation: u64) -> Result<(), SearchError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| SearchError::Tantivy("Lock poisoned".into()))?;
-        set_meta(
-            &conn,
-            MetaKey::TantivyCommittedGeneration,
-            &generation.to_string(),
-        )?;
-        *self
-            .committed_generation
-            .lock()
-            .map_err(|_| SearchError::Tantivy("Lock poisoned".into()))? = generation;
-        Ok(())
-    }
-
-    fn checkpoint(&self) -> Result<SearchCheckpoint, SearchError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| SearchError::Tantivy("Lock poisoned".into()))?;
-        let epoch = get_meta_u64(&conn, MetaKey::Epoch)?.unwrap_or(1);
-        let generation = get_meta_u64(&conn, MetaKey::Generation)?.unwrap_or(0);
-
-        let checkpoint_path = self.checkpoint_path(epoch, generation);
-        let payload = if checkpoint_path.exists() {
-            std::fs::read(&checkpoint_path)?
-        } else {
-            Vec::new()
-        };
-
-        Ok(SearchCheckpoint {
-            epoch,
-            generation,
-            payload,
-        })
-    }
-
-    fn load_checkpoint(&mut self) -> Result<SearchCheckpoint, SearchError> {
-        self.checkpoint()
-    }
-
-    fn publish_checkpoint(&self, epoch: u64, generation: u64) -> Result<(), SearchError> {
-        use std::fs::{self, File};
-        use std::io::Write;
-
-        let checkpoint_dir = self.cache_dir.join("checkpoints");
-        fs::create_dir_all(&checkpoint_dir)?;
-
-        let temp_path = checkpoint_dir.join(format!(".checkpoint-{epoch}-{generation}.tmp"));
-        let final_path = self.checkpoint_path(epoch, generation);
-
-        let mut file = File::create(&temp_path)?;
-        file.write_all(&[])?; // Empty payload for now
-        file.sync_all()?;
-
-        fs::rename(&temp_path, &final_path)?;
-
-        Ok(())
-    }
-
-    fn search(
-        &self,
-        _query: &QueryAst,
-        _note_ids: &[i64],
-        _limit: usize,
-    ) -> Result<Vec<i64>, SearchError> {
-        // Commit if dirty (commit-before-search, D12)
-        if *self
-            .dirty
-            .lock()
-            .map_err(|_| SearchError::Tantivy("Lock poisoned".into()))?
-        {
-            self.commit()?;
-        }
-
-        // Return empty results for now
-        Ok(Vec::new())
-    }
-
-    fn searcher(&self) -> Result<Box<dyn SearcherTrait>, SearchError> {
-        Ok(Box::new(StubSearcher))
-    }
-}
-
-/// Stub searcher implementation.
-struct StubSearcher;
-
-impl SearcherTrait for StubSearcher {
-    fn search(
-        &self,
-        _query: &QueryAst,
-        _note_ids: &[i64],
-        _limit: usize,
-    ) -> Result<Vec<i64>, SearchError> {
-        Ok(Vec::new())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::schema::create_schema;
-    use tempfile::{NamedTempFile, tempdir};
-
-    #[test]
-    fn test_stub_backend() {
-        let temp_dir = tempdir().unwrap();
-        let cache_dir = temp_dir.path().join("cache");
-
-        let temp = NamedTempFile::new().unwrap();
-        let mut conn = Connection::open_with_flags(
-            temp.path(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-        )
-        .unwrap();
-
-        create_schema(&mut conn).unwrap();
-
-        let backend = StubSearchBackend::new(conn, &cache_dir).unwrap();
-        assert_eq!(backend.committed_generation(), 0);
-    }
-
-    #[test]
-    fn test_commit() {
-        let temp_dir = tempdir().unwrap();
-        let cache_dir = temp_dir.path().join("cache");
-
-        let temp = NamedTempFile::new().unwrap();
-        let mut conn = Connection::open_with_flags(
-            temp.path(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-        )
-        .unwrap();
-
-        create_schema(&mut conn).unwrap();
-
-        let backend = StubSearchBackend::new(conn, &cache_dir).unwrap();
-
-        // Mark as dirty
-        backend.apply_document(1, "title", "body").unwrap();
-
-        backend.commit().unwrap();
-
-        assert_eq!(backend.committed_generation(), 0); // Generation is still 0
-    }
-
-    #[test]
-    fn test_checkpoint() {
-        let temp_dir = tempdir().unwrap();
-        let cache_dir = temp_dir.path().join("cache");
-
-        let temp = NamedTempFile::new().unwrap();
-        let mut conn = Connection::open_with_flags(
-            temp.path(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-        )
-        .unwrap();
-
-        create_schema(&mut conn).unwrap();
-
-        let backend = StubSearchBackend::new(conn, &cache_dir).unwrap();
-
-        let checkpoint = backend.checkpoint().unwrap();
-        assert_eq!(checkpoint.epoch, 1);
-        assert_eq!(checkpoint.generation, 0);
-    }
-
-    #[test]
-    fn dirty_search_commits_and_publishes_checkpoint() {
-        let temp_dir = tempdir().unwrap();
-        let cache_dir = temp_dir.path().join("cache");
-        let temp = NamedTempFile::new().unwrap();
-        let mut conn = Connection::open(temp.path()).unwrap();
-        create_schema(&mut conn).unwrap();
-        set_meta(&conn, MetaKey::Generation, "4").unwrap();
-
-        let mut backend = StubSearchBackend::new(conn, &cache_dir).unwrap();
-        backend.apply_document(8, "title", "body").unwrap();
-        backend.delete_document(9).unwrap();
-        assert!(
-            backend
-                .search(&QueryAst::Unresolved, &[], 10)
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(backend.committed_generation(), 4);
-        let checkpoint = backend.checkpoint().unwrap();
-        assert_eq!((checkpoint.epoch, checkpoint.generation), (1, 4));
-        assert!(cache_dir.join("checkpoints/checkpoint-1-4").exists());
-        assert_eq!(
-            backend
-                .searcher()
-                .unwrap()
-                .search(&QueryAst::Text("x".into()), &[], 1)
-                .unwrap(),
-            Vec::<i64>::new()
-        );
-        assert_eq!(backend.load_checkpoint().unwrap(), checkpoint);
-    }
-
-    #[test]
-    fn explicit_generation_updates_stub_generation() {
-        let temp_dir = tempdir().unwrap();
-        let cache_dir = temp_dir.path().join("cache");
-        let temp = NamedTempFile::new().unwrap();
-        let mut conn = Connection::open(temp.path()).unwrap();
-        create_schema(&mut conn).unwrap();
-        set_meta(&conn, MetaKey::Generation, "3").unwrap();
-
-        let backend = StubSearchBackend::new(conn, &cache_dir).unwrap();
-        backend.set_committed_generation(2).unwrap();
-        assert_eq!(backend.committed_generation(), 2);
-        assert_eq!(backend.committed_generation(), 2);
-    }
 }

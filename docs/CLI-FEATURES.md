@@ -75,8 +75,11 @@ warnings are visible but do not fail the command.
 flavite-cli query [QUERY] [--path PATH] [--limit N]
 ```
 
-Run a query expression against the vault. `QUERY` is required; `--limit`
-defaults to **50**. See [QueryLanguage.md](QueryLanguage.md) for the syntax.
+Run a **structural** query expression against the vault. `QUERY` is
+required; `--limit` defaults to **50**. See
+[QueryLanguage.md](QueryLanguage.md) for the syntax. Text predicates are
+rejected explicitly (use `search`); supported structural terms are
+`tag:…`, `unresolved`, and their `AND`/`OR`/`NOT` combinations.
 
 - Human output: one result per line (`path` + `title`).
 - `--json`: a bare JSON array of note results:
@@ -98,12 +101,32 @@ matches).
 ### `search`
 
 ```
-flavite-cli search [TERM] [--path PATH] [--limit N]
+flavite-cli search [TERM] [--path PATH] [--mode text|expression|literal|regex]
+                   [--field title|aliases|tags|body|all] [--limit N] [--all] [--json]
 ```
 
-Identical pipeline to `query` — the term is parsed with the same query
-grammar. Differences are only the defaults: `TERM` positional and `--limit`
-defaults to **20**.
+Saved-content search through a materialized search session (RFC-0006 S06).
+Plain text is the default mode: whitespace means `AND` and punctuation is
+text. `--mode expression` parses the explicit operator syntax (`AND`/`OR`
+`NOT`, quotes as phrases, parentheses) — it is **not** whitespace-split.
+`--field` restricts every text term to one indexed field; in expression mode
+field filters are written directly (`title:rocket`). `--limit` is the page
+size (1–200, default **50**); each JSON page reports `session`, the frozen
+`epoch`/`generation` snapshot, the exact `total`, the `rows`, and the
+`next` ordinal token. `--all` consumes every continuation token before
+printing; the session is explicitly closed afterwards.
+
+Machine-readable failures are one deterministic JSON object on stderr:
+`{"error": {"kind": "busy|invalid|limit-exceeded|reset-required|expired|failed|unsupported", "message": …}}`.
+`literal`/`regex` modes (vault source matching, RFC-0006 S07) refuse with
+kind `unsupported` in this build.
+
+### `query` (text predicates)
+
+`flavite-cli query` remains the structural-only endpoint: a query AST that
+contains any text predicate fails with
+`text predicates are not supported on the structural query endpoint; use
+the search session endpoint` — never an empty success.
 
 ### `rename`
 

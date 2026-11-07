@@ -132,7 +132,8 @@ pub fn fixture(notes: &[(&str, &str)]) -> Fixture {
         },
     );
     let mut flavite = Flavite::open(identity, session, VaultConfig::default()).expect("facade");
-    flavite.set_graph_service_for_test(db, Some(std::sync::Arc::new(generation_watch)));
+    flavite.set_graph_service_for_test(db.clone(), Some(std::sync::Arc::new(generation_watch)));
+    flavite.query_service().set_search_db_path(db);
     reconcile(&flavite);
     let client = flavite.new_link_client();
     Fixture {

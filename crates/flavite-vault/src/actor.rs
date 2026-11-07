@@ -200,8 +200,24 @@ pub enum VaultActorMsg {
         source_path_key: Option<String>,
         reply: Sender<VaultActorResp>,
     },
-    /// Execute full-text or hybrid search through the index owner.
-    SearchNotes {
+    /// Evaluate one saved-content search against a coherent captured
+    /// snapshot (synchronous seam for graph filter membership).
+    EvaluateSavedSearch {
+        query: flavite_index::query::Query,
+        limit: usize,
+        reply: Sender<VaultActorResp>,
+    },
+    /// Ordered search-snapshot capture handshake (D-07): the actor holds
+    /// its generation-order gate (this single-threaded handler), the worker
+    /// establishes its SQL snapshot and acks the generation, then the actor
+    /// enqueues the ordered Capture(G).
+    SearchCaptureHandshake {
+        establish: Sender<()>,
+        ack: Receiver<(u64, u64)>,
+        reply: Sender<Result<flavite_index::search_session::CaptureTicket, String>>,
+    },
+    /// Execute a structural-only query page (text rejected explicitly).
+    StructuralQuery {
         query: flavite_index::query::Query,
         limit: usize,
         reply: Sender<VaultActorResp>,
@@ -280,7 +296,8 @@ pub enum VaultActorResp {
     /// Canonical link resolution verdict.
     ResolveTarget(Result<flavite_index::resolver::Resolution, String>),
     /// Search results from the structural index and Tantivy.
-    SearchNotes(Result<flavite_index::SearchPage, String>),
+    EvaluateSavedSearch(Result<flavite_index::SearchPage, String>),
+    StructuralQuery(Result<flavite_index::SearchPage, String>),
     /// Save completion after the structural index callback.
     Saved(Result<SaveReceipt, SaveFailure>),
     /// Durable history snapshot record.
@@ -637,24 +654,58 @@ impl VaultActorHandle {
         }
     }
 
-    /// Execute a text or hybrid search on the actor that owns Tantivy.
-    pub fn search_notes(
+    /// Begin the ordered search-snapshot capture handshake (D-07). The
+    /// worker side establishes its own SQL snapshot when signalled and
+    /// acks the generation it read.
+    pub fn begin_search_capture(
+        &self,
+    ) -> Result<crate::search_capture::SearchCaptureHandshake, String> {
+        crate::search_capture::SearchCaptureHandshake::begin(&self.sender)
+    }
+
+    /// Evaluate one saved-content search against a coherent captured
+    /// snapshot on the actor that owns the index (synchronous seam for the
+    /// graph filter membership path; search sessions use the async capture
+    /// handshake instead).
+    pub fn evaluate_saved_search(
         &self,
         query: flavite_index::query::Query,
         limit: usize,
     ) -> Result<flavite_index::SearchPage, String> {
         let (reply, response) = crossbeam::channel::bounded(1);
         self.sender
-            .send(VaultActorMsg::SearchNotes {
+            .send(VaultActorMsg::EvaluateSavedSearch {
                 query,
                 limit,
                 reply,
             })
             .map_err(|error| error.to_string())?;
         match response.recv().map_err(|error| error.to_string())? {
-            VaultActorResp::SearchNotes(result) => result,
+            VaultActorResp::EvaluateSavedSearch(result) => result,
             VaultActorResp::Error(error) => Err(error),
             _ => Err("unexpected search response".to_owned()),
+        }
+    }
+
+    /// Execute a structural-only query page on the actor (§6.1: text
+    /// predicates are rejected explicitly, never an empty success).
+    pub fn structural_query(
+        &self,
+        query: flavite_index::query::Query,
+        limit: usize,
+    ) -> Result<flavite_index::SearchPage, String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::StructuralQuery {
+                query,
+                limit,
+                reply,
+            })
+            .map_err(|error| error.to_string())?;
+        match response.recv().map_err(|error| error.to_string())? {
+            VaultActorResp::StructuralQuery(result) => result,
+            VaultActorResp::Error(error) => Err(error),
+            _ => Err("unexpected structural response".to_owned()),
         }
     }
 
@@ -1171,8 +1222,8 @@ impl VaultActor {
                         if mutating { self.catalog.begin(); }
                         self.handle_message(msg);
                         if mutating { self.catalog.finish(&self.index); }
-                        if let Err(error) = self.index.commit_search_if_due(false) {
-                            tracing::error!(%error, "deferred Tantivy commit failed");
+                        if let Err(error) = self.index.drain_search_acks() {
+                            tracing::error!(%error, "search writer acknowledgement drain failed");
                         }
                     }
                     Err(_) => { info!("VaultActor channel disconnected, shutting down"); break; }
@@ -1203,8 +1254,8 @@ impl VaultActor {
                             );
                         }
                     }
-                    if let Err(error) = self.index.commit_search_if_due(false) {
-                        tracing::error!(%error, "deferred Tantivy commit failed");
+                    if let Err(error) = self.index.drain_search_acks() {
+                        tracing::error!(%error, "search writer acknowledgement drain failed");
                     }
                     if last_verification.elapsed() >= self.verification_interval {
                         self.handle_reconcile(ReconcileScope::Full, ReconcileMode::FastMetadata, None);
@@ -1233,12 +1284,45 @@ impl VaultActor {
         if let Some(watcher) = fs_watcher.as_mut() {
             watcher.shutdown();
         }
-        if let Err(error) = self.index.commit_search_if_due(true) {
-            tracing::error!(%error, "final Tantivy commit failed");
+        if let Err(error) = self.index.drain_search_acks() {
+            tracing::error!(%error, "final search acknowledgement drain failed");
         }
 
         is_running.store(false, Ordering::SeqCst);
         info!("VaultActor stopped");
+    }
+
+    /// The actor side of the ordered capture handshake (D-07). This handler
+    /// runs to completion on the sole SQL-owner thread, so no generation
+    /// commit can interleave between the worker's generation read and the
+    /// ordered Capture(G) enqueue: the capture lands after envelope G and
+    /// before envelope G+1. The 50 ms handshake budget returns Busy; it
+    /// never includes Tantivy commit or evaluation.
+    fn search_capture_handshake(
+        &mut self,
+        establish: Sender<()>,
+        ack: Receiver<(u64, u64)>,
+    ) -> Result<flavite_index::search_session::CaptureTicket, String> {
+        use flavite_index::search_session::{CaptureTicket, HANDSHAKE_TIMEOUT};
+        establish
+            .send(())
+            .map_err(|_| "capture worker left the handshake".to_owned())?;
+        let (epoch, generation) = ack
+            .recv_timeout(HANDSHAKE_TIMEOUT)
+            .map_err(|_| "search snapshot handshake timed out".to_owned())?;
+        self.index.drain_search_acks()?;
+        let (outcome_tx, outcome_rx) = crossbeam::channel::bounded(1);
+        let Some(writer) = self.index.search_writer() else {
+            return Err("this index handle does not own the search writer".to_owned());
+        };
+        writer
+            .enqueue_capture(epoch, generation, outcome_tx)
+            .map_err(|error| error.to_string())?;
+        Ok(CaptureTicket {
+            epoch,
+            generation,
+            outcome: outcome_rx,
+        })
     }
 
     /// Handle a message.
@@ -1302,8 +1386,8 @@ impl VaultActor {
                     .try_send(VaultActorResp::Identity(self.identity.clone()));
             }
             VaultActorMsg::Shutdown => {
-                if let Err(error) = self.index.commit_search_if_due(true) {
-                    tracing::error!(%error, "shutdown Tantivy commit failed");
+                if let Err(error) = self.index.drain_search_acks() {
+                    tracing::error!(%error, "shutdown search acknowledgement drain failed");
                 }
                 let _ = self.resp_sender.try_send(VaultActorResp::Ack);
                 // Shutdown will happen when the channel is dropped
@@ -1421,12 +1505,31 @@ impl VaultActor {
                 ));
                 let _ = reply.try_send(response);
             }
-            VaultActorMsg::SearchNotes {
+            VaultActorMsg::SearchCaptureHandshake {
+                establish,
+                ack,
+                reply,
+            } => {
+                let outcome = self.search_capture_handshake(establish, ack);
+                let _ = reply.send(outcome);
+            }
+            VaultActorMsg::StructuralQuery {
                 query,
                 limit,
                 reply,
             } => {
-                let response = VaultActorResp::SearchNotes(self.index.search_notes(&query, limit));
+                let response =
+                    VaultActorResp::StructuralQuery(self.index.structural_page(&query, limit));
+                let _ = reply.send(response);
+            }
+            VaultActorMsg::EvaluateSavedSearch {
+                query,
+                limit,
+                reply,
+            } => {
+                let response = VaultActorResp::EvaluateSavedSearch(
+                    self.index.evaluate_saved_search(&query, limit),
+                );
                 let _ = reply.try_send(response);
             }
             VaultActorMsg::Save { request, reply } => {
@@ -2148,8 +2251,8 @@ impl VaultActor {
             });
         }
 
-        if let Err(error) = self.index.commit_search_if_due(true) {
-            tracing::error!(%error, "post-reconcile Tantivy commit failed");
+        if let Err(error) = self.index.drain_search_acks() {
+            tracing::error!(%error, "post-reconcile search acknowledgement drain failed");
         }
         let response = VaultActorResp::ReconcileComplete { summary, version };
         if let Some(reply) = reply {

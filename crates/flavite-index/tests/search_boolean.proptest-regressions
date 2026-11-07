@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 77b3dd0cfb25e776127ee275e76b928ee22fc2fb31a3ad1d4d7f6be21f16b387 # shrinks to query = Tag { name: "proj", hierarchical: false }

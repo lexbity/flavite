@@ -1964,13 +1964,49 @@ impl Session {
         self.actor.read_bounded(self.root().join(relative), max)
     }
 
-    /// Execute a text or hybrid query on the index actor.
-    pub fn search_notes(
+    /// Evaluate one saved-content search against a coherent captured
+    /// snapshot (synchronous seam for graph filter membership; search
+    /// sessions use the async capture handshake).
+    ///
+    /// # Errors
+    /// Returns the actor error text when evaluation fails.
+    pub fn evaluate_saved_search(
         &self,
         query: flavite_index::query::Query,
         limit: usize,
     ) -> Result<flavite_index::SearchPage, String> {
-        self.actor.search_notes(query, limit)
+        self.actor.evaluate_saved_search(query, limit)
+    }
+
+    /// Begin the ordered search-snapshot capture handshake (D-07): the
+    /// caller establishes its own SQL snapshot when signalled, acks the
+    /// generation it read, and then waits asynchronously for the searcher.
+    ///
+    /// # Errors
+    /// Returns the actor error text when the handshake cannot begin.
+    pub fn begin_search_capture(
+        &self,
+    ) -> Result<crate::search_capture::SearchCaptureHandshake, String> {
+        self.actor.begin_search_capture()
+    }
+
+    /// The vault identity this session serves.
+    #[must_use]
+    pub fn vault_uuid(&self) -> uuid::Uuid {
+        self.identity.uuid
+    }
+
+    /// Execute a structural-only query page (§6.1: text predicates are
+    /// rejected explicitly by the index, never an empty success).
+    ///
+    /// # Errors
+    /// Returns the typed text rejection or the actor error text.
+    pub fn structural_page(
+        &self,
+        query: flavite_index::query::Query,
+        limit: usize,
+    ) -> Result<flavite_index::SearchPage, String> {
+        self.actor.structural_query(query, limit)
     }
 
     /// List a note's bounded local-history records, newest first (W10).

@@ -132,12 +132,19 @@ fn frozen_corpus_matches_the_old_assembly_algorithm() {
         // most `limit` rows (the +1 probe drives `has_more` alone), so the
         // reference assembles the same id window.
         let ids = actor
-            .search_text(query_text, &[], limit.saturating_add(1))
+            .evaluate_saved_search(
+                &Query::Text(flavite_index::query::TextLeaf::all_fields(query_text)),
+                limit.saturating_add(1),
+            )
+            .map(|p| p.items.into_iter().map(|r| r.note_id).collect::<Vec<_>>())
             .unwrap();
         let window = &ids[..ids.len().min(limit)];
         let expected = reference_assemble(actor.writer().conn(), window, &terms);
         let page = actor
-            .search_notes(&Query::Text(query_text.into()), limit)
+            .evaluate_saved_search(
+                &Query::Text(flavite_index::query::TextLeaf::all_fields(query_text)),
+                limit,
+            )
             .unwrap();
         assert_eq!(
             page.items
@@ -161,7 +168,10 @@ fn has_more_truth_table() {
     let (_dir, mut actor) = indexed_index(total, "tabletoken");
     for limit in [total - 1, total, total + 1] {
         let page = actor
-            .search_notes(&Query::Text("tabletoken".into()), limit)
+            .evaluate_saved_search(
+                &Query::Text(flavite_index::query::TextLeaf::all_fields("tabletoken")),
+                limit,
+            )
             .unwrap();
         assert_eq!(
             page.items.len(),
@@ -207,7 +217,7 @@ fn structural_only_pages_have_no_scores_and_a_honest_sentinel() {
         hierarchical: false,
     };
     for limit in [5usize, 6, 7] {
-        let page = actor.search_notes(&query, limit).unwrap();
+        let page = actor.evaluate_saved_search(&query, limit).unwrap();
         let tagged = 6; // tagged0..5 (the six generic notes carry no tag).
         assert_eq!(page.items.len(), tagged.min(limit));
         assert_eq!(page.has_more, tagged > limit);
@@ -224,11 +234,23 @@ fn batched_assembly_crosses_512_row_chunks() {
     let (_dir, mut actor) = indexed_index(total, "chunktoken");
     for limit in [513usize, 1_024] {
         let ids = actor
-            .search_text("chunktoken", &[], limit.saturating_add(1))
+            .evaluate_saved_search(
+                &Query::Text(flavite_index::query::TextLeaf::all_fields("chunktoken")),
+                limit.saturating_add(1),
+            )
+            .map(|page| {
+                page.items
+                    .into_iter()
+                    .map(|row| row.note_id)
+                    .collect::<Vec<_>>()
+            })
             .unwrap();
         assert_eq!(ids.len(), limit + 1, "probe row must be fetched");
         let page = actor
-            .search_notes(&Query::Text("chunktoken".into()), limit)
+            .evaluate_saved_search(
+                &Query::Text(flavite_index::query::TextLeaf::all_fields("chunktoken")),
+                limit,
+            )
             .unwrap();
         assert_eq!(page.items.len(), limit);
         assert!(page.has_more);

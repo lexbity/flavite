@@ -22,6 +22,7 @@ pub mod properties;
 pub mod reconcile_worker;
 pub mod rename;
 pub mod save;
+pub mod search_capture;
 pub mod session;
 pub mod sync;
 pub mod text_edit;

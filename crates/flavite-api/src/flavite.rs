@@ -2080,9 +2080,14 @@ impl Flavite {
         query: &crate::Query,
         limit: usize,
     ) -> Result<QueryResult, FlaviteError> {
+        if query.contains_text() {
+            // The general query endpoint is structural-only (§6.1): a text
+            // AST returns UnsupportedTextPredicate, never an empty success.
+            return Err(FlaviteError::UnsupportedTextPredicate);
+        }
         let page = self
             .session
-            .search_notes(query.clone(), limit.saturating_add(1))
+            .structural_page(query.clone(), limit.saturating_add(1))
             .map_err(FlaviteError::IndexError)?;
         let has_more = page.items.len() > limit;
         let rows = page.items.into_iter().take(limit);
@@ -2099,6 +2104,75 @@ impl Flavite {
             generation: page.generation,
             has_more,
         })
+    }
+
+    /// Start (or refresh) one materialized saved-content search session
+    /// (`search.start`, §6.1). Blocking; callers must not invoke this on a
+    /// UI or SQL-actor turn. The returned page carries the frozen snapshot
+    /// provenance, the exact total and the continuation token.
+    ///
+    /// # Errors
+    /// Returns the typed session error mapped onto [`FlaviteError`].
+    pub fn search_start(
+        &self,
+        options: crate::search_sessions::SearchQueryOptions,
+    ) -> Result<crate::search_sessions::SearchPageMaterialized, FlaviteError> {
+        self.queries
+            .search_sessions()
+            .start(options)
+            .map_err(FlaviteError::SearchSession)
+    }
+
+    /// Fetch one search-session page by continuation token
+    /// (`search.page`). Idempotent replay; the frozen snapshot never
+    /// changes within a session.
+    ///
+    /// # Errors
+    /// Returns the typed session error mapped onto [`FlaviteError`].
+    pub fn search_page(
+        &self,
+        token: &crate::search_sessions::PageToken,
+    ) -> Result<crate::search_sessions::SearchPageMaterialized, FlaviteError> {
+        self.queries
+            .search_sessions()
+            .page(token)
+            .map_err(FlaviteError::SearchSession)
+    }
+
+    /// Fetch one search-session page after rechecking the caller's
+    /// ReadNotes capability (`search.page` for capability-bearing
+    /// consumers): session permissions are intersected again at every page
+    /// (§6.3).
+    ///
+    /// # Errors
+    /// Returns `CapabilityDenied` or the typed session error.
+    pub fn search_page_as(
+        &self,
+        capabilities: &[crate::Capability],
+        token: &crate::search_sessions::PageToken,
+    ) -> Result<crate::search_sessions::SearchPageMaterialized, FlaviteError> {
+        if !capabilities
+            .iter()
+            .any(|grant| grant.covers(&crate::Capability::ReadNotes, None))
+        {
+            return Err(FlaviteError::CapabilityDenied("ReadNotes"));
+        }
+        self.search_page(token)
+    }
+
+    /// Explicitly close one search session (`search.close`) and drop its
+    /// spool.
+    ///
+    /// # Errors
+    /// Returns the typed session error mapped onto [`FlaviteError`].
+    pub fn search_close(
+        &self,
+        session: crate::search_sessions::SearchSessionId,
+    ) -> Result<(), FlaviteError> {
+        self.queries
+            .search_sessions()
+            .close(session)
+            .map_err(FlaviteError::SearchSession)
     }
 
     /// Query the index on behalf of a capability-bearing API consumer.
@@ -2226,6 +2300,16 @@ pub enum FlaviteError {
     /// Indexed lookup failed.
     #[error("Index error: {0}")]
     IndexError(String),
+
+    /// A text predicate reached the structural-only query endpoint (§6.1).
+    #[error(
+        "text predicates are not supported on the structural query endpoint; use the search session endpoint"
+    )]
+    UnsupportedTextPredicate,
+
+    /// A search session command failed (RFC-0006 S06).
+    #[error("Search session error: {0}")]
+    SearchSession(#[from] crate::search_sessions::SearchSessionError),
 
     /// Vault operation could not be submitted.
     #[error("Vault operation failed: {0}")]
@@ -2396,6 +2480,9 @@ mod tests {
             VaultConfig::default(),
         )
         .unwrap();
+        // The injected index database rides the temp dir, not the global
+        // cache path; rebind the search-session snapshot source to it.
+        flavite.query_service().set_search_db_path(db);
         (flavite, root, temp)
     }
 
@@ -2648,16 +2735,34 @@ mod tests {
     }
 
     #[test]
-    fn query_facade_searches_notes_indexed_during_vault_open() {
+    fn search_session_enumerates_notes_indexed_during_vault_open() {
         let (flavite, _root, _temp) = test_flavite();
         await_initial_reconcile(&flavite);
         let page = flavite
-            .query_with_limit(&crate::Query::Text("hello".into()), 10)
+            .search_start(crate::search_sessions::SearchQueryOptions {
+                mode: crate::search_sessions::SearchMode::FullText,
+                text: "hello".into(),
+                page_size: 10,
+            })
             .unwrap();
-        assert_eq!(page.notes.len(), 1);
-        assert_eq!(page.notes[0].path, "note.md");
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].path, "note.md");
         assert_eq!(page.generation, 1);
-        assert!(!page.has_more);
+        assert!(page.next.is_none());
+        flavite.search_close(page.session).unwrap();
+    }
+
+    #[test]
+    fn structural_query_endpoint_rejects_text_predicates() {
+        let (flavite, _root, _temp) = test_flavite();
+        await_initial_reconcile(&flavite);
+        assert!(matches!(
+            flavite.query_with_limit(
+                &crate::Query::Text(flavite_index::query::TextLeaf::all_fields("hello")),
+                10
+            ),
+            Err(FlaviteError::UnsupportedTextPredicate)
+        ));
     }
 
     #[test]
@@ -2665,14 +2770,18 @@ mod tests {
         let (flavite, _root, _temp) = test_flavite();
         await_initial_reconcile(&flavite);
         assert!(matches!(
-            flavite.query_as(&[], &crate::Query::Text("hello".into()), 10),
+            flavite.query_as(
+                &[],
+                &crate::Query::Not(Box::new(crate::Query::Unresolved)),
+                10
+            ),
             Err(FlaviteError::CapabilityDenied("ReadNotes"))
         ));
         assert_eq!(
             flavite
                 .query_as(
                     &[crate::Capability::ReadNotes],
-                    &crate::Query::Text("hello".into()),
+                    &crate::Query::Not(Box::new(crate::Query::Unresolved)),
                     10
                 )
                 .unwrap()
