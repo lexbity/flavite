@@ -61,15 +61,15 @@ pub fn parse_chord(text: &str) -> Option<Chord> {
     for token in text.split('+') {
         let token = token.trim();
         match token {
-            "Mod" if key.is_none() => modifiers |= modifiers::CTRL,
+            "Mod" | "Ctrl" if key.is_none() => modifiers |= modifiers::CTRL,
             "Shift" if key.is_none() => modifiers |= modifiers::SHIFT,
             "Alt" if key.is_none() => modifiers |= modifiers::ALT,
-            "Ctrl" if key.is_none() => modifiers |= modifiers::CTRL,
             "Super" if key.is_none() => modifiers |= modifiers::SUPER,
             other => {
                 if key.is_some() || other.is_empty() {
                     return None;
                 }
+                // clippy: allow this pattern since canonical_key returns Option<()>
                 if canonical_key(other).is_none() {
                     return None;
                 }

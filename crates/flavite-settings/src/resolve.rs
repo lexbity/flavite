@@ -86,7 +86,7 @@ impl Resolved {
     }
 }
 
-/// Extension trait for SettingRegistry to resolve documents.
+/// Extension trait for `SettingRegistry` to resolve documents.
 pub trait RegistryResolve {
     /// Resolve a document against the registry, filling in defaults for missing values.
     fn resolve(&self, doc: &SettingsDoc) -> Resolved;

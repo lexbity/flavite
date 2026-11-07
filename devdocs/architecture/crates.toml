@@ -108,6 +108,8 @@ active = [
     # semantic model and decoded images for rendering.
     { from = "flavite-api", to = "flavite-theme" },
     { from = "flavite-ui", to = "flavite-theme" },
+    # RFC-0007 S2: Settings store and commands consume the pure settings codec.
+    { from = "flavite-api", to = "flavite-settings" },
 
     # C14 - CLI consumes flavite-api only (D16 dogfood - fully migrated)
     { from = "flavite-cli", to = "flavite-api" },

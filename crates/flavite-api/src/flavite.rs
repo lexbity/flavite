@@ -562,6 +562,8 @@ pub struct Flavite {
     /// seams that recreate the service (`set_graph_db_path_for_test`)
     /// rewire the same watch.
     pub(crate) generation_watch: Option<Arc<flavite_index::GenerationWatch>>,
+    /// Vault settings store (RFC-0007 S2): CAS storage for the v2 settings document.
+    pub(crate) settings_store: crate::settings_store::SettingsStore,
 }
 
 /// Build the per-vault attached services shared by every constructor.
@@ -580,6 +582,7 @@ fn attach_services(
 ) -> (
     flavite_vault::user_state::VaultUserStateStore,
     Arc<crate::graph_service::GraphService>,
+    crate::settings_store::SettingsStore,
 ) {
     let vault_user_state = flavite_vault::user_state::VaultUserStateStore::new(
         Box::new(flavite_fs::OsFs::new()),
@@ -590,7 +593,13 @@ fn attach_services(
         Some(Arc::clone(session)),
         index_watch,
     );
-    (vault_user_state, graph)
+    // Create a separate store instance for settings (shared fs not needed - same paths)
+    let settings_vault_store = Arc::new(flavite_vault::user_state::VaultUserStateStore::new(
+        Box::new(flavite_fs::OsFs::new()),
+        root,
+    ));
+    let settings_store = crate::settings_store::SettingsStore::new(settings_vault_store, true);
+    (vault_user_state, graph, settings_store)
 }
 
 impl Flavite {
@@ -612,7 +621,7 @@ impl Flavite {
         let vault_uuid = vault_ref.uuid.to_string();
 
         let session = Arc::new(session);
-        let (vault_user_state, graph) =
+        let (vault_user_state, graph, settings_store) =
             attach_services(vault_ref.uuid, &identity.root, &session, None);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
@@ -642,6 +651,7 @@ impl Flavite {
             themes: crate::themes::ThemeStore::open(Box::new(flavite_fs::OsFs::new())).ok(),
             vault_user_state,
             graph,
+            settings_store,
             // Headless constructors own no writer-side signal; their graph
             // services wake on control kicks and the sweep (RFC-0005 §5.3).
             generation_watch: None,
@@ -665,7 +675,7 @@ impl Flavite {
     ) -> Result<Self, FlaviteError> {
         let vault_uuid = vault_ref.uuid.to_string();
         let session = Arc::new(session);
-        let (vault_user_state, graph) =
+        let (vault_user_state, graph, settings_store) =
             attach_services(vault_ref.uuid, &vault_ref.root, &session, None);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
@@ -695,6 +705,7 @@ impl Flavite {
             themes: crate::themes::ThemeStore::open(Box::new(flavite_fs::OsFs::new())).ok(),
             vault_user_state,
             graph,
+            settings_store,
             // Headless constructor: no writer-side signal owned here; the
             // graph service wakes on control kicks and the sweep.
             generation_watch: None,
@@ -729,7 +740,7 @@ impl Flavite {
         let vault_uuid = identity.uuid.to_string();
         let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
         let generation_watch = index_watch.clone();
-        let (vault_user_state, graph) =
+        let (vault_user_state, graph, settings_store) =
             attach_services(vault_ref.uuid, &identity.root, &session, index_watch);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
@@ -753,6 +764,7 @@ impl Flavite {
             themes: crate::themes::ThemeStore::open(Box::new(flavite_fs::OsFs::new())).ok(),
             vault_user_state,
             graph,
+            settings_store,
             notice_acks: Mutex::new(std::collections::BTreeMap::new()),
             next_notice_id: AtomicU64::new(1),
             catalog_sequence: AtomicU64::new(1),
@@ -1015,12 +1027,45 @@ impl Flavite {
                 ArgSchema::typed::<crate::themes::UninstallThemeArgs>(),
                 crate::themes::handle_theme_unroutable,
             ),
+            // Settings commands (RFC-0007 §4.5)
+            (
+                "settings.list",
+                "List all settings",
+                ArgSchema::typed::<crate::settings_cmds::SettingsListArgs>(),
+                crate::settings_cmds::handle_settings_unroutable,
+            ),
+            (
+                "settings.get",
+                "Get a setting value",
+                ArgSchema::typed::<crate::settings_cmds::SettingsGetArgs>(),
+                crate::settings_cmds::handle_settings_unroutable,
+            ),
+            (
+                "settings.set",
+                "Set a setting value",
+                ArgSchema::typed::<crate::settings_cmds::SettingsSetArgs>(),
+                crate::settings_cmds::handle_settings_unroutable,
+            ),
+            (
+                "settings.reset",
+                "Reset a setting to default",
+                ArgSchema::typed::<crate::settings_cmds::SettingsResetArgs>(),
+                crate::settings_cmds::handle_settings_unroutable,
+            ),
+
         ];
         for (id, title, args, handler) in registrations {
             let spec = if id.starts_with("theme.") {
                 // Theme commands write device state, not the vault: they
                 // stay available on read-only vaults and gate on Themes.
                 CommandSpec::new(id, title, args).requires(crate::Capability::Themes)
+            } else if id.starts_with("settings.") {
+                // Settings commands gate on Settings capability
+                if matches!(id, "settings.set" | "settings.reset") {
+                    CommandSpec::new(id, title, args).write().requires(crate::Capability::Settings)
+                } else {
+                    CommandSpec::new(id, title, args).requires(crate::Capability::Settings)
+                }
             } else if matches!(
                 id,
                 "note.open"
@@ -1299,37 +1344,92 @@ impl Flavite {
             .ok_or_else(|| FlaviteError::IndexError("native path decode produced no path".into()))
     }
 
-    /// Read the versioned vault settings document through the API boundary.
-    pub fn read_settings(&self) -> Result<Option<String>, FlaviteError> {
-        let path = self.vault_ref.root.join(".flavite").join("settings.toml");
-        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            return Err(FlaviteError::SettingsIo(
-                "settings.toml must not be a symlink".into(),
-            ));
-        }
-        match std::fs::read_to_string(path) {
-            Ok(contents) => Ok(Some(contents)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(FlaviteError::SettingsIo(error.to_string())),
-        }
+    /// Read the settings document from the vault store (RFC-0007 S2).
+    ///
+    /// Returns `None` if no settings document exists. Use `settings_read` for
+    /// a resolved view with defaults.
+    pub fn read_settings_raw(&self) -> Result<Option<crate::settings_store::StoredSettings>, FlaviteError> {
+        self.settings_store.read().map_err(|e| FlaviteError::SettingsIo(e.to_string()))
     }
 
-    /// Atomically write the versioned vault settings document through the API boundary.
-    pub fn write_settings(&self, contents: &str) -> Result<(), FlaviteError> {
-        let directory = self.vault_ref.root.join(".flavite");
-        std::fs::create_dir_all(&directory)
-            .map_err(|error| FlaviteError::SettingsIo(error.to_string()))?;
-        let path = directory.join("settings.toml");
-        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            return Err(FlaviteError::SettingsIo(
-                "settings.toml must not be a symlink".into(),
-            ));
+    /// Read and resolve the settings document against the registry.
+    ///
+    /// This is the typed entry point for settings consumption: it returns
+    /// all effective values (document values with defaults filled in).
+    pub fn settings_read(
+        &self,
+    ) -> Result<crate::settings_store::ResolvedSettings, FlaviteError> {
+        use flavite_settings::resolve::RegistryResolve;
+        let registry = flavite_settings::registry::SettingRegistry::with_builtins();
+        let stored = self.settings_store.load_or_initialize(&registry)
+            .map_err(|e| FlaviteError::SettingsIo(e.to_string()))?;
+        let resolved = registry.resolve(&stored.doc);
+        Ok(crate::settings_store::ResolvedSettings {
+            resolved,
+            generation: stored.generation,
+            read_only: stored.is_read_only(),
+            warnings: stored.warnings,
+        })
+    }
+
+    /// Write the settings document to the vault store with CAS (RFC-0007 S2).
+    ///
+    /// This is the typed entry point for settings mutation. It validates the
+    /// document against the registry and enforces the 256 KiB bound.
+    pub fn settings_write(
+        &self,
+        doc: &flavite_settings::document::SettingsDoc,
+        expected_generation: u64,
+    ) -> Result<u64, FlaviteError> {
+        self.settings_store.write(doc, expected_generation)
+            .map_err(|e| FlaviteError::SettingsIo(e.to_string()))
+    }
+
+    /// Set a single setting value by ID (RFC-0007 S2).
+    ///
+    /// This is a convenience method that reads the current document, sets the
+    /// value, validates it, and writes with CAS.
+    pub fn settings_set(
+        &self,
+        id: &str,
+        value: flavite_settings::value::SettingValue,
+    ) -> Result<u64, FlaviteError> {
+        let registry = flavite_settings::registry::SettingRegistry::with_builtins();
+        // Validate ID is not reserved
+        if flavite_settings::registry::SettingRegistry::is_reserved_namespace(id) {
+            return Err(FlaviteError::SettingsIo("reserved namespace".to_owned()));
         }
-        flavite_fs::atomic::atomic_write(&flavite_fs::OsFs::new(), &path, contents.as_bytes())
-            .map(|_| ())
-            .map_err(|error| FlaviteError::SettingsIo(error.to_string()))
+        // Set and persist
+        self.settings_store.set_value(&registry, id, value)
+            .map_err(|e| FlaviteError::SettingsIo(e.to_string()))
+    }
+
+    /// Get the setting descriptors from the registry.
+    ///
+    /// Returns the complete built-in descriptor table (RFC-0007 D-04).
+    pub fn setting_descriptors(&self) -> Vec<flavite_settings::descriptor::SettingDescriptor> {
+        flavite_settings::registry::SettingRegistry::builtins()
+    }
+
+    /// Read the settings document (legacy compatibility shim for flavite-ui).
+    /// Use `settings_read()` for the typed entry point.
+    pub fn read_settings(&self) -> Result<Option<String>, FlaviteError> {
+        let stored = self.settings_store.read()
+            .map_err(|e| FlaviteError::SettingsIo(e.to_string()))?;
+        Ok(stored.and_then(|s| flavite_settings::codec::serialize(&s.doc).ok()))
+    }
+
+    /// Write the settings document (legacy compatibility shim for flavite-ui).
+    /// Use `settings_write()` for the typed entry point.
+    pub fn write_settings(&self, contents: &str) -> Result<(), FlaviteError> {
+        let doc = flavite_settings::codec::parse(Some(contents))
+            .map_err(|e| FlaviteError::SettingsIo(e.to_string()))?;
+        let stored = self.settings_store.read()
+            .map_err(|e| FlaviteError::SettingsIo(e.to_string()))?;
+        let generation = stored.map(|s| s.generation).unwrap_or(0);
+        self.settings_store.write(&doc.doc, generation)
+            .map_err(|e| FlaviteError::SettingsIo(e.to_string()))?;
+        Ok(())
     }
 
     /// Execute a typed command through the registry.
@@ -1402,6 +1502,10 @@ impl Flavite {
             // Theme commands never touch buffers or the vault session;
             // their handlers need the facade-owned theme store.
             return crate::themes::execute_theme_command(self, &invocation);
+        }
+        if invocation.command_id.starts_with("settings.") {
+            // Settings commands need the facade-owned settings store.
+            return crate::settings_cmds::execute_settings_command(self, &invocation);
         }
         if let Some(buffer_id) = invocation.preconditions.buffer_id {
             let revision = invocation.preconditions.expected_revision;

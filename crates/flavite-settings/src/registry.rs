@@ -23,6 +23,7 @@ impl SettingRegistry {
     /// Get the built-in descriptors (the complete v1 set from RFC-0007 D-04).
     /// This is the authoritative list of all settings the backend expresses.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn builtins() -> Vec<SettingDescriptor> {
         vec![
             // Appearance settings
@@ -248,6 +249,9 @@ impl SettingRegistry {
     }
 
     /// Validate that an ID is well-formed and not reserved.
+    ///
+    /// # Errors
+    /// Returns `Err(String)` if the ID is not valid or is in a reserved namespace.
     pub fn validate_id(&self, id: &str) -> Result<(), String> {
         if !SettingDescriptor::is_valid_id(id) {
             return Err(format!("{id} is not a valid setting ID"));

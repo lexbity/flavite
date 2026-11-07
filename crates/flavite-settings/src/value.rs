@@ -100,30 +100,45 @@ impl SettingValue {
     }
 
     /// Convert to boolean, panicking if not a boolean (for debug use only).
+    ///
+    /// # Panics
+    /// Panics if the value is not a boolean.
     #[must_use]
     pub fn to_bool(&self) -> bool {
         self.as_bool().expect("expected bool")
     }
 
     /// Convert to integer, panicking if not an integer (for debug use only).
+    ///
+    /// # Panics
+    /// Panics if the value is not an integer.
     #[must_use]
     pub fn to_int(&self) -> i64 {
         self.as_int().expect("expected int")
     }
 
     /// Convert to string, panicking if not a string (for debug use only).
+    ///
+    /// # Panics
+    /// Panics if the value is not a string.
     #[must_use]
     pub fn to_str(&self) -> &str {
         self.as_str().expect("expected str")
     }
 
     /// Convert to list, panicking if not a list (for debug use only).
+    ///
+    /// # Panics
+    /// Panics if the value is not a list.
     #[must_use]
     pub fn to_list(&self) -> &Vec<String> {
         self.as_list().expect("expected list")
     }
 
     /// Convert to shortcut map, panicking if not a shortcut map (for debug use only).
+    ///
+    /// # Panics
+    /// Panics if the value is not a shortcut map.
     #[must_use]
     pub fn to_shortcut_map(&self) -> &BTreeMap<String, String> {
         self.as_shortcut_map().expect("expected shortcut map")

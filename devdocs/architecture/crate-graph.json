@@ -186,6 +186,11 @@
     },
     {
       "from": "flavite-api",
+      "to": "flavite-settings",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-api",
       "to": "flavite-syntax",
       "kind": "normal"
     },

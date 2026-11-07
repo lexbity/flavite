@@ -16,8 +16,8 @@
 
 use crate::identity::resolve_data_dir;
 use flavite_fs::Fs;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Hard byte bound for one user-state file (codec bound plus envelope).
 pub const MAX_USER_STATE_BYTES: u64 = 5 * 1024 * 1024;
@@ -335,11 +335,15 @@ impl UserStateStore {
 /// The fixed set of vault-relative user-state kinds. Like
 /// [`UserStateKind`], callers cannot invent locations: the file name is
 /// part of the kind, not an argument (§11.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VaultUserStateKind {
     /// Graph position pins — `<vault>/.flavite/graph.json`, existing
     /// format, existing semantics (D-11).
     GraphPins,
+    /// Workspace layouts — `<vault>/.flavite/workspace-layouts.json` (RFC-0007).
+    WorkspaceLayouts,
+    /// Vault settings — `<vault>/.flavite/settings.toml` (RFC-0007).
+    Settings,
 }
 
 impl VaultUserStateKind {
@@ -348,27 +352,33 @@ impl VaultUserStateKind {
     pub const fn relative_path(self) -> &'static str {
         match self {
             Self::GraphPins => ".flavite/graph.json",
+            Self::WorkspaceLayouts => ".flavite/workspace-layouts.json",
+            Self::Settings => ".flavite/settings.toml",
         }
     }
 }
 
 /// Vault-relative user state stored behind the injected `Fs`.
 ///
-/// The graph-pins document keeps its established on-disk bytes — the
-/// `{"version":1,"pins":[…]}` shape with unknown-field preservation is the
-/// UI codec's contract, not this store's. The store therefore treats the
-/// file as an opaque JSON document: bounded size, symlink protection, one
-/// shared atomic-replace primitive (§4.4/D6), and a compare-and-set
-/// generation.
+/// Each kind owns its file format and bound. The graph-pins document keeps
+/// its established on-disk bytes — the `{"version":1,"pins":[…]}` shape
+/// with unknown-field preservation is the UI codec's contract, not this
+/// store's. The store therefore treats files as opaque bytes: bounded size,
+/// symlink protection, one shared atomic-replace primitive (§4.4/D6), and
+/// a compare-and-set generation.
 ///
 /// The generation counter is process-scoped by design: the vault's single
 /// writer lock already serializes across processes (§11.2), and the CAS
 /// exists to reject stale in-process writes after a re-read — never to
 /// rewrite the established file format with a new envelope.
+///
+/// RFC-0007 note: Settings documents are bounded at 256 KiB (not the
+/// MAX_USER_STATE_BYTES bound) and are TOML, not JSON. The store does not
+/// enforce format — the codec does — but the caller ensures the bound.
 pub struct VaultUserStateStore {
     fs: Box<dyn Fs + Send + Sync>,
     vault_root: PathBuf,
-    graph_pins_generation: AtomicU64,
+    generations: std::sync::RwLock<BTreeMap<VaultUserStateKind, u64>>,
 }
 
 impl std::fmt::Debug for VaultUserStateStore {
@@ -385,7 +395,7 @@ impl VaultUserStateStore {
         Self {
             fs,
             vault_root: vault_root.to_path_buf(),
-            graph_pins_generation: AtomicU64::new(0),
+            generations: std::sync::RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -399,25 +409,96 @@ impl VaultUserStateStore {
         path
     }
 
-    /// Read the graph-pins document; `None` when nothing was ever written.
+    /// Read the stored document for a kind; `None` when nothing was ever written.
     ///
     /// # Errors
     /// Typed bounds, protection, and filesystem failures.
-    pub fn read_graph_pins(&self) -> Result<Option<StoredUserState>, UserStateError> {
-        let path = self.path_for(VaultUserStateKind::GraphPins);
+    pub fn read(&self, kind: VaultUserStateKind) -> Result<Option<StoredUserState>, UserStateError> {
+        let path = self.path_for(kind);
         self.guard_protected(&path)?;
         let bytes = match self.fs.read_if_exists(&path) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Ok(None),
             Err(error) => return Err(UserStateError::Fs(error.to_string())),
         };
-        if bytes.len() as u64 > MAX_USER_STATE_BYTES {
-            return Err(UserStateError::TooLarge { size: bytes.len() });
-        }
+        // Delegate bound checking to the caller (different bounds per kind).
+        let generation = {
+            let guard = self.generations.read().map_err(|_| UserStateError::Fs("poisoned lock".into()))?;
+            *guard.get(&kind).unwrap_or(&0)
+        };
         Ok(Some(StoredUserState {
-            generation: self.graph_pins_generation.load(Ordering::Acquire),
+            generation,
             payload: bytes,
         }))
+    }
+
+    /// Write the document for a kind under a compare-and-set generation
+    /// receipt; returns the new generation.
+    ///
+    /// The payload is opaque bytes; the caller enforces the format and bound.
+    /// The write goes through the shared atomic-replace primitive
+    /// (`flavite_fs::atomic::atomic_write`).
+    ///
+    /// # Errors
+    /// [`UserStateError::GenerationMismatch`] on a stale receipt,
+    /// [`UserStateError::ReadOnly`] when `allow_writes` is false, and typed
+    /// protection/filesystem failures. Bound enforcement is the caller's
+    /// responsibility (different kinds have different bounds).
+    pub fn write(
+        &self,
+        kind: VaultUserStateKind,
+        expected_generation: u64,
+        payload: &[u8],
+        allow_writes: bool,
+    ) -> Result<u64, UserStateError> {
+        if !allow_writes {
+            return Err(UserStateError::ReadOnly);
+        }
+        let path = self.path_for(kind);
+        let parent = path
+            .parent()
+            .ok_or_else(|| UserStateError::Fs("path has no parent".into()))?;
+        self.guard_protected(&path)?;
+        self.guard_protected(parent)?;
+        
+        let actual = {
+            let guard = self.generations.read().map_err(|_| UserStateError::Fs("poisoned lock".into()))?;
+            *guard.get(&kind).unwrap_or(&0)
+        };
+        
+        if actual != expected_generation {
+            return Err(UserStateError::GenerationMismatch {
+                expected: expected_generation,
+                actual,
+            });
+        }
+        
+        if let Err(error) = self.fs.create_dir_all(parent) {
+            return Err(UserStateError::Fs(error.to_string()));
+        }
+        if let Err(error) = flavite_fs::atomic::atomic_write(self.fs.as_ref(), &path, payload) {
+            return Err(UserStateError::Fs(error.to_string()));
+        }
+        
+        let next = expected_generation.saturating_add(1);
+        {
+            let mut guard = self.generations.write().map_err(|_| UserStateError::Fs("poisoned lock".into()))?;
+            guard.insert(kind, next);
+        }
+        Ok(next)
+    }
+
+    /// Read the graph-pins document (legacy method for backwards compatibility).
+    ///
+    /// # Errors
+    /// Typed bounds, protection, and filesystem failures.
+    pub fn read_graph_pins(&self) -> Result<Option<StoredUserState>, UserStateError> {
+        let result = self.read(VaultUserStateKind::GraphPins)?;
+        if let Some(ref stored) = result
+            && stored.payload.len() as u64 > MAX_USER_STATE_BYTES {
+            return Err(UserStateError::TooLarge { size: stored.payload.len() });
+        }
+        Ok(result)
     }
 
     /// Write the graph-pins document under a compare-and-set generation
@@ -439,9 +520,6 @@ impl VaultUserStateStore {
         payload: &[u8],
         allow_writes: bool,
     ) -> Result<u64, UserStateError> {
-        if !allow_writes {
-            return Err(UserStateError::ReadOnly);
-        }
         if payload.len() as u64 > MAX_USER_STATE_BYTES {
             return Err(UserStateError::TooLarge {
                 size: payload.len(),
@@ -454,28 +532,12 @@ impl VaultUserStateStore {
                 "graph pins must be a JSON object".into(),
             ));
         }
-        let path = self.path_for(VaultUserStateKind::GraphPins);
-        let parent = path
-            .parent()
-            .ok_or_else(|| UserStateError::Fs("graph pins path has no parent".into()))?;
-        self.guard_protected(&path)?;
-        self.guard_protected(parent)?;
-        let actual = self.graph_pins_generation.load(Ordering::Acquire);
-        if actual != expected_generation {
-            return Err(UserStateError::GenerationMismatch {
-                expected: expected_generation,
-                actual,
-            });
-        }
-        if let Err(error) = self.fs.create_dir_all(parent) {
-            return Err(UserStateError::Fs(error.to_string()));
-        }
-        if let Err(error) = flavite_fs::atomic::atomic_write(self.fs.as_ref(), &path, payload) {
-            return Err(UserStateError::Fs(error.to_string()));
-        }
-        let next = expected_generation.saturating_add(1);
-        self.graph_pins_generation.store(next, Ordering::Release);
-        Ok(next)
+        self.write(
+            VaultUserStateKind::GraphPins,
+            expected_generation,
+            payload,
+            allow_writes,
+        )
     }
 
     fn guard_protected(&self, path: &Path) -> Result<(), UserStateError> {

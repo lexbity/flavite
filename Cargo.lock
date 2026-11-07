@@ -1493,6 +1493,7 @@ dependencies = [
  "flavite-fs",
  "flavite-graph",
  "flavite-index",
+ "flavite-settings",
  "flavite-syntax",
  "flavite-text-search",
  "flavite-theme",

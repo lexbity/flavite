@@ -40,6 +40,7 @@ Normal/build:
 - `flavite-fs` (normal)
 - `flavite-graph` (normal)
 - `flavite-index` (normal)
+- `flavite-settings` (normal)
 - `flavite-syntax` (normal)
 - `flavite-text-search` (normal)
 - `flavite-theme` (normal)

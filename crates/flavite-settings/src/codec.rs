@@ -51,7 +51,7 @@ pub fn parse(text: Option<&str>) -> Result<Parsed, SettingsCodecError> {
     let schema = table
         .get("schema")
         .and_then(toml::Value::as_integer)
-        .map(|v| v as u32)
+        .and_then(|v| Some(v as u32))
         .unwrap_or(SCHEMA_VERSION); // Default to current schema version
 
     let mut warnings = Vec::new();
@@ -108,23 +108,20 @@ pub fn parse(text: Option<&str>) -> Result<Parsed, SettingsCodecError> {
                     
                     if let Some(descriptor) = registry.lookup(&id) {
                         // Known setting - parse and validate
-                        match parse_value(&v, &descriptor.kind) {
-                            Ok(setting_value) => {
-                                if descriptor.kind.validate(&setting_value).is_ok() {
-                                    section_map.insert(k.clone(), setting_value);
-                                } else {
-                                    warnings.push(format!(
-                                        "{id}: value out of bounds, using default"
-                                    ));
-                                    section_map.insert(k.clone(), descriptor.default.clone());
-                                }
-                            }
-                            Err(_) => {
+                        if let Ok(setting_value) = parse_value(v, &descriptor.kind) {
+                            if descriptor.kind.validate(&setting_value).is_ok() {
+                                section_map.insert(k.clone(), setting_value);
+                            } else {
                                 warnings.push(format!(
-                                    "{id}: invalid value type, using default"
+                                    "{id}: value out of bounds, using default"
                                 ));
                                 section_map.insert(k.clone(), descriptor.default.clone());
                             }
+                        } else {
+                            warnings.push(format!(
+                                "{id}: invalid value type, using default"
+                            ));
+                            section_map.insert(k.clone(), descriptor.default.clone());
                         }
                     } else {
                         // Unknown key in known section - preserve
@@ -173,7 +170,7 @@ fn is_valid_section_name(name: &str) -> bool {
     })
 }
 
-/// Parse a TOML value into a SettingValue based on the expected kind.
+/// Parse a `toml::Value` into a `SettingValue` based on the expected kind.
 fn parse_value(value: &toml::Value, kind: &crate::descriptor::SettingKind) -> Result<SettingValue, String> {
     match kind {
         crate::descriptor::SettingKind::Bool => {
@@ -205,7 +202,7 @@ fn parse_value(value: &toml::Value, kind: &crate::descriptor::SettingKind) -> Re
             let array = value.as_array().ok_or_else(|| "expected array".to_owned())?;
             let list: Result<Vec<String>, _> = array
                 .iter()
-                .map(|v| v.as_str().map(|s| s.to_owned()).ok_or_else(|| "expected string in list".to_owned()))
+                .map(|v| v.as_str().map(std::borrow::ToOwned::to_owned).ok_or_else(|| "expected string in list".to_owned()))
                 .collect();
             list.map(SettingValue::List)
         }
@@ -285,7 +282,7 @@ pub fn serialize(doc: &SettingsDoc) -> Result<String, SettingsCodecError> {
     })
 }
 
-/// Convert a SettingValue to a toml::Value.
+/// Convert a `SettingValue` to a `toml::Value`.
 fn to_toml_value(value: &SettingValue) -> toml::Value {
     match value {
         SettingValue::Bool(v) => toml::Value::Boolean(*v),

@@ -42,7 +42,7 @@ pub enum SettingKind {
     Choice(&'static [(&'static str, &'static str)]), // (value, label)
     /// Line width: bounded integer or "full".
     LineWidth,
-    /// Theme package selection (dynamic options from ThemeStore).
+    /// Theme package selection (dynamic options from `ThemeStore`).
     ThemePackage,
     /// A list of strings.
     StringList,
@@ -52,7 +52,11 @@ pub enum SettingKind {
 
 impl SettingKind {
     /// Validate a value against this kind.
+    ///
     /// Returns Ok(()) if valid, or Err with a description of the validation failure.
+    ///
+    /// # Errors
+    /// Returns `Err(String)` if the value doesn't match the expected kind or is out of bounds.
     pub fn validate(&self, value: &SettingValue) -> Result<(), String> {
         match self {
             Self::Bool => {
@@ -86,7 +90,7 @@ impl SettingKind {
                         Ok(())
                     } else {
                         let valid: Vec<_> = options.iter().map(|(val, _)| *val).collect();
-                        Err(format!("value must be one of {:?}", valid))
+                        Err(format!("value must be one of {valid:?}"))
                     }
                 } else {
                     Err("expected string".to_owned())
@@ -141,12 +145,11 @@ impl SettingKind {
         match self {
             Self::Bool => SettingValue::Bool(false),
             Self::Int { min, .. } => SettingValue::Int(*min),
-            Self::Text => SettingValue::Str(String::new()),
+            Self::Text | Self::ThemePackage => SettingValue::Str(String::new()),
             Self::Choice(options) => {
                 SettingValue::Str(options.first().map(|(v, _)| (*v).to_owned()).unwrap_or_default())
             }
             Self::LineWidth => SettingValue::Int(80),
-            Self::ThemePackage => SettingValue::Str(String::new()),
             Self::StringList => SettingValue::List(Vec::new()),
             Self::ShortcutMap => SettingValue::ShortcutMap(BTreeMap::new()),
         }
@@ -179,6 +182,7 @@ pub struct SettingDescriptor {
 impl SettingDescriptor {
     /// Create a new setting descriptor.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         id: &'static str,
         category: &'static str,
@@ -221,6 +225,9 @@ impl SettingDescriptor {
     }
 
     /// Validate a value against this descriptor's kind.
+    ///
+    /// # Errors
+    /// Returns `SettingsCodecError::InvalidValue` if the value doesn't match the expected kind.
     pub fn validate_value(&self, value: &SettingValue) -> Result<(), SettingsCodecError> {
         self.kind.validate(value).map_err(|e| SettingsCodecError::InvalidValue(self.id.to_owned(), e))
     }
