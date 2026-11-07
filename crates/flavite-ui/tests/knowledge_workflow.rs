@@ -151,6 +151,16 @@ fn back_and_forward_restore_place_within_one_tab() {
     assert!(a_text.contains("[[b]]"));
 
     // Open b in the same tab (picker replace mode): a goes to Back.
+    // The picker matches against the catalog host's snapshot; submit
+    // before the first snapshot lands matches nothing and opens nothing
+    // (a real user cannot submit a picker with no matches either) — wait
+    // for the catalog the same way navigation_identity does.
+    wait(app, |a| {
+        a.note_candidates()
+            .all()
+            .iter()
+            .any(|candidate| candidate.path().to_string() == "b.md")
+    });
     app.picker = flavite_ui::app::Picker {
         open: true,
         query: String::new(),
