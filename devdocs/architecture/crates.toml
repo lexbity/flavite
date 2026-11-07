@@ -21,7 +21,7 @@ tier1 = [
     "flavite-graph-protocol",
 ]
 # Tier 2 (§10.5: ≥ 80% line coverage floor).
-tier2 = ["flavite-api", "flavite-graph", "flavite-theme"]
+tier2 = ["flavite-api", "flavite-graph", "flavite-theme", "flavite-settings"]
 # Tier 3 — measured, not gating until Phase 6 (§10.5).
 tier3 = ["flavite-cli", "flavite-editor", "flavite-ui", "flavite-app"]
 # The isolated source-matching helper is a packaged binary (RFC-0006 §6.2/
@@ -41,6 +41,7 @@ flavite-vault = "Session/BufferManager ownership + actors, journal, history, rec
 flavite-api = "Registry, typed commands/results, revisioned views, events, capabilities (§4.1)"
 flavite-graph = "Layout, spatial — CPU only (§4.1)"
 flavite-theme = "Theme package codec: parse browser .xpi themes, map them onto the semantic surface, bounded image/APNG decode — pure, IO-free"
+flavite-settings = "Settings descriptors, registry, v2 TOML codec, and chord parsing — pure, IO-free (RFC-0007 S1)"
 flavite-cli = "Headless CLI; consumes flavite-api (D16 dogfood) (§4.1)"
 flavite-workspace = "IO-free workspace model: layout tree, tab groups, typed transactions, geometry (RFC-0003 D-02)"
 flavite-editor = "iced widget over EditorModel (iced permitted here and in flavite-ui only) (§4.1)"
@@ -107,6 +108,7 @@ active = [
     # semantic model and decoded images for rendering.
     { from = "flavite-api", to = "flavite-theme" },
     { from = "flavite-ui", to = "flavite-theme" },
+
     # C14 - CLI consumes flavite-api only (D16 dogfood - fully migrated)
     { from = "flavite-cli", to = "flavite-api" },
     # B7 - Card layer uses API and buffer for production wiring
@@ -145,6 +147,7 @@ core_tier = [
     "flavite-workspace",
     "flavite-theme",
     "flavite-cli",
+    "flavite-settings",
 ]
 # Forbidden in core-tier transitive closure (normal+build deps only;
 # dev-deps are exempt but listed in the artifact).

@@ -53,6 +53,10 @@
       "kind": "workspace"
     },
     {
+      "id": "flavite-settings",
+      "kind": "workspace"
+    },
+    {
       "id": "flavite-syntax",
       "kind": "workspace"
     },

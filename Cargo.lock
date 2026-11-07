@@ -1628,6 +1628,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flavite-settings"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+]
+
+[[package]]
 name = "flavite-syntax"
 version = "0.1.0"
 dependencies = [
