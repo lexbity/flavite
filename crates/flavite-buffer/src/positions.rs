@@ -7,8 +7,6 @@
 //! end of the replacement for positions intersecting a replacement. Mapping
 //! never silently reauthorizes a writing target; callers decide validity.
 
-use unicode_segmentation::UnicodeSegmentation;
-
 /// Boundary affinity for a mapped position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Affinity {
@@ -160,24 +158,6 @@ pub fn snap_to_char_boundary(text: &str, position: usize) -> usize {
     mapped
 }
 
-/// Clamp to the text length and round down to the start of the grapheme
-/// cluster containing the position, so an anchor never splits a cluster.
-#[must_use]
-pub fn snap_to_grapheme(text: &str, position: usize) -> usize {
-    let clamped = position.min(text.len());
-    if clamped == text.len() {
-        return text.len();
-    }
-    let mut start = 0;
-    for (offset, _) in text.grapheme_indices(true) {
-        if offset > clamped {
-            break;
-        }
-        start = offset;
-    }
-    start
-}
-
 fn shift(position: usize, delta: isize) -> usize {
     shift_pos(position, delta)
 }
@@ -266,16 +246,16 @@ mod tests {
     }
 
     #[test]
-    fn snapping_never_splits_characters_or_graphemes() {
+    fn snapping_never_splits_characters() {
         // "é" is two bytes but one char; "aé" prefix at 2 splits the char.
         let text = "aéz";
         assert_eq!(snap_to_char_boundary(text, 2), 1);
         assert_eq!(snap_to_char_boundary(text, 4), 4);
-        // The flag emoji is a multi-codepoint grapheme cluster.
+        // The flag emoji is a multi-codepoint grapheme cluster; byte offsets
+        // inside it are legal edit boundaries at scalar starts only.
         let flags = "🇦🇧z";
-        assert_eq!(snap_to_grapheme(flags, 4), 0);
-        assert_eq!(snap_to_grapheme(flags, 8), 8);
-        assert_eq!(snap_to_grapheme(flags, 100), 9);
+        assert_eq!(snap_to_char_boundary(flags, 4), 4);
+        assert_eq!(snap_to_char_boundary(flags, 100), 9);
     }
 
     #[test]

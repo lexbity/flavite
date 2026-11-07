@@ -26,7 +26,7 @@ use flavite_graph::{
 use flavite_workspace::{GraphCamera, GraphView, LayoutAction, NoteLocator, TabId, ViewKind};
 use iced::Rectangle;
 
-use crate::app::{App, Message};
+use crate::app::App;
 use crate::graph::events::{GestureArbiter, GestureOutcome};
 use crate::graph::geometry::{GeometryOverrides, HitNode, RenderGeometry};
 use crate::graph::instance::Camera;
@@ -1813,21 +1813,5 @@ pub fn cancel_gestures(app: &mut App) {
             state.box_preview = None;
             state.arbiter.cancel();
         }
-    }
-}
-
-/// The message wrapper the graph widgets publish through `App`.
-#[must_use]
-pub fn graph_message(
-    tab: TabId,
-    incarnation: u64,
-    key: RenderKey,
-    message: GraphMessage,
-) -> Message {
-    Message::GraphAction {
-        tab,
-        incarnation,
-        key,
-        message,
     }
 }

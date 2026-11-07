@@ -117,6 +117,9 @@ pub struct HistoryStore {
     root: PathBuf,
     cap_bytes: u64,
     records: Vec<SnapshotRef>,
+    /// Wall-clock anchor for the unreferenced-blob sweep; the sweep walks
+    /// every shard, so it is throttled instead of running per mutation.
+    last_blob_sweep: std::time::Instant,
 }
 
 impl std::fmt::Debug for HistoryStore {
@@ -175,6 +178,7 @@ impl HistoryStore {
             root,
             cap_bytes,
             records,
+            last_blob_sweep: std::time::Instant::now() - Self::BLOB_SWEEP_INTERVAL,
         })
     }
 
@@ -201,9 +205,10 @@ impl HistoryStore {
         pin: bool,
         now_secs: u64,
     ) -> Result<SnapshotRef, HistoryError> {
+        // The pre-write prune/persist pair is part of the tested save
+        // choreography (each is a durable boundary before any effect).
         self.prune_records(now_secs);
         self.persist_metadata()?;
-        self.remove_unreferenced_blobs()?;
         let hash = blake3::hash(bytes).to_hex().to_string();
         let note_key = hex::encode(note_key);
         let encoded = zstd::stream::encode_all(bytes, 3)
@@ -228,7 +233,7 @@ impl HistoryStore {
         self.records.push(record.clone());
         self.prune_records(now_secs);
         self.persist_metadata()?;
-        self.remove_unreferenced_blobs()?;
+        self.remove_unreferenced_blobs(false)?;
         Ok(record)
     }
 
@@ -247,7 +252,13 @@ impl HistoryStore {
                 && record.reason == HistoryReason::RecoveryBase
                 && record.pins > 0
         }) {
-            self.get(&hash)?;
+            // Existence is a stat; the blob's bytes were verified when it
+            // was created and `get` decodes + re-hashes the full content.
+            if !self.has_blob(&hash)? {
+                return Err(HistoryError::Metadata(format!(
+                    "missing history blob {hash}"
+                )));
+            }
             return Ok(record.clone());
         }
         self.snapshot(note_key, bytes, HistoryReason::RecoveryBase, true, now_secs)
@@ -265,7 +276,7 @@ impl HistoryStore {
             record.pins -= 1;
         }
         self.persist_metadata()?;
-        self.remove_unreferenced_blobs()
+        self.remove_unreferenced_blobs(false)
     }
 
     pub fn get(&self, hash: &str) -> Result<Vec<u8>, HistoryError> {
@@ -332,7 +343,7 @@ impl HistoryStore {
         }
         self.prune_records(now);
         self.persist_metadata()?;
-        self.remove_unreferenced_blobs()?;
+        self.remove_unreferenced_blobs(/* force */ true)?;
         sizes = self.live_blob_sizes()?;
         total = sizes.values().sum();
         if total.saturating_add(incoming) <= self.cap_bytes {
@@ -415,7 +426,7 @@ impl HistoryStore {
         }
         self.records = retained;
         self.persist_metadata()?;
-        self.remove_unreferenced_blobs()?;
+        self.remove_unreferenced_blobs(false)?;
         Ok(())
     }
 
@@ -481,7 +492,18 @@ impl HistoryStore {
         durable_replace(&*self.fs, &self.root.join(META_FILE), &bytes)?;
         Ok(())
     }
-    fn remove_unreferenced_blobs(&self) -> Result<(), HistoryError> {
+    /// Minimum wall-clock spacing between unreferenced-blob sweeps. The
+    /// sweep lists every shard; per-mutation sweeps dominated the save path
+    /// at corpus scale. Retention is unchanged: unreferenced blobs are
+    /// removed at the next mutation after the interval, and `make_room`
+    /// forces one when capacity demands it.
+    const BLOB_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    fn remove_unreferenced_blobs(&mut self, force: bool) -> Result<(), HistoryError> {
+        if !force && self.last_blob_sweep.elapsed() < Self::BLOB_SWEEP_INTERVAL {
+            return Ok(());
+        }
+        self.last_blob_sweep = std::time::Instant::now();
         let live: HashSet<_> = self.records.iter().map(|r| r.hash.as_str()).collect();
         let base = self.root.join("blobs");
         if !self.fs.exists(&base)? {

@@ -143,23 +143,29 @@ pub fn handle_settings_list(
     _args: SettingsListArgs,
 ) -> Result<(String, serde_json::Value), String> {
     use flavite_settings::resolve::RegistryResolve;
-    
+
     let registry = SettingRegistry::with_builtins();
-    
+
     // Load or initialize settings
-    let stored = flavite.settings_store.load_or_initialize(&registry)
+    let stored = flavite
+        .settings_store
+        .load_or_initialize(&registry)
         .map_err(|e| format!("failed to load settings: {}", e.wire_code()))?;
-    
+
     let resolved = registry.resolve(&stored.doc);
-    
-    let settings: Vec<SettingEntry> = registry.all()
+
+    let settings: Vec<SettingEntry> = registry
+        .all()
         .iter()
         .map(|descriptor| {
             let id = descriptor.id.to_owned();
-            let value = resolved.get(&id).cloned().unwrap_or_else(|| descriptor.default.clone());
+            let value = resolved
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| descriptor.default.clone());
             let default = descriptor.default.clone();
             let modified = value != default;
-            
+
             SettingEntry {
                 id,
                 category: descriptor.category.to_owned(),
@@ -173,15 +179,18 @@ pub fn handle_settings_list(
             }
         })
         .collect();
-    
+
     let result = SettingsListResult {
         settings,
         generation: stored.generation,
         read_only: stored.is_read_only(),
         warnings: stored.warnings,
     };
-    
-    Ok(("settings.list".to_owned(), serde_json::to_value(result).unwrap()))
+
+    Ok((
+        "settings.list".to_owned(),
+        serde_json::to_value(result).unwrap(),
+    ))
 }
 
 /// Handle `settings.get` command.
@@ -190,24 +199,30 @@ pub fn handle_settings_get(
     args: SettingsGetArgs,
 ) -> Result<(String, serde_json::Value), String> {
     use flavite_settings::resolve::RegistryResolve;
-    
+
     let registry = SettingRegistry::with_builtins();
-    
+
     // Validate the ID
     if SettingRegistry::is_reserved_namespace(&args.id) {
         return Err(format!("reserved namespace: {}", args.id));
     }
-    
-    let descriptor = registry.lookup(&args.id)
+
+    let descriptor = registry
+        .lookup(&args.id)
         .ok_or_else(|| format!("unknown setting: {}", args.id))?;
-    
+
     // Load or initialize settings
-    let stored = flavite.settings_store.load_or_initialize(&registry)
+    let stored = flavite
+        .settings_store
+        .load_or_initialize(&registry)
         .map_err(|e| format!("failed to load settings: {}", e.wire_code()))?;
-    
+
     let resolved = registry.resolve(&stored.doc);
-    let value = resolved.get(&args.id).cloned().unwrap_or_else(|| descriptor.default.clone());
-    
+    let value = resolved
+        .get(&args.id)
+        .cloned()
+        .unwrap_or_else(|| descriptor.default.clone());
+
     let result = SettingsGetResult {
         id: args.id,
         value: setting_value_to_json(&value),
@@ -222,8 +237,11 @@ pub fn handle_settings_get(
             requires_write: descriptor.requires_write,
         },
     };
-    
-    Ok(("settings.get".to_owned(), serde_json::to_value(result).unwrap()))
+
+    Ok((
+        "settings.get".to_owned(),
+        serde_json::to_value(result).unwrap(),
+    ))
 }
 
 /// Handle `settings.set` command.
@@ -232,30 +250,37 @@ pub fn handle_settings_set(
     args: SettingsSetArgs,
 ) -> Result<(String, serde_json::Value), String> {
     let registry = SettingRegistry::with_builtins();
-    
+
     // Validate the ID
     if SettingRegistry::is_reserved_namespace(&args.id) {
         return Err(format!("reserved namespace: {}", args.id));
     }
-    
-    let descriptor = registry.lookup(&args.id)
+
+    let descriptor = registry
+        .lookup(&args.id)
         .ok_or_else(|| format!("unknown setting: {}", args.id))?;
-    
+
     // Convert JSON value to SettingValue
     let value = json_to_setting_value(&args.value, &descriptor.kind)
         .map_err(|e| format!("invalid value: {}", e))?;
-    
+
     // Validate the value
-    descriptor.validate_value(&value)
+    descriptor
+        .validate_value(&value)
         .map_err(|e| format!("validation failed: {}", e))?;
-    
+
     // Write the value
-    let generation = flavite.settings_store.set_value(&registry, &args.id, value)
+    let generation = flavite
+        .settings_store
+        .set_value(&registry, &args.id, value)
         .map_err(|e| format!("failed to set setting: {}", e.wire_code()))?;
-    
+
     let result = SettingsSetResult { generation };
-    
-    Ok(("settings.set".to_owned(), serde_json::to_value(result).unwrap()))
+
+    Ok((
+        "settings.set".to_owned(),
+        serde_json::to_value(result).unwrap(),
+    ))
 }
 
 /// Handle `settings.reset` command.
@@ -264,22 +289,28 @@ pub fn handle_settings_reset(
     args: SettingsResetArgs,
 ) -> Result<(String, serde_json::Value), String> {
     let registry = SettingRegistry::with_builtins();
-    
+
     // Validate the ID
     if SettingRegistry::is_reserved_namespace(&args.id) {
         return Err(format!("reserved namespace: {}", args.id));
     }
-    
-    let descriptor = registry.lookup(&args.id)
+
+    let descriptor = registry
+        .lookup(&args.id)
         .ok_or_else(|| format!("unknown setting: {}", args.id))?;
-    
+
     // Write the default value
-    let generation = flavite.settings_store.set_value(&registry, &args.id, descriptor.default.clone())
+    let generation = flavite
+        .settings_store
+        .set_value(&registry, &args.id, descriptor.default.clone())
         .map_err(|e| format!("failed to reset setting: {}", e.wire_code()))?;
-    
+
     let result = SettingsResetResult { generation };
-    
-    Ok(("settings.reset".to_owned(), serde_json::to_value(result).unwrap()))
+
+    Ok((
+        "settings.reset".to_owned(),
+        serde_json::to_value(result).unwrap(),
+    ))
 }
 
 /// Stub handler for settings commands (they're routed on the facade turn).
@@ -305,7 +336,7 @@ pub(crate) fn execute_settings_command(
     invocation: &Invocation,
 ) -> ExecutionResult {
     use crate::result::{LocalResult, LocalSuccess};
-    
+
     let outcome = match invocation.command_id {
         "settings.list" => {
             let Ok(args) = serde_json::from_value::<SettingsListArgs>(invocation.args.clone())
@@ -337,7 +368,7 @@ pub(crate) fn execute_settings_command(
         }
         _ => return rejected(invocation, "unknown settings command"),
     };
-    
+
     match outcome {
         Ok((command_id, data)) => ExecutionResult::Local(LocalResult::Success(
             LocalSuccess::with_command(invocation.request_id, command_id, data),
@@ -365,7 +396,11 @@ fn setting_value_to_json(value: &SettingValue) -> serde_json::Value {
         SettingValue::Bool(v) => serde_json::Value::Bool(*v),
         SettingValue::Int(v) => serde_json::Value::from(*v),
         SettingValue::Str(v) => serde_json::Value::String(v.clone()),
-        SettingValue::List(v) => serde_json::Value::Array(v.iter().map(|s| serde_json::Value::String(s.clone())).collect()),
+        SettingValue::List(v) => serde_json::Value::Array(
+            v.iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect(),
+        ),
         SettingValue::ShortcutMap(map) => {
             let mut obj = serde_json::Map::new();
             for (k, v) in map {
@@ -382,41 +417,46 @@ fn json_to_setting_value(
     kind: &flavite_settings::descriptor::SettingKind,
 ) -> Result<SettingValue, String> {
     use flavite_settings::descriptor::SettingKind;
-    
+
     match kind {
-        SettingKind::Bool => {
-            value.as_bool().map(SettingValue::Bool).ok_or_else(|| "expected boolean".to_owned())
-        }
-        SettingKind::Int { min, max } => {
-            value.as_i64().ok_or_else(|| "expected integer".to_owned())
-                .and_then(|v| {
-                    if v >= *min && v <= *max {
-                        Ok(SettingValue::Int(v))
-                    } else {
-                        Err(format!("value must be between {min} and {max}"))
-                    }
-                })
-        }
-        SettingKind::Text => {
-            value.as_str().map(|s| SettingValue::Str(s.to_owned())).ok_or_else(|| "expected string".to_owned())
-        }
-        SettingKind::Choice(options) => {
-            value.as_str().ok_or_else(|| "expected string".to_owned())
-                .and_then(|s| {
-                    if options.iter().any(|(val, _)| *val == s) {
-                        Ok(SettingValue::Str(s.to_owned()))
-                    } else {
-                        let valid: Vec<_> = options.iter().map(|(val, _)| *val).collect();
-                        Err(format!("value must be one of {:?}", valid))
-                    }
-                })
-        }
+        SettingKind::Bool => value
+            .as_bool()
+            .map(SettingValue::Bool)
+            .ok_or_else(|| "expected boolean".to_owned()),
+        SettingKind::Int { min, max } => value
+            .as_i64()
+            .ok_or_else(|| "expected integer".to_owned())
+            .and_then(|v| {
+                if v >= *min && v <= *max {
+                    Ok(SettingValue::Int(v))
+                } else {
+                    Err(format!("value must be between {min} and {max}"))
+                }
+            }),
+        SettingKind::Text => value
+            .as_str()
+            .map(|s| SettingValue::Str(s.to_owned()))
+            .ok_or_else(|| "expected string".to_owned()),
+        SettingKind::Choice(options) => value
+            .as_str()
+            .ok_or_else(|| "expected string".to_owned())
+            .and_then(|s| {
+                if options.iter().any(|(val, _)| *val == s) {
+                    Ok(SettingValue::Str(s.to_owned()))
+                } else {
+                    let valid: Vec<_> = options.iter().map(|(val, _)| *val).collect();
+                    Err(format!("value must be one of {:?}", valid))
+                }
+            }),
         SettingKind::LineWidth => {
             if let Some(s) = value.as_str()
-                && s == "full" {
+                && s == "full"
+            {
                 return Ok(SettingValue::Str("full".to_owned()));
             }
-            value.as_i64().ok_or_else(|| "expected integer or 'full'".to_owned())
+            value
+                .as_i64()
+                .ok_or_else(|| "expected integer or 'full'".to_owned())
                 .and_then(|v| {
                     if (40..=160).contains(&v) {
                         Ok(SettingValue::Int(v))
@@ -425,27 +465,36 @@ fn json_to_setting_value(
                     }
                 })
         }
-        SettingKind::ThemePackage => {
-            value.as_str().map(|s| SettingValue::Str(s.to_owned())).ok_or_else(|| "expected string".to_owned())
-        }
-        SettingKind::StringList => {
-            value.as_array().ok_or_else(|| "expected array".to_owned())
-                .and_then(|arr| {
-                    arr.iter().map(|v| v.as_str().map(|s| s.to_owned()).ok_or_else(|| "expected string in list".to_owned()))
-                        .collect::<Result<Vec<String>, _>>()
-                })
-                .map(SettingValue::List)
-        }
-        SettingKind::ShortcutMap => {
-            value.as_object().ok_or_else(|| "expected object".to_owned())
-                .and_then(|obj| {
-                    let mut map = BTreeMap::new();
-                    for (k, v) in obj {
-                        let chord = v.as_str().ok_or_else(|| format!("expected string chord for {k}"))?.to_owned();
-                        map.insert(k.clone(), chord);
-                    }
-                    Ok(SettingValue::ShortcutMap(map))
-                })
-        }
+        SettingKind::ThemePackage => value
+            .as_str()
+            .map(|s| SettingValue::Str(s.to_owned()))
+            .ok_or_else(|| "expected string".to_owned()),
+        SettingKind::StringList => value
+            .as_array()
+            .ok_or_else(|| "expected array".to_owned())
+            .and_then(|arr| {
+                arr.iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map(|s| s.to_owned())
+                            .ok_or_else(|| "expected string in list".to_owned())
+                    })
+                    .collect::<Result<Vec<String>, _>>()
+            })
+            .map(SettingValue::List),
+        SettingKind::ShortcutMap => value
+            .as_object()
+            .ok_or_else(|| "expected object".to_owned())
+            .and_then(|obj| {
+                let mut map = BTreeMap::new();
+                for (k, v) in obj {
+                    let chord = v
+                        .as_str()
+                        .ok_or_else(|| format!("expected string chord for {k}"))?
+                        .to_owned();
+                    map.insert(k.clone(), chord);
+                }
+                Ok(SettingValue::ShortcutMap(map))
+            }),
     }
 }

@@ -5,7 +5,9 @@
 //! The facade exposes only fixed kinds, generation receipts, and typed
 //! failures; hosts never see or choose file paths.
 
-pub use flavite_vault::user_state::{StoredUserState, UserStateError, UserStateKind, VaultUserStateKind};
+pub use flavite_vault::user_state::{
+    StoredUserState, UserStateError, UserStateKind, VaultUserStateKind,
+};
 
 use crate::{Flavite, FlaviteError};
 use flavite_workspace::PersistedWorkspace;
@@ -130,17 +132,17 @@ impl Flavite {
     /// # Errors
     /// Returns [`FlaviteError::UserState`] on filesystem, protection, or
     /// corruption failures.
-    pub fn read_workspace_layout(
-        &self,
-    ) -> Result<Option<StoredWorkspace>, FlaviteError> {
-        let stored = self.vault_user_state
+    pub fn read_workspace_layout(&self) -> Result<Option<StoredWorkspace>, FlaviteError> {
+        let stored = self
+            .vault_user_state
             .read(VaultUserStateKind::WorkspaceLayouts)
             .map_err(FlaviteError::UserState)?;
         match stored {
             Some(stored) => {
                 let workspace: flavite_workspace::PersistedWorkspace =
-                    serde_json::from_slice(&stored.payload)
-                        .map_err(|e| FlaviteError::UserState(UserStateError::Corrupt(e.to_string())))?;
+                    serde_json::from_slice(&stored.payload).map_err(|e| {
+                        FlaviteError::UserState(UserStateError::Corrupt(e.to_string()))
+                    })?;
                 Ok(Some(StoredWorkspace {
                     generation: stored.generation,
                     workspace,

@@ -407,7 +407,10 @@ impl VaultUserStateStore {
     ///
     /// # Errors
     /// Typed bounds, protection, and filesystem failures.
-    pub fn read(&self, kind: VaultUserStateKind) -> Result<Option<StoredUserState>, UserStateError> {
+    pub fn read(
+        &self,
+        kind: VaultUserStateKind,
+    ) -> Result<Option<StoredUserState>, UserStateError> {
         let path = self.path_for(kind);
         self.guard_protected(&path)?;
         let bytes = match self.fs.read_if_exists(&path) {
@@ -417,7 +420,10 @@ impl VaultUserStateStore {
         };
         // Delegate bound checking to the caller (different bounds per kind).
         let generation = {
-            let guard = self.generations.read().map_err(|_| UserStateError::Fs("poisoned lock".into()))?;
+            let guard = self
+                .generations
+                .read()
+                .map_err(|_| UserStateError::Fs("poisoned lock".into()))?;
             *guard.get(&kind).unwrap_or(&0)
         };
         Ok(Some(StoredUserState {
@@ -456,19 +462,22 @@ impl VaultUserStateStore {
         self.guard_protected(&path)?;
         self.guard_protected(&backup)?;
         self.guard_protected(parent)?;
-        
+
         let actual = {
-            let guard = self.generations.read().map_err(|_| UserStateError::Fs("poisoned lock".into()))?;
+            let guard = self
+                .generations
+                .read()
+                .map_err(|_| UserStateError::Fs("poisoned lock".into()))?;
             *guard.get(&kind).unwrap_or(&0)
         };
-        
+
         if actual != expected_generation {
             return Err(UserStateError::GenerationMismatch {
                 expected: expected_generation,
                 actual,
             });
         }
-        
+
         if let Err(error) = self.fs.create_dir_all(parent) {
             return Err(UserStateError::Fs(error.to_string()));
         }
@@ -484,10 +493,13 @@ impl VaultUserStateStore {
         if let Err(error) = flavite_fs::atomic::atomic_write(self.fs.as_ref(), &path, payload) {
             return Err(UserStateError::Fs(error.to_string()));
         }
-        
+
         let next = expected_generation.saturating_add(1);
         {
-            let mut guard = self.generations.write().map_err(|_| UserStateError::Fs("poisoned lock".into()))?;
+            let mut guard = self
+                .generations
+                .write()
+                .map_err(|_| UserStateError::Fs("poisoned lock".into()))?;
             guard.insert(kind, next);
         }
         Ok(next)
@@ -513,8 +525,11 @@ impl VaultUserStateStore {
     pub fn read_graph_pins(&self) -> Result<Option<StoredUserState>, UserStateError> {
         let result = self.read(VaultUserStateKind::GraphPins)?;
         if let Some(ref stored) = result
-            && stored.payload.len() as u64 > MAX_USER_STATE_BYTES {
-            return Err(UserStateError::TooLarge { size: stored.payload.len() });
+            && stored.payload.len() as u64 > MAX_USER_STATE_BYTES
+        {
+            return Err(UserStateError::TooLarge {
+                size: stored.payload.len(),
+            });
         }
         Ok(result)
     }

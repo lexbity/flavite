@@ -219,7 +219,7 @@ fn clean_quit_flushes_layout_and_reports_no_pending_work() {
         &flavite_workspace::encode_workspace(&stored.workspace).unwrap(),
         &uuid,
     )
-        .expect("the persisted layout decodes");
+    .expect("the persisted layout decodes");
 
     // Clean note tabs closed; the note bytes on the device are untouched.
     assert!(app.workspace.tab(&alpha).is_none(), "the note tab closed");

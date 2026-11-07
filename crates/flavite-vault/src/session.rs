@@ -1746,9 +1746,9 @@ impl Session {
                                         std::panic::AssertUnwindSafe(run),
                                     ) {
                                         Ok(outcome) => outcome,
-                                        Err(panic) => Err(format!(
-                                            "replace worker panicked: {panic:?}"
-                                        )),
+                                        Err(panic) => {
+                                            Err(format!("replace worker panicked: {panic:?}"))
+                                        }
                                     };
                                     match outcome {
                                         Ok((phase, totals)) => ReplaceOutcomeMessage::ApplyDone {
@@ -3929,7 +3929,7 @@ impl Session {
         let data_dir = self
             .resolved_data_dir()
             .ok_or_else(|| "private data directory is unavailable".to_owned())?;
-        crate::replace::auth::load_or_create_key(&data_dir, &self.identity.uuid)
+        crate::operation_key::load_or_create_key(&data_dir, &self.identity.uuid)
             .map_err(|error| error.to_string())
     }
 
@@ -4133,11 +4133,7 @@ impl Session {
                 {
                     applied.applied_revision = Some(revision);
                 }
-                items.push(crate::replace::JobItem {
-                    record,
-                    effect,
-                    receipts: std::collections::BTreeMap::new(),
-                });
+                items.push(crate::replace::JobItem { record, effect });
             }
             let mut phase = crate::replace::JobPhase::Paused;
             for record in log.records().ok().into_iter().flatten() {
@@ -4196,6 +4192,16 @@ impl Session {
         let key = relative.as_os_str().as_encoded_bytes();
         self.leases
             .is_leased_by(key, crate::source_leases::LeaseOwner::Replace)
+    }
+
+    /// Typed D-10 refusal for a source whose durable replacement lease is
+    /// live: input is refused with "Replacement in progress", never
+    /// buffered for replay after the lease.
+    fn replacement_in_progress(&self) -> SessionResult {
+        SessionResult::ActionRequired {
+            code: "replacement-in-progress",
+            data: None,
+        }
     }
 
     /// Shared admission guard: at most [`REPLACE_QUEUE_MAX`] replace jobs
@@ -4395,14 +4401,9 @@ impl Session {
             entry.selected_ids = selected_ids.clone();
             entry.selection_revision = entry.selection_revision.saturating_add(1);
             let revision = entry.selection_revision;
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"flavite-replace-selection-v1");
-            hasher.update(&preview_id.to_be_bytes());
-            hasher.update(&revision.to_le_bytes());
-            for id in &selected_ids {
-                hasher.update(&id.to_le_bytes());
-            }
-            (revision, hex::encode(hasher.finalize().as_bytes()))
+            let digest =
+                crate::replace::coordinator::selection_digest(preview_id, revision, &selected_ids);
+            (revision, digest)
         };
         SessionResult::Success(CommandResult::ReplaceSelected {
             selection_revision: revision,
@@ -4499,14 +4500,24 @@ impl Session {
             }) {
                 let state = entry.state.lock_recovering();
                 return match state.phase {
-                    crate::replace::JobPhase::Completed => {
+                    // A finished run replays its recorded receipt (D-11:
+                    // repeated Apply requests return the same receipt);
+                    // NeedsRecovery's recorded state IS its receipt.
+                    crate::replace::JobPhase::Completed
+                    | crate::replace::JobPhase::Partial
+                    | crate::replace::JobPhase::Cancelled
+                    | crate::replace::JobPhase::NeedsRecovery => {
                         SessionResult::Success(CommandResult::ReplaceJobFinished {
                             job_id: *existing_id,
                             phase: state.phase,
                             totals: state.totals.clone(),
                         })
                     }
-                    _ => SessionResult::Busy,
+                    // A live run or a paused job awaiting explicit Resume is
+                    // busy, not a receipt.
+                    crate::replace::JobPhase::Ready
+                    | crate::replace::JobPhase::Applying
+                    | crate::replace::JobPhase::Paused => SessionResult::Busy,
                 };
             }
         }
@@ -4526,6 +4537,18 @@ impl Session {
         {
             return SessionResult::Error { message };
         }
+        // Stamp the frozen selection onto the sealed manifest (D-09/§6.4):
+        // after restart a resumed job can prove the on-disk selection
+        // matches the revision the caller authorized.
+        let selection_digest =
+            crate::replace::coordinator::selection_digest(job_id, current_revision, &selected_ids);
+        if let Err(error) =
+            store.stamp_selection(&io, &job_hex, current_revision, &selection_digest)
+        {
+            return SessionResult::Error {
+                message: error.to_string(),
+            };
+        }
         let selected_set: std::collections::BTreeSet<u64> = selected_ids.iter().copied().collect();
         let items: Vec<crate::replace::JobItem> = manifest
             .notes
@@ -4534,7 +4557,6 @@ impl Session {
             .map(|note| crate::replace::JobItem {
                 record: note.clone(),
                 effect: None,
-                receipts: std::collections::BTreeMap::new(),
             })
             .collect();
         let state = Arc::new(Mutex::new(JobState {
@@ -4657,6 +4679,8 @@ impl Session {
             }
         };
         let mode = state.lock_recovering().mode;
+        let prior_phase = state.lock_recovering().phase;
+        let state_for_restore = Arc::clone(&state);
         state.lock_recovering().phase = crate::replace::JobPhase::Applying;
         cancel.store(false, Ordering::Relaxed);
         let store = crate::replace::ReplaceStore::new(&self.identity.root);
@@ -4685,6 +4709,9 @@ impl Session {
             .as_ref()
             .is_some_and(|jobs| jobs.send(ReplaceJob { request_id, work }).is_ok());
         if !admitted {
+            // The phase was set optimistically before admission; restore it
+            // so status does not report a phantom running job.
+            state_for_restore.lock_recovering().phase = prior_phase;
             self.pending_replace.lock_recovering().remove(&request_id);
             return SessionResult::Error {
                 message: "replacement apply workers are unavailable".into(),
@@ -4763,6 +4790,8 @@ impl Session {
             }
         };
         state.lock_recovering().mode = JobMode::Revert;
+        let prior_phase = state.lock_recovering().phase;
+        let state_for_restore = Arc::clone(&state);
         state.lock_recovering().phase = crate::replace::JobPhase::Applying;
         cancel.store(false, Ordering::Relaxed);
         let store = crate::replace::ReplaceStore::new(&self.identity.root);
@@ -4783,6 +4812,8 @@ impl Session {
             .is_ok()
         });
         if !admitted {
+            // Restore the pre-admission phase: no phantom running job.
+            state_for_restore.lock_recovering().phase = prior_phase;
             self.pending_replace.lock_recovering().remove(&request_id);
             return SessionResult::Error {
                 message: "replacement revert workers are unavailable".into(),
@@ -4929,44 +4960,34 @@ impl Session {
                     let result = match outcome {
                         Ok(found) => {
                             let found = *found;
-                            let page = {
-                                let entry = SourceFinderEntry {
-                                    id: finder_id,
-                                    expires_at_unix_ms: crate::replace::preview::unix_ms_now()
-                                        .saturating_add(30 * 60 * 1000),
-                                    scope: found.scope,
-                                    truncated_scope: found.truncated_scope,
-                                    notes: found.notes.clone(),
-                                    exclusions: found.exclusions.clone(),
-                                    total_notes: found.total_notes,
-                                    total_matches: found.total_matches,
-                                };
-                                match self.find_page(&entry, 0, 0, 50) {
-                                    Ok(page) => page,
-                                    Err(message) => {
-                                        self.pending_replace.lock_recovering().remove(&request_id);
-                                        return self.record_completion(
-                                            request_id,
-                                            SessionResult::Error { message },
-                                        );
-                                    }
+                            // One entry construction: the first page is cut
+                            // from the entry that gets inserted, instead of
+                            // cloning all matched notes twice.
+                            let entry = SourceFinderEntry {
+                                id: finder_id,
+                                expires_at_unix_ms: crate::replace::preview::unix_ms_now()
+                                    .saturating_add(30 * 60 * 1000),
+                                scope: found.scope,
+                                truncated_scope: found.truncated_scope,
+                                notes: found.notes,
+                                exclusions: found.exclusions,
+                                total_notes: found.total_notes,
+                                total_matches: found.total_matches,
+                            };
+                            let page = match self.find_page(&entry, 0, 0, 50) {
+                                Ok(page) => page,
+                                Err(message) => {
+                                    self.pending_replace.lock_recovering().remove(&request_id);
+                                    return self.record_completion(
+                                        request_id,
+                                        SessionResult::Error { message },
+                                    );
                                 }
                             };
                             let mut finders = self.finders.lock_recovering();
                             if finders.len() >= MAX_LIVE_FINDERS {
                                 SessionResult::Busy
                             } else {
-                                let entry = SourceFinderEntry {
-                                    id: finder_id,
-                                    expires_at_unix_ms: crate::replace::preview::unix_ms_now()
-                                        .saturating_add(30 * 60 * 1000),
-                                    scope: found.scope,
-                                    truncated_scope: found.truncated_scope,
-                                    notes: found.notes.clone(),
-                                    exclusions: found.exclusions.clone(),
-                                    total_notes: found.total_notes,
-                                    total_matches: found.total_matches,
-                                };
                                 let inner = CommandResult::SourceFindStarted {
                                     finder_id,
                                     scope: entry.scope,
@@ -5247,6 +5268,12 @@ impl Session {
     /// but may close while retaining a durable recovery snapshot that
     /// provably covers its current revision and bytes.
     fn close_note(&self, path: PathBuf, retain_recovery: bool) -> SessionResult {
+        // Closing a leased draft without keeping its recovery would destroy
+        // the evidence a running job pinned (D-10); a retained close stays
+        // available for inspection paths.
+        if !retain_recovery && self.leased_by_replace(&path) {
+            return self.replacement_in_progress();
+        }
         // Get buffer ID
         let buffer_id = {
             self.buffer_manager
@@ -5369,6 +5396,9 @@ impl Session {
     /// history, drop the retained recovery copy of the same edits, and
     /// reload the buffer from disk as one guarded destructive action.
     fn discard_edits(&self, path: PathBuf) -> SessionResult {
+        if self.leased_by_replace(&path) {
+            return self.replacement_in_progress();
+        }
         let Some(buffer_id) = self.get_buffer_id(&path) else {
             return SessionResult::Error {
                 message: "Buffer not found".into(),
@@ -5552,7 +5582,16 @@ impl Session {
                 message: "Buffer not found".to_string(),
             };
         };
-        let (bytes, revision, base_hash, base_bytes, state, source_format, source_text) = {
+        let (
+            bytes,
+            revision,
+            base_hash,
+            base_bytes,
+            state,
+            source_format,
+            leading_signature,
+            nul_content,
+        ) = {
             let mut manager = self.buffer_manager.lock_recovering();
             let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
                 return SessionResult::Error {
@@ -5585,6 +5624,11 @@ impl Session {
                     };
                 }
             };
+            // The FEFF/NUL probes are computed under the lock from the
+            // borrowed text: an owned copy of a 32 MiB note is not needed
+            // for two boolean answers.
+            let leading_signature = buffer.text().starts_with('\u{FEFF}');
+            let nul_content = buffer.text().contains('\0');
             (
                 bytes,
                 buffer.revision(),
@@ -5592,7 +5636,8 @@ impl Session {
                 buffer.base_bytes().to_vec(),
                 buffer.state(),
                 buffer.model().source_format(),
-                buffer.text().to_owned(),
+                leading_signature,
+                nul_content,
             )
         };
         if !state.allows_manual_save() {
@@ -5616,8 +5661,6 @@ impl Session {
         // typed: an ambiguous source is never advertised as durably
         // configured, and a green Saved receipt always implies a durably
         // reachable descriptor.
-        let leading_signature = source_text.starts_with('\u{FEFF}');
-        let nul_content = source_text.contains('\0');
         let needs_hint = source_format.encoding() != flavite_encoding::FileEncoding::Utf8
             || source_format.bom()
             || leading_signature
@@ -5790,6 +5833,12 @@ impl Session {
     /// Undo an edit.
     fn undo(&self, buffer_id: BufferId, revision: Revision) -> SessionResult {
         let mut buffer_manager = self.buffer_manager.lock_recovering();
+        if buffer_manager
+            .path_for_id(buffer_id)
+            .is_some_and(|path| self.leased_by_replace(path))
+        {
+            return self.replacement_in_progress();
+        }
 
         // Get the buffer and call undo on its model
         if let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) {
@@ -5835,6 +5884,12 @@ impl Session {
     /// Redo an edit.
     fn redo(&self, buffer_id: BufferId, revision: Revision) -> SessionResult {
         let mut buffer_manager = self.buffer_manager.lock_recovering();
+        if buffer_manager
+            .path_for_id(buffer_id)
+            .is_some_and(|path| self.leased_by_replace(path))
+        {
+            return self.replacement_in_progress();
+        }
 
         // Get the buffer and call redo on its model
         if let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) {
@@ -6027,20 +6082,24 @@ impl Session {
         // preserved, no BOM). A decode failure is a typed choice request,
         // never a partial merge or a lossy reinterpretation.
         let limits = flavite_encoding::DecodeLimits::default();
-        let decode_layer = |bytes: &[u8],
+        // Owned inputs move into the decode map without a source copy, and
+        // the decoded layer moves out without a text copy. The remote
+        // layer's raw hash is taken before the move.
+        let theirs_disk_hash = *blake3::hash(&theirs).as_bytes();
+        let decode_layer = |bytes: Vec<u8>,
                             policy: flavite_encoding::DecodePolicy|
          -> Result<String, flavite_encoding::CodecError> {
-            flavite_encoding::decode(bytes, policy, &limits, &flavite_encoding::NOT_CANCELLED)
-                .map(|decoded| decoded.text().to_string())
+            flavite_encoding::decode_vec(bytes, policy, &limits, &flavite_encoding::NOT_CANCELLED)
+                .map(flavite_encoding::DecodedContent::into_text)
         };
         let base_policy = base_format
             .map(flavite_encoding::DecodePolicy::Explicit)
             .unwrap_or(flavite_encoding::DecodePolicy::Auto);
         let (Ok(base), Ok(mine), Ok(theirs_text)) = (
-            decode_layer(&base, base_policy),
+            decode_layer(base, base_policy),
             String::from_utf8(mine)
                 .map_err(|_| flavite_encoding::CodecError::InvalidUtf8 { source_byte: 0 }),
-            decode_layer(&theirs, flavite_encoding::DecodePolicy::Auto),
+            decode_layer(theirs, flavite_encoding::DecodePolicy::Auto),
         ) else {
             return SessionResult::ActionRequired {
                 code: "merge-unsupported-encoding",
@@ -6051,7 +6110,7 @@ impl Session {
             path,
             buffer_id,
             revision,
-            disk_hash: *blake3::hash(&theirs).as_bytes(),
+            disk_hash: theirs_disk_hash,
             result: crate::merge::three_way_merge(&base, &mine, &theirs_text),
         }
     }
@@ -6064,6 +6123,9 @@ impl Session {
         expected_disk_hash: [u8; 32],
         merged_bytes: Vec<u8>,
     ) -> SessionResult {
+        if self.leased_by_replace(&path) {
+            return self.replacement_in_progress();
+        }
         let Some(theirs) = self.actor.read_file(path.clone()).ok().flatten() else {
             return SessionResult::ActionRequired {
                 code: "file-deleted",
@@ -6276,6 +6338,12 @@ impl Session {
         target: flavite_encoding::SourceFormat,
     ) -> SessionResult {
         let mut manager = self.buffer_manager.lock_recovering();
+        if manager
+            .path_for_id(buffer_id)
+            .is_some_and(|path| self.leased_by_replace(path))
+        {
+            return self.replacement_in_progress();
+        }
         let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
             return SessionResult::Error {
                 message: "Buffer no longer open".into(),
@@ -6467,6 +6535,9 @@ impl Session {
         revision: Revision,
         hash: String,
     ) -> SessionResult {
+        if self.leased_by_replace(&path) {
+            return self.replacement_in_progress();
+        }
         // The buffer for `path` must be the exact buffer the caller saw:
         // restoring into a buffer belonging to another note is refused.
         {
@@ -8825,17 +8896,17 @@ mod tests {
 
         let recovery_dir = temp.path().join("recovery");
         let mut writer = RecoveryWriter::new(RecoveryConfig::new("test".into(), recovery_dir, 0));
-        writer
-            .write_buffer(
-                b"note.md",
-                session
-                    .buffer_manager()
-                    .lock()
-                    .unwrap()
-                    .get_buffer_by_id(buffer_id)
-                    .unwrap(),
-            )
-            .unwrap();
+        let recovery_file = flavite_buffer::RecoveryFile::from_buffer(
+            session
+                .buffer_manager()
+                .lock()
+                .unwrap()
+                .get_buffer_by_id(buffer_id)
+                .unwrap(),
+            0,
+            false,
+        );
+        writer.write_snapshot_now(b"note.md", recovery_file);
         session.recovery_writer = Some(Arc::new(Mutex::new(writer)));
 
         assert!(matches!(

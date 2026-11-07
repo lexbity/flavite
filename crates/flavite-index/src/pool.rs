@@ -685,26 +685,34 @@ fn reserve_search_envelope(
 }
 
 /// Publish the immutable generation envelope after the commit succeeded.
-/// The reservation already held the capacity, so this cannot fail while the
-/// writer lives (D-07).
+/// The reservation already held the capacity, so the only failure is a
+/// writer death between reserve and enqueue. The apply is already durable
+/// at that point, and the dead writer has reset pending captures — the next
+/// envelope trips the owner's desync rebuild (the designed self-healing), so
+/// this is logged and carried, never surfaced as an apply failure.
 fn publish_search_envelope(
     reservation: Option<crate::search_writer::EnvelopeReservation>,
     handle: Option<&SearchWriterHandle>,
     epoch: u64,
     generation: u64,
     ops: &mut Vec<SearchDocOp>,
-) -> Result<(), String> {
+) {
     let (Some(reservation), Some(handle)) = (reservation, handle) else {
-        return Ok(());
+        return;
     };
     let envelope = SearchEnvelope {
         epoch,
         generation,
         ops: std::sync::Arc::from(std::mem::take(ops).into_boxed_slice()),
     };
-    reservation
-        .enqueue(handle, envelope)
-        .map_err(|error| error.to_string())
+    if let Err(error) = reservation.enqueue(handle, envelope) {
+        tracing::warn!(
+            %error,
+            epoch,
+            generation,
+            "search envelope publish failed after commit; the writer rebuilds from the authoritative cache"
+        );
+    }
 }
 
 /// Read the advisory committed-generation mirror for the search writer.
@@ -937,14 +945,18 @@ impl IndexActor {
         Ok((epoch, generation))
     }
 
-    /// Resolve one editor link through the same resolver used by ingestion.
+    /// Resolve one editor link through the maintained resolver state — the
+    /// same base+overlay every apply folds into — instead of rebuilding a
+    /// full catalog per call on this actor thread. The base reloads only as
+    /// a fallback, when the committed generation has run ahead of it
+    /// (catalog.rs header: `load` is only needed at backstops).
     /// `source_path_key` is the folded vault-relative path of the source note.
     ///
     /// # Errors
-    /// Returns an error when SQLite cannot look up the source or refresh the
-    /// resolver's indexed candidate cache.
+    /// Returns an error when SQLite cannot look up the source or reload the
+    /// resolver base.
     pub fn resolve_target(
-        &self,
+        &mut self,
         target_key: &str,
         raw_target: &str,
         is_embed: bool,
@@ -963,11 +975,21 @@ impl IndexActor {
             })
             .transpose()?
             .flatten();
-        let mut resolver = Resolver::new(conn);
-        resolver
-            .refresh_cache()
-            .map_err(|error| error.to_string())?;
-        Ok(resolver.resolve(target_key, raw_target, is_embed, source_note_id))
+        let generation = get_meta_u64(conn, MetaKey::Generation)
+            .map_err(|error| error.to_string())?
+            .unwrap_or(0);
+        if self.resolver.base().generation < generation {
+            self.resolver
+                .reload_base(conn)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(self.resolver.overlay().resolve(
+            self.resolver.base(),
+            target_key,
+            raw_target,
+            is_embed,
+            source_note_id,
+        ))
     }
 
     /// List native path keys currently represented in the structural index.
@@ -1349,7 +1371,7 @@ impl IndexActor {
                 epoch,
                 generation,
                 &mut plan.search_ops,
-            )?;
+            );
             self.resolver.commit_backstop(catalog);
             self.resolver.note_committed_apply(row_count as u64);
             self.resolver.fold_overlay(epoch, generation);
@@ -1475,7 +1497,7 @@ impl IndexActor {
             epoch,
             generation,
             &mut plan.search_ops,
-        )?;
+        );
         // Commit fold (§6.2.4): SQLite writes are durable; in-memory state
         // follows. Counters track committed applies only.
         if let Some(catalog) = backstop_catalog {
@@ -2374,23 +2396,16 @@ impl IndexActor {
         query: &crate::query::Query,
         limit: usize,
     ) -> Result<SearchPage, String> {
-        let epoch = crate::schema::get_meta_u64(self.writer.conn(), MetaKey::Epoch)
-            .map_err(|error| error.to_string())?
-            .unwrap_or(1);
-        let generation = crate::schema::get_meta_u64(self.writer.conn(), MetaKey::Generation)
-            .map_err(|error| error.to_string())?
-            .unwrap_or(0);
         self.drain_search_acks()?;
         let Some(handle) = &self.search_writer else {
             return Err("this index handle does not own the search writer".to_owned());
         };
-        let outcome = handle.capture_blocking(epoch, generation);
-        let searcher = match outcome? {
-            crate::search_writer::CaptureOutcome::Searcher { searcher, .. } => searcher,
-            crate::search_writer::CaptureOutcome::ResetRequired => {
-                return Err(crate::types::IndexError::ResetRequired.to_string());
-            }
-        };
+        // D-07 (AC-9): pin the SQL read snapshot FIRST and capture at its
+        // committed meta. The capture reply carries the writer's actual
+        // frontier; a reply stamped at any other epoch/generation means a
+        // commit raced the capture, and returning it would be the mixed
+        // G/G+1 bundle the contract forbids — refuse with a retryable busy
+        // instead.
         let conn = self
             .read_pool
             .get(Some(Duration::from_secs(2)))
@@ -2398,6 +2413,28 @@ impl IndexActor {
         let tx = conn
             .unchecked_transaction()
             .map_err(|error| error.to_string())?;
+        let epoch = crate::schema::get_meta_u64(&tx, MetaKey::Epoch)
+            .map_err(|error| error.to_string())?
+            .unwrap_or(1);
+        let generation = crate::schema::get_meta_u64(&tx, MetaKey::Generation)
+            .map_err(|error| error.to_string())?
+            .unwrap_or(0);
+        let outcome = handle.capture_blocking(epoch, generation);
+        let searcher = match outcome? {
+            crate::search_writer::CaptureOutcome::Searcher {
+                epoch: stamped_epoch,
+                generation: stamped_generation,
+                searcher,
+            } => {
+                if (stamped_epoch, stamped_generation) != (epoch, generation) {
+                    return Err("busy: search snapshot advanced during capture; retry".to_owned());
+                }
+                searcher
+            }
+            crate::search_writer::CaptureOutcome::ResetRequired => {
+                return Err(crate::types::IndexError::ResetRequired.to_string());
+            }
+        };
         let universe =
             crate::search_eval::Universe::from_tx(&tx).map_err(|error| error.to_string())?;
         let snapshot = crate::search_eval::Snapshot {

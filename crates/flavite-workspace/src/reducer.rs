@@ -367,6 +367,9 @@ pub enum LayoutAction {
 impl LayoutAction {
     /// The revision this action was built against.
     #[must_use]
+    // One arm per enum variant keeps this accessor exhaustively checked at
+    // compile time; the variant list grows with the enum by design.
+    #[allow(clippy::too_many_lines)]
     pub const fn expected_revision(&self) -> u64 {
         match self {
             Self::SetNoteMode {

@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use crate::decode::decode_scalar_at;
 use crate::format::{
-    CANCEL_CHECK_BYTES, CodecError, CodecLimitKind, FileEncoding, SourceFormat, check_limit,
+    CANCEL_CHECK_BYTES, CancelToken, CodecError, CodecLimitKind, DecodeLimits, FileEncoding,
+    SourceFormat, check_limit,
 };
 
 /// Maximum scalar distance between adjacent checkpoints (§6.10, NFR-18).
@@ -45,6 +46,11 @@ pub(crate) fn scan_utf16(
     max_map_bytes: u64,
     cancel: &crate::format::CancelToken,
 ) -> Result<Utf16Scan, CodecError> {
+    // Structural errors are diagnosed before budget errors: the first
+    // invalid sequence names its kind, not the map size (§6.10).
+    if !body.len().is_multiple_of(2) {
+        return Err(CodecError::OddUtf16ByteCount);
+    }
     let unit_count = body.len() / 2;
     // Predicted checkpoint count for this body: refused before allocation.
     let predicted_checkpoints = unit_count / CHECKPOINT_SCALARS + 1;
@@ -53,9 +59,6 @@ pub(crate) fn scan_utf16(
         max_map_bytes,
         CodecLimitKind::MapBytes,
     )?;
-    if !body.len().is_multiple_of(2) {
-        return Err(CodecError::OddUtf16ByteCount);
-    }
     let mut checkpoints = Vec::with_capacity(predicted_checkpoints);
     // Worst case is three UTF-8 bytes per two-byte BMP code unit.
     let mut out = String::with_capacity(unit_count.saturating_mul(3));
@@ -152,6 +155,54 @@ impl DecodeMap {
         }
     }
 
+    /// Build the boundary map for `source` under an explicit `format`
+    /// without producing text. Callers that already hold the decoded layer
+    /// (for example a buffer re-encoding under an unchanged descriptor)
+    /// compose snapshots from parts without a decode round trip (D-06).
+    /// For UTF-16 this walks the same scalar scan as decode; for
+    /// ASCII/UTF-8 the map is the pure identity translation and the bytes
+    /// are not revalidated — the caller guarantees they encode its decoded
+    /// text under `format`.
+    ///
+    /// # Errors
+    ///
+    /// Typed [`CodecError`] for unsatisfied BOM signatures, exceeded limits
+    /// and cancellation; malformed UTF-16 structure is rejected by the scan.
+    pub fn build(
+        source: Arc<[u8]>,
+        format: SourceFormat,
+        limits: &DecodeLimits,
+        cancel: &CancelToken,
+    ) -> Result<Self, CodecError> {
+        if cancel.is_cancelled() {
+            return Err(CodecError::Cancelled);
+        }
+        check_limit(source.len(), limits.max_raw_bytes, CodecLimitKind::RawBytes)?;
+        let sig_len = if format.bom() {
+            let sig = format.encoding().signature();
+            if !source.starts_with(sig) {
+                return Err(CodecError::BomConflict);
+            }
+            sig.len()
+        } else {
+            0
+        };
+        match format.encoding() {
+            FileEncoding::Ascii | FileEncoding::Utf8 => Ok(Self::identity(source, format)),
+            FileEncoding::Utf16Le | FileEncoding::Utf16Be => {
+                let scan = scan_utf16(
+                    &source[sig_len..],
+                    format.encoding(),
+                    sig_len,
+                    limits.max_decoded_utf8_bytes,
+                    limits.max_map_bytes,
+                    cancel,
+                )?;
+                Ok(Self::from_utf16_scan(source, format, scan))
+            }
+        }
+    }
+
     /// The descriptor the map was built for.
     #[must_use]
     pub const fn format(&self) -> SourceFormat {
@@ -187,7 +238,19 @@ impl DecodeMap {
             return None; // BOM interior
         }
         match self.format.encoding() {
-            FileEncoding::Ascii | FileEncoding::Utf8 => Some(source_byte - self.bom_len),
+            FileEncoding::Ascii | FileEncoding::Utf8 => {
+                // §6.10: a UTF-8 continuation byte is never a legal
+                // boundary, even though the offset arithmetic is identity.
+                if self
+                    .source
+                    .get(source_byte)
+                    .is_some_and(|byte| byte & 0xC0 == 0x80)
+                {
+                    None
+                } else {
+                    Some(source_byte - self.bom_len)
+                }
+            }
             FileEncoding::Utf16Le | FileEncoding::Utf16Be => {
                 self.utf16_source_to_decoded(source_byte)
             }
@@ -205,7 +268,14 @@ impl DecodeMap {
             return Some(self.source.len());
         }
         match self.format.encoding() {
-            FileEncoding::Ascii | FileEncoding::Utf8 => Some(decoded_byte + self.bom_len),
+            FileEncoding::Ascii | FileEncoding::Utf8 => {
+                let at = decoded_byte + self.bom_len;
+                if self.source.get(at).is_some_and(|byte| byte & 0xC0 == 0x80) {
+                    None
+                } else {
+                    Some(at)
+                }
+            }
             FileEncoding::Utf16Le | FileEncoding::Utf16Be => {
                 self.utf16_decoded_to_source(decoded_byte)
             }
@@ -293,7 +363,7 @@ impl DecodeMap {
 #[cfg(test)]
 mod tests {
 
-    use crate::format::{CancelToken, DecodeLimits, DecodePolicy};
+    use crate::format::{CancelToken, DecodeLimits, DecodePolicy, SourceFormat};
 
     fn decode_auto(source: &[u8]) -> crate::decode::DecodedContent {
         crate::decode::decode(
@@ -322,6 +392,82 @@ mod tests {
         // EOF pairs on both sides.
         assert_eq!(map.source_to_decoded(7), Some(4));
         assert_eq!(map.decoded_to_source(4), Some(7));
+    }
+
+    #[test]
+    fn utf8_map_rejects_continuation_interiors() {
+        // "é" = C3 A9, then "b".
+        let decoded = decode_auto("\u{e9}b".as_bytes());
+        let map = decoded.map();
+        // Scalar starts are legal; continuation positions are not (§6.10).
+        assert_eq!(map.source_to_decoded(0), Some(0));
+        assert_eq!(map.source_to_decoded(2), Some(2));
+        assert_eq!(map.source_to_decoded(1), None);
+        assert_eq!(map.decoded_to_source(0), Some(0));
+        assert_eq!(map.decoded_to_source(2), Some(2));
+        assert_eq!(map.decoded_to_source(1), None);
+        // Inversion holds on the whole legal domain.
+        for legal in [0usize, 2, 3] {
+            let s = map.source_to_decoded(legal).expect("legal boundary");
+            assert_eq!(map.decoded_to_source(s), Some(legal));
+        }
+        // A 4-byte scalar rejects every interior on both sides.
+        let wide = decode_auto("x\u{1F600}y".as_bytes());
+        let map = wide.map();
+        assert_eq!(map.source_to_decoded(1), Some(1));
+        for interior in [2usize, 3, 4] {
+            assert_eq!(map.source_to_decoded(interior), None);
+            assert_eq!(map.decoded_to_source(interior), None);
+        }
+        assert_eq!(map.source_to_decoded(5), Some(5));
+    }
+
+    #[test]
+    fn build_matches_decode_map_for_the_same_bytes() {
+        use crate::decode::decode;
+        for (format, source) in [
+            (SourceFormat::utf8(), "héllo\r\nwörld\n".as_bytes().to_vec()),
+            (SourceFormat::utf16le_with_bom(), {
+                let mut bytes = Vec::from([0xFF, 0xFE]);
+                for unit in "A😀\r\nsecon\r\n".encode_utf16() {
+                    bytes.extend_from_slice(&unit.to_le_bytes());
+                }
+                bytes
+            }),
+        ] {
+            let cancel = CancelToken::new();
+            let built = crate::map::DecodeMap::build(
+                std::sync::Arc::from(source.clone()),
+                format,
+                &DecodeLimits::default(),
+                &cancel,
+            )
+            .expect("builds");
+            let decoded = decode(
+                &source,
+                DecodePolicy::Explicit(format),
+                &DecodeLimits::default(),
+                &CancelToken::new(),
+            )
+            .expect("decodes");
+            // Probe a spread of legal and illegal positions on both maps.
+            let total = source.len();
+            for at in [0usize, 1, 2, total / 2, total.saturating_sub(1), total] {
+                assert_eq!(
+                    built.source_to_decoded(at),
+                    decoded.map().source_to_decoded(at),
+                    "source_to_decoded({at}) under {format:?}"
+                );
+            }
+            let decoded_len = built.source_to_decoded(total).expect("eof");
+            for at in [0usize, 1, decoded_len / 2, decoded_len] {
+                assert_eq!(
+                    built.decoded_to_source(at),
+                    decoded.map().decoded_to_source(at),
+                    "decoded_to_source({at}) under {format:?}"
+                );
+            }
+        }
     }
 
     #[test]

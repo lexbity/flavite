@@ -295,10 +295,7 @@ impl ThemeStore {
     ///
     /// # Errors
     /// Filesystem failures during copy operations.
-    pub fn migrate_from_device(
-        &self,
-        device_themes_root: &Path,
-    ) -> Result<usize, ThemeStoreError> {
+    pub fn migrate_from_device(&self, device_themes_root: &Path) -> Result<usize, ThemeStoreError> {
         // Ensure vault themes directory exists
         self.fs
             .create_dir_all(&self.root)
@@ -348,7 +345,11 @@ impl ThemeStore {
             for file_entry in [PACKAGE_ENTRY, META_ENTRY] {
                 let src = device_theme_dir.join(file_entry);
                 let dst = vault_theme_dir.join(file_entry);
-                if self.fs.exists(&src).map_err(|e| ThemeStoreError::Fs(e.to_string()))? {
+                if self
+                    .fs
+                    .exists(&src)
+                    .map_err(|e| ThemeStoreError::Fs(e.to_string()))?
+                {
                     self.fs
                         .create_dir_all(&vault_theme_dir)
                         .map_err(|error| ThemeStoreError::Fs(error.to_string()))?;
@@ -356,7 +357,9 @@ impl ThemeStore {
                         .fs
                         .read_if_exists(&src)
                         .map_err(|error| ThemeStoreError::Fs(error.to_string()))?
-                        .ok_or_else(|| ThemeStoreError::Fs(format!("cannot read {}", src.display())))?;
+                        .ok_or_else(|| {
+                            ThemeStoreError::Fs(format!("cannot read {}", src.display()))
+                        })?;
                     atomic_write(self.fs.as_ref(), &dst, &bytes)
                         .map_err(|error| ThemeStoreError::Fs(error.to_string()))?;
                 }

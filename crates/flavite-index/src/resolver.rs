@@ -543,6 +543,17 @@ impl ResolverState {
         self.backstop_forced = true;
     }
 
+    /// Replace the base with one fresh consistent read; backstop bookkeeping
+    /// and counters carry over (catalog.rs header: `load` is only needed at
+    /// backstops and cold starts, never per resolution).
+    ///
+    /// # Errors
+    /// Returns a SQLite error when the catalog queries fail.
+    pub fn reload_base(&mut self, conn: &Connection) -> Result<()> {
+        self.base = ResolverCatalog::load(conn)?;
+        Ok(())
+    }
+
     /// Install a completed backstop walk at commit and reset the counter.
     /// The walk itself runs in the apply spine (pool.rs) so the whole-vault
     /// call site stays the single grep-gated `re_resolve_all` invocation.

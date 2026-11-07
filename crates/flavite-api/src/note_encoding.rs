@@ -71,7 +71,7 @@ pub(crate) fn handle_reopen_encoding(
     invocation: &Invocation,
 ) -> Result<SessionResult, String> {
     let args: ReopenEncodingArgs = decode(invocation)?;
-    let expected_raw_hash = decode_hash32(&args.raw_hash)?;
+    let expected_raw_hash = decode_hash32(&args.raw_hash, "raw_hash")?;
     let encoding = decode_encoding(&args.encoding)?;
     Ok(session.execute(SessionCommand::ReopenEncoding {
         path: args.path,
@@ -104,12 +104,17 @@ pub(crate) fn handle_convert_encoding(
     }))
 }
 
-/// Parse a 64-character lowercase hex raw hash into 32 bytes.
-fn decode_hash32(value: &str) -> Result<[u8; 32], String> {
-    let bytes = hex::decode(value).map_err(|_| "raw_hash must be 64 hex characters")?;
+/// Parse a 64-hex-character hash into 32 bytes. The one hex→`[u8; 32]`
+/// decoder for the api tier (raw hashes and disk hashes share it); `field`
+/// names the argument in refusal text.
+///
+/// # Errors
+/// Non-hex or wrong-length input is a typed refusal naming the field.
+pub(crate) fn decode_hash32(value: &str, field: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(value).map_err(|_| format!("{field} must be 64 hex characters"))?;
     let bytes: [u8; 32] = bytes
         .try_into()
-        .map_err(|_| "raw_hash must be 64 hex characters")?;
+        .map_err(|_| format!("{field} must be 64 hex characters"))?;
     Ok(bytes)
 }
 

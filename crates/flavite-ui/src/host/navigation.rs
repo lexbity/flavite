@@ -1,14 +1,15 @@
 //! Per-view back/forward navigation (RFC-0003 W10, §8.1).
 //!
 //! Each note tab owns a bounded visit history. Navigation replaces the
-//! tab's note through the reducer's typed [`LayoutAction::NavigateTab`]:
+//! tab's note through the reducer's typed
+//! [`LayoutAction::NavigateTab`](flavite_workspace::LayoutAction::NavigateTab):
 //! the tab keeps its identity, position, and mode while the replaced note's
 //! caret authority is dropped — the same contract as closing the note, so
 //! a writing target can never silently cross notes (D-04/D-07).
 //!
 //! This host is device-session state; it is never persisted (FR-26).
 
-use flavite_workspace::{LayoutAction, NoteLocator, TabId};
+use flavite_workspace::{NoteLocator, TabId};
 use std::collections::BTreeMap;
 
 /// Bounded history per note view (NFR-01: 100 entries per note view).
@@ -146,24 +147,4 @@ impl NavHost {
             }
         }
     }
-}
-
-/// Build the reducer action for one navigation step. Returns `None` when
-/// the target entry equals the tab's current note (nothing to do).
-#[must_use]
-pub fn navigate_action<'a>(
-    app: &flavite_workspace::WorkspaceState,
-    tab: TabId,
-    entry: &'a NavEntry,
-) -> Option<Box<dyn FnOnce(u64) -> LayoutAction + 'a>> {
-    use flavite_workspace::ViewKind;
-    let is_same =
-        matches!(app.tab(&tab)?.kind(), ViewKind::Note(note) if note.locator() == &entry.locator);
-    (!is_same).then(|| {
-        Box::new(move |revision: u64| LayoutAction::NavigateTab {
-            expected_revision: revision,
-            tab,
-            locator: entry.locator.clone(),
-        }) as Box<dyn FnOnce(u64) -> LayoutAction + 'a>
-    })
 }

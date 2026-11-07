@@ -18,7 +18,6 @@ flavite-encoding = { path = "../flavite-encoding", features = ["serde"] }
 # Serialization for recovery files
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-unicode-segmentation = { workspace = true }
 # Hashing for content addressing
 blake3 = { workspace = true }
 [dev-dependencies]

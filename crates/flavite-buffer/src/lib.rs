@@ -26,4 +26,4 @@ pub use revision::{
     BaseHash, BufferId, ContentHash, EditPrecondition, PreconditionResult, Revision,
 };
 pub use state::{Buffer, BufferState, StateTransition, TransitionReason};
-pub use undo::{EditGroup, EditOp, EolMetadata, LinearUndoStack, UndoNode, UndoTree};
+pub use undo::{EditOp, UndoNode, UndoTree};

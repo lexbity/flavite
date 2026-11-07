@@ -43,10 +43,17 @@ pub fn encode(
     // Validate representability and compute the exact output length before
     // allocating (§6.10: output size known before any filesystem effect).
     let body_len = match format.encoding() {
-        FileEncoding::Ascii => match text.as_bytes().iter().position(|b| *b >= 0x80) {
-            Some(idx) => return Err(CodecError::Unencodable { text_byte: idx }),
-            None => text.len(),
-        },
+        FileEncoding::Ascii => {
+            let bytes = text.as_bytes();
+            if bytes.is_ascii() {
+                text.len()
+            } else {
+                let Some(idx) = bytes.iter().position(|b| *b >= 0x80) else {
+                    unreachable!("non-ASCII text contains a >= 0x80 byte");
+                };
+                return Err(CodecError::Unencodable { text_byte: idx });
+            }
+        }
         FileEncoding::Utf8 => text.len(),
         FileEncoding::Utf16Le | FileEncoding::Utf16Be => {
             let units = text

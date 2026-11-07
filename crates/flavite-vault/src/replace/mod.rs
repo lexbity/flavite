@@ -6,14 +6,13 @@
 //! revision (D-09). Destructive Apply/Cancel/Resume/Revert/forget are
 //! S08/S11 commands and are never exposed here.
 
-pub mod auth;
 pub mod coordinator;
 pub mod log;
 pub mod plan;
 pub mod preview;
 pub mod store;
 
-pub use auth::{KeyStoreError, OperationKey, load_or_create_key};
+pub use crate::operation_key::{KeyStoreError, OperationKey, load_or_create_key};
 pub use coordinator::{
     CoordinatorCtx, ItemEffect, JobItem, JobPhase, JobTotals, ReplaceItemOutcome,
     ReplaceItemRequest, read_draft_state, run_apply, run_revert, write_draft_state,

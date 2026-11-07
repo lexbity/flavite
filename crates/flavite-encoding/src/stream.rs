@@ -164,7 +164,10 @@ impl StreamingDecoder {
         match &mut self.phase {
             Phase::Sig { .. } => unreachable!("resolved before active absorb"),
             Phase::Active(ActiveState::Ascii) => {
-                if let Some(idx) = chunk.iter().position(|b| *b >= 0x80) {
+                if !chunk.is_ascii() {
+                    let Some(idx) = chunk.iter().position(|b| *b >= 0x80) else {
+                        unreachable!("non-ASCII chunk contains a >= 0x80 byte");
+                    };
                     return Err(CodecError::InvalidUtf8 {
                         source_byte: base + idx,
                     });
@@ -175,57 +178,13 @@ impl StreamingDecoder {
                     CodecLimitKind::DecodedUtf8Bytes,
                 )?;
                 // All-ASCII bytes are valid UTF-8.
-                let text = std::str::from_utf8(chunk).unwrap_or_default();
+                let text = std::str::from_utf8(chunk).expect("all-ASCII chunk is valid UTF-8");
                 self.text.push_str(text);
                 Ok(())
             }
             Phase::Active(ActiveState::Utf8(state)) => {
                 let max_decoded = self.limits.max_decoded_utf8_bytes;
-                let mut idx = 0usize;
-                // Complete any scalar the previous chunk split, then bulk
-                // validate the aligned remainder in one pass.
-                while state.need > 0 && idx < chunk.len() {
-                    state.feed(chunk[idx], base + idx, &mut self.text, max_decoded)?;
-                    idx += 1;
-                }
-                let rest = &chunk[idx..];
-                if rest.is_empty() {
-                    return Ok(());
-                }
-                match std::str::from_utf8(rest) {
-                    Ok(text) => {
-                        check_limit(
-                            self.text.len() + text.len(),
-                            max_decoded,
-                            CodecLimitKind::DecodedUtf8Bytes,
-                        )?;
-                        self.text.push_str(text);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        let valid = e.valid_up_to();
-                        check_limit(
-                            self.text.len() + valid,
-                            max_decoded,
-                            CodecLimitKind::DecodedUtf8Bytes,
-                        )?;
-                        let prefix = std::str::from_utf8(&rest[..valid]).expect("valid prefix");
-                        self.text.push_str(prefix);
-                        // Feed the remaining bytes through the incremental
-                        // validator: an interior error carries its exact
-                        // position; a trailing incomplete suffix is held.
-                        let start = idx + valid;
-                        for (offset, byte) in chunk[start..].iter().enumerate() {
-                            state.feed(
-                                *byte,
-                                base + start + offset,
-                                &mut self.text,
-                                max_decoded,
-                            )?;
-                        }
-                        Ok(())
-                    }
-                }
+                state.feed(chunk, base, &mut self.text, max_decoded)
             }
             Phase::Active(ActiveState::Utf16(state)) => {
                 let max_decoded = self.limits.max_decoded_utf8_bytes;
@@ -331,6 +290,28 @@ impl StreamingDecoder {
                 Err(CodecError::BomConflict)
             }
             DecodePolicy::Auto => {
+                // A UTF-16 BOM prefix that never grew past the signature
+                // buffer (`FF FE` + one odd byte) is still a UTF-16 file
+                // with a truncated code unit: activate the format so
+                // `finish` reports OddUtf16ByteCount — the one-shot
+                // decoder's contract (one codec contract, FR-24).
+                if pending.starts_with(FileEncoding::Utf16Le.signature())
+                    || pending.starts_with(FileEncoding::Utf16Be.signature())
+                {
+                    let le = pending.starts_with(FileEncoding::Utf16Le.signature());
+                    return self.activate(
+                        SourceFormat::new_unchecked(
+                            if le {
+                                FileEncoding::Utf16Le
+                            } else {
+                                FileEncoding::Utf16Be
+                            },
+                            true,
+                        ),
+                        2,
+                        pending,
+                    );
+                }
                 if pending == FileEncoding::Utf16Le.signature() {
                     return self.activate(
                         SourceFormat::new_unchecked(FileEncoding::Utf16Le, true),
@@ -381,122 +362,85 @@ impl StreamingDecoder {
     }
 }
 
-/// Incremental strict UTF-8 validator/pusher.
+/// Incremental strict UTF-8 validator: a ≤3-byte incomplete tail plus
+/// standard-library validation of `tail + chunk` as one sequence (D-15:
+/// standard-library strict validation is the contract, not a private
+/// lead/continuation table). Incomplete suffixes are retained and never
+/// error before `finish`.
 #[derive(Debug)]
 struct Utf8Incremental {
-    /// Absolute source byte where the current scalar started.
-    scalar_start: usize,
-    /// Continuation bytes still expected.
-    need: usize,
-    /// Accumulated payload bits of the current scalar.
-    acc: u32,
-    /// Allowed range for the next continuation byte (overlong/surrogate
-    /// guards).
-    next_min: u8,
-    next_max: u8,
+    /// Incomplete trailing bytes of earlier pushes (≤3: never a complete
+    /// scalar on its own).
+    tail: Vec<u8>,
+    /// Absolute source byte where `tail[0]` sits.
+    tail_start: usize,
 }
 
 impl Utf8Incremental {
     fn new() -> Self {
         Self {
-            scalar_start: 0,
-            need: 0,
-            acc: 0,
-            next_min: 0x80,
-            next_max: 0xBF,
+            tail: Vec::new(),
+            tail_start: 0,
         }
     }
 
     fn feed(
         &mut self,
-        byte: u8,
-        pos: usize,
+        chunk: &[u8],
+        base: usize,
         out: &mut String,
         max_decoded: u64,
     ) -> Result<(), CodecError> {
-        if self.need == 0 {
-            self.scalar_start = pos;
-            match byte {
-                0x00..=0x7F => {
-                    push_scalar(out, char::from(byte), max_decoded)?;
-                    return Ok(());
-                }
-                0xC2..=0xDF => {
-                    self.need = 1;
-                    self.acc = u32::from(byte & 0x1F);
-                    self.next_min = 0x80;
-                    self.next_max = 0xBF;
-                }
-                0xE0 => {
-                    self.need = 2;
-                    self.acc = 0;
-                    self.next_min = 0xA0;
-                    self.next_max = 0xBF;
-                }
-                0xE1..=0xEC | 0xEE..=0xEF => {
-                    self.need = 2;
-                    self.acc = u32::from(byte & 0x0F);
-                    self.next_min = 0x80;
-                    self.next_max = 0xBF;
-                }
-                0xED => {
-                    self.need = 2;
-                    self.acc = u32::from(byte & 0x0F);
-                    self.next_min = 0x80;
-                    self.next_max = 0x9F;
-                }
-                0xF0 => {
-                    self.need = 3;
-                    self.acc = 0;
-                    self.next_min = 0x90;
-                    self.next_max = 0xBF;
-                }
-                0xF1..=0xF3 => {
-                    self.need = 3;
-                    self.acc = u32::from(byte & 0x07);
-                    self.next_min = 0x80;
-                    self.next_max = 0xBF;
-                }
-                0xF4 => {
-                    self.need = 3;
-                    self.acc = u32::from(byte & 0x07);
-                    self.next_min = 0x80;
-                    self.next_max = 0x8F;
-                }
-                _ => return Err(CodecError::InvalidUtf8 { source_byte: pos }),
-            }
+        if chunk.is_empty() {
             return Ok(());
         }
-        if byte < self.next_min || byte > self.next_max {
-            return Err(CodecError::InvalidUtf8 {
-                source_byte: self.scalar_start,
-            });
+        if self.tail.is_empty() {
+            self.tail_start = base;
         }
-        self.acc = (self.acc << 6) | u32::from(byte & 0x3F);
-        self.next_min = 0x80;
-        self.next_max = 0xBF;
-        self.need -= 1;
-        if self.need == 0 {
-            // The range guards above guarantee validity.
-            match char::from_u32(self.acc) {
-                Some(scalar) => push_scalar(out, scalar, max_decoded)?,
-                None => {
+        self.tail.extend_from_slice(chunk);
+        match std::str::from_utf8(&self.tail) {
+            Ok(text) => {
+                check_limit(
+                    out.len() + text.len(),
+                    max_decoded,
+                    CodecLimitKind::DecodedUtf8Bytes,
+                )?;
+                out.push_str(text);
+                self.tail.clear();
+                Ok(())
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                check_limit(
+                    out.len() + valid,
+                    max_decoded,
+                    CodecLimitKind::DecodedUtf8Bytes,
+                )?;
+                let prefix =
+                    std::str::from_utf8(&self.tail[..valid]).expect("valid_up_to is a boundary");
+                out.push_str(prefix);
+                if e.error_len().is_some() {
+                    // A definite encoding error at this source position.
                     return Err(CodecError::InvalidUtf8 {
-                        source_byte: self.scalar_start,
+                        source_byte: self.tail_start + valid,
                     });
                 }
+                // Incomplete suffix: retained for the next push (or
+                // reported by `finish`).
+                self.tail.drain(..valid);
+                Ok(())
             }
         }
-        Ok(())
     }
 
     fn finish(&self) -> Result<(), CodecError> {
-        if self.need > 0 {
-            return Err(CodecError::InvalidUtf8 {
-                source_byte: self.scalar_start,
-            });
+        if self.tail.is_empty() {
+            Ok(())
+        } else {
+            Err(CodecError::InvalidUtf8 {
+                source_byte: self.tail_start,
+            })
         }
-        Ok(())
     }
 }
 
@@ -515,7 +459,9 @@ fn push_scalar(out: &mut String, scalar: char, max_decoded: u64) -> Result<(), C
 #[derive(Debug)]
 struct Utf16Incremental {
     le: bool,
-    pending_byte: Option<u8>,
+    /// An odd trailing byte and the absolute source position it was read
+    /// at, held across pushes.
+    pending_byte: Option<(u8, usize)>,
     pending_high: Option<(u16, usize)>,
 }
 
@@ -549,9 +495,9 @@ impl Utf16Incremental {
             return Ok(());
         }
         let mut idx = 0usize;
-        if let Some(held) = self.pending_byte.take() {
+        if let Some((held, held_pos)) = self.pending_byte.take() {
             let unit = self.read_unit(held, chunk[0]);
-            self.process_unit(unit, base.saturating_sub(1), out, max_decoded)?;
+            self.process_unit(unit, held_pos, out, max_decoded)?;
             idx = 1;
         }
         while idx + 1 < chunk.len() {
@@ -560,7 +506,7 @@ impl Utf16Incremental {
             idx += 2;
         }
         if idx < chunk.len() {
-            self.pending_byte = Some(chunk[chunk.len() - 1]);
+            self.pending_byte = Some((chunk[chunk.len() - 1], base + chunk.len() - 1));
         }
         Ok(())
     }

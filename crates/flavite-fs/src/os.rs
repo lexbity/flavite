@@ -28,23 +28,21 @@ impl OsFs {
         }
     }
 
-    fn get_native_id(path: &Path) -> Result<(u64, u64)> {
-        let meta = std::fs::symlink_metadata(path).map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                FsError::NotFound(path.to_path_buf())
-            } else {
-                FsError::Io(format!("failed to get metadata: {}", e))
-            }
-        })?;
+    /// Native `(volume_id, native_id)` identity from an already-fetched
+    /// stat, so callers never stat the same path twice.
+    fn native_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            Ok((meta.dev(), meta.ino()))
+            (metadata.dev(), metadata.ino())
         }
         #[cfg(windows)]
         {
             use std::os::windows::fs::MetadataExt;
-            Ok((meta.volume_serial_number(), meta.file_index()))
+            (
+                metadata.volume_serial_number().unwrap_or(0),
+                metadata.file_index().unwrap_or(0),
+            )
         }
     }
 }
@@ -184,6 +182,21 @@ impl Fs for OsFs {
                 FsError::PathEscape(relative.into())
             }
         })?;
+        // D-10: containment blocks `..` escape, but cap-std follows a
+        // symlink in the FINAL component. Validate the final object itself
+        // (lstat through the same directory capability) and refuse a
+        // note that is a symlink: reads must land on the note's own
+        // object, never on a link an external writer can repoint.
+        let final_type = directory.symlink_metadata(relative).map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                FsError::NotFound(relative.into())
+            } else {
+                FsError::PathEscape(relative.into())
+            }
+        })?;
+        if final_type.is_symlink() {
+            return Err(FsError::PathEscape(relative.into()));
+        }
         let mut bytes = Vec::new();
         file.take(max.saturating_add(1))
             .read_to_end(&mut bytes)
@@ -198,6 +211,9 @@ impl Fs for OsFs {
     }
 
     fn metadata(&self, path: &Path) -> Result<Metadata> {
+        // One stat supplies size, times, type, identity and mode; the final
+        // component is reported as itself (lstat), matching the `Fs::metadata`
+        // symlink contract.
         let meta = std::fs::symlink_metadata(path).map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 FsError::NotFound(path.to_path_buf())
@@ -207,16 +223,34 @@ impl Fs for OsFs {
         })?;
 
         let file_type = meta.file_type();
-        let (volume_id, native_id) = Self::get_native_id(path)?;
-        Ok(Metadata {
-            size: meta.len(),
-            mtime_ns: Self::mtime_ns(&meta),
-            native_id,
-            volume_id,
-            is_symlink: file_type.is_symlink(),
-            is_dir: file_type.is_dir(),
-            mode: 0o644,
-        })
+        let (volume_id, native_id) = Self::native_identity(&meta);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Metadata {
+                size: meta.len(),
+                mtime_ns: Self::mtime_ns(&meta),
+                native_id,
+                volume_id,
+                is_symlink: file_type.is_symlink(),
+                is_dir: file_type.is_dir(),
+                mode: meta.mode(),
+            })
+        }
+        // Windows carries no POSIX mode bits; the conventional default
+        // stands in (the readonly flag is reported via `copy_mode`).
+        #[cfg(windows)]
+        {
+            Ok(Metadata {
+                size: meta.len(),
+                mtime_ns: Self::mtime_ns(&meta),
+                native_id,
+                volume_id,
+                is_symlink: file_type.is_symlink(),
+                is_dir: file_type.is_dir(),
+                mode: 0o644,
+            })
+        }
     }
 
     fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>> {
@@ -248,6 +282,13 @@ impl Fs for OsFs {
         Ok(path.exists())
     }
 
+    /// Platform reality (§4.8, S3-2 scenario 4): Linux has no dataless or
+    /// recall file state, so a local file is never a placeholder and
+    /// `Ok(false)` is exact there. Windows
+    /// (`FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`/`_RECALL_ON_OPEN`) and macOS
+    /// (`UF_DATALESS` in `st_flags`) detection is unimplemented by design —
+    /// a freshly created, fully local file never reports as a placeholder
+    /// on any platform.
     fn is_placeholder(&self, _path: &Path) -> Result<bool> {
         Ok(false)
     }
@@ -339,10 +380,26 @@ impl Fs for OsFs {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        // Creating a hard link is an atomic no-replace operation: the
-        // destination is either created in full or left untouched. Both paths
-        // are in the same directory for our staging callers.
+        // The kernel's dedicated primitive (S3-2 scenario 7): the
+        // destination is either created in full or left untouched — no
+        // link+unlink emulation.
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(|error| {
+            match error.kind() {
+                io::ErrorKind::AlreadyExists => FsError::AlreadyExists(to.to_path_buf()),
+                io::ErrorKind::NotFound => FsError::NotFound(from.to_path_buf()),
+                _ => FsError::Io(format!("failed to rename without replacement: {error}")),
+            }
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()> {
+        // Non-Linux platforms keep the atomic no-replace link install: the
+        // destination is either created in full or left untouched. Both
+        // paths are in the same directory for our staging callers.
         std::fs::hard_link(from, to).map_err(|e| {
             if e.kind() == io::ErrorKind::AlreadyExists {
                 FsError::AlreadyExists(to.to_path_buf())

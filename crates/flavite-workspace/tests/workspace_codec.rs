@@ -351,7 +351,11 @@ fn settings_tab_round_trips_through_the_codec() {
     // Restore rehydrates the Settings tab like every other kind.
     let catalog = BTreeSet::new();
     let plan = flavite_workspace::plan_restore(&decoded, &catalog).expect("plan");
-    assert!(plan.report.is_empty(), "no drops expected: {:?}", plan.report);
+    assert!(
+        plan.report.is_empty(),
+        "no drops expected: {:?}",
+        plan.report
+    );
     let restored = plan
         .tabs
         .iter()

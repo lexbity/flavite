@@ -63,6 +63,19 @@ impl Fs for SlowFs {
         }
         self.inner.read_if_exists(path)
     }
+    fn read_capped_in_root(&self, root: &Path, relative: &Path, max: u64) -> Result<Vec<u8>> {
+        // The open path reads through the contained primitive; the
+        // coalescing contract counts exactly the flight's read.
+        let path = root.join(relative);
+        if path == self.path_b {
+            self.reads_of_b.fetch_add(1, Ordering::SeqCst);
+            let delay = self.read_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+        }
+        self.inner.read_capped_in_root(root, relative, max)
+    }
     fn read_capped(&self, path: &Path, max: u64) -> Result<Vec<u8>> {
         self.inner.read_capped(path, max)
     }
@@ -146,6 +159,9 @@ fn fixture() -> (Fixture, std::sync::Arc<SlowFs>) {
         }
         fn read_capped(&self, p: &Path, m: u64) -> Result<Vec<u8>> {
             self.0.read_capped(p, m)
+        }
+        fn read_capped_in_root(&self, r: &Path, rel: &Path, m: u64) -> Result<Vec<u8>> {
+            self.0.read_capped_in_root(r, rel, m)
         }
         fn metadata(&self, p: &Path) -> Result<Metadata> {
             self.0.metadata(p)

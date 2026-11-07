@@ -143,9 +143,6 @@ pub struct JobItem {
     pub record: NoteCandidateRecord,
     /// Current effect; `None` = not yet started.
     pub effect: Option<ItemEffect>,
-    /// Action-request key mapped to the last result receipt for
-    /// idempotent replay within this session.
-    pub receipts: BTreeMap<u128, ItemEffect>,
 }
 
 /// Aggregate job status (derived counts; NFR: no count inflation).
@@ -338,13 +335,31 @@ pub fn write_draft_state(
     io.fsync_dir(&store.base().join(job_id))
 }
 
+/// Hard decoder bound for one draft-state sidecar: 50k items × 16 bytes is
+/// well under this; anything larger is corrupt or hostile (§6.4).
+const DRAFT_STATE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The canonical selection digest binding preview, revision and ids (D-09):
+/// recomputed at Apply and stamped into the sealed manifest.
+pub fn selection_digest(preview_id: u128, revision: u64, selected_ids: &[u64]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"flavite-replace-selection-v1");
+    hasher.update(&preview_id.to_be_bytes());
+    hasher.update(&revision.to_le_bytes());
+    for id in selected_ids {
+        hasher.update(&id.to_le_bytes());
+    }
+    hex::encode(hasher.finalize().as_bytes())
+}
+
 /// Read the sidecar `(item_id, applied_revision)` map (empty when absent).
 pub fn read_draft_state(
     io: &dyn OpStoreIo,
     store: &ReplaceStore,
     job_id: &str,
 ) -> Result<BTreeMap<u64, u64>, String> {
-    let Some(bytes) = io.read(&draft_state_path(store, job_id))? else {
+    let Some(bytes) = io.read_capped(&draft_state_path(store, job_id), DRAFT_STATE_MAX_BYTES)?
+    else {
         return Ok(BTreeMap::new());
     };
     if bytes.len() < 8 || (bytes.len() - 8) % 16 != 0 {
@@ -363,11 +378,11 @@ pub fn read_draft_state(
     Ok(map)
 }
 
-fn decode_hash(hex_hash: &str) -> [u8; 32] {
+fn decode_hash(hex_hash: &str) -> Result<[u8; 32], String> {
     hex::decode(hex_hash)
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
-        .unwrap_or([0u8; 32])
+        .ok_or_else(|| "sealed record hash is undecodable".to_owned())
 }
 
 /// Decode one sealed payload to normalized text.
@@ -391,6 +406,12 @@ fn payload_text(
 /// skipped (idempotent resume). Returns the terminal phase plus recomputed
 /// totals.
 #[allow(clippy::too_many_arguments)]
+/// A source lease held by an editor/save flight defers the item this long
+/// before the job records a Busy attempt (D-10: "the job waits at most 5
+/// seconds then skips that item").
+const LEASE_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const LEASE_BUSY_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 pub fn run_apply(
     ctx: &CoordinatorCtx,
     job_id: &str,
@@ -412,32 +433,47 @@ pub fn run_apply(
                 | ItemEffect::Stale
                 | ItemEffect::Unsupported
                 | ItemEffect::SatisfiedUnattributed
-                | ItemEffect::Busy
                 | ItemEffect::Reverted
                 | ItemEffect::RevertedDraft,
             ) => continue,
-            // A nonterminal item (crash between intent and outcome) is
-            // reconciled by RE-RUNNING the guarded apply: the before-hash
-            // guard and the after-hash satisfaction check make that exact —
-            // a satisfied target classifies without overwriting, a guard
-            // change goes Stale, and only a truly untouched item re-applies
-            // (§6.4/§6.9: resume reconciles an existing durable intent).
-            Some(ItemEffect::NeedsRecovery) | None => {}
+            // A nonterminal item (crash between intent and outcome, or a
+            // deferred Busy attempt) is reconciled by RE-RUNNING the
+            // guarded apply: the before-hash guard and the after-hash
+            // satisfaction check make that exact — a satisfied target
+            // classifies without overwriting, a guard change goes Stale,
+            // and only a truly untouched item re-applies (§6.4/§6.9: resume
+            // reconciles an existing durable intent, Retry can retry Busy).
+            Some(ItemEffect::Busy) | Some(ItemEffect::NeedsRecovery) | None => {}
         }
         if cancel.load(Ordering::Relaxed) {
             phase = JobPhase::Cancelled;
             break;
         }
         let item_id = item.record.item_id;
-        // 1. Lease (non-replacing). Busy is a deferred attempt, not an
-        // effect; the item stays not-started (`effect: None`) and is
-        // retryable by Resume.
+        // 1. Lease (non-replacing). A pending save/edit holds the source:
+        // wait a bounded 5 s (D-10), then record Busy — a deferred attempt,
+        // not a terminal effect — so Resume may retry it (§6.4).
         let relative = Path::new(&item.record.path);
         let lease_key = relative.as_os_str().as_encoded_bytes().to_vec();
-        let Ok(lease) = ctx
-            .leases
-            .acquire(lease_key, crate::source_leases::LeaseOwner::Replace)
-        else {
+        let busy_deadline = std::time::Instant::now() + LEASE_BUSY_WAIT;
+        let lease = loop {
+            if let Ok(lease) = ctx
+                .leases
+                .acquire(lease_key.clone(), crate::source_leases::LeaseOwner::Replace)
+            {
+                break Some(lease);
+            }
+            if cancel.load(Ordering::Relaxed) || std::time::Instant::now() >= busy_deadline {
+                break None;
+            }
+            std::thread::sleep(LEASE_BUSY_POLL);
+        };
+        let Some(lease) = lease else {
+            if cancel.load(Ordering::Relaxed) {
+                phase = JobPhase::Cancelled;
+                break;
+            }
+            item.effect = Some(ItemEffect::Busy);
             continue;
         };
         // 2. Durable intent BEFORE any side effect.
@@ -483,12 +519,22 @@ pub fn run_apply(
                         break;
                     }
                 };
+                let (Ok(expected_before_hash), Ok(expected_after_hash)) = (
+                    decode_hash(&item.record.disk_hash),
+                    decode_hash(&item.record.after.hash),
+                ) else {
+                    ctx.leases.release(&lease);
+                    item.effect = Some(ItemEffect::NeedsRecovery);
+                    tracing::warn!(job_id, item_id, "sealed record hash undecodable");
+                    phase = JobPhase::NeedsRecovery;
+                    break;
+                };
                 let request = ReplaceItemRequest {
                     job_id: job_id.to_owned(),
                     item_id,
                     path: ctx.root.join(&item.record.path),
-                    expected_before_hash: decode_hash(&item.record.disk_hash),
-                    expected_after_hash: decode_hash(&item.record.after.hash),
+                    expected_before_hash,
+                    expected_after_hash,
                     after_bytes,
                     note_key,
                 };
@@ -834,11 +880,12 @@ fn revert_saved_item(
         job_id: job_id.to_owned(),
         item_id: record.item_id,
         path: ctx.root.join(&record.path),
-        expected_before_hash: decode_hash(&record.after.hash),
+        expected_before_hash: decode_hash(&record.after.hash)?,
         // The inverse target state is the recorded before content.
-        expected_after_hash: decode_hash(&record.before.hash),
+        expected_after_hash: decode_hash(&record.before.hash)?,
         after_bytes: before_bytes,
-        note_key: hex::decode(&record.path_native).unwrap_or_default(),
+        note_key: hex::decode(&record.path_native)
+            .map_err(|_| "revert note key is undecodable".to_owned())?,
     };
     match ctx.actor.revert_replace_item(request) {
         Ok(ReplaceItemOutcome::Replaced { conflict }) => {

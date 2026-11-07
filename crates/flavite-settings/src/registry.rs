@@ -135,7 +135,11 @@ impl SettingRegistry {
                 "Vault",
                 "Rename Behavior",
                 "Link behavior for in-app note renames",
-                SettingKind::Choice(&[("rewrite", "Rewrite"), ("alias", "Alias"), ("none", "None")]),
+                SettingKind::Choice(&[
+                    ("rewrite", "Rewrite"),
+                    ("alias", "Alias"),
+                    ("none", "None"),
+                ]),
                 SettingValue::Str("rewrite".to_owned()),
                 Visibility::Visible,
                 Apply::Live,
@@ -235,7 +239,10 @@ impl SettingRegistry {
     /// Get all visible descriptors.
     #[must_use]
     pub fn visible(&self) -> Vec<&SettingDescriptor> {
-        self.descriptors.iter().filter(|d| d.visibility == Visibility::Visible).collect()
+        self.descriptors
+            .iter()
+            .filter(|d| d.visibility == Visibility::Visible)
+            .collect()
     }
 
     /// Get descriptors by category.
@@ -243,7 +250,9 @@ impl SettingRegistry {
     pub fn by_category(&self) -> BTreeMap<String, Vec<&SettingDescriptor>> {
         let mut map: BTreeMap<String, Vec<&SettingDescriptor>> = BTreeMap::new();
         for descriptor in &self.descriptors {
-            map.entry(descriptor.category.to_owned()).or_default().push(descriptor);
+            map.entry(descriptor.category.to_owned())
+                .or_default()
+                .push(descriptor);
         }
         map
     }
@@ -298,7 +307,7 @@ mod tests {
     fn test_builtins_categories() {
         let registry = SettingRegistry::with_builtins();
         let categories = registry.by_category();
-        
+
         // Should have: Appearance, Editor, Links, Sidebar, Vault, Shortcuts, State
         assert!(categories.contains_key("Appearance"));
         assert!(categories.contains_key("Editor"));
@@ -320,7 +329,7 @@ mod tests {
     #[test]
     fn test_lookup() {
         let registry = SettingRegistry::with_builtins();
-        
+
         assert!(registry.lookup("appearance.theme").is_some());
         assert!(registry.lookup("editor.font_size").is_some());
         assert!(registry.lookup("nonexistent").is_none());
@@ -335,7 +344,7 @@ mod tests {
     #[test]
     fn test_validate_id() {
         let registry = SettingRegistry::with_builtins();
-        
+
         assert!(registry.validate_id("appearance.theme").is_ok());
         assert!(registry.validate_id("plugins.foo").is_err());
         assert!(registry.validate_id("invalid").is_err());
@@ -345,13 +354,13 @@ mod tests {
     fn test_snapshot_builtins_table() {
         // Normative test: the D-04 table must be exactly represented
         let descriptors = SettingRegistry::builtins();
-        
+
         // Check each descriptor matches the specification
         let mut found_ids = Vec::new();
         for d in &descriptors {
             found_ids.push(d.id);
         }
-        
+
         // All 16 IDs from D-04
         let expected_ids = vec![
             "appearance.theme",
@@ -371,7 +380,7 @@ mod tests {
             "shortcuts.overrides",
             "state.graph_activation_acknowledged",
         ];
-        
+
         assert_eq!(found_ids, expected_ids);
     }
 }

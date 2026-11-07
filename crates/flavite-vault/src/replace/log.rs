@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::auth::OperationKey;
 use super::plan::ENGINE_VERSION;
 use super::store::{OpStoreIo, ReplaceStore, StoreError};
+use crate::operation_key::OperationKey;
 
 /// One log record frame length bound (NFR: one record ≤64 KiB).
 pub const MAX_LOG_FRAME_BYTES: usize = 64 * 1024;
@@ -564,7 +564,7 @@ mod tests {
         store.seal_preview(&io, &empty_manifest(job)).expect("seal");
         let data_dir = tmp_data_dir();
         let vault = uuid::Uuid::now_v7();
-        let key = super::super::auth::load_or_create_key(&data_dir, &vault).expect("key");
+        let key = crate::operation_key::load_or_create_key(&data_dir, &vault).expect("key");
         let mut log =
             JobLog::open(Box::new(io.clone()), &store, job, key, &data_dir, &vault).expect("open");
         let first = log.append(7, ItemAction::IntentDurable).expect("intent");
@@ -580,7 +580,7 @@ mod tests {
         assert_eq!(second.seq, 2);
         drop(log);
 
-        let key2 = super::super::auth::load_or_create_key(&data_dir, &vault).expect("key2");
+        let key2 = crate::operation_key::load_or_create_key(&data_dir, &vault).expect("key2");
         let mut reopened =
             JobLog::open(Box::new(io), &store, job, key2, &data_dir, &vault).expect("reopen");
         assert_eq!(reopened.seq(), 2);
@@ -602,7 +602,7 @@ mod tests {
         store.seal_preview(&io, &empty_manifest(job)).expect("seal");
         let data_dir = tmp_data_dir();
         let vault = uuid::Uuid::now_v7();
-        let key = super::super::auth::load_or_create_key(&data_dir, &vault).expect("key");
+        let key = crate::operation_key::load_or_create_key(&data_dir, &vault).expect("key");
         let mut log =
             JobLog::open(Box::new(io.clone()), &store, job, key, &data_dir, &vault).expect("open");
         log.append(1, ItemAction::IntentDurable).expect("intent");
@@ -619,7 +619,7 @@ mod tests {
         fs.write_new(&file, &bytes).unwrap();
         fs.fsync_file(&file).unwrap();
 
-        let key2 = super::super::auth::load_or_create_key(&data_dir, &vault).expect("key2");
+        let key2 = crate::operation_key::load_or_create_key(&data_dir, &vault).expect("key2");
         let err =
             JobLog::open(Box::new(io), &store, job, key2, &data_dir, &vault).expect_err("corrupt");
         assert!(matches!(err, LogError::Corrupt(_)));
@@ -636,7 +636,7 @@ mod tests {
         store.seal_preview(&io, &empty_manifest(job)).expect("seal");
         let data_dir = tmp_data_dir();
         let vault = uuid::Uuid::now_v7();
-        let key = super::super::auth::load_or_create_key(&data_dir, &vault).expect("key");
+        let key = crate::operation_key::load_or_create_key(&data_dir, &vault).expect("key");
         let mut log = JobLog::open(
             Box::new(io.clone()),
             &store,

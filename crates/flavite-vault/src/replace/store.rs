@@ -24,6 +24,19 @@ pub trait OpStoreIo: Send + Sync {
     fn write_replace(&self, path: &Path, bytes: &[u8]) -> Result<(), String>;
     /// Read a file; `None` when absent.
     fn read(&self, path: &Path) -> Result<Option<Vec<u8>>, String>;
+    /// Read a file bounded by `max` bytes (§6.4 decoder bounds: operation
+    /// store files are untrusted input validated before parsing). `None`
+    /// when absent; an error when the file exceeds the bound.
+    fn read_capped(&self, path: &Path, max: u64) -> Result<Option<Vec<u8>>, String> {
+        match self.read(path)? {
+            None => Ok(None),
+            Some(bytes) if bytes.len() as u64 > max => Err(format!(
+                "operation-store file exceeds its {} byte bound",
+                max
+            )),
+            Some(bytes) => Ok(Some(bytes)),
+        }
+    }
     /// List plain file names in a directory (sorted; `None` when absent).
     fn list_dir(&self, path: &Path) -> Result<Option<Vec<String>>, String>;
     /// Fsync one file.
@@ -152,7 +165,10 @@ impl ReplaceStore {
         reference: &super::plan::SealedPayloadRef,
     ) -> Result<Option<Vec<u8>>, StoreError> {
         let path = self.payload_path(job_id, &reference.hash);
-        let Some(bytes) = io.read(&path).map_err(StoreError::Io)? else {
+        let Some(bytes) = io
+            .read_capped(&path, reference.len)
+            .map_err(StoreError::Io)?
+        else {
             return Ok(None);
         };
         if bytes.len() as u64 != reference.len {
@@ -199,6 +215,9 @@ impl ReplaceStore {
         Ok(())
     }
 
+    /// Hard decoder bound for one manifest header (§6.4).
+    pub const MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
+
     /// Load a sealed manifest; `None` when the job is not present.
     pub fn read_manifest(
         &self,
@@ -206,7 +225,10 @@ impl ReplaceStore {
         job_id: &str,
     ) -> Result<Option<PreviewManifest>, StoreError> {
         let path = self.manifest_path(job_id);
-        let Some(bytes) = io.read(&path).map_err(StoreError::Io)? else {
+        let Some(bytes) = io
+            .read_capped(&path, Self::MANIFEST_MAX_BYTES)
+            .map_err(StoreError::Io)?
+        else {
             return Ok(None);
         };
         let manifest: PreviewManifest = serde_json::from_slice(&bytes)
@@ -225,6 +247,49 @@ impl ReplaceStore {
             ));
         }
         Ok(Some(manifest))
+    }
+
+    /// Stamp the frozen selection revision/digest onto the sealed manifest
+    /// at first Apply (D-09/§6.4): after restart, a resumed job can prove
+    /// the on-disk selection matches the revision the caller authorized.
+    ///
+    /// # Errors
+    ///
+    /// Typed [`StoreError`] for absent/unknown manifests and IO failure.
+    pub fn stamp_selection(
+        &self,
+        io: &dyn OpStoreIo,
+        job_id: &str,
+        selection_revision: u64,
+        selection_digest: &str,
+    ) -> Result<(), StoreError> {
+        let path = self.manifest_path(job_id);
+        let Some(bytes) = io
+            .read_capped(&path, Self::MANIFEST_MAX_BYTES)
+            .map_err(StoreError::Io)?
+        else {
+            return Err(StoreError::MissingObject {
+                hash: job_id.to_owned(),
+                expected: 0,
+            });
+        };
+        let mut manifest: PreviewManifest = serde_json::from_slice(&bytes)
+            .map_err(|error| StoreError::Corrupt(error.to_string()))?;
+        if manifest.schema != PREVIEW_SCHEMA_VERSION
+            || manifest.engine_version > super::plan::ENGINE_VERSION
+        {
+            return Err(StoreError::UnsupportedVersion {
+                schema: manifest.schema,
+                engine: manifest.engine_version,
+            });
+        }
+        manifest.selection_revision = Some(selection_revision);
+        manifest.selection_digest = Some(selection_digest.to_owned());
+        let json = serde_json::to_vec(&manifest)
+            .map_err(|error| StoreError::Corrupt(error.to_string()))?;
+        io.write_replace(&path, &json).map_err(StoreError::Io)?;
+        io.fsync_file(&path).map_err(StoreError::Io)?;
+        Ok(())
     }
 
     /// Remove a preview job tree (expiry/forget). Idempotent.

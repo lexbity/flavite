@@ -1536,7 +1536,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "unicode-segmentation",
 ]
 
 [[package]]
@@ -1563,6 +1562,7 @@ dependencies = [
  "cosmic-text",
  "flavite-api",
  "flavite-buffer",
+ "flavite-editor",
  "flavite-syntax",
  "iced",
  "nucleo-matcher",
@@ -1702,6 +1702,7 @@ dependencies = [
  "flavite-graph",
  "flavite-index",
  "flavite-settings",
+ "flavite-syntax",
  "flavite-theme",
  "flavite-vault",
  "flavite-workspace",

@@ -232,6 +232,12 @@ pub enum ContextQueryResult {
         ordinal: u64,
     },
     SearchClosed,
+    /// A search-session operation failed with its typed session error
+    /// (RFC-0006 S06): hosts render the typed kind instead of guessing from
+    /// presentation text. Generic context failures stay on `Failed`.
+    SearchFailed {
+        error: crate::search_sessions::SearchSessionError,
+    },
 
     /// A complete bounded note catalog with provenance (RFC-0004 W-D).
     /// `Arc`-shared so hosts swap snapshots wholesale; stale snapshots
@@ -325,6 +331,15 @@ impl crate::search_sessions::SearchCaptureProvider for SessionCaptureProvider {
         self.0.begin_search_capture()
     }
 }
+
+/// The grants the in-process query service presents to the search-session
+/// registry (§6.7: trusted in-process callers adapt through the host
+/// handle). `submit()` carries no capability context — the service runs
+/// inside the facade's host trust boundary whose built-in grants include
+/// `ReadNotes`, so the host grant is presented explicitly rather than
+/// threading a new parameter through every payload (that would ripple into
+/// every host payload constructor for no enforcement gain).
+const HOST_READ_GRANTS: &[crate::Capability] = &[crate::Capability::ReadNotes];
 
 /// Bounded async query service owned by the facade.
 pub struct QueryService {
@@ -630,32 +645,32 @@ fn execute(
         QueryPayload::Preview { path } => execute_preview(session, path),
         QueryPayload::Backlinks { path } => execute_backlinks(session, graph, path),
         QueryPayload::Search { text, limit } => execute_search(search_sessions, text, *limit),
-        QueryPayload::SearchStart { options } => match search_sessions.start(options.clone()) {
-            Ok(page) => {
-                let page_size = u64::try_from(page.rows.len()).unwrap_or(0);
-                ContextQueryResult::SearchStarted {
-                    page: Arc::new(page),
-                    page_size,
+        QueryPayload::SearchStart { options } => {
+            match search_sessions.start(options.clone(), HOST_READ_GRANTS) {
+                Ok(page) => {
+                    let page_size = u64::try_from(page.rows.len()).unwrap_or(0);
+                    ContextQueryResult::SearchStarted {
+                        page: Arc::new(page),
+                        page_size,
+                    }
                 }
-            }
-            Err(error) => ContextQueryResult::Failed {
-                message: error.to_string(),
-            },
-        },
-        QueryPayload::SearchPage { token } => {
-            let ordinal = token.next_ordinal;
-            match search_sessions.page(token) {
-                Ok(page) => ContextQueryResult::SearchPaged {
-                    page: Arc::new(page),
-                    ordinal,
-                },
                 Err(error) => ContextQueryResult::Failed {
                     message: error.to_string(),
                 },
             }
         }
+        QueryPayload::SearchPage { token } => {
+            let ordinal = token.next_ordinal;
+            match search_sessions.page(token, HOST_READ_GRANTS) {
+                Ok(page) => ContextQueryResult::SearchPaged {
+                    page: Arc::new(page),
+                    ordinal,
+                },
+                Err(error) => ContextQueryResult::SearchFailed { error },
+            }
+        }
         QueryPayload::SearchClose { session } => {
-            let _ = search_sessions.close(*session);
+            let _ = search_sessions.close(HOST_READ_GRANTS, *session);
             ContextQueryResult::SearchClosed
         }
         QueryPayload::Catalog { limit } => crate::catalog_service::execute_catalog(session, *limit),
@@ -876,12 +891,10 @@ fn execute_search(
         text: text.to_owned(),
         page_size,
     };
-    let page = match search_sessions.start(options) {
+    let page = match search_sessions.start(options, HOST_READ_GRANTS) {
         Ok(page) => page,
         Err(error) => {
-            return ContextQueryResult::Failed {
-                message: error.to_string(),
-            };
+            return ContextQueryResult::SearchFailed { error };
         }
     };
     let provenance = Provenance {
@@ -903,7 +916,7 @@ fn execute_search(
     let session = page.session;
     // The legacy payload has no continuation token: close the session so
     // the bounded registry admits the next submission (§6.1 adapter).
-    let _ = search_sessions.close(session);
+    let _ = search_sessions.close(HOST_READ_GRANTS, session);
     ContextQueryResult::Search {
         items,
         provenance,

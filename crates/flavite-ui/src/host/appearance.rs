@@ -208,7 +208,10 @@ impl AppearanceHost {
     /// The chosen palette source (`system`, `light`, or `dark`).
     #[must_use]
     pub fn theme_name(&self) -> String {
-        self.value("appearance.theme").as_str().unwrap_or("system").to_owned()
+        self.value("appearance.theme")
+            .as_str()
+            .unwrap_or("system")
+            .to_owned()
     }
 
     /// The interface scale in percent.
@@ -248,19 +251,25 @@ impl AppearanceHost {
     /// Whether motion is reduced.
     #[must_use]
     pub fn reduced_motion(&self) -> bool {
-        self.value("appearance.reduced_motion").as_bool().unwrap_or(false)
+        self.value("appearance.reduced_motion")
+            .as_bool()
+            .unwrap_or(false)
     }
 
     /// Whether stable IDs are preferred when inserting links.
     #[must_use]
     pub fn prefer_stable_links(&self) -> bool {
-        self.value("links.prefer_stable_links").as_bool().unwrap_or(true)
+        self.value("links.prefer_stable_links")
+            .as_bool()
+            .unwrap_or(true)
     }
 
     /// Whether the graph gesture-contract notice was acknowledged.
     #[must_use]
     pub fn graph_activation_acknowledged(&self) -> bool {
-        self.value("state.graph_activation_acknowledged").as_bool().unwrap_or(false)
+        self.value("state.graph_activation_acknowledged")
+            .as_bool()
+            .unwrap_or(false)
     }
 
     /// The selected theme package id, when one is selected.
@@ -442,10 +451,7 @@ impl AppearanceHost {
         self.shortcuts = crate::host::commands::DEFAULT_CHORDS
             .iter()
             .filter_map(|(id, default)| {
-                let text = overrides
-                    .get(*id)
-                    .map(String::as_str)
-                    .unwrap_or(default);
+                let text = overrides.get(*id).map(String::as_str).unwrap_or(default);
                 let settings_chord = flavite_settings::chord::parse_chord(text)
                     .or_else(|| flavite_settings::chord::parse_chord(default))?;
                 let chord = flavite_api::Chord {
@@ -524,7 +530,8 @@ impl crate::app::App {
         let removed = result.is_success();
         self.report_theme_result(result, "Theme removed");
         if removed && self.appearance.theme_package_id().as_deref() == Some(id.as_str()) {
-            let _ = self.apply_setting("appearance.theme_package", SettingValue::Str(String::new()));
+            let _ =
+                self.apply_setting("appearance.theme_package", SettingValue::Str(String::new()));
         }
         self.appearance
             .reload_installed_themes(self.flavite.as_ref().expect("vault present above"));

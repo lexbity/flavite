@@ -1060,6 +1060,10 @@ impl CliDriver {
             .flavite
             .as_ref()
             .context("search requires an opened vault")?;
+        // The CLI is a trusted local session: its grant set is the built-in
+        // host grant that covers ReadNotes (Invocation::builtin_grants for
+        // non-plugin origins), presented explicitly to the session registry.
+        let grants = &[flavite_api::Capability::ReadNotes];
         let page_size = u64::try_from(limit.clamp(1, 200)).unwrap_or(50);
         let outcome = match mode {
             CliSearchMode::Literal | CliSearchMode::Regex => {
@@ -1079,7 +1083,7 @@ impl CliDriver {
                     text,
                     page_size,
                 };
-                flavite.search_start(options)
+                flavite.search_start(grants, options)
             }
         };
         let mut page = outcome.map_err(|error| {
@@ -1125,7 +1129,7 @@ impl CliDriver {
             match &page.next {
                 Some(_) if consume_all => {
                     let token = page.next.expect("next checked");
-                    page = flavite.search_page(&token).map_err(|error| {
+                    page = flavite.search_page(grants, &token).map_err(|error| {
                         eprintln!("{}", json_error(&error));
                         anyhow::anyhow!("search failed")
                     })?;
@@ -1134,10 +1138,12 @@ impl CliDriver {
             }
         }
         // Explicit session close (search.close, §6.1): the spool is dropped.
-        flavite.search_close(page.session).map_err(|error| {
-            eprintln!("{}", json_error(&error));
-            anyhow::anyhow!("search failed")
-        })?;
+        flavite
+            .search_close(grants, page.session)
+            .map_err(|error| {
+                eprintln!("{}", json_error(&error));
+                anyhow::anyhow!("search failed")
+            })?;
         Ok(())
     }
 
@@ -1492,8 +1498,10 @@ fn json_error(error: &flavite_api::FlaviteError) -> String {
             }
             flavite_api::search_sessions::SearchSessionError::ResetRequired => "reset-required",
             flavite_api::search_sessions::SearchSessionError::Expired => "expired",
+            flavite_api::search_sessions::SearchSessionError::Denied(_) => "denied",
             flavite_api::search_sessions::SearchSessionError::Failed(_) => "failed",
         },
+        flavite_api::FlaviteError::CapabilityDenied(_) => "denied",
         _ => "failed",
     };
     serde_json::json!({ "error": { "kind": kind, "message": error.to_string() } }).to_string()

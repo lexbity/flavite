@@ -462,10 +462,16 @@ fn edit_error(id: &str, error: &SettingsCodecError, registry: &SettingRegistry) 
         SettingsCodecError::InvalidValue(_, reason) => {
             // The two bounded editor inputs keep their long-standing copy.
             match (&descriptor.kind, id) {
-                (flavite_settings::descriptor::SettingKind::Int { min, max }, "appearance.scale_pct") => {
+                (
+                    flavite_settings::descriptor::SettingKind::Int { min, max },
+                    "appearance.scale_pct",
+                ) => {
                     format!("Interface scale must be {min}–{max}%")
                 }
-                (flavite_settings::descriptor::SettingKind::Int { min, max }, "editor.font_size") => {
+                (
+                    flavite_settings::descriptor::SettingKind::Int { min, max },
+                    "editor.font_size",
+                ) => {
                     format!("Editor font size must be {min}–{max}")
                 }
                 _ => format!("{}: {reason}", descriptor.title),
@@ -489,7 +495,11 @@ pub fn handle(app: &mut App, message: SettingsMessage) -> iced::Task<Message> {
             iced::Task::none()
         }
         SettingsMessage::CategorySelect { tab, category } => {
-            let category = if category.is_empty() { None } else { Some(category) };
+            let category = if category.is_empty() {
+                None
+            } else {
+                Some(category)
+            };
             app.settings.select_category(tab, category);
             iced::Task::none()
         }
@@ -523,12 +533,10 @@ pub fn handle(app: &mut App, message: SettingsMessage) -> iced::Task<Message> {
             }
             app.apply_setting(&id, SettingValue::List(list))
         }
-        SettingsMessage::ChooseThemePackage { package, .. } => {
-            app.apply_setting(
-                "appearance.theme_package",
-                SettingValue::Str(package.unwrap_or_default()),
-            )
-        }
+        SettingsMessage::ChooseThemePackage { package, .. } => app.apply_setting(
+            "appearance.theme_package",
+            SettingValue::Str(package.unwrap_or_default()),
+        ),
         SettingsMessage::IntDraft { tab, id, text } => {
             app.settings.set_int_draft(tab, &id, text);
             iced::Task::none()
@@ -575,12 +583,17 @@ pub fn handle(app: &mut App, message: SettingsMessage) -> iced::Task<Message> {
         }
         SettingsMessage::ResetOne { id, .. } => {
             let registry = SettingRegistry::with_builtins();
-            match registry.lookup(&id).map(|descriptor| descriptor.default.clone()) {
+            match registry
+                .lookup(&id)
+                .map(|descriptor| descriptor.default.clone())
+            {
                 Some(value) => app.apply_setting(&id, value),
                 None => iced::Task::none(),
             }
         }
-        SettingsMessage::SetShortcut { command, chord } => app.set_shortcut_override(&command, chord),
+        SettingsMessage::SetShortcut { command, chord } => {
+            app.set_shortcut_override(&command, chord)
+        }
         SettingsMessage::RestoreShortcuts => app.apply_setting(
             "shortcuts.overrides",
             SettingValue::ShortcutMap(BTreeMap::new()),
@@ -618,9 +631,10 @@ pub fn handle(app: &mut App, message: SettingsMessage) -> iced::Task<Message> {
             app.settings.pending_uninstall = None;
             iced::Task::none()
         }
-        SettingsMessage::AcknowledgeGraphActivation => {
-            app.apply_setting("state.graph_activation_acknowledged", SettingValue::Bool(true))
-        }
+        SettingsMessage::AcknowledgeGraphActivation => app.apply_setting(
+            "state.graph_activation_acknowledged",
+            SettingValue::Bool(true),
+        ),
         SettingsMessage::FocusSearch { tab } => {
             iced::widget::operation::focus(crate::views::settings::search_input_id(tab))
         }
@@ -666,13 +680,14 @@ fn current_list(app: &App, id: &str) -> Vec<String> {
 /// document generation moved. The appearance host re-adopts the resolved
 /// values so an externally changed theme or scale repaints.
 fn adopt_on_focus(app: &mut App) -> iced::Task<Message> {
-    let changed = app.flavite.as_ref().is_some_and(|flavite| {
-        match flavite.read_settings_raw() {
+    let changed = app
+        .flavite
+        .as_ref()
+        .is_some_and(|flavite| match flavite.read_settings_raw() {
             Ok(Some(stored)) => stored.generation != app.settings.generation,
             Ok(None) => false,
             Err(_) => app.settings.load_error.is_none(),
-        }
-    });
+        });
     if changed {
         let flavite = app.flavite.as_ref().expect("checked above");
         app.settings.load(flavite);
@@ -748,8 +763,7 @@ impl App {
         for (id, text) in &next {
             effective.insert(id.clone(), text.clone());
         }
-        if let Err(error) =
-            flavite_settings::chord::validate_shortcuts(&effective, &owned_defaults)
+        if let Err(error) = flavite_settings::chord::validate_shortcuts(&effective, &owned_defaults)
         {
             let message = error.to_string();
             self.appearance.shortcut_error = Some(message.clone());

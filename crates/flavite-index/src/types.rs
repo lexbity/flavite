@@ -279,6 +279,3 @@ pub const MAX_NOTE_BYTES: usize = 32 * 1024 * 1024; // 32 MB
 
 /// Maximum attachment size to hash (larger files are listed but not hashed).
 pub const ATTACHMENT_HASH_MAX: usize = 64 * 1024 * 1024; // 64 MB
-
-/// Default invalidation log storage budget (64 MiB).
-pub const DEFAULT_LOG_BUDGET: usize = 64 * 1024 * 1024;

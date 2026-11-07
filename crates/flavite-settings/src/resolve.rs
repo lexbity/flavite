@@ -33,16 +33,14 @@ impl Resolved {
     /// Panics in debug if the value is not a boolean.
     #[must_use]
     pub fn bool(&self, id: &str) -> bool {
-        self.get(id)
-            .is_some_and(|v| v.as_bool().unwrap_or(false))
+        self.get(id).is_some_and(|v| v.as_bool().unwrap_or(false))
     }
 
     /// Get an integer value by ID, returning the default if not found.
     /// Panics in debug if the value is not an integer.
     #[must_use]
     pub fn int(&self, id: &str) -> i64 {
-        self.get(id)
-            .map_or(0, |v| v.as_int().unwrap_or(0))
+        self.get(id).map_or(0, |v| v.as_int().unwrap_or(0))
     }
 
     /// Get a string value by ID, returning the default if not found.
@@ -96,7 +94,9 @@ impl RegistryResolve for SettingRegistry {
 
         // Start with defaults from all descriptors
         for descriptor in self.all() {
-            resolved.values.insert(descriptor.id.to_owned(), descriptor.default.clone());
+            resolved
+                .values
+                .insert(descriptor.id.to_owned(), descriptor.default.clone());
         }
 
         // Overlay with document values
@@ -104,7 +104,7 @@ impl RegistryResolve for SettingRegistry {
         for (section, section_map) in &doc.sections {
             for (key, value) in section_map {
                 let id = format!("{section}.{key}");
-                
+
                 // Validate against descriptor if it exists
                 if let Some(descriptor) = self.lookup(&id) {
                     if let Err(e) = descriptor.kind.validate(value) {
@@ -131,7 +131,7 @@ impl RegistryResolve for SettingRegistry {
 #[must_use]
 pub fn defaults_document(registry: &SettingRegistry) -> SettingsDoc {
     let mut doc = SettingsDoc::new(crate::descriptor::SCHEMA_VERSION);
-    
+
     for descriptor in registry.all() {
         let parts: Vec<&str> = descriptor.id.split('.').collect();
         if parts.len() == 2 {
@@ -142,7 +142,7 @@ pub fn defaults_document(registry: &SettingRegistry) -> SettingsDoc {
                 .insert(key.to_owned(), descriptor.default.clone());
         }
     }
-    
+
     doc
 }
 
@@ -155,29 +155,35 @@ mod tests {
         let registry = SettingRegistry::with_builtins();
         let doc = SettingsDoc::new(2);
         let resolved = registry.resolve(&doc);
-        
+
         // Should have all defaults
         assert!(resolved.get("appearance.theme").is_some());
         assert_eq!(resolved.str("appearance.theme"), "system");
         assert_eq!(resolved.int("editor.font_size"), 14);
-        assert_eq!(resolved.bool("sidebar.open"), true);
+        assert!(resolved.bool("sidebar.open"));
     }
 
     #[test]
     fn test_resolve_document_overrides() {
         let registry = SettingRegistry::with_builtins();
         let mut doc = SettingsDoc::new(2);
-        
+
         // Set some values
-        doc.set("appearance.theme", SettingValue::Str("dark".to_owned()), &registry).unwrap();
-        doc.set("editor.font_size", SettingValue::Int(18), &registry).unwrap();
-        
+        doc.set(
+            "appearance.theme",
+            SettingValue::Str("dark".to_owned()),
+            &registry,
+        )
+        .unwrap();
+        doc.set("editor.font_size", SettingValue::Int(18), &registry)
+            .unwrap();
+
         let resolved = registry.resolve(&doc);
-        
+
         // Should have overridden values
         assert_eq!(resolved.str("appearance.theme"), "dark");
         assert_eq!(resolved.int("editor.font_size"), 18);
-        
+
         // Other values should be defaults
         assert_eq!(resolved.int("editor.line_width"), 80);
     }
@@ -186,13 +192,16 @@ mod tests {
     fn test_resolve_invalid_value_uses_default() {
         let registry = SettingRegistry::with_builtins();
         let mut doc = SettingsDoc::new(2);
-        
+
         // Create the editor section and add an invalid value directly
         doc.sections.insert("editor".to_owned(), BTreeMap::new());
-        doc.sections.get_mut("editor").unwrap().insert("font_size".to_owned(), SettingValue::Int(999));
-        
+        doc.sections
+            .get_mut("editor")
+            .unwrap()
+            .insert("font_size".to_owned(), SettingValue::Int(999));
+
         let resolved = registry.resolve(&doc);
-        
+
         // Should fall back to default with warning
         assert_eq!(resolved.int("editor.font_size"), 14); // default
         assert!(!resolved.warnings.is_empty());
@@ -202,11 +211,16 @@ mod tests {
     fn test_is_modified() {
         let registry = SettingRegistry::with_builtins();
         let mut doc = SettingsDoc::new(2);
-        
-        doc.set("appearance.theme", SettingValue::Str("dark".to_owned()), &registry).unwrap();
-        
+
+        doc.set(
+            "appearance.theme",
+            SettingValue::Str("dark".to_owned()),
+            &registry,
+        )
+        .unwrap();
+
         let resolved = registry.resolve(&doc);
-        
+
         assert!(resolved.is_modified("appearance.theme", &registry));
         assert!(!resolved.is_modified("appearance.scale_pct", &registry));
     }
@@ -215,9 +229,9 @@ mod tests {
     fn test_defaults_document() {
         let registry = SettingRegistry::with_builtins();
         let doc = defaults_document(&registry);
-        
+
         assert_eq!(doc.schema, 2);
-        
+
         // Should have all builtin settings
         assert!(doc.contains("appearance.theme"));
         assert!(doc.contains("editor.font_size"));
@@ -229,7 +243,7 @@ mod tests {
         let registry = SettingRegistry::with_builtins();
         let doc = SettingsDoc::new(2);
         let resolved = registry.resolve(&doc);
-        
+
         // Should have all 16 descriptors
         assert_eq!(resolved.all().len(), 16);
     }

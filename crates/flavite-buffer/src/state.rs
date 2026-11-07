@@ -608,22 +608,6 @@ impl Buffer {
         StateTransition::new(old_state, BufferState::Clean, TransitionReason::Reopened)
     }
 
-    /// User chose to keep local changes.
-    ///
-    /// Saves the local changes over the disk content.
-    /// Returns the state transition.
-    pub fn keep_local(&mut self) -> StateTransition {
-        let old_state = self.state;
-        let new_state = BufferState::Dirty;
-
-        // This legacy transition has no observed disk bytes. A caller that
-        // resolves a real conflict must use `resolve_keep_local` below.
-
-        self.state = new_state;
-
-        StateTransition::new(old_state, new_state, TransitionReason::KeepLocal)
-    }
-
     /// Resolve a detected conflict by retaining mine against the exact disk
     /// bytes observed and snapshotted by the caller (decoded under
     /// `disk_policy`; a decode failure performs no transition).
@@ -686,16 +670,26 @@ impl Buffer {
 
     /// User chose to discard local changes.
     ///
-    /// Discards local changes and reloads from disk (if available and strictly
-    /// decodable under `policy`). A malformed disk source is NOT adopted
-    /// silently: the buffer resets to empty and drops its disk base so the
-    /// caller can present the encoding decision (§6.10).
-    pub fn discard(&mut self, disk_bytes: Option<&[u8]>, policy: DecodePolicy) -> StateTransition {
+    /// Discards local changes and reloads from disk, strictly decoded under
+    /// `policy`. A malformed disk source is NOT adopted and the buffer is NOT
+    /// replaced: the typed codec error is returned with the buffer untouched
+    /// so the caller can present the encoding decision (§6.10, FR-22 — an
+    /// invalid source never constructs an empty buffer, S00).
+    ///
+    /// # Errors
+    ///
+    /// The typed [`flavite_encoding::CodecError`] of the strict decode; no
+    /// state change occurs.
+    pub fn discard(
+        &mut self,
+        disk_bytes: Option<&[u8]>,
+        policy: DecodePolicy,
+    ) -> Result<StateTransition, flavite_encoding::CodecError> {
         let old_state = self.state;
 
-        if let Some(bytes) = disk_bytes
-            && let Ok(snapshot) = TextSnapshot::with_policy(bytes, policy)
-        {
+        if let Some(bytes) = disk_bytes {
+            let snapshot =
+                TextSnapshot::with_policy(bytes, policy).map_err(|TextError::Codec(e)| e)?;
             let new_hash = BaseHash::from_snapshot(&snapshot);
             let format = snapshot.format();
 
@@ -706,17 +700,25 @@ impl Buffer {
             self.base_format = format;
             self.state = BufferState::Clean;
 
-            return StateTransition::new(old_state, BufferState::Clean, TransitionReason::Discard);
+            return Ok(StateTransition::new(
+                old_state,
+                BufferState::Clean,
+                TransitionReason::Discard,
+            ));
         }
 
-        // No disk content available, just reset to empty
+        // No disk content available: reset to a fresh untitled buffer.
         self.model = EditorModel::new_empty();
         self.base_hash = None;
         self.base_format = None;
         self.disk_hash = None;
         self.state = BufferState::Clean;
 
-        StateTransition::new(old_state, BufferState::Clean, TransitionReason::Discard)
+        Ok(StateTransition::new(
+            old_state,
+            BufferState::Clean,
+            TransitionReason::Discard,
+        ))
     }
 
     /// Handle successful save.
@@ -807,19 +809,6 @@ impl Buffer {
         let old_state = self.state;
         // Rename doesn't change the state
         StateTransition::new(old_state, old_state, TransitionReason::Renamed)
-    }
-
-    /// Reopen the buffer (create a new buffer instance for the same file).
-    ///
-    /// Returns the state transition.
-    pub fn reopen(&mut self) -> StateTransition {
-        let old_state = self.state;
-        // Reopening resets the buffer to a clean state with the current content
-        self.base_hash = Some(self.content_hash());
-        self.disk_hash = self.base_hash;
-        self.state = BufferState::Clean;
-
-        StateTransition::new(old_state, BufferState::Clean, TransitionReason::Reopened)
     }
 
     /// Check if the buffer allows autosave.
@@ -1008,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn keep_local() {
+    fn resolve_keep_local_restores_the_disk_base() {
         let mut buffer = Buffer::from_text("hello");
 
         // Make it dirty
@@ -1020,9 +1009,12 @@ mod tests {
         buffer.check_external_change(b"goodbye", flavite_encoding::DecodePolicy::Auto);
         assert_eq!(buffer.state(), BufferState::Conflicted);
 
-        // Keep local
-        let _transition = buffer.keep_local();
+        // Resolve against the observed disk bytes
+        let _transition = buffer
+            .resolve_keep_local(b"goodbye", flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
         assert_eq!(buffer.state(), BufferState::Dirty);
+        assert_eq!(buffer.base_bytes(), b"goodbye");
         assert!(buffer.allows_manual_save());
         assert!(buffer.allows_autosave());
     }
@@ -1037,9 +1029,37 @@ mod tests {
         buffer.apply_local_edit(edit);
 
         // Discard
-        let _transition = buffer.discard(Some(b"hello"), flavite_encoding::DecodePolicy::Auto);
+        buffer
+            .discard(Some(b"hello"), flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
         assert_eq!(buffer.state(), BufferState::Clean);
         assert_eq!(buffer.text(), "hello");
+
+        // An invalid disk source refuses the discard with the typed error:
+        // the buffer is never replaced with an empty one (S00, §6.10).
+        let mut conflicted = Buffer::from_text("hello");
+        conflicted.apply_local_edit(crate::undo::EditOp::new(
+            Span::new(TextByte(5), TextByte(5)),
+            " mine".into(),
+        ));
+        conflicted.check_external_change(b"goodbye", flavite_encoding::DecodePolicy::Auto);
+        assert!(matches!(
+            conflicted.discard(Some(&[0xff]), flavite_encoding::DecodePolicy::Auto),
+            Err(flavite_encoding::CodecError::InvalidUtf8 { .. })
+        ));
+        assert_eq!(conflicted.text(), "hello mine");
+        assert_eq!(conflicted.state(), BufferState::Conflicted);
+        assert_eq!(conflicted.base_bytes(), b"hello");
+
+        // Discarding a buffer with no disk file resets to a fresh untitled
+        // buffer.
+        let mut untitled = Buffer::from_text("scratch");
+        untitled
+            .discard(None, flavite_encoding::DecodePolicy::Auto)
+            .unwrap();
+        assert!(untitled.is_empty());
+        assert_eq!(untitled.state(), BufferState::Clean);
+        assert!(untitled.base_hash().is_none());
     }
 
     #[test]
@@ -1205,7 +1225,7 @@ mod tests {
         assert_eq!(buffer.base_bytes(), b"saved");
         buffer.record_replaced_disk_hash(BaseHash::from_bytes(*blake3::hash(b"hashed").as_bytes()));
         assert_eq!(buffer.base_bytes(), buffer.model().to_source_bytes());
-        let reopened = buffer.reopen();
+        let reopened = buffer.reopen_with_snapshot(TextSnapshot::new(b"base").unwrap(), b"base");
         assert_eq!(reopened.reason, TransitionReason::Reopened);
         assert_eq!(buffer.state(), BufferState::Clean);
         let saved = buffer.handle_save_completed_revision(buffer.revision(), b"disk");

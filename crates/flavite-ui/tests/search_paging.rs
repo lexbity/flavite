@@ -194,11 +194,14 @@ fn quota_overflow_reports_busy_and_never_labels_partial_rows_complete() {
         app.flavite
             .as_ref()
             .unwrap()
-            .search_start(flavite_api::search_sessions::SearchQueryOptions {
-                mode: flavite_api::search_sessions::SearchMode::FullText,
-                text: "hitword".into(),
-                page_size: 50,
-            })
+            .search_start(
+                &[flavite_api::Capability::ReadNotes],
+                flavite_api::search_sessions::SearchQueryOptions {
+                    mode: flavite_api::search_sessions::SearchMode::FullText,
+                    text: "hitword".into(),
+                    page_size: 50,
+                },
+            )
             .unwrap();
     }
     let _ = app.update(Message::SearchQuery {

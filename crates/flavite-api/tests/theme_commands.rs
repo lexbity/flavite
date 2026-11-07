@@ -224,11 +224,7 @@ fn theme_commands_are_read_only_gated() {
         panic!("Expected Local Error result");
     }
     // list should still work on read-only vaults
-    let result = invoke(
-        &fixture.flavite,
-        "theme.list",
-        serde_json::json!({}),
-    );
+    let result = invoke(&fixture.flavite, "theme.list", serde_json::json!({}));
     assert!(matches!(
         result,
         ExecutionResult::Local(LocalResult::Success(_))

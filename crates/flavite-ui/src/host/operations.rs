@@ -20,11 +20,7 @@ pub struct OperationRow {
 
 /// Operations host: aggregates live replacement jobs across Replace tabs.
 #[derive(Debug, Default)]
-pub struct OperationsHost {
-    /// Debounced refresh counter (job status refreshes at most every 250 ms
-    /// while active, NFR-17).
-    last_refresh: Option<std::time::Instant>,
-}
+pub struct OperationsHost {}
 
 impl OperationsHost {
     /// Aggregate every live job.
@@ -40,28 +36,6 @@ impl OperationsHost {
                 })
             })
             .collect()
-    }
-
-    /// Refresh gating (NFR-17): at most every 250 ms while a job is active.
-    #[must_use]
-    pub fn refresh_due(&mut self, replace: &ReplaceHost) -> bool {
-        let active = replace.tabs.values().any(|state| {
-            state
-                .job
-                .as_ref()
-                .is_some_and(|job| matches!(job.phase.as_str(), "applying" | "partial"))
-        });
-        if !active {
-            self.last_refresh = None;
-            return false;
-        }
-        let due = self
-            .last_refresh
-            .is_none_or(|last| last.elapsed() >= std::time::Duration::from_millis(250));
-        if due {
-            self.last_refresh = Some(std::time::Instant::now());
-        }
-        due
     }
 
     /// Aggregate counts for diagnostics (bounded labels).

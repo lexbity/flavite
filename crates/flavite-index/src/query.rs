@@ -183,12 +183,17 @@ fn parse_term_token(raw: &str, expression: bool) -> Result<Query, QueryParseErro
         return Ok(Query::Text(strip_quoted_phrase(value)?));
     }
     if let Some(value) = token.strip_prefix("tag:").filter(|v| !v.is_empty()) {
+        // Plain mode keeps quote characters in the accumulated token, so a
+        // quoted tag value arrives wrapped and strips through the same
+        // quote handling as text values.
         return Ok(Query::Tag {
-            name: flavite_syntax::wellknown::normalize_tag(value),
+            name: flavite_syntax::wellknown::normalize_tag(&strip_quoted_phrase(value)?.term),
             hierarchical: false,
         });
     }
-    if token.eq_ignore_ascii_case("unresolved") {
+    // The structural `unresolved` keyword exists only in expression mode;
+    // plain text containing the word is literal input (§6.9).
+    if expression && token.eq_ignore_ascii_case("unresolved") {
         return Ok(Query::Unresolved);
     }
     if token.contains(':') {
@@ -199,9 +204,9 @@ fn parse_term_token(raw: &str, expression: bool) -> Result<Query, QueryParseErro
         }
         // Plain text mode treats punctuation as text (§6.9): an arbitrary
         // `key:value` form is literal token/phrase input, never a field.
-        return Ok(Query::Text(TextLeaf::all_fields(token)));
+        return Ok(Query::Text(strip_quoted_phrase(token)?));
     }
-    Ok(Query::Text(TextLeaf::all_fields(token)))
+    Ok(Query::Text(strip_quoted_phrase(token)?))
 }
 
 /// One field-filtered text leaf.
@@ -628,9 +633,12 @@ impl QueryParser {
 }
 
 /// Plain full-text mode (D-07): whitespace separates AND-combined terms;
-/// quoted runs become one phrase; supported field-filter prefixes are
-/// honored; everything else — punctuation included — is literal text
-/// (§6.9). There are no implicit operators in this mode.
+/// quoted runs — with or without a field-filter prefix — become one phrase
+/// leaf; supported field-filter prefixes are honored; everything else —
+/// punctuation included — is literal text (§6.9). There are no implicit
+/// operators in this mode. An opening quote inside a token keeps the token
+/// accumulating (`title:"foo bar"` is one leaf, never a standalone `title:`
+/// term plus a separate phrase).
 fn parse_plain(input: &str) -> Result<Query, QueryParseError> {
     let mut leaves: Vec<Query> = Vec::new();
     let mut current = String::new();
@@ -638,18 +646,15 @@ fn parse_plain(input: &str) -> Result<Query, QueryParseError> {
     for ch in input.chars() {
         match (quote, ch) {
             (Some(q), c) if q == c => {
+                // Closing quote: keep accumulating. Both quote characters
+                // stay in the token so `parse_term_token` strips the wrapped
+                // run into one phrase leaf at flush time.
                 quote = None;
-                if !current.trim().is_empty() {
-                    leaves.push(parse_term_token(&current, false)?);
-                }
-                current.clear();
+                current.push(c);
             }
             (None, '\'' | '"') => {
-                if !current.trim().is_empty() {
-                    leaves.push(parse_term_token(&current, false)?);
-                    current.clear();
-                }
                 quote = Some(ch);
+                current.push(ch);
             }
             (None, c) if c.is_whitespace() => {
                 if !current.trim().is_empty() {
@@ -740,75 +745,149 @@ fn saturating_to_i64<T: TryInto<i64>>(value: T) -> i64 {
     value.try_into().unwrap_or(i64::MAX)
 }
 
+/// Escape the LIKE metacharacters so a bound user value matches itself
+/// literally: `%`, `_` and `\` in the value lose their wildcard meaning and
+/// the pattern carries [`escape_like`]'s own `ESCAPE '\'` clause.
+fn escape_like(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// One typed property predicate: the comparison the ingested row layout
+/// implies for an operator/value pair.
+enum PropMatch {
+    /// The pair is not expressible over the stored rows; it matches nothing.
+    Impossible,
+    /// `v_num <op> ?` with a bound number (`num` rows).
+    Num(&'static str, f64),
+    /// `v_text <op> ?` with a bound string (`text`/`bool`/`date`/
+    /// `datetime` rows).
+    Text(&'static str, String),
+    /// `v_text LIKE ? ESCAPE '\'` with a pre-rendered pattern.
+    Pattern(String),
+    /// `v_text <null test>`; binds no value (`null` rows carry no text).
+    NullTest(&'static str),
+}
+
 /// Build the SQL condition and parameters for one property comparison.
 ///
-/// Null comparisons bind no value and read `IS NULL` / `IS NOT NULL`; every
-/// other comparison binds its rendered value. Values compare as text
-/// (`v_text`), matching the property table's layout.
+/// The predicate branches on the value type so it compares the column the
+/// writer fills (`pool.rs`'s property ingestion): numbers live in `v_num`
+/// behind the `num` vtype, booleans are the writer's `"true"`/`"false"`
+/// text encoding, dates/datetimes compare lexically on `v_text`, and a
+/// `null` value matches the `null` rows whose `v_text` is NULL. Text keeps
+/// the historical `v_text` comparison. An operator/value pair the layout
+/// cannot express matches nothing instead of binding a decoy literal.
 fn prop_to_sql(
     key: &str,
     op: CmpOp,
     value: &PropertyValue,
 ) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
-    // The rendered bound value; `None` marks a NULL comparison.
-    let val_param: Option<String> = match (op, value) {
-        (_, PropertyValue::Null) => None,
-        (CmpOp::Eq | CmpOp::Neq, PropertyValue::Text(t)) => Some(t.clone()),
-        (CmpOp::Eq | CmpOp::Neq, PropertyValue::Number(n)) => Some(n.to_string()),
-        (CmpOp::Eq | CmpOp::Neq, PropertyValue::Bool(b)) => {
-            Some(if *b { "1" } else { "0" }.to_string())
-        }
-        (CmpOp::Eq | CmpOp::Neq, PropertyValue::Date(d)) => Some(d.clone()),
-        (CmpOp::Eq | CmpOp::Neq, PropertyValue::Datetime(dt)) => Some(dt.clone()),
-        (CmpOp::Lt | CmpOp::Lte | CmpOp::Gt | CmpOp::Gte, PropertyValue::Number(n)) => {
-            Some(n.to_string())
-        }
-        (CmpOp::Contains, PropertyValue::Text(t)) => Some(format!("%{t}%")),
-        (CmpOp::StartsWith, PropertyValue::Text(t)) => Some(format!("{t}%")),
-        (CmpOp::EndsWith, PropertyValue::Text(t)) => Some(format!("%{t}")),
-        // Fallback for an operator/value pair this condition does not
-        // express: bind the literal "NULL" string, as this query always has.
-        _ => Some("NULL".to_string()),
+    let comparison_sql = |op: &CmpOp| match op {
+        CmpOp::Eq => "=",
+        CmpOp::Neq => "!=",
+        CmpOp::Lt => "<",
+        CmpOp::Lte => "<=",
+        CmpOp::Gt => ">",
+        CmpOp::Gte => ">=",
+        CmpOp::Contains | CmpOp::StartsWith | CmpOp::EndsWith => "LIKE",
     };
-
-    let condition = |op_sql: &str| {
+    let matched = match (op, value) {
+        // The writer stores `null` rows with `v_text IS NULL`; `Neq` is its
+        // complement over the same rows.
+        (CmpOp::Eq, PropertyValue::Null) => PropMatch::NullTest("IS NULL"),
+        (CmpOp::Neq, PropertyValue::Null) => PropMatch::NullTest("IS NOT NULL"),
+        // Numeric comparisons must run on `v_num`: a text-spelled
+        // comparison can never match an ingested number row.
+        (
+            op @ (CmpOp::Eq | CmpOp::Neq | CmpOp::Lt | CmpOp::Lte | CmpOp::Gt | CmpOp::Gte),
+            PropertyValue::Number(number),
+        ) => PropMatch::Num(comparison_sql(&op), *number),
+        // Booleans are written as `value.to_string()` — `"true"`/`"false"`
+        // text — so equality compares that exact encoding.
+        (op @ (CmpOp::Eq | CmpOp::Neq), PropertyValue::Bool(bool_value)) => PropMatch::Text(
+            comparison_sql(&op),
+            if *bool_value { "true" } else { "false" }.to_owned(),
+        ),
+        // Dates and datetimes are ISO text: every comparison is lexical.
+        (
+            op @ (CmpOp::Eq | CmpOp::Neq | CmpOp::Lt | CmpOp::Lte | CmpOp::Gt | CmpOp::Gte),
+            PropertyValue::Date(date) | PropertyValue::Datetime(date),
+        ) => PropMatch::Text(comparison_sql(&op), date.clone()),
+        // Text keeps the historical `v_text` comparison.
+        (op @ (CmpOp::Eq | CmpOp::Neq), PropertyValue::Text(text)) => {
+            PropMatch::Text(comparison_sql(&op), text.clone())
+        }
+        // Substring/prefix/suffix shapes are LIKE with the user's
+        // metacharacters escaped, so `100%` matches `100%`, not `100x`.
+        (CmpOp::Contains, PropertyValue::Text(text)) => {
+            PropMatch::Pattern(format!("%{}%", escape_like(text)))
+        }
+        (CmpOp::StartsWith, PropertyValue::Text(text)) => {
+            PropMatch::Pattern(format!("{}%", escape_like(text)))
+        }
+        (CmpOp::EndsWith, PropertyValue::Text(text)) => {
+            PropMatch::Pattern(format!("%{}", escape_like(text)))
+        }
+        (
+            CmpOp::Contains | CmpOp::StartsWith | CmpOp::EndsWith,
+            PropertyValue::Date(date) | PropertyValue::Datetime(date),
+        ) => PropMatch::Pattern(match op {
+            CmpOp::StartsWith => format!("{}%", escape_like(date)),
+            CmpOp::EndsWith => format!("%{}", escape_like(date)),
+            _ => format!("%{}%", escape_like(date)),
+        }),
+        _ => PropMatch::Impossible,
+    };
+    let vtype = match value {
+        PropertyValue::Text(_) => "text",
+        PropertyValue::Number(_) => "num",
+        PropertyValue::Bool(_) => "bool",
+        PropertyValue::Date(_) => "date",
+        PropertyValue::Datetime(_) => "datetime",
+        PropertyValue::Null => "null",
+    };
+    let condition = |column: &str, comparison: &str| {
         format!(
-            "note_id IN (SELECT note_id FROM properties WHERE key = ? AND vtype = ? AND v_text {op_sql})"
+            "note_id IN (SELECT note_id FROM properties WHERE key = ? AND vtype = ? AND {column} {comparison})"
         )
     };
-
-    match val_param {
-        Some(bound) => {
-            let op_sql: &str = match op {
-                CmpOp::Eq => "=",
-                CmpOp::Neq => "!=",
-                CmpOp::Lt => "<",
-                CmpOp::Lte => "<=",
-                CmpOp::Gt => ">",
-                CmpOp::Gte => ">=",
-                CmpOp::Contains | CmpOp::StartsWith | CmpOp::EndsWith => "LIKE",
-            };
-            (
-                format!("{} ?", condition(op_sql)),
-                vec![
-                    Box::new(key.to_string()) as Box<dyn rusqlite::ToSql>,
-                    Box::new("text".to_string()) as Box<dyn rusqlite::ToSql>,
-                    Box::new(bound) as Box<dyn rusqlite::ToSql>,
-                ],
-            )
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+        vec![Box::new(key.to_string()) as Box<dyn rusqlite::ToSql>];
+    let sql = match matched {
+        PropMatch::Impossible => {
+            return (
+                "note_id IN (SELECT note_id FROM properties WHERE key = ? AND 1 = 0)".to_string(),
+                params,
+            );
         }
-        None => (
-            condition(match op {
-                CmpOp::Eq => "IS NULL",
-                // Only `Neq` reaches here with a NULL value.
-                _ => "IS NOT NULL",
-            }),
-            vec![
-                Box::new(key.to_string()) as Box<dyn rusqlite::ToSql>,
-                Box::new("text".to_string()) as Box<dyn rusqlite::ToSql>,
-            ],
-        ),
-    }
+        PropMatch::Num(comparison, number) => {
+            params.push(Box::new(vtype.to_string()) as Box<dyn rusqlite::ToSql>);
+            params.push(Box::new(number) as Box<dyn rusqlite::ToSql>);
+            condition("v_num", &format!("{comparison} ?"))
+        }
+        PropMatch::Text(comparison, bound) => {
+            params.push(Box::new(vtype.to_string()) as Box<dyn rusqlite::ToSql>);
+            params.push(Box::new(bound) as Box<dyn rusqlite::ToSql>);
+            condition("v_text", &format!("{comparison} ?"))
+        }
+        PropMatch::Pattern(pattern) => {
+            params.push(Box::new(vtype.to_string()) as Box<dyn rusqlite::ToSql>);
+            params.push(Box::new(pattern) as Box<dyn rusqlite::ToSql>);
+            condition("v_text", "LIKE ? ESCAPE '\\'")
+        }
+        PropMatch::NullTest(null_test) => {
+            params.push(Box::new(vtype.to_string()) as Box<dyn rusqlite::ToSql>);
+            condition("v_text", null_test)
+        }
+    };
+    (sql, params)
 }
 
 /// Compute the next hierarchical key for range queries.
@@ -1070,6 +1149,179 @@ mod tests {
         }
         assert!(Query::And(vec![]).to_sql().unwrap().0.is_empty());
         assert!(Query::Or(vec![]).to_sql().unwrap().0.is_empty());
+    }
+
+    /// Ingest-shaped property rows: exactly the columns the pool's property
+    /// writer fills for each `PropertyValue` kind.
+    fn insert_property(
+        conn: &Connection,
+        note_id: i64,
+        key: &str,
+        vtype: &str,
+        v_text: Option<&str>,
+        v_num: Option<f64>,
+    ) {
+        conn.execute(
+            "INSERT INTO properties(note_id, key, ord, vtype, v_text, v_num) VALUES(?1, ?2, 0, ?3, ?4, ?5)",
+            rusqlite::params![note_id, key, vtype, v_text, v_num],
+        )
+        .unwrap();
+    }
+
+    fn insert_bare_note(conn: &Connection, note_id: i64) {
+        conn.execute(
+            "INSERT INTO notes (note_id, path, path_native, path_key, stem_key, title, content_hash, size, mtime_ns, scan_ns, generation) VALUES (?1, '', ?2, '', '', '', X'00', 0, 0, 0, 0)",
+            rusqlite::params![note_id, vec![u8::try_from(note_id).expect("fixture IDs fit in a byte")]],
+        )
+        .unwrap();
+    }
+
+    fn matching_note_ids(conn: &Connection, query: &Query) -> Vec<i64> {
+        query
+            .execute(conn, 10, None)
+            .unwrap()
+            .items
+            .iter()
+            .map(|note| note.note_id)
+            .collect()
+    }
+
+    #[test]
+    fn typed_property_leaves_match_the_ingested_row_layout() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut conn = Connection::open(temp.path()).unwrap();
+        create_schema(&mut conn).unwrap();
+        for id in 1..=5 {
+            insert_bare_note(&conn, id);
+        }
+        // num rows carry `v_num` only; bool rows the writer's text encoding;
+        // date rows lexical text; null rows NULL columns.
+        insert_property(&conn, 1, "count", "num", None, Some(2.0));
+        insert_property(&conn, 2, "count", "num", None, Some(7.0));
+        insert_property(&conn, 3, "done", "bool", Some("true"), Some(1.0));
+        insert_property(&conn, 4, "done", "bool", Some("false"), Some(0.0));
+        insert_property(&conn, 5, "due", "date", Some("2026-01-01"), None);
+        insert_property(&conn, 5, "draft", "null", None, None);
+        insert_property(&conn, 1, "title", "text", Some("chapter 100%"), None);
+        insert_property(&conn, 2, "title", "text", Some("100 percent"), None);
+
+        let prop = |key: &str, op: CmpOp, value: PropertyValue| Query::Prop {
+            key: key.to_owned(),
+            op,
+            value,
+        };
+        // num-gt / num-lt compare `v_num`: the old text comparison could
+        // never match an ingested number row.
+        assert_eq!(
+            matching_note_ids(&conn, &prop("count", CmpOp::Gt, PropertyValue::Number(2.0))),
+            vec![2]
+        );
+        assert_eq!(
+            matching_note_ids(
+                &conn,
+                &prop("count", CmpOp::Lte, PropertyValue::Number(2.0))
+            ),
+            vec![1]
+        );
+        assert_eq!(
+            matching_note_ids(&conn, &prop("count", CmpOp::Eq, PropertyValue::Number(7.0))),
+            vec![2]
+        );
+        // bool-eq matches the writer's `"true"`/`"false"` encoding.
+        assert_eq!(
+            matching_note_ids(&conn, &prop("done", CmpOp::Eq, PropertyValue::Bool(true))),
+            vec![3]
+        );
+        assert_eq!(
+            matching_note_ids(&conn, &prop("done", CmpOp::Eq, PropertyValue::Bool(false))),
+            vec![4]
+        );
+        // null rows are the `null` vtype with `v_text IS NULL`.
+        assert_eq!(
+            matching_note_ids(&conn, &prop("draft", CmpOp::Eq, PropertyValue::Null)),
+            vec![5]
+        );
+        assert!(
+            matching_note_ids(&conn, &prop("draft", CmpOp::Neq, PropertyValue::Null)).is_empty()
+        );
+        // date equality is lexical over the stored text.
+        assert_eq!(
+            matching_note_ids(
+                &conn,
+                &prop("due", CmpOp::Eq, PropertyValue::Date("2026-01-01".into()))
+            ),
+            vec![5]
+        );
+        // text-contains stays on `v_text`, and LIKE metacharacters in the
+        // value match literally: `100%` matches only the literal `100%`.
+        assert_eq!(
+            matching_note_ids(
+                &conn,
+                &prop("title", CmpOp::Contains, PropertyValue::Text("100%".into()))
+            ),
+            vec![1]
+        );
+        assert_eq!(
+            matching_note_ids(
+                &conn,
+                &prop(
+                    "title",
+                    CmpOp::Contains,
+                    PropertyValue::Text("percent".into())
+                )
+            ),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn plain_mode_parses_a_quoted_field_filter_as_one_phrase_leaf() {
+        // `title:"foo bar"` is a single field-scoped phrase leaf — never a
+        // standalone `title:` term ANDed with a detached phrase.
+        assert_eq!(
+            Query::parse_typed("title:\"foo bar\"", QueryMode::Plain).unwrap(),
+            Query::Text(TextLeaf {
+                fields: vec![TextField::Title],
+                phrase: true,
+                term: "foo bar".into(),
+            })
+        );
+        // Plain quoted text without a field prefix still works: one phrase
+        // leaf over all indexed fields.
+        assert_eq!(
+            Query::parse_typed("\"foo bar\"", QueryMode::Plain).unwrap(),
+            Query::Text(TextLeaf::phrase("foo bar"))
+        );
+        // Mixed unquoted and quoted tokens AND as separate leaves.
+        assert_eq!(
+            Query::parse_typed("lead title:\"foo bar\"", QueryMode::Plain).unwrap(),
+            Query::And(vec![
+                Query::Text(TextLeaf::all_fields("lead")),
+                Query::Text(TextLeaf {
+                    fields: vec![TextField::Title],
+                    phrase: true,
+                    term: "foo bar".into(),
+                }),
+            ])
+        );
+    }
+
+    #[test]
+    fn unresolved_is_structural_only_in_expression_mode() {
+        assert_eq!(Query::parse("unresolved").unwrap(), Query::Unresolved);
+        // Plain text containing the word is literal input, not a predicate.
+        assert_eq!(
+            Query::parse_typed("unresolved", QueryMode::Plain).unwrap(),
+            Query::Text(TextLeaf::all_fields("unresolved"))
+        );
+        assert_eq!(
+            Query::parse_typed("my unresolved note", QueryMode::Plain).unwrap(),
+            Query::And(vec![
+                Query::Text(TextLeaf::all_fields("my")),
+                Query::Text(TextLeaf::all_fields("unresolved")),
+                Query::Text(TextLeaf::all_fields("note")),
+            ])
+        );
     }
 
     #[test]

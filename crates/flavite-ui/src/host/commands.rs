@@ -462,7 +462,10 @@ pub fn resolved_chord(
     // Parse using flavite_settings and convert to flavite_api::Chord
     flavite_settings::chord::parse_chord(text)
         .or_else(|| flavite_settings::chord::parse_chord(default))
-        .map(|c| Chord { modifiers: c.modifiers, key: c.key })
+        .map(|c| Chord {
+            modifiers: c.modifiers,
+            key: c.key,
+        })
 }
 
 /// Verify the composed catalog has no collisions with the core registry.
@@ -1451,12 +1454,6 @@ fn graph_action_tab(app: &App) -> Option<TabId> {
         .map(|_| tab)
 }
 
-/// The focused group the shell routes commands to.
-#[must_use]
-pub fn focused_group_or_first(app: &App) -> Option<GroupId> {
-    app.focused_group().or_else(|| app.workspace.first_group())
-}
-
 /// Canonical option/replace command interpretation shared by palette and native AT.
 pub fn note_search_command(app: &App, tab: TabId, id: &str) -> Option<Message> {
     use crate::host::note_search::NoteSearchMessage as Search;
@@ -1495,10 +1492,12 @@ fn intern_chords(chords: &[Chord]) -> &'static [Chord] {
     static INTERNED: OnceLock<Mutex<HashMap<String, &'static [Chord]>>> = OnceLock::new();
     let key = chords
         .iter()
-        .map(|c| flavite_settings::chord::chord_string(&flavite_settings::chord::Chord {
-            modifiers: c.modifiers,
-            key: c.key.clone(),
-        }))
+        .map(|c| {
+            flavite_settings::chord::chord_string(&flavite_settings::chord::Chord {
+                modifiers: c.modifiers,
+                key: c.key.clone(),
+            })
+        })
         .collect::<Vec<_>>()
         .join(";");
     let cache = INTERNED.get_or_init(|| Mutex::new(HashMap::new()));

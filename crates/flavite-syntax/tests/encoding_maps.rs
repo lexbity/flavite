@@ -25,11 +25,7 @@ fn utf16_snapshot_preserves_text_and_descriptor() {
     assert!(snap.has_bom());
     // Normalized text: CRLF folded to LF.
     assert_eq!(snap.text(), "A😀\nsecon\n");
-    assert_eq!(
-        snap.source(),
-        bytes,
-        "byte-exact unedited round trip"
-    );
+    assert_eq!(snap.source(), bytes, "byte-exact unedited round trip");
     assert_eq!(snap.line_count(), 2);
     assert_eq!(snap.lines()[0].eol, Eol::Crlf);
     assert_eq!(snap.lines()[1].eol, Eol::Crlf);
@@ -243,7 +239,10 @@ fn span_to_source_endpoints_match_text_to_source() {
     );
     // Illegal interiors still refuse (inside the emoji on both sides).
     let wide = TextSnapshot::new("x\u{1F600}y".as_bytes()).unwrap();
-    assert_eq!(wide.span_to_source(Span::new(TextByte(2), TextByte(3))), None);
+    assert_eq!(
+        wide.span_to_source(Span::new(TextByte(2), TextByte(3))),
+        None
+    );
 }
 
 #[test]

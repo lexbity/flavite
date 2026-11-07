@@ -195,9 +195,25 @@ proptest! {
         let decoded = decode_explicit(&bytes, format);
         let map = decoded.map();
         prop_assert_eq!(map.bom_len(), 3);
+
+        // Identity arithmetic past the signature, restricted to the legal
+        // boundary domain: scalar starts plus EOF; UTF-8 continuation
+        // interiors are refused on both sides (§6.10), mirroring the
+        // UTF-16 oracle above.
+        let mut legal_decoded = BTreeSet::new();
+        let mut decoded_byte = 0usize;
+        for ch in text.chars() {
+            legal_decoded.insert(decoded_byte);
+            decoded_byte += ch.len_utf8();
+        }
+        legal_decoded.insert(text.len());
         for db in 0..=text.len() {
-            prop_assert_eq!(map.decoded_to_source(db), Some(db + 3));
-            prop_assert_eq!(map.source_to_decoded(db + 3), Some(db));
+            let mapped = map.decoded_to_source(db);
+            prop_assert_eq!(mapped.is_some(), legal_decoded.contains(&db));
+            if let Some(sb) = mapped {
+                prop_assert_eq!(sb, db + 3);
+                prop_assert_eq!(map.source_to_decoded(sb), Some(db));
+            }
         }
         for sb in 0..3usize {
             prop_assert_eq!(map.source_to_decoded(sb), None, "BOM interior");

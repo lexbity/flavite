@@ -233,6 +233,16 @@ fn handle_task(session: &Session, invocation: &Invocation) -> Result<SessionResu
         },
     }))
 }
+/// Facade-routed commands (`search.*`): registered for capability
+/// classification; execution happens on the facade turn through the
+/// QueryService, never through the Session command pump.
+fn handle_facade_routed(
+    _session: &Session,
+    _invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    Err("search commands are routed on the facade turn".into())
+}
+
 fn handle_open(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
     let (path, policy) = match decode::<OpenArgs>(invocation)? {
         OpenArgs::Path(path) => (path, OpenPolicyArg::default()),
@@ -481,6 +491,28 @@ type HandlerRegistration = (&'static str, &'static str, ArgSchema, CommandHandle
 /// credit budget is derived from this single constant.
 pub const MAX_NOTICE_ACKS: usize = 256;
 
+/// Command ids whose effect is a read over the authorized note universe
+/// (§6.1: search/source-find/text-find/replace-preview gates). The registry
+/// applies ReadNotes to these instead of the write default.
+const READ_NOTES_COMMAND_IDS: [&str; 16] = [
+    "note.open",
+    "note.history",
+    "note.reopen_encoding",
+    "text.prepare_replace",
+    "text.find",
+    "search.start",
+    "search.page",
+    "search.refresh",
+    "search.close",
+    "source_find.start",
+    "source_find.page",
+    "source_find.close",
+    "replace.preview",
+    "replace.select",
+    "replace.status",
+    "replace.job_status",
+];
+
 /// Stable token for one notice presentation acknowledgement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NoticeId(pub u64);
@@ -599,15 +631,17 @@ fn attach_services(
         Box::new(flavite_fs::OsFs::new()),
         root,
     ));
-    let settings_store = crate::settings_store::SettingsStore::new(settings_vault_store.clone(), true);
+    let settings_store =
+        crate::settings_store::SettingsStore::new(settings_vault_store.clone(), true);
     // Initialize settings store with migration from legacy stores
     let vault_uuid = uuid.to_string();
     // Create a registry with built-in descriptors
     let registry = flavite_settings::registry::SettingRegistry::with_builtins();
     // Trigger migration if needed - this loads or creates the v2 settings document
-    let _ = settings_store.load_or_migrate(&registry, root, data_dir, &vault_uuid)
+    let _ = settings_store
+        .load_or_migrate(&registry, root, data_dir, &vault_uuid)
         .map_err(|e| eprintln!("Failed to load or migrate settings: {}", e));
-    
+
     // Migrate workspace-layouts.json from device store to vault (RFC-0007 S4)
     if let Some(data_dir) = data_dir {
         let device_layout_path = data_dir
@@ -616,7 +650,7 @@ fn attach_services(
             .join(&vault_uuid)
             .join("workspace-layouts.json");
         let vault_layout_path = root.join(".flavite").join("workspace-layouts.json");
-        
+
         // Only copy if vault version doesn't exist yet
         if device_layout_path.exists()
             && !vault_layout_path.exists()
@@ -631,12 +665,12 @@ fn attach_services(
             );
         }
     }
-    
+
     // Migrate themes from device store to vault (RFC-0007 S5)
     if let Some(data_dir) = data_dir {
         let device_themes_root = data_dir.join("flavite").join("themes");
         let vault_themes_root = root.join(".flavite").join("themes");
-        
+
         if device_themes_root.exists()
             && !vault_themes_root.exists()
             && let Ok(entries) = std::fs::read_dir(&device_themes_root)
@@ -650,12 +684,12 @@ fn attach_services(
                 let theme_dir_name = entry.file_name();
                 let src_dir = device_themes_root.join(&theme_dir_name);
                 let dst_dir = vault_themes_root.join(&theme_dir_name);
-                
+
                 // Skip if already exists in vault
                 if dst_dir.exists() {
                     continue;
                 }
-                
+
                 // Copy theme files
                 for file_name in ["theme.flavite.xpi", "theme.json"] {
                     let src_file = src_dir.join(file_name);
@@ -678,31 +712,27 @@ fn attach_services(
             }
         }
     }
-    
+
     (vault_user_state, graph, settings_store)
 }
 
 impl Flavite {
-    /// Open a vault and create a Flavite facade.
-    ///
-    /// # Arguments
-    /// * `identity` - The vault identity
-    /// * `session` - The headless Session
-    /// * `config` - Vault configuration
-    ///
-    /// # Returns
-    /// A new Flavite facade, or an error if the vault cannot be opened.
-    pub fn open(
-        identity: VaultIdentity,
-        session: Session,
-        _config: VaultConfig,
+    /// The one private constructor: attach the per-vault services, build
+    /// the facade fields, and register the built-in commands. Every public
+    /// constructor delegates here; only the identity source and the
+    /// writer-side signal differ.
+    fn with_services(
+        uuid: uuid::Uuid,
+        root: PathBuf,
+        session: Arc<Session>,
+        index_watch: Option<Arc<flavite_index::GenerationWatch>>,
+        data_dir: Option<&Path>,
     ) -> Result<Self, FlaviteError> {
-        let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
+        let vault_ref = ApiVaultRef::new(uuid, root.clone());
         let vault_uuid = vault_ref.uuid.to_string();
-
-        let session = Arc::new(session);
+        let generation_watch = index_watch.clone();
         let (vault_user_state, graph, settings_store) =
-            attach_services(vault_ref.uuid, &identity.root, &session, None, None);
+            attach_services(vault_ref.uuid, &root, &session, index_watch, data_dir);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
             uuid::Uuid::now_v7().as_u128(),
@@ -730,24 +760,41 @@ impl Flavite {
             .ok(),
             themes: Some(crate::themes::ThemeStore::at_vault(
                 Box::new(flavite_fs::OsFs::new()),
-                &identity.root,
+                &root,
             )),
             vault_user_state,
             graph,
             settings_store,
-            // Headless constructors own no writer-side signal; their graph
-            // services wake on control kicks and the sweep (RFC-0005 §5.3).
-            generation_watch: None,
+            // RFC-0005 S5: keep the writer-side watch (when the host opened
+            // with a generation signal) for seams that recreate the service
+            // (`set_graph_db_path_for_test` rewires the same one). Headless
+            // constructors own no signal; their graph services wake on
+            // control kicks and the sweep (RFC-0005 §5.3).
+            generation_watch,
         };
 
-        // Register built-in commands
         flavite.register_builtin_commands()?;
 
         Ok(flavite)
     }
 
-    /// Build the device-local user-state store for a vault, `None` when the
-    /// OS data directory is unavailable (the host reports that honestly).
+    /// Open a vault and create a Flavite facade.
+    ///
+    /// # Arguments
+    /// * `identity` - The vault identity
+    /// * `session` - The headless Session
+    /// * `config` - Vault configuration
+    ///
+    /// # Returns
+    /// A new Flavite facade, or an error if the vault cannot be opened.
+    pub fn open(
+        identity: VaultIdentity,
+        session: Session,
+        _config: VaultConfig,
+    ) -> Result<Self, FlaviteError> {
+        Self::with_services(identity.uuid, identity.root, Arc::new(session), None, None)
+    }
+
     /// Create a new Flavite with a custom session builder.
     ///
     /// This is useful for testing or when you need to customize the session.
@@ -756,52 +803,13 @@ impl Flavite {
         vault_ref: ApiVaultRef,
         _config: VaultConfig,
     ) -> Result<Self, FlaviteError> {
-        let vault_uuid = vault_ref.uuid.to_string();
-        let vault_root = vault_ref.root.clone();
-        let session = Arc::new(session);
-        let (vault_user_state, graph, settings_store) =
-            attach_services(vault_ref.uuid, &vault_root, &session, None, None);
-        let queries = crate::query_service::QueryService::new(
-            Arc::clone(&session),
-            uuid::Uuid::now_v7().as_u128(),
-            Arc::clone(&graph),
-        );
-        let theme_store = crate::themes::ThemeStore::at_vault(
-            Box::new(flavite_fs::OsFs::new()),
-            &vault_root,
-        );
-        let flavite = Self {
-            session,
-            command_registry: CommandRegistry::new(),
-            ingress: Mutex::new(()),
-            operation_ids: Mutex::new(HashMap::new()),
-            pending_requests: Mutex::new(HashSet::new()),
-            terminal_backlog: Mutex::new(HashMap::new()),
-            backlog_cv: Condvar::new(),
-            notice_acks: Mutex::new(std::collections::BTreeMap::new()),
-            next_notice_id: AtomicU64::new(1),
-            catalog_sequence: AtomicU64::new(1),
-            vault_ref,
-            read_only: false,
-            owned_vault: None,
-            queries,
-            user_state: flavite_vault::user_state::UserStateStore::open(
-                Box::new(flavite_fs::OsFs::new()),
-                &vault_uuid,
-            )
-            .ok(),
-            themes: Some(theme_store),
-            vault_user_state,
-            graph,
-            settings_store,
-            // Headless constructor: no writer-side signal owned here; the
-            // graph service wakes on control kicks and the sweep.
-            generation_watch: None,
-        };
-
-        flavite.register_builtin_commands()?;
-
-        Ok(flavite)
+        Self::with_services(
+            vault_ref.uuid,
+            vault_ref.root.clone(),
+            Arc::new(session),
+            None,
+            None,
+        )
     }
 
     /// Create a new Flavite with a shared Session reference.
@@ -826,51 +834,7 @@ impl Flavite {
         index_watch: Option<Arc<flavite_index::GenerationWatch>>,
         data_dir: Option<&Path>,
     ) -> Result<Self, FlaviteError> {
-        let vault_uuid = identity.uuid.to_string();
-        let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
-        let generation_watch = index_watch.clone();
-        let (vault_user_state, graph, settings_store) =
-            attach_services(vault_ref.uuid, &identity.root, &session, index_watch, data_dir);
-        let queries = crate::query_service::QueryService::new(
-            Arc::clone(&session),
-            uuid::Uuid::now_v7().as_u128(),
-            Arc::clone(&graph),
-        );
-        let flavite = Self {
-            session,
-            command_registry: CommandRegistry::new(),
-            ingress: Mutex::new(()),
-            operation_ids: Mutex::new(HashMap::new()),
-            pending_requests: Mutex::new(HashSet::new()),
-            terminal_backlog: Mutex::new(HashMap::new()),
-            backlog_cv: Condvar::new(),
-            queries,
-            user_state: flavite_vault::user_state::UserStateStore::open(
-                Box::new(flavite_fs::OsFs::new()),
-                &vault_uuid,
-            )
-            .ok(),
-            themes: Some(crate::themes::ThemeStore::at_vault(
-                Box::new(flavite_fs::OsFs::new()),
-                &identity.root,
-            )),
-            vault_user_state,
-            graph,
-            settings_store,
-            notice_acks: Mutex::new(std::collections::BTreeMap::new()),
-            next_notice_id: AtomicU64::new(1),
-            catalog_sequence: AtomicU64::new(1),
-            vault_ref,
-            read_only: false,
-            owned_vault: None,
-            // RFC-0005 S5: keep the watch for seams that recreate the
-            // service (`set_graph_db_path_for_test` rewires the same one).
-            generation_watch,
-        };
-
-        flavite.register_builtin_commands()?;
-
-        Ok(flavite)
+        Self::with_services(identity.uuid, identity.root, session, index_watch, data_dir)
     }
 
     /// Open a vault and construct the public facade while retaining ownership
@@ -1195,6 +1159,30 @@ impl Flavite {
                 crate::settings_cmds::handle_settings_unroutable,
             ),
             (
+                "search.start",
+                "Start a saved-content search session",
+                ArgSchema::typed::<crate::search_sessions::SearchQueryOptions>(),
+                handle_facade_routed,
+            ),
+            (
+                "search.page",
+                "Fetch one search-session page",
+                ArgSchema::typed::<crate::search_sessions::PageToken>(),
+                handle_facade_routed,
+            ),
+            (
+                "search.refresh",
+                "Refresh a search session",
+                ArgSchema::typed::<crate::search_sessions::SearchQueryOptions>(),
+                handle_facade_routed,
+            ),
+            (
+                "search.close",
+                "Close a search session",
+                ArgSchema::typed::<crate::search_sessions::SearchSessionId>(),
+                handle_facade_routed,
+            ),
+            (
                 "settings.get",
                 "Get a setting value",
                 ArgSchema::typed::<crate::settings_cmds::SettingsGetArgs>(),
@@ -1212,7 +1200,6 @@ impl Flavite {
                 ArgSchema::typed::<crate::settings_cmds::SettingsResetArgs>(),
                 crate::settings_cmds::handle_settings_unroutable,
             ),
-
         ];
         for (id, title, args, handler) in registrations {
             let spec = if id.starts_with("theme.") {
@@ -1220,32 +1207,35 @@ impl Flavite {
                 // on read-only vaults in the command handler, but still require
                 // the Themes capability.
                 if matches!(id, "theme.install" | "theme.uninstall") {
-                    CommandSpec::new(id, title, args).write().requires(crate::Capability::Themes)
+                    CommandSpec::new(id, title, args)
+                        .write()
+                        .requires(crate::Capability::Themes)
                 } else {
                     CommandSpec::new(id, title, args).requires(crate::Capability::Themes)
                 }
             } else if id.starts_with("settings.") {
                 // Settings commands gate on Settings capability
                 if matches!(id, "settings.set" | "settings.reset") {
-                    CommandSpec::new(id, title, args).write().requires(crate::Capability::Settings)
+                    CommandSpec::new(id, title, args)
+                        .write()
+                        .requires(crate::Capability::Settings)
                 } else {
                     CommandSpec::new(id, title, args).requires(crate::Capability::Settings)
                 }
             } else if matches!(
                 id,
-                "note.open"
-                    | "note.history"
-                    | "note.reopen_encoding"
-                    | "text.prepare_replace"
-                    | "text.find"
-                    | "source_find.start"
-                    | "source_find.page"
-                    | "source_find.close"
-                    | "replace.preview"
-                    | "replace.select"
-                    | "replace.status"
-                    | "replace.job_status"
+                "link.prepare" | "link.prepare_remove" | "link.insert" | "link.remove"
             ) {
+                // Link editing reads the connection target (ReadNotes) and
+                // writes the source buffer (WriteNotes) — both gates ride
+                // the registry's requires mechanism (§6.3).
+                CommandSpec::new(id, title, args)
+                    .write()
+                    .requires(crate::Capability::WriteNotes {
+                        scope: crate::WriteScope::Vault,
+                    })
+                    .requires(crate::Capability::ReadNotes)
+            } else if READ_NOTES_COMMAND_IDS.contains(&id) {
                 CommandSpec::new(id, title, args).requires(crate::Capability::ReadNotes)
             } else {
                 CommandSpec::new(id, title, args)
@@ -1520,7 +1510,9 @@ impl Flavite {
     ///
     /// Returns `None` if no settings document exists. Use `settings_read` for
     /// a resolved view with defaults.
-    pub fn read_settings_raw(&self) -> Result<Option<crate::settings_store::StoredSettings>, FlaviteError> {
+    pub fn read_settings_raw(
+        &self,
+    ) -> Result<Option<crate::settings_store::StoredSettings>, FlaviteError> {
         self.settings_store.read().map_err(FlaviteError::from)
     }
 
@@ -1528,12 +1520,12 @@ impl Flavite {
     ///
     /// This is the typed entry point for settings consumption: it returns
     /// all effective values (document values with defaults filled in).
-    pub fn settings_read(
-        &self,
-    ) -> Result<crate::settings_store::ResolvedSettings, FlaviteError> {
+    pub fn settings_read(&self) -> Result<crate::settings_store::ResolvedSettings, FlaviteError> {
         use flavite_settings::resolve::RegistryResolve;
         let registry = flavite_settings::registry::SettingRegistry::with_builtins();
-        let stored = self.settings_store.load_or_initialize(&registry)
+        let stored = self
+            .settings_store
+            .load_or_initialize(&registry)
             .map_err(FlaviteError::from)?;
         let resolved = registry.resolve(&stored.doc);
         Ok(crate::settings_store::ResolvedSettings {
@@ -1553,7 +1545,9 @@ impl Flavite {
         doc: &flavite_settings::document::SettingsDoc,
         expected_generation: u64,
     ) -> Result<u64, FlaviteError> {
-        self.settings_store.write(doc, expected_generation).map_err(FlaviteError::from)
+        self.settings_store
+            .write(doc, expected_generation)
+            .map_err(FlaviteError::from)
     }
 
     /// Set a single setting value by ID (RFC-0007 S2).
@@ -1575,7 +1569,9 @@ impl Flavite {
             ));
         }
         // Set and persist
-        self.settings_store.set_value(&registry, id, value).map_err(FlaviteError::from)
+        self.settings_store
+            .set_value(&registry, id, value)
+            .map_err(FlaviteError::from)
     }
 
     /// The last-good settings backup, when one exists (RFC-0007 FR-10: the
@@ -1590,7 +1586,9 @@ impl Flavite {
     /// document under the current generation (RFC-0007 FR-10). Returns the
     /// new generation.
     pub fn settings_restore_backup(&self) -> Result<u64, FlaviteError> {
-        self.settings_store.restore_backup().map_err(FlaviteError::from)
+        self.settings_store
+            .restore_backup()
+            .map_err(FlaviteError::from)
     }
 
     /// Get the setting descriptors from the registry.
@@ -1609,10 +1607,8 @@ impl Flavite {
     #[doc(hidden)]
     pub fn set_vault_store_fs_for_test(&mut self, fs: flavite_fs::MemFs) {
         let root = self.vault_ref().root.clone();
-        self.vault_user_state = flavite_vault::user_state::VaultUserStateStore::new(
-            Box::new(fs.clone()),
-            &root,
-        );
+        self.vault_user_state =
+            flavite_vault::user_state::VaultUserStateStore::new(Box::new(fs.clone()), &root);
         self.themes = Some(crate::themes::ThemeStore::at_vault(
             Box::new(fs.clone()),
             &root,
@@ -1621,8 +1617,7 @@ impl Flavite {
             Box::new(fs.clone()),
             &root,
         ));
-        self.settings_store =
-            crate::settings_store::SettingsStore::new(settings_vault_store, true);
+        self.settings_store = crate::settings_store::SettingsStore::new(settings_vault_store, true);
         let registry = flavite_settings::registry::SettingRegistry::with_builtins();
         let _ = self.settings_store.load_or_migrate(
             &registry,
@@ -1661,42 +1656,38 @@ impl Flavite {
                 crate::command::CommandValidationError::InvalidArgs(message) => {
                     (RejectionReason::InvalidArgs, message)
                 }
+                crate::command::CommandValidationError::PayloadTooLarge { observed, limit } => (
+                    RejectionReason::InvalidArgs,
+                    format!(
+                        "command payload of {observed} bytes exceeds the {} KiB ({limit}-byte) ceiling",
+                        limit / 1024
+                    ),
+                ),
             };
             return ExecutionResult::Rejected(
                 RejectedResult::with_request(reason, invocation.request_id).with_message(message),
             );
         }
-        if let Some(required) = self
-            .command_registry
-            .get_spec(invocation.command_id)
-            .and_then(|spec| spec.required_capability)
-            && !invocation.capabilities.iter().any(|granted| {
-                granted.covers(&required, self.command_target(&invocation).as_deref())
-            })
-        {
-            return ExecutionResult::Rejected(
-                RejectedResult::with_request(
-                    RejectionReason::CapabilityDenied,
-                    invocation.request_id,
-                )
-                .with_message(format!("missing capability: {}", required.description())),
-            );
-        }
-        if matches!(
-            invocation.command_id,
-            "link.prepare" | "link.prepare_remove" | "link.insert" | "link.remove"
-        ) && !invocation
-            .capabilities
-            .iter()
-            .any(|cap| cap.covers(&crate::Capability::ReadNotes, None))
-        {
-            return ExecutionResult::Rejected(
-                RejectedResult::with_request(
-                    RejectionReason::CapabilityDenied,
-                    invocation.request_id,
-                )
-                .with_message("Reading the connection target requires ReadNotes"),
-            );
+        // Every required capability of the spec must be covered; the
+        // registry is the single enforcement point (no command-id special
+        // cases on the dispatch path).
+        let target = self.command_target(&invocation);
+        if let Some(spec) = self.command_registry.get_spec(invocation.command_id) {
+            for required in &spec.required_capabilities {
+                if !invocation
+                    .capabilities
+                    .iter()
+                    .any(|granted| granted.covers(required, target.as_deref()))
+                {
+                    return ExecutionResult::Rejected(
+                        RejectedResult::with_request(
+                            RejectionReason::CapabilityDenied,
+                            invocation.request_id,
+                        )
+                        .with_message(format!("missing capability: {}", required.description())),
+                    );
+                }
+            }
         }
         if invocation.command_id.starts_with("theme.") {
             // Theme commands never touch buffers or the vault session;
@@ -1776,6 +1767,13 @@ impl Flavite {
                     | CommandDispatchError::Handler(message) => {
                         (RejectionReason::InvalidArgs, message)
                     }
+                    CommandDispatchError::PayloadTooLarge { observed, limit } => (
+                        RejectionReason::InvalidArgs,
+                        format!(
+                            "command payload of {observed} bytes exceeds the {} KiB ({limit}-byte) ceiling",
+                            limit / 1024
+                        ),
+                    ),
                 };
                 ExecutionResult::Rejected(
                     RejectedResult::with_request(reason, invocation.request_id)
@@ -2488,13 +2486,6 @@ impl Flavite {
         })
     }
 
-    /// Query the index.
-    ///
-    /// Query the structural index and Tantivy search view.
-    pub fn query(&self, query: &crate::Query) -> Result<QueryResult, FlaviteError> {
-        self.query_with_limit(query, 100)
-    }
-
     /// Current index and watcher summary for CLI and diagnostics.
     pub fn vault_info(&self) -> Result<VaultInfo, FlaviteError> {
         let version = self.session.version().map_err(FlaviteError::IndexError)?;
@@ -2577,67 +2568,54 @@ impl Flavite {
     /// provenance, the exact total and the continuation token.
     ///
     /// # Errors
-    /// Returns the typed session error mapped onto [`FlaviteError`].
+    /// Returns `CapabilityDenied` when the presented grants lack ReadNotes,
+    /// else the typed session error mapped onto [`FlaviteError`].
     pub fn search_start(
         &self,
+        capabilities: &[crate::Capability],
         options: crate::search_sessions::SearchQueryOptions,
     ) -> Result<crate::search_sessions::SearchPageMaterialized, FlaviteError> {
         self.queries
             .search_sessions()
-            .start(options)
-            .map_err(FlaviteError::SearchSession)
+            .start(options, capabilities)
+            .map_err(map_session_error)
     }
 
     /// Fetch one search-session page by continuation token
     /// (`search.page`). Idempotent replay; the frozen snapshot never
-    /// changes within a session.
+    /// changes within a session. Session permissions are intersected again
+    /// at every page (§6.3): the presented grants and the session's stored
+    /// snapshot must both cover ReadNotes.
     ///
     /// # Errors
-    /// Returns the typed session error mapped onto [`FlaviteError`].
+    /// Returns `CapabilityDenied` when ReadNotes is not presented, else the
+    /// typed session error mapped onto [`FlaviteError`].
     pub fn search_page(
-        &self,
-        token: &crate::search_sessions::PageToken,
-    ) -> Result<crate::search_sessions::SearchPageMaterialized, FlaviteError> {
-        self.queries
-            .search_sessions()
-            .page(token)
-            .map_err(FlaviteError::SearchSession)
-    }
-
-    /// Fetch one search-session page after rechecking the caller's
-    /// ReadNotes capability (`search.page` for capability-bearing
-    /// consumers): session permissions are intersected again at every page
-    /// (§6.3).
-    ///
-    /// # Errors
-    /// Returns `CapabilityDenied` or the typed session error.
-    pub fn search_page_as(
         &self,
         capabilities: &[crate::Capability],
         token: &crate::search_sessions::PageToken,
     ) -> Result<crate::search_sessions::SearchPageMaterialized, FlaviteError> {
-        if !capabilities
-            .iter()
-            .any(|grant| grant.covers(&crate::Capability::ReadNotes, None))
-        {
-            return Err(FlaviteError::CapabilityDenied("ReadNotes"));
-        }
-        self.search_page(token)
+        self.queries
+            .search_sessions()
+            .page(token, capabilities)
+            .map_err(map_session_error)
     }
 
     /// Explicitly close one search session (`search.close`) and drop its
     /// spool.
     ///
     /// # Errors
-    /// Returns the typed session error mapped onto [`FlaviteError`].
+    /// Returns `CapabilityDenied` when ReadNotes is not presented, else the
+    /// typed session error mapped onto [`FlaviteError`].
     pub fn search_close(
         &self,
+        capabilities: &[crate::Capability],
         session: crate::search_sessions::SearchSessionId,
     ) -> Result<(), FlaviteError> {
         self.queries
             .search_sessions()
-            .close(session)
-            .map_err(FlaviteError::SearchSession)
+            .close(capabilities, session)
+            .map_err(map_session_error)
     }
 
     /// Query the index on behalf of a capability-bearing API consumer.
@@ -2654,6 +2632,18 @@ impl Flavite {
             return Err(FlaviteError::CapabilityDenied("ReadNotes"));
         }
         self.query_with_limit(query, limit)
+    }
+}
+
+/// Map a typed session error onto the facade error: a capability denial
+/// keeps the facade's denial kind; everything else stays the typed session
+/// error.
+fn map_session_error(error: crate::search_sessions::SearchSessionError) -> FlaviteError {
+    match error {
+        crate::search_sessions::SearchSessionError::Denied(name) => {
+            FlaviteError::CapabilityDenied(name)
+        }
+        other => FlaviteError::SearchSession(other),
     }
 }
 
@@ -2996,10 +2986,10 @@ mod tests {
         let spec = flavite.command_registry().get_spec("note.rename").unwrap();
         assert!(spec.requires_write);
         assert_eq!(
-            spec.required_capability,
-            Some(crate::Capability::WriteNotes {
+            spec.required_capabilities,
+            vec![crate::Capability::WriteNotes {
                 scope: crate::WriteScope::Vault
-            })
+            }]
         );
         let valid = serde_json::json!({
             "from": "note.md",
@@ -3208,17 +3198,103 @@ mod tests {
         let (flavite, _root, _temp) = test_flavite();
         await_initial_reconcile(&flavite);
         let page = flavite
-            .search_start(crate::search_sessions::SearchQueryOptions {
-                mode: crate::search_sessions::SearchMode::FullText,
-                text: "hello".into(),
-                page_size: 10,
-            })
+            .search_start(
+                &[crate::Capability::ReadNotes],
+                crate::search_sessions::SearchQueryOptions {
+                    mode: crate::search_sessions::SearchMode::FullText,
+                    text: "hello".into(),
+                    page_size: 10,
+                },
+            )
             .unwrap();
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0].path, "note.md");
         assert_eq!(page.generation, 1);
         assert!(page.next.is_none());
-        flavite.search_close(page.session).unwrap();
+        assert!(!page.older_available);
+        flavite
+            .search_close(&[crate::Capability::ReadNotes], page.session)
+            .unwrap();
+    }
+
+    /// §6.3/D-07: the ReadNotes requirement for the search-session surface
+    /// and the link commands is enforced by the registry classification —
+    /// a grant-less caller is refused at the dispatch entry with the
+    /// capability-denied reason.
+    #[test]
+    fn registry_classifies_search_and_link_commands_as_read_gated() {
+        let (flavite, _root, _temp) = test_flavite();
+        for id in [
+            "search.start",
+            "search.page",
+            "search.refresh",
+            "search.close",
+            "note.open",
+        ] {
+            let spec = flavite
+                .command_registry()
+                .get_spec(id)
+                .unwrap_or_else(|| panic!("{id} must be registered"));
+            assert!(
+                spec.required_capabilities
+                    .contains(&crate::Capability::ReadNotes),
+                "{id} must require ReadNotes"
+            );
+        }
+        let link_spec = flavite
+            .command_registry()
+            .get_spec("link.prepare")
+            .expect("link.prepare registered");
+        assert!(link_spec.requires_write);
+        assert!(
+            link_spec
+                .required_capabilities
+                .contains(&crate::Capability::ReadNotes)
+        );
+        assert!(
+            link_spec
+                .required_capabilities
+                .contains(&crate::Capability::WriteNotes {
+                    scope: crate::WriteScope::Vault
+                })
+        );
+    }
+
+    /// §6.1 payload ceiling: an oversized command payload is refused at the
+    /// dispatch entry with the typed shape, before any schema decode.
+    #[test]
+    fn oversized_command_payloads_are_rejected() {
+        let (flavite, root, _temp) = test_flavite();
+        let oversized = serde_json::json!({
+            "pad": "x".repeat(crate::command::MAX_INVOCATION_PAYLOAD_BYTES + 1),
+            "path": root.join("note.md").to_string_lossy(),
+        });
+        let rejected = flavite.execute(Invocation::new(
+            90,
+            "note.save",
+            oversized,
+            crate::Origin::Gui,
+        ));
+        assert!(
+            matches!(
+                &rejected,
+                ExecutionResult::Rejected(RejectedResult {
+                    reason: RejectionReason::InvalidArgs,
+                    ..
+                })
+            ),
+            "oversized payload must be refused: {rejected:?}"
+        );
+        let message = match rejected {
+            ExecutionResult::Rejected(rejected) => rejected.message,
+            other => panic!("expected rejection: {other:?}"),
+        };
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|message| message.contains("512")),
+            "the ceiling message names the limit: {message:?}"
+        );
     }
 
     #[test]

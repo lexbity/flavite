@@ -156,7 +156,7 @@ mod tests {
         assert!(!value.is_int());
         assert_eq!(value.as_bool(), Some(true));
         assert_eq!(value.as_int(), None);
-        assert_eq!(value.to_bool(), true);
+        assert!(value.to_bool());
     }
 
     #[test]

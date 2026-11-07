@@ -40,8 +40,14 @@ fn directory_capability_refuses_outside_symlinks_and_symlink_swaps() {
             .is_err()
     );
     symlink("inside", root.path().join("link")).unwrap();
-    assert_eq!(
+    // A note that IS a symlink is refused even when its target stays in
+    // root (D-10: the final object must be the note itself).
+    assert!(
         fs.read_capped_in_root(root.path(), std::path::Path::new("link"), 1024)
+            .is_err()
+    );
+    assert_eq!(
+        fs.read_capped_in_root(root.path(), std::path::Path::new("inside"), 1024)
             .unwrap(),
         b"inside"
     );
@@ -67,10 +73,13 @@ fn directory_capability_refuses_outside_symlinks_and_symlink_swaps() {
             index += 1;
         }
     });
+    // Under the symlink swap race no read ever succeeds: every refused
+    // read is a refused symlink, so no bytes ever cross the boundary.
     for _ in 0..1000 {
-        if let Ok(bytes) = fs.read_capped_in_root(root.path(), std::path::Path::new("link"), 1024) {
-            assert_eq!(bytes, b"inside");
-        }
+        assert!(
+            fs.read_capped_in_root(root.path(), std::path::Path::new("link"), 1024)
+                .is_err()
+        );
     }
     running.store(false, std::sync::atomic::Ordering::Release);
     writer.join().unwrap();

@@ -1,5 +1,12 @@
 //! Viewport state and Unicode-safe cursor helpers.
 
+/// Canonical shared boundary primitives (RFC-0006 §4.1): the editor's caret
+/// movement, deletion, and clamping all use the pinned syntax segmentation.
+pub use flavite_syntax::text::{
+    clamp_char_boundary, next_grapheme_boundary, next_word_boundary, prev_grapheme_boundary,
+    prev_word_boundary,
+};
+
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Scroll and visible-line state for the editor.
@@ -38,16 +45,6 @@ impl Viewport {
         let start = self.first_line.min(line_count);
         start..start.saturating_add(self.visible_lines).min(line_count)
     }
-}
-
-/// Clamp a byte offset to a UTF-8 character boundary.
-#[must_use]
-pub fn clamp_char_boundary(text: &str, byte: usize) -> usize {
-    let mut at = byte.min(text.len());
-    while !text.is_char_boundary(at) {
-        at = at.saturating_sub(1);
-    }
-    at
 }
 
 /// Selectable characters for native text adapters. AccessKit stores each
@@ -98,26 +95,6 @@ pub fn accessible_character_lengths(text: &str) -> Vec<u8> {
     }
 }
 
-/// Previous extended grapheme boundary, including combining and emoji sequences.
-#[must_use]
-pub fn previous_grapheme_boundary(text: &str, byte: usize) -> usize {
-    let byte = clamp_char_boundary(text, byte);
-    unicode_segmentation::GraphemeCursor::new(byte, text.len(), true)
-        .prev_boundary(text, 0)
-        .expect("complete text supplies grapheme context")
-        .unwrap_or(0)
-}
-
-/// Next extended grapheme boundary.
-#[must_use]
-pub fn next_grapheme_boundary(text: &str, byte: usize) -> usize {
-    let byte = clamp_char_boundary(text, byte);
-    unicode_segmentation::GraphemeCursor::new(byte, text.len(), true)
-        .next_boundary(text, 0)
-        .expect("complete text supplies grapheme context")
-        .unwrap_or(text.len())
-}
-
 /// Clamp shaped glyph offsets to an extended grapheme boundary. Shapers can
 /// expose scalar offsets inside combining/emoji sequences.
 #[must_use]
@@ -130,31 +107,8 @@ pub fn clamp_grapheme_boundary(text: &str, byte: usize) -> usize {
     {
         byte
     } else {
-        cursor
-            .prev_boundary(text, 0)
-            .expect("complete text supplies grapheme context")
-            .unwrap_or(0)
+        prev_grapheme_boundary(text, flavite_syntax::TextByte(byte)).0
     }
-}
-
-/// Start of the preceding Unicode word, skipping intervening punctuation.
-#[must_use]
-pub fn previous_word_boundary(text: &str, byte: usize) -> usize {
-    let byte = clamp_char_boundary(text, byte);
-    text[..byte]
-        .unicode_word_indices()
-        .next_back()
-        .map_or(0, |(at, _)| at)
-}
-
-/// End of the next Unicode word, skipping intervening punctuation.
-#[must_use]
-pub fn next_word_boundary(text: &str, byte: usize) -> usize {
-    let byte = clamp_char_boundary(text, byte);
-    text[byte..]
-        .unicode_word_indices()
-        .next()
-        .map_or(text.len(), |(at, word)| byte + at + word.len())
 }
 
 #[cfg(test)]
@@ -162,47 +116,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn grapheme_cursors_match_whole_text_segmentation_at_every_scalar_boundary() {
-        for text in ["", "a\r\nb", "e\u{301} 🧑🏽‍💻 🇨🇦🇺🇸", "a\u{301}\u{301}\u{301}z"]
-        {
-            let boundaries: Vec<_> = text
-                .grapheme_indices(true)
-                .map(|(at, _)| at)
-                .chain([text.len()])
-                .collect();
-            for byte in text.char_indices().map(|(at, _)| at).chain([text.len()]) {
-                let previous = boundaries
-                    .iter()
-                    .copied()
-                    .rfind(|at| *at < byte)
-                    .unwrap_or(0);
-                let next = boundaries
-                    .iter()
-                    .copied()
-                    .find(|at| *at > byte)
-                    .unwrap_or(text.len());
-                let clamped = boundaries
-                    .iter()
-                    .copied()
-                    .rfind(|at| *at <= byte)
-                    .unwrap_or(0);
-                assert_eq!(
-                    previous_grapheme_boundary(text, byte),
-                    previous,
-                    "previous {text:?} {byte}"
-                );
-                assert_eq!(
-                    next_grapheme_boundary(text, byte),
-                    next,
-                    "next {text:?} {byte}"
-                );
-                assert_eq!(
-                    clamp_grapheme_boundary(text, byte),
-                    clamped,
-                    "clamp {text:?} {byte}"
-                );
-            }
-        }
+    fn reexported_boundaries_move_and_clamp_like_the_syntax_primitives() {
+        let text = "a🧑🏽‍💻e\u{301}";
+        assert_eq!(
+            prev_grapheme_boundary(text, flavite_syntax::TextByte(text.len())).0,
+            "a🧑🏽‍💻".len()
+        );
+        assert_eq!(
+            next_grapheme_boundary(text, flavite_syntax::TextByte(1)).0,
+            "a🧑🏽‍💻".len()
+        );
+        assert_eq!(clamp_char_boundary("é", 1), 0);
+        assert_eq!(
+            prev_word_boundary("one two", flavite_syntax::TextByte(4)).0,
+            0
+        );
+        assert_eq!(
+            next_word_boundary("one two", flavite_syntax::TextByte(0)).0,
+            3
+        );
     }
 
     #[test]

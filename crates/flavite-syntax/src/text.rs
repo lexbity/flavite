@@ -344,12 +344,7 @@ impl TextSnapshot {
     ///
     /// Typed strict-decode failure; see [`TextSnapshot::new`].
     pub fn with_policy(bytes: &[u8], policy: DecodePolicy) -> Result<Self, TextError> {
-        Self::decoding(
-            bytes,
-            policy,
-            &DecodeLimits::default(),
-            &CancelToken::new(),
-        )
+        Self::decoding(bytes, policy, &DecodeLimits::default(), &CancelToken::new())
     }
 
     /// [`TextSnapshot::with_policy`] with caller-supplied byte limits and a
@@ -373,7 +368,11 @@ impl TextSnapshot {
     /// second normalization pass (§4.1).
     #[must_use]
     pub fn from_decoded(decoded: flavite_encoding::DecodedContent) -> Self {
-        Self::from_parts(Arc::clone(decoded.source()), decoded.map().clone(), decoded.into_text())
+        Self::from_parts(
+            Arc::clone(decoded.source()),
+            decoded.map().clone(),
+            decoded.into_text(),
+        )
     }
 
     /// Compose a disk-backed snapshot from already-validated parts — the
@@ -675,7 +674,12 @@ pub fn prev_grapheme_boundary(text: &str, at: TextByte) -> TextByte {
         return TextByte(start);
     }
     let mut cursor = unicode_segmentation::GraphemeCursor::new(start, text.len(), true);
-    TextByte(cursor.prev_boundary(text, 0).expect("complete text").unwrap_or(0))
+    TextByte(
+        cursor
+            .prev_boundary(text, 0)
+            .expect("complete text")
+            .unwrap_or(0),
+    )
 }
 
 /// Next extended-grapheme boundary at or after `at`.
@@ -1086,7 +1090,10 @@ mod tests {
             s.span_to_source(across),
             Some(Span::new(SourceByte(2), SourceByte(5)))
         );
-        assert_eq!(s.span_to_source(Span::new(TextByte(2), TextByte(2))), Some(Span::new(SourceByte(2), SourceByte(2))));
+        assert_eq!(
+            s.span_to_source(Span::new(TextByte(2), TextByte(2))),
+            Some(Span::new(SourceByte(2), SourceByte(2)))
+        );
     }
 
     #[test]
@@ -1131,10 +1138,9 @@ mod tests {
         // ZWJ family emoji and long combining runs are one extended cluster
         // for caret movement (D-04).
         // GB9 joins marks to their base, GB11 joins emoji across ZWJ.
-        for (text, first_end, second_end) in [
-            ("a🧑🏽‍💻b", 1usize, 16usize),
-            ("a\u{301}\u{301}\u{301}z", 7, 8),
-        ] {
+        for (text, first_end, second_end) in
+            [("a🧑🏽‍💻b", 1usize, 16usize), ("a\u{301}\u{301}\u{301}z", 7, 8)]
+        {
             let s = snap(text);
             let first = s.next_grapheme_boundary(TextByte(0));
             assert_eq!(first.0, first_end, "first cluster of {text:?}");
@@ -1152,7 +1158,8 @@ mod tests {
         assert_eq!(flags.prev_grapheme_boundary(third), second);
         // Enumeration from every scalar boundary matches whole-text
         // segmentation (editor compatibility contract, moved to the owner).
-        for text in ["", "a\r\nb", "e\u{301} 🧑🏽‍💻 🇨🇦🇺🇸", "a\u{301}\u{301}\u{301}z"] {
+        for text in ["", "a\r\nb", "e\u{301} 🧑🏽‍💻 🇨🇦🇺🇸", "a\u{301}\u{301}\u{301}z"]
+        {
             let mut expected = Vec::new();
             let mut offset = 0usize;
             expected.push(0usize);
@@ -1190,10 +1197,16 @@ mod tests {
     fn word_movement_skips_punctuation() {
         // Movement policy (D-04): land on words, skipping punctuation runs;
         // matching policy (word_boundaries) keeps punctuation boundaries.
-        assert_eq!(prev_word_boundary("hello, world", TextByte(12)), TextByte(7));
+        assert_eq!(
+            prev_word_boundary("hello, world", TextByte(12)),
+            TextByte(7)
+        );
         assert_eq!(prev_word_boundary("hello, world", TextByte(6)), TextByte(0));
         assert_eq!(next_word_boundary("hello, world", TextByte(0)), TextByte(5));
-        assert_eq!(next_word_boundary("hello, world", TextByte(5)), TextByte(12));
+        assert_eq!(
+            next_word_boundary("hello, world", TextByte(5)),
+            TextByte(12)
+        );
         assert_eq!(next_word_boundary("can't stop", TextByte(0)), TextByte(5));
         assert_eq!(next_word_boundary("", TextByte(0)), TextByte(0));
         assert_eq!(prev_word_boundary("", TextByte(0)), TextByte(0));

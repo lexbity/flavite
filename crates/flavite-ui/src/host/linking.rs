@@ -7,7 +7,6 @@
 //! revision, or view identity stops matching. No fallback caret is ever
 //! manufactured: unmet preconditions surface as honest, actionable states.
 
-use flavite_api::ExecutionResult;
 use flavite_workspace::TabId;
 
 /// The acknowledged source caret a gesture is bound to.
@@ -123,13 +122,6 @@ impl LinkIntents {
     #[must_use]
     pub const fn state(&self) -> &GestureState {
         &self.state
-    }
-
-    /// Reset presentation to idle (no pending gesture).
-    pub fn clear_state(&mut self) {
-        if !matches!(self.state, GestureState::Idle) {
-            self.state = GestureState::Idle;
-        }
     }
 
     /// Begin one insertion gesture from a picker/context action. Returns the
@@ -308,18 +300,6 @@ pub struct PreparedData {
     pub expires_in_ms: u64,
     /// Whether explicit confirmation is required.
     pub requires_confirmation: bool,
-}
-
-/// Extract the inserted revision from a successful commit payload.
-#[must_use]
-pub fn inserted_revision(result: &ExecutionResult) -> Option<u64> {
-    match result {
-        ExecutionResult::Local(flavite_api::LocalResult::Success(success)) => success
-            .data
-            .get("revision")
-            .and_then(serde_json::Value::as_u64),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

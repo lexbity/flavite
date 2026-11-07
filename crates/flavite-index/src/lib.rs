@@ -54,7 +54,7 @@ pub use query::*;
 pub use resolver::*;
 
 // Re-export change-feed items (retention helpers stay module-scoped in
-// `change`; `DEFAULT_LOG_BUDGET` here would conflict with the types export)
+// `change`)
 pub use changelog::*;
 
 // Re-export pool items

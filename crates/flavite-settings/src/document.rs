@@ -46,7 +46,9 @@ impl SettingsDoc {
             return None;
         }
         let (section, key) = (parts[0], parts[1]);
-        self.sections.get(section).and_then(|map| map.get(key).cloned())
+        self.sections
+            .get(section)
+            .and_then(|map| map.get(key).cloned())
     }
 
     /// Set a setting value by its dotted ID.
@@ -79,7 +81,7 @@ impl SettingsDoc {
             return Err(SettingsCodecError::UnknownKey(id.to_owned()));
         }
         let (section, key) = (parts[0], parts[1]);
-        
+
         // Ensure the section exists and is mutable
         self.sections
             .entry(section.to_owned())
@@ -183,10 +185,17 @@ mod tests {
     fn test_get_set() {
         let registry = SettingRegistry::with_builtins();
         let mut doc = SettingsDoc::new(2);
-        
+
         // Set a value
-        assert!(doc.set("appearance.theme", SettingValue::Str("dark".to_owned()), &registry).is_ok());
-        
+        assert!(
+            doc.set(
+                "appearance.theme",
+                SettingValue::Str("dark".to_owned()),
+                &registry
+            )
+            .is_ok()
+        );
+
         // Get the value back
         let value = doc.get("appearance.theme");
         assert!(value.is_some());
@@ -197,30 +206,48 @@ mod tests {
     fn test_invalid_id() {
         let registry = SettingRegistry::with_builtins();
         let mut doc = SettingsDoc::new(2);
-        
+
         // Invalid ID (no dot)
-        assert!(doc.set("invalid", SettingValue::Bool(true), &registry).is_err());
-        
+        assert!(
+            doc.set("invalid", SettingValue::Bool(true), &registry)
+                .is_err()
+        );
+
         // Reserved namespace
-        assert!(doc.set("plugins.foo", SettingValue::Bool(true), &registry).is_err());
+        assert!(
+            doc.set("plugins.foo", SettingValue::Bool(true), &registry)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_invalid_value_type() {
         let registry = SettingRegistry::with_builtins();
         let mut doc = SettingsDoc::new(2);
-        
+
         // Try to set a string where an int is expected
-        assert!(doc.set("editor.font_size", SettingValue::Str("not_a_number".to_owned()), &registry).is_err());
+        assert!(
+            doc.set(
+                "editor.font_size",
+                SettingValue::Str("not_a_number".to_owned()),
+                &registry
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn test_contains() {
         let registry = SettingRegistry::with_builtins();
         let mut doc = SettingsDoc::new(2);
-        
+
         assert!(!doc.contains("appearance.theme"));
-        doc.set("appearance.theme", SettingValue::Str("light".to_owned()), &registry).unwrap();
+        doc.set(
+            "appearance.theme",
+            SettingValue::Str("light".to_owned()),
+            &registry,
+        )
+        .unwrap();
         assert!(doc.contains("appearance.theme"));
     }
 
@@ -228,10 +255,15 @@ mod tests {
     fn test_remove() {
         let registry = SettingRegistry::with_builtins();
         let mut doc = SettingsDoc::new(2);
-        
-        doc.set("appearance.theme", SettingValue::Str("dark".to_owned()), &registry).unwrap();
+
+        doc.set(
+            "appearance.theme",
+            SettingValue::Str("dark".to_owned()),
+            &registry,
+        )
+        .unwrap();
         assert!(doc.contains("appearance.theme"));
-        
+
         doc.remove("appearance.theme");
         assert!(!doc.contains("appearance.theme"));
     }
@@ -240,10 +272,16 @@ mod tests {
     fn test_all_settings() {
         let registry = SettingRegistry::with_builtins();
         let mut doc = SettingsDoc::new(2);
-        
-        doc.set("appearance.theme", SettingValue::Str("dark".to_owned()), &registry).unwrap();
-        doc.set("editor.font_size", SettingValue::Int(16), &registry).unwrap();
-        
+
+        doc.set(
+            "appearance.theme",
+            SettingValue::Str("dark".to_owned()),
+            &registry,
+        )
+        .unwrap();
+        doc.set("editor.font_size", SettingValue::Int(16), &registry)
+            .unwrap();
+
         let all = doc.all_settings();
         assert_eq!(all.len(), 2);
         assert!(all.contains_key("appearance.theme"));
@@ -254,10 +292,16 @@ mod tests {
     fn test_section() {
         let registry = SettingRegistry::with_builtins();
         let mut doc = SettingsDoc::new(2);
-        
-        doc.set("appearance.theme", SettingValue::Str("dark".to_owned()), &registry).unwrap();
-        doc.set("appearance.scale_pct", SettingValue::Int(125), &registry).unwrap();
-        
+
+        doc.set(
+            "appearance.theme",
+            SettingValue::Str("dark".to_owned()),
+            &registry,
+        )
+        .unwrap();
+        doc.set("appearance.scale_pct", SettingValue::Int(125), &registry)
+            .unwrap();
+
         let section = doc.section("appearance");
         assert!(section.is_some());
         assert_eq!(section.unwrap().len(), 2);
@@ -267,7 +311,7 @@ mod tests {
     fn test_is_read_only() {
         let doc = SettingsDoc::new(SCHEMA_VERSION);
         assert!(!doc.is_read_only());
-        
+
         let doc = SettingsDoc::new(SCHEMA_VERSION + 1);
         assert!(doc.is_read_only());
     }

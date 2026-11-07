@@ -283,8 +283,9 @@ pub trait Fs: Send + Sync {
     /// target bytes and compare against `expected_base_hash` (when `Some`;
     /// `None` asserts the target is absent — no-clobber creation); atomically
     /// exchange the staged file with the target so the previous bytes land on
-    /// the staged path; fsync the parent directory (both names durable);
-    /// then compare the displaced bytes against the expected base. A
+    /// the staged path; fsync the displaced object and the parent directory
+    /// (data and both names durable); then compare the displaced bytes
+    /// against the expected base. A
     /// mismatch at that final compare means an external writer raced between
     /// the base check and the exchange — the displaced bytes are still
     /// retained and reported, never discarded and never auto-rolled-back.
@@ -406,8 +407,10 @@ pub(crate) fn retained_replace<F: Fs + ?Sized>(
         return Err(error);
     }
     // The exchange already happened and the displaced object remains on
-    // the staged path. The caller reconciles durability — the displaced
-    // bytes must NEVER be deleted here.
+    // the staged path. Sync the displaced data and the directories (both
+    // names durable, D-10/§6.5) before the displaced bytes are read —
+    // the displaced bytes must NEVER be deleted here.
+    fs.fsync_file(&staged)?;
     fs.fsync_dir(parent)?;
     fs.fsync_dir(&staging)?;
 

@@ -14,6 +14,11 @@ use std::sync::RwLock;
 /// An erased, statically typed command handler registered with its schema.
 pub type CommandHandler = fn(&Session, &Invocation) -> Result<SessionResult, String>;
 
+/// The command-invocation payload ceiling (§6.1): serialized argument
+/// payloads above this size are refused at the dispatch entry before any
+/// schema decode.
+pub const MAX_INVOCATION_PAYLOAD_BYTES: usize = 512 * 1024;
+
 /// A command specification defining what a command does.
 #[derive(Debug, Clone)]
 pub struct CommandSpec {
@@ -29,8 +34,9 @@ pub struct CommandSpec {
     pub keys: &'static [Chord],
     /// Whether this command mutates vault or user data.
     pub requires_write: bool,
-    /// Capability required before this handler may execute.
-    pub required_capability: Option<Capability>,
+    /// Capabilities required before this handler may execute; every entry
+    /// must be covered by the caller's grants.
+    pub required_capabilities: Vec<Capability>,
 }
 
 impl CommandSpec {
@@ -44,7 +50,7 @@ impl CommandSpec {
             when: None,
             keys: &[],
             requires_write: false,
-            required_capability: None,
+            required_capabilities: Vec::new(),
         }
     }
 
@@ -64,7 +70,7 @@ impl CommandSpec {
             when,
             keys,
             requires_write: false,
-            required_capability: None,
+            required_capabilities: Vec::new(),
         }
     }
 
@@ -76,10 +82,10 @@ impl CommandSpec {
         self
     }
 
-    /// Require a declared capability at dispatch.
+    /// Require one more declared capability at dispatch.
     #[must_use]
     pub fn requires(mut self, capability: Capability) -> Self {
-        self.required_capability = Some(capability);
+        self.required_capabilities.push(capability);
         self
     }
 }
@@ -117,10 +123,34 @@ impl ArgSchema {
         }
     }
 
-    /// Validate an invocation's JSON arguments at the API boundary.
-    pub fn validate(&self, value: &serde_json::Value) -> Result<(), String> {
-        (self.validate)(value)
+    /// Validate an invocation's JSON arguments at the API boundary: the
+    /// serialized payload must fit the §6.1 ceiling before schema decoding.
+    ///
+    /// # Errors
+    /// Returns [`ArgValidationError::PayloadTooLarge`] above
+    /// [`MAX_INVOCATION_PAYLOAD_BYTES`] and [`ArgValidationError::Invalid`]
+    /// when the registered schema rejects the payload.
+    pub fn validate(&self, value: &serde_json::Value) -> Result<(), ArgValidationError> {
+        let observed = serde_json::to_vec(value)
+            .map_err(|error| ArgValidationError::Invalid(error.to_string()))?
+            .len();
+        if observed > MAX_INVOCATION_PAYLOAD_BYTES {
+            return Err(ArgValidationError::PayloadTooLarge {
+                observed,
+                limit: MAX_INVOCATION_PAYLOAD_BYTES,
+            });
+        }
+        (self.validate)(value).map_err(ArgValidationError::Invalid)
     }
+}
+
+/// Argument validation failure at the dispatch entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArgValidationError {
+    /// The serialized payload exceeds the §6.1 dispatch ceiling.
+    PayloadTooLarge { observed: usize, limit: usize },
+    /// The payload failed the registered schema.
+    Invalid(String),
 }
 
 /// A keyboard chord (combination of modifier and key).
@@ -153,7 +183,6 @@ impl Chord {
             key: c.key,
         })
     }
-
 }
 
 impl std::fmt::Display for Chord {
@@ -334,6 +363,10 @@ impl CommandRegistry {
     }
 
     /// Validate arguments against the registered command schema.
+    ///
+    /// # Errors
+    /// Returns `Unavailable` for unregistered ids and the typed validation
+    /// error otherwise.
     pub fn validate(
         &self,
         id: &str,
@@ -347,11 +380,22 @@ impl CommandRegistry {
             .spec
             .args
             .validate(args)
-            .map_err(CommandValidationError::InvalidArgs)
+            .map_err(|error| match error {
+                ArgValidationError::Invalid(message) => {
+                    CommandValidationError::InvalidArgs(message)
+                }
+                ArgValidationError::PayloadTooLarge { observed, limit } => {
+                    CommandValidationError::PayloadTooLarge { observed, limit }
+                }
+            })
     }
 
     /// Validate arguments and dispatch through the handler registered with the
     /// command specification. Validation finishes before the handler can run.
+    ///
+    /// # Errors
+    /// Returns the typed dispatch error; the handler runs only after the
+    /// payload passes the registered schema.
     pub fn dispatch(
         &self,
         session: &Session,
@@ -361,11 +405,15 @@ impl CommandRegistry {
         let registered = commands
             .get(invocation.command_id)
             .ok_or_else(|| CommandDispatchError::Unavailable(invocation.command_id.to_owned()))?;
-        registered
-            .spec
-            .args
-            .validate(&invocation.args)
-            .map_err(CommandDispatchError::InvalidArgs)?;
+        match registered.spec.args.validate(&invocation.args) {
+            Ok(()) => {}
+            Err(ArgValidationError::Invalid(message)) => {
+                return Err(CommandDispatchError::InvalidArgs(message));
+            }
+            Err(ArgValidationError::PayloadTooLarge { observed, limit }) => {
+                return Err(CommandDispatchError::PayloadTooLarge { observed, limit });
+            }
+        }
         (registered.handler)(session, invocation).map_err(CommandDispatchError::Handler)
     }
 
@@ -398,6 +446,8 @@ pub enum CommandValidationError {
     Unavailable(String),
     /// Arguments do not match the registered typed schema.
     InvalidArgs(String),
+    /// Arguments exceed the §6.1 payload ceiling (NFR-12 shape).
+    PayloadTooLarge { observed: usize, limit: usize },
 }
 
 /// Failure to dispatch a registered command.
@@ -407,6 +457,8 @@ pub enum CommandDispatchError {
     Unavailable(String),
     /// Typed argument validation failed.
     InvalidArgs(String),
+    /// Arguments exceed the §6.1 payload ceiling (NFR-12 shape).
+    PayloadTooLarge { observed: usize, limit: usize },
     /// Handler refused an otherwise valid request before side effects.
     Handler(String),
 }
@@ -485,6 +537,32 @@ mod tests {
         assert!(matches!(
             result,
             Err(CommandRegistrationError::DuplicateId(_))
+        ));
+    }
+
+    #[test]
+    fn oversized_payloads_are_refused_with_the_typed_ceiling() {
+        let schema = ArgSchema::typed::<serde_json::Value>();
+        let within = serde_json::json!({ "pad": "x".repeat(MAX_INVOCATION_PAYLOAD_BYTES / 2) });
+        assert!(schema.validate(&within).is_ok());
+        let oversized = serde_json::json!({ "pad": "x".repeat(MAX_INVOCATION_PAYLOAD_BYTES + 1) });
+        assert_eq!(
+            schema.validate(&oversized),
+            Err(ArgValidationError::PayloadTooLarge {
+                observed: serde_json::to_vec(&oversized).unwrap().len(),
+                limit: MAX_INVOCATION_PAYLOAD_BYTES,
+            })
+        );
+        let registry = CommandRegistry::new();
+        registry
+            .register(
+                CommandSpec::new("test.cmd", "Test", ArgSchema::typed::<serde_json::Value>()),
+                test_handler,
+            )
+            .unwrap();
+        assert!(matches!(
+            registry.validate("test.cmd", &oversized),
+            Err(CommandValidationError::PayloadTooLarge { .. })
         ));
     }
 

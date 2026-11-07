@@ -2,14 +2,14 @@
 
 use flavite_api::CompletionCandidate;
 
-use crate::keymap::KeyAction;
+use crate::input::PreparedInput;
+use crate::keymap::{KeyAction, key_action};
 use crate::links::{LinkResolution, LinkSpan, match_candidates, resolve_link, scan_note};
-use crate::navigation::{VerticalMotion, vertical_target};
+use crate::navigation::VerticalMotion;
 use crate::surface::{EditorAction, EditorSurface, EditorView, LinkNavigation};
-use crate::viewport::{
-    Viewport, clamp_char_boundary, next_grapheme_boundary, previous_grapheme_boundary,
-};
+use crate::viewport::{Viewport, clamp_char_boundary};
 use cosmic_text::{Attrs, Buffer as ShapingBuffer, FontSystem, Metrics, Shaping};
+#[cfg(feature = "test-support")]
 use flavite_api::BufferView;
 use iced::advanced::input_method::InputMethod;
 use iced::advanced::{
@@ -179,7 +179,10 @@ pub struct EditorWidget<'a, Message> {
 }
 
 impl<'a, Message> EditorWidget<'a, Message> {
-    /// Create an editor from the API's immutable revisioned view.
+    /// Create an editor from the API's immutable revisioned view. Production
+    /// shells share an already-owned revision through [`Self::from_view`];
+    /// this copy-making constructor exists for deterministic tests.
+    #[cfg(feature = "test-support")]
     pub fn new(view: &BufferView, on_action: impl Fn(EditorAction) -> Message + 'a) -> Self {
         Self::from_view(EditorView::from(view), on_action)
     }
@@ -333,6 +336,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
     }
 
     /// Build a headless state for embedding and deterministic tests.
+    #[cfg(feature = "test-support")]
     #[must_use]
     pub fn state_for_test() -> EditorState {
         EditorState::default()
@@ -465,35 +469,69 @@ impl<'a, Message> EditorWidget<'a, Message> {
             }
         }
         let action = key_action(key, modifiers, text);
-        if matches!(
+        if action == KeyAction::Ignore {
+            return false;
+        }
+        let (start, end) = state.selection();
+        // Vertical motion keeps the sticky column; every other action drops it.
+        let vertical = if matches!(
             action,
             KeyAction::Up | KeyAction::Down | KeyAction::PageUp | KeyAction::PageDown
         ) {
-            let motion = state.vertical_motion(action, state.text_width);
-            let (at, x) = vertical_target(&self.view.text, state.caret, motion);
-            state.preferred_x = Some(x);
-            state.move_to(at, modifiers.shift());
-            state.ensure_caret_visible(&self.view.text);
-            return true;
-        }
-        state.preferred_x = None;
-        let range = state.selection();
-        let (start, end) = range;
-        let mut emitted = false;
-        match action {
-            KeyAction::Insert | KeyAction::Newline => {
-                let replacement = if action == KeyAction::Newline {
-                    "\n"
-                } else {
-                    text.unwrap_or("")
-                };
-                if !replacement.is_empty() {
-                    let edit =
-                        EditorAction::replace(&self.view, start, end, replacement.to_owned());
-                    state.caret = start + replacement.len();
-                    state.anchor = state.caret;
-                    self.emit(shell, edit);
-                    if action == KeyAction::Insert && replacement == "[" && start == end {
+            Some(state.vertical_motion(action, state.text_width))
+        } else {
+            state.preferred_x = None;
+            None
+        };
+        let pasted = if action == KeyAction::Paste {
+            clipboard
+                .read(iced::advanced::clipboard::Kind::Standard)
+                .unwrap_or_default()
+        } else {
+            text.unwrap_or_default().to_owned()
+        };
+        let captured = crate::input::CapturedInput {
+            buffer: self.view.buffer_id,
+            observed_revision: self.view.revision,
+            sequence: state.interaction_sequence,
+            action,
+            text: pasted,
+            extend: modifiers.shift(),
+            document_boundary: modifiers.command() || modifiers.control(),
+            vertical,
+        };
+        let Ok(prepared) =
+            crate::input::prepare(&self.view, (state.anchor, state.caret), &captured)
+        else {
+            return false;
+        };
+        match prepared {
+            PreparedInput::Edit {
+                action: edit,
+                caret,
+                clipboard: cut,
+            } => {
+                if let Some(cut) = cut {
+                    clipboard.write(iced::advanced::clipboard::Kind::Standard, cut);
+                }
+                self.emit(shell, edit);
+                state.caret = caret;
+                state.anchor = caret;
+                if state.autocomplete_start.is_some()
+                    && matches!(
+                        action,
+                        KeyAction::Backspace
+                            | KeyAction::BackspaceWord
+                            | KeyAction::Delete
+                            | KeyAction::DeleteWord
+                    )
+                {
+                    state.autocomplete_query.pop();
+                    state.autocomplete_selected = 0;
+                }
+                if action == KeyAction::Insert {
+                    let replacement = captured.text.as_str();
+                    if replacement == "[" && start == end {
                         if state.caret >= 2
                             && self.view.text.get(state.caret - 2..state.caret - 1) == Some("[")
                         {
@@ -502,138 +540,34 @@ impl<'a, Message> EditorWidget<'a, Message> {
                             state.autocomplete_query.push('[');
                             state.autocomplete_selected = 0;
                         }
-                    } else if state.autocomplete_start.is_some() && action == KeyAction::Insert {
+                    } else if state.autocomplete_start.is_some() {
                         state.autocomplete_query.push_str(replacement);
                         state.autocomplete_selected = 0;
                     }
-                    emitted = true;
                 }
             }
-            KeyAction::Previous
-            | KeyAction::Next
-            | KeyAction::PreviousWord
-            | KeyAction::NextWord
-            | KeyAction::Home
-            | KeyAction::End => {
-                let selected = start != end;
-                let target = match action {
-                    KeyAction::Previous if selected && !modifiers.shift() => start,
-                    KeyAction::Next if selected && !modifiers.shift() => end,
-                    KeyAction::Previous => previous_grapheme_boundary(&self.view.text, state.caret),
-                    KeyAction::Next => next_grapheme_boundary(&self.view.text, state.caret),
-                    KeyAction::PreviousWord => {
-                        crate::viewport::previous_word_boundary(&self.view.text, state.caret)
-                    }
-                    KeyAction::NextWord => {
-                        crate::viewport::next_word_boundary(&self.view.text, state.caret)
-                    }
-                    KeyAction::Home if modifiers.command() || modifiers.control() => 0,
-                    KeyAction::End if modifiers.command() || modifiers.control() => {
-                        self.view.text.len()
-                    }
-                    KeyAction::Home => line_bounds(&self.view.text, state.caret).0,
-                    KeyAction::End => line_bounds(&self.view.text, state.caret).1,
-                    _ => state.caret,
-                };
-                state.move_to(target, modifiers.shift());
-                emitted = true;
+            PreparedInput::History(edit) => self.emit(shell, edit),
+            PreparedInput::Selection { anchor, head } => {
+                state.anchor = anchor;
+                state.caret = head;
             }
-            KeyAction::Backspace
-            | KeyAction::Delete
-            | KeyAction::BackspaceWord
-            | KeyAction::DeleteWord => {
-                emitted = true;
-                let (from, to) = if start != end {
-                    (start, end)
-                } else if action == KeyAction::BackspaceWord {
-                    (
-                        crate::viewport::previous_word_boundary(&self.view.text, state.caret),
-                        state.caret,
-                    )
-                } else if action == KeyAction::DeleteWord {
-                    (
-                        state.caret,
-                        crate::viewport::next_word_boundary(&self.view.text, state.caret),
-                    )
-                } else if action == KeyAction::Backspace {
-                    (
-                        previous_grapheme_boundary(&self.view.text, state.caret),
-                        state.caret,
-                    )
-                } else {
-                    (
-                        state.caret,
-                        next_grapheme_boundary(&self.view.text, state.caret),
-                    )
-                };
-                if from < to {
-                    self.emit(
-                        shell,
-                        EditorAction::replace(&self.view, from, to, String::new()),
-                    );
-                    state.caret = from;
-                    state.anchor = from;
-                    if state.autocomplete_start.is_some() {
-                        state.autocomplete_query.pop();
-                        state.autocomplete_selected = 0;
-                    }
-                    emitted = true;
+            PreparedInput::VerticalSelection {
+                anchor,
+                head,
+                preferred_x,
+            } => {
+                state.anchor = anchor;
+                state.caret = head;
+                state.preferred_x = Some(preferred_x);
+            }
+            PreparedInput::Copy(content) => {
+                if !content.is_empty() {
+                    clipboard.write(iced::advanced::clipboard::Kind::Standard, content);
                 }
-            }
-            KeyAction::Undo | KeyAction::Redo => {
-                // Undo and redo remain Session commands. The action variant is
-                // represented through the same host callback in A7; the caller
-                // can map it to the corresponding typed Session command.
-                self.emit(
-                    shell,
-                    EditorAction::history(&self.view, action == KeyAction::Redo),
-                );
-                emitted = true;
-            }
-            KeyAction::Copy | KeyAction::Cut => {
-                emitted = true;
-                if start < end {
-                    clipboard.write(
-                        iced::advanced::clipboard::Kind::Standard,
-                        self.view.text[start..end].to_owned(),
-                    );
-                    if action == KeyAction::Cut {
-                        self.emit(
-                            shell,
-                            EditorAction::replace(&self.view, start, end, String::new()),
-                        );
-                        state.caret = start;
-                        state.anchor = start;
-                    }
-                }
-            }
-            KeyAction::Paste => {
-                emitted = true;
-                if let Some(plain_text) = clipboard.read(iced::advanced::clipboard::Kind::Standard)
-                    && !plain_text.is_empty()
-                {
-                    self.emit(
-                        shell,
-                        EditorAction::replace(&self.view, start, end, plain_text.clone()),
-                    );
-                    state.caret = start + plain_text.len();
-                    state.anchor = state.caret;
-                }
-            }
-            KeyAction::SelectAll => {
-                state.anchor = 0;
-                state.caret = self.view.text.len();
-                emitted = true;
-            }
-            KeyAction::Ignore => {}
-            KeyAction::Up | KeyAction::Down | KeyAction::PageUp | KeyAction::PageDown => {
-                unreachable!("handled vertical motion")
             }
         }
-        if emitted {
-            state.ensure_caret_visible(&self.view.text);
-        }
-        emitted
+        state.ensure_caret_visible(&self.view.text);
+        true
     }
 }
 
@@ -2171,60 +2105,6 @@ impl<'a, Message: 'static> From<EditorWidget<'a, Message>>
     }
 }
 
-fn key_action(key: &Key, modifiers: Modifiers, text: Option<&str>) -> KeyAction {
-    // Alt on macOS and Ctrl elsewhere are word motions. Command remains
-    // available for the document/application command bindings.
-    let word = if cfg!(target_os = "macos") {
-        modifiers.alt() && !modifiers.control() && !modifiers.command()
-    } else {
-        modifiers.control() && !modifiers.alt() && !modifiers.logo()
-    };
-    if word {
-        match key {
-            Key::Named(Named::ArrowLeft) => return KeyAction::PreviousWord,
-            Key::Named(Named::ArrowRight) => return KeyAction::NextWord,
-            Key::Named(Named::Backspace) => return KeyAction::BackspaceWord,
-            Key::Named(Named::Delete) => return KeyAction::DeleteWord,
-            _ => {}
-        }
-    }
-    if modifiers.command() || modifiers.control() {
-        return match key {
-            Key::Named(Named::Home) => KeyAction::Home,
-            Key::Named(Named::End) => KeyAction::End,
-            Key::Character(c) if c.eq_ignore_ascii_case("a") => KeyAction::SelectAll,
-            Key::Character(c) if c.eq_ignore_ascii_case("c") => KeyAction::Copy,
-            Key::Character(c) if c.eq_ignore_ascii_case("x") => KeyAction::Cut,
-            Key::Character(c) if c.eq_ignore_ascii_case("v") => KeyAction::Paste,
-            Key::Character(c) if c.eq_ignore_ascii_case("z") && modifiers.shift() => {
-                KeyAction::Redo
-            }
-            Key::Character(c) if c.eq_ignore_ascii_case("z") => KeyAction::Undo,
-            Key::Character(c) if c.eq_ignore_ascii_case("y") => KeyAction::Redo,
-            _ => KeyAction::Ignore,
-        };
-    }
-    match key {
-        Key::Named(Named::ArrowUp) => KeyAction::Up,
-        Key::Named(Named::ArrowDown) => KeyAction::Down,
-        Key::Named(Named::PageUp) => KeyAction::PageUp,
-        Key::Named(Named::PageDown) => KeyAction::PageDown,
-        Key::Named(Named::ArrowLeft) => KeyAction::Previous,
-        Key::Named(Named::ArrowRight) => KeyAction::Next,
-        Key::Named(Named::Home) => KeyAction::Home,
-        Key::Named(Named::End) => KeyAction::End,
-        Key::Named(Named::Backspace) => KeyAction::Backspace,
-        Key::Named(Named::Delete) => KeyAction::Delete,
-        Key::Named(Named::Enter) => KeyAction::Newline,
-        _ if text
-            .is_some_and(|value| !value.is_empty() && !value.chars().all(char::is_control)) =>
-        {
-            KeyAction::Insert
-        }
-        _ => KeyAction::Ignore,
-    }
-}
-
 fn link_action_at(view: &EditorView, spans: &[LinkSpan], byte: usize) -> Option<EditorAction> {
     let link = spans
         .iter()
@@ -2380,6 +2260,7 @@ pub(crate) fn caret_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::viewport::{next_grapheme_boundary, prev_grapheme_boundary};
     use flavite_buffer::state::BufferState;
     use flavite_syntax::text::{Span, TextByte};
     use iced::advanced::widget::Operation as _;
@@ -3039,8 +2920,8 @@ mod tests {
     fn caret_moves_by_grapheme_clusters() {
         let text = "a🧑🏽‍💻e\u{301}";
         let end = text.len();
-        assert_eq!(previous_grapheme_boundary(text, end), "a🧑🏽‍💻".len());
-        assert_eq!(next_grapheme_boundary(text, 1), "a🧑🏽‍💻".len());
+        assert_eq!(prev_grapheme_boundary(text, TextByte(end)).0, "a🧑🏽‍💻".len());
+        assert_eq!(next_grapheme_boundary(text, TextByte(1)).0, "a🧑🏽‍💻".len());
     }
 
     #[test]
@@ -3130,7 +3011,7 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_input_before_view_refresh_keeps_optimistic_caret() {
+    fn consecutive_input_before_view_refresh_emits_one_edit_then_waits() {
         let view = test_view("x", 92);
         let widget = EditorWidget::new(&view, |action| action);
         let mut state = EditorWidget::<EditorAction>::state_for_test();
@@ -3139,31 +3020,42 @@ mod tests {
         state.anchor = 1;
         let mut clipboard = iced::advanced::clipboard::Null;
         let mut messages = Vec::new();
-        let mut shell = Shell::new(&mut messages);
-
-        for (key, text) in [("a", "a"), ("b", "b")] {
+        {
+            let mut shell = Shell::new(&mut messages);
             widget.execute_key(
                 &mut state,
-                &Key::Character(key.into()),
+                &Key::Character("a".into()),
                 Modifiers::empty(),
-                Some(text),
+                Some("a"),
                 &mut clipboard,
                 &mut shell,
             );
         }
-        drop(shell);
 
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 1);
         assert_eq!(
             messages[0].as_edit().unwrap().2[0].range,
             Span::new(TextByte(1), TextByte(1))
         );
-        assert_eq!(
-            messages[1].as_edit().unwrap().2[0].range,
-            Span::new(TextByte(2), TextByte(2))
-        );
-        assert_eq!(state.caret(), 3);
-        assert_eq!(state.selection(), (3, 3));
+        assert_eq!(state.caret(), 2);
+        assert_eq!(state.selection(), (2, 2));
+        // The caret now runs ahead of the acknowledged "x" snapshot, so the
+        // shared interpreter refuses the next capture until the host
+        // acknowledges and refreshes the view ("place the caret again").
+        {
+            let mut shell = Shell::new(&mut messages);
+            assert!(!widget.execute_key(
+                &mut state,
+                &Key::Character("b".into()),
+                Modifiers::empty(),
+                Some("b"),
+                &mut clipboard,
+                &mut shell,
+            ));
+        }
+        assert_eq!(messages.len(), 1);
+        assert_eq!(state.caret(), 2);
+        assert_eq!(state.selection(), (2, 2));
     }
 
     #[test]

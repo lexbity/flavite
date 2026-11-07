@@ -136,10 +136,7 @@ fn search_narrows_the_rows_to_matches() {
         query: String::new(),
     }));
     let registry = SettingRegistry::with_builtins();
-    assert_eq!(
-        settings::rows(app, tab).len(),
-        registry.visible().len()
-    );
+    assert_eq!(settings::rows(app, tab).len(), registry.visible().len());
 }
 
 #[test]
@@ -175,7 +172,10 @@ fn modified_markers_track_edits() {
         "defaults carry no modified markers"
     );
 
-    let _ = app.apply_setting("appearance.scale_pct", flavite_settings::value::SettingValue::Int(150));
+    let _ = app.apply_setting(
+        "appearance.scale_pct",
+        flavite_settings::value::SettingValue::Int(150),
+    );
     let after = settings::rows(app, tab);
     let scale = after
         .iter()
@@ -260,8 +260,15 @@ fn scalar_edits_persist_apply_and_survive_reopen() {
         id: "editor.font_size".into(),
         text: "16".into(),
     }));
-    let _ = app.update(Message::Settings(SettingsMessage::IntSubmit { tab, id: "editor.font_size".into() }));
-    assert!(app.status.starts_with("Settings saved"), "status: {}", app.status);
+    let _ = app.update(Message::Settings(SettingsMessage::IntSubmit {
+        tab,
+        id: "editor.font_size".into(),
+    }));
+    assert!(
+        app.status.starts_with("Settings saved"),
+        "status: {}",
+        app.status
+    );
     assert_eq!(app.appearance.editor_font_size(), 16, "live apply");
     assert_eq!(app.appearance.metrics().editor_font_size, 16.0);
 
@@ -278,7 +285,10 @@ fn scalar_edits_persist_apply_and_survive_reopen() {
         value: true,
     }));
     assert!(app.appearance.reduced_motion());
-    let _ = app.update(Message::Settings(SettingsMessage::SetLineWidth { tab, columns: None }));
+    let _ = app.update(Message::Settings(SettingsMessage::SetLineWidth {
+        tab,
+        columns: None,
+    }));
     assert_eq!(app.appearance.line_width_columns(), None);
     let _ = app.update(Message::Settings(SettingsMessage::Toggle {
         tab,
@@ -288,7 +298,10 @@ fn scalar_edits_persist_apply_and_survive_reopen() {
     assert!(!app.appearance.sidebar_open());
 
     // The vault document holds every edit.
-    let stored = app.flavite.as_ref().unwrap()
+    let stored = app
+        .flavite
+        .as_ref()
+        .unwrap()
         .read_settings_raw()
         .expect("read")
         .expect("written");
@@ -323,8 +336,10 @@ fn cas_conflict_reloads_and_reports_without_silent_drop() {
 
     // An external writer advances the document between the UI's read and
     // the UI's write (the in-process analogue of a second device).
-    let _ = app.flavite.as_ref().unwrap()
-        .settings_set("editor.font_size", flavite_settings::value::SettingValue::Int(18));
+    let _ = app.flavite.as_ref().unwrap().settings_set(
+        "editor.font_size",
+        flavite_settings::value::SettingValue::Int(18),
+    );
     let stale_generation = app.settings.generation;
     assert_ne!(stale_generation, 0);
 
@@ -357,8 +372,10 @@ fn external_edits_adopt_on_focus_gained() {
     let mut fixture = ui_fixture(2213, "/settings-focus", &seed_for_reopen());
     let app = &mut fixture.app;
     open_settings(app);
-    let _ = app.flavite.as_ref().unwrap()
-        .settings_set("appearance.scale_pct", flavite_settings::value::SettingValue::Int(150));
+    let _ = app.flavite.as_ref().unwrap().settings_set(
+        "appearance.scale_pct",
+        flavite_settings::value::SettingValue::Int(150),
+    );
     let _ = app.update(Message::Settings(SettingsMessage::FocusGained));
     assert!(
         app.status.contains("changed elsewhere"),
@@ -400,16 +417,15 @@ fn unparseable_document_shows_restore_affordance_and_round_trips() {
         "the last-good backup is offered"
     );
     let _ = app.update(Message::Settings(SettingsMessage::RestoreBackup));
-    assert!(
-        app.status.contains("restored"),
-        "status: {}",
-        app.status
-    );
+    assert!(app.status.contains("restored"), "status: {}", app.status);
     // The restored document parses and holds the last-good backup state.
     // The store's `.bak` trails by one write (pre-write backup, the same
     // rule as the device store): the restore recovers every write except
     // the very last one before the corruption.
-    let stored = app.flavite.as_ref().unwrap()
+    let stored = app
+        .flavite
+        .as_ref()
+        .unwrap()
         .read_settings_raw()
         .expect("read")
         .expect("restored");
@@ -428,7 +444,10 @@ fn read_only_facade_refuses_edits_and_keeps_the_document() {
     let mut fixture = ui_fixture(2215, "/settings-readonly", &seed_for_reopen());
     let app = &mut fixture.app;
     let tab = open_settings(app);
-    let before = app.flavite.as_ref().unwrap()
+    let before = app
+        .flavite
+        .as_ref()
+        .unwrap()
         .read_settings_raw()
         .expect("read")
         .expect("doc");
@@ -445,7 +464,10 @@ fn read_only_facade_refuses_edits_and_keeps_the_document() {
         "status: {}",
         app.status
     );
-    let after = app.flavite.as_ref().unwrap()
+    let after = app
+        .flavite
+        .as_ref()
+        .unwrap()
         .read_settings_raw()
         .expect("read")
         .expect("doc");
@@ -463,7 +485,10 @@ fn bounds_refused_without_changing_state() {
         id: "editor.font_size".into(),
         text: "9999".into(),
     }));
-    let _ = app.update(Message::Settings(SettingsMessage::IntSubmit { tab, id: "editor.font_size".into() }));
+    let _ = app.update(Message::Settings(SettingsMessage::IntSubmit {
+        tab,
+        id: "editor.font_size".into(),
+    }));
     assert!(
         app.status.contains("Editor font size must be"),
         "status: {}",
@@ -482,7 +507,10 @@ fn bounds_refused_without_changing_state() {
         id: "editor.font_size".into(),
         text: "abc".into(),
     }));
-    let _ = app.update(Message::Settings(SettingsMessage::IntSubmit { tab, id: "editor.font_size".into() }));
+    let _ = app.update(Message::Settings(SettingsMessage::IntSubmit {
+        tab,
+        id: "editor.font_size".into(),
+    }));
     assert!(app.settings.row_error.is_some());
     assert_eq!(app.appearance.editor_font_size(), 14);
 }
@@ -548,10 +576,16 @@ fn reset_one_restores_the_descriptor_default() {
         id: "appearance.scale_pct".into(),
         text: "150".into(),
     }));
-    let _ = app.update(Message::Settings(SettingsMessage::IntSubmit { tab, id: "appearance.scale_pct".into() }));
+    let _ = app.update(Message::Settings(SettingsMessage::IntSubmit {
+        tab,
+        id: "appearance.scale_pct".into(),
+    }));
     let rows = settings::rows(app, tab);
     assert!(
-        rows.iter().find(|row| row.id == "appearance.scale_pct").unwrap().modified,
+        rows.iter()
+            .find(|row| row.id == "appearance.scale_pct")
+            .unwrap()
+            .modified,
         "edited row is marked"
     );
     let _ = app.update(Message::Settings(SettingsMessage::ResetOne {
@@ -611,7 +645,9 @@ fn shortcut_capture_flows_through_the_tab() {
     let _ = app.update(message);
     assert!(app.settings.capture.is_none(), "capture ends");
     assert!(
-        app.appearance.shortcut_overrides().contains_key("workspace.find"),
+        app.appearance
+            .shortcut_overrides()
+            .contains_key("workspace.find"),
         "the captured override lands"
     );
     assert_eq!(
@@ -643,7 +679,9 @@ fn shortcut_capture_flows_through_the_tab() {
     let _ = app.update(cancelled.expect("escape is intercepted during capture"));
     assert!(app.settings.capture.is_none());
     assert!(
-        !app.appearance.shortcut_overrides().contains_key("workspace.next_group"),
+        !app.appearance
+            .shortcut_overrides()
+            .contains_key("workspace.next_group"),
         "a cancelled capture records nothing"
     );
 
@@ -673,13 +711,17 @@ fn shortcut_capture_flows_through_the_tab() {
         .expect("collision refused");
     assert!(error.contains("already used by"), "error: {error}");
     assert!(
-        !app.appearance.shortcut_overrides().contains_key("workspace.replace")
+        !app.appearance
+            .shortcut_overrides()
+            .contains_key("workspace.replace")
     );
 
     // The per-row Reset clears one override through the funnel.
     let _ = app.update(app.reset_shortcut_message("workspace.find".into()));
     assert!(
-        !app.appearance.shortcut_overrides().contains_key("workspace.find"),
+        !app.appearance
+            .shortcut_overrides()
+            .contains_key("workspace.find"),
         "the override is cleared"
     );
     // The tab still renders after the whole flow.
@@ -740,17 +782,27 @@ fn theme_package_management_flows_through_the_tab() {
         tab,
         id: theme_id.clone(),
     }));
-    assert_eq!(app.settings.pending_uninstall.as_deref(), Some(theme_id.as_str()));
-    let _ = app.update(Message::Settings(SettingsMessage::ThemeUninstallCancel { tab }));
+    assert_eq!(
+        app.settings.pending_uninstall.as_deref(),
+        Some(theme_id.as_str())
+    );
+    let _ = app.update(Message::Settings(SettingsMessage::ThemeUninstallCancel {
+        tab,
+    }));
     assert!(app.settings.pending_uninstall.is_none());
-    assert!(!app.appearance.installed_themes.is_empty(), "cancel keeps the package");
+    assert!(
+        !app.appearance.installed_themes.is_empty(),
+        "cancel keeps the package"
+    );
 
     // Confirming removes the package through the theme.uninstall command.
     let _ = app.update(Message::Settings(SettingsMessage::ThemeUninstallAsk {
         tab,
         id: theme_id.clone(),
     }));
-    let _ = app.update(Message::Settings(SettingsMessage::ThemeUninstallConfirm { tab }));
+    let _ = app.update(Message::Settings(SettingsMessage::ThemeUninstallConfirm {
+        tab,
+    }));
     assert!(
         app.appearance.installed_themes.is_empty(),
         "the package is removed: {:?}",

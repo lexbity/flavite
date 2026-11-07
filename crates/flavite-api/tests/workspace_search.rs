@@ -127,18 +127,24 @@ fn dirty_edits_are_absent_from_saved_search() {
 }
 
 #[test]
-fn empty_and_invalid_queries_fail_with_retryable_text() {
+fn empty_and_invalid_queries_fail_with_typed_session_errors() {
     let f = fixture(&[("alpha.md", "body\n")]);
     let empty = search_once(&f.flavite, "   ", 10);
-    let ContextQueryResult::Failed { message } = empty else {
-        panic!("empty query must fail, got {empty:?}");
+    let ContextQueryResult::SearchFailed { error } = empty else {
+        panic!("empty query must fail with the typed session error, got {empty:?}");
     };
-    assert!(!message.is_empty());
+    assert!(
+        matches!(
+            error,
+            flavite_api::search_sessions::SearchSessionError::Invalid { .. }
+        ),
+        "an empty query is a typed invalid request: {error:?}"
+    );
 
     let broken = search_once(&f.flavite, "prop:missing:::", 10);
     assert!(matches!(
         broken,
-        ContextQueryResult::Failed { .. } | ContextQueryResult::Search { .. }
+        ContextQueryResult::SearchFailed { .. } | ContextQueryResult::Search { .. }
     ));
 }
 

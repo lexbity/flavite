@@ -572,6 +572,10 @@ pub fn open_or_init(path: &Path) -> Result<Connection> {
 
     if has_user_tables && !schema_matches {
         tracing::info!(reason = "schema", "rebuilding incompatible index cache");
+        // The epoch survives cache recreation (it increments when SQLite is
+        // recreated), so read the old epoch before the files go away: a
+        // cursor from the deleted database must never alias the fresh one.
+        let previous_epoch = get_meta_u64(&conn, MetaKey::Epoch).ok().flatten();
         // The index is a disposable cache. Close SQLite before removing its
         // database and WAL sidecars so no connection can retain old pages.
         drop(conn);
@@ -589,6 +593,13 @@ pub fn open_or_init(path: &Path) -> Result<Connection> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         create_schema(&mut conn)?;
+        if let Some(previous) = previous_epoch {
+            set_meta(
+                &conn,
+                MetaKey::Epoch,
+                &previous.saturating_add(1).to_string(),
+            )?;
+        }
         // Force the Tantivy owner to rebuild its disposable index from the
         // fresh structural cache, without coupling this layer to its path.
         set_meta(
@@ -830,6 +841,27 @@ mod tests {
         assert_eq!(version.schema_minor, SCHEMA_MINOR);
         assert_eq!(version.epoch, INITIAL_EPOCH);
         assert_eq!(version.generation, 0);
+    }
+
+    #[test]
+    fn recreation_increments_the_epoch() {
+        let temp = NamedTempFile::new().unwrap();
+        {
+            let mut conn = Connection::open(temp.path()).unwrap();
+            create_schema(&mut conn).unwrap();
+            set_meta(&conn, MetaKey::Epoch, "7").unwrap();
+            // Drift the schema marker so open_or_init must delete and
+            // recreate the cache.
+            set_meta(&conn, MetaKey::SchemaVersion, "1.0").unwrap();
+        }
+        let conn = open_or_init(temp.path()).unwrap();
+        assert_eq!(get_epoch(&conn).unwrap(), 8);
+        // The fresh cache still carries the recreation marker for the
+        // Tantivy owner's rebuild.
+        assert_eq!(
+            get_meta_u64(&conn, MetaKey::TantivyCommittedGeneration).unwrap(),
+            Some(u64::MAX)
+        );
     }
 
     #[test]

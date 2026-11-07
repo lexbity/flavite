@@ -90,6 +90,10 @@ Normal/build:
 - `iced` (normal)
 - `nucleo-matcher` (normal)
 
+Dev-only:
+
+- `flavite-editor`
+
 ### `flavite-encoding`
 
 No dependencies.
@@ -169,6 +173,7 @@ Normal/build:
 - `flavite-editor` (normal)
 - `flavite-graph` (normal)
 - `flavite-settings` (normal)
+- `flavite-syntax` (normal)
 - `flavite-theme` (normal)
 - `flavite-workspace` (normal)
 - `iced` (normal)

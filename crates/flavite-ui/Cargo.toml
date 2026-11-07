@@ -20,6 +20,9 @@ flavite-graph = { path = "../flavite-graph" }
 flavite-api = { path = "../flavite-api" }
 flavite-buffer = { path = "../flavite-buffer" }
 flavite-editor = { path = "../flavite-editor" }
+# Canonical boundary primitives (TextByte coordinates) used by native input
+# admission through the editor's re-exports (RFC-0006 §4.1).
+flavite-syntax = { path = "../flavite-syntax" }
 # D-02: the shell reduces authoritative layout through the IO-free model.
 flavite-workspace = { path = "../flavite-workspace" }
 # XPI themes: the shell renders the codec's semantic model and decoded images.

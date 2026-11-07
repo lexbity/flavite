@@ -121,10 +121,16 @@ fn preference_edits_persist_and_reload_through_the_vault_document() {
         Some("light".to_owned())
     );
     assert_eq!(
-        stored.doc.get("appearance.scale_pct").and_then(|v| v.as_int()),
+        stored
+            .doc
+            .get("appearance.scale_pct")
+            .and_then(|v| v.as_int()),
         Some(150)
     );
-    assert_eq!(stored.doc.get("editor.line_width").and_then(|v| v.as_int()), Some(80));
+    assert_eq!(
+        stored.doc.get("editor.line_width").and_then(|v| v.as_int()),
+        Some(80)
+    );
     assert_eq!(
         stored
             .doc
@@ -160,7 +166,11 @@ fn unreadable_or_future_documents_disable_edits_instead_of_overwriting() {
     host.load(app.flavite.as_ref().unwrap());
     assert!(host.read_only, "a corrupt document disables edits");
     assert!(host.load_error.is_some());
-    assert_eq!(app.appearance.scheme(), Scheme::Dark, "defaults apply read-only");
+    assert_eq!(
+        app.appearance.scheme(),
+        Scheme::Dark,
+        "defaults apply read-only"
+    );
 
     // A future schema is readable but never overwritten: writes are refused
     // so the newer build's data survives.
@@ -212,18 +222,22 @@ fn shortcut_overrides_reject_collisions_and_os_reserved_chords() {
     let mut fixture = ui_fixture(1115, "/appearance-shortcuts", &seed());
     let app = &mut fixture.app;
     // A collision with another command is refused with a named conflict.
-    app.set_shortcut_override("workspace.find", Some("Mod+W".into()));
+    let _ = app.set_shortcut_override("workspace.find", Some("Mod+W".into()));
     let error = app
         .appearance
         .shortcut_error
         .clone()
         .expect("collision refused");
     assert!(error.contains("already used by"), "error: {error}");
-    assert!(!app.appearance.shortcut_overrides().contains_key("workspace.find"));
+    assert!(
+        !app.appearance
+            .shortcut_overrides()
+            .contains_key("workspace.find")
+    );
 
     // An OS-reserved chord is refused with its owner so the editor can
     // offer an alternate action.
-    app.set_shortcut_override("workspace.find", Some("Alt+F4".into()));
+    let _ = app.set_shortcut_override("workspace.find", Some("Alt+F4".into()));
     let error = app
         .appearance
         .shortcut_error
@@ -232,21 +246,25 @@ fn shortcut_overrides_reject_collisions_and_os_reserved_chords() {
     assert!(error.contains("reserved by the desktop"), "error: {error}");
 
     // An unreadable chord is refused.
-    app.set_shortcut_override("workspace.find", Some("Ctrl+".into()));
+    let _ = app.set_shortcut_override("workspace.find", Some("Ctrl+".into()));
     assert!(app.appearance.shortcut_error.is_some());
 
     // A valid, non-colliding override lands and takes effect. (Mod+Shift+F
     // is now RFC-0006 S07's vault-Find default, so a collision-free chord
     // is used here.)
-    app.set_shortcut_override("workspace.find", Some("Mod+Shift+Q".into()));
+    let _ = app.set_shortcut_override("workspace.find", Some("Mod+Shift+Q".into()));
     assert!(app.appearance.shortcut_error.is_none());
-    assert!(app.appearance.shortcut_overrides().contains_key("workspace.find"));
+    assert!(
+        app.appearance
+            .shortcut_overrides()
+            .contains_key("workspace.find")
+    );
     assert!(app.appearance.shortcuts.iter().any(|(chord, id)| {
         *id == "workspace.find" && chord.key == "Q" && chord.modifiers & mods::SHIFT != 0
     }));
 
     // Restoring defaults clears every override.
-    app.set_shortcut_override("workspace.note_mode", Some("Mod+R".into()));
+    let _ = app.set_shortcut_override("workspace.note_mode", Some("Mod+R".into()));
     set_setting(
         app,
         "shortcuts.overrides",
@@ -285,7 +303,7 @@ fn keyboard_resolution_uses_the_effective_table_exactly() {
         Some("workspace.next_group")
     );
     // An override changes the effective binding immediately.
-    app.set_shortcut_override("workspace.find", Some("Mod+Shift+Q".into()));
+    let _ = app.set_shortcut_override("workspace.find", Some("Mod+Shift+Q".into()));
     assert_eq!(app.appearance.chord_command(&key_f, &Modifiers::CTRL), None);
     // Mod+Shift+F stays the RFC-0006 S07 vault-Find binding (the override
     // moved `workspace.find` to Mod+Shift+Q instead).
@@ -313,7 +331,7 @@ fn appearance_edits_never_change_document_bytes() {
     set_setting(app, "editor.font_size", SettingValue::Int(20));
     set_setting(app, "editor.line_width", SettingValue::Int(72));
     set_setting(app, "appearance.reduced_motion", SettingValue::Bool(true));
-    app.set_shortcut_override("workspace.find", Some("Mod+Shift+F".into()));
+    let _ = app.set_shortcut_override("workspace.find", Some("Mod+Shift+F".into()));
     pump_all(app);
     let bytes = fixture
         .fs
@@ -385,8 +403,14 @@ fn sidebar_presentation_persists_and_survives_a_fresh_host() {
         .read_settings_raw()
         .expect("read stored settings")
         .expect("settings were written");
-    assert_eq!(stored.doc.get("sidebar.open").and_then(|v| v.as_bool()), Some(false));
-    assert_eq!(stored.doc.get("sidebar.width").and_then(|v| v.as_int()), Some(300));
+    assert_eq!(
+        stored.doc.get("sidebar.open").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        stored.doc.get("sidebar.width").and_then(|v| v.as_int()),
+        Some(300)
+    );
 
     let mut fresh = AppearanceHost::boot();
     fresh.load(app.flavite.as_ref().unwrap());
@@ -395,5 +419,5 @@ fn sidebar_presentation_persists_and_survives_a_fresh_host() {
     assert_eq!(fresh.metrics().sidebar_width, 300.0);
 }
 
-use iced::keyboard::{Key, Modifiers, key::Named};
 use flavite_api::command::modifiers as mods;
+use iced::keyboard::{Key, Modifiers, key::Named};

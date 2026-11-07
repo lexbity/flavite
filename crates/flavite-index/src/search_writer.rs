@@ -577,9 +577,14 @@ fn writer_loop(
         };
         parked.retain(|pending| {
             if pending.generation <= frontier {
+                // The reply carries the writer's actual frontier, not the
+                // requested generation: a capture parked for an older
+                // generation than the batch committed must fail the
+                // worker's coherence check (D-07: never a mixed G/G+1
+                // bundle).
                 let _ = pending.reply.try_send(CaptureOutcome::Searcher {
                     epoch,
-                    generation: pending.generation,
+                    generation: frontier,
                     searcher: searcher.clone(),
                 });
                 false
@@ -614,8 +619,16 @@ fn writer_loop(
                     let _ = report_tx.send(WriterReport::Desynced);
                     continue;
                 }
-                let mut ops: Vec<SearchDocOp> = first.ops.iter().cloned().collect();
-                let mut last = first;
+                let SearchEnvelope {
+                    epoch: first_epoch,
+                    generation: first_generation,
+                    ops: first_ops,
+                } = first;
+                // Envelopes already hold immutable `Arc` slices: the batch
+                // carries the slices, never a deep clone of their bodies.
+                let mut ops: Vec<Arc<[SearchDocOp]>> = vec![first_ops];
+                let mut last_epoch = first_epoch;
+                let mut last_generation = first_generation;
                 while let Ok(next) = rx.try_recv() {
                     match next {
                         WriterCommand::Envelope(envelope) => {
@@ -624,7 +637,7 @@ fn writer_loop(
                             if desynced {
                                 continue;
                             }
-                            if envelope.generation != last.generation.saturating_add(1) {
+                            if envelope.generation != last_generation.saturating_add(1) {
                                 desynced = true;
                                 for pending in parked.drain(..) {
                                     let _ = pending.reply.try_send(CaptureOutcome::ResetRequired);
@@ -632,8 +645,14 @@ fn writer_loop(
                                 let _ = report_tx.send(WriterReport::Desynced);
                                 continue 'outer;
                             }
-                            ops.extend(envelope.ops.iter().cloned());
-                            last = envelope;
+                            let SearchEnvelope {
+                                epoch,
+                                generation,
+                                ops: envelope_ops,
+                            } = envelope;
+                            ops.push(envelope_ops);
+                            last_epoch = epoch;
+                            last_generation = generation;
                         }
                         other => {
                             // Process the straddling command after this
@@ -649,8 +668,8 @@ fn writer_loop(
                     &reader,
                     fields,
                     &ops,
-                    last.epoch,
-                    last.generation,
+                    last_epoch,
+                    last_generation,
                     ack_tx,
                     frontier_cell,
                     epoch_cell,
@@ -664,15 +683,8 @@ fn writer_loop(
                     let _ = report_tx.send(WriterReport::Desynced);
                     continue;
                 }
-                frontier = last.generation;
-                complete_parked(&mut parked, frontier, last.epoch, &reader, &fields);
-                // The epoch reset below invalidates any capture parked for a
-                // generation the new index no longer contains.
-                if desynced {
-                    for pending in parked.drain(..) {
-                        let _ = pending.reply.try_send(CaptureOutcome::ResetRequired);
-                    }
-                }
+                frontier = last_generation;
+                complete_parked(&mut parked, frontier, last_epoch, &reader, &fields);
             }
             other => replayed.push_back(other),
         }
@@ -684,7 +696,7 @@ fn writer_loop(
                     continue 'outer;
                 }
                 WriterCommand::Capture {
-                    epoch,
+                    epoch: _requested_epoch,
                     generation,
                     reply,
                 } => {
@@ -693,8 +705,15 @@ fn writer_loop(
                         continue;
                     }
                     if generation <= frontier {
+                        // The reply carries the writer's own frontier and
+                        // epoch, never the requested ones: only a reply
+                        // stamped at the caller's exact snapshot passes its
+                        // coherence check (D-07: never a mixed G/G+1
+                        // bundle).
                         let _ = reply.try_send(CaptureOutcome::Searcher {
-                            epoch,
+                            epoch: *epoch_cell
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
                             generation: frontier,
                             searcher: crate::search::CapturedSearcher {
                                 searcher: reader.searcher(),
@@ -760,15 +779,24 @@ fn writer_commit_and_stamp(
     writer: &mut tantivy::IndexWriter,
     reader: &tantivy::IndexReader,
     fields: SearchFields,
-    ops: &[SearchDocOp],
+    ops: &[Arc<[SearchDocOp]>],
     epoch: u64,
     generation: u64,
     ack_tx: &Sender<SearchCommitAck>,
     frontier_cell: &Mutex<u64>,
     epoch_cell: &Mutex<u64>,
 ) -> Result<(), ()> {
-    apply_ops(writer, fields, ops);
-    if writer.commit().is_err() || reader.reload().is_err() {
+    for batch in ops {
+        apply_ops(writer, fields, batch);
+    }
+    // The actual error is logged here: the caller only converts the failure
+    // into `WriterReport::Desynced`, which carries no error text.
+    if let Err(error) = writer.commit() {
+        tracing::error!(%error, "search writer commit failed; waiting for the desync rebuild");
+        return Err(());
+    }
+    if let Err(error) = reader.reload() {
+        tracing::error!(%error, "search writer reload failed; waiting for the desync rebuild");
         return Err(());
     }
     *frontier_cell
@@ -830,20 +858,21 @@ fn apply_ops(writer: &mut tantivy::IndexWriter, fields: SearchFields, ops: &[Sea
 }
 
 /// Read the full document set for a rebuild from the authoritative SQLite
-/// cache (notes joined with `search_docs`, aliases, tags) in ONE read
-/// transaction. Runs on the SQL owner thread at startup/recovery only.
+/// cache (notes joined with `search_docs`, aliases, tags). Three ordered
+/// queries total — one per table, merged by `note_id` — so startup does not
+/// pay one aliases/tags statement pair per note on the SQL owner thread.
 ///
 /// # Errors
 /// Returns an error when the cache read fails.
 pub fn read_rebuild_docs(conn: &rusqlite::Connection) -> Result<Vec<SearchDocOp>, String> {
-    let mut stmt = conn
+    let mut docs_stmt = conn
         .prepare(
             "SELECT n.note_id,n.title,COALESCE(s.body_text,''), \
              COALESCE(s.content_hash,x''), n.parse_ok \
-             FROM notes n LEFT JOIN search_docs s USING(note_id)",
+             FROM notes n LEFT JOIN search_docs s USING(note_id) ORDER BY n.note_id",
         )
         .map_err(|error| error.to_string())?;
-    let rows = stmt
+    let doc_rows = docs_stmt
         .query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -854,8 +883,14 @@ pub fn read_rebuild_docs(conn: &rusqlite::Connection) -> Result<Vec<SearchDocOp>
             ))
         })
         .map_err(|error| error.to_string())?;
+    let alias_rows = grouped_strings(
+        conn,
+        "SELECT note_id, alias FROM aliases ORDER BY note_id, alias_key",
+    )?;
+    let tag_rows = grouped_strings(conn, "SELECT note_id, tag FROM tags ORDER BY note_id, tag")?;
+    let (mut alias_index, mut tag_index) = (0usize, 0usize);
     let mut docs = Vec::new();
-    for row in rows {
+    for row in doc_rows {
         let (id, title, body, hash, parse_ok) = row.map_err(|error| error.to_string())?;
         let mut content_hash = [0u8; 32];
         if hash.len() == 32 {
@@ -869,16 +904,30 @@ pub fn read_rebuild_docs(conn: &rusqlite::Connection) -> Result<Vec<SearchDocOp>
             });
             continue;
         }
-        let aliases = read_strings(
-            conn,
-            "SELECT alias FROM aliases WHERE note_id=?1 ORDER BY alias_key",
-            id,
-        )?;
-        let tags = read_strings(
-            conn,
-            "SELECT tag FROM tags WHERE note_id=?1 ORDER BY tag",
-            id,
-        )?;
+        // Merge-scan: both side queries are ordered by note_id, so each
+        // note's group is the leading run of its cursor.
+        let mut aliases = Vec::new();
+        while let Some((group_note_id, alias)) = alias_rows.get(alias_index) {
+            match group_note_id.cmp(&id) {
+                std::cmp::Ordering::Less => alias_index += 1,
+                std::cmp::Ordering::Equal => {
+                    aliases.push(alias.clone());
+                    alias_index += 1;
+                }
+                std::cmp::Ordering::Greater => break,
+            }
+        }
+        let mut tags = Vec::new();
+        while let Some((group_note_id, tag)) = tag_rows.get(tag_index) {
+            match group_note_id.cmp(&id) {
+                std::cmp::Ordering::Less => tag_index += 1,
+                std::cmp::Ordering::Equal => {
+                    tags.push(tag.clone());
+                    tag_index += 1;
+                }
+                std::cmp::Ordering::Greater => break,
+            }
+        }
         docs.push(SearchDocOp::Upsert {
             note_id: id,
             content_hash,
@@ -891,14 +940,13 @@ pub fn read_rebuild_docs(conn: &rusqlite::Connection) -> Result<Vec<SearchDocOp>
     Ok(docs)
 }
 
-fn read_strings(
-    conn: &rusqlite::Connection,
-    sql: &str,
-    note_id: i64,
-) -> Result<Vec<String>, String> {
+/// All `(note_id, value)` rows of one ordered side query.
+fn grouped_strings(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<(i64, String)>, String> {
     let mut stmt = conn.prepare(sql).map_err(|error| error.to_string())?;
     let rows = stmt
-        .query_map([note_id], |row| row.get::<_, String>(0))
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(|error| error.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())

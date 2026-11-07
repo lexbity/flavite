@@ -188,7 +188,10 @@ fn open_settings_opens_focuses_and_duplicates_like_every_tool_tab() {
     // The fresh workspace opens with one Empty tab; OpenSettings appends
     // and focuses the Settings tab.
     assert_eq!(state.tabs().count(), 2);
-    assert!(matches!(state.tab(&state.focused_tab()).unwrap().kind(), ViewKind::Settings));
+    assert!(matches!(
+        state.tab(&state.focused_tab()).unwrap().kind(),
+        ViewKind::Settings
+    ));
 
     // The tab duplicates (it is stateless; the duplicate is independent).
     let tab = state.focused_tab();
@@ -201,7 +204,10 @@ fn open_settings_opens_focuses_and_duplicates_like_every_tool_tab() {
         },
     );
     assert_eq!(state.tabs().count(), 3);
-    assert!(matches!(state.tab(&state.focused_tab()).unwrap().kind(), ViewKind::Settings));
+    assert!(matches!(
+        state.tab(&state.focused_tab()).unwrap().kind(),
+        ViewKind::Settings
+    ));
 
     // Closing the original keeps the group alive with the duplicate.
     let revision = state.revision();
@@ -213,5 +219,8 @@ fn open_settings_opens_focuses_and_duplicates_like_every_tool_tab() {
         },
     );
     assert_eq!(state.tabs().count(), 2);
-    assert!(matches!(state.tab(&state.focused_tab()).unwrap().kind(), ViewKind::Settings));
+    assert!(matches!(
+        state.tab(&state.focused_tab()).unwrap().kind(),
+        ViewKind::Settings
+    ));
 }

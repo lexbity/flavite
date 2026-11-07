@@ -299,38 +299,6 @@ impl BufferManager {
         }
     }
 
-    /// Attach a pre-validated snapshot, or return the existing buffer.
-    ///
-    /// This is the second sanctioned half of open: the raw-bytes decode and
-    /// the buffer installation happen exactly ONCE each, at the vault's codec
-    /// boundary. An existing buffer is never replaced here (§6.10).
-    #[must_use]
-    pub fn open_snapshot(
-        &mut self,
-        note_path: PathBuf,
-        snapshot: TextSnapshot,
-    ) -> (&Buffer, Option<StateTransition>) {
-        self.touch_graph_stamp();
-        let entry = self.buffers.entry(note_path.clone());
-        match entry {
-            std::collections::hash_map::Entry::Occupied(occupied) => {
-                // Buffer already exists, return it; the never-attached
-                // snapshot is dropped without any document effect.
-                (occupied.into_mut(), None)
-            }
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                let mut buffer = Buffer::from_snapshot(snapshot);
-                buffer
-                    .model_mut()
-                    .set_coalesce_window(self.default_coalesce_window);
-                let buffer_id = buffer.buffer_id();
-                self.buffer_ids.insert(buffer_id, vacant.key().clone());
-                let buffer_ref = vacant.insert(buffer);
-                (buffer_ref, None)
-            }
-        }
-    }
-
     /// Close a note and return its buffer.
     ///
     /// The buffer is removed from the manager. If the buffer is dirty,

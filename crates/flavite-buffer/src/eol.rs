@@ -255,24 +255,6 @@ impl EolTable {
 
         out
     }
-
-    /// Apply EOL metadata to a range of newly inserted lines.
-    ///
-    /// New lines inherit the dominant EOL of the buffer.
-    pub fn apply_to_inserted(&mut self, start_line: usize, count: usize) {
-        let _dominant = self.dominant_eol();
-        for i in 0..count {
-            let line_idx = start_line + i;
-            if line_idx < self.line_endings.len() {
-                // For existing lines that were split, keep their original EOL
-                continue;
-            }
-            // New lines get the dominant EOL
-            // We'll push them when the actual line split happens
-        }
-        // This is called during edit application; the actual line split
-        // will push new entries with the correct EOL
-    }
 }
 
 /// Statistics about line endings for diagnostics.
@@ -433,8 +415,6 @@ mod tests {
         assert!(table.line_endings.is_empty());
 
         table.push(LineEnding::Crlf);
-        table.apply_to_inserted(1, 2);
-        table.apply_to_inserted(0, 1);
         table.clear();
         assert_eq!(table.line_count(), 0);
         assert!(!table.has_trailing_newline());

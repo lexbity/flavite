@@ -1,5 +1,7 @@
 //! Raw input captured in event order, interpreted against acknowledged host text.
 //! No speculative text buffer/history is kept in a widget between redraws.
+use flavite_syntax::TextByte;
+
 use crate::{EditorAction, EditorView, keymap::KeyAction};
 #[derive(Debug, Clone, PartialEq)]
 pub struct CapturedInput {
@@ -44,8 +46,8 @@ pub fn prepare(
         return Err("Selection changed; place the caret again");
     }
     let (start, end) = (anchor.min(head), anchor.max(head));
-    let previous = |at: usize| crate::viewport::previous_grapheme_boundary(text, at);
-    let next = |at: usize| crate::viewport::next_grapheme_boundary(text, at);
+    let previous = |at: usize| crate::viewport::prev_grapheme_boundary(text, TextByte(at)).0;
+    let next = |at: usize| crate::viewport::next_grapheme_boundary(text, TextByte(at)).0;
     let replace = |from, to, replacement: String, clipboard: Option<String>| {
         if from == to && replacement.is_empty() {
             clipboard.map_or(
@@ -78,7 +80,7 @@ pub fn prepare(
             if start != end {
                 start
             } else if input.action == KeyAction::BackspaceWord {
-                crate::viewport::previous_word_boundary(text, start)
+                crate::viewport::prev_word_boundary(text, TextByte(start)).0
             } else {
                 previous(start)
             },
@@ -91,7 +93,7 @@ pub fn prepare(
             if start != end {
                 end
             } else if input.action == KeyAction::DeleteWord {
-                crate::viewport::next_word_boundary(text, end)
+                crate::viewport::next_word_boundary(text, TextByte(end)).0
             } else {
                 next(end)
             },
@@ -129,8 +131,10 @@ pub fn prepare(
                 KeyAction::Next if start != end && !input.extend => end,
                 KeyAction::Previous => previous(head),
                 KeyAction::Next => next(head),
-                KeyAction::PreviousWord => crate::viewport::previous_word_boundary(text, head),
-                KeyAction::NextWord => crate::viewport::next_word_boundary(text, head),
+                KeyAction::PreviousWord => {
+                    crate::viewport::prev_word_boundary(text, TextByte(head)).0
+                }
+                KeyAction::NextWord => crate::viewport::next_word_boundary(text, TextByte(head)).0,
                 KeyAction::Home if input.document_boundary => 0,
                 KeyAction::End if input.document_boundary => text.len(),
                 KeyAction::Home => text[..head].rfind('\n').map_or(0, |at| at + 1),

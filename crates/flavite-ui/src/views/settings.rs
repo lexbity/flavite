@@ -305,10 +305,7 @@ fn error_card<'a>(
 /// Fuzzy-match descriptors against the query over id, title, description,
 /// and category (the `picker::shared_matcher` pattern). An empty query
 /// matches everything, in registry order.
-fn match_rows<'a>(
-    query: &str,
-    visible: &'a [&'a SettingDescriptor],
-) -> Vec<&'a SettingDescriptor> {
+fn match_rows<'a>(query: &str, visible: &'a [&'a SettingDescriptor]) -> Vec<&'a SettingDescriptor> {
     let needle = query.trim();
     if needle.is_empty() {
         return visible.to_vec();
@@ -351,8 +348,8 @@ fn setting_row<'a>(
     let registry = SettingRegistry::with_builtins();
     let resolved = app.settings.resolved.as_ref();
     let modified = resolved.is_some_and(|resolved| resolved.is_modified(descriptor.id, &registry));
-    let mut head = row![text(descriptor.title.to_owned()).size(metrics.text),]
-        .spacing(metrics.spacing_sm);
+    let mut head =
+        row![text(descriptor.title.to_owned()).size(metrics.text),].spacing(metrics.spacing_sm);
     if modified {
         head = head.push(text("●").size(metrics.text_sm).style(style::dim_text));
         head = head.push(
@@ -449,7 +446,8 @@ fn control<'a>(
                     .width(Length::Fixed(120.0 * metrics.scale)),
                 text(format!(
                     "{}–{}",
-                    int_bounds(descriptor).0, int_bounds(descriptor).1
+                    int_bounds(descriptor).0,
+                    int_bounds(descriptor).1
                 ))
                 .size(metrics.text_sm)
                 .style(style::dim_text),
@@ -494,8 +492,12 @@ fn control<'a>(
                     SettingValue::Int(columns) => Some(u16::try_from(*columns).unwrap_or(80)),
                     _ => Some(80),
                 });
-            let segments: [(Option<u16>, &str); 4] =
-                [(Some(80), "80"), (Some(100), "100"), (Some(120), "120"), (None, "Full")];
+            let segments: [(Option<u16>, &str); 4] = [
+                (Some(80), "80"),
+                (Some(100), "100"),
+                (Some(120), "120"),
+                (None, "Full"),
+            ];
             let mut row_widgets = row![].spacing(metrics.spacing_sm);
             for (columns, label) in segments {
                 let active = current == Some(columns);
@@ -546,11 +548,13 @@ fn control<'a>(
             chips = chips.push(
                 text_input("Add entry…", &draft)
                     .id(input_id(tab, descriptor.id))
-                    .on_input(move |value| Message::Settings(SettingsMessage::ListDraft {
-                        tab,
-                        id: list_id.clone(),
-                        text: value,
-                    }))
+                    .on_input(move |value| {
+                        Message::Settings(SettingsMessage::ListDraft {
+                            tab,
+                            id: list_id.clone(),
+                            text: value,
+                        })
+                    })
                     .on_submit(Message::Settings(SettingsMessage::ListSubmit {
                         tab,
                         id: descriptor.id.to_owned(),
@@ -588,10 +592,12 @@ fn action_or_ghost(
 /// The current display chord for a command (override or default).
 fn chord_label(app: &App, id: &str) -> String {
     crate::host::commands::resolved_chord(id, &app.appearance.shortcut_overrides())
-        .map(|chord| flavite_settings::chord::chord_string(&flavite_settings::chord::Chord {
-            modifiers: chord.modifiers,
-            key: chord.key,
-        }))
+        .map(|chord| {
+            flavite_settings::chord::chord_string(&flavite_settings::chord::Chord {
+                modifiers: chord.modifiers,
+                key: chord.key,
+            })
+        })
         .unwrap_or_else(|| "unbound".into())
 }
 
@@ -599,10 +605,7 @@ fn chord_label(app: &App, id: &str) -> String {
 /// capture button, and a reset button when overridden (the dialog-era
 /// capture state machine, now tab-scoped state).
 #[allow(clippy::too_many_lines)]
-fn shortcut_section<'a>(
-    app: &'a App,
-    metrics: &crate::style::Metrics,
-) -> Element<'a, Message> {
+fn shortcut_section<'a>(app: &'a App, metrics: &crate::style::Metrics) -> Element<'a, Message> {
     let mut section = column![].spacing(2);
     for (id, _) in crate::host::commands::DEFAULT_CHORDS {
         let capturing = app.settings.capture.as_deref() == Some(*id);
@@ -614,14 +617,12 @@ fn shortcut_section<'a>(
         .spacing(metrics.spacing_sm)
         .align_y(iced::alignment::Vertical::Center);
         row = row.push(
-            button(
-                text(if capturing { "Press keys…" } else { "Change" }).size(metrics.text_sm),
-            )
-            .padding(tab_strip::chip_padding())
-            .style(action_or_ghost(capturing))
-            .on_press(Message::Settings(SettingsMessage::BeginShortcutCapture {
-                command: (*id).to_owned(),
-            })),
+            button(text(if capturing { "Press keys…" } else { "Change" }).size(metrics.text_sm))
+                .padding(tab_strip::chip_padding())
+                .style(action_or_ghost(capturing))
+                .on_press(Message::Settings(SettingsMessage::BeginShortcutCapture {
+                    command: (*id).to_owned(),
+                })),
         );
         if overridden {
             row = row.push(
@@ -712,19 +713,25 @@ fn theme_package_section<'a>(
         );
         if pending {
             theme_row = theme_row.push(
-                text("Remove this package?").size(metrics.text_sm).style(style::dim_text),
+                text("Remove this package?")
+                    .size(metrics.text_sm)
+                    .style(style::dim_text),
             );
             theme_row = theme_row.push(
                 button(text("Confirm removal").size(metrics.text_sm))
                     .padding(tab_strip::chip_padding())
                     .style(style::action())
-                    .on_press(Message::Settings(SettingsMessage::ThemeUninstallConfirm { tab })),
+                    .on_press(Message::Settings(SettingsMessage::ThemeUninstallConfirm {
+                        tab,
+                    })),
             );
             theme_row = theme_row.push(
                 button(text("Keep").size(metrics.text_sm))
                     .padding(tab_strip::chip_padding())
                     .style(style::ghost())
-                    .on_press(Message::Settings(SettingsMessage::ThemeUninstallCancel { tab })),
+                    .on_press(Message::Settings(SettingsMessage::ThemeUninstallCancel {
+                        tab,
+                    })),
             );
         } else {
             theme_row = theme_row.push(

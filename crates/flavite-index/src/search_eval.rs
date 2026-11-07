@@ -36,6 +36,11 @@ pub enum EvalError {
         kind: &'static str,
         observed: usize,
         limit: usize,
+        /// RFC-0006 resource-bound contract: limits are explicit
+        /// completeness boundaries. Every limit in this evaluator refuses
+        /// the whole evaluation, so no truncated set escapes and the field
+        /// is always `false` here.
+        completeness: bool,
     },
     #[error("attachment predicates are not members of note search")]
     AttachmentNotSearchable,
@@ -84,6 +89,7 @@ impl Universe {
                     kind: "snapshot_universe",
                     observed: ids.len(),
                     limit: MAX_UNIVERSE_NOTES,
+                    completeness: false,
                 });
             }
         }
@@ -229,6 +235,7 @@ pub fn to_nnf(query: &Query) -> Result<(Nnf, Vec<Query>), EvalError> {
             kind: "text_leaves",
             observed: leaves.len(),
             limit: crate::query::MAX_QUERY_TEXT_LEAVES,
+            completeness: false,
         });
     }
     Ok((nnf, leaves))
@@ -246,6 +253,7 @@ fn normalize(
             kind: "nnf_nodes",
             observed: *nodes,
             limit: MAX_NNF_NODES,
+            completeness: false,
         });
     }
     match query {
@@ -348,6 +356,7 @@ pub fn evaluate(query: &Query, snapshot: &Snapshot<'_>) -> Result<Vec<ScoredNote
                     kind: "text_leaves",
                     observed: usize::try_from(next_bit).unwrap_or(usize::MAX),
                     limit: 64,
+                    completeness: false,
                 });
             }
         }
@@ -379,24 +388,23 @@ pub fn evaluate(query: &Query, snapshot: &Snapshot<'_>) -> Result<Vec<ScoredNote
     let has_positive_text = !bit_scores.is_empty();
     let mut rows = Vec::new();
     for ordinal in root_set.iter_ordinals() {
-        let mask = root_masks
-            .get(usize::try_from(ordinal).unwrap_or(usize::MAX))
-            .copied()
-            .unwrap_or(0);
+        let index = usize::try_from(ordinal).unwrap_or(usize::MAX);
+        let mask = match &root_masks {
+            Masks::None => 0,
+            // A uniform root mask applies to exactly the root set members.
+            Masks::Uniform(mask) => *mask,
+            Masks::Dense(table) => table.get(index).copied().unwrap_or(0),
+        };
         let mut score = 0.0f32;
         for (bit, scores) in &bit_scores {
             if mask & bit != 0 {
-                score += scores
-                    .get(usize::try_from(ordinal).unwrap_or(usize::MAX))
-                    .copied()
-                    .unwrap_or(0.0);
+                score += scores.get(index).copied().unwrap_or(0.0);
             }
         }
         if !score.is_finite() {
             return Err(EvalError::NonFiniteScore);
         }
         let score = has_positive_text.then_some(score);
-        let index = usize::try_from(ordinal).unwrap_or(usize::MAX);
         let note_id = snapshot
             .universe
             .ids
@@ -418,11 +426,40 @@ pub fn evaluate(query: &Query, snapshot: &Snapshot<'_>) -> Result<Vec<ScoredNote
     Ok(rows)
 }
 
-/// Contributing-leaf masks in dense ordinal order; zero where an ordinal is
-/// not retained or carries no positive text bit. At 50k ordinals this is
-/// 400 KiB per fold node (transient, depth-bounded), versus ~10x that in
-/// per-entry hashing for the previous map shape.
-type Masks = Vec<u64>;
+/// Contributing-leaf masks for one folded subtree, in compact shape. A
+/// subtree whose contribution is absent or uniform (one text leaf, or an
+/// AND tree whose satisfied branches all contribute uniformly) carries no
+/// dense table; only a per-ordinal-varying contribution materializes one
+/// (at 50k ordinals that table is 400 KiB per fold node, and a ~250-term
+/// AND chain would otherwise hold one per ancestor, depth-bounded but
+/// ~100 MiB transient). Dense entries are zero where the subtree does not
+/// retain the ordinal.
+#[derive(Debug)]
+enum Masks {
+    /// The subtree contributes no text bits (structural or negative
+    /// leaves): every retained ordinal carries mask zero (§6.3).
+    None,
+    /// Every ordinal in the subtree's own retained set carries exactly this
+    /// mask.
+    Uniform(u64),
+    /// Per-ordinal masks in dense universe order.
+    Dense(Vec<u64>),
+}
+
+impl Masks {
+    /// The mask one ordinal carries from this subtree: zero outside the
+    /// subtree's own retained set.
+    fn value_at(&self, set: &Bitset, ordinal: usize) -> u64 {
+        if !set.get(u32::try_from(ordinal).unwrap_or(u32::MAX)) {
+            return 0;
+        }
+        match self {
+            Self::None => 0,
+            Self::Uniform(mask) => *mask,
+            Self::Dense(table) => table.get(ordinal).copied().unwrap_or(0),
+        }
+    }
+}
 
 fn fold_masks(
     nnf: &Nnf,
@@ -431,24 +468,17 @@ fn fold_masks(
     universe_len: usize,
 ) -> (Bitset, Masks) {
     match nnf {
-        Nnf::All => (Bitset::full(universe_len), Vec::new()),
-        Nnf::None => (Bitset::empty(universe_len), Vec::new()),
+        Nnf::All => (Bitset::full(universe_len), Masks::None),
+        Nnf::None => (Bitset::empty(universe_len), Masks::None),
         Nnf::Leaf(index) => {
             let Some(Some((set, _))) = leaf_sets.get(*index) else {
-                return (Bitset::empty(universe_len), Vec::new());
+                return (Bitset::empty(universe_len), Masks::None);
             };
-            let masks: Masks = if let Some(bit) = leaf_mask_bits.get(index) {
-                let mut masks = vec![0u64; universe_len];
-                for ordinal in set.iter_ordinals() {
-                    let index = usize::try_from(ordinal).unwrap_or(usize::MAX);
-                    if let Some(slot) = masks.get_mut(index) {
-                        *slot = *bit;
-                    }
-                }
-                masks
-            } else {
-                Vec::new()
-            };
+            // One leaf, one mask bit, carried uniformly by every retained
+            // ordinal; structural leaves contribute mask zero (§6.3).
+            let masks = leaf_mask_bits
+                .get(index)
+                .map_or(Masks::None, |bit| Masks::Uniform(*bit));
             (set.clone(), masks)
         }
         Nnf::Not(index) => {
@@ -457,23 +487,37 @@ fn fold_masks(
                 .and_then(|entry| entry.as_ref().map(|(set, _)| set.clone()))
                 .unwrap_or_else(|| Bitset::empty(universe_len));
             // Negative leaves contribute mask zero (§6.3).
-            (set.complement(universe_len), Vec::new())
+            (set.complement(universe_len), Masks::None)
         }
         Nnf::And(a, b) => {
             let (set_a, masks_a) = fold_masks(a, leaf_sets, leaf_mask_bits, universe_len);
             let (set_b, masks_b) = fold_masks(b, leaf_sets, leaf_mask_bits, universe_len);
             let set = set_a.intersect(&set_b);
             // Union contributing masks from both satisfied branches for
-            // retained IDs (§6.3).
-            let mut masks = vec![0u64; universe_len];
-            for ordinal in set.iter_ordinals() {
-                let index = usize::try_from(ordinal).unwrap_or(usize::MAX);
-                let mask = masks_a.get(index).copied().unwrap_or(0)
-                    | masks_b.get(index).copied().unwrap_or(0);
-                if let Some(slot) = masks.get_mut(index) {
-                    *slot = mask;
+            // retained IDs (§6.3). The retained intersection never reads
+            // beyond either branch's own set, so uniform shapes stay
+            // allocation-free and a None branch hands a dense table
+            // straight through.
+            let masks = match (masks_a, masks_b) {
+                (Masks::None, Masks::None) => Masks::None,
+                (Masks::Uniform(x), Masks::Uniform(y)) => Masks::Uniform(x | y),
+                (Masks::None, Masks::Uniform(mask)) | (Masks::Uniform(mask), Masks::None) => {
+                    Masks::Uniform(mask)
                 }
-            }
+                (Masks::None, dense) | (dense, Masks::None) => dense,
+                (masks_a, masks_b) => {
+                    let mut table = vec![0u64; universe_len];
+                    for ordinal in set.iter_ordinals() {
+                        let index = usize::try_from(ordinal).unwrap_or(usize::MAX);
+                        let mask =
+                            masks_a.value_at(&set_a, index) | masks_b.value_at(&set_b, index);
+                        if let Some(slot) = table.get_mut(index) {
+                            *slot = mask;
+                        }
+                    }
+                    Masks::Dense(table)
+                }
+            };
             (set, masks)
         }
         Nnf::Or(a, b) => {
@@ -481,16 +525,26 @@ fn fold_masks(
             let (set_b, masks_b) = fold_masks(b, leaf_sets, leaf_mask_bits, universe_len);
             let set = set_a.union(&set_b);
             // Union masks of satisfied branches: an ID retained from branch
-            // A carries A's mask; from both, the union (§6.3).
-            let mut masks = vec![0u64; universe_len];
-            for ordinal in set.iter_ordinals() {
-                let index = usize::try_from(ordinal).unwrap_or(usize::MAX);
-                let mask = masks_a.get(index).copied().unwrap_or(0)
-                    | masks_b.get(index).copied().unwrap_or(0);
-                if let Some(slot) = masks.get_mut(index) {
-                    *slot = mask;
+            // A carries A's mask; from both, the union (§6.3). Only a dense
+            // sibling answers for the whole union unchanged — any uniform
+            // participation varies per retained ordinal and materializes
+            // dense.
+            let masks = match (masks_a, masks_b) {
+                (Masks::None, Masks::None) => Masks::None,
+                (Masks::None, dense) | (dense, Masks::None) => dense,
+                (masks_a, masks_b) => {
+                    let mut table = vec![0u64; universe_len];
+                    for ordinal in set.iter_ordinals() {
+                        let index = usize::try_from(ordinal).unwrap_or(usize::MAX);
+                        let mask =
+                            masks_a.value_at(&set_a, index) | masks_b.value_at(&set_b, index);
+                        if let Some(slot) = table.get_mut(index) {
+                            *slot = mask;
+                        }
+                    }
+                    Masks::Dense(table)
                 }
-            }
+            };
             (set, masks)
         }
     }

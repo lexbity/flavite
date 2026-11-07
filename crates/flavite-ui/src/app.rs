@@ -10,15 +10,13 @@ use crate::host::context::ContextRegistry;
 use crate::host::documents::{AttachDecision, DocumentRegistry};
 use crate::operation::OperationPump;
 use crate::palette::matching_specs;
-use flavite_settings::value::SettingValue;
 use crate::subscription;
 use crate::workspace::{Adapter, StripMenu, gestures};
 use flavite_api::queries::NoteCatalogEntry;
-use flavite_api::{
-    ExecutionResult, Flavite, Invocation, LocalResult, Origin, VaultConfig,
-};
-use flavite_settings::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
+use flavite_api::{ExecutionResult, Flavite, Invocation, LocalResult, Origin, VaultConfig};
 use flavite_editor::{EditorAction, EditorInteractionSnapshot, EditorView};
+use flavite_settings::value::SettingValue;
+use flavite_settings::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 use flavite_workspace::{
     Effect, GroupId, Ids, LayoutAction, NoteLocator, Outcome, SplitId, TabId, WorkspaceState,
 };
@@ -1253,7 +1251,9 @@ impl App {
                 // Read rename_behavior from the resolved settings (RFC-0007 S3)
                 let strategy = if let Ok(stored) = flavite.settings_read() {
                     let value = stored.resolved.get("vault.rename_behavior");
-                    value.and_then(|v| v.as_str().map(|s| s.to_owned())).unwrap_or_else(|| "rewrite".to_owned())
+                    value
+                        .and_then(|v| v.as_str().map(|s| s.to_owned()))
+                        .unwrap_or_else(|| "rewrite".to_owned())
                 } else {
                     "rewrite".to_owned()
                 };

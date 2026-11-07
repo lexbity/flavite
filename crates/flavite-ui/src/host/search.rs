@@ -265,7 +265,7 @@ impl SearchHost {
             return;
         };
         for session in closes {
-            let _ = flavite.search_close(session);
+            let _ = flavite.search_close(&[flavite_api::Capability::ReadNotes], session);
         }
     }
 
@@ -377,6 +377,29 @@ impl SearchHost {
                 state.error = Some(message.clone());
                 state.updating = false;
             }
+            QueryResult::SearchFailed { error } if is_current => {
+                // Typed session failures (RFC-0006 S06 §6.1): each kind gets
+                // its honest affordance instead of guessing from text.
+                state.updating = false;
+                state.error = Some(match error {
+                    SearchSessionError::Busy(_) => "Search is busy; try again".to_owned(),
+                    SearchSessionError::ResetRequired => {
+                        "The search snapshot was reset; refresh to start a new session".to_owned()
+                    }
+                    SearchSessionError::Expired => {
+                        "The search session expired; the rows shown are stale".to_owned()
+                    }
+                    SearchSessionError::LimitExceeded {
+                        kind,
+                        observed,
+                        limit,
+                        ..
+                    } => format!(
+                        "The vault exceeds the search {kind} bound: {observed} of {limit}; narrow the query"
+                    ),
+                    other => other.to_string(),
+                });
+            }
             QueryResult::SearchClosed => {}
             // Updating/stale outcomes never repaint and stay correlated so a
             // duplicate completion is still recognized.
@@ -389,7 +412,9 @@ impl SearchHost {
     }
 }
 
-use flavite_api::search_sessions::{PageToken, SearchMode, SearchQueryOptions, SearchSessionId};
+use flavite_api::search_sessions::{
+    PageToken, SearchMode, SearchQueryOptions, SearchSessionError, SearchSessionId,
+};
 use flavite_api::{ContextQueryResult as QueryResult, QueryOutcome, QueryPayload, RequestToken};
 use flavite_workspace::TabId;
 
@@ -432,6 +457,7 @@ mod tests {
                     content_hash: Vec::new(),
                 })
                 .collect(),
+            older_available: false,
             next: next.map(|next_ordinal| PageToken {
                 session: flavite_api::search_sessions::SearchSessionId::from_u128(9),
                 query_digest: [0u8; 32],
@@ -538,5 +564,54 @@ mod tests {
         assert!(!host.observe(&outcome));
         assert!(host.tabs[&tab].rows.is_empty());
         assert!(host.tabs[&tab].total.is_none());
+    }
+
+    #[test]
+    fn typed_session_failures_render_their_own_affordance() {
+        let tab = TabId::from_raw(1);
+        let failed = |error: SearchSessionError| {
+            let mut host = SearchHost::default();
+            {
+                let state = host.tabs.entry(tab).or_default();
+                state.query_epoch = 2;
+                state.rows = vec![SearchRowView {
+                    note_id: 1,
+                    path: "n.md".into(),
+                    title: "t".into(),
+                    excerpt: String::new(),
+                }];
+            }
+            let request = token(1);
+            host.requests.insert(request, (tab, 2));
+            let outcome = QueryOutcome {
+                token: request,
+                payload: QueryPayload::SearchStart {
+                    options: SearchQueryOptions {
+                        mode: SearchMode::FullText,
+                        text: "q".into(),
+                        page_size: 50,
+                    },
+                },
+                result: QueryResult::SearchFailed { error },
+            };
+            assert!(host.observe(&outcome));
+            (
+                host.tabs[&tab].error.clone().unwrap(),
+                host.tabs[&tab].rows.is_empty(),
+            )
+        };
+        assert_eq!(
+            failed(SearchSessionError::Busy("search snapshot handshake")),
+            ("Search is busy; try again".to_owned(), false)
+        );
+        // A typed failure never clears the frozen rows; expiry marks them
+        // stale so Refresh re-anchors to a new snapshot.
+        assert_eq!(
+            failed(SearchSessionError::Expired),
+            (
+                "The search session expired; the rows shown are stale".to_owned(),
+                false
+            )
+        );
     }
 }

@@ -208,11 +208,11 @@ fn out_of_order_receipts_never_corrupt_and_notes_stay_untouched() {
         &app.workspace,
         &app.flavite.as_ref().unwrap().vault_ref().uuid.to_string(),
     );
-    let refused =
-        app.flavite
-            .as_mut()
-            .unwrap()
-            .write_workspace_layout(0, &persisted);
+    let refused = app
+        .flavite
+        .as_mut()
+        .unwrap()
+        .write_workspace_layout(0, &persisted);
     assert!(
         matches!(
             refused,

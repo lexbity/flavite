@@ -127,6 +127,13 @@ active = [
     { from = "flavite-ui", to = "flavite-fs" },
     { from = "flavite-ui", to = "flavite-index" },
     { from = "flavite-ui", to = "flavite-vault" },
+    # RFC-0006 S02: viewport re-exports the canonical syntax boundary
+    # primitives (flavite_editor::viewport::… delegates to syntax::text).
+    { from = "flavite-ui", to = "flavite-syntax" },
+    # Test-support feature unification: the crate enables its own
+    # test-support feature for unit/integration tests via a self
+    # dev-dependency (production builds never enable it).
+    { from = "flavite-editor", to = "flavite-editor" },
     # A7 - custom editor widget consumes API views and EditorModel types
     { from = "flavite-editor", to = "flavite-api" },
     { from = "flavite-editor", to = "flavite-buffer" },

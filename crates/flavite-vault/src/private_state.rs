@@ -26,6 +26,14 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
             let _ = file.sync_all();
         }
         std::fs::rename(&temp, path).map_err(|e| e.to_string())?;
+        // The rename itself must be durable: this is the high-water head's
+        // durability boundary (§6.9) — surviving records with a lost head
+        // rename would quarantine a valid job as HeadMismatch.
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
         Ok(())
     })();
     if result.is_err() {

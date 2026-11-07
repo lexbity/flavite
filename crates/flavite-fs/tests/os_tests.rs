@@ -281,3 +281,58 @@ fn os_fs_path_key_never_collapses_non_utf8_bytes() {
     ]));
     assert!(OsFs::new().encode_path_key(&path).is_err());
 }
+
+#[test]
+fn os_fs_rename_no_replace_never_clobbers_the_destination() {
+    let dir = tempdir().unwrap();
+    let fs = OsFs::new();
+    let from = dir.path().join("staged");
+    let to = dir.path().join("target");
+    std::fs::write(&from, b"new bytes").unwrap();
+    std::fs::write(&to, b"old bytes").unwrap();
+
+    let error = fs.rename_no_replace(&from, &to).unwrap_err();
+    assert!(matches!(error, FsError::AlreadyExists(_)));
+    assert_eq!(std::fs::read(&to).unwrap(), b"old bytes");
+    assert_eq!(std::fs::read(&from).unwrap(), b"new bytes");
+
+    let fresh = dir.path().join("fresh");
+    fs.rename_no_replace(&from, &fresh).unwrap();
+    assert_eq!(std::fs::read(&fresh).unwrap(), b"new bytes");
+    assert!(!from.exists(), "the primitive is a rename, not a link");
+
+    assert!(matches!(
+        fs.rename_no_replace(&from, &fresh).unwrap_err(),
+        FsError::NotFound(_)
+    ));
+}
+
+#[test]
+fn os_fs_concurrent_no_replace_creators_have_exactly_one_winner() {
+    use std::sync::Arc;
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("contested");
+    let fs = Arc::new(OsFs::new());
+    let winner = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for index in 0..8 {
+        let fs = Arc::clone(&fs);
+        let winner = Arc::clone(&winner);
+        let target = target.clone();
+        let staged = dir.path().join(format!("stage-{index}"));
+        std::fs::write(&staged, format!("bytes {index}")).unwrap();
+        handles.push(std::thread::spawn(move || {
+            if fs.rename_no_replace(&staged, &target).is_ok() {
+                winner.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    assert_eq!(
+        winner.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one creator installs the name"
+    );
+}

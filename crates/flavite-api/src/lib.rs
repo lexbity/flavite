@@ -67,7 +67,10 @@ pub use user_state::{
     StoredUserState, UserStateError, UserStateKind, read_last_vault_device, write_last_vault_device,
 };
 pub mod settings_store;
-pub use settings_store::{defaults_document, ResolvedSettings, SettingsStore, SettingsStoreError, StoredSettings, MAX_SETTINGS_BYTES};
+pub use settings_store::{
+    MAX_SETTINGS_BYTES, ResolvedSettings, SettingsStore, SettingsStoreError, StoredSettings,
+    defaults_document,
+};
 pub mod settings_cmds;
 pub use settings_cmds::*;
 

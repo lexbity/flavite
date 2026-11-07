@@ -15,3 +15,15 @@ flavite-syntax = { path = "../flavite-syntax" }
 nucleo-matcher = { workspace = true }
 serde_json = { workspace = true }
 unicode-segmentation = { workspace = true }
+
+[features]
+# Test-only constructors (`EditorWidget::new` copy view, `state_for_test`).
+# Production shells build through `from_view`; deterministic tests and
+# fixture harnesses enable this feature (flavite-ui's `ui-test-support`
+# turns it on transitively).
+test-support = []
+
+[dev-dependencies]
+# The crate enables its own test-support feature for its unit and
+# integration tests.
+flavite-editor = { path = ".", features = ["test-support"] }

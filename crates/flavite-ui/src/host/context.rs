@@ -304,6 +304,11 @@ impl ContextRegistry {
             QueryResult::Failed { message } => ToolState::Failed {
                 message: message.clone(),
             },
+            // Typed search-session failures render their error text; the
+            // kind-specific affordances live on the search host.
+            QueryResult::SearchFailed { error } => ToolState::Failed {
+                message: error.to_string(),
+            },
             // Search pages (W10) are routed to the search host before the
             // context registry; they never repaint a context tool.
             QueryResult::Search { .. } => return false,
@@ -334,12 +339,6 @@ impl ContextRegistry {
     #[must_use]
     pub fn any_pending(&self) -> bool {
         self.tools.values().any(|tool| tool.pending.is_some())
-    }
-
-    /// Whether any context tool is attached.
-    #[must_use]
-    pub fn no_tools(&self) -> bool {
-        self.tools.is_empty()
     }
 
     /// Current incarnation of one tool.

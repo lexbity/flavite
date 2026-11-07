@@ -18,6 +18,7 @@ use crate::types::{
     VaultIdentity, Version,
 };
 use crossbeam::channel::{Receiver, Sender, bounded, select, tick, unbounded};
+use flavite_encoding::{DecodeLimits, DecodePolicy};
 use flavite_fs::Fs;
 use flavite_index::{IndexActor, MAX_NOTE_BYTES};
 use std::collections::HashMap;
@@ -1755,22 +1756,62 @@ impl VaultActor {
             VaultActorMsg::ReadFile { path, reply } => {
                 // Untrusted path: bounded contained read like ReadBounded
                 // (§6.5/§6.7 — never an uncontained whole-file read).
+                // Callers pass either an absolute in-root path or the note's
+                // vault-relative path (open workers); containment
+                // validation canonicalizes the target, so a not-yet-created
+                // note (CreateIfMissing probes the current bytes first)
+                // reports absence instead of escaping — a missing path
+                // leaks nothing either way.
                 let result = (|| {
-                    self.fs.validate_in_root(&self.identity.root, &path)?;
-                    if self.fs.is_placeholder(&path)? {
-                        return Err(flavite_fs::FsError::Unsupported(
-                            "Download this attachment locally first".into(),
-                        ));
-                    }
-                    match self.fs.read_capped_in_root(
+                    // Bounded contained read (§6.5/§6.7). Adapters with
+                    // handle-relative containment serve through
+                    // `read_capped_in_root`; the fallback validates
+                    // containment by canonicalization and reads bounded —
+                    // every adapter implements `read_capped`. A
+                    // not-yet-created note (CreateIfMissing probes the
+                    // current bytes first) reports absence: a missing path
+                    // leaks nothing either way.
+                    let read = |relative: &Path| match self.fs.read_capped_in_root(
                         &self.identity.root,
-                        path.strip_prefix(&self.identity.root)
-                            .map_err(|_| flavite_fs::FsError::PathEscape(path.clone()))?,
+                        relative,
                         MAX_NOTE_BYTES as u64,
                     ) {
                         Ok(bytes) => Ok(Some(bytes)),
                         Err(flavite_fs::FsError::NotFound(_)) => Ok(None),
+                        Err(flavite_fs::FsError::Unsupported(_)) => {
+                            // Adapters without handle-relative containment
+                            // still serve bounded reads of the full path;
+                            // containment was validated above for absolute
+                            // requests, and relative requests are
+                            // vault-relative by caller contract.
+                            let full = self.identity.root.join(relative);
+                            match self.fs.read_capped(&full, MAX_NOTE_BYTES as u64) {
+                                Ok(bytes) => Ok(Some(bytes)),
+                                Err(flavite_fs::FsError::NotFound(_)) => Ok(None),
+                                Err(error) => Err(error),
+                            }
+                        }
                         Err(error) => Err(error),
+                    };
+                    if path.is_absolute() {
+                        match self.fs.validate_in_root(&self.identity.root, &path) {
+                            Ok(()) => {}
+                            Err(flavite_fs::FsError::NotFound(_)) => return Ok(None),
+                            Err(error) => return Err(error),
+                        }
+                        if self.fs.is_placeholder(&path)? {
+                            return Err(flavite_fs::FsError::Unsupported(
+                                "Download this attachment locally first".into(),
+                            ));
+                        }
+                        let relative = path
+                            .strip_prefix(&self.identity.root)
+                            .map_err(|_| flavite_fs::FsError::PathEscape(path.clone()))?;
+                        read(relative)
+                    } else {
+                        // Vault-relative request paths (open workers)
+                        // cannot escape: containment is the root itself.
+                        read(&path)
                     }
                 })();
                 let response = match result {
@@ -2933,35 +2974,79 @@ impl VaultActor {
         let mut patches =
             Vec::with_capacity(grouped.len() + usize::from(strategy == RenameStrategy::Alias));
         for (_path_key, (path, expected_base_hash, mut spans)) in grouped {
-            let mut bytes = self
+            let raw = self
                 .fs
                 .read_if_exists(&path)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("inbound source disappeared: {}", path.display()))?;
-            if *blake3::hash(&bytes).as_bytes() != expected_base_hash {
+            if *blake3::hash(&raw).as_bytes() != expected_base_hash {
                 return Err(format!(
                     "inbound source changed since index scan: {}",
                     path.display()
                 ));
             }
+            // §6.10: decode under the source descriptor, compute the edits
+            // in text coordinates and serialize the entire guarded source.
+            // Slicing raw bytes with decoded-text spans corrupted BOM'd
+            // UTF-8 (every span off by the BOM length) and refused UTF-16
+            // sources outright. Auto accepts a recognized BOM and BOM-less
+            // UTF-8 and never guesses BOM-less UTF-16; a hint-resolved
+            // decode is the open path's job, so an unresolvable source is
+            // a typed refusal with its bytes untouched.
+            let decoded = flavite_encoding::decode(
+                &raw,
+                DecodePolicy::Auto,
+                &DecodeLimits::default(),
+                &flavite_encoding::NOT_CANCELLED,
+            )
+            .map_err(|error| {
+                format!(
+                    "inbound source could not be decoded ({}): {error}",
+                    path.display()
+                )
+            })?;
+            let format = decoded.format();
+            let source_bytes_arc = std::sync::Arc::clone(decoded.source());
+            let map = decoded.map().clone();
+            let mut decoded_text = decoded.into_text();
+            // The indexed spans are folded-text coordinates: compose the
+            // snapshot from the decoded parts for the composed mapping
+            // without a second decode (§4.1).
+            let snapshot = flavite_syntax::text::TextSnapshot::from_parts(
+                source_bytes_arc,
+                map,
+                decoded_text.clone(),
+            );
             spans.sort_unstable_by_key(|span| std::cmp::Reverse(span.0));
             let replacements = {
-                let source_text = std::str::from_utf8(&bytes)
-                    .map_err(|_| format!("inbound source is not UTF-8: {}", path.display()))?;
+                let source_text = snapshot.text();
+                let map = snapshot.map().expect("decoded snapshot is disk-backed");
                 let mut replacements = Vec::with_capacity(spans.len());
                 for (start, end) in spans {
-                    if start > end
-                        || end > bytes.len()
-                        || !source_text.is_char_boundary(start)
-                        || !source_text.is_char_boundary(end)
-                    {
+                    if start > end || end > source_text.len() {
                         return Err(format!(
                             "indexed link span is stale or invalid: {}",
                             path.display()
                         ));
                     }
-                    let target = source_text
-                        .get(start..end)
+                    // The indexed spans are folded-text coordinates; map
+                    // them to the decoded layer through the composed map.
+                    let source_span = snapshot
+                        .span_to_source(flavite_syntax::text::Span::new(
+                            flavite_syntax::TextByte(start),
+                            flavite_syntax::TextByte(end),
+                        ))
+                        .ok_or_else(|| {
+                            format!("indexed link span is stale or invalid: {}", path.display())
+                        })?;
+                    let decoded_start = map
+                        .source_to_decoded(source_span.start.0)
+                        .ok_or("indexed link span is invalid")?;
+                    let decoded_end = map
+                        .source_to_decoded(source_span.end.0)
+                        .ok_or("indexed link span is invalid")?;
+                    let target = decoded_text
+                        .get(decoded_start..decoded_end)
                         .ok_or("indexed link span is invalid")?;
                     let offset = target.find(old_stem).ok_or_else(|| {
                         format!(
@@ -2969,15 +3054,30 @@ impl VaultActor {
                             path.display()
                         )
                     })?;
-                    let target_start = start + offset;
+                    let target_start = decoded_start + offset;
                     let target_end = target_start + old_stem.len();
                     replacements.push((target_start, target_end));
                 }
                 replacements
             };
             for (start, end) in replacements {
-                bytes.splice(start..end, new_stem.bytes());
+                decoded_text.replace_range(start..end, new_stem);
             }
+            // Serialize the whole guarded source under its descriptor; the
+            // encoder restores the BOM signature and the decoded text still
+            // carries the original physical EOLs.
+            let bytes = flavite_encoding::encode(
+                &decoded_text,
+                format,
+                &flavite_encoding::EncodeLimits::default(),
+                &flavite_encoding::NOT_CANCELLED,
+            )
+            .map_err(|error| {
+                format!(
+                    "inbound source could not be re-encoded ({}): {error}",
+                    path.display()
+                )
+            })?;
             let is_renamed_source = path == from;
             let relative_source = path
                 .strip_prefix(&self.identity.root)
@@ -3011,16 +3111,44 @@ impl VaultActor {
         }
 
         if strategy == RenameStrategy::Alias {
-            let source_bytes = self
+            let raw = self
                 .fs
                 .read_if_exists(&from)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("rename source disappeared: {}", from.display()))?;
-            let alias_bytes =
-                flavite_syntax::frontmatter::append_list_value(&source_bytes, "aliases", old_stem)?;
+            // Decode under the descriptor, patch the decoded layer, then
+            // serialize under the same descriptor (§6.10).
+            let decoded = flavite_encoding::decode(
+                &raw,
+                DecodePolicy::Auto,
+                &DecodeLimits::default(),
+                &flavite_encoding::NOT_CANCELLED,
+            )
+            .map_err(|error| format!("rename source could not be decoded: {error}"))?;
+            let format = decoded.format();
+            let decoded_bytes = decoded.text().as_bytes().to_vec();
+            let patched = flavite_syntax::frontmatter::append_list_value(
+                &decoded_bytes,
+                "aliases",
+                old_stem,
+            )?;
+            let patched_text = String::from_utf8(patched)
+                .map_err(|_| "frontmatter patch produced invalid UTF-8".to_owned())?;
+            let alias_bytes = flavite_encoding::encode(
+                &patched_text,
+                format,
+                &flavite_encoding::EncodeLimits::default(),
+                &flavite_encoding::NOT_CANCELLED,
+            )
+            .map_err(|error| format!("rename source could not be re-encoded: {error}"))?;
+            let source_bytes = raw;
+            // History keys are raw reversible native bytes; a lossy
+            // display path would never match the note's other history
+            // records (merge bases, saves, recovery).
+            let alias_note_key = crate::session::native_note_key(&from, &self.identity.root);
             self.history_store()?
                 .snapshot(
-                    from.to_string_lossy().as_bytes(),
+                    &alias_note_key,
                     &source_bytes,
                     HistoryReason::Rename,
                     false,

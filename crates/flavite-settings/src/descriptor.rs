@@ -151,9 +151,12 @@ impl SettingKind {
             Self::Bool => SettingValue::Bool(false),
             Self::Int { min, .. } => SettingValue::Int(*min),
             Self::Text | Self::ThemePackage => SettingValue::Str(String::new()),
-            Self::Choice(options) => {
-                SettingValue::Str(options.first().map(|(v, _)| (*v).to_owned()).unwrap_or_default())
-            }
+            Self::Choice(options) => SettingValue::Str(
+                options
+                    .first()
+                    .map(|(v, _)| (*v).to_owned())
+                    .unwrap_or_default(),
+            ),
             Self::LineWidth => SettingValue::Int(80),
             Self::StringList => SettingValue::List(Vec::new()),
             Self::ShortcutMap => SettingValue::ShortcutMap(BTreeMap::new()),
@@ -226,7 +229,9 @@ impl SettingDescriptor {
         if id.starts_with("plugins.") {
             return false;
         }
-        id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' || c == '_')
+        id.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' || c == '_'
+        })
     }
 
     /// Validate a value against this descriptor's kind.
@@ -234,7 +239,9 @@ impl SettingDescriptor {
     /// # Errors
     /// Returns `SettingsCodecError::InvalidValue` if the value doesn't match the expected kind.
     pub fn validate_value(&self, value: &SettingValue) -> Result<(), SettingsCodecError> {
-        self.kind.validate(value).map_err(|e| SettingsCodecError::InvalidValue(self.id.to_owned(), e))
+        self.kind
+            .validate(value)
+            .map_err(|e| SettingsCodecError::InvalidValue(self.id.to_owned(), e))
     }
 }
 
@@ -256,16 +263,16 @@ mod tests {
         // Too long
         let long_id = "a".repeat(129);
         assert!(!SettingDescriptor::is_valid_id(&long_id));
-        
+
         // No dot
         assert!(!SettingDescriptor::is_valid_id("appearance"));
-        
+
         // Starts with plugins.
         assert!(!SettingDescriptor::is_valid_id("plugins.foo.bar"));
-        
+
         // Uppercase
         assert!(!SettingDescriptor::is_valid_id("Appearance.Theme"));
-        
+
         // Invalid characters (underscores are actually allowed per RFC)
         assert!(!SettingDescriptor::is_valid_id("appearance.theme value"));
     }
@@ -273,7 +280,7 @@ mod tests {
     #[test]
     fn test_int_kind_validation() {
         let kind = SettingKind::Int { min: 10, max: 100 };
-        
+
         assert!(kind.validate(&SettingValue::Int(50)).is_ok());
         assert!(kind.validate(&SettingValue::Int(10)).is_ok());
         assert!(kind.validate(&SettingValue::Int(100)).is_ok());
@@ -285,16 +292,22 @@ mod tests {
     #[test]
     fn test_choice_kind_validation() {
         let kind = SettingKind::Choice(&[("light", "Light"), ("dark", "Dark")]);
-        
-        assert!(kind.validate(&SettingValue::Str("light".to_owned())).is_ok());
+
+        assert!(
+            kind.validate(&SettingValue::Str("light".to_owned()))
+                .is_ok()
+        );
         assert!(kind.validate(&SettingValue::Str("dark".to_owned())).is_ok());
-        assert!(kind.validate(&SettingValue::Str("system".to_owned())).is_err());
+        assert!(
+            kind.validate(&SettingValue::Str("system".to_owned()))
+                .is_err()
+        );
     }
 
     #[test]
     fn test_line_width_validation() {
         let kind = SettingKind::LineWidth;
-        
+
         assert!(kind.validate(&SettingValue::Int(80)).is_ok());
         assert!(kind.validate(&SettingValue::Int(40)).is_ok());
         assert!(kind.validate(&SettingValue::Int(160)).is_ok());

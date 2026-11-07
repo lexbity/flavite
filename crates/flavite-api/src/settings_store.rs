@@ -39,10 +39,7 @@ pub enum SettingsStoreError {
     /// The document is unparseable.
     Unparseable(String),
     /// A write conflict (CAS generation mismatch).
-    Conflict {
-        expected: u64,
-        actual: u64,
-    },
+    Conflict { expected: u64, actual: u64 },
     /// The vault is read-only; settings cannot be written.
     ReadOnly,
     /// The underlying vault user state store failed.
@@ -64,7 +61,10 @@ impl std::fmt::Display for SettingsStoreError {
             Self::SchemaNewer => write!(f, "settings schema version is newer than supported"),
             Self::Unparseable(msg) => write!(f, "settings document unparseable: {msg}"),
             Self::Conflict { expected, actual } => {
-                write!(f, "settings CAS conflict: expected generation {expected}, got {actual}")
+                write!(
+                    f,
+                    "settings CAS conflict: expected generation {expected}, got {actual}"
+                )
             }
             Self::ReadOnly => write!(f, "vault is read-only: settings are not writable"),
             Self::VaultStore(e) => write!(f, "vault user state error: {e}"),
@@ -81,21 +81,13 @@ impl From<UserStateError> for SettingsStoreError {
             UserStateError::GenerationMismatch { expected, actual } => {
                 Self::Conflict { expected, actual }
             }
-            UserStateError::TooLarge { size } => {
-                Self::TooLarge { size }
-            }
-            UserStateError::ReadOnly => {
-                Self::ReadOnly
-            }
+            UserStateError::TooLarge { size } => Self::TooLarge { size },
+            UserStateError::ReadOnly => Self::ReadOnly,
             UserStateError::Protected { path } => {
                 Self::VaultStore(UserStateError::Protected { path })
             }
-            UserStateError::Corrupt(msg) => {
-                Self::Unparseable(msg)
-            }
-            UserStateError::NotJson(msg) => {
-                Self::Unparseable(msg)
-            }
+            UserStateError::Corrupt(msg) => Self::Unparseable(msg),
+            UserStateError::NotJson(msg) => Self::Unparseable(msg),
             other => Self::VaultStore(other),
         }
     }
@@ -175,7 +167,7 @@ impl SettingsStore {
     /// Returns typed errors for parse failures, bounds, and filesystem issues.
     pub fn read(&self) -> Result<Option<StoredSettings>, SettingsStoreError> {
         let stored = self.vault_store.read(VaultUserStateKind::Settings)?;
-        
+
         let Some(stored) = stored else {
             return Ok(None);
         };
@@ -190,7 +182,7 @@ impl SettingsStore {
         // Parse the document
         let text = String::from_utf8(stored.payload.clone())
             .map_err(|e| SettingsStoreError::Unparseable(e.to_string()))?;
-        
+
         let parsed = parse(Some(&text)).map_err(SettingsStoreError::Codec)?;
 
         Ok(Some(StoredSettings {
@@ -223,9 +215,7 @@ impl SettingsStore {
         // Check size bound
         let text = serialize(doc).map_err(SettingsStoreError::Codec)?;
         if text.len() > MAX_SETTINGS_BYTES {
-            return Err(SettingsStoreError::TooLarge {
-                size: text.len(),
-            });
+            return Err(SettingsStoreError::TooLarge { size: text.len() });
         }
 
         // Write through the vault store
@@ -301,7 +291,7 @@ impl SettingsStore {
                 // v2 document doesn't exist - migrate from legacy
                 let mut doc = crate::settings_store::defaults_document(registry);
                 let mut warnings = Vec::new();
-                
+
                 // Step 1: Overlay v1 settings.toml from vault
                 // V1 format: flat TOML with vault-specific settings
                 let v1_settings_path = vault_root.join(".flavite").join("settings.toml");
@@ -320,7 +310,7 @@ impl SettingsStore {
                         ));
                     }
                 }
-                
+
                 // Step 2: Overlay device-preferences.json from data dir
                 // V1 format: JSON with user preferences
                 if let Some(data_dir) = data_dir {
@@ -332,10 +322,16 @@ impl SettingsStore {
                     #[allow(clippy::collapsible_if)]
                     if device_prefs_path.exists() {
                         if let Ok(contents) = std::fs::read_to_string(&device_prefs_path) {
-                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents)
+                            {
                                 if let Some(obj) = value.as_object() {
                                     // Map v1 device preferences to v2 settings
-                                    self.overlay_v1_device_preferences(registry, &mut doc, &mut warnings, obj);
+                                    self.overlay_v1_device_preferences(
+                                        registry,
+                                        &mut doc,
+                                        &mut warnings,
+                                        obj,
+                                    );
                                 }
                             }
                             warnings.push(format!(
@@ -345,7 +341,7 @@ impl SettingsStore {
                         }
                     }
                 }
-                
+
                 // Write the migrated document
                 let next = self.write(&doc, 0)?;
                 Ok(StoredSettings {
@@ -366,7 +362,7 @@ impl SettingsStore {
         table: &toml::value::Table,
     ) {
         use flavite_settings::value::SettingValue;
-        
+
         // Map v1 fields to v2 setting IDs according to D-09
         // v1: rename_behavior -> v2: vault.rename_behavior
         if let Some(value) = table.get("rename_behavior") {
@@ -380,32 +376,45 @@ impl SettingsStore {
                 let _ = doc.set("vault.rename_behavior", setting_value, registry);
             }
         }
-        
+
         // v1: recovery_interval_secs -> v2: vault.recovery_interval_secs
         if let Some(value) = table.get("recovery_interval_secs") {
             if let Some(int_val) = value.as_integer() {
-                let _ = doc.set("vault.recovery_interval_secs", SettingValue::Int(int_val), registry);
+                let _ = doc.set(
+                    "vault.recovery_interval_secs",
+                    SettingValue::Int(int_val),
+                    registry,
+                );
             }
         }
-        
+
         // v1: verification_interval_mins -> v2: vault.verification_interval_mins
         if let Some(value) = table.get("verification_interval_mins") {
             if let Some(int_val) = value.as_integer() {
-                let _ = doc.set("vault.verification_interval_mins", SettingValue::Int(int_val), registry);
+                let _ = doc.set(
+                    "vault.verification_interval_mins",
+                    SettingValue::Int(int_val),
+                    registry,
+                );
             }
         }
-        
+
         // v1: change_log_budget_mib -> v2: vault.change_log_budget_mib
         if let Some(value) = table.get("change_log_budget_mib") {
             if let Some(int_val) = value.as_integer() {
-                let _ = doc.set("vault.change_log_budget_mib", SettingValue::Int(int_val), registry);
+                let _ = doc.set(
+                    "vault.change_log_budget_mib",
+                    SettingValue::Int(int_val),
+                    registry,
+                );
             }
         }
-        
+
         // v1: ignore_globs -> v2: vault.ignore_globs
         if let Some(value) = table.get("ignore_globs") {
             if let Some(array) = value.as_array() {
-                let list: Vec<String> = array.iter()
+                let list: Vec<String> = array
+                    .iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_owned()))
                     .collect();
                 let _ = doc.set("vault.ignore_globs", SettingValue::List(list), registry);
@@ -422,9 +431,9 @@ impl SettingsStore {
         obj: &serde_json::Map<String, serde_json::Value>,
     ) {
         use flavite_settings::value::SettingValue;
-        
+
         // Map v1 device preferences fields to v2 setting IDs according to D-09
-        
+
         // theme -> appearance.theme
         if let Some(value) = obj.get("theme") {
             if let Some(text) = value.as_str() {
@@ -434,81 +443,121 @@ impl SettingsStore {
                     "dark" => "dark",
                     _ => "system",
                 };
-                let _ = doc.set("appearance.theme", SettingValue::Str(theme.to_owned()), registry);
+                let _ = doc.set(
+                    "appearance.theme",
+                    SettingValue::Str(theme.to_owned()),
+                    registry,
+                );
             }
         }
-        
+
         // theme_package -> appearance.theme_package
         if let Some(value) = obj.get("theme_package") {
             if let Some(text) = value.as_str() {
-                let _ = doc.set("appearance.theme_package", SettingValue::Str(text.to_owned()), registry);
+                let _ = doc.set(
+                    "appearance.theme_package",
+                    SettingValue::Str(text.to_owned()),
+                    registry,
+                );
             } else {
-                let _ = doc.set("appearance.theme_package", SettingValue::Str("".to_owned()), registry);
+                let _ = doc.set(
+                    "appearance.theme_package",
+                    SettingValue::Str("".to_owned()),
+                    registry,
+                );
             }
         }
-        
+
         // interface_scale_pct -> appearance.scale_pct
         if let Some(value) = obj.get("interface_scale_pct") {
             if let Some(int_val) = value.as_u64() {
-                let _ = doc.set("appearance.scale_pct", SettingValue::Int(int_val as i64), registry);
+                let _ = doc.set(
+                    "appearance.scale_pct",
+                    SettingValue::Int(int_val as i64),
+                    registry,
+                );
             }
         }
-        
+
         // reduced_motion -> appearance.reduced_motion
         if let Some(value) = obj.get("reduced_motion") {
             if let Some(bool_val) = value.as_bool() {
-                let _ = doc.set("appearance.reduced_motion", SettingValue::Bool(bool_val), registry);
+                let _ = doc.set(
+                    "appearance.reduced_motion",
+                    SettingValue::Bool(bool_val),
+                    registry,
+                );
             }
         }
-        
+
         // editor_font_size -> editor.font_size
         if let Some(value) = obj.get("editor_font_size") {
             if let Some(int_val) = value.as_u64() {
-                let _ = doc.set("editor.font_size", SettingValue::Int(int_val as i64), registry);
+                let _ = doc.set(
+                    "editor.font_size",
+                    SettingValue::Int(int_val as i64),
+                    registry,
+                );
             }
         }
-        
+
         // line_width -> editor.line_width
         if let Some(value) = obj.get("line_width") {
             if let Some(obj_map) = value.as_object() {
                 if let Some(columns) = obj_map.get("columns").and_then(|v| v.as_u64()) {
-                    let _ = doc.set("editor.line_width", SettingValue::Int(columns as i64), registry);
+                    let _ = doc.set(
+                        "editor.line_width",
+                        SettingValue::Int(columns as i64),
+                        registry,
+                    );
                 } else if let Some(text) = obj_map.get("type").and_then(|v| v.as_str()) {
                     if text == "full" {
-                        let _ = doc.set("editor.line_width", SettingValue::Str("full".to_owned()), registry);
+                        let _ = doc.set(
+                            "editor.line_width",
+                            SettingValue::Str("full".to_owned()),
+                            registry,
+                        );
                     }
                 }
             }
         }
-        
+
         // prefer_stable_links -> links.prefer_stable_links
         if let Some(value) = obj.get("prefer_stable_links") {
             if let Some(bool_val) = value.as_bool() {
-                let _ = doc.set("links.prefer_stable_links", SettingValue::Bool(bool_val), registry);
+                let _ = doc.set(
+                    "links.prefer_stable_links",
+                    SettingValue::Bool(bool_val),
+                    registry,
+                );
             }
         }
-        
+
         // sidebar_open -> sidebar.open
         if let Some(value) = obj.get("sidebar_open") {
             if let Some(bool_val) = value.as_bool() {
                 let _ = doc.set("sidebar.open", SettingValue::Bool(bool_val), registry);
             }
         }
-        
+
         // sidebar_width -> sidebar.width
         if let Some(value) = obj.get("sidebar_width") {
             if let Some(int_val) = value.as_u64() {
                 let _ = doc.set("sidebar.width", SettingValue::Int(int_val as i64), registry);
             }
         }
-        
+
         // graph_activation_acknowledged -> state.graph_activation_acknowledged
         if let Some(value) = obj.get("graph_activation_acknowledged") {
             if let Some(bool_val) = value.as_bool() {
-                let _ = doc.set("state.graph_activation_acknowledged", SettingValue::Bool(bool_val), registry);
+                let _ = doc.set(
+                    "state.graph_activation_acknowledged",
+                    SettingValue::Bool(bool_val),
+                    registry,
+                );
             }
         }
-        
+
         // shortcuts -> [shortcuts]
         if let Some(value) = obj.get("shortcuts") {
             if let Some(shortcuts_obj) = value.as_object() {
@@ -519,11 +568,16 @@ impl SettingsStore {
                         if flavite_settings::chord::parse_chord(chord_text).is_some() {
                             shortcuts_map.insert(command_id.clone(), chord_text.to_owned());
                         } else {
-                            warnings.push(format!("Invalid chord for {}: {}", command_id, chord_text));
+                            warnings
+                                .push(format!("Invalid chord for {}: {}", command_id, chord_text));
                         }
                     }
                 }
-                let _ = doc.set("shortcuts", SettingValue::ShortcutMap(shortcuts_map), registry);
+                let _ = doc.set(
+                    "shortcuts",
+                    SettingValue::ShortcutMap(shortcuts_map),
+                    registry,
+                );
             }
         }
     }
@@ -537,19 +591,14 @@ impl SettingsStore {
     /// # Errors
     /// Same as `read`, plus codec failures if the backup itself is broken.
     pub fn backup(&self) -> Result<Option<StoredSettings>, SettingsStoreError> {
-        let Some(bytes) = self
-            .vault_store
-            .read_backup(VaultUserStateKind::Settings)?
-        else {
+        let Some(bytes) = self.vault_store.read_backup(VaultUserStateKind::Settings)? else {
             return Ok(None);
         };
         if bytes.len() > MAX_SETTINGS_BYTES {
-            return Err(SettingsStoreError::TooLarge {
-                size: bytes.len(),
-            });
+            return Err(SettingsStoreError::TooLarge { size: bytes.len() });
         }
-        let text = String::from_utf8(bytes)
-            .map_err(|e| SettingsStoreError::Unparseable(e.to_string()))?;
+        let text =
+            String::from_utf8(bytes).map_err(|e| SettingsStoreError::Unparseable(e.to_string()))?;
         let parsed = parse(Some(&text)).map_err(SettingsStoreError::Codec)?;
         let generation = self
             .vault_store
@@ -611,10 +660,12 @@ impl SettingsStore {
         value: SettingValue,
     ) -> Result<u64, SettingsStoreError> {
         let mut stored = self.load_or_initialize(registry)?;
-        
+
         // Validate ID
         if SettingRegistry::is_reserved_namespace(id) {
-            return Err(SettingsStoreError::Codec(SettingsCodecError::ReservedNamespace(id.to_owned())));
+            return Err(SettingsStoreError::Codec(
+                SettingsCodecError::ReservedNamespace(id.to_owned()),
+            ));
         }
 
         // Set the value
@@ -633,7 +684,10 @@ impl SettingsStore {
     ) -> Result<(Vec<SettingValue>, Vec<String>), SettingsStoreError> {
         let stored = self.load_or_initialize(registry)?;
         let resolved = registry.resolve(&stored.doc);
-        Ok((resolved.all().values().cloned().collect(), resolved.warnings().to_vec()))
+        Ok((
+            resolved.all().values().cloned().collect(),
+            resolved.warnings().to_vec(),
+        ))
     }
 }
 
@@ -641,7 +695,7 @@ impl SettingsStore {
 #[must_use]
 pub fn defaults_document(registry: &SettingRegistry) -> SettingsDoc {
     let mut doc = SettingsDoc::new(flavite_settings::descriptor::SCHEMA_VERSION);
-    
+
     for descriptor in registry.all() {
         let parts: Vec<&str> = descriptor.id.split('.').collect();
         if parts.len() == 2 {
@@ -652,7 +706,7 @@ pub fn defaults_document(registry: &SettingRegistry) -> SettingsDoc {
                 .insert(key.to_owned(), descriptor.default.clone());
         }
     }
-    
+
     doc
 }
 
@@ -675,8 +729,8 @@ pub struct ResolvedSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flavite_fs::fs::Fs;
     use flavite_fs::MemFs;
+    use flavite_fs::fs::Fs;
     use flavite_settings::registry::SettingRegistry;
     use flavite_vault::user_state::VaultUserStateStore;
     use std::collections::BTreeMap;
@@ -707,12 +761,15 @@ mod tests {
     fn write_and_read_round_trip() {
         let (store, _dir) = settings_store();
         let registry = SettingRegistry::with_builtins();
-        
+
         let doc = defaults_document(&registry);
         let next = store.write(&doc, 0).expect("write should succeed");
         assert_eq!(next, 1);
-        
-        let stored = store.read().expect("read should succeed").expect("should have doc");
+
+        let stored = store
+            .read()
+            .expect("read should succeed")
+            .expect("should have doc");
         assert_eq!(stored.generation, 1);
         assert!(!stored.is_read_only());
     }
@@ -721,13 +778,19 @@ mod tests {
     fn cas_conflict() {
         let (store, _dir) = settings_store();
         let registry = SettingRegistry::with_builtins();
-        
+
         let doc = defaults_document(&registry);
         store.write(&doc, 0).expect("first write");
-        
+
         // Second write with stale generation should fail
         let result = store.write(&doc, 0);
-        assert!(matches!(result, Err(SettingsStoreError::Conflict { expected: 0, actual: 1 })));
+        assert!(matches!(
+            result,
+            Err(SettingsStoreError::Conflict {
+                expected: 0,
+                actual: 1
+            })
+        ));
     }
 
     #[test]
@@ -735,7 +798,7 @@ mod tests {
         let (vault_store, _dir) = vault_store();
         let store = SettingsStore::new(vault_store, false);
         let registry = SettingRegistry::with_builtins();
-        
+
         let doc = defaults_document(&registry);
         let result = store.write(&doc, 0);
         assert!(matches!(result, Err(SettingsStoreError::ReadOnly)));
@@ -745,12 +808,15 @@ mod tests {
     fn oversized_document_rejected() {
         let (store, _dir) = settings_store();
         let registry = SettingRegistry::with_builtins();
-        
+
         let mut doc = defaults_document(&registry);
         // Add a huge unknown section to exceed the bound
         let huge_value = "x".repeat(MAX_SETTINGS_BYTES + 1);
-        doc.unknown_tables.insert("huge".to_owned(), BTreeMap::from([("value".to_owned(), toml::Value::String(huge_value))]));
-        
+        doc.unknown_tables.insert(
+            "huge".to_owned(),
+            BTreeMap::from([("value".to_owned(), toml::Value::String(huge_value))]),
+        );
+
         let result = store.write(&doc, 0);
         assert!(matches!(result, Err(SettingsStoreError::TooLarge { .. })));
     }
@@ -759,7 +825,7 @@ mod tests {
     fn load_or_initialize_creates_defaults() {
         let (store, _dir) = settings_store();
         let registry = SettingRegistry::with_builtins();
-        
+
         let stored = store.load_or_initialize(&registry).expect("load or init");
         assert_eq!(stored.generation, 1);
         assert!(!stored.is_read_only());
@@ -769,11 +835,11 @@ mod tests {
     fn load_or_initialize_returns_existing() {
         let (store, _dir) = settings_store();
         let registry = SettingRegistry::with_builtins();
-        
+
         // Write a document first
         let doc = defaults_document(&registry);
         store.write(&doc, 0).expect("write");
-        
+
         // Load should return the existing document
         let stored = store.load_or_initialize(&registry).expect("load or init");
         assert_eq!(stored.generation, 1);
@@ -784,11 +850,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("vault dir");
         let fs: Box<dyn Fs + Send + Sync> = Box::new(MemFs::new());
         let vault_store = VaultUserStateStore::new(fs, dir.path());
-        
+
         let path = vault_store.path_for(VaultUserStateKind::Settings);
         assert_eq!(
             path,
-            PathBuf::from(dir.path()).join(".flavite").join("settings.toml")
+            PathBuf::from(dir.path())
+                .join(".flavite")
+                .join("settings.toml")
         );
     }
 }

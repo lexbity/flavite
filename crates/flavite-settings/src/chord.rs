@@ -389,7 +389,7 @@ mod tests {
         let original = "Mod+Alt+Shift+P";
         let parsed = parse_chord(original).unwrap();
         let formatted = chord_string(&parsed);
-        
+
         // Note: order may differ (Mod vs Ctrl), but the chord is equivalent
         let reparsed = parse_chord(&formatted).unwrap();
         assert_eq!(parsed.modifiers, reparsed.modifiers);
@@ -404,15 +404,24 @@ mod tests {
 
         // Ctrl+Alt+Backspace is reserved
         let chord = parse_chord("Mod+Alt+Backspace").unwrap();
-        assert_eq!(os_reserved(&chord), Some("the desktop (session kill switch)"));
+        assert_eq!(
+            os_reserved(&chord),
+            Some("the desktop (session kill switch)")
+        );
 
         // Ctrl+Alt+Arrow keys are reserved
         let chord = parse_chord("Mod+Alt+ArrowLeft").unwrap();
-        assert_eq!(os_reserved(&chord), Some("the desktop (workspace switching)"));
+        assert_eq!(
+            os_reserved(&chord),
+            Some("the desktop (workspace switching)")
+        );
 
         // Alt+Tab is reserved
         let chord = parse_chord("Alt+Tab").unwrap();
-        assert_eq!(os_reserved(&chord), Some("the desktop (application switching)"));
+        assert_eq!(
+            os_reserved(&chord),
+            Some("the desktop (application switching)")
+        );
 
         // Regular chords are not reserved
         let chord = parse_chord("Mod+S").unwrap();
@@ -424,7 +433,7 @@ mod tests {
         let mut shortcuts = BTreeMap::new();
         shortcuts.insert("note.save".to_owned(), "Mod+S".to_owned());
         shortcuts.insert("note.new".to_owned(), "Mod+N".to_owned());
-        
+
         let defaults = BTreeMap::new();
         assert!(validate_shortcuts(&shortcuts, &defaults).is_ok());
     }
@@ -434,7 +443,7 @@ mod tests {
         let mut shortcuts = BTreeMap::new();
         shortcuts.insert("note.save".to_owned(), "Mod+S".to_owned());
         shortcuts.insert("note.new".to_owned(), "Mod+S".to_owned());
-        
+
         let defaults = BTreeMap::new();
         let result = validate_shortcuts(&shortcuts, &defaults);
         assert!(matches!(result, Err(ShortcutError::Collision { .. })));
@@ -444,7 +453,7 @@ mod tests {
     fn test_validate_shortcuts_os_reserved() {
         let mut shortcuts = BTreeMap::new();
         shortcuts.insert("note.close".to_owned(), "Alt+F4".to_owned());
-        
+
         let defaults = BTreeMap::new();
         let result = validate_shortcuts(&shortcuts, &defaults);
         assert!(matches!(result, Err(ShortcutError::OsReserved { .. })));
@@ -454,7 +463,7 @@ mod tests {
     fn test_validate_shortcuts_unreadable() {
         let mut shortcuts = BTreeMap::new();
         shortcuts.insert("note.save".to_owned(), "Invalid+Chord".to_owned());
-        
+
         let defaults = BTreeMap::new();
         let result = validate_shortcuts(&shortcuts, &defaults);
         assert!(matches!(result, Err(ShortcutError::UnreadableChord { .. })));
@@ -465,10 +474,10 @@ mod tests {
         // If a command's default is an OS-reserved chord, overriding to the same chord is allowed
         let mut shortcuts = BTreeMap::new();
         shortcuts.insert("note.close".to_owned(), "Alt+F4".to_owned());
-        
+
         let mut defaults = BTreeMap::new();
         defaults.insert("note.close".to_owned(), "Alt+F4".to_owned());
-        
+
         let result = validate_shortcuts(&shortcuts, &defaults);
         assert!(result.is_ok());
     }

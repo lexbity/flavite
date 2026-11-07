@@ -74,6 +74,21 @@ pub fn decode(
     decode_inner(Arc::from(source), policy, limits, cancel)
 }
 
+/// Decode owned source bytes without copying them at the boundary. The map
+/// shares the moved buffer instead of duplicating the caller's `Vec`.
+///
+/// # Errors
+///
+/// See [`decode`].
+pub fn decode_vec(
+    source: Vec<u8>,
+    policy: DecodePolicy,
+    limits: &DecodeLimits,
+    cancel: &CancelToken,
+) -> Result<DecodedContent, CodecError> {
+    decode_inner(Arc::from(source), policy, limits, cancel)
+}
+
 fn decode_inner(
     source: Arc<[u8]>,
     policy: DecodePolicy,
@@ -161,6 +176,9 @@ fn auto_signature(source: &[u8]) -> Result<(SourceFormat, usize), CodecError> {
         return Ok((SourceFormat::new_unchecked(FileEncoding::Utf8, true), 3));
     }
     if source.starts_with(FileEncoding::Utf16Le.signature()) {
+        // The UTF-32LE prefix is diagnosed first; any remaining odd
+        // trailing byte surfaces as OddUtf16ByteCount from the decode —
+        // the same contract the streaming decoder applies at EOF.
         return Ok((SourceFormat::new_unchecked(FileEncoding::Utf16Le, true), 2));
     }
     if source.starts_with(FileEncoding::Utf16Be.signature()) {
@@ -237,7 +255,11 @@ fn decode_ascii(
         if cancel.is_cancelled() {
             return Err(CodecError::Cancelled);
         }
-        if let Some(idx) = body[start..end].iter().position(|b| *b >= 0x80) {
+        let chunk = &body[start..end];
+        if !chunk.is_ascii() {
+            let Some(idx) = chunk.iter().position(|b| *b >= 0x80) else {
+                unreachable!("non-ASCII chunk contains a >= 0x80 byte");
+            };
             return Err(CodecError::InvalidUtf8 {
                 source_byte: start + idx + sig_len,
             });
@@ -248,7 +270,9 @@ fn decode_ascii(
             CodecLimitKind::DecodedUtf8Bytes,
         )?;
         // All bytes are ASCII, therefore valid UTF-8.
-        out.push_str(std::str::from_utf8(&body[start..end]).unwrap_or_default());
+        out.push_str(
+            std::str::from_utf8(&body[start..end]).expect("all-ASCII chunk is valid UTF-8"),
+        );
         start = end;
     }
     Ok(out)
@@ -325,6 +349,53 @@ mod tests {
         for (source, encoding, bom) in cases {
             let decoded = decode_auto(source).expect("decodes");
             assert_eq!(decoded.format(), SourceFormat::new(encoding, bom).unwrap());
+        }
+    }
+
+    #[test]
+    fn truncated_signature_resolves_identically_one_shot_and_streaming() {
+        use crate::stream::StreamingDecoder;
+        // Every prefix shorter than a full UTF-16 body unit plus the
+        // ambiguity set: the one-shot decoder must resolve exactly like
+        // streaming push-all + finish (one codec contract, FR-24).
+        let inputs: Vec<Vec<u8>> = Vec::from([
+            Vec::new(),
+            vec![0xFF],
+            vec![0xFE],
+            vec![0xFF, 0xFE],
+            vec![0xFE, 0xFF],
+            vec![0xFF, 0xFE, 0x00],
+            vec![0xFF, 0xFE, 0x41],
+            vec![0xFE, 0xFF, 0x00],
+            vec![0xFE, 0xFF, 0x00, 0x00],
+            vec![0xFF, 0xFE, 0x00, 0x00],
+        ]);
+        for source in &inputs {
+            let one_shot = decode(
+                source,
+                DecodePolicy::Auto,
+                &DecodeLimits::default(),
+                &CancelToken::new(),
+            )
+            .map(|decoded| (decoded.text().to_owned(), decoded.format()));
+            let mut decoder = StreamingDecoder::new(DecodePolicy::Auto, DecodeLimits::default());
+            let streaming = decoder
+                .push(source, &CancelToken::new())
+                .and_then(|()| decoder.finish())
+                .map(|decoded| (decoded.text().to_owned(), decoded.format()));
+            assert_eq!(one_shot, streaming, "one-shot vs streaming for {source:?}");
+        }
+        // The unified truncated-BOM contract: a UTF-16 BOM prefix with an
+        // odd trailing byte is a truncated code unit on both paths.
+        for source in [&[0xFFu8, 0xFE, 0x00][..], &[0xFE, 0xFF, 0x41][..]] {
+            let error = decode(
+                source,
+                DecodePolicy::Auto,
+                &DecodeLimits::default(),
+                &CancelToken::new(),
+            )
+            .expect_err("truncated UTF-16 code unit");
+            assert_eq!(error, CodecError::OddUtf16ByteCount);
         }
     }
 

@@ -278,8 +278,12 @@ impl App {
             at == 0
                 || flavite_editor::viewport::next_grapheme_boundary(
                     &view.text,
-                    flavite_editor::viewport::previous_grapheme_boundary(&view.text, at),
-                ) == at
+                    flavite_editor::viewport::prev_grapheme_boundary(
+                        &view.text,
+                        flavite_syntax::TextByte(at),
+                    ),
+                )
+                .0 == at
         };
         if !boundary(anchor) || !boundary(head) {
             return;

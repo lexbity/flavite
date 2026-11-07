@@ -15,7 +15,8 @@
 //! revisioned read views.
 
 use flavite_encoding::{
-    CodecError, DecodePolicy, EncodeLimits, FormatStamp, SourceFormat, encode as codec_encode,
+    CodecError, DecodeLimits, DecodeMap, DecodePolicy, EncodeLimits, FormatStamp, SourceFormat,
+    encode as codec_encode,
 };
 use flavite_syntax::text::{Span, TextByte, TextSnapshot};
 use ropey::{Rope, RopeSlice};
@@ -219,6 +220,142 @@ pub fn spliced_eol_table(old: &EolTable, old_text: &str, new_text: &str) -> EolT
             .unwrap_or(dominant);
     }
     new_table
+}
+
+/// Bounded affected-range splice (§6.9, S01): the EOL entries of only the
+/// edited line run are recomputed. `old_text` is the full pre-edit text,
+/// `window_start..tail_end` the pre-edit byte range of the edited run (a
+/// line-aligned run through the merge boundary), `window_new` its post-edit
+/// text (old head + replacement + unchanged tail), and `window_first` the
+/// table index of the run's first line. Unchanged prefix/suffix entries keep
+/// their recorded endings, changed lines inherit the old dominant ending,
+/// and a new final unterminated line stays unterminated — identical to
+/// [`spliced_eol_table`], which stays the reference path for prepared
+/// batches (the install path here must agree with it exactly).
+fn spliced_eol_table_in_window(
+    old: &EolTable,
+    old_text: &str,
+    window_start: usize,
+    tail_end: usize,
+    window_new: &str,
+    window_first: usize,
+) -> EolTable {
+    let window_old = &old_text[window_start..tail_end];
+    let old_count = old.line_count();
+    if window_new.is_empty() {
+        // The whole run was deleted. The surviving document is the
+        // unchanged, line-aligned head and tail: the run contributes no
+        // lines (a wholly deleted run is not a phantom unterminated line).
+        if window_start == 0 && tail_end == old_text.len() {
+            // The document is now empty: one unterminated line (§6.10).
+            return EolTable {
+                line_endings: vec![crate::eol::LineEnding::None],
+                has_trailing_newline: false,
+            };
+        }
+        let removed = old_count
+            .saturating_sub(window_first)
+            .min(window_old.split_inclusive('\n').count());
+        let mut table = old.clone();
+        table
+            .line_endings
+            .splice(window_first..window_first + removed, []);
+        // The surviving document tail is unchanged: the old final line when
+        // the tail survives, otherwise the (terminated) last head line.
+        table.has_trailing_newline = if tail_end < old_text.len() {
+            old.has_trailing_newline
+        } else {
+            window_start > 0
+        };
+        return table;
+    }
+    let dominant = match old.dominant_eol() {
+        crate::eol::LineEnding::None => crate::eol::LineEnding::Lf,
+        ending => ending,
+    };
+    // `logical_lines` maps an empty run to its one phantom line, matching
+    // the whole-document reference.
+    let old_lines = logical_lines(window_old);
+    let new_lines = logical_lines(window_new);
+    let removed = old_count.saturating_sub(window_first).min(old_lines.len());
+    let new_count = old_count - removed + new_lines.len();
+
+    let mut head = 0;
+    while head < old_lines.len() && head < new_lines.len() && old_lines[head] == new_lines[head] {
+        head += 1;
+    }
+    let prefix = window_first + head;
+    let mut suffix = 0;
+    while suffix < old_lines.len().saturating_sub(head)
+        && suffix < new_lines.len().saturating_sub(head)
+        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    // The unchanged lines beyond the window are equal on both sides and
+    // always extend the whole-document suffix (the reference compares them
+    // line by line); the window tail matches stack on top of them.
+    let beyond_window = old_count
+        .saturating_sub(window_first)
+        .saturating_sub(removed);
+    let suffix = (suffix + beyond_window)
+        .min(old_count.saturating_sub(prefix))
+        .min(new_count.saturating_sub(prefix));
+    let old_middle = old_count.saturating_sub(prefix + suffix);
+    let new_middle = new_count.saturating_sub(prefix + suffix);
+
+    let mut table = EolTable::default();
+    table.line_endings.reserve(new_count);
+    for line in 0..new_count {
+        // The scanned terminator of the new text at this line: a replacement
+        // line without a newline is authoritative and never inherits one.
+        let scanned = if line < window_first {
+            old.get(line)
+        } else if line < window_first + new_lines.len() {
+            Some(line_ending_of(new_lines[line - window_first]))
+        } else {
+            old.get(old_count - (new_count - line))
+        };
+        if scanned == Some(crate::eol::LineEnding::None) {
+            table.line_endings.push(crate::eol::LineEnding::None);
+            continue;
+        }
+        let old_line = if line < prefix {
+            Some(line)
+        } else if line >= new_count - suffix {
+            Some(old_count - (new_count - line))
+        } else if old_middle == new_middle {
+            Some(line)
+        } else {
+            None
+        };
+        let ending = old_line
+            .and_then(|old_line| old.get(old_line))
+            .unwrap_or(dominant);
+        table.line_endings.push(ending);
+    }
+    // The reference's trailing flag comes from the whole-document scan: the
+    // last document line lies beyond the window (the old trailing state
+    // stands) or is the window's final new line.
+    table.has_trailing_newline = if tail_end < old_text.len() {
+        old.has_trailing_newline
+    } else {
+        new_lines
+            .last()
+            .is_some_and(|line| line_ending_of(line) != crate::eol::LineEnding::None)
+    };
+    table
+}
+
+/// The recorded ending of one split-inclusive line slice.
+fn line_ending_of(line: &str) -> crate::eol::LineEnding {
+    if line.ends_with("\r\n") {
+        crate::eol::LineEnding::Crlf
+    } else if line.ends_with('\n') {
+        crate::eol::LineEnding::Lf
+    } else {
+        crate::eol::LineEnding::None
+    }
 }
 
 /// The physical-EOL decoded layer for a normalized text plus its EOL table
@@ -598,32 +735,7 @@ impl EditorModel {
     /// source bytes; use [`EditorModel::try_to_source_bytes`] for those.
     #[must_use]
     pub fn decoded_text(&self) -> String {
-        let text = self.text();
-        let mut out = String::with_capacity(text.len() + self.eol_table.line_count());
-        let mut start = 0usize;
-        let breaks: Vec<usize> = if text.ends_with('\n') {
-            text.match_indices('\n').map(|(i, _)| i).collect()
-        } else {
-            let mut v: Vec<usize> = text.match_indices('\n').map(|(i, _)| i).collect();
-            v.push(text.len());
-            v
-        };
-        for (i, &end) in breaks.iter().enumerate() {
-            out.push_str(&text[start..end]);
-            match self.eol_table.line_endings.get(i) {
-                Some(crate::eol::LineEnding::Lf) => out.push('\n'),
-                Some(crate::eol::LineEnding::Crlf) => out.push_str("\r\n"),
-                // No recorded ending for this line (new/last): keep LF when
-                // the normalized text carries one, otherwise terminate none.
-                _ => {
-                    if end < text.len() {
-                        out.push('\n');
-                    }
-                }
-            }
-            start = if end < text.len() { end + 1 } else { end };
-        }
-        out
+        decoded_layer(self.text(), &self.eol_table)
     }
 
     /// Change the buffer's save format as one isolated, revision-advancing
@@ -884,9 +996,14 @@ impl EditorModel {
                 Ok(self.install_prepared(batch))
             }
             crate::undo::UndoPolicy::Typing => {
-                if self.batch_error(edits).is_some() {
-                    return Err(self.batch_error(edits).unwrap_or(BatchError::Empty));
+                if let Some(error) = self.batch_error(edits) {
+                    return Err(error);
                 }
+                // Precondition (documented): `edits` just validated clean
+                // against this exact text, so `apply_edit_ops_inner`'s own
+                // refusal cannot trigger. That check stays in place for the
+                // other callers — the prepared-edits invariants do not
+                // weaken; this path simply pays for it once.
                 Ok(self.apply_edit_ops(edits))
             }
         }
@@ -1059,20 +1176,35 @@ impl EditorModel {
     /// fails with `Unencodable` before any file effect).
     #[must_use]
     pub fn snapshot(&self) -> TextSnapshot {
-        match self.try_to_source_bytes() {
-            Ok(source_bytes) => {
-                TextSnapshot::with_policy(&source_bytes, DecodePolicy::Explicit(self.source_format))
-                    .unwrap_or_else(|_| {
-                        TextSnapshot::from_normalized_with_descriptor(
-                            self.text(),
-                            self.source_format,
-                        )
-                    })
-            }
-            Err(_) => {
-                TextSnapshot::from_normalized_with_descriptor(self.text(), self.source_format)
+        // Fast path (NFR-2): serialize once from the decoded layer, build
+        // the boundary map without decoding again, and compose the snapshot
+        // from the validated parts — the inverse of
+        // [`TextSnapshot::from_decoded`], two O(note) passes instead of a
+        // full decode-back + line rescan per keystroke.
+        let decoded = self.decoded_text();
+        let encoded = codec_encode(
+            &decoded,
+            self.source_format,
+            &EncodeLimits::default(),
+            &flavite_encoding::NOT_CANCELLED,
+        );
+        if let Ok(source) = encoded {
+            let source: std::sync::Arc<[u8]> = source.into();
+            if let Ok(map) = DecodeMap::build(
+                source.clone(),
+                self.source_format,
+                &DecodeLimits::default(),
+                &flavite_encoding::NOT_CANCELLED,
+            ) {
+                return TextSnapshot::from_parts(source, map, decoded);
             }
         }
+        // Pending-descriptor fallback (§6.10): the draft does not serialize
+        // under its descriptor, so the snapshot is the explicit synthetic
+        // normalized view carrying the save-format intent. `source()` is the
+        // decoded UTF-8, NOT serialized form; Undo/Redo still restore text,
+        // EOL and format exactly and saving fails with `Unencodable` typed.
+        TextSnapshot::from_normalized_with_descriptor(self.text(), self.source_format)
     }
 
     /// Get the content hash of the current buffer (serialized source when
@@ -1093,20 +1225,23 @@ impl EditorModel {
     }
 
     /// Update text and its Rope index without rebuilding either document.
-    /// Ordinary character edits keep every line's EOL metadata unchanged.
+    /// Ordinary character edits keep every line's EOL metadata unchanged;
+    /// newline-changing edits splice only the affected line range (S01).
     fn apply_text_edit(&mut self, edit: &EditOp) {
         let range = edit.range.start.0..edit.range.end.0;
         let changes_lines =
             self.text[range.clone()].contains('\n') || edit.replacement.contains('\n');
-        let old_text = changes_lines.then(|| self.text.clone());
+        // The bounded splice is computed off the pre-edit text and rope, so
+        // no whole-document copy is needed.
+        let spliced = changes_lines.then(|| self.affected_eol_splice(edit, &range));
         let ended_with_lf = self.text.ends_with('\n');
         let start = self.rope.byte_to_char(range.start);
         let end = self.rope.byte_to_char(range.end);
         self.rope.remove(start..end);
         self.rope.insert(start, &edit.replacement);
         self.text.replace_range(range, &edit.replacement);
-        if let Some(old_text) = old_text {
-            self.rebuild_eol_table(&old_text);
+        if let Some(table) = spliced {
+            self.eol_table = table;
         } else if ended_with_lf && !self.text.ends_with('\n') {
             // Typing in the synthetic empty Rope line creates a real,
             // unterminated source line; it inherits no terminator.
@@ -1120,55 +1255,59 @@ impl EditorModel {
         }
     }
 
-    /// Rebuild the EOL table from the current rope state.
-    ///
-    /// This is called when we can't easily update the EOL table incrementally.
-    fn rebuild_eol_table(&mut self, old_text: &str) {
-        let dominant = match self.eol_table.dominant_eol() {
-            crate::eol::LineEnding::None => crate::eol::LineEnding::Lf,
-            ending => ending,
-        };
-        let snapshot = TextSnapshot::from_normalized(self.text());
-        let mut new_table = EolTable::from_snapshot(&snapshot);
-        let old_lines = logical_lines(old_text);
-        let new_lines = logical_lines(self.text());
-        let mut prefix = 0;
-        while prefix < old_lines.len()
-            && prefix < new_lines.len()
-            && old_lines[prefix] == new_lines[prefix]
-        {
-            prefix += 1;
-        }
-        let mut suffix = 0;
-        while suffix < old_lines.len().saturating_sub(prefix)
-            && suffix < new_lines.len().saturating_sub(prefix)
-            && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
-        {
-            suffix += 1;
-        }
-        let old_middle = old_lines.len() - prefix - suffix;
-        let new_middle = new_lines.len() - prefix - suffix;
-        for (line, ending) in new_table.line_endings.iter_mut().enumerate() {
-            // A replacement line without a newline is authoritative: do not
-            // carry the old file's ending onto the new final unterminated line.
-            if *ending == crate::eol::LineEnding::None {
-                continue;
-            }
-            let old_line = if line < prefix {
-                Some(line)
-            } else if line >= prefix + new_middle {
-                Some(old_lines.len() - (new_lines.len() - line))
-            } else if old_middle == new_middle {
-                Some(line)
+    /// The bounded affected-range EOL splice for one contiguous edit against
+    /// the current text/rope (§6.9, S01). The affected old-line window comes
+    /// from the rope's line index and only those entries are recomputed;
+    /// everything else is byte-identical to [`spliced_eol_table`], which
+    /// remains the reference path for prepared batches.
+    fn affected_eol_splice(&self, edit: &EditOp, range: &std::ops::Range<usize>) -> EolTable {
+        let (first_rope_line, tail_end) = if range.is_empty() {
+            // Pure insertion: the inserted lines join the line at the point.
+            let line = self.rope.byte_to_line(range.start);
+            (line, self.line_end_byte(line))
+        } else {
+            let last = self.rope.byte_to_line(range.end - 1);
+            let tail_end = if edit.replacement.ends_with('\n') {
+                self.line_end_byte(last)
             } else {
-                None
+                // The replacement's tail merges the following old line when
+                // it lacks a trailing newline: the window runs to the next
+                // line boundary at or after the edit end.
+                match self.text[range.end..].find('\n') {
+                    Some(offset) => range.end + offset + 1,
+                    None => self.text.len(),
+                }
             };
-            *ending = old_line
-                .and_then(|old_line| self.eol_table.get(old_line))
-                .unwrap_or(dominant);
-        }
+            (self.rope.byte_to_line(range.start), tail_end)
+        };
+        // Rope line indices double as table indices, except the synthetic
+        // trailing line after a final newline (which has no table entry).
+        let window_first = first_rope_line.min(self.eol_table.line_count().saturating_sub(1));
+        let window_start = self.rope.line_to_byte(window_first);
+        let window_new = format!(
+            "{}{}{}",
+            &self.text[window_start..range.start],
+            edit.replacement,
+            &self.text[range.end..tail_end],
+        );
+        spliced_eol_table_in_window(
+            &self.eol_table,
+            &self.text,
+            window_start,
+            tail_end,
+            &window_new,
+            window_first,
+        )
+    }
 
-        self.eol_table = new_table;
+    /// Byte offset of the end of `line` (after its newline; the text end for
+    /// the final line).
+    fn line_end_byte(&self, line: usize) -> usize {
+        if line + 1 < self.rope.len_lines() {
+            self.rope.line_to_byte(line + 1)
+        } else {
+            self.text.len()
+        }
     }
 
     /// Set the coalesce window for the undo tree.
@@ -1430,7 +1569,7 @@ mod tests {
         assert_eq!(model.eol_table(), &initial);
         assert!(model.undo().is_some());
         assert!(model.text().ends_with('é'));
-        assert_eq!(model.snapshot().to_source_bytes(), model.to_source_bytes());
+        assert_eq!(model.snapshot().source(), model.to_source_bytes());
         assert!(model.redo().is_some());
         assert_eq!(model.eol_table(), &initial);
     }
@@ -1471,6 +1610,56 @@ mod tests {
             assert_eq!(model.rope.to_string(), model.text());
             assert_eq!(model.snapshot().text(), model.text());
             assert_eq!(model.to_source_bytes(), model.text().as_bytes());
+        }
+    }
+
+    #[test]
+    fn bounded_eol_splice_matches_the_reference_splice_on_randomized_edits() {
+        // Deterministic LCG: repeated runs always cover the same corpus.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Lines carry mixed endings so dominant-vs-recorded divergences are
+        // exercised, plus empty units so the empty-text edges appear.
+        let units = ["a", "b\r", "\n", "c\r\n", "dd", "\r\n", "e\n", ""];
+        for iteration in 0..2_000 {
+            let text: String = (0..(next() % 9 + 1))
+                .map(|_| units[(next() as usize) % units.len()])
+                .collect();
+            let model = EditorModel::from_text(&text);
+            let old_text = model.text().to_string();
+            let old_table = model.eol_table().clone();
+            let start = (next() as usize) % (old_text.len() + 1);
+            let end = start + (next() as usize) % (old_text.len() + 1 - start);
+            // Frequently reproduce the replaced bytes so identity windows
+            // (equal-line prefix extension) are exercised too.
+            let replacement = if next() % 4 == 0 && end > start {
+                old_text[start..end].to_string()
+            } else {
+                (0..(next() % 4))
+                    .map(|_| units[(next() as usize) % units.len()])
+                    .collect()
+            };
+            // The reference: the whole-document splice prepare_batch uses.
+            let expected = spliced_eol_table(
+                &old_table,
+                &old_text,
+                &format!("{}{}{}", &old_text[..start], replacement, &old_text[end..]),
+            );
+            let mut edited = EditorModel::from_text(&text);
+            edited.apply_edit_ops(&[EditOp::new(
+                Span::new(TextByte(start), TextByte(end)),
+                replacement.clone(),
+            )]);
+            assert_eq!(
+                edited.eol_table(),
+                &expected,
+                "iteration {iteration}: {start}..{end} -> {replacement:?} on {old_text:?}"
+            );
         }
     }
 
@@ -1702,5 +1891,34 @@ mod tests {
         model.clear();
         assert!(model.is_empty());
         assert!(model.to_source_bytes().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod splice_debug {
+    use super::*;
+
+    #[test]
+    fn debug_case_iteration2() {
+        let text = "e\ne\nc\n";
+        let model = EditorModel::from_text(text);
+        eprintln!("old_text={:?} table={:?}", model.text(), model.eol_table());
+        let old_table = model.eol_table().clone();
+        let old_text = model.text().to_string();
+        let replacement = "\r\ne\n".to_string();
+        let new_text = format!("{}{}{}", &old_text[..0], replacement, &old_text[1..]);
+        eprintln!("new_text={:?}", new_text);
+        let expected = spliced_eol_table(&old_table, &old_text, &new_text);
+        eprintln!(
+            "spliced={:?} dominant={:?}",
+            expected,
+            old_table.dominant_eol()
+        );
+        let mut edited = EditorModel::from_text(text);
+        edited.apply_edit_ops(&[EditOp::new(
+            Span::new(TextByte(0), TextByte(1)),
+            replacement.clone(),
+        )]);
+        eprintln!("bounded={:?}", edited.eol_table());
     }
 }

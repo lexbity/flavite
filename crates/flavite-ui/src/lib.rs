@@ -9,6 +9,10 @@
 pub mod accessibility;
 pub mod app;
 pub mod graph;
+#[cfg(feature = "ui-test-support")]
+/// Fixture/harness support. Compiled only under `ui-test-support`; the
+/// production build never includes it (RFC-0003 §16.2).
+#[cfg(feature = "ui-test-support")]
 pub mod harness;
 pub mod host;
 pub mod operation;

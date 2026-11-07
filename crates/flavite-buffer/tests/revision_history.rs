@@ -90,10 +90,18 @@ fn coalesced_undo_transform_matches_real_text_and_redo_keeps_mixed_line_endings(
         Span::new(TextByte(0), TextByte(2)),
         "αβ".into(),
     )]);
+    // The insert and the replacement coalesce into one undo group: a
+    // single undo returns to the empty text, and its recorded transition
+    // op is the combined redo direction — replace the empty span with the
+    // whole "αβ" text (applied to "" it reproduces the undone state).
     model.undo();
-    let forward = &model.last_transition_ops()[0];
-    assert_eq!(forward.apply(""), "αβ");
-    let inverse = forward.invert("");
-    assert_eq!(inverse.range.end.0, 4);
-    assert_eq!(inverse.replacement, "");
+    assert_eq!(model.text(), "");
+    let redo_op = &model.last_transition_ops()[0];
+    assert_eq!(redo_op.range.start, TextByte(0));
+    assert_eq!(redo_op.range.end, TextByte(0));
+    assert_eq!(redo_op.replacement, "αβ");
+    assert_eq!(redo_op.apply(""), "αβ");
+    // Redo replays the coalesced group as one forward transition.
+    model.redo();
+    assert_eq!(model.text(), "αβ");
 }

@@ -108,15 +108,6 @@ impl DocumentRegistry {
             .unwrap_or(0)
     }
 
-    /// The buffer attached to the tab's document, if any.
-    #[must_use]
-    pub fn buffer_of(&self, tab: flavite_workspace::TabId) -> Option<u64> {
-        self.documents
-            .values()
-            .find(|entry| entry.leases.contains_key(&tab))
-            .and_then(|entry| entry.buffer)
-    }
-
     /// The document is fully closed: drop the retained entry so the next
     /// open starts a fresh Session buffer (W12 §8.3 last-view close).
     pub fn close_document(&mut self, tab: flavite_workspace::TabId) {

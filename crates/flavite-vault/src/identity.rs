@@ -126,12 +126,6 @@ pub fn resolve_data_dir(explicit: Option<&Path>) -> Option<PathBuf> {
     ProjectDirs::from("com", "flavite", "Flavite").map(|p| p.data_dir().to_path_buf())
 }
 
-/// Get the OS cache directory for Flavite.
-#[allow(dead_code)]
-fn get_cache_dir() -> Option<PathBuf> {
-    ProjectDirs::from("com", "flavite", "Flavite").map(|p| p.cache_dir().to_path_buf())
-}
-
 fn registry_path_in(data_dir: &Path, root_key: &[u8]) -> PathBuf {
     data_dir
         .join(FLAVITE_DIR)

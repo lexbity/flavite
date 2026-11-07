@@ -41,6 +41,10 @@ const RECOVERY_VERSION: u8 = 2;
 /// is retained until the v2 receipt).
 const RECOVERY_VERSION_V1: u8 = 1;
 
+/// Raw upper bound for one recovery file on disk (§4.5.3): larger files are
+/// refused before any read or decode.
+const MAX_RECOVERY_FILE_BYTES: u64 = 128 * 1024 * 1024;
+
 /// Header at the start of every recovery file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecoveryHeader {
@@ -433,10 +437,9 @@ impl RecoveryFile {
         let encoded_attempt = flavite_encoding::encode(
             decoded_str,
             source_format,
-            &flavite_encoding::EncodeLimits {
-                max_input_utf8_bytes: 64 * 1024 * 1024,
-                max_output_bytes: 64 * 1024 * 1024,
-            },
+            // The writer encoded under the shared RFC envelope (32 MiB), so
+            // verification uses the same limits.
+            &flavite_encoding::EncodeLimits::default(),
             &flavite_encoding::NOT_CANCELLED,
         );
         match (&recovery.encoded, encoded_attempt) {
@@ -524,10 +527,7 @@ impl RecoveryFile {
         let encoded = flavite_encoding::encode(
             std::str::from_utf8(&decoded).ok()?,
             source_format,
-            &flavite_encoding::EncodeLimits {
-                max_input_utf8_bytes: 64 * 1024 * 1024,
-                max_output_bytes: 64 * 1024 * 1024,
-            },
+            &flavite_encoding::EncodeLimits::default(),
             &flavite_encoding::NOT_CANCELLED,
         )
         .ok();
@@ -565,10 +565,7 @@ impl RecoveryFile {
         flavite_encoding::encode(
             decoded,
             self.source_format,
-            &flavite_encoding::EncodeLimits {
-                max_input_utf8_bytes: 64 * 1024 * 1024,
-                max_output_bytes: 64 * 1024 * 1024,
-            },
+            &flavite_encoding::EncodeLimits::default(),
             &flavite_encoding::NOT_CANCELLED,
         )
     }
@@ -728,97 +725,6 @@ impl RecoveryWriter {
         self.should_write_revision(recovery.header.buffer_id, recovery.header.revision)
     }
 
-    /// Write recovery files for all dirty buffers.
-    ///
-    /// Returns the paths that were written.
-    pub fn write_all(&mut self, buffers: &[(Vec<u8>, &Buffer)]) -> Vec<PathBuf> {
-        let mut written = Vec::new();
-
-        for (note_key, buffer) in buffers {
-            if self.should_write(buffer)
-                && let Some(path) = self.write_buffer(note_key, buffer)
-            {
-                written.push(path);
-            }
-        }
-
-        written
-    }
-
-    /// Write a recovery file for a specific buffer.
-    ///
-    /// The write is atomic: write to a temp file, fsync, rename.
-    /// Returns the path if successful.
-    pub fn write_buffer(&mut self, note_key: &[u8], buffer: &Buffer) -> Option<PathBuf> {
-        let path = self.recovery_path_for_note_key(note_key);
-        let buffer_id = buffer.buffer_id();
-
-        // Get or create checkpoint sequence
-        let seq = *self.checkpoint_seq.entry(buffer_id).or_insert(0);
-        let next_seq = seq + 1;
-        self.checkpoint_seq.insert(buffer_id, next_seq);
-
-        // Create recovery file
-        let recovery_file = RecoveryFile::from_buffer(buffer, seq, false);
-        let bytes = recovery_file.to_bytes();
-
-        // Ensure directory exists
-        if let Some(parent) = path.parent()
-            && let Err(_) = fs::create_dir_all(parent)
-        {
-            return None;
-        }
-
-        // Write atomically
-        let temp_path = path.with_extension(format!(
-            "{}.{}.tmp",
-            buffer_id.as_u64(),
-            buffer.revision().as_u64()
-        ));
-
-        let mut file = match File::create(&temp_path) {
-            Ok(f) => f,
-            Err(_) => {
-                return None;
-            }
-        };
-
-        if file.write_all(&bytes).is_err() {
-            fs::remove_file(&temp_path).ok();
-            return None;
-        }
-
-        if file.sync_all().is_err() {
-            fs::remove_file(&temp_path).ok();
-            return None;
-        }
-
-        drop(file);
-
-        // v1→v2 migration receipt before the atomic replace.
-        let retained_v1 = retain_v1_before_write(&path);
-
-        // Rename atomically
-        if fs::rename(&temp_path, &path).is_err() {
-            fs::remove_file(&temp_path).ok();
-            return None;
-        }
-
-        #[cfg(unix)]
-        if let Some(parent) = path.parent()
-            && let Err(_) = File::open(parent).and_then(|directory| directory.sync_all())
-        {
-            return None;
-        }
-
-        retire_v1_copy(retained_v1.as_ref());
-
-        // Update last write time
-        self.last_write.insert(buffer_id, Instant::now());
-
-        Some(path)
-    }
-
     /// Write an immutable recovery snapshot after the caller has released the
     /// BufferManager lock and durably pinned its merge base.
     pub fn write_snapshot(
@@ -875,63 +781,6 @@ impl RecoveryWriter {
         Some(path)
     }
 
-    /// Write a checkpoint for a buffer.
-    ///
-    /// Checkpoints are durable recovery points that are written before
-    /// operations like save or undo.
-    pub fn write_checkpoint(&mut self, note_key: &[u8], buffer: &Buffer) -> Option<PathBuf> {
-        let buffer_id = buffer.buffer_id();
-
-        // Get or create checkpoint sequence
-        let seq = *self.checkpoint_seq.entry(buffer_id).or_insert(0);
-        let next_seq = seq + 1;
-        self.checkpoint_seq.insert(buffer_id, next_seq);
-
-        // Create recovery file with checkpoint flag
-        let recovery_file = RecoveryFile::from_buffer(buffer, seq, true);
-        let path = self.recovery_path_for_note_key(note_key);
-        let bytes = recovery_file.to_bytes();
-
-        // Ensure directory exists
-        if let Some(parent) = path.parent()
-            && let Err(_) = fs::create_dir_all(parent)
-        {
-            return None;
-        }
-
-        // Write atomically (same as write_buffer)
-        let temp_path = path.with_extension("tmp");
-
-        let mut file = match File::create(&temp_path) {
-            Ok(f) => f,
-            Err(_) => {
-                return None;
-            }
-        };
-
-        if file.write_all(&bytes).is_err() {
-            fs::remove_file(&temp_path).ok();
-            return None;
-        }
-
-        if file.sync_all().is_err() {
-            fs::remove_file(&temp_path).ok();
-            return None;
-        }
-
-        drop(file);
-
-        if fs::rename(&temp_path, &path).is_err() {
-            fs::remove_file(&temp_path).ok();
-            return None;
-        }
-
-        // Update last write time
-        self.last_write.insert(buffer_id, Instant::now());
-
-        Some(path)
-    }
-
     /// Write a durable checkpoint (RFC-0006 S09/D-11): the same atomic,
     /// directory-synced write as the periodic/normal path, but stamped as a
     /// checkpoint so crash recovery can classify a draft-replacement effect
@@ -973,7 +822,6 @@ impl RecoveryWriter {
     ///
     /// Returns the recovery file if successful and valid.
     pub fn read_recovery_file(&self, path: &Path) -> Option<RecoveryFile> {
-        const MAX_RECOVERY_FILE_BYTES: u64 = 128 * 1024 * 1024;
         if fs::metadata(path).ok()?.len() > MAX_RECOVERY_FILE_BYTES {
             return None;
         }
@@ -1011,7 +859,7 @@ impl RecoveryWriter {
 
     /// Delete all recovery files for a specific buffer.
     pub fn delete_for_buffer(&self, buffer_id: BufferId) -> usize {
-        self.remove_matching(|file| file.header.buffer_id == buffer_id)
+        self.remove_matching(|header| header.buffer_id == buffer_id)
     }
 
     /// Retire only recovery records for this buffer whose revision is covered
@@ -1021,8 +869,8 @@ impl RecoveryWriter {
             .entry(buffer_id)
             .and_modify(|covered| *covered = (*covered).max(saved_revision))
             .or_insert(saved_revision);
-        self.remove_matching(|file| {
-            file.header.buffer_id == buffer_id && file.header.revision <= saved_revision
+        self.remove_matching(|header| {
+            header.buffer_id == buffer_id && header.revision <= saved_revision
         })
     }
 
@@ -1032,12 +880,29 @@ impl RecoveryWriter {
         self.delete_recovery_file(&self.recovery_path_for_note_key(note_key))
     }
 
-    fn remove_matching(&self, predicate: impl Fn(&RecoveryFile) -> bool) -> usize {
+    /// Remove every recovery file whose 38-byte header matches. The header
+    /// carries (buffer_id, revision), so candidacy is decided without
+    /// decoding; the full decode + re-encode verification only runs for
+    /// those candidates — never for every `*.bin` on every save.
+    fn remove_matching(&self, header_matches: impl Fn(&RecoveryHeader) -> bool) -> usize {
         let mut removed = 0;
         for path in self.list_recovery_files() {
-            if self
-                .read_recovery_file(&path)
-                .is_some_and(|file| predicate(&file))
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            if metadata.len() > MAX_RECOVERY_FILE_BYTES {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let Some(header) = RecoveryHeader::from_bytes(&bytes) else {
+                continue;
+            };
+            if !header_matches(&header) {
+                continue;
+            }
+            if RecoveryFile::from_bytes(&bytes).is_some_and(|file| header_matches(&file.header))
                 && self.delete_recovery_file(&path)
             {
                 removed += 1;
@@ -1322,7 +1187,10 @@ mod tests {
         let mut writer = RecoveryWriter::new(config);
 
         let buffer = Buffer::from_text("hello world");
-        let path = writer.write_buffer(b"notes/hello.md", &buffer);
+        let path = writer.write_snapshot_now(
+            b"notes/hello.md",
+            RecoveryFile::from_buffer(&buffer, 0, false),
+        );
 
         assert!(path.is_some());
         let path = path.unwrap();
@@ -1340,7 +1208,12 @@ mod tests {
         let note_key = b"notes/identity.md";
         let first_process = Buffer::from_text("recovered");
         let mut writer = RecoveryWriter::new(config.clone());
-        writer.write_buffer(note_key, &first_process).unwrap();
+        writer
+            .write_snapshot_now(
+                note_key,
+                RecoveryFile::from_buffer(&first_process, 0, false),
+            )
+            .unwrap();
         drop(writer);
 
         let second_process = Buffer::from_text("disk");
@@ -1392,7 +1265,10 @@ mod tests {
         let mut writer = RecoveryWriter::new(config);
 
         let buffer = Buffer::from_text("hello world");
-        let path = writer.write_buffer(b"notes/hello.md", &buffer);
+        let path = writer.write_snapshot_now(
+            b"notes/hello.md",
+            RecoveryFile::from_buffer(&buffer, 0, false),
+        );
 
         assert!(path.is_some());
 
@@ -1422,7 +1298,10 @@ mod tests {
         assert!(writer.should_write(&buffer));
 
         // Write it
-        writer.write_buffer(b"notes/hello.md", &buffer);
+        writer.write_snapshot_now(
+            b"notes/hello.md",
+            RecoveryFile::from_buffer(&buffer, 0, false),
+        );
 
         // Second write within interval should not happen
         assert!(!writer.should_write(&buffer));
@@ -1435,7 +1314,7 @@ mod tests {
         let mut writer = RecoveryWriter::new(config);
 
         let buffer = Buffer::from_text("hello world");
-        let path = writer.write_checkpoint(b"notes/hello.md", &buffer);
+        let path = writer.write_checkpoint_durable(b"notes/hello.md", &buffer);
 
         assert!(path.is_some());
 
@@ -1453,8 +1332,14 @@ mod tests {
         // Write some buffers
         let buffer1 = Buffer::from_text("hello");
         let buffer2 = Buffer::from_text("world");
-        writer.write_buffer(b"notes/one.md", &buffer1);
-        writer.write_buffer(b"notes/two.md", &buffer2);
+        writer.write_snapshot_now(
+            b"notes/one.md",
+            RecoveryFile::from_buffer(&buffer1, 0, false),
+        );
+        writer.write_snapshot_now(
+            b"notes/two.md",
+            RecoveryFile::from_buffer(&buffer2, 0, false),
+        );
 
         // List files
         let files = writer.list_recovery_files();
@@ -1588,12 +1473,13 @@ mod tests {
         let clean = Buffer::from_text("clean");
         assert!(!writer.should_write(&clean));
 
-        let written = writer.write_all(&[
-            (b"first.md".to_vec(), &first),
-            (b"second.md".to_vec(), &second),
-            (b"clean.md".to_vec(), &clean),
-        ]);
-        assert_eq!(written.len(), 2);
+        // The periodic batch writes only the dirty buffers, gated by the
+        // revision stamps.
+        let written = [
+            writer.write_snapshot(b"first.md", RecoveryFile::from_buffer(&first, 0, false)),
+            writer.write_snapshot(b"second.md", RecoveryFile::from_buffer(&second, 0, false)),
+        ];
+        assert!(written.iter().all(|path| path.is_some()));
         assert!(!writer.should_write(&first));
         assert_eq!(writer.list_recovery_files().len(), 2);
 
@@ -1605,12 +1491,16 @@ mod tests {
         immutable.header.buffer_id = BufferId::new();
         assert!(writer.should_write_snapshot(&immutable));
         assert!(writer.delete_recovery_file(&snapshot_path));
-        writer.write_buffer(b"first.md", &first).unwrap();
+        writer
+            .write_snapshot_now(b"first.md", RecoveryFile::from_buffer(&first, 0, false))
+            .unwrap();
 
         assert_eq!(writer.delete_for_buffer(second.buffer_id()), 1);
         assert!(writer.read_for_note_key(b"second.md").is_none());
         assert!(writer.delete_for_note_key(b"first.md"));
-        let extra = writer.write_buffer(b"extra.md", &first).unwrap();
+        let extra = writer
+            .write_snapshot_now(b"extra.md", RecoveryFile::from_buffer(&first, 0, false))
+            .unwrap();
         assert!(writer.delete_all() >= 1);
         assert!(!extra.exists());
         assert_eq!(writer.list_recovery_files().len(), 0);

@@ -47,9 +47,12 @@ pub mod resolve;
 pub mod value;
 
 // Re-export key types for convenience
-pub use chord::{chord_string, parse_chord, validate_shortcuts, Chord, ShortcutError};
-pub use codec::{parse, serialize, MAX_DOCUMENT_SIZE};
-pub use descriptor::{Apply, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, SCHEMA_VERSION, SettingDescriptor, SettingKind, Visibility};
+pub use chord::{Chord, ShortcutError, chord_string, parse_chord, validate_shortcuts};
+pub use codec::{MAX_DOCUMENT_SIZE, parse, serialize};
+pub use descriptor::{
+    Apply, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, SCHEMA_VERSION, SettingDescriptor, SettingKind,
+    Visibility,
+};
 pub use document::{Parsed, SettingsDoc};
 pub use error::SettingsCodecError;
 pub use registry::SettingRegistry;

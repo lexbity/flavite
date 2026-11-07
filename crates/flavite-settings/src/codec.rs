@@ -39,9 +39,8 @@ pub fn parse(text: Option<&str>) -> Result<Parsed, SettingsCodecError> {
     }
 
     // Parse TOML
-    let value: toml::Value = toml::from_str(text).map_err(|e| {
-        SettingsCodecError::Unparseable(format!("TOML parse error: {e}"))
-    })?;
+    let value: toml::Value = toml::from_str(text)
+        .map_err(|e| SettingsCodecError::Unparseable(format!("TOML parse error: {e}")))?;
 
     let table = value.as_table().ok_or_else(|| {
         SettingsCodecError::Unparseable("settings root must be a TOML table".to_owned())
@@ -59,7 +58,9 @@ pub fn parse(text: Option<&str>) -> Result<Parsed, SettingsCodecError> {
     if schema > SCHEMA_VERSION {
         return Ok(Parsed::new(
             SettingsDoc::new(schema),
-            vec![format!("schema version {schema} is newer than supported version {SCHEMA_VERSION}")],
+            vec![format!(
+                "schema version {schema} is newer than supported version {SCHEMA_VERSION}"
+            )],
         ));
     }
 
@@ -70,7 +71,7 @@ pub fn parse(text: Option<&str>) -> Result<Parsed, SettingsCodecError> {
     let mut found_unknown_tables = false;
 
     let registry = SettingRegistry::with_builtins();
-    
+
     for (key, value) in table {
         if key == "schema" {
             continue;
@@ -95,8 +96,10 @@ pub fn parse(text: Option<&str>) -> Result<Parsed, SettingsCodecError> {
             let categories = registry.by_category();
             // Check if the key (lowercase from TOML) matches a category (capitalized in registry)
             let is_known_category = categories.contains_key(key.as_str())
-                || categories.keys().any(|c| c.to_lowercase() == key.to_lowercase());
-            
+                || categories
+                    .keys()
+                    .any(|c| c.to_lowercase() == key.to_lowercase());
+
             if is_known_category || is_valid_section_name(key) {
                 let mut section_map = BTreeMap::new();
                 let mut section_unknown = BTreeMap::new();
@@ -104,22 +107,18 @@ pub fn parse(text: Option<&str>) -> Result<Parsed, SettingsCodecError> {
                 for (k, v) in section_table {
                     // Try to look up the descriptor
                     let id = format!("{key}.{k}");
-                    
+
                     if let Some(descriptor) = registry.lookup(&id) {
                         // Known setting - parse and validate
                         if let Ok(setting_value) = parse_value(v, &descriptor.kind) {
                             if descriptor.kind.validate(&setting_value).is_ok() {
                                 section_map.insert(k.clone(), setting_value);
                             } else {
-                                warnings.push(format!(
-                                    "{id}: value out of bounds, using default"
-                                ));
+                                warnings.push(format!("{id}: value out of bounds, using default"));
                                 section_map.insert(k.clone(), descriptor.default.clone());
                             }
                         } else {
-                            warnings.push(format!(
-                                "{id}: invalid value type, using default"
-                            ));
+                            warnings.push(format!("{id}: invalid value type, using default"));
                             section_map.insert(k.clone(), descriptor.default.clone());
                         }
                     } else {
@@ -164,26 +163,34 @@ pub fn parse(text: Option<&str>) -> Result<Parsed, SettingsCodecError> {
 
 /// Check if a section name is valid (lowercase alphanumeric with hyphens/underscores).
 fn is_valid_section_name(name: &str) -> bool {
-    !name.is_empty() && name.chars().all(|c| {
-        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '.'
-    })
+    !name.is_empty()
+        && name.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '.'
+        })
 }
 
 /// Parse a `toml::Value` into a `SettingValue` based on the expected kind.
-fn parse_value(value: &toml::Value, kind: &crate::descriptor::SettingKind) -> Result<SettingValue, String> {
+fn parse_value(
+    value: &toml::Value,
+    kind: &crate::descriptor::SettingKind,
+) -> Result<SettingValue, String> {
     match kind {
-        crate::descriptor::SettingKind::Bool => {
-            value.as_bool().map(SettingValue::Bool).ok_or_else(|| "expected boolean".to_owned())
-        }
-        crate::descriptor::SettingKind::Int { .. } => {
-            value.as_integer().map(SettingValue::Int).ok_or_else(|| "expected integer".to_owned())
-        }
-        crate::descriptor::SettingKind::Text => {
-            value.as_str().map(|s| SettingValue::Str(s.to_owned())).ok_or_else(|| "expected string".to_owned())
-        }
-        crate::descriptor::SettingKind::Choice(_) => {
-            value.as_str().map(|s| SettingValue::Str(s.to_owned())).ok_or_else(|| "expected string".to_owned())
-        }
+        crate::descriptor::SettingKind::Bool => value
+            .as_bool()
+            .map(SettingValue::Bool)
+            .ok_or_else(|| "expected boolean".to_owned()),
+        crate::descriptor::SettingKind::Int { .. } => value
+            .as_integer()
+            .map(SettingValue::Int)
+            .ok_or_else(|| "expected integer".to_owned()),
+        crate::descriptor::SettingKind::Text => value
+            .as_str()
+            .map(|s| SettingValue::Str(s.to_owned()))
+            .ok_or_else(|| "expected string".to_owned()),
+        crate::descriptor::SettingKind::Choice(_) => value
+            .as_str()
+            .map(|s| SettingValue::Str(s.to_owned()))
+            .ok_or_else(|| "expected string".to_owned()),
         crate::descriptor::SettingKind::LineWidth => {
             // Can be integer or string "full"
             if let Some(s) = value.as_str() {
@@ -194,22 +201,34 @@ fn parse_value(value: &toml::Value, kind: &crate::descriptor::SettingKind) -> Re
                 Err("expected integer or string".to_owned())
             }
         }
-        crate::descriptor::SettingKind::ThemePackage => {
-            value.as_str().map(|s| SettingValue::Str(s.to_owned())).ok_or_else(|| "expected string".to_owned())
-        }
+        crate::descriptor::SettingKind::ThemePackage => value
+            .as_str()
+            .map(|s| SettingValue::Str(s.to_owned()))
+            .ok_or_else(|| "expected string".to_owned()),
         crate::descriptor::SettingKind::StringList => {
-            let array = value.as_array().ok_or_else(|| "expected array".to_owned())?;
+            let array = value
+                .as_array()
+                .ok_or_else(|| "expected array".to_owned())?;
             let list: Result<Vec<String>, _> = array
                 .iter()
-                .map(|v| v.as_str().map(std::borrow::ToOwned::to_owned).ok_or_else(|| "expected string in list".to_owned()))
+                .map(|v| {
+                    v.as_str()
+                        .map(std::borrow::ToOwned::to_owned)
+                        .ok_or_else(|| "expected string in list".to_owned())
+                })
                 .collect();
             list.map(SettingValue::List)
         }
         crate::descriptor::SettingKind::ShortcutMap => {
-            let table = value.as_table().ok_or_else(|| "expected table".to_owned())?;
+            let table = value
+                .as_table()
+                .ok_or_else(|| "expected table".to_owned())?;
             let mut map = BTreeMap::new();
             for (k, v) in table {
-                let chord = v.as_str().ok_or_else(|| format!("expected string chord for {k}"))?.to_owned();
+                let chord = v
+                    .as_str()
+                    .ok_or_else(|| format!("expected string chord for {k}"))?
+                    .to_owned();
                 map.insert(k.clone(), chord);
             }
             Ok(SettingValue::ShortcutMap(map))
@@ -225,17 +244,26 @@ pub fn serialize(doc: &SettingsDoc) -> Result<String, SettingsCodecError> {
     let mut table = toml::value::Table::new();
 
     // Add schema
-    table.insert("schema".to_owned(), toml::Value::Integer(i64::from(doc.schema)));
+    table.insert(
+        "schema".to_owned(),
+        toml::Value::Integer(i64::from(doc.schema)),
+    );
 
     // Add known sections in fixed order
     let category_order = [
-        "appearance", "editor", "links", "sidebar", "vault", "shortcuts", "state",
+        "appearance",
+        "editor",
+        "links",
+        "sidebar",
+        "vault",
+        "shortcuts",
+        "state",
     ];
 
     for category in &category_order {
         if let Some(section) = doc.sections.get(*category) {
             let mut section_table = toml::value::Table::new();
-            
+
             for (key, value) in section {
                 let toml_value = to_toml_value(value);
                 section_table.insert(key.clone(), toml_value);
@@ -267,7 +295,9 @@ pub fn serialize(doc: &SettingsDoc) -> Result<String, SettingsCodecError> {
 
     // Add unknown tables in sorted order
     for (name, keys) in &doc.unknown_tables {
-        if !doc.sections.contains_key(name.as_str()) && !doc.unknown_keys.contains_key(name.as_str()) {
+        if !doc.sections.contains_key(name.as_str())
+            && !doc.unknown_keys.contains_key(name.as_str())
+        {
             let mut section_table = toml::value::Table::new();
             for (key, value) in keys {
                 section_table.insert(key.clone(), value.clone());
@@ -276,9 +306,8 @@ pub fn serialize(doc: &SettingsDoc) -> Result<String, SettingsCodecError> {
         }
     }
 
-    toml::to_string(&toml::Value::Table(table)).map_err(|e| {
-        SettingsCodecError::Unparseable(format!("TOML serialization error: {e}"))
-    })
+    toml::to_string(&toml::Value::Table(table))
+        .map_err(|e| SettingsCodecError::Unparseable(format!("TOML serialization error: {e}")))
 }
 
 /// Convert a `SettingValue` to a `toml::Value`.
@@ -326,7 +355,10 @@ scale_pct = 125
         let parsed = result.unwrap();
         assert_eq!(parsed.doc.schema, 2);
         assert!(parsed.doc.contains("appearance.theme"));
-        assert_eq!(parsed.doc.get("appearance.theme").unwrap().as_str(), Some("dark"));
+        assert_eq!(
+            parsed.doc.get("appearance.theme").unwrap().as_str(),
+            Some("dark")
+        );
     }
 
     #[test]
@@ -341,7 +373,7 @@ future_option = "value"
         let result = parse(Some(toml));
         assert!(result.is_ok());
         let parsed = result.unwrap();
-        assert!(parsed.doc.unknown_keys.get("appearance").is_some());
+        assert!(parsed.doc.unknown_keys.contains_key("appearance"));
         assert!(parsed.doc.unknown_keys["appearance"].contains_key("future_option"));
     }
 
@@ -382,10 +414,10 @@ theme = "dark"
 
     #[test]
     fn test_parse_invalid_toml() {
-        let toml = r#"
+        let toml = r"
 schema = 2
 [appearance
-"#;
+";
         let result = parse(Some(toml));
         assert!(result.is_err());
     }
@@ -394,7 +426,10 @@ schema = 2
     fn test_parse_oversized_document() {
         let toml = "x".repeat(MAX_DOCUMENT_SIZE + 1);
         let result = parse(Some(&toml));
-        assert!(matches!(result.unwrap_err(), SettingsCodecError::DocumentTooLarge));
+        assert!(matches!(
+            result.unwrap_err(),
+            SettingsCodecError::DocumentTooLarge
+        ));
     }
 
     #[test]
@@ -414,11 +449,20 @@ line_width = 80
         let parsed = parse(Some(toml)).unwrap();
         let serialized = serialize(&parsed.doc).unwrap();
         let reparsed = parse(Some(&serialized)).unwrap();
-        
+
         assert_eq!(parsed.doc.schema, reparsed.doc.schema);
-        assert_eq!(parsed.doc.get("appearance.theme"), reparsed.doc.get("appearance.theme"));
-        assert_eq!(parsed.doc.get("appearance.scale_pct"), reparsed.doc.get("appearance.scale_pct"));
-        assert_eq!(parsed.doc.get("editor.font_size"), reparsed.doc.get("editor.font_size"));
+        assert_eq!(
+            parsed.doc.get("appearance.theme"),
+            reparsed.doc.get("appearance.theme")
+        );
+        assert_eq!(
+            parsed.doc.get("appearance.scale_pct"),
+            reparsed.doc.get("appearance.scale_pct")
+        );
+        assert_eq!(
+            parsed.doc.get("editor.font_size"),
+            reparsed.doc.get("editor.font_size")
+        );
     }
 
     #[test]
@@ -436,8 +480,8 @@ option = "bar"
         let parsed = parse(Some(toml)).unwrap();
         let serialized = serialize(&parsed.doc).unwrap();
         let reparsed = parse(Some(&serialized)).unwrap();
-        
-        assert!(reparsed.doc.unknown_keys.get("appearance").is_some());
+
+        assert!(reparsed.doc.unknown_keys.contains_key("appearance"));
         // plugins.foo is stored under "plugins" key
         assert!(reparsed.doc.unknown_tables.contains_key("plugins"));
         assert!(reparsed.doc.unknown_tables["plugins"].contains_key("foo"));
@@ -456,10 +500,10 @@ font_size = 16
 "#;
         let parsed1 = parse(Some(toml)).unwrap();
         let serialized1 = serialize(&parsed1.doc).unwrap();
-        
+
         let parsed2 = parse(Some(&serialized1)).unwrap();
         let serialized2 = serialize(&parsed2.doc).unwrap();
-        
+
         // Should be byte-identical
         assert_eq!(serialized1, serialized2);
     }
@@ -475,7 +519,10 @@ line_width = "full"
         let result = parse(Some(toml));
         assert!(result.is_ok());
         let parsed = result.unwrap();
-        assert_eq!(parsed.doc.get("editor.line_width").unwrap().as_str(), Some("full"));
+        assert_eq!(
+            parsed.doc.get("editor.line_width").unwrap().as_str(),
+            Some("full")
+        );
     }
 
     #[test]
@@ -495,9 +542,12 @@ schema = 2
         // Debug output
         // println!("sections: {:?}", parsed.doc.sections.keys().collect::<Vec<_>>());
         // println!("unknown_keys: {:?}", parsed.doc.unknown_keys.keys().collect::<Vec<_>>());
-        
+
         // The shortcuts section should be created, and the unknown keys preserved
-        assert!(parsed.doc.sections.contains_key("shortcuts"), "sections should contain shortcuts");
+        assert!(
+            parsed.doc.sections.contains_key("shortcuts"),
+            "sections should contain shortcuts"
+        );
         // The actual shortcut entries are unknown keys in the shortcuts section
         assert!(parsed.doc.unknown_keys.contains_key("shortcuts"));
         assert_eq!(parsed.doc.unknown_keys["shortcuts"].len(), 2);

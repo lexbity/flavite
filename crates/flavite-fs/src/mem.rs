@@ -368,6 +368,74 @@ impl MemFs {
             }
         }
     }
+
+    /// The rename body without locking, shared by [`Fs::rename_replace`]
+    /// and [`Fs::rename_no_replace`] so the no-replace existence check and
+    /// the install are atomic against the same state.
+    fn rename_replace_locked(state: &mut MemState, from: &Path, to: &Path) -> Result<()> {
+        let kind =
+            Self::path_kind(state, from).ok_or_else(|| FsError::NotFound(from.to_path_buf()))?;
+        // Self-rename is a no-op.
+        if from == to {
+            return Ok(());
+        }
+        // Remove existing destination (if different from source).
+        match Self::path_kind(state, to) {
+            Some(PathKind::File) => {
+                state.vol_files.remove(to);
+            }
+            Some(PathKind::Symlink) => {
+                state.symlinks.remove(to);
+            }
+            Some(PathKind::Dir) => {
+                return Err(FsError::Io(format!(
+                    "cannot replace directory: {}",
+                    to.display()
+                )));
+            }
+            None => {}
+        }
+        Self::remove_dir_entry(state, from);
+        Self::remove_dir_entry(state, to);
+        match kind {
+            PathKind::File => {
+                let bytes = state.vol_files.remove(from).unwrap_or_default();
+                state.vol_files.insert(to.to_path_buf(), bytes);
+            }
+            PathKind::Symlink => {
+                let target = state.symlinks.remove(from).unwrap_or_default();
+                state.symlinks.insert(to.to_path_buf(), target);
+            }
+            PathKind::Dir => {
+                // Move the directory entry and all descendants.
+                let children = state.vol_dirs.remove(from).unwrap_or_default();
+                // Rewrite children paths from `from/...` to `to/...`.
+                let new_children: BTreeSet<PathBuf> = children
+                    .iter()
+                    .map(|c| {
+                        let suffix = c.strip_prefix(from).unwrap_or(c);
+                        to.join(suffix)
+                    })
+                    .collect();
+                state.vol_dirs.insert(to.to_path_buf(), new_children);
+                // Move all descendant entries in vol_dirs, vol_files, symlinks,
+                // identities, modes, mtimes.
+                Self::move_descendants(state, from, to);
+            }
+        }
+        // Move identity/mode/mtime.
+        if let Some(id) = state.identities.remove(from) {
+            state.identities.insert(to.to_path_buf(), id);
+        }
+        if let Some(mode) = state.modes.remove(from) {
+            state.modes.insert(to.to_path_buf(), mode);
+        }
+        if let Some(mtime) = state.mtimes.remove(from) {
+            state.mtimes.insert(to.to_path_buf(), mtime);
+        }
+        Self::add_dir_entry(state, to);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -687,77 +755,17 @@ impl Fs for MemFs {
 
     fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
         let mut state = self.lock();
-        let kind =
-            Self::path_kind(&state, from).ok_or_else(|| FsError::NotFound(from.to_path_buf()))?;
-        // Self-rename is a no-op.
-        if from == to {
-            return Ok(());
-        }
-        // Remove existing destination (if different from source).
-        match Self::path_kind(&state, to) {
-            Some(PathKind::File) => {
-                state.vol_files.remove(to);
-            }
-            Some(PathKind::Symlink) => {
-                state.symlinks.remove(to);
-            }
-            Some(PathKind::Dir) => {
-                return Err(FsError::Io(format!(
-                    "cannot replace directory: {}",
-                    to.display()
-                )));
-            }
-            None => {}
-        }
-        Self::remove_dir_entry(&mut state, from);
-        Self::remove_dir_entry(&mut state, to);
-        match kind {
-            PathKind::File => {
-                let bytes = state.vol_files.remove(from).unwrap_or_default();
-                state.vol_files.insert(to.to_path_buf(), bytes);
-            }
-            PathKind::Symlink => {
-                let target = state.symlinks.remove(from).unwrap_or_default();
-                state.symlinks.insert(to.to_path_buf(), target);
-            }
-            PathKind::Dir => {
-                // Move the directory entry and all descendants.
-                let children = state.vol_dirs.remove(from).unwrap_or_default();
-                // Rewrite children paths from `from/...` to `to/...`.
-                let new_children: BTreeSet<PathBuf> = children
-                    .iter()
-                    .map(|c| {
-                        let suffix = c.strip_prefix(from).unwrap_or(c);
-                        to.join(suffix)
-                    })
-                    .collect();
-                state.vol_dirs.insert(to.to_path_buf(), new_children);
-                // Move all descendant entries in vol_dirs, vol_files, symlinks,
-                // identities, modes, mtimes.
-                Self::move_descendants(&mut state, from, to);
-            }
-        }
-        // Move identity/mode/mtime.
-        if let Some(id) = state.identities.remove(from) {
-            state.identities.insert(to.to_path_buf(), id);
-        }
-        if let Some(mode) = state.modes.remove(from) {
-            state.modes.insert(to.to_path_buf(), mode);
-        }
-        if let Some(mtime) = state.mtimes.remove(from) {
-            state.mtimes.insert(to.to_path_buf(), mtime);
-        }
-        Self::add_dir_entry(&mut state, to);
-        Ok(())
+        Self::rename_replace_locked(&mut state, from, to)
     }
 
     fn rename_no_replace(&self, from: &Path, to: &Path) -> Result<()> {
-        let state = self.lock();
+        let mut state = self.lock();
+        // The existence check and the install share one lock scope: two
+        // concurrent creators can never both succeed (S3-2 scenario 7).
         if Self::path_exists(&state, to) {
             return Err(FsError::AlreadyExists(to.to_path_buf()));
         }
-        drop(state);
-        self.rename_replace(from, to)
+        Self::rename_replace_locked(&mut state, from, to)
     }
 
     fn fsync_file(&self, path: &Path) -> Result<()> {
@@ -1167,6 +1175,35 @@ mod tests {
         fs.rename_no_replace(Path::new("/a.md"), Path::new("/b.md"))
             .unwrap();
         assert!(fs.exists(Path::new("/b.md")).unwrap());
+    }
+
+    #[test]
+    fn concurrent_no_replace_creators_have_exactly_one_winner() {
+        let shared = fs();
+        let winner = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let fs = shared.clone();
+            let winner = std::sync::Arc::clone(&winner);
+            let source = format!("/stage-{index}.md");
+            write(&fs, &source, b"bytes");
+            handles.push(std::thread::spawn(move || {
+                if fs
+                    .rename_no_replace(Path::new(&source), Path::new("/contested.md"))
+                    .is_ok()
+                {
+                    winner.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(
+            winner.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the existence check and the install share one lock scope"
+        );
     }
 
     // --- fsync_file / fsync_dir ---

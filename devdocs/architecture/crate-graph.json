@@ -301,6 +301,11 @@
     },
     {
       "from": "flavite-editor",
+      "to": "flavite-editor",
+      "kind": "dev"
+    },
+    {
+      "from": "flavite-editor",
       "to": "flavite-syntax",
       "kind": "normal"
     },
@@ -447,6 +452,11 @@
     {
       "from": "flavite-ui",
       "to": "flavite-settings",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "flavite-syntax",
       "kind": "normal"
     },
     {

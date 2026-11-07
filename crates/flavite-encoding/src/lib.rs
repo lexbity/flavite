@@ -31,7 +31,7 @@ pub mod format;
 pub mod map;
 pub mod stream;
 
-pub use decode::{DecodedContent, decode};
+pub use decode::{DecodedContent, decode, decode_vec};
 pub use encode::encode;
 pub use format::{
     CANCEL_CHECK_BYTES, CODEC_VERSION, CancelToken, CodecError, CodecLimitKind, DecodeLimits,
