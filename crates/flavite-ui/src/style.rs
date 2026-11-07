@@ -9,6 +9,7 @@ pub mod tokens;
 pub mod type_scale;
 
 pub use tokens::Scheme;
+pub use tokens::theme_resolved;
 pub use type_scale::Metrics;
 
 use iced::widget::{button, container, text};
@@ -40,6 +41,10 @@ pub const HEADING: f32 = 20.0;
 pub const BRAND: f32 = 19.0;
 /// Tab strip height (§13.1: tab height 32 px).
 pub const TAB_HEIGHT: f32 = 32.0;
+/// Top toolbar strip height. The bar is fixed-height so a theme package's
+/// `theme_frame` image can layer exactly behind it (xpi themes); the row
+/// content is vertically centered within it.
+pub const TOP_BAR_HEIGHT: f32 = 36.0;
 /// Splitter thickness at 100% scale (§7.5). Single source: the workspace
 /// model owns the value; the layout solver divides by exactly this width.
 pub const SPLITTER_WIDTH: f32 = flavite_workspace::SPLITTER_WIDTH;
@@ -340,6 +345,52 @@ pub fn launch_action(theme: &Theme, status: button::Status) -> button::Style {
     style.border.width = 1.0;
     style.border.radius = 28.0.into();
     style
+}
+
+/// Button style for the themed top bar (xpi themes): text carries the
+/// theme's frame text color when the package supplies one, otherwise the
+/// palette text; surfaces stay transparent with a subtle hover wash.
+pub fn top_bar_button(
+    text_color: Option<Color>,
+) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
+    move |theme, status| {
+        let palette = theme.palette();
+        let base = text_color.unwrap_or(palette.text);
+        let text_color = match status {
+            button::Status::Hovered | button::Status::Pressed => Color { a: 0.85, ..base },
+            _ => base,
+        };
+        let background = match status {
+            button::Status::Hovered => Some(Background::Color(Color { a: 0.12, ..base })),
+            button::Status::Pressed => Some(Background::Color(Color { a: 0.18, ..base })),
+            _ => None,
+        };
+        button::Style {
+            background,
+            text_color,
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: border::Radius::from(RADIUS),
+            },
+            shadow: Shadow::default(),
+            snap: false,
+        }
+    }
+}
+
+/// Text style for the themed top bar: the theme's frame text color, or
+/// the palette text with the dim_text alpha search when the package
+/// stayed silent.
+pub fn top_bar_dim_text(text_color: Option<Color>) -> impl Fn(&Theme) -> text::Style + Copy {
+    move |theme| {
+        if let Some(color) = text_color {
+            return text::Style {
+                color: Some(Color { a: 0.85, ..color }),
+            };
+        }
+        dim_text(theme)
+    }
 }
 
 /// Button style: a quiet secondary action.

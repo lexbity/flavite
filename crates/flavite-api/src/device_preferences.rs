@@ -90,6 +90,11 @@ impl LineWidth {
 pub struct Preferences {
     /// Light/dark/System palette choice.
     pub theme: ThemeChoice,
+    /// The installed theme package shaping the palette, when one is
+    /// selected. `None` keeps the built-in System/Light/Dark palettes.
+    /// The scheme above still resolves which variant (base vs
+    /// `dark_theme`) a package supplies.
+    pub theme_package: Option<String>,
     /// Interface scale in percent (75–200).
     pub interface_scale_pct: u16,
     /// Editor font size in logical pixels.
@@ -144,6 +149,7 @@ impl Preferences {
     pub fn defaults() -> Self {
         Self {
             theme: ThemeChoice::System,
+            theme_package: None,
             interface_scale_pct: 100,
             editor_font_size: 16,
             line_width: LineWidth::Full,
@@ -207,6 +213,7 @@ impl Preferences {
                 key.as_str(),
                 "schema"
                     | "theme"
+                    | "theme_package"
                     | "interface_scale_pct"
                     | "editor_font_size"
                     | "line_width"
@@ -229,6 +236,22 @@ impl Preferences {
             Some(_) => {
                 warnings.push("theme reset to system (invalid theme name)".into());
                 ThemeChoice::default()
+            }
+        };
+        let theme_package = match map.get("theme_package") {
+            None => None,
+            Some(Value::String(id)) => {
+                let id = id.trim();
+                if id.is_empty() || id.len() > 256 {
+                    warnings.push("theme_package was ignored (empty or oversized id)".into());
+                    None
+                } else {
+                    Some(id.to_owned())
+                }
+            }
+            Some(_) => {
+                warnings.push("theme_package must be a theme id string".into());
+                None
             }
         };
         let interface_scale_pct = bounded_field(
@@ -335,6 +358,7 @@ impl Preferences {
         Ok(Parsed {
             preferences: Self {
                 theme,
+                theme_package,
                 interface_scale_pct,
                 editor_font_size,
                 line_width,
@@ -356,6 +380,9 @@ impl Preferences {
         let mut map = Map::new();
         map.insert("schema".into(), Value::from(PREFERENCES_SCHEMA));
         map.insert("theme".into(), Value::from(self.theme.name()));
+        if let Some(package) = &self.theme_package {
+            map.insert("theme_package".into(), Value::from(package.as_str()));
+        }
         map.insert(
             "interface_scale_pct".into(),
             Value::from(self.interface_scale_pct),
@@ -532,6 +559,25 @@ mod tests {
         let encoded = preferences.to_json().to_string();
         let parsed = Preferences::parse(Some(&encoded)).unwrap();
         assert!(parsed.preferences.prefer_stable_links);
+    }
+
+    #[test]
+    fn theme_package_preference_round_trips_and_defaults_to_none() {
+        let mut preferences = Preferences::defaults();
+        assert_eq!(preferences.theme_package, None);
+        preferences.theme_package = Some("starfield@host".to_owned());
+        let encoded = preferences.to_json().to_string();
+        let parsed = Preferences::parse(Some(&encoded)).unwrap();
+        assert_eq!(
+            parsed.preferences.theme_package.as_deref(),
+            Some("starfield@host")
+        );
+        // Absent and invalid forms fall back to None, the built-in palettes.
+        let absent = Preferences::parse(Some(r#"{"schema":1}"#)).unwrap();
+        assert_eq!(absent.preferences.theme_package, None);
+        let invalid = Preferences::parse(Some(r#"{"schema":1,"theme_package":42}"#)).unwrap();
+        assert_eq!(invalid.preferences.theme_package, None);
+        assert!(!invalid.warnings.is_empty());
     }
 
     #[test]

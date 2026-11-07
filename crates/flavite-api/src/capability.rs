@@ -25,6 +25,8 @@ pub enum Capability {
     UiPanel,
     /// Make network requests.
     Net,
+    /// Install, list, and remove device-local theme packages.
+    Themes,
 }
 
 impl Capability {
@@ -36,6 +38,7 @@ impl Capability {
             Self::WriteNotes { .. } => "Write notes",
             Self::UiPanel => "Create UI panels",
             Self::Net => "Make network requests",
+            Self::Themes => "Manage theme packages",
         }
     }
 
@@ -45,7 +48,8 @@ impl Capability {
         match (self, required) {
             (Self::ReadNotes, Self::ReadNotes)
             | (Self::UiPanel, Self::UiPanel)
-            | (Self::Net, Self::Net) => true,
+            | (Self::Net, Self::Net)
+            | (Self::Themes, Self::Themes) => true,
             (Self::WriteNotes { scope: granted }, Self::WriteNotes { scope: needed }) => {
                 match (granted, needed) {
                     (WriteScope::Vault, _) => true,

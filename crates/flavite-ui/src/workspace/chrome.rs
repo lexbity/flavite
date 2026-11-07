@@ -33,12 +33,16 @@ pub enum Icon {
 pub struct Glyph {
     kind: Icon,
     size: f32,
+    /// An explicit ink color for themed surfaces (xpi themes); `None`
+    /// follows the active palette text.
+    ink: Option<iced::Color>,
 }
 
 pub fn icon<'a>(metrics: Metrics, kind: Icon) -> Element<'a, Message> {
     Element::new(Glyph {
         kind,
         size: metrics.icon_target * 0.5,
+        ink: None,
     })
 }
 
@@ -48,13 +52,35 @@ pub fn icon_button(
     label: &str,
     message: Option<Message>,
 ) -> Element<'_, Message> {
+    themed_icon_button(metrics, kind, label, message, None)
+}
+
+/// An icon button for the themed top bar: the glyph and its hover wash
+/// carry the theme's frame text color when the package supplies one.
+pub fn themed_icon_button(
+    metrics: Metrics,
+    kind: Icon,
+    label: &str,
+    message: Option<Message>,
+    ink: Option<iced::Color>,
+) -> Element<'_, Message> {
     tooltip(
-        button(container(icon(metrics, kind)).center(Length::Fixed(metrics.icon_target * 0.5)))
-            .width(metrics.icon_target)
-            .height(metrics.icon_target)
-            .padding(4)
-            .style(style::toolbar_button)
-            .on_press_maybe(message),
+        button(
+            container(Element::new(Glyph {
+                kind,
+                size: metrics.icon_target * 0.5,
+                ink,
+            }))
+            .center(Length::Fixed(metrics.icon_target * 0.5)),
+        )
+        .width(metrics.icon_target)
+        .height(metrics.icon_target)
+        .padding(4)
+        .style(move |theme, status| match ink {
+            Some(_) => style::top_bar_button(ink)(theme, status),
+            None => style::toolbar_button(theme, status),
+        })
+        .on_press_maybe(message),
         container(iced::widget::text(label).size(metrics.text_sm))
             .padding(6)
             .style(style::card),
@@ -90,6 +116,7 @@ impl Widget<Message, Theme, Renderer> for Glyph {
         // Glyph geometry is authored on a 16 px grid and scales with the
         // laid-out size.
         let s = p.width / 16.0;
+        let ink = self.ink.unwrap_or_else(|| theme.palette().text);
         let mut line = |x: f32, y: f32, w: f32, h: f32| {
             renderer.fill_quad(
                 renderer::Quad {
@@ -101,7 +128,7 @@ impl Widget<Message, Theme, Renderer> for Glyph {
                     },
                     ..renderer::Quad::default()
                 },
-                theme.palette().text,
+                ink,
             );
         };
         match self.kind {
@@ -214,7 +241,7 @@ impl Widget<Message, Theme, Renderer> for Glyph {
                             height: 12.0 * s,
                         },
                         border: Border {
-                            color: theme.palette().text,
+                            color: ink,
                             width: 1.0,
                             ..Border::default()
                         },
@@ -233,7 +260,7 @@ impl Widget<Message, Theme, Renderer> for Glyph {
                             },
                             ..renderer::Quad::default()
                         },
-                        theme.palette().text,
+                        ink,
                     ),
                     Icon::SplitDown => renderer.fill_quad(
                         renderer::Quad {
@@ -245,7 +272,7 @@ impl Widget<Message, Theme, Renderer> for Glyph {
                             },
                             ..renderer::Quad::default()
                         },
-                        theme.palette().text,
+                        ink,
                     ),
                     _ => {}
                 }

@@ -48,12 +48,18 @@ toml = { workspace = true }
 # Filesystem (re-exported for CLI)
 flavite-fs = { path = "../flavite-fs" }
 
+# Theme packages: the facade owns installed-theme storage and the typed
+# theme commands over the pure package codec.
+flavite-theme = { path = "../flavite-theme" }
+
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 [dev-dependencies]
 # For tests
 tempfile = "3"
 proptest = { workspace = true }
+# Theme-store test fixtures build in-memory .xpi zips.
+zip = { workspace = true }
 
 [features]
 # Test-only fault injection (FaultFs) for durability tests; flavite-fs is

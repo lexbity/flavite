@@ -98,6 +98,9 @@ impl TypeMetrics {
 pub struct EditorColors {
     /// Selection highlight fill.
     pub selection: Color,
+    /// Editor surface fill (xpi themes: the package's field color; the
+    /// built-in palettes keep the shell background).
+    pub background: Color,
     /// Resolved link underline.
     pub link: Color,
     /// Unresolved link underline.
@@ -123,6 +126,7 @@ pub struct EditorColors {
 impl Default for EditorColors {
     fn default() -> Self {
         Self {
+            background: Color::from_rgb(0.098, 0.114, 0.137),
             selection: Color::from_rgba(0.24, 0.42, 0.67, 0.55),
             link: Color::from_rgb(0.35, 0.67, 0.98),
             link_unresolved: Color::from_rgb(0.95, 0.48, 0.43),
@@ -1441,7 +1445,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         &self,
         tree: &Tree,
         renderer: &mut iced::Renderer,
-        theme: &Theme,
+        _theme: &Theme,
         _style: &renderer::Style,
         layout: Layout<'_>,
         _cursor: mouse::Cursor,
@@ -1455,7 +1459,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 border: Border::default(),
                 ..renderer::Quad::default()
             },
-            Background::Color(theme.palette().background),
+            Background::Color(self.colors.background),
         );
         let clip = bounds
             .intersection(viewport)

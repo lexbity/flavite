@@ -13,8 +13,8 @@ use crate::workspace::{
 };
 use flavite_workspace::{GroupId, LayoutAction, TabId, ViewKind};
 use iced::widget::{
-    Space, button, column, container, mouse_area, opaque, pane_grid, row, rule, scrollable, stack,
-    text, text_input,
+    Space, button, column, container, image, mouse_area, opaque, pane_grid, row, rule, scrollable,
+    stack, text, text_input,
 };
 use iced::{Element, Length, Padding, alignment};
 
@@ -91,7 +91,7 @@ fn shell(app: &App) -> Element<'_, Message> {
                 .width(Length::Fill)
                 .align_y(alignment::Vertical::Top)
                 .padding(Padding {
-                    top: 36.0,
+                    top: app.appearance.metrics().top_bar_height,
                     ..Padding::default()
                 })
         ]
@@ -107,45 +107,72 @@ fn top_bar(app: &App) -> Element<'_, Message> {
         || app.root().display().to_string(),
         |name| name.to_string_lossy().to_string(),
     );
+    let themed = app.appearance.theme_semantic().copied();
+    let (frame_color, frame_text) =
+        style::tokens::top_bar_colors(app.appearance.scheme(), themed.as_ref());
     let title: Element<'_, Message> = if app.menu_bar_visible {
-        menu_bar(app)
+        menu_bar(app, frame_text, frame_color.is_some())
     } else {
         text(vault_name)
             .size(metrics.text)
-            .style(style::dim_text)
+            .style(style::top_bar_dim_text(frame_text))
             .into()
     };
-    container(
-        row![
-            chrome::icon_button(
-                metrics,
-                Icon::Menu,
-                "Application menu",
-                Some(Message::AppMenu)
-            ),
-            title,
-            Space::new().width(Length::Fill),
-            chrome::icon_button(
-                metrics,
-                Icon::Search,
-                "Quick switch · Ctrl+P",
-                Some(Message::PickerOpen)
-            ),
-            chrome::icon_button(
-                metrics,
-                Icon::Commands,
-                "Commands · Ctrl+Shift+P",
-                Some(Message::PaletteOpen)
-            ),
+    let row = row![
+        chrome::themed_icon_button(
+            metrics,
+            Icon::Menu,
+            "Application menu",
+            Some(Message::AppMenu),
+            frame_text
+        ),
+        title,
+        Space::new().width(Length::Fill),
+        chrome::themed_icon_button(
+            metrics,
+            Icon::Search,
+            "Quick switch · Ctrl+P",
+            Some(Message::PickerOpen),
+            frame_text
+        ),
+        chrome::themed_icon_button(
+            metrics,
+            Icon::Commands,
+            "Commands · Ctrl+Shift+P",
+            Some(Message::PaletteOpen),
+            frame_text
+        ),
+    ]
+    .spacing(metrics.spacing_sm)
+    .align_y(alignment::Vertical::Center);
+    // XPI themes: a package `theme_frame` layers exactly behind the bar,
+    // and its `frame` color paints the bar when no image is declared. The
+    // bar is fixed-height so an image fills it without disturbing layout;
+    // without any themed frame the bar keeps the shell's plain surface.
+    let content: Element<'_, Message> = match app.appearance.theme_frame_handle() {
+        Some(handle) => stack![
+            image(handle.clone())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .content_fit(iced::ContentFit::Cover),
+            row
         ]
-        .spacing(metrics.spacing_sm)
-        .align_y(alignment::Vertical::Center),
-    )
-    .width(Length::Fill)
-    .height(36.0 * metrics.scale)
-    .padding([0, 8])
-    .style(style::toolbar)
-    .into()
+        .into(),
+        None => row.into(),
+    };
+    container(content)
+        .width(Length::Fill)
+        .height(metrics.top_bar_height)
+        .align_y(alignment::Vertical::Center)
+        .padding([0, 8])
+        .style(move |theme| match frame_color {
+            Some(color) => iced::widget::container::Style {
+                background: Some(iced::Background::Color(color)),
+                ..iced::widget::container::Style::default()
+            },
+            None => style::toolbar(theme),
+        })
+        .into()
 }
 
 fn workspace_with_navigation(app: &App) -> Element<'_, Message> {
@@ -208,7 +235,11 @@ fn workspace_with_navigation(app: &App) -> Element<'_, Message> {
 /// The standard sorted menu bar (W10): every entry resolves through the
 /// shared host-command catalog availability, so menu, palette, keyboard,
 /// and accessibility surfaces cannot drift (D-16).
-fn menu_bar(app: &App) -> Element<'_, Message> {
+fn menu_bar(
+    app: &App,
+    frame_text: Option<iced::Color>,
+    themed_frame: bool,
+) -> Element<'_, Message> {
     const MENUS: [(&str, crate::workspace::StripMenu); 8] = [
         ("File", crate::workspace::StripMenu::File),
         ("Edit", crate::workspace::StripMenu::Edit),
@@ -232,10 +263,14 @@ fn menu_bar(app: &App) -> Element<'_, Message> {
                     right: 6.0,
                 })
                 .style(move |theme, status| {
-                    if active {
+                    if active && themed_frame {
+                        // On a themed frame the built-in list-row surface
+                        // would clash; the pressed wash marks the open menu.
+                        style::top_bar_button(frame_text)(theme, button::Status::Pressed)
+                    } else if active {
                         style::list_row(true)(theme, status)
                     } else {
-                        style::ghost()(theme, status)
+                        style::top_bar_button(frame_text)(theme, status)
                     }
                 })
                 .on_press(Message::TopMenu(menu)),
@@ -416,7 +451,10 @@ fn menu_overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Me
     let metrics = app.appearance.metrics();
     let width = 256.0_f32.min(app.window_size().width);
     let (x, y) = if menu.is_top_menu() {
-        (menu.bar_x() * metrics.scale, 36.0 * metrics.scale)
+        (
+            menu.bar_x() * metrics.scale,
+            app.appearance.metrics().top_bar_height,
+        )
     } else {
         let rect = app
             .group_bounds

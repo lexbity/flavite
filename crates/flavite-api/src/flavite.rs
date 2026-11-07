@@ -546,6 +546,9 @@ pub struct Flavite {
     pub(crate) queries: crate::query_service::QueryService,
     /// Device-local user state (W06); `None` without an OS data directory.
     pub(crate) user_state: Option<flavite_vault::user_state::UserStateStore>,
+    /// Device-local installed theme packages; `None` without an OS data
+    /// directory. Theme commands run here, not on the vault session.
+    pub(crate) themes: Option<crate::themes::ThemeStore>,
     /// Vault-relative user state (graph pins; W07/TD-11) behind the `Fs`.
     pub(crate) vault_user_state: flavite_vault::user_state::VaultUserStateStore,
     /// One graph base service per vault (W07/TD-12): the only graph-path
@@ -636,6 +639,7 @@ impl Flavite {
                 &vault_uuid,
             )
             .ok(),
+            themes: crate::themes::ThemeStore::open(Box::new(flavite_fs::OsFs::new())).ok(),
             vault_user_state,
             graph,
             // Headless constructors own no writer-side signal; their graph
@@ -688,6 +692,7 @@ impl Flavite {
                 &vault_uuid,
             )
             .ok(),
+            themes: crate::themes::ThemeStore::open(Box::new(flavite_fs::OsFs::new())).ok(),
             vault_user_state,
             graph,
             // Headless constructor: no writer-side signal owned here; the
@@ -745,6 +750,7 @@ impl Flavite {
                 &vault_uuid,
             )
             .ok(),
+            themes: crate::themes::ThemeStore::open(Box::new(flavite_fs::OsFs::new())).ok(),
             vault_user_state,
             graph,
             notice_acks: Mutex::new(std::collections::BTreeMap::new()),
@@ -991,9 +997,31 @@ impl Flavite {
                 ArgSchema::typed::<crate::documents::ApplyMergeArgs>(),
                 crate::documents::handle_apply_merge,
             ),
+            (
+                "theme.install",
+                "Install a theme package",
+                ArgSchema::typed::<crate::themes::InstallThemeArgs>(),
+                crate::themes::handle_theme_unroutable,
+            ),
+            (
+                "theme.list",
+                "List installed themes",
+                ArgSchema::typed::<crate::themes::ListThemesArgs>(),
+                crate::themes::handle_theme_unroutable,
+            ),
+            (
+                "theme.uninstall",
+                "Remove an installed theme",
+                ArgSchema::typed::<crate::themes::UninstallThemeArgs>(),
+                crate::themes::handle_theme_unroutable,
+            ),
         ];
         for (id, title, args, handler) in registrations {
-            let spec = if matches!(
+            let spec = if id.starts_with("theme.") {
+                // Theme commands write device state, not the vault: they
+                // stay available on read-only vaults and gate on Themes.
+                CommandSpec::new(id, title, args).requires(crate::Capability::Themes)
+            } else if matches!(
                 id,
                 "note.open"
                     | "note.history"
@@ -1197,6 +1225,14 @@ impl Flavite {
         &self.queries
     }
 
+    /// The device-local theme store, `None` without an OS data directory.
+    /// Hosts read installed packages for rendering; mutations go through
+    /// the `theme.*` commands so the capability gate applies.
+    #[must_use]
+    pub fn themes(&self) -> Option<&crate::themes::ThemeStore> {
+        self.themes.as_ref()
+    }
+
     /// Current number of notice credits held by the host.
     #[must_use]
     pub fn outstanding_notice_count(&self) -> usize {
@@ -1361,6 +1397,11 @@ impl Flavite {
                 )
                 .with_message("Reading the connection target requires ReadNotes"),
             );
+        }
+        if invocation.command_id.starts_with("theme.") {
+            // Theme commands never touch buffers or the vault session;
+            // their handlers need the facade-owned theme store.
+            return crate::themes::execute_theme_command(self, &invocation);
         }
         if let Some(buffer_id) = invocation.preconditions.buffer_id {
             let revision = invocation.preconditions.expected_revision;
@@ -2329,6 +2370,10 @@ pub enum FlaviteError {
     /// Device-local user state failed (W06).
     #[error("User state error: {0}")]
     UserState(#[from] flavite_vault::user_state::UserStateError),
+
+    /// Device-local theme storage failed.
+    #[error("Theme store error: {0}")]
+    ThemeStore(String),
 
     /// JSON serialization error.
     #[error("JSON error: {0}")]

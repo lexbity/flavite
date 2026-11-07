@@ -22,6 +22,8 @@ flavite-buffer = { path = "../flavite-buffer" }
 flavite-editor = { path = "../flavite-editor" }
 # D-02: the shell reduces authoritative layout through the IO-free model.
 flavite-workspace = { path = "../flavite-workspace" }
+# XPI themes: the shell renders the codec's semantic model and decoded images.
+flavite-theme = { path = "../flavite-theme" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # W10 file/folder dialogs: xdg-desktop-portal backend (no C toolkit link),
