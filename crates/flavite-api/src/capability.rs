@@ -27,6 +27,8 @@ pub enum Capability {
     Net,
     /// Install, list, and remove device-local theme packages.
     Themes,
+    /// Read and change vault settings (RFC-0007).
+    Settings,
 }
 
 impl Capability {
@@ -39,6 +41,7 @@ impl Capability {
             Self::UiPanel => "Create UI panels",
             Self::Net => "Make network requests",
             Self::Themes => "Manage theme packages",
+            Self::Settings => "Read and change vault settings",
         }
     }
 
@@ -49,7 +52,8 @@ impl Capability {
             (Self::ReadNotes, Self::ReadNotes)
             | (Self::UiPanel, Self::UiPanel)
             | (Self::Net, Self::Net)
-            | (Self::Themes, Self::Themes) => true,
+            | (Self::Themes, Self::Themes)
+            | (Self::Settings, Self::Settings) => true,
             (Self::WriteNotes { scope: granted }, Self::WriteNotes { scope: needed }) => {
                 match (granted, needed) {
                     (WriteScope::Vault, _) => true,
@@ -83,6 +87,9 @@ pub mod declarations {
             scope: WriteScope::Vault,
         },
     ];
+
+    /// Settings capabilities (GUI/CLI built-ins).
+    pub const SETTINGS: &[Capability] = &[Capability::Settings];
 }
 
 #[cfg(test)]

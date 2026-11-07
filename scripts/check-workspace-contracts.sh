@@ -204,7 +204,9 @@ case "$profile" in
         ;;
     W11)
         bash "$0" W10 "$root"
-        for file in crates/flavite-ui/src/style/tokens.rs crates/flavite-ui/src/style/contrast.rs crates/flavite-ui/src/style/type_scale.rs crates/flavite-ui/src/preferences.rs crates/flavite-ui/src/host/appearance.rs crates/flavite-ui/tests/appearance_preferences.rs crates/flavite-ui/tests/visual_contract.rs crates/flavite-workspace/tests/geometry_matrix.rs; do
+        # RFC-0007 S3 deleted the ui/preferences.rs shim; the settings
+        # surface is the Settings tab host and renderer.
+        for file in crates/flavite-ui/src/style/tokens.rs crates/flavite-ui/src/style/contrast.rs crates/flavite-ui/src/style/type_scale.rs crates/flavite-ui/src/host/settings.rs crates/flavite-ui/src/views/settings.rs crates/flavite-ui/src/host/appearance.rs crates/flavite-ui/tests/appearance_preferences.rs crates/flavite-ui/tests/visual_contract.rs crates/flavite-workspace/tests/geometry_matrix.rs; do
             assert_nonempty "$root/$file"
         done
         # Semantic tokens: production view/layout chrome carries no raw

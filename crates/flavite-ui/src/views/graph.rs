@@ -110,8 +110,8 @@ fn activation_notice<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             button(text("Got it").size(metrics.text_sm))
                 .padding(tab_strip::chip_padding())
                 .style(style::action())
-                .on_press(Message::Preferences(
-                    crate::host::appearance::PreferenceMessage::AcknowledgeGraphActivation,
+                .on_press(Message::Settings(
+                    crate::host::settings::SettingsMessage::AcknowledgeGraphActivation,
                 )),
         ]
         .spacing(metrics.spacing)

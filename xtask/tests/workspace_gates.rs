@@ -197,7 +197,9 @@ fn w11_gate_rejects_raw_view_colors_and_missing_appearance_inputs() {
     assert!(!forbidden.status.success());
     assert!(String::from_utf8_lossy(&forbidden.stderr).contains("forbidden production pattern"));
     fs::write(view, "implementation\n").unwrap();
-    fs::remove_file(temp.path().join("crates/flavite-ui/src/preferences.rs")).unwrap();
+    // RFC-0007 S3 deleted the ui/preferences.rs shim; the settings surface
+    // required by this gate is the Settings tab host.
+    fs::remove_file(temp.path().join("crates/flavite-ui/src/host/settings.rs")).unwrap();
     let missing = run_gate(temp.path(), "W11");
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("missing or empty"));

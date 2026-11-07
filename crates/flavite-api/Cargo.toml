@@ -18,6 +18,7 @@ flavite-syntax = { path = "../flavite-syntax" }
 # DTOs and publishes its base frames. The dependency points one way only —
 # flavite-graph never sees the facade, the database, or any toolkit.
 flavite-graph = { path = "../flavite-graph" }
+flavite-workspace = { path = "../flavite-workspace" }
 arc-swap = { workspace = true }
 
 # Serialization
@@ -51,6 +52,9 @@ flavite-fs = { path = "../flavite-fs" }
 # Theme packages: the facade owns installed-theme storage and the typed
 # theme commands over the pure package codec.
 flavite-theme = { path = "../flavite-theme" }
+
+# Settings: the facade owns settings storage (RFC-0007).
+flavite-settings = { path = "../flavite-settings" }
 
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 

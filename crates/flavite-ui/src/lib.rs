@@ -14,8 +14,6 @@ pub mod host;
 pub mod operation;
 pub mod palette;
 pub mod picker;
-pub mod preferences;
-pub mod settings;
 pub mod style;
 pub mod subscription;
 pub mod views;

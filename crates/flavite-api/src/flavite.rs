@@ -22,7 +22,7 @@ use flavite_vault::sync::{MutexExt, WAIT_TICK, wait_result_recovering};
 use flavite_vault::types::{Epoch, Generation, VaultConfig, VaultIdentity};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use thiserror::Error;
@@ -562,6 +562,8 @@ pub struct Flavite {
     /// seams that recreate the service (`set_graph_db_path_for_test`)
     /// rewire the same watch.
     pub(crate) generation_watch: Option<Arc<flavite_index::GenerationWatch>>,
+    /// Vault settings store (RFC-0007 S2): CAS storage for the v2 settings document.
+    pub(crate) settings_store: crate::settings_store::SettingsStore,
 }
 
 /// Build the per-vault attached services shared by every constructor.
@@ -577,9 +579,11 @@ fn attach_services(
     root: &std::path::Path,
     session: &Arc<Session>,
     index_watch: Option<Arc<flavite_index::GenerationWatch>>,
+    data_dir: Option<&std::path::Path>,
 ) -> (
     flavite_vault::user_state::VaultUserStateStore,
     Arc<crate::graph_service::GraphService>,
+    crate::settings_store::SettingsStore,
 ) {
     let vault_user_state = flavite_vault::user_state::VaultUserStateStore::new(
         Box::new(flavite_fs::OsFs::new()),
@@ -590,7 +594,92 @@ fn attach_services(
         Some(Arc::clone(session)),
         index_watch,
     );
-    (vault_user_state, graph)
+    // Create a separate store instance for settings (shared fs not needed - same paths)
+    let settings_vault_store = Arc::new(flavite_vault::user_state::VaultUserStateStore::new(
+        Box::new(flavite_fs::OsFs::new()),
+        root,
+    ));
+    let settings_store = crate::settings_store::SettingsStore::new(settings_vault_store.clone(), true);
+    // Initialize settings store with migration from legacy stores
+    let vault_uuid = uuid.to_string();
+    // Create a registry with built-in descriptors
+    let registry = flavite_settings::registry::SettingRegistry::with_builtins();
+    // Trigger migration if needed - this loads or creates the v2 settings document
+    let _ = settings_store.load_or_migrate(&registry, root, data_dir, &vault_uuid)
+        .map_err(|e| eprintln!("Failed to load or migrate settings: {}", e));
+    
+    // Migrate workspace-layouts.json from device store to vault (RFC-0007 S4)
+    if let Some(data_dir) = data_dir {
+        let device_layout_path = data_dir
+            .join("flavite")
+            .join("workspace")
+            .join(&vault_uuid)
+            .join("workspace-layouts.json");
+        let vault_layout_path = root.join(".flavite").join("workspace-layouts.json");
+        
+        // Only copy if vault version doesn't exist yet
+        if device_layout_path.exists()
+            && !vault_layout_path.exists()
+            && std::fs::create_dir_all(vault_layout_path.parent().unwrap()).is_ok()
+            && std::fs::read(&device_layout_path)
+                .is_ok_and(|bytes| std::fs::write(&vault_layout_path, &bytes).is_ok())
+        {
+            eprintln!(
+                "Migrated workspace layout from {} to {}",
+                device_layout_path.display(),
+                vault_layout_path.display()
+            );
+        }
+    }
+    
+    // Migrate themes from device store to vault (RFC-0007 S5)
+    if let Some(data_dir) = data_dir {
+        let device_themes_root = data_dir.join("flavite").join("themes");
+        let vault_themes_root = root.join(".flavite").join("themes");
+        
+        if device_themes_root.exists()
+            && !vault_themes_root.exists()
+            && let Ok(entries) = std::fs::read_dir(&device_themes_root)
+            && std::fs::create_dir_all(&vault_themes_root).is_ok()
+        {
+            let mut copied = 0;
+            for entry in entries.flatten() {
+                if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                    continue;
+                }
+                let theme_dir_name = entry.file_name();
+                let src_dir = device_themes_root.join(&theme_dir_name);
+                let dst_dir = vault_themes_root.join(&theme_dir_name);
+                
+                // Skip if already exists in vault
+                if dst_dir.exists() {
+                    continue;
+                }
+                
+                // Copy theme files
+                for file_name in ["theme.flavite.xpi", "theme.json"] {
+                    let src_file = src_dir.join(file_name);
+                    let dst_file = dst_dir.join(file_name);
+                    if src_file.exists()
+                        && let Ok(bytes) = std::fs::read(&src_file)
+                        && std::fs::create_dir_all(&dst_dir).is_ok()
+                    {
+                        let _ = std::fs::write(&dst_file, &bytes);
+                    }
+                }
+                copied += 1;
+            }
+            if copied > 0 {
+                eprintln!(
+                    "Migrated {copied} theme(s) from {} to {}",
+                    device_themes_root.display(),
+                    vault_themes_root.display()
+                );
+            }
+        }
+    }
+    
+    (vault_user_state, graph, settings_store)
 }
 
 impl Flavite {
@@ -612,8 +701,8 @@ impl Flavite {
         let vault_uuid = vault_ref.uuid.to_string();
 
         let session = Arc::new(session);
-        let (vault_user_state, graph) =
-            attach_services(vault_ref.uuid, &identity.root, &session, None);
+        let (vault_user_state, graph, settings_store) =
+            attach_services(vault_ref.uuid, &identity.root, &session, None, None);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
             uuid::Uuid::now_v7().as_u128(),
@@ -639,9 +728,13 @@ impl Flavite {
                 &vault_uuid,
             )
             .ok(),
-            themes: crate::themes::ThemeStore::open(Box::new(flavite_fs::OsFs::new())).ok(),
+            themes: Some(crate::themes::ThemeStore::at_vault(
+                Box::new(flavite_fs::OsFs::new()),
+                &identity.root,
+            )),
             vault_user_state,
             graph,
+            settings_store,
             // Headless constructors own no writer-side signal; their graph
             // services wake on control kicks and the sweep (RFC-0005 §5.3).
             generation_watch: None,
@@ -664,13 +757,18 @@ impl Flavite {
         _config: VaultConfig,
     ) -> Result<Self, FlaviteError> {
         let vault_uuid = vault_ref.uuid.to_string();
+        let vault_root = vault_ref.root.clone();
         let session = Arc::new(session);
-        let (vault_user_state, graph) =
-            attach_services(vault_ref.uuid, &vault_ref.root, &session, None);
+        let (vault_user_state, graph, settings_store) =
+            attach_services(vault_ref.uuid, &vault_root, &session, None, None);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
             uuid::Uuid::now_v7().as_u128(),
             Arc::clone(&graph),
+        );
+        let theme_store = crate::themes::ThemeStore::at_vault(
+            Box::new(flavite_fs::OsFs::new()),
+            &vault_root,
         );
         let flavite = Self {
             session,
@@ -692,9 +790,10 @@ impl Flavite {
                 &vault_uuid,
             )
             .ok(),
-            themes: crate::themes::ThemeStore::open(Box::new(flavite_fs::OsFs::new())).ok(),
+            themes: Some(theme_store),
             vault_user_state,
             graph,
+            settings_store,
             // Headless constructor: no writer-side signal owned here; the
             // graph service wakes on control kicks and the sweep.
             generation_watch: None,
@@ -717,7 +816,7 @@ impl Flavite {
         session: Arc<Session>,
         config: VaultConfig,
     ) -> Result<Self, FlaviteError> {
-        Self::with_vault_inner(identity, session, config, None)
+        Self::with_vault_inner(identity, session, config, None, None)
     }
 
     fn with_vault_inner(
@@ -725,12 +824,13 @@ impl Flavite {
         session: Arc<Session>,
         _config: VaultConfig,
         index_watch: Option<Arc<flavite_index::GenerationWatch>>,
+        data_dir: Option<&Path>,
     ) -> Result<Self, FlaviteError> {
         let vault_uuid = identity.uuid.to_string();
         let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
         let generation_watch = index_watch.clone();
-        let (vault_user_state, graph) =
-            attach_services(vault_ref.uuid, &identity.root, &session, index_watch);
+        let (vault_user_state, graph, settings_store) =
+            attach_services(vault_ref.uuid, &identity.root, &session, index_watch, data_dir);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
             uuid::Uuid::now_v7().as_u128(),
@@ -750,9 +850,13 @@ impl Flavite {
                 &vault_uuid,
             )
             .ok(),
-            themes: crate::themes::ThemeStore::open(Box::new(flavite_fs::OsFs::new())).ok(),
+            themes: Some(crate::themes::ThemeStore::at_vault(
+                Box::new(flavite_fs::OsFs::new()),
+                &identity.root,
+            )),
             vault_user_state,
             graph,
+            settings_store,
             notice_acks: Mutex::new(std::collections::BTreeMap::new()),
             next_notice_id: AtomicU64::new(1),
             catalog_sequence: AtomicU64::new(1),
@@ -806,6 +910,7 @@ impl Flavite {
         data_dir: Option<PathBuf>,
     ) -> Result<Self, FlaviteError> {
         let (generation_signal, generation_watch) = flavite_index::GenerationSignal::new();
+        let data_dir_clone = data_dir.clone();
         let vault = Vault::open_with_data_dir_and_generation_signal(
             root,
             Box::new(flavite_fs::OsFs::new()),
@@ -819,6 +924,7 @@ impl Flavite {
             vault.session_arc(),
             config,
             Some(Arc::new(generation_watch)),
+            data_dir_clone.as_deref(),
         )?;
         flavite.owned_vault = Some(vault);
         Ok(flavite)
@@ -1081,12 +1187,50 @@ impl Flavite {
                 ArgSchema::typed::<crate::themes::UninstallThemeArgs>(),
                 crate::themes::handle_theme_unroutable,
             ),
+            // Settings commands (RFC-0007 §4.5)
+            (
+                "settings.list",
+                "List all settings",
+                ArgSchema::typed::<crate::settings_cmds::SettingsListArgs>(),
+                crate::settings_cmds::handle_settings_unroutable,
+            ),
+            (
+                "settings.get",
+                "Get a setting value",
+                ArgSchema::typed::<crate::settings_cmds::SettingsGetArgs>(),
+                crate::settings_cmds::handle_settings_unroutable,
+            ),
+            (
+                "settings.set",
+                "Set a setting value",
+                ArgSchema::typed::<crate::settings_cmds::SettingsSetArgs>(),
+                crate::settings_cmds::handle_settings_unroutable,
+            ),
+            (
+                "settings.reset",
+                "Reset a setting to default",
+                ArgSchema::typed::<crate::settings_cmds::SettingsResetArgs>(),
+                crate::settings_cmds::handle_settings_unroutable,
+            ),
+
         ];
         for (id, title, args, handler) in registrations {
             let spec = if id.starts_with("theme.") {
-                // Theme commands write device state, not the vault: they
-                // stay available on read-only vaults and gate on Themes.
-                CommandSpec::new(id, title, args).requires(crate::Capability::Themes)
+                // Theme commands write vault state; install/uninstall are gated
+                // on read-only vaults in the command handler, but still require
+                // the Themes capability.
+                if matches!(id, "theme.install" | "theme.uninstall") {
+                    CommandSpec::new(id, title, args).write().requires(crate::Capability::Themes)
+                } else {
+                    CommandSpec::new(id, title, args).requires(crate::Capability::Themes)
+                }
+            } else if id.starts_with("settings.") {
+                // Settings commands gate on Settings capability
+                if matches!(id, "settings.set" | "settings.reset") {
+                    CommandSpec::new(id, title, args).write().requires(crate::Capability::Settings)
+                } else {
+                    CommandSpec::new(id, title, args).requires(crate::Capability::Settings)
+                }
             } else if matches!(
                 id,
                 "note.open"
@@ -1372,37 +1516,120 @@ impl Flavite {
             .ok_or_else(|| FlaviteError::IndexError("native path decode produced no path".into()))
     }
 
-    /// Read the versioned vault settings document through the API boundary.
-    pub fn read_settings(&self) -> Result<Option<String>, FlaviteError> {
-        let path = self.vault_ref.root.join(".flavite").join("settings.toml");
-        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            return Err(FlaviteError::SettingsIo(
-                "settings.toml must not be a symlink".into(),
-            ));
-        }
-        match std::fs::read_to_string(path) {
-            Ok(contents) => Ok(Some(contents)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(FlaviteError::SettingsIo(error.to_string())),
-        }
+    /// Read the settings document from the vault store (RFC-0007 S2).
+    ///
+    /// Returns `None` if no settings document exists. Use `settings_read` for
+    /// a resolved view with defaults.
+    pub fn read_settings_raw(&self) -> Result<Option<crate::settings_store::StoredSettings>, FlaviteError> {
+        self.settings_store.read().map_err(FlaviteError::from)
     }
 
-    /// Atomically write the versioned vault settings document through the API boundary.
-    pub fn write_settings(&self, contents: &str) -> Result<(), FlaviteError> {
-        let directory = self.vault_ref.root.join(".flavite");
-        std::fs::create_dir_all(&directory)
-            .map_err(|error| FlaviteError::SettingsIo(error.to_string()))?;
-        let path = directory.join("settings.toml");
-        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            return Err(FlaviteError::SettingsIo(
-                "settings.toml must not be a symlink".into(),
+    /// Read and resolve the settings document against the registry.
+    ///
+    /// This is the typed entry point for settings consumption: it returns
+    /// all effective values (document values with defaults filled in).
+    pub fn settings_read(
+        &self,
+    ) -> Result<crate::settings_store::ResolvedSettings, FlaviteError> {
+        use flavite_settings::resolve::RegistryResolve;
+        let registry = flavite_settings::registry::SettingRegistry::with_builtins();
+        let stored = self.settings_store.load_or_initialize(&registry)
+            .map_err(FlaviteError::from)?;
+        let resolved = registry.resolve(&stored.doc);
+        Ok(crate::settings_store::ResolvedSettings {
+            resolved,
+            generation: stored.generation,
+            read_only: stored.is_read_only(),
+            warnings: stored.warnings,
+        })
+    }
+
+    /// Write the settings document to the vault store with CAS (RFC-0007 S2).
+    ///
+    /// This is the typed entry point for settings mutation. It validates the
+    /// document against the registry and enforces the 256 KiB bound.
+    pub fn settings_write(
+        &self,
+        doc: &flavite_settings::document::SettingsDoc,
+        expected_generation: u64,
+    ) -> Result<u64, FlaviteError> {
+        self.settings_store.write(doc, expected_generation).map_err(FlaviteError::from)
+    }
+
+    /// Set a single setting value by ID (RFC-0007 S2).
+    ///
+    /// This is a convenience method that reads the current document, sets the
+    /// value, validates it, and writes with CAS.
+    pub fn settings_set(
+        &self,
+        id: &str,
+        value: flavite_settings::value::SettingValue,
+    ) -> Result<u64, FlaviteError> {
+        let registry = flavite_settings::registry::SettingRegistry::with_builtins();
+        // Validate ID is not reserved
+        if flavite_settings::registry::SettingRegistry::is_reserved_namespace(id) {
+            return Err(FlaviteError::Settings(
+                crate::settings_store::SettingsStoreError::Codec(
+                    flavite_settings::error::SettingsCodecError::ReservedNamespace(id.to_owned()),
+                ),
             ));
         }
-        flavite_fs::atomic::atomic_write(&flavite_fs::OsFs::new(), &path, contents.as_bytes())
-            .map(|_| ())
-            .map_err(|error| FlaviteError::SettingsIo(error.to_string()))
+        // Set and persist
+        self.settings_store.set_value(&registry, id, value).map_err(FlaviteError::from)
+    }
+
+    /// The last-good settings backup, when one exists (RFC-0007 FR-10: the
+    /// diagnosis path behind the unparseable-document restore affordance).
+    pub fn settings_backup(
+        &self,
+    ) -> Result<Option<crate::settings_store::StoredSettings>, FlaviteError> {
+        self.settings_store.backup().map_err(FlaviteError::from)
+    }
+
+    /// Restore the last-good settings backup over the (unparseable)
+    /// document under the current generation (RFC-0007 FR-10). Returns the
+    /// new generation.
+    pub fn settings_restore_backup(&self) -> Result<u64, FlaviteError> {
+        self.settings_store.restore_backup().map_err(FlaviteError::from)
+    }
+
+    /// Get the setting descriptors from the registry.
+    ///
+    /// Returns the complete built-in descriptor table (RFC-0007 D-04).
+    pub fn setting_descriptors(&self) -> Vec<flavite_settings::descriptor::SettingDescriptor> {
+        flavite_settings::registry::SettingRegistry::builtins()
+    }
+
+    /// Test-only seam: rewire every vault-rooted store (vault user state,
+    /// theme packages, settings) onto a caller-owned `MemFs` so vault
+    /// persistence is exercised hermetically — fixtures root vaults at
+    /// virtual paths no real filesystem can address. The settings document
+    /// is (re-)initialized on the new filesystem. Never part of the
+    /// production path.
+    #[doc(hidden)]
+    pub fn set_vault_store_fs_for_test(&mut self, fs: flavite_fs::MemFs) {
+        let root = self.vault_ref().root.clone();
+        self.vault_user_state = flavite_vault::user_state::VaultUserStateStore::new(
+            Box::new(fs.clone()),
+            &root,
+        );
+        self.themes = Some(crate::themes::ThemeStore::at_vault(
+            Box::new(fs.clone()),
+            &root,
+        ));
+        let settings_vault_store = Arc::new(flavite_vault::user_state::VaultUserStateStore::new(
+            Box::new(fs.clone()),
+            &root,
+        ));
+        self.settings_store =
+            crate::settings_store::SettingsStore::new(settings_vault_store, true);
+        let registry = flavite_settings::registry::SettingRegistry::with_builtins();
+        let _ = self.settings_store.load_or_migrate(
+            &registry,
+            &root,
+            None,
+            &self.vault_ref().uuid.to_string(),
+        );
     }
 
     /// Execute a typed command through the registry.
@@ -1475,6 +1702,10 @@ impl Flavite {
             // Theme commands never touch buffers or the vault session;
             // their handlers need the facade-owned theme store.
             return crate::themes::execute_theme_command(self, &invocation);
+        }
+        if invocation.command_id.starts_with("settings.") {
+            // Settings commands need the facade-owned settings store.
+            return crate::settings_cmds::execute_settings_command(self, &invocation);
         }
         if let Some(buffer_id) = invocation.preconditions.buffer_id {
             let revision = invocation.preconditions.expected_revision;
@@ -2528,8 +2759,8 @@ pub enum FlaviteError {
     BufferManagerPoisoned,
 
     /// The vault settings document could not be read or written.
-    #[error("Settings I/O failed: {0}")]
-    SettingsIo(String),
+    #[error("Settings error: {0}")]
+    Settings(#[from] crate::settings_store::SettingsStoreError),
 
     /// Indexed lookup failed.
     #[error("Index error: {0}")]

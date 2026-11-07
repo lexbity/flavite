@@ -127,7 +127,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             app.appearance.theme_semantic(),
         ))
         .with_candidates(app.editor_candidates().clone())
-        .with_stable_links(app.appearance.prefs.prefer_stable_links)
+        .with_stable_links(app.appearance.prefer_stable_links())
         .with_link_resolutions(app.editor_link_resolutions(
             tab,
             incarnation,

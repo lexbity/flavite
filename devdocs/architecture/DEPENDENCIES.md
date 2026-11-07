@@ -18,6 +18,7 @@ Generated from `cargo metadata --format-version 1 --all-features`.
 | `flavite-graph` | 2 | Layout, spatial — CPU only (§4.1) |
 | `flavite-graph-protocol` | 1 | IO-free bounded durable graph scope value types shared by core and workspace (RFC-0003 W08) |
 | `flavite-index` | 1 | SQLite, tantivy, resolver, query exec (§4.1) |
+| `flavite-settings` | 2 | Settings descriptors, registry, v2 TOML codec, and chord parsing — pure, IO-free (RFC-0007 S1) |
 | `flavite-syntax` | 1 | Scanner, frontmatter patcher, pulldown glue — pure, IO-free (§4.1) |
 | `flavite-text-search` | 1 | Literal/regex source matches, match options, captures and replacement-template expansion over borrowed normalized UTF-8 — no editor/buffer authority (RFC-0006 §4.1) |
 | `flavite-text-search-worker` | ? | Isolated source-matching helper binary: framed match/template pages only, self-limited memory, no IO beyond stdin/stdout (RFC-0006 §6.2, D-14) |
@@ -39,10 +40,12 @@ Normal/build:
 - `flavite-fs` (normal)
 - `flavite-graph` (normal)
 - `flavite-index` (normal)
+- `flavite-settings` (normal)
 - `flavite-syntax` (normal)
 - `flavite-text-search` (normal)
 - `flavite-theme` (normal)
 - `flavite-vault` (normal)
+- `flavite-workspace` (normal)
 - `image` (normal)
 - `rusqlite` (normal)
 - `tracing` (normal)
@@ -73,6 +76,7 @@ Normal/build:
 
 - `blake3` (normal)
 - `flavite-api` (normal)
+- `flavite-settings` (normal)
 - `tracing` (normal)
 
 ### `flavite-editor`
@@ -123,6 +127,10 @@ Normal/build:
 - `tantivy` (normal)
 - `tracing` (normal)
 
+### `flavite-settings`
+
+No dependencies.
+
 ### `flavite-syntax`
 
 Normal/build:
@@ -160,6 +168,7 @@ Normal/build:
 - `flavite-buffer` (normal)
 - `flavite-editor` (normal)
 - `flavite-graph` (normal)
+- `flavite-settings` (normal)
 - `flavite-theme` (normal)
 - `flavite-workspace` (normal)
 - `iced` (normal)
@@ -172,6 +181,7 @@ Dev-only:
 - `flavite-fs`
 - `flavite-index`
 - `flavite-vault`
+- `zip`
 
 ### `flavite-vault`
 
@@ -229,12 +239,12 @@ Normal/build:
 - `tantivy` ← flavite-index, xtask
 - `tracing` ← flavite-api, flavite-cli, flavite-index, flavite-vault
 - `tree-sitter` ← flavite-syntax
-- `zip` ← flavite-api, flavite-theme
+- `zip` ← flavite-api, flavite-theme, flavite-ui
 - `zstd` ← flavite-vault
 
 ## Layering rules (§10.2)
 
-Core-tier crates: flavite-fs, flavite-syntax, flavite-encoding, flavite-text-search, flavite-index, flavite-buffer, flavite-vault, flavite-api, flavite-graph, flavite-graph-protocol, flavite-workspace, flavite-theme, flavite-cli
+Core-tier crates: flavite-fs, flavite-syntax, flavite-encoding, flavite-text-search, flavite-index, flavite-buffer, flavite-vault, flavite-api, flavite-graph, flavite-graph-protocol, flavite-workspace, flavite-theme, flavite-cli, flavite-settings
 
 Forbidden in core-tier transitive closure (normal+build): iced, iced_*, winit, wgpu, cosmic-text
 
@@ -245,7 +255,7 @@ UI crates (may depend on forbidden): flavite-editor, flavite-ui
 | Tier | Crates | Floor |
 |---|---|---|
 | 1 — durability-critical | flavite-fs, flavite-syntax, flavite-encoding, flavite-text-search, flavite-buffer, flavite-vault, flavite-index, flavite-workspace, flavite-graph-protocol | ≥ 90% line |
-| 2 | flavite-api, flavite-graph, flavite-theme | ≥ 80% line |
+| 2 | flavite-api, flavite-graph, flavite-theme, flavite-settings | ≥ 80% line |
 | 3 — measured, not gating | flavite-cli, flavite-editor, flavite-ui, flavite-app | reported only |
 
 Temporary floor waivers (must have a valid expiry and reason):

@@ -172,6 +172,7 @@ fn tab_view(app: &App, tab: TabId, active: bool, width: f32) -> Element<'_, Mess
     let kind = match view.kind() {
         ViewKind::Notes => Icon::Notes,
         ViewKind::Graph(_) => Icon::Graph,
+        ViewKind::Settings => Icon::Settings,
         _ => Icon::Note,
     };
     let label = view.title();

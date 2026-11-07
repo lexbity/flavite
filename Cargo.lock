@@ -1493,10 +1493,12 @@ dependencies = [
  "flavite-fs",
  "flavite-graph",
  "flavite-index",
+ "flavite-settings",
  "flavite-syntax",
  "flavite-text-search",
  "flavite-theme",
  "flavite-vault",
+ "flavite-workspace",
  "hex",
  "image",
  "proptest",
@@ -1545,6 +1547,7 @@ dependencies = [
  "blake3",
  "clap",
  "flavite-api",
+ "flavite-settings",
  "hex",
  "serde_json",
  "tempfile",
@@ -1630,6 +1633,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flavite-settings"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+]
+
+[[package]]
 name = "flavite-syntax"
 version = "0.1.0"
 dependencies = [
@@ -1688,6 +1701,7 @@ dependencies = [
  "flavite-fs",
  "flavite-graph",
  "flavite-index",
+ "flavite-settings",
  "flavite-theme",
  "flavite-vault",
  "flavite-workspace",
@@ -1704,6 +1718,7 @@ dependencies = [
  "thiserror 2.0.21",
  "toml",
  "uuid",
+ "zip",
 ]
 
 [[package]]

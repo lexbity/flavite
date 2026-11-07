@@ -10,14 +10,14 @@ use crate::host::context::ContextRegistry;
 use crate::host::documents::{AttachDecision, DocumentRegistry};
 use crate::operation::OperationPump;
 use crate::palette::matching_specs;
-use crate::settings::Settings;
+use flavite_settings::value::SettingValue;
 use crate::subscription;
 use crate::workspace::{Adapter, StripMenu, gestures};
 use flavite_api::queries::NoteCatalogEntry;
 use flavite_api::{
     ExecutionResult, Flavite, Invocation, LocalResult, Origin, VaultConfig,
-    device_preferences::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH},
 };
+use flavite_settings::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 use flavite_editor::{EditorAction, EditorInteractionSnapshot, EditorView};
 use flavite_workspace::{
     Effect, GroupId, Ids, LayoutAction, NoteLocator, Outcome, SplitId, TabId, WorkspaceState,
@@ -121,9 +121,9 @@ pub struct App {
     /// Interface appearance: theme, scale, editor type, reduced motion,
     /// shortcut overrides (W11).
     pub appearance: crate::host::appearance::AppearanceHost,
-    /// While a Preferences shortcut editor row is capturing, the command
-    /// id waiting for the next key press (W11). Escape cancels capture.
-    pub shortcut_capture: Option<String>,
+    /// The Settings tab host (RFC-0007 S6): resolved document view plus
+    /// per-tab search/selection state.
+    pub settings: crate::host::settings::SettingsHost,
     /// The active close decision (W12), when a final dirty/conflicted view
     /// needs an explicit safety outcome before its tab may disappear.
     pub closing: Option<crate::host::closing::ClosePlan>,
@@ -170,8 +170,6 @@ pub struct App {
     /// (W-D): `plan_restore` validates membership against the catalog,
     /// which is no longer synchronously available on the attach turn.
     restore_pending: bool,
-    settings: Settings,
-    settings_valid: bool,
     pub operations: OperationPump,
     /// Completions routed past the per-pump turn budget; the next pump tick
     /// continues (NFR-08: UI event-loop work is budgeted, never lost).
@@ -223,8 +221,8 @@ pub enum Message {
     Layout(flavite_workspace::LayoutAction),
     /// The OS color scheme changed (W11 System theme).
     SystemTheme(iced::theme::Mode),
-    /// A device-preference edit (W11).
-    Preferences(crate::host::appearance::PreferenceMessage),
+    /// A Settings tab message (RFC-0007 S6).
+    Settings(crate::host::settings::SettingsMessage),
     /// The native theme-package dialog resolved (xpi themes).
     ThemePackagePicked(Option<std::path::PathBuf>),
     /// Begin a close for one tab (W12): decide or close.
@@ -667,7 +665,7 @@ impl App {
             link_verdicts: BTreeMap::new(),
             persistence: crate::host::persistence::PersistenceHost::default(),
             appearance: crate::host::appearance::AppearanceHost::boot(),
-            shortcut_capture: None,
+            settings: crate::host::settings::SettingsHost::default(),
             closing: None,
             close_queue: Vec::new(),
             shutdown: None,
@@ -698,8 +696,6 @@ impl App {
             pointer_feedback: false,
             window_geometry_dirty: true,
             restore_pending: false,
-            settings: Settings::default(),
-            settings_valid: true,
             operations: OperationPump::default(),
             completion_backlog: VecDeque::new(),
             status,
@@ -714,18 +710,6 @@ impl App {
 
     fn attach_vault(&mut self, flavite: Flavite) {
         self.root = flavite.vault_ref().root.clone();
-        self.settings = match flavite.read_settings() {
-            Ok(contents) => Settings::parse(contents.as_deref()).unwrap_or_else(|error| {
-                self.settings_valid = false;
-                self.status = format!("Settings could not be parsed; saving is disabled: {error}");
-                Settings::default()
-            }),
-            Err(error) => {
-                self.settings_valid = false;
-                self.status = format!("Settings could not be read: {error}");
-                Settings::default()
-            }
-        };
         // D-16: the composed catalog is checked once at attach; UI ids are
         // namespaced, so any overlap is a build defect worth surfacing.
         let core_ids: Vec<&str> = flavite.command_registry().command_ids().to_vec();
@@ -733,9 +717,10 @@ impl App {
         if !conflicts.is_empty() {
             self.status = format!("Command catalog conflict: {}", conflicts.join(", "));
         }
-        // Device preferences load at attach (W11): parse failures keep
-        // defaults with saving disabled; the document is never overwritten.
+        // Settings and preferences now load from the unified settings store (RFC-0007 S3)
         self.appearance.load(&flavite);
+        // The Settings tab host loads its own resolved view (RFC-0007 S6).
+        self.settings.load(&flavite);
         if let Some(note) = self.appearance.status_note() {
             self.status = format!("{} — {}", self.status, note);
         }
@@ -748,7 +733,7 @@ impl App {
             self.status = format!("{} — {}", self.status, error);
         }
         self.flavite = Some(flavite);
-        if self.settings_valid && conflicts.is_empty() && self.appearance.last_error.is_none() {
+        if conflicts.is_empty() && self.appearance.last_error.is_none() {
             self.status = "Vault ready".into();
         }
         // Graph pins load once through the API at attach (TD-11): a decode
@@ -784,18 +769,19 @@ impl App {
         let _ = flavite_api::write_last_vault_device(&self.root);
     }
 
-    /// Restore the device-local workspace layout (W06): decode, plan, and
+    /// Restore the vault-local workspace layout (RFC-0007 S4): decode, plan, and
     /// apply through one atomic reducer transaction; note tabs reopen
     /// through their normal open flights. Every failure is an honest
     /// report — never a default overwrite.
     fn restore_workspace_layout(&mut self) {
-        use flavite_api::UserStateKind;
         let Some(flavite) = &self.flavite else {
             return;
         };
-        let uuid = flavite.vault_ref().uuid.to_string();
-        let stored = match flavite.read_user_state(UserStateKind::WorkspaceLayouts) {
-            Ok(Some(stored)) => stored,
+        let stored = match flavite.read_workspace_layout() {
+            Ok(Some(stored)) => {
+                self.persistence.observe_generation(stored.generation);
+                stored
+            }
             Ok(None) => {
                 if self.use_workbench_default {
                     self.use_writing_layout();
@@ -808,21 +794,14 @@ impl App {
                 return;
             }
         };
-        self.persistence.observe_generation(stored.generation);
-        let decoded = match flavite_workspace::decode_workspace(&stored.payload, &uuid) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                self.status = format!("Workspace layout not restored: {error}");
-                return;
-            }
-        };
+        // stored.workspace is already the PersistedWorkspace, no need to decode
         let catalog: std::collections::BTreeSet<String> = self
             .catalog_host
             .entries
             .iter()
             .filter_map(|entry| entry.path.to_str().map(str::to_owned))
             .collect();
-        let plan = match flavite_workspace::plan_restore(&decoded, &catalog) {
+        let plan = match flavite_workspace::plan_restore(&stored.workspace, &catalog) {
             Ok(plan) => plan,
             Err(error) => {
                 self.status = format!("Workspace layout not restored: {error:?}");
@@ -838,7 +817,8 @@ impl App {
                 .iter()
                 .map(|tab| (tab.id, tab.kind.clone()))
                 .collect(),
-            groups: decoded
+            groups: stored
+                .workspace
                 .groups
                 .iter()
                 .filter_map(|group| {
@@ -977,10 +957,9 @@ impl App {
         self.write_layout(self.persistence.due(Instant::now()));
     }
 
-    /// Write the device-local layout under this save request (W06).
+    /// Write the vault-local layout under this save request (RFC-0007 S4).
     /// Failures are recorded on the persistence host, never silent.
     fn write_layout(&mut self, request: crate::host::persistence::SaveRequest) {
-        use flavite_api::UserStateKind;
         let crate::host::persistence::SaveRequest::Write {
             expected_generation,
         } = request
@@ -997,24 +976,13 @@ impl App {
             named_layouts: named,
             ..persisted
         };
-        let bytes = match flavite_workspace::encode_workspace(&persisted) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                self.persistence.record_failure(
-                    crate::host::persistence::PersistenceFailure::Failed {
-                        message: error.to_string(),
-                    },
-                );
-                return;
-            }
-        };
         // The store is behind &mut; go through the facade with a
         // fresh mutable borrow.
         let write = self
             .flavite
             .as_mut()
             .expect("checked above")
-            .write_user_state(UserStateKind::WorkspaceLayouts, expected_generation, &bytes);
+            .write_workspace_layout(expected_generation, &persisted);
         match write {
             Ok(generation) => self.persistence.record_success(generation),
             Err(flavite_api::FlaviteError::UserState(
@@ -1282,10 +1250,12 @@ impl App {
                 let Some(flavite) = &self.flavite else {
                     return;
                 };
-                let strategy = match self.settings.rename_behavior {
-                    crate::settings::RenameBehavior::Rewrite => "rewrite",
-                    crate::settings::RenameBehavior::Alias => "alias",
-                    crate::settings::RenameBehavior::None => "none",
+                // Read rename_behavior from the resolved settings (RFC-0007 S3)
+                let strategy = if let Ok(stored) = flavite.settings_read() {
+                    let value = stored.resolved.get("vault.rename_behavior");
+                    value.and_then(|v| v.as_str().map(|s| s.to_owned())).unwrap_or_else(|| "rewrite".to_owned())
+                } else {
+                    "rewrite".to_owned()
                 };
                 let request_id = flavite.command_registry().next_request_id();
                 let invocation = Invocation::new(
@@ -1316,12 +1286,6 @@ impl App {
             crate::host::dialogs::Dialog::About => {
                 self.dialog = None;
             }
-            // Preferences edits commit through Message::Preferences as
-            // they are made; submit only closes the dialog.
-            crate::host::dialogs::Dialog::Preferences => {
-                self.dialog = None;
-                self.shortcut_capture = None;
-            }
             // W12 dialogs resolve through their own messages; Enter runs
             // the primary action where it is safe (never a destructive one).
             crate::host::dialogs::Dialog::RecoveryOffer { path } => {
@@ -1334,7 +1298,7 @@ impl App {
             crate::host::dialogs::Dialog::Close { .. }
             | crate::host::dialogs::Dialog::Conflict { .. } => {
                 self.dialog = None;
-                self.shortcut_capture = None;
+                self.settings.capture = None;
             }
         }
     }
@@ -1583,7 +1547,7 @@ impl App {
     /// the persisted presentation state.
     #[must_use]
     pub fn sidebar_open(&self) -> bool {
-        self.appearance.prefs.sidebar_open
+        self.appearance.sidebar_open()
     }
 
     /// The navigator's effective width in logical pixels: the live drag
@@ -1591,29 +1555,31 @@ impl App {
     #[must_use]
     pub fn sidebar_width(&self) -> f32 {
         self.sidebar_width_preview
-            .unwrap_or_else(|| f32::from(self.appearance.prefs.sidebar_width))
+            .unwrap_or_else(|| f32::from(self.appearance.sidebar_width()))
     }
 
     /// Flip the navigator and store the new state quietly: the status line
     /// keeps whatever it was reporting.
     pub fn toggle_sidebar(&mut self) {
-        let open = !self.appearance.prefs.sidebar_open;
+        let open = !self.appearance.sidebar_open();
         self.set_sidebar_open(open);
     }
 
-    /// Store the navigator's open flag in the preferences and persist them.
+    /// Store the navigator's open flag through the settings funnel
+    /// (RFC-0007 S7: one edit pipeline; the status line keeps whatever it
+    /// was reporting, so a quiet flip is a quiet funnel write).
     pub fn set_sidebar_open(&mut self, open: bool) {
-        if self.appearance.prefs.sidebar_open != open {
-            self.appearance.prefs.sidebar_open = open;
-            self.persist_sidebar_prefs();
-        }
-    }
-
-    /// Persist the device preferences without touching the status line;
-    /// failures surface later through [`crate::host::appearance`].
-    fn persist_sidebar_prefs(&mut self) {
-        if let Some(flavite) = self.flavite.as_mut() {
-            self.appearance.persist(flavite);
+        if self.appearance.sidebar_open() != open {
+            let previous = self.status.clone();
+            let outcome = self.apply_setting("sidebar.open", SettingValue::Bool(open));
+            let _ = outcome;
+            // A quiet flip: success keeps the status line as it was; a
+            // refusal (read-only vault) surfaces through the funnel.
+            if !self.status.starts_with("settings_read_only")
+                && !self.status.starts_with("Attach a vault")
+            {
+                self.status = previous;
+            }
         }
     }
 
@@ -2559,9 +2525,8 @@ impl App {
                 let _ = self.update_shutdown(message);
             }
             Message::SystemTheme(mode) => self.appearance.system_theme(mode),
-            Message::Preferences(update) => {
-                // Preference edits persist inline; the task is always none.
-                let _ = self.update_preferences(update);
+            Message::Settings(message) => {
+                return crate::host::settings::handle(self, message);
             }
             Message::WindowEvent(iced::window::Event::CloseRequested) => {
                 self.begin_shutdown();
@@ -2572,6 +2537,12 @@ impl App {
                 {
                     self.status = format!("Vault focus reconcile failed: {error}");
                 }
+                // D-11 (RFC-0007): focus is the settings sync point —
+                // external edits adopt here; the file watcher is not used.
+                return crate::host::settings::handle(
+                    self,
+                    crate::host::settings::SettingsMessage::FocusGained,
+                );
             }
             Message::WindowEvent(iced::window::Event::Resized(size)) => {
                 self.window_size = size;
@@ -2627,6 +2598,10 @@ impl App {
                             group,
                         },
                         flavite_workspace::ViewKind::Notes => LayoutAction::OpenNotes {
+                            expected_revision: revision,
+                            group,
+                        },
+                        flavite_workspace::ViewKind::Settings => LayoutAction::OpenSettings {
                             expected_revision: revision,
                             group,
                         },
@@ -3005,7 +2980,7 @@ impl App {
                 self.submit_dialog();
             }
             Message::DialogCancel => {
-                self.shortcut_capture = None;
+                self.settings.capture = None;
                 if matches!(
                     self.dialog,
                     Some(crate::host::dialogs::Dialog::Close { .. })
@@ -3031,8 +3006,9 @@ impl App {
             }
             Message::ThemePackagePicked(picked) => {
                 if let Some(path) = picked {
-                    return self.update_preferences(
-                        crate::host::appearance::PreferenceMessage::ThemeInstallFromPath(path),
+                    return crate::host::settings::handle(
+                        self,
+                        crate::host::settings::SettingsMessage::ThemeInstallFromPath(path),
                     );
                 }
             }
@@ -3276,9 +3252,19 @@ impl App {
                             .round()
                             .clamp(f32::from(MIN_SIDEBAR_WIDTH), f32::from(MAX_SIDEBAR_WIDTH))
                             as u16;
-                        if stored != self.appearance.prefs.sidebar_width {
-                            self.appearance.prefs.sidebar_width = stored;
-                            self.persist_sidebar_prefs();
+                        if stored != self.appearance.sidebar_width() {
+                            let previous = self.status.clone();
+                            let _ = self.apply_setting(
+                                "sidebar.width",
+                                SettingValue::Int(i64::from(stored)),
+                            );
+                            // A quiet commit: success keeps the status
+                            // line as it was; refusals surface.
+                            if !self.status.starts_with("settings_read_only")
+                                && !self.status.starts_with("Attach a vault")
+                            {
+                                self.status = previous;
+                            }
                         }
                     }
                 }
@@ -4012,7 +3998,7 @@ impl App {
                 "target_path": target_path.clone(),
                 "completion": completion,
                 "expected_target": expected,
-                "stable_link_policy": if self.appearance.prefs.prefer_stable_links {
+                "stable_link_policy": if self.appearance.prefer_stable_links() {
                     "prefer_stable"
                 } else {
                     "disabled"
@@ -4131,7 +4117,7 @@ impl App {
     /// The combined catalog snapshot for the palette: core specs plus the
     /// host commands, in stable order.
     fn palette_matches(&self) -> Vec<flavite_api::CommandSpec> {
-        let mut specs = host_commands::ui_specs(&self.appearance.prefs.shortcuts);
+        let mut specs = host_commands::ui_specs(&self.appearance.shortcut_overrides());
         if let Some(flavite) = &self.flavite {
             specs.extend(flavite.command_registry().specs());
         }
@@ -4593,7 +4579,7 @@ mod tests {
             link_verdicts: BTreeMap::new(),
             persistence: crate::host::persistence::PersistenceHost::default(),
             appearance: crate::host::appearance::AppearanceHost::boot(),
-            shortcut_capture: None,
+            settings: crate::host::settings::SettingsHost::default(),
             closing: None,
             close_queue: Vec::new(),
             shutdown: None,
@@ -4624,8 +4610,6 @@ mod tests {
             pointer_feedback: false,
             window_geometry_dirty: true,
             restore_pending: false,
-            settings: Settings::default(),
-            settings_valid: true,
             operations: OperationPump::default(),
             completion_backlog: VecDeque::new(),
             status: "Ready".into(),

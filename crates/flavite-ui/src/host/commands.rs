@@ -10,7 +10,7 @@ use flavite_workspace::{GroupId, LayoutAction, NoteLocator, TabId, ViewKind};
 use iced::keyboard::{self, Modifiers};
 
 /// Remappable shell commands and their default chords (W11 input catalog).
-/// The chord strings parse through [`crate::preferences::parse_chord`];
+/// The chord strings parse through [`flavite_settings::chord::parse_chord`];
 /// `Mod` is the platform command modifier. A preference override replaces
 /// the default for that command id only.
 pub const DEFAULT_CHORDS: &[(&str, &str)] = &[
@@ -212,7 +212,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     },
     UiCommand {
         id: "workspace.preferences",
-        title: "Open preferences (theme, scale, shortcuts)",
+        title: "Open settings (theme, scale, shortcuts)",
     },
     UiCommand {
         id: "workspace.toggle_theme",
@@ -441,7 +441,7 @@ pub fn ui_specs(overrides: &std::collections::BTreeMap<String, String>) -> Vec<C
                 command.title,
                 ArgSchema::typed::<serde_json::Value>(),
                 None,
-                crate::preferences::intern_chords(&keys),
+                intern_chords(&keys),
             )
         })
         .collect()
@@ -459,7 +459,10 @@ pub fn resolved_chord(
         .find(|(command, _)| *command == id)
         .map(|(_, chord)| *chord)?;
     let text = overrides.get(id).map(String::as_str).unwrap_or(default);
-    crate::preferences::parse_chord(text).or_else(|| crate::preferences::parse_chord(default))
+    // Parse using flavite_settings and convert to flavite_api::Chord
+    flavite_settings::chord::parse_chord(text)
+        .or_else(|| flavite_settings::chord::parse_chord(default))
+        .map(|c| Chord { modifiers: c.modifiers, key: c.key })
 }
 
 /// Verify the composed catalog has no collisions with the core registry.
@@ -497,10 +500,10 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
     };
     // A Preferences shortcut row is capturing: the next key press becomes
     // that command's chord; Escape cancels (W11 collision editor).
-    if let Some(command) = app.shortcut_capture.clone() {
+    if let Some(command) = app.settings.capture.clone() {
         if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
-            return Some(Message::Preferences(
-                crate::host::appearance::PreferenceMessage::ShortcutCaptured {
+            return Some(Message::Settings(
+                crate::host::settings::SettingsMessage::ShortcutCaptured {
                     command,
                     chord: None,
                 },
@@ -523,8 +526,8 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
         }
         parts.push(token.as_str());
         let chord = parts.join("+");
-        return Some(Message::Preferences(
-            crate::host::appearance::PreferenceMessage::ShortcutCaptured {
+        return Some(Message::Settings(
+            crate::host::settings::SettingsMessage::ShortcutCaptured {
                 command,
                 chord: Some(chord),
             },
@@ -592,6 +595,23 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
     }
     if modifiers.shift() && matches!(&key, keyboard::Key::Named(keyboard::key::Named::F10)) {
         return Some(Message::RunHostCommand("workspace.group_actions"));
+    }
+    // RFC-0007 FR-6 (keyboard-only operation): `/` focuses the Settings
+    // tab's search input when the settings view is focused.
+    if modifiers.is_empty()
+        && matches!(&key, keyboard::Key::Character(character) if character == "/")
+        && matches!(
+            app.workspace
+                .tab(&app.workspace.focused_tab())
+                .map(|session| session.kind()),
+            Some(flavite_workspace::ViewKind::Settings)
+        )
+        && app.dialog.is_none()
+    {
+        let tab = app.workspace.focused_tab();
+        return Some(Message::Settings(
+            crate::host::settings::SettingsMessage::FocusSearch { tab },
+        ));
     }
     // Graph tab operations (§9.3 keyboard): Enter opens the selected
     // note; command+Enter requests one link insertion at the retained
@@ -1044,31 +1064,38 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
             app.dialog = Some(crate::host::dialogs::Dialog::About);
         }
         "workspace.preferences" => {
-            app.shortcut_capture = None;
-            app.dialog = Some(crate::host::dialogs::Dialog::Preferences);
+            // RFC-0007 D-08: the command opens the durable Settings tab.
+            if let Some(group) = app.navigation_group() {
+                app.dispatch_layout(|revision| LayoutAction::OpenSettings {
+                    expected_revision: revision,
+                    group,
+                });
+            }
         }
         "workspace.toggle_theme" => {
             // Toggle resolves the active scheme to an explicit choice, so
-            // the flip is one undoable, inspectable preference edit.
+            // the flip is one inspectable settings edit through the funnel.
             let next = match app.appearance.scheme() {
-                crate::style::Scheme::Dark => crate::preferences::ThemeChoice::Light,
-                crate::style::Scheme::Light => crate::preferences::ThemeChoice::Dark,
+                crate::style::Scheme::Dark => "light",
+                crate::style::Scheme::Light => "dark",
             };
-            return app.update(Message::Preferences(
-                crate::host::appearance::PreferenceMessage::SetTheme(next),
-            ));
+            return app.apply_setting(
+                "appearance.theme",
+                flavite_settings::value::SettingValue::Str(next.to_owned()),
+            );
         }
         "workspace.cycle_interface_scale" => {
             const LADDER: [u16; 4] = [100, 150, 200, 75];
-            let current = app.appearance.prefs.interface_scale_pct;
+            let current = app.appearance.scale_pct();
             let position = LADDER.iter().position(|step| *step == current);
             let next = match position {
                 Some(index) => LADDER[(index + 1) % LADDER.len()],
                 None => 100,
             };
-            return app.update(Message::Preferences(
-                crate::host::appearance::PreferenceMessage::SetScale(next),
-            ));
+            return app.apply_setting(
+                "appearance.scale_pct",
+                flavite_settings::value::SettingValue::Int(i64::from(next)),
+            );
         }
         "workspace.open_graph" => {
             if let Some(group) = focused_group {
@@ -1370,6 +1397,7 @@ pub fn available(app: &App, id: &str) -> bool {
         | "workspace.open_note_dialog"
         | "workspace.open_search_view"
         | "workspace.open_replace_view"
+        | "workspace.preferences"
         | "workspace.refresh_catalog" => app.flavite.is_some(),
         "help.about" => true,
         _ => true,
@@ -1457,4 +1485,28 @@ pub fn note_search_command(app: &App, tab: TabId, id: &str) -> Option<Message> {
         }
         _ => return None,
     }))
+}
+
+/// Intern a chord slice for the catalog's `&'static [Chord]` key lists.
+/// This delegates to flavite_settings::chord::chord_string for the key.
+fn intern_chords(chords: &[Chord]) -> &'static [Chord] {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static INTERNED: OnceLock<Mutex<HashMap<String, &'static [Chord]>>> = OnceLock::new();
+    let key = chords
+        .iter()
+        .map(|c| flavite_settings::chord::chord_string(&flavite_settings::chord::Chord {
+            modifiers: c.modifiers,
+            key: c.key.clone(),
+        }))
+        .collect::<Vec<_>>()
+        .join(";");
+    let cache = INTERNED.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap();
+    if let Some(slice) = guard.get(&key) {
+        return slice;
+    }
+    let leaked: &'static [Chord] = Box::leak(chords.to_vec().into_boxed_slice());
+    guard.insert(key, leaked);
+    leaked
 }

@@ -24,6 +24,7 @@ pub mod operations;
 pub mod persistence;
 pub mod replace;
 pub mod search;
+pub mod settings;
 pub mod shell;
 pub mod shutdown;
 

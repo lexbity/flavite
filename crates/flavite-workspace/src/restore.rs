@@ -80,6 +80,7 @@ pub fn plan(
             PersistedKind::Notes => Some(ViewKind::Notes),
             PersistedKind::Search => Some(ViewKind::Search),
             PersistedKind::Replace => Some(ViewKind::Replace),
+            PersistedKind::Settings => Some(ViewKind::Settings),
             PersistedKind::History { locator } => NoteLocator::from_components(locator.clone())
                 .ok()
                 .map(ViewKind::History),

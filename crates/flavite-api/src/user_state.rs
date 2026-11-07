@@ -1,12 +1,23 @@
-//! Device-local user state for hosts (RFC-0003 §22, W06, D-11).
+//! Device-local user state for hosts (RFC-0003 §22, W10, RFC-0007).
 //!
-//! Workspace layouts and device preferences live in the OS data directory
-//! keyed by vault UUID. The facade exposes only fixed kinds, generation
-//! receipts, and typed failures; hosts never see or choose file paths.
+//! App-launch and encoding-hints live in the OS data directory.
+//! Workspace layouts and settings now live in the vault (RFC-0007 S4/S5).
+//! The facade exposes only fixed kinds, generation receipts, and typed
+//! failures; hosts never see or choose file paths.
 
-pub use flavite_vault::user_state::{StoredUserState, UserStateError, UserStateKind};
+pub use flavite_vault::user_state::{StoredUserState, UserStateError, UserStateKind, VaultUserStateKind};
 
 use crate::{Flavite, FlaviteError};
+use flavite_workspace::PersistedWorkspace;
+
+/// A workspace layout with its storage generation for tracking CAS.
+#[derive(Debug, Clone)]
+pub struct StoredWorkspace {
+    /// The generation of the stored layout.
+    pub generation: u64,
+    /// The decoded workspace.
+    pub workspace: PersistedWorkspace,
+}
 
 /// The most recently opened vault root on this device, if any (W10 no-vault
 /// startup, FR-22). Device-local app-scope state, independent of any vault,
@@ -109,5 +120,59 @@ impl Flavite {
             Box::new(flavite_fs::MemFs::new()),
             root.join(uuid),
         ));
+    }
+
+    /// Read the workspace layout from the vault.
+    ///
+    /// Workspace layouts are now stored in the vault at
+    /// `<vault>/.flavite/workspace-layouts.json` (RFC-0007 S4).
+    ///
+    /// # Errors
+    /// Returns [`FlaviteError::UserState`] on filesystem, protection, or
+    /// corruption failures.
+    pub fn read_workspace_layout(
+        &self,
+    ) -> Result<Option<StoredWorkspace>, FlaviteError> {
+        let stored = self.vault_user_state
+            .read(VaultUserStateKind::WorkspaceLayouts)
+            .map_err(FlaviteError::UserState)?;
+        match stored {
+            Some(stored) => {
+                let workspace: flavite_workspace::PersistedWorkspace =
+                    serde_json::from_slice(&stored.payload)
+                        .map_err(|e| FlaviteError::UserState(UserStateError::Corrupt(e.to_string())))?;
+                Ok(Some(StoredWorkspace {
+                    generation: stored.generation,
+                    workspace,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Write the workspace layout to the vault under a compare-and-set
+    /// generation receipt; returns the new generation.
+    ///
+    /// Workspace layouts are now stored in the vault at
+    /// `<vault>/.flavite/workspace-layouts.json` (RFC-0007 S4).
+    ///
+    /// # Errors
+    /// Returns [`FlaviteError::UserState`]; a stale receipt is a typed
+    /// generation mismatch, never a silent overwrite.
+    pub fn write_workspace_layout(
+        &mut self,
+        expected_generation: u64,
+        workspace: &flavite_workspace::PersistedWorkspace,
+    ) -> Result<u64, FlaviteError> {
+        let payload = serde_json::to_vec(workspace)
+            .map_err(|e| FlaviteError::UserState(UserStateError::Fs(e.to_string())))?;
+        self.vault_user_state
+            .write(
+                VaultUserStateKind::WorkspaceLayouts,
+                expected_generation,
+                &payload,
+                true,
+            )
+            .map_err(FlaviteError::UserState)
     }
 }

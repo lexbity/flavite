@@ -53,6 +53,10 @@
       "kind": "workspace"
     },
     {
+      "id": "flavite-settings",
+      "kind": "workspace"
+    },
+    {
       "id": "flavite-syntax",
       "kind": "workspace"
     },
@@ -182,6 +186,11 @@
     },
     {
       "from": "flavite-api",
+      "to": "flavite-settings",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-api",
       "to": "flavite-syntax",
       "kind": "normal"
     },
@@ -198,6 +207,11 @@
     {
       "from": "flavite-api",
       "to": "flavite-vault",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-api",
+      "to": "flavite-workspace",
       "kind": "normal"
     },
     {
@@ -258,6 +272,11 @@
     {
       "from": "flavite-cli",
       "to": "flavite-api",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-cli",
+      "to": "flavite-settings",
       "kind": "normal"
     },
     {
@@ -427,6 +446,11 @@
     },
     {
       "from": "flavite-ui",
+      "to": "flavite-settings",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
       "to": "flavite-theme",
       "kind": "normal"
     },
@@ -459,6 +483,11 @@
       "from": "flavite-ui",
       "to": "nucleo",
       "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "zip",
+      "kind": "dev"
     },
     {
       "from": "flavite-vault",

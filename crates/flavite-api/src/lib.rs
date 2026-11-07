@@ -25,7 +25,6 @@
 
 pub mod capability;
 pub mod command;
-pub mod device_preferences;
 pub mod doctor;
 pub mod documents;
 pub mod event;
@@ -67,6 +66,10 @@ pub mod user_state;
 pub use user_state::{
     StoredUserState, UserStateError, UserStateKind, read_last_vault_device, write_last_vault_device,
 };
+pub mod settings_store;
+pub use settings_store::{defaults_document, ResolvedSettings, SettingsStore, SettingsStoreError, StoredSettings, MAX_SETTINGS_BYTES};
+pub mod settings_cmds;
+pub use settings_cmds::*;
 
 // Re-export key types for convenience
 pub use capability::*;

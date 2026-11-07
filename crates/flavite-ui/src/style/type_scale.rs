@@ -10,7 +10,6 @@ use super::{
     BRAND, HEADING, PALETTE_WIDTH, SPACING, SPACING_LG, SPACING_SM, TAB_HEIGHT, TEXT, TEXT_LG,
     TEXT_SM, TOP_BAR_HEIGHT,
 };
-use crate::preferences::{LineWidth, Preferences};
 
 /// Minimum icon-button target before scale (NFR-15 floor: 24 px).
 const ICON_TARGET: f32 = 32.0;
@@ -55,8 +54,8 @@ pub struct Metrics {
     /// Editor line height derived from the font size (rounded to 0.5 px
     /// so caret/scroll math stays stable across preference changes).
     pub editor_line_height: f32,
-    /// Readable editor line width in columns, or full pane width.
-    pub line_width: LineWidth,
+    /// Readable editor line width in columns (`None` = full pane width).
+    pub line_width_columns: Option<u16>,
 }
 
 impl Metrics {
@@ -66,7 +65,7 @@ impl Metrics {
     pub fn new(
         interface_scale_pct: u16,
         editor_font_size: u16,
-        line_width: LineWidth,
+        line_width_columns: Option<u16>,
         sidebar_width: u16,
     ) -> Self {
         let scale = f32::from(interface_scale_pct) / 100.0;
@@ -94,19 +93,8 @@ impl Metrics {
             icon_target: scaled(ICON_TARGET).max(24.0),
             editor_font_size: editor,
             editor_line_height,
-            line_width,
+            line_width_columns,
         }
-    }
-
-    /// Metrics from the active preferences.
-    #[must_use]
-    pub fn from_preferences(preferences: &Preferences) -> Self {
-        Self::new(
-            preferences.interface_scale_pct,
-            preferences.editor_font_size,
-            preferences.line_width,
-            preferences.sidebar_width,
-        )
     }
 
     /// The editor widget's type settings (font size + derived line height).
@@ -123,15 +111,16 @@ impl Metrics {
     #[must_use]
     pub fn editor_max_line_width(&self) -> Option<f32> {
         // Monospace advance is ~0.6 em; columns × advance caps the wrap.
-        self.line_width
-            .columns()
+        self.line_width_columns
             .map(|columns| f32::from(columns) * 0.6 * self.editor_font_size)
     }
 }
 
 impl Default for Metrics {
     fn default() -> Self {
-        Self::new(100, 16, LineWidth::Full, 240)
+        // Registry defaults (RFC-0007 D-04): scale 100%, font 14,
+        // line width 80 columns, sidebar 260 px.
+        Self::new(100, 14, Some(80), 260)
     }
 }
 
@@ -150,13 +139,13 @@ mod tests {
         assert_eq!(metrics.brand, 19.0);
         assert_eq!(metrics.tab_height, 32.0);
         assert_eq!(metrics.spacing, 8.0);
-        assert_eq!(metrics.editor_font_size, 16.0);
-        assert_eq!(metrics.editor_line_height, 22.5);
+        assert_eq!(metrics.editor_font_size, 14.0);
+        assert_eq!(metrics.editor_line_height, 19.5);
     }
 
     #[test]
     fn scale_multiplies_chrome_and_type() {
-        let metrics = Metrics::new(150, 16, LineWidth::Full, 240);
+        let metrics = Metrics::new(150, 16, None, 240);
         assert_eq!(metrics.scale, 1.5);
         assert_eq!(metrics.text, 21.0);
         assert_eq!(metrics.tab_height, 48.0);
@@ -164,14 +153,14 @@ mod tests {
             metrics.editor_font_size, 16.0,
             "editor size is its own preference"
         );
-        let tiny = Metrics::new(75, 12, LineWidth::Columns(40), 240);
+        let tiny = Metrics::new(75, 12, Some(40), 240);
         assert_eq!(tiny.text_sm, 9.0);
-        assert_eq!(tiny.line_width, LineWidth::Columns(40));
+        assert_eq!(tiny.line_width_columns, Some(40));
     }
 
     #[test]
     fn icon_targets_never_drop_below_the_accessibility_floor() {
-        let metrics = Metrics::new(75, 12, LineWidth::Full, 240);
+        let metrics = Metrics::new(75, 12, None, 240);
         assert!(metrics.icon_target >= 24.0, "NFR-15 pointer target floor");
     }
 }

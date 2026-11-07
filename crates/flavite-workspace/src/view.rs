@@ -138,6 +138,9 @@ pub enum ViewKind {
     Outline(ContextBinding),
     /// Current frontmatter with guarded scalar edits.
     Properties(ContextBinding),
+    /// Vault settings, rendered generically from the setting registry
+    /// (RFC-0007 D-08): search, category TOC, and per-descriptor rows.
+    Settings,
 }
 
 impl ViewKind {
@@ -160,6 +163,7 @@ impl ViewKind {
             ViewKind::Backlinks(binding) => Some(ViewKind::Backlinks(binding.clone())),
             ViewKind::Outline(binding) => Some(ViewKind::Outline(binding.clone())),
             ViewKind::Properties(binding) => Some(ViewKind::Properties(binding.clone())),
+            ViewKind::Settings => Some(ViewKind::Settings),
         }
     }
 }
@@ -468,6 +472,7 @@ impl ViewSession {
             ViewKind::Backlinks(_) => "Backlinks".into(),
             ViewKind::Outline(_) => "Outline".into(),
             ViewKind::Properties(_) => "Properties".into(),
+            ViewKind::Settings => "Settings".into(),
         }
     }
 
@@ -489,6 +494,7 @@ impl ViewSession {
             ViewKind::Backlinks(binding) => Some(ViewKind::Backlinks(binding.clone())),
             ViewKind::Outline(binding) => Some(ViewKind::Outline(binding.clone())),
             ViewKind::Properties(binding) => Some(ViewKind::Properties(binding.clone())),
+            ViewKind::Settings => Some(ViewKind::Settings),
         }
     }
 }

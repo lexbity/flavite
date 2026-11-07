@@ -12,7 +12,6 @@ pub mod merge;
 pub mod recovery;
 
 use crate::app::{App, Message};
-use crate::preferences::{LineWidth, ThemeChoice};
 use crate::style;
 use crate::workspace::tab_strip;
 use flavite_workspace::NoteLocator;
@@ -43,9 +42,6 @@ pub enum Dialog {
     },
     /// Version and command surface summary.
     About,
-    /// Interface preferences (W11): theme, scale, editor type, motion,
-    /// and shortcut overrides with collision capture.
-    Preferences,
     /// Close decision for a final unsaved view (W12).
     Close { tab: TabId },
     /// Conflict resolution for a buffer whose file changed on disk (W12).
@@ -83,7 +79,6 @@ impl Dialog {
             Self::NewNote { .. } => "new_note",
             Self::Rename { .. } => "rename",
             Self::About => "about",
-            Self::Preferences => "preferences",
             Self::Close { .. } => "close",
             Self::Conflict { .. } => "conflict",
             Self::Merge { .. } => "merge",
@@ -99,7 +94,6 @@ impl Dialog {
             Self::NewNote { .. } => "New note",
             Self::Rename { .. } => "Rename or move note",
             Self::About => "About Flavite",
-            Self::Preferences => "Preferences",
             Self::Close { .. } => "Unsaved changes",
             Self::Conflict { .. } => "Conflict",
             Self::Merge { .. } => "Confirm merge",
@@ -233,348 +227,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
             ]
             .spacing(metrics.spacing_sm),
         ),
-        Dialog::Preferences => preferences_body(app, *metrics),
         Dialog::Close { tab } => close::view(app, *tab, *metrics),
         Dialog::Conflict { tab } => conflict::view(app, *tab, *metrics),
         Dialog::Merge { prepared, .. } => merge::view(prepared, *metrics),
         Dialog::RecoveryOffer { path } => recovery::view(path, *metrics),
         Dialog::ShutdownTimeout { concern } => close::shutdown_view(app, concern, *metrics),
-    }
-}
-
-/// One choice row: a label plus the mutually exclusive option buttons.
-fn choice_row<'a>(
-    metrics: style::Metrics,
-    label: &str,
-    options: &[(&'static str, bool, Message)],
-) -> Element<'a, Message> {
-    let mut row = row![text(label.to_owned()).size(metrics.text)]
-        .spacing(metrics.spacing_sm)
-        .align_y(iced::alignment::Vertical::Center);
-    for (name, active, message) in options {
-        row = row.push(
-            button(text(*name).size(metrics.text_sm))
-                .padding(tab_strip::chip_padding())
-                .style(action_or_ghost(*active))
-                .on_press(message.clone()),
-        );
-    }
-    row.into()
-}
-
-/// The current display chord for a command (override or default).
-fn chord_label(app: &App, id: &str) -> String {
-    crate::host::commands::resolved_chord(id, &app.appearance.prefs.shortcuts)
-        .map(|chord| crate::preferences::chord_string(&chord))
-        .unwrap_or_else(|| "unbound".into())
-}
-
-/// One shortcut-editor row: the command's default id, its effective
-/// chord, a capture button, and a reset button when overridden.
-fn shortcut_row<'a>(metrics: style::Metrics, app: &App, id: &'static str) -> Element<'a, Message> {
-    use crate::host::appearance::PreferenceMessage as P;
-    let capturing = app.shortcut_capture.as_deref() == Some(id);
-    let overridden = app.appearance.prefs.shortcuts.contains_key(id);
-    let mut row = row![
-        text(id).size(metrics.text_sm),
-        text(chord_label(app, id)).size(metrics.text),
-    ]
-    .spacing(metrics.spacing_sm)
-    .align_y(iced::alignment::Vertical::Center);
-    row = row.push(
-        button(text(if capturing { "Press keys…" } else { "Change" }).size(metrics.text_sm))
-            .padding(tab_strip::chip_padding())
-            .style(action_or_ghost(capturing))
-            .on_press(Message::Preferences(P::BeginShortcutCapture(id.to_owned()))),
-    );
-    if overridden {
-        row = row.push(
-            button(text("Reset").size(metrics.text_sm))
-                .padding(tab_strip::chip_padding())
-                .style(style::ghost())
-                .on_press(Message::Preferences(P::SetShortcut {
-                    command: id.to_owned(),
-                    chord: None,
-                })),
-        );
-    }
-    row.into()
-}
-
-/// The Preferences dialog body (W11): theme, scale, editor type, motion,
-/// and the shortcut editor with capture and restore-defaults (D-15).
-fn preferences_body(app: &App, metrics: style::Metrics) -> Element<'_, Message> {
-    use crate::host::appearance::PreferenceMessage as P;
-    let appearance = &app.appearance;
-    let scale = appearance.prefs.interface_scale_pct;
-    let font = appearance.prefs.editor_font_size;
-    let width = appearance.prefs.line_width;
-
-    let mut body = column![
-        text("Preferences").size(metrics.heading),
-        choice_row(
-            metrics,
-            "Theme",
-            &[
-                (
-                    "System",
-                    appearance.prefs.theme == ThemeChoice::System,
-                    Message::Preferences(P::SetTheme(ThemeChoice::System)),
-                ),
-                (
-                    "Light",
-                    appearance.prefs.theme == ThemeChoice::Light,
-                    Message::Preferences(P::SetTheme(ThemeChoice::Light)),
-                ),
-                (
-                    "Dark",
-                    appearance.prefs.theme == ThemeChoice::Dark,
-                    Message::Preferences(P::SetTheme(ThemeChoice::Dark)),
-                ),
-            ],
-        ),
-        choice_row(
-            metrics,
-            "Interface scale",
-            &[
-                ("75%", scale == 75, Message::Preferences(P::SetScale(75))),
-                ("100%", scale == 100, Message::Preferences(P::SetScale(100))),
-                ("150%", scale == 150, Message::Preferences(P::SetScale(150))),
-                ("200%", scale == 200, Message::Preferences(P::SetScale(200))),
-            ],
-        ),
-        choice_row(
-            metrics,
-            "Editor font size",
-            &[
-                (
-                    "12",
-                    font == 12,
-                    Message::Preferences(P::SetEditorFontSize(12))
-                ),
-                (
-                    "14",
-                    font == 14,
-                    Message::Preferences(P::SetEditorFontSize(14))
-                ),
-                (
-                    "16",
-                    font == 16,
-                    Message::Preferences(P::SetEditorFontSize(16))
-                ),
-                (
-                    "18",
-                    font == 18,
-                    Message::Preferences(P::SetEditorFontSize(18))
-                ),
-                (
-                    "20",
-                    font == 20,
-                    Message::Preferences(P::SetEditorFontSize(20))
-                ),
-                (
-                    "24",
-                    font == 24,
-                    Message::Preferences(P::SetEditorFontSize(24))
-                ),
-                (
-                    "28",
-                    font == 28,
-                    Message::Preferences(P::SetEditorFontSize(28))
-                ),
-            ],
-        ),
-        choice_row(
-            metrics,
-            "Editor line width",
-            &[
-                (
-                    "Full",
-                    width == LineWidth::Full,
-                    Message::Preferences(P::SetLineWidth(LineWidth::Full)),
-                ),
-                (
-                    "60",
-                    width == LineWidth::Columns(60),
-                    Message::Preferences(P::SetLineWidth(LineWidth::Columns(60))),
-                ),
-                (
-                    "80",
-                    width == LineWidth::Columns(80),
-                    Message::Preferences(P::SetLineWidth(LineWidth::Columns(80))),
-                ),
-                (
-                    "100",
-                    width == LineWidth::Columns(100),
-                    Message::Preferences(P::SetLineWidth(LineWidth::Columns(100))),
-                ),
-                (
-                    "120",
-                    width == LineWidth::Columns(120),
-                    Message::Preferences(P::SetLineWidth(LineWidth::Columns(120))),
-                ),
-                (
-                    "160",
-                    width == LineWidth::Columns(160),
-                    Message::Preferences(P::SetLineWidth(LineWidth::Columns(160))),
-                ),
-            ],
-        ),
-        choice_row(
-            metrics,
-            "Reduced motion",
-            &[
-                (
-                    "Off",
-                    !appearance.prefs.reduced_motion,
-                    Message::Preferences(P::SetReducedMotion(false)),
-                ),
-                (
-                    "On",
-                    appearance.prefs.reduced_motion,
-                    Message::Preferences(P::SetReducedMotion(true)),
-                ),
-            ],
-        ),
-        choice_row(
-            metrics,
-            "Stable-ID links",
-            &[
-                (
-                    "Readable",
-                    !appearance.prefs.prefer_stable_links,
-                    Message::Preferences(P::SetStableLinks(false)),
-                ),
-                (
-                    "Stable",
-                    appearance.prefs.prefer_stable_links,
-                    Message::Preferences(P::SetStableLinks(true)),
-                ),
-            ],
-        ),
-        text("Theme packages").size(metrics.text_lg),
-        theme_package_section(app, metrics),
-        text("Keyboard shortcuts").size(metrics.text_lg),
-    ]
-    .spacing(metrics.spacing_sm);
-    for (id, _) in crate::host::commands::DEFAULT_CHORDS {
-        body = body.push(shortcut_row(metrics, app, id));
-    }
-    body = body.push(
-        row![
-            button(text("Restore default shortcuts").size(metrics.text_sm))
-                .padding(tab_strip::chip_padding())
-                .style(style::ghost())
-                .on_press(Message::Preferences(P::RestoreShortcuts)),
-            cancel_button(),
-        ]
-        .spacing(metrics.spacing_sm),
-    );
-    if let Some(error) = &appearance.shortcut_error {
-        body = body.push(
-            text(error.clone())
-                .size(metrics.text_sm)
-                .style(style::dim_text),
-        );
-    }
-    if appearance.last_error.is_some() {
-        body = body.push(
-            text(appearance.last_error.clone().unwrap_or_default())
-                .size(metrics.text_sm)
-                .style(style::dim_text),
-        );
-    }
-    dialog_card(metrics, body)
-}
-
-/// The theme-package section (xpi themes): the installed list with
-/// per-theme select/remove, the install button (native dialog), and the
-/// conversion warnings of the active package.
-fn theme_package_section<'a>(app: &App, metrics: style::Metrics) -> Element<'a, Message> {
-    use crate::host::appearance::PreferenceMessage as P;
-    let appearance = &app.appearance;
-    let mut section = column![].spacing(metrics.spacing_sm);
-    section = section.push(
-        row![
-            button(text("Install theme (.xpi)…").size(metrics.text_sm))
-                .padding(tab_strip::chip_padding())
-                .style(style::ghost())
-                .on_press(Message::Preferences(P::ThemeInstallPick)),
-            button(text("Built-in palettes").size(metrics.text_sm))
-                .padding(tab_strip::chip_padding())
-                .style(action_or_ghost(appearance.prefs.theme_package.is_none()))
-                .on_press(Message::Preferences(P::SetThemePackage(None))),
-        ]
-        .spacing(metrics.spacing_sm),
-    );
-    if appearance.installed_themes.is_empty() {
-        section = section.push(
-            text("No theme packages installed. Convert a browser theme with `flavite theme convert`, or install a standard .xpi directly.")
-                .size(metrics.text_sm)
-                .style(style::dim_text),
-        );
-    }
-    for theme in &appearance.installed_themes {
-        let active = appearance.prefs.theme_package.as_deref() == Some(theme.id.as_str());
-        let mut row = row![
-            text(if theme.name.is_empty() {
-                theme.id.clone()
-            } else {
-                theme.name.clone()
-            })
-            .size(metrics.text),
-            text(if theme.animated_frame { "animated" } else { "" })
-                .size(metrics.text_sm)
-                .style(style::dim_text),
-        ]
-        .spacing(metrics.spacing_sm)
-        .align_y(iced::alignment::Vertical::Center);
-        row = row.push(
-            button(text(if active { "Active" } else { "Use" }).size(metrics.text_sm))
-                .padding(tab_strip::chip_padding())
-                .style(action_or_ghost(active))
-                .on_press(Message::Preferences(P::SetThemePackage(Some(
-                    theme.id.clone(),
-                )))),
-        );
-        row = row.push(
-            button(text("Remove").size(metrics.text_sm))
-                .padding(tab_strip::chip_padding())
-                .style(style::ghost())
-                .on_press(Message::Preferences(P::ThemeUninstall(theme.id.clone()))),
-        );
-        section = section.push(row);
-    }
-    if let Some(package) = appearance.theme_package.as_ref()
-        && !package.warnings.is_empty()
-    {
-        section = section.push(
-            text(package.warnings.join("; "))
-                .size(metrics.text_sm)
-                .style(style::dim_text),
-        );
-    }
-    if let Some(error) = &appearance.theme_error {
-        section = section.push(
-            text(error.clone())
-                .size(metrics.text_sm)
-                .style(style::dim_text),
-        );
-    }
-    section.into()
-}
-
-/// The pressed (action) or quiet (ghost) style, chosen at call time so
-/// option rows can highlight the active choice with one helper.
-fn action_or_ghost(
-    active: bool,
-) -> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style + Copy {
-    move |theme, status| {
-        if active {
-            style::action()(theme, status)
-        } else {
-            style::ghost()(theme, status)
-        }
     }
 }
 

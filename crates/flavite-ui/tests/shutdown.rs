@@ -7,7 +7,6 @@
 
 mod support;
 
-use flavite_api::UserStateKind;
 use flavite_editor::{
     EditorAction, EditorInteractionSnapshot, input::CapturedInput, keymap::KeyAction,
 };
@@ -157,18 +156,17 @@ fn stage_awaiting_operations(app: &mut App, ago: Duration) {
 fn poison_layout_generation(app: &mut App) {
     let uuid = app.flavite.as_ref().unwrap().vault_ref().uuid.to_string();
     let persisted = flavite_workspace::persist_workspace(&app.workspace, &uuid);
-    let bytes = flavite_workspace::encode_workspace(&persisted).unwrap();
     let stored = app
         .flavite
         .as_ref()
         .unwrap()
-        .read_user_state(UserStateKind::WorkspaceLayouts)
+        .read_workspace_layout()
         .unwrap();
     let generation = stored.as_ref().map_or(0, |stored| stored.generation);
     app.flavite
         .as_mut()
         .unwrap()
-        .write_user_state(UserStateKind::WorkspaceLayouts, generation, &bytes)
+        .write_workspace_layout(generation, &persisted)
         .expect("external layout write");
 }
 
@@ -211,12 +209,16 @@ fn clean_quit_flushes_layout_and_reports_no_pending_work() {
         .flavite
         .as_ref()
         .unwrap()
-        .read_user_state(UserStateKind::WorkspaceLayouts)
+        .read_workspace_layout()
         .unwrap()
         .expect("the layout file was written");
     assert!(stored.generation >= 1);
     let uuid = app.flavite.as_ref().unwrap().vault_ref().uuid.to_string();
-    flavite_workspace::decode_workspace(&stored.payload, &uuid)
+    // stored.workspace is already the PersistedWorkspace
+    flavite_workspace::decode_workspace(
+        &flavite_workspace::encode_workspace(&stored.workspace).unwrap(),
+        &uuid,
+    )
         .expect("the persisted layout decodes");
 
     // Clean note tabs closed; the note bytes on the device are untouched.

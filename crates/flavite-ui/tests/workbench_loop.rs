@@ -798,11 +798,10 @@ fn entity_frames_freeze_for_the_pair_hold_while_emphasis_updates() {
 
     // Emphasis-only (palette switch) is allowed to update during the hold.
     let gen0 = app.graph.state(graph).expect("state").geometry_generation;
-    let _ = app.update(Message::Preferences(
-        flavite_ui::host::appearance::PreferenceMessage::SetTheme(
-            flavite_ui::preferences::ThemeChoice::Light,
-        ),
-    ));
+    let _ = app.apply_setting(
+        "appearance.theme",
+        flavite_settings::value::SettingValue::Str("light".into()),
+    );
     let _ = app.update(Message::Pump);
     assert!(
         app.graph.state(graph).expect("state").geometry_generation > gen0,

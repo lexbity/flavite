@@ -202,15 +202,32 @@ fn uninstalling_an_unknown_theme_is_a_typed_not_found() {
 }
 
 #[test]
-fn theme_commands_stay_available_on_read_only_vaults() {
+fn theme_commands_are_read_only_gated() {
     let mut fixture = fixture();
     fixture.flavite.set_read_only(true);
     let path = package_file(fixture.temp.path());
-    // A read-only vault blocks note writes, never device-local theme state.
+    // Themes are now vault state, so install/uninstall are gated on read-only vaults.
+    // list should still work on read-only vaults.
     let result = invoke(
         &fixture.flavite,
         "theme.install",
         serde_json::json!({ "path": path.display().to_string() }),
+    );
+    assert!(matches!(
+        result,
+        ExecutionResult::Local(LocalResult::Error(_))
+    ));
+    // Verify the error code is theme_read_only
+    if let ExecutionResult::Local(LocalResult::Error(error)) = result {
+        assert_eq!(error.code, "theme_read_only");
+    } else {
+        panic!("Expected Local Error result");
+    }
+    // list should still work on read-only vaults
+    let result = invoke(
+        &fixture.flavite,
+        "theme.list",
+        serde_json::json!({}),
     );
     assert!(matches!(
         result,

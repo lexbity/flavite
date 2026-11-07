@@ -24,6 +24,7 @@ flavite-editor = { path = "../flavite-editor" }
 flavite-workspace = { path = "../flavite-workspace" }
 # XPI themes: the shell renders the codec's semantic model and decoded images.
 flavite-theme = { path = "../flavite-theme" }
+flavite-settings = { path = "../flavite-settings" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # W10 file/folder dialogs: xdg-desktop-portal backend (no C toolkit link),
@@ -52,3 +53,6 @@ uuid = { version = "1", features = ["v4"] }
 # the Rust ↔ WGSL uniform layout contract without needing a GPU adapter, so
 # the shader gate runs on every CI platform (PLAN-B §5 B2).
 naga = { version = "27", features = ["wgsl-in"] }
+# Settings-tab theme tests build in-memory .xpi packages (same fixture shape
+# as flavite-api's theme_commands).
+zip = { workspace = true }
