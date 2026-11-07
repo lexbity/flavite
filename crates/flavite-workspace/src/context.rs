@@ -136,7 +136,7 @@ pub enum ContextSource {
 #[must_use]
 pub fn is_source_kind(kind: &ViewKind) -> bool {
     match kind {
-        ViewKind::Note(_) | ViewKind::Graph(_) | ViewKind::Search => true,
+        ViewKind::Note(_) | ViewKind::Graph(_) | ViewKind::Search | ViewKind::Replace => true,
         ViewKind::History(_)
         | ViewKind::Empty
         | ViewKind::Notes

@@ -527,6 +527,7 @@ fn active_view(app: &App, tab: TabId) -> Element<'_, Message> {
         ViewKind::Empty => new_tab(app),
         ViewKind::Notes => crate::views::notes::view(app, tab),
         ViewKind::Search => crate::views::search::view(app, tab),
+        ViewKind::Replace => crate::views::replace::view(app, tab),
         ViewKind::History(locator) => crate::views::history::view(app, tab, locator),
         ViewKind::Note(note) => crate::views::note::view(app, tab, note.load(), note.locator()),
         ViewKind::Graph(_) => crate::views::graph::view(app, tab),

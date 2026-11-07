@@ -12,6 +12,7 @@
 use crate::actor::VaultActorHandle;
 use crate::channels::{NoticeChannel, PulseChannel};
 use crate::encoding::{CHOICE_REQUIRED_CODE, ChoiceReason, EncodingHintsState, Resolution};
+use crate::replace::store::OpStoreIo;
 use crate::save::{DiskPrecondition, DurabilityOutcome, SaveFailureStage, SaveRequest};
 use crate::sync::MutexExt;
 use crate::sync::WAIT_TICK;
@@ -99,6 +100,16 @@ const TEXT_PREPARE_WORKERS: usize = 2;
 /// NFR-10: at most this many queued text prepare/find admissions before
 /// new admissions are refused with an explicit Busy (never unbounded).
 const TEXT_QUEUE_MAX: usize = 16;
+/// RFC-0006 S07: bounded vault source-find/preview workers (NFR-10:
+/// replacement preparation workers 2).
+const REPLACE_PREPARE_WORKERS: usize = 2;
+/// NFR-10: queued replace admissions before explicit Busy.
+const REPLACE_QUEUE_MAX: usize = 16;
+/// S07: at most this many live source-finder sessions.
+const MAX_LIVE_FINDERS: usize = 4;
+/// S07: at most this many live sealed previews (plus NFR-10: two live
+/// previews per vault).
+const MAX_LIVE_PREVIEWS: usize = 2;
 /// Per-buffer journal memo cap (C1). Entries are keyed `(txn_id, item_id)`
 /// inside the buffer's own memo: total memo memory is bounded by
 /// `open_buffers × JOURNAL_MEMO_CAP × entry`, roughly ≤ 800 KiB per open
@@ -439,6 +450,49 @@ pub enum SessionCommand {
         revision: Revision,
         plan_id: u128,
     },
+    /// Start a vault source find (RFC-0006 S07): frozen scope, exact
+    /// per-note matching (literal in-process; regex via the isolated
+    /// helper, Bulk permits), spans streamed to a private spool. Read-only.
+    SourceFindStart {
+        request_id: u64,
+        request: crate::replace::preview::SourceFindRequest,
+    },
+    /// One continuation page of an open finder session (S07).
+    SourceFindPage {
+        finder_id: u128,
+        note_index: u64,
+        match_offset: u64,
+        page_len: usize,
+    },
+    /// Close a finder session and drop its spool (S07).
+    SourceFindClose { finder_id: u128 },
+    /// Prepare and seal a replacement preview (S07/D-09): full scan, exact
+    /// serialized outputs, sealed manifest + content-addressed payloads.
+    /// Read-only; nothing is applied.
+    ReplacePreviewPrepare {
+        request_id: u64,
+        request: crate::replace::preview::PreviewRequest,
+    },
+    /// Record a selection revision on a sealed preview (S07). Produces an
+    /// immutable selection digest; it never mutates notes.
+    ReplaceSelect {
+        preview_id: u128,
+        selected: ReplaceSelection,
+    },
+    /// Report a sealed preview's status and totals (S07).
+    ReplaceStatus { preview_id: u128 },
+}
+
+/// Which notes a preview selection names (S07/D-09). Selection is a local
+/// revision/digest, not a mutation grant.
+#[derive(Debug, Clone)]
+pub enum ReplaceSelection {
+    /// Select every eligible candidate.
+    All,
+    /// Select none.
+    None,
+    /// Select exactly the candidates whose native path (hex) is listed.
+    Keys(Vec<String>),
 }
 
 /// Conflict resolution strategy.
@@ -617,6 +671,74 @@ pub enum CommandResult {
         next_offset: Option<u64>,
         truncated: bool,
     },
+    /// A vault source-find session started (RFC-0006 S07): frozen scope,
+    /// exact totals, typed exclusions and the first page.
+    SourceFindStarted {
+        finder_id: u128,
+        scope: crate::replace::ScopeVersion,
+        truncated_scope: bool,
+        total_notes: u64,
+        total_matches: u64,
+        exclusions: Vec<crate::replace::NoteExclusion>,
+        page: SourceFindPageData,
+    },
+    /// One vault source-find continuation page (S07).
+    SourceFindPaged {
+        finder_id: u128,
+        page: SourceFindPageData,
+    },
+    /// A source-find session was closed and its spool dropped (S07).
+    SourceFindClosed,
+    /// A replacement preview was sealed (S07/D-09): the plan is ready and
+    /// non-applying; selection is a separate command.
+    ReplacePreviewSealed {
+        preview_id: u128,
+        manifest: Arc<crate::replace::PreviewManifest>,
+    },
+    /// A selection revision was recorded on the sealed plan (S07).
+    ReplaceSelected {
+        selection_revision: u64,
+        selection_digest: String,
+    },
+    /// The current status of a sealed preview (S07).
+    ReplaceStatus {
+        preview_id: u128,
+        manifest: Arc<crate::replace::PreviewManifest>,
+    },
+}
+
+/// One page of a vault source-find session (S07): note/match-ordered,
+/// with exact continuation. Rows carry the note identity and bounded match
+/// spans; pages never duplicate and never skip (ordinal-based).
+#[derive(Debug, Clone)]
+pub struct SourceFindPageData {
+    /// Zero-based note ordinal this page begins at.
+    pub note_index: u64,
+    /// Total notes with matches in the finder.
+    pub note_total: u64,
+    /// Match offset within the first row.
+    pub match_offset: u64,
+    /// Rows in ascending note order.
+    pub rows: Vec<MatchRow>,
+    /// Next note ordinal, when more notes remain.
+    pub next_note_index: Option<u64>,
+    /// Next match offset within the last row, when more matches remain.
+    pub next_match_offset: Option<u64>,
+}
+
+/// One find row: a note with a page of its matches.
+#[derive(Debug, Clone)]
+pub struct MatchRow {
+    /// Note ordinal (ascending native order).
+    pub ordinal: u64,
+    /// Portable vault-relative path.
+    pub path: String,
+    /// Indexed title.
+    pub title: String,
+    /// Exact total matches for this note.
+    pub note_matches: u64,
+    /// Half-open `TextByte` spans on this page.
+    pub matches: Vec<(u64, u64)>,
 }
 
 /// Errors from Session commands.
@@ -851,6 +973,23 @@ pub struct Session {
     text_queue: Option<crossbeam::channel::Receiver<TextJob>>,
     /// Completed preparations awaiting installation on a Session turn.
     text_results: crossbeam::channel::Receiver<TextOutcomeMessage>,
+    /// RFC-0006 S07: bounded vault source-find/preview workers' job queue.
+    replace_jobs: Option<crossbeam::channel::Sender<ReplaceJob>>,
+    /// Queue-depth view for bounded admission (NFR-10).
+    replace_queue: Option<crossbeam::channel::Receiver<ReplaceJob>>,
+    /// Completed S07 scans awaiting installation on a Session turn.
+    replace_results: crossbeam::channel::Receiver<ReplaceOutcomeMessage>,
+    /// RFC-0006 S07: live source-finder sessions (bounded).
+    finders: Mutex<HashMap<u128, SourceFinderEntry>>,
+    finder_nonce: u64,
+    finder_counter: AtomicU64,
+    /// RFC-0006 S07: live sealed previews (bounded).
+    previews: Mutex<HashMap<u128, PreviewEntry>>,
+    preview_nonce: u64,
+    preview_counter: AtomicU64,
+    /// RFC-0006 S07: request ids of admitted-but-not-installed replace
+    /// jobs (so `wait_for_operation` treats them as in-flight).
+    pending_replace: Mutex<HashSet<u64>>,
     /// Semantic link plan store (W05). Plans are process-local capabilities.
     link_plans: std::sync::Arc<Mutex<crate::link::LinkPlanStore>>,
     /// Bounded prepare workers' job queue.
@@ -913,6 +1052,79 @@ enum TextOutcomeMessage {
         revision: Revision,
         outcome: Result<crate::text_edit::FindOutcome, crate::text_edit::PrepareError>,
     },
+}
+
+/// One queued vault source-find or replacement-preview job (RFC-0006
+/// S07). The worker owns the scan; the Session installs the result.
+struct ReplaceJob {
+    request_id: u64,
+    work: ReplaceWork,
+}
+
+/// Which S07 computation a queued job performs.
+enum ReplaceWork {
+    Find {
+        finder_id: u128,
+        request: crate::replace::preview::SourceFindRequest,
+    },
+    Preview {
+        preview_id: u128,
+        request: crate::replace::preview::PreviewRequest,
+    },
+}
+
+/// One finished S07 scan awaiting installation.
+enum ReplaceOutcomeMessage {
+    Find {
+        request_id: u64,
+        finder_id: u128,
+        outcome: Result<
+            Box<crate::replace::preview::SourceFindOutcome>,
+            crate::replace::preview::PreviewError,
+        >,
+    },
+    Preview {
+        request_id: u64,
+        preview_id: u128,
+        outcome: Result<
+            Box<crate::replace::preview::PreviewManifest>,
+            crate::replace::preview::PreviewError,
+        >,
+    },
+}
+
+/// A live source-finder session (S07): spool location plus the in-memory
+/// per-note index; spans live in the private spool.
+#[derive(Debug, Clone)]
+struct SourceFinderEntry {
+    /// Finder id (128-bit hex on the wire).
+    id: u128,
+    /// Unix-ms expiry (30-minute total lifetime).
+    expires_at_unix_ms: u64,
+    /// Frozen scope.
+    scope: crate::replace::ScopeVersion,
+    /// Scope truncation flag.
+    truncated_scope: bool,
+    /// Per-note records.
+    notes: Vec<crate::replace::preview::FindNoteRecord>,
+    /// Typed exclusions.
+    exclusions: Vec<crate::replace::NoteExclusion>,
+    /// Total scoped notes.
+    total_notes: u64,
+    /// Exact total matches.
+    total_matches: u64,
+}
+
+/// A live sealed preview (S07): the manifest is authoritative on disk; the
+/// entry caches identity/expiry for access-time checks.
+#[derive(Debug)]
+struct PreviewEntry {
+    /// Unix-ms expiry.
+    expires_at_unix_ms: u64,
+    /// Cached manifest (loaded once at seal time).
+    manifest: Arc<crate::replace::PreviewManifest>,
+    /// Monotonic selection revision counter (S07/D-09).
+    selection_revision: u64,
 }
 
 /// One core-issued replacement plan (D-06/§6.9). `consumed` records the
@@ -1257,6 +1469,70 @@ impl Session {
                 .try_into()
                 .expect("fixed-size slice"),
         );
+        let (replace_job_sender, replace_job_receiver) =
+            crossbeam::channel::unbounded::<ReplaceJob>();
+        let (replace_result_sender, replace_result_receiver) =
+            crossbeam::channel::unbounded::<ReplaceOutcomeMessage>();
+        {
+            let ctx = crate::replace::preview::PreviewCtx {
+                actor: actor.clone(),
+                manager: manager.clone(),
+                root: identity.root.clone(),
+                vault_uuid: identity.uuid,
+            };
+            for worker_index in 0..REPLACE_PREPARE_WORKERS {
+                let jobs = replace_job_receiver.clone();
+                let results = replace_result_sender.clone();
+                let ctx = ctx.clone();
+                std::thread::Builder::new()
+                    .name(format!("vault-replace-{worker_index}"))
+                    .spawn(move || {
+                        // Workers exit when the Session drops the job sender.
+                        while let Ok(job) = jobs.recv() {
+                            // Bound the working set: a cancelled scan exits
+                            // at its next checkpoint.
+                            let cancelled = std::sync::atomic::AtomicBool::new(false);
+                            let message = match job.work {
+                                ReplaceWork::Find { finder_id, request } => {
+                                    let outcome = crate::replace::preview::run_find(
+                                        &ctx,
+                                        &request,
+                                        &hex::encode(finder_id.to_be_bytes()),
+                                        &crate::replace::ActorOpStoreIo::new(ctx.actor.clone()),
+                                        &cancelled,
+                                    );
+                                    ReplaceOutcomeMessage::Find {
+                                        request_id: job.request_id,
+                                        finder_id,
+                                        outcome: outcome.map(Box::new),
+                                    }
+                                }
+                                ReplaceWork::Preview {
+                                    preview_id,
+                                    request,
+                                } => {
+                                    let outcome = crate::replace::preview::run_preview(
+                                        &ctx,
+                                        &request,
+                                        &hex::encode(preview_id.to_be_bytes()),
+                                        &crate::replace::ReplaceStore::new(&ctx.root),
+                                        &crate::replace::ActorOpStoreIo::new(ctx.actor.clone()),
+                                        &cancelled,
+                                    );
+                                    ReplaceOutcomeMessage::Preview {
+                                        request_id: job.request_id,
+                                        preview_id,
+                                        outcome: outcome.map(Box::new),
+                                    }
+                                }
+                            };
+                            // Sending only fails when the Session is gone.
+                            let _ = results.send(message);
+                        }
+                    })
+                    .expect("replace worker thread creation failed");
+            }
+        }
         Self {
             text_jobs: Some(text_job_sender),
             text_queue: Some(text_job_receiver),
@@ -1264,6 +1540,16 @@ impl Session {
             text_plan_nonce,
             text_plan_counter: AtomicU64::new(0),
             text_plans: Mutex::new(HashMap::new()),
+            replace_jobs: Some(replace_job_sender),
+            replace_queue: Some(replace_job_receiver),
+            replace_results: replace_result_receiver,
+            finders: Mutex::new(HashMap::new()),
+            finder_nonce: text_plan_nonce,
+            finder_counter: AtomicU64::new(0),
+            previews: Mutex::new(HashMap::new()),
+            preview_nonce: text_plan_nonce,
+            preview_counter: AtomicU64::new(0),
+            pending_replace: Mutex::new(HashSet::new()),
             driving_turn: Mutex::new(()),
             structure_worker: crate::properties::StructureWorker::new(),
             identity,
@@ -1421,6 +1707,7 @@ impl Session {
         self.pump_structure_completions();
         self.pump_link_completions();
         self.pump_text_completions();
+        self.pump_replace_completions();
         self.pump_open_completions();
         self.pump_save_completions();
         self.pump_reconcile_completions();
@@ -1876,6 +2163,26 @@ impl Session {
                 revision,
                 plan_id,
             } => self.apply_replace(buffer_id, revision, plan_id),
+            SessionCommand::SourceFindStart {
+                request_id,
+                request,
+            } => self.source_find_start(request_id, request),
+            SessionCommand::SourceFindPage {
+                finder_id,
+                note_index,
+                match_offset,
+                page_len,
+            } => self.source_find_page(finder_id, note_index, match_offset, page_len),
+            SessionCommand::SourceFindClose { finder_id } => self.source_find_close(finder_id),
+            SessionCommand::ReplacePreviewPrepare {
+                request_id,
+                request,
+            } => self.replace_preview_prepare(request_id, request),
+            SessionCommand::ReplaceSelect {
+                preview_id,
+                selected,
+            } => self.replace_select(preview_id, selected),
+            SessionCommand::ReplaceStatus { preview_id } => self.replace_status(preview_id),
             SessionCommand::RestoreHistory {
                 path,
                 buffer_id,
@@ -2340,6 +2647,7 @@ impl Session {
         self.pump_structure_completions();
         self.pump_link_completions();
         self.pump_text_completions();
+        self.pump_replace_completions();
         self.pump_open_completions();
         self.pump_save_completions();
         self.pump_reconcile_completions();
@@ -2445,6 +2753,7 @@ impl Session {
             self.pump_save_completions();
             self.pump_reconcile_completions();
             self.pump_rename_completions();
+            self.pump_replace_completions();
             if let Some(result) = self.take_completion(request_id) {
                 return result;
             }
@@ -2505,6 +2814,7 @@ impl Session {
                 .lock_recovering()
                 .values()
                 .any(|flight| flight.request_ids.contains(&request_id))
+            || self.pending_replace.lock_recovering().contains(&request_id)
     }
 
     /// Record a terminal operation result and wake any parked waiters (S6).
@@ -3280,6 +3590,469 @@ impl Session {
             }
         }
         result
+    }
+
+    /// Core-issued finder id (128-bit; hex on the wire).
+    fn next_finder_id(&self) -> u128 {
+        let counter = self.finder_counter.fetch_add(1, Ordering::Relaxed);
+        (u128::from(self.finder_nonce) << 64) | u128::from(counter)
+    }
+
+    /// Core-issued preview id (128-bit; hex on the wire).
+    fn next_preview_id(&self) -> u128 {
+        let counter = self.preview_counter.fetch_add(1, Ordering::Relaxed);
+        (u128::from(self.preview_nonce) << 64) | u128::from(counter)
+    }
+
+    /// The read surface vault scan workers use (RFC-0006 S07).
+    #[must_use]
+    pub fn preview_ctx(&self) -> crate::replace::preview::PreviewCtx {
+        crate::replace::preview::PreviewCtx {
+            actor: self.actor.clone(),
+            manager: Arc::clone(&self.buffer_manager),
+            root: self.identity.root.clone(),
+            vault_uuid: self.identity.uuid,
+        }
+    }
+
+    /// Shared admission guard: at most [`REPLACE_QUEUE_MAX`] replace jobs
+    /// may be queued before explicit Busy (NFR-10).
+    fn replace_queue_full(&self) -> bool {
+        self.replace_queue
+            .as_ref()
+            .is_some_and(|queue| queue.len() >= REPLACE_QUEUE_MAX)
+    }
+
+    /// Reclaim expired source sessions on access.
+    fn sweep_source_sessions(&self) {
+        let now = crate::replace::preview::unix_ms_now();
+        let mut finders = self.finders.lock_recovering();
+        finders.retain(|_, entry| entry.expires_at_unix_ms > now);
+        let mut previews = self.previews.lock_recovering();
+        previews.retain(|_, entry| entry.expires_at_unix_ms > now);
+    }
+
+    /// Admit one vault source find (S07): read-only, frozen scope, exact
+    /// per-note matches on a bounded worker. Read-only; no plan slot.
+    fn source_find_start(
+        &self,
+        request_id: u64,
+        request: crate::replace::preview::SourceFindRequest,
+    ) -> SessionResult {
+        if request.query.is_empty()
+            && request.mode == flavite_text_search::matcher::MatchMode::Literal
+        {
+            return SessionResult::Error {
+                message: crate::text_edit::IDLE_QUERY.to_owned(),
+            };
+        }
+        self.sweep_source_sessions();
+        if self.finders.lock_recovering().len() >= MAX_LIVE_FINDERS {
+            return SessionResult::Busy;
+        }
+        if self.replace_queue_full() {
+            return SessionResult::Busy;
+        }
+        let finder_id = self.next_finder_id();
+        self.pending_replace.lock_recovering().insert(request_id);
+        match &self.replace_jobs {
+            Some(jobs)
+                if jobs
+                    .send(ReplaceJob {
+                        request_id,
+                        work: ReplaceWork::Find { finder_id, request },
+                    })
+                    .is_ok() =>
+            {
+                SessionResult::Pending { request_id }
+            }
+            _ => {
+                self.pending_replace.lock_recovering().remove(&request_id);
+                SessionResult::Error {
+                    message: "source find workers are unavailable".into(),
+                }
+            }
+        }
+    }
+
+    /// One continuation page of an open finder (S07). Pages slice the
+    /// private spool by (note ordinal, match ordinal); replay is
+    /// idempotent and gaps are impossible by construction.
+    fn source_find_page(
+        &self,
+        finder_id: u128,
+        note_index: u64,
+        match_offset: u64,
+        page_len: usize,
+    ) -> SessionResult {
+        self.sweep_source_sessions();
+        let entry = {
+            let finders = self.finders.lock_recovering();
+            finders.get(&finder_id).cloned()
+        };
+        let Some(entry) = entry else {
+            return SessionResult::ActionRequired {
+                code: "source-find-expired",
+                data: None,
+            };
+        };
+        let page_len = page_len.clamp(1, 200);
+        let page = match self.find_page(&entry, note_index, match_offset, page_len) {
+            Ok(page) => page,
+            Err(message) => {
+                return SessionResult::Error { message };
+            }
+        };
+        SessionResult::Success(CommandResult::SourceFindPaged { finder_id, page })
+    }
+
+    /// Close a finder and drop its spool (best effort; expiry sweeps any
+    /// remainder).
+    fn source_find_close(&self, finder_id: u128) -> SessionResult {
+        let removed = self.finders.lock_recovering().remove(&finder_id);
+        if removed.is_some() {
+            let base = crate::replace::preview::source_find_base(&self.identity.root)
+                .join(hex::encode(finder_id.to_be_bytes()));
+            let io = crate::replace::ActorOpStoreIo::new(self.actor.clone());
+            let _ = io.remove(&base.join("spans"));
+            let _ = io.remove(&base);
+        }
+        SessionResult::Success(CommandResult::SourceFindClosed)
+    }
+
+    /// Admit one replacement-preview prepare (S07): full scan and seal on
+    /// a bounded worker; nothing is applied.
+    fn replace_preview_prepare(
+        &self,
+        request_id: u64,
+        request: crate::replace::preview::PreviewRequest,
+    ) -> SessionResult {
+        if request.include_drafts {
+            return SessionResult::Error {
+                message: "draft inclusion is not available in this build".into(),
+            };
+        }
+        self.sweep_source_sessions();
+        if self.previews.lock_recovering().len() >= MAX_LIVE_PREVIEWS {
+            return SessionResult::Busy;
+        }
+        if self.replace_queue_full() {
+            return SessionResult::Busy;
+        }
+        let preview_id = self.next_preview_id();
+        self.pending_replace.lock_recovering().insert(request_id);
+        match &self.replace_jobs {
+            Some(jobs)
+                if jobs
+                    .send(ReplaceJob {
+                        request_id,
+                        work: ReplaceWork::Preview {
+                            preview_id,
+                            request,
+                        },
+                    })
+                    .is_ok() =>
+            {
+                SessionResult::Pending { request_id }
+            }
+            _ => {
+                self.pending_replace.lock_recovering().remove(&request_id);
+                SessionResult::Error {
+                    message: "replacement preview workers are unavailable".into(),
+                }
+            }
+        }
+    }
+
+    /// Record a selection revision on a sealed preview (S07/D-09): a local
+    /// identity, never a mutation grant. Selection never mutates the sealed
+    /// plan or any note.
+    fn replace_select(
+        &self,
+        preview_id: u128,
+        selected: crate::session::ReplaceSelection,
+    ) -> SessionResult {
+        self.sweep_source_sessions();
+        let (revision, digest) = {
+            let mut previews = self.previews.lock_recovering();
+            let Some(entry) = previews.get_mut(&preview_id) else {
+                return SessionResult::ActionRequired {
+                    code: "preview-expired",
+                    data: None,
+                };
+            };
+            let manifest = entry.manifest.clone();
+            let mut selected_ids: Vec<u64> = match selected {
+                crate::session::ReplaceSelection::All => manifest
+                    .notes
+                    .iter()
+                    .filter(|n| !n.no_change)
+                    .map(|n| n.item_id)
+                    .collect(),
+                crate::session::ReplaceSelection::None => Vec::new(),
+                crate::session::ReplaceSelection::Keys(keys) => {
+                    let wanted: std::collections::BTreeSet<&str> =
+                        keys.iter().map(String::as_str).collect();
+                    let mut ids = Vec::new();
+                    for note in &manifest.notes {
+                        if note.no_change {
+                            continue;
+                        }
+                        if wanted.contains(note.path_native.as_str()) {
+                            ids.push(note.item_id);
+                        }
+                    }
+                    if ids.len() != wanted.len() {
+                        return SessionResult::Error {
+                            message: "selection names a note outside this preview".into(),
+                        };
+                    }
+                    ids
+                }
+            };
+            selected_ids.sort_unstable();
+            selected_ids.dedup();
+            entry.selection_revision = entry.selection_revision.saturating_add(1);
+            let revision = entry.selection_revision;
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"flavite-replace-selection-v1");
+            hasher.update(&preview_id.to_be_bytes());
+            hasher.update(&revision.to_le_bytes());
+            for id in &selected_ids {
+                hasher.update(&id.to_le_bytes());
+            }
+            (revision, hex::encode(hasher.finalize().as_bytes()))
+        };
+        SessionResult::Success(CommandResult::ReplaceSelected {
+            selection_revision: revision,
+            selection_digest: digest,
+        })
+    }
+
+    /// Report the current status of a sealed preview (S07).
+    fn replace_status(&self, preview_id: u128) -> SessionResult {
+        self.sweep_source_sessions();
+        let entry = {
+            let previews = self.previews.lock_recovering();
+            previews
+                .get(&preview_id)
+                .map(|entry| entry.manifest.clone())
+        };
+        let Some(manifest) = entry else {
+            return SessionResult::ActionRequired {
+                code: "preview-expired",
+                data: None,
+            };
+        };
+        SessionResult::Success(CommandResult::ReplaceStatus {
+            preview_id,
+            manifest,
+        })
+    }
+
+    /// Build one page of a finder session from the spool.
+    fn find_page(
+        &self,
+        entry: &SourceFinderEntry,
+        note_index: u64,
+        match_offset: u64,
+        page_len: usize,
+    ) -> Result<SourceFindPageData, String> {
+        let io = crate::replace::ActorOpStoreIo::new(self.actor.clone());
+        let base = crate::replace::preview::source_find_base(&self.identity.root)
+            .join(hex::encode(entry.id.to_be_bytes()))
+            .join("spans");
+        let mut rows = Vec::new();
+        let mut collected = 0usize;
+        let mut cursor_note = note_index;
+        let mut cursor_match = match_offset;
+        let start = entry
+            .notes
+            .iter()
+            .position(|n| n.ordinal >= cursor_note)
+            .unwrap_or(entry.notes.len());
+        for record in &entry.notes[start..] {
+            if collected >= page_len {
+                break;
+            }
+            let bytes = io
+                .read(&base.join(&record.spans_file))?
+                .ok_or_else(|| "find spool file is missing".to_owned())?;
+            if bytes.len() < 8 || (bytes.len() - 8) % 16 != 0 {
+                return Err("find spool file is corrupt".to_owned());
+            }
+            let total = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
+            if ((bytes.len() - 8) / 16) as u64 != total {
+                return Err("find spool count mismatch".to_owned());
+            }
+            if cursor_match >= total {
+                cursor_note = record.ordinal + 1;
+                cursor_match = 0;
+                continue;
+            }
+            let remaining = (page_len - collected) as u64;
+            let take = (total - cursor_match).min(remaining) as usize;
+            let mut matches = Vec::with_capacity(take);
+            for chunk in bytes[8..]
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .skip(cursor_match as usize)
+                .take(take)
+            {
+                let start = u64::from_le_bytes(chunk[..8].try_into().expect("8 bytes"));
+                let end = u64::from_le_bytes(chunk[8..].try_into().expect("8 bytes"));
+                matches.push((start, end));
+            }
+            rows.push(MatchRow {
+                ordinal: record.ordinal,
+                path: record.path.clone(),
+                title: record.title.clone(),
+                note_matches: record.match_count,
+                matches,
+            });
+            collected += take;
+            cursor_match += take as u64;
+            if cursor_match >= total {
+                cursor_note = record.ordinal + 1;
+                cursor_match = 0;
+            }
+        }
+        let next_note_index = if collected >= page_len {
+            if cursor_match > 0 {
+                Some(cursor_note)
+            } else {
+                entry
+                    .notes
+                    .iter()
+                    .find(|n| n.ordinal >= cursor_note)
+                    .map(|n| n.ordinal)
+            }
+        } else {
+            None
+        };
+        Ok(SourceFindPageData {
+            note_index: cursor_note,
+            note_total: u64::try_from(entry.notes.len()).unwrap_or(u64::MAX),
+            match_offset: cursor_match,
+            rows,
+            next_note_index,
+            next_match_offset: (cursor_match > 0).then_some(cursor_match),
+        })
+    }
+
+    /// Install finished S07 scans into their destinations on a Session turn,
+    /// completing every correlated caller once.
+    fn pump_replace_completions(&self) {
+        while let Ok(message) = self.replace_results.try_recv() {
+            let (request_id, result) = match message {
+                ReplaceOutcomeMessage::Find {
+                    request_id,
+                    finder_id,
+                    outcome,
+                } => {
+                    let result = match outcome {
+                        Ok(found) => {
+                            let found = *found;
+                            let page = {
+                                let entry = SourceFinderEntry {
+                                    id: finder_id,
+                                    expires_at_unix_ms: crate::replace::preview::unix_ms_now()
+                                        .saturating_add(30 * 60 * 1000),
+                                    scope: found.scope,
+                                    truncated_scope: found.truncated_scope,
+                                    notes: found.notes.clone(),
+                                    exclusions: found.exclusions.clone(),
+                                    total_notes: found.total_notes,
+                                    total_matches: found.total_matches,
+                                };
+                                match self.find_page(&entry, 0, 0, 50) {
+                                    Ok(page) => page,
+                                    Err(message) => {
+                                        self.pending_replace.lock_recovering().remove(&request_id);
+                                        return self.record_completion(
+                                            request_id,
+                                            SessionResult::Error { message },
+                                        );
+                                    }
+                                }
+                            };
+                            let mut finders = self.finders.lock_recovering();
+                            if finders.len() >= MAX_LIVE_FINDERS {
+                                SessionResult::Busy
+                            } else {
+                                let entry = SourceFinderEntry {
+                                    id: finder_id,
+                                    expires_at_unix_ms: crate::replace::preview::unix_ms_now()
+                                        .saturating_add(30 * 60 * 1000),
+                                    scope: found.scope,
+                                    truncated_scope: found.truncated_scope,
+                                    notes: found.notes.clone(),
+                                    exclusions: found.exclusions.clone(),
+                                    total_notes: found.total_notes,
+                                    total_matches: found.total_matches,
+                                };
+                                let inner = CommandResult::SourceFindStarted {
+                                    finder_id,
+                                    scope: entry.scope,
+                                    truncated_scope: entry.truncated_scope,
+                                    total_notes: entry.total_notes,
+                                    total_matches: entry.total_matches,
+                                    exclusions: entry.exclusions.clone(),
+                                    page,
+                                };
+                                finders.insert(finder_id, entry);
+                                SessionResult::Success(inner)
+                            }
+                        }
+                        Err(error) => SessionResult::Error {
+                            message: error.message(),
+                        },
+                    };
+                    (request_id, result)
+                }
+                ReplaceOutcomeMessage::Preview {
+                    request_id,
+                    preview_id,
+                    outcome,
+                } => {
+                    let result = match outcome {
+                        Ok(manifest) => {
+                            let manifest = *manifest;
+                            let mut previews = self.previews.lock_recovering();
+                            if previews.len() >= MAX_LIVE_PREVIEWS {
+                                SessionResult::Busy
+                            } else {
+                                let entry = PreviewEntry {
+                                    expires_at_unix_ms: manifest.expires_at_unix_ms,
+                                    manifest: Arc::new(manifest),
+                                    selection_revision: 0,
+                                };
+                                let inner = CommandResult::ReplacePreviewSealed {
+                                    preview_id,
+                                    manifest: entry.manifest.clone(),
+                                };
+                                previews.insert(preview_id, entry);
+                                SessionResult::Success(inner)
+                            }
+                        }
+                        Err(error) => {
+                            // Best-effort cleanup of any partially written
+                            // payloads (no manifest was sealed on failure).
+                            let store = crate::replace::ReplaceStore::new(&self.identity.root);
+                            let io = crate::replace::ActorOpStoreIo::new(self.actor.clone());
+                            let _ = store.remove_job(&io, &hex::encode(preview_id.to_be_bytes()));
+                            SessionResult::Error {
+                                message: error.message(),
+                            }
+                        }
+                    };
+                    (request_id, result)
+                }
+            };
+            self.record_completion(request_id, result);
+            self.pending_replace.lock_recovering().remove(&request_id);
+        }
     }
 
     /// Install finished preparations and read-only finds into their

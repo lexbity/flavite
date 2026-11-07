@@ -205,6 +205,11 @@ pub enum LayoutAction {
         expected_revision: u64,
         group: GroupId,
     },
+    /// Open a vault source Find / replacement preview view (RFC-0006 S07).
+    OpenReplace {
+        expected_revision: u64,
+        group: GroupId,
+    },
     /// Open the local-history view of `locator` in `group` (W10).
     OpenHistory {
         expected_revision: u64,
@@ -372,6 +377,9 @@ impl LayoutAction {
                 expected_revision, ..
             }
             | Self::OpenSearch {
+                expected_revision, ..
+            }
+            | Self::OpenReplace {
                 expected_revision, ..
             }
             | Self::OpenHistory {
@@ -1342,6 +1350,14 @@ fn apply(state: &mut WorkspaceState, action: &LayoutAction) -> Result<Vec<Effect
             Ok(vec![Effect::ViewAttached {
                 tab,
                 kind: ViewKind::Search,
+            }])
+        }
+        LayoutAction::OpenReplace { group, .. } => {
+            let tab = state.ids.tab_id();
+            let tab = state.append_tab(*group, ViewSession::new(tab, ViewKind::Replace))?;
+            Ok(vec![Effect::ViewAttached {
+                tab,
+                kind: ViewKind::Replace,
             }])
         }
         LayoutAction::OpenHistory { locator, group, .. } => {

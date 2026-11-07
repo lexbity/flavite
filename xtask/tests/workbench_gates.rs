@@ -179,6 +179,67 @@ fn seed_s06_inputs(root: &Path) {
     }
 }
 
+fn seed_s07_inputs(root: &Path) {
+    seed_s06_inputs(root);
+    for relative in [
+        "crates/flavite-vault/src/replace/mod.rs",
+        "crates/flavite-vault/src/replace/plan.rs",
+        "crates/flavite-vault/src/replace/preview.rs",
+        "crates/flavite-vault/src/replace/store.rs",
+        "crates/flavite-vault/tests/replace_preview.rs",
+        "crates/flavite-api/src/replace.rs",
+        "crates/flavite-api/tests/source_find.rs",
+        "crates/flavite-ui/src/host/replace.rs",
+        "crates/flavite-ui/src/views/replace.rs",
+        "crates/flavite-ui/tests/vault_replace_preview.rs",
+        "scripts/tests/workbench/vault_source_preview.py",
+    ] {
+        seed_file(root, relative);
+    }
+}
+
+#[test]
+fn s07_gate_passes_clean_tree_and_rejects_s07_isolation_violations() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_s07_inputs(temp.path());
+    let clean = run_gate(temp.path(), "S07");
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // The UI host never touches the filesystem or the index/vault crates.
+    let host = temp.path().join("crates/flavite-ui/src/host/replace.rs");
+    fs::write(&host, "use std::fs::File;\n").unwrap();
+    let rejected = run_gate(temp.path(), "S07");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("std::fs"));
+    fs::write(&host, "implementation\n").unwrap();
+
+    // The vault preview never consults the full-text index for offsets.
+    let preview = temp
+        .path()
+        .join("crates/flavite-vault/src/replace/preview.rs");
+    fs::write(&preview, "fn f() { search_notes(\"q\"); }\n").unwrap();
+    let rejected = run_gate(temp.path(), "S07");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("search_notes"));
+    fs::write(&preview, "implementation\n").unwrap();
+
+    // The S07 facade registers no destructive Apply path.
+    let api = temp.path().join("crates/flavite-api/src/replace.rs");
+    fs::write(&api, "fn apply_replace() {}\n").unwrap();
+    let rejected = run_gate(temp.path(), "S07");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("apply_replace"));
+
+    // Presence is enforced: removing a completed S07 file fails.
+    fs::remove_file(temp.path().join("crates/flavite-vault/src/replace/plan.rs")).unwrap();
+    let missing = run_gate(temp.path(), "S07");
+    assert!(!missing.status.success());
+}
+
 #[test]
 fn s06_gate_passes_clean_tree_and_rejects_retired_search_paths() {
     let temp = tempfile::tempdir().unwrap();

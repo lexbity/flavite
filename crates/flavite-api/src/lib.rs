@@ -58,6 +58,7 @@ pub mod properties;
 pub use properties::*;
 pub mod queries;
 pub mod query_service;
+pub mod replace;
 pub mod result;
 pub mod search_sessions;
 pub mod themes;

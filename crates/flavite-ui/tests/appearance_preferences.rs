@@ -256,10 +256,12 @@ fn shortcut_overrides_reject_collisions_and_os_reserved_chords() {
     });
     assert!(app.appearance.shortcut_error.is_some());
 
-    // A valid, non-colliding override lands and takes effect.
+    // A valid, non-colliding override lands and takes effect. (Mod+Shift+F
+    // is now RFC-0006 S07's vault-Find default, so a collision-free chord
+    // is used here.)
     let _ = app.update_preferences(PreferenceMessage::SetShortcut {
         command: "workspace.find".into(),
-        chord: Some("Mod+Shift+F".into()),
+        chord: Some("Mod+Shift+Q".into()),
     });
     assert!(app.appearance.shortcut_error.is_none());
     assert!(
@@ -269,7 +271,7 @@ fn shortcut_overrides_reject_collisions_and_os_reserved_chords() {
             .contains_key("workspace.find")
     );
     assert!(app.appearance.shortcuts.iter().any(|(chord, id)| {
-        *id == "workspace.find" && chord.key == "F" && chord.modifiers & mods::SHIFT != 0
+        *id == "workspace.find" && chord.key == "Q" && chord.modifiers & mods::SHIFT != 0
     }));
 
     // Restoring defaults clears every override.
@@ -292,7 +294,8 @@ fn shortcut_overrides_reject_collisions_and_os_reserved_chords() {
 fn keyboard_resolution_uses_the_effective_table_exactly() {
     let mut fixture = ui_fixture(1116, "/appearance-keys", &seed());
     let app = &mut fixture.app;
-    // Default: Mod+F resolves find; Mod+Shift+F does not (exact match).
+    // Default: Mod+F resolves find; Mod+Shift+F is the RFC-0006 S07 vault
+    // Find command (exact match).
     let key_f = Key::Character("f".into());
     assert_eq!(
         app.appearance.chord_command(&key_f, &Modifiers::CTRL),
@@ -301,7 +304,7 @@ fn keyboard_resolution_uses_the_effective_table_exactly() {
     assert_eq!(
         app.appearance
             .chord_command(&key_f, &(Modifiers::CTRL | Modifiers::SHIFT)),
-        None
+        Some("workspace.open_replace_view")
     );
     // F6 cycles groups without any modifier.
     assert_eq!(
@@ -312,12 +315,21 @@ fn keyboard_resolution_uses_the_effective_table_exactly() {
     // An override changes the effective binding immediately.
     let _ = app.update_preferences(PreferenceMessage::SetShortcut {
         command: "workspace.find".into(),
-        chord: Some("Mod+Shift+F".into()),
+        chord: Some("Mod+Shift+Q".into()),
     });
     assert_eq!(app.appearance.chord_command(&key_f, &Modifiers::CTRL), None);
+    // Mod+Shift+F stays the RFC-0006 S07 vault-Find binding (the override
+    // moved `workspace.find` to Mod+Shift+Q instead).
     assert_eq!(
         app.appearance
             .chord_command(&key_f, &(Modifiers::CTRL | Modifiers::SHIFT)),
+        Some("workspace.open_replace_view")
+    );
+    assert_eq!(
+        app.appearance.chord_command(
+            &Key::Character("q".into()),
+            &(Modifiers::CTRL | Modifiers::SHIFT)
+        ),
         Some("workspace.find")
     );
 }

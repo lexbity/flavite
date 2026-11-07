@@ -41,6 +41,7 @@ pub const DEFAULT_CHORDS: &[(&str, &str)] = &[
     ("workspace.open_note_dialog", "Mod+O"),
     ("workspace.group_actions", "Shift+F10"),
     ("workspace.preferences", "Mod+,"),
+    ("workspace.open_replace_view", "Mod+Shift+F"),
     ("note.save", "Mod+S"),
 ];
 
@@ -284,6 +285,10 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     UiCommand {
         id: "workspace.open_search_view",
         title: "Open saved-content search",
+    },
+    UiCommand {
+        id: "workspace.open_replace_view",
+        title: "Open vault source find / replace preview",
     },
     UiCommand {
         id: "workspace.new_note",
@@ -961,6 +966,23 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
                 }
             }
         }
+        // ---- RFC-0006 S07 ----
+        "workspace.open_replace_view" => {
+            if let Some(group) = app.navigation_group() {
+                app.dispatch_layout(|revision| LayoutAction::OpenReplace {
+                    expected_revision: revision,
+                    group,
+                });
+                if let Some(active) = app.workspace.group(&group).map(|g| g.active()) {
+                    let id = iced::widget::Id::from(format!(
+                        "{}{}",
+                        crate::views::replace::REPLACE_INPUT_ID_PREFIX,
+                        active.raw()
+                    ));
+                    return iced::widget::operation::focus(id);
+                }
+            }
+        }
         "workspace.new_note" => {
             app.dialog = Some(crate::host::dialogs::Dialog::NewNote {
                 path: String::new(),
@@ -1347,6 +1369,7 @@ pub fn available(app: &App, id: &str) -> bool {
         "workspace.new_note"
         | "workspace.open_note_dialog"
         | "workspace.open_search_view"
+        | "workspace.open_replace_view"
         | "workspace.refresh_catalog" => app.flavite.is_some(),
         "help.about" => true,
         _ => true,

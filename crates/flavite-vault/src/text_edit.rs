@@ -182,10 +182,32 @@ pub fn prepare_ops(
     text: &str,
     request: &ReplaceRequest,
 ) -> Result<(Vec<EditOp>, u64, u64), PrepareError> {
+    prepare_ops_with_class(
+        text,
+        request,
+        crate::text_worker::HelperPermitClass::Interactive,
+    )
+}
+
+/// Like [`prepare_ops`], but helper permits are taken from the Bulk class
+/// (RFC-0006 §6.2: bulk source operations cannot occupy the interactive
+/// reservation). Used by vault-wide source scans (S07).
+pub fn prepare_ops_bulk(
+    text: &str,
+    request: &ReplaceRequest,
+) -> Result<(Vec<EditOp>, u64, u64), PrepareError> {
+    prepare_ops_with_class(text, request, crate::text_worker::HelperPermitClass::Bulk)
+}
+
+fn prepare_ops_with_class(
+    text: &str,
+    request: &ReplaceRequest,
+    class: crate::text_worker::HelperPermitClass,
+) -> Result<(Vec<EditOp>, u64, u64), PrepareError> {
     match request.mode {
         // D-14: regex runs in the isolated helper process; literal stays
         // in-process and never depends on helper availability.
-        MatchMode::Regex => prepare_regex(text, request),
+        MatchMode::Regex => prepare_regex(text, request, class),
         MatchMode::Literal => prepare_literal(text, request),
     }
 }
@@ -199,29 +221,68 @@ pub fn prepare_ops(
 ///
 /// [`PrepareError`] with zero effects.
 pub fn prepare_find(text: &str, request: &FindRequest) -> Result<FindOutcome, PrepareError> {
+    prepare_find_with_class(
+        text,
+        request,
+        crate::text_worker::HelperPermitClass::Interactive,
+    )
+}
+
+/// Like [`prepare_find`] with Bulk-class helper permits (vault-wide source
+/// find, S07).
+pub fn prepare_find_bulk(text: &str, request: &FindRequest) -> Result<FindOutcome, PrepareError> {
+    prepare_find_with_class(text, request, crate::text_worker::HelperPermitClass::Bulk)
+}
+
+fn prepare_find_with_class(
+    text: &str,
+    request: &FindRequest,
+    class: crate::text_worker::HelperPermitClass,
+) -> Result<FindOutcome, PrepareError> {
     if request.offset > u64::try_from(MAX_MATCHES_PER_JOB).unwrap_or(u64::MAX) {
         return Err(PrepareError::MatchOffsetOutOfRange);
     }
     let scope = scope_of(request.scope)?;
     match request.mode {
         MatchMode::Regex => {
-            let run = crate::text_worker::run_match(
-                &crate::text_worker::HelperRequest {
-                    kind: RequestKind::Find,
-                    source: text,
-                    pattern: &request.query,
-                    mode: MatchMode::Regex,
-                    case_sensitive: request.case_sensitive,
-                    whole_word: request.whole_word,
-                    scope: request.scope,
-                    max_matches: MAX_MATCHES_PER_JOB,
-                    report_matches: MAX_FIND_SPANS,
-                    skip_matches: request.offset,
-                    max_output: 0,
-                    template_raw: "",
-                },
-                &std::sync::atomic::AtomicBool::new(false),
-            )
+            let run = match class {
+                crate::text_worker::HelperPermitClass::Interactive => {
+                    crate::text_worker::run_match(
+                        &crate::text_worker::HelperRequest {
+                            kind: RequestKind::Find,
+                            source: text,
+                            pattern: &request.query,
+                            mode: MatchMode::Regex,
+                            case_sensitive: request.case_sensitive,
+                            whole_word: request.whole_word,
+                            scope: request.scope,
+                            max_matches: MAX_MATCHES_PER_JOB,
+                            report_matches: MAX_FIND_SPANS,
+                            skip_matches: request.offset,
+                            max_output: 0,
+                            template_raw: "",
+                        },
+                        &std::sync::atomic::AtomicBool::new(false),
+                    )
+                }
+                crate::text_worker::HelperPermitClass::Bulk => crate::text_worker::run_match_bulk(
+                    &crate::text_worker::HelperRequest {
+                        kind: RequestKind::Find,
+                        source: text,
+                        pattern: &request.query,
+                        mode: MatchMode::Regex,
+                        case_sensitive: request.case_sensitive,
+                        whole_word: request.whole_word,
+                        scope: request.scope,
+                        max_matches: MAX_MATCHES_PER_JOB,
+                        report_matches: MAX_FIND_SPANS,
+                        skip_matches: request.offset,
+                        max_output: 0,
+                        template_raw: "",
+                    },
+                    &std::sync::atomic::AtomicBool::new(false),
+                ),
+            }
             .map_err(worker_error)?;
             // The helper proved the exact total over the complete scan.
             let spans = run
@@ -309,6 +370,7 @@ pub fn prepare_find(text: &str, request: &FindRequest) -> Result<FindOutcome, Pr
 fn prepare_regex(
     text: &str,
     request: &ReplaceRequest,
+    class: crate::text_worker::HelperPermitClass,
 ) -> Result<(Vec<EditOp>, u64, u64), PrepareError> {
     let scope = scope_of(request.scope)?;
     // Local template validation first: typed and exact, before any
@@ -321,23 +383,42 @@ fn prepare_regex(
             other => PrepareError::Template(other),
         })?;
     let cancelled = std::sync::atomic::AtomicBool::new(false);
-    let run = crate::text_worker::run_match(
-        &crate::text_worker::HelperRequest {
-            kind: RequestKind::Replace,
-            source: text,
-            pattern: &request.query,
-            mode: MatchMode::Regex,
-            case_sensitive: request.case_sensitive,
-            whole_word: request.whole_word,
-            scope: request.scope,
-            max_matches: MAX_MATCHES_PER_JOB,
-            report_matches: usize::MAX,
-            skip_matches: 0,
-            max_output: MAX_OUTPUT_BYTES,
-            template_raw: &request.replacement,
-        },
-        &cancelled,
-    )
+    let run = match class {
+        crate::text_worker::HelperPermitClass::Interactive => crate::text_worker::run_match(
+            &crate::text_worker::HelperRequest {
+                kind: RequestKind::Replace,
+                source: text,
+                pattern: &request.query,
+                mode: MatchMode::Regex,
+                case_sensitive: request.case_sensitive,
+                whole_word: request.whole_word,
+                scope: request.scope,
+                max_matches: MAX_MATCHES_PER_JOB,
+                report_matches: usize::MAX,
+                skip_matches: 0,
+                max_output: MAX_OUTPUT_BYTES,
+                template_raw: &request.replacement,
+            },
+            &cancelled,
+        ),
+        crate::text_worker::HelperPermitClass::Bulk => crate::text_worker::run_match_bulk(
+            &crate::text_worker::HelperRequest {
+                kind: RequestKind::Replace,
+                source: text,
+                pattern: &request.query,
+                mode: MatchMode::Regex,
+                case_sensitive: request.case_sensitive,
+                whole_word: request.whole_word,
+                scope: request.scope,
+                max_matches: MAX_MATCHES_PER_JOB,
+                report_matches: usize::MAX,
+                skip_matches: 0,
+                max_output: MAX_OUTPUT_BYTES,
+                template_raw: &request.replacement,
+            },
+            &cancelled,
+        ),
+    }
     .map_err(worker_error)?;
     let mut ops = Vec::with_capacity(run.matches.len());
     let mut output_len = text.len() as u64;

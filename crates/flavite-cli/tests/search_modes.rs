@@ -154,8 +154,10 @@ fn deterministic_errors_cover_unsupported_and_empty_queries() {
     let vault = prepared_vault_dir(&env);
     let path = vault.to_str().unwrap().to_owned();
 
-    // Vault source matching arrives with RFC-0006 S07; the refusal is a
-    // typed error object, not a panic and not a silent text search.
+    // Vault source matching (RFC-0006 S07): regex runs through the
+    // isolated helper; without the installed sibling the result is a typed
+    // refusal ("regex is unavailable"), never a silent text search and
+    // never a panic. With the helper installed it succeeds.
     let out = env.run(&[
         "search",
         "--path",
@@ -166,16 +168,22 @@ fn deterministic_errors_cover_unsupported_and_empty_queries() {
         "regex",
         "pattern",
     ]);
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let parsed = json_line(&stderr).unwrap();
-    assert_eq!(parsed["error"]["kind"], "unsupported");
-    assert!(
-        parsed["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("--mode text")
-    );
+    if out.status.success() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let first: serde_json::Value =
+            serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+        assert_eq!(first["mode"], "regex");
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let parsed = json_line(&stderr).unwrap();
+        assert_eq!(parsed["error"]["kind"], "error", "stderr: {stderr}");
+        let message = parsed["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("regex is unavailable")
+                || message.contains("invalid regular expression"),
+            "typed regex refusal: {message}"
+        );
+    }
 
     // Empty/whitespace queries are invalid, never "match everywhere".
     let out = env.run(&["search", "--path", &path, "--no-watch", "--json", "   "]);

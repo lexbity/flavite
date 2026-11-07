@@ -796,16 +796,7 @@ impl CliDriver {
         let page_size = u64::try_from(limit.clamp(1, 200)).unwrap_or(50);
         let outcome = match mode {
             CliSearchMode::Literal | CliSearchMode::Regex => {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({
-                        "error": {
-                            "kind": "unsupported",
-                            "message": "vault source matching (literal/regex) is not available in this build; use --mode text or --mode expression"
-                        }
-                    })
-                );
-                anyhow::bail!("search failed");
+                return self.run_vault_source_find(term, mode, page_size, consume_all);
             }
             CliSearchMode::Text | CliSearchMode::Expression => {
                 let text = match (field, mode) {
@@ -881,6 +872,135 @@ impl CliDriver {
             anyhow::anyhow!("search failed")
         })?;
         Ok(())
+    }
+
+    /// Vault source find (RFC-0006 S07): literal/regex matching over saved
+    /// Markdown source with exact per-note match paging (D-08).
+    fn run_vault_source_find(
+        &self,
+        term: &str,
+        mode: CliSearchMode,
+        page_size: u64,
+        consume_all: bool,
+    ) -> Result<()> {
+        let flavite = self
+            .flavite
+            .as_ref()
+            .context("search requires an opened vault")?;
+        let request_id = flavite.command_registry().next_request_id();
+        let result = flavite.execute(Invocation::new(
+            request_id,
+            "source_find.start",
+            serde_json::json!({
+                "query": term,
+                "mode": if matches!(mode, CliSearchMode::Regex) { "regex" } else { "literal" },
+            }),
+            Origin::Cli,
+        ));
+        let result = match result {
+            ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
+            result => result,
+        };
+        let ExecutionResult::Local(LocalResult::Success(start)) = result else {
+            eprintln!("{}", serde_json::to_string(&execution_error_json(&result))?);
+            anyhow::bail!("search failed");
+        };
+        let finder = start
+            .data
+            .get("finder_id")
+            .and_then(serde_json::Value::as_str)
+            .context("source find result lacks finder_id")?
+            .to_owned();
+        let mut pages = 0u64;
+        let mut cursor = start.data.clone();
+        loop {
+            pages += 1;
+            self.print_source_find_page(&cursor, mode, pages);
+            let next_note = cursor
+                .get("page")
+                .and_then(|page| page.get("next_note_index"))
+                .and_then(serde_json::Value::as_u64);
+            let next_match = cursor
+                .get("page")
+                .and_then(|page| page.get("next_match_offset"))
+                .and_then(serde_json::Value::as_u64);
+            let note_index = cursor
+                .get("page")
+                .and_then(|page| page.get("note_index"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if !consume_all || (next_note.is_none() && next_match.is_none()) {
+                break;
+            }
+            let request_id = flavite.command_registry().next_request_id();
+            let result = flavite.execute(Invocation::new(
+                request_id,
+                "source_find.page",
+                serde_json::json!({
+                    "finder_id": finder,
+                    "note_index": note_index,
+                    "match_offset": next_match.unwrap_or(0),
+                    "page_len": page_size,
+                }),
+                Origin::Cli,
+            ));
+            let result = match result {
+                ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
+                result => result,
+            };
+            let ExecutionResult::Local(LocalResult::Success(next)) = result else {
+                eprintln!("{}", serde_json::to_string(&execution_error_json(&result))?);
+                anyhow::bail!("search failed");
+            };
+            cursor = next.data.clone();
+        }
+        let request_id = flavite.command_registry().next_request_id();
+        let _ = flavite.execute(Invocation::new(
+            request_id,
+            "source_find.close",
+            serde_json::json!({ "finder_id": finder }),
+            Origin::Cli,
+        ));
+        Ok(())
+    }
+
+    fn print_source_find_page(&self, data: &serde_json::Value, mode: CliSearchMode, pages: u64) {
+        if self.json {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "mode": if matches!(mode, CliSearchMode::Regex) { "regex" } else { "literal" },
+                    "snapshot": data.get("snapshot"),
+                    "total_notes": data.get("total_notes"),
+                    "total_matches": data.get("total_matches"),
+                    "truncated_scope": data.get("truncated_scope"),
+                    "exclusions": data.get("exclusions"),
+                    "page": data.get("page"),
+                }))
+                .unwrap_or_default()
+            );
+        } else {
+            if let Some(rows) = data
+                .get("page")
+                .and_then(|page| page.get("rows"))
+                .and_then(serde_json::Value::as_array)
+            {
+                for row in rows {
+                    let path = row
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let count = row
+                        .get("note_matches")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    println!("{path}\t{count}");
+                }
+            }
+            if pages > 1 {
+                eprintln!("page {pages}: source find continuation consumed");
+            }
+        }
     }
 
     fn run_rename(&self, from: PathBuf, to: PathBuf, strategy: CliRenameStrategy) -> Result<()> {
@@ -1110,6 +1230,26 @@ fn json_error(error: &flavite_api::FlaviteError) -> String {
         _ => "failed",
     };
     serde_json::json!({ "error": { "kind": kind, "message": error.to_string() } }).to_string()
+}
+
+/// Render an `ExecutionResult` failure as the deterministic machine-readable
+/// error object (RFC-0006 S07 source-find paths).
+fn execution_error_json(result: &ExecutionResult) -> serde_json::Value {
+    let inner = match result {
+        ExecutionResult::Local(LocalResult::Error(error)) => {
+            serde_json::json!({ "kind": "error", "message": error.message })
+        }
+        ExecutionResult::Rejected(rejected) => serde_json::json!({
+            "kind": "rejected",
+            "reason": format!("{:?}", rejected.reason),
+            "message": rejected.message,
+        }),
+        ExecutionResult::ActionRequired { code, .. } => {
+            serde_json::json!({ "kind": "action-required", "code": code })
+        }
+        _ => serde_json::json!({ "kind": "failed" }),
+    };
+    serde_json::json!({ "error": inner })
 }
 
 /// Main entry point.

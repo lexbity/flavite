@@ -295,6 +295,41 @@ run_s06_gates() {
     gate assert_absent 'MAX_TANTIVY_FILTER_SIZE' "$root/crates/flavite-index/src"
 }
 
+run_s07_gates() {
+    # S07 presence: the vault replace module, the reader source-find/preview
+    # commands, the UI host/view, and the proof surfaces (RFC-0006 S07
+    # table).
+    local file
+    for file in \
+        crates/flavite-vault/src/replace/mod.rs \
+        crates/flavite-vault/src/replace/plan.rs \
+        crates/flavite-vault/src/replace/preview.rs \
+        crates/flavite-vault/src/replace/store.rs \
+        crates/flavite-vault/tests/replace_preview.rs \
+        crates/flavite-api/src/replace.rs \
+        crates/flavite-api/tests/source_find.rs \
+        crates/flavite-ui/src/host/replace.rs \
+        crates/flavite-ui/src/views/replace.rs \
+        crates/flavite-ui/tests/vault_replace_preview.rs \
+        scripts/tests/workbench/vault_source_preview.py; do
+        gate assert_nonempty "$root/$file"
+    done
+    # S07 source isolation gates (exact required invocations, §12).
+    gate assert_absent 'std::fs|flavite_index|flavite_vault' \
+        "$root/crates/flavite-ui/src/host/replace.rs" \
+        "$root/crates/flavite-ui/src/views/replace.rs"
+    gate assert_absent 'search_notes\(|search_hits\(' \
+        "$root/crates/flavite-vault/src/replace/preview.rs"
+    gate assert_absent 'pub .*plan.*ops:.*Vec|pub .*trusted.*offset' \
+        "$root/crates/flavite-api/src/replace.rs"
+    gate assert_absent 'fn apply_replace\(' \
+        "$root/crates/flavite-api/src/replace.rs"
+    # The vault preview never self-writes: no raw file IO and no Session
+    # mutation authority inside the replace module.
+    gate assert_absent 'std::fs::write|std::fs::File::create' \
+        "$root/crates/flavite-vault/src/replace"
+}
+
 case "$slice" in
     S00) run_s00_gates ;;
     S01) run_s00_gates; run_s01_gates ;;
@@ -302,7 +337,8 @@ case "$slice" in
     S04) run_s00_gates; run_s01_gates; run_s03_gates; run_s04_gates ;;
     S05) run_s00_gates; run_s01_gates; run_s03_gates; run_s04_gates; run_s05_gates ;;
     S06) run_s00_gates; run_s01_gates; run_s03_gates; run_s04_gates; run_s05_gates; run_s06_gates ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: S00 S01 S03 S04 S05 S06)" >&2; exit 2 ;;
+    S07) run_s00_gates; run_s01_gates; run_s03_gates; run_s04_gates; run_s05_gates; run_s06_gates; run_s07_gates ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: S00 S01 S03 S04 S05 S06 S07)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then

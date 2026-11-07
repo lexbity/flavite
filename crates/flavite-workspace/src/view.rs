@@ -126,6 +126,8 @@ pub enum ViewKind {
     Notes,
     /// Saved-content full-text search over the indexed vault (W10).
     Search,
+    /// Vault source Find and sealed replacement preview (RFC-0006 S07).
+    Replace,
     /// Local history of one note: snapshots, previews, guarded restore (W10).
     History(NoteLocator),
     /// Saved source-text preview of the bound context source (W04).
@@ -150,6 +152,7 @@ impl ViewKind {
             ViewKind::Graph(graph) => Some(ViewKind::Graph(graph.clone())),
             ViewKind::Notes => Some(ViewKind::Notes),
             ViewKind::Search => Some(ViewKind::Search),
+            ViewKind::Replace => Some(ViewKind::Replace),
             ViewKind::History(locator) => Some(ViewKind::History(locator.clone())),
             // A duplicated context tool is an independent view with its own
             // copy of the binding; the binding target itself is unchanged.
@@ -457,6 +460,7 @@ impl ViewSession {
             ViewKind::Empty => "New tab".into(),
             ViewKind::Notes => "Notes".into(),
             ViewKind::Search => "Search".into(),
+            ViewKind::Replace => "Replace".into(),
             ViewKind::History(locator) => format!("History: {}", locator.title()),
             ViewKind::Note(note) => note.locator().title().to_owned(),
             ViewKind::Graph(_) => "Graph".into(),
@@ -479,6 +483,7 @@ impl ViewSession {
             ViewKind::Graph(graph) => Some(ViewKind::Graph(graph.clone())),
             ViewKind::Notes => Some(ViewKind::Notes),
             ViewKind::Search => Some(ViewKind::Search),
+            ViewKind::Replace => Some(ViewKind::Replace),
             ViewKind::History(locator) => Some(ViewKind::History(locator.clone())),
             ViewKind::Preview(binding) => Some(ViewKind::Preview(binding.clone())),
             ViewKind::Backlinks(binding) => Some(ViewKind::Backlinks(binding.clone())),

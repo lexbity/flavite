@@ -88,6 +88,8 @@ pub struct App {
     pub graph: crate::host::graph::GraphHost,
     /// Saved-content search states (W10).
     pub search: crate::host::search::SearchHost,
+    /// RFC-0006 S07: vault source Find / replacement preview states.
+    pub replace: crate::host::replace::ReplaceHost,
     /// Local-history listings (W10).
     pub history: crate::views::history::HistoryHost,
     /// Per-view back/forward navigation (W10).
@@ -418,6 +420,37 @@ pub enum Message {
         tab: TabId,
         mode: crate::host::search::SearchPanelMode,
     },
+    // ---- RFC-0006 S07: vault source Find / replacement preview ----
+    ReplaceEdit {
+        tab: TabId,
+        field: crate::host::replace::ReplaceField,
+        value: String,
+    },
+    ReplaceToggle {
+        tab: TabId,
+        flag: crate::host::replace::ReplaceFlag,
+    },
+    ReplaceSetMode {
+        tab: TabId,
+        mode: crate::host::replace::ReplacePanelMode,
+    },
+    ReplaceSubmitNow {
+        tab: TabId,
+    },
+    ReplaceNextPage {
+        tab: TabId,
+    },
+    ReplaceRunPreview {
+        tab: TabId,
+    },
+    ReplaceSelect {
+        tab: TabId,
+        selection: crate::host::replace::SelectAction,
+    },
+    ReplaceOpenNote {
+        tab: TabId,
+        path: String,
+    },
     // ---- W10: History view ----
     HistoryRefresh {
         tab: TabId,
@@ -589,6 +622,7 @@ impl App {
             reading: crate::host::reading::ReadingHost::default(),
             catalog_host: crate::host::catalog::CatalogHost::default(),
             note_search: crate::host::note_search::NoteSearchHost::default(),
+            replace: crate::host::replace::ReplaceHost::default(),
             encoding: crate::host::encoding::EncodingHost::default(),
             input_chains: BTreeMap::new(),
             linking: crate::host::linking::LinkIntents::default(),
@@ -2609,6 +2643,10 @@ impl App {
                             expected_revision: revision,
                             group,
                         },
+                        flavite_workspace::ViewKind::Replace => LayoutAction::OpenReplace {
+                            expected_revision: revision,
+                            group,
+                        },
                         // History opens for a specific note through the
                         // note tab's group actions, never generically.
                         flavite_workspace::ViewKind::History(_) => LayoutAction::OpenEmpty {
@@ -2843,6 +2881,29 @@ impl App {
             Message::SearchNextPage { tab } => self.search.next_page(tab, self.flavite.as_ref()),
             Message::SearchRefresh { tab } => self.search.refresh(tab),
             Message::SearchSetMode { tab, mode } => self.search.set_mode(tab, mode),
+            // ---- RFC-0006 S07: vault source Find / replacement preview ----
+            Message::ReplaceEdit { tab, field, value } => {
+                self.replace.edited(tab, field, value);
+            }
+            Message::ReplaceToggle { tab, flag } => self.replace.toggle(tab, flag),
+            Message::ReplaceSetMode { tab, mode } => self.replace.set_mode(tab, mode),
+            Message::ReplaceSubmitNow { tab } => {
+                self.replace.submit_now(tab);
+            }
+            Message::ReplaceNextPage { tab } => self.replace.next_page(tab, self.flavite.as_ref()),
+            Message::ReplaceRunPreview { tab } => {
+                self.replace.run_preview(tab, self.flavite.as_ref())
+            }
+            Message::ReplaceSelect { tab, selection } => {
+                self.replace.select(tab, selection, self.flavite.as_ref());
+            }
+            Message::ReplaceOpenNote { path, .. } => {
+                if let Ok(locator) =
+                    flavite_workspace::NoteLocator::from_relative(std::path::Path::new(&path))
+                {
+                    self.open_intent(crate::host::open_intents::OpenIntent::reuse(locator, None));
+                }
+            }
             // ---- W10: History view ----
             Message::HistoryRefresh { tab } => {
                 if let Some(locator) =
@@ -3276,6 +3337,21 @@ impl App {
             .collect();
         let search_api = self.flavite.as_ref();
         self.search.admit_due(search_api, &search_incarnations);
+        self.replace.admit_due(self.flavite.as_ref());
+        // Retain replace host state only for live tabs; a closed tab drops
+        // its finder/preview sessions.
+        {
+            let closed: Vec<TabId> = self
+                .replace
+                .tabs
+                .keys()
+                .copied()
+                .filter(|tab| self.workspace.tab(tab).is_none())
+                .collect();
+            for tab in closed {
+                self.replace.detach(tab, self.flavite.as_ref());
+            }
+        }
         let query_outcomes = self
             .flavite
             .as_ref()
@@ -3507,6 +3583,9 @@ impl App {
             return;
         }
         if crate::host::note_search::completion(self, &completion) {
+            return;
+        }
+        if self.replace.observe(&completion) {
             return;
         }
         if self.linking.handles(completion.request_id) {
@@ -4453,6 +4532,7 @@ mod tests {
             reading: crate::host::reading::ReadingHost::default(),
             catalog_host: crate::host::catalog::CatalogHost::default(),
             note_search: crate::host::note_search::NoteSearchHost::default(),
+            replace: crate::host::replace::ReplaceHost::default(),
             encoding: crate::host::encoding::EncodingHost::default(),
             input_chains: BTreeMap::new(),
             linking: crate::host::linking::LinkIntents::default(),

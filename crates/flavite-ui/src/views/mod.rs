@@ -12,6 +12,7 @@ pub mod note;
 pub mod notes;
 pub mod notifications;
 pub mod preview;
+pub mod replace;
 pub mod search;
 
 use crate::app::Message;

@@ -338,6 +338,7 @@ pub fn menu_entries(app: &App, group: GroupId, menu: StripMenu) -> Vec<MenuEntry
             ("Toggle notes sidebar", "workspace.toggle_sidebar"),
             ("Notes list", "workspace.open_notes_view"),
             ("Search", "workspace.open_search_view"),
+            ("Vault find / replace", "workspace.open_replace_view"),
             ("Graph", "workspace.open_graph"),
             ("Preview", "workspace.open_preview"),
             ("Backlinks", "workspace.open_backlinks"),

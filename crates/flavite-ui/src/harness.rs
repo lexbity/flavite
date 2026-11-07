@@ -117,6 +117,7 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                         flavite_workspace::ViewKind::Empty => "empty",
                         flavite_workspace::ViewKind::Notes => "notes",
                         flavite_workspace::ViewKind::Search => "search",
+                        flavite_workspace::ViewKind::Replace => "replace",
                         flavite_workspace::ViewKind::History(_) => "history",
                         flavite_workspace::ViewKind::Preview(_) => "preview",
                         flavite_workspace::ViewKind::Backlinks(_) => "backlinks",

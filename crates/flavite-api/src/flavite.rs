@@ -896,6 +896,42 @@ impl Flavite {
                 crate::text_edit::handle_apply_replace,
             ),
             (
+                "source_find.start",
+                "Find in vault source",
+                ArgSchema::typed::<crate::replace::SourceFindStartArgs>(),
+                crate::replace::handle_source_find_start,
+            ),
+            (
+                "source_find.page",
+                "Source find continuation page",
+                ArgSchema::typed::<crate::replace::SourceFindPageArgs>(),
+                crate::replace::handle_source_find_page,
+            ),
+            (
+                "source_find.close",
+                "Close source find session",
+                ArgSchema::typed::<crate::replace::SourceFindCloseArgs>(),
+                crate::replace::handle_source_find_close,
+            ),
+            (
+                "replace.preview",
+                "Preview vault replacement",
+                ArgSchema::typed::<crate::replace::ReplacePreviewArgs>(),
+                crate::replace::handle_replace_preview,
+            ),
+            (
+                "replace.select",
+                "Select preview notes",
+                ArgSchema::typed::<crate::replace::ReplaceSelectArgs>(),
+                crate::replace::handle_replace_select,
+            ),
+            (
+                "replace.status",
+                "Replacement preview status",
+                ArgSchema::typed::<crate::replace::ReplaceStatusArgs>(),
+                crate::replace::handle_replace_status,
+            ),
+            (
                 "link.prepare",
                 "Prepare link insertion",
                 ArgSchema::typed::<crate::links::LinkPrepareArgs>(),
@@ -1028,6 +1064,12 @@ impl Flavite {
                     | "note.reopen_encoding"
                     | "text.prepare_replace"
                     | "text.find"
+                    | "source_find.start"
+                    | "source_find.page"
+                    | "source_find.close"
+                    | "replace.preview"
+                    | "replace.select"
+                    | "replace.status"
             ) {
                 CommandSpec::new(id, title, args).requires(crate::Capability::ReadNotes)
             } else {
@@ -1444,6 +1486,18 @@ impl Flavite {
                 invocation.request_id,
             ));
         }
+        // RFC-0006 S07/D-09: read-only vaults can Find/search/preview under
+        // the read budget but cannot persist a vault-local replacement
+        // preview; they receive a non-applicable device-local inspection
+        // report. `replace.preview` is ReadNotes, so the write gate above
+        // does not apply — it is refused here explicitly.
+        if self.read_only && invocation.command_id == "replace.preview" {
+            return ExecutionResult::Local(LocalResult::Error(LocalError::with_request(
+                "read_only_non_applicable",
+                "this vault is read-only: the replacement preview cannot be persisted here; inspection results are non-applicable device-local reports",
+                invocation.request_id,
+            )));
+        }
         let result = self.dispatch_command(&invocation);
 
         // Convert SessionResult to ExecutionResult
@@ -1613,6 +1667,24 @@ impl Flavite {
                 "text.prepare_replace"
             }
             SessionResult::Success(crate::session::CommandResult::Found { .. }) => "text.find",
+            SessionResult::Success(crate::session::CommandResult::SourceFindStarted { .. }) => {
+                "source_find.start"
+            }
+            SessionResult::Success(crate::session::CommandResult::SourceFindPaged { .. }) => {
+                "source_find.page"
+            }
+            SessionResult::Success(crate::session::CommandResult::SourceFindClosed) => {
+                "source_find.close"
+            }
+            SessionResult::Success(crate::session::CommandResult::ReplacePreviewSealed {
+                ..
+            }) => "replace.preview",
+            SessionResult::Success(crate::session::CommandResult::ReplaceSelected { .. }) => {
+                "replace.select"
+            }
+            SessionResult::Success(crate::session::CommandResult::ReplaceStatus { .. }) => {
+                "replace.status"
+            }
             SessionResult::MergeReady { .. }
             | SessionResult::Conflict { .. }
             | SessionResult::ActionRequired { .. } => "conflict.resolve",
@@ -1817,6 +1889,64 @@ impl Flavite {
                             "truncated": truncated,
                         })
                     }
+                    crate::session::CommandResult::SourceFindStarted {
+                        finder_id,
+                        scope,
+                        truncated_scope,
+                        total_notes,
+                        total_matches,
+                        exclusions,
+                        page,
+                    } => {
+                        serde_json::json!({
+                            "finder_id": crate::replace::encode_id(finder_id),
+                            "snapshot": {
+                                "epoch": scope.epoch,
+                                "generation": scope.generation,
+                            },
+                            "truncated_scope": truncated_scope,
+                            "total_notes": total_notes,
+                            "total_matches": total_matches,
+                            "exclusions": exclusions
+                                .into_iter()
+                                .map(|exclusion| serde_json::json!({
+                                    "path": exclusion.path,
+                                    "reason": crate::replace::exclusion_reason_str(exclusion.reason),
+                                }))
+                                .collect::<Vec<_>>(),
+                            "page": crate::replace::find_page_json(&page),
+                        })
+                    }
+                    crate::session::CommandResult::SourceFindPaged { finder_id, page } => {
+                        serde_json::json!({
+                            "finder_id": crate::replace::encode_id(finder_id),
+                            "page": crate::replace::find_page_json(&page),
+                        })
+                    }
+                    crate::session::CommandResult::SourceFindClosed => serde_json::Value::Null,
+                    crate::session::CommandResult::ReplacePreviewSealed {
+                        preview_id,
+                        manifest,
+                    } => serde_json::json!({
+                        "preview_id": crate::replace::encode_id(preview_id),
+                        "plan": crate::replace::preview_plan_json(&manifest),
+                        "page": crate::replace::preview_page_json(&manifest, 0, 50),
+                    }),
+                    crate::session::CommandResult::ReplaceSelected {
+                        selection_revision,
+                        selection_digest,
+                    } => serde_json::json!({
+                        "selection_revision": selection_revision,
+                        "selection_digest": selection_digest,
+                    }),
+                    crate::session::CommandResult::ReplaceStatus {
+                        preview_id,
+                        manifest,
+                    } => serde_json::json!({
+                        "preview_id": crate::replace::encode_id(preview_id),
+                        "plan": crate::replace::preview_plan_json(&manifest),
+                        "page": crate::replace::preview_page_json(&manifest, 0, 200),
+                    }),
                     crate::session::CommandResult::EditsDiscarded { buffer_id } => {
                         serde_json::json!({ "buffer_id": buffer_id.as_u64() })
                     }

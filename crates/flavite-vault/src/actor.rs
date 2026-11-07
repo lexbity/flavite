@@ -21,7 +21,7 @@ use crossbeam::channel::{Receiver, Sender, bounded, select, tick, unbounded};
 use flavite_fs::Fs;
 use flavite_index::{IndexActor, MAX_NOTE_BYTES};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -187,6 +187,38 @@ pub enum VaultActorMsg {
         after: Option<flavite_index::NoteCatalogCursor>,
         reply: Sender<VaultActorResp>,
     },
+    /// Private operation-store directory creation (contained under
+    /// `.flavite/operations`; RFC-0006 S07).
+    OpStoreMkdirAll {
+        path: PathBuf,
+        reply: Sender<VaultActorResp>,
+    },
+    /// Private operation-store exclusive file create.
+    OpStoreWriteNew {
+        path: PathBuf,
+        bytes: Vec<u8>,
+        reply: Sender<VaultActorResp>,
+    },
+    /// Private operation-store read.
+    OpStoreRead {
+        path: PathBuf,
+        reply: Sender<VaultActorResp>,
+    },
+    /// Private operation-store file fsync.
+    OpStoreFsyncFile {
+        path: PathBuf,
+        reply: Sender<VaultActorResp>,
+    },
+    /// Private operation-store directory fsync.
+    OpStoreFsyncDir {
+        path: PathBuf,
+        reply: Sender<VaultActorResp>,
+    },
+    /// Private operation-store file removal (idempotent).
+    OpStoreRemove {
+        path: PathBuf,
+        reply: Sender<VaultActorResp>,
+    },
     /// Decode a bounded graph catalog through this vault's exact Fs codec.
     DecodeGraphPaths {
         keys: Vec<Vec<u8>>,
@@ -308,6 +340,8 @@ pub enum VaultActorResp {
     HistoryList(Result<Vec<crate::history::HistoryEntry>, String>),
     /// Bounded history snapshot bytes.
     HistoryBytes(Result<Vec<u8>, String>),
+    /// Private operation-store acknowledgement.
+    OpStoreAck(Result<(), String>),
 }
 
 /// Errors from the VaultActor.
@@ -626,6 +660,75 @@ impl VaultActorHandle {
             VaultActorResp::NoteCatalog(result) => result,
             VaultActorResp::Error(error) => Err(error),
             _ => Err("unexpected note-catalog response".to_owned()),
+        }
+    }
+
+    /// Private operation-store directory creation (RFC-0006 S07).
+    pub fn op_store_mkdir_all(&self, path: PathBuf) -> Result<(), String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::OpStoreMkdirAll { path, reply })
+            .map_err(|error| error.to_string())?;
+        self.op_store_reply(response)
+    }
+
+    /// Private operation-store exclusive file create.
+    pub fn op_store_write_new(&self, path: PathBuf, bytes: Vec<u8>) -> Result<(), String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::OpStoreWriteNew { path, bytes, reply })
+            .map_err(|error| error.to_string())?;
+        self.op_store_reply(response)
+    }
+
+    /// Private operation-store read (`None` when absent).
+    pub fn op_store_read(&self, path: PathBuf) -> Result<Option<Vec<u8>>, String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::OpStoreRead { path, reply })
+            .map_err(|error| error.to_string())?;
+        match response.recv().map_err(|error| error.to_string())? {
+            VaultActorResp::File(bytes) => Ok(bytes),
+            VaultActorResp::Error(error) => Err(error),
+            _ => Err("unexpected operation-store read response".to_owned()),
+        }
+    }
+
+    /// Private operation-store file fsync.
+    pub fn op_store_fsync_file(&self, path: PathBuf) -> Result<(), String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::OpStoreFsyncFile { path, reply })
+            .map_err(|error| error.to_string())?;
+        self.op_store_reply(response)
+    }
+
+    /// Private operation-store directory fsync.
+    pub fn op_store_fsync_dir(&self, path: PathBuf) -> Result<(), String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::OpStoreFsyncDir { path, reply })
+            .map_err(|error| error.to_string())?;
+        self.op_store_reply(response)
+    }
+
+    /// Private operation-store file removal (idempotent).
+    pub fn op_store_remove(&self, path: PathBuf) -> Result<(), String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::OpStoreRemove { path, reply })
+            .map_err(|error| error.to_string())?;
+        self.op_store_reply(response)
+    }
+
+    fn op_store_reply(
+        &self,
+        response: crossbeam::channel::Receiver<VaultActorResp>,
+    ) -> Result<(), String> {
+        match response.recv().map_err(|error| error.to_string())? {
+            VaultActorResp::OpStoreAck(result) => result,
+            VaultActorResp::Error(error) => Err(error),
+            _ => Err("unexpected operation-store response".to_owned()),
         }
     }
 
@@ -1463,6 +1566,55 @@ impl VaultActor {
                     }
                 });
             }
+            VaultActorMsg::OpStoreMkdirAll { path, reply } => {
+                let result = (|| {
+                    self.validate_ops_path(&path)?;
+                    self.fs.create_dir_all(&path).map_err(|e| e.to_string())
+                })();
+                let _ = reply.try_send(VaultActorResp::OpStoreAck(result));
+            }
+            VaultActorMsg::OpStoreWriteNew { path, bytes, reply } => {
+                let result = (|| {
+                    self.validate_ops_path(&path)?;
+                    self.fs.write_new(&path, &bytes).map_err(|e| e.to_string())
+                })();
+                let _ = reply.try_send(VaultActorResp::OpStoreAck(result));
+            }
+            VaultActorMsg::OpStoreRead { path, reply } => {
+                let result = (|| {
+                    self.validate_ops_path(&path)?;
+                    self.fs.read_if_exists(&path).map_err(|e| e.to_string())
+                })();
+                let _ = reply.try_send(match result {
+                    Ok(bytes) => VaultActorResp::File(bytes),
+                    Err(error) => VaultActorResp::Error(error),
+                });
+            }
+            VaultActorMsg::OpStoreFsyncFile { path, reply } => {
+                let result = (|| {
+                    self.validate_ops_path(&path)?;
+                    self.fs.fsync_file(&path).map_err(|e| e.to_string())
+                })();
+                let _ = reply.try_send(VaultActorResp::OpStoreAck(result));
+            }
+            VaultActorMsg::OpStoreFsyncDir { path, reply } => {
+                let result = (|| {
+                    self.validate_ops_path(&path)?;
+                    self.fs.fsync_dir(&path).map_err(|e| e.to_string())
+                })();
+                let _ = reply.try_send(VaultActorResp::OpStoreAck(result));
+            }
+            VaultActorMsg::OpStoreRemove { path, reply } => {
+                let result = (|| {
+                    self.validate_ops_path(&path)?;
+                    match self.fs.remove(&path) {
+                        Ok(()) => Ok(()),
+                        Err(flavite_fs::FsError::NotFound(_)) => Ok(()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                })();
+                let _ = reply.try_send(VaultActorResp::OpStoreAck(result));
+            }
             VaultActorMsg::ReadFile { path, reply } => {
                 let response = self
                     .fs
@@ -1679,6 +1831,28 @@ impl VaultActor {
             .map_err(|e| e.to_string())?;
         self.catalog.begin();
         self.catalog.finish(&self.index);
+        Ok(())
+    }
+
+    /// Validate a private operation-store path: it must live under the
+    /// vault's `.flavite/operations` namespace AND inside the vault root
+    /// (RFC-0006 S07). Structure is checked without canonicalizing paths
+    /// that do not exist yet (a fresh store directory has no canonical
+    /// form on OS filesystems).
+    fn validate_ops_path(&self, path: &Path) -> Result<(), String> {
+        let ops_root = self.identity.root.join(".flavite").join("operations");
+        if !path.starts_with(&ops_root) {
+            return Err("private operation paths must live under .flavite/operations".to_owned());
+        }
+        let relative = path
+            .strip_prefix(&self.identity.root)
+            .map_err(|_| "private operation path escaped the vault root".to_owned())?;
+        if relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err("private operation path has unsafe components".to_owned());
+        }
         Ok(())
     }
 

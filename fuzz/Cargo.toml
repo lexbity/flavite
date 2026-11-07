@@ -47,6 +47,10 @@ name = "text_match"
 path = "fuzz_targets/text_match.rs"
 
 [[bin]]
+name = "replace_plan"
+path = "fuzz_targets/replace_plan.rs"
+
+[[bin]]
 name = "text_worker_protocol"
 path = "fuzz_targets/text_worker_protocol.rs"
 
