@@ -44,13 +44,29 @@ fn spans(matches: &[flavite_text_search::Match]) -> Vec<(usize, usize)> {
 
 #[test]
 fn empty_matches_advance_one_scalar_and_report_eof_once() {
-    // `a*` on "b": an empty match at 0, then the real match, then the
-    // end-of-document empty match — one per location, ascending.
+    // `a*` emits one match per location, ascending: the empty match at a
+    // boundary, scalar progress after an empty match, and exactly one
+    // end-of-document empty match — independent of where the preceding
+    // non-empty match happened to end.
     let matcher = regex("a*");
     assert_eq!(spans(&matcher.find("b").unwrap()), vec![(0, 0), (1, 1)]);
-    assert_eq!(spans(&matcher.find("ba").unwrap()), vec![(0, 0), (1, 2)]);
-    // Greedy `a*` consumes the whole run in one match.
-    assert_eq!(matcher.find("a".repeat(1_000).as_str()).unwrap().len(), 1);
+    assert_eq!(
+        spans(&matcher.find("ba").unwrap()),
+        vec![(0, 0), (1, 2), (2, 2)]
+    );
+    assert_eq!(
+        spans(&matcher.find("aa").unwrap()),
+        vec![(0, 2), (2, 2)],
+        "the EOF empty match follows an EOF-ending non-empty match too"
+    );
+    // Greedy `a*` consumes the whole run in one match; only the single
+    // end-of-document empty match follows it.
+    let run = matcher.find("a".repeat(1_000).as_str()).unwrap();
+    assert_eq!(
+        spans(&run),
+        vec![(0, 1_000), (1_000, 1_000)],
+        "greedy consumption, not one match per scalar"
+    );
     // The empty regex is legal and makes scalar-progress explicit: one
     // empty match per location, ascending, terminating at EOF.
     let empty = regex("");
@@ -83,11 +99,14 @@ fn named_groups_resolve_by_name() {
     // Expansion is evaluated per original match; inserted text is never
     // rescanned.
     let both = matcher.find("bob@example al@example").unwrap();
-    let pairs = template
-        .expand_pairs(&matcher, "bob@example al@example", &both)
+    let first = template
+        .expand(&matcher, "bob@example al@example", &both[0])
         .unwrap();
-    assert_eq!(pairs[0], (both[0].span, "bob at example".to_owned()));
-    assert_eq!(pairs[1], (both[1].span, "al at example".to_owned()));
+    let second = template
+        .expand(&matcher, "bob@example al@example", &both[1])
+        .unwrap();
+    assert_eq!(first, "bob at example");
+    assert_eq!(second, "al at example");
 }
 
 #[test]

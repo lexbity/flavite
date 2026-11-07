@@ -683,9 +683,7 @@ fn compute_note_ops(
             });
         }
         let spans = validate_helper_spans(&run, text)?;
-        if run.output_len != text.len() as u64
-            && run.output_len > crate::text_edit::MAX_OUTPUT_BYTES as u64
-        {
+        if run.output_len > crate::text_edit::MAX_OUTPUT_BYTES as u64 {
             return Err(PreviewError::InvalidInput("output bound"));
         }
         let count = u64::try_from(spans.len()).unwrap_or(u64::MAX);

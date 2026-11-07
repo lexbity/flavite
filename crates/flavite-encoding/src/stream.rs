@@ -40,12 +40,6 @@ impl StreamDecoded {
     pub const fn format(&self) -> SourceFormat {
         self.format
     }
-
-    /// Consume into the decoded UTF-8 text.
-    #[must_use]
-    pub fn into_text(self) -> String {
-        self.text
-    }
 }
 
 #[derive(Debug)]
@@ -187,10 +181,51 @@ impl StreamingDecoder {
             }
             Phase::Active(ActiveState::Utf8(state)) => {
                 let max_decoded = self.limits.max_decoded_utf8_bytes;
-                for (idx, byte) in chunk.iter().enumerate() {
-                    state.feed(*byte, base + idx, &mut self.text, max_decoded)?;
+                let mut idx = 0usize;
+                // Complete any scalar the previous chunk split, then bulk
+                // validate the aligned remainder in one pass.
+                while state.need > 0 && idx < chunk.len() {
+                    state.feed(chunk[idx], base + idx, &mut self.text, max_decoded)?;
+                    idx += 1;
                 }
-                Ok(())
+                let rest = &chunk[idx..];
+                if rest.is_empty() {
+                    return Ok(());
+                }
+                match std::str::from_utf8(rest) {
+                    Ok(text) => {
+                        check_limit(
+                            self.text.len() + text.len(),
+                            max_decoded,
+                            CodecLimitKind::DecodedUtf8Bytes,
+                        )?;
+                        self.text.push_str(text);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let valid = e.valid_up_to();
+                        check_limit(
+                            self.text.len() + valid,
+                            max_decoded,
+                            CodecLimitKind::DecodedUtf8Bytes,
+                        )?;
+                        let prefix = std::str::from_utf8(&rest[..valid]).expect("valid prefix");
+                        self.text.push_str(prefix);
+                        // Feed the remaining bytes through the incremental
+                        // validator: an interior error carries its exact
+                        // position; a trailing incomplete suffix is held.
+                        let start = idx + valid;
+                        for (offset, byte) in chunk[start..].iter().enumerate() {
+                            state.feed(
+                                *byte,
+                                base + start + offset,
+                                &mut self.text,
+                                max_decoded,
+                            )?;
+                        }
+                        Ok(())
+                    }
+                }
             }
             Phase::Active(ActiveState::Utf16(state)) => {
                 let max_decoded = self.limits.max_decoded_utf8_bytes;
@@ -211,7 +246,7 @@ impl StreamingDecoder {
         match self.policy {
             DecodePolicy::Explicit(format) => {
                 let sig = format.encoding().signature();
-                if !format.has_bom() {
+                if !format.bom() {
                     // Explicit BOM-less never strips signatures.
                     self.activate(format, 0, &pending)
                 } else if pending.starts_with(sig) {
@@ -286,7 +321,7 @@ impl StreamingDecoder {
         match self.policy {
             DecodePolicy::Explicit(format) => {
                 let sig = format.encoding().signature();
-                if !format.has_bom() {
+                if !format.bom() {
                     return self.activate(format, 0, pending);
                 }
                 if pending == sig {
@@ -631,17 +666,18 @@ impl StreamingEncoder {
         )?;
         if !self.signature_written {
             self.signature_written = true;
-            if self.format.has_bom() {
+            if self.format.bom() {
                 let sig = self.format.encoding().signature();
                 self.write_bytes(sig, out)?;
             }
         }
-        for sub in chunk_at_char_boundary(text, CANCEL_CHECK_BYTES) {
+        let mut write_chunk = |sub: &str| -> Result<(), CodecError> {
             if cancel.is_cancelled() {
                 return Err(CodecError::Cancelled);
             }
-            self.push_sub(sub, out)?;
-        }
+            self.push_sub(sub, out)
+        };
+        for_each_char_boundary_chunk(text, CANCEL_CHECK_BYTES, &mut write_chunk)?;
         self.input_pos = new_pos;
         Ok(())
     }
@@ -728,10 +764,13 @@ impl StreamingEncoder {
     }
 }
 
-/// Split `text` into slices of at most `max_bytes`, each ending on a char
-/// boundary.
-fn chunk_at_char_boundary(text: &str, max_bytes: usize) -> Vec<&str> {
-    let mut slices = Vec::new();
+/// Run `f` over slices of `text` of at most `max_bytes`, each ending on a
+/// char boundary, without materializing the slice list.
+fn for_each_char_boundary_chunk(
+    text: &str,
+    max_bytes: usize,
+    f: &mut dyn FnMut(&str) -> Result<(), CodecError>,
+) -> Result<(), CodecError> {
     let bytes = text.as_bytes();
     let mut start = 0usize;
     while start < bytes.len() {
@@ -747,10 +786,10 @@ fn chunk_at_char_boundary(text: &str, max_bytes: usize) -> Vec<&str> {
                     .next()
                     .map_or(bytes.len() - start, char::len_utf8);
         }
-        slices.push(&text[start..end]);
+        f(&text[start..end])?;
         start = end;
     }
-    slices
+    Ok(())
 }
 
 /// Streaming encode convenience: encode `text` in one push.
@@ -813,7 +852,7 @@ mod tests {
         decoder.push(&[0xDE], &CancelToken::new()).unwrap();
         let outcome = decoder.finish().unwrap();
         assert_eq!(outcome.text(), "\u{1F600}");
-        assert!(outcome.format().has_bom());
+        assert!(outcome.format().bom());
 
         let mut decoder = StreamingDecoder::new(DecodePolicy::Auto, DecodeLimits::default());
         decoder
@@ -883,15 +922,17 @@ mod tests {
     #[test]
     fn chunk_at_char_boundary_respects_scalars() {
         let text = "a\u{1F600}b";
-        let slices = chunk_at_char_boundary(text, 2);
-        let joined: String = slices.iter().copied().collect();
-        assert_eq!(joined, text);
+        let mut joined = String::new();
         let mut offset = 0usize;
-        for slice in &slices {
+        for_each_char_boundary_chunk(text, 2, &mut |slice| {
+            joined.push_str(slice);
             assert!(text.is_char_boundary(offset));
             offset += slice.len();
             assert!(text.is_char_boundary(offset));
-        }
+            Ok(())
+        })
+        .expect("chunks collect");
+        assert_eq!(joined, text);
         assert_eq!(offset, text.len());
     }
 
@@ -905,7 +946,7 @@ mod tests {
             .unwrap();
         let outcome = decoder.finish().unwrap();
         assert_eq!(outcome.text(), "");
-        assert!(outcome.format().has_bom());
+        assert!(outcome.format().bom());
 
         // Truncated signature at finish is a conflict, not a guess.
         let mut decoder = StreamingDecoder::new(policy, DecodeLimits::default());

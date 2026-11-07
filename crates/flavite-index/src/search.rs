@@ -111,37 +111,6 @@ impl TantivyBackend {
         self.fields
     }
 
-    /// The pinned analyzer for term/phrase leaves.
-    #[must_use]
-    pub fn analyzer(&self) -> Option<TextAnalyzer> {
-        self.index.tokenizers().get("flavite")
-    }
-
-    /// Publish the search checkpoint atomically (same format as before:
-    /// `epoch:generation`). Called by the SQL owner after a committed
-    /// acknowledgement, never by the writer thread.
-    ///
-    /// # Errors
-    /// Returns an error when the checkpoint file cannot be written or
-    /// synced.
-    pub fn publish_checkpoint(&self, epoch: u64, generation: u64) -> Result<(), SearchError> {
-        use std::io::Write;
-        let path = self.index_dir.join("checkpoint");
-        let temp = self.index_dir.join("checkpoint.tmp");
-        let mut f = std::fs::File::create(&temp)?;
-        write!(f, "{epoch}:{generation}")?;
-        f.sync_all()?;
-        std::fs::rename(temp, path)?;
-        Ok(())
-    }
-
-    /// Read the durable checkpoint payload, if any.
-    ///
-    /// # Errors
-    /// Returns an error when the checkpoint file cannot be read.
-    pub fn checkpoint(&self) -> Result<Vec<u8>, SearchError> {
-        Ok(std::fs::read(self.index_dir.join("checkpoint")).unwrap_or_default())
-    }
 }
 
 /// A searcher captured by the ordered writer, stamped with the generation
@@ -397,9 +366,6 @@ pub enum SearchError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("Index not initialized")]
-    NotInitialized,
 
     #[error("Tantivy error: {0}")]
     Tantivy(String),

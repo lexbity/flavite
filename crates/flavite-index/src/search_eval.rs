@@ -156,14 +156,6 @@ impl Bitset {
             .is_some_and(|word| word >> (ordinal % 64) & 1 == 1)
     }
 
-    #[must_use]
-    pub fn intersects(&self, other: &Self) -> bool {
-        self.words
-            .iter()
-            .zip(other.words.iter())
-            .any(|(a, b)| a & b != 0)
-    }
-
     /// Set ordinals in ascending order.
     pub fn iter_ordinals(&self) -> impl Iterator<Item = u32> + '_ {
         self.words
@@ -219,16 +211,6 @@ pub enum Nnf {
     Not(usize),
     And(Box<Nnf>, Box<Nnf>),
     Or(Box<Nnf>, Box<Nnf>),
-}
-
-impl Nnf {
-    #[must_use]
-    pub fn node_count(&self) -> usize {
-        match self {
-            Self::All | Self::None | Self::Leaf(_) | Self::Not(_) => 1,
-            Self::And(a, b) | Self::Or(a, b) => 1 + a.node_count() + b.node_count(),
-        }
-    }
 }
 
 /// Normalize `query` to NNF, deduplicating identical leaves so they share
@@ -324,14 +306,15 @@ fn leaf_index(query: &Query, leaves: &mut Vec<Query>) -> usize {
     leaves.len() - 1
 }
 
-/// One evaluated row: note identity, canonical native path and the summed
-/// score of distinct positive text leaves. Rows from a tree with no
-/// positive text leaf carry `None` (structural-only, D11); zero-score rows
-/// under a mixed tree keep `Some(0.0)` so ordering stays total (§6.3).
+/// One evaluated row: note identity and the summed score of distinct
+/// positive text leaves. Rows from a tree with no positive text leaf carry
+/// `None` (structural-only, D11); zero-score rows under a mixed tree keep
+/// `Some(0.0)` so ordering stays total (§6.3). Rows are produced in
+/// canonical `(path_native, note_id)` order, so the final stable
+/// score-descending sort keeps that tiebreak without cloning paths.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScoredNote {
     pub note_id: i64,
-    pub path_native: Vec<u8>,
     pub score: Option<f32>,
 }
 
@@ -370,19 +353,19 @@ pub fn evaluate(query: &Query, snapshot: &Snapshot<'_>) -> Result<Vec<ScoredNote
         }
     }
     // Evaluate every leaf once; identical leaves share the result.
-    let mut leaf_sets: Vec<Option<(Bitset, HashMap<u32, f32>)>> = Vec::with_capacity(leaves.len());
+    let mut leaf_sets: Vec<Option<(Bitset, Vec<f32>)>> = Vec::with_capacity(leaves.len());
     for leaf in &leaves {
         leaf_sets.push(eval_leaf(leaf, snapshot)?);
     }
     // Mask-bit -> leaf score table for the root sum.
-    let bit_scores: Vec<(u64, &HashMap<u32, f32>)> = leaves
+    let bit_scores: Vec<(u64, &[f32])> = leaves
         .iter()
         .enumerate()
         .filter_map(|(index, leaf)| {
             if let Query::Text(_) = leaf {
                 let bit = leaf_mask_bits.get(&index)?;
                 let scores = leaf_sets.get(index)?.as_ref()?;
-                Some((*bit, &scores.1))
+                Some((*bit, scores.1.as_slice()))
             } else {
                 None
             }
@@ -396,11 +379,17 @@ pub fn evaluate(query: &Query, snapshot: &Snapshot<'_>) -> Result<Vec<ScoredNote
     let has_positive_text = !bit_scores.is_empty();
     let mut rows = Vec::new();
     for ordinal in root_set.iter_ordinals() {
-        let mask = root_masks.get(&ordinal).copied().unwrap_or(0);
+        let mask = root_masks
+            .get(usize::try_from(ordinal).unwrap_or(usize::MAX))
+            .copied()
+            .unwrap_or(0);
         let mut score = 0.0f32;
         for (bit, scores) in &bit_scores {
             if mask & bit != 0 {
-                score += scores.get(&ordinal).copied().unwrap_or(0.0);
+                score += scores
+                    .get(usize::try_from(ordinal).unwrap_or(usize::MAX))
+                    .copied()
+                    .unwrap_or(0.0);
             }
         }
         if !score.is_finite() {
@@ -408,54 +397,57 @@ pub fn evaluate(query: &Query, snapshot: &Snapshot<'_>) -> Result<Vec<ScoredNote
         }
         let score = has_positive_text.then_some(score);
         let index = usize::try_from(ordinal).unwrap_or(usize::MAX);
-        let path_native = snapshot
-            .universe
-            .paths
-            .get(index)
-            .cloned()
-            .unwrap_or_default();
         let note_id = snapshot
             .universe
             .ids
             .get(index)
             .copied()
             .unwrap_or_default();
-        rows.push(ScoredNote {
-            note_id,
-            path_native,
-            score,
-        });
+        rows.push(ScoredNote { note_id, score });
     }
     // Complete ordering: score descending, then canonical native PathKey
-    // bytes ascending, then note ID (D-07). Negative-only/structural
-    // queries all score zero, collapsing to native path order.
+    // bytes ascending, then note ID (D-07). `iter_ordinals` yields the
+    // universe's canonical `ORDER BY path_native, note_id` order, so a
+    // STABLE sort on score alone preserves that exact tiebreak without
+    // cloning any path bytes.
     rows.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.path_native.cmp(&b.path_native))
-            .then_with(|| a.note_id.cmp(&b.note_id))
     });
     Ok(rows)
 }
 
+/// Contributing-leaf masks in dense ordinal order; zero where an ordinal is
+/// not retained or carries no positive text bit. At 50k ordinals this is
+/// 400 KiB per fold node (transient, depth-bounded), versus ~10x that in
+/// per-entry hashing for the previous map shape.
+type Masks = Vec<u64>;
+
 fn fold_masks(
     nnf: &Nnf,
-    leaf_sets: &[Option<(Bitset, HashMap<u32, f32>)>],
+    leaf_sets: &[Option<(Bitset, Vec<f32>)>],
     leaf_mask_bits: &HashMap<usize, u64>,
     universe_len: usize,
-) -> (Bitset, HashMap<u32, u64>) {
+) -> (Bitset, Masks) {
     match nnf {
-        Nnf::All => (Bitset::full(universe_len), HashMap::new()),
-        Nnf::None => (Bitset::empty(universe_len), HashMap::new()),
+        Nnf::All => (Bitset::full(universe_len), Vec::new()),
+        Nnf::None => (Bitset::empty(universe_len), Vec::new()),
         Nnf::Leaf(index) => {
             let Some(Some((set, _))) = leaf_sets.get(*index) else {
-                return (Bitset::empty(universe_len), HashMap::new());
+                return (Bitset::empty(universe_len), Vec::new());
             };
-            let masks: HashMap<u32, u64> = if let Some(bit) = leaf_mask_bits.get(index) {
-                set.iter_ordinals().map(|ord| (ord, *bit)).collect()
+            let masks: Masks = if let Some(bit) = leaf_mask_bits.get(index) {
+                let mut masks = vec![0u64; universe_len];
+                for ordinal in set.iter_ordinals() {
+                    let index = usize::try_from(ordinal).unwrap_or(usize::MAX);
+                    if let Some(slot) = masks.get_mut(index) {
+                        *slot = *bit;
+                    }
+                }
+                masks
             } else {
-                HashMap::new()
+                Vec::new()
             };
             (set.clone(), masks)
         }
@@ -465,7 +457,7 @@ fn fold_masks(
                 .and_then(|entry| entry.as_ref().map(|(set, _)| set.clone()))
                 .unwrap_or_else(|| Bitset::empty(universe_len));
             // Negative leaves contribute mask zero (§6.3).
-            (set.complement(universe_len), HashMap::new())
+            (set.complement(universe_len), Vec::new())
         }
         Nnf::And(a, b) => {
             let (set_a, masks_a) = fold_masks(a, leaf_sets, leaf_mask_bits, universe_len);
@@ -473,12 +465,13 @@ fn fold_masks(
             let set = set_a.intersect(&set_b);
             // Union contributing masks from both satisfied branches for
             // retained IDs (§6.3).
-            let mut masks = HashMap::new();
+            let mut masks = vec![0u64; universe_len];
             for ordinal in set.iter_ordinals() {
-                let mask = masks_a.get(&ordinal).copied().unwrap_or(0)
-                    | masks_b.get(&ordinal).copied().unwrap_or(0);
-                if mask != 0 {
-                    masks.insert(ordinal, mask);
+                let index = usize::try_from(ordinal).unwrap_or(usize::MAX);
+                let mask = masks_a.get(index).copied().unwrap_or(0)
+                    | masks_b.get(index).copied().unwrap_or(0);
+                if let Some(slot) = masks.get_mut(index) {
+                    *slot = mask;
                 }
             }
             (set, masks)
@@ -489,12 +482,13 @@ fn fold_masks(
             let set = set_a.union(&set_b);
             // Union masks of satisfied branches: an ID retained from branch
             // A carries A's mask; from both, the union (§6.3).
-            let mut masks = HashMap::new();
+            let mut masks = vec![0u64; universe_len];
             for ordinal in set.iter_ordinals() {
-                let mask = masks_a.get(&ordinal).copied().unwrap_or(0)
-                    | masks_b.get(&ordinal).copied().unwrap_or(0);
-                if mask != 0 {
-                    masks.insert(ordinal, mask);
+                let index = usize::try_from(ordinal).unwrap_or(usize::MAX);
+                let mask = masks_a.get(index).copied().unwrap_or(0)
+                    | masks_b.get(index).copied().unwrap_or(0);
+                if let Some(slot) = masks.get_mut(index) {
+                    *slot = mask;
                 }
             }
             (set, masks)
@@ -508,7 +502,7 @@ fn fold_masks(
 fn eval_leaf(
     leaf: &Query,
     snapshot: &Snapshot<'_>,
-) -> Result<Option<(Bitset, HashMap<u32, f32>)>, EvalError> {
+) -> Result<Option<(Bitset, Vec<f32>)>, EvalError> {
     match leaf {
         Query::Text(text_leaf) => {
             let limit = snapshot
@@ -523,7 +517,8 @@ fn eval_leaf(
                 .leaf_hits(text_leaf, limit)
                 .map_err(|error| EvalError::Search(error.to_string()))?;
             let mut set = Bitset::empty(snapshot.universe.len());
-            let mut scores: HashMap<u32, f32> = HashMap::new();
+            // Dense per-ordinal score table: no hashing on the hot path.
+            let mut scores = vec![0.0f32; snapshot.universe.len()];
             for hit in hits {
                 if !hit.score.is_finite() {
                     return Err(EvalError::NonFiniteScore);
@@ -532,7 +527,10 @@ fn eval_leaf(
                     set.set(ordinal);
                     // The captured searcher's score for this leaf; identical
                     // leaves share one evaluation.
-                    scores.insert(ordinal, hit.score);
+                    let index = usize::try_from(ordinal).unwrap_or(usize::MAX);
+                    if let Some(slot) = scores.get_mut(index) {
+                        *slot = hit.score;
+                    }
                 }
             }
             Ok(Some((set, scores)))
@@ -559,7 +557,7 @@ fn eval_leaf(
                     set.set(ordinal);
                 }
             }
-            Ok(Some((set, HashMap::new())))
+            Ok(Some((set, Vec::new())))
         }
     }
 }

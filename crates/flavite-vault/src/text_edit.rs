@@ -189,16 +189,6 @@ pub fn prepare_ops(
     )
 }
 
-/// Like [`prepare_ops`], but helper permits are taken from the Bulk class
-/// (RFC-0006 §6.2: bulk source operations cannot occupy the interactive
-/// reservation). Used by vault-wide source scans (S07).
-pub fn prepare_ops_bulk(
-    text: &str,
-    request: &ReplaceRequest,
-) -> Result<(Vec<EditOp>, u64, u64), PrepareError> {
-    prepare_ops_with_class(text, request, crate::text_worker::HelperPermitClass::Bulk)
-}
-
 fn prepare_ops_with_class(
     text: &str,
     request: &ReplaceRequest,
@@ -226,12 +216,6 @@ pub fn prepare_find(text: &str, request: &FindRequest) -> Result<FindOutcome, Pr
         request,
         crate::text_worker::HelperPermitClass::Interactive,
     )
-}
-
-/// Like [`prepare_find`] with Bulk-class helper permits (vault-wide source
-/// find, S07).
-pub fn prepare_find_bulk(text: &str, request: &FindRequest) -> Result<FindOutcome, PrepareError> {
-    prepare_find_with_class(text, request, crate::text_worker::HelperPermitClass::Bulk)
 }
 
 fn prepare_find_with_class(

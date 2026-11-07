@@ -157,27 +157,6 @@ impl ReplacementTemplate {
         Ok(total)
     }
 
-    /// Expansion strings paired with the original match spans (§4.1: the
-    /// matcher returns "expansion strings paired with those spans", never a
-    /// generic edit model).
-    ///
-    /// # Errors
-    ///
-    /// Same as [`ReplacementTemplate::expand`], evaluated per match.
-    pub fn expand_pairs(
-        &self,
-        matcher: &Matcher,
-        text: &str,
-        hits: &[Match],
-    ) -> Result<Vec<(Span<TextByte>, String)>, TemplateError> {
-        hits.iter()
-            .map(|found| {
-                let expansion = self.expand(matcher, text, found)?;
-                Ok((found.span, expansion))
-            })
-            .collect()
-    }
-
     /// Exact total output length after replacing every match, checked
     /// against `budget` before any buffer reservation (§6.2).
     ///
@@ -465,11 +444,10 @@ mod tests {
         let matcher = regex_matcher("(a+)(b+)");
         let found = matcher.find("xaabbyabb").unwrap();
         assert_eq!(found.len(), 2);
-        let pairs = template
-            .expand_pairs(&matcher, "xaabbyabb", &found)
-            .unwrap();
-        assert_eq!(pairs[0], (found[0].span, "[aa|bb|aabb]".to_owned()));
-        assert_eq!(pairs[1], (found[1].span, "[a|bb|abb]".to_owned()));
+        let first = template.expand(&matcher, "xaabbyabb", &found[0]).unwrap();
+        let second = template.expand(&matcher, "xaabbyabb", &found[1]).unwrap();
+        assert_eq!(first, "[aa|bb|aabb]");
+        assert_eq!(second, "[a|bb|abb]");
     }
 
     #[test]

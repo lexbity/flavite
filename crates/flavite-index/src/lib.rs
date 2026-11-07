@@ -35,7 +35,6 @@ pub mod query;
 pub mod resolver;
 pub mod schema;
 pub mod search;
-pub mod search_docs;
 pub mod search_eval;
 pub mod search_session;
 pub mod search_writer;
@@ -64,8 +63,6 @@ pub use pool::*;
 // Re-export search items
 pub use search::*;
 
-// Re-export search_docs items (but not SearchDoc which conflicts with types)
-pub use search_docs::{SearchDocBatch, SearchDocCache, SearchDocUpdate};
 
 // Re-export the generation broadcast types (RFC-0005 §5.1): the only
 // writer-side signal surface.

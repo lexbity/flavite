@@ -4,10 +4,10 @@
 use std::sync::Arc;
 
 use crate::format::{
-    CancelToken, CodecError, CodecLimitKind, DecodeLimits, DecodePolicy, FileEncoding,
-    SourceFormat, check_limit,
+    CANCEL_CHECK_BYTES, CancelToken, CodecError, CodecLimitKind, DecodeLimits, DecodePolicy,
+    FileEncoding, SourceFormat, check_limit,
 };
-use crate::map::DecodeMap;
+use crate::map::{DecodeMap, scan_utf16};
 
 /// Successfully decoded content: UTF-8 text, the resolved
 /// [`SourceFormat`] and a checked [`DecodeMap`] sharing the original bytes.
@@ -47,15 +47,12 @@ impl DecodedContent {
     pub fn source(&self) -> &std::sync::Arc<[u8]> {
         self.map.source_bytes()
     }
-
-    /// Consume into the decoded UTF-8 text.
-    #[must_use]
-    pub fn into_text(self) -> String {
-        self.text
-    }
 }
 
 /// Decode encoded source bytes under `policy` into UTF-8 content.
+///
+/// The map shares one immutable copy of the source bytes; callers holding
+/// borrowed slices accept that single copy at this boundary.
 ///
 /// # Errors
 ///
@@ -71,21 +68,6 @@ pub fn decode(
     decode_inner(Arc::from(source), policy, limits, cancel)
 }
 
-/// Like [`decode`], sharing an already-immutable source buffer instead of
-/// copying it for the decode map.
-///
-/// # Errors
-///
-/// Same as [`decode`].
-pub fn decode_shared(
-    source: Arc<[u8]>,
-    policy: DecodePolicy,
-    limits: &DecodeLimits,
-    cancel: &CancelToken,
-) -> Result<DecodedContent, CodecError> {
-    decode_inner(source, policy, limits, cancel)
-}
-
 fn decode_inner(
     source: Arc<[u8]>,
     policy: DecodePolicy,
@@ -99,18 +81,29 @@ fn decode_inner(
 
     let (format, sig_len) = resolve_format(&source, policy)?;
     let body = &source[sig_len..];
-    let text = match format.encoding() {
-        FileEncoding::Ascii => decode_ascii(body, sig_len, limits.max_decoded_utf8_bytes)?,
-        FileEncoding::Utf8 => decode_utf8(body, sig_len, limits.max_decoded_utf8_bytes)?,
-        FileEncoding::Utf16Le | FileEncoding::Utf16Be => decode_utf16(
-            body,
-            format.encoding(),
-            sig_len,
-            limits.max_decoded_utf8_bytes,
-        )?,
+    let (text, map) = match format.encoding() {
+        FileEncoding::Ascii => {
+            let text = decode_ascii(body, sig_len, limits.max_decoded_utf8_bytes, cancel)?;
+            (text, DecodeMap::identity(source, format))
+        }
+        FileEncoding::Utf8 => {
+            let text = decode_utf8(body, sig_len, limits.max_decoded_utf8_bytes, cancel)?;
+            (text, DecodeMap::identity(source, format))
+        }
+        FileEncoding::Utf16Le | FileEncoding::Utf16Be => {
+            let mut scan = scan_utf16(
+                body,
+                format.encoding(),
+                sig_len,
+                limits.max_decoded_utf8_bytes,
+                limits.max_map_bytes,
+                cancel,
+            )?;
+            let text = std::mem::take(&mut scan.text);
+            (text, DecodeMap::from_utf16_scan(source, format, scan))
+        }
     };
 
-    let map = DecodeMap::build(source, format, limits.max_map_bytes)?;
     Ok(DecodedContent { text, format, map })
 }
 
@@ -123,7 +116,7 @@ fn resolve_format(
         DecodePolicy::Auto => auto_signature(source),
         DecodePolicy::Explicit(format) => {
             let sig = format.encoding().signature();
-            if format.has_bom() {
+            if format.bom() {
                 if source.starts_with(sig) {
                     Ok((format, sig.len()))
                 } else {
@@ -170,49 +163,87 @@ fn auto_signature(source: &[u8]) -> Result<(SourceFormat, usize), CodecError> {
     Ok((SourceFormat::new_unchecked(FileEncoding::Utf8, false), 0))
 }
 
-fn decode_utf8(body: &[u8], sig_len: usize, max_decoded: u64) -> Result<String, CodecError> {
-    check_limit(body.len(), max_decoded, CodecLimitKind::DecodedUtf8Bytes)?;
-    match std::str::from_utf8(body) {
-        Ok(text) => Ok(text.to_owned()),
-        Err(e) => Err(CodecError::InvalidUtf8 {
-            source_byte: e.valid_up_to() + sig_len,
-        }),
-    }
-}
-
-fn decode_ascii(body: &[u8], sig_len: usize, max_decoded: u64) -> Result<String, CodecError> {
-    check_limit(body.len(), max_decoded, CodecLimitKind::DecodedUtf8Bytes)?;
-    if let Some(idx) = body.iter().position(|b| *b >= 0x80) {
-        return Err(CodecError::InvalidUtf8 {
-            source_byte: idx + sig_len,
-        });
-    }
-    // All bytes are ASCII, therefore valid UTF-8.
-    Ok(String::from_utf8(body.to_vec()).unwrap_or_default())
-}
-
-fn decode_utf16(
+/// Strict UTF-8 decode in [`CANCEL_CHECK_BYTES`] chunks: cancellation is
+/// checked at least every 64 KiB of raw progress (NFR-19) while each chunk
+/// still validates through the standard library's `from_utf8`.
+fn decode_utf8(
     body: &[u8],
-    encoding: FileEncoding,
     sig_len: usize,
     max_decoded: u64,
+    cancel: &CancelToken,
 ) -> Result<String, CodecError> {
-    if !body.len().is_multiple_of(2) {
-        return Err(CodecError::OddUtf16ByteCount);
+    check_limit(body.len(), max_decoded, CodecLimitKind::DecodedUtf8Bytes)?;
+    let mut out = String::with_capacity(body.len());
+    let mut start = 0usize;
+    while start < body.len() {
+        let end = body.len().min(start + CANCEL_CHECK_BYTES);
+        if cancel.is_cancelled() {
+            return Err(CodecError::Cancelled);
+        }
+        match std::str::from_utf8(&body[start..end]) {
+            Ok(text) => {
+                check_limit(
+                    out.len() + text.len(),
+                    max_decoded,
+                    CodecLimitKind::DecodedUtf8Bytes,
+                )?;
+                out.push_str(text);
+                start = end;
+            }
+            Err(e) if e.error_len().is_none() && end < body.len() => {
+                // The chunk boundary split a multibyte sequence: the valid
+                // prefix is real and the (≤3 byte) incomplete tail leads the
+                // next chunk. A non-final chunk is CANCEL_CHECK_BYTES long,
+                // so the tail can never swallow the whole chunk here.
+                let valid = e.valid_up_to();
+                check_limit(
+                    out.len() + valid,
+                    max_decoded,
+                    CodecLimitKind::DecodedUtf8Bytes,
+                )?;
+                let prefix = std::str::from_utf8(&body[start..start + valid])
+                    .expect("valid_up_to prefix is valid UTF-8");
+                out.push_str(prefix);
+                start += valid;
+            }
+            Err(e) => {
+                return Err(CodecError::InvalidUtf8 {
+                    source_byte: start + e.valid_up_to() + sig_len,
+                });
+            }
+        }
     }
-    let unit_count = body.len() / 2;
-    let mut out = String::new();
-    let mut unit_index = 0;
-    while unit_index < unit_count {
-        let (scalar, pair_len) = decode_scalar_at(body, encoding, unit_index, sig_len)?;
-        let len = scalar.len_utf8();
+    Ok(out)
+}
+
+/// Strict ASCII decode in [`CANCEL_CHECK_BYTES`] chunks (NFR-19).
+fn decode_ascii(
+    body: &[u8],
+    sig_len: usize,
+    max_decoded: u64,
+    cancel: &CancelToken,
+) -> Result<String, CodecError> {
+    check_limit(body.len(), max_decoded, CodecLimitKind::DecodedUtf8Bytes)?;
+    let mut out = String::with_capacity(body.len());
+    let mut start = 0usize;
+    while start < body.len() {
+        let end = body.len().min(start + CANCEL_CHECK_BYTES);
+        if cancel.is_cancelled() {
+            return Err(CodecError::Cancelled);
+        }
+        if let Some(idx) = body[start..end].iter().position(|b| *b >= 0x80) {
+            return Err(CodecError::InvalidUtf8 {
+                source_byte: start + idx + sig_len,
+            });
+        }
         check_limit(
-            out.len() + len,
+            out.len() + (end - start),
             max_decoded,
             CodecLimitKind::DecodedUtf8Bytes,
         )?;
-        out.push(scalar);
-        unit_index += pair_len / 2;
+        // All bytes are ASCII, therefore valid UTF-8.
+        out.push_str(std::str::from_utf8(&body[start..end]).unwrap_or_default());
+        start = end;
     }
     Ok(out)
 }

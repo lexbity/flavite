@@ -3,10 +3,10 @@
 //! Flavite MUST preserve byte-exact round-trips for unedited files and maintain
 //! mixed-EOL files without normalization. This is achieved via:
 //!
-//! 1. A bitmap recording LF/CRLF/None per line
-//! 2. Explicit BOM flag
-//! 3. Explicit trailing-newline flag
-//! 4. A serialization pass that reconstructs the original bytes
+//! 1. A table recording LF/CRLF/None per line (the BOM lives in the
+//!    `SourceFormat` descriptor, never here)
+//! 2. An explicit trailing-newline flag
+//! 3. A serialization pass that reconstructs the original bytes
 //!
 //! Newly inserted lines inherit the dominant EOL of the file; edits and their
 //! undo carry EOL metadata so mixed-EOL state is preserved.

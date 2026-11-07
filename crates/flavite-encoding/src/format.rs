@@ -50,17 +50,6 @@ impl FileEncoding {
         }
     }
 
-    /// Stable lowercase name used by diagnostics and CLI output — never note
-    /// content.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Ascii => "ascii",
-            Self::Utf8 => "utf-8",
-            Self::Utf16Le => "utf-16le",
-            Self::Utf16Be => "utf-16be",
-        }
-    }
     /// Stable machine-readable code used in persisted records and wire DTOs
     /// (`"ascii"`, `"utf8"`, `"utf16le"`, `"utf16be"`; RFC-0006 §6.1/§6.10).
     #[must_use]
@@ -96,7 +85,8 @@ impl FileEncoding {
 
 /// The sole source-format descriptor, shared/re-exported across core and
 /// facade types (§6.10). Fields are private; every combination is validated
-/// at construction. ASCII+BOM is invalid.
+/// at construction (also at deserialization through the raw pair).
+/// ASCII+BOM is invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(
     feature = "serde",
@@ -135,13 +125,6 @@ impl SourceFormat {
     }
 
     /// Whether the descriptor carries the encoding's BOM signature.
-    #[must_use]
-    pub const fn has_bom(&self) -> bool {
-        self.bom
-    }
-
-    /// Whether the descriptor carries the encoding's BOM signature
-    /// (RFC-0006 S00 integration spelling of [`Self::has_bom`]).
     #[must_use]
     pub const fn bom(&self) -> bool {
         self.bom
@@ -261,12 +244,9 @@ pub const CODEC_VERSION: u32 = 1;
 /// A format stamp is what invalidates raw-hash/source-span observations even
 /// when the normalized text is byte-identical: two files with the same
 /// decoded text but different descriptors produce different stamps.
+/// Persisted records serialize the descriptor fields separately, so this
+/// type carries no serde representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Serialize, serde::Deserialize),
-    serde(deny_unknown_fields)
-)]
 pub struct FormatStamp {
     /// The authoritative descriptor.
     pub format: SourceFormat,
@@ -296,16 +276,6 @@ impl FormatStamp {
             codec_version: CODEC_VERSION,
             hint_generation: Some(hint_generation),
         }
-    }
-
-    /// True when both stamps describe the same descriptor and codec version;
-    /// the hint generation participates so a re-confirmed hint can
-    /// invalidate stale observations.
-    #[must_use]
-    pub fn is_compatible(&self, other: &Self) -> bool {
-        self.format == other.format
-            && self.codec_version == other.codec_version
-            && self.hint_generation == other.hint_generation
     }
 }
 

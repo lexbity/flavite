@@ -5,7 +5,6 @@
 use flavite_syntax::{Span, TextByte};
 use flavite_text_search::{
     MatchError, MatchLimits, MatchMode, MatchOptions, MatchPage, Matcher, PATTERN_MAX_BYTES,
-    select_ordinals,
 };
 use proptest::prelude::*;
 
@@ -159,7 +158,7 @@ fn replacement_length_is_computed_before_any_edit() {
 }
 
 #[test]
-fn pages_and_ordinals_compose() {
+fn pages_replay_idempotently() {
     let matcher = build("ab", MatchOptions::default());
     let found = matcher.find("ab ab ab ab").unwrap();
     assert_eq!(found.len(), 4);
@@ -168,7 +167,4 @@ fn pages_and_ordinals_compose() {
     assert_eq!(page.slice(&found).len(), 4);
     assert_eq!(page.slice(&found), page.slice(&found));
     assert!(!page.has_more(found.len()));
-    // Requested ordinals are deduplicated and stay ascending.
-    let picked = select_ordinals(&found, &[3, 0, 0]).unwrap();
-    assert_eq!(spans(&picked), vec![(0, 2), (9, 11)]);
 }

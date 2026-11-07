@@ -411,7 +411,7 @@ impl SearchSessionService {
             tx: &tx,
         };
         let scored = search_eval::evaluate(&query, &snapshot).map_err(map_eval)?;
-        let anchor_terms = text_terms(&query);
+        let anchor_terms = flavite_index::text_terms(&query);
         let rows =
             materialize_rows(&tx, &scored, &anchor_terms).map_err(SearchSessionError::Failed)?;
         drop(tx);
@@ -696,22 +696,6 @@ fn materialize_rows(
         });
     }
     Ok(rows)
-}
-
-/// Distinct text-leaf terms of the query, for excerpt anchoring.
-fn text_terms(query: &flavite_index::Query) -> Vec<String> {
-    match query {
-        flavite_index::Query::Text(leaf) => vec![leaf.term.clone()],
-        flavite_index::Query::And(parts) | flavite_index::Query::Or(parts) => {
-            let mut terms = Vec::new();
-            for part in parts {
-                terms.extend(text_terms(part));
-            }
-            terms
-        }
-        flavite_index::Query::Not(inner) => text_terms(inner),
-        _ => Vec::new(),
-    }
 }
 
 // ---------------------------------------------------------------------------

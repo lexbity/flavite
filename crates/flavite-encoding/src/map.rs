@@ -11,16 +11,95 @@
 use std::sync::Arc;
 
 use crate::decode::decode_scalar_at;
-use crate::format::{CodecError, CodecLimitKind, FileEncoding, SourceFormat, check_limit};
+use crate::format::{
+    CANCEL_CHECK_BYTES, CodecError, CodecLimitKind, FileEncoding, SourceFormat, check_limit,
+};
 
 /// Maximum scalar distance between adjacent checkpoints (§6.10, NFR-18).
 pub const CHECKPOINT_SCALARS: usize = 255;
 
 /// One sparse scalar-boundary checkpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Checkpoint {
+pub(crate) struct Checkpoint {
     source_byte: usize,
     decoded_byte: usize,
+}
+
+/// Fused result of the single UTF-16 decode pass: the decoded text, the
+/// sparse checkpoints collected along the way and the decoded byte length.
+pub(crate) struct Utf16Scan {
+    pub(crate) text: String,
+    pub(crate) checkpoints: Vec<Checkpoint>,
+    pub(crate) decoded_len: usize,
+}
+
+/// Decode UTF-16 `body` once, producing the text, the checkpoint table and
+/// the decoded length in a single scalar walk. The map budget is refused
+/// before any allocation (§6.10) and cancellation is checked at least every
+/// [`CANCEL_CHECK_BYTES`] of raw progress (NFR-19).
+pub(crate) fn scan_utf16(
+    body: &[u8],
+    encoding: FileEncoding,
+    bom_len: usize,
+    max_decoded: u64,
+    max_map_bytes: u64,
+    cancel: &crate::format::CancelToken,
+) -> Result<Utf16Scan, CodecError> {
+    let unit_count = body.len() / 2;
+    // Predicted checkpoint count for this body: refused before allocation.
+    let predicted_checkpoints = unit_count / CHECKPOINT_SCALARS + 1;
+    check_limit(
+        predicted_checkpoints.saturating_mul(std::mem::size_of::<Checkpoint>()),
+        max_map_bytes,
+        CodecLimitKind::MapBytes,
+    )?;
+    if !body.len().is_multiple_of(2) {
+        return Err(CodecError::OddUtf16ByteCount);
+    }
+    let mut checkpoints = Vec::with_capacity(predicted_checkpoints);
+    // Worst case is three UTF-8 bytes per two-byte BMP code unit.
+    let mut out = String::with_capacity(unit_count.saturating_mul(3));
+    let mut src = bom_len;
+    let mut dec = 0usize;
+    let mut since_last = 0usize;
+    checkpoints.push(Checkpoint {
+        source_byte: src,
+        decoded_byte: dec,
+    });
+    let mut next_cancel = bom_len + CANCEL_CHECK_BYTES;
+    let mut unit_index = 0usize;
+    while unit_index < unit_count {
+        let raw = bom_len + unit_index * 2;
+        if raw >= next_cancel {
+            if cancel.is_cancelled() {
+                return Err(CodecError::Cancelled);
+            }
+            next_cancel = raw + CANCEL_CHECK_BYTES;
+        }
+        let (scalar, pair_len) = decode_scalar_at(body, encoding, unit_index, bom_len)?;
+        check_limit(
+            dec + scalar.len_utf8(),
+            max_decoded,
+            CodecLimitKind::DecodedUtf8Bytes,
+        )?;
+        out.push(scalar);
+        src += pair_len;
+        dec += scalar.len_utf8();
+        unit_index += pair_len / 2;
+        since_last += 1;
+        if since_last == CHECKPOINT_SCALARS {
+            checkpoints.push(Checkpoint {
+                source_byte: src,
+                decoded_byte: dec,
+            });
+            since_last = 0;
+        }
+    }
+    Ok(Utf16Scan {
+        text: out,
+        checkpoints,
+        decoded_len: dec,
+    })
 }
 
 /// Maps byte positions of the original encoded source to byte positions of
@@ -42,43 +121,34 @@ pub struct DecodeMap {
 }
 
 impl DecodeMap {
-    pub(crate) fn build(
+    /// Map for a UTF-8/ASCII source: decode is a pure offset translation
+    /// past the BOM, so there is no checkpoint table.
+    pub(crate) fn identity(source: Arc<[u8]>, format: SourceFormat) -> Self {
+        let bom_len = format.bom_len();
+        let decoded_len = source.len() - bom_len;
+        Self {
+            source,
+            format,
+            bom_len,
+            decoded_len,
+            checkpoints: Arc::from([]),
+        }
+    }
+
+    /// Map for a UTF-16 source from the fused decode scan; the scan already
+    /// refused the map budget before allocation.
+    pub(crate) fn from_utf16_scan(
         source: Arc<[u8]>,
         format: SourceFormat,
-        max_map_bytes: u64,
-    ) -> Result<Self, CodecError> {
-        let bom_len = if format.has_bom() {
-            format.encoding().signature().len()
-        } else {
-            0
-        };
-        match format.encoding() {
-            FileEncoding::Ascii | FileEncoding::Utf8 => {
-                let decoded_len = source.len() - bom_len;
-                Ok(Self {
-                    source,
-                    format,
-                    bom_len,
-                    decoded_len,
-                    checkpoints: Arc::from([]),
-                })
-            }
-            FileEncoding::Utf16Le | FileEncoding::Utf16Be => {
-                let checkpoints = build_utf16_checkpoints(&source, format.encoding(), bom_len)?;
-                check_limit(
-                    checkpoints.len() * std::mem::size_of::<Checkpoint>(),
-                    max_map_bytes,
-                    CodecLimitKind::MapBytes,
-                )?;
-                let decoded_len = utf16_decoded_len(&source, format.encoding(), bom_len)?;
-                Ok(Self {
-                    source,
-                    format,
-                    bom_len,
-                    decoded_len,
-                    checkpoints: Arc::from(checkpoints),
-                })
-            }
+        scan: Utf16Scan,
+    ) -> Self {
+        let bom_len = format.bom_len();
+        Self {
+            source,
+            format,
+            bom_len,
+            decoded_len: scan.decoded_len,
+            checkpoints: Arc::from(scan.checkpoints),
         }
     }
 
@@ -97,18 +167,6 @@ impl DecodeMap {
     #[must_use]
     pub const fn bom_len(&self) -> usize {
         self.bom_len
-    }
-
-    /// Length of the original encoded source bytes.
-    #[must_use]
-    pub fn source_len(&self) -> usize {
-        self.source.len()
-    }
-
-    /// Length of the decoded UTF-8 content bytes.
-    #[must_use]
-    pub const fn decoded_len(&self) -> usize {
-        self.decoded_len
     }
 
     /// Map an original source byte offset to the decoded UTF-8 byte offset.
@@ -232,56 +290,6 @@ impl DecodeMap {
     }
 }
 
-fn build_utf16_checkpoints(
-    source: &[u8],
-    encoding: FileEncoding,
-    bom_len: usize,
-) -> Result<Vec<Checkpoint>, CodecError> {
-    let body = &source[bom_len..];
-    let unit_count = body.len() / 2;
-    let mut checkpoints = Vec::new();
-    let mut src = bom_len;
-    let mut dec = 0usize;
-    let mut since_last = 0usize;
-    checkpoints.push(Checkpoint {
-        source_byte: src,
-        decoded_byte: dec,
-    });
-    let mut unit_index = 0;
-    while unit_index < unit_count {
-        let (scalar, pair_len) = decode_scalar_at(body, encoding, unit_index, bom_len)?;
-        src += pair_len;
-        dec += scalar.len_utf8();
-        unit_index += pair_len / 2;
-        since_last += 1;
-        if since_last == CHECKPOINT_SCALARS {
-            checkpoints.push(Checkpoint {
-                source_byte: src,
-                decoded_byte: dec,
-            });
-            since_last = 0;
-        }
-    }
-    Ok(checkpoints)
-}
-
-fn utf16_decoded_len(
-    source: &[u8],
-    encoding: FileEncoding,
-    bom_len: usize,
-) -> Result<usize, CodecError> {
-    let body = &source[bom_len..];
-    let unit_count = body.len() / 2;
-    let mut dec = 0usize;
-    let mut unit_index = 0;
-    while unit_index < unit_count {
-        let (scalar, pair_len) = decode_scalar_at(body, encoding, unit_index, bom_len)?;
-        dec += scalar.len_utf8();
-        unit_index += pair_len / 2;
-    }
-    Ok(dec)
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -303,8 +311,6 @@ mod tests {
         let decoded = decode_auto(&source);
         let map = decoded.map();
         assert_eq!(map.bom_len(), 3);
-        assert_eq!(map.source_len(), 7);
-        assert_eq!(map.decoded_len(), 4);
         // BOM interior is illegal; position after the BOM is legal.
         assert_eq!(map.source_to_decoded(0), None);
         assert_eq!(map.source_to_decoded(2), None);

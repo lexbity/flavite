@@ -92,7 +92,17 @@ impl Default for MatchLimits {
 pub struct Match {
     /// Whole-match span (capture group 0) in `TextByte` coordinates.
     pub span: Span<TextByte>,
-    groups: Arc<[Option<Span<TextByte>>]>,
+    groups: Groups,
+}
+
+/// Capture-group storage: the common whole-match-only case carries no heap
+/// allocation; capture-bearing matches share the group table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Groups {
+    /// Only the whole match (group 0), already stored in [`Match::span`].
+    Whole,
+    /// Explicit capture-group spans (group 0 included).
+    Many(Arc<[Option<Span<TextByte>>]>),
 }
 
 impl Match {
@@ -102,23 +112,42 @@ impl Match {
     /// engine-private.
     #[must_use]
     pub fn new(span: Span<TextByte>, groups: Vec<Option<Span<TextByte>>>) -> Self {
+        let groups = if groups.len() == 1 {
+            Groups::Whole
+        } else {
+            Groups::Many(groups.into())
+        };
+        Self { span, groups }
+    }
+
+    /// A whole-match-only hit: no capture groups beyond group 0, no
+    /// allocation (the literal engine's hot path).
+    #[must_use]
+    pub const fn whole(span: Span<TextByte>) -> Self {
         Self {
             span,
-            groups: groups.into(),
+            groups: Groups::Whole,
         }
     }
 
     /// Number of capture groups including group 0.
     #[must_use]
     pub fn group_count(&self) -> usize {
-        self.groups.len()
+        match &self.groups {
+            Groups::Whole => 1,
+            Groups::Many(groups) => groups.len(),
+        }
     }
 
     /// Span of capture group `index`; `None` when the group did not
     /// participate in the match.
     #[must_use]
     pub fn group_span(&self, index: usize) -> Option<Span<TextByte>> {
-        self.groups.get(index).copied().flatten()
+        match &self.groups {
+            Groups::Whole if index == 0 => Some(self.span),
+            Groups::Whole => None,
+            Groups::Many(groups) => groups.get(index).copied().flatten(),
+        }
     }
 
     /// Text of capture group `index` borrowed from the searched source.
@@ -375,11 +404,6 @@ impl Matcher {
         scope: Option<Span<TextByte>>,
     ) -> Result<MatchIter<'t>, MatchError> {
         let scope = validate_scope(text, scope)?;
-        let boundaries = if self.options.whole_word {
-            Some(flavite_syntax::text::WordBoundarySet::compute(text))
-        } else {
-            None
-        };
         let inner = match &self.engine {
             Engine::LiteralBytes { pattern } => InnerIter::Literal {
                 haystack: &text[scope.start.0..scope.end.0],
@@ -404,7 +428,8 @@ impl Matcher {
         Ok(MatchIter {
             limits: self.limits,
             text,
-            boundaries,
+            whole_word: self.options.whole_word,
+            boundaries: std::sync::OnceLock::new(),
             inner,
             emitted: 0,
             done: false,
@@ -434,7 +459,10 @@ enum InnerIter<'t> {
 pub struct MatchIter<'t> {
     limits: MatchLimits,
     text: &'t str,
-    boundaries: Option<flavite_syntax::text::WordBoundarySet>,
+    whole_word: bool,
+    /// UAX #29 boundaries of the FULL text, computed on the first whole-word
+    /// candidate so zero-match scans never pay the O(n) segmentation pass.
+    boundaries: std::sync::OnceLock<flavite_syntax::text::WordBoundarySet>,
     inner: InnerIter<'t>,
     emitted: usize,
     done: bool,
@@ -476,7 +504,7 @@ impl Iterator for MatchIter<'_> {
                     // must never loop on one position).
                     *cursor = (end - *base).max(*cursor + 1);
                     let span = Span::new(TextByte(start), TextByte(end));
-                    Ok(Match::new(span, vec![Some(span)]))
+                    Ok(Match::whole(span))
                 }
                 InnerIter::Regex {
                     regex,
@@ -496,9 +524,12 @@ impl Iterator for MatchIter<'_> {
                 self.done = true;
                 return Some(candidate);
             };
-            if let Some(boundaries) = &self.boundaries {
+            if self.whole_word {
                 // Whole word requires BOTH endpoints to be UAX #29 word
                 // boundaries of the whole text (§6.2).
+                let boundaries = self
+                    .boundaries
+                    .get_or_init(|| flavite_syntax::text::WordBoundarySet::compute(self.text));
                 if !boundaries.contains(hit.span.start.0) || !boundaries.contains(hit.span.end.0) {
                     continue;
                 }
@@ -540,13 +571,11 @@ fn next_regex_candidate(
                     .map_or(0, char::len_utf8)
         };
     } else {
-        // Re-search at a non-EOF endpoint so a zero-width match at that
-        // boundary is observable, as D-05 requires.
-        *cursor = if whole.end() == haystack.len() {
-            haystack.len().saturating_add(1)
-        } else {
-            whole.end()
-        };
+        // Re-search at the endpoint (including EOF itself) so a zero-width
+        // match at that boundary is observable, as D-05 requires. The empty
+        // branch above owns the one-scalar progress after an empty match,
+        // so no infinite loop is possible.
+        *cursor = whole.end();
     }
     let groups = caps
         .iter()
@@ -556,15 +585,6 @@ fn next_regex_candidate(
         Span::new(TextByte(base + whole.start()), TextByte(base + whole.end())),
         groups,
     )))
-}
-
-/// Borrowed text the iterator searches (exposed for consumer-side
-/// capture-text checks without cloning).
-impl<'t> MatchIter<'t> {
-    #[must_use]
-    pub const fn text(&self) -> &'t str {
-        self.text
-    }
 }
 
 fn validate_scope(text: &str, scope: Option<Span<TextByte>>) -> Result<Span<TextByte>, MatchError> {
@@ -584,32 +604,6 @@ fn validate_scope(text: &str, scope: Option<Span<TextByte>>) -> Result<Span<Text
             Ok(scope)
         }
     }
-}
-
-/// Select matches by requested ordinals (§6.2: "select next/all or
-/// requested match ordinals without overlap"). Ordinals are deduplicated
-/// and sorted, so the result is ascending and non-overlapping by
-/// construction.
-///
-/// # Errors
-///
-/// [`MatchError::OrdinalOutOfRange`] for any ordinal beyond the matches.
-pub fn select_ordinals(matches: &[Match], ordinals: &[usize]) -> Result<Vec<Match>, MatchError> {
-    let mut picked: Vec<usize> = ordinals.to_vec();
-    picked.sort_unstable();
-    picked.dedup();
-    for ordinal in &picked {
-        if *ordinal >= matches.len() {
-            return Err(MatchError::OrdinalOutOfRange {
-                ordinal: *ordinal,
-                total: matches.len(),
-            });
-        }
-    }
-    Ok(picked
-        .into_iter()
-        .map(|ordinal| matches[ordinal].clone())
-        .collect())
 }
 
 /// One page of a match list (§6.2: the crate owns `MatchPage`).
@@ -841,25 +835,6 @@ mod tests {
         let first = MatchPage::new(0, 2);
         assert_eq!(first.slice(&found).len(), 2);
         assert!(first.has_more(found.len()));
-    }
-
-    #[test]
-    fn ordinal_selection_sorts_dedups_and_validates() {
-        let matcher = literal("a");
-        let found = matcher.find("aaaa").unwrap();
-        let picked = select_ordinals(&found, &[3, 1, 1]).unwrap();
-        assert_eq!(picked.len(), 2);
-        assert_eq!(picked[0].span, Span::new(TextByte(1), TextByte(2)));
-        assert_eq!(picked[1].span, Span::new(TextByte(3), TextByte(4)));
-        let err = select_ordinals(&found, &[4]).expect_err("ordinal out of range");
-        assert!(matches!(
-            err,
-            MatchError::OrdinalOutOfRange {
-                ordinal: 4,
-                total: 4,
-            }
-        ));
-        assert!(select_ordinals(&found, &[]).unwrap().is_empty());
     }
 
     #[test]

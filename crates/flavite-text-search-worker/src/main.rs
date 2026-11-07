@@ -452,23 +452,13 @@ fn run_request(out: &mut dyn Write, request: &ActiveRequest) {
             break;
         };
         total += 1;
-        let page_end = request.skip_matches.saturating_add(stream_budget);
-        if total <= request.skip_matches || total > page_end {
-            // Count all matches for the exact total while shipping only the
-            // requested ordinal window. A later request can continue from
-            // this stable source/revision ordinal without a hidden cap.
-            continue;
-        }
+        // Validation and output accounting cover EVERY match: the replace
+        // proof is over the whole source, so the final cross-check holds for
+        // any requested ordinal window, not only full-window replaces.
+        // Preflight already validated every template/group; expand() here is
+        // the exact same grammar, so its length is the validated length.
         let expansion = match &template {
             Some(template) => {
-                let len = match template.expansion_len(&matcher, &hit) {
-                    Ok(len) => len,
-                    Err(_) => {
-                        fail(out, FailureCode::Template);
-                        failed = true;
-                        break;
-                    }
-                };
                 let expansion = match template.expand(&matcher, source, &hit) {
                     Ok(expansion) => expansion,
                     Err(_) => {
@@ -477,18 +467,10 @@ fn run_request(out: &mut dyn Write, request: &ActiveRequest) {
                         break;
                     }
                 };
-                // The two exactness paths must agree; a mismatch is a bug,
-                // not something to ship (checked arithmetic, §6.2).
-                if expansion.len() != len {
-                    fail(out, FailureCode::Template);
-                    failed = true;
-                    break;
-                }
                 let span_len = u64::try_from(hit.span.end.0 - hit.span.start.0).unwrap_or(u64::MAX);
-                let Some(next) = output_len
-                    .checked_sub(span_len)
-                    .and_then(|rest| rest.checked_add(u64::try_from(len).unwrap_or(u64::MAX)))
-                else {
+                let Some(next) = output_len.checked_sub(span_len).and_then(|rest| {
+                    rest.checked_add(u64::try_from(expansion.len()).unwrap_or(u64::MAX))
+                }) else {
                     fail(out, FailureCode::Limit);
                     failed = true;
                     break;
@@ -503,6 +485,13 @@ fn run_request(out: &mut dyn Write, request: &ActiveRequest) {
             }
             None => Vec::new(),
         };
+        let page_end = request.skip_matches.saturating_add(stream_budget);
+        if total <= request.skip_matches || total > page_end {
+            // Ship only the requested ordinal window; a later request can
+            // continue from this stable source/revision ordinal without a
+            // hidden cap.
+            continue;
+        }
         let mut matched = WireMatch {
             start: u64::try_from(hit.span.start.0).unwrap_or(u64::MAX),
             end: u64::try_from(hit.span.end.0).unwrap_or(u64::MAX),
@@ -522,7 +511,7 @@ fn run_request(out: &mut dyn Write, request: &ActiveRequest) {
             if !page.is_empty() && !flush(out, request.request_id, &mut page) {
                 return;
             }
-            let index = total.saturating_sub(1);
+            let index = total.saturating_sub(request.skip_matches).saturating_sub(1);
             let expansion_len = u64::try_from(expansion.len()).unwrap_or(u64::MAX);
             if reply(
                 out,

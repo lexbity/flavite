@@ -55,7 +55,7 @@ fn known_independent_fixtures_round_trip_byte_exactly() {
     ] {
         let decoded = auto(&bytes).expect("decodes");
         assert_eq!(decoded.format().encoding(), encoding);
-        assert!(decoded.format().has_bom());
+        assert!(decoded.format().bom());
         assert_eq!(enc(decoded.text(), decoded.format()).unwrap(), bytes);
     }
 }

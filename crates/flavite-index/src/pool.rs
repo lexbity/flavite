@@ -64,7 +64,6 @@ pub struct IndexActor {
     read_pool: ReadPool,
     /// Tantivy read side (searcher capture, checkpoint publication). All
     /// writes belong to the single ordered writer below (RFC-0006 S06).
-    search: TantivyBackend,
     /// The one bounded ordered Tantivy writer owner (D-07). `None` marks a
     /// secondary handle on an index whose writer belongs to another actor
     /// in this process or another process: SQL applies still work (the
@@ -123,16 +122,17 @@ pub fn build_excerpt(body: Option<&str>, terms: &[String]) -> String {
 /// fold comparison is per-char, which stays correct for ASCII terms and
 /// one-char-per-char-folded Unicode alike.
 fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
-    let needle_chars: Vec<char> = needle.to_lowercase().chars().collect();
-    if needle_chars.is_empty() {
+    if needle.is_empty() {
         return None;
     }
-    let haystack_chars: Vec<(usize, char)> = haystack.char_indices().collect();
-    for start in 0..haystack_chars.len() {
+    // Same per-char fold comparison as before, without collecting the whole
+    // body into a char table first: excerpt anchoring runs per result row.
+    for (start_byte, _) in haystack.char_indices() {
+        let mut hay_chars = haystack[start_byte..].chars();
         let mut matched = true;
-        for (offset, expected) in needle_chars.iter().enumerate() {
-            match haystack_chars.get(start + offset) {
-                Some((_, actual)) if actual.to_lowercase().eq(expected.to_lowercase()) => {}
+        for expected in needle.chars() {
+            match hay_chars.next() {
+                Some(actual) if actual.to_lowercase().eq(expected.to_lowercase()) => {}
                 _ => {
                     matched = false;
                     break;
@@ -140,14 +140,15 @@ fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
             }
         }
         if matched {
-            return Some(haystack_chars[start].0);
+            return Some(start_byte);
         }
     }
     None
 }
 
 /// Collect the distinct text-leaf terms of a query for excerpt anchoring.
-fn text_terms(query: &crate::query::Query) -> Vec<String> {
+#[must_use]
+pub fn text_terms(query: &crate::query::Query) -> Vec<String> {
     match query {
         crate::query::Query::Text(leaf) => vec![leaf.term.clone()],
         crate::query::Query::And(parts) | crate::query::Query::Or(parts) => {
@@ -848,7 +849,6 @@ impl IndexActor {
         Ok(Self {
             writer,
             read_pool,
-            search,
             search_writer,
             needs_reparse,
             resolver,
@@ -2181,15 +2181,16 @@ impl IndexActor {
         for ack in handle.drain_acks() {
             let current = committed_of(self.writer.conn());
             if ack.generation >= current {
+                // The SQLite metadata row is the authoritative committed
+                // marker (read by startup and capture provenance); the old
+                // write-only checkpoint file — a per-ack fsync on this SQL
+                // owner thread — had no readers and is gone.
                 crate::schema::set_meta(
                     self.writer.conn(),
                     MetaKey::TantivyCommittedGeneration,
                     &ack.generation.to_string(),
                 )
                 .map_err(|error| error.to_string())?;
-                self.search
-                    .publish_checkpoint(ack.epoch, ack.generation)
-                    .map_err(|error| error.to_string())?;
             }
         }
         if handle
@@ -2428,6 +2429,7 @@ impl IndexActor {
     ///
     /// # Errors
     /// Returns the evaluation error text.
+    #[cfg(test)]
     pub fn search_text_ids(
         &mut self,
         text: &str,

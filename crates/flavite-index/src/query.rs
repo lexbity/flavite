@@ -63,13 +63,6 @@ impl TextLeaf {
             term: term.into(),
         }
     }
-
-    /// Stable evaluation digest input: identical leaves share one searcher
-    /// evaluation and one contributing-mask bit (§6.3).
-    #[must_use]
-    pub fn digest_key(&self) -> (Vec<TextField>, bool, &str) {
-        (self.fields.clone(), self.phrase, self.term.as_str())
-    }
 }
 
 /// Query input mode (D-07). Plain full-text mode treats whitespace as AND
@@ -896,122 +889,6 @@ impl fmt::Display for Query {
     }
 }
 
-/// Query builder for convenience.
-#[derive(Debug, Default)]
-pub struct QueryBuilder {
-    conditions: Vec<Query>,
-    #[allow(dead_code)]
-    and_stack: Vec<Vec<Query>>,
-}
-
-impl QueryBuilder {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[must_use]
-    pub fn tag(mut self, name: &str) -> Self {
-        self.conditions.push(Query::Tag {
-            name: name.to_string(),
-            hierarchical: false,
-        });
-        self
-    }
-
-    #[must_use]
-    pub fn tag_hierarchical(mut self, name: &str) -> Self {
-        self.conditions.push(Query::Tag {
-            name: name.to_string(),
-            hierarchical: true,
-        });
-        self
-    }
-
-    #[must_use]
-    pub fn prop(mut self, key: &str, op: CmpOp, value: PropertyValue) -> Self {
-        self.conditions.push(Query::Prop {
-            key: key.to_string(),
-            op,
-            value,
-        });
-        self
-    }
-
-    #[must_use]
-    pub fn links_to(mut self, note_ref: NoteRef) -> Self {
-        self.conditions.push(Query::LinksTo(note_ref));
-        self
-    }
-
-    #[must_use]
-    pub fn linked_from(mut self, note_ref: NoteRef) -> Self {
-        self.conditions.push(Query::LinkedFrom(note_ref));
-        self
-    }
-
-    #[must_use]
-    pub fn unresolved(mut self) -> Self {
-        self.conditions.push(Query::Unresolved);
-        self
-    }
-
-    #[must_use]
-    pub fn text(mut self, query: &str) -> Self {
-        self.conditions
-            .push(Query::Text(TextLeaf::all_fields(query)));
-        self
-    }
-
-    #[must_use]
-    pub fn attachment(
-        mut self,
-        kind: Option<crate::schema::AttachmentKind>,
-        name: Option<&str>,
-    ) -> Self {
-        self.conditions.push(Query::Attachment {
-            kind,
-            name: name.map(std::string::ToString::to_string),
-        });
-        self
-    }
-
-    #[must_use]
-    pub fn and(mut self) -> Self {
-        let mut new = Self::new();
-        let current_and = std::mem::take(&mut self.conditions);
-        if !current_and.is_empty() {
-            new.conditions.push(Query::And(current_and));
-        }
-        new
-    }
-
-    #[must_use]
-    pub fn or(mut self, query: Query) -> Self {
-        let last = self.conditions.pop().unwrap_or(Query::Unresolved);
-        self.conditions.push(Query::Or(vec![last, query]));
-        self
-    }
-
-    #[must_use]
-    pub fn not(mut self, query: Query) -> Self {
-        self.conditions.push(Query::Not(Box::new(query)));
-        self
-    }
-
-    #[must_use]
-    pub fn build(self) -> Query {
-        let mut conditions = self.conditions;
-        match conditions.len() {
-            0 => Query::Unresolved,
-            // The len == 1 guard makes the pop infallible; `unwrap_or`
-            // keeps the function panic-free by construction.
-            1 => conditions.pop().unwrap_or(Query::Unresolved),
-            _ => Query::And(conditions),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1059,20 +936,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_query_builder() {
-        let query = QueryBuilder::new()
-            .tag("rust")
-            .and()
-            .prop(
-                "language",
-                CmpOp::Eq,
-                PropertyValue::Text("rust".to_string()),
-            )
-            .build();
 
-        assert!(matches!(query, Query::And(_)));
-    }
 
     #[test]
     fn test_next_hierarchical_key() {

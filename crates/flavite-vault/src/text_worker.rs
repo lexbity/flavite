@@ -257,9 +257,19 @@ fn admit(
     if !helper_permits().acquire(class) {
         return Err(TextWorkerError::Busy);
     }
-    let outcome = run_match_locked(&helper, request, cancelled);
-    helper_permits().release(class);
-    outcome
+    // Released on every exit path, including a panic, so a dying worker
+    // thread can never strand the process-global slot as permanent Busy.
+    let _permit = PermitGuard(class);
+    run_match_locked(&helper, request, cancelled)
+}
+
+/// RAII release of one helper slot.
+struct PermitGuard(HelperPermitClass);
+
+impl Drop for PermitGuard {
+    fn drop(&mut self) {
+        helper_permits().release(self.0);
+    }
 }
 
 fn run_match_locked(
@@ -317,7 +327,7 @@ fn drive_helper(
     request: &HelperRequest<'_>,
     cancelled: &AtomicBool,
 ) -> Result<HelperRun, TextWorkerError> {
-    let mut stdin = child.stdin.take().ok_or(TextWorkerError::HelperDied)?;
+    let stdin = child.stdin.take().ok_or(TextWorkerError::HelperDied)?;
     let stdout = child.stdout.take().ok_or(TextWorkerError::HelperDied)?;
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
@@ -345,10 +355,29 @@ fn drive_helper(
         })
         .map_err(|_| TextWorkerError::HelperDied)?;
 
+    // Writes run on their own thread so a helper that stops reading its
+    // stdin can never wedge the parent inside a blocking pipe write: the
+    // shared wall deadline stays owned by this thread, which kills the
+    // child on expiry and thereby unblocks the writer (§6.2: the parent
+    // owns the wall clock, on both directions of the pipe).
+    let (write_tx, write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::Builder::new()
+        .name("text-worker-write".into())
+        .spawn(move || {
+            let mut stdin = stdin;
+            for bytes in write_rx {
+                if write_frame(&mut stdin, &bytes).is_err() {
+                    // Pipe closed: the helper died or was killed.
+                    break;
+                }
+            }
+        })
+        .map_err(|_| TextWorkerError::HelperDied)?;
+
     // 1. Handshake first: the helper refuses Begin without it, and the
     //    engine identity must match before any request is admitted.
     send_frame(
-        &mut stdin,
+        &write_tx,
         &ToHelper::Handshake {
             protocol_version: protocol::PROTOCOL_VERSION,
             engine_version: flavite_text_search::engine_version(),
@@ -379,7 +408,7 @@ fn drive_helper(
     // 2. Begin with kind, scope, report cap and output bound.
     let report_matches = u64::try_from(request.report_matches).unwrap_or(u64::MAX);
     send_frame(
-        &mut stdin,
+        &write_tx,
         &ToHelper::Begin {
             request_id,
             kind: request.kind,
@@ -411,7 +440,7 @@ fn drive_helper(
     //    helper against its own copy).
     if request.kind == RequestKind::Replace {
         send_frame(
-            &mut stdin,
+            &write_tx,
             &ToHelper::Template {
                 request_id,
                 template: request.template_raw.as_bytes().to_vec(),
@@ -424,14 +453,14 @@ fn drive_helper(
     //    through the reader channel; the writes unblock on pipe death).
     for (offset, chunk) in request.source.as_bytes().chunks(CHUNK_BYTES).enumerate() {
         if cancelled.load(Ordering::Relaxed) {
-            let _ = send_frame(&mut stdin, &ToHelper::Cancel { request_id });
+            let _ = send_frame(&write_tx, &ToHelper::Cancel { request_id });
             return Err(TextWorkerError::Cancelled);
         }
         if started.elapsed() >= HELPER_DEADLINE {
             return Err(TextWorkerError::Deadline);
         }
         send_frame(
-            &mut stdin,
+            &write_tx,
             &ToHelper::SourceChunk {
                 request_id,
                 offset: (offset * CHUNK_BYTES) as u64,
@@ -439,8 +468,10 @@ fn drive_helper(
             },
         )?;
     }
-    send_frame(&mut stdin, &ToHelper::EndOfSource { request_id })?;
-    drop(stdin);
+    send_frame(&write_tx, &ToHelper::EndOfSource { request_id })?;
+    // Closing the channel ends the writer thread after the final frame,
+    // which closes the helper's stdin.
+    drop(write_tx);
 
     // 5. Accepted, pages and the terminal proof. Pages alone are not a
     //    result: every exit path except Done returns an error.
@@ -567,12 +598,17 @@ fn drive_helper(
     })
 }
 
-fn send_frame(stdin: &mut impl Write, frame: &ToHelper) -> Result<(), TextWorkerError> {
+fn send_frame(
+    writes: &std::sync::mpsc::Sender<Vec<u8>>,
+    frame: &ToHelper,
+) -> Result<(), TextWorkerError> {
     let bytes = encode(frame).map_err(TextWorkerError::Frame)?;
-    write_frame(stdin, &bytes).map_err(|_| TextWorkerError::HelperDied)
+    if writes.send(bytes).is_err() {
+        // The writer thread is gone: the pipe died or the helper was killed.
+        return Err(TextWorkerError::HelperDied);
+    }
+    Ok(())
 }
-
-use std::io::Write;
 
 fn recv_frame(
     replies: &std::sync::mpsc::Receiver<Result<FromHelper, FrameError>>,
@@ -596,78 +632,6 @@ fn recv_frame(
             }
         }
     }
-}
-
-/// Convenience used by tests and diagnostics: verify a helper is present
-/// and answers the handshake with the pinned engine identity.
-///
-/// # Errors
-///
-/// [`TextWorkerError`] when the helper is missing, dies, or mismatches.
-pub fn probe_helper() -> Result<(), TextWorkerError> {
-    let Some(helper) = sibling_helper_path() else {
-        return Err(TextWorkerError::Unavailable {
-            reason: "helper-not-installed",
-        });
-    };
-    let mut child = Command::new(&helper)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn_with_group()
-        .map_err(|_| TextWorkerError::Unavailable {
-            reason: "helper-spawn-failed",
-        })?;
-    let outcome = (|| {
-        let started = Instant::now();
-        let mut stdin = child.stdin.take().ok_or(TextWorkerError::HelperDied)?;
-        let handshake = encode(&ToHelper::Handshake {
-            protocol_version: protocol::PROTOCOL_VERSION,
-            engine_version: flavite_text_search::engine_version(),
-        })
-        .map_err(TextWorkerError::Frame)?;
-        write_frame(&mut stdin, &handshake).map_err(|_| TextWorkerError::HelperDied)?;
-        drop(stdin);
-        let stdout = child.stdout.take().ok_or(TextWorkerError::HelperDied)?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut reader = stdout;
-            loop {
-                match read_reply(&mut reader) {
-                    Ok(message) => {
-                        if tx.send(Ok(message)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(FrameError::Truncated) => break,
-                    Err(error) => {
-                        let _ = tx.send(Err(error));
-                        break;
-                    }
-                }
-            }
-        });
-        let cancelled = AtomicBool::new(false);
-        match recv_frame(&rx, started, &cancelled) {
-            Ok(FromHelper::HandshakeReply(Ok((p, e))))
-                if p == protocol::PROTOCOL_VERSION
-                    && e == flavite_text_search::engine_version() =>
-            {
-                Ok(())
-            }
-            Ok(FromHelper::HandshakeReply(Ok(_))) => Err(TextWorkerError::Unavailable {
-                reason: "engine-mismatch",
-            }),
-            Ok(FromHelper::HandshakeReply(Err(failure))) => Err(TextWorkerError::Unavailable {
-                reason: failure.code(),
-            }),
-            Ok(_) => Err(TextWorkerError::HelperDied),
-            Err(error) => Err(error),
-        }
-    })();
-    let _ = child.kill();
-    let _ = child.wait();
-    outcome
 }
 
 /// Spawn with the platform's process-group isolation (Unix `process_group`;

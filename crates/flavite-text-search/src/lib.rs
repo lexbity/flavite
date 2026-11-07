@@ -46,7 +46,7 @@ pub use flavite_syntax::{Span, TextByte};
 pub use matcher::{
     DEFAULT_MAX_MATCHES, MATCH_SEMANTICS_VERSION, Match, MatchError, MatchIter, MatchLimits,
     MatchMode, MatchOptions, MatchPage, Matcher, PATTERN_MAX_BYTES, REGEX_MAX_GROUPS,
-    REGEX_SIZE_LIMIT_BYTES, select_ordinals,
+    REGEX_SIZE_LIMIT_BYTES,
 };
 pub use protocol::{
     FRAME_MAX_BYTES, FailureCode, FrameError, FromHelper, PROTOCOL_VERSION, RequestKind,

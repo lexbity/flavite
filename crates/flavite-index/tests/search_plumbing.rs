@@ -8,10 +8,8 @@
 //!   sentinel is now a pool-typed field, so a pre-S4 build does not even
 //!   compile this file (that is the bug-fix proof at the contract level);
 //! * 512-chunk batch boundaries at 513 and 1,024 requested rows;
-//! * `SearchDocCache::get_many` equality at 99/100/101/2,000 ids against
 //!   per-id `get` (the C11 full-table-scan branch is gone).
 
-use flavite_index::search_docs::SearchDocCache;
 use flavite_index::{IndexActor, Query, open_or_init};
 use rusqlite::Connection;
 use tempfile::tempdir;
@@ -262,59 +260,3 @@ fn batched_assembly_crosses_512_row_chunks() {
     }
 }
 
-#[test]
-fn get_many_chunks_equal_per_id_gets() {
-    let dir = tempdir().unwrap();
-    let db = dir.path().join("index.sqlite3");
-    let mut conn = open_or_init(&db).unwrap();
-    {
-        let tx = conn.transaction().unwrap();
-        for id in 1..=2_000i64 {
-            tx.execute(
-                "INSERT INTO notes(note_id,path,path_native,path_key,stem_key,title,size,mtime_ns,scan_ns,generation) VALUES(?1,?2,?2,?2,?2,?2,0,0,0,0)",
-                rusqlite::params![id, format!("n{id}.md")],
-            )
-            .unwrap();
-        }
-        tx.commit().unwrap();
-    }
-    let mut cache = SearchDocCache::new(conn);
-    for id in 1..=2_000i64 {
-        if id == 777 {
-            continue; // deliberate hole across chunks.
-        }
-        let seed = u8::try_from(id % 251).unwrap_or(0);
-        let content_hash: Vec<u8> = (0..32u8).map(|byte| seed ^ byte).collect();
-        cache.set(id, &content_hash, &format!("body {id}")).unwrap();
-    }
-    for requested in [99usize, 100, 101, 2_000] {
-        let requested_id = i64::try_from(requested).unwrap();
-        let ids = (1..=requested_id).collect::<Vec<i64>>();
-        let many = cache.get_many(&ids).unwrap();
-        assert_eq!(
-            many.len(),
-            if requested >= 777 {
-                requested - 1
-            } else {
-                requested
-            },
-            "requested {requested}"
-        );
-        for id in ids {
-            if id == 777 {
-                continue;
-            }
-            let one = cache
-                .get(id)
-                .unwrap()
-                .unwrap_or_else(|| panic!("per-id get must find {id}"));
-            let batched = many
-                .get(&id)
-                .unwrap_or_else(|| panic!("get_many must find {id}"));
-            assert_eq!(batched.note_id, one.note_id);
-            assert_eq!(batched.body_text, one.body_text);
-            assert_eq!(batched.content_hash, one.content_hash);
-        }
-    }
-    assert!(cache.get_many(&[]).unwrap().is_empty());
-}

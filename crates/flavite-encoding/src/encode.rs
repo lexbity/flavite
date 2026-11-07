@@ -34,7 +34,7 @@ pub fn encode(
         CodecLimitKind::InputUtf8Bytes,
     )?;
 
-    let sig_len = if format.has_bom() {
+    let sig_len = if format.bom() {
         format.encoding().signature().len()
     } else {
         0
@@ -67,7 +67,7 @@ pub fn encode(
     check_limit(total, limits.max_output_bytes, CodecLimitKind::OutputBytes)?;
 
     let mut out = Vec::with_capacity(total);
-    if format.has_bom() {
+    if format.bom() {
         out.extend_from_slice(format.encoding().signature());
     }
     match format.encoding() {
