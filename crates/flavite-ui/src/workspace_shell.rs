@@ -103,33 +103,38 @@ fn top_bar(app: &App) -> Element<'_, Message> {
         || app.root().display().to_string(),
         |name| name.to_string_lossy().to_string(),
     );
+    let themed = app.appearance.theme_semantic().copied();
+    let (frame_color, frame_text) =
+        style::tokens::top_bar_colors(app.appearance.scheme(), themed.as_ref());
+    let bar_button = style::top_bar_button(frame_text);
     let row = row![
         button(text("Flavite").size(metrics.brand))
             .padding(tab_strip::chip_padding())
-            .style(style::ghost())
+            .style(bar_button)
             .on_press(Message::AppMenu),
         text(vault_name)
             .size(metrics.text_sm)
-            .style(style::dim_text),
+            .style(style::top_bar_dim_text(frame_text)),
         Space::new()
             .width(Length::Fixed(8.0))
             .height(Length::Fixed(0.0)),
-        menu_bar(app),
+        menu_bar(app, frame_text),
         Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
         button(text("Quick switch").size(metrics.text_sm))
             .padding(tab_strip::chip_padding())
-            .style(style::ghost())
+            .style(bar_button)
             .on_press(Message::PickerOpen),
         button(text("Commands").size(metrics.text_sm))
             .padding(tab_strip::chip_padding())
-            .style(style::ghost())
+            .style(bar_button)
             .on_press(Message::PaletteOpen),
     ]
     .spacing(metrics.spacing)
     .align_y(alignment::Vertical::Center);
-    // XPI themes: a package `theme_frame` layers exactly behind the bar.
-    // The bar is fixed-height so the image fills it without disturbing
-    // layout; without a frame the bar keeps the shell's plain surface.
+    // XPI themes: a package `theme_frame` layers exactly behind the bar,
+    // and its `frame` color paints the bar when no image is declared. The
+    // bar is fixed-height so an image fills it without disturbing layout;
+    // without any themed frame the bar keeps the shell's plain surface.
     let content: Element<'_, Message> = match app.appearance.theme_frame_handle() {
         Some(handle) => stack![
             image(handle.clone())
@@ -145,6 +150,10 @@ fn top_bar(app: &App) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fixed(metrics.top_bar_height))
         .align_y(alignment::Vertical::Center)
+        .style(move |_theme| iced::widget::container::Style {
+            background: frame_color.map(iced::Background::Color),
+            ..iced::widget::container::Style::default()
+        })
         .padding(Padding {
             top: 6.0,
             bottom: 6.0,
@@ -157,7 +166,7 @@ fn top_bar(app: &App) -> Element<'_, Message> {
 /// The standard sorted menu bar (W10): every entry resolves through the
 /// shared host-command catalog availability, so menu, palette, keyboard,
 /// and accessibility surfaces cannot drift (D-16).
-fn menu_bar(app: &App) -> Element<'_, Message> {
+fn menu_bar(app: &App, frame_text: Option<iced::Color>) -> Element<'_, Message> {
     const MENUS: [(&str, crate::workspace::StripMenu); 8] = [
         ("File", crate::workspace::StripMenu::File),
         ("Edit", crate::workspace::StripMenu::Edit),
@@ -184,7 +193,7 @@ fn menu_bar(app: &App) -> Element<'_, Message> {
                     if active {
                         style::list_row(true)(theme, status)
                     } else {
-                        style::ghost()(theme, status)
+                        style::top_bar_button(frame_text)(theme, status)
                     }
                 })
                 .on_press(Message::TopMenu(menu)),

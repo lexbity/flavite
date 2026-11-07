@@ -341,6 +341,52 @@ pub fn action() -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
     }
 }
 
+/// Button style for the themed top bar (xpi themes): text carries the
+/// theme's frame text color when the package supplies one, otherwise the
+/// palette text; surfaces stay transparent with a subtle hover wash.
+pub fn top_bar_button(
+    text_color: Option<Color>,
+) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
+    move |theme, status| {
+        let palette = theme.palette();
+        let base = text_color.unwrap_or(palette.text);
+        let text_color = match status {
+            button::Status::Hovered | button::Status::Pressed => Color { a: 0.85, ..base },
+            _ => base,
+        };
+        let background = match status {
+            button::Status::Hovered => Some(Background::Color(Color { a: 0.12, ..base })),
+            button::Status::Pressed => Some(Background::Color(Color { a: 0.18, ..base })),
+            _ => None,
+        };
+        button::Style {
+            background,
+            text_color,
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: border::Radius::from(RADIUS),
+            },
+            shadow: Shadow::default(),
+            snap: false,
+        }
+    }
+}
+
+/// Text style for the themed top bar: the theme's frame text color, or
+/// the palette text with the dim_text alpha search when the package
+/// stayed silent.
+pub fn top_bar_dim_text(text_color: Option<Color>) -> impl Fn(&Theme) -> text::Style + Copy {
+    move |theme| {
+        if let Some(color) = text_color {
+            return text::Style {
+                color: Some(Color { a: 0.85, ..color }),
+            };
+        }
+        dim_text(theme)
+    }
+}
+
 /// Button style: a quiet secondary action.
 pub fn ghost() -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
     move |theme, status| {

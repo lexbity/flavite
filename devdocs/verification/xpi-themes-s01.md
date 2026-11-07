@@ -142,6 +142,31 @@ all within the 256-frame budget — but all carried as
 `additional_backgrounds`, which v1 drops per T-02; only saturn plus's
 static `theme_frame` renders in v1.
 
+**AC-7 — native GUI demo (Linux, Xvfb evidence).** A real demo vault
+(`/tmp/flavite-demo-vault`) with two demo themes installed through the
+CLI (`theme install` + `theme select`), the production binary booted
+under Xvfb (1280×900, X11), notes opened through the actual quick-switch
+dialog, and the window captured (`target/ui-visual/demo-shot-*.png`):
+
+- **Nyan Cat (Animated)**: the top bar paints the package's `frame`
+  color — sampled `rgb(0,49,99)`, exactly the manifest value — with
+  themed bar text; the editor surface paints `toolbar_field` — sampled
+  `rgb(0,0,0)` — with `toolbar_field_text`; the Preferences dialog lists
+  "Nyan Cat (Animated)" as Active with Remove/Built-in-palettes actions.
+  Nyan's translucent `toolbar` and dim `tab_background_text` correctly
+  fall back through the contrast solver, so untouched surfaces keep the
+  built-in palette (the fallback is visible, not guessed).
+- **Saturn plus**: the static `theme_frame` image renders behind the
+  fixed-height top bar via the stack (Saturn artwork visible across the
+  strip) with the palette mapped from its 6 color keys.
+
+Demo-driven fixes folded in before this record: `top_bar_colors` is now
+wired into the shell (background + `top_bar_button`/`top_bar_dim_text`
+text styles — it had been computed but never painted), and
+`EditorColors` gained a `background` slot the widget paints (it painted
+`palette().background` before, so themed `toolbar_field` surfaces never
+reached the editor).
+
 ## Explicitly not claimed
 
 - GUI animation/visual evidence (screenshots) — the animation path is

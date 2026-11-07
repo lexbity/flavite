@@ -165,6 +165,7 @@ pub fn editor_colors_resolved(
     let Some(background) = slots.editor_background.or(slots.window_background) else {
         return colors;
     };
+    colors.background = background;
     let palette = resolved_palette(scheme, Some(themed));
     let text = slots
         .editor_text
@@ -304,6 +305,7 @@ pub fn editor_colors(scheme: Scheme) -> flavite_editor::EditorColors {
             let palette = light_palette();
             let text = palette.text;
             flavite_editor::EditorColors {
+                background: palette.background,
                 selection: iced::Color {
                     a: 0.45,
                     ..palette.primary
