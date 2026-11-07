@@ -94,6 +94,39 @@ pub struct ReplaceStatusArgs {
     pub limit: usize,
 }
 
+/// Wrapper for `replace.apply` (RFC-0006 S08/D-10): frozen selection
+/// revision + caller-generated idempotency key.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceApplyArgs {
+    pub preview_id: String,
+    pub selection_revision: u64,
+    /// Caller-generated 128-bit hex idempotency key.
+    pub idempotency_key: String,
+}
+
+/// Wrapper for `replace.cancel`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceCancelArgs {
+    pub job_id: String,
+}
+
+/// Wrapper for `replace.resume`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceResumeArgs {
+    pub job_id: String,
+    pub idempotency_key: String,
+}
+
+/// Wrapper for `replace.job_status`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceJobStatusArgs {
+    pub job_id: String,
+}
+
 fn default_page_len() -> usize {
     50
 }
@@ -230,6 +263,84 @@ pub(crate) fn handle_replace_status(
     Ok(session.execute(SessionCommand::ReplaceStatus {
         preview_id: decode_id(&args.preview_id)?,
     }))
+}
+
+/// `replace.apply` (WriteNotes): runs the durable job; idempotent.
+pub(crate) fn handle_replace_apply(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: ReplaceApplyArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::ReplaceApply {
+        request_id: invocation.request_id,
+        preview_id: decode_id(&args.preview_id)?,
+        selection_revision: args.selection_revision,
+        idempotency_key: decode_id(&args.idempotency_key)?,
+    }))
+}
+
+/// `replace.cancel` (WriteNotes): stops admission of the next item.
+pub(crate) fn handle_replace_cancel(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: ReplaceCancelArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::ReplaceCancel {
+        job_id: decode_id(&args.job_id)?,
+    }))
+}
+
+/// `replace.resume` (WriteNotes): explicit resume of a paused/partial job.
+pub(crate) fn handle_replace_resume(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: ReplaceResumeArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::ReplaceResume {
+        request_id: invocation.request_id,
+        job_id: decode_id(&args.job_id)?,
+        idempotency_key: decode_id(&args.idempotency_key)?,
+    }))
+}
+
+/// `replace.job_status` (ReadNotes): current job phase and totals.
+pub(crate) fn handle_replace_job_status(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: ReplaceJobStatusArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::ReplaceJobStatus {
+        job_id: decode_id(&args.job_id)?,
+    }))
+}
+
+/// Stable snake_case job phase string.
+#[must_use]
+pub fn job_phase_str(phase: flavite_vault::replace::JobPhase) -> &'static str {
+    phase.label()
+}
+
+/// One job status projection (phase + totals; never note text).
+#[must_use]
+pub fn job_status_json(
+    phase: flavite_vault::replace::JobPhase,
+    totals: &flavite_vault::replace::JobTotals,
+) -> serde_json::Value {
+    serde_json::json!({
+        "phase": job_phase_str(phase),
+        "totals": {
+            "selected": totals.selected,
+            "saved": totals.saved,
+            "index_pending": totals.index_pending,
+            "conflicts": totals.conflicts,
+            "stale": totals.stale,
+            "busy": totals.busy,
+            "unsupported": totals.unsupported,
+            "needs_recovery": totals.needs_recovery,
+            "satisfied_unattributed": totals.satisfied_unattributed,
+            "not_started": totals.not_started,
+        },
+    })
 }
 
 /// Parse the wire match mode (§6.1 explicit snake_case discriminants).

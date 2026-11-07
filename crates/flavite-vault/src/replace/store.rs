@@ -19,8 +19,13 @@ pub trait OpStoreIo: Send + Sync {
     fn mkdir_all(&self, path: &Path) -> Result<(), String>;
     /// Create a new file exclusively; fails when the path already exists.
     fn write_new(&self, path: &Path, bytes: &[u8]) -> Result<(), String>;
+    /// Atomically replace a file's contents (staging + rename_replace);
+    /// used for the private high-water head.
+    fn write_replace(&self, path: &Path, bytes: &[u8]) -> Result<(), String>;
     /// Read a file; `None` when absent.
     fn read(&self, path: &Path) -> Result<Option<Vec<u8>>, String>;
+    /// List plain file names in a directory (sorted; `None` when absent).
+    fn list_dir(&self, path: &Path) -> Result<Option<Vec<String>>, String>;
     /// Fsync one file.
     fn fsync_file(&self, path: &Path) -> Result<(), String>;
     /// Fsync one directory.
@@ -261,8 +266,34 @@ mod tests {
         fn write_new(&self, path: &Path, bytes: &[u8]) -> Result<(), String> {
             self.0.write_new(path, bytes).map_err(|e| e.to_string())
         }
+        fn write_replace(&self, path: &Path, bytes: &[u8]) -> Result<(), String> {
+            let parent = path.parent().ok_or_else(|| "no parent".to_owned())?;
+            self.0.create_dir_all(parent).map_err(|e| e.to_string())?;
+            let temp = parent.join(format!(".ophead-{}.tmp", uuid::Uuid::now_v7()));
+            self.0.write_new(&temp, bytes).map_err(|e| e.to_string())?;
+            self.0.fsync_file(&temp).map_err(|e| e.to_string())?;
+            self.0
+                .rename_replace(&temp, path)
+                .map_err(|e| e.to_string())?;
+            self.0.fsync_dir(parent).map_err(|e| e.to_string())
+        }
         fn read(&self, path: &Path) -> Result<Option<Vec<u8>>, String> {
             self.0.read_if_exists(path).map_err(|e| e.to_string())
+        }
+        fn list_dir(&self, path: &Path) -> Result<Option<Vec<String>>, String> {
+            match self.0.read_dir(path) {
+                Ok(entries) => {
+                    let mut names = entries
+                        .into_iter()
+                        .filter(|entry| !entry.is_dir)
+                        .map(|entry| entry.name.into_string().map_err(|_| "not UTF-8".to_owned()))
+                        .collect::<Result<Vec<_>, String>>()?;
+                    names.sort();
+                    Ok(Some(names))
+                }
+                Err(flavite_fs::FsError::DirNotFound(_)) => Ok(None),
+                Err(error) => Err(error.to_string()),
+            }
         }
         fn fsync_file(&self, path: &Path) -> Result<(), String> {
             self.0.fsync_file(path).map_err(|e| e.to_string())

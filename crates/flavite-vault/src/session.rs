@@ -28,7 +28,7 @@ use flavite_encoding::DecodePolicy;
 use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -481,6 +481,28 @@ pub enum SessionCommand {
     },
     /// Report a sealed preview's status and totals (S07).
     ReplaceStatus { preview_id: u128 },
+    /// Apply a sealed preview under a frozen selection revision
+    /// (RFC-0006 S08/D-10). The first Apply freezes the selection; a
+    /// different revision is SelectionLocked. `idempotency_key` is a
+    /// caller-generated 128-bit key bound to job/selection/digest.
+    ReplaceApply {
+        request_id: u64,
+        preview_id: u128,
+        selection_revision: u64,
+        idempotency_key: u128,
+    },
+    /// Stop admission of the next item; an item past its durable intent
+    /// point finishes.
+    ReplaceCancel { job_id: u128 },
+    /// Explicitly resume a paused/partial/cancelled job (fresh grants are
+    /// rechecked per item; untouched items run with unchanged guards).
+    ReplaceResume {
+        request_id: u64,
+        job_id: u128,
+        idempotency_key: u128,
+    },
+    /// Current job status and totals.
+    ReplaceJobStatus { job_id: u128 },
 }
 
 /// Which notes a preview selection names (S07/D-09). Selection is a local
@@ -704,6 +726,22 @@ pub enum CommandResult {
     ReplaceStatus {
         preview_id: u128,
         manifest: Arc<crate::replace::PreviewManifest>,
+    },
+    /// A durable replacement job applied/cancelled/resumed/finished (S08).
+    ReplaceJobFinished {
+        job_id: u128,
+        phase: crate::replace::JobPhase,
+        totals: crate::replace::JobTotals,
+    },
+    /// A durable replacement job was cancelled (S08).
+    ReplaceCancelled { job_id: u128 },
+    /// Current durable job status (S08).
+    ReplaceJobStatus {
+        job_id: u128,
+        phase: crate::replace::JobPhase,
+        totals: crate::replace::JobTotals,
+        selection_revision: u64,
+        selected_items: u64,
     },
 }
 
@@ -990,6 +1028,14 @@ pub struct Session {
     /// RFC-0006 S07: request ids of admitted-but-not-installed replace
     /// jobs (so `wait_for_operation` treats them as in-flight).
     pending_replace: Mutex<HashSet<u64>>,
+    /// RFC-0006 S08: per-note source leases (non-replacing; D-10).
+    leases: Arc<crate::source_leases::SourceLeaseRegistry>,
+    /// RFC-0006 S08: durable replacement jobs by job id.
+    replace_jobs_map: Mutex<HashMap<u128, JobEntry>>,
+    /// RFC-0006 S08: one active apply per vault (D-10).
+    active_apply: Mutex<Option<u128>>,
+    /// Private OS data directory (recovery/operation key store).
+    data_dir: Option<PathBuf>,
     /// Semantic link plan store (W05). Plans are process-local capabilities.
     link_plans: std::sync::Arc<Mutex<crate::link::LinkPlanStore>>,
     /// Bounded prepare workers' job queue.
@@ -1061,7 +1107,8 @@ struct ReplaceJob {
     work: ReplaceWork,
 }
 
-/// Which S07 computation a queued job performs.
+/// Which S07/S08 computation a queued job performs.
+#[allow(clippy::large_enum_variant)]
 enum ReplaceWork {
     Find {
         finder_id: u128,
@@ -1071,9 +1118,18 @@ enum ReplaceWork {
         preview_id: u128,
         request: crate::replace::preview::PreviewRequest,
     },
+    /// RFC-0006 S08: run one durable apply (or resume) loop.
+    Apply {
+        job_id: u128,
+        ctx: crate::replace::CoordinatorCtx,
+        key: crate::replace::OperationKey,
+        store: crate::replace::ReplaceStore,
+        state: Arc<Mutex<JobState>>,
+        cancel: Arc<AtomicBool>,
+    },
 }
 
-/// One finished S07 scan awaiting installation.
+/// One finished S07 scan / S08 apply awaiting installation.
 enum ReplaceOutcomeMessage {
     Find {
         request_id: u64,
@@ -1091,6 +1147,54 @@ enum ReplaceOutcomeMessage {
             crate::replace::preview::PreviewError,
         >,
     },
+    ApplyDone {
+        request_id: u64,
+        job_id: u128,
+        phase: crate::replace::JobPhase,
+        totals: crate::replace::JobTotals,
+    },
+    ApplyFailed {
+        request_id: u64,
+        job_id: u128,
+        message: String,
+    },
+}
+
+/// Shared job state (RFC-0006 S08): the worker mutates items; the Session
+/// reads phase/totals for status and idempotent receipts.
+struct JobState {
+    phase: crate::replace::JobPhase,
+    items: Vec<crate::replace::JobItem>,
+    totals: crate::replace::JobTotals,
+}
+
+impl JobState {
+    fn recompute(&mut self) {
+        self.totals = crate::replace::JobTotals::from_items(&self.items);
+    }
+}
+
+/// A live durable replacement job entry (RFC-0006 S08).
+struct JobEntry {
+    state: Arc<Mutex<JobState>>,
+    cancel: Arc<AtomicBool>,
+    /// The preview this job applied (freeze identity).
+    preview_id: u128,
+    selection_revision: u64,
+    /// The action-request key of the last admitted command (idempotent
+    /// replay within this session returns the same receipt).
+    idempotency_key: Option<u128>,
+}
+
+impl std::fmt::Debug for JobEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let phase = self.state.lock_recovering().phase;
+        f.debug_struct("JobEntry")
+            .field("phase", &phase)
+            .field("selection_revision", &self.selection_revision)
+            .field("cancelled", &self.cancel.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 /// A live source-finder session (S07): spool location plus the in-memory
@@ -1123,6 +1227,9 @@ struct PreviewEntry {
     expires_at_unix_ms: u64,
     /// Cached manifest (loaded once at seal time).
     manifest: Arc<crate::replace::PreviewManifest>,
+    /// Currently selected item ids (canonical order; S08 freezes these on
+    /// the first Apply).
+    selected_ids: Vec<u64>,
     /// Monotonic selection revision counter (S07/D-09).
     selection_revision: u64,
 }
@@ -1525,6 +1632,68 @@ impl Session {
                                         outcome: outcome.map(Box::new),
                                     }
                                 }
+                                ReplaceWork::Apply {
+                                    job_id,
+                                    ctx,
+                                    key,
+                                    store,
+                                    state,
+                                    cancel,
+                                } => {
+                                    let job_hex = hex::encode(job_id.to_be_bytes());
+                                    let io = crate::replace::ActorOpStoreIo::new(ctx.actor.clone());
+                                    let data_dir =
+                                        crate::identity::resolve_data_dir(ctx.data_dir.as_deref());
+                                    let outcome = (|| -> Result<
+                                        (crate::replace::JobPhase, crate::replace::JobTotals),
+                                        String,
+                                    > {
+                                        let data_dir = data_dir.ok_or_else(|| {
+                                            "private data directory is unavailable".to_owned()
+                                        })?;
+                                        let mut log = crate::replace::JobLog::open(
+                                            Box::new(io.clone()),
+                                            &store,
+                                            &job_hex,
+                                            key,
+                                            &data_dir,
+                                            &ctx.vault_uuid,
+                                        )
+                                        .map_err(|error| error.to_string())?;
+                                        let mut guard = state.lock_recovering();
+                                        guard.recompute();
+                                        let (phase, totals) = crate::replace::run_apply(
+                                            &ctx,
+                                            &job_hex,
+                                            &mut guard.items,
+                                            &cancel,
+                                            &mut log,
+                                            &store,
+                                            &io,
+                                        );
+                                        guard.phase = phase;
+                                        guard.totals = totals.clone();
+                                        Ok((phase, totals))
+                                    })();
+                                    match outcome {
+                                        Ok((phase, totals)) => ReplaceOutcomeMessage::ApplyDone {
+                                            request_id: job.request_id,
+                                            job_id,
+                                            phase,
+                                            totals,
+                                        },
+                                        Err(message) => {
+                                            let mut guard = state.lock_recovering();
+                                            guard.phase = crate::replace::JobPhase::NeedsRecovery;
+                                            guard.recompute();
+                                            ReplaceOutcomeMessage::ApplyFailed {
+                                                request_id: job.request_id,
+                                                job_id,
+                                                message,
+                                            }
+                                        }
+                                    }
+                                }
                             };
                             // Sending only fails when the Session is gone.
                             let _ = results.send(message);
@@ -1533,13 +1702,14 @@ impl Session {
                     .expect("replace worker thread creation failed");
             }
         }
-        Self {
+        let recovered = Self {
             text_jobs: Some(text_job_sender),
             text_queue: Some(text_job_receiver),
             text_results: text_result_receiver,
             text_plan_nonce,
             text_plan_counter: AtomicU64::new(0),
             text_plans: Mutex::new(HashMap::new()),
+            data_dir,
             replace_jobs: Some(replace_job_sender),
             replace_queue: Some(replace_job_receiver),
             replace_results: replace_result_receiver,
@@ -1550,6 +1720,9 @@ impl Session {
             preview_nonce: text_plan_nonce,
             preview_counter: AtomicU64::new(0),
             pending_replace: Mutex::new(HashSet::new()),
+            leases: Arc::new(crate::source_leases::SourceLeaseRegistry::new()),
+            replace_jobs_map: Mutex::new(HashMap::new()),
+            active_apply: Mutex::new(None),
             driving_turn: Mutex::new(()),
             structure_worker: crate::properties::StructureWorker::new(),
             identity,
@@ -1592,7 +1765,12 @@ impl Session {
             link_results: link_result_receiver,
             buffer_signal: Some(buffer_signal),
             buffer_stamp_version: AtomicU64::new(0),
-        }
+        };
+        // Recover durable replacement jobs from the private store
+        // (RFC-0006 D-11). Runs once at Session construction; never
+        // auto-continues untouched items.
+        recovered.recover_replace_jobs();
+        recovered
     }
 
     /// The current version of `graph_buffer_stamp()` output (RFC-0005
@@ -2183,6 +2361,19 @@ impl Session {
                 selected,
             } => self.replace_select(preview_id, selected),
             SessionCommand::ReplaceStatus { preview_id } => self.replace_status(preview_id),
+            SessionCommand::ReplaceApply {
+                request_id,
+                preview_id,
+                selection_revision,
+                idempotency_key,
+            } => self.replace_apply(request_id, preview_id, selection_revision, idempotency_key),
+            SessionCommand::ReplaceCancel { job_id } => self.replace_cancel(job_id),
+            SessionCommand::ReplaceResume {
+                request_id,
+                job_id,
+                idempotency_key,
+            } => self.replace_resume(request_id, job_id, idempotency_key),
+            SessionCommand::ReplaceJobStatus { job_id } => self.replace_job_status(job_id),
             SessionCommand::RestoreHistory {
                 path,
                 buffer_id,
@@ -3615,6 +3806,226 @@ impl Session {
         }
     }
 
+    /// The durable-replacement coordinator context (RFC-0006 S08).
+    #[must_use]
+    pub fn coordinator_ctx(&self) -> crate::replace::CoordinatorCtx {
+        crate::replace::CoordinatorCtx {
+            actor: self.actor.clone(),
+            root: self.identity.root.clone(),
+            data_dir: self.data_dir.clone(),
+            vault_uuid: self.identity.uuid,
+            leases: Arc::clone(&self.leases),
+        }
+    }
+
+    /// The resolved private OS data directory.
+    #[must_use]
+    pub fn resolved_data_dir(&self) -> Option<PathBuf> {
+        crate::identity::resolve_data_dir(self.data_dir.as_deref())
+    }
+
+    /// Shared per-note source leases (RFC-0006 S08/D-10).
+    #[must_use]
+    pub fn source_leases(&self) -> Arc<crate::source_leases::SourceLeaseRegistry> {
+        Arc::clone(&self.leases)
+    }
+
+    /// Load (or create) the device/vault operation key (RFC-0006 §6.9).
+    /// The key store lives outside the vault; inability to protect it
+    /// refuses applicable replacement operations.
+    pub fn operation_key(&self) -> Result<crate::replace::OperationKey, String> {
+        let data_dir = self
+            .resolved_data_dir()
+            .ok_or_else(|| "private data directory is unavailable".to_owned())?;
+        crate::replace::auth::load_or_create_key(&data_dir, &self.identity.uuid)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Startup recovery of durable replacement jobs (RFC-0006 D-11/§6.4):
+    /// classify intents against durable disk hashes; never auto-continue
+    /// untouched items. Jobs whose authenticated log cannot be verified are
+    /// quarantined (inspection only), never guessed or silently discarded.
+    fn recover_replace_jobs(&self) {
+        let store = crate::replace::ReplaceStore::new(&self.identity.root);
+        let io = crate::replace::ActorOpStoreIo::new(self.actor.clone());
+        let Ok(Some(dirs)) = io.list_dir(store.base()) else {
+            return;
+        };
+        let Some(data_dir) = self.resolved_data_dir() else {
+            return;
+        };
+        let Ok(key) = self.operation_key() else {
+            return;
+        };
+        for dir in dirs {
+            if dir.len() != 32 || !dir.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            let job_dir = store.base().join(&dir);
+            let Some(selection_bytes) = io.read(&job_dir.join("selection.bin")).ok().flatten()
+            else {
+                continue; // sealed previews without an apply have no selection
+            };
+            if selection_bytes.len() < 8 || (selection_bytes.len() - 8) % 8 != 0 {
+                continue;
+            }
+            let selection_count =
+                u64::from_le_bytes(selection_bytes[..8].try_into().expect("8 bytes"));
+            let mut selected_ids = Vec::new();
+            for chunk in selection_bytes[8..].as_chunks::<8>().0 {
+                selected_ids.push(u64::from_le_bytes(*chunk));
+            }
+            if u64::try_from(selected_ids.len()).unwrap_or(u64::MAX) != selection_count {
+                continue;
+            }
+            let Ok(Some(manifest)) = store.read_manifest(&io, &dir) else {
+                continue;
+            };
+            let Ok(log) = crate::replace::JobLog::open(
+                Box::new(io.clone()),
+                &store,
+                &dir,
+                key.clone(),
+                &data_dir,
+                &self.identity.uuid,
+            ) else {
+                // Corrupt/unknown logs quarantine the operation: leave it
+                // out of the resumable set (inspection-only via doctor).
+                continue;
+            };
+            let record_effects: std::collections::HashMap<u64, crate::replace::ItemEffect> = log
+                .records()
+                .ok()
+                .map(|records| {
+                    records
+                        .into_iter()
+                        .filter_map(|record| match record.action {
+                            crate::replace::ItemAction::Outcome { outcome } => Some((
+                                record.item_id,
+                                match outcome {
+                                    crate::replace::PersistedItemOutcome::Saved => {
+                                        crate::replace::ItemEffect::Saved
+                                    }
+                                    crate::replace::PersistedItemOutcome::IndexPending => {
+                                        crate::replace::ItemEffect::IndexPending
+                                    }
+                                    crate::replace::PersistedItemOutcome::AppliedConflict => {
+                                        crate::replace::ItemEffect::AppliedConflict
+                                    }
+                                    crate::replace::PersistedItemOutcome::Stale => {
+                                        crate::replace::ItemEffect::Stale
+                                    }
+                                    crate::replace::PersistedItemOutcome::Busy => {
+                                        crate::replace::ItemEffect::Busy
+                                    }
+                                    crate::replace::PersistedItemOutcome::Denied => {
+                                        crate::replace::ItemEffect::Unsupported
+                                    }
+                                    crate::replace::PersistedItemOutcome::NeedsRecovery => {
+                                        crate::replace::ItemEffect::NeedsRecovery
+                                    }
+                                    crate::replace::PersistedItemOutcome::SatisfiedUnattributed => {
+                                        crate::replace::ItemEffect::SatisfiedUnattributed
+                                    }
+                                },
+                            )),
+                            _ => None,
+                        })
+                        .collect::<std::collections::HashMap<_, _>>()
+                })
+                .unwrap_or_default();
+            let mut items: Vec<crate::replace::JobItem> = Vec::new();
+            for note in &manifest.notes {
+                if !selected_ids.contains(&note.item_id) {
+                    continue;
+                }
+                let effect = match record_effects.get(&note.item_id) {
+                    Some(effect) => Some(*effect),
+                    None => {
+                        // Classify against durable disk hashes (D-11):
+                        // before-hash = not yet applied; after-hash =
+                        // satisfied (never overwritten again); neither =
+                        // divergence.
+                        let full = self.identity.root.join(&note.path);
+                        let current = self
+                            .actor
+                            .read_bounded(full, flavite_index::MAX_NOTE_BYTES as u64);
+                        match current {
+                            Ok(Some(bytes)) => {
+                                let hash = hex::encode(blake3::hash(&bytes).as_bytes());
+                                if hash == note.disk_hash {
+                                    None
+                                } else if hash == note.after.hash {
+                                    Some(crate::replace::ItemEffect::SatisfiedUnattributed)
+                                } else {
+                                    Some(crate::replace::ItemEffect::NeedsRecovery)
+                                }
+                            }
+                            Ok(None) => Some(crate::replace::ItemEffect::Stale),
+                            Err(_) => Some(crate::replace::ItemEffect::NeedsRecovery),
+                        }
+                    }
+                };
+                items.push(crate::replace::JobItem {
+                    record: note.clone(),
+                    effect,
+                    receipts: std::collections::BTreeMap::new(),
+                });
+            }
+            let mut phase = crate::replace::JobPhase::Paused;
+            for record in log.records().ok().into_iter().flatten() {
+                if let crate::replace::ItemAction::JobTerminal { phase: phase_label } =
+                    record.action
+                {
+                    phase = match phase_label.as_str() {
+                        "completed" => crate::replace::JobPhase::Completed,
+                        "partial" => crate::replace::JobPhase::Partial,
+                        "cancelled" => crate::replace::JobPhase::Cancelled,
+                        "paused" => crate::replace::JobPhase::Paused,
+                        "needs-recovery" => crate::replace::JobPhase::NeedsRecovery,
+                        _ => crate::replace::JobPhase::NeedsRecovery,
+                    };
+                }
+            }
+            if phase == crate::replace::JobPhase::Paused
+                && items.iter().any(|item| {
+                    matches!(item.effect, Some(crate::replace::ItemEffect::NeedsRecovery))
+                })
+            {
+                phase = crate::replace::JobPhase::NeedsRecovery;
+            }
+            let totals = crate::replace::JobTotals::from_items(&items);
+            let state = Arc::new(Mutex::new(JobState {
+                phase,
+                items,
+                totals,
+            }));
+            let job_id = match u128::from_str_radix(&dir, 16) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            self.replace_jobs_map.lock_recovering().insert(
+                job_id,
+                JobEntry {
+                    state,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    preview_id: 0,
+                    selection_revision: 0,
+                    idempotency_key: None,
+                },
+            );
+        }
+    }
+
+    /// Whether a source path is leased by a replacement job (RFC-0006
+    /// D-10: input to a leased note is refused, never buffered/replayed).
+    fn leased_by_replace(&self, path: &Path) -> bool {
+        let relative = path.strip_prefix(&self.identity.root).unwrap_or(path);
+        let key = relative.as_os_str().as_encoded_bytes();
+        self.leases
+            .is_leased_by(key, crate::source_leases::LeaseOwner::Replace)
+    }
+
     /// Shared admission guard: at most [`REPLACE_QUEUE_MAX`] replace jobs
     /// may be queued before explicit Busy (NFR-10).
     fn replace_queue_full(&self) -> bool {
@@ -3812,6 +4223,7 @@ impl Session {
             };
             selected_ids.sort_unstable();
             selected_ids.dedup();
+            entry.selected_ids = selected_ids.clone();
             entry.selection_revision = entry.selection_revision.saturating_add(1);
             let revision = entry.selection_revision;
             let mut hasher = blake3::Hasher::new();
@@ -3847,6 +4259,291 @@ impl Session {
         SessionResult::Success(CommandResult::ReplaceStatus {
             preview_id,
             manifest,
+        })
+    }
+
+    /// Admit a durable replacement apply (RFC-0006 S08/D-10).
+    ///
+    /// The first Apply freezes the selection revision; a different revision
+    /// is `SelectionLocked`. One active apply runs per vault; further
+    /// admissions are Busy. The job is persisted (selection file + sealed
+    /// manifest) before the worker starts.
+    #[allow(clippy::too_many_lines)]
+    fn replace_apply(
+        &self,
+        request_id: u64,
+        preview_id: u128,
+        selection_revision: u64,
+        idempotency_key: u128,
+    ) -> SessionResult {
+        self.sweep_source_sessions();
+        if self.active_apply.lock_recovering().is_some() {
+            return SessionResult::Busy;
+        }
+        // The operation key must be usable BEFORE any job start.
+        let key = match self.operation_key() {
+            Ok(key) => key,
+            Err(message) => {
+                return SessionResult::ActionRequired {
+                    code: "replacement-key-unavailable",
+                    data: Some(message),
+                };
+            }
+        };
+        let preview = {
+            let previews = self.previews.lock_recovering();
+            previews.get(&preview_id).map(|entry| {
+                (
+                    entry.manifest.clone(),
+                    entry.selected_ids.clone(),
+                    entry.selection_revision,
+                )
+            })
+        };
+        let Some((manifest, selected_ids, current_revision)) = preview else {
+            return SessionResult::ActionRequired {
+                code: "preview-expired",
+                data: None,
+            };
+        };
+        if current_revision == 0 {
+            return SessionResult::Error {
+                message: "select notes before applying".into(),
+            };
+        }
+        if selection_revision != current_revision {
+            return SessionResult::Error {
+                message: "selection locked: the preview has a newer selection revision".into(),
+            };
+        }
+        if selected_ids.is_empty() {
+            return SessionResult::Error {
+                message: "the selection names no notes".into(),
+            };
+        }
+        // Idempotent replay: an existing completed job for the same frozen
+        // selection returns its receipt; a live one is Busy.
+        {
+            let jobs = self.replace_jobs_map.lock_recovering();
+            if let Some((existing_id, entry)) = jobs.iter().find(|(_, entry)| {
+                entry.preview_id == preview_id && entry.selection_revision == selection_revision
+            }) {
+                let state = entry.state.lock_recovering();
+                return match state.phase {
+                    crate::replace::JobPhase::Completed => {
+                        SessionResult::Success(CommandResult::ReplaceJobFinished {
+                            job_id: *existing_id,
+                            phase: state.phase,
+                            totals: state.totals.clone(),
+                        })
+                    }
+                    _ => SessionResult::Busy,
+                };
+            }
+        }
+        if self.replace_queue_full() {
+            return SessionResult::Busy;
+        }
+        // The job reuses the preview id: payload objects and the sealed
+        // manifest already live under this job dir (content-addressed), so
+        // Apply references the same store objects.
+        let job_id = preview_id;
+        let job_hex = hex::encode(job_id.to_be_bytes());
+        // Persist the frozen selection under the job dir before starting.
+        let store = crate::replace::ReplaceStore::new(&self.identity.root);
+        let io = crate::replace::ActorOpStoreIo::new(self.actor.clone());
+        if let Err(message) =
+            crate::replace::coordinator::write_selection(&io, &store, &job_hex, &selected_ids)
+        {
+            return SessionResult::Error { message };
+        }
+        let selected_set: std::collections::BTreeSet<u64> = selected_ids.iter().copied().collect();
+        let items: Vec<crate::replace::JobItem> = manifest
+            .notes
+            .iter()
+            .filter(|note| !note.no_change && selected_set.contains(&note.item_id))
+            .map(|note| crate::replace::JobItem {
+                record: note.clone(),
+                effect: None,
+                receipts: std::collections::BTreeMap::new(),
+            })
+            .collect();
+        let state = Arc::new(Mutex::new(JobState {
+            phase: crate::replace::JobPhase::Applying,
+            items,
+            totals: crate::replace::JobTotals::default(),
+        }));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ctx = self.coordinator_ctx();
+        self.pending_replace.lock_recovering().insert(request_id);
+        let admitted = self.replace_jobs.as_ref().is_some_and(|jobs| {
+            jobs.send(ReplaceJob {
+                request_id,
+                work: ReplaceWork::Apply {
+                    job_id,
+                    ctx,
+                    key,
+                    store,
+                    state: Arc::clone(&state),
+                    cancel: Arc::clone(&cancel),
+                },
+            })
+            .is_ok()
+        });
+        if !admitted {
+            self.pending_replace.lock_recovering().remove(&request_id);
+            return SessionResult::Error {
+                message: "replacement apply workers are unavailable".into(),
+            };
+        }
+        self.replace_jobs_map.lock_recovering().insert(
+            job_id,
+            JobEntry {
+                state,
+                cancel,
+                preview_id,
+                selection_revision,
+                idempotency_key: Some(idempotency_key),
+            },
+        );
+        *self.active_apply.lock_recovering() = Some(job_id);
+        SessionResult::Pending { request_id }
+    }
+
+    /// Cancel a durable job: stop admission of the next item; an item past
+    /// its durable intent point finishes. Idempotent.
+    fn replace_cancel(&self, job_id: u128) -> SessionResult {
+        let mut jobs = self.replace_jobs_map.lock_recovering();
+        let Some(entry) = jobs.get_mut(&job_id) else {
+            return SessionResult::ActionRequired {
+                code: "job-unknown",
+                data: None,
+            };
+        };
+        let phase = entry.state.lock_recovering().phase;
+        if matches!(
+            phase,
+            crate::replace::JobPhase::Completed
+                | crate::replace::JobPhase::Cancelled
+                | crate::replace::JobPhase::NeedsRecovery
+        ) {
+            return SessionResult::Success(CommandResult::ReplaceCancelled { job_id });
+        }
+        entry.cancel.store(true, Ordering::Relaxed);
+        SessionResult::Success(CommandResult::ReplaceCancelled { job_id })
+    }
+
+    /// Explicitly resume a paused/partial/cancelled job. Untouched items run
+    /// with their unchanged guards; a fresh grant is rechecked per item.
+    /// Idempotent within the session.
+    fn replace_resume(
+        &self,
+        request_id: u64,
+        job_id: u128,
+        idempotency_key: u128,
+    ) -> SessionResult {
+        self.sweep_source_sessions();
+        if self.active_apply.lock_recovering().is_some() {
+            return SessionResult::Busy;
+        }
+        let entry = {
+            let jobs = self.replace_jobs_map.lock_recovering();
+            jobs.get(&job_id).map(|entry| {
+                (
+                    Arc::clone(&entry.state),
+                    Arc::clone(&entry.cancel),
+                    entry.selection_revision,
+                )
+            })
+        };
+        let Some((state, cancel, _revision)) = entry else {
+            return SessionResult::ActionRequired {
+                code: "job-unknown",
+                data: None,
+            };
+        };
+        let phase = state.lock_recovering().phase;
+        if matches!(phase, crate::replace::JobPhase::Completed) {
+            return SessionResult::Success(CommandResult::ReplaceJobFinished {
+                job_id,
+                phase,
+                totals: state.lock_recovering().totals.clone(),
+            });
+        }
+        if matches!(phase, crate::replace::JobPhase::NeedsRecovery) {
+            return SessionResult::ActionRequired {
+                code: "job-needs-recovery",
+                data: None,
+            };
+        }
+        let key = match self.operation_key() {
+            Ok(key) => key,
+            Err(message) => {
+                return SessionResult::ActionRequired {
+                    code: "replacement-key-unavailable",
+                    data: Some(message),
+                };
+            }
+        };
+        state.lock_recovering().phase = crate::replace::JobPhase::Applying;
+        cancel.store(false, Ordering::Relaxed);
+        let store = crate::replace::ReplaceStore::new(&self.identity.root);
+        let ctx = self.coordinator_ctx();
+        self.pending_replace.lock_recovering().insert(request_id);
+        let admitted = self.replace_jobs.as_ref().is_some_and(|jobs| {
+            jobs.send(ReplaceJob {
+                request_id,
+                work: ReplaceWork::Apply {
+                    job_id,
+                    ctx,
+                    key,
+                    store,
+                    state,
+                    cancel,
+                },
+            })
+            .is_ok()
+        });
+        if !admitted {
+            self.pending_replace.lock_recovering().remove(&request_id);
+            return SessionResult::Error {
+                message: "replacement apply workers are unavailable".into(),
+            };
+        }
+        if let Some(entry) = self.replace_jobs_map.lock_recovering().get_mut(&job_id) {
+            entry.idempotency_key = Some(idempotency_key);
+        }
+        *self.active_apply.lock_recovering() = Some(job_id);
+        SessionResult::Pending { request_id }
+    }
+
+    /// Current durable job status.
+    fn replace_job_status(&self, job_id: u128) -> SessionResult {
+        let entry = self
+            .replace_jobs_map
+            .lock_recovering()
+            .get(&job_id)
+            .map(|entry| {
+                let state = entry.state.lock_recovering();
+                (
+                    state.phase,
+                    state.totals.clone(),
+                    entry.selection_revision,
+                    u64::try_from(state.items.len()).unwrap_or(u64::MAX),
+                )
+            });
+        let Some((phase, totals, selection_revision, selected_items)) = entry else {
+            return SessionResult::ActionRequired {
+                code: "job-unknown",
+                data: None,
+            };
+        };
+        SessionResult::Success(CommandResult::ReplaceJobStatus {
+            job_id,
+            phase,
+            totals,
+            selection_revision,
+            selected_items,
         })
     }
 
@@ -4026,6 +4723,7 @@ impl Session {
                                 let entry = PreviewEntry {
                                     expires_at_unix_ms: manifest.expires_at_unix_ms,
                                     manifest: Arc::new(manifest),
+                                    selected_ids: Vec::new(),
                                     selection_revision: 0,
                                 };
                                 let inner = CommandResult::ReplacePreviewSealed {
@@ -4048,6 +4746,45 @@ impl Session {
                         }
                     };
                     (request_id, result)
+                }
+                ReplaceOutcomeMessage::ApplyDone {
+                    request_id,
+                    job_id,
+                    phase,
+                    totals,
+                } => {
+                    {
+                        let mut jobs = self.replace_jobs_map.lock_recovering();
+                        if let Some(entry) = jobs.get_mut(&job_id) {
+                            let mut state = entry.state.lock_recovering();
+                            state.phase = phase;
+                            state.totals = totals.clone();
+                        }
+                    }
+                    *self.active_apply.lock_recovering() = None;
+                    (
+                        request_id,
+                        SessionResult::Success(CommandResult::ReplaceJobFinished {
+                            job_id,
+                            phase,
+                            totals,
+                        }),
+                    )
+                }
+                ReplaceOutcomeMessage::ApplyFailed {
+                    request_id,
+                    job_id,
+                    message,
+                } => {
+                    {
+                        let mut jobs = self.replace_jobs_map.lock_recovering();
+                        if let Some(entry) = jobs.get_mut(&job_id) {
+                            entry.state.lock_recovering().phase =
+                                crate::replace::JobPhase::NeedsRecovery;
+                        }
+                    }
+                    *self.active_apply.lock_recovering() = None;
+                    (request_id, SessionResult::Error { message })
                 }
             };
             self.record_completion(request_id, result);
@@ -4475,6 +5212,14 @@ impl Session {
         undo_policy: flavite_buffer::undo::UndoPolicy,
     ) -> SessionResult {
         let mut buffer_manager = self.buffer_manager.lock_recovering();
+        if let Some(path) = buffer_manager.path_for_id(buffer_id)
+            && self.leased_by_replace(path)
+        {
+            return SessionResult::ActionRequired {
+                code: "replacement-in-progress",
+                data: Some(path.display().to_string()),
+            };
+        }
 
         // Get the buffer and apply all edit ops
         if let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) {
@@ -4511,6 +5256,12 @@ impl Session {
 
     /// Save a note.
     fn save_note(&self, path: PathBuf) -> SessionResult {
+        if self.leased_by_replace(&path) {
+            return SessionResult::ActionRequired {
+                code: "replacement-in-progress",
+                data: Some(path.display().to_string()),
+            };
+        }
         let buffer_id = {
             self.buffer_manager
                 .lock_recovering()
@@ -4694,6 +5445,12 @@ impl Session {
     }
 
     fn rename_note(&self, from: PathBuf, to: PathBuf, strategy: RenameStrategy) -> SessionResult {
+        if self.leased_by_replace(&from) || self.leased_by_replace(&to) {
+            return SessionResult::ActionRequired {
+                code: "replacement-in-progress",
+                data: Some(from.display().to_string()),
+            };
+        }
         let from = if from.is_absolute() {
             from
         } else {

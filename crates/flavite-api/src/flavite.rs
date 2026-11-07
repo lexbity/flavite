@@ -932,6 +932,30 @@ impl Flavite {
                 crate::replace::handle_replace_status,
             ),
             (
+                "replace.apply",
+                "Apply the sealed replacement preview",
+                ArgSchema::typed::<crate::replace::ReplaceApplyArgs>(),
+                crate::replace::handle_replace_apply,
+            ),
+            (
+                "replace.cancel",
+                "Cancel a replacement job",
+                ArgSchema::typed::<crate::replace::ReplaceCancelArgs>(),
+                crate::replace::handle_replace_cancel,
+            ),
+            (
+                "replace.resume",
+                "Resume a replacement job",
+                ArgSchema::typed::<crate::replace::ReplaceResumeArgs>(),
+                crate::replace::handle_replace_resume,
+            ),
+            (
+                "replace.job_status",
+                "Replacement job status",
+                ArgSchema::typed::<crate::replace::ReplaceJobStatusArgs>(),
+                crate::replace::handle_replace_job_status,
+            ),
+            (
                 "link.prepare",
                 "Prepare link insertion",
                 ArgSchema::typed::<crate::links::LinkPrepareArgs>(),
@@ -1070,6 +1094,7 @@ impl Flavite {
                     | "replace.preview"
                     | "replace.select"
                     | "replace.status"
+                    | "replace.job_status"
             ) {
                 CommandSpec::new(id, title, args).requires(crate::Capability::ReadNotes)
             } else {
@@ -1685,6 +1710,15 @@ impl Flavite {
             SessionResult::Success(crate::session::CommandResult::ReplaceStatus { .. }) => {
                 "replace.status"
             }
+            SessionResult::Success(crate::session::CommandResult::ReplaceJobFinished {
+                ..
+            }) => "replace.apply",
+            SessionResult::Success(crate::session::CommandResult::ReplaceCancelled { .. }) => {
+                "replace.cancel"
+            }
+            SessionResult::Success(crate::session::CommandResult::ReplaceJobStatus { .. }) => {
+                "replace.job_status"
+            }
             SessionResult::MergeReady { .. }
             | SessionResult::Conflict { .. }
             | SessionResult::ActionRequired { .. } => "conflict.resolve",
@@ -1946,6 +1980,29 @@ impl Flavite {
                         "preview_id": crate::replace::encode_id(preview_id),
                         "plan": crate::replace::preview_plan_json(&manifest),
                         "page": crate::replace::preview_page_json(&manifest, 0, 200),
+                    }),
+                    crate::session::CommandResult::ReplaceJobFinished {
+                        job_id,
+                        phase,
+                        totals,
+                    } => serde_json::json!({
+                        "job_id": crate::replace::encode_id(job_id),
+                        "status": crate::replace::job_status_json(phase, &totals),
+                    }),
+                    crate::session::CommandResult::ReplaceCancelled { job_id } => {
+                        serde_json::json!({ "job_id": crate::replace::encode_id(job_id) })
+                    }
+                    crate::session::CommandResult::ReplaceJobStatus {
+                        job_id,
+                        phase,
+                        totals,
+                        selection_revision,
+                        selected_items,
+                    } => serde_json::json!({
+                        "job_id": crate::replace::encode_id(job_id),
+                        "selection_revision": selection_revision,
+                        "selected_items": selected_items,
+                        "status": crate::replace::job_status_json(phase, &totals),
                     }),
                     crate::session::CommandResult::EditsDiscarded { buffer_id } => {
                         serde_json::json!({ "buffer_id": buffer_id.as_u64() })

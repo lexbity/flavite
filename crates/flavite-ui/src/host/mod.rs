@@ -20,6 +20,7 @@ pub mod navigation;
 pub mod note_search;
 pub mod occurrences;
 pub mod open_intents;
+pub mod operations;
 pub mod persistence;
 pub mod replace;
 pub mod search;

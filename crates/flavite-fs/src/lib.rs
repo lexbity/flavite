@@ -25,7 +25,10 @@ pub mod fault;
 mod proptests;
 
 pub use atomic::{atomic_write, cleanup_orphan_temps, list_orphan_temps, read_prior_bytes};
-pub use fs::{DirEntry, Fs, FsError, Metadata, Result, hash_file};
+pub use fs::{
+    DirEntry, DisplacedObject, Fs, FsError, Metadata, Result, RetainedReplaceOutcome,
+    RetainedReplaceRequest, hash_file,
+};
 pub use mem::MemFs;
 pub use os::OsFs;
 pub use path::{has_non_normal_components, lexical_canonicalize};

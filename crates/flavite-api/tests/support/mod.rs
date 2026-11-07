@@ -64,6 +64,12 @@ macro_rules! impl_fs_delegates {
         fn fsync_dir(&self, path: &Path) -> Result<()> {
             self.$inner.fsync_dir(path)
         }
+        fn supports_retained_replace(&self) -> Result<bool> {
+            self.$inner.supports_retained_replace()
+        }
+        fn exchange(&self, a: &Path, b: &Path) -> Result<()> {
+            self.$inner.exchange(a, b)
+        }
     };
 }
 

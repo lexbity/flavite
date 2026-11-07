@@ -50,6 +50,15 @@ pub enum FsError {
 
     #[error("directory not found: {}", .0.display())]
     DirNotFound(PathBuf),
+
+    #[error("current bytes do not match the expected base")]
+    BaseMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+
+    #[error("retained replacement staging protocol violated: {0}")]
+    RetainedReplace(String),
 }
 
 /// Convenience `Result` alias for `Fs` operations.
@@ -239,6 +248,232 @@ pub trait Fs: Send + Sync {
     /// [`FsError::FsyncUnsupported`] and callers fall back to the weaker
     /// documented durability mode (§4.9).
     fn fsync_dir(&self, path: &Path) -> Result<()>;
+
+    // --- Retained replacement (RFC-0006 D-10/§6.5) ---
+
+    /// Atomically exchange the two existing files at `a` and `b`.
+    ///
+    /// After a successful exchange, `a` contains `b`'s previous bytes and
+    /// `b` contains `a`'s previous bytes; both paths continue to exist.
+    /// This is the kernel primitive behind [`Fs::replace_preserving_displaced`]:
+    /// Linux implements it with `renameat2(RENAME_EXCHANGE)`, macOS with
+    /// `renamex_np(RENAME_SWAP)`. Implementations that cannot guarantee an
+    /// atomic swap MUST return [`FsError::Unsupported`] — never an emulation
+    /// by unlinking one side (a crash then loses a file name).
+    fn exchange(&self, _a: &Path, _b: &Path) -> Result<()> {
+        Err(FsError::Unsupported(
+            "atomic file exchange is not available on this filesystem".into(),
+        ))
+    }
+
+    /// Whether [`Fs::replace_preserving_displaced`] is available on this
+    /// filesystem (RFC-0006 D-10/§6.5). `false` means the stronger
+    /// displacement guarantee cannot be kept; callers MUST refuse retained
+    /// replacement with a typed `Unsupported` rather than silently falling
+    /// back to an overwrite.
+    fn supports_retained_replace(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Replace `request.target` with `request.bytes` while retaining the
+    /// actual displaced object, per RFC-0006 D-10/§6.5.
+    ///
+    /// Steps: exclusive sibling staging directory `.flavite-op-<id>` next to
+    /// the target; stage and fsync the desired output; read the current
+    /// target bytes and compare against `expected_base_hash` (when `Some`;
+    /// `None` asserts the target is absent — no-clobber creation); atomically
+    /// exchange the staged file with the target so the previous bytes land on
+    /// the staged path; fsync the parent directory (both names durable);
+    /// then compare the displaced bytes against the expected base. A
+    /// mismatch at that final compare means an external writer raced between
+    /// the base check and the exchange — the displaced bytes are still
+    /// retained and reported, never discarded and never auto-rolled-back.
+    ///
+    /// The default implementation is a generic composition over the rest of
+    /// the trait surface; platform backends supply [`Fs::exchange`] and
+    /// [`Fs::supports_retained_replace`]. Fault-injecting wrappers override
+    /// it to orchestrate the same algorithm through their own injected
+    /// methods, so every sub-operation boundary is exercisable.
+    fn replace_preserving_displaced(
+        &self,
+        request: &RetainedReplaceRequest,
+    ) -> Result<RetainedReplaceOutcome> {
+        retained_replace(self, request)
+    }
+}
+
+/// Generic retained-replacement algorithm (RFC-0006 D-10/§6.5), composed
+/// over the [`Fs`] surface. Every sub-step is a trait call, so wrapper
+/// implementations (fault injection, tracing) observe each boundary.
+pub(crate) fn retained_replace<F: Fs + ?Sized>(
+    fs: &F,
+    request: &RetainedReplaceRequest,
+) -> Result<RetainedReplaceOutcome> {
+    if !fs.supports_retained_replace()? {
+        return Err(FsError::Unsupported(
+            "retained replacement is not available on this filesystem".into(),
+        ));
+    }
+    let real = fs.resolve_symlink(&request.target)?;
+    let Some(parent) = real.parent() else {
+        return Err(FsError::RetainedReplace(
+            "destination has no parent".to_owned(),
+        ));
+    };
+    let name = real.file_name().and_then(|n| n.to_str()).unwrap_or("note");
+    let staging = parent.join(format!(".flavite-op-{id}", id = uuid::Uuid::now_v7()));
+    let staged = staging.join(format!(".{name}.staged"));
+    let cleanup = || {
+        let _ = fs.remove(&staged);
+        let _ = fs.remove(&staging);
+    };
+
+    // 1. Exclusive sibling staging directory + staged output.
+    fs.create_dir_all(&staging)?;
+    if let Err(error) = fs.write_new(&staged, &request.bytes) {
+        cleanup();
+        return Err(error);
+    }
+    if let Ok(metadata) = fs.metadata(&real)
+        && !metadata.is_dir
+    {
+        // Copying mode bits is best-effort; failure must not fail the
+        // replacement (permissions are inherited where possible).
+        let _ = fs.copy_mode(&real, &staged);
+    }
+    if let Err(error) = fs.fsync_file(&staged) {
+        cleanup();
+        return Err(error);
+    }
+    match fs.read_if_exists(&staged) {
+        Ok(Some(staged_bytes)) if staged_bytes == request.bytes => {}
+        Ok(_) => {
+            cleanup();
+            return Err(FsError::ShortWrite {
+                expected: request.bytes.len() as u64,
+                written: 0,
+            });
+        }
+        Err(error) => {
+            cleanup();
+            return Err(error);
+        }
+    }
+
+    // 2. Current target bytes + base check.
+    let prior = match fs.read_if_exists(&real) {
+        Ok(value) => value,
+        Err(error) => {
+            cleanup();
+            return Err(error);
+        }
+    };
+    let Some(prior_bytes) = prior else {
+        // Creation: no-clobber atomic install, no displaced object.
+        if request.expected_base_hash.is_some() {
+            cleanup();
+            return Err(FsError::NotFound(real));
+        }
+        if let Err(error) = fs.rename_no_replace(&staged, &real) {
+            cleanup();
+            return Err(error);
+        }
+        fs.fsync_dir(parent)?;
+        let _ = fs.remove(&staging);
+        return Ok(RetainedReplaceOutcome::Created);
+    };
+    let prior_hash = *blake3::hash(&prior_bytes).as_bytes();
+    match request.expected_base_hash {
+        None => {
+            // No-clobber creation: a target that exists is a collision.
+            cleanup();
+            return Err(FsError::AlreadyExists(real));
+        }
+        Some(expected) if prior_hash != expected => {
+            cleanup();
+            return Err(FsError::BaseMismatch {
+                expected,
+                actual: prior_hash,
+            });
+        }
+        Some(_) => {}
+    }
+
+    // 3. Atomic exchange: real gets the new bytes; the staged path now
+    // holds the ACTUAL prior object (the displaced bytes).
+    if let Err(error) = fs.exchange(&staged, &real) {
+        cleanup();
+        return Err(error);
+    }
+    // The exchange already happened and the displaced object remains on
+    // the staged path. The caller reconciles durability — the displaced
+    // bytes must NEVER be deleted here.
+    fs.fsync_dir(parent)?;
+    fs.fsync_dir(&staging)?;
+
+    // 4. Verify the retained displaced object against the expected base.
+    let displaced_bytes = match fs.read_if_exists(&staged) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return Err(FsError::RetainedReplace(
+                "displaced object is missing after exchange".to_owned(),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let displaced_hash = *blake3::hash(&displaced_bytes).as_bytes();
+    let displaced_matches_base = request
+        .expected_base_hash
+        .is_none_or(|expected| displaced_hash == expected);
+    Ok(RetainedReplaceOutcome::Replaced {
+        displaced: DisplacedObject {
+            path: staged,
+            hash: displaced_hash,
+            len: displaced_bytes.len() as u64,
+        },
+        displaced_matches_base,
+    })
+}
+
+/// A retained displaced object (RFC-0006 D-10/§6.5): the exact previous
+/// bytes of a replaced target, still present on disk at [`DisplacedObject::path`]
+/// until the caller archives them durably and retires the staging directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplacedObject {
+    /// Path of the retained previous-target object (inside the exclusive
+    /// sibling staging directory).
+    pub path: PathBuf,
+    /// BLAKE3 of the displaced bytes.
+    pub hash: [u8; 32],
+    /// Byte length of the displaced object.
+    pub len: u64,
+}
+
+/// Outcome of [`Fs::replace_preserving_displaced`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetainedReplaceOutcome {
+    /// The target was replaced; `displaced` is the actual prior object and
+    /// `displaced_matches_base` reports whether it equaled the requested
+    /// base (false ⇒ an external writer raced and its bytes were retained).
+    Replaced {
+        displaced: DisplacedObject,
+        displaced_matches_base: bool,
+    },
+    /// The target was created (no-clobber): there was no prior object.
+    Created,
+}
+
+/// Request for [`Fs::replace_preserving_displaced`].
+#[derive(Debug, Clone)]
+pub struct RetainedReplaceRequest {
+    /// The target path, already validated/anchored by the caller.
+    pub target: PathBuf,
+    /// Expected current bytes hash. `Some` replaces an existing file and is
+    /// checked before the exchange; `None` asserts the target is absent
+    /// (no-clobber creation).
+    pub expected_base_hash: Option<[u8; 32]>,
+    /// The exact desired bytes.
+    pub bytes: Vec<u8>,
 }
 
 /// Compute the BLAKE3 hash of a file's contents (convenience helper).

@@ -111,6 +111,24 @@ pub enum CheckStatus {
     Error,
 }
 
+/// One durable replacement operation as reported by doctor (RFC-0006
+/// S08/§6.8). Inspection-only: rec the key or note content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorOperation {
+    /// Job id (32 lowercase hex).
+    pub job_id: String,
+    /// Whether the sealed manifest is readable and schema-valid.
+    pub manifest_ok: bool,
+    /// Whether a frozen selection record exists.
+    pub selection_present: bool,
+    /// Number of authenticated log records.
+    pub record_count: u64,
+    /// Whether the private high-water head is present.
+    pub head_present: bool,
+    /// True when the operation is quarantined (corrupt/unknown state).
+    pub quarantine: bool,
+}
+
 /// Doctor report for a vault.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoctorReport {
@@ -122,6 +140,8 @@ pub struct DoctorReport {
     pub checks: Vec<DoctorCheck>,
     /// Summary statistics.
     pub summary: DoctorSummary,
+    /// Durable replacement operations under `.flavite/operations/replace`.
+    pub operations: Vec<DoctorOperation>,
 }
 
 impl DoctorReport {
@@ -134,6 +154,7 @@ impl DoctorReport {
             timestamp,
             checks: Vec::new(),
             summary: DoctorSummary::default(),
+            operations: Vec::new(),
         }
     }
 
@@ -1188,6 +1209,60 @@ pub fn run_doctor(vault: ApiVaultRef) -> DoctorReport {
 /// Resolve the vault's persisted/registered identity and hold its root and
 /// instance guards while running diagnostics, without opening the writable
 /// index actor or reconciling the vault.
+/// Enumerate durable replacement operations (RFC-0006 S08/§6.8):
+/// inspection-only, never printing keys or content. Quarantined (corrupt/
+/// unknown) operations are flagged, never guessed as empty.
+fn scan_operations(root: &Path, vault_uuid: &uuid::Uuid) -> Vec<DoctorOperation> {
+    let base = root.join(".flavite").join("operations").join("replace");
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return Vec::new();
+    };
+    let data_dir = flavite_vault::identity::resolve_data_dir(None);
+    let mut operations = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Ok(job_id) = entry.file_name().into_string() else {
+            continue;
+        };
+        if job_id.len() != 32 || !job_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let dir = entry.path();
+        let manifest_ok = std::fs::read(dir.join("manifest.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|value| {
+                value.get("schema").and_then(serde_json::Value::as_u64) == Some(1)
+            });
+        let selection_present = dir.join("selection.bin").is_file();
+        let record_count = std::fs::read_dir(dir.join("records"))
+            .ok()
+            .map(|records| records.flatten().count() as u64)
+            .unwrap_or(0);
+        let head_present = data_dir.as_ref().is_some_and(|data| {
+            data.join("flavite")
+                .join("vaults")
+                .join(vault_uuid.to_string())
+                .join("operations")
+                .join(format!("{job_id}.head"))
+                .is_file()
+        });
+        let quarantine = !manifest_ok || (record_count > 0 && !head_present);
+        operations.push(DoctorOperation {
+            job_id,
+            manifest_ok,
+            selection_present,
+            record_count,
+            head_present,
+            quarantine,
+        });
+    }
+    operations.sort_by(|a, b| a.job_id.cmp(&b.job_id));
+    operations
+}
+
 pub fn run_doctor_root(root: PathBuf) -> Result<DoctorReport, String> {
     let fs = OsFs::new();
     let root = std::fs::canonicalize(&root).map_err(|e| e.to_string())?;
@@ -1197,7 +1272,9 @@ pub fn run_doctor_root(root: PathBuf) -> Result<DoctorReport, String> {
     let identity = flavite_vault::IdentityManager::open(&fs, root)
         .map_err(|e| format!("Cannot acquire vault identity/instance lock: {e}"))?;
     let vault_ref = ApiVaultRef::new(identity.identity().uuid, identity.identity().root.clone());
-    let report = DoctorChecker::new(vault_ref).run();
+    let operations = scan_operations(&identity.identity().root, &identity.identity().uuid);
+    let mut report = DoctorChecker::new(vault_ref).run();
+    report.operations = operations;
     drop(identity);
     Ok(report)
 }

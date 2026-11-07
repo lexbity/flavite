@@ -198,6 +198,78 @@ fn seed_s07_inputs(root: &Path) {
     }
 }
 
+fn seed_s08_inputs(root: &Path) {
+    seed_s07_inputs(root);
+    for relative in [
+        // rg targets of the S08 absence gates (must exist in the tree).
+        "crates/flavite-vault/src/save.rs",
+        "crates/flavite-fs/tests/retained_replace.rs",
+        "crates/flavite-vault/src/source_leases.rs",
+        "crates/flavite-vault/src/replace/coordinator.rs",
+        "crates/flavite-vault/src/replace/log.rs",
+        "crates/flavite-vault/src/replace/auth.rs",
+        "crates/flavite-vault/tests/replace_fault.rs",
+        "crates/flavite-vault/tests/replace_leases.rs",
+        "crates/flavite-api/tests/replace_apply.rs",
+        "crates/flavite-ui/src/host/operations.rs",
+        "crates/flavite-ui/src/views/operations.rs",
+        "crates/flavite-ui/tests/replace_operations.rs",
+        "crates/flavite-cli/tests/operations_cli.rs",
+    ] {
+        seed_file(root, relative);
+    }
+}
+
+#[test]
+fn s08_gate_passes_clean_tree_and_rejects_s08_isolation_violations() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_s08_inputs(temp.path());
+    let clean = run_gate(temp.path(), "S08");
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // The shared save primitive never regresses to a bare rename_replace.
+    let save = temp.path().join("crates/flavite-vault/src/save.rs");
+    fs::write(
+        &save,
+        "fn save_inner() { fs.rename_replace(&temp, &real); }\n",
+    )
+    .unwrap();
+    let rejected = run_gate(temp.path(), "S08");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("rename_replace"));
+    fs::write(&save, "implementation\n").unwrap();
+
+    // The operations host/view never touch the filesystem or block.
+    let ops = temp.path().join("crates/flavite-ui/src/host/operations.rs");
+    fs::write(&ops, "use std::fs::File;\n").unwrap();
+    let rejected = run_gate(temp.path(), "S08");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("std::fs"));
+    fs::write(&ops, "implementation\n").unwrap();
+
+    // The authenticated log never stores free-form string payloads.
+    let log = temp.path().join("crates/flavite-vault/src/replace/log.rs");
+    fs::write(&log, "let m: HashMap<String, String> = HashMap::new();\n").unwrap();
+    let rejected = run_gate(temp.path(), "S08");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("HashMap<String, String>"));
+    fs::write(&log, "implementation\n").unwrap();
+
+    // Presence is enforced: removing a completed S08 file fails.
+    fs::remove_file(
+        temp.path()
+            .join("crates/flavite-vault/src/replace/coordinator.rs"),
+    )
+    .unwrap();
+    let missing = run_gate(temp.path(), "S08");
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("missing/empty"));
+}
+
 #[test]
 fn s07_gate_passes_clean_tree_and_rejects_s07_isolation_violations() {
     let temp = tempfile::tempdir().unwrap();

@@ -32,6 +32,10 @@ pub enum DurabilityOutcome {
     ReplacedDurabilityUncertain,
     ReplacedIndexPending,
     OutcomeUnknown,
+    /// The replacement installed our bytes, but an external writer raced at
+    /// the exchange: the retained displaced bytes differ from the expected
+    /// base. Never represented as a clean Saved (RFC-0006 D-10/§6.5).
+    ReplacedDisplacedConflict,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +49,9 @@ pub enum SaveFailureStage {
     Replace,
     DirectorySync,
     IndexApply,
+    /// Archiving the retained displaced object failed; the object stays on
+    /// disk (never deleted) until durable archival succeeds.
+    Archive,
 }
 
 #[derive(Debug, Clone, Error)]
@@ -123,75 +130,12 @@ where
     let real = fs.resolve_symlink(&request.path).map_err(|e| {
         SaveFailure::at(SaveFailureStage::Resolve, DurabilityOutcome::NotReplaced, e)
     })?;
-    let parent = real.parent().ok_or_else(|| {
-        SaveFailure::at(
-            SaveFailureStage::Resolve,
-            DurabilityOutcome::NotReplaced,
-            "destination has no parent",
-        )
-    })?;
-    let name = real.file_name().and_then(|n| n.to_str()).unwrap_or("note");
-    let temp = parent.join(format!(".{name}.flavite-tmp.{}", uuid::Uuid::now_v7()));
 
-    fs.write_new(&temp, &request.bytes).map_err(|e| {
-        SaveFailure::at(
-            SaveFailureStage::StageWrite,
-            DurabilityOutcome::NotReplaced,
-            e,
-        )
-    })?;
-    match fs.read_if_exists(&temp) {
-        Ok(Some(staged)) if staged == request.bytes => {}
-        Ok(_) => {
-            let _ = fs.remove(&temp);
-            return Err(SaveFailure::at(
-                SaveFailureStage::StageWrite,
-                DurabilityOutcome::NotReplaced,
-                "staged write did not preserve the complete requested bytes",
-            ));
-        }
-        Err(error) => {
-            let _ = fs.remove(&temp);
-            return Err(SaveFailure::at(
-                SaveFailureStage::StageWrite,
-                DurabilityOutcome::NotReplaced,
-                error,
-            ));
-        }
-    }
-    let destination_exists = match fs.exists(&real) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = fs.remove(&temp);
-            return Err(SaveFailure::at(
-                SaveFailureStage::StageWrite,
-                DurabilityOutcome::NotReplaced,
-                e,
-            ));
-        }
-    };
-    if destination_exists && let Err(e) = fs.copy_mode(&real, &temp) {
-        let _ = fs.remove(&temp);
-        return Err(SaveFailure::at(
-            SaveFailureStage::StageWrite,
-            DurabilityOutcome::NotReplaced,
-            e,
-        ));
-    }
-    if let Err(e) = fs.fsync_file(&temp) {
-        let _ = fs.remove(&temp);
-        return Err(SaveFailure::at(
-            SaveFailureStage::StageSync,
-            DurabilityOutcome::NotReplaced,
-            e,
-        ));
-    }
-
-    // Race window begins only after the replacement is staged and synced.
+    // Prior bytes are snapshotted into history BEFORE any source effect; if
+    // an external writer raced earlier, those exact bytes are preserved.
     let prior = match fs.read_if_exists(&real) {
         Ok(v) => v,
         Err(e) => {
-            let _ = fs.remove(&temp);
             return Err(SaveFailure::at(
                 SaveFailureStage::PriorRead,
                 DurabilityOutcome::NotReplaced,
@@ -206,7 +150,6 @@ where
             .as_secs();
         if let Err(e) = history.snapshot(&request.note_key, bytes, HistoryReason::Save, false, now)
         {
-            let _ = fs.remove(&temp);
             return Err(SaveFailure::at(
                 SaveFailureStage::History,
                 DurabilityOutcome::NotReplaced,
@@ -220,7 +163,6 @@ where
         DiskPrecondition::Existing(hash) => current == Some(hash),
     };
     if !matches {
-        let _ = fs.remove(&temp);
         let mut failure = SaveFailure::at(
             SaveFailureStage::Compare,
             DurabilityOutcome::NotReplaced,
@@ -230,33 +172,163 @@ where
         return Err(failure);
     }
 
-    if let Err(e) = fs.rename_replace(&temp, &real) {
-        // A failed native replace can be ambiguous on some providers. Caller
-        // must reconcile before another mutation.
+    // The shared retained-replacement primitive (RFC-0006 D-10/§6.5):
+    // stage+fsync the exact output, re-check the base, exchange atomically
+    // while retaining the ACTUAL displaced object, sync the directory, and
+    // verify the displaced bytes against the expected base. Platforms
+    // without the guarantee refuse with Unsupported — there is no hidden
+    // legacy overwrite fallback.
+    let expected_base_hash = match request.precondition {
+        DiskPrecondition::Absent => None,
+        DiskPrecondition::Existing(hash) => Some(hash),
+    };
+    let retained = flavite_fs::RetainedReplaceRequest {
+        target: real.clone(),
+        expected_base_hash,
+        bytes: request.bytes.clone(),
+    };
+    let outcome = match fs.replace_preserving_displaced(&retained) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let mut failure = match error {
+                flavite_fs::FsError::BaseMismatch { actual, .. } => {
+                    let mut failure = SaveFailure::at(
+                        SaveFailureStage::Compare,
+                        DurabilityOutcome::NotReplaced,
+                        "disk content changed since the buffer base was captured",
+                    );
+                    failure.current_hash = Some(actual);
+                    failure
+                }
+                flavite_fs::FsError::Unsupported(_) => SaveFailure::at(
+                    SaveFailureStage::Replace,
+                    DurabilityOutcome::NotReplaced,
+                    "retained replacement is not available on this filesystem; the save capability is refused rather than silently weakened",
+                ),
+                flavite_fs::FsError::AlreadyExists(_) => SaveFailure::at(
+                    SaveFailureStage::Compare,
+                    DurabilityOutcome::NotReplaced,
+                    "a file appeared at the destination during save",
+                ),
+                flavite_fs::FsError::ShortWrite { .. } => SaveFailure::at(
+                    SaveFailureStage::StageWrite,
+                    DurabilityOutcome::NotReplaced,
+                    "the staged output write failed before any source effect",
+                ),
+                flavite_fs::FsError::RetainedReplace(message) => SaveFailure::at(
+                    SaveFailureStage::Replace,
+                    DurabilityOutcome::OutcomeUnknown,
+                    message,
+                ),
+                other => SaveFailure::at(
+                    SaveFailureStage::Replace,
+                    DurabilityOutcome::OutcomeUnknown,
+                    other,
+                ),
+            };
+            failure.current_hash = fs
+                .read_if_exists(&real)
+                .ok()
+                .flatten()
+                .map(|b| *blake3::hash(&b).as_bytes());
+            return Err(failure);
+        }
+    };
+    let displaced_conflict = match &outcome {
+        flavite_fs::RetainedReplaceOutcome::Created => false,
+        flavite_fs::RetainedReplaceOutcome::Replaced {
+            displaced_matches_base,
+            ..
+        } => !displaced_matches_base,
+    };
+    if displaced_conflict {
+        // An external writer modified the retained object between the base
+        // check and the exchange. Our bytes ARE installed, but this is NOT
+        // a clean Saved: the displaced bytes are archived durably and the
+        // conflict is reported. Never auto-rolled-back against a possibly
+        // newer external writer.
+        if let flavite_fs::RetainedReplaceOutcome::Replaced { displaced, .. } = &outcome
+            && let Ok(Some(bytes)) = fs.read_if_exists(&displaced.path)
+        {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let archived = history.snapshot(
+                &request.note_key,
+                &bytes,
+                HistoryReason::Displaced,
+                false,
+                now,
+            );
+            if archived.is_ok() {
+                let _ = fs.remove(&displaced.path);
+                let _ = fs.remove(displaced.path.parent().expect("staging parent"));
+            }
+        }
         let mut failure = SaveFailure::at(
-            SaveFailureStage::Replace,
-            DurabilityOutcome::OutcomeUnknown,
-            e,
+            SaveFailureStage::Archive,
+            DurabilityOutcome::ReplacedDisplacedConflict,
+            "an external writer raced during save; your bytes are installed and the external writer's bytes are preserved",
         );
-        failure.current_hash = fs
-            .read_if_exists(&real)
-            .ok()
-            .flatten()
-            .map(|b| *blake3::hash(&b).as_bytes());
+        failure.current_hash = Some(*blake3::hash(&request.bytes).as_bytes());
         return Err(failure);
     }
-    if let Err(e) = fs.fsync_dir(parent) {
-        let mut failure = SaveFailure::at(
-            SaveFailureStage::DirectorySync,
-            DurabilityOutcome::ReplacedDurabilityUncertain,
-            e,
-        );
-        failure.current_hash = fs
-            .read_if_exists(&real)
-            .ok()
-            .flatten()
-            .map(|bytes| *blake3::hash(&bytes).as_bytes());
-        return Err(failure);
+    // Durable archival of the displaced object (normal saves retire it only
+    // after the archival receipt), then best-effort removal of the sibling
+    // staging directory.
+    if let flavite_fs::RetainedReplaceOutcome::Replaced { displaced, .. } = &outcome {
+        let displaced_bytes = fs.read_if_exists(&displaced.path);
+        match displaced_bytes {
+            Ok(Some(bytes)) if *blake3::hash(&bytes).as_bytes() == displaced.hash => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                match history.snapshot(
+                    &request.note_key,
+                    &bytes,
+                    HistoryReason::Displaced,
+                    false,
+                    now,
+                ) {
+                    Ok(_) => {
+                        let stage_dir = displaced.path.parent();
+                        let _ = fs.remove(&displaced.path);
+                        if let Some(dir) = stage_dir {
+                            let _ = fs.remove(dir);
+                        }
+                    }
+                    Err(e) => {
+                        let mut failure = SaveFailure::at(
+                            SaveFailureStage::Archive,
+                            DurabilityOutcome::ReplacedDurabilityUncertain,
+                            e,
+                        );
+                        failure.current_hash = Some(*blake3::hash(&request.bytes).as_bytes());
+                        return Err(failure);
+                    }
+                }
+            }
+            Ok(_) => {
+                let mut failure = SaveFailure::at(
+                    SaveFailureStage::Archive,
+                    DurabilityOutcome::ReplacedDurabilityUncertain,
+                    "displaced object bytes did not match the retained object receipt",
+                );
+                failure.current_hash = Some(*blake3::hash(&request.bytes).as_bytes());
+                return Err(failure);
+            }
+            Err(e) => {
+                let mut failure = SaveFailure::at(
+                    SaveFailureStage::Archive,
+                    DurabilityOutcome::ReplacedDurabilityUncertain,
+                    e,
+                );
+                failure.current_hash = Some(*blake3::hash(&request.bytes).as_bytes());
+                return Err(failure);
+            }
+        }
     }
 
     let hash = *blake3::hash(&request.bytes).as_bytes();
@@ -410,9 +482,11 @@ mod tests {
 
     #[test]
     fn unchecked_short_writes_cannot_install_truncated_note_or_history_bytes() {
+        // Order under the retained-replacement primitive: three history
+        // snapshot writes (1–3), then the staged-output write (4).
         for (write_occurrence, expected_stage) in [
-            (1, SaveFailureStage::StageWrite),
-            (3, SaveFailureStage::History),
+            (1, SaveFailureStage::History),
+            (4, SaveFailureStage::StageWrite),
         ] {
             let memory = MemFs::new();
             for directory in ["/vault", "/data", "/data/history"] {
@@ -466,7 +540,7 @@ mod tests {
 
         let script = FaultScript::new().fault_at(
             "read_if_exists",
-            3,
+            1,
             FaultBoundary::Before,
             FaultKind::ExternalWrite,
         );

@@ -26,7 +26,9 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::fs::{DirEntry, Fs, FsError, Metadata, Result};
+use crate::fs::{
+    DirEntry, Fs, FsError, Metadata, Result, RetainedReplaceOutcome, RetainedReplaceRequest,
+};
 use crate::mem::MemFs;
 
 // ---------------------------------------------------------------------------
@@ -822,6 +824,44 @@ impl<F: Fs> Fs for FaultFs<F> {
             Err(e) => self.trace_err("fsync_dir", occ, FaultBoundary::After, e),
         }
         self.inject_after("fsync_dir", occ)?;
+        result
+    }
+
+    fn supports_retained_replace(&self) -> Result<bool> {
+        self.check_alive()?;
+        self.inner.supports_retained_replace()
+    }
+
+    fn exchange(&self, a: &Path, b: &Path) -> Result<()> {
+        self.check_alive()?;
+        let occ = self.bump_count("exchange");
+        self.inject_before("exchange", occ)?;
+        let result = self.inner.exchange(a, b);
+        match &result {
+            Ok(_) => self.trace_ok("exchange", occ, FaultBoundary::After),
+            Err(e) => self.trace_err("exchange", occ, FaultBoundary::After, e),
+        }
+        self.inject_after("exchange", occ)?;
+        result
+    }
+
+    fn replace_preserving_displaced(
+        &self,
+        request: &RetainedReplaceRequest,
+    ) -> Result<RetainedReplaceOutcome> {
+        self.check_alive()?;
+        let occ = self.bump_count("replace_preserving_displaced");
+        self.inject_before("replace_preserving_displaced", occ)?;
+        // Orchestrate the generic algorithm through OUR OWN methods so every
+        // sub-operation (create_dir_all / write_new / fsync_file /
+        // read_if_exists / exchange / fsync_dir / rename_no_replace) is
+        // fault-injectable at its own boundary.
+        let result = crate::fs::retained_replace(self, request);
+        match &result {
+            Ok(_) => self.trace_ok("replace_preserving_displaced", occ, FaultBoundary::After),
+            Err(e) => self.trace_err("replace_preserving_displaced", occ, FaultBoundary::After, e),
+        }
+        self.inject_after("replace_preserving_displaced", occ)?;
         result
     }
 }

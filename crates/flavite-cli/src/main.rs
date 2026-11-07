@@ -143,6 +143,16 @@ enum Commands {
         action: ThemeAction,
     },
 
+    /// Durable vault replacement operations (RFC-0006 S08): apply a sealed
+    /// preview, report job status, cancel, or resume.
+    Replace {
+        /// Path to the vault (overrides global --vault).
+        #[arg(short, long, value_name = "PATH")]
+        path: Option<PathBuf>,
+        #[command(subcommand)]
+        action: ReplaceAction,
+    },
+
     /// Inspect or convert a note's file encoding explicitly (RFC-0006 §6.10).
     Encoding {
         /// Vault-relative note path.
@@ -235,6 +245,78 @@ impl CliBom {
             Self::Absent => "absent",
         }
     }
+}
+
+/// Durable replacement action (RFC-0006 S08).
+#[derive(Subcommand, Debug)]
+enum ReplaceAction {
+    /// Seal a replacement preview (read-only).
+    Preview {
+        /// Literal or regex query.
+        query: String,
+        /// Replacement text.
+        replacement: String,
+        /// Match mode: literal (default) or regex.
+        #[arg(long, default_value = "literal")]
+        mode: String,
+        #[arg(long)]
+        case_sensitive: bool,
+        #[arg(long)]
+        whole_word: bool,
+    },
+    /// Record a selection revision (all/none/keys).
+    Select {
+        /// Hex preview id.
+        #[arg(long)]
+        preview_id: String,
+        /// `all`, `none`, or `keys=a,b,c` (hex native keys).
+        #[arg(long, default_value = "all")]
+        select: String,
+    },
+    /// Apply a sealed preview under a frozen selection revision. When
+    /// `--query`/`--replacement` are given instead of a preview id, a
+    /// preview is sealed and fully selected inline (one process).
+    Apply {
+        /// Hex preview id from `replace.preview`.
+        #[arg(long)]
+        preview_id: Option<String>,
+        /// Frozen selection revision from `replace.select`.
+        #[arg(long)]
+        selection_revision: Option<u64>,
+        /// Caller-generated 128-bit hex idempotency key.
+        #[arg(long)]
+        key: String,
+        /// Inline literal/regex query.
+        #[arg(long)]
+        query: Option<String>,
+        /// Inline replacement text.
+        #[arg(long)]
+        replacement: Option<String>,
+        /// Inline match mode: literal (default) or regex.
+        #[arg(long)]
+        mode: Option<String>,
+    },
+    /// Report current job status.
+    Status {
+        /// Hex job id.
+        #[arg(long)]
+        job_id: String,
+    },
+    /// Stop admission of the next item.
+    Cancel {
+        /// Hex job id.
+        #[arg(long)]
+        job_id: String,
+    },
+    /// Explicitly resume an untouched/paused job.
+    Resume {
+        /// Hex job id.
+        #[arg(long)]
+        job_id: String,
+        /// Caller-generated 128-bit hex idempotency key.
+        #[arg(long)]
+        key: String,
+    },
 }
 
 /// CLI search modes (RFC-0006 S06).
@@ -468,6 +550,27 @@ impl CliDriver {
         }
         println!();
 
+        if !report.operations.is_empty() {
+            println!("Durable replacement operations:");
+            for operation in &report.operations {
+                let state = if operation.quarantine {
+                    "QUARANTINED"
+                } else {
+                    "ok"
+                };
+                println!(
+                    "  {} state={} manifest={} selection={} records={} head={}",
+                    operation.job_id,
+                    state,
+                    operation.manifest_ok,
+                    operation.selection_present,
+                    operation.record_count,
+                    operation.head_present
+                );
+            }
+            println!();
+        }
+
         if report.is_healthy() {
             println!("Overall: HEALTHY ✓");
         } else {
@@ -531,6 +634,157 @@ impl CliDriver {
     }
 
     /// Run one facade `theme.*` command and print its typed result.
+    /// Execute one facade command and return its success data.
+    fn command_json(&self, id: &'static str, args: serde_json::Value) -> Result<serde_json::Value> {
+        let flavite = self
+            .flavite
+            .as_ref()
+            .context("command requires an opened vault")?;
+        let request_id = flavite.command_registry().next_request_id();
+        let result = flavite.execute(Invocation::new(request_id, id, args, Origin::Cli));
+        let result = match result {
+            ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
+            result => result,
+        };
+        let success = match result {
+            ExecutionResult::Local(flavite_api::LocalResult::Success(success)) => success,
+            ExecutionResult::ActionRequired { code, .. } => {
+                anyhow::bail!("{id} requires an action: {code}");
+            }
+            ExecutionResult::Rejected(rejected) => {
+                let reason = format!("{:?}", rejected.reason);
+                let message = rejected.message.unwrap_or_default();
+                anyhow::bail!("{id} was rejected ({reason}): {message}");
+            }
+            other => anyhow::bail!("{id} did not complete: {other:?}"),
+        };
+        Ok(success.data)
+    }
+
+    /// Run one durable replacement action (RFC-0006 S08).
+    fn run_replace(&self, action: ReplaceAction) -> Result<()> {
+        let (id, args): (&'static str, serde_json::Value) = match action {
+            ReplaceAction::Preview {
+                query,
+                replacement,
+                mode,
+                case_sensitive,
+                whole_word,
+            } => (
+                "replace.preview",
+                serde_json::json!({
+                    "query": query,
+                    "replacement": replacement,
+                    "mode": mode,
+                    "case_sensitive": case_sensitive,
+                    "whole_word": whole_word,
+                }),
+            ),
+            ReplaceAction::Select { preview_id, select } => {
+                let select = if select == "all" {
+                    serde_json::Value::String("all".to_owned())
+                } else if let Some(keys) = select.strip_prefix("keys=") {
+                    serde_json::json!({
+                        "keys": keys.split(',').map(str::to_owned).collect::<Vec<_>>()
+                    })
+                } else {
+                    serde_json::Value::String(select)
+                };
+                (
+                    "replace.select",
+                    serde_json::json!({ "preview_id": preview_id, "select": select }),
+                )
+            }
+            ReplaceAction::Apply {
+                preview_id,
+                selection_revision,
+                key,
+                query,
+                replacement,
+                mode,
+            } => {
+                let (preview_id, selection_revision) = match (preview_id, selection_revision) {
+                    (Some(preview_id), Some(revision)) => (preview_id, revision),
+                    (None, None) => {
+                        let query = query.context("inline apply requires --query")?;
+                        let replacement =
+                            replacement.context("inline apply requires --replacement")?;
+                        let mode = mode.unwrap_or_else(|| "literal".to_owned());
+                        // 1. Seal a preview.
+                        let preview = self.command_json(
+                            "replace.preview",
+                            serde_json::json!({
+                                "query": query,
+                                "replacement": replacement,
+                                "mode": mode,
+                            }),
+                        )?;
+                        let preview_id = preview["preview_id"]
+                            .as_str()
+                            .context("preview id missing")?
+                            .to_owned();
+                        // 2. Select everything.
+                        let selected = self.command_json(
+                            "replace.select",
+                            serde_json::json!({
+                                "preview_id": preview_id,
+                                "select": "all",
+                            }),
+                        )?;
+                        let revision = selected["selection_revision"]
+                            .as_u64()
+                            .context("selection revision missing")?;
+                        (preview_id, revision)
+                    }
+                    _ => anyhow::bail!(
+                        "apply requires either --preview-id + --selection-revision or inline --query/--replacement"
+                    ),
+                };
+                (
+                    "replace.apply",
+                    serde_json::json!({
+                        "preview_id": preview_id,
+                        "selection_revision": selection_revision,
+                        "idempotency_key": key,
+                    }),
+                )
+            }
+            ReplaceAction::Status { job_id } => (
+                "replace.job_status",
+                serde_json::json!({ "job_id": job_id }),
+            ),
+            ReplaceAction::Cancel { job_id } => {
+                ("replace.cancel", serde_json::json!({ "job_id": job_id }))
+            }
+            ReplaceAction::Resume { job_id, key } => (
+                "replace.resume",
+                serde_json::json!({
+                    "job_id": job_id,
+                    "idempotency_key": key,
+                }),
+            ),
+        };
+        let data = self.command_json(id, args)?;
+        if self.json {
+            println!("{}", serde_json::to_string(&data)?);
+        } else if id == "replace.job_status" {
+            println!(
+                "phase={} selected={} saved={} conflicts={} stale={} needs_recovery={}",
+                data["status"]["phase"].as_str().unwrap_or("?"),
+                data["selected_items"].as_u64().unwrap_or(0),
+                data["status"]["totals"]["saved"].as_u64().unwrap_or(0),
+                data["status"]["totals"]["conflicts"].as_u64().unwrap_or(0),
+                data["status"]["totals"]["stale"].as_u64().unwrap_or(0),
+                data["status"]["totals"]["needs_recovery"]
+                    .as_u64()
+                    .unwrap_or(0),
+            );
+        } else {
+            println!("{}", serde_json::to_string(&data)?);
+        }
+        Ok(())
+    }
+
     fn run_theme_command(&self, id: &'static str, args: serde_json::Value) -> Result<()> {
         let flavite = self
             .flavite
@@ -1302,6 +1556,11 @@ fn main() -> Result<()> {
             let vault_path = get_vault_path(None, cli.vault);
             driver.open_vault(vault_path, cli.no_watch)?;
             driver.run_encoding(note, action)?;
+        }
+        Commands::Replace { path, action } => {
+            let vault_path = get_vault_path(path, cli.vault);
+            driver.open_vault(vault_path, cli.no_watch)?;
+            driver.run_replace(action)?;
         }
         Commands::Theme { action } => match action {
             // The converter is an offline artifact tool: no vault needed.

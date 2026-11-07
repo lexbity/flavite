@@ -330,6 +330,43 @@ run_s07_gates() {
         "$root/crates/flavite-vault/src/replace"
 }
 
+run_s08_gates() {
+    # S08 presence: retained-replacement primitive + tests, source leases,
+    # authenticated log/coordinator, facade apply commands and UI
+    # operations host/view (RFC-0006 S08 table).
+    local file
+    for file in \
+        crates/flavite-fs/tests/retained_replace.rs \
+        crates/flavite-vault/src/source_leases.rs \
+        crates/flavite-vault/src/replace/coordinator.rs \
+        crates/flavite-vault/src/replace/log.rs \
+        crates/flavite-vault/src/replace/auth.rs \
+        crates/flavite-vault/tests/replace_fault.rs \
+        crates/flavite-vault/tests/replace_leases.rs \
+        crates/flavite-api/tests/replace_apply.rs \
+        crates/flavite-ui/src/host/operations.rs \
+        crates/flavite-ui/src/views/operations.rs \
+        crates/flavite-ui/tests/replace_operations.rs \
+        crates/flavite-cli/tests/operations_cli.rs; do
+        gate assert_nonempty "$root/$file"
+    done
+    # S08 source isolation gates (exact required invocations, §12).
+    gate assert_absent 'rename_replace\(' \
+        "$root/crates/flavite-vault/src/save.rs" \
+        "$root/crates/flavite-vault/src/replace/coordinator.rs"
+    gate assert_absent 'std::fs|std::thread::sleep|wait_for_operation' \
+        "$root/crates/flavite-ui/src/host/operations.rs" \
+        "$root/crates/flavite-ui/src/views/operations.rs"
+    gate assert_absent 'HashMap<String, String>|metadata\.insert' \
+        "$root/crates/flavite-vault/src/replace/log.rs"
+    # The coordinator never carries raw client offsets or second edit
+    # models; the facade never registers forget in S08.
+    gate assert_absent 'pub .*trusted.*offset' \
+        "$root/crates/flavite-vault/src/replace/coordinator.rs"
+    gate assert_absent 'replace.forget' \
+        "$root/crates/flavite-api/src/replace.rs"
+}
+
 case "$slice" in
     S00) run_s00_gates ;;
     S01) run_s00_gates; run_s01_gates ;;
@@ -338,7 +375,8 @@ case "$slice" in
     S05) run_s00_gates; run_s01_gates; run_s03_gates; run_s04_gates; run_s05_gates ;;
     S06) run_s00_gates; run_s01_gates; run_s03_gates; run_s04_gates; run_s05_gates; run_s06_gates ;;
     S07) run_s00_gates; run_s01_gates; run_s03_gates; run_s04_gates; run_s05_gates; run_s06_gates; run_s07_gates ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: S00 S01 S03 S04 S05 S06 S07)" >&2; exit 2 ;;
+    S08) run_s00_gates; run_s01_gates; run_s03_gates; run_s04_gates; run_s05_gates; run_s06_gates; run_s07_gates; run_s08_gates ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: S00 S01 S03 S04 S05 S06 S07 S08)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then

@@ -219,6 +219,17 @@ pub enum VaultActorMsg {
         path: PathBuf,
         reply: Sender<VaultActorResp>,
     },
+    /// Atomically replace a private operation-store file (head updates).
+    OpStoreWriteReplace {
+        path: PathBuf,
+        bytes: Vec<u8>,
+        reply: Sender<VaultActorResp>,
+    },
+    /// List plain file names in a private operation-store directory.
+    OpStoreListDir {
+        path: PathBuf,
+        reply: Sender<VaultActorResp>,
+    },
     /// Decode a bounded graph catalog through this vault's exact Fs codec.
     DecodeGraphPaths {
         keys: Vec<Vec<u8>>,
@@ -257,6 +268,13 @@ pub enum VaultActorMsg {
     /// Save immutable serialized bytes through the D6 path.
     Save {
         request: SaveRequest,
+        reply: Sender<VaultActorResp>,
+    },
+    /// Apply one durable replacement-job item through the retained-replacement
+    /// primitive + index (RFC-0006 S08/D-10). Runs on the actor thread so
+    /// per-note mutation is serialized with saves/renames.
+    ApplyReplaceItem {
+        request: crate::replace::coordinator::ReplaceItemRequest,
         reply: Sender<VaultActorResp>,
     },
     /// Persist bytes observed during an explicit merge/conflict resolution.
@@ -342,6 +360,10 @@ pub enum VaultActorResp {
     HistoryBytes(Result<Vec<u8>, String>),
     /// Private operation-store acknowledgement.
     OpStoreAck(Result<(), String>),
+    /// Private operation-store directory listing (`None` when absent).
+    OpStoreList(Result<Option<Vec<String>>, String>),
+    /// One durable replacement-job item applied.
+    ReplaceItemApplied(Result<crate::replace::coordinator::ReplaceItemOutcome, String>),
 }
 
 /// Errors from the VaultActor.
@@ -721,6 +743,28 @@ impl VaultActorHandle {
         self.op_store_reply(response)
     }
 
+    /// Private operation-store atomic file replacement (head updates).
+    pub fn op_store_write_replace(&self, path: PathBuf, bytes: Vec<u8>) -> Result<(), String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::OpStoreWriteReplace { path, bytes, reply })
+            .map_err(|error| error.to_string())?;
+        self.op_store_reply(response)
+    }
+
+    /// Private operation-store directory listing.
+    pub fn op_store_list_dir(&self, path: PathBuf) -> Result<Option<Vec<String>>, String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::OpStoreListDir { path, reply })
+            .map_err(|error| error.to_string())?;
+        match response.recv().map_err(|error| error.to_string())? {
+            VaultActorResp::OpStoreList(result) => result,
+            VaultActorResp::Error(error) => Err(error),
+            _ => Err("unexpected operation-store list response".to_owned()),
+        }
+    }
+
     fn op_store_reply(
         &self,
         response: crossbeam::channel::Receiver<VaultActorResp>,
@@ -827,6 +871,25 @@ impl VaultActorHandle {
                 }
             })?;
         Ok(response)
+    }
+
+    /// Apply one durable replacement-job item (RFC-0006 S08): bounded
+    /// synchronous call into the actor thread. The coordinator is the only
+    /// caller; the actor performs the retained replacement + history
+    /// archival + index upsert under its single-threaded ordering.
+    pub fn apply_replace_item(
+        &self,
+        request: crate::replace::coordinator::ReplaceItemRequest,
+    ) -> Result<crate::replace::coordinator::ReplaceItemOutcome, String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .try_send(VaultActorMsg::ApplyReplaceItem { request, reply })
+            .map_err(|error| error.to_string())?;
+        match response.recv().map_err(|error| error.to_string())? {
+            VaultActorResp::ReplaceItemApplied(result) => result,
+            VaultActorResp::Error(error) => Err(error),
+            _ => Err("unexpected replace-item response".to_owned()),
+        }
     }
 
     /// Snapshot observed bytes to local safety history before a destructive
@@ -1615,6 +1678,53 @@ impl VaultActor {
                 })();
                 let _ = reply.try_send(VaultActorResp::OpStoreAck(result));
             }
+            VaultActorMsg::OpStoreWriteReplace { path, bytes, reply } => {
+                let result = (|| {
+                    self.validate_ops_path(&path)?;
+                    let parent = path
+                        .parent()
+                        .ok_or_else(|| "private operation path has no parent".to_owned())?;
+                    self.fs.create_dir_all(parent).map_err(|e| e.to_string())?;
+                    let temp = parent.join(format!(".ophead-{}.tmp", uuid::Uuid::now_v7()));
+                    let result = (|| {
+                        self.fs
+                            .write_new(&temp, &bytes)
+                            .map_err(|e| e.to_string())?;
+                        self.fs.fsync_file(&temp).map_err(|e| e.to_string())?;
+                        self.fs
+                            .rename_replace(&temp, &path)
+                            .map_err(|e| e.to_string())?;
+                        self.fs.fsync_dir(parent).map_err(|e| e.to_string())
+                    })();
+                    if result.is_err() {
+                        let _ = self.fs.remove(&temp);
+                    }
+                    result
+                })();
+                let _ = reply.try_send(VaultActorResp::OpStoreAck(result));
+            }
+            VaultActorMsg::OpStoreListDir { path, reply } => {
+                let result = (|| {
+                    self.validate_ops_path(&path)?;
+                    match self.fs.read_dir(&path) {
+                        Ok(entries) => {
+                            let mut names: Vec<String> = entries
+                                .into_iter()
+                                .map(|entry| {
+                                    entry.name.into_string().map_err(|_| {
+                                        "private operation entry is not UTF-8".to_owned()
+                                    })
+                                })
+                                .collect::<Result<_, String>>()?;
+                            names.sort();
+                            Ok(Some(names))
+                        }
+                        Err(flavite_fs::FsError::DirNotFound(_)) => Ok(None),
+                        Err(error) => Err(error.to_string()),
+                    }
+                })();
+                let _ = reply.try_send(VaultActorResp::OpStoreList(result));
+            }
             VaultActorMsg::ReadFile { path, reply } => {
                 let response = self
                     .fs
@@ -1688,6 +1798,10 @@ impl VaultActor {
                 self.save_seq = self.save_seq.saturating_add(1);
                 self.save_paths.insert(request.path.clone(), self.save_seq);
                 self.handle_save(request, reply);
+            }
+            VaultActorMsg::ApplyReplaceItem { request, reply } => {
+                let result = self.apply_replace_item_inner(request);
+                let _ = reply.try_send(VaultActorResp::ReplaceItemApplied(result));
             }
             VaultActorMsg::SnapshotHistory {
                 note_key,
@@ -1934,6 +2048,150 @@ impl VaultActor {
         .map_err(|failure: SaveFailure| failure.for_request(&failure_context));
         self.catalog.finish(&self.index);
         let _ = reply.try_send(VaultActorResp::Saved(result));
+    }
+
+    /// Apply one durable replacement-job item (RFC-0006 S08/D-10): the
+    /// retained-replacement primitive with the exact sealed before-hash,
+    /// durable archival of the actual displaced object, then the index
+    /// upsert. Durable source outcomes are never repeated: a guard
+    /// mismatch returns `Stale` before any effect; an already-present after
+    /// state returns `SatisfiedUnattributed` without overwriting.
+    fn apply_replace_item_inner(
+        &mut self,
+        request: crate::replace::coordinator::ReplaceItemRequest,
+    ) -> Result<crate::replace::coordinator::ReplaceItemOutcome, String> {
+        // Containment: the target must be a normal relative note path.
+        let relative = request
+            .path
+            .strip_prefix(&self.identity.root)
+            .map_err(|_| "replacement item path is outside this vault".to_owned())?;
+        if relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err("replacement item path has unsafe components".to_owned());
+        }
+        let current = match self
+            .fs
+            .read_capped(&request.path, flavite_index::MAX_NOTE_BYTES as u64)
+        {
+            Ok(bytes) => bytes,
+            Err(flavite_fs::FsError::NotFound(_)) => {
+                return Ok(crate::replace::coordinator::ReplaceItemOutcome::Missing);
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let current_hash = *blake3::hash(&current).as_bytes();
+        if current_hash != request.expected_before_hash {
+            return Ok(crate::replace::coordinator::ReplaceItemOutcome::Stale);
+        }
+        // Retained replacement (D-10). The primitive re-checks the base at
+        // the exchange; a mismatch there is reported through the displaced
+        // object, never by discarding it.
+        let retained = flavite_fs::RetainedReplaceRequest {
+            target: request.path.clone(),
+            expected_base_hash: Some(request.expected_before_hash),
+            bytes: request.after_bytes.clone(),
+        };
+        let outcome = match self.fs.replace_preserving_displaced(&retained) {
+            Ok(outcome) => outcome,
+            Err(flavite_fs::FsError::Unsupported(_)) => {
+                return Ok(crate::replace::coordinator::ReplaceItemOutcome::Unsupported);
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let flavite_fs::RetainedReplaceOutcome::Replaced {
+            displaced,
+            displaced_matches_base,
+        } = outcome
+        else {
+            return Err("replacement item unexpectedly created a target".to_owned());
+        };
+        // Archive the actual displaced object durably (history), then retire
+        // the staging directory. On archival failure the object STAYS.
+        let archived = self.archive_displaced(&request, &displaced);
+        if !archived {
+            return Err("displaced object archival failed; the object is retained".to_owned());
+        }
+        // Index upsert. Failure is index-pending: the durable source already
+        // happened and must not be repeated; only cache repair remains.
+        let index = self.index_replace_item(&request);
+        match index {
+            Ok(()) => Ok(crate::replace::coordinator::ReplaceItemOutcome::Replaced {
+                conflict: !displaced_matches_base,
+            }),
+            Err(_) => Ok(crate::replace::coordinator::ReplaceItemOutcome::IndexPending),
+        }
+    }
+
+    /// Durable archival of a displaced object into local history, then
+    /// best-effort removal of the staging file/directory. On an external
+    /// race the displaced bytes legitimately differ from the expected base;
+    /// the ACTUAL observed bytes are archived (never discarded).
+    fn archive_displaced(
+        &mut self,
+        request: &crate::replace::coordinator::ReplaceItemRequest,
+        displaced: &flavite_fs::DisplacedObject,
+    ) -> bool {
+        let Ok(Some(bytes)) = self.fs.read_if_exists(&displaced.path) else {
+            return false;
+        };
+        let ok = self.history_store().is_ok_and(|history| {
+            let now = crate::history::now_secs();
+            history
+                .snapshot(
+                    &request.note_key,
+                    &bytes,
+                    crate::history::HistoryReason::Displaced,
+                    false,
+                    now,
+                )
+                .is_ok()
+        });
+        if ok {
+            let stage_dir = displaced.path.parent();
+            let _ = self.fs.remove(&displaced.path);
+            if let Some(dir) = stage_dir {
+                let _ = self.fs.remove(dir);
+            }
+        }
+        ok
+    }
+
+    /// Index upsert for one replaced note.
+    fn index_replace_item(
+        &mut self,
+        request: &crate::replace::coordinator::ReplaceItemRequest,
+    ) -> Result<(), String> {
+        let relative = request
+            .path
+            .strip_prefix(&self.identity.root)
+            .map_err(|_| "replacement item path is outside this vault".to_owned())?;
+        let index_path_key = self
+            .fs
+            .encode_path_key(relative)
+            .map_err(|e| e.to_string())?;
+        let display_path = relative.to_string_lossy().replace('\\', "/");
+        let mtime_ns = self
+            .fs
+            .metadata(&request.path)
+            .map(|metadata| metadata.mtime_ns)
+            .map_err(|e| e.to_string())?;
+        let scan_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(i64::MAX as u128) as i64;
+        self.index.apply_saved_note(
+            &index_path_key,
+            &display_path,
+            &request.after_bytes,
+            mtime_ns,
+            scan_ns,
+        )?;
+        self.catalog.begin();
+        self.catalog.finish(&self.index);
+        Ok(())
     }
 
     fn history_store(&mut self) -> Result<&mut HistoryStore, String> {

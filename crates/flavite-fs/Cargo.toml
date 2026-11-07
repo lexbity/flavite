@@ -16,6 +16,14 @@ thiserror = { workspace = true }
 # File system notification library for the watcher wrapper
 notify = { workspace = true }
 unicode-normalization = "0.1"
+uuid = { version = "1", features = ["v7"] }
+
+# Retained replacement exchange (RFC-0006 D-10/§6.5): Linux implements the
+# atomic file exchange with renameat2(RENAME_EXCHANGE). Verified in the
+# lock; the dependency is Linux-only so other platforms keep an honest
+# Unsupported (never an unlink+rename emulation).
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "0.38", features = ["fs"] }
 
 cap-std = "4"
 

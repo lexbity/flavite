@@ -795,6 +795,64 @@ impl Fs for MemFs {
         state.dur_dirs.insert(path.to_path_buf(), entries);
         Ok(())
     }
+
+    fn supports_retained_replace(&self) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn exchange(&self, a: &Path, b: &Path) -> Result<()> {
+        let mut state = self.lock();
+        let kind_a =
+            Self::path_kind(&state, a).ok_or_else(|| FsError::NotFound(a.to_path_buf()))?;
+        let kind_b =
+            Self::path_kind(&state, b).ok_or_else(|| FsError::NotFound(b.to_path_buf()))?;
+        if a == b {
+            return Ok(());
+        }
+        // Only regular files can be exchanged (targets are resolved before
+        // the retained replacement is invoked; symlink/dir exchange is not a
+        // legal retained-replacement target).
+        if kind_a != PathKind::File || kind_b != PathKind::File {
+            return Err(FsError::Io(format!(
+                "cannot exchange non-file paths: {} ↔ {}",
+                a.display(),
+                b.display()
+            )));
+        }
+        let bytes_a = state.vol_files.remove(a).unwrap_or_default();
+        let bytes_b = state.vol_files.remove(b).unwrap_or_default();
+        // Durable (fsynced) byte state follows the content.
+        let dur_a = state.dur_files.remove(a);
+        let dur_b = state.dur_files.remove(b);
+        state.vol_files.insert(a.to_path_buf(), bytes_b);
+        state.vol_files.insert(b.to_path_buf(), bytes_a);
+        if let Some(bytes) = dur_b {
+            state.dur_files.insert(a.to_path_buf(), bytes);
+        }
+        if let Some(bytes) = dur_a {
+            state.dur_files.insert(b.to_path_buf(), bytes);
+        }
+        // Identity/mode/mtime travel with the objects.
+        if let Some(id) = state.identities.remove(a) {
+            state.identities.insert(b.to_path_buf(), id);
+        }
+        if let Some(id) = state.identities.remove(b) {
+            state.identities.insert(a.to_path_buf(), id);
+        }
+        if let Some(mode) = state.modes.remove(a) {
+            state.modes.insert(b.to_path_buf(), mode);
+        }
+        if let Some(mode) = state.modes.remove(b) {
+            state.modes.insert(a.to_path_buf(), mode);
+        }
+        if let Some(mtime) = state.mtimes.remove(a) {
+            state.mtimes.insert(b.to_path_buf(), mtime);
+        }
+        if let Some(mtime) = state.mtimes.remove(b) {
+            state.mtimes.insert(a.to_path_buf(), mtime);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

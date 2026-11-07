@@ -68,6 +68,20 @@ pub struct CandidateView {
     pub after_hash: String,
 }
 
+/// One durable replacement job summary (RFC-0006 S08).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct JobView {
+    pub job_id: String,
+    pub phase: String,
+    pub selected: u64,
+    pub saved: u64,
+    pub index_pending: u64,
+    pub conflicts: u64,
+    pub stale: u64,
+    pub needs_recovery: u64,
+    pub not_started: u64,
+}
+
 /// Per-tab Replace state.
 #[derive(Debug, Default)]
 pub struct ReplaceTabState {
@@ -100,6 +114,69 @@ pub struct ReplaceTabState {
     pub selection_ready: bool,
     /// The in-flight selection action (applied on success).
     pending_selection: Option<SelectAction>,
+    /// RFC-0006 S08: durable job bound to this tab's preview.
+    pub job: Option<JobView>,
+    /// The in-flight apply/cancel/resume action id.
+    job_action_request: Option<u64>,
+}
+
+impl ReplaceTabState {
+    /// Whether a durable apply may run (sealed + selected + idle).
+    #[must_use]
+    pub fn can_apply(&self) -> bool {
+        self.preview_id.is_some()
+            && self.selection_ready
+            && self.job.is_none()
+            && self.job_action_request.is_none()
+    }
+
+    /// Whether cancel/resume is available.
+    #[must_use]
+    pub fn can_cancel(&self) -> bool {
+        self.job_action_request.is_none() && self.job.is_some()
+    }
+
+    /// Apply a job-status completion to this tab's state.
+    fn apply_job_status(&mut self, status: serde_json::Value) {
+        let phase = status
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        let totals = status.get("totals").cloned().unwrap_or_default();
+        self.job = Some(JobView {
+            phase,
+            selected: totals
+                .get("selected")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            saved: totals
+                .get("saved")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            index_pending: totals
+                .get("index_pending")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            conflicts: totals
+                .get("conflicts")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            stale: totals
+                .get("stale")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            needs_recovery: totals
+                .get("needs_recovery")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            not_started: totals
+                .get("not_started")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            ..JobView::default()
+        });
+    }
 }
 
 impl ReplaceTabState {
@@ -131,6 +208,8 @@ impl ReplaceTabState {
         self.selected.clear();
         self.selection_ready = false;
         self.pending_selection = None;
+        self.job = None;
+        self.job_action_request = None;
     }
 
     /// Apply a completed selection to the candidate flags.
@@ -164,6 +243,8 @@ pub struct ReplaceHost {
     find_requests: BTreeMap<u64, (flavite_workspace::TabId, u64)>,
     preview_requests: BTreeMap<u64, (flavite_workspace::TabId, u64)>,
     select_requests: BTreeMap<u64, flavite_workspace::TabId>,
+    /// RFC-0006 S08: job command requests (apply/cancel/resume/status).
+    job_requests: BTreeMap<u64, flavite_workspace::TabId>,
 }
 
 impl ReplaceHost {
@@ -191,6 +272,7 @@ impl ReplaceHost {
         self.find_requests.retain(|_, (owner, _)| *owner != tab);
         self.preview_requests.retain(|_, (owner, _)| *owner != tab);
         self.select_requests.retain(|_, owner| *owner != tab);
+        self.job_requests.retain(|_, owner| *owner != tab);
         let Some(api) = flavite else {
             return;
         };
@@ -735,6 +817,47 @@ impl ReplaceHost {
             }
             return true;
         }
+        if let Some(tab) = self.job_requests.remove(&completion.request_id) {
+            let Some(state) = self.tabs.get_mut(&tab) else {
+                return true;
+            };
+            state.job_action_request = None;
+            match &completion.result {
+                ExecutionResult::Local(LocalResult::Success(success)) => {
+                    let data = &success.data;
+                    let job_id = data
+                        .get("job_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    let status = data.get("status").cloned().unwrap_or_default();
+                    if let Some(job) = &mut state.job
+                        && let Some(job_id) = &job_id
+                    {
+                        job.job_id.clone_from(job_id);
+                    }
+                    state.apply_job_status(status);
+                    state.error = None;
+                }
+                ExecutionResult::Local(LocalResult::Error(error)) => {
+                    state.error = Some(error.message.clone());
+                }
+                ExecutionResult::Rejected(rejected) => {
+                    state.error = Some(
+                        rejected
+                            .message
+                            .clone()
+                            .unwrap_or_else(|| "Replacement job was refused".into()),
+                    );
+                }
+                ExecutionResult::ActionRequired { code, .. } => {
+                    state.error = Some(format!("Replacement job needs attention: {code}"));
+                }
+                _ => {
+                    state.error = Some("Replacement job result is stale".into());
+                }
+            }
+            return true;
+        }
         if let Some(tab) = self.select_requests.remove(&completion.request_id) {
             let Some(state) = self.tabs.get_mut(&tab) else {
                 return true;
@@ -778,6 +901,226 @@ impl ReplaceHost {
         }
         false
     }
+
+    /// Start the durable apply for this tab's sealed preview (RFC-0006
+    /// S08).
+    pub fn apply(&mut self, tab: flavite_workspace::TabId, flavite: Option<&flavite_api::Flavite>) {
+        let Some(api) = flavite else {
+            return;
+        };
+        let (preview_id, revision) = {
+            let Some(state) = self.tabs.get_mut(&tab) else {
+                return;
+            };
+            if !state.can_apply() {
+                return;
+            }
+            let Some(preview_id) = state.preview_id.clone() else {
+                return;
+            };
+            let revision = state
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.selection_revision)
+                .unwrap_or(0);
+            if revision == 0 {
+                state.error = Some("Select notes before applying".into());
+                return;
+            }
+            (preview_id, revision)
+        };
+        let idempotency_key = job_key();
+        let request_id = api.command_registry().next_request_id();
+        let result = api.execute(Invocation::new(
+            request_id,
+            "replace.apply",
+            serde_json::json!({
+                "preview_id": preview_id,
+                "selection_revision": revision,
+                "idempotency_key": idempotency_key,
+            }),
+            Origin::Gui,
+        ));
+        match result {
+            ExecutionResult::Pending { request_id } => {
+                self.job_requests.insert(request_id, tab);
+                if let Some(state) = self.tabs.get_mut(&tab) {
+                    state.job_action_request = Some(request_id);
+                    state.error = None;
+                }
+            }
+            ExecutionResult::Local(LocalResult::Success(success)) => {
+                if let Some(state) = self.tabs.get_mut(&tab) {
+                    state.apply_job_status(success.data.get("status").cloned().unwrap_or_default());
+                    if let Some(job) = &mut state.job
+                        && let Some(job_id) = success
+                            .data
+                            .get("job_id")
+                            .and_then(serde_json::Value::as_str)
+                    {
+                        job.job_id.clone_from(&job_id.to_owned());
+                    }
+                }
+            }
+            ExecutionResult::Local(LocalResult::Error(error)) => {
+                if let Some(state) = self.tabs.get_mut(&tab) {
+                    state.error = Some(error.message);
+                }
+            }
+            ExecutionResult::Rejected(rejected) => {
+                if let Some(state) = self.tabs.get_mut(&tab) {
+                    state.error = Some(
+                        rejected
+                            .message
+                            .unwrap_or_else(|| "Replacement was refused".into()),
+                    );
+                }
+            }
+            ExecutionResult::ActionRequired { code, .. } => {
+                if let Some(state) = self.tabs.get_mut(&tab) {
+                    state.error = Some(format!("Replacement needs attention: {code}"));
+                }
+            }
+            _ => {
+                if let Some(state) = self.tabs.get_mut(&tab) {
+                    state.error = Some("Replacement result is stale".into());
+                }
+            }
+        }
+    }
+
+    /// Cancel the tab's durable job (stops admission of the next item).
+    pub fn cancel_job(
+        &mut self,
+        tab: flavite_workspace::TabId,
+        flavite: Option<&flavite_api::Flavite>,
+    ) {
+        self.submit_job_command(tab, flavite, "replace.cancel", "job_id");
+    }
+
+    /// Explicitly resume the tab's durable job.
+    pub fn resume_job(
+        &mut self,
+        tab: flavite_workspace::TabId,
+        flavite: Option<&flavite_api::Flavite>,
+    ) {
+        let Some(api) = flavite else {
+            return;
+        };
+        let job_id = {
+            let Some(state) = self.tabs.get_mut(&tab) else {
+                return;
+            };
+            if !state.can_cancel() {
+                return;
+            }
+            let Some(job_id) = state.job.as_ref().map(|job| job.job_id.clone()) else {
+                return;
+            };
+            state.job_action_request = Some(u64::MAX);
+            job_id
+        };
+        let idempotency_key = job_key();
+        let request_id = api.command_registry().next_request_id();
+        let result = api.execute(Invocation::new(
+            request_id,
+            "replace.resume",
+            serde_json::json!({
+                "job_id": job_id,
+                "idempotency_key": idempotency_key,
+            }),
+            Origin::Gui,
+        ));
+        self.handle_job_response(tab, result);
+    }
+
+    fn submit_job_command(
+        &mut self,
+        tab: flavite_workspace::TabId,
+        flavite: Option<&flavite_api::Flavite>,
+        command: &'static str,
+        key_field: &'static str,
+    ) {
+        let Some(api) = flavite else {
+            return;
+        };
+        let job_id = {
+            let Some(state) = self.tabs.get_mut(&tab) else {
+                return;
+            };
+            if !state.can_cancel() {
+                return;
+            }
+            let Some(job_id) = state.job.as_ref().map(|job| job.job_id.clone()) else {
+                return;
+            };
+            state.job_action_request = Some(u64::MAX);
+            job_id
+        };
+        let request_id = api.command_registry().next_request_id();
+        let mut args = serde_json::Map::new();
+        args.insert(key_field.to_owned(), serde_json::Value::String(job_id));
+        let result = api.execute(Invocation::new(
+            request_id,
+            command,
+            serde_json::Value::Object(args),
+            Origin::Gui,
+        ));
+        self.handle_job_response(tab, result);
+    }
+
+    fn handle_job_response(&mut self, tab: flavite_workspace::TabId, result: ExecutionResult) {
+        match result {
+            ExecutionResult::Pending { request_id } => {
+                self.job_requests.insert(request_id, tab);
+            }
+            ExecutionResult::Local(LocalResult::Success(success)) => {
+                if let Some(state) = self.tabs.get_mut(&tab) {
+                    state.job_action_request = None;
+                    let job_id = success
+                        .data
+                        .get("job_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    if let Some(job) = &mut state.job
+                        && let Some(job_id) = job_id
+                    {
+                        job.job_id.clone_from(&job_id);
+                    }
+                    state.apply_job_status(success.data.get("status").cloned().unwrap_or_default());
+                    state.error = None;
+                }
+            }
+            ExecutionResult::Local(LocalResult::Error(error)) => {
+                if let Some(state) = self.tabs.get_mut(&tab) {
+                    state.job_action_request = None;
+                    state.error = Some(error.message);
+                }
+            }
+            ExecutionResult::Rejected(rejected) => {
+                if let Some(state) = self.tabs.get_mut(&tab) {
+                    state.job_action_request = None;
+                    state.error = Some(
+                        rejected
+                            .message
+                            .unwrap_or_else(|| "Replacement job was refused".into()),
+                    );
+                }
+            }
+            ExecutionResult::ActionRequired { code, .. } => {
+                if let Some(state) = self.tabs.get_mut(&tab) {
+                    state.job_action_request = None;
+                    state.error = Some(format!("Replacement job needs attention: {code}"));
+                }
+            }
+            _ => {
+                if let Some(state) = self.tabs.get_mut(&tab) {
+                    state.job_action_request = None;
+                    state.error = Some("Replacement job result is stale".into());
+                }
+            }
+        }
+    }
 }
 
 /// Which edited field changed.
@@ -804,6 +1147,14 @@ pub enum SelectAction {
 }
 
 /// Submit a best-effort session close command.
+/// A caller-generated 128-bit hex idempotency key (RFC-0006 S08).
+fn job_key() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{:032x}", now.as_nanos() ^ (std::process::id() as u128))
+}
+
 fn submit_close(api: &flavite_api::Flavite, command: &'static str, id: String) {
     let request_id = api.command_registry().next_request_id();
     let _ = api.execute(Invocation::new(

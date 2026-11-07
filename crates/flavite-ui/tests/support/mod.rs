@@ -68,6 +68,12 @@ impl Fs for SharedFs {
     fn fsync_dir(&self, path: &Path) -> Result<()> {
         self.0.fsync_dir(path)
     }
+    fn supports_retained_replace(&self) -> Result<bool> {
+        self.0.supports_retained_replace()
+    }
+    fn exchange(&self, a: &Path, b: &Path) -> Result<()> {
+        self.0.exchange(a, b)
+    }
 }
 
 /// One note to seed into the fixture vault.

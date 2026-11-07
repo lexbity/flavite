@@ -90,6 +90,8 @@ pub struct App {
     pub search: crate::host::search::SearchHost,
     /// RFC-0006 S07: vault source Find / replacement preview states.
     pub replace: crate::host::replace::ReplaceHost,
+    /// RFC-0006 S08: durable replacement operations inventory.
+    pub replace_operations: crate::host::operations::OperationsHost,
     /// Local-history listings (W10).
     pub history: crate::views::history::HistoryHost,
     /// Per-view back/forward navigation (W10).
@@ -451,6 +453,22 @@ pub enum Message {
         tab: TabId,
         path: String,
     },
+    /// RFC-0006 S08: apply the sealed preview (frozen selection).
+    ReplaceApply {
+        tab: TabId,
+    },
+    /// RFC-0006 S08: cancel the durable job.
+    ReplaceCancel {
+        tab: TabId,
+    },
+    /// RFC-0006 S08: resume the durable job.
+    ReplaceResume {
+        tab: TabId,
+    },
+    /// Focus the Replace tab owning a durable job.
+    ReplaceFocusTab {
+        tab: TabId,
+    },
     // ---- W10: History view ----
     HistoryRefresh {
         tab: TabId,
@@ -623,6 +641,7 @@ impl App {
             catalog_host: crate::host::catalog::CatalogHost::default(),
             note_search: crate::host::note_search::NoteSearchHost::default(),
             replace: crate::host::replace::ReplaceHost::default(),
+            replace_operations: crate::host::operations::OperationsHost::default(),
             encoding: crate::host::encoding::EncodingHost::default(),
             input_chains: BTreeMap::new(),
             linking: crate::host::linking::LinkIntents::default(),
@@ -2897,6 +2916,18 @@ impl App {
             Message::ReplaceSelect { tab, selection } => {
                 self.replace.select(tab, selection, self.flavite.as_ref());
             }
+            Message::ReplaceApply { tab } => {
+                self.replace.apply(tab, self.flavite.as_ref());
+            }
+            Message::ReplaceCancel { tab } => {
+                self.replace.cancel_job(tab, self.flavite.as_ref());
+            }
+            Message::ReplaceResume { tab } => {
+                self.replace.resume_job(tab, self.flavite.as_ref());
+            }
+            Message::ReplaceFocusTab { tab } => {
+                self.status = format!("Replacement job on tab {}", tab.raw());
+            }
             Message::ReplaceOpenNote { path, .. } => {
                 if let Ok(locator) =
                     flavite_workspace::NoteLocator::from_relative(std::path::Path::new(&path))
@@ -4533,6 +4564,7 @@ mod tests {
             catalog_host: crate::host::catalog::CatalogHost::default(),
             note_search: crate::host::note_search::NoteSearchHost::default(),
             replace: crate::host::replace::ReplaceHost::default(),
+            replace_operations: crate::host::operations::OperationsHost::default(),
             encoding: crate::host::encoding::EncodingHost::default(),
             input_chains: BTreeMap::new(),
             linking: crate::host::linking::LinkIntents::default(),

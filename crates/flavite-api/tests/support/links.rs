@@ -76,6 +76,12 @@ impl Fs for SharedFs {
     fn fsync_dir(&self, path: &Path) -> Result<()> {
         self.0.fsync_dir(path)
     }
+    fn supports_retained_replace(&self) -> Result<bool> {
+        self.0.supports_retained_replace()
+    }
+    fn exchange(&self, a: &Path, b: &Path) -> Result<()> {
+        self.0.exchange(a, b)
+    }
 }
 
 pub struct Fixture {
@@ -84,6 +90,8 @@ pub struct Fixture {
     pub fs: std::sync::Arc<MemFs>,
     #[allow(dead_code)]
     pub cache: tempfile::TempDir,
+    #[allow(dead_code)]
+    pub data_dir: tempfile::TempDir,
     pub client: u128,
 }
 
@@ -104,6 +112,7 @@ pub fn fixture(notes: &[(&str, &str)]) -> Fixture {
     let cache = tempfile::tempdir().expect("cache dir");
     let db = cache.path().join("semantic-index.sqlite3");
     drop(flavite_index::open_or_init(&db).expect("index"));
+    let data_dir = tempfile::tempdir().expect("data dir");
     let identity = flavite_api::VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![11]);
     // RFC-0005 S5: the fixture rides the production event spine — the
     // actor publishes every committed generation and the graph service
@@ -120,7 +129,7 @@ pub fn fixture(notes: &[(&str, &str)]) -> Fixture {
         .start()
         .expect("start");
     let channels = ChannelSet::new();
-    let session = Session::new(
+    let session = Session::new_with_data_dir(
         identity.clone(),
         actor,
         BufferManager::new(),
@@ -130,6 +139,7 @@ pub fn fixture(notes: &[(&str, &str)]) -> Fixture {
             autosave_idle_interval: Duration::from_secs(3600),
             ..VaultConfig::default()
         },
+        Some(data_dir.path().to_path_buf()),
     );
     let mut flavite = Flavite::open(identity, session, VaultConfig::default()).expect("facade");
     flavite.set_graph_service_for_test(db.clone(), Some(std::sync::Arc::new(generation_watch)));
@@ -141,6 +151,7 @@ pub fn fixture(notes: &[(&str, &str)]) -> Fixture {
         root,
         fs,
         cache,
+        data_dir,
         client,
     }
 }

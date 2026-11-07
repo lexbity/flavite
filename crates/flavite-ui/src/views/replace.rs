@@ -244,6 +244,50 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
             .size(metrics.text_sm)
             .style(style::dim_text),
         );
+        if state.can_apply() {
+            actions = actions.push(
+                button(text("Apply"))
+                    .padding(tab_strip::chip_padding())
+                    .style(style::list_row(true))
+                    .on_press(Message::ReplaceApply { tab }),
+            );
+        }
+    }
+    if let Some(job) = &state.job {
+        let mut job_line = format!(
+            "Job {} · {} · saved {} · conflicts {} · stale {}",
+            &job.job_id[..8],
+            job.phase,
+            job.saved,
+            job.conflicts,
+            job.stale
+        );
+        if job.index_pending > 0 {
+            job_line.push_str(&format!(" · index pending {}", job.index_pending));
+        }
+        if job.not_started > 0 {
+            job_line.push_str(&format!(" · not started {}", job.not_started));
+        }
+        actions = actions.push(text(job_line).size(metrics.text_sm).style(style::dim_text));
+        if state.can_cancel() {
+            actions = actions.push(
+                button(text("Cancel"))
+                    .padding(tab_strip::chip_padding())
+                    .style(style::ghost())
+                    .on_press(Message::ReplaceCancel { tab }),
+            );
+            if matches!(
+                job.phase.as_str(),
+                "paused" | "partial" | "cancelled" | "applying"
+            ) {
+                actions = actions.push(
+                    button(text("Resume"))
+                        .padding(tab_strip::chip_padding())
+                        .style(style::ghost())
+                        .on_press(Message::ReplaceResume { tab }),
+                );
+            }
+        }
     }
 
     container(

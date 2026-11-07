@@ -50,6 +50,37 @@ impl OsFs {
 }
 
 impl Fs for OsFs {
+    /// Atomic exchange on Linux via `renameat2(RENAME_EXCHANGE)`.
+    ///
+    /// Other platforms MUST return `Unsupported` (RFC-0006 D-10/§6.5):
+    /// emulating an exchange by unlinking one side would lose a file name on
+    /// crash, and the retained-replacement guarantee cannot be kept. This is
+    /// an honest product state — the UI refuses retained replacement rather
+    /// than silently weakening the save contract.
+    #[cfg(target_os = "linux")]
+    fn exchange(&self, a: &Path, b: &Path) -> Result<()> {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        renameat_with(CWD, a, CWD, b, RenameFlags::EXCHANGE)
+            .map_err(|error| FsError::Io(format!("rename exchange failed: {error}")))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn exchange(&self, _a: &Path, _b: &Path) -> Result<()> {
+        Err(FsError::Unsupported(
+            "atomic file exchange is not available on this platform".into(),
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn supports_retained_replace(&self) -> Result<bool> {
+        Ok(true)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn supports_retained_replace(&self) -> Result<bool> {
+        Ok(false)
+    }
+
     fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
         // Simplified: use std's canonicalize
         std::fs::canonicalize(path)

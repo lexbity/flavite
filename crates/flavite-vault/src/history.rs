@@ -33,6 +33,10 @@ pub enum HistoryReason {
     Rename,
     RecoveryBase,
     Transaction,
+    /// A retained displaced object (RFC-0006 D-10/§6.5): the exact previous
+    /// bytes of a replaced target, archived durably before the sibling
+    /// staging directory is retired.
+    Displaced,
 }
 
 impl HistoryReason {
@@ -46,6 +50,7 @@ impl HistoryReason {
             Self::Rename => "rename",
             Self::RecoveryBase => "recovery_base",
             Self::Transaction => "transaction",
+            Self::Displaced => "displaced",
         }
     }
 }
