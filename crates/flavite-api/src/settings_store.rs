@@ -266,35 +266,18 @@ impl SettingsStore {
         }
     }
 
-    /// Load settings with migration from legacy stores (RFC-0007 S3).
+    /// Load settings with migration from legacy stores (RFC-0007 S3/D-09).
     ///
     /// If `.flavite/settings.toml` doesn't exist in the vault:
-    /// 1. Create defaults document
-    /// 2. Overlay legacy v1 `.flavite/settings.toml` if it exists
-    /// 3. Overlay legacy `device-preferences.json` from data dir if it exists
+    /// 1. Create the defaults document
+    /// 2. Overlay the legacy v1 `.flavite/settings.toml` if it exists
+    /// 3. Overlay the legacy `device-preferences.json` from the data dir if
+    ///    it exists
     /// 4. Write the migrated v2 document atomically
     ///
-    /// This is the entry point for vault open; it ensures exactly one document
-    /// with idempotent migration.
-    ///
-    /// # Arguments
-    /// * `registry` - The setting registry
-    /// * `vault_root` - The vault root path (for reading v1 settings.toml)
-    /// * `data_dir` - The OS data directory (for reading device-preferences.json)
-    ///
-    /// # Errors
-    /// Same as `read`, `write`, plus filesystem errors for legacy files.
-    #[allow(dead_code)]
-    /// Load settings with migration from legacy stores (RFC-0007 S3).
-    ///
-    /// If `.flavite/settings.toml` doesn't exist in the vault:
-    /// 1. Create defaults document
-    /// 2. Overlay legacy v1 `.flavite/settings.toml` if it exists
-    /// 3. Overlay legacy `device-preferences.json` from data dir if it exists
-    /// 4. Write the migrated v2 document atomically
-    ///
-    /// This is the entry point for vault open; it ensures exactly one document
-    /// with idempotent migration.
+    /// This is the entry point for vault open; it ensures exactly one
+    /// document with idempotent migration. Runs at every open; re-runs are
+    /// no-ops once the v2 document exists.
     ///
     /// # Arguments
     /// * `registry` - The setting registry
@@ -304,7 +287,6 @@ impl SettingsStore {
     ///
     /// # Errors
     /// Same as `read`, `write`, plus filesystem errors for legacy files.
-    #[allow(dead_code)]
     pub fn load_or_migrate(
         &self,
         registry: &SettingRegistry,
@@ -544,6 +526,59 @@ impl SettingsStore {
                 let _ = doc.set("shortcuts", SettingValue::ShortcutMap(shortcuts_map), registry);
             }
         }
+    }
+
+    /// The last-good backup document, when one exists (RFC-0007 FR-10).
+    ///
+    /// The vault store keeps the pre-write bytes at `<name>.bak`; when the
+    /// live document is torn or unparseable, this is the one-click restore
+    /// source. The store never restores silently — the caller decides.
+    ///
+    /// # Errors
+    /// Same as `read`, plus codec failures if the backup itself is broken.
+    pub fn backup(&self) -> Result<Option<StoredSettings>, SettingsStoreError> {
+        let Some(bytes) = self
+            .vault_store
+            .read_backup(VaultUserStateKind::Settings)?
+        else {
+            return Ok(None);
+        };
+        if bytes.len() > MAX_SETTINGS_BYTES {
+            return Err(SettingsStoreError::TooLarge {
+                size: bytes.len(),
+            });
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|e| SettingsStoreError::Unparseable(e.to_string()))?;
+        let parsed = parse(Some(&text)).map_err(SettingsStoreError::Codec)?;
+        let generation = self
+            .vault_store
+            .read(VaultUserStateKind::Settings)?
+            .map_or(0, |stored| stored.generation);
+        Ok(Some(StoredSettings {
+            doc: parsed.doc,
+            generation,
+            warnings: parsed.warnings,
+            read_only: parsed.read_only,
+        }))
+    }
+
+    /// Restore the last-good backup over the current document under the
+    /// store's current generation receipt (RFC-0007 FR-10). Returns the
+    /// new generation.
+    ///
+    /// # Errors
+    /// `Unparseable("no backup exists")` when there is nothing to restore;
+    /// otherwise the same as `backup` and `write`.
+    pub fn restore_backup(&self) -> Result<u64, SettingsStoreError> {
+        let Some(stored) = self.backup()? else {
+            return Err(SettingsStoreError::Unparseable("no backup exists".into()));
+        };
+        let generation = self
+            .vault_store
+            .read(VaultUserStateKind::Settings)?
+            .map_or(0, |raw| raw.generation);
+        self.write(&stored.doc, generation)
     }
 
     /// Get a value by ID from the current document.

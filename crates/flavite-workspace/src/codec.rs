@@ -159,6 +159,9 @@ pub enum PersistedKind {
     Properties {
         binding: PersistedBinding,
     },
+    /// The vault settings tab (RFC-0007 D-08): stateless, restores itself
+    /// from the registry at render time.
+    Settings,
     /// A kind written by a newer build; preserved and re-emitted untouched.
     Other {
         /// The unknown kind tag.
@@ -352,6 +355,7 @@ fn persist_kind(kind: &crate::view::ViewKind) -> PersistedKind {
         crate::view::ViewKind::Backlinks(binding) => PersistedKind::Backlinks {
             binding: persist_binding(binding),
         },
+        crate::view::ViewKind::Settings => PersistedKind::Settings,
     }
 }
 

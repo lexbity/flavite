@@ -7,7 +7,6 @@
 
 mod support;
 
-use flavite_api::UserStateKind;
 use flavite_editor::{
     EditorAction, EditorInteractionSnapshot, input::CapturedInput, keymap::KeyAction,
 };

@@ -1448,7 +1448,7 @@ impl Flavite {
     /// Returns `None` if no settings document exists. Use `settings_read` for
     /// a resolved view with defaults.
     pub fn read_settings_raw(&self) -> Result<Option<crate::settings_store::StoredSettings>, FlaviteError> {
-        self.settings_store.read().map_err(|e| FlaviteError::SettingsIo(e.to_string()))
+        self.settings_store.read().map_err(FlaviteError::from)
     }
 
     /// Read and resolve the settings document against the registry.
@@ -1461,7 +1461,7 @@ impl Flavite {
         use flavite_settings::resolve::RegistryResolve;
         let registry = flavite_settings::registry::SettingRegistry::with_builtins();
         let stored = self.settings_store.load_or_initialize(&registry)
-            .map_err(|e| FlaviteError::SettingsIo(e.to_string()))?;
+            .map_err(FlaviteError::from)?;
         let resolved = registry.resolve(&stored.doc);
         Ok(crate::settings_store::ResolvedSettings {
             resolved,
@@ -1480,8 +1480,7 @@ impl Flavite {
         doc: &flavite_settings::document::SettingsDoc,
         expected_generation: u64,
     ) -> Result<u64, FlaviteError> {
-        self.settings_store.write(doc, expected_generation)
-            .map_err(|e| FlaviteError::SettingsIo(e.to_string()))
+        self.settings_store.write(doc, expected_generation).map_err(FlaviteError::from)
     }
 
     /// Set a single setting value by ID (RFC-0007 S2).
@@ -1496,11 +1495,29 @@ impl Flavite {
         let registry = flavite_settings::registry::SettingRegistry::with_builtins();
         // Validate ID is not reserved
         if flavite_settings::registry::SettingRegistry::is_reserved_namespace(id) {
-            return Err(FlaviteError::SettingsIo("reserved namespace".to_owned()));
+            return Err(FlaviteError::Settings(
+                crate::settings_store::SettingsStoreError::Codec(
+                    flavite_settings::error::SettingsCodecError::ReservedNamespace(id.to_owned()),
+                ),
+            ));
         }
         // Set and persist
-        self.settings_store.set_value(&registry, id, value)
-            .map_err(|e| FlaviteError::SettingsIo(e.to_string()))
+        self.settings_store.set_value(&registry, id, value).map_err(FlaviteError::from)
+    }
+
+    /// The last-good settings backup, when one exists (RFC-0007 FR-10: the
+    /// diagnosis path behind the unparseable-document restore affordance).
+    pub fn settings_backup(
+        &self,
+    ) -> Result<Option<crate::settings_store::StoredSettings>, FlaviteError> {
+        self.settings_store.backup().map_err(FlaviteError::from)
+    }
+
+    /// Restore the last-good settings backup over the (unparseable)
+    /// document under the current generation (RFC-0007 FR-10). Returns the
+    /// new generation.
+    pub fn settings_restore_backup(&self) -> Result<u64, FlaviteError> {
+        self.settings_store.restore_backup().map_err(FlaviteError::from)
     }
 
     /// Get the setting descriptors from the registry.
@@ -1508,6 +1525,38 @@ impl Flavite {
     /// Returns the complete built-in descriptor table (RFC-0007 D-04).
     pub fn setting_descriptors(&self) -> Vec<flavite_settings::descriptor::SettingDescriptor> {
         flavite_settings::registry::SettingRegistry::builtins()
+    }
+
+    /// Test-only seam: rewire every vault-rooted store (vault user state,
+    /// theme packages, settings) onto a caller-owned `MemFs` so vault
+    /// persistence is exercised hermetically — fixtures root vaults at
+    /// virtual paths no real filesystem can address. The settings document
+    /// is (re-)initialized on the new filesystem. Never part of the
+    /// production path.
+    #[doc(hidden)]
+    pub fn set_vault_store_fs_for_test(&mut self, fs: flavite_fs::MemFs) {
+        let root = self.vault_ref().root.clone();
+        self.vault_user_state = flavite_vault::user_state::VaultUserStateStore::new(
+            Box::new(fs.clone()),
+            &root,
+        );
+        self.themes = Some(crate::themes::ThemeStore::at_vault(
+            Box::new(fs.clone()),
+            &root,
+        ));
+        let settings_vault_store = Arc::new(flavite_vault::user_state::VaultUserStateStore::new(
+            Box::new(fs.clone()),
+            &root,
+        ));
+        self.settings_store =
+            crate::settings_store::SettingsStore::new(settings_vault_store, true);
+        let registry = flavite_settings::registry::SettingRegistry::with_builtins();
+        let _ = self.settings_store.load_or_migrate(
+            &registry,
+            &root,
+            None,
+            &self.vault_ref().uuid.to_string(),
+        );
     }
 
     /// Execute a typed command through the registry.
@@ -2517,8 +2566,8 @@ pub enum FlaviteError {
     BufferManagerPoisoned,
 
     /// The vault settings document could not be read or written.
-    #[error("Settings I/O failed: {0}")]
-    SettingsIo(String),
+    #[error("Settings error: {0}")]
+    Settings(#[from] crate::settings_store::SettingsStoreError),
 
     /// Indexed lookup failed.
     #[error("Index error: {0}")]

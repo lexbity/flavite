@@ -485,6 +485,11 @@
       "kind": "normal"
     },
     {
+      "from": "flavite-ui",
+      "to": "zip",
+      "kind": "dev"
+    },
+    {
       "from": "flavite-vault",
       "to": "blake3",
       "kind": "normal"

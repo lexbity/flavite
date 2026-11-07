@@ -132,6 +132,9 @@ pub fn fixture(notes: &[(&str, &str)]) -> Fixture {
         },
     );
     let mut flavite = Flavite::open(identity, session, VaultConfig::default()).expect("facade");
+    // Vault-rooted stores (settings, themes, layout) live on the fixture's
+    // MemFs: the vault identity root is a virtual path (RFC-0007).
+    flavite.set_vault_store_fs_for_test((*fs).clone());
     flavite.set_graph_service_for_test(db.clone(), Some(std::sync::Arc::new(generation_watch)));
     flavite.query_service().set_search_db_path(db);
     reconcile(&flavite);

@@ -13,6 +13,7 @@ pub mod notes;
 pub mod notifications;
 pub mod preview;
 pub mod search;
+pub mod settings;
 
 use crate::app::Message;
 use crate::style::{self, Metrics};

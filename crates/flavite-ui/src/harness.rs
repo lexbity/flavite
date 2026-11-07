@@ -116,6 +116,7 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                         flavite_workspace::ViewKind::Graph(_) => "graph",
                         flavite_workspace::ViewKind::Empty => "empty",
                         flavite_workspace::ViewKind::Notes => "notes",
+                        flavite_workspace::ViewKind::Settings => "settings",
                         flavite_workspace::ViewKind::Search => "search",
                         flavite_workspace::ViewKind::History(_) => "history",
                         flavite_workspace::ViewKind::Preview(_) => "preview",
@@ -391,10 +392,10 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "dialog_kind": app.dialog.as_ref().map(|dialog| dialog.kind_name()),
         "start_error": app.start.error.clone(),
         "theme": app.appearance.scheme().name(),
-        "theme_choice": app.appearance.prefs.theme.name(),
-        "interface_scale_pct": app.appearance.prefs.interface_scale_pct,
-        "editor_font_size": app.appearance.prefs.editor_font_size,
-        "reduced_motion": app.appearance.prefs.reduced_motion,
+        "theme_choice": app.appearance.theme_name(),
+        "interface_scale_pct": app.appearance.scale_pct(),
+        "editor_font_size": app.appearance.editor_font_size(),
+        "reduced_motion": app.appearance.reduced_motion(),
     });
     snapshot["menu_bar_visible"] = app.menu_bar_visible.into();
     snapshot["sidebar_open"] = app.sidebar_open().into();

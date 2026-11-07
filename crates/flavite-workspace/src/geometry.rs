@@ -52,7 +52,7 @@ pub fn view_minimum(kind: &ViewKind, scale: f32) -> Size {
     let (width, height) = match kind {
         ViewKind::Note(_) | ViewKind::History(_) => MIN_NOTE,
         ViewKind::Graph(_) => MIN_GRAPH,
-        ViewKind::Notes | ViewKind::Search | ViewKind::Empty => MIN_LIST,
+        ViewKind::Notes | ViewKind::Search | ViewKind::Settings | ViewKind::Empty => MIN_LIST,
         ViewKind::Preview(_)
         | ViewKind::Backlinks(_)
         | ViewKind::Outline(_)

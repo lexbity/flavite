@@ -4,7 +4,6 @@
 //! layouts switch atomically, missing notes render recoverable states, and
 //! out-of-order storage receipts never corrupt the layout or the notes.
 
-use flavite_api::UserStateKind;
 use flavite_fs::{Fs, MemFs};
 use flavite_ui::app::{App, Message};
 

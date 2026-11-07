@@ -26,6 +26,7 @@ pub enum Icon {
     SplitRight,
     SplitDown,
     Maximize,
+    Settings,
 }
 
 /// A vector icon drawn at half the scaled icon-button target (16 px at 100%).
@@ -230,6 +231,15 @@ impl Widget<Message, Theme, Renderer> for Glyph {
                 line(14.0, 4.0, 1.0, 10.0);
                 line(1.0, 13.0, 14.0, 1.0);
                 line(2.0, 2.0, 5.0, 1.0);
+            }
+            // Three slider rails with staggered knobs (settings).
+            Icon::Settings => {
+                line(2.0, 4.0, 12.0, 1.0);
+                line(2.0, 8.0, 12.0, 1.0);
+                line(2.0, 12.0, 12.0, 1.0);
+                line(9.0, 2.5, 2.0, 4.0);
+                line(4.0, 6.5, 2.0, 4.0);
+                line(10.0, 10.5, 2.0, 4.0);
             }
             kind => {
                 renderer.fill_quad(

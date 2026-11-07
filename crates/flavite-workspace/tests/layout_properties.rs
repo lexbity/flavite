@@ -101,6 +101,7 @@ fn expected_delta(state: &WorkspaceState, action: &LayoutAction) -> Option<i64> 
         | A::OpenEmpty { group, .. }
         | A::OpenNotes { group, .. }
         | A::OpenSearch { group, .. }
+        | A::OpenSettings { group, .. }
         | A::OpenHistory { group, .. }
         | A::OpenGraph { group, .. }
         | A::OpenContext { group, .. }

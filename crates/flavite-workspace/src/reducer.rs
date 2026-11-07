@@ -205,6 +205,11 @@ pub enum LayoutAction {
         expected_revision: u64,
         group: GroupId,
     },
+    /// Open the vault settings tab in `group` (RFC-0007 S6).
+    OpenSettings {
+        expected_revision: u64,
+        group: GroupId,
+    },
     /// Open the local-history view of `locator` in `group` (W10).
     OpenHistory {
         expected_revision: u64,
@@ -372,6 +377,9 @@ impl LayoutAction {
                 expected_revision, ..
             }
             | Self::OpenSearch {
+                expected_revision, ..
+            }
+            | Self::OpenSettings {
                 expected_revision, ..
             }
             | Self::OpenHistory {
@@ -1342,6 +1350,14 @@ fn apply(state: &mut WorkspaceState, action: &LayoutAction) -> Result<Vec<Effect
             Ok(vec![Effect::ViewAttached {
                 tab,
                 kind: ViewKind::Search,
+            }])
+        }
+        LayoutAction::OpenSettings { group, .. } => {
+            let tab = state.ids.tab_id();
+            let tab = state.append_tab(*group, ViewSession::new(tab, ViewKind::Settings))?;
+            Ok(vec![Effect::ViewAttached {
+                tab,
+                kind: ViewKind::Settings,
             }])
         }
         LayoutAction::OpenHistory { locator, group, .. } => {

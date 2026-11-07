@@ -211,7 +211,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     },
     UiCommand {
         id: "workspace.preferences",
-        title: "Open preferences (theme, scale, shortcuts)",
+        title: "Open settings (theme, scale, shortcuts)",
     },
     UiCommand {
         id: "workspace.toggle_theme",
@@ -495,10 +495,10 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
     };
     // A Preferences shortcut row is capturing: the next key press becomes
     // that command's chord; Escape cancels (W11 collision editor).
-    if let Some(command) = app.shortcut_capture.clone() {
+    if let Some(command) = app.settings.capture.clone() {
         if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
-            return Some(Message::Preferences(
-                crate::host::appearance::PreferenceMessage::ShortcutCaptured {
+            return Some(Message::Settings(
+                crate::host::settings::SettingsMessage::ShortcutCaptured {
                     command,
                     chord: None,
                 },
@@ -521,8 +521,8 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
         }
         parts.push(token.as_str());
         let chord = parts.join("+");
-        return Some(Message::Preferences(
-            crate::host::appearance::PreferenceMessage::ShortcutCaptured {
+        return Some(Message::Settings(
+            crate::host::settings::SettingsMessage::ShortcutCaptured {
                 command,
                 chord: Some(chord),
             },
@@ -590,6 +590,23 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
     }
     if modifiers.shift() && matches!(&key, keyboard::Key::Named(keyboard::key::Named::F10)) {
         return Some(Message::RunHostCommand("workspace.group_actions"));
+    }
+    // RFC-0007 FR-6 (keyboard-only operation): `/` focuses the Settings
+    // tab's search input when the settings view is focused.
+    if modifiers.is_empty()
+        && matches!(&key, keyboard::Key::Character(character) if character == "/")
+        && matches!(
+            app.workspace
+                .tab(&app.workspace.focused_tab())
+                .map(|session| session.kind()),
+            Some(flavite_workspace::ViewKind::Settings)
+        )
+        && app.dialog.is_none()
+    {
+        let tab = app.workspace.focused_tab();
+        return Some(Message::Settings(
+            crate::host::settings::SettingsMessage::FocusSearch { tab },
+        ));
     }
     // Graph tab operations (§9.3 keyboard): Enter opens the selected
     // note; command+Enter requests one link insertion at the retained
@@ -1025,31 +1042,38 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
             app.dialog = Some(crate::host::dialogs::Dialog::About);
         }
         "workspace.preferences" => {
-            app.shortcut_capture = None;
-            app.dialog = Some(crate::host::dialogs::Dialog::Preferences);
+            // RFC-0007 D-08: the command opens the durable Settings tab.
+            if let Some(group) = app.navigation_group() {
+                app.dispatch_layout(|revision| LayoutAction::OpenSettings {
+                    expected_revision: revision,
+                    group,
+                });
+            }
         }
         "workspace.toggle_theme" => {
             // Toggle resolves the active scheme to an explicit choice, so
-            // the flip is one undoable, inspectable preference edit.
+            // the flip is one inspectable settings edit through the funnel.
             let next = match app.appearance.scheme() {
-                crate::style::Scheme::Dark => crate::host::appearance::ThemeChoice::Light,
-                crate::style::Scheme::Light => crate::host::appearance::ThemeChoice::Dark,
+                crate::style::Scheme::Dark => "light",
+                crate::style::Scheme::Light => "dark",
             };
-            return app.update(Message::Preferences(
-                crate::host::appearance::PreferenceMessage::SetTheme(next),
-            ));
+            return app.apply_setting(
+                "appearance.theme",
+                flavite_settings::value::SettingValue::Str(next.to_owned()),
+            );
         }
         "workspace.cycle_interface_scale" => {
             const LADDER: [u16; 4] = [100, 150, 200, 75];
-            let current = app.appearance.prefs.interface_scale_pct;
+            let current = app.appearance.scale_pct();
             let position = LADDER.iter().position(|step| *step == current);
             let next = match position {
                 Some(index) => LADDER[(index + 1) % LADDER.len()],
                 None => 100,
             };
-            return app.update(Message::Preferences(
-                crate::host::appearance::PreferenceMessage::SetScale(next),
-            ));
+            return app.apply_setting(
+                "appearance.scale_pct",
+                flavite_settings::value::SettingValue::Int(i64::from(next)),
+            );
         }
         "workspace.open_graph" => {
             if let Some(group) = focused_group {
@@ -1350,6 +1374,7 @@ pub fn available(app: &App, id: &str) -> bool {
         "workspace.new_note"
         | "workspace.open_note_dialog"
         | "workspace.open_search_view"
+        | "workspace.preferences"
         | "workspace.refresh_catalog" => app.flavite.is_some(),
         "help.about" => true,
         _ => true,

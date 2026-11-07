@@ -333,3 +333,29 @@ fn restore_plan_reports_missing_notes_and_drops_invalid_identities() {
         "catalogued notes are not reported missing"
     );
 }
+
+#[test]
+fn settings_tab_round_trips_through_the_codec() {
+    // RFC-0007 S6: the Settings tab is a stateless durable kind.
+    let mut workspace = sample();
+    workspace.tabs.push(PersistedTab {
+        id: "4".into(),
+        kind: PersistedKind::Settings,
+    });
+    workspace.groups[1].tabs.push("4".into());
+    workspace.groups[1].active = "4".into();
+    let bytes = encode_workspace(&workspace).expect("encodes");
+    let decoded = decode_workspace(&bytes, VAULT).expect("decodes");
+    assert_eq!(decoded, workspace);
+
+    // Restore rehydrates the Settings tab like every other kind.
+    let catalog = BTreeSet::new();
+    let plan = flavite_workspace::plan_restore(&decoded, &catalog).expect("plan");
+    assert!(plan.report.is_empty(), "no drops expected: {:?}", plan.report);
+    let restored = plan
+        .tabs
+        .iter()
+        .find(|tab| tab.id.raw() == 4)
+        .expect("settings tab restored");
+    assert_eq!(restored.kind, flavite_workspace::ViewKind::Settings);
+}

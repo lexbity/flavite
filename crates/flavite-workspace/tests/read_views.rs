@@ -172,3 +172,46 @@ fn scrolling_keeps_exact_insertion_authority_but_find_selection_invalidates_it()
         .unwrap();
     assert!(state.writing_target().is_none());
 }
+
+#[test]
+fn open_settings_opens_focuses_and_duplicates_like_every_tool_tab() {
+    let mut state = WorkspaceState::new();
+    let group = state.first_group().unwrap();
+    let revision = state.revision();
+    apply(
+        &mut state,
+        LayoutAction::OpenSettings {
+            expected_revision: revision,
+            group,
+        },
+    );
+    // The fresh workspace opens with one Empty tab; OpenSettings appends
+    // and focuses the Settings tab.
+    assert_eq!(state.tabs().count(), 2);
+    assert!(matches!(state.tab(&state.focused_tab()).unwrap().kind(), ViewKind::Settings));
+
+    // The tab duplicates (it is stateless; the duplicate is independent).
+    let tab = state.focused_tab();
+    let revision = state.revision();
+    apply(
+        &mut state,
+        LayoutAction::DuplicateTab {
+            expected_revision: revision,
+            tab,
+        },
+    );
+    assert_eq!(state.tabs().count(), 3);
+    assert!(matches!(state.tab(&state.focused_tab()).unwrap().kind(), ViewKind::Settings));
+
+    // Closing the original keeps the group alive with the duplicate.
+    let revision = state.revision();
+    apply(
+        &mut state,
+        LayoutAction::CloseTab {
+            expected_revision: revision,
+            tab,
+        },
+    );
+    assert_eq!(state.tabs().count(), 2);
+    assert!(matches!(state.tab(&state.focused_tab()).unwrap().kind(), ViewKind::Settings));
+}

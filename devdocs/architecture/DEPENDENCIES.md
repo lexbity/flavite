@@ -181,6 +181,7 @@ Dev-only:
 - `flavite-fs`
 - `flavite-index`
 - `flavite-vault`
+- `zip`
 
 ### `flavite-vault`
 
@@ -238,7 +239,7 @@ Normal/build:
 - `tantivy` ← flavite-index, xtask
 - `tracing` ← flavite-api, flavite-cli, flavite-index, flavite-vault
 - `tree-sitter` ← flavite-syntax
-- `zip` ← flavite-api, flavite-theme
+- `zip` ← flavite-api, flavite-theme, flavite-ui
 - `zstd` ← flavite-vault
 
 ## Layering rules (§10.2)

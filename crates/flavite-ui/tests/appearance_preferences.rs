@@ -1,20 +1,19 @@
-//! W11 appearance preferences: theme/scale/font/line-width/reduced-motion
-//! edits, device-local persistence semantics, invalid-value handling,
-//! shortcut collision rules, and the guarantee that appearance changes
-//! never touch document bytes (RFC-0003 §27).
+//! W11 appearance preferences (RFC-0007 S7/S8): theme/scale/font/line-
+//! width/reduced-motion edits through the single settings funnel, vault-
+//! document persistence semantics, invalid-value handling, shortcut
+//! collision rules, and the guarantee that appearance changes never touch
+//! document bytes (RFC-0003 §27).
 
-use flavite_api::UserStateKind;
 use flavite_fs::Fs;
+use flavite_settings::value::SettingValue;
 use flavite_ui::app::{App, Message};
-use flavite_ui::host::appearance::{AppearanceHost, LineWidth, PreferenceMessage, Preferences, ThemeChoice};
+use flavite_ui::host::appearance::AppearanceHost;
+use flavite_ui::host::settings::SettingsHost;
 use flavite_ui::style::{Scheme, tokens};
 mod support;
-
-use iced::keyboard::{Key, Modifiers, key::Named};
-use std::time::{Duration, Instant};
 use support::{SeedNote, ui_fixture};
 
-use flavite_api::command::modifiers as mods;
+use std::time::{Duration, Instant};
 
 const NOTE: &str = "appearance.md";
 
@@ -54,6 +53,11 @@ fn wait_ready(app: &mut App) {
     assert!(!app.notes.any_pending(), "every open completed");
 }
 
+fn set_setting(app: &mut App, id: &str, value: SettingValue) {
+    let task = app.apply_setting(id, value);
+    let _ = task;
+}
+
 #[test]
 fn theme_choices_switch_the_resolved_scheme() {
     let mut fixture = ui_fixture(1111, "/appearance-theme", &seed());
@@ -63,21 +67,21 @@ fn theme_choices_switch_the_resolved_scheme() {
         Scheme::Dark,
         "System defaults to dark when no OS scheme is reported"
     );
-    let _ = app.update_preferences(PreferenceMessage::SetTheme(ThemeChoice::Light));
+    set_setting(app, "appearance.theme", SettingValue::Str("light".into()));
     assert_eq!(app.appearance.scheme(), Scheme::Light);
     assert_eq!(
         app.appearance.theme().palette().background,
         tokens::light_palette().background
     );
-    let _ = app.update_preferences(PreferenceMessage::SetTheme(ThemeChoice::Dark));
+    set_setting(app, "appearance.theme", SettingValue::Str("dark".into()));
     assert_eq!(app.appearance.scheme(), Scheme::Dark);
-    let _ = app.update_preferences(PreferenceMessage::SetTheme(ThemeChoice::System));
+    set_setting(app, "appearance.theme", SettingValue::Str("system".into()));
     assert_eq!(app.appearance.scheme(), Scheme::Dark);
 
     // The OS reporting a light scheme flips System, and only System.
     app.appearance.system_theme(iced::theme::Mode::Light);
     assert_eq!(app.appearance.scheme(), Scheme::Light);
-    let _ = app.update_preferences(PreferenceMessage::SetTheme(ThemeChoice::Dark));
+    set_setting(app, "appearance.theme", SettingValue::Str("dark".into()));
     assert_eq!(
         app.appearance.scheme(),
         Scheme::Dark,
@@ -85,15 +89,14 @@ fn theme_choices_switch_the_resolved_scheme() {
     );
 }
 
-#[ignore] // S4: UserStateKind::DevicePreferences removed - needs new test with vault settings
 #[test]
-fn preference_edits_persist_and_reload_through_the_device_store() {
+fn preference_edits_persist_and_reload_through_the_vault_document() {
     let mut fixture = ui_fixture(1112, "/appearance-persist", &seed());
     let app = &mut fixture.app;
-    let _ = app.update_preferences(PreferenceMessage::SetTheme(ThemeChoice::Light));
-    let _ = app.update_preferences(PreferenceMessage::SetScale(150));
-    let _ = app.update_preferences(PreferenceMessage::SetLineWidth(LineWidth::Columns(80)));
-    let _ = app.update_preferences(PreferenceMessage::SetReducedMotion(true));
+    set_setting(app, "appearance.theme", SettingValue::Str("light".into()));
+    set_setting(app, "appearance.scale_pct", SettingValue::Int(150));
+    set_setting(app, "editor.line_width", SettingValue::Int(80));
+    set_setting(app, "appearance.reduced_motion", SettingValue::Bool(true));
     pump_all(app);
     assert!(
         app.appearance.last_error.is_none(),
@@ -101,119 +104,106 @@ fn preference_edits_persist_and_reload_through_the_device_store() {
         app.appearance.last_error
     );
 
-    // The stored document reloads with identical state (the device store
-    // is keyed by vault UUID; cross-process durability of the store itself
-    // is covered by flavite-api workspace_storage).
-    let stored = fixture
-        .app
+    // The stored vault document holds the edited values (RFC-0007: the
+    // vault is the single settings authority).
+    let stored = app
         .flavite
         .as_ref()
         .unwrap()
-        .read_user_state(UserStateKind::DevicePreferences)
-        .expect("read stored preferences")
-        .expect("preferences were written");
-    let reloaded = Preferences::parse(Some(std::str::from_utf8(&stored.payload).unwrap()))
-        .expect("stored document parses");
-    assert_eq!(reloaded.preferences.theme, ThemeChoice::Light);
-    assert_eq!(reloaded.preferences.interface_scale_pct, 150);
-    assert_eq!(reloaded.preferences.line_width, LineWidth::Columns(80));
-    assert!(reloaded.preferences.reduced_motion);
+        .read_settings_raw()
+        .expect("read stored settings")
+        .expect("settings were written");
+    assert_eq!(
+        stored
+            .doc
+            .get("appearance.theme")
+            .and_then(|v| v.as_str().map(str::to_owned)),
+        Some("light".to_owned())
+    );
+    assert_eq!(
+        stored.doc.get("appearance.scale_pct").and_then(|v| v.as_int()),
+        Some(150)
+    );
+    assert_eq!(stored.doc.get("editor.line_width").and_then(|v| v.as_int()), Some(80));
+    assert_eq!(
+        stored
+            .doc
+            .get("appearance.reduced_motion")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
     assert!(
-        reloaded.warnings.is_empty(),
+        stored.warnings.is_empty(),
         "a valid round trip has no warnings"
     );
 
     let mut fresh = AppearanceHost::boot();
-    fresh.load(fixture.app.flavite.as_ref().unwrap());
+    fresh.load(app.flavite.as_ref().unwrap());
     assert_eq!(fresh.scheme(), Scheme::Light);
     assert_eq!(fresh.metrics().scale, 1.5);
 }
 
-#[ignore] // S3: old device_preferences JSON format - needs new test with settings system
 #[test]
-fn invalid_stored_fields_fall_back_with_warnings_and_unknown_fields_survive() {
-    let document = serde_json::json!({
-        "schema": 1,
-        "theme": "sepia",
-        "interface_scale_pct": 300,
-        "editor_font_size": 4,
-        "line_width": "wide",
-        "reduced_motion": "yes",
-        "shortcuts": { "workspace.find": "Not A Chord" },
-        "future_additive_field": { "nested": true }
-    })
-    .to_string();
-    let parsed = Preferences::parse(Some(&document)).expect("field-level invalids are warnings");
-    assert_eq!(parsed.preferences.theme, ThemeChoice::System);
-    assert_eq!(parsed.preferences.interface_scale_pct, 100);
-    assert_eq!(parsed.preferences.editor_font_size, 16);
-    assert_eq!(parsed.preferences.line_width, LineWidth::Full);
-    assert!(!parsed.preferences.reduced_motion);
-    assert!(parsed.preferences.shortcuts.is_empty());
-    assert_eq!(parsed.warnings.len(), 6, "every rejected field is reported");
-    // Unknown additive fields are preserved for forward compatibility.
-    let reencoded = parsed.preferences.to_json();
-    assert_eq!(
-        reencoded["future_additive_field"],
-        serde_json::json!({ "nested": true })
-    );
-    // A valid document round-trips.
-    let mut prefs = Preferences::defaults();
-    prefs.theme = ThemeChoice::Light;
-    let round = Preferences::parse(Some(&prefs.to_stored()))
-        .unwrap()
-        .preferences;
-    assert_eq!(round, prefs);
-}
-
-#[ignore] // S3: old device_preferences system - needs new test with settings system
-#[test]
-fn unreadable_or_future_documents_disable_saving_instead_of_overwriting() {
+fn unreadable_or_future_documents_disable_edits_instead_of_overwriting() {
     let mut fixture = ui_fixture(1113, "/appearance-corrupt", &seed());
     let app = &mut fixture.app;
-    // Write a corrupt document directly, then load it as attach would.
-    let flavite = app.flavite.as_mut().unwrap();
-    // The store refuses non-JSON payloads, so the corrupt case is a valid
-    // JSON document with the wrong shape (not a preferences object).
-    flavite
-        .write_user_state(UserStateKind::DevicePreferences, 0, b"[1, 2]")
+    // Corrupt the vault settings document directly on the fixture fs, then
+    // load it as attach would. The store refuses non-TOML payloads, so the
+    // corrupt case is a torn document the codec cannot parse.
+    let settings_path = std::path::Path::new("/appearance-corrupt/.flavite/settings.toml");
+    fixture.fs.remove(settings_path).expect("seed removed");
+    fixture
+        .fs
+        .write_new(settings_path, b"[1, 2]")
         .expect("corrupt seed written");
-    let mut host = AppearanceHost::boot();
+    let mut host = SettingsHost::default();
     host.load(app.flavite.as_ref().unwrap());
-    assert!(!host.valid, "a corrupt document disables saving");
-    assert!(host.last_error.is_some());
-    assert_eq!(host.scheme(), Scheme::Dark, "defaults apply read-only");
+    assert!(host.read_only, "a corrupt document disables edits");
+    assert!(host.load_error.is_some());
+    assert_eq!(app.appearance.scheme(), Scheme::Dark, "defaults apply read-only");
 
-    let future = serde_json::json!({ "schema": 99 }).to_string();
+    // A future schema is readable but never overwritten: writes are refused
+    // so the newer build's data survives.
+    fixture.fs.remove(settings_path).expect("seed removed");
+    fixture
+        .fs
+        .write_new(settings_path, b"schema = 99\n")
+        .expect("future schema written");
+    let flavite = app.flavite.as_ref().unwrap();
+    let stored = flavite
+        .read_settings_raw()
+        .expect("read stored settings")
+        .expect("settings present");
+    assert!(stored.is_read_only(), "a future schema is read-only");
+    let doc = stored.doc.clone();
     assert!(
-        Preferences::parse(Some(&future)).is_err(),
-        "future schemas are refused, not guessed"
+        flavite.settings_write(&doc, stored.generation).is_err(),
+        "writes to a future-schema document are refused"
     );
 }
 
-#[ignore] // S3: tests device store - needs new test with settings system
 #[test]
 fn out_of_range_edit_inputs_are_refused_without_changing_state() {
     let mut fixture = ui_fixture(1114, "/appearance-bounds", &seed());
     let app = &mut fixture.app;
-    let _ = app.update_preferences(PreferenceMessage::SetScale(300));
+    set_setting(app, "appearance.scale_pct", SettingValue::Int(300));
     assert!(
         app.status.contains("Interface scale must be"),
         "status: {}",
         app.status
     );
-    assert_eq!(app.appearance.prefs.interface_scale_pct, 100);
-    let _ = app.update_preferences(PreferenceMessage::SetEditorFontSize(5));
+    assert_eq!(app.appearance.scale_pct(), 100);
+    set_setting(app, "editor.font_size", SettingValue::Int(5));
     assert!(
         app.status.contains("Editor font size must be"),
         "status: {}",
         app.status
     );
-    assert_eq!(app.appearance.prefs.editor_font_size, 16);
+    assert_eq!(app.appearance.editor_font_size(), 14);
     // The valid range is accepted (D-15: 75–200%).
-    let _ = app.update_preferences(PreferenceMessage::SetScale(75));
+    set_setting(app, "appearance.scale_pct", SettingValue::Int(75));
     assert_eq!(app.appearance.metrics().scale, 0.75);
-    let _ = app.update_preferences(PreferenceMessage::SetScale(200));
+    set_setting(app, "appearance.scale_pct", SettingValue::Int(200));
     assert_eq!(app.appearance.metrics().scale, 2.0);
 }
 
@@ -222,29 +212,18 @@ fn shortcut_overrides_reject_collisions_and_os_reserved_chords() {
     let mut fixture = ui_fixture(1115, "/appearance-shortcuts", &seed());
     let app = &mut fixture.app;
     // A collision with another command is refused with a named conflict.
-    let _ = app.update_preferences(PreferenceMessage::SetShortcut {
-        command: "workspace.find".into(),
-        chord: Some("Mod+W".into()),
-    });
+    app.set_shortcut_override("workspace.find", Some("Mod+W".into()));
     let error = app
         .appearance
         .shortcut_error
         .clone()
         .expect("collision refused");
     assert!(error.contains("already used by"), "error: {error}");
-    assert!(
-        !app.appearance
-            .prefs
-            .shortcuts
-            .contains_key("workspace.find")
-    );
+    assert!(!app.appearance.shortcut_overrides().contains_key("workspace.find"));
 
     // An OS-reserved chord is refused with its owner so the editor can
     // offer an alternate action.
-    let _ = app.update_preferences(PreferenceMessage::SetShortcut {
-        command: "workspace.find".into(),
-        chord: Some("Alt+F4".into()),
-    });
+    app.set_shortcut_override("workspace.find", Some("Alt+F4".into()));
     let error = app
         .appearance
         .shortcut_error
@@ -253,35 +232,25 @@ fn shortcut_overrides_reject_collisions_and_os_reserved_chords() {
     assert!(error.contains("reserved by the desktop"), "error: {error}");
 
     // An unreadable chord is refused.
-    let _ = app.update_preferences(PreferenceMessage::SetShortcut {
-        command: "workspace.find".into(),
-        chord: Some("Ctrl+".into()),
-    });
+    app.set_shortcut_override("workspace.find", Some("Ctrl+".into()));
     assert!(app.appearance.shortcut_error.is_some());
 
     // A valid, non-colliding override lands and takes effect.
-    let _ = app.update_preferences(PreferenceMessage::SetShortcut {
-        command: "workspace.find".into(),
-        chord: Some("Mod+Shift+F".into()),
-    });
+    app.set_shortcut_override("workspace.find", Some("Mod+Shift+F".into()));
     assert!(app.appearance.shortcut_error.is_none());
-    assert!(
-        app.appearance
-            .prefs
-            .shortcuts
-            .contains_key("workspace.find")
-    );
+    assert!(app.appearance.shortcut_overrides().contains_key("workspace.find"));
     assert!(app.appearance.shortcuts.iter().any(|(chord, id)| {
         *id == "workspace.find" && chord.key == "F" && chord.modifiers & mods::SHIFT != 0
     }));
 
     // Restoring defaults clears every override.
-    let _ = app.update_preferences(PreferenceMessage::SetShortcut {
-        command: "workspace.note_mode".into(),
-        chord: Some("Mod+R".into()),
-    });
-    let _ = app.update_preferences(PreferenceMessage::RestoreShortcuts);
-    assert!(app.appearance.prefs.shortcuts.is_empty());
+    app.set_shortcut_override("workspace.note_mode", Some("Mod+R".into()));
+    set_setting(
+        app,
+        "shortcuts.overrides",
+        SettingValue::ShortcutMap(std::collections::BTreeMap::new()),
+    );
+    assert!(app.appearance.shortcut_overrides().is_empty());
     // Defaults are still bound.
     assert!(
         app.appearance
@@ -313,10 +282,7 @@ fn keyboard_resolution_uses_the_effective_table_exactly() {
         Some("workspace.next_group")
     );
     // An override changes the effective binding immediately.
-    let _ = app.update_preferences(PreferenceMessage::SetShortcut {
-        command: "workspace.find".into(),
-        chord: Some("Mod+Shift+F".into()),
-    });
+    app.set_shortcut_override("workspace.find", Some("Mod+Shift+F".into()));
     assert_eq!(app.appearance.chord_command(&key_f, &Modifiers::CTRL), None);
     assert_eq!(
         app.appearance
@@ -330,15 +296,12 @@ fn appearance_edits_never_change_document_bytes() {
     let mut fixture = ui_fixture(1117, "/appearance-bytes", &seed());
     let app = &mut fixture.app;
     open_note(app);
-    let _ = app.update_preferences(PreferenceMessage::SetTheme(ThemeChoice::Light));
-    let _ = app.update_preferences(PreferenceMessage::SetScale(175));
-    let _ = app.update_preferences(PreferenceMessage::SetEditorFontSize(20));
-    let _ = app.update_preferences(PreferenceMessage::SetLineWidth(LineWidth::Columns(72)));
-    let _ = app.update_preferences(PreferenceMessage::SetReducedMotion(true));
-    let _ = app.update_preferences(PreferenceMessage::SetShortcut {
-        command: "workspace.find".into(),
-        chord: Some("Mod+Shift+F".into()),
-    });
+    set_setting(app, "appearance.theme", SettingValue::Str("light".into()));
+    set_setting(app, "appearance.scale_pct", SettingValue::Int(175));
+    set_setting(app, "editor.font_size", SettingValue::Int(20));
+    set_setting(app, "editor.line_width", SettingValue::Int(72));
+    set_setting(app, "appearance.reduced_motion", SettingValue::Bool(true));
+    app.set_shortcut_override("workspace.find", Some("Mod+Shift+F".into()));
     pump_all(app);
     let bytes = fixture
         .fs
@@ -360,7 +323,7 @@ fn scale_changes_reproject_geometry_without_rewriting_ratios() {
     let _ = app.update(Message::RunHostCommand("workspace.split_right"));
     pump_all(app);
     let before = format!("{:?}", app.workspace.tree());
-    let _ = app.update_preferences(PreferenceMessage::SetScale(200));
+    set_setting(app, "appearance.scale_pct", SettingValue::Int(200));
     pump_all(app);
     assert_eq!(app.appearance.metrics().scale, 2.0);
     assert_eq!(
@@ -373,14 +336,13 @@ fn scale_changes_reproject_geometry_without_rewriting_ratios() {
     assert_eq!(format!("{:?}", app.workspace.tree()), before);
 }
 
-#[ignore] // S4: UserStateKind::DevicePreferences removed - needs new test with vault settings
 #[test]
 fn sidebar_presentation_persists_and_survives_a_fresh_host() {
     let mut fixture = ui_fixture(1119, "/appearance-sidebar", &seed());
     let app = &mut fixture.app;
-    assert!(!app.sidebar_open());
+    assert!(app.sidebar_open(), "the registry default opens the sidebar");
     let _ = app.update(Message::ToggleSidebar);
-    assert!(app.sidebar_open());
+    assert!(!app.sidebar_open());
 
     // The divider drag previews live and commits the width on release.
     let _ = app.update(Message::SidebarResizeBegin);
@@ -404,22 +366,22 @@ fn sidebar_presentation_persists_and_survives_a_fresh_host() {
         app.appearance.last_error
     );
 
-    let stored = fixture
-        .app
+    let stored = app
         .flavite
         .as_ref()
         .unwrap()
-        .read_user_state(UserStateKind::DevicePreferences)
-        .expect("read stored preferences")
-        .expect("preferences were written");
-    let reloaded = Preferences::parse(Some(std::str::from_utf8(&stored.payload).unwrap()))
-        .expect("stored document parses");
-    assert!(reloaded.preferences.sidebar_open);
-    assert_eq!(reloaded.preferences.sidebar_width, 300);
+        .read_settings_raw()
+        .expect("read stored settings")
+        .expect("settings were written");
+    assert_eq!(stored.doc.get("sidebar.open").and_then(|v| v.as_bool()), Some(false));
+    assert_eq!(stored.doc.get("sidebar.width").and_then(|v| v.as_int()), Some(300));
 
     let mut fresh = AppearanceHost::boot();
-    fresh.load(fixture.app.flavite.as_ref().unwrap());
-    assert!(fresh.prefs.sidebar_open);
-    assert_eq!(fresh.prefs.sidebar_width, 300);
+    fresh.load(app.flavite.as_ref().unwrap());
+    assert!(!fresh.sidebar_open());
+    assert_eq!(fresh.sidebar_width(), 300);
     assert_eq!(fresh.metrics().sidebar_width, 300.0);
 }
+
+use iced::keyboard::{Key, Modifiers, key::Named};
+use flavite_api::command::modifiers as mods;

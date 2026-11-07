@@ -140,6 +140,7 @@ pub fn is_source_kind(kind: &ViewKind) -> bool {
         ViewKind::History(_)
         | ViewKind::Empty
         | ViewKind::Notes
+        | ViewKind::Settings
         | ViewKind::Preview(_)
         | ViewKind::Backlinks(_)
         | ViewKind::Outline(_)

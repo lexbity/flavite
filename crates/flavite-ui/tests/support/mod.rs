@@ -212,7 +212,84 @@ pub fn vault_stack(
     );
     let mut flavite = Flavite::open(identity, session, VaultConfig::default()).expect("facade");
     flavite.set_user_state_root_for_test(PathBuf::from(format!("/test/ui-fixture-device/{seed}")));
+    // Vault-rooted stores (settings, themes, layout) live on the fixture's
+    // MemFs too: the vault identity root is a virtual path, and persistence
+    // through the vault must be exercised hermetically (RFC-0007).
+    flavite.set_vault_store_fs_for_test((*fs).clone());
     (flavite, fs, cache)
+}
+
+/// Build an additional facade over the SAME fixture filesystem: restart
+/// persistence tests reopen the vault this way and observe the persisted
+/// settings document through a fresh host. Returns the cache tempdir that
+/// keeps the reopened index alive.
+///
+/// # Panics
+/// Panics on fixture plumbing failures (test defects, not behaviors).
+#[must_use]
+pub fn reopen_facade(
+    fs: &std::sync::Arc<MemFs>,
+    root: &str,
+) -> (flavite_api::Flavite, tempfile::TempDir) {
+    use flavite_api::{Flavite, VaultConfig, VaultIdentity};
+    use flavite_buffer::manager::BufferManager;
+    use flavite_index::IndexActor;
+    use flavite_vault::actor::VaultActorBuilder;
+    use flavite_vault::channels::ChannelSet;
+    use flavite_vault::session::Session;
+    use std::path::PathBuf;
+
+    let identity = VaultIdentity::new(uuid::Uuid::now_v7(), PathBuf::from(root), vec![7]);
+    let cache = tempfile::tempdir().expect("cache dir");
+    let db = cache.path().join("reopen-index.sqlite3");
+    drop(flavite_index::open_or_init(&db).expect("index"));
+    let actor = VaultActorBuilder::new()
+        .with_fs(Box::new(SharedFs(fs.clone())) as Box<dyn Fs + Send + Sync>)
+        .with_identity(identity.clone())
+        .with_index(IndexActor::new(&db, 1).expect("index actor"))
+        .build()
+        .expect("actor")
+        .start()
+        .expect("start");
+    let channels = ChannelSet::new();
+    let session = Session::new(
+        identity.clone(),
+        actor,
+        BufferManager::new(),
+        channels.pulse,
+        channels.notice,
+        VaultConfig::default(),
+    );
+    let mut flavite = Flavite::open(identity, session, VaultConfig::default()).expect("facade");
+    flavite.set_vault_store_fs_for_test(fs.as_ref().clone());
+    (flavite, cache)
+}
+
+/// Build a minimal valid `.xpi` theme package on disk for Settings-tab
+/// theme tests (the same manifest shape flavite-api's theme fixtures use).
+///
+/// # Panics
+/// Panics on fixture plumbing failures.
+#[must_use]
+pub fn fixture_theme_package(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::io::{Cursor, Write as _};
+    let manifest = r##"{
+        "manifest_version": 2,
+        "name": "Settings Fixture",
+        "browser_specific_settings": { "gecko": { "id": "settings@host" } },
+        "theme": { "colors": { "frame": "#101010", "tab_background_text": "#eeeeee" } }
+    }"##;
+    let mut buffer = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buffer);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("manifest.json", options).expect("entry");
+        zip.write_all(manifest.as_bytes()).expect("bytes");
+        zip.finish().expect("finish");
+    }
+    let path = dir.join("settings-fixture.xpi");
+    std::fs::write(&path, buffer.into_inner()).expect("package file");
+    path
 }
 
 /// Reconcile a pre-attach vault stack, waiting for the async completion.

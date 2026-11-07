@@ -10,6 +10,7 @@ use crate::host::context::ContextRegistry;
 use crate::host::documents::{AttachDecision, DocumentRegistry};
 use crate::operation::OperationPump;
 use crate::palette::matching_specs;
+use flavite_settings::value::SettingValue;
 use crate::subscription;
 use crate::workspace::{Adapter, StripMenu, gestures};
 use flavite_api::queries::NoteCatalogEntry;
@@ -116,9 +117,9 @@ pub struct App {
     /// Interface appearance: theme, scale, editor type, reduced motion,
     /// shortcut overrides (W11).
     pub appearance: crate::host::appearance::AppearanceHost,
-    /// While a Preferences shortcut editor row is capturing, the command
-    /// id waiting for the next key press (W11). Escape cancels capture.
-    pub shortcut_capture: Option<String>,
+    /// The Settings tab host (RFC-0007 S6): resolved document view plus
+    /// per-tab search/selection state.
+    pub settings: crate::host::settings::SettingsHost,
     /// The active close decision (W12), when a final dirty/conflicted view
     /// needs an explicit safety outcome before its tab may disappear.
     pub closing: Option<crate::host::closing::ClosePlan>,
@@ -216,8 +217,8 @@ pub enum Message {
     Layout(flavite_workspace::LayoutAction),
     /// The OS color scheme changed (W11 System theme).
     SystemTheme(iced::theme::Mode),
-    /// A device-preference edit (W11).
-    Preferences(crate::host::appearance::PreferenceMessage),
+    /// A Settings tab message (RFC-0007 S6).
+    Settings(crate::host::settings::SettingsMessage),
     /// The native theme-package dialog resolved (xpi themes).
     ThemePackagePicked(Option<std::path::PathBuf>),
     /// Begin a close for one tab (W12): decide or close.
@@ -607,7 +608,7 @@ impl App {
             link_verdicts: BTreeMap::new(),
             persistence: crate::host::persistence::PersistenceHost::default(),
             appearance: crate::host::appearance::AppearanceHost::boot(),
-            shortcut_capture: None,
+            settings: crate::host::settings::SettingsHost::default(),
             closing: None,
             close_queue: Vec::new(),
             shutdown: None,
@@ -661,6 +662,8 @@ impl App {
         }
         // Settings and preferences now load from the unified settings store (RFC-0007 S3)
         self.appearance.load(&flavite);
+        // The Settings tab host loads its own resolved view (RFC-0007 S6).
+        self.settings.load(&flavite);
         if let Some(note) = self.appearance.status_note() {
             self.status = format!("{} — {}", self.status, note);
         }
@@ -1226,12 +1229,6 @@ impl App {
             crate::host::dialogs::Dialog::About => {
                 self.dialog = None;
             }
-            // Preferences edits commit through Message::Preferences as
-            // they are made; submit only closes the dialog.
-            crate::host::dialogs::Dialog::Preferences => {
-                self.dialog = None;
-                self.shortcut_capture = None;
-            }
             // W12 dialogs resolve through their own messages; Enter runs
             // the primary action where it is safe (never a destructive one).
             crate::host::dialogs::Dialog::RecoveryOffer { path } => {
@@ -1244,7 +1241,7 @@ impl App {
             crate::host::dialogs::Dialog::Close { .. }
             | crate::host::dialogs::Dialog::Conflict { .. } => {
                 self.dialog = None;
-                self.shortcut_capture = None;
+                self.settings.capture = None;
             }
         }
     }
@@ -1493,7 +1490,7 @@ impl App {
     /// the persisted presentation state.
     #[must_use]
     pub fn sidebar_open(&self) -> bool {
-        self.appearance.prefs.sidebar_open
+        self.appearance.sidebar_open()
     }
 
     /// The navigator's effective width in logical pixels: the live drag
@@ -1501,29 +1498,31 @@ impl App {
     #[must_use]
     pub fn sidebar_width(&self) -> f32 {
         self.sidebar_width_preview
-            .unwrap_or_else(|| f32::from(self.appearance.prefs.sidebar_width))
+            .unwrap_or_else(|| f32::from(self.appearance.sidebar_width()))
     }
 
     /// Flip the navigator and store the new state quietly: the status line
     /// keeps whatever it was reporting.
     pub fn toggle_sidebar(&mut self) {
-        let open = !self.appearance.prefs.sidebar_open;
+        let open = !self.appearance.sidebar_open();
         self.set_sidebar_open(open);
     }
 
-    /// Store the navigator's open flag in the preferences and persist them.
+    /// Store the navigator's open flag through the settings funnel
+    /// (RFC-0007 S7: one edit pipeline; the status line keeps whatever it
+    /// was reporting, so a quiet flip is a quiet funnel write).
     pub fn set_sidebar_open(&mut self, open: bool) {
-        if self.appearance.prefs.sidebar_open != open {
-            self.appearance.prefs.sidebar_open = open;
-            self.persist_sidebar_prefs();
-        }
-    }
-
-    /// Persist the device preferences without touching the status line;
-    /// failures surface later through [`crate::host::appearance`].
-    fn persist_sidebar_prefs(&mut self) {
-        if let Some(flavite) = self.flavite.as_mut() {
-            self.appearance.persist(flavite);
+        if self.appearance.sidebar_open() != open {
+            let previous = self.status.clone();
+            let outcome = self.apply_setting("sidebar.open", SettingValue::Bool(open));
+            let _ = outcome;
+            // A quiet flip: success keeps the status line as it was; a
+            // refusal (read-only vault) surfaces through the funnel.
+            if !self.status.starts_with("settings_read_only")
+                && !self.status.starts_with("Attach a vault")
+            {
+                self.status = previous;
+            }
         }
     }
 
@@ -2469,9 +2468,8 @@ impl App {
                 let _ = self.update_shutdown(message);
             }
             Message::SystemTheme(mode) => self.appearance.system_theme(mode),
-            Message::Preferences(update) => {
-                // Preference edits persist inline; the task is always none.
-                let _ = self.update_preferences(update);
+            Message::Settings(message) => {
+                return crate::host::settings::handle(self, message);
             }
             Message::WindowEvent(iced::window::Event::CloseRequested) => {
                 self.begin_shutdown();
@@ -2482,6 +2480,12 @@ impl App {
                 {
                     self.status = format!("Vault focus reconcile failed: {error}");
                 }
+                // D-11 (RFC-0007): focus is the settings sync point —
+                // external edits adopt here; the file watcher is not used.
+                return crate::host::settings::handle(
+                    self,
+                    crate::host::settings::SettingsMessage::FocusGained,
+                );
             }
             Message::WindowEvent(iced::window::Event::Resized(size)) => {
                 self.window_size = size;
@@ -2537,6 +2541,10 @@ impl App {
                             group,
                         },
                         flavite_workspace::ViewKind::Notes => LayoutAction::OpenNotes {
+                            expected_revision: revision,
+                            group,
+                        },
+                        flavite_workspace::ViewKind::Settings => LayoutAction::OpenSettings {
                             expected_revision: revision,
                             group,
                         },
@@ -2873,7 +2881,7 @@ impl App {
                 self.submit_dialog();
             }
             Message::DialogCancel => {
-                self.shortcut_capture = None;
+                self.settings.capture = None;
                 if matches!(
                     self.dialog,
                     Some(crate::host::dialogs::Dialog::Close { .. })
@@ -2899,8 +2907,9 @@ impl App {
             }
             Message::ThemePackagePicked(picked) => {
                 if let Some(path) = picked {
-                    return self.update_preferences(
-                        crate::host::appearance::PreferenceMessage::ThemeInstallFromPath(path),
+                    return crate::host::settings::handle(
+                        self,
+                        crate::host::settings::SettingsMessage::ThemeInstallFromPath(path),
                     );
                 }
             }
@@ -3144,9 +3153,19 @@ impl App {
                             .round()
                             .clamp(f32::from(MIN_SIDEBAR_WIDTH), f32::from(MAX_SIDEBAR_WIDTH))
                             as u16;
-                        if stored != self.appearance.prefs.sidebar_width {
-                            self.appearance.prefs.sidebar_width = stored;
-                            self.persist_sidebar_prefs();
+                        if stored != self.appearance.sidebar_width() {
+                            let previous = self.status.clone();
+                            let _ = self.apply_setting(
+                                "sidebar.width",
+                                SettingValue::Int(i64::from(stored)),
+                            );
+                            // A quiet commit: success keeps the status
+                            // line as it was; refusals surface.
+                            if !self.status.starts_with("settings_read_only")
+                                && !self.status.starts_with("Attach a vault")
+                            {
+                                self.status = previous;
+                            }
                         }
                     }
                 }
@@ -3862,7 +3881,7 @@ impl App {
                 "target_path": target_path.clone(),
                 "completion": completion,
                 "expected_target": expected,
-                "stable_link_policy": if self.appearance.prefs.prefer_stable_links {
+                "stable_link_policy": if self.appearance.prefer_stable_links() {
                     "prefer_stable"
                 } else {
                     "disabled"
@@ -3981,7 +4000,7 @@ impl App {
     /// The combined catalog snapshot for the palette: core specs plus the
     /// host commands, in stable order.
     fn palette_matches(&self) -> Vec<flavite_api::CommandSpec> {
-        let mut specs = host_commands::ui_specs(&self.appearance.prefs.shortcuts);
+        let mut specs = host_commands::ui_specs(&self.appearance.shortcut_overrides());
         if let Some(flavite) = &self.flavite {
             specs.extend(flavite.command_registry().specs());
         }
@@ -4441,7 +4460,7 @@ mod tests {
             link_verdicts: BTreeMap::new(),
             persistence: crate::host::persistence::PersistenceHost::default(),
             appearance: crate::host::appearance::AppearanceHost::boot(),
-            shortcut_capture: None,
+            settings: crate::host::settings::SettingsHost::default(),
             closing: None,
             close_queue: Vec::new(),
             shutdown: None,
