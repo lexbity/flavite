@@ -1498,6 +1498,7 @@ dependencies = [
  "flavite-text-search",
  "flavite-theme",
  "flavite-vault",
+ "flavite-workspace",
  "hex",
  "image",
  "proptest",

@@ -85,7 +85,7 @@ fn theme_choices_switch_the_resolved_scheme() {
     );
 }
 
-#[ignore] // S3: device store replaced by vault settings - needs new test
+#[ignore] // S4: UserStateKind::DevicePreferences removed - needs new test with vault settings
 #[test]
 fn preference_edits_persist_and_reload_through_the_device_store() {
     let mut fixture = ui_fixture(1112, "/appearance-persist", &seed());
@@ -373,7 +373,7 @@ fn scale_changes_reproject_geometry_without_rewriting_ratios() {
     assert_eq!(format!("{:?}", app.workspace.tree()), before);
 }
 
-#[ignore] // S3: tests device store - needs new test with settings system
+#[ignore] // S4: UserStateKind::DevicePreferences removed - needs new test with vault settings
 #[test]
 fn sidebar_presentation_persists_and_survives_a_fresh_host() {
     let mut fixture = ui_fixture(1119, "/appearance-sidebar", &seed());

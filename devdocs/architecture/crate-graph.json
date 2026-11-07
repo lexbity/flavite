@@ -211,6 +211,11 @@
     },
     {
       "from": "flavite-api",
+      "to": "flavite-workspace",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-api",
       "to": "image",
       "kind": "normal"
     },

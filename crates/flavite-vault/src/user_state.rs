@@ -26,10 +26,6 @@ pub const MAX_USER_STATE_BYTES: u64 = 5 * 1024 * 1024;
 /// decision; callers cannot invent locations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserStateKind {
-    /// The workspace layout file (W06 codec output).
-    WorkspaceLayouts,
-    /// Device UI preferences, split from vault safety settings.
-    DevicePreferences,
     /// App-launch memory (W10): the most recently opened vault root on this
     /// device. Lives in the app scope, not under any vault UUID.
     AppLaunch,
@@ -44,8 +40,6 @@ impl UserStateKind {
     #[must_use]
     pub const fn file_name(self) -> &'static str {
         match self {
-            Self::WorkspaceLayouts => "workspace-layouts.json",
-            Self::DevicePreferences => "device-preferences.json",
             Self::AppLaunch => "app-launch.json",
             Self::EncodingHints => "encoding-hints.json",
         }
@@ -455,10 +449,12 @@ impl VaultUserStateStore {
             return Err(UserStateError::ReadOnly);
         }
         let path = self.path_for(kind);
+        let backup = path.with_extension("bak");
         let parent = path
             .parent()
             .ok_or_else(|| UserStateError::Fs("path has no parent".into()))?;
         self.guard_protected(&path)?;
+        self.guard_protected(&backup)?;
         self.guard_protected(parent)?;
         
         let actual = {
@@ -476,6 +472,15 @@ impl VaultUserStateStore {
         if let Err(error) = self.fs.create_dir_all(parent) {
             return Err(UserStateError::Fs(error.to_string()));
         }
+        // Keep the last good copy before replacing it.
+        if let Some(previous) = self
+            .fs
+            .read_if_exists(&path)
+            .map_err(|error| UserStateError::Fs(error.to_string()))?
+        {
+            flavite_fs::atomic::atomic_write(self.fs.as_ref(), &backup, &previous)
+                .map_err(|error| UserStateError::Fs(error.to_string()))?;
+        }
         if let Err(error) = flavite_fs::atomic::atomic_write(self.fs.as_ref(), &path, payload) {
             return Err(UserStateError::Fs(error.to_string()));
         }
@@ -486,6 +491,19 @@ impl VaultUserStateStore {
             guard.insert(kind, next);
         }
         Ok(next)
+    }
+
+    /// The last-good backup bytes, when one exists (diagnosis path; the
+    /// store never silently restores from it).
+    ///
+    /// # Errors
+    /// Returns filesystem errors and protection violations.
+    pub fn read_backup(&self, kind: VaultUserStateKind) -> Result<Option<Vec<u8>>, UserStateError> {
+        let backup = self.path_for(kind).with_extension("bak");
+        self.guard_protected(&backup)?;
+        self.fs
+            .read_if_exists(&backup)
+            .map_err(|error| UserStateError::Fs(error.to_string()))
     }
 
     /// Read the graph-pins document (legacy method for backwards compatibility).

@@ -709,18 +709,19 @@ impl App {
         let _ = flavite_api::write_last_vault_device(&self.root);
     }
 
-    /// Restore the device-local workspace layout (W06): decode, plan, and
+    /// Restore the vault-local workspace layout (RFC-0007 S4): decode, plan, and
     /// apply through one atomic reducer transaction; note tabs reopen
     /// through their normal open flights. Every failure is an honest
     /// report — never a default overwrite.
     fn restore_workspace_layout(&mut self) {
-        use flavite_api::UserStateKind;
         let Some(flavite) = &self.flavite else {
             return;
         };
-        let uuid = flavite.vault_ref().uuid.to_string();
-        let stored = match flavite.read_user_state(UserStateKind::WorkspaceLayouts) {
-            Ok(Some(stored)) => stored,
+        let stored = match flavite.read_workspace_layout() {
+            Ok(Some(stored)) => {
+                self.persistence.observe_generation(stored.generation);
+                stored
+            }
             Ok(None) => {
                 if self.use_workbench_default {
                     self.use_writing_layout();
@@ -733,21 +734,14 @@ impl App {
                 return;
             }
         };
-        self.persistence.observe_generation(stored.generation);
-        let decoded = match flavite_workspace::decode_workspace(&stored.payload, &uuid) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                self.status = format!("Workspace layout not restored: {error}");
-                return;
-            }
-        };
+        // stored.workspace is already the PersistedWorkspace, no need to decode
         let catalog: std::collections::BTreeSet<String> = self
             .catalog_host
             .entries
             .iter()
             .filter_map(|entry| entry.path.to_str().map(str::to_owned))
             .collect();
-        let plan = match flavite_workspace::plan_restore(&decoded, &catalog) {
+        let plan = match flavite_workspace::plan_restore(&stored.workspace, &catalog) {
             Ok(plan) => plan,
             Err(error) => {
                 self.status = format!("Workspace layout not restored: {error:?}");
@@ -763,7 +757,8 @@ impl App {
                 .iter()
                 .map(|tab| (tab.id, tab.kind.clone()))
                 .collect(),
-            groups: decoded
+            groups: stored
+                .workspace
                 .groups
                 .iter()
                 .filter_map(|group| {
@@ -902,10 +897,9 @@ impl App {
         self.write_layout(self.persistence.due(Instant::now()));
     }
 
-    /// Write the device-local layout under this save request (W06).
+    /// Write the vault-local layout under this save request (RFC-0007 S4).
     /// Failures are recorded on the persistence host, never silent.
     fn write_layout(&mut self, request: crate::host::persistence::SaveRequest) {
-        use flavite_api::UserStateKind;
         let crate::host::persistence::SaveRequest::Write {
             expected_generation,
         } = request
@@ -922,24 +916,13 @@ impl App {
             named_layouts: named,
             ..persisted
         };
-        let bytes = match flavite_workspace::encode_workspace(&persisted) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                self.persistence.record_failure(
-                    crate::host::persistence::PersistenceFailure::Failed {
-                        message: error.to_string(),
-                    },
-                );
-                return;
-            }
-        };
         // The store is behind &mut; go through the facade with a
         // fresh mutable borrow.
         let write = self
             .flavite
             .as_mut()
             .expect("checked above")
-            .write_user_state(UserStateKind::WorkspaceLayouts, expected_generation, &bytes);
+            .write_workspace_layout(expected_generation, &persisted);
         match write {
             Ok(generation) => self.persistence.record_success(generation),
             Err(flavite_api::FlaviteError::UserState(

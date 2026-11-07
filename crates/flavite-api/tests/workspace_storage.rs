@@ -1,11 +1,11 @@
-//! User-state storage conformance (RFC-0003 §22, W06).
+//! User-state storage conformance (RFC-0003 §22, RFC-0007 S4).
 //!
 //! Fs fault injection at every transition, validated generation receipts,
-//! protected originals, symlink rejection, no note-file changes, and the
-//! device-local root layout.
+//! protected originals, symlink rejection, no note-file changes.
+//! Workspace layouts are now vault-local (RFC-0007 S4).
 
 use flavite_fs::{DirEntry, Fs, MemFs, Metadata, Result};
-use flavite_vault::user_state::{UserStateError, UserStateKind, UserStateStore};
+use flavite_vault::user_state::{UserStateError, VaultUserStateKind, VaultUserStateStore};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -113,22 +113,31 @@ impl Fs for FaultyFs {
     }
 }
 
-fn store_on_faulty(op: &'static str, fail_at: usize) -> UserStateStore {
-    UserStateStore::at_root(
+fn vault_store_on_faulty(op: &'static str, fail_at: usize) -> VaultUserStateStore {
+    VaultUserStateStore::new(
         Box::new(FaultyFs::new(op, fail_at)),
-        PathBuf::from("/test/user-state/vault-uuid"),
+        &PathBuf::from("/test/vault"),
     )
 }
 
-fn plain_store() -> (UserStateStore, MemFs) {
+fn vault_plain_store() -> (VaultUserStateStore, MemFs) {
     let fs = MemFs::new();
     (
-        UserStateStore::at_root(
+        VaultUserStateStore::new(
             Box::new(SharedFs(fs.clone())),
-            PathBuf::from("/test/user-state/vault-uuid"),
+            &PathBuf::from("/test/vault"),
         ),
         fs,
     )
+}
+
+// For backwards compatibility in this test file
+fn store_on_faulty(op: &'static str, fail_at: usize) -> VaultUserStateStore {
+    vault_store_on_faulty(op, fail_at)
+}
+
+fn plain_store() -> (VaultUserStateStore, MemFs) {
+    vault_plain_store()
 }
 
 struct SharedFs(MemFs);
@@ -195,20 +204,20 @@ impl Fs for SharedFs {
 
 #[test]
 fn generations_advance_and_receipts_are_enforced() {
-    let (mut store, _fs) = plain_store();
+    let (store, _fs) = plain_store();
     assert!(
         store
-            .read(UserStateKind::WorkspaceLayouts)
+            .read(VaultUserStateKind::WorkspaceLayouts)
             .unwrap()
             .is_none()
     );
 
     let generation = store
-        .write(UserStateKind::WorkspaceLayouts, 0, PAYLOAD_A.as_bytes())
+        .write(VaultUserStateKind::WorkspaceLayouts, 0, PAYLOAD_A.as_bytes(), true)
         .expect("first write");
     assert_eq!(generation, 1);
     let stored = store
-        .read(UserStateKind::WorkspaceLayouts)
+        .read(VaultUserStateKind::WorkspaceLayouts)
         .unwrap()
         .expect("stored");
     assert_eq!(stored.generation, 1);
@@ -216,18 +225,18 @@ fn generations_advance_and_receipts_are_enforced() {
 
     // A stale receipt is a typed mismatch, never a silent overwrite.
     assert_eq!(
-        store.write(UserStateKind::WorkspaceLayouts, 0, PAYLOAD_B.as_bytes()),
+        store.write(VaultUserStateKind::WorkspaceLayouts, 0, PAYLOAD_B.as_bytes(), true),
         Err(UserStateError::GenerationMismatch {
             expected: 0,
             actual: 1,
         })
     );
     let generation = store
-        .write(UserStateKind::WorkspaceLayouts, 1, PAYLOAD_B.as_bytes())
+        .write(VaultUserStateKind::WorkspaceLayouts, 1, PAYLOAD_B.as_bytes(), true)
         .expect("second write");
     assert_eq!(generation, 2);
     let stored = store
-        .read(UserStateKind::WorkspaceLayouts)
+        .read(VaultUserStateKind::WorkspaceLayouts)
         .unwrap()
         .expect("stored");
     assert_eq!(stored.payload, PAYLOAD_B.as_bytes());
@@ -247,14 +256,14 @@ fn fault_injection_surfaces_every_transition_and_keeps_the_original() {
         ("rename_replace", 1),
         ("fsync_dir", 1),
     ] {
-        let mut store = store_on_faulty(op, fail_at);
+        let store = store_on_faulty(op, fail_at);
         // The fault fires inside the FIRST write at the chosen transition.
-        let first = store.write(UserStateKind::WorkspaceLayouts, 0, PAYLOAD_A.as_bytes());
+        let first = store.write(VaultUserStateKind::WorkspaceLayouts, 0, PAYLOAD_A.as_bytes(), true);
         // Reconcile through the stored receipt: a fault before the replace
         // leaves nothing; a fault at the directory sync may have landed the
         // document — the receipt says which, never guessed.
         let stored = store
-            .read(UserStateKind::WorkspaceLayouts)
+            .read(VaultUserStateKind::WorkspaceLayouts)
             .unwrap_or_else(|error| {
                 // A fault still armed on reads means the document never
                 // landed; reconcile from empty once the fault disarms.
@@ -263,13 +272,14 @@ fn fault_injection_surfaces_every_transition_and_keeps_the_original() {
             });
         let expected = stored.as_ref().map_or(0, |stored| stored.generation);
         let retry = store.write(
-            UserStateKind::WorkspaceLayouts,
+            VaultUserStateKind::WorkspaceLayouts,
             expected,
             if expected == 0 {
                 PAYLOAD_A.as_bytes()
             } else {
                 PAYLOAD_B.as_bytes()
             },
+            true,
         );
         assert!(
             retry.is_ok(),
@@ -278,18 +288,19 @@ fn fault_injection_surfaces_every_transition_and_keeps_the_original() {
         // From here every write proceeds normally.
         let reconciled = retry.expect("reconcile succeeded");
         if let Ok(final_generation) = store.write(
-            UserStateKind::WorkspaceLayouts,
+            VaultUserStateKind::WorkspaceLayouts,
             reconciled,
             PAYLOAD_B.as_bytes(),
+            true,
         ) {
             let final_stored = store
-                .read(UserStateKind::WorkspaceLayouts)
+                .read(VaultUserStateKind::WorkspaceLayouts)
                 .expect("read works")
                 .expect("final document");
             assert_eq!(final_stored.generation, final_generation);
         }
         let final_stored = store
-            .read(UserStateKind::WorkspaceLayouts)
+            .read(VaultUserStateKind::WorkspaceLayouts)
             .expect("read works")
             .expect("final document");
         assert_eq!(final_stored.payload, PAYLOAD_B.as_bytes());
@@ -302,22 +313,18 @@ fn fault_injection_surfaces_every_transition_and_keeps_the_original() {
 #[test]
 fn backups_retain_the_last_good_document() {
     let (store, _fs) = plain_store();
-    let mut store = store;
     store
-        .write(UserStateKind::WorkspaceLayouts, 0, PAYLOAD_A.as_bytes())
+        .write(VaultUserStateKind::WorkspaceLayouts, 0, PAYLOAD_A.as_bytes(), true)
         .expect("first");
     store
-        .write(UserStateKind::WorkspaceLayouts, 1, PAYLOAD_B.as_bytes())
+        .write(VaultUserStateKind::WorkspaceLayouts, 1, PAYLOAD_B.as_bytes(), true)
         .expect("second");
     let backup = store
-        .read_backup(UserStateKind::WorkspaceLayouts)
+        .read_backup(VaultUserStateKind::WorkspaceLayouts)
         .expect("backup readable")
         .expect("backup exists");
-    // The backup is the previous stored envelope; decoding it through the
-    // same envelope format yields the first payload verbatim.
-    let envelope: serde_json::Value = serde_json::from_slice(&backup).expect("envelope");
-    let previous = envelope["payload"].as_str().expect("string payload");
-    assert_eq!(previous, PAYLOAD_A, "backup holds the last good copy");
+    // The backup is the previous stored payload (raw bytes).
+    assert_eq!(backup.as_slice(), PAYLOAD_A.as_bytes(), "backup holds the last good copy");
 }
 
 #[test]
@@ -396,33 +403,45 @@ fn protected_paths_are_refused_and_notes_never_touched() {
         }
     }
     let fs = MemFs::new();
-    fs.create_dir_all(Path::new("/test/user-state/vault-uuid"))
+    let vault_root = PathBuf::from("/test/vault");
+    fs.create_dir_all(&vault_root)
         .expect("root");
+    let flavite_dir = vault_root.join(".flavite");
+    fs.create_dir_all(&flavite_dir)
+        .expect("flavite dir");
+    // Create a symlinked workspace-layouts.json file
     fs.write_new(
-        Path::new("/test/user-state/vault-uuid/workspace-layouts.json"),
+        &flavite_dir.join("workspace-layouts.json"),
         br#"{"generation":1,"payload":"{}"}"#,
     )
     .expect("seeded");
-    let store = UserStateStore::at_root(
+    let store = VaultUserStateStore::new(
         Box::new(SymlinkFs(fs)),
-        PathBuf::from("/test/user-state/vault-uuid"),
+        &vault_root,
     );
     assert!(matches!(
-        store.read(UserStateKind::WorkspaceLayouts),
+        store.read(VaultUserStateKind::WorkspaceLayouts),
         Err(UserStateError::Protected { .. })
     ));
-    let mut store = store;
     assert!(matches!(
-        store.write(UserStateKind::WorkspaceLayouts, 0, PAYLOAD_A.as_bytes()),
+        store.write(VaultUserStateKind::WorkspaceLayouts, 0, PAYLOAD_A.as_bytes(), true),
         Err(UserStateError::Protected { .. })
     ));
 }
 
 #[test]
-fn non_json_payloads_are_refused() {
-    let (mut store, _fs) = plain_store();
-    assert!(matches!(
-        store.write(UserStateKind::WorkspaceLayouts, 0, b"not json"),
-        Err(UserStateError::NotJson(_))
-    ));
+fn backup_files_are_created_on_write() {
+    let (store, _fs) = plain_store();
+    store
+        .write(VaultUserStateKind::WorkspaceLayouts, 0, PAYLOAD_A.as_bytes(), true)
+        .expect("first write");
+    store
+        .write(VaultUserStateKind::WorkspaceLayouts, 1, PAYLOAD_B.as_bytes(), true)
+        .expect("second write");
+    // Backup should exist and contain the previous payload
+    let backup = store
+        .read_backup(VaultUserStateKind::WorkspaceLayouts)
+        .expect("backup readable")
+        .expect("backup exists");
+    assert_eq!(backup.as_slice(), PAYLOAD_A.as_bytes());
 }

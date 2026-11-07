@@ -95,18 +95,17 @@ fn write_layout(app: &mut App) {
     // Encode the committed state and write it through the test root.
     let uuid = app.flavite.as_ref().unwrap().vault_ref().uuid.to_string();
     let persisted = flavite_workspace::persist_workspace(&app.workspace, &uuid);
-    let bytes = encode_workspace(&persisted).unwrap();
     let stored = app
         .flavite
         .as_ref()
         .unwrap()
-        .read_user_state(UserStateKind::WorkspaceLayouts)
+        .read_workspace_layout()
         .unwrap();
     let generation = stored.as_ref().map_or(0, |stored| stored.generation);
     app.flavite
         .as_mut()
         .unwrap()
-        .write_user_state(UserStateKind::WorkspaceLayouts, generation, &bytes)
+        .write_workspace_layout(generation, &persisted)
         .expect("layout written");
 }
 
@@ -145,7 +144,7 @@ fn restart_restores_groups_tabs_and_reports_missing_notes() {
         .flavite
         .as_ref()
         .unwrap()
-        .read_user_state(UserStateKind::WorkspaceLayouts)
+        .read_workspace_layout()
         .unwrap()
         .expect("saved layout");
     let restart_identity = app.flavite.as_ref().unwrap().vault_ref().uuid;
@@ -170,7 +169,7 @@ fn restart_restores_groups_tabs_and_reports_missing_notes() {
     );
     reconcile(&pre_attach);
     pre_attach
-        .write_user_state(UserStateKind::WorkspaceLayouts, 0, &stored.payload)
+        .write_workspace_layout(0, &stored.workspace)
         .expect("seeded");
     let mut restarted = App::from_flavite(pre_attach);
     let _ = restarted.update(Message::RefreshCatalog);
@@ -206,16 +205,15 @@ fn out_of_order_receipts_never_corrupt_and_notes_stay_untouched() {
 
     // A stale writer (generation 0 against stored 1) is refused by the
     // receipt; the host records the failure and the file is untouched.
-    let bytes = encode_workspace(&flavite_workspace::persist_workspace(
+    let persisted = flavite_workspace::persist_workspace(
         &app.workspace,
         &app.flavite.as_ref().unwrap().vault_ref().uuid.to_string(),
-    ))
-    .unwrap();
+    );
     let refused =
         app.flavite
             .as_mut()
             .unwrap()
-            .write_user_state(UserStateKind::WorkspaceLayouts, 0, &bytes);
+            .write_workspace_layout(0, &persisted);
     assert!(
         matches!(
             refused,

@@ -113,6 +113,8 @@ active = [
     # RFC-0007 S3: UI and CLI consume settings directly for compatibility types.
     { from = "flavite-ui", to = "flavite-settings" },
     { from = "flavite-cli", to = "flavite-settings" },
+    # RFC-0007 S4: Workspace layout storage now vault-scoped.
+    { from = "flavite-api", to = "flavite-workspace" },
 
     # C14 - CLI consumes flavite-api only (D16 dogfood - fully migrated)
     { from = "flavite-cli", to = "flavite-api" },

@@ -599,7 +599,7 @@ fn attach_services(
         Box::new(flavite_fs::OsFs::new()),
         root,
     ));
-    let settings_store = crate::settings_store::SettingsStore::new(settings_vault_store, true);
+    let settings_store = crate::settings_store::SettingsStore::new(settings_vault_store.clone(), true);
     // Initialize settings store with migration from legacy stores
     let vault_uuid = uuid.to_string();
     // Create a registry with built-in descriptors
@@ -607,6 +607,31 @@ fn attach_services(
     // Trigger migration if needed - this loads or creates the v2 settings document
     let _ = settings_store.load_or_migrate(&registry, root, data_dir, &vault_uuid)
         .map_err(|e| eprintln!("Failed to load or migrate settings: {}", e));
+    
+    // Migrate workspace-layouts.json from device store to vault (RFC-0007 S4)
+    if let Some(data_dir) = data_dir {
+        let device_layout_path = data_dir
+            .join("flavite")
+            .join("workspace")
+            .join(&vault_uuid)
+            .join("workspace-layouts.json");
+        let vault_layout_path = root.join(".flavite").join("workspace-layouts.json");
+        
+        // Only copy if vault version doesn't exist yet
+        if device_layout_path.exists()
+            && !vault_layout_path.exists()
+            && std::fs::create_dir_all(vault_layout_path.parent().unwrap()).is_ok()
+            && std::fs::read(&device_layout_path)
+                .is_ok_and(|bytes| std::fs::write(&vault_layout_path, &bytes).is_ok())
+        {
+            eprintln!(
+                "Migrated workspace layout from {} to {}",
+                device_layout_path.display(),
+                vault_layout_path.display()
+            );
+        }
+    }
+    
     (vault_user_state, graph, settings_store)
 }
 

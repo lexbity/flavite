@@ -45,6 +45,7 @@ Normal/build:
 - `flavite-text-search` (normal)
 - `flavite-theme` (normal)
 - `flavite-vault` (normal)
+- `flavite-workspace` (normal)
 - `image` (normal)
 - `rusqlite` (normal)
 - `tracing` (normal)
