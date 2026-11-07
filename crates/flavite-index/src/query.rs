@@ -936,8 +936,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn test_next_hierarchical_key() {
         assert_eq!(next_hierarchical_key("a"), "a0");

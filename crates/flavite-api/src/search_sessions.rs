@@ -723,7 +723,7 @@ fn seal_spool(
     let path = spool_path(dir, session);
     let temp = path.with_extension("spool.tmp");
     let mut header = serde_json::json!({
-        "schema": 1,
+        "schema": 2,
         "session": session.as_hex(),
         "query_digest": hex::encode(digest),
         "epoch": epoch,
@@ -746,11 +746,17 @@ fn seal_spool(
         .map_err(|error| error.to_string())?;
     for chunk in rows.chunks(SPOOL_CHUNK_ROWS) {
         let payload = serde_json::to_vec(chunk).map_err(|error| error.to_string())?;
+        // Declared row count lets a page read skip decoding chunks wholly
+        // below its ordinal window; paging slices the sealed spool, never
+        // re-decodes it from the start (O(page) per page).
         writer
             .write_all(&(u32::try_from(payload.len()).unwrap_or(u32::MAX)).to_le_bytes())
             .map_err(|error| error.to_string())?;
         writer
             .write_all(blake3::hash(&payload).as_bytes())
+            .map_err(|error| error.to_string())?;
+        writer
+            .write_all(&u32::try_from(chunk.len()).unwrap_or(u32::MAX).to_le_bytes())
             .map_err(|error| error.to_string())?;
         writer
             .write_all(&payload)
@@ -792,7 +798,7 @@ fn read_spool_rows(path: &Path, ordinal: u64, limit: u64) -> Result<Vec<SearchRo
     }
     let header: serde_json::Value =
         serde_json::from_slice(header_bytes).map_err(|error| error.to_string())?;
-    if header.get("schema").and_then(serde_json::Value::as_u64) != Some(1) {
+    if header.get("schema").and_then(serde_json::Value::as_u64) != Some(2) {
         return Err("unsupported spool schema".into());
     }
     // Stream the numbered chunks, collecting the requested window.
@@ -801,7 +807,7 @@ fn read_spool_rows(path: &Path, ordinal: u64, limit: u64) -> Result<Vec<SearchRo
     let mut ordinal_cursor = 0u64;
     let want_end = ordinal.saturating_add(limit);
     while cursor < bytes.len() {
-        if cursor + 4 + 32 > bytes.len() {
+        if cursor + 4 + 32 + 4 > bytes.len() {
             return Err("spool chunk header is truncated".into());
         }
         let len = u32::from_le_bytes([
@@ -813,6 +819,13 @@ fn read_spool_rows(path: &Path, ordinal: u64, limit: u64) -> Result<Vec<SearchRo
         cursor += 4;
         let checksum = &bytes[cursor..cursor + 32];
         cursor += 32;
+        let declared_rows = u32::from_le_bytes([
+            bytes[cursor],
+            bytes[cursor + 1],
+            bytes[cursor + 2],
+            bytes[cursor + 3],
+        ]);
+        cursor += 4;
         let payload_end = cursor
             .checked_add(len)
             .ok_or("spool chunk length overflows")?;
@@ -824,11 +837,14 @@ fn read_spool_rows(path: &Path, ordinal: u64, limit: u64) -> Result<Vec<SearchRo
             return Err("spool chunk checksum mismatch".into());
         }
         cursor = payload_end;
-        let chunk_rows: Vec<SearchRow> =
-            serde_json::from_slice(payload).map_err(|error| error.to_string())?;
-        let chunk_len = u64::try_from(chunk_rows.len()).unwrap_or(0);
+        let chunk_len = u64::from(declared_rows);
         let chunk_end = ordinal_cursor + chunk_len;
         if chunk_end > ordinal && ordinal_cursor < want_end {
+            let chunk_rows: Vec<SearchRow> =
+                serde_json::from_slice(payload).map_err(|error| error.to_string())?;
+            if u64::try_from(chunk_rows.len()).unwrap_or(0) != chunk_len {
+                return Err("spool chunk row count mismatch".into());
+            }
             let skip = ordinal.saturating_sub(ordinal_cursor) as usize;
             let take = (want_end.min(chunk_end) - ordinal.max(ordinal_cursor)) as usize;
             result.extend(chunk_rows.into_iter().skip(skip).take(take));

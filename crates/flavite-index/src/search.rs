@@ -110,7 +110,6 @@ impl TantivyBackend {
     pub const fn fields(&self) -> SearchFields {
         self.fields
     }
-
 }
 
 /// A searcher captured by the ordered writer, stamped with the generation

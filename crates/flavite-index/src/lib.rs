@@ -63,7 +63,6 @@ pub use pool::*;
 // Re-export search items
 pub use search::*;
 
-
 // Re-export the generation broadcast types (RFC-0005 §5.1): the only
 // writer-side signal surface.
 pub use signal::{GenerationSignal, GenerationWatch};

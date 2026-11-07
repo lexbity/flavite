@@ -2373,6 +2373,27 @@ impl Flavite {
             .map_err(FlaviteError::SearchSession)
     }
 
+    /// Fetch one search-session page after rechecking the caller's
+    /// ReadNotes capability (`search.page` for capability-bearing
+    /// consumers): session permissions are intersected again at every page
+    /// (§6.3).
+    ///
+    /// # Errors
+    /// Returns `CapabilityDenied` or the typed session error.
+    pub fn search_page_as(
+        &self,
+        capabilities: &[crate::Capability],
+        token: &crate::search_sessions::PageToken,
+    ) -> Result<crate::search_sessions::SearchPageMaterialized, FlaviteError> {
+        if !capabilities
+            .iter()
+            .any(|grant| grant.covers(&crate::Capability::ReadNotes, None))
+        {
+            return Err(FlaviteError::CapabilityDenied("ReadNotes"));
+        }
+        self.search_page(token)
+    }
+
     /// Explicitly close one search session (`search.close`) and drop its
     /// spool.
     ///

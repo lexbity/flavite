@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use flavite_buffer::revision::BufferId;
 use flavite_buffer::undo::UndoPolicy;
@@ -216,6 +216,10 @@ pub struct ReplaceItemRequest {
     pub item_id: u64,
     pub path: PathBuf,
     pub expected_before_hash: [u8; 32],
+    /// The sealed payload's BLAKE3 digest: verified against the actual
+    /// bytes BEFORE any effect, and used to recognize an already-satisfied
+    /// target as `SatisfiedUnattributed` without overwriting (§6.4).
+    pub expected_after_hash: [u8; 32],
     pub after_bytes: Vec<u8>,
     pub note_key: Vec<u8>,
 }
@@ -398,8 +402,27 @@ pub fn run_apply(
 ) -> (JobPhase, JobTotals) {
     let mut phase = JobPhase::Applying;
     for item in items.iter_mut() {
-        if item.effect.is_some() {
-            continue;
+        match item.effect {
+            // Terminal effects are final for this sealed plan.
+            Some(
+                ItemEffect::Saved
+                | ItemEffect::IndexPending
+                | ItemEffect::AppliedConflict
+                | ItemEffect::AppliedDraft
+                | ItemEffect::Stale
+                | ItemEffect::Unsupported
+                | ItemEffect::SatisfiedUnattributed
+                | ItemEffect::Busy
+                | ItemEffect::Reverted
+                | ItemEffect::RevertedDraft,
+            ) => continue,
+            // A nonterminal item (crash between intent and outcome) is
+            // reconciled by RE-RUNNING the guarded apply: the before-hash
+            // guard and the after-hash satisfaction check make that exact —
+            // a satisfied target classifies without overwriting, a guard
+            // change goes Stale, and only a truly untouched item re-applies
+            // (§6.4/§6.9: resume reconciles an existing durable intent).
+            Some(ItemEffect::NeedsRecovery) | None => {}
         }
         if cancel.load(Ordering::Relaxed) {
             phase = JobPhase::Cancelled;
@@ -425,20 +448,49 @@ pub fn run_apply(
             phase = JobPhase::NeedsRecovery;
             break;
         }
-        // 3. Effect.
+        // 3. EffectStarted names the unique effect identity BEFORE the
+        // effect; recovery narrows a crash window from it (§6.4).
+        let op_id = format!("{job_id}:{item_id}:{}", next_action_seq());
+        if let Err(error) = log.append(item_id, ItemAction::EffectStarted { op_id }) {
+            ctx.leases.release(&lease);
+            item.effect = Some(ItemEffect::NeedsRecovery);
+            tracing::warn!(job_id, item_id, ?error, "replace effect log failed");
+            phase = JobPhase::NeedsRecovery;
+            break;
+        }
         let effect = match item.record.source_kind {
             SourceKind::Saved => {
+                let after_bytes = match store.read_payload(io, job_id, &item.record.after) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) | Err(_) => {
+                        // The sealed after-payload is unreadable: the item
+                        // stays nonterminal (recoverable from the job
+                        // payload), NEVER an empty-byte write.
+                        ctx.leases.release(&lease);
+                        item.effect = Some(ItemEffect::NeedsRecovery);
+                        tracing::warn!(job_id, item_id, "replace after-payload unreadable");
+                        phase = JobPhase::NeedsRecovery;
+                        break;
+                    }
+                };
+                let note_key = match hex::decode(&item.record.path_native) {
+                    Ok(key) => key,
+                    Err(_) => {
+                        ctx.leases.release(&lease);
+                        item.effect = Some(ItemEffect::NeedsRecovery);
+                        tracing::warn!(job_id, item_id, "replace note key undecodable");
+                        phase = JobPhase::NeedsRecovery;
+                        break;
+                    }
+                };
                 let request = ReplaceItemRequest {
                     job_id: job_id.to_owned(),
                     item_id,
                     path: ctx.root.join(&item.record.path),
                     expected_before_hash: decode_hash(&item.record.disk_hash),
-                    after_bytes: store
-                        .read_payload(io, job_id, &item.record.after)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default(),
-                    note_key: hex::decode(&item.record.path_native).unwrap_or_default(),
+                    expected_after_hash: decode_hash(&item.record.after.hash),
+                    after_bytes,
+                    note_key,
                 };
                 match ctx.actor.apply_replace_item(request) {
                     Ok(outcome) => match outcome {
@@ -502,22 +554,26 @@ pub fn run_apply(
     }
     let totals = JobTotals::from_items(items);
     if phase != JobPhase::NeedsRecovery {
-        let any_nonterminal = items
-            .iter()
-            .any(|item| matches!(item.effect, Some(ItemEffect::NeedsRecovery) | None));
-        phase = if any_nonterminal {
-            JobPhase::Partial
-        } else if totals.saved
-            + totals.index_pending
-            + totals.satisfied_unattributed
-            + totals.applied_drafts
-            == totals.selected
-            && totals.conflicts == 0
-        {
-            JobPhase::Completed
-        } else {
-            JobPhase::Partial
-        };
+        // A cancelled run keeps its Cancelled terminal: prior saved items
+        // are counted in the totals and displayed with it (§6.4).
+        if phase != JobPhase::Cancelled {
+            let any_nonterminal = items
+                .iter()
+                .any(|item| matches!(item.effect, Some(ItemEffect::NeedsRecovery) | None));
+            phase = if any_nonterminal {
+                JobPhase::Partial
+            } else if totals.saved
+                + totals.index_pending
+                + totals.satisfied_unattributed
+                + totals.applied_drafts
+                == totals.selected
+                && totals.conflicts == 0
+            {
+                JobPhase::Completed
+            } else {
+                JobPhase::Partial
+            };
+        }
         // Record the terminal job marker.
         let _ = log.append(
             0,
@@ -527,6 +583,13 @@ pub fn run_apply(
         );
     }
     (phase, totals)
+}
+
+/// Per-process action sequence for effect identities (§6.4: core-issued,
+/// unique per save/checkpoint operation).
+fn next_action_seq() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Why a draft item could not be applied.
@@ -722,23 +785,27 @@ pub fn run_revert(
     }
     let totals = JobTotals::from_items(items);
     if phase != JobPhase::NeedsRecovery {
-        let any_nonterminal = items.iter().enumerate().any(|(index, item)| {
-            applied_before[index] && matches!(item.effect, Some(ItemEffect::NeedsRecovery))
-        });
-        let reverted_all = items.iter().enumerate().all(|(index, item)| {
-            !applied_before[index]
-                || matches!(
-                    item.effect,
-                    Some(ItemEffect::Reverted | ItemEffect::RevertedDraft)
-                )
-        });
-        phase = if any_nonterminal {
-            JobPhase::NeedsRecovery
-        } else if reverted_all && applied_before.iter().any(|applied| *applied) {
-            JobPhase::Completed
-        } else {
-            JobPhase::Partial
-        };
+        // A cancelled revert keeps its Cancelled terminal (§6.4); prior
+        // revert outcomes stay in the totals.
+        if phase != JobPhase::Cancelled {
+            let any_nonterminal = items.iter().enumerate().any(|(index, item)| {
+                applied_before[index] && matches!(item.effect, Some(ItemEffect::NeedsRecovery))
+            });
+            let reverted_all = items.iter().enumerate().all(|(index, item)| {
+                !applied_before[index]
+                    || matches!(
+                        item.effect,
+                        Some(ItemEffect::Reverted | ItemEffect::RevertedDraft)
+                    )
+            });
+            phase = if any_nonterminal {
+                JobPhase::NeedsRecovery
+            } else if reverted_all && applied_before.iter().any(|applied| *applied) {
+                JobPhase::Completed
+            } else {
+                JobPhase::Partial
+            };
+        }
         let _ = log.append(
             0,
             ItemAction::JobTerminal {
@@ -768,6 +835,8 @@ fn revert_saved_item(
         item_id: record.item_id,
         path: ctx.root.join(&record.path),
         expected_before_hash: decode_hash(&record.after.hash),
+        // The inverse target state is the recorded before content.
+        expected_after_hash: decode_hash(&record.before.hash),
         after_bytes: before_bytes,
         note_key: hex::decode(&record.path_native).unwrap_or_default(),
     };

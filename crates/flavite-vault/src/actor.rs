@@ -2136,7 +2136,19 @@ impl VaultActor {
             }
             Err(error) => return Err(error.to_string()),
         };
+        // Payload identity BEFORE any effect: the sealed digest must match
+        // the bytes about to be installed (§6.4 — payload verification is
+        // not optional even when a transient store failure is involved).
+        if *blake3::hash(&request.after_bytes).as_bytes() != request.expected_after_hash {
+            return Err("sealed payload does not match its digest".to_owned());
+        }
         let current_hash = *blake3::hash(&current).as_bytes();
+        // An already-satisfied target (e.g. a crash between the durable
+        // intent and the outcome record) classifies WITHOUT overwriting —
+        // the disk already holds exactly the sealed output (§6.4).
+        if current_hash == request.expected_after_hash {
+            return Ok(crate::replace::coordinator::ReplaceItemOutcome::SatisfiedUnattributed);
+        }
         if current_hash != request.expected_before_hash {
             return Ok(crate::replace::coordinator::ReplaceItemOutcome::Stale);
         }

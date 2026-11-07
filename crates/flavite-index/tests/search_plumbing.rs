@@ -259,4 +259,3 @@ fn batched_assembly_crosses_512_row_chunks() {
         );
     }
 }
-
