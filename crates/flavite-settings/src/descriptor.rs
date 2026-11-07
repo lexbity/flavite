@@ -11,6 +11,11 @@ pub const SCHEMA_VERSION: u32 = 2;
 /// Maximum document size in bytes (256 KiB).
 pub const MAX_DOCUMENT_SIZE: usize = 256 * 1024;
 
+/// Minimum sidebar width in logical pixels (RFC-0007).
+pub const MIN_SIDEBAR_WIDTH: u16 = 160;
+/// Maximum sidebar width in logical pixels (RFC-0007).
+pub const MAX_SIDEBAR_WIDTH: u16 = 480;
+
 /// Visibility of a setting in the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {

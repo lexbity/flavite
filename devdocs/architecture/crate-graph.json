@@ -271,6 +271,11 @@
     },
     {
       "from": "flavite-cli",
+      "to": "flavite-settings",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-cli",
       "to": "tracing",
       "kind": "normal"
     },
@@ -433,6 +438,11 @@
       "from": "flavite-ui",
       "to": "flavite-index",
       "kind": "dev"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "flavite-settings",
+      "kind": "normal"
     },
     {
       "from": "flavite-ui",

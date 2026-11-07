@@ -51,6 +51,9 @@ impl SettingsDoc {
 
     /// Set a setting value by its dotted ID.
     /// Validates the value against the registry descriptor.
+    ///
+    /// # Errors
+    /// Returns an error if the ID is invalid, reserved, or the value doesn't match the descriptor.
     pub fn set(
         &mut self,
         id: &str,

@@ -25,7 +25,6 @@
 
 pub mod capability;
 pub mod command;
-pub mod device_preferences;
 pub mod doctor;
 pub mod documents;
 pub mod event;

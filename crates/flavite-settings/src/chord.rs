@@ -69,7 +69,8 @@ pub fn parse_chord(text: &str) -> Option<Chord> {
                 if key.is_some() || other.is_empty() {
                     return None;
                 }
-                // clippy: allow this pattern since canonical_key returns Option<()>
+                // canonical_key returns Option<()>, and we want to return None if it's None
+                #[allow(clippy::question_mark)]
                 if canonical_key(other).is_none() {
                     return None;
                 }

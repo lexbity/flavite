@@ -10,7 +10,7 @@ use super::{
     BRAND, HEADING, PALETTE_WIDTH, SPACING, SPACING_LG, SPACING_SM, TAB_HEIGHT, TEXT, TEXT_LG,
     TEXT_SM, TOP_BAR_HEIGHT,
 };
-use crate::preferences::{LineWidth, Preferences};
+use crate::host::appearance::{LineWidth, Preferences};
 
 /// Minimum icon-button target before scale (NFR-15 floor: 24 px).
 const ICON_TARGET: f32 = 32.0;

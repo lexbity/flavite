@@ -10,14 +10,13 @@ use crate::host::context::ContextRegistry;
 use crate::host::documents::{AttachDecision, DocumentRegistry};
 use crate::operation::OperationPump;
 use crate::palette::matching_specs;
-use crate::settings::Settings;
 use crate::subscription;
 use crate::workspace::{Adapter, StripMenu, gestures};
 use flavite_api::queries::NoteCatalogEntry;
 use flavite_api::{
     ExecutionResult, Flavite, Invocation, LocalResult, Origin, VaultConfig,
-    device_preferences::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH},
 };
+use flavite_settings::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 use flavite_editor::{EditorAction, EditorInteractionSnapshot, EditorView};
 use flavite_workspace::{
     Effect, GroupId, Ids, LayoutAction, NoteLocator, Outcome, SplitId, TabId, WorkspaceState,
@@ -166,8 +165,6 @@ pub struct App {
     /// (W-D): `plan_restore` validates membership against the catalog,
     /// which is no longer synchronously available on the attach turn.
     restore_pending: bool,
-    settings: Settings,
-    settings_valid: bool,
     pub operations: OperationPump,
     /// Completions routed past the per-pump turn budget; the next pump tick
     /// continues (NFR-08: UI event-loop work is budgeted, never lost).
@@ -641,8 +638,6 @@ impl App {
             pointer_feedback: false,
             window_geometry_dirty: true,
             restore_pending: false,
-            settings: Settings::default(),
-            settings_valid: true,
             operations: OperationPump::default(),
             completion_backlog: VecDeque::new(),
             status,
@@ -657,18 +652,6 @@ impl App {
 
     fn attach_vault(&mut self, flavite: Flavite) {
         self.root = flavite.vault_ref().root.clone();
-        self.settings = match flavite.read_settings() {
-            Ok(contents) => Settings::parse(contents.as_deref()).unwrap_or_else(|error| {
-                self.settings_valid = false;
-                self.status = format!("Settings could not be parsed; saving is disabled: {error}");
-                Settings::default()
-            }),
-            Err(error) => {
-                self.settings_valid = false;
-                self.status = format!("Settings could not be read: {error}");
-                Settings::default()
-            }
-        };
         // D-16: the composed catalog is checked once at attach; UI ids are
         // namespaced, so any overlap is a build defect worth surfacing.
         let core_ids: Vec<&str> = flavite.command_registry().command_ids().to_vec();
@@ -676,8 +659,7 @@ impl App {
         if !conflicts.is_empty() {
             self.status = format!("Command catalog conflict: {}", conflicts.join(", "));
         }
-        // Device preferences load at attach (W11): parse failures keep
-        // defaults with saving disabled; the document is never overwritten.
+        // Settings and preferences now load from the unified settings store (RFC-0007 S3)
         self.appearance.load(&flavite);
         if let Some(note) = self.appearance.status_note() {
             self.status = format!("{} — {}", self.status, note);
@@ -691,7 +673,7 @@ impl App {
             self.status = format!("{} — {}", self.status, error);
         }
         self.flavite = Some(flavite);
-        if self.settings_valid && conflicts.is_empty() && self.appearance.last_error.is_none() {
+        if conflicts.is_empty() && self.appearance.last_error.is_none() {
             self.status = "Vault ready".into();
         }
         // Graph pins load once through the API at attach (TD-11): a decode
@@ -1225,10 +1207,12 @@ impl App {
                 let Some(flavite) = &self.flavite else {
                     return;
                 };
-                let strategy = match self.settings.rename_behavior {
-                    crate::settings::RenameBehavior::Rewrite => "rewrite",
-                    crate::settings::RenameBehavior::Alias => "alias",
-                    crate::settings::RenameBehavior::None => "none",
+                // Read rename_behavior from the resolved settings (RFC-0007 S3)
+                let strategy = if let Ok(stored) = flavite.settings_read() {
+                    let value = stored.resolved.get("vault.rename_behavior");
+                    value.and_then(|v| v.as_str().map(|s| s.to_owned())).unwrap_or_else(|| "rewrite".to_owned())
+                } else {
+                    "rewrite".to_owned()
                 };
                 let request_id = flavite.command_registry().next_request_id();
                 let invocation = Invocation::new(
@@ -4505,8 +4489,6 @@ mod tests {
             pointer_feedback: false,
             window_geometry_dirty: true,
             restore_pending: false,
-            settings: Settings::default(),
-            settings_valid: true,
             operations: OperationPump::default(),
             completion_backlog: VecDeque::new(),
             status: "Ready".into(),

@@ -10,7 +10,7 @@ use flavite_workspace::{GroupId, LayoutAction, NoteLocator, TabId, ViewKind};
 use iced::keyboard::{self, Modifiers};
 
 /// Remappable shell commands and their default chords (W11 input catalog).
-/// The chord strings parse through [`crate::preferences::parse_chord`];
+/// The chord strings parse through [`flavite_settings::chord::parse_chord`];
 /// `Mod` is the platform command modifier. A preference override replaces
 /// the default for that command id only.
 pub const DEFAULT_CHORDS: &[(&str, &str)] = &[
@@ -436,7 +436,7 @@ pub fn ui_specs(overrides: &std::collections::BTreeMap<String, String>) -> Vec<C
                 command.title,
                 ArgSchema::typed::<serde_json::Value>(),
                 None,
-                crate::preferences::intern_chords(&keys),
+                intern_chords(&keys),
             )
         })
         .collect()
@@ -454,7 +454,10 @@ pub fn resolved_chord(
         .find(|(command, _)| *command == id)
         .map(|(_, chord)| *chord)?;
     let text = overrides.get(id).map(String::as_str).unwrap_or(default);
-    crate::preferences::parse_chord(text).or_else(|| crate::preferences::parse_chord(default))
+    // Parse using flavite_settings and convert to flavite_api::Chord
+    flavite_settings::chord::parse_chord(text)
+        .or_else(|| flavite_settings::chord::parse_chord(default))
+        .map(|c| Chord { modifiers: c.modifiers, key: c.key })
 }
 
 /// Verify the composed catalog has no collisions with the core registry.
@@ -1029,8 +1032,8 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
             // Toggle resolves the active scheme to an explicit choice, so
             // the flip is one undoable, inspectable preference edit.
             let next = match app.appearance.scheme() {
-                crate::style::Scheme::Dark => crate::preferences::ThemeChoice::Light,
-                crate::style::Scheme::Light => crate::preferences::ThemeChoice::Dark,
+                crate::style::Scheme::Dark => crate::host::appearance::ThemeChoice::Light,
+                crate::style::Scheme::Light => crate::host::appearance::ThemeChoice::Dark,
             };
             return app.update(Message::Preferences(
                 crate::host::appearance::PreferenceMessage::SetTheme(next),
@@ -1434,4 +1437,28 @@ pub fn note_search_command(app: &App, tab: TabId, id: &str) -> Option<Message> {
         }
         _ => return None,
     }))
+}
+
+/// Intern a chord slice for the catalog's `&'static [Chord]` key lists.
+/// This delegates to flavite_settings::chord::chord_string for the key.
+fn intern_chords(chords: &[Chord]) -> &'static [Chord] {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static INTERNED: OnceLock<Mutex<HashMap<String, &'static [Chord]>>> = OnceLock::new();
+    let key = chords
+        .iter()
+        .map(|c| flavite_settings::chord::chord_string(&flavite_settings::chord::Chord {
+            modifiers: c.modifiers,
+            key: c.key.clone(),
+        }))
+        .collect::<Vec<_>>()
+        .join(";");
+    let cache = INTERNED.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap();
+    if let Some(slice) = guard.get(&key) {
+        return slice;
+    }
+    let leaked: &'static [Chord] = Box::leak(chords.to_vec().into_boxed_slice());
+    guard.insert(key, leaked);
+    leaked
 }

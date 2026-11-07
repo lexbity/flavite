@@ -592,7 +592,7 @@ impl CliDriver {
     /// user-state service — never a direct file write.
     fn select_theme(&mut self, id: &str) -> Result<()> {
         let selection = (id != "none").then(|| id.to_owned());
-        let (generation, document) = {
+        let value = {
             let flavite = self
                 .flavite
                 .as_ref()
@@ -607,28 +607,18 @@ impl CliDriver {
                     "theme {selected:?} is not installed (see `flavite theme list`)"
                 );
             }
-            let stored = flavite.read_user_state(flavite_api::UserStateKind::DevicePreferences)?;
-            let generation = stored.as_ref().map_or(0, |stored| stored.generation);
-            let text = stored
-                .as_ref()
-                .map(|stored| String::from_utf8(stored.payload.clone()))
-                .transpose()
-                .ok()
-                .flatten();
-            let parsed = flavite_api::device_preferences::Preferences::parse(text.as_deref())?;
-            let mut preferences = parsed.preferences;
-            preferences.theme_package = selection;
-            (generation, preferences.to_stored())
+            // Use the new settings_set API (RFC-0007 S3)
+            if let Some(ref s) = selection {
+                flavite_settings::value::SettingValue::Str(s.clone())
+            } else {
+                flavite_settings::value::SettingValue::Str("".to_owned())
+            }
         };
         let flavite = self
             .flavite
             .as_mut()
             .context("theme selection requires an opened vault")?;
-        flavite.write_user_state(
-            flavite_api::UserStateKind::DevicePreferences,
-            generation,
-            document.as_bytes(),
-        )?;
+        let _ = flavite.settings_set("appearance.theme_package", value)?;
         println!("Theme selection saved: {}", id);
         Ok(())
     }

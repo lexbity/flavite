@@ -51,8 +51,7 @@ pub fn parse(text: Option<&str>) -> Result<Parsed, SettingsCodecError> {
     let schema = table
         .get("schema")
         .and_then(toml::Value::as_integer)
-        .and_then(|v| Some(v as u32))
-        .unwrap_or(SCHEMA_VERSION); // Default to current schema version
+        .map_or(SCHEMA_VERSION, |v| v as u32); // Default to current schema version
 
     let mut warnings = Vec::new();
 

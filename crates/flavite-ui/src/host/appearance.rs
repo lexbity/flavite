@@ -1,13 +1,312 @@
-//! Interface appearance host (RFC-0003 W11, D-11, D-15): device-local
-//! preferences, the resolved color scheme, scale-aware metrics, theme
-//! packages, and preference persistence through the API user-state
-//! service.
+//! Interface appearance host (RFC-0003 W11, D-11, D-15): unified settings
+//! from the vault, the resolved color scheme, scale-aware metrics, theme
+//! packages, and settings persistence through the SettingsStore.
+//!
+//! # Compatibility
+//! During S3 migration, this module maintains compatibility types (Preferences,
+//! ThemeChoice, LineWidth) that are used by the dialog. These will be removed
+//! in S8 when the dialog is deleted and replaced by the Settings tab.
 
-use crate::preferences::{self, LineWidth, Preferences, ThemeChoice};
+/// Minimum interface scale percentage.
+pub const MIN_INTERFACE_SCALE_PCT: u16 = 75;
+/// Maximum interface scale percentage.
+pub const MAX_INTERFACE_SCALE_PCT: u16 = 200;
+/// Minimum editor font size.
+pub const MIN_EDITOR_FONT_SIZE: u16 = 12;
+/// Maximum editor font size.
+pub const MAX_EDITOR_FONT_SIZE: u16 = 28;
+
 use crate::style::{self, Metrics, Scheme};
-use flavite_api::{Flavite, InstalledTheme, UserStateKind};
+use flavite_api::{Flavite, InstalledTheme};
+use flavite_settings::{
+    resolve::Resolved,
+    value::SettingValue,
+};
 use flavite_theme::{SemanticTheme, ThemeImage};
+use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 use std::time::Instant;
+
+/// Which palette the shell uses (compatibility type for S3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeChoice {
+    /// Follow the OS color scheme; dark when the OS reports nothing.
+    #[default]
+    System,
+    /// Always the light palette.
+    Light,
+    /// Always the dark palette.
+    Dark,
+}
+
+impl ThemeChoice {
+    /// Convert from a string.
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "system" => Some(Self::System),
+            "light" => Some(Self::Light),
+            "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+
+    /// The stable preference name of this choice.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+}
+
+/// The editor's readable line width: bounded columns, or the full pane (compatibility type for S3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LineWidth {
+    /// Wrap text at this many columns.
+    Columns(u16),
+    /// Use the full editor pane width.
+    #[default]
+    Full,
+}
+
+impl LineWidth {
+    /// The bounded column count, or `None` for the full pane width.
+    #[must_use]
+    pub const fn columns(self) -> Option<u16> {
+        match self {
+            Self::Columns(columns) => Some(columns),
+            Self::Full => None,
+        }
+    }
+}
+
+/// Compatibility Preferences type for S3 migration.
+/// This will be removed in S8 when the dialog is deleted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Preferences {
+    /// Light/dark/System palette choice.
+    pub theme: ThemeChoice,
+    /// The installed theme package shaping the palette.
+    pub theme_package: Option<String>,
+    /// Interface scale in percent.
+    pub interface_scale_pct: u16,
+    /// Editor font size in logical pixels.
+    pub editor_font_size: u16,
+    /// Readable editor line width.
+    pub line_width: LineWidth,
+    /// Reduce motion.
+    pub reduced_motion: bool,
+    /// Prefer stable IDs when inserting links.
+    pub prefer_stable_links: bool,
+    /// Graph activation acknowledged.
+    pub graph_activation_acknowledged: bool,
+    /// Whether the collapsible vault navigator is open.
+    pub sidebar_open: bool,
+    /// Notes-sidebar width in logical pixels.
+    pub sidebar_width: u16,
+    /// Command-id -> chord-string overrides.
+    pub shortcuts: BTreeMap<String, String>,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            theme: ThemeChoice::System,
+            theme_package: None,
+            interface_scale_pct: 100,
+            editor_font_size: 16,
+            line_width: LineWidth::Full,
+            reduced_motion: false,
+            prefer_stable_links: true,
+            graph_activation_acknowledged: false,
+            sidebar_open: true,
+            sidebar_width: 260,
+            shortcuts: BTreeMap::new(),
+        }
+    }
+}
+
+impl Preferences {
+    /// Compatibility: create default preferences (S3 migration).
+    pub fn defaults() -> Self {
+        Self::default()
+    }
+
+    /// Compatibility: parse a JSON document into Preferences (S3 migration).
+    /// This maintains the old device_preferences JSON format for tests.
+    pub fn parse(document: Option<&str>) -> Result<ParseResult, String> {
+        let document = document.unwrap_or("");
+        let value: Value = serde_json::from_str(document)
+            .map_err(|e| format!("failed to parse preferences JSON: {e}"))?;
+        let empty_map = Map::new();
+        let map = value.as_object().unwrap_or(&empty_map);
+        let mut warnings = Vec::new();
+        let mut prefs = Preferences::default();
+
+        // Parse theme
+        if let Some(Value::String(theme)) = map.get("theme") {
+            prefs.theme = match theme.as_str() {
+                "system" => ThemeChoice::System,
+                "light" => ThemeChoice::Light,
+                "dark" => ThemeChoice::Dark,
+                _ => {
+                    warnings.push(format!("unknown theme: {theme}"));
+                    ThemeChoice::System
+                }
+            };
+        }
+
+        // Parse theme_package
+        if let Some(Value::String(pkg)) = map.get("theme_package") {
+            prefs.theme_package = if pkg.is_empty() { None } else { Some(pkg.clone()) };
+        }
+
+        // Parse interface_scale_pct
+        prefs.interface_scale_pct = bounded_field(map, "interface_scale_pct", 75, 200, 100, &mut warnings);
+        prefs.editor_font_size = bounded_field(map, "editor_font_size", 12, 28, 14, &mut warnings);
+
+        // Parse line_width
+        if let Some(value) = map.get("line_width") {
+            match value {
+                Value::Number(n) => {
+                    let cols = n.as_f64().unwrap_or_default() as u16;
+                    if (40..=160).contains(&cols) {
+                        prefs.line_width = LineWidth::Columns(cols);
+                    } else {
+                        warnings.push("line_width must be 40..=160".to_string());
+                    }
+                }
+                Value::String(s) => {
+                    if s == "full" {
+                        prefs.line_width = LineWidth::Full;
+                    } else {
+                        warnings.push("line_width must be an integer or \"full\"".to_string());
+                    }
+                }
+                _ => warnings.push("line_width must be an integer or \"full\"".to_string()),
+            }
+        }
+
+        // Parse reduced_motion
+        if let Some(Value::Bool(b)) = map.get("reduced_motion") {
+            prefs.reduced_motion = *b;
+        }
+
+        // Parse prefer_stable_links
+        if let Some(Value::Bool(b)) = map.get("prefer_stable_links") {
+            prefs.prefer_stable_links = *b;
+        }
+
+        // Parse graph_activation_acknowledged
+        if let Some(Value::Bool(b)) = map.get("graph_activation_acknowledged") {
+            prefs.graph_activation_acknowledged = *b;
+        }
+
+        // Parse sidebar_open
+        if let Some(Value::Bool(b)) = map.get("sidebar_open") {
+            prefs.sidebar_open = *b;
+        }
+
+        // Parse sidebar_width
+        prefs.sidebar_width = bounded_field(map, "sidebar_width", 160, 480, 260, &mut warnings);
+
+        // Parse shortcuts
+        if let Some(Value::Object(shortcuts)) = map.get("shortcuts") {
+            for (command, chord) in shortcuts {
+                if let Value::String(chord_str) = chord {
+                    // Validate chord
+                    if flavite_settings::chord::parse_chord(chord_str).is_some() {
+                        prefs.shortcuts.insert(command.clone(), chord_str.clone());
+                    } else {
+                        warnings.push(format!("invalid chord for {command}: {chord_str}"));
+                    }
+                }
+            }
+        }
+
+        Ok(ParseResult { preferences: prefs, warnings })
+    }
+
+    /// Compatibility: convert Preferences to stored JSON string (S3 migration).
+    pub fn to_stored(&self) -> String {
+        self.to_json().to_string()
+    }
+
+    /// Compatibility: convert Preferences to JSON Value (S3 migration).
+    pub fn to_json(&self) -> Value {
+        let mut map = Map::new();
+        map.insert("schema".to_string(), Value::Number(serde_json::Number::from(1)));
+        map.insert("theme".to_string(), Value::String(self.theme.name().to_string()));
+        map.insert(
+            "theme_package".to_string(),
+            Value::String(self.theme_package.clone().unwrap_or_default()),
+        );
+        map.insert("interface_scale_pct".to_string(), Value::Number(self.interface_scale_pct.into()));
+        map.insert("editor_font_size".to_string(), Value::Number(self.editor_font_size.into()));
+        match self.line_width {
+            LineWidth::Columns(cols) => {
+                map.insert("line_width".to_string(), Value::Number(cols.into()));
+            }
+            LineWidth::Full => {
+                map.insert("line_width".to_string(), Value::String("full".to_string()));
+            }
+        }
+        map.insert("reduced_motion".to_string(), Value::Bool(self.reduced_motion));
+        map.insert("prefer_stable_links".to_string(), Value::Bool(self.prefer_stable_links));
+        map.insert(
+            "graph_activation_acknowledged".to_string(),
+            Value::Bool(self.graph_activation_acknowledged),
+        );
+        map.insert("sidebar_open".to_string(), Value::Bool(self.sidebar_open));
+        map.insert("sidebar_width".to_string(), Value::Number(self.sidebar_width.into()));
+        
+        let shortcuts: Map<String, Value> = self
+            .shortcuts
+            .iter()
+            .map(|(cmd, chord)| (cmd.clone(), Value::String(chord.clone())))
+            .collect();
+        if !shortcuts.is_empty() {
+            map.insert("shortcuts".to_string(), Value::Object(shortcuts));
+        }
+        
+        Value::Object(map)
+    }
+}
+
+/// Result of parsing preferences.
+pub struct ParseResult {
+    pub preferences: Preferences,
+    pub warnings: Vec<String>,
+}
+
+/// Helper for bounded field parsing.
+fn bounded_field(
+    map: &Map<String, Value>,
+    key: &str,
+    min: u16,
+    max: u16,
+    default: u16,
+    warnings: &mut Vec<String>,
+) -> u16 {
+    match map.get(key) {
+        None => default,
+        Some(Value::Number(number)) => {
+            let raw = number.as_f64().unwrap_or_default();
+            if raw.is_finite() && raw >= f64::from(min) && raw <= f64::from(max) {
+                raw as u16
+            } else {
+                warnings.push(format!("{key} must be {min}..={max}"));
+                default
+            }
+        }
+        _ => {
+            warnings.push(format!("{key} must be a number"));
+            default
+        }
+    }
+}
 
 /// Preference edit messages, routed through the host catalog (D-16).
 #[derive(Debug, Clone)]
@@ -186,7 +485,7 @@ impl AppearanceHost {
     /// Boot defaults before any vault is attached.
     #[must_use]
     pub fn boot() -> Self {
-        let prefs = Preferences::defaults();
+        let prefs = Preferences::default();
         let metrics = Metrics::from_preferences(&prefs);
         let mut host = Self {
             prefs,
@@ -208,36 +507,80 @@ impl AppearanceHost {
         host
     }
 
-    /// Load device preferences at vault attach. A read or parse failure is
-    /// an honest report with defaults applied; the document is never
-    /// overwritten by that fallback (D-12).
+    /// Load preferences from the unified settings store at vault attach.
+    /// A read or parse failure is an honest report with defaults applied;
+    /// the document is never overwritten by that fallback (D-12, RFC-0007 S3).
     pub fn load(&mut self, flavite: &Flavite) {
-        match flavite.read_user_state(UserStateKind::DevicePreferences) {
-            Ok(None) => {
-                self.valid = true;
-                self.generation = 0;
-            }
-            Ok(Some(stored)) => {
+        // Read from the new unified settings store
+        match flavite.settings_read() {
+            Ok(stored) => {
                 self.generation = stored.generation;
-                let text = std::str::from_utf8(&stored.payload).ok();
-                match preferences::Preferences::parse(text) {
-                    Ok(parsed) => {
-                        self.prefs = parsed.preferences;
-                        self.warnings = parsed.warnings;
-                        self.valid = true;
-                    }
-                    Err(error) => {
-                        self.valid = false;
-                        self.last_error = Some(format!("Preferences could not be read: {error}"));
-                    }
-                }
+                self.valid = !stored.read_only;
+                self.warnings = stored.warnings;
+                
+                // Convert Resolved settings to Preferences compatibility type
+                self.prefs = self.resolved_to_preferences(&stored.resolved);
+                self.metrics = Metrics::from_preferences(&self.prefs);
             }
             Err(error) => {
                 self.valid = false;
-                self.last_error = Some(format!("Preferences could not be read: {error}"));
+                self.last_error = Some(format!("Settings could not be read: {error}"));
+                // Use defaults on error
+                self.prefs = Preferences::default();
+                self.metrics = Metrics::from_preferences(&self.prefs);
             }
         }
-        self.metrics = Metrics::from_preferences(&self.prefs);
+    }
+
+    /// Convert Resolved settings to the Preferences compatibility type.
+    fn resolved_to_preferences(&self, resolved: &Resolved) -> Preferences {
+        let get_str = |id: &str| -> String {
+            resolved.get(id).and_then(|v| v.as_str()).map(|s| s.to_owned()).unwrap_or_default()
+        };
+        let get_bool = |id: &str| -> bool {
+            resolved.get(id).and_then(|v| v.as_bool()).unwrap_or(false)
+        };
+        let get_int = |id: &str| -> u16 {
+            resolved.get(id).and_then(|v| v.as_int()).map(|i| i as u16).unwrap_or_default()
+        };
+
+        // Map theme
+        let theme_name = get_str("appearance.theme");
+        let theme = ThemeChoice::from_name(&theme_name).unwrap_or(ThemeChoice::System);
+        
+        // Map line_width
+        let line_width_value = resolved.get("editor.line_width");
+        let line_width = match line_width_value {
+            Some(SettingValue::Int(columns)) => LineWidth::Columns(*columns as u16),
+            Some(SettingValue::Str(s)) if s == "full" => LineWidth::Full,
+            _ => LineWidth::Columns(80),
+        };
+
+        // Map shortcuts
+        let mut shortcuts = BTreeMap::new();
+        if let Some(SettingValue::ShortcutMap(map)) = resolved.get("shortcuts.overrides") {
+            for (command, chord) in map {
+                shortcuts.insert(command.clone(), chord.clone());
+            }
+        }
+
+        Preferences {
+            theme,
+            theme_package: if get_str("appearance.theme_package").is_empty() {
+                None
+            } else {
+                Some(get_str("appearance.theme_package"))
+            },
+            interface_scale_pct: get_int("appearance.scale_pct"),
+            editor_font_size: get_int("editor.font_size"),
+            line_width,
+            reduced_motion: get_bool("appearance.reduced_motion"),
+            prefer_stable_links: get_bool("links.prefer_stable_links"),
+            graph_activation_acknowledged: get_bool("state.graph_activation_acknowledged"),
+            sidebar_open: get_bool("sidebar.open"),
+            sidebar_width: get_int("sidebar.width"),
+            shortcuts,
+        }
     }
 
     /// The color scheme the shell currently paints with.
@@ -398,13 +741,9 @@ impl AppearanceHost {
     /// Apply an interface scale in percent; out-of-range values are
     /// refused, never clamped into a silently different preference.
     pub fn set_scale(&mut self, percent: u16) -> Result<bool, String> {
-        if !(preferences::MIN_INTERFACE_SCALE_PCT..=preferences::MAX_INTERFACE_SCALE_PCT)
-            .contains(&percent)
-        {
+        if !(MIN_INTERFACE_SCALE_PCT..=MAX_INTERFACE_SCALE_PCT).contains(&percent) {
             return Err(format!(
-                "Interface scale must be {}–{}%",
-                preferences::MIN_INTERFACE_SCALE_PCT,
-                preferences::MAX_INTERFACE_SCALE_PCT
+                "Interface scale must be {MIN_INTERFACE_SCALE_PCT}–{MAX_INTERFACE_SCALE_PCT}%"
             ));
         }
         if self.prefs.interface_scale_pct == percent {
@@ -416,12 +755,9 @@ impl AppearanceHost {
 
     /// Apply an editor font size; out-of-range values are refused.
     pub fn set_editor_font_size(&mut self, size: u16) -> Result<bool, String> {
-        if !(preferences::MIN_EDITOR_FONT_SIZE..=preferences::MAX_EDITOR_FONT_SIZE).contains(&size)
-        {
+        if !(MIN_EDITOR_FONT_SIZE..=MAX_EDITOR_FONT_SIZE).contains(&size) {
             return Err(format!(
-                "Editor font size must be {}–{}",
-                preferences::MIN_EDITOR_FONT_SIZE,
-                preferences::MAX_EDITOR_FONT_SIZE
+                "Editor font size must be {MIN_EDITOR_FONT_SIZE}–{MAX_EDITOR_FONT_SIZE}"
             ));
         }
         if self.prefs.editor_font_size == size {
@@ -495,7 +831,7 @@ impl AppearanceHost {
         for (id, text) in &next {
             effective.insert(id.clone(), text.clone());
         }
-        if let Err(error) = preferences::validate_shortcuts(&effective, &owned_defaults) {
+        if let Err(error) = validate_shortcuts(&effective, &owned_defaults) {
             self.shortcut_error = Some(error.to_string());
             return;
         }
@@ -523,8 +859,12 @@ impl AppearanceHost {
                     .get(*id)
                     .map(String::as_str)
                     .unwrap_or(default);
-                let chord =
-                    preferences::parse_chord(text).or_else(|| preferences::parse_chord(default))?;
+                let settings_chord = flavite_settings::chord::parse_chord(text)
+                    .or_else(|| flavite_settings::chord::parse_chord(default))?;
+                let chord = flavite_api::Chord {
+                    modifiers: settings_chord.modifiers,
+                    key: settings_chord.key,
+                };
                 Some((chord, *id))
             })
             .collect();
@@ -548,26 +888,85 @@ impl AppearanceHost {
         })
     }
 
-    /// Persist the current preferences. Failures are recorded and
-    /// surfaced, never silent (FR-20).
+    /// Persist the current preferences to the unified settings store.
+    /// Failures are recorded and surfaced, never silent (FR-20, RFC-0007 S3).
     pub fn persist(&mut self, flavite: &mut Flavite) {
         if !self.valid {
             return;
         }
-        let document = self.prefs.to_stored();
-        let write = flavite.write_user_state(
-            UserStateKind::DevicePreferences,
-            self.generation,
-            document.as_bytes(),
-        );
-        match write {
-            Ok(generation) => {
-                self.generation = generation;
-                self.last_error = None;
+        
+        // For S3, we need to use the public API. However, we need to set multiple
+        // values atomically. For now, we'll use settings_set for each value.
+        // This is not atomic but will be fixed when the Settings tab is implemented.
+        
+        // Set each preference via settings_set
+        let mut any_error = None;
+        
+        // appearance.theme
+        let theme_str = self.prefs.theme.name();
+        if let Err(e) = flavite.settings_set("appearance.theme", SettingValue::Str(theme_str.to_owned())) {
+            any_error = Some(e.to_string());
+        }
+        
+        // appearance.theme_package
+        if let Some(ref package) = self.prefs.theme_package {
+            if let Err(e) = flavite.settings_set("appearance.theme_package", SettingValue::Str(package.clone())) {
+                any_error = Some(e.to_string());
             }
-            Err(error) => {
-                self.last_error = Some(format!("Preferences were not saved: {error}"));
+        } else {
+            if let Err(e) = flavite.settings_set("appearance.theme_package", SettingValue::Str("".to_owned())) {
+                any_error = Some(e.to_string());
             }
+        }
+        
+        // appearance.scale_pct
+        if let Err(e) = flavite.settings_set("appearance.scale_pct", SettingValue::Int(self.prefs.interface_scale_pct as i64)) {
+            any_error = Some(e.to_string());
+        }
+        
+        // editor.font_size
+        if let Err(e) = flavite.settings_set("editor.font_size", SettingValue::Int(self.prefs.editor_font_size as i64)) {
+            any_error = Some(e.to_string());
+        }
+        
+        // editor.line_width
+        let line_width_value = match self.prefs.line_width {
+            LineWidth::Columns(cols) => SettingValue::Int(cols as i64),
+            LineWidth::Full => SettingValue::Str("full".to_owned()),
+        };
+        if let Err(e) = flavite.settings_set("editor.line_width", line_width_value) {
+            any_error = Some(e.to_string());
+        }
+        
+        // Other boolean settings
+        if let Err(e) = flavite.settings_set("appearance.reduced_motion", SettingValue::Bool(self.prefs.reduced_motion)) {
+            any_error = Some(e.to_string());
+        }
+        if let Err(e) = flavite.settings_set("links.prefer_stable_links", SettingValue::Bool(self.prefs.prefer_stable_links)) {
+            any_error = Some(e.to_string());
+        }
+        if let Err(e) = flavite.settings_set("sidebar.open", SettingValue::Bool(self.prefs.sidebar_open)) {
+            any_error = Some(e.to_string());
+        }
+        if let Err(e) = flavite.settings_set("sidebar.width", SettingValue::Int(self.prefs.sidebar_width as i64)) {
+            any_error = Some(e.to_string());
+        }
+        if let Err(e) = flavite.settings_set("state.graph_activation_acknowledged", SettingValue::Bool(self.prefs.graph_activation_acknowledged)) {
+            any_error = Some(e.to_string());
+        }
+        
+        // Shortcuts - this one is more complex as it's a map
+        let shortcuts_map: std::collections::BTreeMap<String, String> = self.prefs.shortcuts.clone();
+        if let Err(e) = flavite.settings_set("shortcuts.overrides", SettingValue::ShortcutMap(shortcuts_map)) {
+            any_error = Some(e.to_string());
+        }
+        
+        // Update generation (read it back)
+        if let Some(error) = any_error {
+            self.last_error = Some(format!("Settings were not saved: {}", error));
+        } else if let Ok(stored) = flavite.settings_read() {
+            self.generation = stored.generation;
+            self.last_error = None;
         }
     }
 
@@ -774,4 +1173,15 @@ impl crate::app::App {
             self.appearance.reload_installed_themes(flavite);
         }
     }
+}
+
+/// Validate a shortcut map (compatibility wrapper for flavite_settings::chord::validate_shortcuts).
+/// This will be removed in S8 when the dialog is deleted.
+pub fn validate_shortcuts(
+    shortcuts: &BTreeMap<String, String>,
+    owned_defaults: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    // The input maps are already in the right format for flavite_settings
+    flavite_settings::chord::validate_shortcuts(shortcuts, owned_defaults)
+        .map_err(|e| e.to_string())
 }

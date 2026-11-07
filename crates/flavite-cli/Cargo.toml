@@ -14,6 +14,7 @@ path = "src/main.rs"
 # Workspace crates
 # Phase 4: CLI consumes flavite-api only (D16 dogfood)
 flavite-api = { path = "../flavite-api" }
+flavite-settings = { path = "../flavite-settings" }
 
 # CLI parsing
 clap = { version = "4", features = ["derive", "cargo"] }

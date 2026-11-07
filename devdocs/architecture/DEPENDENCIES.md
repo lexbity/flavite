@@ -75,6 +75,7 @@ Normal/build:
 
 - `blake3` (normal)
 - `flavite-api` (normal)
+- `flavite-settings` (normal)
 - `tracing` (normal)
 
 ### `flavite-editor`
@@ -166,6 +167,7 @@ Normal/build:
 - `flavite-buffer` (normal)
 - `flavite-editor` (normal)
 - `flavite-graph` (normal)
+- `flavite-settings` (normal)
 - `flavite-theme` (normal)
 - `flavite-workspace` (normal)
 - `iced` (normal)

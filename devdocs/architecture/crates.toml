@@ -110,6 +110,9 @@ active = [
     { from = "flavite-ui", to = "flavite-theme" },
     # RFC-0007 S2: Settings store and commands consume the pure settings codec.
     { from = "flavite-api", to = "flavite-settings" },
+    # RFC-0007 S3: UI and CLI consume settings directly for compatibility types.
+    { from = "flavite-ui", to = "flavite-settings" },
+    { from = "flavite-cli", to = "flavite-settings" },
 
     # C14 - CLI consumes flavite-api only (D16 dogfood - fully migrated)
     { from = "flavite-cli", to = "flavite-api" },

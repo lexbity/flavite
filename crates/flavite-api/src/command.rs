@@ -141,6 +141,32 @@ impl Chord {
             key: key.to_string(),
         }
     }
+
+    /// Parse a chord string using the authoritative parser from flavite-settings.
+    ///
+    /// This delegates to [`flavite_settings::chord::parse_chord`] to ensure
+    /// there is exactly one chord grammar authority (RFC-0007 D-12, T8).
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        flavite_settings::chord::parse_chord(text).map(|c| Self {
+            modifiers: c.modifiers,
+            key: c.key,
+        })
+    }
+
+}
+
+impl std::fmt::Display for Chord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            flavite_settings::chord::chord_string(&flavite_settings::chord::Chord {
+                modifiers: self.modifiers,
+                key: self.key.clone(),
+            })
+        )
+    }
 }
 
 /// Command availability predicate.

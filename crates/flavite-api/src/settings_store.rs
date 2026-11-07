@@ -15,6 +15,7 @@
 //!
 //! The codec authority lives in `flavite-settings`; this store owns the
 //! IO boundary only.
+#![allow(clippy::collapsible_if)]
 
 use flavite_settings::codec::{parse, serialize};
 use flavite_settings::document::SettingsDoc;
@@ -261,6 +262,286 @@ impl SettingsStore {
                     warnings: Vec::new(),
                     read_only: false,
                 })
+            }
+        }
+    }
+
+    /// Load settings with migration from legacy stores (RFC-0007 S3).
+    ///
+    /// If `.flavite/settings.toml` doesn't exist in the vault:
+    /// 1. Create defaults document
+    /// 2. Overlay legacy v1 `.flavite/settings.toml` if it exists
+    /// 3. Overlay legacy `device-preferences.json` from data dir if it exists
+    /// 4. Write the migrated v2 document atomically
+    ///
+    /// This is the entry point for vault open; it ensures exactly one document
+    /// with idempotent migration.
+    ///
+    /// # Arguments
+    /// * `registry` - The setting registry
+    /// * `vault_root` - The vault root path (for reading v1 settings.toml)
+    /// * `data_dir` - The OS data directory (for reading device-preferences.json)
+    ///
+    /// # Errors
+    /// Same as `read`, `write`, plus filesystem errors for legacy files.
+    #[allow(dead_code)]
+    /// Load settings with migration from legacy stores (RFC-0007 S3).
+    ///
+    /// If `.flavite/settings.toml` doesn't exist in the vault:
+    /// 1. Create defaults document
+    /// 2. Overlay legacy v1 `.flavite/settings.toml` if it exists
+    /// 3. Overlay legacy `device-preferences.json` from data dir if it exists
+    /// 4. Write the migrated v2 document atomically
+    ///
+    /// This is the entry point for vault open; it ensures exactly one document
+    /// with idempotent migration.
+    ///
+    /// # Arguments
+    /// * `registry` - The setting registry
+    /// * `vault_root` - The vault root path (for reading v1 settings.toml)
+    /// * `data_dir` - The OS data directory (for reading device-preferences.json)
+    /// * `vault_uuid` - The vault UUID (for finding device-preferences.json)
+    ///
+    /// # Errors
+    /// Same as `read`, `write`, plus filesystem errors for legacy files.
+    #[allow(dead_code)]
+    pub fn load_or_migrate(
+        &self,
+        registry: &SettingRegistry,
+        vault_root: &std::path::Path,
+        data_dir: Option<&std::path::Path>,
+        vault_uuid: &str,
+    ) -> Result<StoredSettings, SettingsStoreError> {
+        // Try to read the v2 settings document
+        match self.read()? {
+            Some(stored) => Ok(stored),
+            None => {
+                // v2 document doesn't exist - migrate from legacy
+                let mut doc = crate::settings_store::defaults_document(registry);
+                let mut warnings = Vec::new();
+                
+                // Step 1: Overlay v1 settings.toml from vault
+                // V1 format: flat TOML with vault-specific settings
+                let v1_settings_path = vault_root.join(".flavite").join("settings.toml");
+                #[allow(clippy::collapsible_if)]
+                if v1_settings_path.exists() {
+                    if let Ok(contents) = std::fs::read_to_string(&v1_settings_path) {
+                        if let Ok(value) = toml::from_str::<toml::Value>(&contents) {
+                            if let Some(table) = value.as_table() {
+                                // Map v1 fields to v2 settings
+                                self.overlay_v1_vault_settings(registry, &mut doc, table);
+                            }
+                        }
+                        warnings.push(format!(
+                            "Migrated from v1 settings at {}",
+                            v1_settings_path.display()
+                        ));
+                    }
+                }
+                
+                // Step 2: Overlay device-preferences.json from data dir
+                // V1 format: JSON with user preferences
+                if let Some(data_dir) = data_dir {
+                    let device_prefs_path = data_dir
+                        .join("flavite")
+                        .join("workspace")
+                        .join(vault_uuid)
+                        .join("device-preferences.json");
+                    #[allow(clippy::collapsible_if)]
+                    if device_prefs_path.exists() {
+                        if let Ok(contents) = std::fs::read_to_string(&device_prefs_path) {
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
+                                if let Some(obj) = value.as_object() {
+                                    // Map v1 device preferences to v2 settings
+                                    self.overlay_v1_device_preferences(registry, &mut doc, &mut warnings, obj);
+                                }
+                            }
+                            warnings.push(format!(
+                                "Migrated from device-preferences at {}",
+                                device_prefs_path.display()
+                            ));
+                        }
+                    }
+                }
+                
+                // Write the migrated document
+                let next = self.write(&doc, 0)?;
+                Ok(StoredSettings {
+                    doc,
+                    generation: next,
+                    warnings,
+                    read_only: false,
+                })
+            }
+        }
+    }
+
+    /// Overlay v1 vault settings (from .flavite/settings.toml) onto the v2 document.
+    fn overlay_v1_vault_settings(
+        &self,
+        registry: &SettingRegistry,
+        doc: &mut flavite_settings::document::SettingsDoc,
+        table: &toml::value::Table,
+    ) {
+        use flavite_settings::value::SettingValue;
+        
+        // Map v1 fields to v2 setting IDs according to D-09
+        // v1: rename_behavior -> v2: vault.rename_behavior
+        if let Some(value) = table.get("rename_behavior") {
+            if let Some(text) = value.as_str() {
+                let setting_value = match text {
+                    "rewrite" => SettingValue::Str("rewrite".to_owned()),
+                    "alias" => SettingValue::Str("alias".to_owned()),
+                    "none" => SettingValue::Str("none".to_owned()),
+                    _ => SettingValue::Str("rewrite".to_owned()),
+                };
+                let _ = doc.set("vault.rename_behavior", setting_value, registry);
+            }
+        }
+        
+        // v1: recovery_interval_secs -> v2: vault.recovery_interval_secs
+        if let Some(value) = table.get("recovery_interval_secs") {
+            if let Some(int_val) = value.as_integer() {
+                let _ = doc.set("vault.recovery_interval_secs", SettingValue::Int(int_val), registry);
+            }
+        }
+        
+        // v1: verification_interval_mins -> v2: vault.verification_interval_mins
+        if let Some(value) = table.get("verification_interval_mins") {
+            if let Some(int_val) = value.as_integer() {
+                let _ = doc.set("vault.verification_interval_mins", SettingValue::Int(int_val), registry);
+            }
+        }
+        
+        // v1: change_log_budget_mib -> v2: vault.change_log_budget_mib
+        if let Some(value) = table.get("change_log_budget_mib") {
+            if let Some(int_val) = value.as_integer() {
+                let _ = doc.set("vault.change_log_budget_mib", SettingValue::Int(int_val), registry);
+            }
+        }
+        
+        // v1: ignore_globs -> v2: vault.ignore_globs
+        if let Some(value) = table.get("ignore_globs") {
+            if let Some(array) = value.as_array() {
+                let list: Vec<String> = array.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_owned()))
+                    .collect();
+                let _ = doc.set("vault.ignore_globs", SettingValue::List(list), registry);
+            }
+        }
+    }
+
+    /// Overlay v1 device preferences (from device-preferences.json) onto the v2 document.
+    fn overlay_v1_device_preferences(
+        &self,
+        registry: &SettingRegistry,
+        doc: &mut flavite_settings::document::SettingsDoc,
+        warnings: &mut Vec<String>,
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) {
+        use flavite_settings::value::SettingValue;
+        
+        // Map v1 device preferences fields to v2 setting IDs according to D-09
+        
+        // theme -> appearance.theme
+        if let Some(value) = obj.get("theme") {
+            if let Some(text) = value.as_str() {
+                let theme = match text {
+                    "system" => "system",
+                    "light" => "light",
+                    "dark" => "dark",
+                    _ => "system",
+                };
+                let _ = doc.set("appearance.theme", SettingValue::Str(theme.to_owned()), registry);
+            }
+        }
+        
+        // theme_package -> appearance.theme_package
+        if let Some(value) = obj.get("theme_package") {
+            if let Some(text) = value.as_str() {
+                let _ = doc.set("appearance.theme_package", SettingValue::Str(text.to_owned()), registry);
+            } else {
+                let _ = doc.set("appearance.theme_package", SettingValue::Str("".to_owned()), registry);
+            }
+        }
+        
+        // interface_scale_pct -> appearance.scale_pct
+        if let Some(value) = obj.get("interface_scale_pct") {
+            if let Some(int_val) = value.as_u64() {
+                let _ = doc.set("appearance.scale_pct", SettingValue::Int(int_val as i64), registry);
+            }
+        }
+        
+        // reduced_motion -> appearance.reduced_motion
+        if let Some(value) = obj.get("reduced_motion") {
+            if let Some(bool_val) = value.as_bool() {
+                let _ = doc.set("appearance.reduced_motion", SettingValue::Bool(bool_val), registry);
+            }
+        }
+        
+        // editor_font_size -> editor.font_size
+        if let Some(value) = obj.get("editor_font_size") {
+            if let Some(int_val) = value.as_u64() {
+                let _ = doc.set("editor.font_size", SettingValue::Int(int_val as i64), registry);
+            }
+        }
+        
+        // line_width -> editor.line_width
+        if let Some(value) = obj.get("line_width") {
+            if let Some(obj_map) = value.as_object() {
+                if let Some(columns) = obj_map.get("columns").and_then(|v| v.as_u64()) {
+                    let _ = doc.set("editor.line_width", SettingValue::Int(columns as i64), registry);
+                } else if let Some(text) = obj_map.get("type").and_then(|v| v.as_str()) {
+                    if text == "full" {
+                        let _ = doc.set("editor.line_width", SettingValue::Str("full".to_owned()), registry);
+                    }
+                }
+            }
+        }
+        
+        // prefer_stable_links -> links.prefer_stable_links
+        if let Some(value) = obj.get("prefer_stable_links") {
+            if let Some(bool_val) = value.as_bool() {
+                let _ = doc.set("links.prefer_stable_links", SettingValue::Bool(bool_val), registry);
+            }
+        }
+        
+        // sidebar_open -> sidebar.open
+        if let Some(value) = obj.get("sidebar_open") {
+            if let Some(bool_val) = value.as_bool() {
+                let _ = doc.set("sidebar.open", SettingValue::Bool(bool_val), registry);
+            }
+        }
+        
+        // sidebar_width -> sidebar.width
+        if let Some(value) = obj.get("sidebar_width") {
+            if let Some(int_val) = value.as_u64() {
+                let _ = doc.set("sidebar.width", SettingValue::Int(int_val as i64), registry);
+            }
+        }
+        
+        // graph_activation_acknowledged -> state.graph_activation_acknowledged
+        if let Some(value) = obj.get("graph_activation_acknowledged") {
+            if let Some(bool_val) = value.as_bool() {
+                let _ = doc.set("state.graph_activation_acknowledged", SettingValue::Bool(bool_val), registry);
+            }
+        }
+        
+        // shortcuts -> [shortcuts]
+        if let Some(value) = obj.get("shortcuts") {
+            if let Some(shortcuts_obj) = value.as_object() {
+                let mut shortcuts_map = std::collections::BTreeMap::new();
+                for (command_id, chord_str) in shortcuts_obj {
+                    if let Some(chord_text) = chord_str.as_str() {
+                        // Validate the chord using flavite-settings
+                        if flavite_settings::chord::parse_chord(chord_text).is_some() {
+                            shortcuts_map.insert(command_id.clone(), chord_text.to_owned());
+                        } else {
+                            warnings.push(format!("Invalid chord for {}: {}", command_id, chord_text));
+                        }
+                    }
+                }
+                let _ = doc.set("shortcuts", SettingValue::ShortcutMap(shortcuts_map), registry);
             }
         }
     }

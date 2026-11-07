@@ -22,7 +22,7 @@ use flavite_vault::sync::{MutexExt, WAIT_TICK, wait_result_recovering};
 use flavite_vault::types::{Epoch, Generation, VaultConfig, VaultIdentity};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use thiserror::Error;
@@ -579,6 +579,7 @@ fn attach_services(
     root: &std::path::Path,
     session: &Arc<Session>,
     index_watch: Option<Arc<flavite_index::GenerationWatch>>,
+    data_dir: Option<&std::path::Path>,
 ) -> (
     flavite_vault::user_state::VaultUserStateStore,
     Arc<crate::graph_service::GraphService>,
@@ -599,6 +600,13 @@ fn attach_services(
         root,
     ));
     let settings_store = crate::settings_store::SettingsStore::new(settings_vault_store, true);
+    // Initialize settings store with migration from legacy stores
+    let vault_uuid = uuid.to_string();
+    // Create a registry with built-in descriptors
+    let registry = flavite_settings::registry::SettingRegistry::with_builtins();
+    // Trigger migration if needed - this loads or creates the v2 settings document
+    let _ = settings_store.load_or_migrate(&registry, root, data_dir, &vault_uuid)
+        .map_err(|e| eprintln!("Failed to load or migrate settings: {}", e));
     (vault_user_state, graph, settings_store)
 }
 
@@ -622,7 +630,7 @@ impl Flavite {
 
         let session = Arc::new(session);
         let (vault_user_state, graph, settings_store) =
-            attach_services(vault_ref.uuid, &identity.root, &session, None);
+            attach_services(vault_ref.uuid, &identity.root, &session, None, None);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
             uuid::Uuid::now_v7().as_u128(),
@@ -676,7 +684,7 @@ impl Flavite {
         let vault_uuid = vault_ref.uuid.to_string();
         let session = Arc::new(session);
         let (vault_user_state, graph, settings_store) =
-            attach_services(vault_ref.uuid, &vault_ref.root, &session, None);
+            attach_services(vault_ref.uuid, &vault_ref.root, &session, None, None);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
             uuid::Uuid::now_v7().as_u128(),
@@ -728,7 +736,7 @@ impl Flavite {
         session: Arc<Session>,
         config: VaultConfig,
     ) -> Result<Self, FlaviteError> {
-        Self::with_vault_inner(identity, session, config, None)
+        Self::with_vault_inner(identity, session, config, None, None)
     }
 
     fn with_vault_inner(
@@ -736,12 +744,13 @@ impl Flavite {
         session: Arc<Session>,
         _config: VaultConfig,
         index_watch: Option<Arc<flavite_index::GenerationWatch>>,
+        data_dir: Option<&Path>,
     ) -> Result<Self, FlaviteError> {
         let vault_uuid = identity.uuid.to_string();
         let vault_ref = ApiVaultRef::new(identity.uuid, identity.root.clone());
         let generation_watch = index_watch.clone();
         let (vault_user_state, graph, settings_store) =
-            attach_services(vault_ref.uuid, &identity.root, &session, index_watch);
+            attach_services(vault_ref.uuid, &identity.root, &session, index_watch, data_dir);
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
             uuid::Uuid::now_v7().as_u128(),
@@ -818,6 +827,7 @@ impl Flavite {
         data_dir: Option<PathBuf>,
     ) -> Result<Self, FlaviteError> {
         let (generation_signal, generation_watch) = flavite_index::GenerationSignal::new();
+        let data_dir_clone = data_dir.clone();
         let vault = Vault::open_with_data_dir_and_generation_signal(
             root,
             Box::new(flavite_fs::OsFs::new()),
@@ -831,6 +841,7 @@ impl Flavite {
             vault.session_arc(),
             config,
             Some(Arc::new(generation_watch)),
+            data_dir_clone.as_deref(),
         )?;
         flavite.owned_vault = Some(vault);
         Ok(flavite)
@@ -1409,27 +1420,6 @@ impl Flavite {
     /// Returns the complete built-in descriptor table (RFC-0007 D-04).
     pub fn setting_descriptors(&self) -> Vec<flavite_settings::descriptor::SettingDescriptor> {
         flavite_settings::registry::SettingRegistry::builtins()
-    }
-
-    /// Read the settings document (legacy compatibility shim for flavite-ui).
-    /// Use `settings_read()` for the typed entry point.
-    pub fn read_settings(&self) -> Result<Option<String>, FlaviteError> {
-        let stored = self.settings_store.read()
-            .map_err(|e| FlaviteError::SettingsIo(e.to_string()))?;
-        Ok(stored.and_then(|s| flavite_settings::codec::serialize(&s.doc).ok()))
-    }
-
-    /// Write the settings document (legacy compatibility shim for flavite-ui).
-    /// Use `settings_write()` for the typed entry point.
-    pub fn write_settings(&self, contents: &str) -> Result<(), FlaviteError> {
-        let doc = flavite_settings::codec::parse(Some(contents))
-            .map_err(|e| FlaviteError::SettingsIo(e.to_string()))?;
-        let stored = self.settings_store.read()
-            .map_err(|e| FlaviteError::SettingsIo(e.to_string()))?;
-        let generation = stored.map(|s| s.generation).unwrap_or(0);
-        self.settings_store.write(&doc.doc, generation)
-            .map_err(|e| FlaviteError::SettingsIo(e.to_string()))?;
-        Ok(())
     }
 
     /// Execute a typed command through the registry.

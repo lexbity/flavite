@@ -800,7 +800,7 @@ fn entity_frames_freeze_for_the_pair_hold_while_emphasis_updates() {
     let gen0 = app.graph.state(graph).expect("state").geometry_generation;
     let _ = app.update(Message::Preferences(
         flavite_ui::host::appearance::PreferenceMessage::SetTheme(
-            flavite_ui::preferences::ThemeChoice::Light,
+            flavite_ui::host::appearance::ThemeChoice::Light,
         ),
     ));
     let _ = app.update(Message::Pump);

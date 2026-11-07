@@ -12,7 +12,7 @@ pub mod merge;
 pub mod recovery;
 
 use crate::app::{App, Message};
-use crate::preferences::{LineWidth, ThemeChoice};
+use crate::host::appearance::{LineWidth, ThemeChoice};
 use crate::style;
 use crate::workspace::tab_strip;
 use flavite_workspace::NoteLocator;
@@ -265,7 +265,10 @@ fn choice_row<'a>(
 /// The current display chord for a command (override or default).
 fn chord_label(app: &App, id: &str) -> String {
     crate::host::commands::resolved_chord(id, &app.appearance.prefs.shortcuts)
-        .map(|chord| crate::preferences::chord_string(&chord))
+        .map(|chord| flavite_settings::chord::chord_string(&flavite_settings::chord::Chord {
+            modifiers: chord.modifiers,
+            key: chord.key,
+        }))
         .unwrap_or_else(|| "unbound".into())
 }
 

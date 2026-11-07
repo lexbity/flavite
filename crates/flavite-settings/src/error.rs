@@ -58,15 +58,14 @@ impl SettingsCodecError {
     #[must_use]
     pub fn wire_code(&self) -> &'static str {
         match self {
-            Self::UnknownKey(_) => SETTINGS_UNKNOWN_KEY,
-            Self::InvalidValue(_, _) => SETTINGS_INVALID_VALUE,
+            Self::UnknownKey(_) | Self::ReservedNamespace(_) => SETTINGS_UNKNOWN_KEY,
+            Self::InvalidValue(_, _)
+            | Self::InvalidChord(_)
+            | Self::ShortcutCollision(_, _, _)
+            | Self::OsReservedChord(_, _) => SETTINGS_INVALID_VALUE,
             Self::DocumentTooLarge => SETTINGS_TOO_LARGE,
             Self::Unparseable(_) => SETTINGS_UNPARSEABLE,
             Self::SchemaNewer => SETTINGS_SCHEMA_NEWER,
-            Self::ReservedNamespace(_) => SETTINGS_UNKNOWN_KEY,
-            Self::InvalidChord(_) => SETTINGS_INVALID_VALUE,
-            Self::ShortcutCollision(_, _, _) => SETTINGS_INVALID_VALUE,
-            Self::OsReservedChord(_, _) => SETTINGS_INVALID_VALUE,
         }
     }
 }

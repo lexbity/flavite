@@ -34,8 +34,7 @@ impl Resolved {
     #[must_use]
     pub fn bool(&self, id: &str) -> bool {
         self.get(id)
-            .map(|v| v.as_bool().unwrap_or(false))
-            .unwrap_or(false)
+            .is_some_and(|v| v.as_bool().unwrap_or(false))
     }
 
     /// Get an integer value by ID, returning the default if not found.
@@ -43,8 +42,7 @@ impl Resolved {
     #[must_use]
     pub fn int(&self, id: &str) -> i64 {
         self.get(id)
-            .map(|v| v.as_int().unwrap_or(0))
-            .unwrap_or(0)
+            .map_or(0, |v| v.as_int().unwrap_or(0))
     }
 
     /// Get a string value by ID, returning the default if not found.

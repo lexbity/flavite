@@ -5,6 +5,7 @@
 //! the appearance-matrix visual evidence run; this suite pins the
 //! measurable structural contract.
 
+use flavite_ui::host::appearance::LineWidth;
 use flavite_ui::style::{Scheme, contrast, tokens};
 
 // NFR-15 structural constants, checked at compile time.
@@ -121,13 +122,13 @@ fn token_sets_are_deterministic_and_distinct() {
     let a = flavite_ui::style::Metrics::new(
         150,
         18,
-        flavite_ui::preferences::LineWidth::Columns(80),
+        LineWidth::Columns(80),
         240,
     );
     let b = flavite_ui::style::Metrics::new(
         150,
         18,
-        flavite_ui::preferences::LineWidth::Columns(80),
+        LineWidth::Columns(80),
         240,
     );
     assert_eq!(a, b);
@@ -136,7 +137,7 @@ fn token_sets_are_deterministic_and_distinct() {
         flavite_ui::style::Metrics::new(
             175,
             18,
-            flavite_ui::preferences::LineWidth::Columns(80),
+            LineWidth::Columns(80),
             240
         ),
         "different scale, different metrics"
@@ -151,7 +152,7 @@ fn chrome_meets_pointer_target_and_focus_ring_minimums() {
         let metrics = flavite_ui::style::Metrics::new(
             scale_pct,
             16,
-            flavite_ui::preferences::LineWidth::Full,
+            LineWidth::Full,
             240,
         );
         let target = metrics.icon_target;

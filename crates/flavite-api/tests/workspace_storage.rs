@@ -426,27 +426,3 @@ fn non_json_payloads_are_refused() {
         Err(UserStateError::NotJson(_))
     ));
 }
-
-#[test]
-fn device_preferences_are_an_independent_fixed_location() {
-    let (mut store, fs) = plain_store();
-    store
-        .write(UserStateKind::DevicePreferences, 0, PAYLOAD_A.as_bytes())
-        .expect("written");
-    assert!(
-        fs.read_if_exists(Path::new(
-            "/test/user-state/vault-uuid/device-preferences.json"
-        ))
-        .unwrap()
-        .is_some(),
-        "the fixed device-preferences location is used"
-    );
-    assert!(
-        fs.read_if_exists(Path::new(
-            "/test/user-state/vault-uuid/workspace-layouts.json"
-        ))
-        .unwrap()
-        .is_none(),
-        "kinds never share files"
-    );
-}
