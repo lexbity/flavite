@@ -66,9 +66,11 @@ pub struct CandidateView {
     pub no_change: bool,
     pub before_hash: String,
     pub after_hash: String,
+    /// `"saved"` or `"draft"` (RFC-0006 S09).
+    pub source_kind: String,
 }
 
-/// One durable replacement job summary (RFC-0006 S08).
+/// One durable replacement job summary (RFC-0006 S08/S09).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct JobView {
     pub job_id: String,
@@ -77,9 +79,13 @@ pub struct JobView {
     pub saved: u64,
     pub index_pending: u64,
     pub conflicts: u64,
+    pub applied_drafts: u64,
     pub stale: u64,
     pub needs_recovery: u64,
     pub not_started: u64,
+    /// S09 revert-epoch outcomes.
+    pub reverted: u64,
+    pub reverted_drafts: u64,
 }
 
 /// Per-tab Replace state.
@@ -91,6 +97,8 @@ pub struct ReplaceTabState {
     pub regex: bool,
     pub case_sensitive: bool,
     pub whole_word: bool,
+    /// Opt-in draft inclusion (RFC-0006 S09/D-09).
+    pub include_drafts: bool,
     edited_at: Option<Instant>,
     epoch: u64,
     sequence: u64,
@@ -136,6 +144,28 @@ impl ReplaceTabState {
         self.job_action_request.is_none() && self.job.is_some()
     }
 
+    /// Whether a guarded Revert is available: the job finished (or paused/
+    /// cancelled) and applied at least one item, and it is not already a
+    /// completed revert epoch.
+    #[must_use]
+    pub fn can_revert(&self) -> bool {
+        if self.job_action_request.is_some() {
+            return false;
+        }
+        let Some(job) = &self.job else {
+            return false;
+        };
+        if job.reverted > 0 || job.reverted_drafts > 0 {
+            return false;
+        }
+        let applied = job.saved + job.index_pending + job.conflicts + job.applied_drafts;
+        applied > 0
+            && matches!(
+                job.phase.as_str(),
+                "completed" | "partial" | "cancelled" | "paused" | "needs-recovery"
+            )
+    }
+
     /// Apply a job-status completion to this tab's state.
     fn apply_job_status(&mut self, status: serde_json::Value) {
         let phase = status
@@ -162,6 +192,10 @@ impl ReplaceTabState {
                 .get("conflicts")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
+            applied_drafts: totals
+                .get("applied_drafts")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
             stale: totals
                 .get("stale")
                 .and_then(serde_json::Value::as_u64)
@@ -172,6 +206,14 @@ impl ReplaceTabState {
                 .unwrap_or(0),
             not_started: totals
                 .get("not_started")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            reverted: totals
+                .get("reverted")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            reverted_drafts: totals
+                .get("reverted_drafts")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
             ..JobView::default()
@@ -314,6 +356,7 @@ impl ReplaceHost {
             ReplaceFlag::Regex => state.regex = !state.regex,
             ReplaceFlag::CaseSensitive => state.case_sensitive = !state.case_sensitive,
             ReplaceFlag::WholeWord => state.whole_word = !state.whole_word,
+            ReplaceFlag::IncludeDrafts => state.include_drafts = !state.include_drafts,
         }
         if !state.query.trim().is_empty() {
             state.edited_at = Some(Instant::now() - REPLACE_DEBOUNCE);
@@ -492,7 +535,7 @@ impl ReplaceHost {
         let Some(api) = flavite else {
             return;
         };
-        let (query, replacement, regex, case_sensitive, whole_word, epoch) = {
+        let (query, replacement, regex, case_sensitive, whole_word, include_drafts, epoch) = {
             let Some(state) = self.tabs.get_mut(&tab) else {
                 return;
             };
@@ -521,6 +564,7 @@ impl ReplaceHost {
                 state.regex,
                 state.case_sensitive,
                 state.whole_word,
+                state.include_drafts,
                 state.epoch,
             )
         };
@@ -534,7 +578,7 @@ impl ReplaceHost {
                 "mode": if regex { "regex" } else { "literal" },
                 "case_sensitive": case_sensitive,
                 "whole_word": whole_word,
-                "include_drafts": false,
+                "include_drafts": include_drafts,
             }),
             Origin::Gui,
         ));
@@ -825,17 +869,17 @@ impl ReplaceHost {
             match &completion.result {
                 ExecutionResult::Local(LocalResult::Success(success)) => {
                     let data = &success.data;
+                    let status = data.get("status").cloned().unwrap_or_default();
+                    state.apply_job_status(status);
                     let job_id = data
                         .get("job_id")
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned);
-                    let status = data.get("status").cloned().unwrap_or_default();
                     if let Some(job) = &mut state.job
                         && let Some(job_id) = &job_id
                     {
                         job.job_id.clone_from(job_id);
                     }
-                    state.apply_job_status(status);
                     state.error = None;
                 }
                 ExecutionResult::Local(LocalResult::Error(error)) => {
@@ -998,6 +1042,44 @@ impl ReplaceHost {
         self.submit_job_command(tab, flavite, "replace.cancel", "job_id");
     }
 
+    /// Start a guarded Revert action epoch for the tab's job (RFC-0006
+    /// S09/D-11). Available once the job finished (completed/partial/
+    /// cancelled/paused) and it applied at least one item.
+    pub fn revert_job(
+        &mut self,
+        tab: flavite_workspace::TabId,
+        flavite: Option<&flavite_api::Flavite>,
+    ) {
+        let Some(api) = flavite else {
+            return;
+        };
+        let job_id = {
+            let Some(state) = self.tabs.get_mut(&tab) else {
+                return;
+            };
+            if !state.can_revert() {
+                return;
+            }
+            let Some(job_id) = state.job.as_ref().map(|job| job.job_id.clone()) else {
+                return;
+            };
+            state.job_action_request = Some(u64::MAX);
+            job_id
+        };
+        let idempotency_key = job_key();
+        let request_id = api.command_registry().next_request_id();
+        let result = api.execute(Invocation::new(
+            request_id,
+            "replace.revert",
+            serde_json::json!({
+                "job_id": job_id,
+                "idempotency_key": idempotency_key,
+            }),
+            Origin::Gui,
+        ));
+        self.handle_job_response(tab, result);
+    }
+
     /// Explicitly resume the tab's durable job.
     pub fn resume_job(
         &mut self,
@@ -1077,6 +1159,7 @@ impl ReplaceHost {
             ExecutionResult::Local(LocalResult::Success(success)) => {
                 if let Some(state) = self.tabs.get_mut(&tab) {
                     state.job_action_request = None;
+                    state.apply_job_status(success.data.get("status").cloned().unwrap_or_default());
                     let job_id = success
                         .data
                         .get("job_id")
@@ -1087,7 +1170,6 @@ impl ReplaceHost {
                     {
                         job.job_id.clone_from(&job_id);
                     }
-                    state.apply_job_status(success.data.get("status").cloned().unwrap_or_default());
                     state.error = None;
                 }
             }
@@ -1136,6 +1218,8 @@ pub enum ReplaceFlag {
     Regex,
     CaseSensitive,
     WholeWord,
+    /// Opt-in draft inclusion (RFC-0006 S09/D-09).
+    IncludeDrafts,
 }
 
 /// Selection actions.
@@ -1238,6 +1322,7 @@ fn install_preview_page(state: &mut ReplaceTabState, page: Option<&serde_json::V
                         no_change: row.get("no_change")?.as_bool()?,
                         before_hash: row.get("before")?.get("hash")?.as_str()?.to_owned(),
                         after_hash: row.get("after")?.get("hash")?.as_str()?.to_owned(),
+                        source_kind: row.get("source_kind")?.as_str()?.to_owned(),
                     })
                 })
                 .collect()

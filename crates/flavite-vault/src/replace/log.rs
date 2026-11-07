@@ -27,6 +27,9 @@ pub const MAX_LOG_FRAME_BYTES: usize = 64 * 1024;
 pub const GENESIS_AUTH: [u8; 32] = [0u8; 32];
 
 /// Typed per-item action records (schema 1; `deny_unknown_fields`).
+/// Revert records (RFC-0006 S09/D-11) are a distinct action epoch on the
+/// same authenticated chain: `RevertIntentDurable` precedes the inverse
+/// effect and `RevertOutcome` records its terminal state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum ItemAction {
@@ -38,6 +41,10 @@ pub enum ItemAction {
     Outcome { outcome: PersistedItemOutcome },
     /// A durable job-level marker (Completed/Partial/Cancelled/Paused).
     JobTerminal { phase: String },
+    /// Durable intent of a guarded Revert action, before its inverse effect.
+    RevertIntentDurable,
+    /// Terminal per-item Revert outcome.
+    RevertOutcome { outcome: PersistedRevertOutcome },
 }
 
 /// Persisted terminal item outcomes (typed enum discriminants).
@@ -47,11 +54,29 @@ pub enum PersistedItemOutcome {
     Saved,
     IndexPending,
     AppliedConflict,
+    /// A draft buffer edit was installed and durably checkpointed (S09);
+    /// the draft is NOT a file save.
+    AppliedDraft,
     Stale,
     Denied,
     Busy,
     NeedsRecovery,
     SatisfiedUnattributed,
+}
+
+/// Persisted terminal Revert outcomes (RFC-0006 S09/D-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedRevertOutcome {
+    /// A saved note's before-payload was restored durably.
+    Reverted,
+    /// A draft's before text was restored with a durable checkpoint.
+    RevertedDraft,
+    /// A guard (later edit/rename/external write) blocked this note; it is
+    /// skipped and offered compare/manual recovery.
+    Stale,
+    /// The inverse effect started but durability is unconfirmed.
+    NeedsRecovery,
 }
 
 /// The canonical record payload (authenticator excluded; the tag is
@@ -523,6 +548,7 @@ mod tests {
             expires_at_unix_ms: 2,
             selection_revision: None,
             selection_digest: None,
+            include_drafts: false,
             notes: vec![],
             exclusions: vec![],
         }

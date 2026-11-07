@@ -367,6 +367,34 @@ run_s08_gates() {
         "$root/crates/flavite-api/src/replace.rs"
 }
 
+run_s09_gates() {
+    # S09 presence: draft apply/revert proof surfaces and the native
+    # draft-replace-revert scenario (RFC-0006 S09 table).
+    local file
+    for file in \
+        crates/flavite-vault/tests/replace_drafts.rs \
+        crates/flavite-vault/tests/replace_revert.rs \
+        crates/flavite-api/tests/replace_draft_guards.rs \
+        crates/flavite-ui/tests/draft_operations.rs \
+        scripts/tests/workbench/draft_replace_revert.py; do
+        gate assert_nonempty "$root/$file"
+    done
+    # S09 source isolation gates (exact required invocations, §12).
+    # Recovery never replays edits from the operation log, and never uses
+    # an ephemeral buffer id as a restart recovery key.
+    gate assert_absent 'replay.*apply_edits|buffer_id.*as.*recovery_key' \
+        "$root/crates/flavite-vault/src/session.rs" \
+        "$root/crates/flavite-vault/src/replace/coordinator.rs"
+    # The replace/operations hosts never touch the filesystem and never
+    # reach into the Session object directly.
+    gate assert_absent 'std::fs|\.session[.(]|Session::new' \
+        "$root/crates/flavite-ui/src/host/replace.rs" \
+        "$root/crates/flavite-ui/src/host/operations.rs"
+    # Revert is a job action epoch — never a global Undo concept.
+    gate assert_absent 'global.undo|atomic.vault.undo' \
+        "$root/crates/flavite-ui/src/views/operations.rs"
+}
+
 case "$slice" in
     S00) run_s00_gates ;;
     S01) run_s00_gates; run_s01_gates ;;
@@ -376,7 +404,8 @@ case "$slice" in
     S06) run_s00_gates; run_s01_gates; run_s03_gates; run_s04_gates; run_s05_gates; run_s06_gates ;;
     S07) run_s00_gates; run_s01_gates; run_s03_gates; run_s04_gates; run_s05_gates; run_s06_gates; run_s07_gates ;;
     S08) run_s00_gates; run_s01_gates; run_s03_gates; run_s04_gates; run_s05_gates; run_s06_gates; run_s07_gates; run_s08_gates ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: S00 S01 S03 S04 S05 S06 S07 S08)" >&2; exit 2 ;;
+    S09) run_s00_gates; run_s01_gates; run_s03_gates; run_s04_gates; run_s05_gates; run_s06_gates; run_s07_gates; run_s08_gates; run_s09_gates ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: S00 S01 S03 S04 S05 S06 S07 S08 S09)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then

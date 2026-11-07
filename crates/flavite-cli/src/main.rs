@@ -263,6 +263,9 @@ enum ReplaceAction {
         case_sensitive: bool,
         #[arg(long)]
         whole_word: bool,
+        /// Include open unsaved drafts as candidates (RFC-0006 S09).
+        #[arg(long)]
+        include_drafts: bool,
     },
     /// Record a selection revision (all/none/keys).
     Select {
@@ -311,6 +314,17 @@ enum ReplaceAction {
     /// Explicitly resume an untouched/paused job.
     Resume {
         /// Hex job id.
+        #[arg(long)]
+        job_id: String,
+        /// Caller-generated 128-bit hex idempotency key.
+        #[arg(long)]
+        key: String,
+    },
+    /// Start a guarded Revert action epoch (RFC-0006 S09): restore the
+    /// sealed before-payloads of applied items under after-hash/lineage
+    /// preconditions.
+    Revert {
+        /// Hex job id of the apply job to revert.
         #[arg(long)]
         job_id: String,
         /// Caller-generated 128-bit hex idempotency key.
@@ -670,6 +684,7 @@ impl CliDriver {
                 mode,
                 case_sensitive,
                 whole_word,
+                include_drafts,
             } => (
                 "replace.preview",
                 serde_json::json!({
@@ -678,6 +693,7 @@ impl CliDriver {
                     "mode": mode,
                     "case_sensitive": case_sensitive,
                     "whole_word": whole_word,
+                    "include_drafts": include_drafts,
                 }),
             ),
             ReplaceAction::Select { preview_id, select } => {
@@ -758,6 +774,13 @@ impl CliDriver {
             }
             ReplaceAction::Resume { job_id, key } => (
                 "replace.resume",
+                serde_json::json!({
+                    "job_id": job_id,
+                    "idempotency_key": key,
+                }),
+            ),
+            ReplaceAction::Revert { job_id, key } => (
+                "replace.revert",
                 serde_json::json!({
                     "job_id": job_id,
                     "idempotency_key": key,

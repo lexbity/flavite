@@ -114,6 +114,14 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
                 .size(metrics.text_sm)
                 .width(Length::Fill),
         );
+        controls = controls.push(
+            checkbox(state.include_drafts)
+                .label("Include unsaved drafts")
+                .on_toggle(move |_| Message::ReplaceToggle {
+                    tab,
+                    flag: ReplaceFlag::IncludeDrafts,
+                }),
+        );
     }
     let status = if state.updating {
         String::from(if state.mode == ReplacePanelMode::Preview {
@@ -262,6 +270,16 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
             job.conflicts,
             job.stale
         );
+        if job.applied_drafts > 0 {
+            job_line.push_str(&format!(" · drafts applied {}", job.applied_drafts));
+        }
+        if job.reverted > 0 || job.reverted_drafts > 0 {
+            job_line.push_str(&format!(
+                " · reverted {} ({} drafts)",
+                job.reverted + job.reverted_drafts,
+                job.reverted_drafts
+            ));
+        }
         if job.index_pending > 0 {
             job_line.push_str(&format!(" · index pending {}", job.index_pending));
         }
@@ -287,6 +305,14 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
                         .on_press(Message::ReplaceResume { tab }),
                 );
             }
+        }
+        if state.can_revert() {
+            actions = actions.push(
+                button(text("Revert"))
+                    .padding(tab_strip::chip_padding())
+                    .style(style::list_row(true))
+                    .on_press(Message::ReplaceRevert { tab }),
+            );
         }
     }
 
@@ -371,6 +397,9 @@ fn candidate_row(
         "{} · {} match(es) · {} B output",
         candidate.path, candidate.match_count, candidate.output_bytes
     );
+    if candidate.source_kind == "draft" {
+        label.push_str(" · draft");
+    }
     if candidate.no_change {
         label.push_str(" · NoChange");
     }

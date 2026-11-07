@@ -277,6 +277,14 @@ pub enum VaultActorMsg {
         request: crate::replace::coordinator::ReplaceItemRequest,
         reply: Sender<VaultActorResp>,
     },
+    /// Apply one guarded Revert item (RFC-0006 S09/D-11): the inverse
+    /// retained replacement — expected base is the recorded after-hash and
+    /// the installed bytes are the sealed before-payload. Same containment
+    /// and durability rules as [`VaultActorMsg::ApplyReplaceItem`].
+    RevertReplaceItem {
+        request: crate::replace::coordinator::ReplaceItemRequest,
+        reply: Sender<VaultActorResp>,
+    },
     /// Persist bytes observed during an explicit merge/conflict resolution.
     SnapshotHistory {
         note_key: Vec<u8>,
@@ -889,6 +897,25 @@ impl VaultActorHandle {
             VaultActorResp::ReplaceItemApplied(result) => result,
             VaultActorResp::Error(error) => Err(error),
             _ => Err("unexpected replace-item response".to_owned()),
+        }
+    }
+
+    /// Apply one guarded Revert item (RFC-0006 S09/D-11): the inverse
+    /// retained replacement (expected base = recorded after-hash, installed
+    /// bytes = sealed before-payload) with the same containment/durability
+    /// rules. The coordinator is the only caller.
+    pub fn revert_replace_item(
+        &self,
+        request: crate::replace::coordinator::ReplaceItemRequest,
+    ) -> Result<crate::replace::coordinator::ReplaceItemOutcome, String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .try_send(VaultActorMsg::RevertReplaceItem { request, reply })
+            .map_err(|error| error.to_string())?;
+        match response.recv().map_err(|error| error.to_string())? {
+            VaultActorResp::ReplaceItemApplied(result) => result,
+            VaultActorResp::Error(error) => Err(error),
+            _ => Err("unexpected revert-item response".to_owned()),
         }
     }
 
@@ -1803,6 +1830,10 @@ impl VaultActor {
                 let result = self.apply_replace_item_inner(request);
                 let _ = reply.try_send(VaultActorResp::ReplaceItemApplied(result));
             }
+            VaultActorMsg::RevertReplaceItem { request, reply } => {
+                let result = self.revert_replace_item_inner(request);
+                let _ = reply.try_send(VaultActorResp::ReplaceItemApplied(result));
+            }
             VaultActorMsg::SnapshotHistory {
                 note_key,
                 bytes,
@@ -2057,6 +2088,30 @@ impl VaultActor {
     /// mismatch returns `Stale` before any effect; an already-present after
     /// state returns `SatisfiedUnattributed` without overwriting.
     fn apply_replace_item_inner(
+        &mut self,
+        request: crate::replace::coordinator::ReplaceItemRequest,
+    ) -> Result<crate::replace::coordinator::ReplaceItemOutcome, String> {
+        self.retained_item_inner(request)
+    }
+
+    /// Apply one guarded Revert item (RFC-0006 S09/D-11). The request is
+    /// inverse: `expected_before_hash` is the recorded after-hash and
+    /// `after_bytes` is the sealed before-payload. The same containment,
+    /// retained-replacement, archival and index rules apply.
+    fn revert_replace_item_inner(
+        &mut self,
+        request: crate::replace::coordinator::ReplaceItemRequest,
+    ) -> Result<crate::replace::coordinator::ReplaceItemOutcome, String> {
+        self.retained_item_inner(request)
+    }
+
+    /// The shared retained-replacement item effect: containment, exact base
+    /// hash guard, the replaced `replace_preserving_displaced` primitive,
+    /// durable archival of the actual displaced object, then the index
+    /// upsert. Durable source outcomes are never repeated: a guard mismatch
+    /// returns `Stale` before any effect; an already-present target state
+    /// returns `SatisfiedUnattributed` without overwriting.
+    fn retained_item_inner(
         &mut self,
         request: crate::replace::coordinator::ReplaceItemRequest,
     ) -> Result<crate::replace::coordinator::ReplaceItemOutcome, String> {

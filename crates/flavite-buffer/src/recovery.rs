@@ -932,6 +932,43 @@ impl RecoveryWriter {
         Some(path)
     }
 
+    /// Write a durable checkpoint (RFC-0006 S09/D-11): the same atomic,
+    /// directory-synced write as the periodic/normal path, but stamped as a
+    /// checkpoint so crash recovery can classify a draft-replacement effect
+    /// against a durable marker. Returns the written path, or `None` when
+    /// the covered-revision gate refuses (a save receipt already retires
+    /// this revision) or the write fails.
+    pub fn write_checkpoint_durable(
+        &mut self,
+        note_key: &[u8],
+        buffer: &Buffer,
+    ) -> Option<PathBuf> {
+        let buffer_id = buffer.buffer_id();
+        if self
+            .covered_revision
+            .get(&buffer_id)
+            .is_some_and(|covered| buffer.revision() <= *covered)
+        {
+            return None;
+        }
+        let seq = *self.checkpoint_seq.entry(buffer_id).or_insert(0);
+        self.checkpoint_seq.insert(buffer_id, seq.saturating_add(1));
+        let recovery_file = RecoveryFile::from_buffer(buffer, seq, true);
+        let path = self.recovery_path_for_note_key(note_key);
+        // Never regress a preserved newer recovery record.
+        if self.read_recovery_file(&path).is_some_and(|existing| {
+            existing.header.buffer_id == buffer_id
+                && existing.header.revision > recovery_file.header.revision
+        }) {
+            return None;
+        }
+        if write_recovery_atomically(&path, &recovery_file.to_bytes()).is_err() {
+            return None;
+        }
+        self.last_write.insert(buffer_id, Instant::now());
+        Some(path)
+    }
+
     /// Read a recovery file.
     ///
     /// Returns the recovery file if successful and valid.

@@ -325,6 +325,7 @@ mod tests {
             expires_at_unix_ms: 2,
             selection_revision: None,
             selection_digest: None,
+            include_drafts: false,
             notes: vec![NoteCandidateRecord {
                 item_id: 0,
                 path: "a.md".to_owned(),
@@ -349,6 +350,7 @@ mod tests {
                 output_bytes: 1,
                 no_change: false,
                 open_lineage: None,
+                draft_lineage: None,
             }],
             exclusions: vec![],
         }

@@ -348,7 +348,7 @@ fn preview_marks_nochange_rows_and_skips_undecodable_notes() {
 }
 
 #[test]
-fn draft_inclusion_is_refused_and_open_clean_lineage_is_recorded() {
+fn draft_inclusion_is_an_explicit_opt_in_and_clean_lineage_is_recorded() {
     let h = harness();
     seed_note(&h, "notes/a.md", b"alpha\n");
     open_to_terminal(&h.session, h.root.join("notes/a.md"));
@@ -362,8 +362,41 @@ fn draft_inclusion_is_refused_and_open_clean_lineage_is_recorded() {
         note.open_lineage.is_some(),
         "clean open buffer records buffer lineage"
     );
-    // Draft opt-in is absent in S07.
-    let refused = wait_terminal(
+    assert!(!manifest.include_drafts);
+    assert!(note.draft_lineage.is_none());
+    // Draft opt-in is honored since S09: the same open buffer, edited to
+    // Dirty, becomes a Draft candidate carrying its exact lineage.
+    let opened = open_to_terminal(&h.session, h.root.join("notes/a.md"));
+    let (buffer_id, revision) = match expect_success(opened, "open") {
+        CommandResult::NoteOpened {
+            buffer_id,
+            revision,
+        } => (buffer_id, revision),
+        other => panic!("{other:?}"),
+    };
+    let edited = expect_success(
+        wait_terminal(
+            &h.session,
+            h.session.execute(SessionCommand::ApplyEdits {
+                buffer_id,
+                revision,
+                ops: vec![flavite_buffer::EditOp::new(
+                    flavite_syntax::text::Span::new(
+                        flavite_syntax::text::TextByte(5),
+                        flavite_syntax::text::TextByte(5),
+                    ),
+                    " more".to_owned(),
+                )],
+                undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            }),
+        ),
+        "dirty edit",
+    );
+    let dirty_revision = match edited {
+        CommandResult::EditsApplied { new_revision, .. } => new_revision.as_u64(),
+        other => panic!("{other:?}"),
+    };
+    let draft = wait_terminal(
         &h.session,
         h.session.execute(SessionCommand::ReplacePreviewPrepare {
             request_id: rid(),
@@ -377,7 +410,29 @@ fn draft_inclusion_is_refused_and_open_clean_lineage_is_recorded() {
             },
         }),
     );
-    assert!(matches!(refused, SessionResult::Error { .. }));
+    let CommandResult::ReplacePreviewSealed { manifest, .. } =
+        expect_success(draft, "draft preview")
+    else {
+        panic!("sealed draft preview");
+    };
+    assert!(manifest.include_drafts);
+    let draft_note = manifest
+        .notes
+        .iter()
+        .find(|n| n.path == "notes/a.md")
+        .expect("draft candidate");
+    assert_eq!(
+        draft_note.source_kind,
+        flavite_vault::replace::SourceKind::Draft
+    );
+    let lineage = draft_note.draft_lineage.as_ref().expect("draft lineage");
+    assert_eq!(lineage.buffer_id, buffer_id.as_u64());
+    assert_eq!(lineage.preview_revision, dirty_revision);
+    assert!(lineage.applied_revision.is_none());
+    assert!(!lineage.checkpointed);
+    // The draft's before payload is its serialized current content.
+    assert_eq!(draft_note.before.len, 11);
+    assert_eq!(draft_note.after.len, 7);
 }
 
 #[test]

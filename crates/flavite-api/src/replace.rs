@@ -127,6 +127,17 @@ pub struct ReplaceJobStatusArgs {
     pub job_id: String,
 }
 
+/// Wrapper for `replace.revert` (RFC-0006 S09/D-11): a guarded new action
+/// epoch restoring the sealed before-payloads of applied items.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceRevertArgs {
+    /// Hex job id of the apply job to revert.
+    pub job_id: String,
+    /// Caller-generated 128-bit hex idempotency key.
+    pub idempotency_key: String,
+}
+
 fn default_page_len() -> usize {
     50
 }
@@ -314,6 +325,19 @@ pub(crate) fn handle_replace_job_status(
     }))
 }
 
+/// `replace.revert` (WriteNotes): start a guarded Revert action epoch.
+pub(crate) fn handle_replace_revert(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: ReplaceRevertArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::ReplaceRevert {
+        request_id: invocation.request_id,
+        job_id: decode_id(&args.job_id)?,
+        idempotency_key: decode_id(&args.idempotency_key)?,
+    }))
+}
+
 /// Stable snake_case job phase string.
 #[must_use]
 pub fn job_phase_str(phase: flavite_vault::replace::JobPhase) -> &'static str {
@@ -333,12 +357,15 @@ pub fn job_status_json(
             "saved": totals.saved,
             "index_pending": totals.index_pending,
             "conflicts": totals.conflicts,
+            "applied_drafts": totals.applied_drafts,
             "stale": totals.stale,
             "busy": totals.busy,
             "unsupported": totals.unsupported,
             "needs_recovery": totals.needs_recovery,
             "satisfied_unattributed": totals.satisfied_unattributed,
             "not_started": totals.not_started,
+            "reverted": totals.reverted,
+            "reverted_drafts": totals.reverted_drafts,
         },
     })
 }
@@ -370,6 +397,7 @@ pub fn exclusion_reason_str(reason: flavite_vault::replace::ExclusionReason) -> 
         flavite_vault::replace::ExclusionReason::Oversize => "oversize",
         flavite_vault::replace::ExclusionReason::Undecodable => "undecodable",
         flavite_vault::replace::ExclusionReason::OutputTooLarge => "output_too_large",
+        flavite_vault::replace::ExclusionReason::UnencodableDraft => "unencodable_draft",
     }
 }
 
@@ -436,7 +464,10 @@ pub fn preview_candidate_json(
         "item_id": note.item_id,
         "path": note.path,
         "path_native": note.path_native,
-        "source_kind": "saved",
+        "source_kind": match note.source_kind {
+            flavite_vault::replace::SourceKind::Saved => "saved",
+            flavite_vault::replace::SourceKind::Draft => "draft",
+        },
         "disk_hash": note.disk_hash,
         "content_hash": note.content_hash,
         "format": {
@@ -453,6 +484,13 @@ pub fn preview_candidate_json(
         "open_lineage": note.open_lineage.as_ref().map(|lineage| serde_json::json!({
             "buffer_id": lineage.buffer_id,
             "revision": lineage.revision,
+        })),
+        "draft_lineage": note.draft_lineage.as_ref().map(|lineage| serde_json::json!({
+            "buffer_id": lineage.buffer_id,
+            "preview_revision": lineage.preview_revision,
+            "disk_base_hash": lineage.disk_base_hash,
+            "applied_revision": lineage.applied_revision,
+            "checkpointed": lineage.checkpointed,
         })),
     })
 }

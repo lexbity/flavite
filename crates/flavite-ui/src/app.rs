@@ -465,6 +465,10 @@ pub enum Message {
     ReplaceResume {
         tab: TabId,
     },
+    /// RFC-0006 S09: start a guarded Revert action epoch for the job.
+    ReplaceRevert {
+        tab: TabId,
+    },
     /// Focus the Replace tab owning a durable job.
     ReplaceFocusTab {
         tab: TabId,
@@ -2924,6 +2928,9 @@ impl App {
             }
             Message::ReplaceResume { tab } => {
                 self.replace.resume_job(tab, self.flavite.as_ref());
+            }
+            Message::ReplaceRevert { tab } => {
+                self.replace.revert_job(tab, self.flavite.as_ref());
             }
             Message::ReplaceFocusTab { tab } => {
                 self.status = format!("Replacement job on tab {}", tab.raw());

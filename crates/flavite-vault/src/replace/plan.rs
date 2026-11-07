@@ -39,13 +39,17 @@ pub struct ScopeVersion {
     pub generation: u64,
 }
 
-/// The source kind of a candidate. Only `Saved` exists in S07; draft
-/// candidates land with S09 (D-09).
+/// The source kind of a candidate (D-09). `Saved` candidates operate on
+/// the disk bytes; `Draft` candidates are open buffers with unsaved edits,
+/// explicitly opted in via `PreviewRequest::include_drafts` (S09).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     /// A clean saved-disk note; its disk bytes are the working source.
     Saved,
+    /// An open buffer with unsaved edits; the buffer snapshot is the
+    /// working source and a durable recovery checkpoint seals the effect.
+    Draft,
 }
 
 /// Why a scoped note was excluded from the preview (D-09: known exclusions
@@ -70,6 +74,9 @@ pub enum ExclusionReason {
     Undecodable,
     /// The per-note replacement output would exceed its bound.
     OutputTooLarge,
+    /// The draft cannot be serialized under its own strict descriptor
+    /// (e.g. a strict-ASCII draft holding non-ASCII text, §6.10).
+    UnencodableDraft,
 }
 
 impl ExclusionReason {
@@ -85,6 +92,7 @@ impl ExclusionReason {
             Self::Oversize => "oversize",
             Self::Undecodable => "encoding undetermined or malformed",
             Self::OutputTooLarge => "output exceeds bound",
+            Self::UnencodableDraft => "draft cannot be encoded under its descriptor",
         }
     }
 }
@@ -115,6 +123,26 @@ pub struct OpenLineage {
     pub buffer_id: u64,
     /// Exact revision observed at preview time.
     pub revision: u64,
+}
+
+/// Draft-candidate lineage (RFC-0006 S09/D-09/D-11): the exact buffer
+/// revision, source hash and disk base captured at preview time, plus the
+/// revision the replacement install produced once applied (`applied_revision`)
+/// and whether a durable recovery checkpoint covers it. `applied_revision`
+/// is filled by the coordinator, never by the preview; the record is
+/// persisted beside the job (sidecar) and read at restart/revert time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftLineage {
+    /// Buffer id (session-local; never a restart identity).
+    pub buffer_id: u64,
+    /// Exact revision observed at preview time.
+    pub preview_revision: u64,
+    /// Disk base hash (hex) at preview time — the draft's disk precondition.
+    pub disk_base_hash: String,
+    /// Revision immediately after the replacement install (None until Apply).
+    pub applied_revision: Option<u64>,
+    /// Whether a durable recovery checkpoint covers the applied revision.
+    pub checkpointed: bool,
 }
 
 /// Compact source-format descriptor as persisted in the manifest. The
@@ -181,6 +209,10 @@ pub struct NoteCandidateRecord {
     pub no_change: bool,
     /// Clean open-buffer lineage, when open at preview time.
     pub open_lineage: Option<OpenLineage>,
+    /// Draft-candidate lineage; `Some` only when `source_kind` is `Draft`
+    /// (S09). Older plans without it remain readable (serde default).
+    #[serde(default)]
+    pub draft_lineage: Option<DraftLineage>,
 }
 
 /// Aggregate preview totals (derived from per-item records on loads).
@@ -239,6 +271,10 @@ pub struct PreviewManifest {
     pub selection_revision: Option<u64>,
     /// Digest of the current selection (hex); `None` until selected.
     pub selection_digest: Option<String>,
+    /// Whether the preview explicitly opted dirty buffers in as draft
+    /// candidates (S09/D-09). Absent in older plans (serde default false).
+    #[serde(default)]
+    pub include_drafts: bool,
     /// Candidate records in canonical native order.
     pub notes: Vec<NoteCandidateRecord>,
     /// Typed exclusions.
@@ -289,6 +325,7 @@ mod tests {
             expires_at_unix_ms: 0,
             selection_revision: None,
             selection_digest: None,
+            include_drafts: false,
             notes: vec![],
             exclusions: vec![],
         };
@@ -335,6 +372,7 @@ mod tests {
             expires_at_unix_ms: 0,
             selection_revision: None,
             selection_digest: None,
+            include_drafts: false,
             notes: vec![],
             exclusions: vec![],
         };

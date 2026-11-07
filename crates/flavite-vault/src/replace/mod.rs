@@ -16,14 +16,14 @@ pub mod store;
 pub use auth::{KeyStoreError, OperationKey, load_or_create_key};
 pub use coordinator::{
     CoordinatorCtx, ItemEffect, JobItem, JobPhase, JobTotals, ReplaceItemOutcome,
-    ReplaceItemRequest, run_apply,
+    ReplaceItemRequest, read_draft_state, run_apply, run_revert, write_draft_state,
 };
 pub use log::{
     GENESIS_AUTH, ItemAction, JobLog, LogError, LogRecord, MAX_LOG_FRAME_BYTES,
-    PersistedItemOutcome,
+    PersistedItemOutcome, PersistedRevertOutcome,
 };
 pub use plan::{
-    ENGINE_VERSION, ExclusionReason, MAX_PREVIEW_PAYLOAD_BYTES, MAX_SCOPE_NOTES,
+    DraftLineage, ENGINE_VERSION, ExclusionReason, MAX_PREVIEW_PAYLOAD_BYTES, MAX_SCOPE_NOTES,
     MAX_SOURCE_MATCHES, NoteCandidateRecord, NoteExclusion, OpenLineage, PreviewManifest,
     PreviewTotals, ScopeVersion, SealedPayloadRef, SourceKind,
 };

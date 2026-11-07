@@ -21,7 +21,7 @@ use flavite_text_search::template::{ReplacementTemplate, TemplateGrammar};
 use super::plan::OPERATIONS_DIR;
 pub use super::plan::PreviewManifest;
 use super::plan::{
-    ENGINE_VERSION, ExclusionReason, MAX_PREVIEW_PAYLOAD_BYTES, MAX_SCOPE_NOTES,
+    DraftLineage, ENGINE_VERSION, ExclusionReason, MAX_PREVIEW_PAYLOAD_BYTES, MAX_SCOPE_NOTES,
     MAX_SOURCE_MATCHES, NoteCandidateRecord, NoteExclusion, OpenLineage, PreviewTotals,
     ScopeVersion, SourceKind,
 };
@@ -258,23 +258,83 @@ fn open_buffer_map(ctx: &PreviewCtx) -> HashMap<PathBuf, (u64, Revision, BufferS
 
 /// A successfully opened eligible note.
 struct NoteRead {
-    /// Raw disk bytes (before payload).
+    /// Raw payload bytes (disk bytes, or the serialized current draft).
     bytes: Vec<u8>,
     /// Decoded snapshot.
     snapshot: TextSnapshot,
     /// Open buffer lineage when the note was open and Clean.
     lineage: Option<OpenLineage>,
+    /// Draft-candidate lineage when the note was an opted-in Dirty buffer.
+    draft: Option<DraftLineage>,
 }
 
 /// Read one scoped note under the max-note bound, classifying skips as
-/// typed exclusions.
+/// typed exclusions. With `include_drafts` (S09/D-09), an open Dirty
+/// buffer becomes a draft candidate whose payload is its serialized
+/// current content (under its own descriptor), and whose disk base is
+/// recorded for later guards; Conflicted/Orphaned buffers remain excluded.
 fn read_note(
     ctx: &PreviewCtx,
     entry: &NoteCatalogEntry,
     open: &HashMap<PathBuf, (u64, Revision, BufferState)>,
+    include_drafts: bool,
 ) -> Result<NoteRead, NoteExclusion> {
     let relative = PathBuf::from(&entry.path);
     let full = ctx.root.join(&relative);
+    if include_drafts && let Some((buffer_id, revision, BufferState::Dirty)) = open.get(&relative) {
+        let manager = ctx
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(buffer) =
+            manager.get_buffer_by_id(flavite_buffer::revision::BufferId::from(*buffer_id))
+        else {
+            return Err(NoteExclusion {
+                path: entry.path.clone(),
+                reason: ExclusionReason::DirtyBuffer,
+            });
+        };
+        if buffer.state() != BufferState::Dirty {
+            // The buffer moved on between enumeration and read; fall
+            // through to the ordinary disk classification.
+        } else {
+            let bytes = match buffer.model().try_to_source_bytes() {
+                Ok(bytes) => bytes,
+                Err(flavite_encoding::CodecError::Unencodable { .. }) => {
+                    return Err(NoteExclusion {
+                        path: entry.path.clone(),
+                        reason: ExclusionReason::UnencodableDraft,
+                    });
+                }
+                Err(_) => {
+                    return Err(NoteExclusion {
+                        path: entry.path.clone(),
+                        reason: ExclusionReason::OutputTooLarge,
+                    });
+                }
+            };
+            let snapshot = TextSnapshot::new(&bytes).map_err(|_| NoteExclusion {
+                path: entry.path.clone(),
+                reason: ExclusionReason::Undecodable,
+            })?;
+            let disk_base_hash = buffer
+                .base_hash()
+                .map(|hash| hex::encode(hash.as_bytes()))
+                .unwrap_or_default();
+            return Ok(NoteRead {
+                bytes,
+                snapshot,
+                lineage: None,
+                draft: Some(DraftLineage {
+                    buffer_id: *buffer_id,
+                    preview_revision: revision.as_u64(),
+                    disk_base_hash,
+                    applied_revision: None,
+                    checkpointed: false,
+                }),
+            });
+        }
+    }
     let lineage = match open.get(&relative) {
         Some((buffer_id, revision, BufferState::Clean)) => Some(OpenLineage {
             buffer_id: *buffer_id,
@@ -337,6 +397,7 @@ fn read_note(
         bytes,
         snapshot,
         lineage,
+        draft: None,
     })
 }
 
@@ -544,7 +605,7 @@ pub fn run_find(
         {
             return Err(PreviewError::Cancelled);
         }
-        let read = match read_note(ctx, entry, &open) {
+        let read = match read_note(ctx, entry, &open, false) {
             Ok(read) => read,
             Err(exclusion) => {
                 exclusions.push(exclusion);
@@ -669,11 +730,6 @@ pub fn run_preview(
     io: &dyn OpStoreIo,
     cancelled: &AtomicBool,
 ) -> Result<PreviewManifest, PreviewError> {
-    if request.include_drafts {
-        return Err(PreviewError::InvalidInput(
-            "draft inclusion is not available in this build",
-        ));
-    }
     let find_request = SourceFindRequest {
         query: request.query.clone(),
         mode: request.mode,
@@ -718,7 +774,7 @@ pub fn run_preview(
         {
             return Err(PreviewError::Cancelled);
         }
-        let read = match read_note(ctx, entry, &open) {
+        let read = match read_note(ctx, entry, &open, request.include_drafts) {
             Ok(read) => read,
             Err(exclusion) => {
                 if matches!(
@@ -726,6 +782,7 @@ pub fn run_preview(
                     ExclusionReason::DirtyBuffer
                         | ExclusionReason::ConflictedBuffer
                         | ExclusionReason::OrphanedBuffer
+                        | ExclusionReason::UnencodableDraft
                 ) {
                     drafts = drafts.saturating_add(1);
                 }
@@ -784,8 +841,22 @@ pub fn run_preview(
             item_id: u64::try_from(index).unwrap_or(u64::MAX),
             path: entry.path.clone(),
             path_native: hex::encode(&entry.path_native),
-            source_kind: SourceKind::Saved,
-            disk_hash: hex::encode(blake3::hash(&read.bytes).as_bytes()),
+            source_kind: if read.draft.is_some() {
+                SourceKind::Draft
+            } else {
+                SourceKind::Saved
+            },
+            disk_hash: if read.draft.is_some() {
+                // The disk base hash was recorded on the draft lineage; the
+                // `before` payload for a draft is its serialized current
+                // content, not the disk file.
+                read.draft
+                    .as_ref()
+                    .map(|lineage| lineage.disk_base_hash.clone())
+                    .unwrap_or_default()
+            } else {
+                hex::encode(blake3::hash(&read.bytes).as_bytes())
+            },
             content_hash: hex::encode(blake3::hash(read.snapshot.text().as_bytes()).as_bytes()),
             format: super::plan::PersistedSourceFormat::from_format(
                 format_stamp
@@ -802,6 +873,7 @@ pub fn run_preview(
             output_bytes: u64::try_from(after_bytes.len()).unwrap_or(u64::MAX),
             no_change,
             open_lineage: read.lineage,
+            draft_lineage: read.draft,
         });
     }
     let matched = notes.iter().filter(|n| !n.no_change).count() as u64;
@@ -829,6 +901,7 @@ pub fn run_preview(
         expires_at_unix_ms: now_ms.saturating_add(super::plan::PREVIEW_TTL.as_secs() * 1000),
         selection_revision: None,
         selection_digest: None,
+        include_drafts: request.include_drafts,
         notes,
         exclusions,
     };
@@ -952,7 +1025,10 @@ mod tests {
     }
 
     #[test]
-    fn preview_rejects_draft_inclusion_in_s07() {
+    fn draft_inclusion_flag_is_an_explicit_opt_in() {
+        // S09/D-09: draft inclusion is an explicit opt-in carried by the
+        // request and sealed into the manifest; the engine-level behavior
+        // is exercised through real Session preview tests.
         let request = PreviewRequest {
             query: "x".into(),
             replacement: "y".into(),
@@ -961,9 +1037,21 @@ mod tests {
             whole_word: false,
             include_drafts: true,
         };
-        // The request-level guard is the Session admission; the engine
-        // guard is exercised through a Session test. Here we only pin the
-        // policy flag.
         assert!(request.include_drafts);
+        assert!(
+            !PreviewRequest {
+                include_drafts: false,
+                ..request
+            }
+            .include_drafts
+        );
+    }
+
+    #[test]
+    fn unencodable_draft_reason_is_typed() {
+        assert_eq!(
+            ExclusionReason::UnencodableDraft.label(),
+            "draft cannot be encoded under its descriptor"
+        );
     }
 }

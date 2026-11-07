@@ -956,6 +956,12 @@ impl Flavite {
                 crate::replace::handle_replace_job_status,
             ),
             (
+                "replace.revert",
+                "Revert an applied replacement job",
+                ArgSchema::typed::<crate::replace::ReplaceRevertArgs>(),
+                crate::replace::handle_replace_revert,
+            ),
+            (
                 "link.prepare",
                 "Prepare link insertion",
                 ArgSchema::typed::<crate::links::LinkPrepareArgs>(),

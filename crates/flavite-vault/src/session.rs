@@ -501,6 +501,15 @@ pub enum SessionCommand {
         job_id: u128,
         idempotency_key: u128,
     },
+    /// Start a guarded Revert action epoch (RFC-0006 S09/D-11): restore the
+    /// selected before-payloads of applied items under after-hash/lineage
+    /// preconditions. `idempotency_key` is caller-generated and bound to
+    /// the job/action.
+    ReplaceRevert {
+        request_id: u64,
+        job_id: u128,
+        idempotency_key: u128,
+    },
     /// Current job status and totals.
     ReplaceJobStatus { job_id: u128 },
 }
@@ -1028,6 +1037,10 @@ pub struct Session {
     /// RFC-0006 S07: request ids of admitted-but-not-installed replace
     /// jobs (so `wait_for_operation` treats them as in-flight).
     pending_replace: Mutex<HashSet<u64>>,
+    /// In-flight `text.find`/`text.prepare_replace` request ids (lost on
+    /// drain: `wait_for_operation` needs them to stay reported as in
+    /// flight until the text worker's completion lands).
+    pending_text: Mutex<HashSet<u64>>,
     /// RFC-0006 S08: per-note source leases (non-replacing; D-10).
     leases: Arc<crate::source_leases::SourceLeaseRegistry>,
     /// RFC-0006 S08: durable replacement jobs by job id.
@@ -1127,6 +1140,15 @@ enum ReplaceWork {
         state: Arc<Mutex<JobState>>,
         cancel: Arc<AtomicBool>,
     },
+    /// RFC-0006 S09/D-11: run one guarded Revert action epoch.
+    Revert {
+        job_id: u128,
+        ctx: crate::replace::CoordinatorCtx,
+        key: crate::replace::OperationKey,
+        store: crate::replace::ReplaceStore,
+        state: Arc<Mutex<JobState>>,
+        cancel: Arc<AtomicBool>,
+    },
 }
 
 /// One finished S07 scan / S08 apply awaiting installation.
@@ -1160,10 +1182,21 @@ enum ReplaceOutcomeMessage {
     },
 }
 
-/// Shared job state (RFC-0006 S08): the worker mutates items; the Session
-/// reads phase/totals for status and idempotent receipts.
+/// Which action epoch a job is currently running (RFC-0006 S09/D-11):
+/// apply runs the sealed forward replacement; revert restores the sealed
+/// before-payloads. The mode is persisted implicitly by the action records
+/// in the authenticated log and reconstructed on restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobMode {
+    Apply,
+    Revert,
+}
+
+/// Shared job state (RFC-0006 S08/S09): the worker mutates items; the
+/// Session reads phase/totals for status and idempotent receipts.
 struct JobState {
     phase: crate::replace::JobPhase,
+    mode: JobMode,
     items: Vec<crate::replace::JobItem>,
     totals: crate::replace::JobTotals,
 }
@@ -1639,6 +1672,14 @@ impl Session {
                                     store,
                                     state,
                                     cancel,
+                                }
+                                | ReplaceWork::Revert {
+                                    job_id,
+                                    ctx,
+                                    key,
+                                    store,
+                                    state,
+                                    cancel,
                                 } => {
                                     let job_hex = hex::encode(job_id.to_be_bytes());
                                     let io = crate::replace::ActorOpStoreIo::new(ctx.actor.clone());
@@ -1662,15 +1703,26 @@ impl Session {
                                         .map_err(|error| error.to_string())?;
                                         let mut guard = state.lock_recovering();
                                         guard.recompute();
-                                        let (phase, totals) = crate::replace::run_apply(
-                                            &ctx,
-                                            &job_hex,
-                                            &mut guard.items,
-                                            &cancel,
-                                            &mut log,
-                                            &store,
-                                            &io,
-                                        );
+                                        let (phase, totals) = match guard.mode {
+                                            JobMode::Revert => crate::replace::run_revert(
+                                                &ctx,
+                                                &job_hex,
+                                                &mut guard.items,
+                                                &cancel,
+                                                &mut log,
+                                                &store,
+                                                &io,
+                                            ),
+                                            JobMode::Apply => crate::replace::run_apply(
+                                                &ctx,
+                                                &job_hex,
+                                                &mut guard.items,
+                                                &cancel,
+                                                &mut log,
+                                                &store,
+                                                &io,
+                                            ),
+                                        };
                                         guard.phase = phase;
                                         guard.totals = totals.clone();
                                         Ok((phase, totals))
@@ -1720,6 +1772,7 @@ impl Session {
             preview_nonce: text_plan_nonce,
             preview_counter: AtomicU64::new(0),
             pending_replace: Mutex::new(HashSet::new()),
+            pending_text: Mutex::new(HashSet::new()),
             leases: Arc::new(crate::source_leases::SourceLeaseRegistry::new()),
             replace_jobs_map: Mutex::new(HashMap::new()),
             active_apply: Mutex::new(None),
@@ -1988,6 +2041,11 @@ impl Session {
             .dirty_buffers()
             .into_iter()
             .filter(|(_, buffer)| buffer.allows_autosave())
+            // S09/D-11: a draft replacement holds the source lease through
+            // its durable checkpoint; autosave must not save the
+            // after-text mid-effect. The lease refuses it anyway; skipping
+            // avoids noisy failure records for a normal policy pause.
+            .filter(|(path, _)| !self.leased_by_replace(path))
             .map(|(path, buffer)| (path.clone(), buffer.buffer_id(), buffer.revision()))
             .collect::<Vec<_>>();
         for (path, buffer_id, revision) in dirty {
@@ -2373,6 +2431,11 @@ impl Session {
                 job_id,
                 idempotency_key,
             } => self.replace_resume(request_id, job_id, idempotency_key),
+            SessionCommand::ReplaceRevert {
+                request_id,
+                job_id,
+                idempotency_key,
+            } => self.replace_revert(request_id, job_id, idempotency_key),
             SessionCommand::ReplaceJobStatus { job_id } => self.replace_job_status(job_id),
             SessionCommand::RestoreHistory {
                 path,
@@ -2945,6 +3008,7 @@ impl Session {
             self.pump_reconcile_completions();
             self.pump_rename_completions();
             self.pump_replace_completions();
+            self.pump_text_completions();
             if let Some(result) = self.take_completion(request_id) {
                 return result;
             }
@@ -3006,6 +3070,7 @@ impl Session {
                 .values()
                 .any(|flight| flight.request_ids.contains(&request_id))
             || self.pending_replace.lock_recovering().contains(&request_id)
+            || self.pending_text.lock_recovering().contains(&request_id)
     }
 
     /// Record a terminal operation result and wake any parked waiters (S6).
@@ -3596,6 +3661,7 @@ impl Session {
                     })
                     .is_ok() =>
             {
+                self.pending_text.lock_recovering().insert(request_id);
                 SessionResult::Pending { request_id }
             }
             _ => SessionResult::Error {
@@ -3633,6 +3699,7 @@ impl Session {
                     })
                     .is_ok() =>
             {
+                self.pending_text.lock_recovering().insert(request_id);
                 SessionResult::Pending { request_id }
             }
             _ => SessionResult::Error {
@@ -3806,7 +3873,7 @@ impl Session {
         }
     }
 
-    /// The durable-replacement coordinator context (RFC-0006 S08).
+    /// The durable-replacement coordinator context (RFC-0006 S08/S09).
     #[must_use]
     pub fn coordinator_ctx(&self) -> crate::replace::CoordinatorCtx {
         crate::replace::CoordinatorCtx {
@@ -3815,6 +3882,8 @@ impl Session {
             data_dir: self.data_dir.clone(),
             vault_uuid: self.identity.uuid,
             leases: Arc::clone(&self.leases),
+            manager: Arc::clone(&self.buffer_manager),
+            recovery_writer: self.recovery_writer.clone(),
         }
     }
 
@@ -3893,16 +3962,16 @@ impl Session {
                 // out of the resumable set (inspection-only via doctor).
                 continue;
             };
-            let record_effects: std::collections::HashMap<u64, crate::replace::ItemEffect> = log
-                .records()
-                .ok()
-                .map(|records| {
-                    records
-                        .into_iter()
-                        .filter_map(|record| match record.action {
-                            crate::replace::ItemAction::Outcome { outcome } => Some((
-                                record.item_id,
-                                match outcome {
+            let mut record_effects: std::collections::HashMap<u64, crate::replace::ItemEffect> =
+                std::collections::HashMap::new();
+            let mut saw_revert = false;
+            {
+                let records = log.records().ok();
+                if let Some(records) = records {
+                    for record in records {
+                        match record.action {
+                            crate::replace::ItemAction::Outcome { outcome } => {
+                                let effect = match outcome {
                                     crate::replace::PersistedItemOutcome::Saved => {
                                         crate::replace::ItemEffect::Saved
                                     }
@@ -3911,6 +3980,9 @@ impl Session {
                                     }
                                     crate::replace::PersistedItemOutcome::AppliedConflict => {
                                         crate::replace::ItemEffect::AppliedConflict
+                                    }
+                                    crate::replace::PersistedItemOutcome::AppliedDraft => {
+                                        crate::replace::ItemEffect::AppliedDraft
                                     }
                                     crate::replace::PersistedItemOutcome::Stale => {
                                         crate::replace::ItemEffect::Stale
@@ -3927,13 +3999,34 @@ impl Session {
                                     crate::replace::PersistedItemOutcome::SatisfiedUnattributed => {
                                         crate::replace::ItemEffect::SatisfiedUnattributed
                                     }
-                                },
-                            )),
-                            _ => None,
-                        })
-                        .collect::<std::collections::HashMap<_, _>>()
-                })
-                .unwrap_or_default();
+                                };
+                                record_effects.insert(record.item_id, effect);
+                            }
+                            crate::replace::ItemAction::RevertOutcome { outcome } => {
+                                saw_revert = true;
+                                let effect = match outcome {
+                                    crate::replace::PersistedRevertOutcome::Reverted => {
+                                        crate::replace::ItemEffect::Reverted
+                                    }
+                                    crate::replace::PersistedRevertOutcome::RevertedDraft => {
+                                        crate::replace::ItemEffect::RevertedDraft
+                                    }
+                                    crate::replace::PersistedRevertOutcome::Stale => {
+                                        crate::replace::ItemEffect::Stale
+                                    }
+                                    crate::replace::PersistedRevertOutcome::NeedsRecovery => {
+                                        crate::replace::ItemEffect::NeedsRecovery
+                                    }
+                                };
+                                record_effects.insert(record.item_id, effect);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let draft_state =
+                crate::replace::read_draft_state(&io, &store, &dir).unwrap_or_default();
             let mut items: Vec<crate::replace::JobItem> = Vec::new();
             for note in &manifest.notes {
                 if !selected_ids.contains(&note.item_id) {
@@ -3942,32 +4035,83 @@ impl Session {
                 let effect = match record_effects.get(&note.item_id) {
                     Some(effect) => Some(*effect),
                     None => {
-                        // Classify against durable disk hashes (D-11):
-                        // before-hash = not yet applied; after-hash =
-                        // satisfied (never overwritten again); neither =
-                        // divergence.
-                        let full = self.identity.root.join(&note.path);
-                        let current = self
-                            .actor
-                            .read_bounded(full, flavite_index::MAX_NOTE_BYTES as u64);
-                        match current {
-                            Ok(Some(bytes)) => {
-                                let hash = hex::encode(blake3::hash(&bytes).as_bytes());
-                                if hash == note.disk_hash {
-                                    None
-                                } else if hash == note.after.hash {
-                                    Some(crate::replace::ItemEffect::SatisfiedUnattributed)
-                                } else {
-                                    Some(crate::replace::ItemEffect::NeedsRecovery)
+                        if note.source_kind == crate::replace::SourceKind::Draft {
+                            // Draft classification (S09/D-11): the recovery
+                            // checkpoint is the marker. Recorded text equal
+                            // to the after-payload = satisfied (never
+                            // re-applied); equal to the before-payload =
+                            // not started; otherwise divergence.
+                            let note_key = crate::session::native_note_key(
+                                &self.identity.root.join(&note.path),
+                                &self.identity.root,
+                            );
+                            let recovery = self.recovery_writer.as_ref().and_then(|writer| {
+                                writer.lock_recovering().read_for_note_key(&note_key)
+                            });
+                            match recovery {
+                                Some(file) => {
+                                    let after_text = store
+                                        .read_payload(&io, &dir, &note.after)
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|bytes| {
+                                            flavite_syntax::text::TextSnapshot::new(&bytes).ok()
+                                        })
+                                        .map(|snapshot| snapshot.text().to_owned());
+                                    let before_text = store
+                                        .read_payload(&io, &dir, &note.before)
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|bytes| {
+                                            flavite_syntax::text::TextSnapshot::new(&bytes).ok()
+                                        })
+                                        .map(|snapshot| snapshot.text().to_owned());
+                                    match after_text {
+                                        Some(after) if file.text == after => {
+                                            Some(crate::replace::ItemEffect::SatisfiedUnattributed)
+                                        }
+                                        _ if before_text.as_deref() == Some(file.text.as_str()) => {
+                                            None
+                                        }
+                                        _ => Some(crate::replace::ItemEffect::NeedsRecovery),
+                                    }
                                 }
+                                None => None,
                             }
-                            Ok(None) => Some(crate::replace::ItemEffect::Stale),
-                            Err(_) => Some(crate::replace::ItemEffect::NeedsRecovery),
+                        } else {
+                            // Classify against durable disk hashes (D-11):
+                            // before-hash = not yet applied; after-hash =
+                            // satisfied (never overwritten again); neither =
+                            // divergence.
+                            let full = self.identity.root.join(&note.path);
+                            let current = self
+                                .actor
+                                .read_bounded(full, flavite_index::MAX_NOTE_BYTES as u64);
+                            match current {
+                                Ok(Some(bytes)) => {
+                                    let hash = hex::encode(blake3::hash(&bytes).as_bytes());
+                                    if hash == note.disk_hash {
+                                        None
+                                    } else if hash == note.after.hash {
+                                        Some(crate::replace::ItemEffect::SatisfiedUnattributed)
+                                    } else {
+                                        Some(crate::replace::ItemEffect::NeedsRecovery)
+                                    }
+                                }
+                                Ok(None) => Some(crate::replace::ItemEffect::Stale),
+                                Err(_) => Some(crate::replace::ItemEffect::NeedsRecovery),
+                            }
                         }
                     }
                 };
+                let mut record = note.clone();
+                if let Some(applied) = record.draft_lineage.as_mut()
+                    && let Some(revision) = draft_state.get(&note.item_id).copied()
+                {
+                    applied.applied_revision = Some(revision);
+                }
                 items.push(crate::replace::JobItem {
-                    record: note.clone(),
+                    record,
                     effect,
                     receipts: std::collections::BTreeMap::new(),
                 });
@@ -3997,6 +4141,11 @@ impl Session {
             let totals = crate::replace::JobTotals::from_items(&items);
             let state = Arc::new(Mutex::new(JobState {
                 phase,
+                mode: if saw_revert {
+                    JobMode::Revert
+                } else {
+                    JobMode::Apply
+                },
                 items,
                 totals,
             }));
@@ -4131,18 +4280,15 @@ impl Session {
         SessionResult::Success(CommandResult::SourceFindClosed)
     }
 
-    /// Admit one replacement-preview prepare (S07): full scan and seal on
-    /// a bounded worker; nothing is applied.
+    /// Admit one replacement-preview prepare (S07/S09): full scan and seal
+    /// on a bounded worker; nothing is applied. `include_drafts` (S09)
+    /// explicitly adds Dirty buffers as draft candidates; conflicted and
+    /// orphaned buffers remain excluded until resolved.
     fn replace_preview_prepare(
         &self,
         request_id: u64,
         request: crate::replace::preview::PreviewRequest,
     ) -> SessionResult {
-        if request.include_drafts {
-            return SessionResult::Error {
-                message: "draft inclusion is not available in this build".into(),
-            };
-        }
         self.sweep_source_sessions();
         if self.previews.lock_recovering().len() >= MAX_LIVE_PREVIEWS {
             return SessionResult::Busy;
@@ -4370,6 +4516,7 @@ impl Session {
             .collect();
         let state = Arc::new(Mutex::new(JobState {
             phase: crate::replace::JobPhase::Applying,
+            mode: JobMode::Apply,
             items,
             totals: crate::replace::JobTotals::default(),
         }));
@@ -4485,6 +4632,113 @@ impl Session {
                 };
             }
         };
+        let mode = state.lock_recovering().mode;
+        state.lock_recovering().phase = crate::replace::JobPhase::Applying;
+        cancel.store(false, Ordering::Relaxed);
+        let store = crate::replace::ReplaceStore::new(&self.identity.root);
+        let ctx = self.coordinator_ctx();
+        self.pending_replace.lock_recovering().insert(request_id);
+        let work = match mode {
+            JobMode::Revert => ReplaceWork::Revert {
+                job_id,
+                ctx,
+                key,
+                store,
+                state,
+                cancel,
+            },
+            JobMode::Apply => ReplaceWork::Apply {
+                job_id,
+                ctx,
+                key,
+                store,
+                state,
+                cancel,
+            },
+        };
+        let admitted = self
+            .replace_jobs
+            .as_ref()
+            .is_some_and(|jobs| jobs.send(ReplaceJob { request_id, work }).is_ok());
+        if !admitted {
+            self.pending_replace.lock_recovering().remove(&request_id);
+            return SessionResult::Error {
+                message: "replacement apply workers are unavailable".into(),
+            };
+        }
+        if let Some(entry) = self.replace_jobs_map.lock_recovering().get_mut(&job_id) {
+            entry.idempotency_key = Some(idempotency_key);
+        }
+        *self.active_apply.lock_recovering() = Some(job_id);
+        SessionResult::Pending { request_id }
+    }
+
+    /// Start a guarded Revert action epoch (RFC-0006 S09/D-11). Eligible
+    /// items are those with a durable applied outcome (Saved/IndexPending/
+    /// AppliedConflict/SatisfiedUnattributed/AppliedDraft); unapplied items
+    /// are left untouched. Guards are rechecked per item on the worker: a
+    /// later edit/rename/external write skips that note (Stale) and offers
+    /// compare/manual recovery. Idempotent within the session.
+    fn replace_revert(
+        &self,
+        request_id: u64,
+        job_id: u128,
+        idempotency_key: u128,
+    ) -> SessionResult {
+        self.sweep_source_sessions();
+        if self.active_apply.lock_recovering().is_some() {
+            return SessionResult::Busy;
+        }
+        let entry = {
+            let jobs = self.replace_jobs_map.lock_recovering();
+            jobs.get(&job_id).map(|entry| {
+                (
+                    Arc::clone(&entry.state),
+                    Arc::clone(&entry.cancel),
+                    entry.selection_revision,
+                )
+            })
+        };
+        let Some((state, cancel, _revision)) = entry else {
+            return SessionResult::ActionRequired {
+                code: "job-unknown",
+                data: None,
+            };
+        };
+        {
+            let guard = state.lock_recovering();
+            if matches!(
+                guard.phase,
+                crate::replace::JobPhase::Applying | crate::replace::JobPhase::Ready
+            ) {
+                return SessionResult::Busy;
+            }
+            if guard.mode == JobMode::Revert
+                && matches!(
+                    guard.phase,
+                    crate::replace::JobPhase::Completed
+                        | crate::replace::JobPhase::Partial
+                        | crate::replace::JobPhase::Cancelled
+                )
+            {
+                // Idempotent replay of an already-run revert epoch.
+                return SessionResult::Success(CommandResult::ReplaceJobFinished {
+                    job_id,
+                    phase: guard.phase,
+                    totals: guard.totals.clone(),
+                });
+            }
+        }
+        let key = match self.operation_key() {
+            Ok(key) => key,
+            Err(message) => {
+                return SessionResult::ActionRequired {
+                    code: "replacement-key-unavailable",
+                    data: Some(message),
+                };
+            }
+        };
+        state.lock_recovering().mode = JobMode::Revert;
         state.lock_recovering().phase = crate::replace::JobPhase::Applying;
         cancel.store(false, Ordering::Relaxed);
         let store = crate::replace::ReplaceStore::new(&self.identity.root);
@@ -4493,7 +4747,7 @@ impl Session {
         let admitted = self.replace_jobs.as_ref().is_some_and(|jobs| {
             jobs.send(ReplaceJob {
                 request_id,
-                work: ReplaceWork::Apply {
+                work: ReplaceWork::Revert {
                     job_id,
                     ctx,
                     key,
@@ -4507,7 +4761,7 @@ impl Session {
         if !admitted {
             self.pending_replace.lock_recovering().remove(&request_id);
             return SessionResult::Error {
-                message: "replacement apply workers are unavailable".into(),
+                message: "replacement revert workers are unavailable".into(),
             };
         }
         if let Some(entry) = self.replace_jobs_map.lock_recovering().get_mut(&job_id) {
@@ -4880,6 +5134,7 @@ impl Session {
                     (request_id, result)
                 }
             };
+            self.pending_text.lock_recovering().remove(&request_id);
             self.record_completion(request_id, result);
         }
     }

@@ -122,6 +122,68 @@ fn preview_select_apply_status_round_trip_across_processes() {
 }
 
 #[test]
+fn revert_round_trip_restores_before_bytes_across_processes() {
+    let env = CliEnv::new();
+    let vault = prepared_vault_dir(&env);
+    let path = vault.to_str().unwrap().to_owned();
+
+    let applied = env.run_ok(&[
+        "replace",
+        "--path",
+        &path,
+        "--no-watch",
+        "--json",
+        "apply",
+        "--query",
+        "alpha",
+        "--replacement",
+        "omega",
+        "--key",
+        &"1".repeat(32),
+    ]);
+    let job_id = applied["job_id"].as_str().expect("job id").to_owned();
+    assert_eq!(applied["status"]["phase"], "completed");
+
+    // Revert in a fresh process (each CLI invocation is a new session).
+    let reverted = env.run_ok(&[
+        "replace",
+        "--path",
+        &path,
+        "--no-watch",
+        "--json",
+        "revert",
+        "--job-id",
+        &job_id,
+        "--key",
+        &"2".repeat(32),
+    ]);
+    assert_eq!(reverted["status"]["phase"], "completed");
+    assert_eq!(reverted["status"]["totals"]["reverted"], 2);
+    assert_eq!(
+        std::fs::read_to_string(vault.join("a.md")).unwrap(),
+        "alpha one\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(vault.join("b.md")).unwrap(),
+        "alpha two\n"
+    );
+
+    // Status in yet another fresh process shows the revert epoch.
+    let status = env.run_ok(&[
+        "replace",
+        "--path",
+        &path,
+        "--no-watch",
+        "--json",
+        "status",
+        "--job-id",
+        &job_id,
+    ]);
+    assert_eq!(status["status"]["phase"], "completed");
+    assert_eq!(status["status"]["totals"]["reverted"], 2);
+}
+
+#[test]
 fn unknown_job_status_is_a_typed_refusal() {
     let env = CliEnv::new();
     let vault = prepared_vault_dir(&env);
