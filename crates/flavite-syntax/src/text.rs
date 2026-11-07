@@ -40,8 +40,7 @@ use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 
 use flavite_encoding::{
-    CancelToken, DecodeLimits, DecodeMap, DecodePolicy, EncodeLimits, SourceFormat,
-    decode as codec_decode, encode as codec_encode,
+    CancelToken, DecodeLimits, DecodeMap, DecodePolicy, SourceFormat, decode as codec_decode,
 };
 
 /// Return the longest prefix of `text` whose UTF-8 byte length is at most
@@ -266,8 +265,8 @@ pub enum TextError {
 /// * a per-line table mapping `TextByte` ↔ `SourceByte` through the composed
 ///   codec + EOL map;
 /// * the [`SourceFormat`] descriptor (encoding + BOM) for disk-backed
-///   snapshots, so [`TextSnapshot::to_source_bytes`] can reproduce the
-///   original file byte-for-byte when it has not been edited.
+///   snapshots; an unedited snapshot's [`TextSnapshot::source`] is the
+///   original file byte-for-byte.
 ///
 /// Snapshots built by [`TextSnapshot::from_normalized`] are a *synthetic*
 /// UTF-8 view: they carry no disk-decoding claim and MUST NOT determine a
@@ -348,7 +347,7 @@ impl TextSnapshot {
         Self::decoding(
             bytes,
             policy,
-            &DecodeLimits::default_envelope(),
+            &DecodeLimits::default(),
             &CancelToken::new(),
         )
     }
@@ -374,12 +373,21 @@ impl TextSnapshot {
     /// second normalization pass (§4.1).
     #[must_use]
     pub fn from_decoded(decoded: flavite_encoding::DecodedContent) -> Self {
-        let map = decoded.map().clone();
-        let decoded_text = decoded.text();
-        let (lines, fold_prefix) = build_lines_encoded(decoded_text, &map);
+        Self::from_parts(Arc::clone(decoded.source()), decoded.map().clone(), decoded.into_text())
+    }
+
+    /// Compose a disk-backed snapshot from already-validated parts — the
+    /// encoded source, its boundary map and the decoded UTF-8 region —
+    /// without decoding again. This is the serialization inverse of
+    /// [`TextSnapshot::from_decoded`]: a buffer that holds its decoded layer
+    /// and re-encodes once can refresh its snapshot without a decode round
+    /// trip (§4.1, D-06).
+    #[must_use]
+    pub fn from_parts(source: Arc<[u8]>, map: DecodeMap, decoded_text: String) -> Self {
+        let (lines, fold_prefix) = build_lines_encoded(&decoded_text, &map);
         Self {
             text: Arc::from(fold_crlf(decoded_text)),
-            source: Arc::clone(decoded.source()),
+            source,
             lines: lines.into(),
             fold_prefix: fold_prefix.into(),
             disk: Some(map),
@@ -450,73 +458,6 @@ impl TextSnapshot {
         self.lines.len()
     }
 
-    /// Reconstruct the exact source bytes of this (unedited) snapshot.
-    ///
-    /// Byte-exact for any input: descriptor BOM, per-line LF/CRLF, standalone
-    /// CR, and a missing trailing newline all survive (§4.8, §6.10, AC-23).
-    /// An unedited disk-backed snapshot's content is, by construction,
-    /// representable under its own descriptor.
-    ///
-    /// # Panics
-    ///
-    /// Only on an internal impossibility: an unedited snapshot failing to
-    /// re-encode under the descriptor it was decoded from.
-    #[must_use]
-    pub fn to_source_bytes(&self) -> Vec<u8> {
-        match &self.disk {
-            None => self.reconstruct_identity(&[]),
-            Some(map) => {
-                let format = map.format();
-                if format.encoding().is_utf16() {
-                    let decoded = self.reconstruct_decoded();
-                    codec_encode(
-                        &decoded,
-                        format,
-                        &EncodeLimits {
-                            max_input_utf8_bytes: u64::MAX,
-                            max_output_bytes: u64::MAX,
-                        },
-                        &flavite_encoding::CancelToken::new(),
-                    )
-                    .expect("an unedited snapshot re-encodes under its own descriptor")
-                } else {
-                    self.reconstruct_identity(format.bom_bytes())
-                }
-            }
-        }
-    }
-
-    /// Identity-family (ASCII/UTF-8) reconstruction: content slices plus the
-    /// physical terminator bytes recorded per line.
-    fn reconstruct_identity(&self, bom: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(bom.len() + self.source.len());
-        out.extend_from_slice(bom);
-        for line in self.lines.iter() {
-            out.extend_from_slice(&self.text.as_bytes()[line.text_start.0..line.text_end.0]);
-            match line.eol {
-                Eol::Lf => out.push(b'\n'),
-                Eol::Crlf => out.extend_from_slice(b"\r\n"),
-                Eol::None => {}
-            }
-        }
-        out
-    }
-
-    /// Reassemble the decoded UTF-8 region (BOM absent, physical CR/LF
-    /// scalars restored) from normalized text + per-line EOL kinds.
-    fn reconstruct_decoded(&self) -> String {
-        let mut out = String::with_capacity(self.text.len() + self.fold_prefix.len());
-        for line in self.lines.iter() {
-            out.push_str(&self.text[line.text_start.0..line.text_end.0]);
-            match line.eol {
-                Eol::Lf => out.push('\n'),
-                Eol::Crlf => out.push_str("\r\n"),
-                Eol::None => {}
-            }
-        }
-        out
-    }
-
     /// Map a normalized offset to its encoded source offset through the
     /// composed codec + EOL map.
     ///
@@ -534,8 +475,8 @@ impl TextSnapshot {
         let idx = self.line_index_for_text(text.0)?;
         let line = &self.lines[idx];
         // At the line's end we are at the terminator's start position: for
-        // CRLF that is the `\r`; for LF the `\n` itself (the inverse mapping
-        // refuses the LF byte again, as before).
+        // CRLF that is the `\r`; for LF the `\n` itself. Both are legal
+        // boundaries and invert through `source_to_text`.
         if text.0 == line.text_end.0 {
             return Some(line.source_end);
         }
@@ -570,13 +511,10 @@ impl TextSnapshot {
         let idx = self.line_index_for_source(source.0)?;
         let line = &self.lines[idx];
         if source.0 == line.source_end.0 {
-            // Terminator start: the `\r` of a CRLF maps to the folded LF
-            // position in text; the LF byte/unit itself is not addressable.
-            return if line.eol == Eol::Crlf {
-                Some(line.text_end)
-            } else {
-                None
-            };
+            // Terminator start: a legal boundary (§6.10) mapping to the
+            // folded LF position in text. Only the LF *side* of a CRLF pair
+            // remains unaddressable (handled below).
+            return Some(line.text_end);
         }
         if source.0 > line.source_end.0 {
             // Inside the terminator (CRLF's LF side) — illegal.
@@ -595,23 +533,13 @@ impl TextSnapshot {
 
     /// Map a full span from normalized to source coordinates.
     ///
-    /// Both endpoints must be legal; otherwise `None`.
+    /// Each endpoint maps exactly like [`TextSnapshot::text_to_source`]; a
+    /// span between two legal boundaries may legitimately cover a physical
+    /// CRLF pair in the source.
     #[must_use]
     pub fn span_to_source(&self, span: Span<TextByte>) -> Option<Span<SourceByte>> {
         let start_source = self.text_to_source(span.start)?;
         let end_source = self.text_to_source(span.end)?;
-
-        // Check if the span starts at a line end with CRLF, which would include
-        // the CRLF interior in the source.
-        if let Some(idx) = self.line_index_for_text(span.start.0) {
-            let line = &self.lines[idx];
-            if span.start.0 == line.text_end.0 && line.eol == Eol::Crlf {
-                // Starts at a CRLF line end, which means the source span would
-                // include the CRLF bytes, which are illegal.
-                return None;
-            }
-        }
-
         Some(Span::new(start_source, end_source))
     }
 
@@ -714,49 +642,86 @@ impl TextSnapshot {
     }
 }
 
-/// Previous grapheme boundary at or before `at`, using default segmentation.
+/// Clamp a byte offset down to the nearest UTF-8 scalar boundary.
 ///
-/// `at` is clamped to the text, so the function is total over valid offsets.
+/// Canonical shared primitive (RFC-0006 §4.1): the editor's caret snapping
+/// and every composed lookup start here instead of private copies.
+#[must_use]
+pub fn clamp_char_boundary(text: &str, byte: usize) -> usize {
+    let mut at = byte.min(text.len());
+    while !text.is_char_boundary(at) {
+        at = at.saturating_sub(1);
+    }
+    at
+}
+
+/// Previous extended-grapheme boundary at or before `at`.
+///
+/// Extended clusters (ZWJ/emoji sequences move as one) are the shared
+/// segmentation for caret movement and whole-text semantics (D-04/D-05).
+/// `at` is clamped to the text, so the function is total over offsets; an
+/// out-of-range offset returns the text length.
 #[must_use]
 pub fn prev_grapheme_boundary(text: &str, at: TextByte) -> TextByte {
     let clamped = at.0.min(text.len());
     let was_clamped = at.0 > text.len();
-
     if clamped == 0 {
         return TextByte(0);
     }
-    // Snap to a char boundary first so we never index mid-scalar.
-    let mut start = clamped;
-    while start > 0 && !text.is_char_boundary(start) {
-        start -= 1;
-    }
-
-    // If we were clamped (out of range) and snapped to the end, return the end.
+    let start = clamp_char_boundary(text, clamped);
+    // Out-of-range input snaps to the end instead of stepping back one
+    // cluster from it.
     if was_clamped && start == text.len() {
         return TextByte(start);
     }
-
-    let head = &text[..start];
-    match head.grapheme_indices(false).next_back() {
-        Some((idx, _)) => TextByte(idx),
-        None => TextByte(0),
-    }
+    let mut cursor = unicode_segmentation::GraphemeCursor::new(start, text.len(), true);
+    TextByte(cursor.prev_boundary(text, 0).expect("complete text").unwrap_or(0))
 }
 
-/// Next grapheme boundary at or after `at`, using default segmentation.
+/// Next extended-grapheme boundary at or after `at`.
 #[must_use]
 pub fn next_grapheme_boundary(text: &str, at: TextByte) -> TextByte {
-    let mut start = at.0.min(text.len());
-    while start < text.len() && !text.is_char_boundary(start) {
-        start += 1;
-    }
+    let start = clamp_char_boundary(text, at.0.min(text.len()));
     if start >= text.len() {
         return TextByte(text.len());
     }
-    match text[start..].grapheme_indices(false).next() {
-        Some((idx, g)) => TextByte(start + idx + g.len()),
-        None => TextByte(text.len()),
-    }
+    let mut cursor = unicode_segmentation::GraphemeCursor::new(start, text.len(), true);
+    TextByte(
+        cursor
+            .next_boundary(text, 0)
+            .expect("complete text")
+            .unwrap_or(text.len()),
+    )
+}
+
+/// Start of the previous UAX #29 word segment that contains word
+/// characters, skipping intervening punctuation (movement policy, D-04).
+///
+/// This is deliberately a different filter from [`word_boundaries`]: word
+/// *movement* lands on words, while whole-word *matching* uses segment
+/// boundaries where punctuation-only matches qualify. Both policies share
+/// the pinned UAX #29 tables (§6.2).
+#[must_use]
+pub fn prev_word_boundary(text: &str, at: TextByte) -> TextByte {
+    let clamped = clamp_char_boundary(text, at.0.min(text.len()));
+    TextByte(
+        text[..clamped]
+            .unicode_word_indices()
+            .next_back()
+            .map_or(0, |(at, _)| at),
+    )
+}
+
+/// End of the next UAX #29 word segment containing word characters.
+#[must_use]
+pub fn next_word_boundary(text: &str, at: TextByte) -> TextByte {
+    let clamped = clamp_char_boundary(text, at.0.min(text.len()));
+    TextByte(
+        text[clamped..]
+            .unicode_word_indices()
+            .next()
+            .map_or(text.len(), |(at, word)| clamped + at + word.len()),
+    )
 }
 
 /// Unicode default (locale-independent) casefold + NFC lookup key (§4.8).
@@ -845,9 +810,11 @@ impl WordBoundarySet {
 }
 
 /// Replace CRLF with LF, leaving standalone CR bytes untouched (§4.8, R12).
-fn fold_crlf(text: &str) -> String {
+/// Ownership of the buffer moves through unchanged when there is nothing to
+/// fold, so open/index paths never copy a CR-free document.
+fn fold_crlf(text: String) -> String {
     if !text.contains('\r') {
-        return text.to_string();
+        return text;
     }
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -990,7 +957,7 @@ mod tests {
         assert!(Arc::ptr_eq(&snapshot.text, &cloned.text));
         assert!(Arc::ptr_eq(&snapshot.source, &cloned.source));
         assert!(Arc::ptr_eq(&snapshot.lines, &cloned.lines));
-        assert_eq!(cloned.to_source_bytes(), snapshot.source());
+        assert_eq!(cloned.source(), snapshot.source());
     }
 
     fn snap(src: &str) -> TextSnapshot {
@@ -1035,7 +1002,7 @@ mod tests {
             "unicode ✓ ✓\r\nsecond\n",
         ] {
             let s = snap(src);
-            assert_eq!(s.to_source_bytes(), src.as_bytes(), "round-trip: {src:?}");
+            assert_eq!(s.source(), src.as_bytes(), "round-trip: {src:?}");
         }
     }
 
@@ -1044,7 +1011,7 @@ mod tests {
         let s = snap("\u{FEFF}hello\r\nworld");
         assert!(s.has_bom());
         assert_eq!(s.text(), "hello\nworld");
-        assert_eq!(s.to_source_bytes(), "\u{FEFF}hello\r\nworld".as_bytes());
+        assert_eq!(s.source(), "\u{FEFF}hello\r\nworld".as_bytes());
         assert_eq!(s.text_to_source(TextByte(0)), Some(SourceByte(3)));
         assert_eq!(
             s.source_to_text(SourceByte(0)),
@@ -1112,9 +1079,14 @@ mod tests {
             s.span_to_source(span),
             Some(Span::new(SourceByte(0), SourceByte(2)))
         );
-        // A span ending inside a CRLF pair is rejected.
-        let bad = Span::new(TextByte(2), TextByte(4));
-        assert_eq!(s.span_to_source(bad), None);
+        // A span across the folded LF legitimately covers the physical CRLF
+        // pair; its endpoints invert individually.
+        let across = Span::new(TextByte(2), TextByte(4));
+        assert_eq!(
+            s.span_to_source(across),
+            Some(Span::new(SourceByte(2), SourceByte(5)))
+        );
+        assert_eq!(s.span_to_source(Span::new(TextByte(2), TextByte(2))), Some(Span::new(SourceByte(2), SourceByte(2))));
     }
 
     #[test]
@@ -1152,6 +1124,81 @@ mod tests {
         let s2 = snap("\u{1F600}");
         assert_eq!(s2.next_grapheme_boundary(TextByte(1)), TextByte(4));
         assert_eq!(s2.prev_grapheme_boundary(TextByte(1)), TextByte(0));
+    }
+
+    #[test]
+    fn extended_grapheme_clusters_move_as_one() {
+        // ZWJ family emoji and long combining runs are one extended cluster
+        // for caret movement (D-04).
+        // GB9 joins marks to their base, GB11 joins emoji across ZWJ.
+        for (text, first_end, second_end) in [
+            ("a🧑🏽‍💻b", 1usize, 16usize),
+            ("a\u{301}\u{301}\u{301}z", 7, 8),
+        ] {
+            let s = snap(text);
+            let first = s.next_grapheme_boundary(TextByte(0));
+            assert_eq!(first.0, first_end, "first cluster of {text:?}");
+            let second = s.next_grapheme_boundary(first);
+            assert_eq!(second.0, second_end, "cluster in {text:?} moves as one");
+            assert_eq!(s.prev_grapheme_boundary(second), first);
+        }
+        // Regional-indicator pairs: each flag is one cluster.
+        let flags = snap("a🇨🇦🇺🇸b");
+        let first = flags.next_grapheme_boundary(TextByte(0));
+        let second = flags.next_grapheme_boundary(first);
+        let third = flags.next_grapheme_boundary(second);
+        assert_eq!(second.0 - first.0, "🇨🇦".len());
+        assert_eq!(third.0 - second.0, "🇺🇸".len());
+        assert_eq!(flags.prev_grapheme_boundary(third), second);
+        // Enumeration from every scalar boundary matches whole-text
+        // segmentation (editor compatibility contract, moved to the owner).
+        for text in ["", "a\r\nb", "e\u{301} 🧑🏽‍💻 🇨🇦🇺🇸", "a\u{301}\u{301}\u{301}z"] {
+            let mut expected = Vec::new();
+            let mut offset = 0usize;
+            expected.push(0usize);
+            for cluster in text.grapheme_indices(true) {
+                offset += cluster.1.len();
+                expected.push(offset);
+            }
+            let mut at = TextByte(0);
+            let mut walked = vec![0usize];
+            while at.0 < text.len() {
+                at = next_grapheme_boundary(text, at);
+                walked.push(at.0);
+            }
+            assert_eq!(walked, expected, "forward walk of {text:?}");
+            for pair in expected.windows(2) {
+                assert_eq!(
+                    prev_grapheme_boundary(text, TextByte(pair[1])),
+                    TextByte(pair[0]),
+                    "backward walk of {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clamp_char_boundary_snaps_down() {
+        let text = "a😀b";
+        assert_eq!(clamp_char_boundary(text, 0), 0);
+        assert_eq!(clamp_char_boundary(text, 2), 1);
+        assert_eq!(clamp_char_boundary(text, 5), 5);
+        assert_eq!(clamp_char_boundary(text, 99), text.len());
+    }
+
+    #[test]
+    fn word_movement_skips_punctuation() {
+        // Movement policy (D-04): land on words, skipping punctuation runs;
+        // matching policy (word_boundaries) keeps punctuation boundaries.
+        assert_eq!(prev_word_boundary("hello, world", TextByte(12)), TextByte(7));
+        assert_eq!(prev_word_boundary("hello, world", TextByte(6)), TextByte(0));
+        assert_eq!(next_word_boundary("hello, world", TextByte(0)), TextByte(5));
+        assert_eq!(next_word_boundary("hello, world", TextByte(5)), TextByte(12));
+        assert_eq!(next_word_boundary("can't stop", TextByte(0)), TextByte(5));
+        assert_eq!(next_word_boundary("", TextByte(0)), TextByte(0));
+        assert_eq!(prev_word_boundary("", TextByte(0)), TextByte(0));
+        // Mid-scalar input snaps down first ("a😀b" is 6 bytes).
+        assert_eq!(next_word_boundary("a😀b", TextByte(2)), TextByte(6));
     }
 
     #[test]

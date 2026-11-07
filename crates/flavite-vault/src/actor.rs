@@ -1753,11 +1753,32 @@ impl VaultActor {
                 let _ = reply.try_send(VaultActorResp::OpStoreList(result));
             }
             VaultActorMsg::ReadFile { path, reply } => {
-                let response = self
-                    .fs
-                    .read_if_exists(&path)
-                    .map(VaultActorResp::File)
-                    .unwrap_or_else(|e| VaultActorResp::Error(e.to_string()));
+                // Untrusted path: bounded contained read like ReadBounded
+                // (§6.5/§6.7 — never an uncontained whole-file read).
+                let result = (|| {
+                    self.fs.validate_in_root(&self.identity.root, &path)?;
+                    if self.fs.is_placeholder(&path)? {
+                        return Err(flavite_fs::FsError::Unsupported(
+                            "Download this attachment locally first".into(),
+                        ));
+                    }
+                    match self.fs.read_capped_in_root(
+                        &self.identity.root,
+                        path.strip_prefix(&self.identity.root)
+                            .map_err(|_| flavite_fs::FsError::PathEscape(path.clone()))?,
+                        MAX_NOTE_BYTES as u64,
+                    ) {
+                        Ok(bytes) => Ok(Some(bytes)),
+                        Err(flavite_fs::FsError::NotFound(_)) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                })();
+                let response = match result {
+                    Ok(bytes) => VaultActorResp::File(bytes),
+                    Err(_) => {
+                        VaultActorResp::Error("Content unavailable or exceeds read limit".into())
+                    }
+                };
                 let _ = reply.try_send(response);
             }
             VaultActorMsg::NoteCatalog {

@@ -224,7 +224,7 @@ fn utf16le_bom_open_edit_save_preserves_descriptor_and_bytes() {
     let redecoded = decode(
         &on_disk,
         DecodePolicy::Auto,
-        &DecodeLimits::default_envelope(),
+        &DecodeLimits::default(),
         &NOT_CANCELLED,
     )
     .expect("saved bytes decode");
@@ -413,7 +413,7 @@ fn convert_encoding_then_save_writes_utf16be_bom() {
     let redecoded = decode(
         &on_disk,
         DecodePolicy::Auto,
-        &DecodeLimits::default_envelope(),
+        &DecodeLimits::default(),
         &NOT_CANCELLED,
     )
     .expect("saved bytes decode");

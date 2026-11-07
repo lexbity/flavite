@@ -254,7 +254,7 @@ fn utf16_dirty_draft_recovery_replays_recorded_format() {
     let redecoded = decode(
         &expected,
         DecodePolicy::Auto,
-        &DecodeLimits::default_envelope(),
+        &DecodeLimits::default(),
         &NOT_CANCELLED,
     )
     .expect("expected bytes decode");

@@ -421,19 +421,6 @@ impl Default for DecodeLimits {
     }
 }
 
-impl DecodeLimits {
-    /// The RFC-0006 NFR-18/NFR-19 envelope (alias of `Default` used by the
-    /// integration call sites).
-    #[must_use]
-    pub const fn default_envelope() -> Self {
-        Self {
-            max_raw_bytes: MAX_RAW_BYTES,
-            max_decoded_utf8_bytes: MAX_DECODED_UTF8_BYTES,
-            max_map_bytes: MAX_MAP_BYTES,
-        }
-    }
-}
-
 /// Encode-side resource limits (§6.10). Input and serialized output are
 /// independent budgets (UTF-16 expansion of ASCII can double the size).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,17 +433,6 @@ pub struct EncodeLimits {
 
 impl Default for EncodeLimits {
     fn default() -> Self {
-        Self {
-            max_input_utf8_bytes: MAX_ENCODE_INPUT_UTF8_BYTES,
-            max_output_bytes: MAX_ENCODE_OUTPUT_BYTES,
-        }
-    }
-}
-
-impl EncodeLimits {
-    /// The RFC-0006 NFR-18/NFR-19 envelope (alias of `Default`).
-    #[must_use]
-    pub const fn default_envelope() -> Self {
         Self {
             max_input_utf8_bytes: MAX_ENCODE_INPUT_UTF8_BYTES,
             max_output_bytes: MAX_ENCODE_OUTPUT_BYTES,

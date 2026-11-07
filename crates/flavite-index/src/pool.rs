@@ -1581,7 +1581,7 @@ impl IndexActor {
         let decoded = flavite_encoding::decode(
             bytes,
             flavite_encoding::DecodePolicy::Auto,
-            &flavite_encoding::DecodeLimits::default_envelope(),
+            &flavite_encoding::DecodeLimits::default(),
             &flavite_encoding::NOT_CANCELLED,
         );
         let Ok(content) = decoded else {
@@ -1883,7 +1883,7 @@ impl IndexActor {
         let decoded = flavite_encoding::decode(
             bytes,
             flavite_encoding::DecodePolicy::Auto,
-            &flavite_encoding::DecodeLimits::default_envelope(),
+            &flavite_encoding::DecodeLimits::default(),
             &flavite_encoding::NOT_CANCELLED,
         );
         let (preview, decode_status, encoding_code, bom) = match decoded {

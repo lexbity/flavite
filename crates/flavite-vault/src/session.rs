@@ -1685,7 +1685,7 @@ impl Session {
                                     let io = crate::replace::ActorOpStoreIo::new(ctx.actor.clone());
                                     let data_dir =
                                         crate::identity::resolve_data_dir(ctx.data_dir.as_deref());
-                                    let outcome = (|| -> Result<
+                                    let run = || -> Result<
                                         (crate::replace::JobPhase, crate::replace::JobTotals),
                                         String,
                                     > {
@@ -1701,13 +1701,21 @@ impl Session {
                                             &ctx.vault_uuid,
                                         )
                                         .map_err(|error| error.to_string())?;
-                                        let mut guard = state.lock_recovering();
-                                        guard.recompute();
-                                        let (phase, totals) = match guard.mode {
+                                        // Release the state mutex for the
+                                        // whole run: Cancel/Status/Resume must
+                                        // stay observable while items process
+                                        // (D-10, NFR-12). The durable outcome
+                                        // is published back afterwards.
+                                        let (mode, mut items) = {
+                                            let mut guard = state.lock_recovering();
+                                            guard.recompute();
+                                            (guard.mode, std::mem::take(&mut guard.items))
+                                        };
+                                        let (phase, totals) = match mode {
                                             JobMode::Revert => crate::replace::run_revert(
                                                 &ctx,
                                                 &job_hex,
-                                                &mut guard.items,
+                                                &mut items,
                                                 &cancel,
                                                 &mut log,
                                                 &store,
@@ -1716,17 +1724,32 @@ impl Session {
                                             JobMode::Apply => crate::replace::run_apply(
                                                 &ctx,
                                                 &job_hex,
-                                                &mut guard.items,
+                                                &mut items,
                                                 &cancel,
                                                 &mut log,
                                                 &store,
                                                 &io,
                                             ),
                                         };
+                                        let mut guard = state.lock_recovering();
+                                        guard.items = items;
                                         guard.phase = phase;
                                         guard.totals = totals.clone();
                                         Ok((phase, totals))
-                                    })();
+                                    };
+                                    // A panicking worker must not brick the
+                                    // job: without this the worker thread
+                                    // dies mid-recv and `active_apply` stays
+                                    // set until restart (§6.7 bounded
+                                    // shutdown). Report the run as failed.
+                                    let outcome = match std::panic::catch_unwind(
+                                        std::panic::AssertUnwindSafe(run),
+                                    ) {
+                                        Ok(outcome) => outcome,
+                                        Err(panic) => Err(format!(
+                                            "replace worker panicked: {panic:?}"
+                                        )),
+                                    };
                                     match outcome {
                                         Ok((phase, totals)) => ReplaceOutcomeMessage::ApplyDone {
                                             request_id: job.request_id,
@@ -3467,7 +3490,7 @@ impl Session {
         // saved note (and an autosave could later write that emptiness over
         // the real bytes).
         let native_key = hex::encode(native_note_key(&read.path, &self.identity.root));
-        let limits = flavite_encoding::DecodeLimits::default_envelope();
+        let limits = flavite_encoding::DecodeLimits::default();
         // An explicitly created note is new UTF-8 content by construction;
         // a stale hint for a previously deleted path must not block it.
         let mut explicit = (absent || read.policy == OpenPolicy::CreateNew)
@@ -4617,12 +4640,13 @@ impl Session {
                 totals: state.lock_recovering().totals.clone(),
             });
         }
-        if matches!(phase, crate::replace::JobPhase::NeedsRecovery) {
-            return SessionResult::ActionRequired {
-                code: "job-needs-recovery",
-                data: None,
-            };
-        }
+        // A NeedsRecovery job is crossable by an explicit Resume (§6.4:
+        // NeedsRecovery --inspect--> Paused | Partial). The coordinator
+        // reconciles every nonterminal item through the guarded apply —
+        // before-hash guard plus after-hash satisfaction — so nothing is
+        // recomputed against changed content and no uncertain overwrite is
+        // repeated. Unverifiable authorization still fails at the first
+        // authenticated append, BEFORE any effect (§6.9).
         let key = match self.operation_key() {
             Ok(key) => key,
             Err(message) => {
@@ -6002,7 +6026,7 @@ impl Session {
         // captured descriptors, then merge the decoded layers (physical EOLs
         // preserved, no BOM). A decode failure is a typed choice request,
         // never a partial merge or a lossy reinterpretation.
-        let limits = flavite_encoding::DecodeLimits::default_envelope();
+        let limits = flavite_encoding::DecodeLimits::default();
         let decode_layer = |bytes: &[u8],
                             policy: flavite_encoding::DecodePolicy|
          -> Result<String, flavite_encoding::CodecError> {

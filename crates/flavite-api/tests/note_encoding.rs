@@ -232,7 +232,7 @@ fn convert_to_utf16le_bom_then_save_writes_bommed_bytes() {
     let redecoded = decode(
         &on_disk,
         DecodePolicy::Auto,
-        &DecodeLimits::default_envelope(),
+        &DecodeLimits::default(),
         &NOT_CANCELLED,
     )
     .expect("saved bytes decode");

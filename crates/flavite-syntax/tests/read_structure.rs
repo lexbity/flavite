@@ -108,5 +108,5 @@ fn task_coordinates_do_not_renormalize_preserved_carriage_returns_or_bom_content
     assert_eq!(changed, "\r\n- [x] task\n");
     let snapshot = flavite_syntax::TextSnapshot::from_normalized("\u{feff}\r\ncontent");
     assert_eq!(snapshot.text(), "\u{feff}\r\ncontent");
-    assert_eq!(snapshot.to_source_bytes(), snapshot.text().as_bytes());
+    assert_eq!(snapshot.source(), snapshot.text().as_bytes());
 }

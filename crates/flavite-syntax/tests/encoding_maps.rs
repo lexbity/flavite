@@ -26,7 +26,7 @@ fn utf16_snapshot_preserves_text_and_descriptor() {
     // Normalized text: CRLF folded to LF.
     assert_eq!(snap.text(), "A😀\nsecon\n");
     assert_eq!(
-        snap.to_source_bytes(),
+        snap.source(),
         bytes,
         "byte-exact unedited round trip"
     );
@@ -69,24 +69,31 @@ fn utf16_mapping_inverts_at_every_legal_boundary() {
     }
     let snap = TextSnapshot::with_policy(&bytes, DecodePolicy::Auto).unwrap();
     assert_eq!(snap.text(), "ab\nc😀d\nef");
-    // Every legal text boundary maps; inversion holds except at the LF-byte
-    // of an LF-terminated line end (that source byte is deliberately not a
-    // legal boundary — same asymmetry as UTF-8, asserted here explicitly).
+    // Every legal text boundary maps; inversion holds on the whole legal
+    // domain (§6.10), including the LF terminator start of LF-terminated
+    // lines (it maps to the folded LF text position).
     for t in legal_boundaries(snap.text()) {
         let s = snap
             .text_to_source(TextByte(t))
             .unwrap_or_else(|| panic!("text boundary {t} must map"));
-        match snap.source_to_text(s) {
-            Some(back) => assert_eq!(back, TextByte(t), "inversion at {t}"),
-            None => {
-                let lf_terminator = snap
-                    .lines()
-                    .iter()
-                    .any(|l| l.text_end.0 == t && l.eol == Eol::Lf);
-                assert!(lf_terminator, "only the LF byte may refuse inversion: {t}");
-            }
-        }
+        assert_eq!(
+            snap.source_to_text(s),
+            Some(TextByte(t)),
+            "inversion at {t}"
+        );
     }
+    // The LF side of a CRLF pair stays unaddressable: it is inside the
+    // terminator, not a legal boundary.
+    let crlf_line = snap
+        .lines()
+        .iter()
+        .find(|l| l.eol == Eol::Crlf)
+        .expect("fixture has a CRLF line");
+    assert_eq!(
+        snap.source_to_text(SourceByte(crlf_line.source_end.0 + 1)),
+        None,
+        "CRLF interior is refused"
+    );
     // EOF pair.
     let eof = snap.text_to_source(TextByte(snap.text().len())).unwrap();
     assert_eq!(eof, SourceByte(bytes.len()));
@@ -133,13 +140,13 @@ fn standalone_cr_and_leading_content_feff_survive_utf16_and_utf8() {
         let bytes = flavite_encoding::encode(
             src,
             format,
-            &flavite_encoding::EncodeLimits::default_envelope(),
+            &flavite_encoding::EncodeLimits::default(),
             &flavite_encoding::NOT_CANCELLED,
         )
         .unwrap();
         let snap = TextSnapshot::with_policy(&bytes, DecodePolicy::Explicit(format)).unwrap();
         assert_eq!(snap.text(), "a\rb\n");
-        assert_eq!(snap.to_source_bytes(), bytes);
+        assert_eq!(snap.source(), bytes);
         // The content CR maps 1:1 onto itself through the composed map.
         let cr = snap.text_to_source(TextByte(1)).unwrap();
         assert_eq!(snap.source_to_text(cr), Some(TextByte(1)));
@@ -193,7 +200,7 @@ fn parser_output_equal_across_encodings_with_different_raw_offsets() {
     let decoded16 = flavite_encoding::decode(
         raw16,
         DecodePolicy::Explicit(SourceFormat::utf16le()),
-        &flavite_encoding::DecodeLimits::default_envelope(),
+        &flavite_encoding::DecodeLimits::default(),
         &flavite_encoding::NOT_CANCELLED,
     )
     .unwrap();
@@ -215,13 +222,28 @@ fn blake3_hash(bytes: &[u8]) -> [u8; 32] {
 }
 
 #[test]
-fn span_to_source_rejects_crlf_interior_start() {
+fn span_to_source_endpoints_match_text_to_source() {
     let src = "a\r\nb";
     let snap = TextSnapshot::new(src.as_bytes()).unwrap();
-    // A zero-width span at the folded LF (text 1) would include the CRLF
-    // interior — refused exactly as before the encoding refactor.
-    let span = Span::new(TextByte(1), TextByte(1));
-    assert_eq!(snap.span_to_source(span), None);
+    // Text "a\nb": span endpoints map exactly like text_to_source; a span
+    // starting at the folded LF (text 1) legitimately covers the physical
+    // CRLF pair in the source (§6.10: begin/end of CRLF are legal).
+    assert_eq!(
+        snap.span_to_source(Span::new(TextByte(1), TextByte(1))),
+        Some(Span::new(SourceByte(1), SourceByte(1)))
+    );
+    assert_eq!(
+        snap.span_to_source(Span::new(TextByte(1), TextByte(2))),
+        Some(Span::new(SourceByte(1), SourceByte(3))),
+        "span covering the folded LF includes both CRLF bytes"
+    );
+    assert_eq!(
+        snap.span_to_source(Span::new(TextByte(0), TextByte(3))),
+        Some(Span::new(SourceByte(0), SourceByte(4)))
+    );
+    // Illegal interiors still refuse (inside the emoji on both sides).
+    let wide = TextSnapshot::new("x\u{1F600}y".as_bytes()).unwrap();
+    assert_eq!(wide.span_to_source(Span::new(TextByte(2), TextByte(3))), None);
 }
 
 #[test]
@@ -246,7 +268,7 @@ fn empty_and_bom_only_files_map_eof() {
             snap.source_to_text(SourceByte(snap.source().len())),
             Some(TextByte(0))
         );
-        assert_eq!(snap.to_source_bytes(), bytes);
+        assert_eq!(snap.source(), bytes);
     }
 }
 
@@ -273,7 +295,7 @@ fn dense_newline_utf16_lines_walk_monotonically() {
         assert_eq!(line.text_start, TextByte(i));
         assert_eq!(line.text_end, TextByte(i)); // empty content
     }
-    assert_eq!(snap.to_source_bytes(), bytes);
+    assert_eq!(snap.source(), bytes);
 }
 
 #[test]
@@ -286,5 +308,5 @@ fn from_normalized_stays_a_synthetic_view() {
     // A leading BOM *character* is content here and must survive.
     let snap = TextSnapshot::from_normalized("\u{FEFF}x");
     assert_eq!(snap.text(), "\u{FEFF}x");
-    assert_eq!(snap.to_source_bytes(), "\u{FEFF}x".as_bytes());
+    assert_eq!(snap.source(), "\u{FEFF}x".as_bytes());
 }

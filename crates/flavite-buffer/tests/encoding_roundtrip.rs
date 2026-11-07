@@ -216,7 +216,7 @@ fn open_edit_serialize_redecode_round_trips_every_format() {
         let redecoded = decode(
             &serialized,
             fixture.policy,
-            &DecodeLimits::default_envelope(),
+            &DecodeLimits::default(),
             &NOT_CANCELLED,
         )
         .unwrap_or_else(|e| panic!("fixture {} re-decode failed: {e}", fixture.name));
@@ -249,7 +249,7 @@ fn golden_utf16_bytes_for_supplementary_scalar() {
     let le = encode(
         text,
         SourceFormat::utf16le_with_bom(),
-        &EncodeLimits::default_envelope(),
+        &EncodeLimits::default(),
         &NOT_CANCELLED,
     )
     .expect("LE encode");
@@ -257,7 +257,7 @@ fn golden_utf16_bytes_for_supplementary_scalar() {
     let be = encode(
         text,
         SourceFormat::utf16be_with_bom(),
-        &EncodeLimits::default_envelope(),
+        &EncodeLimits::default(),
         &NOT_CANCELLED,
     )
     .expect("BE encode");
@@ -271,7 +271,7 @@ fn golden_utf16_bytes_for_supplementary_scalar() {
         let decoded = decode(
             bytes,
             DecodePolicy::Auto,
-            &DecodeLimits::default_envelope(),
+            &DecodeLimits::default(),
             &NOT_CANCELLED,
         )
         .expect("golden decodes");

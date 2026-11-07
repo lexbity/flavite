@@ -588,7 +588,7 @@ impl EditorModel {
         codec_encode(
             &decoded,
             self.source_format,
-            &EncodeLimits::default_envelope(),
+            &EncodeLimits::default(),
             &flavite_encoding::NOT_CANCELLED,
         )
     }
@@ -647,7 +647,7 @@ impl EditorModel {
         codec_encode(
             &self.decoded_text(),
             target,
-            &EncodeLimits::default_envelope(),
+            &EncodeLimits::default(),
             &flavite_encoding::NOT_CANCELLED,
         )?;
         self.source_format = target;
@@ -829,7 +829,7 @@ impl EditorModel {
         let undo_snapshot = match codec_encode(
             &decoded,
             self.source_format,
-            &EncodeLimits::default_envelope(),
+            &EncodeLimits::default(),
             &flavite_encoding::NOT_CANCELLED,
         ) {
             Ok(source) => {

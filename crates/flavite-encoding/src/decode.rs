@@ -29,6 +29,12 @@ impl DecodedContent {
         &self.text
     }
 
+    /// Unwrap the decoded UTF-8 text without copying it.
+    #[must_use]
+    pub fn into_text(self) -> String {
+        self.text
+    }
+
     /// The resolved descriptor the bytes were decoded under.
     #[must_use]
     pub const fn format(&self) -> SourceFormat {
