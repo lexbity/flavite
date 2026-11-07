@@ -14,7 +14,10 @@ use crate::settings::Settings;
 use crate::subscription;
 use crate::workspace::{Adapter, StripMenu, gestures};
 use flavite_api::queries::NoteCatalogEntry;
-use flavite_api::{ExecutionResult, Flavite, Invocation, LocalResult, Origin, VaultConfig};
+use flavite_api::{
+    ExecutionResult, Flavite, Invocation, LocalResult, Origin, VaultConfig,
+    device_preferences::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH},
+};
 use flavite_editor::{EditorAction, EditorInteractionSnapshot, EditorView};
 use flavite_workspace::{
     Effect, GroupId, Ids, LayoutAction, NoteLocator, Outcome, SplitId, TabId, WorkspaceState,
@@ -130,9 +133,12 @@ pub struct App {
     pub named_layouts: Vec<flavite_workspace::NamedLayout>,
     pub picker: Picker,
     /// Presentation state for the collapsible vault navigator and app menus.
-    pub sidebar_open: bool,
+    /// Open/width truth lives in the device preferences; the preview here is
+    /// the live drag width before its commit.
     pub sidebar_filter: String,
     pub sidebar_bounds: BTreeMap<String, iced::Rectangle>,
+    pub resizing_sidebar: bool,
+    sidebar_width_preview: Option<f32>,
     pub menu_bar_visible: bool,
     use_workbench_default: bool,
     pub palette_open: bool,
@@ -181,6 +187,7 @@ pub struct App {
 #[derive(Debug, Clone)]
 pub enum Message {
     ToggleSidebar,
+    SidebarResizeBegin,
     SidebarToTab,
     NotesToSidebar(TabId),
     SidebarFilter(String),
@@ -411,8 +418,8 @@ pub enum Message {
         hash: String,
     },
     // ---- W10: navigation ----
-    NavigateBack,
-    NavigateForward,
+    NavigateBack(TabId),
+    NavigateForward(TabId),
     // ---- W10: dialogs and menubar actions ----
     /// Open a note through the native file dialog.
     OpenNoteDialog,
@@ -600,9 +607,10 @@ impl App {
             shutdown: None,
             named_layouts: Vec::new(),
             picker: Picker::default(),
-            sidebar_open: false,
             sidebar_filter: String::new(),
             sidebar_bounds: BTreeMap::new(),
+            resizing_sidebar: false,
+            sidebar_width_preview: None,
             menu_bar_visible: false,
             use_workbench_default: false,
             palette_open: false,
@@ -856,7 +864,7 @@ impl App {
             expected_revision,
             group: document_group,
         });
-        self.sidebar_open = false;
+        self.set_sidebar_open(false);
     }
 
     /// Save the workspace layout immediately (W06: explicit flush with a
@@ -1093,11 +1101,16 @@ impl App {
     /// One step of per-view back/forward navigation (W10). The replacement
     /// is a typed reducer transaction; the nav host records the move only
     /// when the transaction committed.
-    fn navigate_history(&mut self, forward: bool) {
-        let Some(tab) = self.focused_note_tab() else {
+    fn navigate_history(&mut self, tab: TabId, forward: bool) {
+        if !matches!(
+            self.workspace
+                .tab(&tab)
+                .map(flavite_workspace::ViewSession::kind),
+            Some(flavite_workspace::ViewKind::Note(_))
+        ) {
             self.status = "Back/forward applies to a note tab".into();
             return;
-        };
+        }
         let anchor = self
             .workspace
             .tab(&tab)
@@ -1490,6 +1503,44 @@ impl App {
     #[must_use]
     pub fn focused_group(&self) -> Option<GroupId> {
         self.workspace.focused_group()
+    }
+
+    /// Whether the vault navigator is open. The device preferences carry
+    /// the persisted presentation state.
+    #[must_use]
+    pub fn sidebar_open(&self) -> bool {
+        self.appearance.prefs.sidebar_open
+    }
+
+    /// The navigator's effective width in logical pixels: the live drag
+    /// preview while resizing, otherwise the stored preference.
+    #[must_use]
+    pub fn sidebar_width(&self) -> f32 {
+        self.sidebar_width_preview
+            .unwrap_or_else(|| f32::from(self.appearance.prefs.sidebar_width))
+    }
+
+    /// Flip the navigator and store the new state quietly: the status line
+    /// keeps whatever it was reporting.
+    pub fn toggle_sidebar(&mut self) {
+        let open = !self.appearance.prefs.sidebar_open;
+        self.set_sidebar_open(open);
+    }
+
+    /// Store the navigator's open flag in the preferences and persist them.
+    pub fn set_sidebar_open(&mut self, open: bool) {
+        if self.appearance.prefs.sidebar_open != open {
+            self.appearance.prefs.sidebar_open = open;
+            self.persist_sidebar_prefs();
+        }
+    }
+
+    /// Persist the device preferences without touching the status line;
+    /// failures surface later through [`crate::host::appearance`].
+    fn persist_sidebar_prefs(&mut self) {
+        if let Some(flavite) = self.flavite.as_mut() {
+            self.appearance.persist(flavite);
+        }
     }
 
     /// Navigation tools belong beside the graph, in the document area.
@@ -2257,7 +2308,12 @@ impl App {
                 }
             }
             Message::MenuClose => self.strip_menu = None,
-            Message::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
+            Message::ToggleSidebar => self.toggle_sidebar(),
+            Message::SidebarResizeBegin => {
+                if !self.has_composition() {
+                    self.resizing_sidebar = true;
+                }
+            }
             Message::SidebarFilter(value) => {
                 self.sidebar_filter = value;
                 self.sidebar_bounds
@@ -2274,7 +2330,7 @@ impl App {
                     });
                     self.notes_filters
                         .insert(self.workspace.focused_tab(), self.sidebar_filter.clone());
-                    self.sidebar_open = false;
+                    self.set_sidebar_open(false);
                 }
             }
             Message::NotesToSidebar(tab) => {
@@ -2299,7 +2355,7 @@ impl App {
                         expected_revision,
                         tab,
                     });
-                    self.sidebar_open = true;
+                    self.set_sidebar_open(true);
                 }
             }
             Message::CancelGesture => {
@@ -2307,6 +2363,8 @@ impl App {
                 self.drag_revision = None;
                 self.resize_preview.clear();
                 self.resizing_split = None;
+                self.resizing_sidebar = false;
+                self.sidebar_width_preview = None;
                 self.strip_menu = None;
                 // Escape also restores an in-flight node drag to its prior
                 // position and drops click candidates (never a pin write).
@@ -2780,8 +2838,8 @@ impl App {
                 self.restore_history_snapshot(tab, &hash);
             }
             // ---- W10: navigation ----
-            Message::NavigateBack => self.navigate_history(false),
-            Message::NavigateForward => self.navigate_history(true),
+            Message::NavigateBack(tab) => self.navigate_history(tab, false),
+            Message::NavigateForward(tab) => self.navigate_history(tab, true),
             // ---- W10: dialogs ----
             Message::NewNoteDialog => {
                 if !self.has_composition() {
@@ -3032,6 +3090,15 @@ impl App {
                     self.resize_preview.insert(split, ratio_to_ppm(ratio));
                     self.pointer_feedback = true;
                 }
+                if self.resizing_sidebar {
+                    let width = position
+                        .x
+                        .clamp(f32::from(MIN_SIDEBAR_WIDTH), f32::from(MAX_SIDEBAR_WIDTH));
+                    if self.sidebar_width_preview != Some(width) {
+                        self.sidebar_width_preview = Some(width);
+                        self.pointer_feedback = true;
+                    }
+                }
                 let was_dragging = self.gesture.dragging();
                 self.gesture.moved(position);
                 if self.gesture.dragging() {
@@ -3073,6 +3140,19 @@ impl App {
                         split,
                         desired_ratio_ppm: ppm,
                     });
+                }
+                if self.resizing_sidebar {
+                    self.resizing_sidebar = false;
+                    if let Some(width) = self.sidebar_width_preview.take() {
+                        let stored = width
+                            .round()
+                            .clamp(f32::from(MIN_SIDEBAR_WIDTH), f32::from(MAX_SIDEBAR_WIDTH))
+                            as u16;
+                        if stored != self.appearance.prefs.sidebar_width {
+                            self.appearance.prefs.sidebar_width = stored;
+                            self.persist_sidebar_prefs();
+                        }
+                    }
                 }
             }
             _ => {}
@@ -4371,9 +4451,10 @@ mod tests {
             shutdown: None,
             named_layouts: Vec::new(),
             picker: Picker::default(),
-            sidebar_open: false,
             sidebar_filter: String::new(),
             sidebar_bounds: BTreeMap::new(),
+            resizing_sidebar: false,
+            sidebar_width_preview: None,
             menu_bar_visible: false,
             use_workbench_default: false,
             palette_open: false,

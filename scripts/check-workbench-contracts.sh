@@ -178,7 +178,8 @@ run_s04_gates() {
         crates/flavite-ui/tests/workbench_loop.rs \
         scripts/workbench-visual-linux.sh \
         scripts/tests/workbench/common.py \
-        scripts/tests/workbench/graph_editor_loop.py; do
+        scripts/tests/workbench/graph_editor_loop.py \
+        scripts/tests/workbench/reference_workspace.py; do
         gate assert_nonempty "$root/$file"
     done
     # D-02: activation is the pair outcome; explicit Insert is a distinct

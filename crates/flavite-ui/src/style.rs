@@ -26,8 +26,6 @@ pub const SPACING: f32 = 8.0;
 pub const SPACING_SM: f32 = 4.0;
 /// Loose spacing (section separation).
 pub const SPACING_LG: f32 = 12.0;
-/// Sidebar width.
-pub const SIDEBAR_WIDTH: f32 = 232.0;
 /// Command palette card width.
 pub const PALETTE_WIDTH: f32 = 640.0;
 /// Secondary text.

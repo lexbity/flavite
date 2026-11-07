@@ -28,8 +28,8 @@ case "$backend" in
 esac
 case "$scenario" in
     graph-editor-loop|note-regex-replace|link-completion|reference-workspace) ;;
-    "") echo "missing --scenario (implemented: graph-editor-loop note-regex-replace link-completion)" >&2; exit 2 ;;
-    *) echo "unsupported scenario: $scenario (implemented: graph-editor-loop note-regex-replace link-completion)" >&2; exit 2 ;;
+    "") echo "missing --scenario (implemented: graph-editor-loop note-regex-replace link-completion reference-workspace)" >&2; exit 2 ;;
+    *) echo "unsupported scenario: $scenario (implemented: graph-editor-loop note-regex-replace link-completion reference-workspace)" >&2; exit 2 ;;
 esac
 if [[ "$(uname -s)" != Linux ]]; then
     echo "workbench visual runner is Linux-only" >&2

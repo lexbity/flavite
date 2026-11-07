@@ -248,7 +248,7 @@ fn authoritative_rename_relocates_views_bindings_and_history() {
         eprintln!("focused={:?}", app.focused_note_tab());
         eprintln!("status_before_back={}", app.status_text());
     }
-    let _ = app.update(Message::NavigateBack);
+    let _ = app.update(Message::NavigateBack(tab));
     wait(&mut app, |a| !a.notes.any_pending());
     if std::env::var("FLAVITE_DEBUG_RENAME").is_ok() {
         eprintln!("status_after_back={}", app.status_text());

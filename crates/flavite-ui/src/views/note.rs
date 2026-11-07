@@ -148,20 +148,6 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
     }
     let meta = container(
         row![
-            chrome::icon_button(
-                *metrics,
-                Icon::Back,
-                "Back",
-                app.nav.can_go_back(tab).then_some(Message::NavigateBack)
-            ),
-            chrome::icon_button(
-                *metrics,
-                Icon::Forward,
-                "Forward",
-                app.nav
-                    .can_go_forward(tab)
-                    .then_some(Message::NavigateForward)
-            ),
             text(path_label).size(metrics.text).style(style::dim_text),
             iced::widget::Space::new().width(Length::Fill),
             chrome::icon_button(

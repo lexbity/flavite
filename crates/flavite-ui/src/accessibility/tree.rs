@@ -186,7 +186,7 @@ pub fn build_node_map(app: &App) -> BTreeMap<NodeId, NodeTarget> {
     }
     map.insert(node_id("quick-switch", 0), NodeTarget::OpenPicker);
     map.insert(node_id("sidebar-toggle", 0), NodeTarget::ToggleSidebar);
-    if app.sidebar_open {
+    if app.sidebar_open() {
         map.insert(node_id("sidebar-filter", 0), NodeTarget::SidebarFilter);
         map.insert(node_id("sidebar-detach", 0), NodeTarget::SidebarToTab);
     }
@@ -364,7 +364,7 @@ fn visible_catalog(app: &App) -> Vec<(std::path::PathBuf, NodeId)> {
     let notes_tab_visible = app.workspace.tabs().any(|(tab, v)| {
         app.is_tab_visible(*tab) && matches!(v.kind(), flavite_workspace::ViewKind::Notes)
     });
-    if !notes_tab_visible && app.sidebar_open {
+    if !notes_tab_visible && app.sidebar_open() {
         return app
             .note_candidates()
             .matches(&app.sidebar_filter)
@@ -594,7 +594,7 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
             nodes.push((id, button));
             window_children.push(id);
         }
-        if app.sidebar_open {
+        if app.sidebar_open() {
             let id = node_id("sidebar-filter", 0);
             let mut filter = Node::new(Role::TextInput);
             filter.set_label("Filter notes");

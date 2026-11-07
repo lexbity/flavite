@@ -123,6 +123,7 @@ fn seed_s04_inputs(root: &Path) {
         "scripts/workbench-visual-linux.sh",
         "scripts/tests/workbench/common.py",
         "scripts/tests/workbench/graph_editor_loop.py",
+        "scripts/tests/workbench/reference_workspace.py",
         // rg targets of the S04 absence gates.
         "crates/flavite-ui/src/graph/events.rs",
         "crates/flavite-ui/src/host/graph.rs",

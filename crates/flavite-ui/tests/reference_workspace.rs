@@ -79,7 +79,7 @@ fn sidebar_filter_and_tab_placement_preserve_the_graph_and_expose_native_actions
         group: groups[1],
     });
     let _ = app.update(Message::SidebarToTab);
-    assert!(!app.sidebar_open);
+    assert!(!app.sidebar_open());
     assert_eq!(app.workspace.group(&groups[1]).unwrap().active(), graph);
     assert!(matches!(
         app.workspace
@@ -95,7 +95,7 @@ fn sidebar_filter_and_tab_placement_preserve_the_graph_and_expose_native_actions
         "placement retains the filter"
     );
     let _ = app.update(Message::NotesToSidebar(notes_tab));
-    assert!(app.sidebar_open);
+    assert!(app.sidebar_open());
     assert_eq!(app.sidebar_filter, "beta");
     assert_eq!(app.workspace.group(&groups[1]).unwrap().active(), graph);
     assert_eq!(
@@ -126,7 +126,7 @@ fn sidebar_chord_and_application_menu_are_real_shell_actions() {
     )
     .expect("sidebar command resolves");
     let _ = app.update(message);
-    assert!(app.sidebar_open);
+    assert!(app.sidebar_open());
     let before = app.workspace.clone();
     let _ = app.update(Message::AppMenu);
     assert!(app.menu_bar_visible);
@@ -135,4 +135,15 @@ fn sidebar_chord_and_application_menu_are_real_shell_actions() {
         "revealing categories does not open an unrelated command menu"
     );
     assert_eq!(app.workspace, before);
+}
+
+#[test]
+fn back_forward_take_explicit_tabs_and_stay_gated_to_notes() {
+    let (mut app, _cache) = fixture();
+    let groups = app.workspace.group_order();
+    let empty = app.workspace.group(&groups[0]).unwrap().active();
+    let before = app.workspace.clone();
+    let _ = app.update(Message::NavigateBack(empty));
+    assert_eq!(app.status_text(), "Back/forward applies to a note tab");
+    assert_eq!(app.workspace, before, "a gated step changes nothing");
 }

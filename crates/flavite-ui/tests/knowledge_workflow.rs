@@ -179,7 +179,7 @@ fn back_and_forward_restore_place_within_one_tab() {
     assert!(!app.nav.can_go_forward(tab));
 
     // Back returns to a in the SAME tab identity.
-    let _ = app.update(Message::NavigateBack);
+    let _ = app.update(Message::NavigateBack(tab));
     wait(app, |a| {
         app_note_is(a, tab, "a.md") && !a.notes.any_pending()
     });
@@ -187,7 +187,7 @@ fn back_and_forward_restore_place_within_one_tab() {
     assert!(app.nav.can_go_forward(tab));
 
     // Forward returns to b again.
-    let _ = app.update(Message::NavigateForward);
+    let _ = app.update(Message::NavigateForward(tab));
     wait(app, |a| {
         app_note_is(a, tab, "b.md") && !a.notes.any_pending()
     });

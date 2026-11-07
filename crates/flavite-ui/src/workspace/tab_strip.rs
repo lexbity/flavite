@@ -12,12 +12,18 @@ use iced::{Element, Length, alignment};
 /// paths use the scaled [`crate::style::Metrics::controls_width`].
 pub const CONTROLS_WIDTH: f32 = 96.0;
 
+/// The back/forward arrows at the strip's left edge reserve this much
+/// tab-slot width; slot math everywhere subtracts it before the first tab.
+#[must_use]
+pub fn nav_width(metrics: crate::style::Metrics) -> f32 {
+    2.0 * metrics.icon_target
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StripMenu {
     NewView,
     Actions,
     Tabs,
-    App,
     /// Standard top menu bar (W10): File.
     File,
     /// Standard top menu bar (W10): Edit.
@@ -104,8 +110,31 @@ pub fn view(app: &App, group: GroupId) -> Element<'_, Message> {
     let metrics = app.appearance.metrics();
     let width = app.group_bounds.get(&group).map_or(400.0, |r| r.width);
     let active_index = g.tabs().iter().position(|t| *t == g.active()).unwrap_or(0);
-    let slots = plan(width, metrics.controls_width, g.tabs().len(), active_index);
+    let nav = nav_width(*metrics);
+    let slots = plan(
+        width,
+        metrics.controls_width + nav,
+        g.tabs().len(),
+        active_index,
+    );
+    let active_tab = g.active();
     let mut tabs = row![].spacing(0);
+    tabs = tabs.push(chrome::icon_button(
+        *metrics,
+        Icon::Back,
+        "Back",
+        app.nav
+            .can_go_back(active_tab)
+            .then_some(Message::NavigateBack(active_tab)),
+    ));
+    tabs = tabs.push(chrome::icon_button(
+        *metrics,
+        Icon::Forward,
+        "Forward",
+        app.nav
+            .can_go_forward(active_tab)
+            .then_some(Message::NavigateForward(active_tab)),
+    ));
     for tab in g.tabs().iter().skip(slots.start).take(slots.count) {
         tabs = tabs.push(tab_view(app, *tab, *tab == g.active(), slots.tab_width));
     }
@@ -258,21 +287,6 @@ pub fn menu_entries(app: &App, group: GroupId, menu: StripMenu) -> Vec<MenuEntry
             ("Move tab to next group", "workspace.move_tab_next_group"),
             ("Merge next group", "workspace.merge_next_group"),
             ("Close group", "workspace.close_group"),
-        ]
-        .into_iter()
-        .map(|(label, id)| MenuEntry {
-            label: label.into(),
-            action: crate::host::commands::available(app, id)
-                .then_some(Message::RunHostCommand(id)),
-        })
-        .collect(),
-        StripMenu::App => [
-            ("Open notes", "workspace.open_notes_view"),
-            ("Open graph", "workspace.open_graph"),
-            ("Quick switch", "workspace.quick_switch"),
-            ("Command palette", "workspace.command_palette"),
-            ("Split right", "workspace.split_right"),
-            ("Split down", "workspace.split_down"),
         ]
         .into_iter()
         .map(|(label, id)| MenuEntry {

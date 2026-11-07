@@ -369,3 +369,53 @@ fn scale_changes_reproject_geometry_without_rewriting_ratios() {
     pump_all(app);
     assert_eq!(format!("{:?}", app.workspace.tree()), before);
 }
+
+#[test]
+fn sidebar_presentation_persists_and_survives_a_fresh_host() {
+    let mut fixture = ui_fixture(1119, "/appearance-sidebar", &seed());
+    let app = &mut fixture.app;
+    assert!(!app.sidebar_open());
+    let _ = app.update(Message::ToggleSidebar);
+    assert!(app.sidebar_open());
+
+    // The divider drag previews live and commits the width on release.
+    let _ = app.update(Message::SidebarResizeBegin);
+    let _ = app.update(Message::Mouse(iced::mouse::Event::CursorMoved {
+        position: iced::Point::new(300.0, 40.0),
+    }));
+    assert_eq!(
+        app.sidebar_width(),
+        300.0,
+        "the drag preview follows the pointer"
+    );
+    let _ = app.update(Message::Mouse(iced::mouse::Event::ButtonReleased(
+        iced::mouse::Button::Left,
+    )));
+    assert_eq!(app.sidebar_width(), 300.0);
+    assert!(!app.resizing_sidebar);
+    pump_all(app);
+    assert!(
+        app.appearance.last_error.is_none(),
+        "persistence errors surface: {:?}",
+        app.appearance.last_error
+    );
+
+    let stored = fixture
+        .app
+        .flavite
+        .as_ref()
+        .unwrap()
+        .read_user_state(UserStateKind::DevicePreferences)
+        .expect("read stored preferences")
+        .expect("preferences were written");
+    let reloaded = Preferences::parse(Some(std::str::from_utf8(&stored.payload).unwrap()))
+        .expect("stored document parses");
+    assert!(reloaded.preferences.sidebar_open);
+    assert_eq!(reloaded.preferences.sidebar_width, 300);
+
+    let mut fresh = AppearanceHost::boot();
+    fresh.load(fixture.app.flavite.as_ref().unwrap());
+    assert!(fresh.prefs.sidebar_open);
+    assert_eq!(fresh.prefs.sidebar_width, 300);
+    assert_eq!(fresh.metrics().sidebar_width, 300.0);
+}

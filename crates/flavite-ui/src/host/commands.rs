@@ -933,7 +933,7 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
             }
         }
         "workspace.writing_layout" => app.use_writing_layout(),
-        "workspace.toggle_sidebar" => app.sidebar_open = !app.sidebar_open,
+        "workspace.toggle_sidebar" => app.toggle_sidebar(),
         "workspace.open_notes_view" => {
             if let Some(group) = app.navigation_group() {
                 app.dispatch_layout(|revision| LayoutAction::OpenNotes {
@@ -1003,10 +1003,10 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
             }
         }
         "workspace.navigate_back" => {
-            return app.update(Message::NavigateBack);
+            return app.update(Message::NavigateBack(app.workspace.focused_tab()));
         }
         "workspace.navigate_forward" => {
-            return app.update(Message::NavigateForward);
+            return app.update(Message::NavigateForward(app.workspace.focused_tab()));
         }
         "workspace.select_all" | "workspace.caret_start" | "workspace.caret_end" => {
             let tab = app.workspace.focused_tab();

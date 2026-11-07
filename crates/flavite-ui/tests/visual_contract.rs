@@ -118,14 +118,27 @@ fn token_sets_are_deterministic_and_distinct() {
     );
     assert_ne!(dark_a.background, tokens::light_palette().background);
     // The metrics resolution is a pure function of its inputs.
-    let a =
-        flavite_ui::style::Metrics::new(150, 18, flavite_ui::preferences::LineWidth::Columns(80));
-    let b =
-        flavite_ui::style::Metrics::new(150, 18, flavite_ui::preferences::LineWidth::Columns(80));
+    let a = flavite_ui::style::Metrics::new(
+        150,
+        18,
+        flavite_ui::preferences::LineWidth::Columns(80),
+        240,
+    );
+    let b = flavite_ui::style::Metrics::new(
+        150,
+        18,
+        flavite_ui::preferences::LineWidth::Columns(80),
+        240,
+    );
     assert_eq!(a, b);
     assert_ne!(
         a,
-        flavite_ui::style::Metrics::new(175, 18, flavite_ui::preferences::LineWidth::Columns(80)),
+        flavite_ui::style::Metrics::new(
+            175,
+            18,
+            flavite_ui::preferences::LineWidth::Columns(80),
+            240
+        ),
         "different scale, different metrics"
     );
 }
@@ -139,6 +152,7 @@ fn chrome_meets_pointer_target_and_focus_ring_minimums() {
             scale_pct,
             16,
             flavite_ui::preferences::LineWidth::Full,
+            240,
         );
         let target = metrics.icon_target;
         assert!(target >= 24.0, "icon target {target} < 24 at {scale_pct}%");

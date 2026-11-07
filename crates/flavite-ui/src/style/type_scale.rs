@@ -7,8 +7,8 @@
 //! scales together and the geometry solver sees the same chrome growth.
 
 use super::{
-    BRAND, HEADING, PALETTE_WIDTH, SIDEBAR_WIDTH, SPACING, SPACING_LG, SPACING_SM, TAB_HEIGHT,
-    TEXT, TEXT_LG, TEXT_SM,
+    BRAND, HEADING, PALETTE_WIDTH, SPACING, SPACING_LG, SPACING_SM, TAB_HEIGHT, TEXT, TEXT_LG,
+    TEXT_SM,
 };
 use crate::preferences::{LineWidth, Preferences};
 
@@ -58,9 +58,15 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    /// Metrics from raw validated preference values.
+    /// Metrics from raw validated preference values. The sidebar width is
+    /// the user's own logical-pixel choice and is not scale-multiplied.
     #[must_use]
-    pub fn new(interface_scale_pct: u16, editor_font_size: u16, line_width: LineWidth) -> Self {
+    pub fn new(
+        interface_scale_pct: u16,
+        editor_font_size: u16,
+        line_width: LineWidth,
+        sidebar_width: u16,
+    ) -> Self {
         let scale = f32::from(interface_scale_pct) / 100.0;
         let editor = f32::from(editor_font_size);
         // 1.4 ratio, rounded to the nearest half pixel: the editor widget
@@ -77,7 +83,7 @@ impl Metrics {
             brand: scaled(BRAND),
             tab_height: scaled(TAB_HEIGHT),
             controls_width: scaled(CONTROLS_WIDTH),
-            sidebar_width: scaled(SIDEBAR_WIDTH),
+            sidebar_width: f32::from(sidebar_width),
             palette_width: scaled(PALETTE_WIDTH),
             spacing: scaled(SPACING),
             spacing_sm: scaled(SPACING_SM),
@@ -96,6 +102,7 @@ impl Metrics {
             preferences.interface_scale_pct,
             preferences.editor_font_size,
             preferences.line_width,
+            preferences.sidebar_width,
         )
     }
 
@@ -121,7 +128,7 @@ impl Metrics {
 
 impl Default for Metrics {
     fn default() -> Self {
-        Self::new(100, 16, LineWidth::Full)
+        Self::new(100, 16, LineWidth::Full, 240)
     }
 }
 
@@ -146,7 +153,7 @@ mod tests {
 
     #[test]
     fn scale_multiplies_chrome_and_type() {
-        let metrics = Metrics::new(150, 16, LineWidth::Full);
+        let metrics = Metrics::new(150, 16, LineWidth::Full, 240);
         assert_eq!(metrics.scale, 1.5);
         assert_eq!(metrics.text, 21.0);
         assert_eq!(metrics.tab_height, 48.0);
@@ -154,14 +161,14 @@ mod tests {
             metrics.editor_font_size, 16.0,
             "editor size is its own preference"
         );
-        let tiny = Metrics::new(75, 12, LineWidth::Columns(40));
+        let tiny = Metrics::new(75, 12, LineWidth::Columns(40), 240);
         assert_eq!(tiny.text_sm, 9.0);
         assert_eq!(tiny.line_width, LineWidth::Columns(40));
     }
 
     #[test]
     fn icon_targets_never_drop_below_the_accessibility_floor() {
-        let metrics = Metrics::new(75, 12, LineWidth::Full);
+        let metrics = Metrics::new(75, 12, LineWidth::Full, 240);
         assert!(metrics.icon_target >= 24.0, "NFR-15 pointer target floor");
     }
 }

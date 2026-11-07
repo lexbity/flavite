@@ -26,6 +26,10 @@ pub const MAX_EDITOR_FONT_SIZE: u16 = 28;
 pub const MIN_LINE_WIDTH: u16 = 40;
 /// Readable line width in columns (D-15): 40–160.
 pub const MAX_LINE_WIDTH: u16 = 160;
+/// Supported notes-sidebar widths, in logical pixels.
+pub const MIN_SIDEBAR_WIDTH: u16 = 160;
+/// Supported notes-sidebar widths, in logical pixels.
+pub const MAX_SIDEBAR_WIDTH: u16 = 480;
 
 /// Which palette the shell uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -100,6 +104,10 @@ pub struct Preferences {
     /// gesture contract (double-click now activates; insertion is the
     /// explicit Insert command). Persisted once, dismissible thereafter.
     pub graph_activation_acknowledged: bool,
+    /// Whether the collapsible vault navigator is open.
+    pub sidebar_open: bool,
+    /// Notes-sidebar width in logical pixels (160–480).
+    pub sidebar_width: u16,
     /// Command-id → chord-string overrides for remappable commands.
     pub shortcuts: BTreeMap<String, String>,
     /// Unknown additive fields, preserved verbatim on save.
@@ -142,6 +150,8 @@ impl Preferences {
             reduced_motion: false,
             prefer_stable_links: false,
             graph_activation_acknowledged: false,
+            sidebar_open: false,
+            sidebar_width: 240,
             shortcuts: BTreeMap::new(),
             unknown: BTreeMap::new(),
         }
@@ -203,6 +213,8 @@ impl Preferences {
                     | "reduced_motion"
                     | "prefer_stable_links"
                     | "graph_activation_acknowledged"
+                    | "sidebar_open"
+                    | "sidebar_width"
                     | "shortcuts"
             ) {
                 unknown.insert(key.clone(), value.clone());
@@ -284,6 +296,22 @@ impl Preferences {
                 false
             }
         };
+        let sidebar_open = match map.get("sidebar_open") {
+            None => false,
+            Some(Value::Bool(flag)) => *flag,
+            Some(_) => {
+                warnings.push("sidebar_open must be true or false".into());
+                false
+            }
+        };
+        let sidebar_width = bounded_field(
+            &map,
+            "sidebar_width",
+            MIN_SIDEBAR_WIDTH,
+            MAX_SIDEBAR_WIDTH,
+            240,
+            &mut warnings,
+        );
         let shortcuts = match map.get("shortcuts") {
             None => BTreeMap::new(),
             Some(Value::Object(entries)) => {
@@ -313,6 +341,8 @@ impl Preferences {
                 reduced_motion,
                 prefer_stable_links,
                 graph_activation_acknowledged,
+                sidebar_open,
+                sidebar_width,
                 shortcuts,
                 unknown,
             },
@@ -350,6 +380,8 @@ impl Preferences {
             "graph_activation_acknowledged".into(),
             Value::from(self.graph_activation_acknowledged),
         );
+        map.insert("sidebar_open".into(), Value::from(self.sidebar_open));
+        map.insert("sidebar_width".into(), Value::from(self.sidebar_width));
         let shortcuts = self
             .shortcuts
             .iter()
@@ -512,6 +544,32 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("prefer_stable_links"))
+        );
+    }
+
+    #[test]
+    fn sidebar_presentation_round_trips_with_defaults() {
+        let defaults = Preferences::defaults();
+        assert!(!defaults.sidebar_open);
+        assert_eq!(defaults.sidebar_width, 240);
+        let mut preferences = Preferences::defaults();
+        preferences.sidebar_open = true;
+        preferences.sidebar_width = 360;
+        let encoded = preferences.to_json().to_string();
+        let parsed = Preferences::parse(Some(&encoded)).unwrap();
+        assert!(parsed.preferences.sidebar_open);
+        assert_eq!(parsed.preferences.sidebar_width, 360);
+    }
+
+    #[test]
+    fn out_of_range_sidebar_width_falls_back_with_a_warning() {
+        let parsed = Preferences::parse(Some(r#"{"schema":1,"sidebar_width":900}"#)).unwrap();
+        assert_eq!(parsed.preferences.sidebar_width, 240);
+        assert!(
+            parsed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("sidebar_width"))
         );
     }
 }

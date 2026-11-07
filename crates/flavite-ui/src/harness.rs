@@ -99,7 +99,9 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         .filter_map(|group| {
             let state = app.workspace.group(&group)?;
             let bounds = app.group_bounds.get(&group).copied();
-            let slots = crate::workspace::tab_strip::plan(bounds.map_or(0.0,|r|r.width),app.appearance.metrics().controls_width,state.tabs().len(),state.tabs().iter().position(|t| *t==state.active()).unwrap_or(0));
+            let metrics = app.appearance.metrics();
+            let strip_x = crate::workspace::tab_strip::nav_width(*metrics);
+            let slots = crate::workspace::tab_strip::plan(bounds.map_or(0.0,|r|r.width),metrics.controls_width + strip_x,state.tabs().len(),state.tabs().iter().position(|t| *t==state.active()).unwrap_or(0));
             let tabs: Vec<serde_json::Value> = state
                 .tabs()
                 .iter()
@@ -284,6 +286,7 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                 "group": group.to_string(),
                 "bounds": bounds.map(|r| [r.x,r.y,r.width,r.height]),
                 "tab_width": slots.tab_width,
+                "strip_x": strip_x,
                 "label": app
                     .workspace
                     .tab(&state.active())
@@ -394,7 +397,7 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "reduced_motion": app.appearance.prefs.reduced_motion,
     });
     snapshot["menu_bar_visible"] = app.menu_bar_visible.into();
-    snapshot["sidebar_open"] = app.sidebar_open.into();
+    snapshot["sidebar_open"] = app.sidebar_open().into();
     snapshot["sidebar_filter"] = app.sidebar_filter.clone().into();
     snapshot["sidebar_bounds"] = serde_json::json!(
         app.sidebar_bounds

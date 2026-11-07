@@ -203,13 +203,19 @@ impl App {
             let x = position.x - rect.x;
             let y = position.y - rect.y;
             let active = g.tabs().iter().position(|t| *t == g.active()).unwrap_or(0);
-            let slots = tab_strip::plan(rect.width, metrics.controls_width, g.tabs().len(), active);
+            let nav = tab_strip::nav_width(*metrics);
+            let slots = tab_strip::plan(
+                rect.width,
+                metrics.controls_width + nav,
+                g.tabs().len(),
+                active,
+            );
             if y < tab_height {
-                if x >= rect.width - metrics.controls_width {
+                if x < nav || x >= rect.width - metrics.controls_width {
                     return None;
                 }
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let offset = ((x / slots.tab_width.max(1.0)) + 0.5).floor() as usize;
+                let offset = (((x - nav) / slots.tab_width.max(1.0)) + 0.5).floor() as usize;
                 return Some(Target {
                     group,
                     index: (slots.start + offset.min(slots.count)).min(g.tabs().len()),

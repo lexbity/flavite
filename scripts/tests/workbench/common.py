@@ -179,7 +179,9 @@ def focus_tab(harness, title, load):
     point(
         window,
         harness,
-        x + min(w - 12, tab["slot_index"] * group["tab_width"] + 35),
+        x
+        + group.get("strip_x", 0.0)
+        + min(w - 12, tab["slot_index"] * group["tab_width"] + 35),
         y + 16,
     )
     run("xdotool", "click", "1")

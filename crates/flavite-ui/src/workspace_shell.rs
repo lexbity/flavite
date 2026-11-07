@@ -13,8 +13,8 @@ use crate::workspace::{
 };
 use flavite_workspace::{GroupId, LayoutAction, TabId, ViewKind};
 use iced::widget::{
-    Space, button, column, container, opaque, pane_grid, row, rule, scrollable, stack, text,
-    text_input,
+    Space, button, column, container, mouse_area, opaque, pane_grid, row, rule, scrollable, stack,
+    text, text_input,
 };
 use iced::{Element, Length, Padding, alignment};
 
@@ -150,7 +150,7 @@ fn top_bar(app: &App) -> Element<'_, Message> {
 
 fn workspace_with_navigation(app: &App) -> Element<'_, Message> {
     let panes = bounds::workspace(workspace_region(app), app);
-    if !app.sidebar_open {
+    if !app.sidebar_open() {
         return panes;
     }
     let metrics = *app.appearance.metrics();
@@ -188,15 +188,21 @@ fn workspace_with_navigation(app: &App) -> Element<'_, Message> {
         rule::horizontal(1),
         crate::views::notes::sidebar(app),
     ]
-    .width(metrics.sidebar_width + 40.0 * metrics.scale)
+    .width(app.sidebar_width())
     .height(Length::Fill);
-    row![
-        container(navigator).style(style::toolbar),
-        rule::vertical(1),
-        panes
-    ]
-    .height(Length::Fill)
-    .into()
+    let divider = mouse_area(
+        container(
+            Space::new()
+                .width(Length::Fixed(6.0 * metrics.scale))
+                .height(Length::Fill),
+        )
+        .style(style::toolbar),
+    )
+    .interaction(iced::mouse::Interaction::ResizingHorizontally)
+    .on_press(Message::SidebarResizeBegin);
+    row![container(navigator).style(style::toolbar), divider, panes]
+        .height(Length::Fill)
+        .into()
 }
 
 /// The standard sorted menu bar (W10): every entry resolves through the
@@ -341,7 +347,13 @@ fn group_panel(app: &App, group: GroupId, _focused: bool) -> Element<'_, Message
     let panel = if let Some(target) = app.gesture.target().filter(|t| t.group == group) {
         let rect = app.group_bounds.get(&group).copied().unwrap_or_default();
         let active = g.tabs().iter().position(|t| *t == g.active()).unwrap_or(0);
-        let slots = tab_strip::plan(rect.width, metrics.controls_width, g.tabs().len(), active);
+        let nav = tab_strip::nav_width(*metrics);
+        let slots = tab_strip::plan(
+            rect.width,
+            metrics.controls_width + nav,
+            g.tabs().len(),
+            active,
+        );
         // Drop-target geometry tracks the scaled tab strip chrome.
         let tab_height = metrics.tab_height;
         #[allow(clippy::cast_precision_loss)]
@@ -368,7 +380,7 @@ fn group_panel(app: &App, group: GroupId, _focused: bool) -> Element<'_, Message
                 (rect.height - tab_height) / 2.0,
             ),
             None => (
-                (target.index.saturating_sub(slots.start) as f32 * slots.tab_width)
+                (nav + target.index.saturating_sub(slots.start) as f32 * slots.tab_width)
                     .min(rect.width - metrics.controls_width),
                 0.0,
                 3.0,
@@ -403,9 +415,7 @@ fn menu_overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Me
     };
     let metrics = app.appearance.metrics();
     let width = 256.0_f32.min(app.window_size().width);
-    let (x, y) = if menu == crate::workspace::StripMenu::App {
-        (metrics.spacing_lg, 36.0)
-    } else if menu.is_top_menu() {
+    let (x, y) = if menu.is_top_menu() {
         (menu.bar_x() * metrics.scale, 36.0 * metrics.scale)
     } else {
         let rect = app

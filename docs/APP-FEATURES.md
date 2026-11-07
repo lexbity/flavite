@@ -193,6 +193,7 @@ Remappable in Preferences.
 | Mod+O | Open note… |
 | Mod+T / Mod+Shift+T | New tab / Reopen closed tab |
 | Mod+W | Close tab |
+| Mod+B | Toggle the notes sidebar |
 | Mod+Tab / Mod+Shift+Tab | Next / previous tab |
 | F6 / Shift+F6 | Next / previous group |
 | Mod+Alt+Right / Mod+Alt+Down | Split group right / down |
