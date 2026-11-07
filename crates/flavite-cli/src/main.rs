@@ -90,7 +90,12 @@ enum Commands {
         limit: usize,
     },
 
-    /// Search notes by text content.
+    /// Search saved note content through a materialized search session
+    /// (RFC-0006 S06). Plain text is the default mode: whitespace means
+    /// AND and punctuation is text. Expression mode parses the explicit
+    /// operator syntax (AND/OR/NOT, quotes, parentheses). Literal and
+    /// regex modes are vault source matching (RFC-0006 S07) and are
+    /// refused here with a typed error.
     Search {
         /// Path to the vault (overrides global --vault).
         #[arg(short, long, value_name = "PATH")]
@@ -100,9 +105,22 @@ enum Commands {
         #[arg(required = true, value_name = "TERM")]
         term: String,
 
-        /// Limit the number of results.
-        #[arg(short, long, default_value = "20", value_name = "N")]
+        /// Search mode: text (default) or expression.
+        #[arg(long, value_enum, default_value_t = CliSearchMode::Text)]
+        mode: CliSearchMode,
+
+        /// Restrict text leaves to one indexed field (title, aliases,
+        /// tags, body, all). Expression mode embeds field filters directly.
+        #[arg(long, value_name = "FIELD")]
+        field: Option<String>,
+
+        /// Page size (1..=200, default 50).
+        #[arg(short, long, default_value = "50", value_name = "N")]
         limit: usize,
+
+        /// Consume every continuation token before exiting.
+        #[arg(long)]
+        all: bool,
     },
 
     /// Rename a note through the durable vault rename transaction.
@@ -210,6 +228,19 @@ impl CliBom {
             Self::Absent => "absent",
         }
     }
+}
+
+/// CLI search modes (RFC-0006 S06).
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliSearchMode {
+    /// Plain full-text: whitespace means AND, punctuation is text.
+    Text,
+    /// Explicit expression syntax (AND/OR/NOT, quotes, parentheses).
+    Expression,
+    /// Vault source literal matching (RFC-0006 S07; not available yet).
+    Literal,
+    /// Vault source regex matching (RFC-0006 S07; not available yet).
+    Regex,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -547,24 +578,115 @@ impl CliDriver {
         Ok(())
     }
 
-    /// Run a search.
-    #[allow(clippy::ptr_arg)]
-    fn run_search(&self, _vault_path: &Path, term: &str, limit: usize) -> Result<()> {
+    /// Run a saved-content search through a materialized search session
+    /// (RFC-0006 S06): explicit modes, page tokens with total/next, and a
+    /// deterministic machine-readable error object. The wrapper waits only
+    /// on its caller thread — never on the SQL actor or the search-writer
+    /// thread (§12).
+    #[allow(clippy::too_many_lines)]
+    fn run_search(
+        &self,
+        _vault_path: &Path,
+        term: &str,
+        mode: CliSearchMode,
+        field: Option<&str>,
+        limit: usize,
+        consume_all: bool,
+    ) -> Result<()> {
         info!("Running search: {}", term);
+        use flavite_api::search_sessions::{SearchMode, SearchQueryOptions};
 
         let flavite = self
             .flavite
             .as_ref()
             .context("search requires an opened vault")?;
-        let query = flavite_api::Query::parse(term).map_err(anyhow::Error::msg)?;
-        let result = flavite.query_with_limit(&query, limit)?;
-        if self.json {
-            println!("{}", serde_json::to_string(&result.notes)?);
-        } else {
-            for note in &result.notes {
-                println!("{}\t{}", note.path, note.title);
+        let page_size = u64::try_from(limit.clamp(1, 200)).unwrap_or(50);
+        let outcome = match mode {
+            CliSearchMode::Literal | CliSearchMode::Regex => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "error": {
+                            "kind": "unsupported",
+                            "message": "vault source matching (literal/regex) is not available in this build; use --mode text or --mode expression"
+                        }
+                    })
+                );
+                anyhow::bail!("search failed");
+            }
+            CliSearchMode::Text | CliSearchMode::Expression => {
+                let text = match (field, mode) {
+                    (Some(field), _) => format!("{field}:{term}"),
+                    (None, _) => term.to_owned(),
+                };
+                let options = SearchQueryOptions {
+                    mode: match mode {
+                        CliSearchMode::Text => SearchMode::FullText,
+                        CliSearchMode::Expression => SearchMode::Expression,
+                        CliSearchMode::Literal | CliSearchMode::Regex => unreachable!(),
+                    },
+                    text,
+                    page_size,
+                };
+                flavite.search_start(options)
+            }
+        };
+        let mut page = outcome.map_err(|error| {
+            eprintln!("{}", json_error(&error));
+            anyhow::anyhow!("search failed")
+        })?;
+        let mut pages = 0u64;
+        loop {
+            pages += 1;
+            if self.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "session": page.session.as_hex(),
+                        "epoch": page.epoch,
+                        "generation": page.generation,
+                        "total": page.total,
+                        "rows": page.rows.iter().map(|row| serde_json::json!({
+                            "path": row.path,
+                            "title": row.title,
+                            "excerpt": row.excerpt,
+                            "score": row.score,
+                        })).collect::<Vec<_>>(),
+                        "next": page.next.as_ref().map(|token| token.next_ordinal),
+                    }))?
+                );
+            } else {
+                for row in &page.rows {
+                    println!("{}\t{}", row.path, row.title);
+                }
+                if let Some(token) = &page.next {
+                    eprintln!(
+                        "page {pages}: {} of {} results; next ordinal {}",
+                        token.next_ordinal, page.total, token.next_ordinal
+                    );
+                } else {
+                    eprintln!(
+                        "{} results in {} page(s); snapshot {}/{}",
+                        page.total, pages, page.epoch, page.generation
+                    );
+                }
+            }
+            match &page.next {
+                Some(_) if consume_all => {
+                    let token = page.next.expect("next checked");
+                    page = flavite.search_page(&token).map_err(|error| {
+                        eprintln!("{}", json_error(&error));
+                        anyhow::anyhow!("search failed")
+                    })?;
+                }
+                _ => break,
             }
         }
+        // Explicit session close (search.close, §6.1): the spool is dropped.
+        flavite.search_close(page.session).map_err(|error| {
+            eprintln!("{}", json_error(&error));
+            anyhow::anyhow!("search failed")
+        })?;
         Ok(())
     }
 
@@ -778,6 +900,25 @@ fn get_vault_path(cli_path: Option<PathBuf>, global_path: Option<PathBuf>) -> Pa
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Render a typed search-session error as the deterministic machine-readable
+/// error object (RFC-0006 S06).
+fn json_error(error: &flavite_api::FlaviteError) -> String {
+    let kind = match error {
+        flavite_api::FlaviteError::SearchSession(inner) => match inner {
+            flavite_api::search_sessions::SearchSessionError::Busy(_) => "busy",
+            flavite_api::search_sessions::SearchSessionError::Invalid { .. } => "invalid",
+            flavite_api::search_sessions::SearchSessionError::LimitExceeded { .. } => {
+                "limit-exceeded"
+            }
+            flavite_api::search_sessions::SearchSessionError::ResetRequired => "reset-required",
+            flavite_api::search_sessions::SearchSessionError::Expired => "expired",
+            flavite_api::search_sessions::SearchSessionError::Failed(_) => "failed",
+        },
+        _ => "failed",
+    };
+    serde_json::json!({ "error": { "kind": kind, "message": error.to_string() } }).to_string()
+}
+
 /// Main entry point.
 fn main() -> Result<()> {
     // Parse CLI arguments
@@ -807,10 +948,17 @@ fn main() -> Result<()> {
             driver.open_vault(vault_path.clone(), cli.no_watch)?;
             driver.run_query(&vault_path, &query, limit)?;
         }
-        Commands::Search { path, term, limit } => {
+        Commands::Search {
+            path,
+            term,
+            mode,
+            field,
+            limit,
+            all,
+        } => {
             let vault_path = get_vault_path(path, cli.vault);
             driver.open_vault(vault_path.clone(), cli.no_watch)?;
-            driver.run_search(&vault_path, &term, limit)?;
+            driver.run_search(&vault_path, &term, mode, field.as_deref(), limit, all)?;
         }
         Commands::Rename { from, to, strategy } => {
             let vault_path = get_vault_path(None, cli.vault);

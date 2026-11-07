@@ -250,13 +250,58 @@ run_s05_gates() {
         "$root/crates/flavite-ui/src/app.rs"
 }
 
+
+run_s06_gates() {
+    # S06 presence: the ordered writer owner, the complete evaluator, the
+    # capture protocol, the materialized session service, the search host,
+    # and the proof surfaces (RFC-0006 S06 table).
+    local file
+    for file in \
+        crates/flavite-index/src/search_eval.rs \
+        crates/flavite-index/src/search_session.rs \
+        crates/flavite-index/src/search_writer.rs \
+        crates/flavite-api/src/search_sessions.rs \
+        crates/flavite-ui/src/host/search.rs \
+        crates/flavite-index/tests/search_boolean.rs \
+        crates/flavite-index/tests/search_writer.rs \
+        crates/flavite-api/tests/search_sessions.rs \
+        crates/flavite-ui/tests/search_paging.rs \
+        crates/flavite-cli/tests/search_modes.rs; do
+        gate assert_nonempty "$root/$file"
+    done
+    # S06 source isolation gates (exact required invocations, §12).
+    gate assert_absent 'trimmed\.split_whitespace\(' \
+        "$root/crates/flavite-api/src/query_service.rs" \
+        "$root/crates/flavite-api/src/search_sessions.rs"
+    gate assert_absent 'fn load_more|MAX_PAGE_LIMIT|page_limit.*SEARCH_PAGE' \
+        "$root/crates/flavite-ui/src/views/search.rs" \
+        "$root/crates/flavite-ui/src/host/search.rs"
+    gate assert_absent 'Self::Text\(_query\)' "$root/crates/flavite-index/src/query.rs"
+    gate assert_absent 'SearchState' "$root/crates/flavite-ui/src/views/search.rs"
+    gate assert_absent 'fn search_notes_with_filter_limit' "$root/crates/flavite-index/src/pool.rs"
+    # The old synchronous commit-before-search contract is deleted from
+    # production search paths (D-07): no commit inside search_hits/searcher.
+    gate assert_absent 'commit_before_search|if self\.is_dirty\(\) \{\s*$' \
+        "$root/crates/flavite-index/src/search.rs"
+    # The index keeps no synchronous IndexWriter: writes belong to the one
+    # ordered writer thread, and the deferred-commit timer is gone.
+    gate assert_absent 'writer: Mutex<IndexWriter>|fn commit_search_if_due' \
+        "$root/crates/flavite-index/src/search.rs" \
+        "$root/crates/flavite-index/src/pool.rs" \
+        "$root/crates/flavite-vault/src/actor.rs"
+    # The legacy And-only hybrid extraction and the giant-filter fallback
+    # are deleted with search_notes_with_filter_limit.
+    gate assert_absent 'MAX_TANTIVY_FILTER_SIZE' "$root/crates/flavite-index/src"
+}
+
 case "$slice" in
     S00) run_s00_gates ;;
     S01) run_s00_gates; run_s01_gates ;;
     S03) run_s00_gates; run_s01_gates; run_s03_gates ;;
     S04) run_s00_gates; run_s01_gates; run_s03_gates; run_s04_gates ;;
     S05) run_s00_gates; run_s01_gates; run_s03_gates; run_s04_gates; run_s05_gates ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: S00 S01 S03 S04 S05)" >&2; exit 2 ;;
+    S06) run_s00_gates; run_s01_gates; run_s03_gates; run_s04_gates; run_s05_gates; run_s06_gates ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: S00 S01 S03 S04 S05 S06)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then

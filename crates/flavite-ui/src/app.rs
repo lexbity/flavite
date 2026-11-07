@@ -84,7 +84,7 @@ pub struct App {
     /// Graph view host: per-tab camera/selection/pins/geometry (W07).
     pub graph: crate::host::graph::GraphHost,
     /// Saved-content search states (W10).
-    pub search: crate::views::search::SearchHost,
+    pub search: crate::host::search::SearchHost,
     /// Local-history listings (W10).
     pub history: crate::views::history::HistoryHost,
     /// Per-view back/forward navigation (W10).
@@ -388,8 +388,15 @@ pub enum Message {
     SearchSubmitNow {
         tab: TabId,
     },
-    SearchLoadMore {
+    SearchNextPage {
         tab: TabId,
+    },
+    SearchRefresh {
+        tab: TabId,
+    },
+    SearchSetMode {
+        tab: TabId,
+        mode: crate::host::search::SearchPanelMode,
     },
     // ---- W10: History view ----
     HistoryRefresh {
@@ -569,7 +576,7 @@ impl App {
                 host.backend = crate::host::graph::GraphBackend::from_env();
                 host
             },
-            search: crate::views::search::SearchHost::default(),
+            search: crate::host::search::SearchHost::default(),
             history: crate::views::history::HistoryHost::default(),
             nav: crate::host::navigation::NavHost::default(),
             open_memory: crate::host::open_intents::OpenMemory::default(),
@@ -2622,7 +2629,9 @@ impl App {
             Message::SearchSubmitNow { tab } => {
                 self.search.submit_now(tab);
             }
-            Message::SearchLoadMore { tab } => self.search.load_more(tab),
+            Message::SearchNextPage { tab } => self.search.next_page(tab, self.flavite.as_ref()),
+            Message::SearchRefresh { tab } => self.search.refresh(tab),
+            Message::SearchSetMode { tab, mode } => self.search.set_mode(tab, mode),
             // ---- W10: History view ----
             Message::HistoryRefresh { tab } => {
                 if let Some(locator) =
@@ -4212,7 +4221,7 @@ mod tests {
                 host.backend = crate::host::graph::GraphBackend::from_env();
                 host
             },
-            search: crate::views::search::SearchHost::default(),
+            search: crate::host::search::SearchHost::default(),
             history: crate::views::history::HistoryHost::default(),
             nav: crate::host::navigation::NavHost::default(),
             open_memory: crate::host::open_intents::OpenMemory::default(),

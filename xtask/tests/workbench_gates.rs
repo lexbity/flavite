@@ -156,6 +156,90 @@ fn seed_s05_inputs(root: &Path) {
     }
 }
 
+fn seed_s06_inputs(root: &Path) {
+    seed_s05_inputs(root);
+    for relative in [
+        "crates/flavite-index/src/search_eval.rs",
+        "crates/flavite-index/src/search_session.rs",
+        "crates/flavite-index/src/search_writer.rs",
+        "crates/flavite-api/src/search_sessions.rs",
+        "crates/flavite-ui/src/host/search.rs",
+        "crates/flavite-index/tests/search_boolean.rs",
+        "crates/flavite-index/tests/search_writer.rs",
+        "crates/flavite-api/tests/search_sessions.rs",
+        "crates/flavite-ui/tests/search_paging.rs",
+        "crates/flavite-cli/tests/search_modes.rs",
+        // rg targets of the S06 absence gates.
+        "crates/flavite-index/src/query.rs",
+        "crates/flavite-index/src/search.rs",
+        "crates/flavite-ui/src/views/search.rs",
+    ] {
+        seed_file(root, relative);
+    }
+}
+
+#[test]
+fn s06_gate_passes_clean_tree_and_rejects_retired_search_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_s06_inputs(temp.path());
+    let clean = run_gate(temp.path(), "S06");
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // The legacy whitespace-split search adapter stays dead.
+    let query_service = temp.path().join("crates/flavite-api/src/query_service.rs");
+    fs::write(&query_service, "let terms = trimmed.split_whitespace();\n").unwrap();
+    let rejected = run_gate(temp.path(), "S06");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("split_whitespace"));
+    fs::write(&query_service, "implementation\n").unwrap();
+
+    // The UI never grows a page-limit-growth Load-more path again.
+    let host = temp.path().join("crates/flavite-ui/src/host/search.rs");
+    fs::write(&host, "const MAX_PAGE_LIMIT: u64 = 200;\n").unwrap();
+    let rejected = run_gate(temp.path(), "S06");
+    assert!(!rejected.status.success());
+    fs::write(&host, "implementation\n").unwrap();
+
+    // The structural SQL translator never regains the text placeholder.
+    let query = temp.path().join("crates/flavite-index/src/query.rs");
+    fs::write(
+        &query,
+        "Self::Text(_query) => (\"1 = 0\".to_string(), Vec::new()),\n",
+    )
+    .unwrap();
+    let rejected = run_gate(temp.path(), "S06");
+    assert!(!rejected.status.success());
+    fs::write(&query, "implementation\n").unwrap();
+
+    // The view owns no search state (it lives in the host).
+    let view = temp.path().join("crates/flavite-ui/src/views/search.rs");
+    fs::write(&view, "pub struct SearchState;\n").unwrap();
+    let rejected = run_gate(temp.path(), "S06");
+    assert!(!rejected.status.success());
+    fs::write(&view, "implementation\n").unwrap();
+
+    // The retired private hybrid executor stays dead.
+    let pool = temp.path().join("crates/flavite-index/src/pool.rs");
+    fs::write(&pool, "fn search_notes_with_filter_limit() {}\n").unwrap();
+    let rejected = run_gate(temp.path(), "S06");
+    assert!(!rejected.status.success());
+    fs::write(&pool, "implementation\n").unwrap();
+
+    // Presence is enforced: removing a completed S06 file fails.
+    fs::remove_file(
+        temp.path()
+            .join("crates/flavite-index/src/search_writer.rs"),
+    )
+    .unwrap();
+    let missing = run_gate(temp.path(), "S06");
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("missing/empty"));
+}
+
 #[test]
 fn workbench_gate_rejects_unknown_slice() {
     let temp = tempfile::tempdir().unwrap();

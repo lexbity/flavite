@@ -651,7 +651,7 @@ fn query_membership(
         Query::Text(text) => {
             let session = session.ok_or("Saved text search unavailable")?;
             let page = session
-                .search_notes(Query::Text(text.clone()), 50_001)
+                .evaluate_saved_search(Query::Text(text.clone()), 50_001)
                 .map_err(|_| "Saved text search failed")?;
             if page.items.len() > 50_000 {
                 return Err("Saved search exceeds 50k note view limit".into());

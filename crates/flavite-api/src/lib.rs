@@ -56,6 +56,7 @@ pub use properties::*;
 pub mod queries;
 pub mod query_service;
 pub mod result;
+pub mod search_sessions;
 pub mod types;
 pub mod user_state;
 pub use user_state::{

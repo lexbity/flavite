@@ -18,10 +18,12 @@
 //! - **Two generations**: SQLite's `index.generation` bumps inline on every
 //!   applied change and is authoritative. A second counter,
 //!   `tantivy.committed_generation`, records what tantivy has actually committed.
-//! - **Deferred commits**: Document adds/deletes are applied to the tantivy
-//!   `IndexWriter` immediately (in-memory, cheap), but `commit()` is deferred
-//!   (commit-before-search, or at most every 5 s while dirty, or at end of
-//!   bulk reconcile, or on clean shutdown).
+//! - **One ordered writer (RFC-0006 S06, D-07)**: document upserts/deletes
+//!   travel to the Tantivy `IndexWriter` as immutable per-generation
+//!   envelopes through a single bounded ordered writer thread, which
+//!   commits and reloads without holding the SQL actor or any UI turn.
+//!   `Capture(G)` is an ordered queue message answered with a searcher
+//!   stamped exactly at G; synchronous commit-before-search is deleted.
 //! - **Atomic checkpoint publication**: The search checkpoint is published
 //!   atomically with its own durable commit. Replay uses this checkpoint as the
 //!   authority, not the SQLite mirror.
@@ -34,6 +36,9 @@ pub mod resolver;
 pub mod schema;
 pub mod search;
 pub mod search_docs;
+pub mod search_eval;
+pub mod search_session;
+pub mod search_writer;
 pub mod signal;
 pub mod types;
 

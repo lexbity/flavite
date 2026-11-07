@@ -21,6 +21,7 @@ pub mod note_search;
 pub mod occurrences;
 pub mod open_intents;
 pub mod persistence;
+pub mod search;
 pub mod shell;
 pub mod shutdown;
 

@@ -242,6 +242,11 @@ pub enum IndexError {
 
     #[error("Reset required: epoch changed or cursor too old")]
     ResetRequired,
+
+    #[error(
+        "text predicates are not supported on the structural query endpoint; use the search session endpoint"
+    )]
+    UnsupportedTextPredicate,
 }
 
 /// Query comparison operator.

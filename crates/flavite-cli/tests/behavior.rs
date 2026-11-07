@@ -67,7 +67,9 @@ fn init_open_info_query_and_external_rename_are_real() {
             .unwrap()
     );
 
-    let query = env.run(&["query", "--path", vault.to_str().unwrap(), "needleword"]);
+    // Text terms belong to the search session endpoint (§6.1); `query` is
+    // structural-only.
+    let query = env.run(&["search", "--path", vault.to_str().unwrap(), "needleword"]);
     assert!(
         query.status.success(),
         "{}",
@@ -82,7 +84,7 @@ fn init_open_info_query_and_external_rename_are_real() {
         "{}",
         String::from_utf8_lossy(&renamed.stderr)
     );
-    let after = env.run(&["query", "--path", vault.to_str().unwrap(), "needleword"]);
+    let after = env.run(&["search", "--path", vault.to_str().unwrap(), "needleword"]);
     assert!(
         after.status.success(),
         "{}",
@@ -133,7 +135,7 @@ fn init_open_info_query_and_external_rename_are_real() {
 }
 
 #[test]
-fn query_rejects_unsupported_expression_instead_of_searching_literal_text() {
+fn query_rejects_text_predicates_instead_of_searching_them() {
     let env = CliEnv::new();
     let vault = tempfile::tempdir().unwrap();
     let output = env.run(&[
@@ -143,7 +145,13 @@ fn query_rejects_unsupported_expression_instead_of_searching_literal_text() {
         "title:foo",
     ]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported query syntax"));
+    // §6.1: the structural endpoint rejects text predicates explicitly —
+    // `title:foo` is a valid field-filtered TEXT query, and the typed error
+    // names the search session endpoint as the repair.
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("text predicates are not supported on the structural query endpoint")
+    );
 }
 
 #[test]
@@ -221,10 +229,26 @@ fn alias_strategy_and_typed_search_are_reachable_from_cli() {
         String::from_utf8_lossy(&search.stderr)
     );
     assert!(String::from_utf8_lossy(&search.stdout).contains("B.md"));
+    // Plain text mode treats punctuation as text (§6.9): `bogus:x` is a
+    // literal term here, not a field filter — the same form fails with the
+    // typed expression error only in expression mode.
+    let literal = env.run(&[
+        "search",
+        "--vault",
+        vault.path().to_str().unwrap(),
+        "bogus:x",
+    ]);
+    assert!(
+        literal.status.success(),
+        "{}",
+        String::from_utf8_lossy(&literal.stderr)
+    );
     let invalid = env.run(&[
         "search",
         "--vault",
         vault.path().to_str().unwrap(),
+        "--mode",
+        "expression",
         "bogus:x",
     ]);
     assert!(!invalid.status.success());

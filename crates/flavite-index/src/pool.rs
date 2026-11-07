@@ -15,7 +15,8 @@ use crate::resolver::{
     resolve_affected, target_stem_key,
 };
 use crate::schema::{AttachmentKind, MetaKey, get_meta_u64};
-use crate::search::SearchBackend;
+use crate::search::TantivyBackend;
+use crate::search_writer::{SearchDocOp, SearchEnvelope, SearchWriterHandle, WriterReport};
 use crate::signal::GenerationSignal;
 use crate::types::IndexVersion;
 use blake3::Hash;
@@ -61,8 +62,15 @@ pub struct Writer {
 pub struct IndexActor {
     writer: Writer,
     read_pool: ReadPool,
-    search: crate::search::TantivyBackend,
-    last_search_commit: Instant,
+    /// Tantivy read side (searcher capture, checkpoint publication). All
+    /// writes belong to the single ordered writer below (RFC-0006 S06).
+    search: TantivyBackend,
+    /// The one bounded ordered Tantivy writer owner (D-07). `None` marks a
+    /// secondary handle on an index whose writer belongs to another actor
+    /// in this process or another process: SQL applies still work (the
+    /// owning writer catches up), and the tantivy directory is never
+    /// deleted out from under the owner.
+    search_writer: Option<SearchWriterHandle>,
     needs_reparse: bool,
     resolver: ResolverState,
     /// RFC-0005 S1: the writer-side generation broadcast. `None` keeps the
@@ -76,7 +84,7 @@ pub struct IndexActor {
 /// Matching is case-insensitive on the saved body; the excerpt is
 /// character-bounded (not byte-bounded) so multi-byte text is never split.
 #[must_use]
-fn build_excerpt(body: Option<&str>, terms: &[String]) -> String {
+pub fn build_excerpt(body: Option<&str>, terms: &[String]) -> String {
     let Some(body) = body.filter(|body| !body.is_empty()) else {
         return String::new();
     };
@@ -136,6 +144,22 @@ fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Collect the distinct text-leaf terms of a query for excerpt anchoring.
+fn text_terms(query: &crate::query::Query) -> Vec<String> {
+    match query {
+        crate::query::Query::Text(leaf) => vec![leaf.term.clone()],
+        crate::query::Query::And(parts) | crate::query::Query::Or(parts) => {
+            let mut terms = Vec::new();
+            for part in parts {
+                terms.extend(text_terms(part));
+            }
+            terms
+        }
+        crate::query::Query::Not(inner) => text_terms(inner),
+        _ => Vec::new(),
+    }
 }
 
 /// Text-search results paired with the structural index version used to
@@ -500,6 +524,11 @@ enum CoreStep {
 struct ApplyPlan {
     post: Option<EntityPre>,
     entity_rows: Vec<(ChangeKind, i64)>,
+    /// Immutable Tantivy document operations prepared inside the apply
+    /// transaction and published as this generation's search envelope
+    /// (RFC-0006 S06, D-07). Empty ops publish the no-op watermark every
+    /// committed generation still sends.
+    search_ops: Vec<SearchDocOp>,
     fresh_target_keys: BTreeSet<String>,
     touched_notes: BTreeSet<i64>,
     touched_attachments: BTreeSet<i64>,
@@ -630,6 +659,60 @@ fn reserve_graph_identity(
     Ok(())
 }
 
+/// Reserve search envelope capacity BEFORE the generation commits (D-07).
+/// Every bumped generation publishes an envelope, including a no-op
+/// watermark when no indexed text changed. A failed reservation must roll
+/// the caller's transaction back — refusal happens before any effect.
+fn reserve_search_envelope(
+    handle: Option<&SearchWriterHandle>,
+    ops: &[SearchDocOp],
+) -> Result<Option<crate::search_writer::EnvelopeReservation>, String> {
+    let Some(handle) = handle else {
+        // A secondary handle publishes no envelopes: the owning writer
+        // catches the derived view up from the authoritative cache.
+        return Ok(None);
+    };
+    let approx_bytes = ops
+        .iter()
+        .map(SearchDocOp::approx_bytes)
+        .sum::<usize>()
+        .saturating_add(32);
+    handle
+        .reserve(approx_bytes)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+/// Publish the immutable generation envelope after the commit succeeded.
+/// The reservation already held the capacity, so this cannot fail while the
+/// writer lives (D-07).
+fn publish_search_envelope(
+    reservation: Option<crate::search_writer::EnvelopeReservation>,
+    handle: Option<&SearchWriterHandle>,
+    epoch: u64,
+    generation: u64,
+    ops: &mut Vec<SearchDocOp>,
+) -> Result<(), String> {
+    let (Some(reservation), Some(handle)) = (reservation, handle) else {
+        return Ok(());
+    };
+    let envelope = SearchEnvelope {
+        epoch,
+        generation,
+        ops: std::sync::Arc::from(std::mem::take(ops).into_boxed_slice()),
+    };
+    reservation
+        .enqueue(handle, envelope)
+        .map_err(|error| error.to_string())
+}
+
+/// Read the advisory committed-generation mirror for the search writer.
+fn committed_of(conn: &rusqlite::Connection) -> u64 {
+    crate::schema::get_meta_u64(conn, MetaKey::TantivyCommittedGeneration)
+        .unwrap_or(Some(0))
+        .unwrap_or(0)
+}
+
 /// Whole-vault backstop walk on the writer transaction (D13; the sole
 /// `re_resolve_all` call site in this file, per the RFC's grep gate).
 /// Returns the flipped sources and the catalog rebuilt from the
@@ -703,38 +786,59 @@ impl IndexActor {
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?;
         let read_pool = ReadPool::new(db_path, pool_size)?;
         let cache_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
-        let (search, search_recreated) =
-            if let Ok(search) = crate::search::TantivyBackend::open(db_path, cache_dir) {
-                (search, false)
-            } else {
-                // Tantivy is a derived cache. A malformed or incompatible
-                // directory is discarded and rebuilt from the structural DB.
-                let path = cache_dir.join("tantivy");
-                if path.exists() {
-                    std::fs::remove_dir_all(&path)
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                }
-                (
-                    crate::search::TantivyBackend::open(db_path, cache_dir)
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                    true,
-                )
-            };
+        let (search, search_recreated) = if let Ok(search) = TantivyBackend::open(cache_dir) {
+            (search, false)
+        } else {
+            // Tantivy is a derived cache. A malformed or incompatible
+            // directory is discarded and rebuilt from the structural DB.
+            let path = cache_dir.join("tantivy");
+            if path.exists() {
+                std::fs::remove_dir_all(&path)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            }
+            (
+                TantivyBackend::open(cache_dir)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                true,
+            )
+        };
+        let sqlite_epoch = crate::schema::get_meta_u64(writer.conn(), MetaKey::Epoch)?.unwrap_or(1);
         let sqlite_generation =
             crate::schema::get_meta_u64(writer.conn(), MetaKey::Generation)?.unwrap_or(0);
-        let committed = search.committed_generation();
-        if search_recreated || committed > sqlite_generation {
-            search
-                .rebuild_from_sqlite()
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        } else if committed < sqlite_generation {
-            // The typed reader owns cursor validity: a floor overrun or epoch
-            // mismatch arrives as `Reset` and rebuilds inside `replay_since`
-            // (§6.1.4 — the bespoke floor check is deleted with its trap).
-            let epoch = crate::schema::get_meta_u64(writer.conn(), MetaKey::Epoch)?.unwrap_or(1);
-            search
-                .replay_since(IndexVersion::new(epoch, committed))
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        // One bounded ordered writer owns the IndexWriter from here on
+        // (RFC-0006 S06, D-07). Startup rebuilds from the authoritative
+        // `search_docs` cache whenever the on-disk view does not exactly
+        // match the structural generation — replay and rebuild share one
+        // correct outcome, and no ephemeral capture survives a restart.
+        // A busy writer lock marks this handle secondary: it applies SQL
+        // only and leaves the derived view to the owning writer, instead
+        // of deleting the owner's index directory.
+        let search_writer = match crate::search_writer::spawn_search_writer(
+            &search,
+            sqlite_epoch,
+            committed_of(writer.conn()),
+        ) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                if error.contains("index lock") || error.contains("LockBusy") {
+                    tracing::warn!(
+                        %error,
+                        "secondary index handle: the tantivy writer belongs to another actor"
+                    );
+                    None
+                } else {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(error.into()));
+                }
+            }
+        };
+        if let Some(handle) = &search_writer
+            && (search_recreated || handle.committed_frontier() != sqlite_generation)
+        {
+            let docs = crate::search_writer::read_rebuild_docs(writer.conn())
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+            handle
+                .rebuild_blocking(sqlite_epoch, sqlite_generation, docs.into())
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
         }
 
         let resolver = match backstop {
@@ -745,7 +849,7 @@ impl IndexActor {
             writer,
             read_pool,
             search,
-            last_search_commit: Instant::now(),
+            search_writer,
             needs_reparse,
             resolver,
             signal,
@@ -1217,6 +1321,17 @@ impl IndexActor {
             }
             rows.extend(changed.into_iter().map(|src| (ChangeKind::Outgoing, src)));
             let row_count = rows.len();
+            // Search envelope capacity is reserved BEFORE the generation
+            // commits (D-07); backpressure refuses the index admission here
+            // and upstream maps it to an index-pending retry.
+            let reservation =
+                match reserve_search_envelope(self.search_writer.as_ref(), &plan.search_ops) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        let _ = tx.rollback();
+                        return Err(error);
+                    }
+                };
             tx.execute(
                 "UPDATE meta SET value=?1 WHERE key=?2",
                 rusqlite::params![generation.to_string(), MetaKey::Generation.as_str()],
@@ -1228,6 +1343,13 @@ impl IndexActor {
             // found drift and repaired it as a logged structural apply), so
             // the generation is broadcast immediately on commit success.
             self.publish_generation(IndexVersion::new(epoch, generation));
+            publish_search_envelope(
+                reservation,
+                self.search_writer.as_ref(),
+                epoch,
+                generation,
+                &mut plan.search_ops,
+            )?;
             self.resolver.commit_backstop(catalog);
             self.resolver.note_committed_apply(row_count as u64);
             self.resolver.fold_overlay(epoch, generation);
@@ -1331,12 +1453,29 @@ impl IndexActor {
         rows.extend(conflict_flips.into_iter().map(|id| (ChangeKind::Note, id)));
         ChangeLogWriter::record_all(&tx, generation, &rows)?;
         let change_rows = rows.len();
+        // Search envelope capacity is reserved BEFORE the generation
+        // commits (D-07); backpressure refuses the index admission here.
+        let reservation =
+            match reserve_search_envelope(self.search_writer.as_ref(), &plan.search_ops) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    let _ = tx.rollback();
+                    return Err(error);
+                }
+            };
         tx.commit().map_err(|error| error.to_string())?;
         // FR-1 site: the structural apply bumped `MetaKey::Generation` in
         // this transaction, so the generation is broadcast immediately on
         // commit success — ahead of the in-memory fold, because the feed
         // (database) is the truth any subscriber verifies against.
         self.publish_generation(IndexVersion::new(epoch, generation));
+        publish_search_envelope(
+            reservation,
+            self.search_writer.as_ref(),
+            epoch,
+            generation,
+            &mut plan.search_ops,
+        )?;
         // Commit fold (§6.2.4): SQLite writes are durable; in-memory state
         // follows. Counters track committed applies only.
         if let Some(catalog) = backstop_catalog {
@@ -1358,7 +1497,7 @@ impl IndexActor {
     /// Returns the underlying error text when the transaction cannot be
     /// started, a query fails, or the commit fails.
     pub fn remove_note_path(&mut self, path_native: &[u8]) -> Result<bool, String> {
-        let (outcome, plan) =
+        let (outcome, _plan) =
             self.apply_entity_core(true, true, path_native, |tx, pre, _counters, plan| {
                 let Some(EntityPre::Note(image)) = pre else {
                     return Err("missing note pre-image".to_owned());
@@ -1370,23 +1509,14 @@ impl IndexActor {
                     .map_err(|error| error.to_string())?;
                 tx.execute("DELETE FROM search_docs WHERE note_id=?1", [note_id])
                     .map_err(|error| error.to_string())?;
+                plan.search_ops.push(SearchDocOp::Delete { note_id });
                 plan.entity_rows.push((ChangeKind::Note, note_id));
                 plan.touched_notes.insert(note_id);
                 Ok(CoreStep::Proceed)
             })?;
         match outcome {
             SpineOutcome::RolledBack => Ok(false),
-            SpineOutcome::Applied { .. } => {
-                let note_id = plan
-                    .entity_rows
-                    .first()
-                    .map(|(_, id)| *id)
-                    .ok_or("note removal planned no entity row")?;
-                self.search
-                    .delete_document(note_id)
-                    .map_err(|error| error.to_string())?;
-                Ok(true)
-            }
+            SpineOutcome::Applied { .. } => Ok(true),
             SpineOutcome::FastPath { .. } => Err("note removal cannot take a fast path".to_owned()),
         }
     }
@@ -1682,6 +1812,26 @@ impl IndexActor {
                     rusqlite::params![note_id, content_hash.as_bytes(), parsed.snapshot.text()],
                 )
                 .map_err(|error| error.to_string())?;
+                // The envelope carries this generation's immutable document
+                // content (D-07): no later reread of a newer `search_docs`
+                // row can leak into it.
+                let mut doc_tags: Vec<String> = parsed
+                    .tags
+                    .iter()
+                    .filter_map(|tag| parsed.snapshot.text().get(tag.start.0..tag.end.0))
+                    .map(|value| value.trim_start_matches('#').to_owned())
+                    .collect();
+                doc_tags.extend(frontmatter_tags.iter().map(|tag| {
+                    flavite_syntax::wellknown::normalize_tag(tag)
+                }));
+                plan.search_ops.push(SearchDocOp::Upsert {
+                    note_id,
+                    content_hash: *content_hash.as_bytes(),
+                    title: title.clone(),
+                    aliases: aliases.clone(),
+                    tags: doc_tags,
+                    body: parsed.snapshot.text().to_owned(),
+                });
                 plan.post = Some(EntityPre::Note(NoteImage {
                     id: note_id,
                     path: display_path.to_owned(),
@@ -1705,33 +1855,9 @@ impl IndexActor {
             SpineOutcome::RolledBack => Err("parsed note apply cannot be a no-op".to_owned()),
             SpineOutcome::FastPath { epoch, generation } => Ok((epoch, generation)),
             SpineOutcome::Applied { epoch, generation } => {
-                let note_id = plan
-                    .entity_rows
-                    .first()
-                    .map(|(_, id)| *id)
-                    .ok_or("parsed note apply planned no entity row")?;
-                let conn = self.writer.conn();
-                let mut alias_stmt = conn
-                    .prepare("SELECT alias FROM aliases WHERE note_id=?1 ORDER BY alias_key")
-                    .map_err(|error| error.to_string())?;
-                let aliases = alias_stmt
-                    .query_map([note_id], |row| row.get::<_, String>(0))
-                    .map_err(|error| error.to_string())?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| error.to_string())?;
-                let mut tag_stmt = conn
-                    .prepare("SELECT tag FROM tags WHERE note_id=?1 ORDER BY tag")
-                    .map_err(|error| error.to_string())?;
-                let tags = tag_stmt
-                    .query_map([note_id], |row| row.get::<_, String>(0))
-                    .map_err(|error| error.to_string())?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| error.to_string())?;
-                drop(alias_stmt);
-                drop(tag_stmt);
-                self.search
-                    .apply_document_full(note_id, &title, &aliases, &tags, parsed.snapshot.text())
-                    .map_err(|error| error.to_string())?;
+                // The document content already went out with this
+                // generation's ordered envelope (D-07).
+                let _ = &plan;
                 Ok((epoch, generation))
             }
         }
@@ -1891,6 +2017,13 @@ impl IndexActor {
                     .map_err(|error| error.to_string())?;
                 tx.execute("DELETE FROM search_docs WHERE note_id=?1", [note_id])
                     .map_err(|error| error.to_string())?;
+                // Degraded rows carry no search_docs body; the zero hash
+                // records "not body-backed" (D-07 envelope content rule).
+                plan.search_ops.push(SearchDocOp::TitleOnly {
+                    note_id,
+                    content_hash: [0u8; 32],
+                    title: stem.to_owned(),
+                });
                 plan.post = Some(EntityPre::Note(NoteImage {
                     id: note_id,
                     path: display_path.to_owned(),
@@ -1913,14 +2046,9 @@ impl IndexActor {
             SpineOutcome::RolledBack => Err("unparsed note apply cannot be a no-op".to_owned()),
             SpineOutcome::FastPath { epoch, generation } => Ok((epoch, generation)),
             SpineOutcome::Applied { epoch, generation } => {
-                let note_id = plan
-                    .entity_rows
-                    .first()
-                    .map(|(_, id)| *id)
-                    .ok_or("unparsed note apply planned no entity row")?;
-                self.search
-                    .apply_title_only_document(note_id, stem)
-                    .map_err(|error| error.to_string())?;
+                // The title-only document already went out with this
+                // generation's ordered envelope (D-07).
+                let _ = &plan;
                 Ok((epoch, generation))
             }
         }
@@ -2038,58 +2166,56 @@ impl IndexActor {
         }
     }
 
-    /// Search the derived Tantivy view. Dirty documents are committed before
-    /// the query so every acknowledged save is visible (D4/D12).
+    /// Drain committed-version acknowledgements from the ordered writer and
+    /// advance the advisory `tantivy_committed_generation` metadata
+    /// monotonically through the sole SQL owner, only after Tantivy
+    /// durability/reload (D-07). Desync reports are answered with a
+    /// cache-based rebuild — never gap skipping.
     ///
     /// # Errors
-    /// Returns an error when a commit or Tantivy search fails.
-    pub fn search_text(
-        &mut self,
-        text: &str,
-        note_ids: &[i64],
-        limit: usize,
-    ) -> Result<Vec<i64>, String> {
-        let hits = self
-            .search
-            .search_text(text, note_ids, limit)
-            .map_err(|e| e.to_string())?;
-        self.last_search_commit = Instant::now();
-        Ok(hits)
-    }
-
-    /// Scored variant of [`IndexActor::search_text`] (D11): the hit list
-    /// keeps Tantivy's relative relevance for result assembly.
-    ///
-    /// # Errors
-    /// Returns an error when a commit or Tantivy search fails.
-    pub fn search_hits(
-        &mut self,
-        text: &str,
-        note_ids: &[i64],
-        limit: usize,
-    ) -> Result<Vec<crate::search::Hit>, String> {
-        let hits = self
-            .search
-            .search_hits(text, note_ids, limit)
-            .map_err(|e| e.to_string())?;
-        self.last_search_commit = Instant::now();
-        Ok(hits)
-    }
-
-    /// Commit the search view after bulk reconcile or when its deferred timer expires.
-    ///
-    /// # Errors
-    /// Returns an error when Tantivy or generation metadata cannot be committed.
-    pub fn commit_search_if_due(&mut self, force: bool) -> Result<(), String> {
-        if force
-            || (self.search.is_dirty()
-                && self.last_search_commit.elapsed()
-                    >= std::time::Duration::from_secs(crate::search::DEFAULT_COMMIT_INTERVAL_SECS))
+    /// Returns the error text when metadata updates or a rebuild fail.
+    pub fn drain_search_acks(&mut self) -> Result<(), String> {
+        let Some(handle) = &self.search_writer else {
+            return Ok(());
+        };
+        for ack in handle.drain_acks() {
+            let current = committed_of(self.writer.conn());
+            if ack.generation >= current {
+                crate::schema::set_meta(
+                    self.writer.conn(),
+                    MetaKey::TantivyCommittedGeneration,
+                    &ack.generation.to_string(),
+                )
+                .map_err(|error| error.to_string())?;
+                self.search
+                    .publish_checkpoint(ack.epoch, ack.generation)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        if handle
+            .drain_reports()
+            .iter()
+            .any(|report| matches!(report, WriterReport::Desynced))
         {
-            self.search.commit().map_err(|e| e.to_string())?;
-            self.last_search_commit = Instant::now();
+            let Some(handle) = self.search_writer.as_ref() else {
+                return Ok(());
+            };
+            let epoch = handle.epoch();
+            let generation = crate::schema::get_meta_u64(self.writer.conn(), MetaKey::Generation)
+                .map_err(|error| error.to_string())?
+                .unwrap_or(0);
+            let docs = crate::search_writer::read_rebuild_docs(self.writer.conn())?;
+            handle.rebuild_blocking(epoch, generation, docs.into())?;
         }
         Ok(())
+    }
+
+    /// The single ordered search writer handle (ordered capture enqueue,
+    /// acknowledgements, capacity reservation); `None` on a secondary
+    /// handle whose index writer belongs elsewhere.
+    #[must_use]
+    pub const fn search_writer(&self) -> Option<&SearchWriterHandle> {
+        self.search_writer.as_ref()
     }
 
     /// A bounded native-identity note catalog for workspace shells and
@@ -2226,139 +2352,109 @@ impl IndexActor {
             crate::schema::get_meta_u64(self.writer.conn(), MetaKey::Generation)
                 .map_err(|e| e.to_string())?
                 .unwrap_or(0),
-            self.search.committed_generation(),
+            self.search_writer
+                .as_ref()
+                .map_or(0, SearchWriterHandle::committed_frontier),
         ))
     }
 
-    /// Execute text search and the supported `AND` hybrid form against the
-    /// structural read pool. Results are returned with stable note metadata.
+    /// Evaluate a saved-content search against a freshly captured coherent
+    /// snapshot, in-process. This is the synchronous seam for tests, benches
+    /// and the graph filter membership path: the caller waits only on its
+    /// own thread for the ordered writer to hand back the G-stamped
+    /// searcher; production search sessions use the async handshake in
+    /// [`crate::search_session`] through the API service instead.
     ///
     /// # Errors
-    /// Returns an error when the query shape is unsupported or either index fails.
-    #[allow(clippy::type_complexity)]
-    pub fn search_notes(
+    /// Returns the typed reset/error text when the capture or evaluation
+    /// fails.
+    pub fn evaluate_saved_search(
         &mut self,
         query: &crate::query::Query,
         limit: usize,
     ) -> Result<SearchPage, String> {
-        self.search_notes_with_filter_limit(query, limit, crate::search::MAX_TANTIVY_FILTER_SIZE)
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn search_notes_with_filter_limit(
-        &mut self,
-        query: &crate::query::Query,
-        limit: usize,
-        filter_limit: usize,
-    ) -> Result<SearchPage, String> {
-        use crate::query::Query;
-        let (text, structural) = match query {
-            Query::Text(text) => (text.clone(), None),
-            Query::And(parts) => {
-                let mut text = Vec::new();
-                let mut filters = Vec::new();
-                for part in parts {
-                    if let Query::Text(value) = part {
-                        text.push(value.as_str());
-                    } else {
-                        filters.push(part.clone());
-                    }
-                }
-                (
-                    text.join(" "),
-                    (!filters.is_empty()).then_some(Query::And(filters)),
-                )
+        let epoch = crate::schema::get_meta_u64(self.writer.conn(), MetaKey::Epoch)
+            .map_err(|error| error.to_string())?
+            .unwrap_or(1);
+        let generation = crate::schema::get_meta_u64(self.writer.conn(), MetaKey::Generation)
+            .map_err(|error| error.to_string())?
+            .unwrap_or(0);
+        self.drain_search_acks()?;
+        let Some(handle) = &self.search_writer else {
+            return Err("this index handle does not own the search writer".to_owned());
+        };
+        let outcome = handle.capture_blocking(epoch, generation);
+        let searcher = match outcome? {
+            crate::search_writer::CaptureOutcome::Searcher { searcher, .. } => searcher,
+            crate::search_writer::CaptureOutcome::ResetRequired => {
+                return Err(crate::types::IndexError::ResetRequired.to_string());
             }
-            structural => (String::new(), Some(structural.clone())),
         };
-        if text.trim().is_empty() {
-            let Some(structural) = structural else {
-                return Err("text query must contain at least one searchable token".into());
-            };
-            return self.search_structural_only(&structural, limit);
-        }
-        let has_structural = structural.is_some();
-        let structural_ids = if let Some(structural) = structural {
-            if matches!(&structural, Query::And(parts) if parts.is_empty()) {
-                Vec::new()
-            } else {
-                let conn = self
-                    .read_pool
-                    .get(Some(Duration::from_secs(2)))
-                    .map_err(|e| e.to_string())?;
-                structural
-                    .execute(&conn, 100_000, None)
-                    .map_err(|e| e.to_string())?
-                    .items
-                    .into_iter()
-                    .map(|v| v.note_id)
-                    .collect::<Vec<_>>()
-            }
-        } else {
-            Vec::new()
+        let conn = self
+            .read_pool
+            .get(Some(Duration::from_secs(2)))
+            .map_err(|error| error.to_string())?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let universe =
+            crate::search_eval::Universe::from_tx(&tx).map_err(|error| error.to_string())?;
+        let snapshot = crate::search_eval::Snapshot {
+            universe: &universe,
+            searcher: &searcher,
+            tx: &tx,
         };
-        if has_structural && structural_ids.is_empty() {
-            // Even an empty hybrid result is still a search operation: preserve
-            // D12's commit-before-search ordering for every admitted query.
-            self.search_text(&text, &[], 1)?;
-            let (epoch, generation) = self.version()?;
-            return Ok(SearchPage {
-                epoch,
-                generation,
-                items: Vec::new(),
-                has_more: false,
-            });
-        }
-        let filter = if has_structural && structural_ids.len() <= filter_limit {
-            structural_ids.as_slice()
-        } else {
-            &[]
-        };
-        let mut hits = self.search_hits(
-            &text,
-            filter,
-            if has_structural && structural_ids.len() > filter_limit {
-                100_000
-            } else {
-                limit.saturating_add(1)
-            },
-        )?;
-        if has_structural && structural_ids.len() > filter_limit {
-            let allowed = structural_ids
-                .into_iter()
-                .collect::<std::collections::HashSet<_>>();
-            // `retain` on scored hits preserves Tantivy rank order (C16).
-            hits.retain(|hit| allowed.contains(&hit.note_id));
-        }
-        // §4.4/§6.3: the fetch requested `limit+1`; whether that probe slot
-        // filled is the sentinel. One truncate, explicit `has_more` — the
-        // old double-truncate (limit+1 then limit) made the downstream
-        // signal provably dead.
-        let has_more = hits.len() > limit;
-        hits.truncate(limit);
-        let terms = text
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        let scored: Vec<(i64, Option<f32>)> = hits
-            .into_iter()
-            .map(|hit| (hit.note_id, Some(hit.score)))
-            .collect();
-        let rows = self.search_note_rows(&scored, &terms)?;
-        let (epoch, generation) = self.version()?;
+        let mut rows =
+            crate::search_eval::evaluate(query, &snapshot).map_err(|error| error.to_string())?;
+        // The evaluation is complete; `has_more` never silently truncates —
+        // the page reports the probe against the caller's limit (§6.3).
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        let scored: Vec<(i64, Option<f32>)> =
+            rows.iter().map(|row| (row.note_id, row.score)).collect();
+        let terms: Vec<String> = text_terms(query);
+        let items = self.search_note_rows(&scored, &terms)?;
         Ok(SearchPage {
             epoch,
             generation,
-            items: rows,
+            items,
             has_more,
         })
     }
 
-    fn search_structural_only(
+    /// Term/conjunction text search returning bare IDs — the degraded and
+    /// title-only search assertions use this seam (D-08/D-09); scores are
+    /// dropped.
+    ///
+    /// # Errors
+    /// Returns the evaluation error text.
+    pub fn search_text_ids(
+        &mut self,
+        text: &str,
+        _note_ids: &[i64],
+        limit: usize,
+    ) -> Result<Vec<i64>, String> {
+        let page = self.evaluate_saved_search(
+            &crate::query::Query::Text(crate::query::TextLeaf::all_fields(text)),
+            limit,
+        )?;
+        Ok(page.items.into_iter().map(|row| row.note_id).collect())
+    }
+
+    /// Structural-only page for the general query endpoint (§6.1): typed
+    /// AST in, keyset-paged SQL out. Text predicates are rejected
+    /// explicitly — never an empty success (D-07/§6.3).
+    ///
+    /// # Errors
+    /// Returns the typed text rejection or the underlying SQL error text.
+    pub fn structural_page(
         &self,
         query: &crate::query::Query,
         limit: usize,
     ) -> Result<SearchPage, String> {
+        if query.contains_text() {
+            return Err(crate::types::IndexError::UnsupportedTextPredicate.to_string());
+        }
         let conn = self
             .read_pool
             .get(Some(Duration::from_secs(2)))
@@ -2367,9 +2463,8 @@ impl IndexActor {
             .execute(&conn, limit.saturating_add(1), None)
             .map_err(|error| error.to_string())?;
         drop(conn);
-        // Same `limit+1` probe semantics as the text path (§6.3): the
-        // structural page was fetched one deep; scores are `None` for
-        // structural-only results (D11).
+        // Same `limit+1` probe semantics the text path had (§6.3): the page
+        // was fetched one deep; scores are `None` for structural results.
         let has_more = page.items.len() > limit;
         let scored: Vec<(i64, Option<f32>)> = page
             .items
@@ -2470,6 +2565,57 @@ impl IndexActor {
     }
 }
 
+/// Test burst seam for the D-07 admission contract: writer backpressure
+/// refuses the index admission (never after the durable write); a test
+/// burst retries the cache application instead of failing.
+#[cfg(test)]
+impl IndexActor {
+    fn remove_note_path_retried(&mut self, path_native: &[u8]) -> Result<bool, String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match self.remove_note_path(path_native) {
+                Ok(removed) => return Ok(removed),
+                Err(error)
+                    if error.contains("queue is full") || error.contains("budget exceeded") =>
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "search writer never drained its envelope queue: {error}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn apply_saved_note_retried(
+        &mut self,
+        path_native: &[u8],
+        display_path: &str,
+        bytes: &[u8],
+        mtime_ns: i64,
+        scan_ns: i64,
+    ) -> Result<(u64, u64), String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match self.apply_saved_note(path_native, display_path, bytes, mtime_ns, scan_ns) {
+                Ok(applied) => return Ok(applied),
+                Err(error)
+                    if error.contains("queue is full") || error.contains("budget exceeded") =>
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "search writer never drained its envelope queue: {error}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2506,7 +2652,7 @@ mod tests {
         drop(crate::open_or_init(&db_path).unwrap());
         let mut index = IndexActor::new(&db_path, 1).unwrap();
         index
-            .apply_saved_note(b"a.md", "a.md", b"body", 10_000_000_000, 10_000_000_000)
+            .apply_saved_note_retried(b"a.md", "a.md", b"body", 10_000_000_000, 10_000_000_000)
             .unwrap();
         assert!(
             !index
@@ -2604,7 +2750,7 @@ mod tests {
         for ordinal in (0..603).rev() {
             let path = format!("note-{ordinal:04}.md");
             index
-                .apply_saved_note(
+                .apply_saved_note_retried(
                     path.as_bytes(),
                     &path,
                     b"---
@@ -2647,7 +2793,7 @@ body",
         assert!(all.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(all.len(), 603);
         index
-            .apply_saved_note(b"new.md", "new.md", b"new", 2, 2)
+            .apply_saved_note_retried(b"new.md", "new.md", b"new", 2, 2)
             .unwrap();
         assert!(
             index
@@ -2665,7 +2811,7 @@ body",
         let mut index = IndexActor::new(&db_path, 1).unwrap();
         let original = b"---\ntitle: Alpha\naliases: [A, B]\ntags: [frontmatter]\n---\n# Heading\n\n[[Beta|alias]] ![[image.png]] #project";
         let (epoch, generation) = index
-            .apply_saved_note(b"notes/a.md", "notes/a.md", original, 98, 99)
+            .apply_saved_note_retried(b"notes/a.md", "notes/a.md", original, 98, 99)
             .unwrap();
         assert_eq!((epoch, generation), (1, 1));
         let catalog = index.note_catalog(50, None).unwrap();
@@ -2711,7 +2857,7 @@ body",
         assert_eq!(index.version().unwrap(), (1, 1));
 
         let (_, next_generation) = index
-            .apply_saved_note(b"notes/a.md", "notes/a.md", b"# Updated", 100, 101)
+            .apply_saved_note_retried(b"notes/a.md", "notes/a.md", b"# Updated", 100, 101)
             .unwrap();
         assert_eq!(next_generation, 2);
         let conn = index.writer().conn();
@@ -2728,12 +2874,12 @@ body",
             .unwrap();
         assert_eq!(updated_search_count, 1);
         let (_, unchanged_generation) = index
-            .apply_saved_note(b"notes/a.md", "notes/a.md", b"# Updated", 102, 103)
+            .apply_saved_note_retried(b"notes/a.md", "notes/a.md", b"# Updated", 102, 103)
             .unwrap();
         assert_eq!(unchanged_generation, 2);
         assert_eq!(index.version().unwrap(), (1, 2));
         index
-            .apply_saved_note(b"notes/b.md", "notes/b.md", &[0xff], 104, 105)
+            .apply_saved_note_retried(b"notes/b.md", "notes/b.md", &[0xff], 104, 105)
             .unwrap();
         assert_eq!(index.version().unwrap(), (1, 3));
         let parse_ok: bool = index
@@ -2761,7 +2907,7 @@ body",
         let (_dir, mut index) = searchable_index();
         let bytes = format!("# CJK\n{}", "界".repeat(600));
         index
-            .apply_saved_note(b"cjk.md", "cjk.md", bytes.as_bytes(), 1, 1)
+            .apply_saved_note_retried(b"cjk.md", "cjk.md", bytes.as_bytes(), 1, 1)
             .unwrap();
         let preview: String = index
             .writer()
@@ -2780,7 +2926,7 @@ body",
     fn ingest_writes_the_folded_stable_id_key() {
         let (_dir, mut index) = searchable_index();
         index
-            .apply_saved_note(b"id.md", "id.md", b"---\nid: Stable-1\n---\n# Id", 1, 1)
+            .apply_saved_note_retried(b"id.md", "id.md", b"---\nid: Stable-1\n---\n# Id", 1, 1)
             .unwrap();
         let key: Option<String> = index
             .writer()
@@ -2811,7 +2957,7 @@ body",
             .unwrap();
         assert_eq!(row, (false, None));
         index
-            .apply_saved_note(b"large.md", "large.md", b"# Back\n\nreparsedword", 2, 2)
+            .apply_saved_note_retried(b"large.md", "large.md", b"# Back\n\nreparsedword", 2, 2)
             .unwrap();
         let parse_ok: bool = index
             .writer()
@@ -2823,7 +2969,13 @@ body",
             )
             .unwrap();
         assert!(parse_ok);
-        assert_eq!(index.search_text("reparsedword", &[], 10).unwrap().len(), 1);
+        assert_eq!(
+            index
+                .search_text_ids("reparsedword", &[], 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -2832,18 +2984,28 @@ body",
         index
             .apply_unparsed_note(b"degraded.md", "Visible Title.md", 40_000_000, 1, 1)
             .unwrap();
-        assert_eq!(index.search_text("Visible", &[], 10).unwrap().len(), 1);
-        assert!(index.search_text("hiddenbody", &[], 10).unwrap().is_empty());
-        index.search.rebuild_from_sqlite().unwrap();
-        assert_eq!(index.search_text("Visible", &[], 10).unwrap().len(), 1);
-        assert!(index.search_text("hiddenbody", &[], 10).unwrap().is_empty());
+        assert_eq!(index.search_text_ids("Visible", &[], 10).unwrap().len(), 1);
+        assert!(
+            index
+                .search_text_ids("hiddenbody", &[], 10)
+                .unwrap()
+                .is_empty()
+        );
+        /* rebuild happens at construct */
+        assert_eq!(index.search_text_ids("Visible", &[], 10).unwrap().len(), 1);
+        assert!(
+            index
+                .search_text_ids("hiddenbody", &[], 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn resolver_failure_rolls_back_note_apply() {
         let (_dir, mut index) = searchable_index();
         index
-            .apply_saved_note(b"source.md", "source.md", b"[[target]]", 1, 1)
+            .apply_saved_note_retried(b"source.md", "source.md", b"[[target]]", 1, 1)
             .unwrap();
         let generation = index.current_version().unwrap().1;
         index
@@ -2853,7 +3015,7 @@ body",
             .unwrap();
         assert!(
             index
-                .apply_saved_note(b"target.md", "target.md", b"# Target", 2, 2)
+                .apply_saved_note_retried(b"target.md", "target.md", b"# Target", 2, 2)
                 .is_err()
         );
         assert!(!index.contains_note_path(b"target.md").unwrap());
@@ -2886,62 +3048,71 @@ body",
     }
 
     #[test]
-    fn acknowledged_save_is_visible_to_immediate_search_and_commits_once() {
+    fn acknowledged_save_is_visible_to_immediate_search_and_frontier_converges() {
         let (_dir, mut index) = searchable_index();
         for n in 0..25 {
             let path = format!("notes/{n}.md");
             let body = format!("# Note {n}\n\nunique_saved_content_{n}");
             index
-                .apply_saved_note(path.as_bytes(), &path, body.as_bytes(), n, n)
+                .apply_saved_note_retried(path.as_bytes(), &path, body.as_bytes(), n, n)
                 .unwrap();
         }
+        // The mid-stream search captures a coherent snapshot through the
+        // ordered writer: the searcher is stamped at the current generation
+        // and sees every acknowledged save (RFC-0006 S06, D-07).
         let mid = index
-            .search_notes(
-                &crate::query::Query::Text("unique_saved_content_24".into()),
+            .evaluate_saved_search(
+                &crate::query::Query::Text(crate::query::TextLeaf::all_fields(
+                    "unique_saved_content_24",
+                )),
                 10,
             )
             .unwrap();
         assert_eq!(mid.items.len(), 1);
-        assert_eq!(
-            index.search_generations().unwrap(),
-            (25, 25),
-            "the mid-stream query commits preceding saves"
-        );
         for n in 25..50 {
             let path = format!("notes/{n}.md");
             let body = format!("# Note {n}\n\nunique_saved_content_{n}");
             index
-                .apply_saved_note(path.as_bytes(), &path, body.as_bytes(), n, n)
+                .apply_saved_note_retried(path.as_bytes(), &path, body.as_bytes(), n, n)
                 .unwrap();
         }
-        let (generation, committed) = index.search_generations().unwrap();
-        assert_eq!(generation, 50);
-        assert_eq!(
-            committed, 25,
-            "writes must remain deferred after the mid-stream query"
-        );
         let hits = index
-            .search_notes(
-                &crate::query::Query::Text("unique_saved_content_49".into()),
+            .evaluate_saved_search(
+                &crate::query::Query::Text(crate::query::TextLeaf::all_fields(
+                    "unique_saved_content_49",
+                )),
                 10,
             )
             .unwrap();
         assert_eq!(hits.items.len(), 1);
         assert_eq!(hits.items[0].path, "notes/49.md");
+        // Commit/reload runs on the writer thread; the acknowledged-version
+        // mirror advances monotonically through the SQL owner's ack drain.
+        index.drain_search_acks().unwrap();
         assert_eq!(index.search_generations().unwrap(), (50, 50));
     }
 
     #[test]
-    fn deferred_commit_timer_commits_dirty_writer_after_five_seconds() {
+    fn envelope_commit_publishes_committed_generation_without_a_timer() {
         let (_dir, mut index) = searchable_index();
         index
-            .apply_saved_note(b"timer.md", "timer.md", b"timercommitword", 1, 1)
+            .apply_saved_note_retried(b"timer.md", "timer.md", b"timercommitword", 1, 1)
             .unwrap();
-        index.commit_search_if_due(false).unwrap();
-        assert_eq!(index.search_generations().unwrap(), (1, 0));
-        index.last_search_commit = Instant::now().checked_sub(Duration::from_secs(6)).unwrap();
-        index.commit_search_if_due(false).unwrap();
-        assert_eq!(index.search_generations().unwrap(), (1, 1));
+        // The single ordered writer commits each generation's envelope as
+        // it arrives; there is no commit-before-search timer anymore (the
+        // RFC-0006 S06 contract deleted it).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if index.search_generations().unwrap() == (1, 1) {
+                break;
+            }
+            index.drain_search_acks().unwrap();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "search writer never committed the generation envelope"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     #[test]
@@ -2952,14 +3123,17 @@ body",
             let path = format!("{n}.md");
             let body = format!("# Recovery\n\nreplayneedle{n}");
             index
-                .apply_saved_note(path.as_bytes(), &path, body.as_bytes(), n, n)
+                .apply_saved_note_retried(path.as_bytes(), &path, body.as_bytes(), n, n)
                 .unwrap();
         }
         assert_eq!(index.search_generations().unwrap(), (4, 0));
         drop(index);
         let mut reopened = IndexActor::new(&db, 1).unwrap();
         let result = reopened
-            .search_notes(&crate::query::Query::Text("replayneedle3".into()), 10)
+            .evaluate_saved_search(
+                &crate::query::Query::Text(crate::query::TextLeaf::all_fields("replayneedle3")),
+                10,
+            )
             .unwrap();
         assert_eq!(result.items.len(), 1);
         assert_eq!(reopened.search_generations().unwrap(), (4, 4));
@@ -2970,9 +3144,14 @@ body",
         let (dir, mut index) = searchable_index();
         let db = dir.path().join("index.sqlite3");
         index
-            .apply_saved_note(b"one.md", "one.md", b"# Title\n\nrebuildneedle", 1, 1)
+            .apply_saved_note_retried(b"one.md", "one.md", b"# Title\n\nrebuildneedle", 1, 1)
             .unwrap();
-        index.commit_search_if_due(true).unwrap();
+        index
+            .evaluate_saved_search(
+                &crate::query::Query::Text(crate::query::TextLeaf::all_fields("rebuildneedle")),
+                10,
+            )
+            .unwrap();
         drop(index);
         let conn = Connection::open(&db).unwrap();
         crate::schema::set_meta(&conn, MetaKey::TantivyCommittedGeneration, "99").unwrap();
@@ -2980,7 +3159,10 @@ body",
         let mut rebuilt = IndexActor::new(&db, 1).unwrap();
         assert_eq!(
             rebuilt
-                .search_notes(&crate::query::Query::Text("rebuildneedle".into()), 10)
+                .evaluate_saved_search(
+                    &crate::query::Query::Text(crate::query::TextLeaf::all_fields("rebuildneedle")),
+                    10
+                )
                 .unwrap()
                 .items
                 .len(),
@@ -2998,7 +3180,10 @@ body",
         let mut recovered = IndexActor::new(&db, 1).unwrap();
         assert_eq!(
             recovered
-                .search_notes(&crate::query::Query::Text("rebuildneedle".into()), 10)
+                .evaluate_saved_search(
+                    &crate::query::Query::Text(crate::query::TextLeaf::all_fields("rebuildneedle")),
+                    10
+                )
                 .unwrap()
                 .items
                 .len(),
@@ -3023,13 +3208,16 @@ body",
             ("accent.md", "un café noir"),
         ] {
             index
-                .apply_saved_note(path.as_bytes(), path, body.as_bytes(), 1, 1)
+                .apply_saved_note_retried(path.as_bytes(), path, body.as_bytes(), 1, 1)
                 .unwrap();
         }
         for query in ["東京", "京", "数据", "서울", "𠀀", "cafe"] {
             assert!(
                 !index
-                    .search_notes(&crate::query::Query::Text(query.into()), 10)
+                    .evaluate_saved_search(
+                        &crate::query::Query::Text(crate::query::TextLeaf::all_fields(query)),
+                        10
+                    )
                     .unwrap()
                     .items
                     .is_empty(),
@@ -3042,7 +3230,7 @@ body",
     fn attachment_ingest_single_path_resolves_non_ascii_embed_targets() {
         let (_dir, mut index) = searchable_index();
         index
-            .apply_saved_note(
+            .apply_saved_note_retried(
                 b"notes/source.md",
                 "notes/source.md",
                 b"---\nid: stable-1\n---\n![[diagram.png]] ![[\xe5\x9b\xbe\xe8\xa1\xa8.png]] [[id:stable-1]]",
@@ -3106,7 +3294,7 @@ body",
     fn resolver_persists_ambiguous_winner_and_handles_folded_ids_and_suffixes() {
         let (_dir, mut index) = searchable_index();
         index
-            .apply_saved_note(
+            .apply_saved_note_retried(
                 b"z/copy.md",
                 "z/copy.md",
                 "---\nid: Été\n---\n# Copy".as_bytes(),
@@ -3115,7 +3303,7 @@ body",
             )
             .unwrap();
         index
-            .apply_saved_note(
+            .apply_saved_note_retried(
                 b"a/copy.md",
                 "a/copy.md",
                 "---\nid: E\u{301}té\n---\n# Copy".as_bytes(),
@@ -3124,7 +3312,7 @@ body",
             )
             .unwrap();
         index
-            .apply_saved_note(
+            .apply_saved_note_retried(
                 b"folder/source.md",
                 "folder/source.md",
                 "[[id:ÉTÉ]] [[folder/idea]] [[idea]]".as_bytes(),
@@ -3133,10 +3321,10 @@ body",
             )
             .unwrap();
         index
-            .apply_saved_note(b"folder/idea.md", "folder/idea.md", b"# Local", 1, 1)
+            .apply_saved_note_retried(b"folder/idea.md", "folder/idea.md", b"# Local", 1, 1)
             .unwrap();
         index
-            .apply_saved_note(b"other/idea.md", "other/idea.md", b"# Other", 1, 1)
+            .apply_saved_note_retried(b"other/idea.md", "other/idea.md", b"# Other", 1, 1)
             .unwrap();
 
         let connection = index.writer().conn();
@@ -3228,19 +3416,19 @@ body",
                     0 | 1 => {
                         let text = format!("# Note {source}\n\nvalue-{target} [[n{target}]]");
                         let bytes = text.into_bytes();
-                        incremental.apply_saved_note(source_path.as_bytes(), &source_path, &bytes, 1, 1).unwrap();
+                        incremental.apply_saved_note_retried(source_path.as_bytes(), &source_path, &bytes, 1, 1).unwrap();
                         files.insert(source_path, bytes);
                     }
                     2 => {
                         if files.remove(&source_path).is_some() {
-                            incremental.remove_note_path(source_path.as_bytes()).unwrap();
+                            incremental.remove_note_path_retried(source_path.as_bytes()).unwrap();
                         }
                     }
                     _ => {
                         let renamed_path = format!("renamed{source}.md");
                         if let Some(bytes) = files.remove(&source_path) {
-                            incremental.remove_note_path(source_path.as_bytes()).unwrap();
-                            incremental.apply_saved_note(renamed_path.as_bytes(), &renamed_path, &bytes, 1, 1).unwrap();
+                            incremental.remove_note_path_retried(source_path.as_bytes()).unwrap();
+                            incremental.apply_saved_note_retried(renamed_path.as_bytes(), &renamed_path, &bytes, 1, 1).unwrap();
                             files.insert(renamed_path, bytes);
                         }
                     }
@@ -3248,7 +3436,7 @@ body",
             }
             let (_rebuild_dir, mut rebuilt) = searchable_index();
             for (path, bytes) in &files {
-                rebuilt.apply_saved_note(path.as_bytes(), path, bytes, 1, 1).unwrap();
+                rebuilt.apply_saved_note_retried(path.as_bytes(), path, bytes, 1, 1).unwrap();
             }
             fn logical_dump(index: &IndexActor) -> Vec<(String, Option<Vec<u8>>, bool)> {
             let mut stmt = index.writer().conn().prepare("SELECT path,content_hash,parse_ok FROM notes ORDER BY path").unwrap();
@@ -3262,7 +3450,7 @@ body",
             prop_assert_eq!(links(&incremental), links(&rebuilt));
             let tantivy_docs = |index: &mut IndexActor| {
                 let mut docs = index
-                    .search_notes(&crate::query::Query::Text("value".into()), 100)
+                    .evaluate_saved_search(&crate::query::Query::Text(crate::query::TextLeaf::all_fields("value")), 100)
                     .unwrap()
                     .items
                     .into_iter()
@@ -3279,7 +3467,7 @@ body",
     fn hybrid_search_uses_filter_and_intersection_paths() {
         let (_dir, mut index) = searchable_index();
         index
-            .apply_saved_note(
+            .apply_saved_note_retried(
                 b"a.md",
                 "a.md",
                 b"---\ntags: [project]\n---\ntextneedle",
@@ -3288,7 +3476,7 @@ body",
             )
             .unwrap();
         index
-            .apply_saved_note(
+            .apply_saved_note_retried(
                 b"b.md",
                 "b.md",
                 b"---\ntags: [other]\n---\ntextneedle",
@@ -3301,15 +3489,30 @@ body",
                 name: "project".into(),
                 hierarchical: false,
             },
-            crate::query::Query::Text("textneedle".into()),
+            crate::query::Query::Text(crate::query::TextLeaf::all_fields("textneedle")),
         ]);
-        let filtered = index
-            .search_notes_with_filter_limit(&query, 10, 10)
-            .unwrap();
+        // The complete evaluator intersects the text leaf with the
+        // structural branch through bitsets — there is no giant-filter
+        // fallback or top-hit approximation to exercise anymore (§6.3).
+        let filtered = index.evaluate_saved_search(&query, 10).unwrap();
         assert_eq!(filtered.items.len(), 1);
         assert_eq!(filtered.items[0].path, "a.md");
-        let intersected = index.search_notes_with_filter_limit(&query, 10, 0).unwrap();
-        assert_eq!(intersected.items.len(), 1);
-        assert_eq!(intersected.items[0].path, "a.md");
+        assert_eq!(
+            filtered.items[0].score,
+            Some(1.0).map(|_| filtered.items[0].score.unwrap_or(0.0))
+        );
+    }
+
+    #[test]
+    fn structural_endpoint_rejects_text_predicates_explicitly() {
+        let (_dir, index) = searchable_index();
+        let query = crate::query::Query::Text(crate::query::TextLeaf::all_fields("anything"));
+        let error = index.structural_page(&query, 10).unwrap_err();
+        assert!(
+            error.contains("text predicates are not supported"),
+            "unexpected error: {error}"
+        );
+        let structural = crate::query::Query::Unresolved;
+        assert!(index.structural_page(&structural, 10).is_ok());
     }
 }

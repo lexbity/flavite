@@ -125,9 +125,9 @@ fn search_view_finds_saved_content_and_opens_results() {
         a.search
             .tabs
             .get(&search_tab)
-            .is_some_and(|state| !state.results.is_empty())
+            .is_some_and(|state| !state.rows.is_empty())
     });
-    let results = app.search.tabs[&search_tab].results.clone();
+    let results = app.search.tabs[&search_tab].rows.clone();
     assert_eq!(results[0].path, "b.md");
     assert!(results[0].excerpt.contains("Original"));
 

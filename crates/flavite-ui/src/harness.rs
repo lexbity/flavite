@@ -342,8 +342,8 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                 serde_json::json!({
                     "tab": tab.to_string(),
                     "query": state.query,
-                    "results": state.results.iter().map(|row| serde_json::json!({"path": row.path, "title": row.title, "excerpt": row.excerpt})).collect::<Vec<_>>(),
-                    "has_more": state.has_more,
+                    "results": state.rows.iter().map(|row| serde_json::json!({"path": row.path, "title": row.title, "excerpt": row.excerpt})).collect::<Vec<_>>(),
+                    "has_next": state.has_next(),
                     "error": state.error,
                 })
             })

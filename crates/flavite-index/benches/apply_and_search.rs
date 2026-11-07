@@ -130,10 +130,10 @@ fn main() {
     // commit; subsequent samples run against a clean writer, isolating the
     // query + batched-assembly path from post-commit cost.
     let mut search_samples = Vec::with_capacity(SAMPLES);
-    let probe = Query::Text("benchtoken".into());
+    let probe = Query::Text(flavite_index::query::TextLeaf::all_fields("benchtoken"));
     let warm = Instant::now();
     let page = targeted
-        .search_notes(&probe, 200)
+        .evaluate_saved_search(&probe, 200)
         .expect("warm search commits pending writer ops");
     let warm_wall = warm.elapsed();
     assert_eq!(page.items.len(), 200);
@@ -146,7 +146,9 @@ fn main() {
     );
     for _ in 0..SAMPLES {
         let started = Instant::now();
-        let page = targeted.search_notes(&probe, 200).expect("measured search");
+        let page = targeted
+            .evaluate_saved_search(&probe, 200)
+            .expect("measured search");
         assert_eq!(page.items.len(), 200);
         search_samples.push(started.elapsed());
     }
