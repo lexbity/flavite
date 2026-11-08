@@ -372,6 +372,12 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "focused_text_chars": focused_text,
         "pending_operations": app.pending_operations(),
         "focused_text": focused_text_content,
+        "context_mode": app.context_mode.session.as_ref().map(|session|serde_json::json!({
+            "tab":session.tab.to_string(),"state":session.mode.label(),"menu":session.menu.map(|m|m.title()),
+            "message":session.message,
+            "bounds":app.context_mode.bounds.iter().filter(|((tab,_),_)|*tab==session.tab)
+                .map(|((_,name),r)|(*name,[r.x,r.y,r.width,r.height])).collect::<std::collections::BTreeMap<_,_>>()
+        })),
         "document_anchor": app.workspace.document_anchor().map(|tab| tab.to_string()),
         "writing_target": writing_target,
         "graph_service": graph_service,

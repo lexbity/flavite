@@ -29,6 +29,8 @@ pub enum UndoPolicy {
     Isolated,
     /// Ordinary typing — existing coalescing rules apply.
     Typing,
+    /// Explicit Context Mode typing, closed by an interaction boundary.
+    Context { origin: u128 },
 }
 
 /// An edit operation over the normalized text.
@@ -205,6 +207,8 @@ impl UndoNode {
 /// Stores the complete history of edits with branching support.
 #[derive(Debug)]
 pub struct UndoTree {
+    /// A continuous run can only coalesce edits from its own editor view.
+    context_origin: Option<u128>,
     /// All nodes in the tree.
     nodes: Vec<UndoNode>,
     /// The current node ID (where new edits go).
@@ -222,6 +226,7 @@ impl UndoTree {
     pub fn new(snapshot: TextSnapshot) -> Self {
         let root = UndoNode::root(Revision::INITIAL, snapshot);
         Self {
+            context_origin: None,
             nodes: vec![root],
             current_id: 0,
             position_id: 0,
@@ -285,7 +290,24 @@ impl UndoTree {
     ///
     /// Returns the new revision.
     pub fn apply(&mut self, edit: EditOp, snapshot: TextSnapshot) -> Revision {
-        self.apply_with_coalescing(edit, snapshot, true)
+        if self.context_origin.is_some() {
+            self.seal_current();
+        }
+        self.apply_with_coalescing(edit, snapshot, true, false)
+    }
+
+    /// One explicit typing run, independent of the ordinary idle timer.
+    pub fn apply_context(
+        &mut self,
+        edit: EditOp,
+        snapshot: TextSnapshot,
+        origin: u128,
+    ) -> Revision {
+        if self.context_origin != Some(origin) {
+            self.seal_current();
+        }
+        self.context_origin = Some(origin);
+        self.apply_with_coalescing(edit, snapshot, true, true)
     }
 
     /// Apply a distinct operation that must start a new undo-tree node.
@@ -293,7 +315,8 @@ impl UndoTree {
     /// into nearby typing and lose its independent undo boundary.
     pub fn apply_boundary(&mut self, mut edit: EditOp, snapshot: TextSnapshot) -> Revision {
         edit.boundary = true;
-        self.apply_with_coalescing(edit, snapshot, false)
+        self.context_origin = None;
+        self.apply_with_coalescing(edit, snapshot, false, false)
     }
 
     fn apply_with_coalescing(
@@ -301,6 +324,7 @@ impl UndoTree {
         edit: EditOp,
         snapshot: TextSnapshot,
         allow_coalescing: bool,
+        continuous: bool,
     ) -> Revision {
         let branched = self.position_id != self.current_id;
         let current_id = self.position_id;
@@ -309,8 +333,11 @@ impl UndoTree {
             && !branched
             && if let Some(current) = self.nodes.get(current_id as usize) {
                 if let Some(current_edit) = &current.edit {
-                    current_edit.can_coalesce(&edit)
-                        && current.timestamp.elapsed() < self.coalesce_window
+                    !current_edit.boundary
+                        && !edit.boundary
+                        && (continuous
+                            || (current_edit.can_coalesce(&edit)
+                                && current.timestamp.elapsed() < self.coalesce_window))
                 } else {
                     false
                 }
@@ -383,6 +410,7 @@ impl UndoTree {
     }
     /// Preserve a save/semantic boundary without adding a document edit.
     pub fn seal_current(&mut self) {
+        self.context_origin = None;
         if let Some(node) = self.nodes.get_mut(self.position_id as usize)
             && let Some(edit) = &mut node.edit
         {
@@ -396,6 +424,7 @@ impl UndoTree {
     /// Returns the parent's revision and snapshot.
     /// The caller (model) is responsible for advancing the revision (§4.5.2).
     pub fn undo(&mut self) -> Option<(Revision, Option<TextSnapshot>)> {
+        self.seal_current();
         let current = self.position()?;
         if current.is_root() {
             return None;
@@ -413,6 +442,7 @@ impl UndoTree {
     /// Returns the target's revision and snapshot.
     /// The caller (model) is responsible for advancing the revision (§4.5.2).
     pub fn redo(&mut self) -> Option<(Revision, Option<TextSnapshot>)> {
+        self.seal_current();
         let child = self.get(self.redo_target()?)?;
         let result = (child.revision, child.snapshot.clone());
         self.position_id = child.id;
@@ -421,6 +451,7 @@ impl UndoTree {
     /// Move to a specific node.
     pub fn goto(&mut self, id: u64) -> bool {
         if self.nodes.iter().any(|n| n.id == id) {
+            self.seal_current();
             self.position_id = id;
             self.current_id = id;
             true
@@ -467,6 +498,7 @@ impl UndoTree {
     }
     /// Clear all history except the root.
     pub fn clear(&mut self) {
+        self.context_origin = None;
         if !self.nodes.is_empty() {
             let root = self.nodes[0].clone();
             self.nodes = vec![root];
@@ -492,19 +524,100 @@ impl UndoTree {
 }
 impl Default for UndoTree {
     fn default() -> Self {
-        // Default empty tree - callers should use new() with a snapshot
-        Self {
-            nodes: Vec::new(),
-            current_id: 0,
-            position_id: 0,
-            coalesce_window: DEFAULT_COALESCE_WINDOW,
-            next_id: 0,
-        }
+        Self::new(TextSnapshot::from_normalized(""))
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_runs_ignore_idle_but_never_cross_origins_or_explicit_boundaries() {
+        let snap = TextSnapshot::from_normalized;
+        let edit =
+            |at, value: &str| EditOp::new(Span::new(TextByte(at), TextByte(at)), value.into());
+        let mut tree = UndoTree::with_coalesce_window(snap("café"), Duration::ZERO);
+        tree.apply_context(edit(0, "A"), snap("Acafé"), 1);
+        tree.apply_context(edit(6, "雪"), snap("Acafé雪"), 1);
+        assert_eq!(
+            tree.history().len(),
+            2,
+            "one explicit run despite idle and distance"
+        );
+        assert_eq!(
+            tree.current().unwrap().edit.as_ref().unwrap().apply("café"),
+            "Acafé雪"
+        );
+        tree.apply_context(edit(9, "B"), snap("Acafé雪B"), 2);
+        assert_eq!(
+            tree.history().len(),
+            3,
+            "a different view cannot join the run"
+        );
+        tree.seal_current();
+        tree.seal_current();
+        assert_eq!(tree.history().len(), 3, "sealing creates no document edit");
+        tree.apply_context(edit(10, "C"), snap("Acafé雪BC"), 2);
+        assert_eq!(tree.undo().unwrap().1.unwrap().text(), "Acafé雪B");
+        assert_eq!(tree.undo().unwrap().1.unwrap().text(), "Acafé雪");
+        assert_eq!(tree.undo().unwrap().1.unwrap().text(), "café");
+        assert_eq!(tree.redo().unwrap().1.unwrap().text(), "Acafé雪");
+        tree.apply_context(edit(9, "branch"), snap("Acafé雪branch"), 1);
+        assert_eq!(tree.undo().unwrap().1.unwrap().text(), "Acafé雪");
+    }
+
+    #[test]
+    fn ordinary_edits_and_history_navigation_close_context_runs() {
+        let snap = TextSnapshot::from_normalized;
+        let edit =
+            |at, value: &str| EditOp::new(Span::new(TextByte(at), TextByte(at)), value.into());
+        let mut tree = UndoTree::new(snap(""));
+        tree.apply_context(edit(0, "A"), snap("A"), 1);
+        tree.apply(edit(1, "B"), snap("AB"));
+        assert_eq!(tree.history().len(), 3);
+        tree.apply_context(edit(2, "C"), snap("ABC"), 1);
+        let id = tree.current().unwrap().id;
+        assert!(tree.goto(id));
+        tree.apply_context(edit(3, "D"), snap("ABCD"), 1);
+        assert_eq!(tree.undo().unwrap().1.unwrap().text(), "ABC");
+        assert_eq!(tree.undo().unwrap().1.unwrap().text(), "AB");
+        assert_eq!(tree.undo().unwrap().1.unwrap().text(), "A");
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn context_groups_match_an_independent_snapshot_history(
+            operations in proptest::collection::vec((".{0,24}", 0u128..3, proptest::bool::ANY), 1..80)
+        ) {
+            let mut tree = UndoTree::with_coalesce_window(TextSnapshot::from_normalized(""), Duration::ZERO);
+            let mut states = vec![String::new()];
+            let mut text = String::new();
+            let mut origin = None;
+            for (next, view, seal) in operations {
+                if seal { tree.seal_current(); origin = None; }
+                let op = EditOp::new(Span::new(TextByte(0), TextByte(text.len())), next.clone());
+                tree.apply_context(op, TextSnapshot::from_normalized(&next), view);
+                if origin == Some(view) { *states.last_mut().unwrap() = next.clone(); }
+                else { states.push(next.clone()); }
+                origin = Some(view);
+                text = next;
+                proptest::prop_assert_eq!(tree.depth(), states.len() - 1);
+                let current = tree.current().unwrap();
+                let parent = tree.get(current.parent_id.unwrap()).unwrap().snapshot.as_ref().unwrap().text();
+                proptest::prop_assert_eq!(current.edit.as_ref().unwrap().apply(parent), text.clone());
+            }
+            for expected in states[..states.len()-1].iter().rev() {
+                let snapshot = tree.undo().unwrap().1.unwrap();
+                proptest::prop_assert_eq!(snapshot.text(), expected);
+            }
+            proptest::prop_assert!(tree.undo().is_none());
+            for expected in &states[1..] {
+                let snapshot = tree.redo().unwrap().1.unwrap();
+                proptest::prop_assert_eq!(snapshot.text(), expected);
+            }
+            proptest::prop_assert!(tree.redo().is_none());
+        }
+    }
     #[test]
     fn edit_op_apply() {
         let op = EditOp::new(Span::new(TextByte(6), TextByte(11)), "world".to_string());
@@ -587,7 +700,7 @@ mod tests {
         assert_eq!(tree.depth(), 0);
         assert_eq!(tree.history().len(), 1);
         assert_eq!(tree.current_revision(), Revision::INITIAL);
-        assert!(UndoTree::default().current().is_none());
+        assert!(UndoTree::default().current().unwrap().is_root());
     }
 
     mod coalesce_properties {

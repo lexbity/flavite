@@ -66,6 +66,8 @@ pub(crate) struct LinkVerdictSnapshot {
 /// Run-ready application state. `Flavite` owns the only Session and buffer
 /// authority; the workspace model owns layout truth.
 pub struct App {
+    /// Transient, target-bound source-editor command layer.
+    pub context_mode: crate::host::context_mode::ContextHost,
     pub flavite: Option<Flavite>,
     root: PathBuf,
     pub workspace: WorkspaceState,
@@ -186,6 +188,12 @@ pub struct App {
 /// workspace model or the host catalog.
 #[derive(Debug, Clone)]
 pub enum Message {
+    ContextMode(crate::host::context_mode::ContextMessage),
+    ContextNative {
+        tab: TabId,
+        incarnation: u64,
+        request: flavite_editor::context::ContextRequest,
+    },
     ToggleSidebar,
     SidebarResizeBegin,
     SidebarToTab,
@@ -675,6 +683,7 @@ impl App {
             sidebar_width_preview: None,
             menu_bar_visible: false,
             use_workbench_default: false,
+            context_mode: crate::host::context_mode::ContextHost::default(),
             palette_open: false,
             palette_query: String::new(),
             palette_selected: 0,
@@ -1936,6 +1945,9 @@ impl App {
                 prefix,
                 candidate,
             } => {
+                if self.context_mode.mode(tab) == flavite_editor::context::ContextMode::Command {
+                    return;
+                }
                 let valid = self.valid_writing_target().is_some_and(
                     |(source_tab, source_incarnation, buffer, revision, caret)| {
                         (source_tab, source_incarnation, buffer, revision, caret)
@@ -1963,6 +1975,11 @@ impl App {
                 );
             }
             EditorAction::Interaction(snapshot) => {
+                if snapshot.composing
+                    && self.context_mode.mode(tab) == flavite_editor::context::ContextMode::Command
+                {
+                    return;
+                }
                 let Some(current) = self.note_editor_view(tab) else {
                     return;
                 };
@@ -1975,6 +1992,14 @@ impl App {
                 }
                 let selection =
                     flavite_workspace::Selection::new(snapshot.selection.0, snapshot.selection.1);
+                if snapshot.focused
+                    && self
+                        .workspace
+                        .tab(&tab)
+                        .is_some_and(|v| v.interaction().selections != [selection])
+                {
+                    crate::host::context_mode::selection_changed(self, tab);
+                }
                 let mut interaction = self
                     .workspace
                     .tab(&tab)
@@ -2031,6 +2056,9 @@ impl App {
                 expected_revision,
                 navigation,
             } => {
+                if self.context_mode.mode(tab).active() {
+                    return;
+                }
                 let Some(source) = self.note_editor_view(tab) else {
                     self.status = "Edit link: the source note is no longer open".into();
                     return;
@@ -2098,6 +2126,15 @@ impl App {
                 }
             }
             edit_or_history => {
+                if crate::host::context_mode::too_narrow(self, tab)
+                    || (self.context_mode.mode(tab)
+                        == flavite_editor::context::ContextMode::Command
+                        && matches!(edit_or_history, EditorAction::Edit { .. }))
+                {
+                    self.context_mode
+                        .notice("Commands are active · choose Type to enter text");
+                    return;
+                }
                 let expected_buffer = self.notes.state(&tab).and_then(|state| state.buffer);
                 let Some(expected_buffer) = expected_buffer else {
                     self.status = "Editor buffer is not ready".into();
@@ -2281,6 +2318,7 @@ impl App {
         let geometry_only = matches!(message, Message::SidebarControlBounds(..));
         self.pointer_feedback = false;
         let task = self.update_inner(message);
+        crate::host::context_mode::reconcile(self);
         if !geometry_only && (!pointer_only || self.pointer_feedback) {
             self.refresh_semantics();
         }
@@ -2291,6 +2329,62 @@ impl App {
 
     fn update_inner(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::ContextMode(message) => {
+                return crate::host::context_mode::handle(self, message);
+            }
+            Message::ContextNative {
+                tab,
+                incarnation,
+                request,
+            } => {
+                use crate::host::context_mode::{ContextMessage, EditorTarget};
+                use flavite_editor::context::ContextEvent;
+                if self.workspace.focused_tab() != tab
+                    && !matches!(request.event, ContextEvent::EnterAt(_))
+                {
+                    return Task::none();
+                }
+                let captured = EditorTarget {
+                    tab,
+                    incarnation,
+                    buffer: request.buffer,
+                    revision: request.revision,
+                    selection: request.selection,
+                };
+                let target = if matches!(request.event, ContextEvent::EnterAt(_)) {
+                    captured
+                } else if crate::host::input::accepts_context(self, tab, incarnation, &request) {
+                    let Some(target) = EditorTarget::capture(self, tab) else {
+                        return Task::none();
+                    };
+                    target
+                } else {
+                    self.context_mode
+                        .notice("Source changed; choose the command again");
+                    return Task::none();
+                };
+                let message = match request.event.clone() {
+                    ContextEvent::Commit(input) => {
+                        let task = crate::host::input::commit_composition(self, target, input);
+                        crate::host::input::remember_context(self, target, &request);
+                        return task;
+                    }
+                    ContextEvent::Key(key) => {
+                        let task = crate::host::context_mode::native_key(self, target, key);
+                        crate::host::input::remember_context(self, target, &request);
+                        return task;
+                    }
+                    ContextEvent::Command(command) => ContextMessage::Run(target, command),
+                    ContextEvent::Menu(menu) => ContextMessage::OpenMenu(target, menu),
+                    ContextEvent::EnterAt(selection) => ContextMessage::EnterAt(target, selection),
+                    ContextEvent::Unbound => ContextMessage::Unbound(target),
+                };
+                let task = crate::host::context_mode::handle(self, message);
+                if !matches!(request.event, ContextEvent::EnterAt(_)) {
+                    crate::host::input::remember_context(self, target, &request);
+                }
+                return task;
+            }
             Message::EditorInput {
                 tab,
                 incarnation,
@@ -2548,6 +2642,7 @@ impl App {
                 self.window_size = size;
             }
             Message::WindowEvent(iced::window::Event::Unfocused) => {
+                crate::host::context_mode::window_blurred(self);
                 self.gesture.cancel();
                 self.drag_revision = None;
                 self.resize_preview.clear();
@@ -2798,11 +2893,19 @@ impl App {
                 self.drag_revision = Some(self.workspace.revision());
             }
             Message::PaletteOpen => {
+                self.context_mode.palette_target = crate::host::context_mode::EditorTarget::capture(
+                    self,
+                    self.workspace.focused_tab(),
+                );
                 self.palette_open = true;
                 self.palette_selected = 0;
                 return iced::widget::operation::focus(crate::workspace_shell::PALETTE_INPUT_ID);
             }
-            Message::PaletteClose => self.palette_open = false,
+            Message::PaletteClose => {
+                self.palette_open = false;
+                self.context_mode.palette_target = None;
+                return crate::host::context_mode::resume_focus(self);
+            }
             Message::PaletteQuery(query) => {
                 self.palette_query = query;
                 self.palette_selected = 0;
@@ -4134,11 +4237,28 @@ impl App {
         self.palette_open = false;
         self.palette_query.clear();
         self.palette_selected = 0;
+        let editor_target = self.context_mode.palette_target.take();
+        if let Some(command) = flavite_editor::context::ContextCommand::ALL
+            .iter()
+            .find(|c| c.id() == id)
+        {
+            if let Some(target) = editor_target {
+                return crate::host::context_mode::handle(
+                    self,
+                    crate::host::context_mode::ContextMessage::Run(target, *command),
+                );
+            }
+            if id.starts_with("editor.") {
+                self.status = "The command's editor is no longer available".into();
+                return Task::none();
+            }
+        }
         if let Some(command) = host_commands::UI_COMMANDS.iter().find(|c| c.id == id) {
-            return host_commands::dispatch(self, command.id);
+            return host_commands::dispatch(self, command.id)
+                .chain(crate::host::context_mode::resume_focus(self));
         }
         self.run_core_command(id);
-        Task::none()
+        crate::host::context_mode::resume_focus(self)
     }
 
     /// Fuzzy-matched catalog entries for the picker.
@@ -4591,6 +4711,7 @@ mod tests {
             sidebar_width_preview: None,
             menu_bar_visible: false,
             use_workbench_default: false,
+            context_mode: crate::host::context_mode::ContextHost::default(),
             palette_open: false,
             palette_query: String::new(),
             palette_selected: 0,

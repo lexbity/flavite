@@ -474,7 +474,10 @@ impl AppearanceHost {
         let pressed = crate::host::commands::modifier_bits(modifiers);
         let token = crate::host::commands::key_token(key)?;
         self.shortcuts.iter().find_map(|(chord, id)| {
-            (chord.modifiers == pressed
+            (flavite_settings::chord::physical_modifiers(
+                chord.modifiers,
+                cfg!(target_os = "macos"),
+            ) == pressed
                 && crate::host::commands::chord_key_token(&chord.key).as_deref()
                     == Some(token.as_str()))
             .then_some(*id)

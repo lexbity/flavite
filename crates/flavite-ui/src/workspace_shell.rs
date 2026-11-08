@@ -32,6 +32,18 @@ pub fn view(app: &App) -> Element<'_, Message> {
         return crate::host::dialogs::start_view(app);
     }
     let shell = shell(app);
+    if !app.picker.open
+        && !app.palette_open
+        && app.dialog.is_none()
+        && app.strip_menu.is_none()
+        && app
+            .context_mode
+            .session
+            .as_ref()
+            .is_some_and(|s| s.menu.is_some())
+    {
+        return crate::views::context_toolbar::overlay(app, shell);
+    }
     if app.strip_menu.is_some() && !app.picker.open && !app.palette_open {
         return menu_overlay(app, shell);
     }
@@ -56,7 +68,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         } else {
             Message::DialogCancel
         });
-    stack![
+    let content = stack![
         shell,
         opaque(backdrop),
         container(overlay)
@@ -69,7 +81,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
             .width(Length::Fill)
             .height(Length::Fill)
     ]
-    .into()
+    .into();
+    if app.dialog.is_none() {
+        crate::views::context_toolbar::exit_overlay(app, content)
+    } else {
+        content
+    }
 }
 
 fn shell(app: &App) -> Element<'_, Message> {

@@ -27,6 +27,11 @@ pub enum Icon {
     SplitDown,
     Maximize,
     Settings,
+    Cut,
+    Copy,
+    Paste,
+    Undo,
+    Redo,
 }
 
 /// A vector icon drawn at half the scaled icon-button target (16 px at 100%).
@@ -133,6 +138,59 @@ impl Widget<Message, Theme, Renderer> for Glyph {
             );
         };
         match self.kind {
+            Icon::Cut => {
+                for (x, y, w, h) in [
+                    (2.0, 10.0, 4.0, 1.0),
+                    (2.0, 14.0, 4.0, 1.0),
+                    (2.0, 10.0, 1.0, 5.0),
+                    (6.0, 10.0, 1.0, 5.0),
+                    (10.0, 10.0, 4.0, 1.0),
+                    (10.0, 14.0, 4.0, 1.0),
+                    (10.0, 10.0, 1.0, 5.0),
+                    (14.0, 10.0, 1.0, 5.0),
+                ] {
+                    line(x, y, w, h);
+                }
+                for i in 0..9_u16 {
+                    let t = f32::from(i);
+                    line(3.0 + t, 2.0 + t, 1.0, 1.0);
+                    line(12.0 - t, 2.0 + t, 1.0, 1.0);
+                }
+            }
+            Icon::Copy | Icon::Paste => {
+                for (x, y, w, h) in [
+                    (5.0, 4.0, 9.0, 1.0),
+                    (5.0, 14.0, 9.0, 1.0),
+                    (5.0, 4.0, 1.0, 11.0),
+                    (13.0, 4.0, 1.0, 11.0),
+                ] {
+                    line(x, y, w, h);
+                }
+                if matches!(self.kind, Icon::Copy) {
+                    line(2.0, 1.0, 9.0, 1.0);
+                    line(2.0, 1.0, 1.0, 11.0);
+                } else {
+                    line(7.0, 2.0, 5.0, 3.0);
+                    line(7.0, 8.0, 5.0, 1.0);
+                    line(7.0, 11.0, 5.0, 1.0);
+                }
+            }
+            Icon::Undo | Icon::Redo => {
+                let flipped = matches!(self.kind, Icon::Redo);
+                for (x, y, w, h) in [
+                    (2.0, 5.0, 10.0, 1.0),
+                    (12.0, 5.0, 1.0, 7.0),
+                    (6.0, 12.0, 7.0, 1.0),
+                ] {
+                    line(if flipped { 16.0 - x - w } else { x }, y, w, h);
+                }
+                for i in 0..4_u16 {
+                    let t = f32::from(i);
+                    let x = 2.0 + t;
+                    line(if flipped { 15.0 - x } else { x }, 5.0 - t, 1.0, 1.0);
+                    line(if flipped { 15.0 - x } else { x }, 5.0 + t, 1.0, 1.0);
+                }
+            }
             Icon::Menu => {
                 for y in [3.0, 7.5, 12.0] {
                     line(2.0, y, 12.0, 1.0);

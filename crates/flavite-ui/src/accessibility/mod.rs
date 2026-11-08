@@ -22,6 +22,21 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
     }
     let target = app.a11y_nodes.get(&request.target_node)?.clone();
     match target {
+        NodeTarget::EditorContextExpand(target) if request.action == Action::Click => {
+            Some(Message::ContextMode(
+                crate::host::context_mode::ContextMessage::ExpandPane(target),
+            ))
+        }
+        NodeTarget::EditorContextCommand { target, command } if request.action == Action::Click => {
+            Some(Message::ContextMode(
+                crate::host::context_mode::ContextMessage::Run(target, command),
+            ))
+        }
+        NodeTarget::EditorContextMenu { target, menu } if request.action == Action::Click => {
+            Some(Message::ContextMode(
+                crate::host::context_mode::ContextMessage::OpenMenu(target, menu),
+            ))
+        }
         NodeTarget::FindQuery(tab)
             if app.is_tab_visible(tab) && app.note_search.finds.contains_key(&tab) =>
         {

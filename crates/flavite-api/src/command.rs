@@ -219,12 +219,14 @@ pub mod modifiers {
     pub const NONE: u8 = 0b0000;
     /// Shift key.
     pub const SHIFT: u8 = 0b0001;
-    /// Control key (Ctrl on Windows/Linux, Command on macOS).
+    /// Literal Control key.
     pub const CTRL: u8 = 0b0010;
     /// Alt key (Option on macOS).
     pub const ALT: u8 = 0b0100;
     /// Super key (Windows key on Windows, Command on macOS).
     pub const SUPER: u8 = 0b1000;
+    /// Platform action modifier (Command on macOS, Control elsewhere).
+    pub const MOD: u8 = 0b1_0000;
 }
 
 /// An invocation of a command.

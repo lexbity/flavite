@@ -113,6 +113,18 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         })
         .unwrap_or_default();
     let initial_interaction = app.editor_interaction_snapshot(tab);
+    let context_mode = app.context_mode.mode(tab);
+    let too_narrow = crate::host::context_mode::too_narrow(app, tab);
+    let mut editor_colors = crate::style::tokens::editor_colors_resolved(
+        app.appearance.scheme(),
+        app.appearance.theme_semantic(),
+    );
+    if context_mode == flavite_editor::context::ContextMode::Command {
+        editor_colors.selection = iced::Color {
+            a: 0.4,
+            ..editor_colors.autocomplete_accent
+        };
+    }
     let mut editor =
         flavite_editor::EditorWidget::from_view(view, move |action| Message::EditorAction {
             tab,
@@ -122,10 +134,10 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         .with_view_key(tab.raw(), incarnation)
         .with_type_metrics(app.appearance.metrics().editor_type())
         .with_max_line_width(app.appearance.metrics().editor_max_line_width())
-        .with_colors(crate::style::tokens::editor_colors_resolved(
-            app.appearance.scheme(),
-            app.appearance.theme_semantic(),
-        ))
+        .with_colors(editor_colors)
+        .with_context_mode(context_mode,move |request| Message::ContextNative { tab,incarnation,request })
+        .with_context_toggle(move |event| matches!(event,iced::keyboard::Event::KeyPressed {key,modifiers,..}
+            if app.settings.capture.is_none() && app.appearance.chord_command(key,modifiers)==Some("editor.context_toggle")))
         .with_candidates(app.editor_candidates().clone())
         .with_stable_links(app.appearance.prefer_stable_links())
         .with_link_resolutions(app.editor_link_resolutions(
@@ -134,7 +146,8 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             source_buffer,
             source_revision,
         ))
-        .with_keyboard_enabled(!crate::host::note_search::blocks_typing(app, &tab))
+        .with_keyboard_enabled(!crate::host::note_search::blocks_typing(app, &tab)
+            && !app.context_mode.session.as_ref().is_some_and(|s|s.tab==tab && s.menu.is_some()))
         .with_input_intents(move |input| Message::EditorInput {
             tab,
             incarnation,
@@ -153,6 +166,32 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         row![
             text(path_label).size(metrics.text).style(style::dim_text),
             iced::widget::Space::new().width(Length::Fill),
+            bounds::observe(
+                chrome::icon_button(
+                    *metrics,
+                    Icon::Commands,
+                    "Context Mode",
+                    crate::host::context_mode::EditorTarget::capture(app, tab)
+                        .filter(|target| crate::host::context_mode::available(
+                            app,
+                            *target,
+                            flavite_editor::context::ContextCommand::Toggle
+                        ))
+                        .map(|target| {
+                            Message::ContextMode(crate::host::context_mode::ContextMessage::Run(
+                                target,
+                                flavite_editor::context::ContextCommand::Toggle,
+                            ))
+                        })
+                ),
+                move |rect| Message::ContextMode(
+                    crate::host::context_mode::ContextMessage::Bounds(
+                        tab,
+                        "editor.context_toggle",
+                        rect
+                    )
+                )
+            ),
             chrome::icon_button(
                 *metrics,
                 Icon::Search,
@@ -202,7 +241,57 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
     let footer = container(text(state).size(metrics.text_sm).style(style::dim_text))
         .height(24)
         .padding([4, 12]);
-    let editor: Element<'a, Message> = if mode == flavite_workspace::NoteMode::Edit {
+    let footer: Element<'a, Message> = if context_mode.active()
+        && let Some(target) = crate::host::context_mode::EditorTarget::capture(app, tab)
+    {
+        iced::widget::mouse_area(footer)
+            .on_double_click(Message::ContextMode(
+                crate::host::context_mode::ContextMessage::Run(
+                    target,
+                    flavite_editor::context::ContextCommand::Exit,
+                ),
+            ))
+            .into()
+    } else {
+        footer.into()
+    };
+    let editor: Element<'a, Message> = if too_narrow {
+        bounds::observe(
+            container(
+                column![
+                    text("Pane too narrow").size(metrics.text),
+                    text("Expand this pane to continue editing.").size(metrics.text_sm),
+                    bounds::observe(
+                        button(text("Expand pane").size(metrics.text_sm))
+                            .style(style::action())
+                            .on_press_maybe(
+                                crate::host::context_mode::EditorTarget::capture(app, tab).map(
+                                    |target| {
+                                        Message::ContextMode(
+                                            crate::host::context_mode::ContextMessage::ExpandPane(
+                                                target,
+                                            ),
+                                        )
+                                    }
+                                )
+                            ),
+                        move |rect| Message::ContextMode(
+                            crate::host::context_mode::ContextMessage::Bounds(
+                                tab,
+                                "Expand pane",
+                                rect
+                            )
+                        ),
+                    ),
+                ]
+                .spacing(metrics.spacing),
+            )
+            .padding(metrics.spacing)
+            .width(Length::Fill)
+            .height(Length::Fill),
+            move |rect| Message::EditorBounds(tab, rect),
+        )
+    } else if mode == flavite_workspace::NoteMode::Edit {
         bounds::observe(
             editor.width(Length::Fill).height(Length::Fill),
             move |rect| Message::EditorBounds(tab, rect),
@@ -232,6 +321,14 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             "Loading reading view…",
             "Preparing the current revision.",
         )
+    };
+    let meta: Element<'a, Message> = if context_mode.active() {
+        crate::host::context_mode::EditorTarget::capture(app, tab).map_or_else(
+            || meta.into(),
+            |target| crate::views::context_toolbar::view(app, target),
+        )
+    } else {
+        meta.into()
     };
     let mut content = column![meta, rule::horizontal(1)];
     if let Some(banner) = encoding_banner(app, tab, metrics) {

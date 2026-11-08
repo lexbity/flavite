@@ -10,6 +10,7 @@ pub mod catalog;
 pub mod closing;
 pub mod commands;
 pub mod context;
+pub mod context_mode;
 pub mod dialogs;
 pub mod documents;
 pub mod encoding;

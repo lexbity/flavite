@@ -59,6 +59,44 @@ while keeping independent carets, selections, and scroll positions.
 - Saving: Mod+S saves; saves are atomic (temp file + replace) through the
   core session, guarded by revisions.
 
+## Context Mode
+
+Enter from the note header's **Context Mode** button, right-click inside the
+source editor, or use **Ctrl+Space** (macOS: **Ctrl+Shift+Space**). The toggle
+is remappable in Preferences. Right-click keeps a range when clicked inside
+it; otherwise it selects the Unicode word under the pointer.
+
+A horizontal toolbar replaces the note header. Its leading **×** always exits,
+including while its menu or command palette is open. Double-click the toolbar
+caption or editor footer to exit. Changing tabs or switching to Read exits;
+window focus loss retains the mode. Exiting preserves the selection.
+
+- **COMMAND**: physical letter keys act on the selection. **I/A** type before/
+  after it; Shift+I/A type at the line boundaries; O/Shift+O open a line below/
+  above; C changes; D deletes; Shift+D cuts; Y copies; P pastes; U/Shift+U undo/
+  redo. With an empty selection, Copy/Cut select the current line, and Delete/
+  Change use one grapheme on that line. An empty line is not silently joined.
+- **TYPING**: text input, IME, and ordinary navigation remain available.
+  Repositioning keeps typing active. **Escape** returns to commands; it never
+  exits Context Mode. An open menu consumes Escape first.
+- **Select / Go / Type** menus expose word/line/all selection, clearing a
+  selection, movement, and typing entries. H/J/K/L move; W/B move by Unicode
+  word; Shift extends. The menu hints identify physical key positions.
+- **Cut/Copy/Paste, Undo/Redo, Commands, Find and Replace** use the existing
+  clipboard, shared buffer history, palette and in-note search. Text fields in
+  those overlays own typing. Narrow panes move actions into **More** while
+  keeping Exit visible. Below 320 logical pixels, editing pauses and an
+  **Expand pane** control appears; the mode and selection are retained.
+
+Context edits are revision guarded. A delayed paste is refused after its source
+or selection changes or the mode exits. A temporary typing run is one Undo unit
+until a selection/motion, toolbar command, Escape, save, foreign edit, or exit
+ends the group; an idle pause alone does not split it. Different editor views
+cannot merge their typing runs. Mode state is transient and is not restored on
+restart. This interface currently uses the editor's single selection; multiple
+selections and clickable command-history restoration are further specification
+work, not controls exposed by this implementation.
+
 ## Reading mode
 
 Mod+E on the same tab renders CommonMark plus Flavite extensions:
@@ -229,7 +267,8 @@ journal live in `<vault>/.flavite/`.
 
 Known gaps, tracked in `devdocs/verification/KNOWN_MANUAL_UX_GAPS.md`:
 
-- Right-click context menus are not implemented yet (deferred).
+- Source-editor right-click enters Context Mode. General context menus elsewhere
+  remain deferred.
 - Drag ghost / empty-space drop feedback for split gestures is still open;
   the underlying split commands work.
 - No vault file browser (folder-tree notes list) yet; the Notes view and

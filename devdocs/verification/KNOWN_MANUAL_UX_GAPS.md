@@ -22,14 +22,20 @@ These require human/manual testing (pointer, rendering, IME, assistive tech):
   pointer/overlay interactions.
 - **Splits via drag**: commands work; drag/drop affordances need manual
   testing (drag ghost and background-drop feedback remain open).
-- **Right-click context menus**: not implemented anywhere yet (deferred).
+- **Context Mode**: source-editor right-click now enters the horizontal command
+  toolbar. Linux Xvfb input/paint and semantic routing are automated; real
+  hardware selection feel, IME and assistive-technology navigation still need
+  manual review. The current interface operates on one selection. Multi-selection
+  and clickable command-history restoration remain specification work.
+- **General right-click context menus**: surfaces outside the source editor
+  remain deferred.
 - **Perceived latency**: per-event shaping passes were eliminated and
   per-move host rebuilds gated; actual latency needs measurement by feel on
   real hardware.
 - **Narrow window adaptation / visuals**: responsive behavior and visual
   polish require manual review.
 
-Deferred this round (explicitly): right-click context menus, drag ghost /
+Deferred this round (explicitly): general context menus, drag ghost /
 empty-space drop feedback, vault file browser (folder tree notes list),
 note lifecycle UI (create/rename/delete).
 

@@ -132,11 +132,12 @@ struct ApplyEditsArgs {
 }
 
 /// Wire form of the undo policy (§6.1: explicit snake_case discriminants).
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum UndoPolicyArg {
     Isolated,
     Typing,
+    Context { origin: String },
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -377,6 +378,19 @@ fn handle_edits(session: &Session, invocation: &Invocation) -> Result<SessionRes
     let undo_policy = match args.undo_policy.unwrap_or(UndoPolicyArg::Isolated) {
         UndoPolicyArg::Isolated => flavite_buffer::undo::UndoPolicy::Isolated,
         UndoPolicyArg::Typing => flavite_buffer::undo::UndoPolicy::Typing,
+        UndoPolicyArg::Context { origin } => {
+            if origin.len() != 32
+                || !origin
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err("context undo origin must be 32 lowercase hex characters".into());
+            }
+            flavite_buffer::undo::UndoPolicy::Context {
+                origin: u128::from_str_radix(&origin, 16)
+                    .map_err(|_| "invalid context undo origin")?,
+            }
+        }
     };
     Ok(session.execute(SessionCommand::ApplyEdits {
         buffer_id: BufferId::from(args.buffer_id),
@@ -391,6 +405,13 @@ fn handle_undo(session: &Session, invocation: &Invocation) -> Result<SessionResu
         buffer_id: BufferId::from(args.buffer_id),
         revision: Revision::new(args.revision),
     }))
+}
+fn handle_seal_undo_group(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: BufferRevisionArgs = decode(invocation)?;
+    Ok(session.seal_undo_group(BufferId::from(args.buffer_id), Revision::new(args.revision)))
 }
 fn handle_redo(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
     let args: BufferRevisionArgs = decode(invocation)?;
@@ -1054,6 +1075,12 @@ impl Flavite {
                 "Insert link",
                 ArgSchema::custom(crate::links::validate_link_insert_args),
                 handle_link_insert,
+            ),
+            (
+                "buffer.seal_undo_group",
+                "Close editor typing group",
+                ArgSchema::typed::<BufferRevisionArgs>(),
+                handle_seal_undo_group,
             ),
             (
                 "buffer.undo",
@@ -1795,6 +1822,7 @@ impl Flavite {
             | "task.toggle"
             | "apply_edits"
             | "buffer.undo"
+            | "buffer.seal_undo_group"
             | "buffer.redo"
             | "note.convert_encoding"
             | "text.apply_replace" => invocation
@@ -1827,6 +1855,7 @@ impl Flavite {
                 | "task.toggle"
                 | "apply_edits"
                 | "buffer.undo"
+                | "buffer.seal_undo_group"
                 | "buffer.redo"
                 | "note.convert_encoding"
                 | "text.apply_replace"
@@ -1898,6 +1927,9 @@ impl Flavite {
             }
             SessionResult::Success(crate::session::CommandResult::NoteRenamed { .. }) => {
                 "note.rename"
+            }
+            SessionResult::Success(crate::session::CommandResult::UndoGroupSealed { .. }) => {
+                "buffer.seal_undo_group"
             }
             SessionResult::Success(crate::session::CommandResult::UndoPerformed { .. }) => {
                 "buffer.undo"
@@ -2076,6 +2108,12 @@ impl Flavite {
                             "to": to.to_string_lossy(),
                         })
                     }
+                    crate::session::CommandResult::UndoGroupSealed {
+                        buffer_id,
+                        revision,
+                    } => serde_json::json!({
+                        "buffer_id": buffer_id.as_u64(), "revision": revision.as_u64(),
+                    }),
                     crate::session::CommandResult::UndoPerformed {
                         buffer_id,
                         new_revision,

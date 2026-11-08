@@ -2,11 +2,11 @@
 //!
 //! This module provides the authoritative implementation of the chord grammar
 //! used throughout flavite. It is the single source of truth for:
-//! - Parsing chord strings (e.g., "Mod+S", "Ctrl+Alt+Right")
+//! - Parsing chord strings (e.g., "Mod+S", "Ctrl+Alt+ArrowRight")
 //! - Formatting chords for display
 //! - Validating shortcuts (no collisions, no OS-reserved chords)
 //!
-//! A chord consists of zero or more modifier keys (Mod/Ctrl, Shift, Alt, Super)
+//! A chord consists of zero or more modifier keys (Mod, Ctrl, Shift, Alt, Super)
 //! followed by exactly one key (printable character, function key, or named key).
 
 use std::collections::BTreeMap;
@@ -17,12 +17,30 @@ pub mod modifiers {
     pub const NONE: u8 = 0b0000;
     /// Shift key.
     pub const SHIFT: u8 = 0b0001;
-    /// Control key (Ctrl on Windows/Linux, Command on macOS).
+    /// Literal Control key on every platform.
     pub const CTRL: u8 = 0b0010;
     /// Alt key (Option on macOS).
     pub const ALT: u8 = 0b0100;
     /// Super key (Windows key on Windows, Command on macOS).
     pub const SUPER: u8 = 0b1000;
+    /// Platform action modifier: Command on macOS, Control elsewhere.
+    pub const MOD: u8 = 0b1_0000;
+}
+
+/// Resolve semantic platform modifiers to literal native modifier bits.
+#[must_use]
+pub const fn physical_modifiers(bits: u8, macos: bool) -> u8 {
+    let literal = bits & !modifiers::MOD;
+    if bits & modifiers::MOD != 0 {
+        literal
+            | if macos {
+                modifiers::SUPER
+            } else {
+                modifiers::CTRL
+            }
+    } else {
+        literal
+    }
 }
 
 /// A keyboard chord (combination of modifier and key).
@@ -45,7 +63,7 @@ impl Chord {
     }
 }
 
-/// Parse a chord string like `Mod+P`, `Ctrl+Alt+Right`, or `F6` into a `Chord`.
+/// Parse a chord string like `Mod+P`, `Ctrl+Alt+ArrowRight`, or `F6` into a `Chord`.
 ///
 /// The grammar:
 /// - Modifiers: Mod, Ctrl, Shift, Alt, Super (case-insensitive but canonical form is as named)
@@ -61,10 +79,22 @@ pub fn parse_chord(text: &str) -> Option<Chord> {
     for token in text.split('+') {
         let token = token.trim();
         match token {
-            "Mod" | "Ctrl" if key.is_none() => modifiers |= modifiers::CTRL,
-            "Shift" if key.is_none() => modifiers |= modifiers::SHIFT,
-            "Alt" if key.is_none() => modifiers |= modifiers::ALT,
-            "Super" if key.is_none() => modifiers |= modifiers::SUPER,
+            "Mod" | "Ctrl" | "Shift" | "Alt" | "Super" if key.is_none() => {
+                let flag = match token {
+                    "Mod" => modifiers::MOD,
+                    "Ctrl" => modifiers::CTRL,
+                    "Shift" => modifiers::SHIFT,
+                    "Alt" => modifiers::ALT,
+                    _ => modifiers::SUPER,
+                };
+                if physical_modifiers(modifiers, cfg!(target_os = "macos"))
+                    & physical_modifiers(flag, cfg!(target_os = "macos"))
+                    != 0
+                {
+                    return None;
+                }
+                modifiers |= flag;
+            }
             other => {
                 if key.is_some() || other.is_empty() {
                     return None;
@@ -88,6 +118,7 @@ pub fn parse_chord(text: &str) -> Option<Chord> {
 fn canonical_key(token: &str) -> Option<()> {
     const NAMED: &[&str] = &[
         "Enter",
+        "Space",
         "Tab",
         "Escape",
         "Backspace",
@@ -136,8 +167,11 @@ pub fn chord_string(chord: &Chord) -> String {
     let mut parts = Vec::new();
 
     // Order: Ctrl/Mod, Alt, Shift, Super
-    if chord.modifiers & modifiers::CTRL != 0 {
+    if chord.modifiers & modifiers::MOD != 0 {
         parts.push("Mod");
+    }
+    if chord.modifiers & modifiers::CTRL != 0 {
+        parts.push("Ctrl");
     }
     if chord.modifiers & modifiers::ALT != 0 {
         parts.push("Alt");
@@ -225,7 +259,11 @@ pub fn validate_shortcuts(
         }
 
         let serialized = chord_string(&chord);
-        if let Some(previous) = resolved.insert(chord, command.clone()) {
+        let physical = Chord {
+            modifiers: physical_modifiers(chord.modifiers, cfg!(target_os = "macos")),
+            key: chord.key.to_uppercase(),
+        };
+        if let Some(previous) = resolved.insert(physical, command.clone()) {
             // Rebinding a command to its own current chord is a no-op, not a collision
             if previous != *command {
                 return Err(ShortcutError::Collision {
@@ -244,7 +282,8 @@ pub fn validate_shortcuts(
 /// the owner named for the user-facing explanation.
 #[must_use]
 pub fn os_reserved(chord: &Chord) -> Option<&'static str> {
-    let command = chord.modifiers & modifiers::CTRL != 0;
+    let command =
+        physical_modifiers(chord.modifiers, cfg!(target_os = "macos")) & modifiers::CTRL != 0;
     let alt = chord.modifiers & modifiers::ALT != 0;
     let shift = chord.modifiers & modifiers::SHIFT != 0;
     let super_key = chord.modifiers & modifiers::SUPER != 0;
@@ -280,7 +319,7 @@ mod tests {
         assert_eq!(
             parse_chord("Mod+S"),
             Some(Chord {
-                modifiers: modifiers::CTRL,
+                modifiers: modifiers::MOD,
                 key: "S".to_owned()
             })
         );
@@ -298,7 +337,7 @@ mod tests {
         assert_eq!(
             parse_chord("Mod+Alt+Shift+P"),
             Some(Chord {
-                modifiers: modifiers::CTRL | modifiers::ALT | modifiers::SHIFT,
+                modifiers: modifiers::MOD | modifiers::ALT | modifiers::SHIFT,
                 key: "P".to_owned()
             })
         );
@@ -316,7 +355,7 @@ mod tests {
         assert_eq!(
             parse_chord("Mod+F12"),
             Some(Chord {
-                modifiers: modifiers::CTRL,
+                modifiers: modifiers::MOD,
                 key: "F12".to_owned()
             })
         );
@@ -345,14 +384,14 @@ mod tests {
         assert_eq!(
             parse_chord("Mod + S"),
             Some(Chord {
-                modifiers: modifiers::CTRL,
+                modifiers: modifiers::MOD,
                 key: "S".to_owned()
             })
         );
         assert_eq!(
             parse_chord("  Mod  +  S  "),
             Some(Chord {
-                modifiers: modifiers::CTRL,
+                modifiers: modifiers::MOD,
                 key: "S".to_owned()
             })
         );
@@ -364,15 +403,14 @@ mod tests {
         assert_eq!(parse_chord("Mod"), None); // No key - modifiers without key
         assert_eq!(parse_chord("Mod+"), None); // No key
         assert_eq!(parse_chord("Mod+Shift"), None); // No key - only modifiers
-        // Note: "Mod+Mod+S" is currently accepted (duplicate mods are allowed by |=)
-        // This could be tightened in the future if needed
+        assert_eq!(parse_chord("Mod+Mod+S"), None);
         assert_eq!(parse_chord("S+Mod"), None); // Modifier after key
     }
 
     #[test]
     fn test_chord_string() {
         let chord = Chord {
-            modifiers: modifiers::CTRL | modifiers::SHIFT,
+            modifiers: modifiers::MOD | modifiers::SHIFT,
             key: "S".to_owned(),
         };
         assert_eq!(chord_string(&chord), "Mod+Shift+S");
@@ -403,14 +441,14 @@ mod tests {
         assert_eq!(os_reserved(&chord), Some("the desktop (close window)"));
 
         // Ctrl+Alt+Backspace is reserved
-        let chord = parse_chord("Mod+Alt+Backspace").unwrap();
+        let chord = parse_chord("Ctrl+Alt+Backspace").unwrap();
         assert_eq!(
             os_reserved(&chord),
             Some("the desktop (session kill switch)")
         );
 
         // Ctrl+Alt+Arrow keys are reserved
-        let chord = parse_chord("Mod+Alt+ArrowLeft").unwrap();
+        let chord = parse_chord("Ctrl+Alt+ArrowLeft").unwrap();
         assert_eq!(
             os_reserved(&chord),
             Some("the desktop (workspace switching)")
@@ -485,7 +523,32 @@ mod tests {
     #[test]
     fn test_canonical_chord() {
         assert_eq!(canonical_chord("Mod+S"), Some("Mod+S".to_owned()));
-        assert_eq!(canonical_chord("Ctrl+S"), Some("Mod+S".to_owned()));
+        assert_eq!(canonical_chord("Ctrl+S"), Some("Ctrl+S".to_owned()));
         assert_eq!(canonical_chord("invalid"), None);
+    }
+
+    #[test]
+    fn control_and_platform_modifier_are_distinct_and_collisions_use_native_keys() {
+        assert_eq!(physical_modifiers(modifiers::CTRL, true), modifiers::CTRL);
+        assert_eq!(physical_modifiers(modifiers::MOD, true), modifiers::SUPER);
+        assert_eq!(physical_modifiers(modifiers::MOD, false), modifiers::CTRL);
+        let literal = if cfg!(target_os = "macos") {
+            "Super+S"
+        } else {
+            "Ctrl+S"
+        };
+        for alternate in [literal, "Mod+s"] {
+            let bindings = BTreeMap::from([
+                ("first".to_string(), "Mod+S".to_string()),
+                ("second".to_string(), alternate.to_string()),
+            ]);
+            assert!(matches!(
+                validate_shortcuts(&bindings, &BTreeMap::new()),
+                Err(ShortcutError::Collision { .. })
+            ));
+        }
+        assert_eq!(parse_chord("Ctrl+Ctrl+Space"), None);
+        assert_eq!(parse_chord("Control+Space"), None);
+        assert_eq!(parse_chord("Ctrl+Right"), None);
     }
 }

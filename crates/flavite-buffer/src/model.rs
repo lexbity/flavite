@@ -969,8 +969,21 @@ impl EditorModel {
     /// Undo node (D-06). The install cannot fail: validation and the
     /// candidate were completed by [`EditorModel::prepare_batch`].
     pub fn install_prepared(&mut self, batch: PreparedBatch) -> Revision {
+        self.install_prepared_inner(batch, None)
+    }
+
+    fn install_prepared_inner(
+        &mut self,
+        batch: PreparedBatch,
+        context_origin: Option<u128>,
+    ) -> Revision {
         self.apply_text_edit(&batch.op);
-        self.undo_tree.apply_boundary(batch.op, batch.undo_snapshot);
+        if let Some(origin) = context_origin {
+            self.undo_tree
+                .apply_context(batch.op, batch.undo_snapshot, origin);
+        } else {
+            self.undo_tree.apply_boundary(batch.op, batch.undo_snapshot);
+        }
         let revision = self.revision.next();
         self.revision = revision;
         self.is_dirty = true;
@@ -991,6 +1004,10 @@ impl EditorModel {
         policy: crate::undo::UndoPolicy,
     ) -> Result<Revision, BatchError> {
         match policy {
+            crate::undo::UndoPolicy::Context { origin } => {
+                let batch = self.prepare_batch(edits)?;
+                Ok(self.install_prepared_inner(batch, Some(origin)))
+            }
             crate::undo::UndoPolicy::Isolated => {
                 let batch = self.prepare_batch(edits)?;
                 Ok(self.install_prepared(batch))

@@ -18,17 +18,184 @@ pub struct InputChain {
     sequence: u64,
     preferred_x: Option<f32>,
 }
+
+/// Native event sequence and host interaction sequence are separate: one
+/// command can acknowledge several internal selection/edit operations.
+#[derive(Debug)]
+pub struct ContextCapture {
+    target: super::context_mode::EditorTarget,
+    base: u64,
+    sequence: u64,
+    acknowledged: u64,
+}
+
+fn context_chain(
+    app: &App,
+    tab: TabId,
+    incarnation: u64,
+    request: &flavite_editor::context::ContextRequest,
+) -> bool {
+    app.context_mode.capture.as_ref().is_some_and(|chain| {
+        let current = super::context_mode::EditorTarget::capture(app, tab);
+        chain.target.tab == tab
+            && chain.target.incarnation == incarnation
+            && current == Some(chain.target)
+            && chain.target.buffer == request.buffer
+            && request.revision >= chain.base
+            && request.revision <= chain.target.revision
+            && request.sequence > chain.sequence
+            && app
+                .workspace
+                .tab(&tab)
+                .is_some_and(|v| v.interaction().sequence == chain.acknowledged)
+    })
+}
+
+pub fn remember_context(
+    app: &mut App,
+    before: super::context_mode::EditorTarget,
+    request: &flavite_editor::context::ContextRequest,
+) {
+    let continued = context_chain(app, before.tab, before.incarnation, request);
+    let base = app
+        .context_mode
+        .capture
+        .as_ref()
+        .filter(|_| continued)
+        .map_or(request.revision, |c| c.base);
+    let Some(after) = super::context_mode::EditorTarget::capture(app, before.tab) else {
+        return;
+    };
+    // A core turn may pump a foreign change. Only an acknowledged input
+    // receipt may authorize a changed revision; a failed command may not.
+    if after.revision != before.revision
+        && !app.input_chains.get(&before.tab).is_some_and(|c| {
+            c.incarnation == before.incarnation
+                && c.buffer == before.buffer
+                && c.revision == after.revision
+                && c.base <= before.revision
+        })
+    {
+        app.context_mode.capture = None;
+        return;
+    }
+    app.context_mode.capture = Some(ContextCapture {
+        target: after,
+        base,
+        sequence: request.sequence,
+        acknowledged: app
+            .workspace
+            .tab(&before.tab)
+            .unwrap()
+            .interaction()
+            .sequence,
+    });
+}
+
+/// Command keys follow already-acknowledged motions/edits from this same view,
+/// even when the next native event arrives before the new frame is painted.
+#[must_use]
+pub fn accepts_context(
+    app: &App,
+    tab: TabId,
+    incarnation: u64,
+    request: &flavite_editor::context::ContextRequest,
+) -> bool {
+    let (Some(view), Some(session)) = (app.note_editor_view(tab), app.workspace.tab(&tab)) else {
+        return false;
+    };
+    if app.notes.incarnation(tab) != Some(incarnation) || request.buffer != view.buffer_id {
+        return false;
+    }
+    if app.context_mode.capture.as_ref().is_some_and(|chain| {
+        chain.target.tab == tab
+            && chain.target.incarnation == incarnation
+            && chain.target.buffer == request.buffer
+            && request.sequence <= chain.sequence
+    }) {
+        return false;
+    }
+    if context_chain(app, tab, incarnation, request) {
+        return true;
+    }
+    if request.sequence <= session.interaction().sequence {
+        return false;
+    }
+    let own_chain = app.input_chains.get(&tab).is_some_and(|chain| {
+        chain.incarnation == incarnation
+            && chain.buffer == request.buffer
+            && chain.revision == view.revision
+            && request.revision >= chain.base
+            && request.revision <= chain.revision
+            && request.sequence > chain.sequence
+    });
+    own_chain
+        || (request.revision == view.revision
+            && app
+                .editor_interaction_snapshot(tab)
+                .is_some_and(|s| s.selection == request.selection))
+}
 pub fn handle(
     app: &mut App,
     tab: TabId,
     incarnation: u64,
+    input: CapturedInput,
+) -> iced::Task<Message> {
+    handle_inner(app, tab, incarnation, input, false)
+}
+
+pub fn commit_composition(
+    app: &mut App,
+    target: super::context_mode::EditorTarget,
     mut input: CapturedInput,
 ) -> iced::Task<Message> {
+    if input.action != KeyAction::Insert || input.text.is_empty() {
+        return iced::Task::none();
+    }
+    input.buffer = target.buffer;
+    input.observed_revision = target.revision;
+    input.sequence = app
+        .workspace
+        .tab(&target.tab)
+        .unwrap()
+        .interaction()
+        .sequence
+        .saturating_add(1);
+    handle_inner(app, target.tab, target.incarnation, input, true)
+}
+
+fn handle_inner(
+    app: &mut App,
+    tab: TabId,
+    incarnation: u64,
+    mut input: CapturedInput,
+    composition_commit: bool,
+) -> iced::Task<Message> {
+    if super::context_mode::too_narrow(app, tab) {
+        app.context_mode
+            .notice("Pane too narrow · expand the pane to continue editing");
+        return iced::Task::none();
+    }
+    if app.context_mode.mode(tab) == flavite_editor::context::ContextMode::Command
+        && matches!(
+            input.action,
+            KeyAction::Insert
+                | KeyAction::Newline
+                | KeyAction::Backspace
+                | KeyAction::BackspaceWord
+        )
+    {
+        app.context_mode
+            .notice("Commands are active · choose Type to enter text");
+        return iced::Task::none();
+    }
     if !app.is_tab_visible(tab)
         || !reading::is_edit(app, tab)
         || app.picker.open
         || app.palette_open
         || app.strip_menu.is_some()
+        || app.dialog.is_some()
+        || app.shutdown.is_some()
         || note_search::blocks_typing(app, &tab)
         || app.notes.incarnation(tab) != Some(incarnation)
     {
@@ -51,14 +218,33 @@ pub fn handle(
     });
     if input.buffer != view.buffer_id
         || input.sequence <= interaction.sequence
-        || interaction.composition == CompositionState::Active
+        || (interaction.composition == CompositionState::Active && !composition_commit)
         || (input.observed_revision != view.revision && !own_chain)
     {
         app.input_chains.remove(&tab);
         app.status = "Input source changed; place the caret before continuing".into();
         return iced::Task::none();
     }
+    if composition_commit {
+        interaction.composition = CompositionState::Idle;
+    }
     let selection = interaction.selections.first().copied().unwrap_or_default();
+    if matches!(
+        input.action,
+        KeyAction::Previous
+            | KeyAction::Next
+            | KeyAction::PreviousWord
+            | KeyAction::NextWord
+            | KeyAction::Up
+            | KeyAction::Down
+            | KeyAction::PageUp
+            | KeyAction::PageDown
+            | KeyAction::Home
+            | KeyAction::End
+            | KeyAction::SelectAll
+    ) {
+        super::context_mode::selection_changed(app, tab);
+    }
     if let Some(motion) = input.vertical.as_mut() {
         // Geometry is captured by the widget, but the sticky column belongs
         // to the acknowledged input chain. A preceding Home/Left/edit may
@@ -112,14 +298,27 @@ pub fn handle(
         let Some(api) = &app.flavite else {
             return iced::Task::none();
         };
-        let result = api.execute(
-            action
-                .into_invocation(api.command_registry().next_request_id())
-                .expect("prepared mutation"),
-        );
+        let mut invocation = action
+            .into_invocation(api.command_registry().next_request_id())
+            .expect("prepared mutation");
+        if invocation.command_id == "apply_edits" {
+            let typing = app.context_mode.mode(tab)
+                != flavite_editor::context::ContextMode::Command
+                && !matches!(input.action, KeyAction::Paste | KeyAction::Cut);
+            invocation.args["undo_policy"] = if typing
+                && app.context_mode.mode(tab) == flavite_editor::context::ContextMode::Typing
+            {
+                serde_json::json!({"context":{"origin":format!("{:032x}",tab.raw())}})
+            } else {
+                serde_json::json!(if typing { "typing" } else { "isolated" })
+            };
+        }
+        let result = api.execute(invocation);
         if !result.is_success() {
             app.input_chains.remove(&tab);
             app.status = "Input rejected; source changed or is unavailable".into();
+            app.context_mode
+                .notice("Input rejected; source changed or is unavailable");
             return iced::Task::none();
         }
         app.workspace.invalidate_writing_target(view.buffer_id);

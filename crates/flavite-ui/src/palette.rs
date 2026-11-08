@@ -58,12 +58,15 @@ pub fn keybinding(spec: &CommandSpec) -> Option<String> {
 /// Human-readable text for one effective command binding.
 pub fn chord_label(chord: &flavite_api::Chord) -> String {
     let mut parts = Vec::new();
-    if chord.modifiers & flavite_api::command::modifiers::CTRL != 0 {
+    if chord.modifiers & flavite_api::command::modifiers::MOD != 0 {
         parts.push(if cfg!(target_os = "macos") {
             "Cmd"
         } else {
             "Ctrl"
         });
+    }
+    if chord.modifiers & flavite_api::command::modifiers::CTRL != 0 {
+        parts.push("Ctrl");
     }
     if chord.modifiers & flavite_api::command::modifiers::SHIFT != 0 {
         parts.push("Shift");

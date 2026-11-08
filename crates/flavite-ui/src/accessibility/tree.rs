@@ -12,6 +12,15 @@ use std::collections::{BTreeMap, BTreeSet};
 /// What a native action on a semantic node routes to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeTarget {
+    EditorContextCommand {
+        target: crate::host::context_mode::EditorTarget,
+        command: flavite_editor::context::ContextCommand,
+    },
+    EditorContextMenu {
+        target: crate::host::context_mode::EditorTarget,
+        menu: flavite_editor::context::ContextMenu,
+    },
+    EditorContextExpand(crate::host::context_mode::EditorTarget),
     ToggleSidebar,
     SidebarToTab,
     SidebarFilter,
@@ -144,10 +153,141 @@ fn note_node_id(path: &std::path::Path) -> NodeId {
     NodeId(hasher.finish())
 }
 
+struct ContextControl {
+    id: NodeId,
+    target: NodeTarget,
+    label: String,
+    bounds: iced::Rectangle,
+    enabled: bool,
+}
+
+fn context_controls(app: &App) -> Vec<ContextControl> {
+    use crate::host::context_mode::{EditorTarget, available};
+    use flavite_editor::context::{ContextCommand as C, ContextMenu};
+    if app.dialog.is_some() || app.strip_menu.is_some() {
+        return Vec::new();
+    }
+    let mut controls = BTreeMap::new();
+    for (&tab, _) in app.workspace.tabs() {
+        if !app.is_tab_visible(tab) || !crate::host::reading::is_edit(app, tab) {
+            continue;
+        }
+        let Some(target) = EditorTarget::capture(app, tab) else {
+            continue;
+        };
+        let active = app.context_mode.mode(tab).active();
+        if crate::host::context_mode::too_narrow(app, tab)
+            && !app.palette_open
+            && !app.picker.open
+            && let Some(bounds) = app.context_mode.bounds.get(&(tab, "Expand pane"))
+        {
+            let id = node_id("context-expand", tab.raw());
+            controls.insert(
+                id,
+                ContextControl {
+                    id,
+                    target: NodeTarget::EditorContextExpand(target),
+                    label: "Expand pane".into(),
+                    bounds: *bounds,
+                    enabled: true,
+                },
+            );
+        }
+        let width =
+            app.editor_bounds.get(&tab).map_or(640.0, |b| b.width) / app.appearance.metrics().scale;
+        for &command in C::ALL {
+            let visible = if app.palette_open || app.picker.open {
+                active && command == C::Exit
+            } else if !active {
+                command == C::Toggle
+            } else {
+                match command {
+                    C::Exit => true,
+                    C::Commands => width >= 320.0,
+                    C::Cut | C::Copy | C::Paste => width >= 600.0,
+                    C::Undo | C::Redo => width >= 430.0,
+                    _ => false,
+                }
+            };
+            if !visible {
+                continue;
+            }
+            if let Some(bounds) = app.context_mode.bounds.get(&(tab, command.id())) {
+                let id = node_id(command.id(), tab.raw());
+                controls.insert(
+                    id,
+                    ContextControl {
+                        id,
+                        target: NodeTarget::EditorContextCommand { target, command },
+                        label: command.title().into(),
+                        bounds: *bounds,
+                        enabled: available(app, target, command),
+                    },
+                );
+            }
+        }
+        if !active || app.palette_open || app.picker.open {
+            continue;
+        }
+        for menu in [
+            ContextMenu::Select,
+            ContextMenu::Go,
+            ContextMenu::Type,
+            ContextMenu::More,
+        ] {
+            if width < 320.0 {
+                continue;
+            }
+            if matches!(menu, ContextMenu::Select | ContextMenu::Go) && width < 720.0 {
+                continue;
+            }
+            if menu == ContextMenu::Type && width < 390.0 {
+                continue;
+            }
+            if let Some(bounds) = app.context_mode.bounds.get(&(tab, menu.title())) {
+                let id = node_id(menu.title(), tab.raw());
+                controls.insert(
+                    id,
+                    ContextControl {
+                        id,
+                        target: NodeTarget::EditorContextMenu { target, menu },
+                        label: format!("{} menu", menu.title()),
+                        bounds: *bounds,
+                        enabled: true,
+                    },
+                );
+            }
+        }
+        if let Some(session) = app.context_mode.session.as_ref().filter(|s| s.tab == tab)
+            && let (Some(menu), Some(target)) = (session.menu, session.menu_target)
+        {
+            for &command in menu.commands() {
+                if let Some(bounds) = app.context_mode.bounds.get(&(tab, command.title())) {
+                    let id = node_id(command.id(), tab.raw());
+                    controls.insert(
+                        id,
+                        ContextControl {
+                            id,
+                            target: NodeTarget::EditorContextCommand { target, command },
+                            label: command.title().into(),
+                            bounds: *bounds,
+                            enabled: available(app, target, command),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    controls.into_values().collect()
+}
+
 /// Build the routing map consumed by [`crate::accessibility::route_action`].
 #[must_use]
 pub fn build_node_map(app: &App) -> BTreeMap<NodeId, NodeTarget> {
     let mut map = BTreeMap::new();
+    for control in context_controls(app).into_iter().filter(|c| c.enabled) {
+        map.insert(control.id, control.target);
+    }
     if let Some((group, menu)) = app.strip_menu {
         for (i, entry) in crate::workspace::tab_strip::menu_entries(app, group, menu)
             .iter()
@@ -792,6 +932,34 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
         }
     }
 
+    let mut context_children = Vec::new();
+    for control in context_controls(app) {
+        let mut node = Node::new(Role::Button);
+        node.set_label(control.label);
+        node.set_bounds(semantic_bounds(control.bounds));
+        if control.enabled {
+            node.add_action(Action::Click);
+        } else {
+            node.set_disabled();
+        }
+        context_children.push(control.id);
+        nodes.push((control.id, node));
+    }
+    if !context_children.is_empty() {
+        let id = node_id("context-toolbar", 0);
+        let mut toolbar = Node::new(Role::Toolbar);
+        toolbar.set_label(
+            app.context_mode
+                .session
+                .as_ref()
+                .map_or("Editor commands".into(), |s| {
+                    format!("Context Mode · {}", s.mode.label())
+                }),
+        );
+        toolbar.set_children(context_children);
+        nodes.push((id, toolbar));
+        window_children.push(id);
+    }
     root.set_children(window_children);
     text_cache.retain(&mounted_buffers);
     nodes.insert(0, (ROOT, root));

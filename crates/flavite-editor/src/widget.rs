@@ -153,7 +153,12 @@ thread_local! {
 
 /// Custom editor surface. Mutations are emitted as revision-guarded actions;
 /// this widget never mutates a buffer or accesses the filesystem itself.
+type ContextToggle<'a> = Box<dyn Fn(&keyboard::Event) -> bool + 'a>;
+
 pub struct EditorWidget<'a, Message> {
+    context_mode: crate::context::ContextMode,
+    on_context: Option<Box<dyn Fn(crate::context::ContextRequest) -> Message + 'a>>,
+    context_toggle: Option<ContextToggle<'a>>,
     view: EditorView,
     candidates: Arc<[CompletionCandidate]>,
     link_resolutions: Arc<HashMap<String, LinkResolution>>,
@@ -190,6 +195,9 @@ impl<'a, Message> EditorWidget<'a, Message> {
     /// Create an editor from an already shared, API-owned text revision.
     pub fn from_view(view: EditorView, on_action: impl Fn(EditorAction) -> Message + 'a) -> Self {
         Self {
+            context_mode: crate::context::ContextMode::Off,
+            on_context: None,
+            context_toggle: None,
             view,
             candidates: Arc::from([]),
             link_resolutions: Arc::new(HashMap::new()),
@@ -214,6 +222,68 @@ impl<'a, Message> EditorWidget<'a, Message> {
     #[must_use]
     pub fn with_colors(mut self, colors: EditorColors) -> Self {
         self.colors = colors;
+        self
+    }
+
+    /// Interpret command-state physical keys without inserting source text.
+    #[must_use]
+    pub fn with_context_mode(
+        mut self,
+        mode: crate::context::ContextMode,
+        on_context: impl Fn(crate::context::ContextRequest) -> Message + 'a,
+    ) -> Self {
+        self.context_mode = mode;
+        self.on_context = Some(Box::new(on_context));
+        self
+    }
+
+    fn emit_context(
+        &self,
+        state: &mut EditorState,
+        event: crate::context::ContextEvent,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        if let Some(callback) = &self.on_context {
+            state.interaction_sequence = state.interaction_sequence.saturating_add(1);
+            shell.publish(callback(crate::context::ContextRequest {
+                buffer: self.view.buffer_id,
+                revision: self.view.revision,
+                selection: (state.anchor, state.caret),
+                sequence: state.interaction_sequence,
+                event,
+            }));
+            shell.capture_event();
+            shell.request_redraw();
+        }
+    }
+
+    fn emit_context_commit(&self, state: &EditorState, text: &str, shell: &mut Shell<'_, Message>) {
+        if let Some(callback) = &self.on_context {
+            shell.publish(callback(crate::context::ContextRequest {
+                buffer: self.view.buffer_id,
+                revision: self.view.revision,
+                selection: (state.anchor, state.caret),
+                sequence: state.interaction_sequence,
+                event: crate::context::ContextEvent::Commit(crate::input::CapturedInput {
+                    buffer: self.view.buffer_id,
+                    observed_revision: self.view.revision,
+                    sequence: state.interaction_sequence,
+                    action: KeyAction::Insert,
+                    text: text.into(),
+                    extend: false,
+                    document_boundary: false,
+                    vertical: None,
+                }),
+            }));
+            shell.capture_event();
+            shell.request_redraw();
+        }
+    }
+
+    /// Let the host's resolved keybinding catalogue own the toggle chord.
+    #[must_use]
+    pub fn with_context_toggle(mut self, matches: impl Fn(&keyboard::Event) -> bool + 'a) -> Self {
+        self.context_toggle = Some(Box::new(matches));
         self
     }
 
@@ -368,6 +438,10 @@ impl<'a, Message> EditorWidget<'a, Message> {
         let refresh = !same_resolutions || state.revision != Some(self.view.revision);
         state.reconcile_view(&self.view, &self.link_resolutions, refresh);
         state.resolution_snapshot = Some(self.link_resolutions.clone());
+        if self.context_mode == crate::context::ContextMode::Command {
+            state.close_autocomplete();
+            state.composition = None;
+        }
         if let Some(interaction) = self.initial_interaction {
             if self.on_input_intent.is_some()
                 && state.controlled_pending
@@ -1711,7 +1785,14 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 renderer::Quad {
                     bounds: Rectangle::new(
                         Point::new(bounds.x + PAD_X + x, bounds.y + PAD_Y + y),
-                        Size::new(1.5, self.type_metrics.line_height),
+                        Size::new(
+                            if self.context_mode == crate::context::ContextMode::Command {
+                                4.0
+                            } else {
+                                1.5
+                            },
+                            self.type_metrics.line_height,
+                        ),
                     ),
                     border: Border::default(),
                     ..renderer::Quad::default()
@@ -1768,10 +1849,67 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             return;
         }
         let before_interaction = state.interaction_snapshot(Some(&self.view.text));
+        if let iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) = event
+            && self.input_enabled
+            && self.keyboard_enabled
+            && state.composition.is_none()
+            && self.on_context.is_some()
+            && let Some(position) = cursor.position_in(layout.bounds())
+        {
+            let byte = state.hit_test_cached(
+                &self.view.text,
+                self.view.revision,
+                state.viewport,
+                position.x - PAD_X,
+                position.y - PAD_Y,
+                self.text_wrap_width(layout.bounds().width),
+            );
+            let (start, end) = state.selection();
+            let selection = if start < end && start <= byte && byte < end {
+                (state.anchor, state.caret)
+            } else {
+                crate::context::word_bounds(&self.view.text, byte)
+            };
+            self.emit_context(
+                state,
+                crate::context::ContextEvent::EnterAt(selection),
+                shell,
+            );
+            return;
+        }
+        if let iced::Event::Keyboard(keyboard::Event::KeyPressed { key, repeat, .. }) = event
+            && state.focused
+            && state.composition.is_none()
+            && self.on_context.is_some()
+        {
+            use crate::context::{ContextCommand, ContextEvent};
+            if let iced::Event::Keyboard(key_event) = event
+                && self
+                    .context_toggle
+                    .as_ref()
+                    .is_some_and(|matches| matches(key_event))
+            {
+                if !repeat {
+                    self.emit_context(state, ContextEvent::Command(ContextCommand::Toggle), shell);
+                }
+                shell.capture_event();
+                return;
+            }
+            if matches!(key, Key::Named(Named::Escape))
+                && state.autocomplete_start.is_none()
+                && self.context_mode.active()
+            {
+                self.emit_context(state, ContextEvent::Command(ContextCommand::Escape), shell);
+                return;
+            }
+        }
+
         if let iced::Event::Keyboard(keyboard::Event::KeyPressed {
             key,
+            physical_key,
             modifiers,
             text,
+            repeat,
             ..
         }) = event
             && state.focused
@@ -1784,18 +1922,35 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     key,
                     Key::Named(Named::Enter | Named::ArrowUp | Named::ArrowDown | Named::Escape)
                 );
-            if action != KeyAction::Ignore && !completion_control {
+            let context_printable = self.context_mode.active()
+                && !modifiers.control()
+                && !modifiers.alt()
+                && !modifiers.logo()
+                && matches!(key, Key::Character(_));
+            if (action != KeyAction::Ignore || context_printable) && !completion_control {
                 if !matches!(
                     action,
                     KeyAction::Insert | KeyAction::Backspace | KeyAction::Delete | KeyAction::Paste
                 ) {
                     state.close_autocomplete();
                 }
+                let physical = if let keyboard::key::Physical::Code(code) = physical_key {
+                    Some(*code)
+                } else {
+                    None
+                };
+                let geometry_action = physical
+                    .and_then(|code| crate::context::motion_key(code, *modifiers))
+                    .filter(|a| matches!(a, KeyAction::Up | KeyAction::Down))
+                    .unwrap_or(action);
                 let vertical = if matches!(
-                    action,
+                    geometry_action,
                     KeyAction::Up | KeyAction::Down | KeyAction::PageUp | KeyAction::PageDown
                 ) {
-                    Some(state.vertical_motion(action, self.text_wrap_width(layout.bounds().width)))
+                    Some(state.vertical_motion(
+                        geometry_action,
+                        self.text_wrap_width(layout.bounds().width),
+                    ))
                 } else {
                     state.preferred_x = None;
                     None
@@ -1809,7 +1964,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 };
                 state.interaction_sequence = state.interaction_sequence.saturating_add(1);
                 state.controlled_pending = true;
-                shell.publish(callback(crate::input::CapturedInput {
+                let input = crate::input::CapturedInput {
                     buffer: self.view.buffer_id,
                     observed_revision: self.view.revision,
                     sequence: state.interaction_sequence,
@@ -1818,7 +1973,23 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     extend: modifiers.shift(),
                     document_boundary: modifiers.command() || modifiers.control(),
                     vertical,
-                }));
+                };
+                if let Some(context) = &self.on_context {
+                    shell.publish(context(crate::context::ContextRequest {
+                        buffer: self.view.buffer_id,
+                        revision: self.view.revision,
+                        selection: (state.anchor, state.caret),
+                        sequence: state.interaction_sequence,
+                        event: crate::context::ContextEvent::Key(crate::context::ContextKey {
+                            code: physical,
+                            modifiers: *modifiers,
+                            repeat: *repeat,
+                            input,
+                        }),
+                    }));
+                } else {
+                    shell.publish(callback(input));
+                }
                 shell.capture_event();
                 shell.request_redraw();
                 return;
@@ -1826,6 +1997,21 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         }
         match event {
             iced::Event::InputMethod(input_event) if state.focused => {
+                if self.context_mode == crate::context::ContextMode::Command {
+                    shell.capture_event();
+                    return;
+                }
+                if let input_method::Event::Commit(text) = input_event
+                    && !text.is_empty()
+                    && self.on_input_intent.is_some()
+                    && self.on_context.is_some()
+                {
+                    state.composition = None;
+                    state.interaction_sequence = state.interaction_sequence.saturating_add(1);
+                    state.controlled_pending = true;
+                    self.emit_context_commit(state, text, shell);
+                    return;
+                }
                 if let Some(action) = state.input_method_event(&self.view, input_event) {
                     self.emit(shell, action);
                 }
@@ -1887,7 +2073,10 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                         );
                         // A click on a link navigates (point-and-click contract);
                         // modifier clicks take the same path.
-                        if let Some(action) = link_action_at(&self.view, &state.link_spans, byte) {
+                        if !self.context_mode.active()
+                            && let Some(action) =
+                                link_action_at(&self.view, &state.link_spans, byte)
+                        {
                             self.emit(shell, action);
                             shell.capture_event();
                             shell.request_redraw();
@@ -2005,13 +2194,18 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 ..
             }) if state.focused
                 && state.composition.is_none()
+                && self.context_mode != crate::context::ContextMode::Command
                 && self.execute_key(state, key, *modifiers, text.as_deref(), clipboard, shell) =>
             {
                 shell.capture_event();
             }
             _ => {}
         }
-        if self.input_enabled && state.focused && state.ime_active {
+        if self.input_enabled
+            && state.focused
+            && state.ime_active
+            && self.context_mode != crate::context::ContextMode::Command
+        {
             let width = self.text_wrap_width(layout.bounds().width);
             let caret_byte = state.caret;
             let (x, y) = {

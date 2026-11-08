@@ -583,6 +583,11 @@ pub enum SessionResult {
 /// Data returned from successful commands.
 #[derive(Debug, Clone)]
 pub enum CommandResult {
+    /// An editor interaction closed the current typing group without editing.
+    UndoGroupSealed {
+        buffer_id: BufferId,
+        revision: Revision,
+    },
     /// Note was opened.
     NoteOpened {
         buffer_id: BufferId,
@@ -5831,6 +5836,31 @@ impl Session {
     }
 
     /// Undo an edit.
+    /// Close the current typing group under the same revision guard as edits.
+    /// This never creates an undo node or changes document freshness.
+    pub fn seal_undo_group(&self, buffer_id: BufferId, revision: Revision) -> SessionResult {
+        let _turn = self.driving_turn.lock_recovering();
+        self.pump_external_changes_inner();
+        let mut manager = self.buffer_manager.lock_recovering();
+        let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
+            return SessionResult::Error {
+                message: "Buffer is no longer open".into(),
+            };
+        };
+        if buffer.revision() != revision {
+            return SessionResult::StaleRevision {
+                buffer_id,
+                expected: revision,
+                actual: buffer.revision(),
+            };
+        }
+        buffer.model_mut().seal_undo_group();
+        SessionResult::Success(CommandResult::UndoGroupSealed {
+            buffer_id,
+            revision,
+        })
+    }
+
     fn undo(&self, buffer_id: BufferId, revision: Revision) -> SessionResult {
         let mut buffer_manager = self.buffer_manager.lock_recovering();
         if buffer_manager

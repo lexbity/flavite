@@ -15,6 +15,14 @@ use iced::keyboard::{self, Modifiers};
 /// the default for that command id only.
 pub const DEFAULT_CHORDS: &[(&str, &str)] = &[
     ("workspace.toggle_sidebar", "Mod+B"),
+    (
+        "editor.context_toggle",
+        if cfg!(target_os = "macos") {
+            "Ctrl+Shift+Space"
+        } else {
+            "Ctrl+Space"
+        },
+    ),
     ("workspace.find", "Mod+F"),
     ("workspace.replace", "Mod+H"),
     ("workspace.note_mode", "Mod+E"),
@@ -50,7 +58,7 @@ pub const DEFAULT_CHORDS: &[(&str, &str)] = &[
 pub fn modifier_bits(modifiers: &Modifiers) -> u8 {
     use flavite_api::command::modifiers as mods;
     let mut bits = mods::NONE;
-    if modifiers.command() {
+    if modifiers.control() {
         bits |= mods::CTRL;
     }
     if modifiers.shift() {
@@ -92,6 +100,7 @@ fn named_token(named: keyboard::key::Named) -> Option<&'static str> {
     use keyboard::key::Named;
     Some(match named {
         Named::Enter => "Enter",
+        Named::Space => "Space",
         Named::Tab => "Tab",
         Named::Escape => "Escape",
         Named::Backspace => "Backspace",
@@ -444,6 +453,30 @@ pub fn ui_specs(overrides: &std::collections::BTreeMap<String, String>) -> Vec<C
                 intern_chords(&keys),
             )
         })
+        .chain(
+            flavite_editor::context::ContextCommand::ALL
+                .iter()
+                .filter(|command| {
+                    command.id().starts_with("editor.")
+                        || matches!(
+                            command,
+                            flavite_editor::context::ContextCommand::LineStart
+                                | flavite_editor::context::ContextCommand::LineEnd
+                        )
+                })
+                .map(|command| {
+                    let keys: Vec<Chord> = resolved_chord(command.id(), overrides)
+                        .into_iter()
+                        .collect();
+                    CommandSpec::with_availability(
+                        command.id(),
+                        command.title(),
+                        ArgSchema::typed::<serde_json::Value>(),
+                        None,
+                        intern_chords(&keys),
+                    )
+                }),
+        )
         .collect()
 }
 
@@ -480,11 +513,13 @@ pub fn catalog_conflicts(core_ids: &[&str]) -> Vec<String> {
         }
     }
     let mut seen = std::collections::BTreeSet::new();
-    for command in UI_COMMANDS {
-        if !seen.insert(command.id) {
+    for command in ui_specs(&Default::default()) {
+        if !seen.insert(command.id) || core_ids.contains(&command.id) {
             conflicts.push(command.id.to_owned());
         }
     }
+    conflicts.sort();
+    conflicts.dedup();
     conflicts
 }
 
@@ -492,6 +527,22 @@ pub fn catalog_conflicts(core_ids: &[&str]) -> Vec<String> {
 /// precedence; plain typing never triggers layout commands.
 #[must_use]
 pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
+    if app.settings.capture.is_none()
+        && app.dialog.is_none()
+        && !app.has_composition()
+        && let keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            repeat: false,
+            ..
+        } = &event
+        && app.appearance.chord_command(key, modifiers) == Some("editor.context_toggle")
+    {
+        return Some(Message::RunHostCommand("editor.context_toggle"));
+    }
+    if let Some(message) = crate::host::context_mode::keyboard_message(app, &event) {
+        return Some(message);
+    }
     let keyboard::Event::KeyPressed {
         key,
         modifiers,
@@ -520,6 +571,8 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
         let mut parts = Vec::new();
         if modifiers.command() {
             parts.push("Mod");
+        } else if modifiers.control() {
+            parts.push("Ctrl");
         }
         if modifiers.alt() {
             parts.push("Alt");
@@ -656,7 +709,8 @@ fn keyboard_command_message(app: &App, id: &'static str) -> Option<Message> {
     let layout = |action: LayoutAction| Some(Message::Layout(action));
     let revision = app.workspace.revision();
     match id {
-        "workspace.toggle_sidebar"
+        "editor.context_toggle"
+        | "workspace.toggle_sidebar"
         | "workspace.find"
         | "workspace.replace"
         | "workspace.note_mode"
@@ -719,8 +773,11 @@ fn splitter_increment(
     use flavite_workspace::{Side, layout::Arrangement as Arr};
     use keyboard::key::Named;
     if modifier_bits(modifiers)
-        != flavite_api::command::modifiers::CTRL
-            | flavite_api::command::modifiers::ALT
+        != (if cfg!(target_os = "macos") {
+            flavite_api::command::modifiers::SUPER
+        } else {
+            flavite_api::command::modifiers::CTRL
+        }) | flavite_api::command::modifiers::ALT
             | flavite_api::command::modifiers::SHIFT
     {
         return None;
@@ -854,6 +911,22 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
     if app.shutdown.is_some() {
         app.status = "Quitting: resolve the quit (decide or cancel) first".into();
         return iced::Task::none();
+    }
+    if (id.starts_with("editor.")
+        || matches!(
+            id,
+            "workspace.caret_start_line" | "workspace.caret_end_line"
+        ))
+        && let Some(command) = flavite_editor::context::ContextCommand::ALL
+            .iter()
+            .find(|c| c.id() == id)
+        && let Some(target) =
+            crate::host::context_mode::EditorTarget::capture(app, app.workspace.focused_tab())
+    {
+        return crate::host::context_mode::handle(
+            app,
+            crate::host::context_mode::ContextMessage::Run(target, *command),
+        );
     }
     if !available(app, id) {
         app.status = "This command is unavailable in the current view".into();
@@ -1272,6 +1345,23 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
 /// still recheck every accepted action.
 #[must_use]
 pub fn available(app: &App, id: &str) -> bool {
+    if id.starts_with("editor.")
+        || matches!(
+            id,
+            "workspace.caret_start_line" | "workspace.caret_end_line"
+        )
+    {
+        return flavite_editor::context::ContextCommand::ALL
+            .iter()
+            .find(|c| c.id() == id)
+            .is_some_and(|command| {
+                crate::host::context_mode::EditorTarget::capture(app, app.workspace.focused_tab())
+                    .is_some_and(|target| {
+                        crate::host::context_mode::available(app, target, *command)
+                    })
+            });
+    }
+
     if app.has_composition() {
         return false;
     }
