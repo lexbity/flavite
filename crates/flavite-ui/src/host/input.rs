@@ -141,7 +141,25 @@ pub fn handle(
     incarnation: u64,
     input: CapturedInput,
 ) -> iced::Task<Message> {
-    handle_inner(app, tab, incarnation, input, false)
+    handle_inner(app, tab, incarnation, input, false, None)
+}
+
+/// A toolbar verb may have an implicit effective range, but its history
+/// records the selection before that internal adjustment.
+pub struct HistoryIntent {
+    pub kind: flavite_buffer::history::EditKind,
+    pub before: [usize; 2],
+    pub after: Option<[usize; 2]>,
+}
+
+pub fn handle_command(
+    app: &mut App,
+    tab: TabId,
+    incarnation: u64,
+    input: CapturedInput,
+    intent: HistoryIntent,
+) -> iced::Task<Message> {
+    handle_inner(app, tab, incarnation, input, false, Some(intent))
 }
 
 pub fn commit_composition(
@@ -161,7 +179,7 @@ pub fn commit_composition(
         .interaction()
         .sequence
         .saturating_add(1);
-    handle_inner(app, target.tab, target.incarnation, input, true)
+    handle_inner(app, target.tab, target.incarnation, input, true, None)
 }
 
 fn handle_inner(
@@ -170,6 +188,7 @@ fn handle_inner(
     incarnation: u64,
     mut input: CapturedInput,
     composition_commit: bool,
+    history_intent: Option<HistoryIntent>,
 ) -> iced::Task<Message> {
     if super::context_mode::too_narrow(app, tab) {
         app.context_mode
@@ -190,6 +209,7 @@ fn handle_inner(
         return iced::Task::none();
     }
     if !app.is_tab_visible(tab)
+        || app.context_mode.history.open
         || !reading::is_edit(app, tab)
         || app.picker.open
         || app.palette_open
@@ -275,6 +295,9 @@ fn handle_inner(
         } => {
             mutation = Some(action);
             interaction.selections = vec![Selection::caret(caret)];
+            if let Some(after) = history_intent.as_ref().and_then(|intent| intent.after) {
+                interaction.selections = vec![Selection::new(after[0], after[1])];
+            }
             clipboard = copied;
         }
         PreparedInput::History(action) => {
@@ -295,6 +318,13 @@ fn handle_inner(
         PreparedInput::Copy(copied) => clipboard = Some(copied),
     }
     if let Some(action) = mutation {
+        let edit_change = action.as_edit().and_then(|(_, _, edits)| {
+            (edits.len() == 1).then(|| flavite_buffer::history::HistoryChange {
+                start: edits[0].range.start.0,
+                end: edits[0].range.end.0,
+                inserted: edits[0].replacement.len(),
+            })
+        });
         let Some(api) = &app.flavite else {
             return iced::Task::none();
         };
@@ -302,6 +332,29 @@ fn handle_inner(
             .into_invocation(api.command_registry().next_request_id())
             .expect("prepared mutation");
         if invocation.command_id == "apply_edits" {
+            use flavite_buffer::history::{EditKind, EditorEdit};
+            let kind = match input.action {
+                KeyAction::Cut => EditKind::Cut,
+                KeyAction::Paste => EditKind::Paste,
+                KeyAction::Delete | KeyAction::DeleteWord => EditKind::Delete,
+                KeyAction::Backspace | KeyAction::BackspaceWord => EditKind::Backspace,
+                _ => EditKind::Typing,
+            };
+            invocation.args["editor"] = serde_json::to_value(EditorEdit {
+                origin: format!("{:032x}", tab.raw()),
+                kind: history_intent.as_ref().map_or(kind, |intent| intent.kind),
+                before: vec![
+                    history_intent
+                        .as_ref()
+                        .map_or([selection.anchor, selection.head], |intent| intent.before),
+                ],
+                after: interaction
+                    .selections
+                    .iter()
+                    .map(|s| [s.anchor, s.head])
+                    .collect(),
+            })
+            .expect("history record is serializable");
             let typing = app.context_mode.mode(tab)
                 != flavite_editor::context::ContextMode::Command
                 && !matches!(input.action, KeyAction::Paste | KeyAction::Cut);
@@ -321,23 +374,58 @@ fn handle_inner(
                 .notice("Input rejected; source changed or is unavailable");
             return iced::Task::none();
         }
+        if let Some(change) = edit_change
+            && let Some(current) = app.note_editor_view(tab)
+        {
+            apply_history_movement(
+                app,
+                tab,
+                view.buffer_id,
+                view.revision,
+                current.revision,
+                &flavite_buffer::history::HistoryMovement {
+                    selections: None,
+                    change,
+                },
+            );
+        }
+        if history
+            && let flavite_api::ExecutionResult::Local(flavite_api::LocalResult::Success(success)) =
+                &result
+            && let Some(value) = success
+                .data
+                .get("movement")
+                .filter(|value| !value.is_null())
+            && let Ok(movement) =
+                serde_json::from_value::<flavite_buffer::history::HistoryMovement>(value.clone())
+        {
+            let Some(current) = app.note_editor_view(tab) else {
+                return iced::Task::none();
+            };
+            apply_history_movement(
+                app,
+                tab,
+                view.buffer_id,
+                view.revision,
+                current.revision,
+                &movement,
+            );
+            if let Some(selections) = movement.selections {
+                interaction.selections = selections
+                    .into_iter()
+                    .map(|[a, h]| Selection::new(a, h))
+                    .collect();
+            } else {
+                interaction.selections =
+                    map_selections(&current.text, &interaction.selections, &movement.change);
+            }
+        }
         app.workspace.invalidate_writing_target(view.buffer_id);
         app.linking.invalidate_if_source_changed(None);
     }
     let Some(current) = app.note_editor_view(tab) else {
         return iced::Task::none();
     };
-    if history {
-        let mut at = interaction
-            .selections
-            .first()
-            .map_or(0, |selection| selection.head)
-            .min(current.text.len());
-        while !current.text.is_char_boundary(at) {
-            at -= 1;
-        }
-        interaction.selections = vec![Selection::caret(at)];
-    }
     // The exact source edit's acknowledged caret authorizes typing. History
     // lacks an exact transform and requires a subsequent caret interaction.
     let retain_target = app.workspace.writing_target().is_some();
@@ -388,7 +476,92 @@ fn handle_inner(
     } else {
         "Editing current note".into()
     };
+    if let Some(session) = &mut app.context_mode.session {
+        session.attention = false;
+    }
     app.reconcile_contexts();
     app.refresh_semantics();
     clipboard.map_or_else(iced::Task::none, iced::clipboard::write)
+}
+
+pub fn map_selections(
+    text: &str,
+    selections: &[Selection],
+    change: &flavite_buffer::history::HistoryChange,
+) -> Vec<Selection> {
+    let point = |at, affinity| map_history_point(text, at, change, affinity);
+    selections
+        .iter()
+        .map(|s| {
+            use flavite_buffer::Affinity::{Left, Right};
+            if s.anchor < s.head {
+                Selection::new(point(s.anchor, Left), point(s.head, Right))
+            } else if s.anchor > s.head {
+                Selection::new(point(s.anchor, Right), point(s.head, Left))
+            } else {
+                Selection::caret(point(s.head, Right))
+            }
+        })
+        .collect()
+}
+
+pub fn map_history_point(
+    text: &str,
+    at: usize,
+    change: &flavite_buffer::history::HistoryChange,
+    affinity: flavite_buffer::Affinity,
+) -> usize {
+    let mapped = flavite_buffer::positions::map_through_replacement(
+        at,
+        flavite_buffer::TextEdit::new(change.start, change.end, change.inserted),
+        affinity,
+    );
+    let floor = flavite_editor::viewport::clamp_grapheme_boundary(text, mapped);
+    if affinity == flavite_buffer::Affinity::Right && floor < mapped.min(text.len()) {
+        flavite_editor::viewport::next_grapheme_boundary(text, flavite_syntax::TextByte(floor)).0
+    } else {
+        floor
+    }
+}
+
+/// Map passive views once, without adopting the initiating view's selection
+/// or stealing focus. Their old revision is an exact mapping guard.
+pub fn apply_history_movement(
+    app: &mut App,
+    source: TabId,
+    buffer: u64,
+    before: u64,
+    after: u64,
+    movement: &flavite_buffer::history::HistoryMovement,
+) {
+    let Some(view) = app.note_editor_view(source) else {
+        return;
+    };
+    let mapped: Vec<_> = app
+        .workspace
+        .tabs()
+        .filter(|(id, _)| **id != source)
+        .filter_map(|(_, tab)| {
+            let mut interaction = tab.interaction().clone();
+            if interaction.buffer_id != Some(buffer) || interaction.revision != before {
+                return None;
+            }
+            interaction.selections =
+                map_selections(&view.text, &interaction.selections, &movement.change);
+            interaction.revision = after;
+            interaction.sequence += 1;
+            interaction.viewport_anchor = map_history_point(
+                &view.text,
+                interaction.viewport_anchor,
+                &movement.change,
+                flavite_buffer::Affinity::Left,
+            );
+            Some(interaction)
+        })
+        .collect();
+    for interaction in mapped {
+        let _ = app
+            .workspace
+            .acknowledge_interaction(interaction, &view.text);
+    }
 }

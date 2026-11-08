@@ -6,6 +6,7 @@
 //! §4.16.1).
 
 pub mod eol;
+pub mod history;
 pub mod manager;
 pub mod model;
 pub mod positions;

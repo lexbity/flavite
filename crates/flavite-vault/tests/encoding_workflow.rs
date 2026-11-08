@@ -195,6 +195,7 @@ fn utf16le_bom_open_edit_save_preserves_descriptor_and_bytes() {
             "X".to_owned(),
         )],
         undo_policy: UndoPolicy::Isolated,
+        editor: None,
     });
     let applied = expect_success(result, "apply edits");
     let CommandResult::EditsApplied { new_revision, .. } = applied else {
@@ -317,6 +318,7 @@ fn reopen_encoding_refuses_dirty_buffer() {
             "draft ".to_owned(),
         )],
         undo_policy: UndoPolicy::Isolated,
+        editor: None,
     });
     expect_success(result, "apply edits");
 

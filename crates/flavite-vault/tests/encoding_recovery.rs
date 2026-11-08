@@ -164,6 +164,7 @@ fn utf16_dirty_draft_recovery_replays_recorded_format() {
             "DIRTY DRAFT ".to_owned(),
         )],
         undo_policy: UndoPolicy::Isolated,
+        editor: None,
     });
     expect_success(result, "apply draft edit");
 
@@ -287,6 +288,7 @@ fn utf16_save_retires_intent_and_binds_saved_hash() {
             "more".to_owned(),
         )],
         undo_policy: UndoPolicy::Isolated,
+        editor: None,
     });
     expect_success(result, "apply edit");
 

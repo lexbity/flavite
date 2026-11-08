@@ -375,6 +375,12 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "context_mode": app.context_mode.session.as_ref().map(|session|serde_json::json!({
             "tab":session.tab.to_string(),"state":session.mode.label(),"menu":session.menu.map(|m|m.title()),
             "message":session.message,
+            "history":{
+                "open":app.context_mode.history.open,
+                "page":app.context_mode.history.page,
+                "bounds":(if app.context_mode.history.open { &app.context_mode.history.rows } else { &app.context_mode.history.bounds }).iter().map(|(node,r)|(node.to_string(),[r.x,r.y,r.width,r.height])).collect::<std::collections::BTreeMap<_,_>>(),
+                "controls":app.context_mode.history.controls.iter().map(|(name,r)|(*name,[r.x,r.y,r.width,r.height])).collect::<std::collections::BTreeMap<_,_>>()
+            },
             "bounds":app.context_mode.bounds.iter().filter(|((tab,_),_)|*tab==session.tab)
                 .map(|((_,name),r)|(*name,[r.x,r.y,r.width,r.height])).collect::<std::collections::BTreeMap<_,_>>()
         })),

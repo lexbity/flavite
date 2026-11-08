@@ -147,6 +147,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             source_revision,
         ))
         .with_keyboard_enabled(!crate::host::note_search::blocks_typing(app, &tab)
+            && !app.context_mode.history.open
             && !app.context_mode.session.as_ref().is_some_and(|s|s.tab==tab && s.menu.is_some()))
         .with_input_intents(move |input| Message::EditorInput {
             tab,

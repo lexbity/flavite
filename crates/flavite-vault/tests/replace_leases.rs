@@ -163,6 +163,7 @@ fn session_refuses_save_edit_and_rename_on_a_leased_source() {
             "x".into(),
         )],
         undo_policy: flavite_buffer::undo::UndoPolicy::Isolated,
+        editor: None,
     });
     assert!(
         matches!(

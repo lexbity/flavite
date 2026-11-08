@@ -131,7 +131,7 @@ switching to `canvas` is a workaround for driver problems, not a necessity.
 |---|---|
 | `FLAVITE_VAULT` | Default vault folder for the desktop app. Overridden by `--vault PATH`. Unset: start screen / fallback root. |
 | `LATTICE_VAULT` | **Deprecated.** Honored only if `FLAVITE_VAULT` is unset; prints a deprecation notice. |
-| `FLAVITE_DATA_DIR` | When set to an absolute path, replaces the OS data dir entirely (vault registry, root guards, workspace layouts, preferences). |
+| `FLAVITE_DATA_DIR` | When set to an absolute path, replaces the OS data dir entirely (vault registry, root guards, instance locks, app-launch memory, encoding hints, recovery checkpoints, operation keys). Vault-rooted state under `<vault>/.flavite/` is unaffected. |
 | `FLAVITE_GRAPH_BACKEND` | `gpu` (default) or `canvas` for the graph renderer. |
 
 Additional variables exist for test harnesses and crash-simulation
@@ -147,11 +147,17 @@ kill processes or inject UI faults.
 | Your notes | Your vault folder (plain Markdown). |
 | Vault identity | `<vault>/.flavite/vault.toml` |
 | Graph pins | `<vault>/.flavite/graph.json` |
+| Workspace layout | `<vault>/.flavite/workspace-layouts.json` (plus last-good `.bak`) |
+| Preferences / settings | `<vault>/.flavite/settings.toml` |
+| Installed themes | `<vault>/.flavite/themes/<id>/` |
 | Recovery journal | `<vault>/.flavite/journal/` |
-| Workspace layouts & preferences | `<data>/flavite/workspace/<vault-uuid>/` (`workspace-layouts.json`, `device-preferences.json`) |
+| Durable replacement jobs | `<vault>/.flavite/operations/replace/` |
 | Remembered last vault | `<data>/flavite/app/app-launch.json` |
 | Vault registry / root guards / instance locks | `<data>/flavite/vaults/`, `<data>/flavite/roots/` |
+| Recovery checkpoints / operation keys | `<data>/flavite/vaults/<vault-uuid>/recovery/`, `<data>/flavite/vaults/<vault-uuid>/operations/` |
 
+Everything under `<vault>/.flavite/` is vault-rooted: it travels with the
+vault and is never machine-pinned. Everything under `<data>` is device-local.
 `<data>` is the OS data directory for the app (`ProjectDirs` for
 `com.flavite/Flavite` — e.g. `~/.local/share/Flavite` on Linux), with
 `FLAVITE_DATA_DIR` overriding it entirely when set to an absolute path.

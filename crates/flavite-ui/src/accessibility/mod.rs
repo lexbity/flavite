@@ -22,6 +22,11 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
     }
     let target = app.a11y_nodes.get(&request.target_node)?.clone();
     match target {
+        NodeTarget::EditorHistory { source, action } if request.action == Action::Click => {
+            Some(Message::EditorHistory(
+                crate::host::editor_history::HistoryMessage::Act(source, action),
+            ))
+        }
         NodeTarget::EditorContextExpand(target) if request.action == Action::Click => {
             Some(Message::ContextMode(
                 crate::host::context_mode::ContextMessage::ExpandPane(target),

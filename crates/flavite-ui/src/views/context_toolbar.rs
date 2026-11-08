@@ -10,9 +10,7 @@ use crate::{
     },
 };
 use flavite_editor::context::{ContextCommand, ContextMenu};
-use iced::widget::{
-    Space, button, column, container, mouse_area, opaque, row, scrollable, stack, text,
-};
+use iced::widget::{Space, button, column, container, opaque, row, scrollable, stack, text};
 use iced::{Element, Length, alignment};
 
 fn observed<'a>(
@@ -89,6 +87,21 @@ pub fn view(app: &App, target: EditorTarget) -> Element<'_, Message> {
     if width >= 390.0 {
         actions = actions.push(menu_button(app, target, ContextMenu::Type));
     }
+    if width >= 860.0 {
+        actions = actions.push(observed(
+            target.tab,
+            ContextCommand::History.id(),
+            button(text("History").size(metrics.text_sm))
+                .padding([5, 7])
+                .style(style::ghost())
+                .on_press(Message::EditorHistory(
+                    crate::host::editor_history::HistoryMessage::Act(
+                        target,
+                        crate::host::editor_history::HistoryAction::Open,
+                    ),
+                )),
+        ));
+    }
     if width >= 320.0 {
         actions = actions
             .push(Space::new().width(Length::Fill))
@@ -115,23 +128,7 @@ pub fn view(app: &App, target: EditorTarget) -> Element<'_, Message> {
             if count == 1 { "" } else { "s" }
         )
     };
-    let detail = mouse_area(
-        container(
-            row![
-                text(summary).size(metrics.text_sm),
-                Space::new().width(8.0 * metrics.scale),
-                text(caption).size(metrics.text_sm).style(style::dim_text)
-            ]
-            .align_y(alignment::Vertical::Center),
-        )
-        .height(24.0 * metrics.scale)
-        .width(Length::Fill)
-        .clip(true),
-    )
-    .on_double_click(Message::ContextMode(ContextMessage::Run(
-        target,
-        ContextCommand::Exit,
-    )));
+    let detail = crate::views::editor_history::strip(app, target, summary, caption);
     observed(
         target.tab,
         "toolbar",

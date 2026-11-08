@@ -7,6 +7,7 @@
 pub mod backlinks;
 pub mod context_header;
 pub mod context_toolbar;
+pub mod editor_history;
 pub mod graph;
 pub mod history;
 pub mod note;

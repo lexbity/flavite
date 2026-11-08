@@ -12,7 +12,8 @@ or your vault.
 ## Features
 
 - **Movable tab workspace** — drag, split, merge, maximize, and reopen tabs
-  across recursively split tab groups. Layout is saved per vault, device-local.
+  across recursively split tab groups. Layout is saved per vault, in the
+  vault (`.flavite/workspace-layouts.json`).
 - **Shared editing** — multiple views of one note share text and Undo history,
   while keeping independent carets, selections, and scroll.
 - **Rendered reading** — toggle Edit/Read (Ctrl/Cmd+E) on the same tab;
@@ -24,7 +25,7 @@ or your vault.
 - **Safe mutations** — Session-owned writes, revision guards, conflict and
   recovery handling, atomic saves. No silent target rebasing.
 - **Local and private** — no network, no accounts, no telemetry. Layouts and
-  preferences stay on the device.
+  preferences ride inside the vault; nothing leaves your machine.
 
 See [docs/APP-FEATURES.md](docs/APP-FEATURES.md) for the full feature guide,
 including every keyboard shortcut.
@@ -34,7 +35,7 @@ including every keyboard shortcut.
 | Binary | Crate | What it is |
 |---|---|---|
 | `flavite` | `crates/flavite-app` | The desktop app (iced/winit GUI). Requires a display server. |
-| `flavite-cli` | `crates/flavite-cli` | Headless vault access: open, init, doctor, query, search, rename, info. No GPU or display needed. |
+| `flavite-cli` | `crates/flavite-cli` | Headless vault access: open, init, doctor, query, search, rename, theme, replace, encoding, info. No GPU or display needed. |
 
 There is also a demo example (`cargo build -p flavite-ui --example app-demo`)
 that runs the same UI without CLI parsing; it exists for visual testing, not
@@ -82,19 +83,31 @@ CLI commands and flags: [docs/CLI-FEATURES.md](docs/CLI-FEATURES.md).
 
 ## Data locations
 
-Notes stay wherever your vault folder is. Device-local state lives outside the
-vault:
+Notes stay wherever your vault folder is. Most user state is **vault-rooted**
+under `<vault>/.flavite/`:
 
-- Workspace layouts / UI preferences: OS data dir under
-  `flavite/workspace/<vault-uuid>/` (`workspace-layouts.json`,
-  `device-preferences.json`), versioned with last-good backups. Override the
-  base directory with `FLAVITE_DATA_DIR`.
-- App-scope state (remembered last vault): `flavite/app/app-launch.json`
-  under the OS data dir.
-- Vault-local user state: `<vault>/.flavite/` — `vault.toml` identity,
-  `graph.json` graph pins, `journal/` recovery journal.
-- Note saves are atomic (temp sibling file, then replace); recovery uses the
-  core journal/safety contracts. Resetting a layout never touches notes.
+- Identity: `vault.toml`
+- Graph pins: `graph.json`
+- Workspace layouts: `workspace-layouts.json` (versioned, with last-good
+  `.bak` backups)
+- Preferences / settings (theme, interface scale, font size, line width,
+  shortcut overrides, vault tuning): `settings.toml`
+- Installed themes: `themes/<id>/`
+- Recovery journal: `journal/`
+- Durable replacement operations: `operations/replace/`
+
+Device-local state lives outside the vault, under the OS data dir:
+
+- Remembered last vault: `flavite/app/app-launch.json`
+- Vault registry, root guards, instance locks: `flavite/vaults/`,
+  `flavite/roots/`
+- Unsaved-buffer recovery checkpoints and durable-operation keys:
+  `flavite/vaults/<vault-uuid>/recovery/` and `…/operations/`
+- Source-format hints: `flavite/workspace/<vault-uuid>/encoding-hints.json`
+
+Override the device base directory with `FLAVITE_DATA_DIR`. Note saves are
+atomic (temp sibling file, then replace); recovery uses the core
+journal/safety contracts. Resetting a layout never touches notes.
 
 ## Development
 

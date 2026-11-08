@@ -60,10 +60,12 @@ pub struct ContextSession {
     pub menu_target: Option<EditorTarget>,
     pub selected: usize,
     pub message: String,
+    pub attention: bool,
 }
 
 #[derive(Debug, Default)]
 pub struct ContextHost {
+    pub history: super::editor_history::HistoryHost,
     pub session: Option<ContextSession>,
     pub bounds: BTreeMap<(TabId, &'static str), Rectangle>,
     generation: u64,
@@ -73,6 +75,9 @@ pub struct ContextHost {
 }
 
 impl ContextHost {
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
     #[must_use]
     pub fn mode(&self, tab: TabId) -> ContextMode {
         self.session
@@ -84,11 +89,19 @@ impl ContextHost {
     pub fn notice(&mut self, text: impl Into<String>) {
         if let Some(session) = &mut self.session {
             session.message = text.into();
+            session.attention = true;
+        }
+    }
+
+    pub fn feedback(&mut self, text: impl Into<String>) {
+        if let Some(session) = &mut self.session {
+            session.message = text.into();
+            session.attention = false;
         }
     }
 }
 
-fn valid(app: &App, target: EditorTarget, selection: bool) -> bool {
+pub(crate) fn valid(app: &App, target: EditorTarget, selection: bool) -> bool {
     super::reading::is_edit(app, target.tab)
         && app.is_tab_visible(target.tab)
         && app.notes.incarnation(target.tab) == Some(target.incarnation)
@@ -113,8 +126,16 @@ pub fn too_narrow(app: &App, tab: TabId) -> bool {
 /// Available commands derive from the same target checks as execution.
 #[must_use]
 pub fn available(app: &App, target: EditorTarget, command: ContextCommand) -> bool {
+    if command == ContextCommand::History && !app.context_mode.mode(target.tab).active() {
+        return false;
+    }
     if command == ContextCommand::Exit {
         return app.context_mode.mode(target.tab).active();
+    }
+    if app.context_mode.history.open
+        && !matches!(command, ContextCommand::Escape | ContextCommand::Toggle)
+    {
+        return false;
     }
     valid(app, target, false)
         && !app.has_composition()
@@ -125,7 +146,7 @@ pub fn available(app: &App, target: EditorTarget, command: ContextCommand) -> bo
                 && app.flavite.as_ref().is_some_and(|api| !api.is_read_only())))
 }
 
-fn seal(app: &App, tab: TabId) {
+pub(crate) fn seal(app: &App, tab: TabId) {
     let (Some(api), Some(view)) = (&app.flavite, app.note_editor_view(tab)) else {
         return;
     };
@@ -173,6 +194,7 @@ pub fn resume_focus(app: &App) -> Task<Message> {
         return Task::none();
     };
     if app.workspace.focused_tab() != s.tab
+        || app.context_mode.history.open
         || app.palette_open
         || app.picker.open
         || app.dialog.is_some()
@@ -193,6 +215,7 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
     };
     let s = app.context_mode.session.as_ref()?;
     if app.palette_open
+        || app.context_mode.history.open
         || app.picker.open
         || app.dialog.is_some()
         || app.strip_menu.is_some()
@@ -245,6 +268,7 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
 }
 
 fn exit(app: &mut App) {
+    app.context_mode.history = Default::default();
     app.context_mode.capture = None;
     if let Some(session) = app.context_mode.session.take() {
         seal(app, session.tab);
@@ -290,6 +314,7 @@ pub fn reconcile(app: &mut App) {
         s.menu_target = None;
         s.message = "Source changed; choose the command again".into();
     }
+    super::editor_history::reconcile(app);
 }
 
 /// A pointer/motion boundary ends the old typing undo group, not typing mode.
@@ -298,6 +323,15 @@ pub fn selection_changed(app: &mut App, tab: TabId) {
         return;
     }
     app.context_mode.capture = None;
+    if app
+        .context_mode
+        .history
+        .page
+        .as_ref()
+        .is_some_and(|page| page.trail.iter().any(|entry| entry.current && entry.open))
+    {
+        super::editor_history::invalidate(app);
+    }
     if app.context_mode.mode(tab).active() {
         seal(app, tab);
         if let Some(s) = &mut app.context_mode.session {
@@ -316,6 +350,7 @@ pub fn native_key(
     use flavite_editor::context::{command_key, menu_key, motion_key};
     use iced::keyboard::key::Code;
     if !valid(app, target, true)
+        || app.context_mode.history.open
         || too_narrow(app, target.tab)
         || app.palette_open
         || app.picker.open
@@ -431,6 +466,16 @@ fn select(app: &mut App, target: EditorTarget, anchor: usize, head: usize) {
 }
 
 fn input(app: &mut App, target: EditorTarget, action: KeyAction, text: String) -> Task<Message> {
+    input_command(app, target, action, text, None)
+}
+
+fn input_command(
+    app: &mut App,
+    target: EditorTarget,
+    action: KeyAction,
+    text: String,
+    semantic: Option<super::input::HistoryIntent>,
+) -> Task<Message> {
     let Some(view) = app.note_editor_view(target.tab) else {
         return Task::none();
     };
@@ -443,21 +488,21 @@ fn input(app: &mut App, target: EditorTarget, action: KeyAction, text: String) -
         .workspace
         .tab(&target.tab)
         .map_or(1, |v| v.interaction().sequence.saturating_add(1));
-    super::input::handle(
-        app,
-        target.tab,
-        target.incarnation,
-        CapturedInput {
-            buffer: view.buffer_id,
-            observed_revision: view.revision,
-            sequence,
-            action,
-            text,
-            extend: false,
-            document_boundary: false,
-            vertical: None,
-        },
-    )
+    let captured = CapturedInput {
+        buffer: view.buffer_id,
+        observed_revision: view.revision,
+        sequence,
+        action,
+        text,
+        extend: false,
+        document_boundary: false,
+        vertical: None,
+    };
+    if let Some(intent) = semantic {
+        super::input::handle_command(app, target.tab, target.incarnation, captured, intent)
+    } else {
+        super::input::handle(app, target.tab, target.incarnation, captured)
+    }
 }
 
 /// Execute every toolbar/accelerator/palette action through one target guard.
@@ -520,7 +565,10 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
             Task::none()
         }
         ContextMessage::OpenMenu(target, menu) => {
-            if valid(app, target, true) && app.context_mode.mode(target.tab).active() {
+            if !app.context_mode.history.open
+                && valid(app, target, true)
+                && app.context_mode.mode(target.tab).active()
+            {
                 seal(app, target.tab);
                 if let Some(s) = &mut app.context_mode.session {
                     s.menu = Some(menu);
@@ -538,7 +586,10 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
             Task::none()
         }
         ContextMessage::PasteReady(target, generation, content) => {
-            if generation != app.context_mode.generation || !valid(app, target, true) {
+            if generation != app.context_mode.generation
+                || !valid(app, target, true)
+                || app.context_mode.history.open
+            {
                 app.context_mode
                     .notice("Source changed; paste was not applied");
                 return Task::none();
@@ -572,6 +623,7 @@ fn enter(app: &mut App, target: EditorTarget) {
         exit(app);
     }
     seal(app, target.tab);
+    super::editor_history::invalidate(app);
     if !valid(app, target, false) {
         app.context_mode
             .notice("Source changed; command was not applied");
@@ -587,6 +639,7 @@ fn enter(app: &mut App, target: EditorTarget) {
         menu_target: None,
         selected: 0,
         message: "Select text, then act · i types · Esc returns to commands".into(),
+        attention: false,
     });
 }
 
@@ -623,16 +676,31 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         return focus(app, target.tab);
     }
     if command == Escape {
+        if app.context_mode.history.open {
+            return super::editor_history::handle(
+                app,
+                super::editor_history::HistoryMessage::Act(
+                    target,
+                    super::editor_history::HistoryAction::Close,
+                ),
+            );
+        }
+        super::editor_history::invalidate(app);
         if let Some(s) = &mut app.context_mode.session {
             if s.menu.take().is_none() {
                 s.mode = ContextMode::Command;
             }
             s.message = "Commands · exit with ✕ or the toggle shortcut".into();
+            s.attention = false;
         }
         seal(app, target.tab);
         return focus(app, target.tab);
     }
     seal(app, target.tab);
+    super::editor_history::invalidate(app);
+    if command != History {
+        app.context_mode.history.open = false;
+    }
     if !valid(app, target, true) {
         app.context_mode
             .notice("Source changed; command was not applied");
@@ -642,8 +710,18 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         s.menu = None;
         s.menu_target = None;
         s.message = command.title().into();
+        s.attention = false;
     }
     match command {
+        History => {
+            return super::editor_history::handle(
+                app,
+                super::editor_history::HistoryMessage::Act(
+                    target,
+                    super::editor_history::HistoryAction::Open,
+                ),
+            );
+        }
         Commands => return app.update(Message::PaletteOpen),
         Find | Replace => {
             let message = if command == Find {
@@ -748,7 +826,7 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
                 edit = Some((KeyAction::Delete, String::new()));
             }
         }
-        Toggle | Exit | Escape | Paste | Undo | Redo | Commands | Find | Replace => {
+        Toggle | Exit | Escape | Paste | Undo | Redo | Commands | Find | Replace | History => {
             unreachable!("handled before planning")
         }
     }
@@ -762,12 +840,25 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         }
     }
     let task = edit.map_or_else(Task::none, |(action, text)| {
-        input(app, target, action, text)
+        use flavite_buffer::history::EditKind;
+        let kind = match command {
+            Change => EditKind::Change,
+            OpenAbove => EditKind::OpenAbove,
+            OpenBelow => EditKind::OpenBelow,
+            Cut => EditKind::Cut,
+            _ => EditKind::Delete,
+        };
+        input_command(
+            app,
+            target,
+            action,
+            text,
+            Some(super::input::HistoryIntent {
+                kind,
+                before: [anchor, head],
+                after: caret_after.map(|at| [at, at]),
+            }),
+        )
     });
-    if let Some(at) = caret_after
-        && let Some(current) = EditorTarget::capture(app, target.tab)
-    {
-        select(app, current, at, at);
-    }
     task.chain(focus(app, target.tab))
 }

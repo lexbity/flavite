@@ -1,18 +1,20 @@
 //! Device-local and vault-local user state storage (RFC-0003 §22, W06/W07,
-//! D-11/D-12).
+//! D-11/D-12, RFC-0007).
 //!
-//! Workspace layouts and device preferences are device-local user state in
-//! the OS data directory, keyed by vault UUID: never note truth, never
-//! synced through the vault. The store owns fixed, validated locations —
-//! no arbitrary caller filenames — with atomic generations, a last-good
-//! backup, and explicit fault surfaces for tests.
+//! Device-local user state (app-launch memory, encoding hints) lives in the
+//! OS data directory: never note truth, never synced through the vault. The
+//! store owns fixed, validated locations — no arbitrary caller filenames —
+//! with atomic generations, a last-good backup, and explicit fault surfaces
+//! for tests.
 //!
-//! Graph pin coordinates keep their existing vault-relative location
-//! (`.flavite/graph.json`) and file format (D-11: "Graph pin coordinates
-//! retain their existing vault-user-state location and semantics behind a
-//! consolidated storage service"). `VaultUserStateStore` moves that storage
-//! behind the API's `Fs` while the UI keeps only the in-memory codec and
-//! identity rules (TD-11).
+//! Workspace layouts, settings, and graph pins are vault-user state in
+//! `.flavite/` behind `VaultUserStateStore` (RFC-0007 S4/S5): graph pin
+//! coordinates keep their existing vault-relative location (`.flavite/
+//! graph.json`) and file format (D-11: "Graph pin coordinates retain their
+//! existing vault-user-state location and semantics behind a consolidated
+//! storage service"). `VaultUserStateStore` moves that storage behind the
+//! API's `Fs` while the UI keeps only the in-memory codec and identity
+//! rules (TD-11).
 
 use crate::identity::resolve_data_dir;
 use flavite_fs::Fs;
@@ -133,6 +135,9 @@ impl std::fmt::Debug for UserStateStore {
 
 impl UserStateStore {
     /// Build a store rooted at `<data>/flavite/workspace/<vault-uuid>`.
+    /// This device-local per-vault store currently hosts source-format
+    /// hints only; workspace layouts and settings are vault-rooted
+    /// (RFC-0007 S4/S5).
     ///
     /// # Errors
     /// Returns [`UserStateError::Unavailable`] when no OS data directory
@@ -149,8 +154,10 @@ impl UserStateStore {
     }
 
     /// Build a store rooted at an explicit data directory (S8/M3):
-    /// `<data>/flavite/workspace/<vault-uuid>`. Libraries never read the
-    /// environment; tests and binaries pass the resolved directory here.
+    /// `<data>/flavite/workspace/<vault-uuid>` (device-local per-vault
+    /// store; currently hosts encoding hints only). Libraries never read
+    /// the environment; tests and binaries pass the resolved directory
+    /// here.
     ///
     /// # Errors
     /// Same `Unavailable` contract as [`UserStateStore::open`] when the OS

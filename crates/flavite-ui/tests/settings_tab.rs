@@ -626,12 +626,13 @@ fn shortcut_capture_flows_through_the_tab() {
         app.status
     );
 
-    // The next key press (Mod+Shift+F) becomes the chord.
+    // Ctrl+Shift+Q is free. Mod+Shift+F belongs to vault Replace; using
+    // that default here would test collision refusal instead of capture.
     let captured = commands::keyboard_message(
         app,
         iced::keyboard::Event::KeyPressed {
-            key: Key::Character("f".into()),
-            modified_key: Key::Character("f".into()),
+            key: Key::Character("q".into()),
+            modified_key: Key::Character("q".into()),
             modifiers: Modifiers::CTRL | Modifiers::SHIFT,
             text: None,
             physical_key: iced::keyboard::key::Physical::Unidentified(
@@ -652,7 +653,7 @@ fn shortcut_capture_flows_through_the_tab() {
     );
     assert_eq!(
         app.appearance.chord_command(
-            &Key::Character("f".into()),
+            &Key::Character("q".into()),
             &(Modifiers::CTRL | Modifiers::SHIFT)
         ),
         Some("workspace.find")
@@ -692,8 +693,8 @@ fn shortcut_capture_flows_through_the_tab() {
     let colliding = commands::keyboard_message(
         app,
         iced::keyboard::Event::KeyPressed {
-            key: Key::Character("f".into()),
-            modified_key: Key::Character("f".into()),
+            key: Key::Character("q".into()),
+            modified_key: Key::Character("q".into()),
             modifiers: Modifiers::CTRL | Modifiers::SHIFT,
             text: None,
             physical_key: iced::keyboard::key::Physical::Unidentified(

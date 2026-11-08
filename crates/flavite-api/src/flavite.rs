@@ -129,6 +129,7 @@ struct ApplyEditsArgs {
     /// neighboring typing. The editor's captured typing path requests
     /// `typing` explicitly through its own typed action.
     undo_policy: Option<UndoPolicyArg>,
+    editor: Option<flavite_buffer::history::EditorEdit>,
 }
 
 /// Wire form of the undo policy (§6.1: explicit snake_case discriminants).
@@ -397,6 +398,7 @@ fn handle_edits(session: &Session, invocation: &Invocation) -> Result<SessionRes
         revision: Revision::new(args.revision),
         ops,
         undo_policy,
+        editor: args.editor,
     }))
 }
 fn handle_undo(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
@@ -412,6 +414,52 @@ fn handle_seal_undo_group(
 ) -> Result<SessionResult, String> {
     let args: BufferRevisionArgs = decode(invocation)?;
     Ok(session.seal_undo_group(BufferId::from(args.buffer_id), Revision::new(args.revision)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditingHistoryArgs {
+    buffer_id: u64,
+    revision: u64,
+    cursor: Option<flavite_buffer::history::HistoryCursor>,
+    limit: Option<usize>,
+}
+
+fn handle_editing_history(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditingHistoryArgs = decode(invocation)?;
+    let limit = args.limit.unwrap_or(flavite_buffer::history::PAGE_LIMIT);
+    if !(1..=flavite_buffer::history::PAGE_LIMIT).contains(&limit) {
+        return Err("History page limit must be 1..=100".into());
+    }
+    Ok(session.execute(SessionCommand::EditingHistory {
+        buffer_id: args.buffer_id.into(),
+        revision: Revision::new(args.revision),
+        cursor: args.cursor,
+        limit,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreEditingStateArgs {
+    buffer_id: u64,
+    revision: u64,
+    target: flavite_buffer::history::HistoryTarget,
+}
+
+fn handle_restore_editing_state(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: RestoreEditingStateArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::RestoreEditingState {
+        buffer_id: args.buffer_id.into(),
+        revision: Revision::new(args.revision),
+        target: args.target,
+    }))
 }
 fn handle_redo(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
     let args: BufferRevisionArgs = decode(invocation)?;
@@ -515,9 +563,10 @@ pub const MAX_NOTICE_ACKS: usize = 256;
 /// Command ids whose effect is a read over the authorized note universe
 /// (§6.1: search/source-find/text-find/replace-preview gates). The registry
 /// applies ReadNotes to these instead of the write default.
-const READ_NOTES_COMMAND_IDS: [&str; 16] = [
+const READ_NOTES_COMMAND_IDS: &[&str] = &[
     "note.open",
     "note.history",
+    "buffer.history_page",
     "note.reopen_encoding",
     "text.prepare_replace",
     "text.find",
@@ -1083,6 +1132,18 @@ impl Flavite {
                 handle_seal_undo_group,
             ),
             (
+                "buffer.history_page",
+                "List editing history",
+                ArgSchema::typed::<EditingHistoryArgs>(),
+                handle_editing_history,
+            ),
+            (
+                "buffer.restore_state",
+                "Restore editing state",
+                ArgSchema::typed::<RestoreEditingStateArgs>(),
+                handle_restore_editing_state,
+            ),
+            (
                 "buffer.undo",
                 "Undo",
                 ArgSchema::typed::<BufferRevisionArgs>(),
@@ -1459,9 +1520,9 @@ impl Flavite {
         &self.queries
     }
 
-    /// The device-local theme store, `None` without an OS data directory.
-    /// Hosts read installed packages for rendering; mutations go through
-    /// the `theme.*` commands so the capability gate applies.
+    /// The vault's theme store (`.flavite/themes/`), always present for an
+    /// opened vault. Hosts read installed packages for rendering; mutations
+    /// go through the `theme.*` commands so the capability gate applies.
     #[must_use]
     pub fn themes(&self) -> Option<&crate::themes::ThemeStore> {
         self.themes.as_ref()
@@ -1823,6 +1884,8 @@ impl Flavite {
             | "apply_edits"
             | "buffer.undo"
             | "buffer.seal_undo_group"
+            | "buffer.history_page"
+            | "buffer.restore_state"
             | "buffer.redo"
             | "note.convert_encoding"
             | "text.apply_replace" => invocation
@@ -1856,6 +1919,8 @@ impl Flavite {
                 | "apply_edits"
                 | "buffer.undo"
                 | "buffer.seal_undo_group"
+                | "buffer.history_page"
+                | "buffer.restore_state"
                 | "buffer.redo"
                 | "note.convert_encoding"
                 | "text.apply_replace"
@@ -1931,6 +1996,12 @@ impl Flavite {
             SessionResult::Success(crate::session::CommandResult::UndoGroupSealed { .. }) => {
                 "buffer.seal_undo_group"
             }
+            SessionResult::Success(crate::session::CommandResult::EditingHistory { .. }) => {
+                "buffer.history_page"
+            }
+            SessionResult::Success(crate::session::CommandResult::EditingStateRestored {
+                ..
+            }) => "buffer.restore_state",
             SessionResult::Success(crate::session::CommandResult::UndoPerformed { .. }) => {
                 "buffer.undo"
             }
@@ -2114,22 +2185,40 @@ impl Flavite {
                     } => serde_json::json!({
                         "buffer_id": buffer_id.as_u64(), "revision": revision.as_u64(),
                     }),
+                    crate::session::CommandResult::EditingHistory {
+                        buffer_id,
+                        revision,
+                        page,
+                    } => serde_json::json!({
+                        "buffer_id": buffer_id.as_u64(), "revision": revision.as_u64(), "page": page,
+                    }),
+                    crate::session::CommandResult::EditingStateRestored {
+                        buffer_id,
+                        revision,
+                        movement,
+                    } => serde_json::json!({
+                        "buffer_id": buffer_id.as_u64(), "revision": revision.as_u64(), "movement": movement,
+                    }),
                     crate::session::CommandResult::UndoPerformed {
                         buffer_id,
                         new_revision,
+                        movement,
                     } => {
                         serde_json::json!({
                             "buffer_id": buffer_id.as_u64(),
                             "revision": new_revision.as_u64(),
+                            "movement": movement,
                         })
                     }
                     crate::session::CommandResult::RedoPerformed {
                         buffer_id,
                         new_revision,
+                        movement,
                     } => {
                         serde_json::json!({
                             "buffer_id": buffer_id.as_u64(),
                             "revision": new_revision.as_u64(),
+                            "movement": movement,
                         })
                     }
                     crate::session::CommandResult::ConflictResolved => serde_json::Value::Null,
@@ -3203,6 +3292,7 @@ mod tests {
                 "!".into(),
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            editor: None,
         });
         assert!(matches!(
             flavite.get_buffer_view(buffer_id, Some(Revision::new(initial.revision))),
@@ -3447,6 +3537,7 @@ mod tests {
                 " mine".into(),
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            editor: None,
         });
         fs.write_new(&root.join(".external"), b"external").unwrap();
         fs.rename_replace(&root.join(".external"), &root.join("note.md"))
@@ -3963,10 +4054,12 @@ mod tests {
             CommandResult::UndoPerformed {
                 buffer_id: buffer,
                 new_revision: revision,
+                movement: None,
             },
             CommandResult::RedoPerformed {
                 buffer_id: buffer,
                 new_revision: revision,
+                movement: None,
             },
             CommandResult::ConflictResolved,
             CommandResult::RecoveryRestored {

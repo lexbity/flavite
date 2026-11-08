@@ -10,7 +10,7 @@ if _ocr_language is None:
     raise RuntimeError("Context Mode paint checks require a Tesseract Latin language model (eng or afr)")
 
 
-def painted(window, harness, output, expected, menu=False):
+def painted(window, harness, output, expected, menu=False, history=False):
     """Semantic readiness precedes presentation; require the actual control paint."""
     deadline = time.monotonic() + 15
     last = ""
@@ -18,6 +18,8 @@ def painted(window, harness, output, expected, menu=False):
         value = common.snapshot(harness)
         mode = value.get("context_mode") or {}
         rect = mode.get("bounds", {}).get("toolbar")
+        if history:
+            rect = mode.get("history", {}).get("controls", {}).get("history-card")
         if not rect or (menu and expected not in mode.get("bounds", {})):
             time.sleep(0.04)
             continue

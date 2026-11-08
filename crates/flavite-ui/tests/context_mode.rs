@@ -593,3 +593,277 @@ fn keys_from_a_departed_editor_cannot_become_literal_text_in_a_visible_backgroun
     );
     assert_eq!(f.app.note_editor_view(tab).unwrap().text, original.text);
 }
+
+#[test]
+fn history_controls_restore_selection_and_branch_without_adding_an_edit() {
+    use flavite_ui::host::editor_history::{HistoryAction, HistoryMessage};
+    let (mut f, tab) = fixture(3114);
+    selection(&mut f.app, tab, 4, 9);
+    run(&mut f.app, tab, Command::Toggle);
+    run(&mut f.app, tab, Command::Change);
+    type_text(&mut f.app, tab, "tea");
+    run(&mut f.app, tab, Command::Escape);
+    let changed = f.app.note_editor_view(tab).unwrap();
+    let page = f.app.context_mode.history.page.clone().unwrap();
+    let changed_state = page.trail.last().unwrap().target;
+    assert_eq!(
+        page.trail.last().unwrap().kind,
+        flavite_buffer::history::EditKind::Change
+    );
+    run(&mut f.app, tab, Command::Undo);
+    assert_eq!(
+        f.app.editor_interaction_snapshot(tab).unwrap().selection,
+        (4, 9)
+    );
+    run(&mut f.app, tab, Command::Redo);
+    assert_eq!(
+        f.app.editor_interaction_snapshot(tab).unwrap().selection,
+        (7, 7)
+    );
+    selection(&mut f.app, tab, 0, 0);
+    run(&mut f.app, tab, Command::Delete);
+    let before = f.app.note_editor_view(tab).unwrap();
+    let count = f
+        .app
+        .context_mode
+        .history
+        .page
+        .as_ref()
+        .unwrap()
+        .entries
+        .len();
+    let source = EditorTarget::capture(&f.app, tab).unwrap();
+    let _ = f.app.update(Message::EditorHistory(HistoryMessage::Act(
+        source,
+        HistoryAction::Restore(changed_state),
+    )));
+    assert_eq!(f.app.note_editor_view(tab).unwrap().text, changed.text);
+    assert!(f.app.note_editor_view(tab).unwrap().revision > before.revision);
+    assert_eq!(
+        f.app.editor_interaction_snapshot(tab).unwrap().selection,
+        (7, 7)
+    );
+    assert_eq!(
+        f.app
+            .context_mode
+            .history
+            .page
+            .as_ref()
+            .unwrap()
+            .entries
+            .len(),
+        count
+    );
+    run(&mut f.app, tab, Command::InsertEnd);
+    type_text(&mut f.app, tab, " branch");
+    assert_eq!(
+        f.app
+            .context_mode
+            .history
+            .page
+            .as_ref()
+            .unwrap()
+            .entries
+            .len(),
+        count + 1
+    );
+}
+
+#[test]
+fn history_popup_suspends_typing_escape_closes_it_and_exit_stays_available() {
+    use flavite_ui::host::editor_history::{HistoryAction, HistoryMessage};
+    let (mut f, tab) = fixture(3115);
+    run(&mut f.app, tab, Command::Toggle);
+    run(&mut f.app, tab, Command::InsertStart);
+    type_text(&mut f.app, tab, "A");
+    let original = f.app.note_editor_view(tab).unwrap();
+    let pending_paste = EditorTarget::capture(&f.app, tab).unwrap();
+    let paste_generation = f.app.context_mode.generation();
+    run(&mut f.app, tab, Command::History);
+    assert!(f.app.context_mode.history.open);
+    assert_eq!(f.app.context_mode.mode(tab), ContextMode::Typing);
+    type_text(&mut f.app, tab, "not editor input");
+    run(&mut f.app, tab, Command::Delete);
+    let _ = f
+        .app
+        .update(Message::ContextMode(ContextMessage::PasteReady(
+            pending_paste,
+            paste_generation,
+            Some("queued paste".into()),
+        )));
+    let _ = f.app.update(Message::ContextMode(ContextMessage::OpenMenu(
+        pending_paste,
+        ContextMenu::Select,
+    )));
+    assert!(f.app.context_mode.session.as_ref().unwrap().menu.is_none());
+    assert!(
+        f.app.context_mode.history.open,
+        "queued background commands cannot dismiss an owned chooser"
+    );
+    assert_eq!(
+        f.app.note_editor_view(tab).unwrap().revision,
+        original.revision
+    );
+    let source = EditorTarget::capture(&f.app, tab).unwrap();
+    let _ = f.app.update(Message::EditorHistory(HistoryMessage::Act(
+        source,
+        HistoryAction::Close,
+    )));
+    assert!(!f.app.context_mode.history.open);
+    assert_eq!(f.app.context_mode.mode(tab), ContextMode::Typing);
+    run(&mut f.app, tab, Command::History);
+    run(&mut f.app, tab, Command::Exit);
+    assert!(!f.app.context_mode.history.open);
+    assert_eq!(f.app.context_mode.mode(tab), ContextMode::Off);
+}
+
+#[test]
+fn stale_history_activation_and_read_only_restore_leave_the_source_unchanged() {
+    use flavite_ui::host::editor_history::{HistoryAction, HistoryMessage};
+    let (mut f, tab) = fixture(3116);
+    run(&mut f.app, tab, Command::Toggle);
+    let root = f.app.context_mode.history.page.as_ref().unwrap().entries[0].target;
+    run(&mut f.app, tab, Command::Delete);
+    let old = EditorTarget::capture(&f.app, tab).unwrap();
+    run(&mut f.app, tab, Command::Delete);
+    let before = f.app.note_editor_view(tab).unwrap();
+    let _ = f.app.update(Message::EditorHistory(HistoryMessage::Act(
+        old,
+        HistoryAction::Restore(root),
+    )));
+    assert_eq!(
+        f.app.note_editor_view(tab).unwrap().revision,
+        before.revision
+    );
+    f.app.flavite.as_mut().unwrap().set_read_only(true);
+    let source = EditorTarget::capture(&f.app, tab).unwrap();
+    let _ = f.app.update(Message::EditorHistory(HistoryMessage::Act(
+        source,
+        HistoryAction::Restore(root),
+    )));
+    assert_eq!(
+        f.app.note_editor_view(tab).unwrap().revision,
+        before.revision
+    );
+}
+
+#[test]
+fn history_maps_passive_split_selections_and_scroll_without_adopting_or_focusing_them() {
+    use flavite_ui::host::editor_history::{HistoryAction, HistoryMessage};
+    use flavite_workspace::Selection;
+    let (mut f, passive) = fixture(3117);
+    let _ = f
+        .app
+        .update(Message::RunHostCommand("workspace.split_right"));
+    let source = f.app.workspace.focused_tab();
+    assert_ne!(source, passive);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while f.app.note_editor_view(source).is_none() {
+        assert!(Instant::now() < deadline);
+        let _ = f.app.update(Message::Pump);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let text = f.app.note_editor_view(passive).unwrap().text;
+    let mut interaction = f.app.workspace.tab(&passive).unwrap().interaction().clone();
+    interaction.selections = vec![Selection::new(15, 11)];
+    interaction.viewport_anchor = 10;
+    interaction.focused = false;
+    interaction.sequence += 1;
+    f.app
+        .workspace
+        .acknowledge_interaction(interaction, &text)
+        .unwrap();
+    selection(&mut f.app, source, 0, 0);
+    run(&mut f.app, source, Command::Toggle);
+    let root = f.app.context_mode.history.page.as_ref().unwrap().entries[0].target;
+    run(&mut f.app, source, Command::InsertStart);
+    type_text(&mut f.app, source, "雪");
+    let passive_view = f.app.workspace.tab(&passive).unwrap().interaction();
+    assert_eq!(passive_view.selections, vec![Selection::new(18, 14)]);
+    assert_eq!(passive_view.viewport_anchor, 13);
+    assert!(!passive_view.focused);
+    let target = EditorTarget::capture(&f.app, source).unwrap();
+    let _ = f.app.update(Message::EditorHistory(HistoryMessage::Act(
+        target,
+        HistoryAction::Restore(root),
+    )));
+    let passive_view = f.app.workspace.tab(&passive).unwrap().interaction();
+    assert_eq!(passive_view.selections, vec![Selection::new(15, 11)]);
+    assert_eq!(passive_view.viewport_anchor, 10);
+    assert!(!passive_view.focused);
+    assert_eq!(
+        passive_view.revision,
+        f.app.note_editor_view(source).unwrap().revision
+    );
+    assert_eq!(
+        f.app.editor_interaction_snapshot(source).unwrap().selection,
+        (0, 0)
+    );
+    assert_eq!(f.app.workspace.document_anchor(), Some(source));
+}
+
+#[test]
+fn accessible_history_restores_through_the_real_handler_and_masks_background_actions() {
+    use flavite_ui::{
+        accessibility::{route_action, tree},
+        host::editor_history::HistoryMessage,
+    };
+    let (mut f, tab) = fixture(3118);
+    run(&mut f.app, tab, Command::Toggle);
+    run(&mut f.app, tab, Command::InsertStart);
+    type_text(&mut f.app, tab, "A");
+    run(&mut f.app, tab, Command::History);
+    let source = EditorTarget::capture(&f.app, tab).unwrap();
+    let node = f
+        .app
+        .context_mode
+        .history
+        .page
+        .as_ref()
+        .unwrap()
+        .entries
+        .last()
+        .unwrap()
+        .target
+        .node;
+    let _ = f.app.update(Message::EditorHistory(HistoryMessage::Bounds {
+        source,
+        generation: f.app.context_mode.generation(),
+        node,
+        popup: true,
+        rect: iced::Rectangle::new(iced::Point::new(80.0, 180.0), iced::Size::new(400.0, 52.0)),
+    }));
+    let semantic = tree::shell_tree(&f.app);
+    let id = semantic
+        .nodes
+        .iter()
+        .find(|(_, n)| n.label() == Some("Initial state · Earlier state"))
+        .unwrap()
+        .0;
+    assert!(
+        tree::build_node_map(&f.app)
+            .values()
+            .all(|target| !matches!(target, tree::NodeTarget::Editor { .. }))
+    );
+    let message = route_action(
+        &f.app,
+        accesskit::ActionRequest {
+            action: accesskit::Action::Click,
+            target_tree: accesskit::TreeId::ROOT,
+            target_node: id,
+            data: None,
+        },
+    )
+    .expect("history button publishes a real restore target");
+    let _ = f.app.update(message);
+    assert_eq!(
+        &*f.app.note_editor_view(tab).unwrap().text,
+        "one café\nsecond line\n"
+    );
+    assert_eq!(
+        f.app.editor_interaction_snapshot(tab).unwrap().selection,
+        (0, 0)
+    );
+    assert!(!f.app.context_mode.history.open);
+    assert_eq!(f.app.context_mode.mode(tab), ContextMode::Typing);
+}

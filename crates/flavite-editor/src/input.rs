@@ -3,6 +3,55 @@
 use flavite_syntax::TextByte;
 
 use crate::{EditorAction, EditorView, keymap::KeyAction};
+
+/// Resolve the right-affinity caret over three borrowed edit chunks. Joining
+/// emoji/combining sequences must not leave a caret inside a grapheme, and a
+/// large note must not be copied merely to decide this boundary.
+fn post_edit_caret(
+    before: &str,
+    start: usize,
+    end: usize,
+    replacement: &str,
+) -> Result<usize, &'static str> {
+    use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
+    let at = start + replacement.len();
+    let len = before.len() - (end - start) + replacement.len();
+    if at == len {
+        return Ok(at);
+    }
+    let chunks = [
+        (0, &before[..start]),
+        (start, replacement),
+        (at, &before[end..]),
+    ];
+    let provide = |cursor: &mut GraphemeCursor, wanted| {
+        let Some((base, chunk)) = chunks
+            .iter()
+            .rev()
+            .find(|(base, chunk)| *base < wanted && wanted <= base + chunk.len())
+        else {
+            return Err("Cannot resolve edit grapheme context");
+        };
+        cursor.provide_context(&chunk[..wanted - base], *base);
+        Ok(())
+    };
+    let mut cursor = GraphemeCursor::new(at, len, true);
+    loop {
+        match cursor.is_boundary(chunks[2].1, at) {
+            Ok(true) => return Ok(at),
+            Ok(false) => break,
+            Err(GraphemeIncomplete::PreContext(wanted)) => provide(&mut cursor, wanted)?,
+            Err(_) => return Err("Cannot resolve edit grapheme boundary"),
+        }
+    }
+    loop {
+        match cursor.next_boundary(chunks[2].1, at) {
+            Ok(boundary) => return Ok(boundary.unwrap_or(len)),
+            Err(GraphemeIncomplete::PreContext(wanted)) => provide(&mut cursor, wanted)?,
+            Err(_) => return Err("Cannot resolve edit grapheme boundary"),
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq)]
 pub struct CapturedInput {
     pub buffer: u64,
@@ -48,18 +97,22 @@ pub fn prepare(
     let (start, end) = (anchor.min(head), anchor.max(head));
     let previous = |at: usize| crate::viewport::prev_grapheme_boundary(text, TextByte(at)).0;
     let next = |at: usize| crate::viewport::next_grapheme_boundary(text, TextByte(at)).0;
-    let replace = |from, to, replacement: String, clipboard: Option<String>| {
+    let replace = |from,
+                   to,
+                   replacement: String,
+                   clipboard: Option<String>|
+     -> Result<PreparedInput, &'static str> {
         if from == to && replacement.is_empty() {
-            clipboard.map_or(
+            Ok(clipboard.map_or(
                 PreparedInput::Selection { anchor, head },
                 PreparedInput::Copy,
-            )
+            ))
         } else {
-            PreparedInput::Edit {
-                caret: from + replacement.len(),
+            Ok(PreparedInput::Edit {
+                caret: post_edit_caret(text, from, to, &replacement)?,
                 action: EditorAction::replace(view, from, to, replacement),
                 clipboard,
-            }
+            })
         }
     };
     if input.action == KeyAction::Paste && input.text.is_empty() {
@@ -72,10 +125,10 @@ pub fn prepare(
             if input.action == KeyAction::Newline {
                 "\n".into()
             } else {
-                input.text.clone()
+                input.text.replace("\r\n", "\n")
             },
             None,
-        ),
+        )?,
         KeyAction::Backspace | KeyAction::BackspaceWord => replace(
             if start != end {
                 start
@@ -87,7 +140,7 @@ pub fn prepare(
             end,
             String::new(),
             None,
-        ),
+        )?,
         KeyAction::Delete | KeyAction::DeleteWord => replace(
             start,
             if start != end {
@@ -99,8 +152,8 @@ pub fn prepare(
             },
             String::new(),
             None,
-        ),
-        KeyAction::Cut => replace(start, end, String::new(), Some(text[start..end].into())),
+        )?,
+        KeyAction::Cut => replace(start, end, String::new(), Some(text[start..end].into()))?,
         KeyAction::Copy => PreparedInput::Copy(text[start..end].into()),
         KeyAction::Undo | KeyAction::Redo => {
             PreparedInput::History(EditorAction::history(view, input.action == KeyAction::Redo))
@@ -153,6 +206,79 @@ pub fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunked_edit_carets_match_a_whole_string_unicode_oracle() {
+        use unicode_segmentation::UnicodeSegmentation;
+        let parts = [
+            "", "a", "\u{301}", "👩", "\u{200d}", "💻", "🇦", "🇧", "\r", "\n",
+        ];
+        let samples: Vec<_> = parts
+            .iter()
+            .flat_map(|a| parts.iter().map(move |b| format!("{a}{b}")))
+            .collect();
+        for before in &samples {
+            let endpoints: Vec<_> = before
+                .char_indices()
+                .map(|(at, _)| at)
+                .chain(std::iter::once(before.len()))
+                .collect();
+            for &start in &endpoints {
+                for &end in endpoints.iter().filter(|&&end| end >= start) {
+                    for replacement in &samples {
+                        let after =
+                            format!("{}{}{}", &before[..start], replacement, &before[end..]);
+                        let at = start + replacement.len();
+                        let expected = after
+                            .grapheme_indices(true)
+                            .map(|(at, _)| at)
+                            .chain(std::iter::once(after.len()))
+                            .find(|&boundary| boundary >= at)
+                            .unwrap();
+                        assert_eq!(
+                            post_edit_caret(before, start, end, replacement),
+                            Ok(expected),
+                            "{before:?}[{start}..{end}] = {replacement:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn edit_caret_obeys_graphemes_that_join_across_chunk_boundaries() {
+        for (text, start, end, replacement, expected) in [
+            ("\u{301}x", 0, 0, "a", 3),
+            ("👩💻", 4, 4, "\u{200d}", 11),
+            ("🇦x🇧", 4, 5, "", 8),
+            ("word", 0, 0, "A", 1),
+        ] {
+            assert_eq!(
+                post_edit_caret(text, start, end, replacement).unwrap(),
+                expected
+            );
+            let after = format!("{}{}{}", &text[..start], replacement, &text[end..]);
+            use unicode_segmentation::UnicodeSegmentation;
+            assert!(
+                expected == after.len()
+                    || after.grapheme_indices(true).any(|(at, _)| at == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_newlines_are_normalized_before_caret_and_history_are_planned() {
+        let view = view();
+        let mut key = input(KeyAction::Paste);
+        key.text = "a\r\nb\rc".into();
+        let PreparedInput::Edit { action, caret, .. } = prepare(&view, (0, 0), &key).unwrap()
+        else {
+            panic!("edit");
+        };
+        assert_eq!(caret, 5);
+        assert_eq!(action.as_edit().unwrap().2[0].replacement, "a\nb\rc");
+    }
 
     fn view() -> EditorView {
         EditorView {

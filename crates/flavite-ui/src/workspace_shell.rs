@@ -32,6 +32,14 @@ pub fn view(app: &App) -> Element<'_, Message> {
         return crate::host::dialogs::start_view(app);
     }
     let shell = shell(app);
+    if app.context_mode.history.open
+        && !app.picker.open
+        && !app.palette_open
+        && app.dialog.is_none()
+        && app.strip_menu.is_none()
+    {
+        return crate::views::editor_history::overlay(app, shell);
+    }
     if !app.picker.open
         && !app.palette_open
         && app.dialog.is_none()

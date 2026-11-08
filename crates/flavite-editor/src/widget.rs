@@ -435,7 +435,8 @@ impl<'a, Message> EditorWidget<'a, Message> {
             .resolution_snapshot
             .as_ref()
             .is_some_and(|previous| Arc::ptr_eq(previous, &self.link_resolutions));
-        let refresh = !same_resolutions || state.revision != Some(self.view.revision);
+        let source_changed = state.revision != Some(self.view.revision);
+        let refresh = !same_resolutions || source_changed;
         state.reconcile_view(&self.view, &self.link_resolutions, refresh);
         state.resolution_snapshot = Some(self.link_resolutions.clone());
         if self.context_mode == crate::context::ContextMode::Command {
@@ -443,7 +444,16 @@ impl<'a, Message> EditorWidget<'a, Message> {
             state.composition = None;
         }
         if let Some(interaction) = self.initial_interaction {
-            if self.on_input_intent.is_some()
+            if source_changed && !state.controlled_pending && interaction.sequence > 0 {
+                // Pointer release/blur events can have a larger local sequence
+                // while still naming the old text. A new acknowledged source
+                // revision owns its selection and focus. Keep the native
+                // capture counter monotonic after installing that receipt.
+                let captured_sequence = state.interaction_sequence;
+                state.interaction_sequence = interaction.sequence - 1;
+                state.restore_interaction(&self.view.text, interaction);
+                state.interaction_sequence = state.interaction_sequence.max(captured_sequence);
+            } else if self.on_input_intent.is_some()
                 && state.controlled_pending
                 && interaction.sequence > state.controlled_ack
             {
@@ -2458,6 +2468,48 @@ mod tests {
     use flavite_buffer::state::BufferState;
     use flavite_syntax::text::{Span, TextByte};
     use iced::advanced::widget::Operation as _;
+
+    #[test]
+    fn new_source_receipt_restores_focus_and_selection_after_an_old_pointer_release() {
+        let original = EditorView::from(&test_view("abcdef", 77));
+        let mut state = EditorState::default();
+        let snapshot = |revision, sequence, at, focused| EditorInteractionSnapshot {
+            buffer_id: 77,
+            revision,
+            sequence,
+            caret: at,
+            selection: (at, at),
+            viewport_anchor: 0,
+            focused,
+            composing: false,
+        };
+        EditorWidget::from_view(original.clone(), |action| action)
+            .with_initial_interaction(snapshot(original.revision, 40, 0, false))
+            .synchronize(&mut state);
+        state.interaction_sequence = 100;
+        state.focused = false;
+        let mut restored = original;
+        restored.revision += 1;
+        restored.text = "xyabcdef".into();
+        let widget = EditorWidget::from_view(restored.clone(), |action| action)
+            .with_initial_interaction(snapshot(restored.revision, 41, 4, true));
+        widget.synchronize(&mut state);
+        assert!(state.focused);
+        assert_eq!(state.caret, 4);
+        assert_eq!(
+            state.interaction_sequence, 100,
+            "native sequence cannot go backwards"
+        );
+        state.caret = 6;
+        state.anchor = 6;
+        state.focused = false;
+        widget.synchronize(&mut state);
+        assert_eq!(
+            state.caret, 6,
+            "resolver-only refresh cannot overwrite newer pointer state"
+        );
+        assert!(!state.focused);
+    }
 
     #[test]
     fn word_and_line_clicks_extend_as_units_in_both_directions() {

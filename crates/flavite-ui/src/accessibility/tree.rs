@@ -12,6 +12,10 @@ use std::collections::{BTreeMap, BTreeSet};
 /// What a native action on a semantic node routes to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeTarget {
+    EditorHistory {
+        source: crate::host::context_mode::EditorTarget,
+        action: crate::host::editor_history::HistoryAction,
+    },
     EditorContextCommand {
         target: crate::host::context_mode::EditorTarget,
         command: flavite_editor::context::ContextCommand,
@@ -196,7 +200,7 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
         let width =
             app.editor_bounds.get(&tab).map_or(640.0, |b| b.width) / app.appearance.metrics().scale;
         for &command in C::ALL {
-            let visible = if app.palette_open || app.picker.open {
+            let visible = if app.palette_open || app.picker.open || app.context_mode.history.open {
                 active && command == C::Exit
             } else if !active {
                 command == C::Toggle
@@ -204,6 +208,7 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
                 match command {
                     C::Exit => true,
                     C::Commands => width >= 320.0,
+                    C::History => width >= 860.0,
                     C::Cut | C::Copy | C::Paste => width >= 600.0,
                     C::Undo | C::Redo => width >= 430.0,
                     _ => false,
@@ -226,7 +231,7 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
                 );
             }
         }
-        if !active || app.palette_open || app.picker.open {
+        if !active || app.palette_open || app.picker.open || app.context_mode.history.open {
             continue;
         }
         for menu in [
@@ -278,6 +283,106 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
             }
         }
     }
+    if app.dialog.is_none()
+        && !app.palette_open
+        && !app.picker.open
+        && app.strip_menu.is_none()
+        && let Some(session) = &app.context_mode.session
+        && let Some(source) = crate::host::context_mode::EditorTarget::capture(app, session.tab)
+    {
+        use crate::host::editor_history::{self, HistoryAction};
+        let host = &app.context_mode.history;
+        if let Some(page) = &host.page {
+            let entries: Vec<_> = if host.open {
+                page.entries.iter().collect()
+            } else {
+                editor_history::visible_entries(app, source)
+            };
+            for entry in entries {
+                if let Some(bounds) =
+                    (if host.open { &host.rows } else { &host.bounds }).get(&entry.target.node)
+                {
+                    let id = node_id(
+                        &format!(
+                            "editing-history-{}-{}-{}",
+                            entry.target.epoch, entry.target.node, entry.target.version
+                        ),
+                        source.tab.raw(),
+                    );
+                    controls.insert(
+                        id,
+                        ContextControl {
+                            id,
+                            target: NodeTarget::EditorHistory {
+                                source,
+                                action: HistoryAction::Restore(entry.target),
+                            },
+                            label: format!(
+                                "{}{}",
+                                if entry.initial {
+                                    "Initial state"
+                                } else {
+                                    entry.kind.label()
+                                },
+                                if entry.current {
+                                    " · Current"
+                                } else if entry.on_path {
+                                    " · Earlier state"
+                                } else {
+                                    " · Other branch"
+                                }
+                            ),
+                            bounds: *bounds,
+                            enabled: editor_history::can_restore(app, source, entry)
+                                && (host.open
+                                    || app
+                                        .context_mode
+                                        .session
+                                        .as_ref()
+                                        .is_some_and(|s| s.menu.is_none())),
+                        },
+                    );
+                }
+            }
+        }
+        if host.open {
+            for (name, label, action) in [
+                (
+                    "history-close",
+                    "Close editing history",
+                    Some(HistoryAction::Close),
+                ),
+                (
+                    "history-refresh",
+                    "Newest editing states",
+                    Some(HistoryAction::Refresh),
+                ),
+                (
+                    "history-next",
+                    "Older editing states",
+                    host.page
+                        .as_ref()
+                        .and_then(|p| p.next)
+                        .map(HistoryAction::NextPage),
+                ),
+            ] {
+                let Some(action) = action else { continue };
+                if let Some(bounds) = host.controls.get(name) {
+                    let id = node_id(name, source.tab.raw());
+                    controls.insert(
+                        id,
+                        ContextControl {
+                            id,
+                            target: NodeTarget::EditorHistory { source, action },
+                            label: label.into(),
+                            bounds: *bounds,
+                            enabled: true,
+                        },
+                    );
+                }
+            }
+        }
+    }
     controls.into_values().collect()
 }
 
@@ -287,6 +392,13 @@ pub fn build_node_map(app: &App) -> BTreeMap<NodeId, NodeTarget> {
     let mut map = BTreeMap::new();
     for control in context_controls(app).into_iter().filter(|c| c.enabled) {
         map.insert(control.id, control.target);
+    }
+    if app.context_mode.history.open
+        && !app.palette_open
+        && !app.picker.open
+        && app.dialog.is_none()
+    {
+        return map;
     }
     if let Some((group, menu)) = app.strip_menu {
         for (i, entry) in crate::workspace::tab_strip::menu_entries(app, group, menu)

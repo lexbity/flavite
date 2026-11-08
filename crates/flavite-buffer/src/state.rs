@@ -147,6 +147,9 @@ pub struct Buffer {
     /// The disk hash at the time of the last disk check.
     /// Used to detect external changes.
     disk_hash: Option<BaseHash>,
+    /// A replacement reached disk but its durability/index milestone failed.
+    /// Matching those bytes must not make history navigation mark us clean.
+    save_requires_completion: bool,
 }
 
 /// Outcome of an external observation that had to be strictly decoded
@@ -178,6 +181,7 @@ impl Buffer {
             base_bytes: snapshot.source().to_vec(),
             base_format,
             disk_hash: Some(hash),
+            save_requires_completion: false,
         }
     }
 
@@ -360,6 +364,55 @@ impl Buffer {
         Some((revision, transition))
     }
 
+    pub fn apply_recorded_edits(
+        &mut self,
+        edits: &[crate::undo::EditOp],
+        policy: crate::undo::UndoPolicy,
+        record: crate::history::EditorEdit,
+    ) -> Result<Revision, String> {
+        let revision = self.model.try_apply_recorded_batch(edits, policy, record)?;
+        if matches!(self.state, BufferState::Clean | BufferState::Dirty) {
+            self.state = BufferState::Dirty;
+        }
+        Ok(revision)
+    }
+
+    pub fn restore_editing_state(
+        &mut self,
+        target: crate::history::HistoryTarget,
+    ) -> Result<Revision, crate::history::HistoryError> {
+        let revision = self.model.restore_state(target)?;
+        self.sync_history_state();
+        Ok(revision)
+    }
+
+    pub fn undo(&mut self) -> Option<Revision> {
+        let revision = self.model.undo()?;
+        self.sync_history_state();
+        Some(revision)
+    }
+
+    pub fn redo(&mut self) -> Option<Revision> {
+        let revision = self.model.redo()?;
+        self.sync_history_state();
+        Some(revision)
+    }
+
+    fn sync_history_state(&mut self) {
+        let dirty = self.save_requires_completion || self.base_hash != Some(self.content_hash());
+        if let Some(hash) = self.base_hash {
+            self.model.set_base_hash(hash);
+        }
+        self.model.set_dirty(dirty);
+        if matches!(self.state, BufferState::Clean | BufferState::Dirty) {
+            self.state = if dirty {
+                BufferState::Dirty
+            } else {
+                BufferState::Clean
+            };
+        }
+    }
+
     pub fn apply_local_edits(
         &mut self,
         edits: &[crate::undo::EditOp],
@@ -421,6 +474,7 @@ impl Buffer {
                 // snapshot's descriptor is adopted: an unambiguous format
                 // change may be taken silently only while clean (§6.10).
                 self.model.replace_snapshot(new_snapshot.clone());
+                self.save_requires_completion = false;
                 self.base_hash = Some(new_disk_hash);
                 self.base_bytes = new_disk_bytes.to_vec();
                 self.base_format = new_snapshot.format();
@@ -531,6 +585,7 @@ impl Buffer {
 
             // Replace the model
             self.model.replace_snapshot(snapshot);
+            self.save_requires_completion = false;
             self.disk_hash = Some(new_hash);
             self.base_hash = Some(new_hash);
             self.base_bytes = disk_bytes.to_vec();
@@ -569,6 +624,7 @@ impl Buffer {
         let recovered_hash = BaseHash::from_snapshot(&recovered);
         let disk_hash = BaseHash::from_snapshot(&disk);
         self.model.replace_snapshot(recovered);
+        self.save_requires_completion = false;
         self.base_hash = Some(disk_hash);
         self.disk_hash = Some(disk_hash);
         self.base_bytes = disk_bytes.to_vec();
@@ -600,6 +656,7 @@ impl Buffer {
     ) -> StateTransition {
         let old_state = self.state;
         self.model.replace_snapshot(snapshot);
+        self.save_requires_completion = false;
         self.base_hash = self.model.base_hash();
         self.disk_hash = self.base_hash;
         self.base_bytes = disk_bytes.to_vec();
@@ -623,6 +680,7 @@ impl Buffer {
         self.disk_hash = Some(hash);
         self.base_bytes = disk_bytes.to_vec();
         self.base_format = snapshot.format();
+        self.save_requires_completion = false;
         self.state = BufferState::Dirty;
         Some(StateTransition::new(
             old_state,
@@ -656,6 +714,7 @@ impl Buffer {
         self.base_bytes = disk_bytes.to_vec();
         self.base_format = disk.format();
         let revision = self.model.apply_snapshot_boundary(merged);
+        self.save_requires_completion = false;
         self.state = if self
             .model
             .try_to_source_bytes()
@@ -694,6 +753,7 @@ impl Buffer {
             let format = snapshot.format();
 
             self.model = EditorModel::from_snapshot(snapshot);
+            self.save_requires_completion = false;
             self.base_hash = Some(new_hash);
             self.disk_hash = Some(new_hash);
             self.base_bytes = bytes.to_vec();
@@ -709,6 +769,7 @@ impl Buffer {
 
         // No disk content available: reset to a fresh untitled buffer.
         self.model = EditorModel::new_empty();
+        self.save_requires_completion = false;
         self.base_hash = None;
         self.base_format = None;
         self.disk_hash = None;
@@ -735,6 +796,12 @@ impl Buffer {
         // Disk hash now matches base hash
         self.disk_hash = self.base_hash;
 
+        self.save_requires_completion = false;
+        if let Some(hash) = self.base_hash {
+            self.model.set_base_hash(hash);
+        }
+        self.model.set_dirty(false);
+
         let new_state = BufferState::Clean;
         self.state = new_state;
 
@@ -758,11 +825,14 @@ impl Buffer {
         self.base_bytes = saved_bytes.to_vec();
         self.base_format = Some(self.model.source_format());
 
+        self.save_requires_completion = false;
+        self.model.set_base_hash(hash);
         let new_state = if self.model.revision() == saved_revision {
             BufferState::Clean
         } else {
             BufferState::Dirty
         };
+        self.model.set_dirty(new_state == BufferState::Dirty);
         self.state = new_state;
         StateTransition::new(old_state, new_state, TransitionReason::SaveCompleted)
     }
@@ -772,6 +842,7 @@ impl Buffer {
     /// save milestone is acknowledged, but retries compare against this disk
     /// state instead of blindly replaying an obsolete base precondition.
     pub fn record_replaced_disk_hash(&mut self, hash: BaseHash) {
+        self.require_save_completion();
         self.base_hash = Some(hash);
         self.disk_hash = Some(hash);
         self.base_bytes = self.model.source_bytes_for_hash();
@@ -781,11 +852,20 @@ impl Buffer {
     /// Record a particular saved revision as the disk base without replacing
     /// the current buffer text, which may contain newer edits.
     pub fn record_replaced_disk_snapshot(&mut self, bytes: &[u8]) {
+        self.require_save_completion();
         let hash = BaseHash::from_bytes(*blake3::hash(bytes).as_bytes());
         self.base_hash = Some(hash);
         self.disk_hash = Some(hash);
         self.base_bytes = bytes.to_vec();
         self.base_format = Some(self.model.source_format());
+    }
+
+    fn require_save_completion(&mut self) {
+        self.save_requires_completion = true;
+        self.model.set_dirty(true);
+        if self.state == BufferState::Clean {
+            self.state = BufferState::Dirty;
+        }
     }
 
     /// Mark a dirty buffer conflicted from a verified disk hash when the

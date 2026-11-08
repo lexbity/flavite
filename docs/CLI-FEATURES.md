@@ -117,9 +117,20 @@ size (1–200, default **50**); each JSON page reports `session`, the frozen
 printing; the session is explicitly closed afterwards.
 
 Machine-readable failures are one deterministic JSON object on stderr:
-`{"error": {"kind": "busy|invalid|limit-exceeded|reset-required|expired|failed|unsupported", "message": …}}`.
-`literal`/`regex` modes (vault source matching, RFC-0006 S07) refuse with
-kind `unsupported` in this build.
+`{"error": {"kind": "busy|invalid|limit-exceeded|reset-required|expired|denied|failed", "message": …}}`.
+
+`literal`/`regex` modes are **vault source matching** (RFC-0006 S07): they
+scan saved Markdown source and report per-note match pages — `snapshot`,
+`total_notes`, `total_matches`, `truncated_scope`, `exclusions`, and a
+`page` with rows (`path`, `note_matches`) plus `next_note_index` /
+`next_match_offset` continuation ordinals; `--all` consumes every
+continuation. Human output prints one `path<TAB>count` per note. Literal
+matching runs in-process; regex runs through the
+`flavite-text-search-worker` helper — without it (or with an invalid
+pattern) the command fails with a typed message (`regex is unavailable` /
+`invalid regular expression`), never a silent text search. `--field`
+applies to `text`/`expression` modes only; `--limit` pages source-find per
+note. `--json` prints each page as one JSON object on stdout.
 
 ### `query` (text predicates)
 
@@ -137,8 +148,88 @@ flavite-cli rename FROM TO [--strategy rewrite|alias|none]
 Rename/move a note (from/to are vault-relative paths), rewriting links per
 the strategy — `rewrite` (default), `alias`, or `none`. Journaled, executed
 through the core `note.rename` command; the CLI reports skipped items.
+`rename` has no per-command `--path`; use the global `--vault PATH`.
 
 - `--json`: `{"strategy": "...", "result": <execution result>}`.
+
+### `theme`
+
+```
+flavite-cli theme <command> [flags]
+```
+
+Convert browser theme packages (Firefox-style `.xpi`) and manage the
+installed themes in this vault's theme store (`<vault>/.flavite/themes/`):
+
+- `theme convert INPUT [-o OUTPUT]` — offline conversion into a
+  `.flavite.xpi` (default output: `<input>.flavite.xpi` beside the input).
+  No vault is needed. Human output prints the theme name, id, output path,
+  and mapped/dropped key counts; `--json` prints `{"output": …,
+  "report": …}`.
+- `theme install PATH` — convert and install a standard `.xpi` into the
+  vault's theme store.
+- `theme list` — list installed themes (`id — name` per line, or
+  "No themes installed.").
+- `theme select ID` — select an installed theme (persisted as
+  `appearance.theme_package` in `<vault>/.flavite/settings.toml`); use
+  `theme select none` for the built-in palettes.
+- `theme uninstall ID` — remove an installed theme.
+
+`install`/`list`/`select`/`uninstall` require an opened vault.
+
+### `replace`
+
+```
+flavite-cli replace <command> [flags]
+```
+
+Durable vault replacement operations (RFC-0006 S08/S09): seal a preview,
+record a selection, apply, track job status, cancel, resume, or revert.
+All actions require an opened vault (`--path` or global `--vault`) and take
+an idempotency `--key` (caller-generated, 128-bit hex) where noted. `--json`
+prints the typed result object; human output prints a status summary for
+`status`.
+
+- `replace preview QUERY REPLACEMENT [--mode literal|regex] [--case-sensitive]
+  [--whole-word] [--include-drafts]` — seal a read-only preview; prints the
+  preview id. `--include-drafts` admits open unsaved drafts as candidates.
+- `replace select --preview-id HEX [--select all|none|keys=a,b,c]` — record
+  a frozen selection revision over a preview. `keys=` takes hex native keys.
+- `replace apply --key HEX (--preview-id HEX --selection-revision N | --query
+  QUERY --replacement TEXT [--mode literal|regex])` — apply a sealed preview
+  under a frozen selection revision; with `--query`/`--replacement` instead,
+  a preview is sealed and fully selected inline in one process. Returns the
+  job id and phase/totals.
+- `replace status --job-id HEX` — report job phase and totals (saved,
+  conflicts, stale, needs-recovery).
+- `replace cancel --job-id HEX` — stop admission of the next item.
+- `replace resume --job-id HEX --key HEX` — explicitly resume an
+  untouched/paused job.
+- `replace revert --job-id HEX --key HEX` — start a guarded Revert epoch
+  (RFC-0006 S09): restore the sealed before-payloads of applied items under
+  after-hash/lineage preconditions.
+
+### `encoding`
+
+```
+flavite-cli encoding NOTE <command> [flags]
+```
+
+Inspect or convert a single note's file encoding (RFC-0006 §6.10). `NOTE`
+is vault-relative. Requires an opened vault.
+
+- `encoding NOTE reopen [--encoding auto|ascii|utf8|utf16le|utf16be]
+  [--bom auto|present|absent]` — reopen the note under an explicit encoding
+  and report the resulting format; `auto` opens without an explicit family
+  (BOM/hint rules). Never discards unsaved text.
+- `encoding NOTE convert --encoding FAMILY [--bom absent|present|auto]` —
+  convert the note's save format, then save durably through the core command
+  (never a CLI file write). Requires an explicit family; `--bom` defaults to
+  `absent`.
+
+- `--json` output: `{"note": …, "encoding": …, "bom": …}` for `reopen`;
+  `{"note": …, "encoding": …, "bom": …, "converted": true, "saved": true}`
+  for `convert`.
 
 ### `info`
 
@@ -191,7 +282,7 @@ flavite-cli search "zettelkasten" --path ~/notes --json
 flavite-cli info --path ~/notes
 
 # Move a note and rewrite inbound links
-flavite-cli rename old/place.md new/place.md --strategy rewrite --path ~/notes
+flavite-cli rename old/place.md new/place.md --strategy rewrite --vault ~/notes
 ```
 
 ## See also

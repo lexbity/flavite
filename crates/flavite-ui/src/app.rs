@@ -188,6 +188,7 @@ pub struct App {
 /// workspace model or the host catalog.
 #[derive(Debug, Clone)]
 pub enum Message {
+    EditorHistory(crate::host::editor_history::HistoryMessage),
     ContextMode(crate::host::context_mode::ContextMessage),
     ContextNative {
         tab: TabId,
@@ -1983,6 +1984,15 @@ impl App {
                 let Some(current) = self.note_editor_view(tab) else {
                     return;
                 };
+                if snapshot.buffer_id == current.buffer_id
+                    && snapshot.revision < current.revision
+                    && !snapshot.focused
+                {
+                    // A toolbar click can release focus from the previous
+                    // frame after a history receipt installed newer text.
+                    // That old blur cannot retire the acknowledged source.
+                    return;
+                }
                 if snapshot.buffer_id != current.buffer_id || snapshot.revision != current.revision
                 {
                     self.input_chains.remove(&tab);
@@ -2329,6 +2339,9 @@ impl App {
 
     fn update_inner(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::EditorHistory(message) => {
+                return crate::host::editor_history::handle(self, message);
+            }
             Message::ContextMode(message) => {
                 return crate::host::context_mode::handle(self, message);
             }

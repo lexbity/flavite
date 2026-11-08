@@ -527,6 +527,9 @@ pub fn catalog_conflicts(core_ids: &[&str]) -> Vec<String> {
 /// precedence; plain typing never triggers layout commands.
 #[must_use]
 pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
+    if let Some(message) = super::editor_history::keyboard_message(app, &event) {
+        return Some(message);
+    }
     if app.settings.capture.is_none()
         && app.dialog.is_none()
         && !app.has_composition()

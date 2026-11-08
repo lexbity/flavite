@@ -110,6 +110,8 @@ impl Selection {
 /// and EOL metadata. It is pure and has zero UI dependencies (D14).
 #[derive(Debug)]
 pub struct EditorModel {
+    history_epoch: crate::history::HistoryEpoch,
+    history_movement: Option<crate::history::HistoryMovement>,
     /// Unique identity for this buffer instance.
     buffer_id: BufferId,
     /// The text content (normalized, CRLF folded to LF).
@@ -397,6 +399,11 @@ impl EditorModel {
     /// claims another format (§6.10).
     #[must_use]
     pub fn from_snapshot(snapshot: TextSnapshot) -> Self {
+        let snapshot = if snapshot.format().is_none() {
+            TextSnapshot::from_normalized_with_descriptor(snapshot.text(), SourceFormat::default())
+        } else {
+            snapshot
+        };
         let text = snapshot.text().to_string();
         let rope = Rope::from_str(&text);
         let eol_table = EolTable::from_snapshot(&snapshot);
@@ -404,6 +411,8 @@ impl EditorModel {
         let format_stamp = FormatStamp::detected(source_format);
 
         Self {
+            history_epoch: crate::history::HistoryEpoch::new(),
+            history_movement: None,
             buffer_id: BufferId::new(),
             text,
             rope,
@@ -455,6 +464,8 @@ impl EditorModel {
             self.format_stamp = FormatStamp::detected(format);
         }
         self.undo_tree = UndoTree::new(snapshot.clone());
+        self.history_epoch = crate::history::HistoryEpoch::new();
+        self.history_movement = None;
         self.revision = self.revision.next();
         self.base_hash = Some(BaseHash::from_snapshot(&snapshot));
         self.is_dirty = false;
@@ -1026,15 +1037,108 @@ impl EditorModel {
         }
     }
 
+    /// Validate the text and recorded selections before installing either.
+    pub fn try_apply_recorded_batch(
+        &mut self,
+        edits: &[EditOp],
+        policy: crate::undo::UndoPolicy,
+        record: crate::history::EditorEdit,
+    ) -> Result<Revision, String> {
+        let batch = self
+            .prepare_batch(edits)
+            .map_err(|e| format!("Invalid edit batch: {e:?}"))?;
+        record
+            .validate(self.text(), batch.undo_snapshot.text())
+            .map_err(|e| e.to_string())?;
+        if let crate::undo::UndoPolicy::Context { origin } = policy
+            && u128::from_str_radix(&record.origin, 16).ok() != Some(origin)
+        {
+            return Err("Recorded editor origin does not match the undo group".into());
+        }
+        self.apply_text_edit(&batch.op);
+        self.undo_tree
+            .apply_recorded(batch.op, batch.undo_snapshot, policy, record);
+        self.revision = self.revision.next();
+        self.is_dirty = true;
+        Ok(self.revision)
+    }
+
+    pub fn history_page(
+        &self,
+        cursor: Option<crate::history::HistoryCursor>,
+        limit: usize,
+    ) -> Result<crate::history::HistoryPage, crate::history::HistoryError> {
+        self.undo_tree
+            .history_page(self.history_epoch, cursor, limit)
+    }
+
+    /// One validated head movement; never replay intermediate states or touch
+    /// the disk baseline. The caller holds the buffer's single-writer turn.
+    pub fn restore_state(
+        &mut self,
+        target: crate::history::HistoryTarget,
+    ) -> Result<Revision, crate::history::HistoryError> {
+        if target.epoch != self.history_epoch {
+            return Err(crate::history::HistoryError::Expired);
+        }
+        let snapshot = self.undo_tree.restore_snapshot(target)?;
+        let selections = self.undo_tree.get(target.node).and_then(|node| {
+            if node.is_root() {
+                Some(vec![[0, 0]])
+            } else {
+                node.editor.as_ref().map(|r| r.after.clone())
+            }
+        });
+        // Allocate all replacement state before moving the head.
+        let text = snapshot.text().to_owned();
+        let rope = Rope::from_str(&text);
+        let table = EolTable::from_snapshot(&snapshot);
+        self.set_history_movement(&snapshot, selections);
+        self.undo_tree.restore_position(target.node);
+        self.text = text;
+        self.rope = rope;
+        self.eol_table = table;
+        if let Some(format) = snapshot.format() {
+            self.source_format = format;
+            self.format_stamp = FormatStamp::detected(format);
+        }
+        self.revision = self.revision.next();
+        self.is_dirty = self.base_hash != Some(BaseHash::from_snapshot(&snapshot));
+        Ok(self.revision)
+    }
+
+    fn set_history_movement(
+        &mut self,
+        snapshot: &TextSnapshot,
+        selections: Option<Vec<[usize; 2]>>,
+    ) {
+        let (prefix, suffix) = common_text_edges(self.text(), snapshot.text());
+        self.history_movement = Some(crate::history::HistoryMovement {
+            selections,
+            change: crate::history::HistoryChange {
+                start: prefix,
+                end: self.text.len() - suffix,
+                inserted: snapshot.text().len() - prefix - suffix,
+            },
+        });
+    }
+
+    #[must_use]
+    pub fn history_movement(&self) -> Option<&crate::history::HistoryMovement> {
+        self.history_movement.as_ref()
+    }
+
     /// Undo the last edit.
     ///
     /// Returns the new revision and whether the undo was successful.
     /// Every undo advances the revision (§4.5.2).
     pub fn undo(&mut self) -> Option<Revision> {
+        let selections = self.undo_tree.undo_selections();
         let transition = self.undo_tree.undo_edit();
         let result = self.undo_tree.undo();
 
         if let Some((_node_rev, Some(snapshot))) = result {
+            self.set_history_movement(&snapshot, selections);
             let new_text = snapshot.text().to_string();
             self.rope = Rope::from_str(&new_text);
             self.text = new_text;
@@ -1047,13 +1151,7 @@ impl EditorModel {
                 self.format_stamp = FormatStamp::detected(format);
             }
             self.revision = self.revision.next();
-            self.is_dirty = true;
-            self.last_transition_ops = transition.into_iter().collect();
-            Some(self.revision)
-        } else if let Some((_node_rev, None)) = result {
-            // We have a revision but no snapshot - this shouldn't happen
-            // in normal operation
-            self.revision = self.revision.next();
+            self.is_dirty = self.base_hash != Some(BaseHash::from_snapshot(&snapshot));
             self.last_transition_ops = transition.into_iter().collect();
             Some(self.revision)
         } else {
@@ -1070,6 +1168,7 @@ impl EditorModel {
         let result = self.undo_tree.redo();
 
         if let Some((_node_rev, Some(snapshot))) = result {
+            self.set_history_movement(&snapshot, self.undo_tree.position_selections());
             let new_text = snapshot.text().to_string();
             self.rope = Rope::from_str(&new_text);
             self.text = new_text;
@@ -1079,11 +1178,7 @@ impl EditorModel {
                 self.format_stamp = FormatStamp::detected(format);
             }
             self.revision = self.revision.next();
-            self.is_dirty = true;
-            self.last_transition_ops = transition.into_iter().collect();
-            Some(self.revision)
-        } else if let Some((_node_rev, None)) = result {
-            self.revision = self.revision.next();
+            self.is_dirty = self.base_hash != Some(BaseHash::from_snapshot(&snapshot));
             self.last_transition_ops = transition.into_iter().collect();
             Some(self.revision)
         } else {

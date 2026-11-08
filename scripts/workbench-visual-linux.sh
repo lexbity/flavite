@@ -27,9 +27,9 @@ case "$backend" in
     *) echo "backend must be gpu or canvas (got: $backend)" >&2; exit 2 ;;
 esac
 case "$scenario" in
-    graph-editor-loop|note-regex-replace|link-completion|reference-workspace|context-mode) ;;
-    "") echo "missing --scenario (implemented: graph-editor-loop note-regex-replace link-completion reference-workspace context-mode)" >&2; exit 2 ;;
-    *) echo "unsupported scenario: $scenario (implemented: graph-editor-loop note-regex-replace link-completion reference-workspace context-mode)" >&2; exit 2 ;;
+    graph-editor-loop|note-regex-replace|link-completion|reference-workspace|context-mode|context-mode-history) ;;
+    "") echo "missing --scenario (implemented: graph-editor-loop note-regex-replace link-completion reference-workspace context-mode context-mode-history)" >&2; exit 2 ;;
+    *) echo "unsupported scenario: $scenario (implemented: graph-editor-loop note-regex-replace link-completion reference-workspace context-mode context-mode-history)" >&2; exit 2 ;;
 esac
 if [[ "$(uname -s)" != Linux ]]; then
     echo "workbench visual runner is Linux-only" >&2
@@ -42,7 +42,7 @@ for tool in xdotool import identify python3; do
         exit 2
     fi
 done
-if [[ "$scenario" == "context-mode" ]] && ! command -v tesseract >/dev/null 2>&1; then
+if [[ "$scenario" == context-mode* ]] && ! command -v tesseract >/dev/null 2>&1; then
     echo "Context Mode paint verification requires tesseract" >&2
     exit 2
 fi

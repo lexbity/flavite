@@ -87,6 +87,13 @@ window focus loss retains the mode. Exiting preserves the selection.
   those overlays own typing. Narrow panes move actions into **More** while
   keeping Exit visible. Below 320 logical pixels, editing pauses and an
   **Expand pane** control appears; the mode and selection are retained.
+- The detail row shows recent **editing-history chips**, marks the current
+  state, and offers a redo chip after moving backward. Click a chip to restore
+  its text and recorded selection. **Editing history** in More or the command
+  palette opens a paged chooser, including other branches. Restoring moves the
+  existing history head; it preserves branches and leaves saved disk bytes
+  alone. Escape closes the chooser first, and Exit remains reachable above it.
+  States across a rename transaction require ordinary Undo/Redo.
 
 Context edits are revision guarded. A delayed paste is refused after its source
 or selection changes or the mode exits. A temporary typing run is one Undo unit
@@ -94,8 +101,8 @@ until a selection/motion, toolbar command, Escape, save, foreign edit, or exit
 ends the group; an idle pause alone does not split it. Different editor views
 cannot merge their typing runs. Mode state is transient and is not restored on
 restart. This interface currently uses the editor's single selection; multiple
-selections and clickable command-history restoration are further specification
-work, not controls exposed by this implementation.
+selections remain further specification work. Editing history is in memory and
+is distinct from the saved note snapshots in the History view.
 
 ## Reading mode
 
@@ -203,8 +210,8 @@ The graph view is a first-class workspace tab over the note-link network:
 ## Autosave and persistence
 
 - Workspace layout autosave: 500 ms debounce, max 2 s dirty age, generation
-  receipts, capped exponential backoff on failure. Persisted per vault,
-  device-local, with last-good `.bak` backups.
+  receipts, capped exponential backoff on failure. Persisted in the vault at
+  `<vault>/.flavite/workspace-layouts.json`, with last-good `.bak` backups.
 - Failures are surfaced as typed states (Unavailable / GenerationMismatch /
   Failed) — never silent loss.
 
@@ -213,7 +220,8 @@ The graph view is a first-class workspace tab over the note-link network:
 Mod+, opens Preferences: theme (Light/Dark/System), interface scale, editor
 font size, line width, reduced motion, and per-command **shortcut overrides**
 (capture the next keypress; collisions are caught; restore defaults per
-command).
+command). Preferences persist in the vault at
+`<vault>/.flavite/settings.toml`.
 
 ## Keyboard shortcuts (defaults)
 
@@ -259,9 +267,11 @@ dragging afterward extends by the selected unit. IME composition is supported
 ## Data locations
 
 See [SETUP.md → Where state lives](SETUP.md#where-state-lives). Summary:
-notes stay in your vault; layouts/preferences and the remembered vault live
-device-locally under the OS data dir; identity, graph pins, and the recovery
-journal live in `<vault>/.flavite/`.
+notes stay in your vault; the workspace layout, preferences, graph pins,
+themes, identity, and recovery journal live in `<vault>/.flavite/`
+(vault-rooted — they travel with the vault). Only the remembered last vault,
+the vault registry / root guards / instance locks, recovery checkpoints and
+operation keys, and encoding hints are device-local under the OS data dir.
 
 ## Current limitations
 

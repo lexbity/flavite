@@ -223,6 +223,7 @@ fn edit(session: &Session, buffer_id: u64, revision: u64, ops: Vec<flavite_buffe
             revision: flavite_buffer::revision::Revision::new(revision),
             ops,
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            editor: None,
         }),
     );
     match expect_success(result, "edit") {

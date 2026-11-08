@@ -7,6 +7,10 @@
 //!
 //! Every edit, undo, redo, reload, and journal patch advances the revision
 //! even if text returns to previous bytes (§4.5.2).
+use crate::history::{
+    EditKind, EditorEdit, HistoryCursor, HistoryEntry, HistoryError, HistoryPage, HistoryTarget,
+    PAGE_LIMIT, TRAIL_LIMIT,
+};
 use crate::revision::Revision;
 use flavite_syntax::text::{Span, TextByte, TextSnapshot};
 use std::time::{Duration, Instant};
@@ -142,6 +146,10 @@ impl EditOp {
 /// - Children (for branching on undo-after-edit)
 #[derive(Debug, Clone)]
 pub struct UndoNode {
+    segment: Option<u64>,
+    pub version: u64,
+    pub editor: Option<EditorEdit>,
+    pub kind: EditKind,
     /// Unique identifier for this node.
     pub id: u64,
     /// The revision at this node.
@@ -162,6 +170,10 @@ impl UndoNode {
     #[must_use]
     pub fn root(revision: Revision, snapshot: TextSnapshot) -> Self {
         Self {
+            segment: None,
+            version: 1,
+            editor: None,
+            kind: EditKind::Edit,
             id: 0,
             revision,
             edit: None,
@@ -181,6 +193,10 @@ impl UndoNode {
         snapshot: TextSnapshot,
     ) -> Self {
         Self {
+            segment: edit.journal.as_ref().map(|_| id),
+            version: 1,
+            editor: None,
+            kind: EditKind::Edit,
             id,
             revision,
             edit: Some(edit),
@@ -207,12 +223,13 @@ impl UndoNode {
 /// Stores the complete history of edits with branching support.
 #[derive(Debug)]
 pub struct UndoTree {
+    generation: u64,
     /// A continuous run can only coalesce edits from its own editor view.
     context_origin: Option<u128>,
     /// All nodes in the tree.
     nodes: Vec<UndoNode>,
-    /// The current node ID (where new edits go).
-    current_id: u64,
+    /// Preferred redo continuation; edits always start at `position_id`.
+    preferred_tip: u64,
     /// The node we're currently at in the tree (for undo/redo).
     position_id: u64,
     /// Time window for coalescing edits.
@@ -226,9 +243,10 @@ impl UndoTree {
     pub fn new(snapshot: TextSnapshot) -> Self {
         let root = UndoNode::root(Revision::INITIAL, snapshot);
         Self {
+            generation: 1,
             context_origin: None,
             nodes: vec![root],
-            current_id: 0,
+            preferred_tip: 0,
             position_id: 0,
             coalesce_window: DEFAULT_COALESCE_WINDOW,
             next_id: 1,
@@ -241,20 +259,20 @@ impl UndoTree {
         tree.coalesce_window = window;
         tree
     }
-    /// Get the current node.
+    /// Get the preferred redo tip.
     #[must_use]
     pub fn current(&self) -> Option<&UndoNode> {
-        self.nodes.get(self.current_id as usize)
+        self.nodes.get(self.preferred_tip as usize)
     }
-    /// Get the current node mutably.
+    /// Get the preferred redo tip mutably.
     #[must_use]
     pub fn current_mut(&mut self) -> Option<&mut UndoNode> {
-        self.nodes.get_mut(self.current_id as usize)
+        self.nodes.get_mut(self.preferred_tip as usize)
     }
     /// Get a node by ID.
     #[must_use]
     pub fn get(&self, id: u64) -> Option<&UndoNode> {
-        self.nodes.get(id as usize)
+        self.nodes.get(usize::try_from(id).ok()?)
     }
     /// Get the position node.
     #[must_use]
@@ -273,14 +291,17 @@ impl UndoTree {
         self.get(target_id)?.edit.clone()
     }
     fn redo_target(&self) -> Option<u64> {
-        let mut child = self.current_id;
+        let mut child = self.preferred_tip;
         while let Some(node) = self.get(child) {
             if node.parent_id == Some(self.position_id) {
                 return Some(child);
             }
-            child = node.parent_id?;
+            let Some(parent) = node.parent_id else {
+                break;
+            };
+            child = parent;
         }
-        None
+        self.position()?.children.last().copied()
     }
 
     /// Apply an edit and advance the tree.
@@ -290,7 +311,7 @@ impl UndoTree {
     ///
     /// Returns the new revision.
     pub fn apply(&mut self, edit: EditOp, snapshot: TextSnapshot) -> Revision {
-        if self.context_origin.is_some() {
+        if self.context_origin.is_some() || self.position().is_some_and(|n| n.editor.is_some()) {
             self.seal_current();
         }
         self.apply_with_coalescing(edit, snapshot, true, false)
@@ -298,6 +319,20 @@ impl UndoTree {
 
     /// One explicit typing run, independent of the ordinary idle timer.
     pub fn apply_context(
+        &mut self,
+        edit: EditOp,
+        snapshot: TextSnapshot,
+        origin: u128,
+    ) -> Revision {
+        // Unannotated callers cannot extend a recorded editor operation: its
+        // after-selection would then describe a state that no longer exists.
+        if self.position().is_some_and(|node| node.editor.is_some()) {
+            self.seal_current();
+        }
+        self.apply_context_inner(edit, snapshot, origin)
+    }
+
+    fn apply_context_inner(
         &mut self,
         edit: EditOp,
         snapshot: TextSnapshot,
@@ -326,12 +361,13 @@ impl UndoTree {
         allow_coalescing: bool,
         continuous: bool,
     ) -> Revision {
-        let branched = self.position_id != self.current_id;
-        let current_id = self.position_id;
+        self.generation += 1;
+        let branched = self.position_id != self.preferred_tip;
+        let position_id = self.position_id;
         // First, check if we should coalesce
         let should_coalesce = allow_coalescing
             && !branched
-            && if let Some(current) = self.nodes.get(current_id as usize) {
+            && if let Some(current) = self.nodes.get(position_id as usize) {
                 if let Some(current_edit) = &current.edit {
                     !current_edit.boundary
                         && !edit.boundary
@@ -346,7 +382,7 @@ impl UndoTree {
             };
         if should_coalesce {
             let parent_text = self
-                .get(current_id)
+                .get(position_id)
                 .and_then(|node| node.parent_id)
                 .and_then(|id| self.get(id))
                 .and_then(|node| node.snapshot.as_ref())
@@ -379,7 +415,8 @@ impl UndoTree {
                     Span::new(TextByte(prefix), TextByte(before.len() - suffix)),
                     after[prefix..after.len() - suffix].into(),
                 );
-                if let Some(node) = self.nodes.get_mut(current_id as usize) {
+                if let Some(node) = self.nodes.get_mut(position_id as usize) {
+                    node.version += 1;
                     node.edit = Some(coalesced);
                     node.snapshot = Some(snapshot);
                     node.timestamp = Instant::now();
@@ -387,24 +424,25 @@ impl UndoTree {
                 }
             }
         }
-        // Get current again for creating new node
-        // Create a new node
         let current_node = self
             .nodes
-            .get(current_id as usize)
+            .get(position_id as usize)
             .expect("current node must exist");
-        let parent_id = current_node.id; // Clone the id to avoid borrow issues
+        let parent_id = current_node.id;
         let new_id = self.next_id;
         self.next_id += 1;
         let new_revision = current_node.revision.next();
-        let new_node = UndoNode::new(new_id, new_revision, edit, parent_id, snapshot);
+        let mut new_node = UndoNode::new(new_id, new_revision, edit, parent_id, snapshot);
+        if new_node.segment.is_none() {
+            new_node.segment = current_node.segment;
+        }
         // Add to parent's children
         if let Some(node) = self.nodes.get_mut(parent_id as usize) {
             node.children.push(new_id);
         }
         // Add the new node
         self.nodes.push(new_node);
-        self.current_id = new_id;
+        self.preferred_tip = new_id;
         self.position_id = new_id;
         new_revision
     }
@@ -431,8 +469,10 @@ impl UndoTree {
         }
         let parent_id = current.parent_id?;
         let parent = self.nodes.get(parent_id as usize)?;
+        let snapshot = parent.snapshot.clone()?;
         self.position_id = parent.id;
-        Some((parent.revision, parent.snapshot.clone()))
+        self.generation += 1;
+        Some((parent.revision, Some(snapshot)))
     }
     /// Redo the last undone edit.
     ///
@@ -444,22 +484,197 @@ impl UndoTree {
     pub fn redo(&mut self) -> Option<(Revision, Option<TextSnapshot>)> {
         self.seal_current();
         let child = self.get(self.redo_target()?)?;
-        let result = (child.revision, child.snapshot.clone());
+        let result = (child.revision, Some(child.snapshot.clone()?));
         self.position_id = child.id;
+        self.generation += 1;
         Some(result)
     }
     /// Move to a specific node.
-    pub fn goto(&mut self, id: u64) -> bool {
-        if self.nodes.iter().any(|n| n.id == id) {
+    fn goto(&mut self, id: u64) -> bool {
+        if self.get(id).is_some() {
             self.seal_current();
+            // Keep the current continuation when jumping to its ancestor.
+            // Selecting another branch must adopt that branch's continuation,
+            // otherwise Undo followed by Redo would return to an unrelated
+            // state from the previously preferred branch.
+            let mut ancestor = Some(self.preferred_tip);
+            while ancestor.is_some_and(|ancestor| ancestor != id) {
+                ancestor = ancestor.and_then(|ancestor| self.get(ancestor)?.parent_id);
+            }
+            if ancestor != Some(id) {
+                let mut tail = id;
+                while let Some(child) = self.get(tail).and_then(|node| node.children.last()) {
+                    tail = *child;
+                }
+                self.preferred_tip = tail;
+            }
             self.position_id = id;
-            self.current_id = id;
+            self.generation += 1;
             true
         } else {
             false
         }
     }
-    /// Get the current revision.
+
+    /// Install an editor edit and its source-free history record together.
+    pub fn apply_recorded(
+        &mut self,
+        edit: EditOp,
+        snapshot: TextSnapshot,
+        policy: UndoPolicy,
+        record: EditorEdit,
+    ) -> Revision {
+        if self
+            .position()
+            .and_then(|n| n.editor.as_ref())
+            .is_none_or(|previous| previous.origin != record.origin)
+        {
+            self.seal_current();
+        }
+        let revision = match policy {
+            UndoPolicy::Isolated => self.apply_boundary(edit, snapshot),
+            UndoPolicy::Context { origin } => self.apply_context_inner(edit, snapshot, origin),
+            UndoPolicy::Typing => {
+                if self.context_origin.is_some() {
+                    self.seal_current();
+                }
+                self.apply_with_coalescing(edit, snapshot, true, false)
+            }
+        };
+        let node = &mut self.nodes[self.position_id as usize];
+        if let Some(previous) = &mut node.editor {
+            previous.after = record.after;
+        } else {
+            node.kind = record.kind;
+            node.editor = Some(record);
+        }
+        revision
+    }
+
+    fn segment(&self, id: u64) -> Option<u64> {
+        self.get(id).and_then(|node| node.segment)
+    }
+
+    fn entry(
+        &self,
+        id: u64,
+        epoch: crate::history::HistoryEpoch,
+        on_path: bool,
+    ) -> Option<HistoryEntry> {
+        let node = self.get(id)?;
+        Some(HistoryEntry {
+            on_path,
+            selection_count: if node.is_root() {
+                Some(1)
+            } else {
+                node.editor.as_ref().map(|record| record.after.len())
+            },
+            target: HistoryTarget {
+                epoch,
+                node: id,
+                version: node.version,
+            },
+            parent: node.parent_id,
+            kind: node.kind,
+            current: id == self.position_id,
+            open: node.edit.as_ref().is_some_and(|edit| !edit.boundary) && id == self.position_id,
+            restorable: self.segment(id) == self.segment(self.position_id),
+            initial: node.is_root(),
+        })
+    }
+
+    pub fn history_page(
+        &self,
+        epoch: crate::history::HistoryEpoch,
+        cursor: Option<HistoryCursor>,
+        limit: usize,
+    ) -> Result<HistoryPage, HistoryError> {
+        if cursor.is_some_and(|c| c.epoch != epoch || c.generation != self.generation) {
+            return Err(HistoryError::StalePage);
+        }
+        let before = cursor.map_or(self.next_id, |c| c.before);
+        let limit = limit.clamp(1, PAGE_LIMIT);
+        let mut ancestors = std::collections::BTreeSet::new();
+        let mut ancestor = Some(self.position_id);
+        while let Some(node) = ancestor.and_then(|id| self.get(id)) {
+            ancestors.insert(node.id);
+            ancestor = node.parent_id;
+        }
+        let mut entries: Vec<_> = self
+            .nodes
+            .iter()
+            .rev()
+            .filter(|n| n.id < before)
+            .take(limit + 1)
+            .filter_map(|n| self.entry(n.id, epoch, ancestors.contains(&n.id)))
+            .collect();
+        let next = (entries.len() > limit).then(|| HistoryCursor {
+            epoch,
+            generation: self.generation,
+            before: entries[limit - 1].target.node,
+        });
+        entries.truncate(limit);
+        let mut trail = Vec::new();
+        let mut id = Some(self.position_id);
+        while let Some(node) = id.and_then(|id| self.get(id)) {
+            trail.push(
+                self.entry(node.id, epoch, true)
+                    .expect("existing history node"),
+            );
+            if trail.len() == TRAIL_LIMIT {
+                break;
+            }
+            id = node.parent_id;
+        }
+        trail.reverse();
+        Ok(HistoryPage {
+            epoch,
+            generation: self.generation,
+            current: self.position_id,
+            entries,
+            trail,
+            redo: self
+                .redo_target()
+                .and_then(|id| self.entry(id, epoch, false)),
+            next,
+        })
+    }
+
+    /// Prepare before changing the head. Tagged filesystem obligations may
+    /// only be crossed by the Session's existing single-step Undo/Redo path.
+    pub fn restore_snapshot(&self, target: HistoryTarget) -> Result<TextSnapshot, HistoryError> {
+        let node = self.get(target.node).ok_or(HistoryError::Expired)?;
+        if node.version != target.version {
+            return Err(HistoryError::Expired);
+        }
+        if self.segment(target.node) != self.segment(self.position_id) {
+            return Err(HistoryError::JournalBoundary);
+        }
+        node.snapshot.clone().ok_or(HistoryError::Expired)
+    }
+
+    pub(crate) fn restore_position(&mut self, id: u64) {
+        assert!(self.goto(id), "validated history state must exist");
+    }
+
+    #[must_use]
+    pub fn position_selections(&self) -> Option<Vec<[usize; 2]>> {
+        let node = self.position()?;
+        if node.is_root() {
+            Some(vec![[0, 0]])
+        } else {
+            node.editor.as_ref().map(|record| record.after.clone())
+        }
+    }
+
+    #[must_use]
+    pub fn undo_selections(&self) -> Option<Vec<[usize; 2]>> {
+        self.position()?
+            .editor
+            .as_ref()
+            .map(|record| record.before.clone())
+    }
+    /// Get the preferred redo tip's revision, not the live buffer revision.
     #[must_use]
     pub fn current_revision(&self) -> Revision {
         self.current()
@@ -473,14 +688,14 @@ impl UndoTree {
             .map(|n| n.revision)
             .unwrap_or(Revision::INITIAL)
     }
-    /// Get the linear history from root to current.
+    /// Get the path from the root to the preferred redo tip.
     #[must_use]
     pub fn history(&self) -> Vec<&UndoNode> {
         let mut path = Vec::new();
-        let mut current_id = self.current_id;
-        while let Some(node) = self.nodes.get(current_id as usize) {
+        let mut preferred_tip = self.preferred_tip;
+        while let Some(node) = self.nodes.get(preferred_tip as usize) {
             path.push(node);
-            current_id = match node.parent_id {
+            preferred_tip = match node.parent_id {
                 Some(id) => id,
                 None => break,
             };
@@ -502,21 +717,21 @@ impl UndoTree {
         if !self.nodes.is_empty() {
             let root = self.nodes[0].clone();
             self.nodes = vec![root];
-            self.current_id = 0;
+            self.preferred_tip = 0;
             self.position_id = 0;
             self.next_id = 1;
         }
     }
-    /// Get the depth from root to current.
+    /// Get the depth from the root to the preferred redo tip.
     #[must_use]
     pub fn depth(&self) -> usize {
-        let mut current_id = self.current_id;
+        let mut preferred_tip = self.preferred_tip;
         let mut depth = 0;
-        while let Some(node) = self.nodes.get(current_id as usize) {
+        while let Some(node) = self.nodes.get(preferred_tip as usize) {
             if node.is_root() {
                 return depth;
             }
-            current_id = node.parent_id.unwrap_or(0);
+            preferred_tip = node.parent_id.unwrap_or(0);
             depth += 1;
         }
         depth

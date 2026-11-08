@@ -3,9 +3,9 @@
 //! Phase 4 / PLAN-C slice C14: The CLI is a consumer of flavite-api.
 //! This demonstrates the dogfooding requirement where the CLI uses the
 //! public API surface instead of directly accessing core internals.
-//!
-//! Note: Full migration to remove all direct flavite-vault/flavite-index
-//! imports is tracked separately (Phase 4 exit gate).
+//! The CLI depends only on `flavite-api` (+ `flavite-settings` for
+//! settings values); it has no direct `flavite-vault`/`flavite-index`
+//! imports.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -94,8 +94,10 @@ enum Commands {
     /// (RFC-0006 S06). Plain text is the default mode: whitespace means
     /// AND and punctuation is text. Expression mode parses the explicit
     /// operator syntax (AND/OR/NOT, quotes, parentheses). Literal and
-    /// regex modes are vault source matching (RFC-0006 S07) and are
-    /// refused here with a typed error.
+    /// regex modes are vault source matching (RFC-0006 S07): literal runs
+    /// in-process, regex runs through the `flavite-text-search-worker`
+    /// helper (typed refusal when it is missing or the pattern is
+    /// invalid).
     Search {
         /// Path to the vault (overrides global --vault).
         #[arg(short, long, value_name = "PATH")]
@@ -340,9 +342,10 @@ enum CliSearchMode {
     Text,
     /// Explicit expression syntax (AND/OR/NOT, quotes, parentheses).
     Expression,
-    /// Vault source literal matching (RFC-0006 S07; not available yet).
+    /// Vault source literal matching (RFC-0006 S07; in-process).
     Literal,
-    /// Vault source regex matching (RFC-0006 S07; not available yet).
+    /// Vault source regex matching (RFC-0006 S07; via the text-search
+    /// worker helper).
     Regex,
 }
 
@@ -365,8 +368,9 @@ impl CliRenameStrategy {
 
 /// CLI driver that uses flavite-api for all operations.
 /// Theme package actions (xpi themes). `Convert` is an offline tool that
-/// needs no vault; the other actions manage the device-local theme store
-/// through the facade's typed `theme.*` commands.
+/// needs no vault; the other actions manage the vault's theme store
+/// (`<vault>/.flavite/themes/`) through the facade's typed `theme.*`
+/// commands.
 #[derive(Subcommand, Debug)]
 enum ThemeAction {
     /// Convert a standard browser theme package into a `.flavite.xpi`.
@@ -378,8 +382,8 @@ enum ThemeAction {
         #[arg(short, long, value_name = "PATH")]
         output: Option<PathBuf>,
     },
-    /// Convert and install a standard `.xpi` into this vault's device
-    /// theme store.
+    /// Convert and install a standard `.xpi` into this vault's theme
+    /// store.
     Install {
         /// Path to the standard `.xpi` theme package.
         path: PathBuf,
@@ -594,10 +598,6 @@ impl CliDriver {
 
     /// Run a query.
     #[allow(clippy::ptr_arg)]
-    /// Inspect or convert a note's encoding through the core commands
-    /// (§6.10). Reopen never discards unsaved text; Convert is followed by
-    /// the guarded save and both wait for real receipts instead of exiting
-    /// after an ephemeral metadata change.
     /// Convert a standard theme package into a `.flavite.xpi` and print
     /// the conversion report (mapped slots, dropped keys, warnings).
     fn convert_theme(&self, input: PathBuf, output: Option<PathBuf>) -> Result<()> {
@@ -864,9 +864,10 @@ impl CliDriver {
         Ok(())
     }
 
-    /// Select (or clear, with `none`) the installed theme in the device
-    /// preferences. The write goes through the facade's compare-and-set
-    /// user-state service — never a direct file write.
+    /// Select (or clear, with `none`) the installed theme. The selection
+    /// is persisted as `appearance.theme_package` in the vault settings
+    /// (`<vault>/.flavite/settings.toml`) through the facade's typed
+    /// settings API — never a direct file write.
     fn select_theme(&mut self, id: &str) -> Result<()> {
         let selection = (id != "none").then(|| id.to_owned());
         let value = {
@@ -877,7 +878,7 @@ impl CliDriver {
             if let Some(selected) = &selection {
                 let installed = flavite
                     .themes()
-                    .context("theme storage is unavailable on this device")?
+                    .context("theme store is unavailable for this vault")?
                     .list()?;
                 anyhow::ensure!(
                     installed.iter().any(|theme| &theme.id == selected),
