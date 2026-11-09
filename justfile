@@ -20,6 +20,7 @@ clippy:
 test:
     #!/usr/bin/env bash
     set -o pipefail
+    mkdir -p target # tee target below must work even when CARGO_TARGET_DIR is set elsewhere
     if ! cargo test --workspace --locked 2>&1 | tee target/last-test.log; then
         if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
             {
