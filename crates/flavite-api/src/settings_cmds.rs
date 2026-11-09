@@ -9,7 +9,7 @@
 //! All commands are gated by `Capability::Settings`.
 //!
 //! The commands are registered in the registry with stub handlers, then
-//! routed to [`execute_settings_command`] on the facade turn (they need
+//! routed to `execute_settings_command` on the facade turn (they need
 //! the facade-owned settings store). The registry still owns their schemas
 //! and capabilities.
 

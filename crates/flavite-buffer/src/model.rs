@@ -1321,7 +1321,7 @@ impl EditorModel {
 
     /// Get the content hash of the current buffer (serialized source when
     /// encodable, otherwise the normalized text identity; see
-    /// [`EditorModel::source_bytes_for_hash`] and
+    /// `EditorModel::source_bytes_for_hash` and
     /// [`EditorModel::snapshot`] for the pending-draft case).
     #[must_use]
     pub fn content_hash(&self) -> BaseHash {

@@ -5,7 +5,7 @@
 //! [`StreamingDecoder::finish`]. There is no IO trait and no lossy
 //! fallback. Streaming decode yields text and the resolved
 //! [`SourceFormat`]; the checked byte map is built by the one-shot
-//! [`decode`](crate::decode) over whole sources.
+//! [`decode()`](fn@crate::decode) over whole sources.
 
 use crate::decode::LONGER_UNSUPPORTED_SIGNATURES;
 use crate::format::{

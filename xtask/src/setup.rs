@@ -54,6 +54,22 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Check if a binary file exists on PATH WITHOUT executing it. Cargo
+/// subcommand binaries (cargo-llvm-cov, cargo-binstall, …) reject a bare
+/// `--version` when run directly, so `command_exists` cannot detect them —
+/// use this for install-skip checks on cargo sub-tools.
+fn on_path(name: &str) -> bool {
+    let Ok(paths) = std::env::var("PATH") else {
+        return false;
+    };
+    let exe = if std::env::consts::OS == "windows" {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    std::env::split_paths(&paths).any(|dir| dir.join(&exe).is_file() || dir.join(name).is_file())
+}
+
 /// Install ripgrep per-OS. The source-gate scripts (`scripts/*.sh`) and
 /// `just lint-arch` shell out to `rg`, and GitHub-hosted runners do not ship
 /// it — a missing `rg` turns the gate into exit 127 (audit 2026-11-08, H4).
@@ -120,6 +136,131 @@ fn install_hook(workspace_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Pinned cargo-binstall release used to fetch PREBUILT binaries for the
+/// cargo sub-tools. Source-compiling cargo-deny/cargo-audit/cargo-llvm-cov
+/// on every cold CI runner cost 10+ min of the gate (NFR-1), so setup
+/// downloads binstall itself (sha256-pinned per platform asset) and only
+/// falls back to `cargo install --locked` when no prebuilt exists.
+const B_INSTALL_VERSION: &str = "1.26.2";
+
+/// (asset filename, release sha256) of cargo-binstall for this platform.
+fn binstall_asset() -> Option<(&'static str, &'static str)> {
+    use std::env::consts::{ARCH, OS};
+    Some(match (OS, ARCH) {
+        ("linux", "x86_64") => (
+            "cargo-binstall-x86_64-unknown-linux-gnu.tgz",
+            "4f28eba175325f67f7c4bb8ae8686914d2d88fead279c0b8c4d3125264d7a512",
+        ),
+        ("linux", "aarch64") => (
+            "cargo-binstall-aarch64-unknown-linux-gnu.tgz",
+            "027438af19e7d9d90accabbb047101c8636c40253f760e92e84cf2f90feddad3",
+        ),
+        ("macos", _) => (
+            "cargo-binstall-universal-apple-darwin.zip",
+            "939e2e61eb4092fe8532769bf5179694be3acff239a13defe339234db6c2bd8e",
+        ),
+        ("windows", "x86_64") => (
+            "cargo-binstall-x86_64-pc-windows-msvc.zip",
+            "c377a4977ffdbdcbf58dd263055b2f1d56ba873c69fbd6bfc60bef98256183a3",
+        ),
+        ("windows", "aarch64") => (
+            "cargo-binstall-aarch64-pc-windows-msvc.zip",
+            "3736cca189d958ae80bd5770e77cce9bbc5653bb2e9561e5002e766f2a185804",
+        ),
+        _ => return None,
+    })
+}
+
+/// Hash a file with the platform's tool and return the hex digest.
+fn sha256_of(path: &Path) -> Result<String> {
+    use std::env::consts::OS;
+    let out = match OS {
+        "windows" => Command::new("certutil")
+            .args(["-hashfile", &path.to_string_lossy(), "SHA256"])
+            .output()?,
+        "macos" => Command::new("shasum")
+            .args(["-a", "256", &path.to_string_lossy()])
+            .output()?,
+        _ => Command::new("sha256sum").arg(path).output()?,
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace()
+        .next()
+        .map(str::to_lowercase)
+        .context("no digest in hash tool output")
+}
+
+/// Download the pinned cargo-binstall release into ~/.cargo/bin.
+/// Soft-fails (warn) — the sub-tools fall back to source builds without it.
+fn install_binstall() -> Result<()> {
+    if on_path("cargo-binstall") {
+        println!("  ✓ cargo-binstall already installed");
+        return Ok(());
+    }
+    let Some((asset, expected)) = binstall_asset() else {
+        println!(
+            "  ⚠ no pinned cargo-binstall asset for this platform; sub-tools will build from source"
+        );
+        return Ok(());
+    };
+    let url = format!(
+        "https://github.com/cargo-bins/cargo-binstall/releases/download/v{B_INSTALL_VERSION}/{asset}"
+    );
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let bin_dir = Path::new(&home).join(".cargo/bin");
+    fs::create_dir_all(&bin_dir)?;
+    let archive =
+        std::env::temp_dir().join(format!("flavite-binstall-{B_INSTALL_VERSION}-{asset}"));
+    let extract_dir = std::env::temp_dir().join(format!("flavite-binstall-{B_INSTALL_VERSION}"));
+    fs::create_dir_all(&extract_dir)?;
+
+    println!("  → downloading cargo-binstall v{B_INSTALL_VERSION} ({asset})");
+    let status = Command::new("curl")
+        .args(["-sSfL", &url, "-o", &archive.to_string_lossy()])
+        .status()
+        .context("failed to spawn curl")?;
+    if !status.success() {
+        println!("  ⚠ curl failed; sub-tools will build from source");
+        return Ok(());
+    }
+    let actual = sha256_of(&archive)?;
+    if actual != expected {
+        anyhow::bail!(
+            "cargo-binstall download checksum mismatch: got {actual}, expected {expected}"
+        );
+    }
+    // bsdtar (ships with macOS/Windows 10+) handles both .tgz and .zip.
+    let status = Command::new("tar")
+        .args([
+            "-xf",
+            &archive.to_string_lossy(),
+            "-C",
+            &extract_dir.to_string_lossy(),
+        ])
+        .status()
+        .context("failed to spawn tar")?;
+    if !status.success() {
+        anyhow::bail!("failed to extract {asset}");
+    }
+    let exe = if std::env::consts::OS == "windows" {
+        "cargo-binstall.exe"
+    } else {
+        "cargo-binstall"
+    };
+    let src = extract_dir.join(exe);
+    let dst = bin_dir.join(exe);
+    fs::copy(&src, &dst).with_context(|| format!("failed to install {}", dst.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&dst)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dst, perms)?;
+    }
+    println!("  ✓ cargo-binstall v{B_INSTALL_VERSION} installed (sha256 verified)");
+    Ok(())
+}
+
 /// Run `just setup` (§10.8).
 pub fn setup() -> Result<()> {
     println!("flavite setup — developer onboarding (§10.8)");
@@ -145,34 +286,53 @@ pub fn setup() -> Result<()> {
         "rustup toolchain install nightly",
     )?;
 
-    // 3. Cargo sub-tools.
-    println!("[3/4] Cargo sub-tools");
-    let tools = [
-        ("cargo-fuzz", "cargo-fuzz"),
-        ("cargo-deny", "cargo-deny"),
-        ("cargo-audit", "cargo-audit"),
-        ("cargo-llvm-cov", "cargo-llvm-cov"),
+    // 3. Cargo sub-tools — pinned versions, PREBUILT via cargo-binstall when
+    // available (seconds even on a cold runner); `cargo install --locked`
+    // (source compile, minutes) is only the fallback.
+    println!("[3/4] Cargo sub-tools (pinned; prebuilt via cargo-binstall)");
+    install_binstall()?;
+    let tools: [(&str, &str); 5] = [
+        ("cargo-fuzz", "0.13.2"),
+        ("cargo-deny", "0.20.2"),
+        ("cargo-audit", "0.22.2"),
+        ("cargo-llvm-cov", "0.9.1"),
+        ("cargo-shear", "1.14.0"),
     ];
-    for (install_name, bin_name) in &tools {
-        if command_exists(bin_name) {
-            println!("  ✓ {bin_name} already installed");
-        } else {
-            println!("  → installing {install_name} (this may take a while)...");
-            run_or_skip(
-                Command::new("cargo").args(["install", install_name, "--locked"]),
-                &format!("cargo install {install_name}"),
-            )?;
+    for (name, version) in &tools {
+        if on_path(name) {
+            println!("  ✓ {name} already installed");
+            continue;
         }
-    }
-    // cargo-shear requires nightly.
-    if command_exists("cargo-shear") {
-        println!("  ✓ cargo-shear already installed");
-    } else {
-        println!("  → installing cargo-shear (this may take a while)...");
-        run_or_skip(
-            Command::new("cargo").args(["+nightly", "install", "cargo-shear", "--locked"]),
-            "cargo +nightly install cargo-shear",
-        )?;
+        let spec = format!("{name}@{version}");
+        if on_path("cargo-binstall") {
+            println!("  → {spec} (prebuilt via cargo-binstall)");
+            let ok = Command::new("cargo")
+                .args(["binstall", "--no-confirm", &spec])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok && on_path(name) {
+                println!("  ✓ {name} {version} installed (prebuilt)");
+                continue;
+            }
+            println!("  ⚠ prebuilt install failed for {spec}; falling back to source build");
+        }
+        println!("  → installing {name} {version} from source (slow)...");
+        // cargo-shear's source build needs nightly; the prebuilt path does not.
+        let mut cmd = Command::new("cargo");
+        if *name == "cargo-shear" {
+            cmd.arg("+nightly");
+        }
+        cmd.args(["install", name, "--locked", "--version", version]);
+        let status = cmd
+            .status()
+            .with_context(|| format!("failed to spawn cargo install {name}"))?;
+        if !status.success() || !on_path(name) {
+            anyhow::bail!(
+                "failed to install {name} {version} (both prebuilt and source paths failed)"
+            );
+        }
+        println!("  ✓ {name} {version} installed (source)");
     }
 
     // ripgrep: required by scripts/check-workspace-contracts.sh,
@@ -193,6 +353,23 @@ pub fn setup() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binstall_asset_is_pinned_for_supported_platforms() {
+        use std::env::consts::{ARCH, OS};
+        if matches!(
+            (OS, ARCH),
+            ("linux", "x86_64" | "aarch64") | ("macos", _) | ("windows", "x86_64" | "aarch64")
+        ) {
+            let (asset, sha) = binstall_asset().expect("asset for supported platform");
+            assert!(asset.starts_with("cargo-binstall-"));
+            assert_eq!(sha.len(), 64, "sha256 hex digest");
+            assert!(
+                sha.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            );
+        }
+    }
 
     #[test]
     fn hook_script_contains_gate_and_fuzz() {

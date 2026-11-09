@@ -31,7 +31,7 @@ use thiserror::Error;
 pub use flavite_vault::types::{ReconcileMode, ReconcileScope};
 
 /// RFC-0004 §6.7 (NFR-10): the host-turn budget guard. Every [`Flavite::execute`]
-/// turn is measured in debug builds; a turn over [`TURN_BUDGET`] emits a
+/// turn is measured in debug builds; a turn over `TURN_BUDGET` emits a
 /// `tracing::warn` naming the command, rate-limited to one per second.
 /// Release builds compile the measurement away entirely — the overhead
 /// policy is zero beyond the two compares the optimizer folds into the

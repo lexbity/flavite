@@ -6,7 +6,7 @@
 //! - [`renderer`] — the production instanced wgpu core (WGSL, pipeline,
 //!   primitive, typed gesture program). The probe consumes it, never the
 //!   reverse.
-//! - [`geometry`] — [`RenderGeometry`](geometry::RenderGeometry): the
+//! - [`geometry`] — [`RenderGeometry`]: the
 //!   identity-safe frame both backends draw and hit-test, built only from
 //!   a base publication and positions frame that agree on `RenderKey`.
 //! - [`instance`] — the plain-data instance buffers, camera, and D15

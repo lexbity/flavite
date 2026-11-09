@@ -44,8 +44,8 @@
 //! projection builder and the snapshot share them without cloning
 //! (FR-9): the per-publish `O(V)` allocation is exactly one `effective`
 //! batch construction. The mirror splices owned working copies inside
-//! [`MirrorState`] and publishes them into the shared fields lazily
-//! ([`MirrorState::refresh_view`]) when a consumer needs a fresh view —
+//! `MirrorState` and publishes them into the shared fields lazily
+//! (`MirrorState::refresh_view`) when a consumer needs a fresh view —
 //! `view()` and a `view_arc` miss — so the splice path stays pure
 //! `O(change)` and the keystroke/stamp-only path never refreshes (NFR-6,
 //! asserted by the allocation-counting gate at 5k notes).
@@ -56,7 +56,7 @@
 //! log_floor` ([`ResetReason::BelowLogFloor`]), parity failure, service
 //! start, and DB recreate. The reset path is the full consistent read
 //! ([`full_saved_graph`], which reuses
-//! [`read_current`](crate::graph_service::read_current), the occurrence
+//! `read_current`, the occurrence
 //! scans, and the metadata scan verbatim) — correct-by-construction,
 //! battle-tested, and the recovery for every drift class. A mirror whose
 //! delta machinery fails mid-apply is *poisoned*, not half-trusted: the
@@ -152,9 +152,9 @@ impl Default for ParityPolicy {
 /// # F3 sharing (RFC-0005 S4)
 ///
 /// `saved`, `occurrences`, and `metadata` are `Arc`-backed: the mirror
-/// owns the *mutable* working copies inside [`MirrorState`] (the splice
+/// owns the *mutable* working copies inside `MirrorState` (the splice
 /// targets), and publishes them into these shared fields on demand
-/// ([`MirrorState::refresh_view`]) so the handoff snapshot
+/// (`MirrorState::refresh_view`) so the handoff snapshot
 /// ([`GraphMirror::view_arc`]) and the projection builder
 /// ([`crate::graph_projection::build`]) can borrow them without cloning —
 /// the per-publish cost is one owned `effective` batch construction, never
@@ -164,7 +164,7 @@ pub struct SavedGraph {
     /// Exact index version every field was read at.
     pub version: IndexVersion,
     /// Saved notes + attachments + resolved edges — the exact
-    /// [`read_current`](crate::graph_service::read_current) shape, native
+    /// `read_current` shape, native
     /// paths decoded.
     pub saved: Arc<GraphBatch>,
     /// Unresolved target nodes derived from saved unresolved links, sorted
@@ -898,7 +898,7 @@ impl GraphMirror {
     /// replaced in one assignment.
     ///
     /// F3 refresh: a miss first publishes the owned working copies into the
-    /// view's shared `Arc` fields ([`MirrorState::refresh_view`]), so the
+    /// view's shared `Arc` fields (`MirrorState::refresh_view`), so the
     /// snapshot carries the post-delta data — same one `O(V)` construction
     /// per delta window S3 already accepted. Cache hits (stamp-only
     /// republishes) skip the refresh entirely: the cursor has not moved,

@@ -52,7 +52,8 @@ impl From<LineEnding> for SyntaxEol {
 /// The EOL side table for a buffer.
 ///
 /// Tracks the line ending style for each line and whether the file has a
-/// trailing newline. BOM ownership lives in the buffer's [`SourceFormat`]
+/// trailing newline. BOM ownership lives in the buffer's
+/// [`SourceFormat`](flavite_encoding::SourceFormat)
 /// descriptor (RFC-0006 §6.10), not here: this table is the EOL map of the
 /// decoded-UTF-8 layer and never carries a format flag.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

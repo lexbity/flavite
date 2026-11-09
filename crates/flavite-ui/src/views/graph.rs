@@ -3,8 +3,8 @@
 //! A first-class workspace view of canonical note/link data: selectable,
 //! movable, and operable by pointer, keyboard, and assistive technology.
 //! Both renderers (instanced wgpu and the software canvas) mount the same
-//! [`RenderGeometry`](crate::graph::geometry::RenderGeometry) and publish
-//! the same typed [`GraphMessage`](crate::graph::renderer::GraphMessage)
+//! [`RenderGeometry`] and publish
+//! the same typed [`GraphMessage`]
 //! set, so a capture on either backend proves the same behavior.
 //!
 //! Persistent affordances (§13.1/D-05): the header always shows the base

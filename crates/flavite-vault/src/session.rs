@@ -1907,7 +1907,7 @@ impl Session {
     /// The turn body runs inside an unwinding-catch boundary: a panic in a
     /// command
     /// transition is contained at this boundary, logged, counted in
-    /// [`Session::panics_total`], and surfaced as
+    /// `Session::panics_total`, and surfaced as
     /// [`SessionEvent::Panicked`]; the caller receives an honest
     /// [`SessionResult::Error`] naming the panic instead of an unwinding
     /// host. The Session stays operable (locks recover per `sync.rs`;
@@ -3044,7 +3044,7 @@ impl Session {
     /// a waiting observer must not hold the turn that the producer needs to
     /// deliver its result. The one path that already holds the turn — the
     /// W12 `restore_recovery` implicit open inside `execute` — uses the
-    /// dedicated [`Session::wait_for_operation_holding_turn`] entry, which
+    /// dedicated `Session::wait_for_operation_holding_turn` entry, which
     /// must not re-acquire it (self-deadlock).
     pub fn wait_for_operation(&self, request_id: u64) -> SessionResult {
         self.wait_loop(request_id)

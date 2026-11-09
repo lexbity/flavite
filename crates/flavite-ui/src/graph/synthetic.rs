@@ -113,9 +113,9 @@ pub struct SyntheticGraph {
     /// The CPU-authoritative snapshot the renderer consumes (D15).
     pub snapshot: GraphSnapshot,
     /// World position per dense node index — exactly what
-    /// the renderer's `ProbeGeometry::from_snapshot` constructor accepts.
+    /// the renderer's [`RenderGeometry::from_snapshot`] constructor accepts.
     ///
-    /// [`ProbeGeometry`]: crate::graph::instance::ProbeGeometry
+    /// [`RenderGeometry::from_snapshot`]: crate::graph::geometry::RenderGeometry::from_snapshot
     pub positions: Vec<[f32; 2]>,
     /// Edges actually generated (≤ [`Self::options`]'s target).
     pub edges_generated: usize,

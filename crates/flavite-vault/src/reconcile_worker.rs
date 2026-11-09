@@ -9,12 +9,12 @@
 //! Three phases, in exactly the pre-S7 order:
 //!
 //! * (a) **enumeration** — serial, unchanged (`walk_paths` / nominated set);
-//! * (b) **observation** — pure [`observe_path`] per file (read + metadata +
+//! * (b) **observation** — pure `observe_path` per file (read + metadata +
 //!   note parse); independent per path, so segments of
 //!   [`SEGMENT_PATHS`] run on a dedicated bounded [`rayon`] pool
 //!   (≤ [`MAX_SCAN_THREADS`] threads) created **once per worker-thread
 //!   lifetime** by [`scan_pool`];
-//! * (c) **emission** — one [`Emitter`] consumes observations in input order
+//! * (c) **emission** — one `Emitter` consumes observations in input order
 //!   and owns every externally visible effect: the 128-outcome batch
 //!   cadence, the 128-index progress cadence, `incomplete` semantics, and
 //!   the channel-error early-exit behavior, all **identical** to the serial
@@ -61,7 +61,7 @@ pub(crate) struct ReconcileJob {
     pub reply: Option<crossbeam::channel::Sender<crate::actor::VaultActorResp>>,
 }
 
-/// The complete public input of one scan (the parts of a [`ReconcileJob`]
+/// The complete public input of one scan (the parts of a `ReconcileJob`
 /// the filesystem phase consumes; `mode`/`watermark`/`reply` belong to the
 /// actor's application side, never to observation or emission).
 #[derive(Debug, Clone)]
@@ -166,7 +166,7 @@ pub fn serial_scan_forced() -> bool {
 
 /// Run one reconcile scan. `pool = Some` observes segments of
 /// [`SEGMENT_PATHS`] paths in parallel; `pool = None` is the serial path.
-/// Both feed the identical [`Emitter`], so the `WorkerMessage` stream and
+/// Both feed the identical `Emitter`, so the `WorkerMessage` stream and
 /// the returned [`ScanResult`] are identical for the same filesystem state
 /// (FR-9; `tests/scan_equivalence.rs` is the gate).
 #[must_use]

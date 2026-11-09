@@ -298,13 +298,13 @@ pub enum DecodePolicy {
 /// Which independent budget a [`CodecError::LimitExceeded`] hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CodecLimitKind {
-    /// Encoded source bytes offered to [`decode`](crate::decode).
+    /// Encoded source bytes offered to [`decode()`](fn@crate::decode).
     RawBytes,
     /// Decoded UTF-8 content bytes.
     DecodedUtf8Bytes,
     /// Decode-map checkpoint overhead.
     MapBytes,
-    /// UTF-8 text offered to [`encode`](crate::encode).
+    /// UTF-8 text offered to [`encode()`](fn@crate::encode).
     InputUtf8Bytes,
     /// Serialized output bytes.
     OutputBytes,

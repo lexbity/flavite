@@ -12,7 +12,11 @@ allow = [
     # and `error-code`); that platform backend is required by the editor.
     "BSL-1.0",
     "ISC",
-    "Unicode-DFS-2016",
+    # Recorded decision (§10.4): "Apache-2.0 WITH LLVM-exception" is the
+    # license of `winx`, a Windows-only transitive dep (cap-std →
+    # cap-primitives → winx). The LLVM exception is a permissive addition
+    # to Apache-2.0, not copyleft. Not compiled into the Linux build.
+    "Apache-2.0 WITH LLVM-exception",
     # Recorded decision (§10.4, §10.9 waiver): Unicode-3.0 is the Unicode
     # License v3, the successor of the already-allowed Unicode-DFS-2016
     # (OSI-approved, permissive, not copyleft). Required by `unicode-ident`
@@ -55,6 +59,11 @@ ignore = [
     # is an internal value type and this app never catches panics around that
     # cache. cryoglyph's semver range prevents a direct patched-version update.
     { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 is transitive through iced/cryoglyph; its concrete glyph-cache key does not have a panicking destructor and the app does not catch rendering panics; upstream semver update review by 2027-04-30." },
+    # Review by 2027-04-30. pin-utils 0.1.1 enters only through wasmtimer,
+    # which is compiled solely for wasm32 targets — never into the shipped
+    # Linux build. The advisory's suggested replacement (core::pin::pin!)
+    # is upstream's to make in wasmtimer; re-evaluate on a wasmtimer update.
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils 0.1.1 is reachable only via wasmtimer on wasm32 targets; not part of the shipped Linux build; review on wasmtimer update by 2027-04-30." },
 ]
 
 [bans]

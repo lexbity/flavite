@@ -5,7 +5,7 @@
 //! future note-target flow all consume this one in-memory matcher over the
 //! bounded catalog snapshot. Command-palette matching stays in
 //! [`crate::palette`] (commands have a different haystack), but both share
-//! the same nucleo matcher configuration through [`shared_matcher`].
+//! the same nucleo matcher configuration through `shared_matcher`.
 //!
 //! §4.7: matching is in-memory nucleo over at most
 //! `MAX_NOTE_CATALOG_LIMIT` titles; no query ever reaches the index.

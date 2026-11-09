@@ -15,8 +15,12 @@
 # Re-enable by adding the OS to the matrix below.
 #
 # Jobs (all required; enumerated in the main ruleset in Phase 8):
-#   gate              G0 — `just gate` (fmt + clippy + test + fault-tests +
-#                     lint-arch + arch-check + workspace-contracts + gc)
+#   gate-fmt-clippy   G0 part 1 — `just fmt` + `just clippy`
+#   gate-test         G0 part 2 — `just test` + `just fault-tests`
+#   gate-arch         G0 part 3 — `just lint-arch` + `just arch-check` +
+#                     `just workspace-contracts` + `just gc`
+#                     (G0 split into 3 parallel jobs 2026-11-09 so wall time
+#                     is max() not sum(); local `just gate` still runs all G0)
 #   linux-extras      G1 — `just ci-gate` verbatim, so CI == local (D-9)
 #   probe-s3-watcher  S3 watcher probe, scenarios 1-3, --self-check (FR-4)
 #   probe-s3-fs       S3 fs-semantics probe, all scenarios, --self-check
@@ -59,19 +63,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  gate:
-    name: gate (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    # 60, not 30: a cold-cache run (compiling the cargo sub-tools inside
-    # `just setup`) was measured at 28.1 min (run 42556101573), so 30 min
-    # left no margin and the job hit the cap. Same budget as linux-extras.
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        # macOS/Windows removed until official support lands — see header
-        # comment. Runner pinned to Ubuntu 26.04 (not ubuntu-latest).
-        os: [ubuntu-26.04]
+  # G0 is split into three parallel jobs (2026-11-09) so a cold run costs
+  # max() instead of sum(). Each job runs its checks as the FIRST substantive
+  # step after setup — nothing may precede them (audit C2: a gate step must
+  # never be skipped because earlier steps failed). Runner pinned to Ubuntu
+  # 26.04 (not ubuntu-latest); macOS/Windows stay out until official support
+  # lands — see header comment.
+  gate-fmt-clippy:
+    name: gate-fmt-clippy (ubuntu-26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -83,27 +84,86 @@ jobs:
 
       # PR runs are lookup-only (see below), so a fork PR cannot write the
       # shared cache. zizmor cannot prove that statically, hence the ignore.
+      # zizmor: ignore[cache-poisoning]
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
         with:
           # v2 restores the latest prefix-matching cache automatically;
           # `restore-keys` is not a valid input on this version (run
           # 42548285621 annotation).
-          key: ${{ matrix.os }}-rust-${{ hashFiles('Cargo.lock') }}
+          key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
           # PR runs may only read the cache, never write it (cache-poisoning).
           lookup-only: ${{ github.event_name == 'pull_request' }}
 
-      # Installs rust components, nightly, cargo sub-tools, and rg (the
+      # Installs rust components, nightly, cargo sub-tools (prebuilt via the
+      # pinned cargo-binstall — see xtask/src/setup.rs), and rg (the
       # source-gate scripts require it; runners don't ship it — audit H4).
       - name: Setup (tools + nightly + rg)
         run: just setup
 
-      # G0: fmt + clippy + test + fault-tests + lint-arch + arch-check +
-      # workspace-contracts + gc. First and only build step of this job.
-      # NOTE: no GPU adapter is required — FLAVITE_REQUIRE_WGPU_ADAPTER is
-      # deliberately unset, so the shader link half skips honestly here;
-      # the lavapipe-backed run lives in visual.yml.
-      - name: Gate (G0)
-        run: just gate
+      - name: fmt + clippy
+        run: |
+          just fmt
+          just clippy
+
+  gate-test:
+    name: gate-test (ubuntu-26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+        with:
+          just-version: 1.59.0
+
+      # zizmor: ignore[cache-poisoning] — PR runs are lookup-only below.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+        with:
+          key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
+          lookup-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: Setup (tools + nightly + rg)
+        run: just setup
+
+      - name: test + fault-tests
+        run: |
+          just test
+          just fault-tests
+
+  gate-arch:
+    name: gate-arch (ubuntu-26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+        with:
+          just-version: 1.59.0
+
+      # zizmor: ignore[cache-poisoning] — PR runs are lookup-only below.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+        with:
+          key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
+          lookup-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: Setup (tools + nightly + rg)
+        run: just setup
+
+      # NOTE: no GPU adapter is required on any gate leg —
+      # FLAVITE_REQUIRE_WGPU_ADAPTER is deliberately unset, so the shader
+      # link half skips honestly here; the lavapipe-backed run lives in
+      # visual.yml.
+      - name: lint-arch + arch-check + workspace-contracts + gc
+        run: |
+          just lint-arch
+          just arch-check
+          just workspace-contracts
+          just gc
 
   # G1 — the full CI gate, run verbatim from the same recipe a dev runs
   # locally (`just ci-gate`), so CI and local can never diverge (plan D-9).
@@ -112,7 +172,7 @@ jobs:
     name: linux-extras (ubuntu-26.04)
     runs-on: ubuntu-26.04
     timeout-minutes: 60
-    needs: gate
+    needs: [gate-fmt-clippy, gate-test, gate-arch]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

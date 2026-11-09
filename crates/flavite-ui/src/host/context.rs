@@ -1,7 +1,7 @@
 //! Host-side context correlation (RFC-0003 §20, W04).
 //!
 //! Each context tool tracks its binding, its effective source (recomputed
-//! through the pure [`ContextRouter`]), and a query state machine
+//! through the pure [`ContextRouter`](flavite_workspace::ContextRouter)), and a query state machine
 //! correlated by (TabId, incarnation, binding sequence). A late or
 //! superseded query result can never repaint a replacement view, and Busy,
 //! no-backlinks, missing-note, and failure are distinct honest states.

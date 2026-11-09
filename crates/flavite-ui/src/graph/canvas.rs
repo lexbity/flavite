@@ -4,7 +4,7 @@
 //! still *draws*: nodes and edges are rasterized through `iced`'s canvas
 //! geometry pipeline from the exact same [`RenderGeometry`] — same dense
 //! identity table, same hit-test function, same published
-//! [`GraphMessage`](super::renderer::GraphMessage) set — so both backends
+//! [`GraphMessage`] set — so both backends
 //! accept the same input and no platform's evidence can be claimed by the
 //! other. A failed renderer must leave the network operable; it is never
 //! allowed to disable note editing (§12.2).

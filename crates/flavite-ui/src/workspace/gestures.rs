@@ -3,7 +3,7 @@
 //! A press on a tab starts a candidate. Movement past the 4-logical-pixel
 //! threshold turns it into a drag; the hovered tab (reported by the tab's
 //! own move events) becomes the insertion target. Release dispatches one
-//! [`LayoutAction::MoveTab`]; Escape cancels without mutation.
+//! [`LayoutAction::MoveTab`](flavite_workspace::LayoutAction::MoveTab); Escape cancels without mutation.
 
 use flavite_workspace::{GroupId, TabId};
 use iced::{Point, Size};

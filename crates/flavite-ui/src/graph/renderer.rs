@@ -796,7 +796,7 @@ impl ShaderPrimitive for GraphPrimitive {
 /// starts node drag or pan and cancels click recognition).
 pub const DRAG_THRESHOLD_LOGICAL: f32 = 4.0;
 
-/// The production graph program: renders [`RenderGeometry`](super::geometry::RenderGeometry)
+/// The production graph program: renders [`RenderGeometry`]
 /// through the view camera and turns real pointer events into typed
 /// [`GraphMessage`]s with identity-safe hits.
 #[derive(Debug, Clone)]
