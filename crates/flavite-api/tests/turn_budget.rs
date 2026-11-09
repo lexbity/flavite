@@ -30,7 +30,10 @@ fn serial() -> MutexGuard<'static, ()> {
 /// burst + drain (every submit is its own host turn through
 /// `Flavite::execute`'s measurement) — the slowest individual turn must
 /// sit under the 2 ms budget, so the guard emitted nothing.
+// Perf-budget test (slowest turn <= 2 ms): tight wall-clock budgets flake on
+// shared runners — runs in release under `just bench-scale`.
 #[test]
+#[ignore = "perf budget; runs under just bench-scale (release, --ignored)"]
 fn fifty_ticket_burst_stays_under_the_budget() {
     let _guard = serial();
     reset_for_test();
