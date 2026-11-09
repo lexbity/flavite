@@ -288,7 +288,8 @@ fuzz-smoke-ci:
     done
     exit $failed
 
-# Developer onboarding (§10.8): install tools + nightly + pre-push hook. Idempotent.
+# Developer onboarding (§10.8): install tools + nightly. Idempotent.
+# No git hooks are installed — gating lives in CI, not pre-push.
 setup:
     cargo xtask setup
 

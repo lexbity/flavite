@@ -50,10 +50,11 @@ This runs `cargo xtask setup`, which is idempotent and installs:
 1. The pinned Rust components (`rustfmt`, `clippy`, `llvm-tools-preview`).
 2. The **nightly** toolchain (minimal profile) — used by `cargo-fuzz`.
 3. Cargo tools, if missing: `cargo-fuzz`, `cargo-deny`, `cargo-audit`,
-   `cargo-llvm-cov`, and `cargo-shear` (nightly).
-4. A **pre-push git hook** that runs `just gate` + `just fuzz-smoke` before
-   every push. Bypass a single push with `git push --no-verify` — CI still
-   enforces the full gate.
+   `cargo-llvm-cov`, and `cargo-shear` (nightly) — prebuilt via a pinned
+   `cargo-binstall` where available.
+
+No git hooks are installed: gating lives in CI (`just gate` / `just ci-gate`),
+not in a local pre-push hook.
 
 Individual steps tolerate failure with a warning and continue; setup ends by
 suggesting `just gate` to verify the workspace.

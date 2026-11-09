@@ -112,7 +112,7 @@ journal/safety contracts. Resetting a layout never touches notes.
 ## Development
 
 - `just setup` — first command after clone: installs components, nightly,
-  cargo tools, and the pre-push hook.
+  and cargo tools. No git hooks are installed; gating lives in CI.
 - `just gate` — fmt + clippy + tests + arch check (≤ 5 min budget).
 - `just ci-gate` — the full CI-level gate (coverage, docs, deny/audit,
   fuzz smoke, network-denied, MSRV).

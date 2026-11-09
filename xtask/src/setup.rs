@@ -1,29 +1,15 @@
 //! Developer onboarding (§10.8): `just setup` — the first command after clone.
 //!
-//! Installs Rust components, the nightly toolchain, cargo sub-tools, and the
-//! pre-push hook. Idempotent: re-running is a no-op success.
+//! Installs Rust components, the nightly toolchain, and cargo sub-tools.
+//! Idempotent: re-running is a no-op success.
+//!
+//! No git hooks are installed: gating lives in CI (`just gate` / `just
+//! ci-gate`), not in a local pre-push hook (product decision 2026-11-09).
 
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-
-/// The pre-push hook script content (§10.3: G0 + fuzz smoke, bypassable via
-/// `--no-verify`; main is gated by the CI ruleset once it lands — see
-/// devdocs/plans/ci-gate-backend-headless-2026-11-08.md Phase 8).
-const PRE_PUSH_HOOK: &str = r#"#!/usr/bin/env bash
-# flavite pre-push hook (§10.3): runs G0 (just gate) + fuzz smoke.
-# Bypass with `git push --no-verify`; main additionally requires green CI via PR.
-set -euo pipefail
-
-echo "=== pre-push: just gate (G0) ==="
-just gate
-
-echo "=== pre-push: just fuzz-smoke ==="
-just fuzz-smoke
-
-echo "=== pre-push: all checks passed ==="
-"#;
 
 /// Run a command, returning Ok if it succeeds or if the tool is already present.
 fn run_or_skip(cmd: &mut Command, description: &str) -> Result<()> {
@@ -111,28 +97,6 @@ fn install_ripgrep() -> Result<()> {
         anyhow::bail!("ripgrep install reported success but `rg --version` still fails");
     }
     println!("  ✓ rg installed and verified");
-    Ok(())
-}
-
-/// Install the pre-push hook into .git/hooks/.
-fn install_hook(workspace_root: &Path) -> Result<()> {
-    let git_dir = workspace_root.join(".git");
-    if !git_dir.exists() {
-        println!("  ⚠ .git not found — skipping hook installation (run `git init` first)");
-        return Ok(());
-    }
-    let hooks_dir = git_dir.join("hooks");
-    fs::create_dir_all(&hooks_dir).context("failed to create hooks directory")?;
-    let hook_path = hooks_dir.join("pre-push");
-    fs::write(&hook_path, PRE_PUSH_HOOK).context("failed to write pre-push hook")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&hook_path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&hook_path, perms)?;
-    }
-    println!("  ✓ pre-push hook installed at {}", hook_path.display());
     Ok(())
 }
 
@@ -267,7 +231,7 @@ pub fn setup() -> Result<()> {
     println!();
 
     // 1. Rust components.
-    println!("[1/4] Rust components (rustfmt, clippy, llvm-tools-preview)");
+    println!("[1/3] Rust components (rustfmt, clippy, llvm-tools-preview)");
     run_or_skip(
         Command::new("rustup").args([
             "component",
@@ -280,7 +244,7 @@ pub fn setup() -> Result<()> {
     )?;
 
     // 2. Nightly toolchain (for cargo-fuzz, §10.6).
-    println!("[2/4] Nightly toolchain (for cargo-fuzz)");
+    println!("[2/3] Nightly toolchain (for cargo-fuzz)");
     run_or_skip(
         Command::new("rustup").args(["toolchain", "install", "nightly", "--profile", "minimal"]),
         "rustup toolchain install nightly",
@@ -289,7 +253,7 @@ pub fn setup() -> Result<()> {
     // 3. Cargo sub-tools — pinned versions, PREBUILT via cargo-binstall when
     // available (seconds even on a cold runner); `cargo install --locked`
     // (source compile, minutes) is only the fallback.
-    println!("[3/4] Cargo sub-tools (pinned; prebuilt via cargo-binstall)");
+    println!("[3/3] Cargo sub-tools (pinned; prebuilt via cargo-binstall)");
     install_binstall()?;
     let tools: [(&str, &str); 5] = [
         ("cargo-fuzz", "0.13.2"),
@@ -340,11 +304,6 @@ pub fn setup() -> Result<()> {
     // cannot be installed — a missing `rg` must never silently skip a gate.
     install_ripgrep()?;
 
-    // 4. Pre-push hook.
-    println!("[4/4] Pre-push hook");
-    let root = crate::clean::find_workspace_root()?;
-    install_hook(&root)?;
-
     println!();
     println!("Setup complete. Run `just gate` to verify the workspace.");
     Ok(())
@@ -369,19 +328,6 @@ mod tests {
                     .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
             );
         }
-    }
-
-    #[test]
-    fn hook_script_contains_gate_and_fuzz() {
-        assert!(PRE_PUSH_HOOK.contains("just gate"));
-        assert!(PRE_PUSH_HOOK.contains("just fuzz-smoke"));
-        assert!(PRE_PUSH_HOOK.contains("--no-verify"));
-    }
-
-    #[test]
-    fn hook_script_is_valid_bash() {
-        assert!(PRE_PUSH_HOOK.starts_with("#!/usr/bin/env bash"));
-        assert!(PRE_PUSH_HOOK.contains("set -euo pipefail"));
     }
 
     #[test]

@@ -86,7 +86,7 @@ PLAN-A **slices A4, A5, and A6** — Phase 0.0 infrastructure (gates, RAG, clean
 - ✅ Installs rustfmt, clippy, llvm-tools-preview
 - ✅ Installs nightly toolchain
 - ✅ Installs cargo-fuzz, cargo-deny, cargo-audit, cargo-llvm-cov, cargo-shear
-- ✅ Installs pre-push hook
+- ~~Installs pre-push hook~~ — removed 2026-11-09 (product decision): no git hooks; gating lives in CI
 - ✅ Idempotent: re-running is no-op
 
 #### 5. Gates (justfile)
