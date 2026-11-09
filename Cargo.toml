@@ -53,7 +53,7 @@ walkdir = "2"
 directories = "5"
 # Serialization
 hex = "0.4"
-toml = "0.8"
+toml = "1.2"
 # Fuzzy matching (§4.7: command palette + quick switcher are in-memory nucleo)
 nucleo = "0.5"
 # Theme packages (.xpi): zip reading/writing with deflate only — the codecs

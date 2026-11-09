@@ -36,7 +36,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 walkdir = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = "0.8"
+toml = { workspace = true }
 # iced for the S1 probe widget (slice A5). The `advanced` feature gates
 # `iced::advanced`, where the custom `Widget` trait lives. Default features
 # (wgpu + tiny-skia + x11 + wayland) match what flavite-editor/flavite-ui

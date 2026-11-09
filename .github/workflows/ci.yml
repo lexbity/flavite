@@ -62,7 +62,10 @@ jobs:
   gate:
     name: gate (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # 60, not 30: a cold-cache run (compiling the cargo sub-tools inside
+    # `just setup`) was measured at 28.1 min (run 42556101573), so 30 min
+    # left no margin and the job hit the cap. Same budget as linux-extras.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
