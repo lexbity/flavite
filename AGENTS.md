@@ -1,4 +1,4 @@
-scratch-devdocs/ stays gitignored
+devdocs/ stays gitignored
 
 no compat
 no aliases (particuraly for "shortcuts")

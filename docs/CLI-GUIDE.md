@@ -1,4 +1,4 @@
-# flavite-cli — reference and guide
+# flavite-cli - draft
 
 `flavite-cli` is the headless companion to the desktop app: vault access
 without a GPU or display. This is the complete command reference, verified
@@ -285,7 +285,57 @@ flavite-cli info --path ~/notes
 flavite-cli rename old/place.md new/place.md --strategy rewrite --vault ~/notes
 ```
 
-## See also
+## Flavite Environment Variables:
 
-- [QueryLanguage.md](QueryLanguage.md) — the query expression grammar.
-- [SETUP.md](SETUP.md) — install, first run, environment variables.
+| Variable | Read by | Effect |
+|---|---|---|
+| `FLAVITE_VAULT` | `flavite-app` (`clap` env + `host/env.rs`) | Default vault folder for the desktop app. Overridden by `--vault PATH`. Unset → start screen. The CLI does **not** read it. |
+| `FLAVITE_GRAPH_BACKEND` | `flavite-ui/src/host/graph.rs` | `gpu` (default) or `canvas`. Selects the graph renderer. |
+| `FLAVITE_DATA_DIR` | none (tests/scripts only) | Documented as "replace the OS data dir". Not honored by production code in this checkout. |
+| `FLAVITE_HARNESS_OUT_FD` | `flavite-ui/src/harness.rs` | fd number for harness JSONL output (test harnesses only; compiled out of production). |
+| `FLAVITE_HARNESS_AUTOSAVE_IDLE_SECS` | `flavite-ui/src/app.rs` | Overrides autosave idle interval (harness). |
+| `FLAVITE_HARNESS_INJECT_HIDE_TAB` | `flavite-ui/src/harness.rs` | Harness UI fault injection. |
+| `FLAVITE_SERIAL_SCAN` / `FLAVITE_SCAN_TIMING` | `flavite-vault` | Test/bench hooks: force serial scan; log scan timing. |
+| `FLAVITE_RENAME_KILL_ROOT`, `FLAVITE_W12_CRASH_ROOT`, `FLAVITE_TANTIVY_KILL_CHILD_ROOT`, `FLAVITE_RECOVERY_KILL_CHILD_ROOT`, `FLAVITE_TANTIVY_READY`, `FLAVITE_RECOVERY_READY_MARKER`, `FLAVITE_DEMO_THEMES`, `FLAVITE_DEBUG_RENAME` | crash-simulation tests | Destructive kill/ready hooks. Do not set outside test scenarios. |
+| `FLAVITE_REQUIRE_WGPU_ADAPTER` | `flavite-ui/tests/shader_validation.rs` | CI: make skipped GPU tests fail. |
+| `LLVM_PROFILE_FILE` | `flavite-graph/src/model.rs` | Coverage runs only. |
+
+## CLI Flag reference:
+
+Global flags (before or after the subcommand):
+
+| Flag | Short | Type | Default | Meaning |
+|---|---|---|---|---|
+| `--vault PATH` | `-v` | path | CWD | Vault root. Resolution order: command `--path` → `--vault` → current directory. Not `FLAVITE_VAULT`. |
+| `--verbose` | `-x` | flag | off | DEBUG logging instead of INFO. |
+| `--no-watch` | — | flag | off | Disable the filesystem watcher for this invocation. |
+| `--json` | — | flag | off | Machine-readable JSON output; events as JSONL on stderr. |
+
+Commands (all exit 0 on success, 1 on error; `doctor` is graded — see below):
+
+| Command | Signature | Notes |
+|---|---|---|
+| `init` | `[--path PATH]` | Creates the directory if missing, writes `<vault>/.flavite/vault.toml` (format: `[vault]\nuuid = "<uuid>"`) + device-local registry entry. |
+| `open` | `[--path PATH]` | Open + full reconcile in `verify` mode. Fails if reconcile fails. |
+| `doctor` | `[--path PATH] [--json]` | Read-only health checks (below). Exit nonzero **only on ERROR-level findings**; warnings exit 0. Refuses while the vault is open. |
+| `query` | `QUERY [--path PATH] [--limit N]` | Structural query (no text predicates — those fail explicitly). Default limit **50**. Human output `path<TAB>title`; `--json` = bare array of `{note_id, path, title, excerpt}`. |
+| `search` | `TERM [--path PATH] [--mode text\|expression\|literal\|regex] [--field title\|aliases\|tags\|body\|all] [--limit N] [--all] [--json]` | Saved-content search. Default mode `text` (whitespace = AND, punctuation is text). `--mode expression` parses `AND`/`OR`/`NOT`, quotes, parentheses (no implicit AND). Page size 1–200, default **50**. `--all` consumes every continuation token. `literal`/`regex` = vault source matching (regex via the worker binary; typed refusal "regex is unavailable" / "invalid regular expression" otherwise). |
+| `rename` | `FROM TO [--strategy rewrite\|alias\|none]` | Vault-relative paths. Default `rewrite`. No per-command `--path`; use global `--vault`. |
+| `theme convert` | `INPUT [-o OUTPUT]` | Offline `.xpi` → `.flavite.xpi` (default output `<input>.flavite.xpi`). No vault needed. |
+| `theme install/list/select/uninstall` | `theme install PATH` / `theme list` / `theme select ID\|none` / `theme uninstall ID` | Need an opened vault. `select none` = built-in palettes. |
+| `replace` | subcommands below | Durable replacement jobs. All need an opened vault. `--key` is a caller-generated 128-bit hex idempotency key (32 hex chars). |
+| `replace preview` | `QUERY REPLACEMENT [--mode literal\|regex] [--case-sensitive] [--whole-word] [--include-drafts]` | Seals a read-only preview; prints the preview id. The preview ledger is **session memory**: for the CLI (one command per process) the usable path is `apply --query --replacement` inline. |
+| `replace select` | `--preview-id HEX [--select all\|none\|keys=a,b,c]` | Records a frozen selection revision. |
+| `replace apply` | `--key HEX (--preview-id HEX --selection-revision N \| --query QUERY --replacement TEXT [--mode …])` | Applies a sealed preview. Inline `--query`/`--replacement` seals+selects-all in one process. Returns job id + phase/totals. |
+| `replace status` | `--job-id HEX` | Reports phase + totals (saved, conflicts, stale, needs-recovery). |
+| `replace cancel` | `--job-id HEX` | Stops admission of the next item. |
+| `replace resume` | `--job-id HEX --key HEX` | Resumes an untouched/paused job. |
+| `replace revert` | `--job-id HEX --key HEX` | Guarded revert epoch: restores sealed before-payloads of applied items. |
+| `encoding reopen` | `NOTE [--encoding auto\|ascii\|utf8\|utf16le\|utf16be] [--bom auto\|present\|absent]` | Reopen under an explicit encoding; reports resulting format. Never discards unsaved text. |
+| `encoding convert` | `NOTE --encoding FAMILY [--bom absent\|present\|auto]` | Converts save format, then saves durably through the core command. `--bom` defaults to `absent`. |
+| `info` | `[--path PATH] [--json]` | Vault overview: `vault`, `api_version`, `note_count`, `epoch`, `generation`, `tantivy_generation`, `watcher`, `drift_found_total`, `autosave.failures_total`, `rename.items_skipped_total`. |
+| `api-test` | no args | Internal self-test; not part of normal workflows. |
+
+Events: commands emit events on **stderr** — JSONL with `--json`, `event {type}: …` otherwise. Notices must be acknowledged (`acknowledge_notice`) after display.
+
+Logs: rotating `flavite.log` (5 MiB → `flavite.log.1`) under the OS data dir's `flavite/logs` (falls back to `$TMPDIR/flavite.log`). Panics write `crash-report.txt` with the last 200 log lines.

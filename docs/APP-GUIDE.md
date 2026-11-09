@@ -1,11 +1,190 @@
-# Flavite app — features and guide
+# Flavite Guide - Draft
 
-The desktop application (binary `flavite`, crate `flavite-app`): a movable,
-split-pane workspace for a vault of Markdown notes. This guide covers what
-each feature does and how to drive it. Setup: [SETUP.md](SETUP.md). Headless
-equivalents: [CLI-FEATURES.md](CLI-FEATURES.md).
+Flavite is a local-first desktop app for Zettelkasten-style note-taking. You write plain Markdown files in a folder (the "vault"), and Flavite gives you:
 
-Key notation: **Mod** = Ctrl on Linux/Windows, Cmd on macOS.
+- a movable tab workspace to view/edit notes side by side,
+- a knowledge graph of the links between notes,
+- full-text search and structural queries,
+- safe editing: revision guards, conflict handling, recovery, atomic saves.
+
+Your notes are just files. Flavite never converts them to a proprietary format, never phones home, and never touches a network or account. Everything Flavite remembers about your vault (layout, settings, graph pins, themes) lives *inside* the vault folder under `.flavite/`.
+
+There are two ways to use it:
+
+| Binary | What it is |
+|---|---|
+| `flavite` | Desktop app. Needs a display server (Wayland/X11). GPU optional. |
+| `flavite-cli` | Headless command line: init, doctor, query, search, rename, theme, replace, encoding, info. No display, no GPU. |
+
+**When NOT to use it:** it's pre-release, so expect rough edges (see "Known rough edges"). It is not a cloud-sync tool, not a multi-user system, and not a file browser. If you want online collaboration or a ready-made hosted service, this isn't it.
+
+---
+
+## Prerequisites
+
+- **Rust toolchain** — pinned to `1.98.1` by `rust-toolchain.toml`; rustup installs it automatically on first build. MSRV is 1.90.0.
+- **`just`** — command runner for dev recipes (`apt install just` or `cargo install just`).
+- **Display + optionally GPU** — only for the desktop app. The CLI needs neither.
+- **Linux** — currently supported fully. macOS/Windows support is deferred (CI runs Linux only).
+
+---
+
+## Install and setup
+
+```sh
+git clone https://github.com/lexbity/flavite
+cd flavite
+
+cargo build -p flavite-app -p flavite-cli -p flavite-text-search-worker
+```
+
+This produces three binaries in `target/debug/`: `flavite`, `flavite-cli`, and `flavite-text-search-worker`. Keep the worker in the **same directory** as the other binaries — the app and CLI look for it as a sibling and never search `PATH` (it powers regex find/replace; literal matching works without it).
+
+If you're going to develop Flavite itself, run `just setup` once (installs components, nightly for fuzzing, cargo tools; no git hooks — gating lives in CI). Not needed just to use it.
+
+> Note: building the desktop app needs the usual Rust GUI system libraries (X11/Wayland dev packages, Vulkan or llvmpipe). On Debian/Ubuntu: `sudo apt install build-essential pkg-config libxkbcommon-dev libssl-dev` and for the graph view `mesa-vulkan-drivers` (or use the canvas backend, below).
+
+---
+
+## Quickstart (under 5 minutes)
+
+The CLI is the fastest way to see the system work. Everything here produces visible output.
+
+### 1. Create a vault
+
+```sh
+mkdir -p ~/notes
+flavite-cli init --path ~/notes
+```
+
+Expected output: nothing on stdout (exit 0). It creates `~/notes/.flavite/vault.toml` (the vault's identity) and registers it on this device.
+
+### 2. Drop in some notes
+
+```sh
+cd ~/notes
+mkdir -p notes
+cat > notes/zet.md <<'EOF'
+# Zettelkasten
+
+Some thoughts about #second-brain and [[notes/foo]].
+EOF
+cat > notes/foo.md <<'EOF'
+# Foo
+
+A note with a [[notes/zet]] link.
+EOF
+```
+
+### 3. Open the vault (builds the index)
+
+```sh
+flavite-cli open --path ~/notes
+```
+
+This runs a full reconcile in verify mode. Exit 0 means it completed.
+
+### 4. Check its health
+
+```sh
+flavite-cli doctor --path ~/notes
+```
+
+You'll see a report with `✓`/`⚠` lines. **Warnings are fine** (e.g. "search index has not been built yet" before first search). Exit code is 0 unless there are ERROR-level findings.
+
+### 5. Query and search
+
+```sh
+flavite-cli query "tag:second-brain" --path ~/notes
+flavite-cli search "zettelkasten" --path ~/notes
+```
+
+Expected:
+
+```
+notes/zet.md	Zettelkasten
+```
+
+(one line per result: `path<TAB>title`).
+
+---
+
+## Common tasks
+
+### Find notes with the structural query
+
+```sh
+flavite-cli query "tag:rust AND NOT unresolved" --path ~/notes
+flavite-cli query "tag:project" --limit 100 --path ~/notes
+```
+
+`query` is structural only: `tag:…`, `unresolved`, and `AND`/`OR`/`NOT` with parentheses. Text terms here are rejected explicitly — use `search` for text.
+
+### Search note text
+
+```sh
+flavite-cli search "rocket science" --path ~/notes        # whitespace = AND
+flavite-cli search "title:rocket AND moon" --mode expression --path ~/notes
+flavite-cli search "second brain" --field body --path ~/notes
+flavite-cli search "TODO" --mode regex --path ~/notes     # needs the worker binary
+```
+
+Add `--json` for machine-readable output (pages report `total` and a `next` token; use `--all` to consume every page).
+
+### Rename a note and rewrite its links
+
+```sh
+flavite-cli rename notes/foo.md notes/bar.md --strategy rewrite --vault ~/notes
+```
+
+`rewrite` (default) updates inbound links in other notes via a journaled transaction; `alias` adds the old stem as an alias and leaves text unchanged; `none` renames only and reports broken links.
+
+### Durable find-and-replace
+
+The `replace` command family makes a *sealed preview*, records a selection, then applies it as a durable job. One-shot version:
+
+```sh
+flavite-cli replace --path ~/notes apply \
+  --key aabbccddaabbccddaabbccddaabbccdd \
+  --query "second-brain" --replacement "second-brain v2" --mode literal
+```
+
+`--key` is your caller-generated 128-bit hex idempotency key (32 hex chars). Output includes the `job_id` and phase/totals, e.g.:
+
+```json
+{"job_id":"...","status":{"phase":"completed","totals":{"saved":1,"selected":1,"...":"..."}}}
+```
+
+> **Note on the multi-step flow:** preview → select → apply is the desktop app's UI flow, where one session stays alive the whole time. The CLI runs one command per process and the preview ledger is session memory — so a preview created in one `flavite-cli` invocation is gone in the next (you'll get `preview-expired`). For the CLI, always use the inline form above. Also, a given plan is applied once: re-running the same query+replacement errors with `file already exists` in `.flavite/operations/replace/` — use `replace revert` or a different query/scope instead.
+
+### Run the desktop app
+
+```sh
+FLAVITE_VAULT=~/notes ./target/debug/flavite
+```
+
+Or run it with no arguments and use the start screen to pick a folder. If the graph view is blank or errors, fall back to the software renderer:
+
+```sh
+FLAVITE_GRAPH_BACKEND=canvas ./target/debug/flavite
+```
+
+The app is a normal window: tabs, split panes, Edit/Read toggle (Mod+E), a search panel, and the graph. See `docs/APP-FEATURES.md` for the full shortcut list.
+
+---
+
+## How it works
+
+Think of a vault as **the source of truth** and everything else as a cache with a paper trail.
+
+- Your notes are the ground truth: plain Markdown files.
+- `<vault>/.flavite/` is the vault's "memory": identity (`vault.toml`), settings (`settings.toml`), layout, graph pins, installed themes, a recovery journal, and durable operation records. It travels with the vault folder.
+- The **index** (SQLite + a full-text engine) lives in the OS cache directory, keyed by the vault's UUID. It is **disposable**: if it's missing, damaged, or from an older schema, it's rebuilt from your notes. That's why `doctor` warns "index cache has not been created" — it just hasn't been built yet.
+- All edits flow through one path: UI/CLI → typed **command** → **session** (which owns buffers, revisions, undo, and saves) → **journal** (a durable transaction record) → disk. Writes are atomic (temp sibling file, then replace). This is why a crash mid-rename doesn't corrupt notes: the journal rolls forward on next open.
+
+The query language is two dialects: `query` is structural (tags, unresolved links, boolean combos) and runs as SQL against the index; `search` is text (full-text or regex over source) and materializes a *frozen snapshot* per search session so paging is stable even as you edit.
+
+
 
 ## Workspace shell
 
@@ -264,27 +443,5 @@ anchor. Double-click selects a word and triple-click selects a source line;
 dragging afterward extends by the selected unit. IME composition is supported
 (Edit/Read toggle is disabled while composing).
 
-## Data locations
 
-See [SETUP.md → Where state lives](SETUP.md#where-state-lives). Summary:
-notes stay in your vault; the workspace layout, preferences, graph pins,
-themes, identity, and recovery journal live in `<vault>/.flavite/`
-(vault-rooted — they travel with the vault). Only the remembered last vault,
-the vault registry / root guards / instance locks, recovery checkpoints and
-operation keys, and encoding hints are device-local under the OS data dir.
 
-## Current limitations
-
-Known gaps, tracked in `devdocs/verification/KNOWN_MANUAL_UX_GAPS.md`:
-
-- Source-editor right-click enters Context Mode. General context menus elsewhere
-  remain deferred.
-- Drag ghost / empty-space drop feedback for split gestures is still open;
-  the underlying split commands work.
-- No vault file browser (folder-tree notes list) yet; the Notes view and
-  quick switcher are the navigation surfaces.
-- No note lifecycle UI (create/rename/delete) beyond New note… and the
-  rename dialog.
-- Editor selection feel, link-click pointer targeting, graph auto-fit
-  behavior, and narrow-window layout still need manual verification on real
-  hardware.

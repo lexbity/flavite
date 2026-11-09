@@ -11,7 +11,7 @@
 # macOS/Windows yet (deferred by product decision, 2026-11-09) — those legs
 # are excluded until support lands. Known blockers when re-enabling:
 # macOS needs `cap_std` in flavite-fs deps; Windows needs the `windows-sys`
-# features used by xtask/src/spike_s3_fs.rs (Win32_Storage_FileSystem etc.).
+# features used by the xtask fs-semantics probe (Win32_Storage_FileSystem etc.).
 # Re-enable by adding the OS to the matrix below.
 #
 # Jobs (all required; enumerated in the main ruleset in Phase 8):
@@ -22,10 +22,10 @@
 #                     (G0 split into 3 parallel jobs 2026-11-09 so wall time
 #                     is max() not sum(); local `just gate` still runs all G0)
 #   linux-extras      G1 — `just ci-gate` verbatim, so CI == local (D-9)
-#   probe-s3-watcher  S3 watcher probe, scenarios 1-3, --self-check (FR-4)
-#   probe-s3-fs       S3 fs-semantics probe, all scenarios, --self-check
-#   probe-s4-search   S4 search probe, 2k notes, --self-check
-#   probe-s4-db       S4 DB probe, 2k notes, --self-check
+#   probe-watcher     watcher probe, scenarios 1-3, --self-check (FR-4)
+#   probe-fs          fs-semantics probe, all scenarios, --self-check
+#   probe-search      search probe, 2k notes, --self-check
+#   probe-db          DB probe, 2k notes, --self-check
 #   negative-tests    seeded arch-edges / arch-layering / coverage violations
 #                     must be detected (FR-6, D-6, AC-28/29)
 #   lint-workflows    zizmor audit + grep gates (Phase 7: SHA pins, no
@@ -41,6 +41,8 @@
 #
 # All actions are pinned to full commit SHAs (audit H5); Dependabot
 # (github-actions ecosystem, .github/dependabot.yml) maintains the pins.
+# Every pinned action targets Node.js 24 natively, so runs emit no
+# "Node.js 20 is deprecated" warnings.
 # `just` is pinned via setup-just's just-version (zizmor unpinned-tools).
 # checkout never persists credentials (zizmor artipacked) and rust-cache is
 # lookup-only on pull_request runs so a fork PR can never write the shared
@@ -74,18 +76,18 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
         with:
           just-version: 1.59.0
 
       # PR runs are lookup-only (see below), so a fork PR cannot write the
       # shared cache. zizmor cannot prove that statically, hence the ignore.
       # zizmor: ignore[cache-poisoning]
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
         with:
           # v2 restores the latest prefix-matching cache automatically;
           # `restore-keys` is not a valid input on this version (run
@@ -110,16 +112,16 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
         with:
           just-version: 1.59.0
 
       # zizmor: ignore[cache-poisoning] — PR runs are lookup-only below.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
           lookup-only: ${{ github.event_name == 'pull_request' }}
@@ -137,16 +139,16 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
         with:
           just-version: 1.59.0
 
       # zizmor: ignore[cache-poisoning] — PR runs are lookup-only below.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
           lookup-only: ${{ github.event_name == 'pull_request' }}
@@ -174,17 +176,17 @@ jobs:
     timeout-minutes: 60
     needs: [gate-fmt-clippy, gate-test, gate-arch]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
         with:
           just-version: 1.59.0
 
       # PR runs are lookup-only (see below), so a fork PR cannot write the
       # shared cache. zizmor cannot prove that statically, hence the ignore.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('fuzz/Cargo.lock') }}
           lookup-only: ${{ github.event_name == 'pull_request' }}
@@ -199,108 +201,108 @@ jobs:
   # scaled-down scenario set with `--self-check` and uploads its JSON report;
   # `if-no-files-found: error` makes a missing report a failure, not a pass.
 
-  probe-s3-watcher:
-    name: probe-s3-watcher (ubuntu-26.04)
+  probe-watcher:
+    name: probe-watcher (ubuntu-26.04)
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
         with:
           just-version: 1.59.0
       # PR runs are lookup-only (see below), so a fork PR cannot write the
       # shared cache. zizmor cannot prove that statically, hence the ignore.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
           lookup-only: ${{ github.event_name == 'pull_request' }}
-      - name: Watcher probe scenarios 1-3 with self-check (S3 C1)
-        run: just spike-s3 --scenarios 1,2,3 --self-check --json target/s3-watcher-report.json
+      - name: Watcher probe scenarios 1-3 with self-check (C1)
+        run: just spike-watcher --scenarios 1,2,3 --self-check --json target/watcher-report.json
       - name: Upload report
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: s3-watcher-report-linux
-          path: target/s3-watcher-report.json
+          name: watcher-report-linux
+          path: target/watcher-report.json
           if-no-files-found: error
 
-  probe-s3-fs:
-    name: probe-s3-fs (ubuntu-26.04)
+  probe-fs:
+    name: probe-fs (ubuntu-26.04)
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
         with:
           just-version: 1.59.0
       # PR runs are lookup-only (see below), so a fork PR cannot write the
       # shared cache. zizmor cannot prove that statically, hence the ignore.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
           lookup-only: ${{ github.event_name == 'pull_request' }}
-      - name: fs-semantics probe, all scenarios, with self-check (S3 C2)
-        run: just spike-s3-fs --scenarios all --self-check --json target/s3-fs-report.json
+      - name: fs-semantics probe, all scenarios, with self-check (C2)
+        run: just spike-fs --scenarios all --self-check --json target/fs-report.json
       - name: Upload report
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: s3-fs-report-linux
-          path: target/s3-fs-report.json
+          name: fs-report-linux
+          path: target/fs-report.json
           if-no-files-found: error
 
-  probe-s4-search:
-    name: probe-s4-search (ubuntu-26.04)
+  probe-search:
+    name: probe-search (ubuntu-26.04)
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
         with:
           just-version: 1.59.0
       # PR runs are lookup-only (see below), so a fork PR cannot write the
       # shared cache. zizmor cannot prove that statically, hence the ignore.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
           lookup-only: ${{ github.event_name == 'pull_request' }}
-      - name: Search probe, 2k notes, with self-check (S4 C3)
-        run: just spike-s4-search --scenarios all --notes 2000 --self-check --json target/s4-search-report.json
+      - name: Search probe, 2k notes, with self-check (C3)
+        run: just spike-search --scenarios all --notes 2000 --self-check --json target/search-report.json
       - name: Upload report
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: s4-search-report-linux
-          path: target/s4-search-report.json
+          name: search-report-linux
+          path: target/search-report.json
           if-no-files-found: error
 
-  probe-s4-db:
-    name: probe-s4-db (ubuntu-26.04)
+  probe-db:
+    name: probe-db (ubuntu-26.04)
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
         with:
           just-version: 1.59.0
       # PR runs are lookup-only (see below), so a fork PR cannot write the
       # shared cache. zizmor cannot prove that statically, hence the ignore.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
           lookup-only: ${{ github.event_name == 'pull_request' }}
-      - name: DB probe, 2k notes, with self-check (S4 C4)
-        run: just spike-s4-db --scenarios all --notes 2000 --dir target/s4-db-probe --self-check --json target/s4-db-report.json
+      - name: DB probe, 2k notes, with self-check (C4)
+        run: just spike-db --scenarios all --notes 2000 --dir target/db-probe --self-check --json target/db-report.json
       - name: Upload report
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: s4-db-report-linux
-          path: target/s4-db-report.json
+          name: db-report-linux
+          path: target/db-report.json
           if-no-files-found: error
 
   # --- Phase 4: negative/meta tests (FR-6, DEBT-9, AC-28/29). Seed a
@@ -313,15 +315,15 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
         with:
           just-version: 1.59.0
       # PR runs are lookup-only (see below), so a fork PR cannot write the
       # shared cache. zizmor cannot prove that statically, hence the ignore.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
           lookup-only: ${{ github.event_name == 'pull_request' }}
@@ -347,7 +349,7 @@ jobs:
           fi
           grep -q "EDGES" arch-check.log || { echo "AC-28 FAIL: no EDGES marker in output"; cat arch-check.log; exit 1; }
           echo "AC-28 PASS: undocumented edge detected"
-          git checkout -- crates devdocs/architecture Cargo.lock
+          git checkout -- crates xtask/arch Cargo.lock
 
       - name: arch-layering-negative (AC-28)
         run: |
@@ -370,7 +372,7 @@ jobs:
           fi
           grep -q "LAYERING" arch-check.log || { echo "AC-28 FAIL: no LAYERING marker in output"; cat arch-check.log; exit 1; }
           echo "AC-28 PASS: layering violation detected"
-          git checkout -- crates devdocs/architecture Cargo.lock
+          git checkout -- crates xtask/arch Cargo.lock
 
       - name: coverage-negative (AC-29)
         run: |
@@ -398,7 +400,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 

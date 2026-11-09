@@ -334,9 +334,9 @@ end_of_record
         // Create a temp workspace with coverage.toml and lcov.
         let tmp = std::env::temp_dir().join(format!("flavite-cov-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(tmp.join("devdocs/architecture")).unwrap();
+        std::fs::create_dir_all(tmp.join("xtask/arch")).unwrap();
         std::fs::write(
-            tmp.join("devdocs/architecture/coverage.toml"),
+            tmp.join("xtask/arch/coverage.toml"),
             r#"
 [floors]
 tier1 = 90.0
@@ -367,9 +367,9 @@ flavite-fs = "tier1"
     fn coverage_above_floor_passes() {
         let tmp = std::env::temp_dir().join(format!("flavite-cov-test2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(tmp.join("devdocs/architecture")).unwrap();
+        std::fs::create_dir_all(tmp.join("xtask/arch")).unwrap();
         std::fs::write(
-            tmp.join("devdocs/architecture/coverage.toml"),
+            tmp.join("xtask/arch/coverage.toml"),
             r#"
 [floors]
 tier1 = 90.0
@@ -399,8 +399,8 @@ flavite-fs = "tier1"
     fn active_waiver_applies_and_expired_waiver_fails() {
         let tmp = std::env::temp_dir().join(format!("flavite-cov-waiver-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(tmp.join("devdocs/architecture")).unwrap();
-        let config = tmp.join("devdocs/architecture/coverage.toml");
+        std::fs::create_dir_all(tmp.join("xtask/arch")).unwrap();
+        let config = tmp.join("xtask/arch/coverage.toml");
         let lcov = tmp.join("lcov.info");
         std::fs::write(
             &lcov,

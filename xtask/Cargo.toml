@@ -7,7 +7,7 @@ repository.workspace = true
 description = "Development tooling: arch graph generation, verification, query CLI (§10.2)"
 # The `cargo xtask` alias is `cargo run -p xtask --`; with multiple binaries in
 # this package, `cargo run` needs a default. The spike probes are invoked
-# explicitly with `--bin` (e.g. `just spike-s3`).
+# explicitly with `--bin` (e.g. `just spike-watcher`).
 default-run = "cargo-xtask"
 
 [lib]

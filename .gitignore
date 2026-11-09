@@ -1,10 +1,10 @@
-# scratch-devdocs/ stays gitignored (AGENTS.md). The architecture artifacts
-# (devdocs/architecture/{crate-graph.json,DEPENDENCIES.md}) are also generated
+# devdocs/ stays gitignored (AGENTS.md). The architecture artifacts
+# (xtask/arch/{crate-graph.json,DEPENDENCIES.md}) are also generated
 # by `cargo xtask arch gen`, but they are INTENTIONALLY TRACKED: `arch check`
 # drift-diffs the on-disk copy, so they must stay in git. Everything below
 # this line is regenerable build/test output — never track it.
 
-scratch-devdocs/
+devdocs/
 
 # Python bytecode caches (regenerable test-runner output).
 __pycache__/

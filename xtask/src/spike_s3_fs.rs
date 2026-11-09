@@ -1667,5 +1667,5 @@ mod tests {
     // binary, not `cargo test`: the lock-holder child must be the probe
     // binary's `--hold-lock` mode, and under `cargo test` the current
     // executable is the libtest harness (which rejects unknown flags). Run it
-    // via `just spike-s3-fs --self-check` — the CI job does exactly that.
+    // via `just spike-fs --self-check` — the CI job does exactly that.
 }

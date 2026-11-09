@@ -66,13 +66,13 @@ fn arch_check_passes_on_clean_fixture() {
 fn arch_gen_creates_artifacts() {
     let tmp = fixture_workspace();
     xtask::arch::generate(&tmp).expect("arch gen failed");
-    assert!(tmp.join("devdocs/architecture/crate-graph.json").exists());
-    assert!(tmp.join("devdocs/architecture/DEPENDENCIES.md").exists());
+    assert!(tmp.join("xtask/arch/crate-graph.json").exists());
+    assert!(tmp.join("xtask/arch/DEPENDENCIES.md").exists());
     // DEPENDENCIES.md has the GENERATED header.
-    let md = fs::read_to_string(tmp.join("devdocs/architecture/DEPENDENCIES.md")).unwrap();
+    let md = fs::read_to_string(tmp.join("xtask/arch/DEPENDENCIES.md")).unwrap();
     assert!(md.contains("GENERATED"));
     // crate-graph.json is valid JSON.
-    let json = fs::read_to_string(tmp.join("devdocs/architecture/crate-graph.json")).unwrap();
+    let json = fs::read_to_string(tmp.join("xtask/arch/crate-graph.json")).unwrap();
     let _: serde_json::Value = serde_json::from_str(&json).expect("invalid JSON");
     cleanup(&tmp);
 }
@@ -182,7 +182,7 @@ fn arch_check_fails_on_drift() {
     let tmp = fixture_workspace();
     xtask::arch::generate(&tmp).expect("arch gen failed");
     // Modify a generated artifact (simulate hand-editing).
-    let json_path = tmp.join("devdocs/architecture/crate-graph.json");
+    let json_path = tmp.join("xtask/arch/crate-graph.json");
     let mut content = fs::read_to_string(&json_path).unwrap();
     content.push_str("\n// hand-edited\n");
     fs::write(&json_path, content).unwrap();

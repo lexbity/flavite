@@ -119,21 +119,21 @@ lint-arch:
 
 # S3 watcher-truth probe (PLAN-C C1, §9 S3-1): per-OS watcher evidence with a
 # D5 nomination-property self-check. CI runs scenarios 1–3 on Linux headless.
-spike-s3 *args:
+spike-watcher *args:
     cargo run -p xtask --bin s3_watcher_probe -- {{args}}
 
 # S3 filesystem-semantics probe (PLAN-C C2, §9 S3-2): rename/symlink/fsync/
 # placeholder/advisory-lock/no-clobber evidence feeding the `Fs` trait contract.
 # Scenario 5 (advisory lock after kill -9) is proven by spawning the probe
 # binary, not by `cargo test`.
-spike-s3-fs *args:
+spike-fs *args:
     cargo run -p xtask --bin s3_fs_probe -- {{args}}
 
 # S4 search probe (PLAN-C C3, §9 S4): CJK bigram-tokenizer quality vs a plain
 # pipeline, deferred commits under 1 s autosave load, `committed_generation`
 # replay after a crash, and atomic checkpoint publication (D12 go/no-go on
 # tantivy vs FTS5). CI re-runs the scaled-down (2k-note) self-check on Linux.
-spike-s4-search *args:
+spike-search *args:
     cargo run -p xtask --bin s4_search_probe -- {{args}}
 
 # S4 DB probe (PLAN-C C4, §9 S4): WAL single-writer + read-pool behavior under
@@ -141,7 +141,7 @@ spike-s4-search *args:
 # generation-bump timing, tantivy writer ops during reconcile, open-time
 # generation check. Evidence for C7 (`pool.rs`, `tantivy.rs`) and C8 batch
 # sizing. CI re-runs the scaled-down (2k-note) self-check on Linux.
-spike-s4-db *args:
+spike-db *args:
     cargo run -p xtask --bin s4_db_probe -- {{args}}
 
 # G0 — local fast gate (§10.3): fmt + clippy + test + arch check + workspace

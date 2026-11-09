@@ -1,6 +1,7 @@
 //! Project-RAG: architecture knowledge and verification (§10.2).
 //!
-//! - `arch gen` — reads `cargo metadata`, writes `crate-graph.json` + `DEPENDENCIES.md`.
+//! - `arch gen` — reads `cargo metadata`, writes `xtask/arch/crate-graph.json` +
+//!   `xtask/arch/DEPENDENCIES.md`.
 //! - `arch check` — drift (regenerate + diff), edges (actual == expected), layering
 //!   (transitive closure of core-tier normal+build deps must not contain
 //!   iced/iced_*/winit/wgpu/cosmic-text).
@@ -205,7 +206,7 @@ fn build_graph(metadata: &CargoMetadata, first_party: &BTreeSet<String>) -> Crat
 // ---------------------------------------------------------------------------
 
 fn load_crates_toml(workspace_root: &Path) -> Result<CratesToml> {
-    let path = workspace_root.join("devdocs/architecture/crates.toml");
+    let path = workspace_root.join("xtask/arch/crates.toml");
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     toml::from_str(&content).context("failed to parse crates.toml")
@@ -381,8 +382,8 @@ pub fn generate(workspace_root: &Path) -> Result<()> {
     let graph = build_graph(&metadata, &first_party);
 
     // Write crate-graph.json.
-    let arch_dir = workspace_root.join("devdocs/architecture");
-    std::fs::create_dir_all(&arch_dir).context("failed to create devdocs/architecture")?;
+    let arch_dir = workspace_root.join("xtask/arch");
+    std::fs::create_dir_all(&arch_dir).context("failed to create xtask/arch")?;
     let json_path = arch_dir.join("crate-graph.json");
     let json = serde_json::to_string_pretty(&graph).context("failed to serialize graph")?;
     std::fs::write(&json_path, &json)
@@ -432,8 +433,8 @@ pub fn check(workspace_root: &Path) -> Result<CheckReport> {
         serde_json::to_string_pretty(&graph).context("failed to serialize graph")?;
     let expected_md = render_dependencies_md(&graph, &crates_toml, coverage_toml.as_ref());
 
-    let json_path = workspace_root.join("devdocs/architecture/crate-graph.json");
-    let md_path = workspace_root.join("devdocs/architecture/DEPENDENCIES.md");
+    let json_path = workspace_root.join("xtask/arch/crate-graph.json");
+    let md_path = workspace_root.join("xtask/arch/DEPENDENCIES.md");
 
     let mut drift = false;
     if let Ok(actual_json) = std::fs::read_to_string(&json_path) {
@@ -714,7 +715,7 @@ fn default_tier2() -> f64 {
 }
 
 pub fn load_coverage_toml(workspace_root: &Path) -> Result<CoverageToml> {
-    let path = workspace_root.join("devdocs/architecture/coverage.toml");
+    let path = workspace_root.join("xtask/arch/coverage.toml");
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     toml::from_str(&content).context("failed to parse coverage.toml")
