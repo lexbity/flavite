@@ -1,10 +1,11 @@
-# CI — required gate (Phase 1 of devdocs/plans/ci-gate-backend-headless-2026-11-08.md).
+# CI — required gate (Phases 1/3/4/7 of
+# devdocs/plans/ci-gate-backend-headless-2026-11-08.md).
 #
-# Thin caller: all gate logic lives in justfile recipes. This workflow runs
-# exactly one required job, `gate`, and NOTHING may run before it in the job —
-# an early failure must never skip the test gate (audit 2026-11-08 finding
-# C2: the G0 step was skipped in 52/52 observed runs because visual steps
-# preceded it).
+# Thin caller: all gate logic lives in justfile recipes. The required check is
+# the `gate` job, which runs `just gate` as its first substantive step and
+# NOTHING may run before it in the job — an early failure must never skip the
+# test gate (audit 2026-11-08 finding C2: the G0 step was skipped in 52/52
+# observed runs because visual steps preceded it).
 #
 # Scope: backend + headless tests only, LINUX ONLY. flavite does not support
 # macOS/Windows yet (deferred by product decision, 2026-11-09) — those legs
@@ -13,15 +14,33 @@
 # features used by xtask/src/spike_s3_fs.rs (Win32_Storage_FileSystem etc.).
 # Re-enable by adding the OS to the matrix below.
 #
-# Xvfb/GPU/visual smoke lives in visual.yml (non-blocking). Probes,
-# linux-extras and negative tests are re-added as separate required jobs in
-# Phases 3-4 of the plan.
+# Jobs (all required; enumerated in the main ruleset in Phase 8):
+#   gate              G0 — `just gate` (fmt + clippy + test + fault-tests +
+#                     lint-arch + arch-check + workspace-contracts + gc)
+#   linux-extras      G1 — `just ci-gate` verbatim, so CI == local (D-9)
+#   probe-s3-watcher  S3 watcher probe, scenarios 1-3, --self-check (FR-4)
+#   probe-s3-fs       S3 fs-semantics probe, all scenarios, --self-check
+#   probe-s4-search   S4 search probe, 2k notes, --self-check
+#   probe-s4-db       S4 DB probe, 2k notes, --self-check
+#   negative-tests    seeded arch-edges / arch-layering / coverage violations
+#                     must be detected (FR-6, D-6, AC-28/29)
+#   lint-workflows    zizmor audit + grep gates (Phase 7: SHA pins, no
+#                     pull_request_target/workflow_run, timeout-minutes and
+#                     permissions on every job)
+#
+# Xvfb/GPU/visual smoke lives in visual.yml (non-blocking, manual only).
+# Long/deep runs (1 h fuzz per target, bench-scale) live in weekly-deep.yml
+# (advisory, scheduled).
 #
 # Triggers: push/PR of new code on main, and tag pushes (v*) for new
-# releases. No scheduled runs (weekly/nightly removed 2026-11-09).
+# releases. No other automatic runs.
 #
 # All actions are pinned to full commit SHAs (audit H5); Dependabot
-# (github-actions ecosystem) maintains the pins.
+# (github-actions ecosystem, .github/dependabot.yml) maintains the pins.
+# `just` is pinned via setup-just's just-version (zizmor unpinned-tools).
+# checkout never persists credentials (zizmor artipacked) and rust-cache is
+# lookup-only on pull_request runs so a fork PR can never write the shared
+# cache (zizmor cache-poisoning).
 
 name: CI
 
@@ -52,15 +71,23 @@ jobs:
         os: [ubuntu-26.04]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+        with:
+          just-version: 1.59.0
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # PR runs are lookup-only (see below), so a fork PR cannot write the
+      # shared cache. zizmor cannot prove that statically, hence the ignore.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
         with:
           # v2 restores the latest prefix-matching cache automatically;
           # `restore-keys` is not a valid input on this version (run
           # 42548285621 annotation).
           key: ${{ matrix.os }}-rust-${{ hashFiles('Cargo.lock') }}
+          # PR runs may only read the cache, never write it (cache-poisoning).
+          lookup-only: ${{ github.event_name == 'pull_request' }}
 
       # Installs rust components, nightly, cargo sub-tools, and rg (the
       # source-gate scripts require it; runners don't ship it — audit H4).
@@ -85,15 +112,286 @@ jobs:
     needs: gate
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+        with:
+          just-version: 1.59.0
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # PR runs are lookup-only (see below), so a fork PR cannot write the
+      # shared cache. zizmor cannot prove that statically, hence the ignore.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('fuzz/Cargo.lock') }}
+          lookup-only: ${{ github.event_name == 'pull_request' }}
 
       - name: Setup (tools + nightly + rg)
         run: just setup
 
       - name: CI gate (G1) — just ci-gate
         run: just ci-gate
+
+  # --- Phase 4: self-checking headless probes (FR-4). Each probe re-runs a
+  # scaled-down scenario set with `--self-check` and uploads its JSON report;
+  # `if-no-files-found: error` makes a missing report a failure, not a pass.
+
+  probe-s3-watcher:
+    name: probe-s3-watcher (ubuntu-26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+        with:
+          just-version: 1.59.0
+      # PR runs are lookup-only (see below), so a fork PR cannot write the
+      # shared cache. zizmor cannot prove that statically, hence the ignore.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+        with:
+          key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
+          lookup-only: ${{ github.event_name == 'pull_request' }}
+      - name: Watcher probe scenarios 1-3 with self-check (S3 C1)
+        run: just spike-s3 --scenarios 1,2,3 --self-check --json target/s3-watcher-report.json
+      - name: Upload report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: s3-watcher-report-linux
+          path: target/s3-watcher-report.json
+          if-no-files-found: error
+
+  probe-s3-fs:
+    name: probe-s3-fs (ubuntu-26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+        with:
+          just-version: 1.59.0
+      # PR runs are lookup-only (see below), so a fork PR cannot write the
+      # shared cache. zizmor cannot prove that statically, hence the ignore.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+        with:
+          key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
+          lookup-only: ${{ github.event_name == 'pull_request' }}
+      - name: fs-semantics probe, all scenarios, with self-check (S3 C2)
+        run: just spike-s3-fs --scenarios all --self-check --json target/s3-fs-report.json
+      - name: Upload report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: s3-fs-report-linux
+          path: target/s3-fs-report.json
+          if-no-files-found: error
+
+  probe-s4-search:
+    name: probe-s4-search (ubuntu-26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+        with:
+          just-version: 1.59.0
+      # PR runs are lookup-only (see below), so a fork PR cannot write the
+      # shared cache. zizmor cannot prove that statically, hence the ignore.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+        with:
+          key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
+          lookup-only: ${{ github.event_name == 'pull_request' }}
+      - name: Search probe, 2k notes, with self-check (S4 C3)
+        run: just spike-s4-search --scenarios all --notes 2000 --self-check --json target/s4-search-report.json
+      - name: Upload report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: s4-search-report-linux
+          path: target/s4-search-report.json
+          if-no-files-found: error
+
+  probe-s4-db:
+    name: probe-s4-db (ubuntu-26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+        with:
+          just-version: 1.59.0
+      # PR runs are lookup-only (see below), so a fork PR cannot write the
+      # shared cache. zizmor cannot prove that statically, hence the ignore.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+        with:
+          key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
+          lookup-only: ${{ github.event_name == 'pull_request' }}
+      - name: DB probe, 2k notes, with self-check (S4 C4)
+        run: just spike-s4-db --scenarios all --notes 2000 --dir target/s4-db-probe --self-check --json target/s4-db-report.json
+      - name: Upload report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: s4-db-report-linux
+          path: target/s4-db-report.json
+          if-no-files-found: error
+
+  # --- Phase 4: negative/meta tests (FR-6, DEBT-9, AC-28/29). Seed a
+  # violation, then prove the gate detects it. Seeding is a SINGLE insert
+  # (D-6: the old double seed crashed `cargo metadata` with a duplicate key
+  # before the violation was ever checked) and `arch gen` has no `|| true` —
+  # a broken manifest must fail loudly.
+  negative-tests:
+    name: negative-tests (ubuntu-26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+        with:
+          just-version: 1.59.0
+      # PR runs are lookup-only (see below), so a fork PR cannot write the
+      # shared cache. zizmor cannot prove that statically, hence the ignore.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+        with:
+          key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
+          lookup-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: arch-edges-negative (AC-28)
+        run: |
+          set -euo pipefail
+          # One undocumented internal edge: flavite-syntax -> flavite-fs.
+          python3 - <<'PY'
+          path = 'crates/flavite-syntax/Cargo.toml'
+          content = open(path).read()
+          dep = 'flavite-fs = { path = "../flavite-fs" }'
+          if '[dependencies]' not in content:
+              content += '\n[dependencies]\n' + dep + '\n'
+          else:
+              content = content.replace('[dependencies]', '[dependencies]\n' + dep, 1)
+          open(path, 'w').write(content)
+          PY
+          cargo xtask arch gen
+          if cargo xtask arch check > arch-check.log 2>&1; then
+            echo "AC-28 FAIL: arch check passed despite the seeded edge"
+            exit 1
+          fi
+          grep -q "EDGES" arch-check.log || { echo "AC-28 FAIL: no EDGES marker in output"; cat arch-check.log; exit 1; }
+          echo "AC-28 PASS: undocumented edge detected"
+          git checkout -- crates devdocs/architecture Cargo.lock
+
+      - name: arch-layering-negative (AC-28)
+        run: |
+          set -euo pipefail
+          # iced (forbidden in the core tier) added to flavite-fs (core tier).
+          python3 - <<'PY'
+          path = 'crates/flavite-fs/Cargo.toml'
+          content = open(path).read()
+          dep = 'iced = "0.14"'
+          if '[dependencies]' not in content:
+              content += '\n[dependencies]\n' + dep + '\n'
+          else:
+              content = content.replace('[dependencies]', '[dependencies]\n' + dep, 1)
+          open(path, 'w').write(content)
+          PY
+          cargo xtask arch gen
+          if cargo xtask arch check > arch-check.log 2>&1; then
+            echo "AC-28 FAIL: arch check passed despite the seeded layering violation"
+            exit 1
+          fi
+          grep -q "LAYERING" arch-check.log || { echo "AC-28 FAIL: no LAYERING marker in output"; cat arch-check.log; exit 1; }
+          echo "AC-28 PASS: layering violation detected"
+          git checkout -- crates devdocs/architecture Cargo.lock
+
+      - name: coverage-negative (AC-29)
+        run: |
+          set -euo pipefail
+          # Doctored lcov: flavite-fs at 50% (tier-1 floor: 90%).
+          mkdir -p target/llvm-cov
+          cat > target/llvm-cov/lcov.info << 'EOF'
+          SF:/project/crates/flavite-fs/src/lib.rs
+          DA:1,1
+          DA:2,0
+          end_of_record
+          EOF
+          if just cov-check > cov-check.log 2>&1; then
+            echo "AC-29 FAIL: cov-check passed on a below-floor lcov"
+            exit 1
+          fi
+          grep -qE "FAIL|below|floor" cov-check.log || { echo "AC-29 FAIL: no floor signal in output"; cat cov-check.log; exit 1; }
+          echo "AC-29 PASS: below-floor coverage detected"
+
+  # --- Phase 7: workflow lint gate (NFR-6, AC-4/AC-5). zizmor is installed
+  # from a pinned release with a sha256-verified download; the grep gates are
+  # the cheap backstops that must hold even if zizmor's rules change.
+  lint-workflows:
+    name: lint-workflows (ubuntu-26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install zizmor (pinned release, sha256-verified)
+        run: |
+          set -euo pipefail
+          version="1.32.0"
+          asset="zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          expected_sha256="bb110cc765eca9cd7efb2e284a956be5974c60027b0970f16397d86208a9957b"
+          curl -sSfL "https://github.com/zizmorcore/zizmor/releases/download/v${version}/${asset}" -o zizmor.tar.gz
+          actual_sha256="$(sha256sum zizmor.tar.gz | awk '{print $1}')"
+          if [ "$actual_sha256" != "$expected_sha256" ]; then
+            echo "zizmor download checksum mismatch: got $actual_sha256" >&2
+            exit 1
+          fi
+          tar -xzf zizmor.tar.gz
+          ./zizmor --version
+
+      - name: zizmor audit (offline — no API calls)
+        run: ./zizmor --offline .github/
+
+      - name: grep gates
+        run: |
+          set -euo pipefail
+          # No floating action tags (a trailing "# vX" version comment is
+          # allowed: the pattern stops at '#').
+          if grep -rnE 'uses:[^#]*@v[0-9]' .github/workflows/; then
+            echo "FAIL: floating action tag found" >&2
+            exit 1
+          fi
+          # No dangerous triggers (as YAML keys) anywhere under .github/.
+          if grep -rnE '^[[:space:]]*(pull_request_target|workflow_run):' .github/; then
+            echo "FAIL: pull_request_target/workflow_run trigger found" >&2
+            exit 1
+          fi
+          for f in .github/workflows/*.yml; do
+            # Every job has timeout-minutes. Job keys sit at exactly 2 spaces
+            # under `jobs:`; the key sits at exactly 4 spaces under a job.
+            awk -v f="$f" '
+              /^jobs:/ { in_jobs = 1; next }
+              in_jobs && /^  [a-zA-Z0-9_-]+:$/ { jobs++ }
+              in_jobs && /^[^ ]/ { in_jobs = 0 }
+              /^ {4}timeout-minutes:/ { timeouts++ }
+              END {
+                if (jobs != timeouts) {
+                  printf "FAIL: %s has %d jobs but %d timeout-minutes\n", f, jobs, timeouts > "/dev/stderr"
+                  bad = 1
+                }
+                exit bad ? 1 : 0
+              }
+            ' "$f" || exit 1
+            # Top-level permissions must be exactly contents: read
+            # (single-line or two-line form).
+            grep -qzP '(?m)^permissions:\s*contents:\s*read\s*$' "$f" || {
+              echo "FAIL: $f is missing top-level 'permissions: contents: read'" >&2
+              exit 1
+            }
+          done
+          echo "grep gates passed"

@@ -1,0 +1,17 @@
+# Dependabot (D-7/FR-19): keeps the action SHA pins in .github/workflows/
+# and the cargo dependencies in Cargo.lock up to date. Weekly; resulting PRs
+# are routed to the repo owner via .github/CODEOWNERS.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

@@ -1,0 +1,102 @@
+# Weekly deep runs (advisory, NOT a required check) — the re-homed home for
+# the long/deep checks that were orphaned when weekly.yml and nightly.yml
+# were removed on 2026-11-09:
+#   - fuzz-long: 1 h per fuzz target, one matrix leg each (D-10/FR-10). The
+#     per-PR drift gate (`just fuzz-build`) and the 60 s/target smoke run
+#     live in ci.yml's linux-extras job.
+#   - bench-scale: the 50k-note release-mode perf gate (FR-17), home of the
+#     wall-clock tests quarantined out of the per-PR gate.
+#
+# Mondays 06:00 UTC or manual dispatch. A red leg is a real signal (fuzz
+# crash inputs are uploaded as artifacts) but never blocks a merge.
+#
+# All actions pinned to full commit SHAs; permissions read-only; runner
+# pinned to ubuntu-26.04.
+
+name: Weekly deep (advisory)
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # 06:00 UTC Mondays
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false # never cancel a scheduled deep run
+
+jobs:
+  fuzz-long:
+    name: fuzz-long (${{ matrix.target }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      # Static list on purpose (a runtime-generated matrix trips zizmor's
+      # template-injection audit); the verify step below fails the run if
+      # this list drifts from fuzz/fuzz_targets/.
+      matrix:
+        target: [encoding, frontmatter_patcher, graph_scope, image_limits, link_insertion, parity, parser, path_safety, read_structure, rename_planner, replace_plan, scanner, text_match, text_worker_protocol, workspace_layout, workspace_restore]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+        with:
+          just-version: 1.59.0
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('fuzz/Cargo.lock') }}
+
+      - name: Verify matrix matches fuzz/fuzz_targets/
+        run: |
+          set -euo pipefail
+          actual="$(ls fuzz/fuzz_targets/*.rs | xargs -n1 basename | sed 's/\.rs$//' | sort)"
+          declared="$(grep -oE 'target: \[.*\]' .github/workflows/weekly-deep.yml | sed 's/^target: \[//; s/\]$//' | tr ',' '\n' | tr -d ' ' | sort)"
+          if [ "$actual" != "$declared" ]; then
+            echo "fuzz matrix drift — update the matrix in weekly-deep.yml" >&2
+            diff <(echo "$actual") <(echo "$declared") >&2 || true
+            exit 1
+          fi
+
+      - name: Setup (tools + nightly + rg)
+        run: just setup
+
+      - name: Long fuzz (1 h, ${{ matrix.target }})
+        run: cd fuzz && cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=3600 -rss_limit_mb=4096
+
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  bench-scale:
+    name: bench-scale (advisory)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    continue-on-error: true # advisory perf gate: red is visible, never blocks
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+        with:
+          just-version: 1.59.0
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
+
+      - name: Setup (tools + nightly + rg)
+        run: just setup
+
+      - name: bench-scale (50k-note release-mode gate)
+        run: just bench-scale
