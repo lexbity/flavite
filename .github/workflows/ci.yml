@@ -1,14 +1,21 @@
 # CI — required gate (Phase 1 of devdocs/plans/ci-gate-backend-headless-2026-11-08.md).
 #
 # Thin caller: all gate logic lives in justfile recipes. This workflow runs
-# exactly one required job, `gate`, on all three OSes, and NOTHING may run
-# before it in the job — an early failure must never skip the test gate
-# (audit 2026-11-08 finding C2: the G0 step was skipped in 52/52 observed
-# runs because visual steps preceded it).
+# exactly one required job, `gate`, and NOTHING may run before it in the job —
+# an early failure must never skip the test gate (audit 2026-11-08 finding
+# C2: the G0 step was skipped in 52/52 observed runs because visual steps
+# preceded it).
 #
-# Scope: backend + headless tests only. Xvfb/GPU/visual smoke lives in
-# visual.yml (non-blocking). Probes, linux-extras and negative tests are
-# re-added as separate required jobs in Phases 3-4 of the plan.
+# Scope: backend + headless tests only, LINUX ONLY. flavite does not support
+# macOS/Windows yet (deferred by product decision, 2026-11-09) — those legs
+# are excluded until support lands. Known blockers when re-enabling:
+# macOS needs `cap_std` in flavite-fs deps; Windows needs the `windows-sys`
+# features used by xtask/src/spike_s3_fs.rs (Win32_Storage_FileSystem etc.).
+# Re-enable by adding the OS to the matrix below (and to weekly fresh-clone).
+#
+# Xvfb/GPU/visual smoke lives in visual.yml (non-blocking). Probes,
+# linux-extras and negative tests are re-added as separate required jobs in
+# Phases 3-4 of the plan.
 #
 # All actions are pinned to full commit SHAs (audit H5); Dependabot
 # (github-actions ecosystem) maintains the pins.
@@ -37,7 +44,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macOS/Windows deferred — see header comment.
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 

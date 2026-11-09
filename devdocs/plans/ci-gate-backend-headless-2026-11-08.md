@@ -19,19 +19,19 @@ This document specifies a restructuring of flavite's GitHub Actions CI so that t
 - **NG-2.** No e2e GUI automation, no screenshot-diffing, no OCR (tesseract) in CI.
 - **NG-3.** No release/deploy pipeline (audit finding L4) — surfaced as follow-on, not ballooned into this change.
 - **NG-4.** No rewrite of test content itself (which tests exist) beyond making existing targets compile/pass; test redesign is product work, not CI work.
-- **NG-5.** No self-hosted runners, no larger runners than `ubuntu/macos/windows-latest` defaults.
+- **NG-5.** No self-hosted runners, no larger runners than `ubuntu-latest`. macOS/Windows runners are not used at all while platform support is deferred (D-2).
 
 ## 2. Questions and Problems (the spine)
 
 ### Q1. Why does the gate never run? → Job topology
 **Problem:** `ci.yml`'s single serial `g1` job runs visual smoke and contract scripts *before* `just gate`; the first failure skips all later steps. Observed: G0 step `skipped` in 52/52 job instances across the last 25 runs (runs API), 0 successes.
 **Decision D-1:** Replace the monolith with a DAG of independent jobs; the required check is a `gate` job that runs `just gate` as its first substantive step. Visual/GPU steps move to a separate non-blocking workflow.
-**Tradeoff:** more jobs = more billed runner-minutes per push (matrix already pays 3 OS legs). Accepted: signal completeness > cost; `concurrency` cancellation (D-10) recovers most of the waste from rapid successive pushes.
+**Tradeoff (updated 2026-11-09):** with a single-OS gate there is no per-OS signal at all — accepted because macOS/Windows are unsupported (D-2). `concurrency` cancellation (D-11) recovers the waste from rapid successive pushes.
 
 ### Q2. Which OS matrix for the gate?
-**Problem:** fs/watcher/journal semantics differ per OS; the audit found a Windows-only compile error (`xtask` `windows_sys::Win32::Storage::FileSystem::CreateFileW` unresolved, run 42448240142 job 128631666464) shipping on `main` precisely because no OS leg ever reached the gate.
-**Decision D-2:** `gate` runs on `[ubuntu-latest, macos-latest, windows-latest]` with `fail-fast: false`. Linux-only extras (coverage, fuzz, network-denied) stay Linux-only because their tools (`llvm-cov`, `cargo-fuzz`, `unshare -n`) are Linux-only.
-**Tradeoff:** 3× runner cost on every push. Alternative rejected: ubuntu-only gate + others nightly — per-OS regressions then land on `main` for up to 24 h. What would change the default: if billed cost exceeds a set monthly budget, demote macOS/Windows to nightly (recorded as follow-on, not silently).
+**Problem:** fs/watcher/journal semantics differ per OS; the audit found a Windows-only compile error (`xtask` `windows_sys::...::CreateFileW` unresolved, run 42448240142 job 128631666464) shipping on `main` precisely because no OS leg ever reached the gate.
+**Decision D-2 (updated 2026-11-09 by product decision):** flavite does **not** support macOS/Windows yet — those platforms are deferred. The gate therefore runs on **`[ubuntu-latest]` only**; macOS/Windows legs are excluded from CI until support is implemented (known blockers then: `cap_std` missing in `flavite-fs` on macOS; `windows-sys` features in `xtask/Cargo.toml` on Windows). Linux-only extras (coverage, fuzz, network-denied) stay Linux-only because their tools (`llvm-cov`, `cargo-fuzz`, `unshare -n`) are Linux-only.
+**Tradeoff:** per-OS regressions on macOS/Windows will not be caught by CI — accepted because those platforms are unsupported; the code is not expected to run there. What changes the default: when macOS/Windows support lands, add the OS to the `gate` matrix in `ci.yml` (and to weekly `fresh-clone`) after fixing the two blockers above.
 
 ### Q3. External binary dependencies in the gate (`rg`)
 **Problem:** `scripts/check-workspace-contracts.sh:12`, `scripts/lib/source-gates.sh`, and `just lint-arch` (`justfile:52-100`) shell out to `rg`, but `just setup` (`xtask/src/setup.rs:83-131`) installs only rustup components and cargo sub-tools. GitHub-hosted runners do not ship `rg` → exit 127 → macOS leg red 15/16, weekly fresh-clone red on ubuntu (run 41462449541).
@@ -93,9 +93,8 @@ This document specifies a restructuring of flavite's GitHub Actions CI so that t
 
 ```
 push/PR ──► ci.yml
-            ├── gate (ubuntu-latest)      timeout 30m   ─┐ required
-            ├── gate (macos-latest)       timeout 30m   ─┤ required (ruleset)
-            ├── gate (windows-latest)     timeout 30m   ─┘
+            └── gate (ubuntu-latest)      timeout 30m   ── required (ruleset)
+                (macOS/Windows legs excluded until platform support lands — D-2)
             ├── linux-extras (ubuntu)     timeout 60m   ── required  runs `just ci-gate`
             ├── probe-s3-watcher          timeout 30m   ── required
             ├── probe-s3-fs               timeout 30m   ── required
@@ -107,7 +106,7 @@ push/PR ──► ci.yml
             ├── corpus-minimize           timeout 120m
             └── coverage-trend            timeout 60m   (no `|| true`)
             (weekly.yml) Mondays 06:00 UTC
-            ├── fresh-clone gate (3 OS)   timeout 45m
+            ├── fresh-clone gate (ubuntu)  timeout 45m   # trim to ubuntu-only in Phase 6 (macOS/Windows deferred)
             ├── advisory-iced-master      timeout 45m   continue-on-error at job level, NO `|| true`
             ├── bench-scale (advisory)    timeout 60m   just bench-scale
             └── ci-health                 timeout 10m   fails if last 3 nightlies not green
@@ -121,7 +120,7 @@ Job naming convention: `<area> (<os>)` so the PR check list tells you what broke
 
 | ID | Requirement |
 |---|---|
-| FR-1 | `ci.yml` MUST define a `gate` job, matrix `[ubuntu-latest, macos-latest, windows-latest]`, `fail-fast: false`, steps: SHA-pinned checkout → `just setup` → `just gate` (fmt, clippy `--workspace --all-targets -- -D warnings`, test, fault-tests, lint-arch, arch-check, gc) → MUST be the first build step; no visual/GPU step may precede it. `timeout-minutes: 30`. |
+| FR-1 | `ci.yml` MUST define a `gate` job, matrix `[ubuntu-latest]` (macOS/Windows excluded until platform support lands — D-2), steps: SHA-pinned checkout → `just setup` → `just gate` (fmt, clippy `--workspace --all-targets -- -D warnings`, test, fault-tests, lint-arch, arch-check, gc) → MUST be the first build step; no visual/GPU step may precede it. `timeout-minutes: 30`. |
 | FR-2 | A `linux-extras` job (ubuntu-latest, `timeout-minutes: 60`) MUST run `just ci-gate` verbatim (single source of truth, D-9). `ci-gate` MUST be reordered: gate → doc → deny/audit/shear → coverage → network-denied → msrv → fuzz-smoke-ci (last). |
 | FR-3 | `just gate` MUST additionally run `just workspace-contracts W09` (headless source gates) on all OS. |
 | FR-4 | Probe jobs (`probe-s3-watcher`, `probe-s3-fs`, `probe-s4-search`, `probe-s4-db`) MUST keep their current `--self-check` invocations and JSON artifacts (`if-no-files-found: error`), gain `timeout-minutes: 30`, SHA-pinned actions, and become required checks. |
@@ -171,7 +170,7 @@ Job naming convention: `<area> (<os>)` so the PR check list tells you what broke
 | DEBT-3 | Source-gate scripts depend on external binary (long-term: port to Rust in xtask) | `scripts/*.sh`, `justfile lint-arch` | install now (Phase 1); port = follow-on, NOT this change |
 | DEBT-4 | Lockfile not enforced on builds (`--locked` missing) | `justfile` recipes | Phase 3 |
 | DEBT-5 | Floating `+nightly` for fuzz | `justfile`, `nightly.yml` | recorded; pin after targets stable (follow-on) |
-| DEBT-6 | Windows compile error in xtask (`windows-sys` features) | `xtask/Cargo.toml`, `xtask/src/spike_s3_fs.rs` | Phase 2 |
+| DEBT-6 | Windows compile error in xtask (`windows-sys` features) — deferred with macOS/Windows support (D-2); fix when Windows support lands | `xtask/Cargo.toml`, `xtask/src/spike_s3_fs.rs` | deferred (was Phase 2) |
 | DEBT-7 | Fuzz target drift (`encoding`, `replace_plan` don't compile); smoke list omits targets | `fuzz/fuzz_targets/`, `justfile` | Phase 3 |
 | DEBT-8 | `recovery_close` fails under `--all-features` | `crates/flavite-api/tests/recovery_close.rs` | Phase 3 |
 | DEBT-9 | Broken negative-test seeding (double insert, `|| true`) | `ci.yml` arch-edges-negative | Phase 4 |
@@ -223,7 +222,7 @@ No data stores, no runtime APIs, no user-facing surface — blast radius is CI c
 ## 7. Acceptance criteria (objective)
 
 - **AC-1:** In the last 10 `CI` runs, the `gate` job's test step conclusion is `success` or `failure` in 10/10, `skipped` in 0/10 (jobs API query; fixes audit C2/NFR-2).
-- **AC-2:** 3 consecutive fully green `CI` runs on all required jobs (all 3 OS `gate`, `linux-extras`, 4 probes, `negative-tests`).
+- **AC-2:** 3 consecutive fully green `CI` runs on all required jobs (`gate (ubuntu-latest)`, `linux-extras`, 4 probes, `negative-tests`).
 - **AC-3:** Ruleset on `main` exists and lists all required checks with strict mode; a test PR with a deliberately failing test cannot be merged (demonstrated once, then reverted).
 - **AC-4:** `grep -rn "uses:.*@v" .github/workflows/` returns 0 matches; every `uses:` matches SHA regex (NFR-6/R-2).
 - **AC-5:** `zizmor .github/workflows/` (run in Phase 7) reports no `unpinned-uses` or `template-injection`; `grep -rn "pull_request_target\|workflow_run" .github/` returns nothing (NFR-9).
@@ -274,7 +273,7 @@ Common conventions for every slice: all `uses:` SHA-pinned with `# vX.Y.Z` comme
       name: gate (${{ matrix.os }})
       runs-on: ${{ matrix.os }}
       timeout-minutes: 30
-      strategy: {fail-fast: false, matrix: {os: [ubuntu-latest, macos-latest, windows-latest]}}
+      strategy: {fail-fast: false, matrix: {os: [ubuntu-latest]}} # macOS/Windows deferred (D-2)
       steps:
         - uses: actions/checkout@<sha> # v4
         - uses: extractions/setup-just@<sha> # v2
@@ -309,22 +308,20 @@ Common conventions for every slice: all `uses:` SHA-pinned with `# vX.Y.Z` comme
 
 ---
 
-## Phase 2 — Windows/macOS legs green (per-OS reality)
+## Phase 2 — macOS/Windows EXCLUDED from CI (superseded by product decision 2026-11-09)
 
-**Goal:** all three `gate` matrix legs conclude `success` in the same run — backend tests are proven on every OS the project ships for.
+**Goal:** the required gate covers exactly the platforms flavite supports: Linux. macOS/Windows legs are removed from the required matrix until platform support is implemented.
 
-**Decisions locked:** D-2 (keep 3-OS), D-6 partially (windows-sys fix), FR-15 (windows-sys features), DEBT-6.
+**Decisions locked:** D-2 (linux-only gate), FR-1 updated.
 
-**What to implement**
-- `xtask/Cargo.toml`: add `features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_Security", "Win32_System_Threading"]` (whatever `spike_s3_fs.rs` imports: `CreateFileW`, `BY_HANDLE_FILE_INFORMATION`, `LockFileEx`, `OVERLAPPED`, `FlushFileBuffers`, `CloseHandle`) to the `windows-sys` dependency; verify with `cargo check -p xtask --target x86_64-pc-windows-msvc` (cross-check; full build on windows runner).
-- Any per-OS test failures that surface (expected class: path separators, fs semantics, watcher timing in `flavite-vault`/`flavite-fs` tests) — fix the test or the code; **no blanket `#[cfg(not(windows))]` skips without a written justification in the commit message**; platform-invalid behavior gets a targeted skip with a linked issue ID.
-- macOS: rg via brew (Phase 1) fixes exit 127; remaining failures are real — fix.
+**What was implemented (commit on `ci/phase1-gate-first-dag`):**
+- `ci.yml`: `gate` matrix reduced to `os: [ubuntu-latest]` with a header comment naming the re-enable path and the two known blockers (macOS: `cap_std` in `flavite-fs` deps; Windows: `windows-sys` features for `xtask/src/spike_s3_fs.rs`).
+- Plan updates: D-2, FR-1, DEBT-6 marked deferred.
+- Note: `xtask setup` still installs rg per-OS (harmless, keeps local dev on macOS/Windows working); weekly `fresh-clone` still has a 3-OS matrix but is advisory/non-blocking until Phase 6 trims it to ubuntu-only.
 
-**How:** iterate locally where possible (`cargo test -p flavite-fs` etc.), cross-check windows via `cargo check --target x86_64-pc-windows-msvc` locally (rustup target add), rely on the windows runner for link/test.
+**Tests / validation:** CI run on the PR shows exactly one `gate (ubuntu-latest)` job, conclusion `success`; no macos/windows jobs exist.
 
-**Tests / validation:** local `cargo check -p xtask --target x86_64-pc-windows-msvc` clean; `just gate` green on Linux (regression guard); CI: one run where all three `gate` legs = `success` (AC-2 partial: 1 of 3 consecutive green full runs).
-
-**Exit criteria:** `gh api .../jobs --jq` shows `gate (ubuntu-latest)`, `gate (macos-latest)`, `gate (windows-latest)` all `success` in one run ID; no new `#[ignore]`/cfg-skip added without justification comment.
+**Exit criteria:** `gh api .../runs/<id>/jobs --jq '.jobs[].name'` lists only `gate (ubuntu-latest)`; run conclusion `success`.
 
 ---
 
@@ -430,12 +427,12 @@ jobs:
 **Decisions locked:** D-9 (bench-scale weekly), FR-17, DEBT-10 (rest), R-8.
 
 **What to implement** — edit `weekly.yml`:
-- `fresh-clone` (3 OS, `just setup && just gate`, timeout 45m) — unchanged behavior, SHA pins, cache, concurrency.
+- `fresh-clone` matrix trimmed to `[ubuntu-latest]` (macOS/Windows deferred — D-2), `just setup && just gate`, timeout 45m, SHA pins, cache, concurrency.
 - Rename `iced-master-advisory` → `advisory-iced-master`; remove both `|| true` (lines 23-24); keep job-level `continue-on-error: true`; the `cargo check` failure now marks the step failed while the job stays advisory — visible in the run, not hidden.
 - Add `bench-scale` job (ubuntu, timeout 60m, `just bench-scale`, `continue-on-error: true` — advisory perf gate).
 - Add `ci-health` job (ubuntu, timeout 10m, NOT required): `gh api repos/lexbity/flavite/actions/workflows/nightly.yml/runs --jq '.workflow_runs[:3]'` and fail if any of the last 3 is not `success` (uses the read-only token; runs listing is allowed). Appends a markdown summary to `$GITHUB_STEP_SUMMARY` with run URLs.
 
-**Tests / validation:** `gh workflow run weekly.yml`; advisory job may be red — its step must show `failure` while job shows `neutral` (continue-on-error) — that is the honest-advisory proof; `ci-health` green after Phase 5's green nightlies; fresh-clone 3 OS green.
+**Tests / validation:** `gh workflow run weekly.yml`; advisory job may be red — its step must show `failure` while job shows `neutral` (continue-on-error) — that is the honest-advisory proof; `ci-health` green after Phase 5's green nightlies; fresh-clone ubuntu green.
 
 **Exit criteria:** weekly run observed; `grep -n "|| true" .github/workflows/weekly.yml` → 0; ci-health summary artifact present.
 
@@ -484,7 +481,7 @@ CI: `lint-workflows` job green in a real run; a Dependabot PR for actions appear
 **What to implement**
 - Create ruleset `protect-main` on `refs/heads/main` (via `gh api -X POST repos/lexbity/flavite/rulesets` or UI):
   - `enforcement: active`
-  - rules: `required_status_checks` with `strict: true`, listing every `ci.yml` job name (`gate (ubuntu-latest)`, `gate (macos-latest)`, `gate (windows-latest)`, `linux-extras (ubuntu)`, `probe-s3-watcher`, `probe-s3-fs`, `probe-s4-search`, `probe-s4-db`, `negative-tests`, `lint-workflows`); `require_pull_request` (reviews: 0 — solo workflow); `block_force_pushes`; `restrict_deletions`.
+  - rules: `required_status_checks` with `strict: true`, listing every `ci.yml` job name (`gate (ubuntu-latest)`, `linux-extras (ubuntu)`, `probe-s3-watcher`, `probe-s3-fs`, `probe-s4-search`, `probe-s4-db`, `negative-tests`, `lint-workflows`); `require_pull_request` (reviews: 0 — solo workflow); `block_force_pushes`; `restrict_deletions`.
   - First create it on a scratch branch (`refs/heads/integration-test`) with enforcement `active`, open one green PR and one deliberately-red PR to prove red is blocked (AC-3), then move to `main`.
 - `xtask/src/setup.rs` `PRE_PUSH_HOOK`: reword to state that `main` requires green CI via PR (FR-22).
 - Update `devdocs/CI-CD-AUDIT-2026-11-08.md` with a one-line resolution note per finding ID (C1→FR-18, C2→FR-1, etc.) — leave the audit as the historical record.
@@ -515,7 +512,9 @@ Evidence: runs `42548285621`, `42550458410`, `42551960216`, `42553438011`, `4255
 
 **Known remaining for Phase 1 polish (not blocking):** cold ubuntu gate wall = 28.1 min (run 42556101573, includes compiling the cargo sub-tools in `just setup` on every cold run); NFR-1 wants p95 ≤ 15 min cold — warm runs and caching `~/.cargo/bin` (rust-cache `cache-directories`) or prebuilt tool binaries (cargo-binstall) are the Phase 3 levers.
 
-**Not done in Phase 1 (as planned):** macOS `cap_std` fix and Windows `windows-sys` features (Phase 2); linux-extras/probes/negatives (Phases 3–4); nightly/weekly (5–6); supply-chain repo settings (7); ruleset (8). PR #1 stays open as the accumulating vehicle.
+**Not done in Phase 1 (as planned):** linux-extras/probes/negatives (Phases 3–4); nightly/weekly (5–6); supply-chain repo settings (7); ruleset (8). PR #1 stays open as the accumulating vehicle.
+
+**Update 2026-11-09 (product decision):** macOS/Windows support is deferred in flavite, so the `gate` matrix is reduced to `[ubuntu-latest]` (Phase 2 rewritten as "excluded until support lands"; re-enable blockers documented in the ci.yml header: macOS `cap_std` dep, Windows `windows-sys` features). Expected CI shape after this commit: exactly one job, `gate (ubuntu-latest)`.
 
 ---
 
