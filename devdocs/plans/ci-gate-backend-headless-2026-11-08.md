@@ -516,6 +516,8 @@ Evidence: runs `42548285621`, `42550458410`, `42551960216`, `42553438011`, `4255
 
 **Update 2026-11-09 (product decision):** macOS/Windows support is deferred in flavite, so the `gate` matrix is reduced to `[ubuntu-latest]` (Phase 2 rewritten as "excluded until support lands"; re-enable blockers documented in the ci.yml header: macOS `cap_std` dep, Windows `windows-sys` features). Expected CI shape after this commit: exactly one job, `gate (ubuntu-latest)`.
 
+**Result of that change:** run `42558881876` — conclusion **`success`** (first green run in the repo's observable history), exactly one job `gate (ubuntu-latest)`, `Gate (G0)` step `success`, wall 28.2 min (cache cold; warm runs should drop well under NFR-1's 15 min). Phase 1 exit criteria met: green linux-only spine, gate never skipped, SHA pins/permissions/concurrency/timeouts/cache in place, rg installed by setup.
+
 ---
 
 ## Cross-slice invariants (checked at every slice boundary)
