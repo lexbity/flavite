@@ -924,7 +924,11 @@ fn watermark_equal_wakes_skip_all_work() {
 /// far fewer deltas, and the final frame sits at the final generation.
 /// (The bounded(1) drop-on-full channel semantics are proven unit-side in
 /// `signal.rs`; this is the service-level contract.)
+// Timing-sensitive coalescing ratio (wakes < 150 for 300 commits depends on
+// pump-vs-commit scheduling; failed on the loaded CI runner, run
+// 42551960216). Runs in release under `just bench-scale`.
 #[test]
+#[ignore = "timing-sensitive; runs under just bench-scale (release, --ignored)"]
 fn burst_commits_coalesce_into_windows_not_per_generation_wakes() {
     let mut fixture = EventFixture::start(ParityPolicy {
         // Parity every delta pump: pumps cost more than commits during the
