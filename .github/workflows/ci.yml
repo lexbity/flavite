@@ -45,8 +45,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
+          # v2 restores the latest prefix-matching cache automatically;
+          # `restore-keys` is not a valid input on this version (run
+          # 42548285621 annotation).
           key: ${{ matrix.os }}-rust-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ matrix.os }}-rust-
 
       # Installs rust components, nightly, cargo sub-tools, and rg (the
       # source-gate scripts require it; runners don't ship it — audit H4).

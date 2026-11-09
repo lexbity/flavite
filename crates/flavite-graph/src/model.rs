@@ -933,7 +933,11 @@ mod tests {
         );
     }
 
+    // Perf-budget test: a wall-clock assertion does not belong in the per-PR
+    // unit gate (shared CI runners made the 1 s budget flaky — audit
+    // 2026-11-08). Runs in release under `just bench-scale` (weekly).
     #[test]
+    #[ignore = "perf budget; runs under just bench-scale (release, --ignored)"]
     fn fifty_k_node_build_smoke() {
         // AC-16 scale smoke: 50k nodes / 200k edges must build in < 1 s.
         // Edge pattern: (i → (i + k) % n) for k in 1..=4 — exactly 4n

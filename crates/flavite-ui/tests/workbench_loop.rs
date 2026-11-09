@@ -802,11 +802,13 @@ fn entity_frames_freeze_for_the_pair_hold_while_emphasis_updates() {
         "appearance.theme",
         flavite_settings::value::SettingValue::Str("light".into()),
     );
-    let _ = app.update(Message::Pump);
-    assert!(
-        app.graph.state(graph).expect("state").geometry_generation > gen0,
-        "selection emphasis/palette may update while the hit geometry is frozen"
-    );
+    // De-flaked (audit 2026-11-08, flaky-test class): wait for the emphasis
+    // update to land instead of assuming a single Pump delivers it. The
+    // asserted property is unchanged — emphasis-only updates DO apply during
+    // the hold.
+    wait_for(&mut app, "theme emphasis during pair hold", |app| {
+        app.graph.state(graph).expect("state").geometry_generation > gen0
+    });
     let gen1 = app.graph.state(graph).expect("state").geometry_generation;
 
     // An entity-moving frame lands during the hold: the node-drag preview
