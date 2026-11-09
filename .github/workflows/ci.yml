@@ -1,278 +1,62 @@
-# G1 — CI gate (§10.3, §10.7).
-# Thin caller: all gate logic lives in justfile recipes.
-# Matrix: ubuntu-latest, macOS-latest, windows-latest.
-# Linux adds: coverage merge, fuzz smoke, network-denied run.
+# CI — required gate (Phase 1 of devdocs/plans/ci-gate-backend-headless-2026-11-08.md).
+#
+# Thin caller: all gate logic lives in justfile recipes. This workflow runs
+# exactly one required job, `gate`, on all three OSes, and NOTHING may run
+# before it in the job — an early failure must never skip the test gate
+# (audit 2026-11-08 finding C2: the G0 step was skipped in 52/52 observed
+# runs because visual steps preceded it).
+#
+# Scope: backend + headless tests only. Xvfb/GPU/visual smoke lives in
+# visual.yml (non-blocking). Probes, linux-extras and negative tests are
+# re-added as separate required jobs in Phases 3-4 of the plan.
+#
+# All actions are pinned to full commit SHAs (audit H5); Dependabot
+# (github-actions ecosystem) maintains the pins.
 
-name: CI (G1)
+name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  g1:
-    name: G1 (${{ matrix.os }})
+  gate:
+    name: gate (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install just
-        uses: extractions/setup-just@v2
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
 
-      - name: Setup (tools + nightly)
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ matrix.os }}-rust-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-rust-
+
+      # Installs rust components, nightly, cargo sub-tools, and rg (the
+      # source-gate scripts require it; runners don't ship it — audit H4).
+      - name: Setup (tools + nightly + rg)
         run: just setup
 
-      # Linux only: lavapipe, so the wgpu half of the S2-1 shader gate has a
-      # device. See `just gpu-setup` for why this cannot be optional.
-      - name: GPU setup (Linux only — lavapipe software Vulkan)
-        if: matrix.os == 'ubuntu-latest'
-        run: just gpu-setup
-
-      # The shader test above validates GPU pipeline construction headlessly.
-      # This separate Linux smoke launches an actual iced window and captures
-      # its rendered contents for visual review.
-      - name: Linux visual smoke setup
-        if: matrix.os == 'ubuntu-latest'
-        run: just ui-visual-setup
-
-      - name: Linux rendered UI smoke
-        if: matrix.os == 'ubuntu-latest'
-        run: just ui-visual-smoke
-
-      - name: Linux workspace pointer and chrome checks
-        if: matrix.os == 'ubuntu-latest'
-        run: just workspace-visual shell-foundation
-
-      - name: Workspace contracts through W09
-        run: just workspace-contracts W09
-
-      - name: Linux graph input, projections and filtering (canvas)
-        if: matrix.os == 'ubuntu-latest'
-        run: just workspace-graph-visual canvas
-
-      - name: Linux graph input, projections and filtering (GPU)
-        if: matrix.os == 'ubuntu-latest'
-        run: just workspace-graph-visual gpu
-
-      - name: Linux rendered reading and structure edits
-        if: matrix.os == 'ubuntu-latest'
-        run: just workspace-visual read-structure
-
-      - name: Upload workspace behavior evidence
-        if: always() && matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: flavite-workspace-shell
-          path: |
-            target/workspace-evidence/**/*.png
-            target/workspace-evidence/**/manifest.json
-            target/workspace-evidence/**/foundation-checks.json
-            target/workspace-evidence/**/graph-checks.json
-            target/workspace-evidence/**/reading-checks.json
-            target/workspace-evidence/**/expected-fixture.json
-            target/workspace-evidence/**/harness.jsonl
-            target/workspace-evidence/**/app.log
-            target/workspace-evidence/w08/**
-            target/workspace-evidence/w09/**
-          if-no-files-found: error
-
-      - name: Upload Linux UI screenshot
-        if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: flavite-ui-visual-smoke
-          path: target/ui-visual/graph.png
-          if-no-files-found: error
-
-      - name: G0 (fmt + clippy + test + arch check)
+      # G0: fmt + clippy + test + fault-tests + lint-arch + arch-check +
+      # workspace-contracts + gc. First and only build step of this job.
+      # NOTE: no GPU adapter is required — FLAVITE_REQUIRE_WGPU_ADAPTER is
+      # deliberately unset, so the shader link half skips honestly here;
+      # the lavapipe-backed run lives in visual.yml.
+      - name: Gate (G0)
         run: just gate
-        env:
-          # On Linux the step above installed lavapipe, so "no adapter" is a
-          # real defect rather than an absent GPU — fail instead of skipping.
-          # Elsewhere the value is empty and the test skips honestly.
-          FLAVITE_REQUIRE_WGPU_ADAPTER: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
-
-      # Linux-only: coverage merge + fuzz smoke + network-denied.
-      - name: Coverage (Linux only)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          mkdir -p target/llvm-cov
-          cargo llvm-cov --workspace --all-features --lcov --output-path target/llvm-cov/lcov.info
-          just cov-check
-
-      - name: Fuzz smoke 60 s (Linux only)
-        if: matrix.os == 'ubuntu-latest'
-        run: just fuzz-smoke-ci
-
-      - name: Network-denied run (Linux only)
-        if: matrix.os == 'ubuntu-latest'
-        run: just network-denied
-
-      - name: Doc build
-        run: just doc
-
-      - name: cargo-deny
-        run: cargo deny check
-
-      - name: cargo-audit
-        run: cargo audit
-
-      - name: MSRV build
-        run: just msrv
-
-  # PLAN-C slice C1: re-run watcher probe scenarios 1–3 on Linux headless and
-  # verify the D5 nomination property (eventual path nomination or explicit
-  # overflow). Measurements, never operation-count equality.
-  s3-watcher-probe:
-    name: S3 watcher probe (C1, Linux)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v2
-      - name: Probe scenarios 1–3 with self-check
-        run: just spike-s3 --scenarios 1,2,3 --self-check --json target/s3-watcher-report.json
-      - name: Upload report
-        uses: actions/upload-artifact@v4
-        with:
-          name: s3-watcher-report-linux
-          path: target/s3-watcher-report.json
-          if-no-files-found: error
-
-  # C2 (§9 S3-2): filesystem-semantics probe — rename-over, symlink identity,
-  # fsync, placeholder, advisory lock after kill -9, no-clobber rename. The
-  # self-check asserts the `Fs` trait contract's per-OS assumptions on Linux.
-  s3-fs-probe:
-    name: S3 fs probe (C2, Linux)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v2
-      - name: Probe all scenarios with self-check
-        run: just spike-s3-fs --scenarios all --self-check --json target/s3-fs-report.json
-      - name: Upload report
-        uses: actions/upload-artifact@v4
-        with:
-          name: s3-fs-report-linux
-          path: target/s3-fs-report.json
-          if-no-files-found: error
-
-  # C3 (§9 S4): search probe — CJK bigram quality vs plain, deferred commits
-  # under autosave, committed_generation replay, atomic checkpoint publication.
-  # CI re-runs the scaled-down (2k-note) self-check; the full probe is 20k.
-  s4-search-probe:
-    name: S4 search probe (C3, Linux)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v2
-      - name: Probe all scenarios (2k notes) with self-check
-        run: just spike-s4-search --scenarios all --notes 2000 --self-check --json target/s4-search-report.json
-      - name: Upload report
-        uses: actions/upload-artifact@v4
-        with:
-          name: s4-search-report-linux
-          path: target/s4-search-report.json
-          if-no-files-found: error
-
-  # C4 (§9 S4): DB probe — WAL single-writer + read pool under reconcile load,
-  # batch-size and pool-size sweeps, generation-bump cost, tantivy writer ops,
-  # open-time generation check. CI re-runs the scaled-down (2k-note) self-check;
-  # the full probe is 20k. Linux only (§9: Windows/macOS evidence deferred).
-  s4-db-probe:
-    name: S4 DB probe (C4, Linux)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v2
-      - name: Probe all scenarios (2k notes) with self-check
-        run: just spike-s4-db --scenarios all --notes 2000 --dir target/s4-db-probe --self-check --json target/s4-db-report.json
-      - name: Upload report
-        uses: actions/upload-artifact@v4
-        with:
-          name: s4-db-report-linux
-          path: target/s4-db-report.json
-          if-no-files-found: error
-
-  # Negative tests (AC-28/29): seed violations, assert failure.
-  arch-edges-negative:
-    name: arch-edges-negative (AC-28)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v2
-      - name: Seed undocumented internal edge
-        run: |
-          # Add a dependency from flavite-syntax to flavite-fs without
-          # updating crates.toml. arch check must fail on the edges check.
-          echo 'flavite-fs = { path = "../flavite-fs" }' >> crates/flavite-syntax/Cargo.toml
-          echo '[dependencies]' >> /dev/null # no-op
-          # Actually add the dep properly:
-          python3 -c "
-          content = open('crates/flavite-syntax/Cargo.toml').read()
-          if '[dependencies]' not in content:
-              content += '\n[dependencies]\nflavite-fs = { path = \"../flavite-fs\" }\n'
-          else:
-              content = content.replace('[dependencies]', '[dependencies]\nflavite-fs = { path = \"../flavite-fs\" }')
-          open('crates/flavite-syntax/Cargo.toml', 'w').write(content)
-          "
-          cargo xtask arch gen || true
-          if cargo xtask arch check 2>&1 | grep -q "EDGES"; then
-            echo "AC-28 PASS: edges violation detected"
-          else
-            echo "AC-28 FAIL: edges violation not detected"
-            exit 1
-          fi
-
-  arch-layering-negative:
-    name: arch-layering-negative (AC-28)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v2
-      - name: Seed layering violation (iced in core crate)
-        run: |
-          # Add iced to flavite-fs (a core-tier crate).
-          python3 -c "
-          content = open('crates/flavite-fs/Cargo.toml').read()
-          if '[dependencies]' not in content:
-              content += '\n[dependencies]\niced = \"0.14\"\n'
-          else:
-              content = content.replace('[dependencies]', '[dependencies]\niced = \"0.14\"')
-          open('crates/flavite-fs/Cargo.toml', 'w').write(content)
-          "
-          cargo xtask arch gen || true
-          if cargo xtask arch check 2>&1 | grep -q "LAYERING"; then
-            echo "AC-28 PASS: layering violation detected"
-          else
-            echo "AC-28 FAIL: layering violation not detected"
-            exit 1
-          fi
-
-  coverage-negative:
-    name: coverage-negative (AC-29)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v2
-      - name: Seed below-floor coverage
-        run: |
-          # Create a doctored lcov with flavite-fs at 50% (floor: 90%).
-          mkdir -p target/llvm-cov
-          cat > target/llvm-cov/lcov.info << 'EOF'
-          SF:/project/crates/flavite-fs/src/lib.rs
-          DA:1,1
-          DA:2,0
-          end_of_record
-          EOF
-          if just cov-check 2>&1 | grep -q "FAIL\|below\|floor"; then
-            echo "AC-29 PASS: below-floor coverage detected"
-          else
-            echo "AC-29 FAIL: below-floor coverage not detected"
-            exit 1
-          fi

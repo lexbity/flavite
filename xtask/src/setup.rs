@@ -9,10 +9,11 @@ use std::path::Path;
 use std::process::Command;
 
 /// The pre-push hook script content (§10.3: G0 + fuzz smoke, bypassable via
-/// `--no-verify`; G1 is the real wall).
+/// `--no-verify`; main is gated by the CI ruleset once it lands — see
+/// devdocs/plans/ci-gate-backend-headless-2026-11-08.md Phase 8).
 const PRE_PUSH_HOOK: &str = r#"#!/usr/bin/env bash
 # flavite pre-push hook (§10.3): runs G0 (just gate) + fuzz smoke.
-# Bypass with `git push --no-verify` — CI still blocks on G1.
+# Bypass with `git push --no-verify`; main additionally requires green CI via PR.
 set -euo pipefail
 
 echo "=== pre-push: just gate (G0) ==="
@@ -51,6 +52,50 @@ fn command_exists(name: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Install ripgrep per-OS. The source-gate scripts (`scripts/*.sh`) and
+/// `just lint-arch` shell out to `rg`, and GitHub-hosted runners do not ship
+/// it — a missing `rg` turns the gate into exit 127 (audit 2026-11-08, H4).
+/// Unlike the cargo tools this MUST succeed: return Err on failure.
+fn install_ripgrep() -> Result<()> {
+    if command_exists("rg") {
+        println!("  ✓ rg already installed");
+        return Ok(());
+    }
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = Command::new("brew");
+        c.args(["install", "ripgrep"]);
+        c
+    } else if cfg!(target_os = "windows") {
+        if command_exists("choco") {
+            let mut c = Command::new("choco");
+            c.args(["install", "ripgrep", "-y"]);
+            c
+        } else {
+            // Fallback: build from source (slow, but correct on any host).
+            let mut c = Command::new("cargo");
+            c.args(["install", "ripgrep", "--locked"]);
+            c
+        }
+    } else {
+        let mut c = Command::new("sudo");
+        c.args(["apt-get", "install", "-y", "ripgrep"]);
+        c
+    };
+    let status = cmd
+        .status()
+        .context("failed to spawn the ripgrep installer")?;
+    if !status.success() {
+        anyhow::bail!(
+            "ripgrep install failed with {status}; the gate scripts require `rg` on PATH"
+        );
+    }
+    if !command_exists("rg") {
+        anyhow::bail!("ripgrep install reported success but `rg --version` still fails");
+    }
+    println!("  ✓ rg installed and verified");
+    Ok(())
 }
 
 /// Install the pre-push hook into .git/hooks/.
@@ -129,6 +174,11 @@ pub fn setup() -> Result<()> {
             "cargo +nightly install cargo-shear",
         )?;
     }
+
+    // ripgrep: required by scripts/check-workspace-contracts.sh,
+    // scripts/lib/source-gates.sh and `just lint-arch`. Hard failure if it
+    // cannot be installed — a missing `rg` must never silently skip a gate.
+    install_ripgrep()?;
 
     // 4. Pre-push hook.
     println!("[4/4] Pre-push hook");

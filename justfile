@@ -127,10 +127,12 @@ spike-s4-search *args:
 spike-s4-db *args:
     cargo run -p xtask --bin s4_db_probe -- {{args}}
 
-# G0 — local fast gate (§10.3): fmt + clippy + test + arch check. ≤ 5 min budget.
-gate: fmt clippy test fault-tests lint-arch arch-check
+# G0 — local fast gate (§10.3): fmt + clippy + test + arch check + workspace
+# source contracts. ≤ 5 min budget. Runs on every OS: the contracts script is
+# headless and platform-independent (needs `rg`, installed by `just setup`).
+gate: fmt clippy test fault-tests lint-arch arch-check workspace-contracts
     @just gc
-    @echo "G0 passed (fmt + clippy + test + arch check)."
+    @echo "G0 passed (fmt + clippy + test + arch check + workspace contracts)."
 
 # Journal crash schedules are part of G0 so durability regressions fail locally.
 fault-tests:
@@ -214,6 +216,14 @@ fuzz-smoke:
         fi
     done
     exit $failed
+
+# Compile every fuzz target without running them. Drift gate: a target that
+# no longer compiles must fail here, not inside a 1 h nightly run (DEBT-7).
+fuzz-build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd fuzz
+    cargo +nightly fuzz build
 
 # G1 variant: 60 s per target (§10.3).
 fuzz-smoke-ci:
