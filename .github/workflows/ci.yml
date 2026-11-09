@@ -70,3 +70,26 @@ jobs:
       # the lavapipe-backed run lives in visual.yml.
       - name: Gate (G0)
         run: just gate
+
+  # G1 — the full CI gate, run verbatim from the same recipe a dev runs
+  # locally (`just ci-gate`), so CI and local can never diverge (plan D-9).
+  # Linux-only: llvm-cov, cargo-fuzz and unshare -n are Linux-only tools.
+  linux-extras:
+    name: linux-extras (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: gate
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ubuntu-rust-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('fuzz/Cargo.lock') }}
+
+      - name: Setup (tools + nightly + rg)
+        run: just setup
+
+      - name: CI gate (G1) — just ci-gate
+        run: just ci-gate

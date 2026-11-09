@@ -655,7 +655,7 @@ mod fault_injected {
             channels.pulse,
             channels.notice,
             config.clone(),
-            Some(data),
+            Some(data.clone()),
         );
         let mut flavite = Flavite::open(identity.clone(), session, config).expect("facade");
         flavite.set_graph_db_path_for_test(db.clone());
