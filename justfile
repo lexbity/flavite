@@ -1,7 +1,8 @@
 # Flavite justfile — single entry point for every gate recipe (§10.3).
 # A4: full G0 (fmt + clippy + test + arch check, ends with gc) + G1 (ci-gate).
 
-# Run rustfmt in check mode.
+# Run rustfmt in check mode. (cargo fmt takes no --locked; it never resolves
+# dependencies — the --locked guarantee applies to the build recipes below.)
 fmt:
     cargo fmt --all -- --check
 
@@ -11,15 +12,30 @@ fmt-fix:
 
 # Run clippy with warnings escalated to errors.
 clippy:
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets --locked -- -D warnings
 
-# Run all workspace tests.
+# Run all workspace tests. On failure, the failed-test lines are appended to
+# $GITHUB_STEP_SUMMARY in CI (audit L1) and the full log is kept in
+# target/last-test.log.
 test:
-    cargo test --workspace
+    #!/usr/bin/env bash
+    set -o pipefail
+    mkdir -p target # tee target below must work even when CARGO_TARGET_DIR is set elsewhere
+    if ! cargo test --workspace --locked 2>&1 | tee target/last-test.log; then
+        if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+                echo "### cargo test — failed tests"
+                echo '```'
+                grep -E "FAILED$|panicked at|failures:$|^error" target/last-test.log | head -50
+                echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+        fi
+        exit 1
+    fi
 
 # Type-check the workspace.
 check:
-    cargo check --workspace
+    cargo check --workspace --locked
 
 # Architecture check (drift + edges + layering, §10.2).
 arch-check:
@@ -33,13 +49,14 @@ arch-gen:
 reconcile-bench:
     cargo bench -p flavite-vault --bench reconcile_concurrency
 
-# RFC-0004 S6 scale gate (AC-4/NFR-2): graph-mirror synchronize wall at the
-# 50k-note / 150k-link design bound plus the full-read fallback parity.
-# RFC-0005 S4: materialization (AC-6/NFR-4) and the NFR-6 allocation gate
-# (5k-note bound) ride the same release-profile ignored test run.
+# Scale/perf gates (AC-4/NFR-2, AC-6/NFR-4, AC-16): all tests marked
+# #[ignore = "perf ..."] across the workspace, run in release. Wall-clock
+# budgets are meaningless on a shared per-PR runner, so they live here
+# (weekly advisory job), not in `just gate`. Includes the RFC-0004 S6
+# graph-mirror synchronize wall, the RFC-0005 S4 materialization and
+# allocation gates, and the flavite-graph 50k-node build smoke.
 bench-scale:
-    cargo test -p flavite-api --test graph_mirror_scale --release -- --ignored --nocapture
-    cargo test -p flavite-api --test graph_allocation_profile --release -- --ignored --nocapture
+    cargo test --workspace --release -- --ignored --nocapture
 
 # Architecture debt gates from RFC-0002 §7; zero matches are required.
 lint-arch:
@@ -127,52 +144,59 @@ spike-s4-search *args:
 spike-s4-db *args:
     cargo run -p xtask --bin s4_db_probe -- {{args}}
 
-# G0 — local fast gate (§10.3): fmt + clippy + test + arch check. ≤ 5 min budget.
-gate: fmt clippy test fault-tests lint-arch arch-check
+# G0 — local fast gate (§10.3): fmt + clippy + test + arch check + workspace
+# source contracts. ≤ 5 min budget. Runs on every OS: the contracts script is
+# headless and platform-independent (needs `rg`, installed by `just setup`).
+gate: fmt clippy test fault-tests lint-arch arch-check workspace-contracts
     @just gc
-    @echo "G0 passed (fmt + clippy + test + arch check)."
+    @echo "G0 passed (fmt + clippy + test + arch check + workspace contracts)."
 
 # Journal crash schedules are part of G0 so durability regressions fail locally.
 fault-tests:
-    cargo test -p flavite-vault --features fault journal::executor
+    cargo test -p flavite-vault --features fault --locked journal::executor
 
-# G1 — CI gate (§10.3): G0 + coverage floors + FaultFs/integration suites +
-# doc build + deny/audit/shear + fuzz smoke 60 s + network-denied + MSRV.
+# G1 — CI gate (§10.3): G0 + doc build + deny/audit/shear + coverage floors +
+# network-denied + MSRV + fuzz compile + fuzz smoke 60 s.
+# Order: cheapest, highest-signal checks first; the expensive instrumented
+# coverage build and the 60 s-per-target fuzz smoke run last, so a cheap
+# failure fails fast (audit 2026-11-08, C2/D-9).
 ci-gate: gate
-    @echo "=== G1: coverage ==="
-    mkdir -p target/llvm-cov
-    cargo llvm-cov --workspace --lcov --output-path target/llvm-cov/lcov.info
-    cargo xtask cov-check --lcov target/llvm-cov/lcov.info
     @echo "=== G1: doc build ==="
-    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+    just doc
     @echo "=== G1: cargo-deny ==="
     cargo deny check
     @echo "=== G1: cargo-audit ==="
     cargo audit
     @echo "=== G1: cargo-shear ==="
     cargo shear
-    @echo "=== G1: fuzz smoke (60 s/target) ==="
-    just fuzz-smoke-ci
+    @echo "=== G1: coverage ==="
+    mkdir -p target/llvm-cov
+    cargo llvm-cov --workspace --locked --lcov --output-path target/llvm-cov/lcov.info
+    just cov-check
     @echo "=== G1: network-denied ==="
     just network-denied
     @echo "=== G1: MSRV build ==="
     just msrv
+    @echo "=== G1: fuzz build (all targets compile) ==="
+    just fuzz-build
+    @echo "=== G1: fuzz smoke (60 s/target) ==="
+    just fuzz-smoke-ci
     @echo "G1 passed."
 
 # Build documentation with warnings as errors (§10.4).
 doc:
-    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 
 # MSRV build (§10.4, §10.8): check against the workspace rust-version.
 msrv:
-    cargo +1.90.0 check --workspace
+    cargo +1.90.0 check --workspace --locked
 
 # Network-denied test run (§10.3, AC-26): build first, then run tests under
 # unshare with no network. A seeded connection attempt must fail the assertion.
 network-denied:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo test --workspace --no-run
+    cargo test --workspace --locked --no-run
     echo "=== network-denied: running tests under unshare -n ==="
     if command -v unshare >/dev/null 2>&1; then
         unshare -n cargo test --workspace || {
@@ -184,8 +208,23 @@ network-denied:
     fi
 
 # Coverage check (§10.5): requires lcov.info from `cargo llvm-cov`.
+# On failure the checker output is appended to $GITHUB_STEP_SUMMARY in CI.
 cov-check lcov="target/llvm-cov/lcov.info":
-    cargo xtask cov-check --lcov {{lcov}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! out=$(cargo xtask cov-check --lcov {{lcov}} 2>&1); then
+        echo "$out" >&2
+        if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+                echo "### cov-check FAILED (below floor or waiver expired)"
+                echo '```'
+                echo "$out" | tail -30
+                echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+        fi
+        exit 1
+    fi
+    echo "$out"
 
 # Run maintained fuzz targets over generated input (§10.6).
 # Rename planning remains excluded while its fuzz target is a prototype; smoke
@@ -199,7 +238,7 @@ fuzz-smoke:
     cd fuzz
     smoke_root="$(mktemp -d)"
     trap 'rm -rf "$smoke_root"' EXIT
-    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore graph_scope read_structure text_match text_worker_protocol replace_plan"
+    targets="encoding image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore graph_scope read_structure text_match text_worker_protocol replace_plan"
     failed=0
     for target in $targets; do
         corpus_dir="$smoke_root/$target"
@@ -215,6 +254,14 @@ fuzz-smoke:
     done
     exit $failed
 
+# Compile every fuzz target without running them. Drift gate: a target that
+# no longer compiles must fail here, not inside a 1 h nightly run (DEBT-7).
+fuzz-build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd fuzz
+    cargo +nightly fuzz build
+
 # G1 variant: 60 s per target (§10.3).
 fuzz-smoke-ci:
     #!/usr/bin/env bash
@@ -222,7 +269,7 @@ fuzz-smoke-ci:
     cd fuzz
     smoke_root="$(mktemp -d)"
     trap 'rm -rf "$smoke_root"' EXIT
-    targets="image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore graph_scope read_structure text_match text_worker_protocol replace_plan"
+    targets="encoding image_limits parser path_safety scanner frontmatter_patcher parity workspace_layout link_insertion workspace_restore graph_scope read_structure text_match text_worker_protocol replace_plan"
     failed=0
     for target in $targets; do
         corpus_dir="$smoke_root/$target"
@@ -233,6 +280,9 @@ fuzz-smoke-ci:
         echo "=== fuzz-smoke-ci: $target (60s) ==="
         if ! cargo +nightly fuzz run "$target" "$corpus_dir" -- -max_total_time=60 -rss_limit_mb=4096; then
             echo "FUZZ SMOKE FAILED: $target"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                echo "- ❌ fuzz smoke failed: \`$target\` (crash artifact in fuzz/artifacts/)" >> "$GITHUB_STEP_SUMMARY"
+            fi
             failed=1
         fi
     done

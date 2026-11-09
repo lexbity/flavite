@@ -1,0 +1,95 @@
+# Visual (non-blocking) — platform-specific UI/UX evidence, deferred from the
+# required gate per devdocs/plans/ci-gate-backend-headless-2026-11-08.md (NG-1,
+# FR-5). Runs the Xvfb rendered-window smoke, the lavapipe-backed shader link
+# half, and the workspace visual scenarios. Never a required check; triggered
+# manually or weekly.
+#
+# All actions pinned to full commit SHAs.
+
+name: Visual (non-blocking)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 8 * * 6' # 08:00 UTC Saturdays
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false # never cancel a scheduled evidence run
+
+jobs:
+  visual:
+    name: visual smoke (ubuntu, lavapipe + xvfb)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ubuntu-rust-${{ hashFiles('Cargo.lock') }}
+
+      - name: Setup (tools + nightly + rg)
+        run: just setup
+
+      # Linux only: lavapipe, so the wgpu half of the shader gate has a
+      # device. See `just gpu-setup` for why this cannot be optional here.
+      - name: GPU setup (lavapipe software Vulkan)
+        run: just gpu-setup
+
+      # With lavapipe installed, "no adapter" is a real defect — the shader
+      # link half must run, not skip (re-homed from the old ci.yml G0 step).
+      - name: Shader validation with required adapter
+        run: cargo test -p flavite-ui --test shader_validation
+        env:
+          FLAVITE_REQUIRE_WGPU_ADAPTER: '1'
+
+      - name: Linux visual smoke setup
+        run: just ui-visual-setup
+
+      # Launches an actual iced window under Xvfb and captures its rendered
+      # contents for visual review.
+      - name: Linux rendered UI smoke
+        run: just ui-visual-smoke
+
+      - name: Linux workspace pointer and chrome checks
+        run: just workspace-visual shell-foundation
+
+      - name: Linux graph input, projections and filtering (canvas)
+        run: just workspace-graph-visual canvas
+
+      - name: Linux graph input, projections and filtering (GPU)
+        run: just workspace-graph-visual gpu
+
+      - name: Linux rendered reading and structure edits
+        run: just workspace-visual read-structure
+
+      - name: Upload workspace behavior evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flavite-workspace-shell
+          path: |
+            target/workspace-evidence/**/*.png
+            target/workspace-evidence/**/manifest.json
+            target/workspace-evidence/**/foundation-checks.json
+            target/workspace-evidence/**/graph-checks.json
+            target/workspace-evidence/**/reading-checks.json
+            target/workspace-evidence/**/expected-fixture.json
+            target/workspace-evidence/**/harness.jsonl
+            target/workspace-evidence/**/app.log
+            target/workspace-evidence/w08/**
+            target/workspace-evidence/w09/**
+          if-no-files-found: error
+
+      - name: Upload Linux UI screenshot
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flavite-ui-visual-smoke
+          path: target/ui-visual/graph.png
+          if-no-files-found: error

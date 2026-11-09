@@ -757,7 +757,15 @@ fn attachment_activation_uses_the_local_inspector_not_a_note_open() {
 /// bounded hold while emphasis-only updates still apply, and the deferred
 /// frame catches up once the gesture resolves. A drag also suppresses the
 /// click pair instead of ever activating.
+// Quarantined (audit 2026-11-08 flaky-test rule): the trailing assertions
+// compare layout positions for exact equality, but the layout's settled
+// positions are not bit-deterministic across runs/machines — observed
+// failing on loaded CI runners (runs 42548285621, 42553438011: "the
+// settled b node moved"). Follow-up: make the layout deterministic or
+// relax these to invariants (b within epsilon of b_center). Still runs
+// weekly under `just bench-scale` (--ignored).
 #[test]
+#[ignore = "non-deterministic layout positions; flaky on CI — see comment above"]
 fn entity_frames_freeze_for_the_pair_hold_while_emphasis_updates() {
     let (mut app, _fs, _cache) = graph_fixture::fixture_with(&[
         ("a.md", "# A\n\nsee [[b]] and [[c]].\n"),
@@ -802,11 +810,13 @@ fn entity_frames_freeze_for_the_pair_hold_while_emphasis_updates() {
         "appearance.theme",
         flavite_settings::value::SettingValue::Str("light".into()),
     );
-    let _ = app.update(Message::Pump);
-    assert!(
-        app.graph.state(graph).expect("state").geometry_generation > gen0,
-        "selection emphasis/palette may update while the hit geometry is frozen"
-    );
+    // De-flaked (audit 2026-11-08, flaky-test class): wait for the emphasis
+    // update to land instead of assuming a single Pump delivers it. The
+    // asserted property is unchanged — emphasis-only updates DO apply during
+    // the hold.
+    wait_for(&mut app, "theme emphasis during pair hold", |app| {
+        app.graph.state(graph).expect("state").geometry_generation > gen0
+    });
     let gen1 = app.graph.state(graph).expect("state").geometry_generation;
 
     // An entity-moving frame lands during the hold: the node-drag preview

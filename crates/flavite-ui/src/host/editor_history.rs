@@ -13,6 +13,41 @@ use std::collections::BTreeMap;
 pub const ROW_HEIGHT: f32 = 52.0;
 pub const ROW_SPACING: f32 = 2.0;
 
+/// Source-free, stable display metadata. Wall-clock changes never affect node
+/// ordering, command grouping, selection, expiry or restore authorization.
+pub fn entry_title(entry: &HistoryEntry) -> String {
+    if entry.initial {
+        return "Initial state".into();
+    }
+    let time = i64::try_from(entry.changed_at_unix_ms)
+        .ok()
+        .filter(|&ms| ms != 0)
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S%.3f")
+                .to_string()
+        })
+        .unwrap_or_else(|| "Time unavailable".into());
+    format!(
+        "{} · {time}{}",
+        entry.kind.label(),
+        if entry.open { " ···" } else { "" }
+    )
+}
+
+pub fn entry_status(entry: &HistoryEntry) -> &'static str {
+    if entry.current {
+        "Current"
+    } else if !entry.restorable {
+        "Use Undo/Redo to cross the rename transaction"
+    } else if entry.on_path {
+        "Earlier state"
+    } else {
+        "Other branch"
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryAction {
     Open,
@@ -110,6 +145,9 @@ pub fn visible_entries(app: &App, source: EditorTarget) -> Vec<&HistoryEntry> {
     {
         return Vec::new();
     }
+    if super::context_mode::effect_caption(app, source.tab).is_some() {
+        return Vec::new();
+    }
     let Some(page) = &app.context_mode.history.page else {
         return Vec::new();
     };
@@ -118,7 +156,7 @@ pub fn visible_entries(app: &App, source: EditorTarget) -> Vec<&HistoryEntry> {
         .get(&source.tab)
         .map_or(640.0, |b| b.width)
         / app.appearance.metrics().scale;
-    let count = (((width - 150.0).max(0.0) / 82.0) as usize).min(12);
+    let count = flavite_editor::context::layout::ContextLayout::new(width).chip_count();
     let redo = page.redo.as_ref().filter(|_| count >= 2);
     let start = page
         .trail
@@ -269,6 +307,7 @@ pub fn handle(app: &mut App, message: HistoryMessage) -> Task<Message> {
             }
             match action {
                 HistoryAction::Open | HistoryAction::Refresh | HistoryAction::NextPage(_) => {
+                    app.context_mode.clear_preview();
                     let cursor = if let HistoryAction::NextPage(cursor) = action {
                         if app.context_mode.history.page.as_ref().and_then(|p| p.next)
                             != Some(cursor)

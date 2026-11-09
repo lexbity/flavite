@@ -27,8 +27,8 @@ fuzz_target!(|data: &[u8]| {
 
     // The raw bytes must never be mutated by any codec call.
     let before: Arc<[u8]> = Arc::from(data);
-    let limits = flavite_encoding::DecodeLimits::default_envelope();
-    let encode_limits = flavite_encoding::EncodeLimits::default_envelope();
+    let limits = flavite_encoding::DecodeLimits::default();
+    let encode_limits = flavite_encoding::EncodeLimits::default();
 
     // Each decode case keeps the policy it used: the re-decode invariant is
     // stated under the SAME policy. An explicit BOM-less UTF-16 descriptor
@@ -77,10 +77,15 @@ fuzz_target!(|data: &[u8]| {
             .expect("round-tripped bytes still decode");
         assert_eq!(redecoded.text(), decoded.text());
 
-        // The boundary map is consistent with the source length and answers
-        // position queries without panicking, at a few probed offsets.
+        // The boundary map answers position queries without panicking, at a
+        // few probed offsets. EOF is always a valid paired boundary, so the
+        // full source length must map to the decoded length.
         let map = decoded.map();
-        assert_eq!(map.source_len(), data.len());
+        assert_eq!(
+            map.source_to_decoded(data.len()),
+            Some(decoded.text().len()),
+            "EOF must map to the decoded length"
+        );
         for probe in [0usize, data.len() / 2, data.len().saturating_sub(1)] {
             let _ = map.source_to_decoded(probe);
             let _ = map.decoded_to_source(probe);

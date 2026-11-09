@@ -136,6 +136,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         .with_max_line_width(app.appearance.metrics().editor_max_line_width())
         .with_colors(editor_colors)
         .with_context_mode(context_mode,move |request| Message::ContextNative { tab,incarnation,request })
+        .with_command_preview(crate::host::context_mode::preview_command(app, tab))
         .with_context_toggle(move |event| matches!(event,iced::keyboard::Event::KeyPressed {key,modifiers,..}
             if app.settings.capture.is_none() && app.appearance.chord_command(key,modifiers)==Some("editor.context_toggle")))
         .with_candidates(app.editor_candidates().clone())

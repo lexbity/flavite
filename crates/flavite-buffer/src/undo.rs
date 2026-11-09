@@ -14,6 +14,14 @@ use crate::history::{
 use crate::revision::Revision;
 use flavite_syntax::text::{Span, TextByte, TextSnapshot};
 use std::time::{Duration, Instant};
+
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|time| u64::try_from(time.as_millis()).ok())
+        .unwrap_or(0)
+}
 /// Default time window for coalescing consecutive edits into a single undo group.
 ///
 /// Edits within this window of the previous edit are coalesced.
@@ -146,6 +154,7 @@ impl EditOp {
 /// - Children (for branching on undo-after-edit)
 #[derive(Debug, Clone)]
 pub struct UndoNode {
+    changed_at_unix_ms: u64,
     segment: Option<u64>,
     pub version: u64,
     pub editor: Option<EditorEdit>,
@@ -170,6 +179,7 @@ impl UndoNode {
     #[must_use]
     pub fn root(revision: Revision, snapshot: TextSnapshot) -> Self {
         Self {
+            changed_at_unix_ms: wall_clock_ms(),
             segment: None,
             version: 1,
             editor: None,
@@ -193,6 +203,7 @@ impl UndoNode {
         snapshot: TextSnapshot,
     ) -> Self {
         Self {
+            changed_at_unix_ms: wall_clock_ms(),
             segment: edit.journal.as_ref().map(|_| id),
             version: 1,
             editor: None,
@@ -416,6 +427,7 @@ impl UndoTree {
                     after[prefix..after.len() - suffix].into(),
                 );
                 if let Some(node) = self.nodes.get_mut(position_id as usize) {
+                    node.changed_at_unix_ms = wall_clock_ms();
                     node.version += 1;
                     node.edit = Some(coalesced);
                     node.snapshot = Some(snapshot);
@@ -563,6 +575,7 @@ impl UndoTree {
     ) -> Option<HistoryEntry> {
         let node = self.get(id)?;
         Some(HistoryEntry {
+            changed_at_unix_ms: node.changed_at_unix_ms,
             on_path,
             selection_count: if node.is_root() {
                 Some(1)

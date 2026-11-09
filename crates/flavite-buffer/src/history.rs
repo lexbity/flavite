@@ -152,6 +152,8 @@ pub struct HistoryTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEntry {
+    /// Wall-clock display metadata only; ordering and expiry use IDs/version.
+    pub changed_at_unix_ms: u64,
     pub selection_count: Option<usize>,
     pub on_path: bool,
     pub target: HistoryTarget,

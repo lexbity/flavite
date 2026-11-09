@@ -5,6 +5,34 @@ use flavite_buffer::{
 };
 use flavite_syntax::text::{Span, TextByte, TextSnapshot};
 
+#[test]
+fn history_display_time_belongs_to_the_edit_and_not_to_head_navigation() {
+    let mut model = EditorModel::from_text("base");
+    edit(&mut model, 0, "A", EditKind::Typing);
+    model.seal_undo_group();
+    let page = model.history_page(None, 100).unwrap();
+    let entry = page.entries[0].clone();
+    assert!(entry.changed_at_unix_ms > 0);
+    edit(&mut model, 1, "B", EditKind::Typing);
+    model.restore_state(entry.target).unwrap();
+    model.undo().unwrap();
+    model.redo().unwrap();
+    let restored = model
+        .history_page(None, 100)
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|e| e.target == entry.target)
+        .unwrap();
+    assert_eq!(restored.changed_at_unix_ms, entry.changed_at_unix_ms);
+    let wire = serde_json::to_value(restored).unwrap();
+    assert_eq!(wire["changed_at_unix_ms"], entry.changed_at_unix_ms);
+    assert!(
+        !wire.to_string().contains("base"),
+        "display metadata never contains note text"
+    );
+}
+
 fn edit(model: &mut EditorModel, at: usize, value: &str, kind: EditKind) {
     let record = EditorEdit {
         origin: format!("{:032x}", 1),
