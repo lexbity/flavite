@@ -11,11 +11,14 @@
 # are excluded until support lands. Known blockers when re-enabling:
 # macOS needs `cap_std` in flavite-fs deps; Windows needs the `windows-sys`
 # features used by xtask/src/spike_s3_fs.rs (Win32_Storage_FileSystem etc.).
-# Re-enable by adding the OS to the matrix below (and to weekly fresh-clone).
+# Re-enable by adding the OS to the matrix below.
 #
 # Xvfb/GPU/visual smoke lives in visual.yml (non-blocking). Probes,
 # linux-extras and negative tests are re-added as separate required jobs in
 # Phases 3-4 of the plan.
+#
+# Triggers: push/PR of new code on main, and tag pushes (v*) for new
+# releases. No scheduled runs (weekly/nightly removed 2026-11-09).
 #
 # All actions are pinned to full commit SHAs (audit H5); Dependabot
 # (github-actions ecosystem) maintains the pins.
@@ -25,9 +28,9 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*'] # new release
   pull_request:
     branches: [main]
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -44,8 +47,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS/Windows deferred — see header comment.
-        os: [ubuntu-latest]
+        # macOS/Windows removed until official support lands — see header
+        # comment. Runner pinned to Ubuntu 26.04 (not ubuntu-latest).
+        os: [ubuntu-26.04]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -75,8 +79,8 @@ jobs:
   # locally (`just ci-gate`), so CI and local can never diverge (plan D-9).
   # Linux-only: llvm-cov, cargo-fuzz and unshare -n are Linux-only tools.
   linux-extras:
-    name: linux-extras (ubuntu)
-    runs-on: ubuntu-latest
+    name: linux-extras (ubuntu-26.04)
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     needs: gate
     steps:
@@ -86,7 +90,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: ubuntu-rust-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('fuzz/Cargo.lock') }}
+          key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('fuzz/Cargo.lock') }}
 
       - name: Setup (tools + nightly + rg)
         run: just setup

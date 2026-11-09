@@ -2,7 +2,7 @@
 # required gate per devdocs/plans/ci-gate-backend-headless-2026-11-08.md (NG-1,
 # FR-5). Runs the Xvfb rendered-window smoke, the lavapipe-backed shader link
 # half, and the workspace visual scenarios. Never a required check; triggered
-# manually or weekly.
+# manually only (weekly schedule removed 2026-11-09 — no scheduled runs).
 #
 # All actions pinned to full commit SHAs.
 
@@ -10,8 +10,6 @@ name: Visual (non-blocking)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 8 * * 6' # 08:00 UTC Saturdays
 
 permissions:
   contents: read
@@ -22,8 +20,8 @@ concurrency:
 
 jobs:
   visual:
-    name: visual smoke (ubuntu, lavapipe + xvfb)
-    runs-on: ubuntu-latest
+    name: visual smoke (ubuntu-26.04, lavapipe + xvfb)
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -32,7 +30,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: ubuntu-rust-${{ hashFiles('Cargo.lock') }}
+          key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
 
       - name: Setup (tools + nightly + rg)
         run: just setup
