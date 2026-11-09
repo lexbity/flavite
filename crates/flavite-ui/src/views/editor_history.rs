@@ -10,22 +10,11 @@ use crate::{
     workspace::bounds,
 };
 use flavite_buffer::history::HistoryEntry;
+use flavite_editor::context::layout;
 use iced::widget::{
     Space, button, column, container, mouse_area, opaque, row, scrollable, stack, text, tooltip,
 };
 use iced::{Element, Length, alignment};
-
-fn label(entry: &HistoryEntry) -> String {
-    if entry.initial {
-        "Initial state".into()
-    } else {
-        format!(
-            "{}{}",
-            entry.kind.label(),
-            if entry.open { " ···" } else { "" }
-        )
-    }
-}
 
 fn observed<'a>(
     app: &App,
@@ -56,14 +45,16 @@ fn observed<'a>(
 }
 
 fn control<'a>(
+    app: &App,
     source: EditorTarget,
     name: &'static str,
     title: &'static str,
     action: Option<HistoryAction>,
 ) -> Element<'a, Message> {
+    let metrics = app.appearance.metrics();
     bounds::observe(
-        button(text(title).size(12))
-            .padding([4, 8])
+        button(text(title).size(metrics.text_sm))
+            .padding([4.0 * metrics.scale, 8.0 * metrics.scale])
             .style(style::ghost())
             .on_press_maybe(
                 action.map(|action| Message::EditorHistory(HistoryMessage::Act(source, action))),
@@ -78,22 +69,21 @@ pub fn strip<'a>(
     source: EditorTarget,
     summary: String,
     caption: String,
+    effect: Option<String>,
 ) -> Element<'a, Message> {
     let metrics = *app.appearance.metrics();
-    let mut content = row![text(summary).size(metrics.text_sm)]
-        .spacing(6.0 * metrics.scale)
-        .align_y(alignment::Vertical::Center);
+    let mut content = row![
+        container(text(summary).size(metrics.text_sm)).width(layout::SUMMARY_WIDTH * metrics.scale)
+    ]
+    .spacing(layout::CHIP_GAP * metrics.scale)
+    .align_y(alignment::Vertical::Center);
     let visible = editor_history::visible_entries(app, source);
     if !visible.is_empty() {
         for entry in visible {
             let full = format!(
-                "{}{}",
-                label(entry),
-                if entry.restorable {
-                    ""
-                } else {
-                    " · Use Undo/Redo to cross the rename transaction"
-                }
+                "{} · {}",
+                editor_history::entry_title(entry),
+                editor_history::entry_status(entry)
             );
             let is_redo = app
                 .context_mode
@@ -104,21 +94,27 @@ pub fn strip<'a>(
                 .redo
                 .as_ref()
                 .is_some_and(|redo| redo.target == entry.target);
-            let mut short: String = label(entry)
-                .chars()
-                .take(if is_redo { 7 } else { 9 })
-                .collect();
+            let mut short = if entry.initial {
+                "Initial".to_owned()
+            } else {
+                match entry.kind {
+                    flavite_buffer::history::EditKind::OpenAbove => "Open above",
+                    flavite_buffer::history::EditKind::OpenBelow => "Open below",
+                    flavite_buffer::history::EditKind::Format => "Format",
+                    flavite_buffer::history::EditKind::Snapshot => "Snapshot",
+                    flavite_buffer::history::EditKind::Edit => "Edit",
+                    _ => entry.kind.label(),
+                }
+                .to_owned()
+            };
             if is_redo {
                 short = format!("↪ {short}");
             } else if entry.current {
                 short.push_str(" ✓");
             }
-            if label(entry).chars().count() > 9 {
-                short.push('…');
-            }
             let chip = button(text(short).size(metrics.text_sm))
-                .width(76.0 * metrics.scale)
-                .padding([1, 4])
+                .width(layout::CHIP_WIDTH * metrics.scale)
+                .padding([1.0 * metrics.scale, 4.0 * metrics.scale])
                 .style(style::list_row(entry.current))
                 .on_press_maybe(
                     (!app.context_mode.history.open
@@ -146,6 +142,16 @@ pub fn strip<'a>(
             ));
         }
     } else {
+        let attention = app
+            .context_mode
+            .session
+            .as_ref()
+            .is_some_and(|session| session.attention);
+        let caption = if attention {
+            caption
+        } else {
+            effect.unwrap_or(caption)
+        };
         content = content.push(text(caption).size(metrics.text_sm).style(style::dim_text));
     }
     let detail = mouse_area(
@@ -180,7 +186,13 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
     let title = row![
         text("Editing history").size(metrics.text),
         Space::new().width(Length::Fill),
-        control(source, "history-close", "Close", Some(HistoryAction::Close))
+        control(
+            app,
+            source,
+            "history-close",
+            "Close",
+            Some(HistoryAction::Close)
+        )
     ]
     .align_y(alignment::Vertical::Center);
     let mut contents = column![
@@ -196,18 +208,12 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
     let mut entries = column![].spacing(editor_history::ROW_SPACING * metrics.scale);
     if let Some(page) = &host.page {
         for (index, entry) in page.entries.iter().enumerate() {
-            let detail: &str = if entry.current {
-                "Current"
-            } else if !entry.restorable {
-                "Use Undo/Redo to cross the rename transaction"
-            } else {
-                if entry.on_path {
-                    "Earlier state"
-                } else {
-                    "Other branch"
-                }
-            };
-            let title = format!("{}{}", label(entry), if entry.current { " ✓" } else { "" });
+            let detail = editor_history::entry_status(entry);
+            let title = format!(
+                "{}{}",
+                editor_history::entry_title(entry),
+                if entry.current { " ✓" } else { "" }
+            );
             let item = button(
                 column![
                     text(title).size(metrics.text),
@@ -241,6 +247,7 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
     );
     contents = contents.push(row![
         control(
+            app,
             source,
             "history-refresh",
             "Newest",
@@ -248,6 +255,7 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
         ),
         Space::new().width(Length::Fill),
         control(
+            app,
             source,
             "history-next",
             "Older states",

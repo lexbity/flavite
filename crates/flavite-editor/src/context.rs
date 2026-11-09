@@ -6,6 +6,9 @@
 use iced::keyboard::{Modifiers, key::Code};
 use unicode_segmentation::UnicodeSegmentation;
 
+pub mod effect;
+pub mod layout;
+
 /// Native editor context intents carry the exact source and visible selection.
 #[derive(Debug, Clone)]
 pub struct ContextRequest {

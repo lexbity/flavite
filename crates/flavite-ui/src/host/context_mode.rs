@@ -38,6 +38,7 @@ impl EditorTarget {
 
 #[derive(Debug, Clone)]
 pub enum ContextMessage {
+    Preview(EditorTarget, ContextCommand, bool),
     Run(EditorTarget, ContextCommand),
     EnterAt(EditorTarget, (usize, usize)),
     OpenMenu(EditorTarget, ContextMenu),
@@ -65,6 +66,7 @@ pub struct ContextSession {
 
 #[derive(Debug, Default)]
 pub struct ContextHost {
+    preview: Option<(EditorTarget, ContextCommand)>,
     pub history: super::editor_history::HistoryHost,
     pub session: Option<ContextSession>,
     pub bounds: BTreeMap<(TabId, &'static str), Rectangle>,
@@ -75,6 +77,9 @@ pub struct ContextHost {
 }
 
 impl ContextHost {
+    pub(crate) fn clear_preview(&mut self) {
+        self.preview = None;
+    }
     pub const fn generation(&self) -> u64 {
         self.generation
     }
@@ -121,6 +126,52 @@ pub fn too_narrow(app: &App, tab: TabId) -> bool {
             .editor_bounds
             .get(&tab)
             .is_some_and(|rect| rect.width / app.appearance.metrics().scale < 320.0)
+}
+
+/// This describes a prospective command, never a committed selection or edit.
+/// Both the source editor and toolbar ask the same bound preview owner.
+pub fn preview_command(app: &App, tab: TabId) -> Option<ContextCommand> {
+    let session = app.context_mode.session.as_ref().filter(|s| s.tab == tab)?;
+    if app.context_mode.history.open
+        || app.palette_open
+        || app.picker.open
+        || app.dialog.is_some()
+        || app.strip_menu.is_some()
+        || app.has_composition()
+        || too_narrow(app, tab)
+    {
+        return None;
+    }
+    let target = EditorTarget::capture(app, tab)?;
+    let command = if let Some((source, command)) = app.context_mode.preview
+        && source == target
+    {
+        command
+    } else if let Some(menu) = session.menu {
+        *menu.commands().get(session.selected)?
+    } else if session.mode == ContextMode::Command {
+        ContextCommand::Delete
+    } else {
+        return None;
+    };
+    available(app, target, command).then_some(command)
+}
+
+pub fn effect_caption(app: &App, tab: TabId) -> Option<String> {
+    let session = app.context_mode.session.as_ref().filter(|s| s.tab == tab)?;
+    let target = EditorTarget::capture(app, tab)?;
+    if session.menu.is_none()
+        && !app
+            .context_mode
+            .preview
+            .is_some_and(|(source, _)| source == target)
+    {
+        return None;
+    }
+    let command = preview_command(app, tab)?;
+    let view = app.note_editor_view(tab)?;
+    flavite_editor::context::effect::plan(&view.text, target.selection, command)
+        .map(|effect| effect.description(command))
 }
 
 /// Available commands derive from the same target checks as execution.
@@ -268,6 +319,7 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
 }
 
 fn exit(app: &mut App) {
+    app.context_mode.clear_preview();
     app.context_mode.history = Default::default();
     app.context_mode.capture = None;
     if let Some(session) = app.context_mode.session.take() {
@@ -322,6 +374,7 @@ pub fn selection_changed(app: &mut App, tab: TabId) {
     if app.context_mode.internal_selection {
         return;
     }
+    app.context_mode.clear_preview();
     app.context_mode.capture = None;
     if app
         .context_mode
@@ -474,7 +527,7 @@ fn input_command(
     target: EditorTarget,
     action: KeyAction,
     text: String,
-    semantic: Option<super::input::HistoryIntent>,
+    semantic: Option<super::input::CommandIntent>,
 ) -> Task<Message> {
     let Some(view) = app.note_editor_view(target.tab) else {
         return Task::none();
@@ -508,6 +561,18 @@ fn input_command(
 /// Execute every toolbar/accelerator/palette action through one target guard.
 pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
     match message {
+        ContextMessage::Preview(source, command, entered) => {
+            if entered
+                && valid(app, source, true)
+                && app.context_mode.mode(source.tab).active()
+                && !app.context_mode.history.open
+            {
+                app.context_mode.preview = Some((source, command));
+            } else if !entered && app.context_mode.preview == Some((source, command)) {
+                app.context_mode.preview = None;
+            }
+            Task::none()
+        }
         ContextMessage::ExpandPane(target) => {
             if valid(app, target, true) && too_narrow(app, target.tab) {
                 super::commands::dispatch(app, "workspace.maximize_group")
@@ -524,6 +589,7 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
             Task::none()
         }
         ContextMessage::CloseMenu(tab) => {
+            app.context_mode.preview = None;
             if let Some(s) = app.context_mode.session.as_mut().filter(|s| s.tab == tab) {
                 s.menu = None;
                 s.menu_target = None;
@@ -531,6 +597,7 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
             focus(app, tab)
         }
         ContextMessage::MenuMove(forward) => {
+            app.context_mode.preview = None;
             if let Some(s) = &mut app.context_mode.session
                 && let Some(menu) = s.menu
             {
@@ -569,6 +636,7 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
                 && valid(app, target, true)
                 && app.context_mode.mode(target.tab).active()
             {
+                app.context_mode.preview = None;
                 seal(app, target.tab);
                 if let Some(s) = &mut app.context_mode.session {
                     s.menu = Some(menu);
@@ -645,6 +713,7 @@ fn enter(app: &mut App, target: EditorTarget) {
 
 fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Message> {
     use ContextCommand::*;
+    app.context_mode.preview = None;
     if command == Exit || (command == Toggle && app.context_mode.mode(target.tab).active()) {
         if app.dialog.is_some() || app.shutdown.is_some() {
             return Task::none();
@@ -763,6 +832,7 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
     let line_with_break = (line_end + usize::from(line_end < text.len())).min(text.len());
     let mut edit = None;
     let mut caret_after = None;
+    let mut effective_selection = None;
     match command {
         SelectAll => select(app, target, 0, text.len()),
         SelectLine => select(app, target, line_start, line_with_break),
@@ -778,52 +848,34 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         InsertStart => select(app, target, start, start),
         InsertEnd => select(app, target, end, end),
         OpenAbove => {
-            select(app, target, line_start, line_start);
+            effective_selection = Some([line_start, line_start]);
             edit = Some((KeyAction::Newline, String::new()));
             caret_after = Some(line_start);
         }
         OpenBelow => {
-            select(app, target, line_end, line_end);
+            effective_selection = Some([line_end, line_end]);
             edit = Some((KeyAction::Newline, String::new()));
         }
-        Cut | Copy => {
-            if start == end {
-                select(app, target, line_start, line_with_break);
-            }
-            edit = Some((
-                if command == Cut {
-                    KeyAction::Cut
-                } else {
-                    KeyAction::Copy
-                },
-                String::new(),
-            ));
-        }
-        Delete | Change => {
-            let mut effective = (start, end);
-            if start == end {
-                let next = flavite_editor::viewport::next_grapheme_boundary(
-                    text,
-                    flavite_syntax::TextByte(head),
-                )
-                .0;
-                let previous = flavite_editor::viewport::prev_grapheme_boundary(
-                    text,
-                    flavite_syntax::TextByte(head),
-                )
-                .0;
-                let (a, b) = if head < line_end {
-                    (head, next)
-                } else if head > line_start {
-                    (previous, head)
-                } else {
-                    (head, head)
-                };
-                select(app, target, a, b);
-                effective = (a, b);
-            }
-            if effective.0 != effective.1 {
-                edit = Some((KeyAction::Delete, String::new()));
+        Cut | Copy | Delete | Change => {
+            let Some(effect) =
+                flavite_editor::context::effect::plan(text, target.selection, command)
+            else {
+                app.context_mode
+                    .notice("Selection changed; place the caret again");
+                return Task::none();
+            };
+            if !effect.range.is_empty() {
+                effective_selection = Some([effect.range.start, effect.range.end]);
+                edit = Some((
+                    match command {
+                        Cut => KeyAction::Cut,
+                        Copy => KeyAction::Copy,
+                        _ => KeyAction::Delete,
+                    },
+                    String::new(),
+                ));
+            } else if command != Change {
+                app.context_mode.notice(effect.description(command));
             }
         }
         Toggle | Exit | Escape | Paste | Undo | Redo | Commands | Find | Replace | History => {
@@ -853,10 +905,11 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             target,
             action,
             text,
-            Some(super::input::HistoryIntent {
+            Some(super::input::CommandIntent {
                 kind,
                 before: [anchor, head],
                 after: caret_after.map(|at| [at, at]),
+                effective_selection,
             }),
         )
     });

@@ -9,8 +9,13 @@ use crate::{
         chrome::{self, Icon},
     },
 };
-use flavite_editor::context::{ContextCommand, ContextMenu};
-use iced::widget::{Space, button, column, container, opaque, row, scrollable, stack, text};
+use flavite_editor::context::{
+    ContextCommand, ContextMenu,
+    layout::{self, ContextLayout},
+};
+use iced::widget::{
+    Space, button, column, container, mouse_area, opaque, row, scrollable, stack, text,
+};
 use iced::{Element, Length, alignment};
 
 fn observed<'a>(
@@ -32,14 +37,33 @@ fn action(
     observed(
         target.tab,
         command.id(),
-        chrome::icon_button(
-            *app.appearance.metrics(),
-            icon,
-            command.title(),
-            context_mode::available(app, target, command)
-                .then_some(Message::ContextMode(ContextMessage::Run(target, command))),
+        previewable(
+            target,
+            command,
+            chrome::icon_button(
+                *app.appearance.metrics(),
+                icon,
+                command.title(),
+                context_mode::available(app, target, command)
+                    .then_some(Message::ContextMode(ContextMessage::Run(target, command))),
+            ),
         ),
     )
+}
+
+fn previewable<'a>(
+    target: EditorTarget,
+    command: ContextCommand,
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    mouse_area(content)
+        .on_enter(Message::ContextMode(ContextMessage::Preview(
+            target, command, true,
+        )))
+        .on_exit(Message::ContextMode(ContextMessage::Preview(
+            target, command, false,
+        )))
+        .into()
 }
 
 /// The mode bar replaces the ordinary note header while active.
@@ -51,13 +75,19 @@ pub fn view(app: &App, target: EditorTarget) -> Element<'_, Message> {
         .map_or(640.0, |b| b.width)
         / metrics.scale;
     let mode = app.context_mode.mode(target.tab);
-    let mut actions = row![
-        action(app, target, ContextCommand::Exit, Icon::Close),
-        text(mode.label()).size(metrics.text_sm),
-    ]
-    .spacing(4.0 * metrics.scale)
-    .align_y(alignment::Vertical::Center);
-    if width >= 600.0 {
+    let plan = ContextLayout::new(width);
+    let mut actions = row![action(app, target, ContextCommand::Exit, Icon::Close)]
+        .spacing(layout::GAP * metrics.scale)
+        .align_y(alignment::Vertical::Center);
+    if plan.shows_state() {
+        actions = actions.push(observed(
+            target.tab,
+            "state",
+            container(text(mode.label()).size(metrics.text_sm))
+                .width(layout::STATE_WIDTH * metrics.scale),
+        ));
+    }
+    if plan.command_visible(ContextCommand::Copy) {
         for (command, icon) in [
             (ContextCommand::Cut, Icon::Cut),
             (ContextCommand::Copy, Icon::Copy),
@@ -66,12 +96,12 @@ pub fn view(app: &App, target: EditorTarget) -> Element<'_, Message> {
             actions = actions.push(action(app, target, command, icon));
         }
     }
-    if width >= 430.0 {
+    if plan.command_visible(ContextCommand::Undo) {
         actions = actions
             .push(action(app, target, ContextCommand::Undo, Icon::Undo))
             .push(action(app, target, ContextCommand::Redo, Icon::Redo));
     }
-    if width >= 320.0 {
+    if plan.command_visible(ContextCommand::Commands) {
         actions = actions.push(action(
             app,
             target,
@@ -79,30 +109,36 @@ pub fn view(app: &App, target: EditorTarget) -> Element<'_, Message> {
             Icon::Commands,
         ));
     }
-    if width >= 720.0 {
+    if plan.menu_visible(ContextMenu::Select) {
         for menu in [ContextMenu::Select, ContextMenu::Go] {
             actions = actions.push(menu_button(app, target, menu));
         }
     }
-    if width >= 390.0 {
+    if plan.menu_visible(ContextMenu::Type) {
         actions = actions.push(menu_button(app, target, ContextMenu::Type));
     }
-    if width >= 860.0 {
+    if plan.command_visible(ContextCommand::Find) {
+        actions = actions.push(action(app, target, ContextCommand::Find, Icon::Search));
+    }
+    if plan.command_visible(ContextCommand::History) {
         actions = actions.push(observed(
             target.tab,
             ContextCommand::History.id(),
             button(text("History").size(metrics.text_sm))
-                .padding([5, 7])
+                .padding([5.0 * metrics.scale, 7.0 * metrics.scale])
+                .width(layout::command_width(ContextCommand::History) * metrics.scale)
                 .style(style::ghost())
-                .on_press(Message::EditorHistory(
-                    crate::host::editor_history::HistoryMessage::Act(
-                        target,
-                        crate::host::editor_history::HistoryAction::Open,
+                .on_press_maybe(
+                    context_mode::available(app, target, ContextCommand::History).then_some(
+                        Message::EditorHistory(crate::host::editor_history::HistoryMessage::Act(
+                            target,
+                            crate::host::editor_history::HistoryAction::Open,
+                        )),
                     ),
-                )),
+                ),
         ));
     }
-    if width >= 320.0 {
+    if plan.menu_visible(ContextMenu::More) {
         actions = actions
             .push(Space::new().width(Length::Fill))
             .push(menu_button(app, target, ContextMenu::More));
@@ -123,12 +159,10 @@ pub fn view(app: &App, target: EditorTarget) -> Element<'_, Message> {
     let summary = if count == 0 {
         "Caret".into()
     } else {
-        format!(
-            "{count} character{} selected",
-            if count == 1 { "" } else { "s" }
-        )
+        format!("{count} char{}", if count == 1 { "" } else { "s" })
     };
-    let detail = crate::views::editor_history::strip(app, target, summary, caption);
+    let effect = context_mode::effect_caption(app, target.tab);
+    let detail = crate::views::editor_history::strip(app, target, summary, caption, effect);
     observed(
         target.tab,
         "toolbar",
@@ -138,7 +172,7 @@ pub fn view(app: &App, target: EditorTarget) -> Element<'_, Message> {
                 .align_y(alignment::Vertical::Center),
             detail
         ])
-        .padding([0, 6])
+        .padding([0.0, 6.0 * metrics.scale])
         .width(Length::Fill)
         .style(style::toolbar),
     )
@@ -155,7 +189,8 @@ fn menu_button(app: &App, target: EditorTarget, menu: ContextMenu) -> Element<'_
         target.tab,
         menu.title(),
         button(text(format!("{} ▾", menu.title())).size(metrics.text_sm))
-            .padding([5, 7])
+            .padding([5.0 * metrics.scale, 7.0 * metrics.scale])
+            .width(layout::menu_width(menu) * metrics.scale)
             .style(style::list_row(open))
             .on_press(Message::ContextMode(if open {
                 ContextMessage::CloseMenu(target.tab)
@@ -195,27 +230,31 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
             .size(metrics.text_sm)
             .style(style::dim_text)
     ]
-    .spacing(2);
+    .spacing(2.0 * metrics.scale);
     for (index, &command) in menu.commands().iter().enumerate() {
         entries = entries.push(observed(
             target.tab,
             command.title(),
-            button(
-                row![
-                    text(command.title()).size(metrics.text),
-                    Space::new().width(Length::Fill),
-                    text(menu.hint(command))
-                        .size(metrics.text_sm)
-                        .style(style::dim_text)
-                ]
-                .spacing(12),
-            )
-            .width(Length::Fill)
-            .padding([7, 10])
-            .style(style::list_row(index == session.selected))
-            .on_press_maybe(
-                context_mode::available(app, target, command)
-                    .then_some(Message::ContextMode(ContextMessage::Run(target, command))),
+            previewable(
+                target,
+                command,
+                button(
+                    row![
+                        text(command.title()).size(metrics.text),
+                        Space::new().width(Length::Fill),
+                        text(menu.hint(command))
+                            .size(metrics.text_sm)
+                            .style(style::dim_text)
+                    ]
+                    .spacing(12.0 * metrics.scale),
+                )
+                .width(Length::Fill)
+                .padding([7.0 * metrics.scale, 10.0 * metrics.scale])
+                .style(style::list_row(index == session.selected))
+                .on_press_maybe(
+                    context_mode::available(app, target, command)
+                        .then_some(Message::ContextMode(ContextMessage::Run(target, command))),
+                ),
             ),
         ));
     }
@@ -230,7 +269,7 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
             .max(80.0)
             .min(430.0 * metrics.scale),
     )
-    .padding(5)
+    .padding(5.0 * metrics.scale)
     .style(style::palette_card);
     let content = stack![
         shell,

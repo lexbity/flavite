@@ -199,20 +199,14 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
         }
         let width =
             app.editor_bounds.get(&tab).map_or(640.0, |b| b.width) / app.appearance.metrics().scale;
+        let plan = flavite_editor::context::layout::ContextLayout::new(width);
         for &command in C::ALL {
             let visible = if app.palette_open || app.picker.open || app.context_mode.history.open {
                 active && command == C::Exit
             } else if !active {
                 command == C::Toggle
             } else {
-                match command {
-                    C::Exit => true,
-                    C::Commands => width >= 320.0,
-                    C::History => width >= 860.0,
-                    C::Cut | C::Copy | C::Paste => width >= 600.0,
-                    C::Undo | C::Redo => width >= 430.0,
-                    _ => false,
-                }
+                plan.command_visible(command)
             };
             if !visible {
                 continue;
@@ -240,13 +234,7 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
             ContextMenu::Type,
             ContextMenu::More,
         ] {
-            if width < 320.0 {
-                continue;
-            }
-            if matches!(menu, ContextMenu::Select | ContextMenu::Go) && width < 720.0 {
-                continue;
-            }
-            if menu == ContextMenu::Type && width < 390.0 {
+            if !plan.menu_visible(menu) {
                 continue;
             }
             if let Some(bounds) = app.context_mode.bounds.get(&(tab, menu.title())) {
@@ -318,19 +306,9 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
                                 action: HistoryAction::Restore(entry.target),
                             },
                             label: format!(
-                                "{}{}",
-                                if entry.initial {
-                                    "Initial state"
-                                } else {
-                                    entry.kind.label()
-                                },
-                                if entry.current {
-                                    " · Current"
-                                } else if entry.on_path {
-                                    " · Earlier state"
-                                } else {
-                                    " · Other branch"
-                                }
+                                "{} · {}",
+                                editor_history::entry_title(entry),
+                                editor_history::entry_status(entry)
                             ),
                             bounds: *bounds,
                             enabled: editor_history::can_restore(app, source, entry)
@@ -1047,6 +1025,13 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
     let mut context_children = Vec::new();
     for control in context_controls(app) {
         let mut node = Node::new(Role::Button);
+        if let NodeTarget::EditorContextCommand { target, command } = &control.target
+            && let Some(view) = app.note_editor_view(target.tab)
+            && let Some(effect) =
+                flavite_editor::context::effect::plan(&view.text, target.selection, *command)
+        {
+            node.set_description(effect.accessible_description());
+        }
         node.set_label(control.label);
         node.set_bounds(semantic_bounds(control.bounds));
         if control.enabled {

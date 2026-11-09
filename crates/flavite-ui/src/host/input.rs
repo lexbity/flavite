@@ -144,12 +144,13 @@ pub fn handle(
     handle_inner(app, tab, incarnation, input, false, None)
 }
 
-/// A toolbar verb may have an implicit effective range, but its history
-/// records the selection before that internal adjustment.
-pub struct HistoryIntent {
+/// A toolbar verb plans an effective range without publishing a speculative
+/// selection. Its history records the actual committed before-selection.
+pub struct CommandIntent {
     pub kind: flavite_buffer::history::EditKind,
     pub before: [usize; 2],
     pub after: Option<[usize; 2]>,
+    pub effective_selection: Option<[usize; 2]>,
 }
 
 pub fn handle_command(
@@ -157,7 +158,7 @@ pub fn handle_command(
     tab: TabId,
     incarnation: u64,
     input: CapturedInput,
-    intent: HistoryIntent,
+    intent: CommandIntent,
 ) -> iced::Task<Message> {
     handle_inner(app, tab, incarnation, input, false, Some(intent))
 }
@@ -188,7 +189,7 @@ fn handle_inner(
     incarnation: u64,
     mut input: CapturedInput,
     composition_commit: bool,
-    history_intent: Option<HistoryIntent>,
+    command_intent: Option<CommandIntent>,
 ) -> iced::Task<Message> {
     if super::context_mode::too_narrow(app, tab) {
         app.context_mode
@@ -275,14 +276,19 @@ fn handle_inner(
             .filter(|chain| own_chain && chain.sequence == interaction.sequence)
             .and_then(|chain| chain.preferred_x);
     }
-    let prepared =
-        match flavite_editor::input::prepare(&view, (selection.anchor, selection.head), &input) {
-            Ok(prepared) => prepared,
-            Err(message) => {
-                app.status = message.into();
-                return iced::Task::none();
-            }
-        };
+    let effective = command_intent
+        .as_ref()
+        .and_then(|intent| intent.effective_selection)
+        .map_or((selection.anchor, selection.head), |[anchor, head]| {
+            (anchor, head)
+        });
+    let prepared = match flavite_editor::input::prepare(&view, effective, &input) {
+        Ok(prepared) => prepared,
+        Err(message) => {
+            app.status = message.into();
+            return iced::Task::none();
+        }
+    };
     let mut clipboard = None;
     let mut mutation = None;
     let mut history = false;
@@ -295,7 +301,7 @@ fn handle_inner(
         } => {
             mutation = Some(action);
             interaction.selections = vec![Selection::caret(caret)];
-            if let Some(after) = history_intent.as_ref().and_then(|intent| intent.after) {
+            if let Some(after) = command_intent.as_ref().and_then(|intent| intent.after) {
                 interaction.selections = vec![Selection::new(after[0], after[1])];
             }
             clipboard = copied;
@@ -342,9 +348,9 @@ fn handle_inner(
             };
             invocation.args["editor"] = serde_json::to_value(EditorEdit {
                 origin: format!("{:032x}", tab.raw()),
-                kind: history_intent.as_ref().map_or(kind, |intent| intent.kind),
+                kind: command_intent.as_ref().map_or(kind, |intent| intent.kind),
                 before: vec![
-                    history_intent
+                    command_intent
                         .as_ref()
                         .map_or([selection.anchor, selection.head], |intent| intent.before),
                 ],

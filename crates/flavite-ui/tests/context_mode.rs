@@ -77,6 +77,118 @@ fn type_text(app: &mut App, tab: TabId, text: &str) {
 }
 
 #[test]
+fn implicit_preview_and_copy_preserve_committed_state_and_cut_uses_the_same_range() {
+    use flavite_ui::host::context_mode::{effect_caption, preview_command};
+    let (mut f, tab) = fixture(3120);
+    selection(&mut f.app, tab, 4, 4);
+    run(&mut f.app, tab, Command::Toggle);
+    run(&mut f.app, tab, Command::InsertStart);
+    let source = EditorTarget::capture(&f.app, tab).unwrap();
+    let before = f.app.editor_interaction_snapshot(tab).unwrap();
+    let text = f.app.note_editor_view(tab).unwrap();
+    let history = f.app.context_mode.history.page.clone();
+    let _ = f.app.update(Message::ContextMode(ContextMessage::Preview(
+        source,
+        Command::Copy,
+        true,
+    )));
+    assert_eq!(preview_command(&f.app, tab), Some(Command::Copy));
+    assert_eq!(
+        effect_caption(&f.app, tab).as_deref(),
+        Some("Copy outlined line")
+    );
+    assert_eq!(f.app.editor_interaction_snapshot(tab).unwrap(), before);
+    assert_eq!(f.app.context_mode.history.page, history);
+    assert_eq!(f.app.context_mode.mode(tab), ContextMode::Typing);
+    run(&mut f.app, tab, Command::Copy);
+    assert_eq!(
+        f.app.editor_interaction_snapshot(tab).unwrap().selection,
+        (4, 4),
+        "implicit line Copy must retain the caret"
+    );
+    assert_eq!(f.app.note_editor_view(tab).unwrap().revision, text.revision);
+    assert_eq!(
+        f.app
+            .context_mode
+            .history
+            .page
+            .as_ref()
+            .unwrap()
+            .entries
+            .len(),
+        history.unwrap().entries.len()
+    );
+    let effect = flavite_editor::context::effect::plan(&text.text, (4, 4), Command::Cut).unwrap();
+    run(&mut f.app, tab, Command::Cut);
+    assert_eq!(
+        &*f.app.note_editor_view(tab).unwrap().text,
+        &format!(
+            "{}{}",
+            &text.text[..effect.range.start],
+            &text.text[effect.range.end..]
+        )
+    );
+    assert_eq!(f.app.context_mode.mode(tab), ContextMode::Typing);
+    run(&mut f.app, tab, Command::Undo);
+    assert_eq!(f.app.note_editor_view(tab).unwrap().text, text.text);
+    assert_eq!(
+        f.app.editor_interaction_snapshot(tab).unwrap().selection,
+        (4, 4)
+    );
+}
+
+#[test]
+fn preview_ownership_rejects_stale_sources_and_old_hover_exits() {
+    use flavite_ui::host::context_mode::{effect_caption, preview_command};
+    let (mut f, tab) = fixture(3121);
+    run(&mut f.app, tab, Command::Toggle);
+    let old = EditorTarget::capture(&f.app, tab).unwrap();
+    let _ = f.app.update(Message::ContextMode(ContextMessage::Preview(
+        old,
+        Command::Copy,
+        true,
+    )));
+    let _ = f.app.update(Message::ContextMode(ContextMessage::Preview(
+        old,
+        Command::Cut,
+        true,
+    )));
+    let _ = f.app.update(Message::ContextMode(ContextMessage::Preview(
+        old,
+        Command::Copy,
+        false,
+    )));
+    assert_eq!(preview_command(&f.app, tab), Some(Command::Cut));
+    selection(&mut f.app, tab, 9, 9);
+    let _ = f.app.update(Message::ContextMode(ContextMessage::Preview(
+        old,
+        Command::Copy,
+        true,
+    )));
+    assert_eq!(preview_command(&f.app, tab), Some(Command::Delete));
+    assert!(effect_caption(&f.app, tab).is_none());
+    let view = f.app.note_editor_view(tab).unwrap();
+    let effect =
+        flavite_editor::context::effect::plan(&view.text, (9, 9), Command::Delete).unwrap();
+    assert_eq!(effect.range, 7..9);
+    run(&mut f.app, tab, Command::Delete);
+    assert_eq!(
+        &*f.app.note_editor_view(tab).unwrap().text,
+        "one caf\nsecond line\n"
+    );
+    run(&mut f.app, tab, Command::History);
+    let source = EditorTarget::capture(&f.app, tab).unwrap();
+    let _ = f.app.update(Message::ContextMode(ContextMessage::Preview(
+        source,
+        Command::Cut,
+        true,
+    )));
+    assert!(preview_command(&f.app, tab).is_none());
+    run(&mut f.app, tab, Command::Exit);
+    assert!(preview_command(&f.app, tab).is_none());
+}
+
+#[test]
 fn enter_delete_undo_exit_preserves_source_identity_and_selection() {
     let (mut f, tab) = fixture(3101);
     selection(&mut f.app, tab, 4, 9);

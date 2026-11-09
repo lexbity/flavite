@@ -375,6 +375,12 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
         "context_mode": app.context_mode.session.as_ref().map(|session|serde_json::json!({
             "tab":session.tab.to_string(),"state":session.mode.label(),"menu":session.menu.map(|m|m.title()),
             "message":session.message,
+            "effect":crate::host::context_mode::preview_command(app,session.tab).and_then(|command|{
+                let view=app.note_editor_view(session.tab)?;
+                let source=crate::host::context_mode::EditorTarget::capture(app,session.tab)?;
+                let effect=flavite_editor::context::effect::plan(&view.text,source.selection,command)?;
+                Some(serde_json::json!({"command":command.id(),"range":[effect.range.start,effect.range.end],"implicit":effect.implicit,"caption":effect.description(command)}))
+            }),
             "history":{
                 "open":app.context_mode.history.open,
                 "page":app.context_mode.history.page,

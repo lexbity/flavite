@@ -157,6 +157,7 @@ type ContextToggle<'a> = Box<dyn Fn(&keyboard::Event) -> bool + 'a>;
 
 pub struct EditorWidget<'a, Message> {
     context_mode: crate::context::ContextMode,
+    context_preview: Option<crate::context::ContextCommand>,
     on_context: Option<Box<dyn Fn(crate::context::ContextRequest) -> Message + 'a>>,
     context_toggle: Option<ContextToggle<'a>>,
     view: EditorView,
@@ -196,6 +197,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
     pub fn from_view(view: EditorView, on_action: impl Fn(EditorAction) -> Message + 'a) -> Self {
         Self {
             context_mode: crate::context::ContextMode::Off,
+            context_preview: None,
             on_context: None,
             context_toggle: None,
             view,
@@ -234,6 +236,13 @@ impl<'a, Message> EditorWidget<'a, Message> {
     ) -> Self {
         self.context_mode = mode;
         self.on_context = Some(Box::new(on_context));
+        self
+    }
+
+    /// Paint a prospective implicit range without changing editor state.
+    #[must_use]
+    pub fn with_command_preview(mut self, command: Option<crate::context::ContextCommand>) -> Self {
+        self.context_preview = command;
         self
     }
 
@@ -1533,6 +1542,46 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 }
             }
         }
+        if self.context_mode.active()
+            && state.composition.is_none()
+            && let Some(effect) = self
+                .context_preview
+                .and_then(|command| {
+                    crate::context::effect::plan(
+                        &self.view.text,
+                        (state.anchor, state.caret),
+                        command,
+                    )
+                })
+                .filter(|effect| effect.implicit && !effect.range.is_empty())
+        {
+            for rect in command_preview_rects(
+                visible_text,
+                source_start,
+                &runs,
+                effect.range,
+                self.type_metrics,
+            ) {
+                let rect = Rectangle::new(
+                    Point::new(bounds.x + PAD_X + rect.x, bounds.y + PAD_Y + rect.y),
+                    rect.size(),
+                );
+                if let Some(rect) = rect.intersection(&clip) {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: rect,
+                            border: Border {
+                                color: self.colors.text,
+                                width: 1.5,
+                                ..Border::default()
+                            },
+                            ..renderer::Quad::default()
+                        },
+                        Background::Color(Color::TRANSPARENT),
+                    );
+                }
+            }
+        }
         // Use the semantic scanner for link decorations. No markdown parser or
         // second link grammar is embedded in the widget. Spans intersecting
         // each line are collected once per line, not once per glyph.
@@ -2419,6 +2468,65 @@ fn line_start_byte(text: &str, line: usize) -> usize {
     text.split_inclusive('\n').take(line).map(str::len).sum()
 }
 
+/// Geometry is derived from the exact shaped glyph clusters used for text.
+/// Joining only visually adjacent rectangles avoids boxing unrelated text in
+/// mixed-direction rows. Only the shaped viewport is inspected.
+fn command_preview_rects(
+    visible: &str,
+    source_start: usize,
+    runs: &[cosmic_text::LayoutRun<'_>],
+    range: std::ops::Range<usize>,
+    metrics: TypeMetrics,
+) -> Vec<Rectangle> {
+    let mut result = Vec::new();
+    for run in runs {
+        let line_start = source_start + line_start_byte(visible, run.line_i);
+        let mut spans: Vec<_> = run
+            .glyphs
+            .iter()
+            .filter(|glyph| {
+                line_start + glyph.end > range.start && line_start + glyph.start < range.end
+            })
+            .map(|glyph| (glyph.x, glyph.x + glyph.w.max(1.0)))
+            .collect();
+        spans.sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
+        let mut merged: Option<(f32, f32)> = None;
+        for (left, right) in spans {
+            if let Some((_, end)) = &mut merged
+                && left <= *end + 0.5
+            {
+                *end = end.max(right);
+            } else {
+                if let Some((start, end)) = merged {
+                    result.push(Rectangle::new(
+                        Point::new(start, run.line_top),
+                        Size::new(end - start, metrics.line_height),
+                    ));
+                }
+                merged = Some((left, right));
+            }
+        }
+        if let Some((start, end)) = merged {
+            result.push(Rectangle::new(
+                Point::new(start, run.line_top),
+                Size::new(end - start, metrics.line_height),
+            ));
+        }
+    }
+    // Newlines have no glyph. An outlined cell makes an empty-line Cut visible
+    // and distinguishes copying/cutting a line with its terminator from Delete.
+    for (local, ch) in visible.char_indices() {
+        if ch == '\n' && range.contains(&(source_start + local)) {
+            let (x, y) = caret_position(runs, visible, local);
+            result.push(Rectangle::new(
+                Point::new(x, y),
+                Size::new(metrics.font_size * 0.6, metrics.line_height),
+            ));
+        }
+    }
+    result
+}
+
 pub(crate) fn caret_position(
     runs: &[cosmic_text::LayoutRun<'_>],
     text: &str,
@@ -2467,6 +2575,48 @@ mod tests {
     use crate::viewport::{next_grapheme_boundary, prev_grapheme_boundary};
     use flavite_buffer::state::BufferState;
     use flavite_syntax::text::{Span, TextByte};
+
+    #[test]
+    fn command_outlines_cover_only_the_affected_shaped_glyphs_and_visible_newlines() {
+        let text = "abcdef\n\n雪e\u{301}";
+        let metrics = TypeMetrics::default();
+        let shaped = shape_text(text, 300.0, metrics);
+        let runs = shaped.layout_runs().collect::<Vec<_>>();
+        let rects = command_preview_rects(text, 100, &runs, 102..104, metrics);
+        assert!(!rects.is_empty());
+        for run in &runs {
+            let line = 100 + line_start_byte(text, run.line_i);
+            for glyph in run.glyphs {
+                let center = Point::new(
+                    glyph.x + glyph.w / 2.0,
+                    run.line_top + metrics.line_height / 2.0,
+                );
+                assert_eq!(
+                    rects.iter().any(|rect| rect.contains(center)),
+                    line + glyph.end > 102 && line + glyph.start < 104
+                );
+            }
+        }
+        let blank_line = command_preview_rects(text, 100, &runs, 107..108, metrics);
+        assert_eq!(
+            blank_line.len(),
+            1,
+            "an empty line's newline has a visible cell"
+        );
+        assert!(blank_line[0].width > 0.0);
+        assert!(
+            command_preview_rects(text, 100, &runs, 0..50, metrics).is_empty(),
+            "offscreen source does not create paint primitives"
+        );
+
+        let wrapped = shape_text("one two three four five", 50.0, metrics);
+        let runs = wrapped.layout_runs().collect::<Vec<_>>();
+        let rects = command_preview_rects("one two three four five", 0, &runs, 0..23, metrics);
+        assert!(
+            rects.iter().any(|rect| rect.y > 0.0),
+            "a wrapped line's outline follows its actual rows"
+        );
+    }
     use iced::advanced::widget::Operation as _;
 
     #[test]
