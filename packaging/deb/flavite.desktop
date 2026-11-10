@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Flavite
+Comment=A local-first, desktop Zettelkasten workspace for Markdown notes
+Exec=flavite %u
+Icon=flavite
+Terminal=false
+Categories=Office;TextEditor;Utility;
+MimeType=text/markdown;
+Keywords=notes;markdown;zettelkasten;knowledge graph;

@@ -1,0 +1,174 @@
+# Release — builds Linux binaries and packages and publishes the GitHub
+# Release. Thin caller: all logic lives in .goreleaser.yaml and the justfile
+# recipes `release-check` / `release-snapshot` / `release` (CI == local, D-9).
+#
+# Triggers:
+#   - push of a v* tag  → job `release`: full GoReleaser release (tarballs,
+#     checksums, .deb, AUR source PKGBUILD into the release, GitHub Release).
+#   - pull_request      → job `release-snapshot`: `goreleaser check` +
+#     `--snapshot --clean` (full pipeline, nothing published), so packaging
+#     and cross-build regressions fail on the PR, not at tag time.
+#
+# Conventions (same as ci.yml): all actions pinned to full commit SHAs
+# (Dependabot maintains the pins), every job has timeout-minutes, top-level
+# permissions are contents: read (grep gate in ci.yml lint-workflows) — the
+# release job alone gets contents: write at job level, zizmor-audited.
+# Tools are installed from pinned releases with sha256-verified downloads
+# (zizmor pattern), never from floating tags.
+#
+# Linux-only for now (product decision 2026-11-09): targets are
+# x86_64/aarch64-unknown-linux-gnu (see .goreleaser.yaml).
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GORELEASER_VERSION: "2.20.0"
+  GORELEASER_SHA256: "d2483159e6007f814132cb56635ad30a70013dbeb813d6033a7e01adf6ae108c"
+  ZIG_VERSION: "0.17.1"
+  # sha256 of zig-x86_64-linux-${ZIG_VERSION}.tar.xz from ziglang.org.
+  ZIG_SHA256: "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a"
+  CARGO_ZIGBUILD_VERSION: "0.24.1"
+
+jobs:
+  # Shared setup steps are repeated per job (GitHub has no step templates);
+  # keep them identical between the two jobs.
+  release-snapshot:
+    name: release-snapshot (ubuntu-26.04)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          # goreleaser needs the full history/tags for changelog + version.
+          fetch-depth: 0
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: 1.59.0
+
+      # zizmor: ignore[cache-poisoning] (same note as ci.yml: PR runs are
+      # lookup-only so a fork PR can never write the shared cache).
+      # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2
+        with:
+          key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
+          lookup-only: true
+
+      - name: Install GoReleaser (pinned release, sha256-verified)
+        run: |
+          set -euo pipefail
+          asset="goreleaser_Linux_x86_64.tar.gz"
+          curl -sSfL "https://github.com/goreleaser/goreleaser/releases/download/v${GORELEASER_VERSION}/${asset}" -o goreleaser.tar.gz
+          actual_sha256="$(sha256sum goreleaser.tar.gz | awk '{print $1}')"
+          if [ "$actual_sha256" != "$GORELEASER_SHA256" ]; then
+            echo "goreleaser download checksum mismatch: got $actual_sha256" >&2
+            exit 1
+          fi
+          tar -xzf goreleaser.tar.gz goreleaser
+          echo "$PWD" >> "$GITHUB_PATH"
+          goreleaser --version
+
+      - name: Install zig (pinned release, sha256-verified)
+        run: |
+          set -euo pipefail
+          asset="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -sSfL "https://ziglang.org/download/${ZIG_VERSION}/${asset}" -o zig.tar.xz
+          actual_sha256="$(sha256sum zig.tar.xz | awk '{print $1}')"
+          if [ "$actual_sha256" != "$ZIG_SHA256" ]; then
+            echo "zig download checksum mismatch: got $actual_sha256" >&2
+            exit 1
+          fi
+          tar -xJf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          zig version
+
+      - name: Install cargo-zigbuild (pinned, --locked)
+        run: cargo install --locked cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION"
+
+      - name: goreleaser check + snapshot release
+        run: |
+          just release-check
+          just release-snapshot
+
+  release:
+    name: release (ubuntu-26.04)
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    # Job-level only: the grep gate requires top-level `permissions: contents:
+    # read`. contents: write is needed to create the GitHub Release; it is
+    # unreachable from pull_request (see the `if:` above).
+    permissions:
+      contents: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # AUR_KEY is only needed once aur_sources skip_upload is disabled
+      # (see .goreleaser.yaml / docs/RELEASING.md).
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: 1.59.0
+
+      # This job only runs on v* tag pushes (maintainer-only), so cache writes
+      # are trusted here; PRs never reach it (they take release-snapshot with
+      # lookup-only). zizmor cannot prove that statically, hence the ignore.
+      # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
+        with:
+          key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install GoReleaser (pinned release, sha256-verified)
+        run: |
+          set -euo pipefail
+          asset="goreleaser_Linux_x86_64.tar.gz"
+          curl -sSfL "https://github.com/goreleaser/goreleaser/releases/download/v${GORELEASER_VERSION}/${asset}" -o goreleaser.tar.gz
+          actual_sha256="$(sha256sum goreleaser.tar.gz | awk '{print $1}')"
+          if [ "$actual_sha256" != "$GORELEASER_SHA256" ]; then
+            echo "goreleaser download checksum mismatch: got $actual_sha256" >&2
+            exit 1
+          fi
+          tar -xzf goreleaser.tar.gz goreleaser
+          echo "$PWD" >> "$GITHUB_PATH"
+          goreleaser --version
+
+      - name: Install zig (pinned release, sha256-verified)
+        run: |
+          set -euo pipefail
+          asset="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -sSfL "https://ziglang.org/download/${ZIG_VERSION}/${asset}" -o zig.tar.xz
+          actual_sha256="$(sha256sum zig.tar.xz | awk '{print $1}')"
+          if [ "$actual_sha256" != "$ZIG_SHA256" ]; then
+            echo "zig download checksum mismatch: got $actual_sha256" >&2
+            exit 1
+          fi
+          tar -xJf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          zig version
+
+      - name: Install cargo-zigbuild (pinned, --locked)
+        run: cargo install --locked cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION"
+
+      - name: goreleaser check + release
+        run: |
+          just release-check
+          just release

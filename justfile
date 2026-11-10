@@ -436,3 +436,22 @@ clean *args:
 # Post-gate garbage collection (§10.10): threshold-based, runs after every gate.
 gc:
     cargo xtask gc
+
+# --- Releases (GoReleaser, see .goreleaser.yaml and docs/RELEASING.md) ---
+# CI (release.yml) runs these verbatim, so local == CI (D-9). All three need
+# `goreleaser` on PATH; the snapshot/release recipes additionally need `zig`
+# and `cargo-zigbuild` (pinned install commands in docs/RELEASING.md).
+
+# Validate .goreleaser.yaml. Fast; runs on every PR via release.yml.
+release-check:
+    goreleaser check
+
+# Full pipeline locally without publishing anything (builds both linux
+# targets, tarballs, .deb, AUR PKGBUILD into dist/).
+release-snapshot:
+    goreleaser release --snapshot --clean
+
+# Real release. CI only, on v* tag pushes; needs GITHUB_TOKEN with
+# contents: write (release.yml provides it).
+release:
+    goreleaser release --clean

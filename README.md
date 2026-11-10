@@ -1,7 +1,7 @@
 # Flavite
 
 [![CI](https://github.com/lexbity/flavite/actions/workflows/ci.yml/badge.svg)](https://github.com/lexbity/flavite/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.90%2B-dea584?logo=rust)](https://www.rust-lang.org/)
 
 A local-first, desktop Zettelkasten workspace. Write notes in Markdown, link
@@ -31,20 +31,6 @@ or your vault.
 - **Local and private** — no network, no accounts, no telemetry. Layouts and
   preferences ride inside the vault; nothing leaves your machine.
 
-See [docs/APP-FEATURES.md](docs/APP-FEATURES.md) for the full feature guide,
-including every keyboard shortcut.
-
-## Two binaries, one codebase
-
-| Binary | Crate | What it is |
-|---|---|---|
-| `flavite` | `crates/flavite-app` | The desktop app (iced/winit GUI). Requires a display server. |
-| `flavite-cli` | `crates/flavite-cli` | Headless vault access: open, init, doctor, query, search, rename, theme, replace, encoding, info. No GPU or display needed. |
-
-There is also a demo example (`cargo build -p flavite-ui --example app-demo`)
-that runs the same UI without CLI parsing; it exists for visual testing, not
-daily use.
-
 ## Quick start
 
 Prerequisites: Rust toolchain (pinned in `rust-toolchain.toml`; rustup picks
@@ -55,7 +41,7 @@ git clone https://github.com/lexbity/flavite
 cd flavite
 
 # Build the desktop app and the CLI
-cargo build -p flavite-app -p flavite-cli
+cargo build -p flavite-app -p flavite-cli -p flavite-text-search-worker
 
 # Run the desktop app on a folder of Markdown notes
 FLAVITE_VAULT=/path/to/your/vault ./target/debug/flavite
@@ -127,16 +113,6 @@ Visual (Linux) checks require Xvfb and friends:
 just ui-visual-setup
 just workspace-visual read-structure
 ```
-
-### Project layout
-
-- `crates/flavite-ui` — desktop shell, views, host adapters.
-- `crates/flavite-workspace` — pure layout/context model (IO-free).
-- `crates/flavite-editor` — text editor widget.
-- `crates/flavite-api` — facade between UI and core.
-- `crates/flavite-vault`, `flavite-index`, `flavite-buffer`, `flavite-syntax`,
-  `flavite-graph` — core services.
-- `scripts/`, `justfile`, `xtask/` — gates, visual harness, architecture checks.
 
 ## License
 

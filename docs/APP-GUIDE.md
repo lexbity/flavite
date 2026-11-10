@@ -29,7 +29,7 @@ There are two ways to use it:
 
 ---
 
-## Install and setup
+## Setup
 
 ```sh
 git clone https://github.com/lexbity/flavite

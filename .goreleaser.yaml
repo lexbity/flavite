@@ -1,0 +1,133 @@
+# GoReleaser configuration for Flavite releases — see docs/RELEASING.md.
+#
+# Linux-only for now (product decision 2026-11-09): x86_64 + aarch64 glibc
+# tarballs, a .deb (nfpm), and a source PKGBUILD for the AUR (aur_sources).
+# macOS/Windows targets are added when the app supports those platforms.
+#
+# Builds use the `rust` builder (cargo zigbuild, pinned in release.yml) for
+# cross-compilation. The workspace links no system libraries at build time
+# (wayland/xkbcommon are dlopen'd via winit's wayland-dlopen/xkbcommon-dl,
+# sqlite is rusqlite/bundled), so zig cc can link everything. The default
+# glibc zig targets (2.31+) run on Debian 12+ and current Arch.
+version: 2
+
+project_name: flavite
+
+builds:
+  # One entry per shipped binary. All three MUST install into the same bin
+  # directory: the regex search worker is resolved as a sibling of the running
+  # executable (crates/flavite-vault/src/text_worker.rs), never via PATH.
+  - id: app
+    builder: rust
+    binary: flavite
+    flags: [--release, --locked, -p=flavite-app]
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+  - id: cli
+    builder: rust
+    binary: flavite-cli
+    flags: [--release, --locked, -p=flavite-cli]
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+  - id: worker
+    builder: rust
+    binary: flavite-text-search-worker
+    flags: [--release, --locked, -p=flavite-text-search-worker]
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+
+archives:
+  - id: flavite
+    ids: [app, cli, worker]
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # README.md and LICENSE are included by default.
+
+checksum:
+  name_template: "checksums.txt"
+
+# Required by aur_sources: the source archive feeds the AUR PKGBUILD.
+source:
+  enabled: true
+
+nfpms:
+  - id: flavite-deb
+    package_name: flavite
+    file_name_template: "{{ .ConventionalFileName }}"
+    vendor: "prestin liu"
+    maintainer: "prestin liu <liuprestin@gmail.com>"
+    homepage: "https://github.com/lexbity/flavite"
+    description: "A local-first, desktop Zettelkasten workspace for Markdown notes"
+    license: "MIT OR Apache-2.0"
+    formats: [deb]
+    section: editors
+    priority: optional
+    bindir: /usr/bin
+    ids: [app, cli, worker]
+    contents:
+      - src: packaging/deb/flavite.desktop
+        dst: /usr/share/applications/flavite.desktop
+      - src: packaging/icons/flavite.png
+        dst: /usr/share/icons/hicolor/256x256/apps/flavite.png
+      - src: packaging/icons/flavite.svg
+        dst: /usr/share/icons/hicolor/scalable/apps/flavite.svg
+      - src: LICENSE
+        dst: /usr/share/doc/flavite/LICENSE
+    overrides:
+      deb:
+        dependencies:
+          # dlopen'd at runtime by winit/wgpu (wayland-dlopen, xkbcommon-dl,
+          # ash), but required on the target system:
+          - libwayland-client0
+          - libwayland-cursor0
+          - libwayland-egl1
+          - libxkbcommon0
+          - libvulkan1
+          - libegl1
+          - libgl1
+
+# Source PKGBUILD for the AUR (package name `flavite`, builds with cargo —
+# the AUR-idiomatic form; binary packages would be `flavite-bin`).
+# skip_upload: the PKGBUILD is written to dist/ only; pushing to
+# aur.archlinux.org is done manually until the flow is proven. When enabling
+# auto-push (skip_upload: false + AUR_KEY secret + AUR package created), also
+# add `disable: "{{ .IsSnapshot }}"` so snapshot runs never push.
+aur_sources:
+  - name: flavite
+    homepage: "https://github.com/lexbity/flavite"
+    description: "A local-first, desktop Zettelkasten workspace for Markdown notes"
+    license: "MIT OR Apache-2.0"
+    maintainers:
+      - "prestin liu <liuprestin@gmail.com>"
+    private_key: "{{ .Env.AUR_KEY }}"
+    git_url: "ssh://[email protected]/flavite.git"
+    skip_upload: true
+    arches: [x86_64, aarch64]
+    makedepends: [cargo, rust]
+    depends:
+      - wayland
+      - libxkbcommon
+      - libglvnd
+      - vulkan-icd-loader
+    build: |
+      cargo build --release --locked -p flavite-app -p flavite-cli -p flavite-text-search-worker
+    package: |
+      install -Dm755 target/release/flavite "$pkgdir/usr/bin/flavite"
+      install -Dm755 target/release/flavite-cli "$pkgdir/usr/bin/flavite-cli"
+      install -Dm755 target/release/flavite-text-search-worker "$pkgdir/usr/bin/flavite-text-search-worker"
+      install -Dm644 packaging/deb/flavite.desktop "$pkgdir/usr/share/applications/flavite.desktop"
+      install -Dm644 packaging/icons/flavite.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/flavite.png"
+      install -Dm644 packaging/icons/flavite.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/flavite.svg"
+      install -Dm644 LICENSE "$pkgdir/usr/share/licenses/flavite/LICENSE"
+    commit_msg_template: "Update to {{ .Tag }}"
+    commit_author:
+      name: "prestin liu"
+      email: "liuprestin@gmail.com"
+
+release:
+  github:
+    owner: lexbity
+    name: flavite
