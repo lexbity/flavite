@@ -13,7 +13,9 @@ use flavite_workspace::{NoteLocator, TabId};
 use std::time::{Duration, Instant};
 
 fn wait(app: &mut App, done: impl Fn(&App) -> bool) {
-    let until = Instant::now() + Duration::from_secs(10);
+    // Workflow pumps are eventually-consistent by design (ticketed catalog
+    // refreshes); sibling workflow suites allow 30 s on shared CI runners.
+    let until = Instant::now() + Duration::from_secs(30);
     loop {
         let _ = app.update(Message::Pump);
         if done(app) {

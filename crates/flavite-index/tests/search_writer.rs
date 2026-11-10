@@ -8,8 +8,8 @@
 use flavite_index::query::TextLeaf;
 use flavite_index::search::TantivyBackend;
 use flavite_index::search_writer::{
-    CaptureOutcome, MAX_OUTSTANDING_ENVELOPES, SearchDocOp, SearchEnvelope, SearchWriterHandle,
-    WriterReport, spawn_search_writer,
+    CaptureOutcome, MAX_OUTSTANDING_ENVELOPES, SearchCommitAck, SearchDocOp, SearchEnvelope,
+    SearchWriterHandle, WriterReport, spawn_search_writer,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,6 +52,24 @@ fn wait_for_frontier(handle: &SearchWriterHandle, frontier: u64) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while handle.committed_frontier() < frontier {
         assert!(std::time::Instant::now() < deadline, "writer stalled");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// The writer updates the committed frontier just before sending the ack,
+/// so waiting for the frontier alone can observe it a beat early; poll the
+/// ack channel until the commit's acknowledgement actually arrives.
+fn wait_for_acks(handle: &SearchWriterHandle) -> Vec<SearchCommitAck> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let acks = handle.drain_acks();
+        if !acks.is_empty() {
+            return acks;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "every commit acknowledges"
+        );
         std::thread::sleep(Duration::from_millis(2));
     }
 }
@@ -127,8 +145,7 @@ fn no_op_watermarks_advance_the_frontier_and_return_acks_in_order() {
     // The batching writer coalesces consecutive envelopes into one commit,
     // so acknowledgements are monotonic through the batch frontier — one
     // ack per commit, never a gap or a regression.
-    let acks = handle.drain_acks();
-    assert!(!acks.is_empty(), "every commit acknowledges");
+    let acks = wait_for_acks(&handle);
     let generations: Vec<u64> = acks.iter().map(|ack| ack.generation).collect();
     assert_eq!(*generations.last().unwrap(), 3);
     assert!(

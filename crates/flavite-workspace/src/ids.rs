@@ -163,4 +163,25 @@ mod tests {
         assert!(rendered.starts_with("tab-"), "{rendered}");
         assert_eq!(rendered.len(), 4 + 32);
     }
+
+    #[test]
+    fn observe_advances_the_generator_past_seen_identities() {
+        let mut ids = Ids::with_seed(3);
+        let before = ids.tab_id();
+        ids.observe(before.raw() + 100);
+        assert!(ids.tab_id().raw() > before.raw() + 100);
+        // Observing a smaller value never moves the generator backwards.
+        let marker = ids.tab_id();
+        ids.observe(1);
+        assert!(ids.tab_id().raw() > marker.raw());
+    }
+
+    #[test]
+    fn default_generator_allocates() {
+        let mut ids = Ids::default();
+        let first = ids.group_id();
+        let second = ids.group_id();
+        assert_ne!(first, second);
+        assert!(second.raw() > first.raw());
+    }
 }

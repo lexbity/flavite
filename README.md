@@ -1,5 +1,9 @@
 # Flavite
 
+<div align="center">
+  <img src="./docs/flavite-logo.png" alt="Flavite logo" width="240" />
+</div>
+
 [![CI](https://github.com/lexbity/flavite/actions/workflows/ci.yml/badge.svg)](https://github.com/lexbity/flavite/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.90%2B-dea584?logo=rust)](https://www.rust-lang.org/)
@@ -8,10 +12,6 @@ A local-first, desktop Zettelkasten workspace. Write notes in Markdown, link
 them, and explore the resulting knowledge graph — all in one movable,
 split-pane layout. Notes are plain files; Flavite never replaces your editor
 or your vault.
-
-> Status: pre-release / in active development. The workspace shell and editor
-> are usable; production packaging, some workflows, and native accessibility
-> evidence are still in progress.
 
 ## Features
 
@@ -100,6 +100,10 @@ atomic (temp sibling file, then replace); recovery uses the core
 journal/safety contracts. Resetting a layout never touches notes.
 
 ## Development
+
+> Status: pre-release / in active development. The workspace shell and editor
+> are usable; production packaging, some workflows, and native accessibility
+> evidence are still in progress.
 
 - `just setup` — first command after clone: installs components, nightly,
   and cargo tools. No git hooks are installed; gating lives in CI.

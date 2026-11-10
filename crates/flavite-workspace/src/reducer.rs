@@ -2610,4 +2610,378 @@ mod tests {
         );
         assert_eq!(state, snapshot);
     }
+
+    #[test]
+    fn workspace_error_display_renders_every_variant() {
+        let cases: Vec<(WorkspaceError, &str)> = vec![
+            (
+                WorkspaceError::StaleRevision {
+                    expected: 3,
+                    actual: 9,
+                },
+                "expected 3, current 9",
+            ),
+            (
+                WorkspaceError::UnknownGroup(GroupId::from_raw(1)),
+                "unknown group grp-",
+            ),
+            (
+                WorkspaceError::UnknownTab(TabId::from_raw(2)),
+                "unknown tab tab-",
+            ),
+            (
+                WorkspaceError::UnknownSplit(SplitId::from_raw(3)),
+                "unknown split spl-",
+            ),
+            (WorkspaceError::GroupLimitReached, "groups"),
+            (WorkspaceError::TabLimitReached, "tabs"),
+            (WorkspaceError::DepthLimitReached, "depth"),
+            (WorkspaceError::InvalidRatio(7), "ratio 7 ppm"),
+            (
+                WorkspaceError::InvalidGraphCamera(crate::view::GraphCameraError::NonFinite),
+                "camera was rejected: graph camera values must be finite",
+            ),
+            (
+                WorkspaceError::InvalidGraphScope("too deep"),
+                "graph filter rejected: too deep",
+            ),
+            (WorkspaceError::NothingToReopen, "no closed tab"),
+            (
+                WorkspaceError::NotDuplicateable(TabId::from_raw(4)),
+                "an empty tab cannot be duplicated",
+            ),
+            (WorkspaceError::NoChange, "would not change"),
+            (
+                WorkspaceError::InvariantViolation("boom".into()),
+                "invariant violated: boom",
+            ),
+        ];
+        for (error, needle) in cases {
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(needle),
+                "{rendered} should contain {needle:?}"
+            );
+        }
+    }
+
+    /// Build a state directly from parts, bypassing the reducer's validation,
+    /// to exercise `validate`'s defensive branches.
+    fn raw_state(
+        tree: LayoutNode,
+        groups: BTreeMap<GroupId, TabGroup>,
+        tabs: BTreeMap<TabId, ViewSession>,
+        focus: TabId,
+        maximized: Option<GroupId>,
+    ) -> WorkspaceState {
+        let mut ids = Ids::with_seed(1);
+        WorkspaceState {
+            id: ids.workspace_id(),
+            revision: 1,
+            ids,
+            tree,
+            groups,
+            tabs,
+            focus,
+            document_anchor: None,
+            document_publication: 0,
+            exploration: None,
+            exploration_sequence: 0,
+            writing_target: None,
+            maximized,
+            recently_closed: VecDeque::new(),
+        }
+    }
+
+    fn group_with(members: &[TabId], active: TabId) -> TabGroup {
+        let mut group = TabGroup::new(members[0]);
+        group.push_all(members[1..].iter().copied());
+        group.set_active(active);
+        group
+    }
+
+    /// A shallow balanced split tree over the given group leaves.
+    fn balanced(leaves: &[GroupId], next_split: &mut u128) -> LayoutNode {
+        if leaves.len() == 1 {
+            return LayoutNode::Group(leaves[0]);
+        }
+        let mid = leaves.len() / 2;
+        *next_split += 1;
+        LayoutNode::Split {
+            id: SplitId::from_raw(*next_split),
+            arrangement: Arrangement::SideBySide,
+            desired_ratio_ppm: DEFAULT_RATIO_PPM,
+            first: Box::new(balanced(&leaves[..mid], next_split)),
+            second: Box::new(balanced(&leaves[mid..], next_split)),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn validate_reports_tree_shape_violations() {
+        let g = GroupId::from_raw(1);
+        let t = TabId::from_raw(1);
+        let session = ViewSession::new(t, ViewKind::Empty);
+
+        // The same group twice in the tree.
+        let tree = LayoutNode::Split {
+            id: SplitId::from_raw(9),
+            arrangement: Arrangement::SideBySide,
+            desired_ratio_ppm: DEFAULT_RATIO_PPM,
+            first: Box::new(LayoutNode::Group(g)),
+            second: Box::new(LayoutNode::Group(g)),
+        };
+        let state = raw_state(
+            tree,
+            BTreeMap::from([(g, group_with(&[t], t))]),
+            BTreeMap::from([(t, session.clone())]),
+            t,
+            None,
+        );
+        assert!(validate(&state).unwrap_err().contains("appears twice"));
+
+        // The same split id twice (with distinct groups so the group check passes).
+        let g2 = GroupId::from_raw(2);
+        let g3 = GroupId::from_raw(3);
+        let t2 = TabId::from_raw(2);
+        let t3 = TabId::from_raw(3);
+        let tree = LayoutNode::Split {
+            id: SplitId::from_raw(9),
+            arrangement: Arrangement::SideBySide,
+            desired_ratio_ppm: DEFAULT_RATIO_PPM,
+            first: Box::new(LayoutNode::Split {
+                id: SplitId::from_raw(9),
+                arrangement: Arrangement::Stacked,
+                desired_ratio_ppm: DEFAULT_RATIO_PPM,
+                first: Box::new(LayoutNode::Group(g)),
+                second: Box::new(LayoutNode::Group(g2)),
+            }),
+            second: Box::new(LayoutNode::Group(g3)),
+        };
+        let state = raw_state(
+            tree,
+            BTreeMap::from([
+                (g, group_with(&[t], t)),
+                (g2, group_with(&[t2], t2)),
+                (g3, group_with(&[t3], t3)),
+            ]),
+            BTreeMap::from([
+                (t, session.clone()),
+                (t2, ViewSession::new(t2, ViewKind::Empty)),
+                (t3, ViewSession::new(t3, ViewKind::Empty)),
+            ]),
+            t,
+            None,
+        );
+        assert!(validate(&state).unwrap_err().contains("appears twice"));
+
+        // Depth beyond the bound (unique groups so earlier checks pass).
+        let mut tree = LayoutNode::Group(GroupId::from_raw(1));
+        let mut groups = BTreeMap::new();
+        let mut tabs = BTreeMap::new();
+        groups.insert(
+            GroupId::from_raw(1),
+            group_with(&[TabId::from_raw(1)], TabId::from_raw(1)),
+        );
+        tabs.insert(
+            TabId::from_raw(1),
+            ViewSession::new(TabId::from_raw(1), ViewKind::Empty),
+        );
+        for raw in 2..=MAX_DEPTH as u128 + 3 {
+            let group = GroupId::from_raw(raw);
+            let tab = TabId::from_raw(raw);
+            groups.insert(group, group_with(&[tab], tab));
+            tabs.insert(tab, ViewSession::new(tab, ViewKind::Empty));
+            tree = LayoutNode::Split {
+                id: SplitId::from_raw(500 + raw),
+                arrangement: Arrangement::Stacked,
+                desired_ratio_ppm: DEFAULT_RATIO_PPM,
+                first: Box::new(tree),
+                second: Box::new(LayoutNode::Group(group)),
+            };
+        }
+        let state = raw_state(tree, groups, tabs, TabId::from_raw(1), None);
+        assert!(validate(&state).unwrap_err().contains("depth"));
+
+        // More groups in the tree than the bound, kept shallow (balanced) so
+        // the depth check does not fire first.
+        let leaf_ids: Vec<GroupId> = (1..=MAX_GROUPS as u128 + 1)
+            .map(GroupId::from_raw)
+            .collect();
+        let mut groups = BTreeMap::new();
+        let mut tabs = BTreeMap::new();
+        for (index, group) in leaf_ids.iter().enumerate() {
+            let tab = TabId::from_raw(index as u128 + 1);
+            groups.insert(*group, group_with(&[tab], tab));
+            tabs.insert(tab, ViewSession::new(tab, ViewKind::Empty));
+        }
+        let tree = balanced(&leaf_ids, &mut 9000);
+        let state = raw_state(tree, groups, tabs, TabId::from_raw(1), None);
+        assert!(validate(&state).unwrap_err().contains("groups exceed"));
+
+        // A ratio outside the persisted range (distinct groups so the
+        // uniqueness checks pass first).
+        let g4 = GroupId::from_raw(4);
+        let t4 = TabId::from_raw(4);
+        let tree = LayoutNode::Split {
+            id: SplitId::from_raw(9),
+            arrangement: Arrangement::SideBySide,
+            desired_ratio_ppm: 5,
+            first: Box::new(LayoutNode::Group(g)),
+            second: Box::new(LayoutNode::Group(g4)),
+        };
+        let state = raw_state(
+            tree,
+            BTreeMap::from([(g, group_with(&[t], t)), (g4, group_with(&[t4], t4))]),
+            BTreeMap::from([
+                (t, session.clone()),
+                (t4, ViewSession::new(t4, ViewKind::Empty)),
+            ]),
+            t,
+            None,
+        );
+        assert!(validate(&state).unwrap_err().contains("out of range"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn validate_reports_membership_and_reference_violations() {
+        let g1 = GroupId::from_raw(1);
+        let g2 = GroupId::from_raw(2);
+        let t1 = TabId::from_raw(1);
+        let t2 = TabId::from_raw(2);
+        let session = || ViewSession::new(t1, ViewKind::Empty);
+        let tree = LayoutNode::Split {
+            id: SplitId::from_raw(9),
+            arrangement: Arrangement::SideBySide,
+            desired_ratio_ppm: DEFAULT_RATIO_PPM,
+            first: Box::new(LayoutNode::Group(g1)),
+            second: Box::new(LayoutNode::Group(g2)),
+        };
+
+        // A mapped group absent from the tree.
+        let state = raw_state(
+            LayoutNode::Group(g1),
+            BTreeMap::from([(g1, group_with(&[t1], t1)), (g2, group_with(&[t2], t2))]),
+            BTreeMap::from([(t1, session()), (t2, ViewSession::new(t2, ViewKind::Empty))]),
+            t1,
+            None,
+        );
+        assert!(validate(&state).unwrap_err().contains("not in the tree"));
+
+        // A group with no tabs.
+        let empty_group = {
+            let mut group = TabGroup::new(t1);
+            group.take_all();
+            group
+        };
+        let state = raw_state(
+            LayoutNode::Group(g1),
+            BTreeMap::from([(g1, empty_group)]),
+            BTreeMap::from([(t1, session())]),
+            t1,
+            None,
+        );
+        assert!(validate(&state).unwrap_err().contains("no tabs"));
+
+        // A stale active tab (active names a tab that is not a member).
+        let stale_group = {
+            let mut group = TabGroup::new(t1);
+            group.push_all([t2]);
+            group.set_active(TabId::from_raw(77));
+            group
+        };
+        let state = raw_state(
+            LayoutNode::Group(g1),
+            BTreeMap::from([(g1, stale_group)]),
+            BTreeMap::from([(t1, session()), (t2, ViewSession::new(t2, ViewKind::Empty))]),
+            t1,
+            None,
+        );
+        assert!(validate(&state).unwrap_err().contains("stale active"));
+
+        // One tab in two groups.
+        let state = raw_state(
+            tree.clone(),
+            BTreeMap::from([(g1, group_with(&[t1], t1)), (g2, group_with(&[t1, t2], t1))]),
+            BTreeMap::from([(t1, session()), (t2, ViewSession::new(t2, ViewKind::Empty))]),
+            t1,
+            None,
+        );
+        assert!(
+            validate(&state)
+                .unwrap_err()
+                .contains("more than one group")
+        );
+
+        // A grouped tab with no session mapping.
+        let ghost = TabId::from_raw(55);
+        let mut group = TabGroup::new(t1);
+        group.insert(1, ghost);
+        let state = raw_state(
+            LayoutNode::Group(g1),
+            BTreeMap::from([(g1, group)]),
+            BTreeMap::from([(t1, session())]),
+            t1,
+            None,
+        );
+        assert!(validate(&state).unwrap_err().contains("unmapped"));
+
+        // A session mapping that names a different tab.
+        let state = raw_state(
+            LayoutNode::Group(g1),
+            BTreeMap::from([(g1, group_with(&[t1], t1))]),
+            BTreeMap::from([(t1, ViewSession::new(t2, ViewKind::Empty))]),
+            t1,
+            None,
+        );
+        assert!(validate(&state).unwrap_err().contains("maps a session for"));
+
+        // A mapped tab displayed by no group.
+        let state = raw_state(
+            LayoutNode::Group(g1),
+            BTreeMap::from([(g1, group_with(&[t1], t1))]),
+            BTreeMap::from([(t1, session()), (t2, ViewSession::new(t2, ViewKind::Empty))]),
+            t1,
+            None,
+        );
+        assert!(validate(&state).unwrap_err().contains("not in any group"));
+
+        // Too many tabs.
+        let mut group = TabGroup::new(t1);
+        let mut tabs = BTreeMap::from([(t1, session())]);
+        for raw in 2..=MAX_TABS as u128 + 1 {
+            let tab = TabId::from_raw(raw);
+            group.push_all([tab]);
+            tabs.insert(tab, ViewSession::new(tab, ViewKind::Empty));
+        }
+        let state = raw_state(
+            LayoutNode::Group(g1),
+            BTreeMap::from([(g1, group)]),
+            tabs,
+            t1,
+            None,
+        );
+        assert!(validate(&state).unwrap_err().contains("too many tabs"));
+
+        // Focus that is not any group's active tab.
+        let state = raw_state(
+            tree.clone(),
+            BTreeMap::from([(g1, group_with(&[t1], t1)), (g2, group_with(&[t2], t2))]),
+            BTreeMap::from([(t1, session()), (t2, ViewSession::new(t2, ViewKind::Empty))]),
+            TabId::from_raw(88),
+            None,
+        );
+        assert!(validate(&state).unwrap_err().contains("not an active tab"));
+
+        // A maximized group absent from the tree.
+        let state = raw_state(
+            LayoutNode::Group(g1),
+            BTreeMap::from([(g1, group_with(&[t1], t1))]),
+            BTreeMap::from([(t1, session())]),
+            t1,
+            Some(GroupId::from_raw(99)),
+        );
+        assert!(validate(&state).unwrap_err().contains("not in the tree"));
+    }
 }

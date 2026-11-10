@@ -531,4 +531,139 @@ mod tests {
         assert_eq!(notes.duplicate(), Some(ViewKind::Notes));
         assert_eq!(empty.title(), "New tab");
     }
+
+    #[test]
+    fn locators_reject_separators_and_join_native_paths() {
+        assert!(NoteLocator::from_components(["a/b"]).is_err());
+        assert!(NoteLocator::from_components(["a\\b"]).is_err());
+        assert!(NoteLocator::from_components(["C:x"]).is_err());
+        let locator = NoteLocator::from_components(["dir", "note.md"]).unwrap();
+        assert_eq!(
+            locator.to_path(std::path::Path::new("/vault")),
+            std::path::PathBuf::from("/vault/dir/note.md")
+        );
+        // A relative path converts through components like any other.
+        let from_path = NoteLocator::from_relative(std::path::Path::new("dir/note.md")).unwrap();
+        assert_eq!(from_path, locator);
+        // Non-UTF-8 native components are refused, never lossy-converted.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = std::ffi::OsString::from_vec(vec![0x66, 0x6f, 0x80]);
+            assert!(NoteLocator::from_relative(std::path::Path::new(&raw)).is_err());
+        }
+    }
+
+    #[test]
+    fn every_view_kind_duplicates_and_titles() {
+        let tab = crate::ids::TabId::from_raw(7);
+        let locator = NoteLocator::from_components(["Some note.md"]).unwrap();
+        let binding = ContextBinding::FollowDocument;
+        let kinds = [
+            (ViewKind::Empty, "New tab"),
+            (ViewKind::Notes, "Notes"),
+            (ViewKind::Search, "Search"),
+            (ViewKind::Replace, "Replace"),
+            (ViewKind::Settings, "Settings"),
+            (ViewKind::History(locator.clone()), "History: Some note"),
+            (
+                ViewKind::Note(NoteView::new(locator.clone(), NoteLoad::Ready)),
+                "Some note",
+            ),
+            (
+                ViewKind::Graph(GraphView::new(GraphCamera::centered())),
+                "Graph",
+            ),
+            (ViewKind::Preview(binding.clone()), "Preview"),
+            (ViewKind::Backlinks(binding.clone()), "Backlinks"),
+            (ViewKind::Outline(binding.clone()), "Outline"),
+            (ViewKind::Properties(binding.clone()), "Properties"),
+        ];
+        for (kind, title) in &kinds {
+            let session = ViewSession::new(tab, kind.clone());
+            assert_eq!(session.title(), *title);
+            let duplicated = session.duplicate();
+            if matches!(kind, ViewKind::Empty) {
+                assert_eq!(duplicated, None);
+                assert_eq!(kind.duplicate(), None);
+            } else {
+                let Some(duplicated) = duplicated else {
+                    panic!("{kind:?} must duplicate")
+                };
+                // A duplicated note re-reserves the load; the rest clone as-is.
+                if let ViewKind::Note(note) = kind {
+                    match &duplicated {
+                        ViewKind::Note(copy) => {
+                            assert_eq!(copy.locator(), note.locator());
+                            assert_eq!(copy.load(), NoteLoad::Reserved);
+                            assert_eq!(copy.mode(), note.mode());
+                        }
+                        other => panic!("expected note duplicate, got {other:?}"),
+                    }
+                } else {
+                    assert_eq!(&duplicated, kind, "stateless kinds duplicate verbatim");
+                }
+                assert!(kind.duplicate().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn graph_camera_bounds_pan_zoom_and_hash_are_exact() {
+        use std::collections::HashSet;
+        // Construction bounds.
+        assert_eq!(
+            GraphCamera::new([f32::INFINITY, 0.0], 1.0),
+            Err(GraphCameraError::NonFinite)
+        );
+        assert_eq!(
+            GraphCamera::new([0.0, 0.0], 0.0),
+            Err(GraphCameraError::ZoomOutOfRange)
+        );
+        // Interaction clamps instead of refusing.
+        let camera = GraphCamera::centered().panned(2.0e9, f32::NAN);
+        assert_eq!(
+            camera,
+            GraphCamera {
+                center: [GraphCamera::MAX_COORDINATE, 0.0],
+                zoom: 1.0,
+            }
+        );
+        let zoomed = GraphCamera::centered().zoomed(1000.0);
+        assert_eq!(
+            zoomed,
+            GraphCamera {
+                center: [0.0, 0.0],
+                zoom: GraphCamera::MAX_ZOOM,
+            }
+        );
+        // Non-positive or non-finite zoom factors are ignored.
+        assert_eq!(GraphCamera::centered().zoomed(0.0), GraphCamera::centered());
+        assert_eq!(
+            GraphCamera::centered().zoomed(-2.0),
+            GraphCamera::centered()
+        );
+        assert_eq!(
+            GraphCamera::centered().zoomed(f32::NAN),
+            GraphCamera::centered()
+        );
+        assert_eq!(GraphCamera::default(), GraphCamera::centered());
+        // Hash treats -0.0 and 0.0 as the same coordinate.
+        let mut set = HashSet::new();
+        set.insert(GraphCamera::new([0.0, 0.0], 1.0).unwrap());
+        assert!(set.contains(&GraphCamera::new([-0.0, -0.0], 1.0).unwrap()));
+        assert!(!set.contains(&GraphCamera::new([1.0, 0.0], 1.0).unwrap()));
+        // Error display strings.
+        assert!(GraphCameraError::NonFinite.to_string().contains("finite"));
+        assert!(
+            GraphCameraError::OutOfWorldRange
+                .to_string()
+                .contains("±1e9")
+        );
+        assert!(
+            GraphCameraError::ZoomOutOfRange
+                .to_string()
+                .contains("0.05–64")
+        );
+    }
 }
