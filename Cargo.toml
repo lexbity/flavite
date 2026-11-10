@@ -50,7 +50,7 @@ tempfile = "3"
 # Dev tooling (xtask)
 walkdir = "2"
 # Project directories
-directories = "5"
+directories = "6"
 # Serialization
 hex = "0.4"
 toml = "1.2"
