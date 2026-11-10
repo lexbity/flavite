@@ -54,7 +54,7 @@ uuid = { version = "1", features = ["v4"] }
 # Headless WGSL validation: parses/validates the probe's shader and asserts
 # the Rust ↔ WGSL uniform layout contract without needing a GPU adapter, so
 # the shader gate runs on every CI platform (PLAN-B §5 B2).
-naga = { version = "27", features = ["wgsl-in"] }
+naga = { version = "30", features = ["wgsl-in"] }
 # Settings-tab theme tests build in-memory .xpi packages (same fixture shape
 # as flavite-api's theme_commands).
 zip = { workspace = true }
