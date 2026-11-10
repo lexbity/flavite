@@ -89,10 +89,6 @@
       "kind": "external"
     },
     {
-      "id": "iced_runtime",
-      "kind": "external"
-    },
-    {
       "id": "iced_winit",
       "kind": "external"
     },
@@ -477,11 +473,6 @@
     {
       "from": "flavite-ui",
       "to": "iced",
-      "kind": "normal"
-    },
-    {
-      "from": "flavite-ui",
-      "to": "iced_runtime",
       "kind": "normal"
     },
     {

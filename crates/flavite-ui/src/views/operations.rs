@@ -6,7 +6,7 @@ use crate::app::{App, Message};
 use crate::host::operations::OperationRow;
 use crate::style;
 use flavite_workspace::TabId;
-use iced::widget::{button, column, container, row, scrollable, text};
+use iced::widget::{button, column, container, scrollable, text};
 use iced::{Element, Length};
 
 /// Render the operations panel for one tab.
@@ -22,7 +22,7 @@ pub fn view(app: &App, _tab: TabId) -> Element<'_, Message> {
         );
     }
     for operation in &rows {
-        body = body.push(operation_row(*metrics, operation));
+        body = body.push(operation_row(operation));
     }
     let summary = app.replace_operations.summary(&app.replace);
     let summary_text = if summary.is_empty() {
@@ -37,9 +37,11 @@ pub fn view(app: &App, _tab: TabId) -> Element<'_, Message> {
     container(
         column![
             text("Durable replacement operations")
-                .size(metrics.text_md)
+                .size(metrics.heading)
                 .style(style::dim_text),
-            text(summary_text).size(metrics.text_sm).style(style::dim_text),
+            text(summary_text)
+                .size(metrics.text_sm)
+                .style(style::dim_text),
             container(scrollable(body).height(Length::Fill))
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -55,7 +57,7 @@ pub fn view(app: &App, _tab: TabId) -> Element<'_, Message> {
     .into()
 }
 
-fn operation_row(metrics: crate::style::Metrics, operation: &OperationRow) -> Element<'static, Message> {
+fn operation_row(operation: &OperationRow) -> Element<'static, Message> {
     let job = &operation.job;
     let mut label = format!(
         "{} · {} · selected {} · saved {} · conflicts {} · stale {} · recovery {}",
@@ -73,9 +75,7 @@ fn operation_row(metrics: crate::style::Metrics, operation: &OperationRow) -> El
     if job.not_started > 0 {
         label.push_str(&format!(" · not started {}", job.not_started));
     }
-    let open = Message::ReplaceFocusTab {
-        tab: operation.tab,
-    };
+    let open = Message::ReplaceFocusTab { tab: operation.tab };
     button(text(label))
         .width(Length::Fill)
         .padding(iced::Padding {

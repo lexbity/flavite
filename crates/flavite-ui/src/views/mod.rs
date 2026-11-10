@@ -13,6 +13,7 @@ pub mod history;
 pub mod note;
 pub mod notes;
 pub mod notifications;
+pub mod operations;
 pub mod preview;
 pub mod replace;
 pub mod search;

@@ -53,12 +53,9 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zbus 5 transitive Linux window-backend dependency; migration requires upstream iced update; review by 2027-04-30." },
     { id = "RUSTSEC-2026-0371", reason = "zbus 5 transitive Linux window-backend dependency; migration requires upstream iced update; review by 2027-04-30." },
     { id = "RUSTSEC-2026-0372", reason = "zbus 5 transitive Linux window-backend dependency; migration requires upstream iced update; review by 2027-04-30." },
-    # Review by 2027-04-30. lru 0.16.4 is used only by cryoglyph's glyph
-    # cache. The advisory requires a panicking Drop implementation for a key
-    # and unwind recovery followed by another eviction; the concrete cache key
-    # is an internal value type and this app never catches panics around that
-    # cache. cryoglyph's semver range prevents a direct patched-version update.
-    { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 is transitive through iced/cryoglyph; its concrete glyph-cache key does not have a panicking destructor and the app does not catch rendering panics; upstream semver update review by 2027-04-30." },
+    # RUSTSEC-2026-0253 (lru <0.18.2 unsound) is fixed by patch, not ignored:
+    # cryoglyph is vendored with lru bumped to 0.18 (vendor/lru-panic-safety),
+    # so lru 0.16.x no longer appears in the dependency graph.
     # Review by 2027-04-30. pin-utils 0.1.1 enters only through wasmtimer,
     # which is compiled solely for wasm32 targets — never into the shipped
     # Linux build. The advisory's suggested replacement (core::pin::pin!)

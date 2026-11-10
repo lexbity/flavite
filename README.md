@@ -1,5 +1,9 @@
 # Flavite
 
+[![CI](https://github.com/lexbity/flavite/actions/workflows/ci.yml/badge.svg)](https://github.com/lexbity/flavite/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.90%2B-dea584?logo=rust)](https://www.rust-lang.org/)
+
 A local-first, desktop Zettelkasten workspace. Write notes in Markdown, link
 them, and explore the resulting knowledge graph — all in one movable,
 split-pane layout. Notes are plain files; Flavite never replaces your editor
@@ -136,4 +140,5 @@ just workspace-visual read-structure
 
 ## License
 
-Apache-2.0. See `LICENSE`.
+MIT OR Apache-2.0 (see the workspace `license` field in `Cargo.toml`). The
+`LICENSE` file carries the Apache-2.0 text.

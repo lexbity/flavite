@@ -61,6 +61,12 @@ nucleo = "0.5"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [patch.crates-io]
+# RUSTSEC-2026-0253: lru <0.18.2 is unsound (use-after-free in LruCache::pop).
+# cryoglyph 0.1.0 pins lru "0.16" and has no upstream release on lru 0.18,
+# so the crate is vendored with a one-line dependency bump to lru 0.18 (the
+# LruCache APIs it uses — unbounded_with_hasher/peek_lru/pop_lru — are
+# unchanged). See vendor/lru-panic-safety/PATCHES.md.
+cryoglyph = { path = "vendor/lru-panic-safety/cryoglyph" }
 iced_program = { path = "vendor/iced-accessibility/iced_program" }
 iced_runtime = { path = "vendor/iced-accessibility/iced_runtime" }
 iced_winit = { path = "vendor/iced-accessibility/iced_winit" }

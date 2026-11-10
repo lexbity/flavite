@@ -14,7 +14,6 @@ arc-swap = { workspace = true }
 iced = { workspace = true, features = ["image-without-codecs"] }
 iced_winit = "=0.14.1"
 accesskit = "=0.25.2"
-iced_runtime = "=0.14.0"
 # §4.7/D1: the command palette matches registry commands in memory with nucleo.
 nucleo = { workspace = true }
 flavite-graph = { path = "../flavite-graph" }
@@ -37,7 +36,6 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "t
 # §10.4 convention: thiserror for libraries. Used for the CPU-side geometry
 # error type (`graph::instance::GeometryError`).
 thiserror = { workspace = true }
-toml = { workspace = true }
 
 [features]
 # Fixture/harness support for integration tests and the visual runner. The

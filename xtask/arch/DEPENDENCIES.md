@@ -177,7 +177,6 @@ Normal/build:
 - `flavite-theme` (normal)
 - `flavite-workspace` (normal)
 - `iced` (normal)
-- `iced_runtime` (normal)
 - `iced_winit` (normal)
 - `nucleo` (normal)
 
@@ -231,7 +230,6 @@ Normal/build:
 - `blake3` ← flavite-api, flavite-buffer, flavite-cli, flavite-fs, flavite-index, flavite-theme, flavite-vault, flavite-workspace, xtask
 - `cosmic-text` ← flavite-editor, xtask
 - `iced` ← flavite-editor, flavite-ui, xtask
-- `iced_runtime` ← flavite-ui
 - `iced_winit` ← flavite-app, flavite-ui
 - `image` ← flavite-api, flavite-theme
 - `notify` ← flavite-fs, flavite-fs, xtask
