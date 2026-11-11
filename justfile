@@ -189,9 +189,14 @@ ci-extras-coverage:
     cargo llvm-cov --workspace --locked --lcov --output-path target/llvm-cov/lcov.info
     just cov-check
     @echo "=== G1: reclaim disk (gc) before network-denied rebuild ==="
+    df -h /
     just gc
+    df -h /
     @echo "=== G1: network-denied ==="
-    just network-denied
+    # line-tables-only: full debug info was only needed for the llvm-cov phase
+    # above; the plain test rebuild does not, and this keeps the rebuild small
+    # on the disk-limited runner (ENOSPC mid-link, 2026-11-11).
+    CARGO_PROFILE_DEV_DEBUG=line-tables-only just network-denied
 
 # G1 extras group 3 — MSRV check + fuzz compile + fuzz smoke 60 s/target.
 # `just gc` after the MSRV check so the fuzz workspace builds into freed space.
@@ -213,24 +218,36 @@ doc:
 msrv:
     cargo +1.90.0 check --workspace --locked
 
-# Network-denied test run (§10.3, AC-26): build first, then run tests under
-# unshare with no network. A seeded connection attempt must fail the assertion.
+# Network-denied test run (§10.3, AC-26): build first, then run the same tests
+# under unshare with no network. A seeded connection attempt must fail the
+# assertion.
 # Ubuntu 24.04+/26.04 block unprivileged user namespaces (AppArmor), so plain
 # `unshare -n` fails with EPERM on current GitHub runners; fall back to
 # creating the netns via passwordless sudo and dropping back to the invoking
 # user inside it with setpriv, so the tests still run unprivileged.
+# The namespace run MUST see the same environment as the build above: cargo
+# fingerprints include CARGO_INCREMENTAL / CARGO_PROFILE_* / RUSTFLAGS, so the
+# old minimal `env HOME=... PATH=...` list (sudo's env_reset drops the rest)
+# flipped incremental back on and forced a full SECOND workspace build inside
+# the netns — ENOSPC mid-link on disk-limited runners (linux-extras-coverage,
+# 2026-11-11: ld died with SIGBUS, query-cache.bin "No space left on device").
+# Forward the whole environment via `env -0` instead.
+# Target selection is --lib --bins --tests: plain `cargo test` also links
+# examples (app-demo pulls in all of iced/wgpu — the heaviest link on the
+# runner) and benches, and never executes them. Examples/benches/doc-tests
+# stay covered by `just clippy --all-targets` and `just test` in the gate jobs.
 network-denied:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo test --workspace --locked --no-run
+    cargo test --workspace --locked --no-run --lib --bins --tests
     echo "=== network-denied: running tests under unshare -n ==="
+    mapfile -d '' -t forwarded_env < <(env -0)
     run_denied() {
         if command -v unshare >/dev/null 2>&1 && unshare -n true 2>/dev/null; then
-            unshare -n cargo test --workspace
+            unshare -n cargo test --workspace --locked --lib --bins --tests
         elif command -v sudo >/dev/null 2>&1 && sudo -n unshare -n true 2>/dev/null; then
             sudo -n unshare -n setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups \
-                env HOME="$HOME" PATH="$PATH" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
-                cargo test --workspace
+                env "${forwarded_env[@]}" cargo test --workspace --locked --lib --bins --tests
         else
             echo "network-denied: unshare not available/permitted on this host, skipping (CI provides it)"
             return 0
