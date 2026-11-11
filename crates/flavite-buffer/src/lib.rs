@@ -6,6 +6,7 @@
 //! §4.16.1).
 
 pub mod budget;
+pub mod commands;
 pub mod eol;
 pub mod history;
 pub mod manager;
@@ -13,13 +14,14 @@ pub mod model;
 pub mod positions;
 pub mod recovery;
 pub mod revision;
+pub mod selection;
 pub mod state;
 pub mod undo;
 
 // Re-export key types for convenience.
 pub use eol::{EolTable, LineEnding};
 pub use manager::{BufferManager, BufferStateChanged, NoteRef};
-pub use model::{EditorModel, EditorModelBuilder, Selection};
+pub use model::{EditorModel, EditorModelBuilder};
 pub use positions::{Affinity, TextEdit};
 pub use recovery::{
     RecoveryConfig, RecoveryFile, RecoveryHeader, RecoveryWriter, RecoveryWriterBuilder,

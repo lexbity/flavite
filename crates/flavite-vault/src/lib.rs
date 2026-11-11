@@ -10,6 +10,7 @@
 pub mod actor;
 pub mod channels;
 pub mod coalesce;
+pub mod editor_receipts;
 pub mod encoding;
 pub mod history;
 pub mod identity;

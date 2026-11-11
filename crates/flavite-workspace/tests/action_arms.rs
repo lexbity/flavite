@@ -85,7 +85,7 @@ fn editable_ack(state: &mut WorkspaceState, tab: TabId, sequence: u64, text: &st
     interaction.sequence = sequence;
     interaction.focused = true;
     interaction.composition = CompositionState::Idle;
-    interaction.selections = vec![Selection::caret(1)];
+    interaction.selections = vec![CommittedSelection::caret(1)];
     state
         .acknowledge_interaction(interaction, text)
         .expect("ack");
@@ -985,7 +985,7 @@ fn interaction_acknowledgement_guards_are_total() {
     base.revision = 5;
     base.buffer_id = Some(3);
     base.focused = true;
-    base.selections = vec![Selection::caret(1)];
+    base.selections = vec![CommittedSelection::caret(1)];
 
     let mut wrong_incarnation = base.clone();
     wrong_incarnation.incarnation = 99;
@@ -994,7 +994,7 @@ fn interaction_acknowledgement_guards_are_total() {
         Err("interaction belongs to a replaced view")
     );
     let mut too_far = base.clone();
-    too_far.selections = vec![Selection::caret(99)];
+    too_far.selections = vec![CommittedSelection::caret(99)];
     assert_eq!(
         state.acknowledge_interaction(too_far, "abc"),
         Err("interaction byte position is outside the current text")
@@ -1104,7 +1104,7 @@ fn content_anchor_display_selection_and_focus_release_paths() {
     assert!(state.writing_target().is_none());
     assert_eq!(
         state.tab(&note).unwrap().interaction().selections,
-        [Selection::new(0, 2)]
+        [CommittedSelection::new(0, 2)]
     );
 
     // Scrolling keeps the retained target only while every guard matches.

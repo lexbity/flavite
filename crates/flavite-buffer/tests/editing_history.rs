@@ -37,8 +37,8 @@ fn edit(model: &mut EditorModel, at: usize, value: &str, kind: EditKind) {
     let record = EditorEdit {
         origin: format!("{:032x}", 1),
         kind,
-        before: vec![[at, at]],
-        after: vec![[at + value.len(), at + value.len()]],
+        before: vec![[0, at, at]],
+        after: vec![[0, at + value.len(), at + value.len()]],
     };
     model
         .try_apply_recorded_batch(
@@ -77,7 +77,7 @@ fn restore_moves_the_existing_head_and_preserves_branches_format_and_baseline() 
     );
     assert_eq!(
         model.history_movement().unwrap().selections,
-        Some(vec![[3, 3]])
+        Some(vec![[0, 3, 3]])
     );
     edit(&mut model, 3, "branch", EditKind::Typing);
     assert_eq!(
@@ -92,7 +92,7 @@ fn restore_moves_the_existing_head_and_preserves_branches_format_and_baseline() 
     );
     assert_eq!(
         model.history_movement().unwrap().selections,
-        Some(vec![[0, 0]])
+        Some(vec![[0, 0, 0]])
     );
     model.restore_state(first).unwrap();
     assert_eq!(
@@ -171,8 +171,8 @@ fn invalid_recorded_graphemes_refuse_before_any_text_or_history_change() {
         EditorEdit {
             origin: "1".repeat(32),
             kind: EditKind::Typing,
-            before: vec![[1, 1]],
-            after: vec![[1, 1]],
+            before: vec![[0, 1, 1]],
+            after: vec![[0, 1, 1]],
         },
     );
     assert!(result.is_err());
@@ -198,7 +198,7 @@ fn unrecorded_context_edits_cannot_extend_a_recorded_selection_receipt() {
     assert_eq!(model.text(), "Abase");
     assert_eq!(
         model.history_movement().unwrap().selections,
-        Some(vec![[1, 1]])
+        Some(vec![[0, 1, 1]])
     );
 }
 
@@ -217,8 +217,8 @@ fn epochs_isolate_buffers_and_invalid_origins_are_atomic() {
                 EditorEdit {
                     origin: format!("{:032x}", 1),
                     kind: EditKind::Typing,
-                    before: vec![[0, 0]],
-                    after: vec![[1, 1]],
+                    before: vec![[0, 0, 0]],
+                    after: vec![[0, 1, 1]],
                 },
             )
             .is_err()

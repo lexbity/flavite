@@ -8,7 +8,7 @@ use flavite_editor::{
     input::{CapturedInput, PreparedInput},
     keymap::KeyAction,
 };
-use flavite_workspace::{CompositionState, Selection, TabId};
+use flavite_workspace::{CommittedSelection, CompositionState, TabId};
 #[derive(Debug)]
 pub struct InputChain {
     incarnation: u64,
@@ -17,6 +17,32 @@ pub struct InputChain {
     revision: u64,
     sequence: u64,
     preferred_x: Option<f32>,
+}
+
+impl InputChain {
+    /// Construct one chain entry (host/context-mode shared path).
+    pub(crate) fn new(
+        incarnation: u64,
+        buffer: u64,
+        base: u64,
+        revision: u64,
+        sequence: u64,
+        preferred_x: Option<f32>,
+    ) -> Self {
+        Self {
+            incarnation,
+            buffer,
+            base,
+            revision,
+            sequence,
+            preferred_x,
+        }
+    }
+
+    /// The chain base revision.
+    pub(crate) const fn base(&self) -> u64 {
+        self.base
+    }
 }
 
 /// Native event sequence and host interaction sequence are separate: one
@@ -300,9 +326,9 @@ fn handle_inner(
             clipboard: copied,
         } => {
             mutation = Some(action);
-            interaction.selections = vec![Selection::caret(caret)];
+            interaction.selections = vec![CommittedSelection::caret(caret)];
             if let Some(after) = command_intent.as_ref().and_then(|intent| intent.after) {
-                interaction.selections = vec![Selection::new(after[0], after[1])];
+                interaction.selections = vec![CommittedSelection::new(after[0], after[1])];
             }
             clipboard = copied;
         }
@@ -311,24 +337,28 @@ fn handle_inner(
             history = true;
         }
         PreparedInput::Selection { anchor, head } => {
-            interaction.selections = vec![Selection::new(anchor, head)]
+            interaction.selections = vec![CommittedSelection::new(anchor, head)]
         }
         PreparedInput::VerticalSelection {
             anchor,
             head,
             preferred_x: x,
         } => {
-            interaction.selections = vec![Selection::new(anchor, head)];
+            interaction.selections = vec![CommittedSelection::new(anchor, head)];
             preferred_x = Some(x);
         }
         PreparedInput::Copy(copied) => clipboard = Some(copied),
     }
     if let Some(action) = mutation {
-        let edit_change = action.as_edit().and_then(|(_, _, edits)| {
-            (edits.len() == 1).then(|| flavite_buffer::history::HistoryChange {
-                start: edits[0].range.start.0,
-                end: edits[0].range.end.0,
-                inserted: edits[0].replacement.len(),
+        let edit_movement = action.as_edit().and_then(|(_, _, edits)| {
+            (edits.len() == 1).then(|| flavite_buffer::history::HistoryMovement {
+                selections: None,
+                spans: vec![flavite_buffer::history::MovementSpan {
+                    start: edits[0].range.start.0,
+                    end: edits[0].range.end.0,
+                    replacement_len: edits[0].replacement.len(),
+                }],
+                truncated: false,
             })
         });
         let Some(api) = &app.flavite else {
@@ -352,12 +382,14 @@ fn handle_inner(
                 before: vec![
                     command_intent
                         .as_ref()
-                        .map_or([selection.anchor, selection.head], |intent| intent.before),
+                        .map_or([0, selection.anchor, selection.head], |intent| {
+                            [0, intent.before[0], intent.before[1]]
+                        }),
                 ],
                 after: interaction
                     .selections
                     .iter()
-                    .map(|s| [s.anchor, s.head])
+                    .map(|s| [0, s.anchor, s.head])
                     .collect(),
             })
             .expect("history record is serializable");
@@ -379,7 +411,7 @@ fn handle_inner(
                 .notice("Input rejected; source changed or is unavailable");
             return iced::Task::none();
         }
-        if let Some(change) = edit_change
+        if let Some(movement) = edit_movement
             && let Some(current) = app.note_editor_view(tab)
         {
             apply_history_movement(
@@ -388,10 +420,7 @@ fn handle_inner(
                 view.buffer_id,
                 view.revision,
                 current.revision,
-                &flavite_buffer::history::HistoryMovement {
-                    selections: None,
-                    change,
-                },
+                &movement,
             );
         }
         if history
@@ -418,11 +447,26 @@ fn handle_inner(
             if let Some(selections) = movement.selections {
                 interaction.selections = selections
                     .into_iter()
-                    .map(|[a, h]| Selection::new(a, h))
+                    .map(|[_, a, h]| CommittedSelection::new(a, h))
                     .collect();
-            } else {
+            } else if !movement.truncated {
                 interaction.selections =
-                    map_selections(&current.text, &interaction.selections, &movement.change);
+                    map_selections(&current.text, &interaction.selections, &movement);
+            } else {
+                // MovementTooComplex: clamp to the document and let the user
+                // re-place the caret; never guess (FEUX-0002 E-13).
+                interaction.selections = interaction
+                    .selections
+                    .iter()
+                    .map(|s| {
+                        let clamp = |at: usize| {
+                            flavite_editor::viewport::clamp_grapheme_boundary(&current.text, at)
+                        };
+                        CommittedSelection::new(clamp(s.anchor), clamp(s.head))
+                    })
+                    .collect();
+                app.context_mode
+                    .notice("Source changed; selections approximated");
             }
         }
         app.workspace.invalidate_writing_target(view.buffer_id);
@@ -491,20 +535,20 @@ fn handle_inner(
 
 pub fn map_selections(
     text: &str,
-    selections: &[Selection],
-    change: &flavite_buffer::history::HistoryChange,
-) -> Vec<Selection> {
-    let point = |at, affinity| map_history_point(text, at, change, affinity);
+    selections: &[CommittedSelection],
+    movement: &flavite_buffer::history::HistoryMovement,
+) -> Vec<CommittedSelection> {
+    let point = |at, affinity| map_history_point(text, at, movement, affinity);
     selections
         .iter()
         .map(|s| {
             use flavite_buffer::Affinity::{Left, Right};
             if s.anchor < s.head {
-                Selection::new(point(s.anchor, Left), point(s.head, Right))
+                CommittedSelection::new(point(s.anchor, Left), point(s.head, Right))
             } else if s.anchor > s.head {
-                Selection::new(point(s.anchor, Right), point(s.head, Left))
+                CommittedSelection::new(point(s.anchor, Right), point(s.head, Left))
             } else {
-                Selection::caret(point(s.head, Right))
+                CommittedSelection::caret(point(s.head, Right))
             }
         })
         .collect()
@@ -513,14 +557,10 @@ pub fn map_selections(
 pub fn map_history_point(
     text: &str,
     at: usize,
-    change: &flavite_buffer::history::HistoryChange,
+    movement: &flavite_buffer::history::HistoryMovement,
     affinity: flavite_buffer::Affinity,
 ) -> usize {
-    let mapped = flavite_buffer::positions::map_through_replacement(
-        at,
-        flavite_buffer::TextEdit::new(change.start, change.end, change.inserted),
-        affinity,
-    );
+    let mapped = flavite_buffer::selection::map_point_through_spans(at, &movement.spans, affinity);
     let floor = flavite_editor::viewport::clamp_grapheme_boundary(text, mapped);
     if affinity == flavite_buffer::Affinity::Right && floor < mapped.min(text.len()) {
         flavite_editor::viewport::next_grapheme_boundary(text, flavite_syntax::TextByte(floor)).0
@@ -551,14 +591,27 @@ pub fn apply_history_movement(
             if interaction.buffer_id != Some(buffer) || interaction.revision != before {
                 return None;
             }
-            interaction.selections =
-                map_selections(&view.text, &interaction.selections, &movement.change);
+            if movement.truncated {
+                // MovementTooComplex: clamp, never guess. The notice is
+                // published by the initiating view's handler; the passive
+                // view only avoids stale coordinates.
+                let clamp =
+                    |at: usize| flavite_editor::viewport::clamp_grapheme_boundary(&view.text, at);
+                interaction.selections = interaction
+                    .selections
+                    .iter()
+                    .map(|s| CommittedSelection::new(clamp(s.anchor), clamp(s.head)))
+                    .collect();
+            } else {
+                interaction.selections =
+                    map_selections(&view.text, &interaction.selections, movement);
+            }
             interaction.revision = after;
             interaction.sequence += 1;
             interaction.viewport_anchor = map_history_point(
                 &view.text,
                 interaction.viewport_anchor,
-                &movement.change,
+                movement,
                 flavite_buffer::Affinity::Left,
             );
             Some(interaction)

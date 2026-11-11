@@ -359,6 +359,105 @@ impl UndoTree {
             .find(|id| self.get(*id).is_some_and(|node| !node.evicted))
     }
 
+    /// The ordered movement spans for one transition from `from` to `to`
+    /// (both surviving node ids), expressed in the coordinates of the text
+    /// before each step. Up-steps (child → parent) contribute the inverse of
+    /// the child's edit; down-steps contribute the child's forward edit.
+    /// Returns `(spans, truncated)`: `truncated` is true when the transition
+    /// crosses an evicted chain link (edits unavailable) or exceeds
+    /// [`crate::history::MAX_MOVEMENT_SPANS`] — passive views must clamp
+    /// instead of guessing (FEUX-0002 E-13).
+    pub fn transition_spans(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> (Vec<crate::history::MovementSpan>, bool) {
+        use crate::history::MovementSpan;
+        // Ancestor set of `to`.
+        let mut ancestors = std::collections::HashSet::new();
+        let mut node = Some(to);
+        while let Some(id) = node {
+            ancestors.insert(id);
+            node = self.get(id).and_then(|n| n.parent_id);
+        }
+        // Climb from `from` to the LCA.
+        let mut up: Vec<u64> = Vec::new();
+        let mut current = from;
+        let mut lca = None;
+        while let Some(id) = Some(current) {
+            if ancestors.contains(&id) {
+                lca = Some(id);
+                break;
+            }
+            let Some(parent) = self.get(id).and_then(|n| n.parent_id) else {
+                return (Vec::new(), true);
+            };
+            up.push(id);
+            current = parent;
+        }
+        let Some(lca) = lca else {
+            return (Vec::new(), true);
+        };
+        // Descend from the LCA to `to`.
+        let mut down: Vec<u64> = Vec::new();
+        let mut current = lca;
+        while current != to {
+            let Some(child) = self.get(current).and_then(|n| {
+                n.children.iter().copied().find(|c| {
+                    self.get(*c).is_some_and(|cnode| {
+                        !cnode.evicted && {
+                            let mut a = Some(*c);
+                            while let Some(x) = a {
+                                if x == to {
+                                    return true;
+                                }
+                                a = self.get(x).and_then(|n| n.parent_id);
+                            }
+                            false
+                        }
+                    })
+                })
+            }) else {
+                return (Vec::new(), true);
+            };
+            down.push(child);
+            current = child;
+        }
+        let mut spans = Vec::with_capacity(up.len() + down.len());
+        for id in up {
+            let Some(node) = self.get(id) else {
+                return (Vec::new(), true);
+            };
+            let Some(edit) = &node.edit else {
+                return (Vec::new(), true);
+            };
+            // Inverse: {start, start + replacement_len, end - start}.
+            let len = edit.replacement.len();
+            spans.push(MovementSpan {
+                start: edit.range.start.0,
+                end: edit.range.start.0 + len,
+                replacement_len: edit.range.end.0 - edit.range.start.0,
+            });
+        }
+        for id in down {
+            let Some(node) = self.get(id) else {
+                return (Vec::new(), true);
+            };
+            let Some(edit) = &node.edit else {
+                return (Vec::new(), true);
+            };
+            spans.push(MovementSpan {
+                start: edit.range.start.0,
+                end: edit.range.end.0,
+                replacement_len: edit.replacement.len(),
+            });
+        }
+        if spans.len() > crate::history::MAX_MOVEMENT_SPANS {
+            return (Vec::new(), true);
+        }
+        (spans, false)
+    }
+
     /// Apply an edit and advance the tree.
     ///
     /// If the edit can be coalesced with the current node's edit, it is merged.
@@ -742,21 +841,27 @@ impl UndoTree {
     }
 
     #[must_use]
-    pub fn position_selections(&self) -> Option<Vec<[usize; 2]>> {
+    pub fn position_selections(&self) -> Option<Vec<[usize; 3]>> {
         let node = self.position()?;
         if node.is_root() {
-            Some(vec![[0, 0]])
+            Some(vec![[0, 0, 0]])
         } else {
             node.editor.as_ref().map(|record| record.after.clone())
         }
     }
 
     #[must_use]
-    pub fn undo_selections(&self) -> Option<Vec<[usize; 2]>> {
+    pub fn undo_selections(&self) -> Option<Vec<[usize; 3]>> {
         self.position()?
             .editor
             .as_ref()
             .map(|record| record.before.clone())
+    }
+
+    /// The current tree position (node id).
+    #[must_use]
+    pub fn position_id(&self) -> u64 {
+        self.position_id
     }
     /// Get the preferred redo tip's revision, not the live buffer revision.
     #[must_use]

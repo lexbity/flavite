@@ -33,7 +33,7 @@ fn insert(api: &Flavite, buffer: u64, at: usize, value: &str, recorded: bool) {
     let mut args = json!({"buffer_id":buffer,"revision":revision(api,buffer),"ops":[{"range":[at,at],"replacement":value}],"undo_policy":"isolated"});
     if recorded {
         args["undo_policy"] = json!({"context":{"origin":format!("{:032x}",1)}});
-        args["editor"] = json!({"origin":format!("{:032x}",1),"kind":"typing","before":[[at,at]],"after":[[at+value.len(),at+value.len()]]});
+        args["editor"] = json!({"origin":format!("{:032x}",1),"kind":"typing","before":[[0,at,at]],"after":[[0,at+value.len(),at+value.len()]]});
     }
     data(execute(api, "apply_edits", args));
 }
@@ -58,7 +58,7 @@ fn state_restoration_is_one_head_move_with_selection_receipts_and_no_disk_edit()
     let args = json!({"buffer_id":buffer,"revision":before,"target":target});
     let receipt = data(execute(&f.flavite, "buffer.restore_state", args.clone()));
     assert_eq!(receipt["revision"], before + 1);
-    assert_eq!(receipt["movement"]["selections"], json!([[4, 4]]));
+    assert_eq!(receipt["movement"]["selections"], json!([[0, 4, 4]]));
     assert_eq!(f.text(buffer), "A雪base\n");
     assert_eq!(
         page(&f.flavite, buffer)["entries"]
@@ -76,14 +76,14 @@ fn state_restoration_is_one_head_move_with_selection_receipts_and_no_disk_edit()
         "buffer.undo",
         json!({"buffer_id":buffer,"revision":revision(&f.flavite,buffer)}),
     ));
-    assert_eq!(undone["movement"]["selections"], json!([[0, 0]]));
+    assert_eq!(undone["movement"]["selections"], json!([[0, 0, 0]]));
     assert_eq!(f.text(buffer), "base\n");
     let redone = data(execute(
         &f.flavite,
         "buffer.redo",
         json!({"buffer_id":buffer,"revision":revision(&f.flavite,buffer)}),
     ));
-    assert_eq!(redone["movement"]["selections"], json!([[4, 4]]));
+    assert_eq!(redone["movement"]["selections"], json!([[0, 4, 4]]));
     assert_eq!(f.text(buffer), "A雪base\n");
     data(execute(
         &f.flavite,

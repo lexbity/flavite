@@ -1,7 +1,7 @@
 //! Target-bound Context Mode controls over the existing editor input and API.
 
 use crate::app::{App, Message};
-use flavite_api::{Invocation, Origin};
+use flavite_api::{ExecutionResult, Invocation, Origin};
 use flavite_edit_context::{
     ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event, menu_key, reduce,
 };
@@ -22,19 +22,24 @@ pub struct EditorTarget {
     pub buffer: u64,
     pub revision: u64,
     pub selection: (usize, usize),
+    /// Monotonic committed-selection version at capture time (FEUX-0002
+    /// E-5): mutations fail on mismatch even when the revision matches.
+    pub selection_version: u64,
 }
 
 impl EditorTarget {
     #[must_use]
     pub fn capture(app: &App, tab: TabId) -> Option<Self> {
         let view = app.note_editor_view(tab)?;
-        let selection = app.editor_interaction_snapshot(tab)?.selection;
+        let interaction = app.workspace.tab(&tab)?.interaction();
+        let selection = interaction.selections.first().copied()?;
         Some(Self {
             tab,
             incarnation: app.notes.incarnation(tab)?,
             buffer: view.buffer_id,
             revision: view.revision,
-            selection,
+            selection: (selection.anchor, selection.head),
+            selection_version: interaction.selection_version,
         })
     }
 }
@@ -132,6 +137,11 @@ pub(crate) fn valid(app: &App, target: EditorTarget, selection: bool) -> bool {
             || app
                 .editor_interaction_snapshot(target.tab)
                 .is_some_and(|s| s.selection == target.selection))
+        && (!selection
+            || app
+                .workspace
+                .tab(&target.tab)
+                .is_some_and(|tab| tab.interaction().selection_version == target.selection_version))
 }
 
 #[must_use]
@@ -548,6 +558,155 @@ fn select(app: &mut App, target: EditorTarget, anchor: usize, head: usize) {
     app.context_mode.internal_selection = false;
 }
 
+/// The ticketed, planner-backed delete (FEUX-0002 X03 proof verb): issue an
+/// operation ticket, run `editor.delete` through the Session single-writer
+/// path, install the receipt's exact after-set on the requesting view, bump
+/// its selection version, and map passive views once via the movement delta.
+fn kernel_delete(app: &mut App, target: EditorTarget) -> Task<Message> {
+    let Some(api) = &app.flavite else {
+        return Task::none();
+    };
+    let issue = Invocation::new(
+        api.command_registry().next_request_id(),
+        "editor.issue_operation",
+        serde_json::json!({"buffer_id": target.buffer}),
+        Origin::Gui,
+    );
+    let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = api.execute(issue)
+    else {
+        app.context_mode.notice("Operation could not be started");
+        return Task::none();
+    };
+    let Some(operation) = success.data.get("operation").cloned() else {
+        app.context_mode.notice("Operation could not be started");
+        return Task::none();
+    };
+    let (anchor, head) = target.selection;
+    let args = serde_json::json!({
+        "buffer_id": target.buffer,
+        "revision": target.revision,
+        "operation": operation,
+        "origin": {
+            "view": format!("{:032x}", target.tab.raw()),
+            "incarnation": target.incarnation,
+        },
+        "selections": {
+            "primary": 0,
+            "items": [[0, anchor, head]],
+        },
+        "kind": "delete",
+    });
+    let result = api.execute(Invocation::new(
+        api.command_registry().next_request_id(),
+        "editor.delete",
+        args,
+        Origin::Gui,
+    ));
+    let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = result else {
+        let message = match &result {
+            ExecutionResult::Rejected(rejected) => rejected
+                .message
+                .clone()
+                .unwrap_or_else(|| "Delete was refused; source changed".into()),
+            ExecutionResult::Local(flavite_api::LocalResult::Error(error)) => {
+                if error.code == "read_only_non_applicable" {
+                    return Task::none();
+                }
+                error.message.clone()
+            }
+            _ => "Delete was refused; source changed".into(),
+        };
+        app.context_mode.notice(message);
+        return Task::none();
+    };
+    let new_revision = success.data["revision"].as_u64().unwrap_or(target.revision);
+    let movement = serde_json::from_value::<flavite_buffer::history::HistoryMovement>(
+        success.data["movement"].clone(),
+    )
+    .unwrap_or(flavite_buffer::history::HistoryMovement {
+        selections: None,
+        spans: Vec::new(),
+        truncated: false,
+    });
+    let after_triples: Vec<[usize; 3]> =
+        serde_json::from_value(success.data["after_selections"].clone()).unwrap_or_default();
+    // Map passive views once (movement spans; clamp on truncation).
+    super::input::apply_history_movement(
+        app,
+        target.tab,
+        target.buffer,
+        target.revision,
+        new_revision,
+        &movement,
+    );
+    // Install the exact after-set on the requesting view; bump the selection
+    // version only when the set actually changed.
+    if let Some(mut interaction) = app
+        .workspace
+        .tab(&target.tab)
+        .map(|v| v.interaction().clone())
+    {
+        let next_selections: Vec<flavite_workspace::CommittedSelection> = after_triples
+            .iter()
+            .map(|[_, a, h]| flavite_workspace::CommittedSelection::new(*a, *h))
+            .collect();
+        let changed = !next_selections.is_empty() && next_selections != interaction.selections;
+        if changed {
+            interaction.selection_version = interaction.selection_version.wrapping_add(1);
+        }
+        interaction.selections = if next_selections.is_empty() {
+            interaction.selections.clone()
+        } else {
+            next_selections
+        };
+        interaction.revision = new_revision;
+        interaction.sequence += 1;
+        interaction.viewport_anchor = interaction.viewport_anchor.min(
+            app.note_editor_view(target.tab)
+                .map_or(0, |view| view.text.len()),
+        );
+        let Some(view) = app.note_editor_view(target.tab) else {
+            return Task::none();
+        };
+        if app
+            .workspace
+            .acknowledge_interaction(interaction, &view.text)
+            .is_err()
+        {
+            app.input_chains.remove(&target.tab);
+        }
+    }
+    app.workspace.invalidate_writing_target(target.buffer);
+    app.linking.invalidate_if_source_changed(None);
+    // Maintain the acknowledged-input chain so queued native keys still
+    // resolve against the new revision (same contract as handle_inner).
+    let sequence = app
+        .workspace
+        .tab(&target.tab)
+        .map_or(1, |v| v.interaction().sequence);
+    let base = app
+        .input_chains
+        .get(&target.tab)
+        .map_or(target.revision, |chain| chain.base());
+    app.input_chains.insert(
+        target.tab,
+        super::input::InputChain::new(
+            target.incarnation,
+            target.buffer,
+            base,
+            new_revision,
+            sequence,
+            None,
+        ),
+    );
+    if let Some(session) = &mut app.context_mode.session {
+        session.state.clear_attention();
+    }
+    app.reconcile_contexts();
+    app.refresh_semantics();
+    focus(app, target.tab)
+}
+
 fn input(app: &mut App, target: EditorTarget, action: KeyAction, text: String) -> Task<Message> {
     input_command(app, target, action, text, None)
 }
@@ -874,6 +1033,7 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             select(app, target, a, b);
         }
         Collapse => select(app, target, head, head),
+        ClearSelection => select(app, target, head, head),
         LineStart | InsertLineStart => select(app, target, line_start, line_start),
         LineEnd | InsertLineEnd => select(app, target, line_end, line_end),
         DocumentStart => select(app, target, 0, 0),
@@ -889,7 +1049,13 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             effective_selection = Some([line_end, line_end]);
             edit = Some((KeyAction::Newline, String::new()));
         }
-        Cut | Copy | Delete | Change => {
+        Delete => {
+            // The ticketed kernel path (FEUX-0002 X03): the planner derives
+            // the effective range, the Session installs atomically, and the
+            // receipt carries the exact after-set + movement delta.
+            return kernel_delete(app, target);
+        }
+        Cut | Copy | Change => {
             let Some(effect) = flavite_edit_context::effect::plan(text, target.selection, command)
             else {
                 app.context_mode

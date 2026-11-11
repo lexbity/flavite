@@ -139,14 +139,61 @@ run_x02_gates() {
     gate assert_present 'pub enum Effect' "$root/crates/flavite-edit-context/src/session.rs"
 }
 
+run_x03_gates() {
+    run_x02_gates
+    # X03 artifacts exist with real content.
+    local file
+    for file in \
+        crates/flavite-buffer/src/selection.rs \
+        crates/flavite-buffer/src/commands.rs \
+        crates/flavite-buffer/tests/selection_properties.rs \
+        crates/flavite-buffer/tests/movement_deltas.rs \
+        crates/flavite-vault/src/editor_receipts.rs \
+        crates/flavite-vault/tests/editor_receipts.rs \
+        crates/flavite-api/src/editor_commands.rs \
+        crates/flavite-api/tests/editor_commands.rs \
+        crates/flavite-ui/tests/editor_spine.rs; do
+        gate assert_nonempty "$root/$file"
+    done
+    # The protocol crate never exists, anywhere.
+    gate assert_absent 'flavite-edit-protocol' \
+        "$root/Cargo.toml" "$root/Cargo.lock" "$root/crates" "$root/docs"
+    # The workspace `Selection` type and the 256 cap are deleted; canonical
+    # values come from `flavite-buffer::selection` only.
+    gate assert_absent '^pub struct Selection\b' \
+        "$root/crates/flavite-workspace/src" "$root/crates/flavite-buffer/src/model.rs"
+    gate assert_absent 'selections\.len\(\) > 256|1\.\.=256' \
+        "$root/crates/flavite-workspace/src"
+    # The algebra stays pure and toolkit-free.
+    gate assert_absent 'iced|winit|wgpu|cosmic_text|std::fs|std::net' \
+        "$root/crates/flavite-buffer/src/selection.rs"
+    # No raw public undo jump.
+    gate assert_absent 'pub fn goto\b' "$root/crates/flavite-buffer/src/undo.rs"
+    # No app-side re-implementation of normalization: the UI and editor never
+    # call the algebra (api translates).
+    gate assert_absent 'normalize\(' \
+        "$root/crates/flavite-ui/src" "$root/crates/flavite-editor/src"
+    # Per-view selection version (workspace data + the GUI target that
+    # validates it, FEUX-001 §5.4's split) and the ticket ledger exist.
+    # Each file asserted individually: rg over several files succeeds on any
+    # one match, which would make a multi-file presence gate vacuous.
+    gate assert_present 'selection_version' "$root/crates/flavite-workspace/src/input.rs"
+    gate assert_present 'selection_version' "$root/crates/flavite-ui/src/host/context_mode.rs"
+    gate assert_present 'pub struct OperationId' "$root/crates/flavite-vault/src/editor_receipts.rs"
+    gate assert_present 'pub struct OperationId' "$root/crates/flavite-vault/src/editor_receipts.rs"
+    gate assert_present 'MAX_SELECTIONS' "$root/crates/flavite-buffer/src/selection.rs"
+    gate assert_present 'MovementSpan' "$root/crates/flavite-buffer/src/history.rs"
+}
+
 case "$slice" in
     X01) run_x01_gates ;;
     X02) run_x02_gates ;;
-    X03|X04|X05|X06|X07|X08)
-        echo "phase ${slice} is not implemented yet; the cumulative gate stops at X02" >&2
+    X03) run_x03_gates ;;
+    X04|X05|X06|X07|X08)
+        echo "phase ${slice} is not implemented yet; the cumulative gate stops at X03" >&2
         exit 2
         ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02)" >&2; exit 2 ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then

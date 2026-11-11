@@ -6,7 +6,7 @@ use flavite_api::{ExecutionResult, Invocation, LocalResult, Origin};
 use flavite_buffer::history::{
     HistoryCursor, HistoryEntry, HistoryMovement, HistoryPage, HistoryTarget,
 };
-use flavite_workspace::Selection;
+use flavite_workspace::CommittedSelection;
 use iced::{Rectangle, Task};
 use std::collections::BTreeMap;
 
@@ -423,21 +423,28 @@ fn restore(app: &mut App, source: EditorTarget, target: HistoryTarget) -> Task<M
     {
         app.workspace.release_editor_focus(Some(source.tab));
         interaction.focused = true;
-        interaction.selections = movement.selections.map_or_else(
-            || super::input::map_selections(&view.text, &interaction.selections, &movement.change),
-            |items| {
-                items
-                    .into_iter()
-                    .map(|[a, h]| Selection::new(a, h))
-                    .collect()
-            },
-        );
+        interaction.selections = if let Some(items) = movement.selections.clone() {
+            items
+                .into_iter()
+                .map(|[_, a, h]| CommittedSelection::new(a, h))
+                .collect()
+        } else if movement.truncated {
+            let clamp =
+                |at: usize| flavite_editor::viewport::clamp_grapheme_boundary(&view.text, at);
+            interaction
+                .selections
+                .iter()
+                .map(|s| CommittedSelection::new(clamp(s.anchor), clamp(s.head)))
+                .collect()
+        } else {
+            super::input::map_selections(&view.text, &interaction.selections, &movement)
+        };
         interaction.revision = view.revision;
         interaction.sequence += 1;
         interaction.viewport_anchor = super::input::map_history_point(
             &view.text,
             interaction.viewport_anchor,
-            &movement.change,
+            &movement,
             flavite_buffer::Affinity::Left,
         );
         let _ = app

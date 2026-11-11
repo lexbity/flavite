@@ -1335,9 +1335,7 @@ mod tests {
         let mut buffer = Buffer::from_text("hello");
         let buffer_id = buffer.buffer_id();
         let revision = buffer.revision();
-        buffer
-            .model_mut()
-            .set_primary_selection(crate::model::Selection::caret(TextByte(3)));
+        buffer.model_mut().set_primary_selection(3, 3);
         let _transition =
             buffer.check_external_change(b"hello world", flavite_encoding::DecodePolicy::Auto);
 
@@ -1346,7 +1344,7 @@ mod tests {
         assert_eq!(buffer.base_bytes(), b"hello world");
         assert_eq!(buffer.buffer_id(), buffer_id);
         assert!(buffer.revision() > revision);
-        assert_eq!(buffer.model().primary_selection().head, TextByte(3));
+        assert_eq!(buffer.model().primary_selection().head(), 3);
     }
 
     #[test]

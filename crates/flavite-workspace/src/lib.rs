@@ -37,7 +37,7 @@ pub use geometry::{
     solve, view_minimum,
 };
 pub use ids::{GroupId, Ids, SplitId, TabId, WorkspaceId};
-pub use input::{CompositionState, EditorInteraction, Selection, WritingTarget};
+pub use input::{CommittedSelection, CompositionState, EditorInteraction, WritingTarget};
 pub use layout::{
     Arrangement, Edge, LayoutNode, MAX_GROUPS, MAX_RATIO_PPM, MAX_TABS, MIN_RATIO_PPM, Side,
     TabDropTarget, TabGroup,

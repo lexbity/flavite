@@ -880,7 +880,7 @@ fn stale_history_activation_and_read_only_restore_leave_the_source_unchanged() {
 #[test]
 fn history_maps_passive_split_selections_and_scroll_without_adopting_or_focusing_them() {
     use flavite_ui::host::editor_history::{HistoryAction, HistoryMessage};
-    use flavite_workspace::Selection;
+    use flavite_workspace::CommittedSelection;
     let (mut f, passive) = fixture(3117);
     let _ = f
         .app
@@ -895,7 +895,7 @@ fn history_maps_passive_split_selections_and_scroll_without_adopting_or_focusing
     }
     let text = f.app.note_editor_view(passive).unwrap().text;
     let mut interaction = f.app.workspace.tab(&passive).unwrap().interaction().clone();
-    interaction.selections = vec![Selection::new(15, 11)];
+    interaction.selections = vec![CommittedSelection::new(15, 11)];
     interaction.viewport_anchor = 10;
     interaction.focused = false;
     interaction.sequence += 1;
@@ -909,7 +909,10 @@ fn history_maps_passive_split_selections_and_scroll_without_adopting_or_focusing
     run(&mut f.app, source, Command::InsertStart);
     type_text(&mut f.app, source, "雪");
     let passive_view = f.app.workspace.tab(&passive).unwrap().interaction();
-    assert_eq!(passive_view.selections, vec![Selection::new(18, 14)]);
+    assert_eq!(
+        passive_view.selections,
+        vec![CommittedSelection::new(18, 14)]
+    );
     assert_eq!(passive_view.viewport_anchor, 13);
     assert!(!passive_view.focused);
     let target = EditorTarget::capture(&f.app, source).unwrap();
@@ -918,7 +921,10 @@ fn history_maps_passive_split_selections_and_scroll_without_adopting_or_focusing
         HistoryAction::Restore(root),
     )));
     let passive_view = f.app.workspace.tab(&passive).unwrap().interaction();
-    assert_eq!(passive_view.selections, vec![Selection::new(15, 11)]);
+    assert_eq!(
+        passive_view.selections,
+        vec![CommittedSelection::new(15, 11)]
+    );
     assert_eq!(passive_view.viewport_anchor, 10);
     assert!(!passive_view.focused);
     assert_eq!(

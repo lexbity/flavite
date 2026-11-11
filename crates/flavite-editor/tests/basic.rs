@@ -44,6 +44,7 @@ fn edits_become_revision_guarded_session_commands() {
             ops,
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
+            operation: None,
         } => {
             assert_eq!(buffer_id.as_u64(), 42);
             assert_eq!(revision.as_u64(), 7);

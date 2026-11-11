@@ -86,8 +86,8 @@ fn refusal_before_mutation_leaves_text_revision_and_history_byte_identical() {
     let record = flavite_buffer::history::EditorEdit {
         origin: format!("{:032x}", 1),
         kind: flavite_buffer::history::EditKind::Typing,
-        before: vec![[0, 0]],
-        after: vec![[4096, 4096]],
+        before: vec![[0, 0, 0]],
+        after: vec![[0, 4096, 4096]],
     };
     let recorded_error = model
         .try_apply_recorded_batch(

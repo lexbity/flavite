@@ -597,7 +597,9 @@ impl WorkspaceState {
                     && target.interaction_sequence == current.interaction().sequence
                     && interaction.composition == crate::input::CompositionState::Idle
                     && interaction.selections
-                        == [crate::input::Selection::caret(target.caret_text_byte)]
+                        == [crate::input::CommittedSelection::caret(
+                            target.caret_text_byte,
+                        )]
             })
             .map(|mut target| {
                 target.interaction_sequence = interaction.sequence;
@@ -675,7 +677,7 @@ impl WorkspaceState {
             .sequence
             .checked_add(1)
             .ok_or("interaction sequence exhausted")?;
-        next.selections = vec![crate::input::Selection::caret(caret)];
+        next.selections = vec![crate::input::CommittedSelection::caret(caret)];
         let sequence = next.sequence;
         view.set_interaction(next);
         self.writing_target = Some(crate::input::WritingTarget {
@@ -813,7 +815,10 @@ impl WorkspaceState {
                 && Some(target.buffer_id) == interaction.buffer_id
                 && target.revision == interaction.revision
                 && target.interaction_sequence == previous_sequence
-                && interaction.selections == [crate::Selection::caret(target.caret_text_byte)]
+                && interaction.selections
+                    == [crate::input::CommittedSelection::caret(
+                        target.caret_text_byte,
+                    )]
             {
                 target.interaction_sequence = interaction.sequence;
             } else {
@@ -842,7 +847,7 @@ impl WorkspaceState {
         self.set_content_anchor(tab, start, text)?;
         let session = self.tabs.get_mut(&tab).ok_or("Missing view")?;
         let mut interaction = session.interaction().clone();
-        interaction.selections = vec![crate::Selection::new(start, end)];
+        interaction.selections = vec![crate::input::CommittedSelection::new(start, end)];
         interaction.revision = revision;
         session.set_interaction(interaction);
         if self.writing_target.is_some_and(|target| target.tab == tab) {

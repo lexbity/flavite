@@ -2011,8 +2011,10 @@ impl App {
                         "Editor input was stale; the current caret state was restored".into();
                     return;
                 }
-                let selection =
-                    flavite_workspace::Selection::new(snapshot.selection.0, snapshot.selection.1);
+                let selection = flavite_workspace::CommittedSelection::new(
+                    snapshot.selection.0,
+                    snapshot.selection.1,
+                );
                 if snapshot.focused
                     && self
                         .workspace
@@ -2373,6 +2375,10 @@ impl App {
                     buffer: request.buffer,
                     revision: request.revision,
                     selection: request.selection,
+                    selection_version: self
+                        .workspace
+                        .tab(&tab)
+                        .map_or(0, |v| v.interaction().selection_version),
                 };
                 let target = if matches!(request.event, ContextEvent::EnterAt(_)) {
                     captured

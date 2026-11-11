@@ -6,9 +6,9 @@
 //! are typed — never silent fallbacks to a different source.
 
 use flavite_workspace::{
-    ContextBinding, ContextRouter, ContextSource, ContextViewKind, EditorInteraction,
-    EntityLocator, LayoutAction, NoteLocator, Outcome, Selection, TabId, ViewKind, WorkspaceState,
-    reduce,
+    CommittedSelection, ContextBinding, ContextRouter, ContextSource, ContextViewKind,
+    EditorInteraction, EntityLocator, LayoutAction, NoteLocator, Outcome, TabId, ViewKind,
+    WorkspaceState, reduce,
 };
 
 fn locator(name: &str) -> NoteLocator {
@@ -42,7 +42,7 @@ fn open_and_focus(state: &WorkspaceState, name: &str) -> (WorkspaceState, TabId)
     let mut interaction = EditorInteraction::new(tab, 1);
     interaction.sequence = 1;
     interaction.focused = true;
-    interaction.selections = vec![Selection::caret(0)];
+    interaction.selections = vec![CommittedSelection::caret(0)];
     interaction.buffer_id = Some(1);
     interaction.revision = 1;
     state

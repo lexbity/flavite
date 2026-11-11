@@ -119,6 +119,88 @@ fn seed_x02_inputs(root: &Path) {
     );
 }
 
+fn seed_x03_inputs(root: &Path) {
+    seed_x02_inputs(root);
+    // The per-file selection-version gates assert the workspace data and the
+    // GUI target that validates it (FEUX-001 §5.4's split).
+    seed_file(
+        root,
+        "crates/flavite-workspace/src/input.rs",
+        "pub selection_version: u64,\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/src/host/context_mode.rs",
+        "pub selection_version: u64,\n",
+    );
+    // The protocol-absence gate scans the workspace root artifacts.
+    seed_file(root, "Cargo.toml", "[workspace]\n");
+    seed_file(root, "Cargo.lock", "# locked\n");
+    seed_file(root, "docs/readme.md", "# docs\n");
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/selection.rs",
+        "pub const MAX_SELECTIONS: usize = 10000;\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/commands.rs",
+        "pub fn plan() {}\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-buffer/tests/selection_properties.rs",
+        "// selection properties\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-buffer/tests/movement_deltas.rs",
+        "// movement deltas\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-vault/src/editor_receipts.rs",
+        "pub struct OperationId {}\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-vault/tests/editor_receipts.rs",
+        "// ticket integration\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-api/src/editor_commands.rs",
+        "pub fn handle_editor_delete() {}\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-api/tests/editor_commands.rs",
+        "// api editor commands\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/tests/editor_spine.rs",
+        "// editor spine\n",
+    );
+    // The workspace has no `Selection` type and no 256 cap.
+    seed_file(
+        root,
+        "crates/flavite-workspace/src/input.rs",
+        "pub struct EditorInteraction { pub selection_version: u64 }\n",
+    );
+    // The history model carries movement spans.
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/history.rs",
+        "pub enum HistoryError { HistoryChanged }\npub struct MovementSpan {}\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/undo.rs",
+        "fn reserve() {}\nfn evict_to_fit() {}\nfn history_truncated() {}\n",
+    );
+}
+
 #[test]
 fn feux_gate_passes_clean_tree_and_rejects_forbidden_patterns() {
     let temp = tempfile::tempdir().unwrap();
@@ -259,6 +341,89 @@ fn feux_gate_fails_on_missing_search_targets_rg_exit_2() {
 }
 
 #[test]
+fn x03_gate_passes_clean_tree_and_rejects_kernel_forgery() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_x03_inputs(temp.path());
+    let clean = run_gate(temp.path(), "X03");
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // The protocol crate must never exist.
+    seed_file(
+        temp.path(),
+        "crates/flavite-edit-protocol/src/lib.rs",
+        "// flavite-edit-protocol\n",
+    );
+    assert!(!run_gate(temp.path(), "X03").status.success());
+    fs::remove_dir_all(temp.path().join("crates/flavite-edit-protocol")).unwrap();
+
+    // A resurrected workspace `Selection` type fails.
+    seed_file(
+        temp.path(),
+        "crates/flavite-workspace/src/input.rs",
+        "pub struct Selection { anchor: usize, head: usize }\n",
+    );
+    assert!(!run_gate(temp.path(), "X03").status.success());
+    seed_file(
+        temp.path(),
+        "crates/flavite-workspace/src/input.rs",
+        "pub struct EditorInteraction { pub selection_version: u64 }\n",
+    );
+
+    // The 256 cap is forbidden.
+    seed_file(
+        temp.path(),
+        "crates/flavite-workspace/src/input.rs",
+        "if selections.len() > 256 {}\n",
+    );
+    assert!(!run_gate(temp.path(), "X03").status.success());
+    seed_file(
+        temp.path(),
+        "crates/flavite-workspace/src/input.rs",
+        "pub struct EditorInteraction { pub selection_version: u64 }\n",
+    );
+
+    // Toolkit deps inside the pure algebra are forbidden.
+    seed_file(
+        temp.path(),
+        "crates/flavite-buffer/src/selection.rs",
+        "use iced::widget;\npub const MAX_SELECTIONS: usize = 10000;\n",
+    );
+    assert!(!run_gate(temp.path(), "X03").status.success());
+    seed_file(
+        temp.path(),
+        "crates/flavite-buffer/src/selection.rs",
+        "pub const MAX_SELECTIONS: usize = 10000;\n",
+    );
+
+    // The UI must not re-implement normalization.
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/src/host/other.rs",
+        "fn normalize() {}\n",
+    );
+    assert!(!run_gate(temp.path(), "X03").status.success());
+    fs::remove_file(temp.path().join("crates/flavite-ui/src/host/other.rs")).unwrap();
+
+    // Removing a required kernel file fails presence.
+    fs::remove_file(
+        temp.path()
+            .join("crates/flavite-vault/src/editor_receipts.rs"),
+    )
+    .unwrap();
+    let missing = run_gate(temp.path(), "X03");
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("missing/empty"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
+#[test]
 fn feux_gate_rejects_unknown_or_unimplemented_slices() {
     let temp = tempfile::tempdir().unwrap();
     seed_x01_inputs(temp.path());
@@ -267,7 +432,7 @@ fn feux_gate_rejects_unknown_or_unimplemented_slices() {
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown slice"));
     // Future phases are not yet implemented: requiring them is a hard
     // failure, never a silent pass.
-    let future = run_gate(temp.path(), "X03");
+    let future = run_gate(temp.path(), "X04");
     assert!(!future.status.success());
     assert!(String::from_utf8_lossy(&future.stderr).contains("not implemented yet"));
 }

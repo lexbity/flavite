@@ -338,6 +338,10 @@ pub enum SessionCommand {
         undo_policy: flavite_buffer::undo::UndoPolicy,
         /// Validated selection metadata installed in the same edit turn.
         editor: Option<flavite_buffer::history::EditorEdit>,
+        /// Session-issued operation ticket (FEUX-0002 E-5). When present,
+        /// the activation is admitted against the ledger; duplicates and
+        /// retired replays are refused with typed outcomes.
+        operation: Option<crate::editor_receipts::OperationId>,
     },
     EditingHistory {
         buffer_id: BufferId,
@@ -638,6 +642,29 @@ pub enum CommandResult {
     EditsApplied {
         buffer_id: BufferId,
         new_revision: Revision,
+        /// Exact movement delta for passive views and the requesting view's
+        /// recorded after-set (FEUX-0002 E-13); `None` on non-editor paths.
+        movement: Option<flavite_buffer::history::HistoryMovement>,
+        /// The canonical after-set as `[id, anchor, head]` triples, when the
+        /// activation carried recorded editor metadata.
+        after_selections: Option<Vec<[usize; 3]>>,
+    },
+    /// A Session-issued editor operation ticket (FEUX-0002 E-5).
+    OperationIssued {
+        buffer_id: BufferId,
+        operation: crate::editor_receipts::OperationId,
+    },
+    /// An editor operation was cancelled by the host.
+    OperationCancelled {
+        buffer_id: BufferId,
+        operation: crate::editor_receipts::OperationId,
+    },
+    /// A selection-only command produced a new canonical set (no history
+    /// node, no revision bump).
+    SelectionsChanged {
+        buffer_id: BufferId,
+        revision: Revision,
+        selections: Vec<[usize; 3]>,
     },
     /// A semantic link plan was prepared (W05).
     LinkPrepared {
@@ -1112,6 +1139,8 @@ pub struct Session {
     /// `flavite_buffer::budget::APP_WIDE_MAX_HISTORY_BYTES`; settable for
     /// fault/limit tests.
     app_history_budget: AtomicU64,
+    /// Editor operation tickets and terminal receipts (FEUX-0002 E-5).
+    editor_operations: Mutex<crate::editor_receipts::ReceiptLedger>,
 }
 
 /// One queued semantic-link prepare job (W05).
@@ -1887,6 +1916,7 @@ impl Session {
             buffer_signal: Some(buffer_signal),
             buffer_stamp_version: AtomicU64::new(0),
             app_history_budget: AtomicU64::new(flavite_buffer::budget::APP_WIDE_MAX_HISTORY_BYTES),
+            editor_operations: Mutex::new(crate::editor_receipts::ReceiptLedger::new()),
         };
         // Recover durable replacement jobs from the private store
         // (RFC-0006 D-11). Runs once at Session construction; never
@@ -2445,7 +2475,8 @@ impl Session {
                 ops,
                 undo_policy,
                 editor,
-            } => self.apply_edits(buffer_id, revision, ops, undo_policy, editor),
+                operation,
+            } => self.apply_edits(buffer_id, revision, ops, undo_policy, editor, operation),
             SessionCommand::EditingHistory {
                 buffer_id,
                 revision,
@@ -2810,6 +2841,8 @@ impl Session {
                         CommandResult::EditsApplied {
                             buffer_id: BufferId::from(buffer_id),
                             new_revision: Revision::new(new_revision),
+                            movement: None,
+                            after_selections: None,
                         }
                     } else {
                         CommandResult::LinkInserted {
@@ -2940,11 +2973,13 @@ impl Session {
             vec![edit],
             flavite_buffer::undo::UndoPolicy::Isolated,
             None,
+            None,
         );
         let result = match applied {
             SessionResult::Success(CommandResult::EditsApplied {
                 buffer_id,
                 new_revision,
+                ..
             }) => SessionResult::Success(CommandResult::LinkInserted {
                 buffer_id,
                 new_revision,
@@ -2995,6 +3030,8 @@ impl Session {
             return SessionResult::Success(CommandResult::EditsApplied {
                 buffer_id,
                 new_revision,
+                movement: None,
+                after_selections: None,
             });
         }
         result
@@ -3942,6 +3979,8 @@ impl Session {
                 Ok((new_revision, _)) => SessionResult::Success(CommandResult::EditsApplied {
                     buffer_id,
                     new_revision,
+                    movement: None,
+                    after_selections: None,
                 }),
                 Err(flavite_buffer::model::BatchError::LimitExceeded { needed, budget }) => {
                     SessionResult::HistoryLimitExceeded {
@@ -5416,6 +5455,12 @@ impl Session {
             // re-opened buffer (new id) starts cold, and the close tier
             // keeps total memo memory bounded by open buffers.
             self.journal_memos.lock_recovering().remove(&_buffer_id);
+            // E-5: tickets issued for the closed buffer identity are dead —
+            // drop pending activations and retire their sequences so a late
+            // or replayed ticket refuses instead of admitting.
+            self.editor_operations
+                .lock_recovering()
+                .close_buffer(_buffer_id.as_u64());
 
             SessionResult::Success(CommandResult::NoteClosed)
         } else {
@@ -5598,6 +5643,8 @@ impl Session {
             Some((new_revision, _)) => SessionResult::Success(CommandResult::EditsApplied {
                 buffer_id,
                 new_revision,
+                movement: None,
+                after_selections: None,
             }),
             None => SessionResult::Error {
                 message: "Invalid structure edit".into(),
@@ -5612,7 +5659,36 @@ impl Session {
         ops: Vec<EditOp>,
         undo_policy: flavite_buffer::undo::UndoPolicy,
         editor: Option<flavite_buffer::history::EditorEdit>,
+        operation: Option<crate::editor_receipts::OperationId>,
     ) -> SessionResult {
+        // Ticket admission (FEUX-0002 E-5): pending proceeds; duplicates and
+        // retired replays are refused with typed outcomes; any consumed
+        // activation completes terminally on every exit path.
+        if let Some(op) = operation {
+            match self.editor_operations.lock_recovering().admit(&op) {
+                crate::editor_receipts::TicketStatus::Pending => {}
+                crate::editor_receipts::TicketStatus::AlreadyApplied => {
+                    return SessionResult::Error {
+                        message: "AlreadyApplied".into(),
+                    };
+                }
+                crate::editor_receipts::TicketStatus::Cancelled => {
+                    return SessionResult::Error {
+                        message: "Cancelled".into(),
+                    };
+                }
+                crate::editor_receipts::TicketStatus::Retired => {
+                    return SessionResult::Error {
+                        message: "ReceiptExpired".into(),
+                    };
+                }
+                crate::editor_receipts::TicketStatus::Unknown => {
+                    return SessionResult::Error {
+                        message: "UnknownOperation".into(),
+                    };
+                }
+            }
+        }
         let mut buffer_manager = self.buffer_manager.lock_recovering();
         if let Some(path) = buffer_manager.path_for_id(buffer_id)
             && self.leased_by_replace(path)
@@ -5663,14 +5739,26 @@ impl Session {
 
         // Apply all edit ops as one authoritative Buffer transition/undo unit.
         let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) else {
+            if let Some(op) = operation {
+                self.editor_operations
+                    .lock_recovering()
+                    .complete(&op, crate::editor_receipts::Outcome::Cancelled);
+            }
             return SessionResult::Error {
                 message: format!("Buffer not found: {:?}", buffer_id),
             };
         };
+
+        let recorded = editor.is_some();
         let new_revision = if let Some(editor) = editor {
             match buffer.apply_recorded_edits(&ops, undo_policy, editor) {
                 Ok(revision) => revision,
                 Err(error) => {
+                    if let Some(op) = operation {
+                        self.editor_operations
+                            .lock_recovering()
+                            .complete(&op, crate::editor_receipts::Outcome::Cancelled);
+                    }
                     return match error {
                         flavite_buffer::model::RecordedBatchError::LimitExceeded {
                             needed,
@@ -5691,6 +5779,11 @@ impl Session {
             match buffer.apply_local_edits_with_policy(&ops, undo_policy) {
                 Ok((revision, _)) => revision,
                 Err(flavite_buffer::model::BatchError::LimitExceeded { needed, budget }) => {
+                    if let Some(op) = operation {
+                        self.editor_operations
+                            .lock_recovering()
+                            .complete(&op, crate::editor_receipts::Outcome::Cancelled);
+                    }
                     return SessionResult::HistoryLimitExceeded {
                         buffer_id,
                         needed,
@@ -5699,16 +5792,61 @@ impl Session {
                     };
                 }
                 Err(_) => {
+                    if let Some(op) = operation {
+                        self.editor_operations
+                            .lock_recovering()
+                            .complete(&op, crate::editor_receipts::Outcome::Cancelled);
+                    }
                     return SessionResult::Error {
                         message: "edit ranges overlap, are out of bounds, or split UTF-8".into(),
                     };
                 }
             }
         };
+        if let Some(op) = operation {
+            self.editor_operations
+                .lock_recovering()
+                .complete(&op, crate::editor_receipts::Outcome::Applied);
+        }
+        // For recorded editor edits, the receipt carries the exact movement
+        // delta and the recorded after-set. The delta is derived from THIS
+        // transition's actual edits (E-13): a batch of disjoint ops yields
+        // one span per op — the tree stores the batch as one combined node
+        // edit (D-06), which is the right truth for undo/restore walk
+        // receipts but not for mapping one apply receipt.
+        let (movement, after_selections) = if recorded {
+            let after = buffer.model().history_position_selections();
+            let mut spans: Vec<flavite_buffer::history::MovementSpan> = ops
+                .iter()
+                .map(|op| flavite_buffer::history::MovementSpan {
+                    start: op.range.start.0,
+                    end: op.range.end.0,
+                    replacement_len: op.replacement.len(),
+                })
+                .collect();
+            let truncated = if spans.len() > flavite_buffer::history::MAX_MOVEMENT_SPANS {
+                spans.clear();
+                true
+            } else {
+                false
+            };
+            (
+                Some(flavite_buffer::history::HistoryMovement {
+                    selections: after.clone(),
+                    spans,
+                    truncated,
+                }),
+                after,
+            )
+        } else {
+            (None, None)
+        };
 
         SessionResult::Success(CommandResult::EditsApplied {
             buffer_id,
             new_revision,
+            movement,
+            after_selections,
         })
     }
 
@@ -5982,6 +6120,43 @@ impl Session {
     /// Undo an edit.
     /// Close the current typing group under the same revision guard as edits.
     /// This never creates an undo node or changes document freshness.
+    /// Issue one editor operation ticket for `buffer_id` (FEUX-0002 E-5).
+    /// Returns `None` when the per-buffer pending cap is reached.
+    pub fn issue_editor_operation(
+        &self,
+        buffer_id: BufferId,
+    ) -> Option<crate::editor_receipts::OperationId> {
+        self.editor_operations
+            .lock_recovering()
+            .issue(buffer_id.as_u64())
+    }
+
+    /// Cancel a pending editor operation (host-initiated). Returns whether a
+    /// pending operation was consumed; a terminal operation reports `false`.
+    pub fn cancel_editor_operation(&self, op: &crate::editor_receipts::OperationId) -> bool {
+        self.editor_operations.lock_recovering().cancel(op)
+    }
+
+    /// Admit one editor operation (dedup/expiry check).
+    #[must_use]
+    pub fn admit_editor_operation(
+        &self,
+        op: &crate::editor_receipts::OperationId,
+    ) -> crate::editor_receipts::TicketStatus {
+        self.editor_operations.lock_recovering().admit(op)
+    }
+
+    /// Complete an editor operation with a terminal outcome.
+    pub fn complete_editor_operation(
+        &self,
+        op: &crate::editor_receipts::OperationId,
+        outcome: crate::editor_receipts::Outcome,
+    ) {
+        self.editor_operations
+            .lock_recovering()
+            .complete(op, outcome);
+    }
+
     pub fn seal_undo_group(&self, buffer_id: BufferId, revision: Revision) -> SessionResult {
         let _turn = self.driving_turn.lock_recovering();
         self.pump_external_changes_inner();
@@ -6442,6 +6617,8 @@ impl Session {
             Some(new_revision) => SessionResult::Success(CommandResult::EditsApplied {
                 buffer_id,
                 new_revision,
+                movement: None,
+                after_selections: None,
             }),
             None => SessionResult::Error {
                 message: "merge output is invalid UTF-8 or exceeds the note size limit".into(),
@@ -7801,9 +7978,10 @@ mod tests {
             editor: Some(flavite_buffer::history::EditorEdit {
                 origin: format!("{:032x}", 1),
                 kind: flavite_buffer::history::EditKind::Typing,
-                before: vec![[0, 0]],
-                after: vec![[1, 1]],
+                before: vec![[0, 0, 0]],
+                after: vec![[0, 1, 1]],
             }),
+            operation: None,
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -7867,6 +8045,7 @@ mod tests {
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
+            operation: None,
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -7887,6 +8066,7 @@ mod tests {
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
+            operation: None,
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -7906,6 +8086,7 @@ mod tests {
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
+            operation: None,
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -7991,6 +8172,7 @@ mod tests {
             ops: vec![edit],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
+            operation: None,
         });
         assert!(matches!(
             edited,
@@ -8003,6 +8185,7 @@ mod tests {
                 ops: vec![],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
+                operation: None,
             }),
             SessionResult::StaleRevision { .. }
         ));
@@ -8134,6 +8317,7 @@ mod tests {
                 )],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
+                operation: None,
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
@@ -8219,6 +8403,7 @@ mod tests {
                 ops: vec![EditOp::new(Span::new(TextByte(5), TextByte(5)), "!".into())],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
+                operation: None,
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
@@ -8256,6 +8441,7 @@ mod tests {
                 )],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
+                operation: None,
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
@@ -8798,6 +8984,7 @@ mod tests {
                 )],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
+                operation: None,
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
@@ -9061,6 +9248,7 @@ mod tests {
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
+            operation: None,
         });
         assert!(matches!(bad_edit, SessionResult::Error { .. }));
         assert!(matches!(
@@ -9084,6 +9272,7 @@ mod tests {
             ops: vec![EditOp::new(Span::new(TextByte(5), TextByte(5)), "!".into())],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
+            operation: None,
         });
         let dirty_revision = match changed {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
@@ -9108,6 +9297,7 @@ mod tests {
                 ops: vec![],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
+                operation: None,
             }),
             SessionResult::StaleRevision { .. }
         ));
@@ -9170,6 +9360,7 @@ mod tests {
                 )],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
+                operation: None,
             }),
             SessionResult::Success(_)
         ));
@@ -9314,6 +9505,7 @@ mod tests {
                 ops: vec![],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
+                operation: None,
             }),
             SessionResult::StaleRevision { .. }
         ));
@@ -9377,6 +9569,7 @@ mod tests {
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
+            operation: None,
         });
         session
             .buffer_manager()
@@ -9449,6 +9642,7 @@ mod tests {
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
+            operation: None,
         });
         let new_revision = match applied {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
@@ -9496,6 +9690,7 @@ mod tests {
                 )],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
+                operation: None,
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
@@ -9586,6 +9781,7 @@ mod tests {
                 ops: vec![EditOp::new(Span::new(TextByte(5), TextByte(5)), "!".into())],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
+                operation: None,
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
