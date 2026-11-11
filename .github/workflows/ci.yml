@@ -21,7 +21,14 @@
 #                     `just workspace-contracts` + `just gc`
 #                     (G0 split into 3 parallel jobs 2026-11-09 so wall time
 #                     is max() not sum(); local `just gate` still runs all G0)
-#   linux-extras      G1 — `just ci-gate` verbatim, so CI == local (D-9)
+#   linux-extras-supply-chain / -coverage / -msrv-fuzz
+#                     G1 extras — one `just ci-extras-*` recipe per job, each on
+#                     a fresh runner with its own disk budget, plus a disk
+#                     preflight. The old single linux-extras job stacked G0 +
+#                     doc + llvm-cov + network-denied + MSRV + fuzz into one
+#                     target/ and died with ENOSPC during `cc` linking
+#                     (2026-11-11). CI runs the same recipes local
+#                     `just ci-gate` composes, so CI == local (D-9)
 #   probe-watcher     watcher probe, scenarios 1-3, --self-check (FR-4)
 #   probe-fs          fs-semantics probe, all scenarios, --self-check
 #   probe-search      search probe, 2k notes, --self-check
@@ -87,7 +94,7 @@ jobs:
       # PR runs are lookup-only (see below), so a fork PR cannot write the
       # shared cache. zizmor cannot prove that statically, hence the ignore.
       # zizmor: ignore[cache-poisoning]
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
         with:
           # v2 restores the latest prefix-matching cache automatically;
           # `restore-keys` is not a valid input on this version (run
@@ -121,7 +128,7 @@ jobs:
           just-version: 1.59.0
 
       # zizmor: ignore[cache-poisoning] — PR runs are lookup-only below.
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
           lookup-only: ${{ github.event_name == 'pull_request' }}
@@ -148,7 +155,7 @@ jobs:
           just-version: 1.59.0
 
       # zizmor: ignore[cache-poisoning] — PR runs are lookup-only below.
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
           lookup-only: ${{ github.event_name == 'pull_request' }}
@@ -167,14 +174,29 @@ jobs:
           just workspace-contracts
           just gc
 
-  # G1 — the full CI gate, run verbatim from the same recipe a dev runs
-  # locally (`just ci-gate`), so CI and local can never diverge (plan D-9).
+  # G1 extras — the `just ci-gate` extras, split into one job per recipe group
+  # so each runs on a FRESH runner with its own disk budget. The old single
+  # linux-extras job stacked G0 + doc + llvm-cov + network-denied + MSRV +
+  # fuzz builds into one target/ and died with ENOSPC during `cc` linking of
+  # flavite-cli (2026-11-11). G0 is NOT re-run here — needs: [gate-*] already
+  # proved it, and the gate-* jobs keep G0 as their first substantive step
+  # (audit C2). Local `just ci-gate` composes exactly these recipes after
+  # `gate`, so CI == local at the recipe level (D-9).
   # Linux-only: llvm-cov, cargo-fuzz and unshare -n are Linux-only tools.
-  linux-extras:
-    name: linux-extras (ubuntu-26.04)
+  # Every job runs a disk preflight after cache restore (fail fast with a
+  # clear message instead of ENOSPC mid-link) and logs disk usage after the
+  # run. The ci-extras-* recipes themselves call `just gc` between heavy
+  # phases to reclaim space (§10.10).
+  linux-extras-supply-chain:
+    name: linux-extras-supply-chain (ubuntu-26.04)
     runs-on: ubuntu-26.04
-    timeout-minutes: 60
+    timeout-minutes: 30
     needs: [gate-fmt-clippy, gate-test, gate-arch]
+    env:
+      # Disk relief: no incremental caches; line-tables-only debug info
+      # (full debug=2 is the bulk of target/ on a disk-limited runner).
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -186,7 +208,7 @@ jobs:
 
       # PR runs are lookup-only (see below), so a fork PR cannot write the
       # shared cache. zizmor cannot prove that statically, hence the ignore.
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('fuzz/Cargo.lock') }}
           lookup-only: ${{ github.event_name == 'pull_request' }}
@@ -194,8 +216,133 @@ jobs:
       - name: Setup (tools + nightly + rg)
         run: just setup
 
-      - name: CI gate (G1) — just ci-gate
-        run: just ci-gate
+      - name: Disk preflight (after cache restore)
+        run: |
+          set -euo pipefail
+          df -h /
+          free_gib="$(df -BG --output=avail / | tail -1 | tr -dc '0-9')"
+          echo "Free on / after cache restore: ${free_gib} GiB (need >= 8)"
+          if [ "$free_gib" -lt 8 ]; then
+            echo "Under 8 GiB — running 'just gc' to reclaim restored caches, then re-checking"
+            just gc || true
+            free_gib="$(df -BG --output=avail / | tail -1 | tr -dc '0-9')"
+            echo "Free on / after gc: ${free_gib} GiB"
+            if [ "$free_gib" -lt 8 ]; then
+              echo "FAIL: still under 8 GiB free on / — refusing to build (would hit ENOSPC mid-link)"
+              exit 1
+            fi
+          fi
+
+      - name: G1 extras — supply chain (doc + deny + audit + shear)
+        run: just ci-extras-supply-chain
+
+      - name: Disk usage after run
+        if: always()
+        run: df -h /
+
+  # Heaviest disk user: the full-workspace instrumented llvm-cov build, then
+  # (after `just gc` inside the recipe) the network-denied test rebuild.
+  # Debug info stays full here on purpose — llvm-cov needs it for accurate
+  # line mapping; only incremental caches are disabled.
+  linux-extras-coverage:
+    name: linux-extras-coverage (ubuntu-26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    needs: [gate-fmt-clippy, gate-test, gate-arch]
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: 1.59.0
+
+      # zizmor: ignore[cache-poisoning] — PR runs are lookup-only below.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+        with:
+          key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('fuzz/Cargo.lock') }}
+          lookup-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: Setup (tools + nightly + rg)
+        run: just setup
+
+      - name: Disk preflight (after cache restore)
+        run: |
+          set -euo pipefail
+          df -h /
+          free_gib="$(df -BG --output=avail / | tail -1 | tr -dc '0-9')"
+          echo "Free on / after cache restore: ${free_gib} GiB (need >= 8)"
+          if [ "$free_gib" -lt 8 ]; then
+            echo "Under 8 GiB — running 'just gc' to reclaim restored caches, then re-checking"
+            just gc || true
+            free_gib="$(df -BG --output=avail / | tail -1 | tr -dc '0-9')"
+            echo "Free on / after gc: ${free_gib} GiB"
+            if [ "$free_gib" -lt 8 ]; then
+              echo "FAIL: still under 8 GiB free on / — refusing to build (would hit ENOSPC mid-link)"
+              exit 1
+            fi
+          fi
+
+      - name: G1 extras — coverage floors + network-denied (gc between phases)
+        run: just ci-extras-coverage
+
+      - name: Disk usage after run
+        if: always()
+        run: df -h /
+
+  linux-extras-msrv-fuzz:
+    name: linux-extras-msrv-fuzz (ubuntu-26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    needs: [gate-fmt-clippy, gate-test, gate-arch]
+    env:
+      # Disk relief: no incremental caches; line-tables-only debug info.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: 1.59.0
+
+      # zizmor: ignore[cache-poisoning] — PR runs are lookup-only below.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
+        with:
+          key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('fuzz/Cargo.lock') }}
+          lookup-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: Setup (tools + nightly + rg)
+        run: just setup
+
+      - name: Disk preflight (after cache restore)
+        run: |
+          set -euo pipefail
+          df -h /
+          free_gib="$(df -BG --output=avail / | tail -1 | tr -dc '0-9')"
+          echo "Free on / after cache restore: ${free_gib} GiB (need >= 8)"
+          if [ "$free_gib" -lt 8 ]; then
+            echo "Under 8 GiB — running 'just gc' to reclaim restored caches, then re-checking"
+            just gc || true
+            free_gib="$(df -BG --output=avail / | tail -1 | tr -dc '0-9')"
+            echo "Free on / after gc: ${free_gib} GiB"
+            if [ "$free_gib" -lt 8 ]; then
+              echo "FAIL: still under 8 GiB free on / — refusing to build (would hit ENOSPC mid-link)"
+              exit 1
+            fi
+          fi
+
+      - name: G1 extras — MSRV + fuzz build + fuzz smoke (gc between phases)
+        run: just ci-extras-msrv-fuzz
+
+      - name: Disk usage after run
+        if: always()
+        run: df -h /
 
   # --- Phase 4: self-checking headless probes (FR-4). Each probe re-runs a
   # scaled-down scenario set with `--self-check` and uploads its JSON report;
@@ -214,7 +361,7 @@ jobs:
           just-version: 1.59.0
       # PR runs are lookup-only (see below), so a fork PR cannot write the
       # shared cache. zizmor cannot prove that statically, hence the ignore.
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
           lookup-only: ${{ github.event_name == 'pull_request' }}
@@ -240,7 +387,7 @@ jobs:
           just-version: 1.59.0
       # PR runs are lookup-only (see below), so a fork PR cannot write the
       # shared cache. zizmor cannot prove that statically, hence the ignore.
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
           lookup-only: ${{ github.event_name == 'pull_request' }}
@@ -266,7 +413,7 @@ jobs:
           just-version: 1.59.0
       # PR runs are lookup-only (see below), so a fork PR cannot write the
       # shared cache. zizmor cannot prove that statically, hence the ignore.
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
           lookup-only: ${{ github.event_name == 'pull_request' }}
@@ -292,7 +439,7 @@ jobs:
           just-version: 1.59.0
       # PR runs are lookup-only (see below), so a fork PR cannot write the
       # shared cache. zizmor cannot prove that statically, hence the ignore.
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
           lookup-only: ${{ github.event_name == 'pull_request' }}
@@ -323,7 +470,7 @@ jobs:
           just-version: 1.59.0
       # PR runs are lookup-only (see below), so a fork PR cannot write the
       # shared cache. zizmor cannot prove that statically, hence the ignore.
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2 # zizmor: ignore[cache-poisoning]
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
           lookup-only: ${{ github.event_name == 'pull_request' }}

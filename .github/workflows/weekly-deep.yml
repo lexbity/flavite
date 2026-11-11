@@ -3,7 +3,7 @@
 # were removed on 2026-11-09:
 #   - fuzz-long: 1 h per fuzz target, one matrix leg each (D-10/FR-10). The
 #     per-PR drift gate (`just fuzz-build`) and the 60 s/target smoke run
-#     live in ci.yml's linux-extras job.
+#     live in ci.yml's linux-extras-msrv-fuzz job.
 #   - bench-scale: the 50k-note release-mode perf gate (FR-17), home of the
 #     wall-clock tests quarantined out of the per-PR gate.
 #
@@ -48,7 +48,7 @@ jobs:
         with:
           just-version: 1.59.0
 
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('fuzz/Cargo.lock') }}
 
@@ -66,8 +66,10 @@ jobs:
       - name: Setup (tools + nightly + rg)
         run: just setup
 
+      # --target x86_64-unknown-linux-gnu: cargo-fuzz's musl default hard-errors
+      # with -Zsanitizer=address on current nightlies (see justfile fuzz recipes).
       - name: Long fuzz (1 h, ${{ matrix.target }})
-        run: cd fuzz && cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=3600 -rss_limit_mb=4096
+        run: cd fuzz && cargo +nightly fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time=3600 -rss_limit_mb=4096
 
       - name: Upload crash artifacts
         if: always()
@@ -91,7 +93,7 @@ jobs:
         with:
           just-version: 1.59.0
 
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ubuntu-26.04-rust-${{ hashFiles('Cargo.lock') }}
 
