@@ -473,9 +473,18 @@ workspace-native:
 clean *args:
     cargo xtask clean {{args}}
 
-# Post-gate garbage collection (§10.10): threshold-based, runs after every gate.
+# Post-gate garbage collection (§10.10): threshold-based with retention —
+# over budget it removes incremental caches, sweeps previous-build artifacts
+# older than the retention window (keeping the current build), and only then
+# considers the wholesale wipe. Runs after every gate.
 gc:
     cargo xtask gc
+
+# Budget-independent sweep of previous-build artifacts (default: older than
+# 14 days): keeps the current build, drops what cargo would otherwise retain
+# forever. Cheap enough to run after heavy build sessions.
+gc-stale:
+    cargo xtask gc --stale-only
 
 # --- Releases (GoReleaser, see .goreleaser.yaml and docs/RELEASING.md) ---
 # CI (release.yml) runs these verbatim, so local == CI (D-9). All three need

@@ -1,12 +1,18 @@
 //! Post-gate cleanup and disk budgets (§10.10).
 //!
 //! `clean` removes build output; `gc` is the threshold-based post-gate step.
-//! Both are git-aware: they never remove tracked files (corpus seeds) or
+//! Cargo keeps one mutable `target/` and never collects artifacts of previous
+//! builds (dependency changes, toolchain updates and feature variants leave
+//! orphans forever), so `gc` is also the *retention* mechanism: between the
+//! incremental tier and the wholesale wipe it sweeps stale build artifacts
+//! older than [`STALE_ARTIFACT_DAYS`], keeping the current build. Both
+//! commands are git-aware: they never remove tracked files (corpus seeds) or
 //! anything outside the workspace root, and never follow symlinks out of it.
 
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 use walkdir::WalkDir;
 
 /// Soft budget: at or under this, `gc` is a no-op (§10.10).
@@ -15,11 +21,20 @@ pub const SOFT_BUDGET: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 /// Hard budget: still over this → remove rebuildable caches, retaining evidence.
 pub const HARD_BUDGET: u64 = 20 * 1024 * 1024 * 1024; // 20 GB
 
+/// Retention window for previous-build artifacts: files under the cache
+/// profiles not modified within this many days are swept before the
+/// wholesale-wipe backstop is considered (§10.10). The current build's
+/// files — and everything written since the window began — survive.
+pub const STALE_ARTIFACT_DAYS: u64 = 14;
+
 /// Report from a `clean` or `gc` operation.
 #[derive(Debug, Default)]
 pub struct CleanReport {
     pub paths_removed: Vec<PathBuf>,
     pub bytes_freed: u64,
+    /// Individual stale build-artifact files removed by the retention sweep
+    /// (in addition to the wholesale paths in `paths_removed`).
+    pub files_removed: u64,
     pub dry_run: bool,
 }
 
@@ -27,14 +42,16 @@ impl CleanReport {
     pub fn print(&self) {
         if self.dry_run {
             println!(
-                "[dry-run] would remove {} path(s), freeing {:.2} GB",
+                "[dry-run] would remove {} path(s) and {} stale file(s), freeing {:.2} GB",
                 self.paths_removed.len(),
+                self.files_removed,
                 self.bytes_freed as f64 / (1024.0 * 1024.0 * 1024.0)
             );
         } else {
             println!(
-                "Removed {} path(s), freed {:.2} GB",
+                "Removed {} path(s) and {} stale file(s), freed {:.2} GB",
                 self.paths_removed.len(),
+                self.files_removed,
                 self.bytes_freed as f64 / (1024.0 * 1024.0 * 1024.0)
             );
         }
@@ -202,20 +219,7 @@ pub fn clean(root: &Path, dry_run: bool) -> Result<CleanReport> {
 /// `clean` retains its documented full-clean semantics.
 fn gc_build_caches(root: &Path) -> Result<CleanReport> {
     let mut paths = vec![root.join("fuzz/target")];
-    if let Ok(entries) = fs::read_dir(root.join("target")) {
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            let cache = matches!(
-                name.to_str(),
-                Some("debug" | "release" | "doc" | "llvm-cov-target")
-            ) || entry.path().join("debug").is_dir()
-                || entry.path().join("release").is_dir();
-            if cache {
-                paths.push(entry.path());
-            }
-        }
-    }
+    paths.extend(cache_profile_dirs(root));
     let mut report = CleanReport::default();
     for path in paths {
         verify_in_root(root, &path)?;
@@ -228,13 +232,101 @@ fn gc_build_caches(root: &Path) -> Result<CleanReport> {
     Ok(report)
 }
 
-/// Post-gate garbage collection (§10.10): threshold-based.
+/// The rebuildable cache profiles under `target/`: the fixed names plus any
+/// target-triple directory containing its own debug/release tree. Everything
+/// else at the target root (evidence, visual fixtures, crash inputs) is
+/// retained evidence and never swept or wiped.
+fn cache_profile_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(entries) = fs::read_dir(root.join("target")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let cache = matches!(
+                name.to_str(),
+                Some("debug" | "release" | "doc" | "llvm-cov-target")
+            ) || entry.path().join("debug").is_dir()
+                || entry.path().join("release").is_dir();
+            if cache {
+                paths.push(entry.path());
+            }
+        }
+    }
+    paths
+}
+
+/// Remove build artifacts of previous builds: every file under the cache
+/// profiles whose last modification predates `cutoff` is deleted, empty
+/// directories pruned, everything else left exactly as cargo wrote it. The
+/// current build (fresh mtimes) survives untouched, so this is the
+/// "keep the last build, drop the old ones" retention step — cargo itself
+/// never collects these orphans.
+pub fn sweep_stale(root: &Path, cutoff: SystemTime, dry_run: bool) -> Result<CleanReport> {
+    let mut report = CleanReport {
+        dry_run,
+        ..Default::default()
+    };
+    for profile in cache_profile_dirs(root) {
+        verify_in_root(root, &profile)?;
+        let mut stale: Vec<(PathBuf, u64)> = Vec::new();
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for entry in WalkDir::new(&profile)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let file_type = entry.file_type();
+            if file_type.is_symlink() {
+                continue; // never follow or remove links out of the tree
+            }
+            if file_type.is_dir() {
+                dirs.push(entry.path().to_path_buf());
+            } else if entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .is_some_and(|modified| modified < cutoff)
+            {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                stale.push((entry.path().to_path_buf(), size));
+            }
+        }
+        if !dry_run {
+            for (file, _) in &stale {
+                let _ = fs::remove_file(file);
+            }
+            // Prune emptied directories, deepest first; never the profile
+            // itself (cargo expects it to exist).
+            for dir in dirs.iter().rev() {
+                if *dir == profile {
+                    continue;
+                }
+                let _ = fs::remove_dir(dir); // fails harmlessly while non-empty
+            }
+        }
+        let freed: u64 = stale.iter().map(|(_, size)| size).sum();
+        report.bytes_freed += freed;
+        report.files_removed += stale.len() as u64;
+        if !stale.is_empty() {
+            report.paths_removed.push(profile);
+        }
+    }
+    Ok(report)
+}
+
+/// Post-gate garbage collection (§10.10): threshold-based with retention.
 ///
 /// - At or under the soft budget → no-op.
 /// - Over soft budget → remove incremental caches + fuzz/target/ + profiling
-///   intermediates, then re-measure.
+///   intermediates, re-measure, then sweep previous-build artifacts older
+///   than the retention window (current build kept).
 /// - Still over hard budget → remove compiled caches; retain evidence/crashes.
 pub fn gc(root: &Path) -> Result<CleanReport> {
+    let cutoff = SystemTime::now() - Duration::from_secs(STALE_ARTIFACT_DAYS * 24 * 3600);
+    gc_with(root, SOFT_BUDGET, HARD_BUDGET, cutoff)
+}
+
+/// [`gc`] with injected budgets and retention window (tests).
+pub fn gc_with(root: &Path, soft: u64, hard: u64, stale_cutoff: SystemTime) -> Result<CleanReport> {
     verify_in_root(root, root)?;
 
     let target_size = dir_size(&root.join("target"));
@@ -246,11 +338,11 @@ pub fn gc(root: &Path) -> Result<CleanReport> {
         target_size as f64 / (1024.0 * 1024.0 * 1024.0),
         fuzz_target_size as f64 / (1024.0 * 1024.0 * 1024.0),
         total as f64 / (1024.0 * 1024.0 * 1024.0),
-        SOFT_BUDGET as f64 / (1024.0 * 1024.0 * 1024.0),
-        HARD_BUDGET as f64 / (1024.0 * 1024.0 * 1024.0),
+        soft as f64 / (1024.0 * 1024.0 * 1024.0),
+        hard as f64 / (1024.0 * 1024.0 * 1024.0),
     );
 
-    if total <= SOFT_BUDGET {
+    if total <= soft {
         println!("gc: under soft budget, no-op");
         return Ok(CleanReport::default());
     }
@@ -266,14 +358,24 @@ pub fn gc(root: &Path) -> Result<CleanReport> {
             report.paths_removed.push(path);
         }
     }
-    report.print();
+
+    // Retention tier: sweep previous-build artifacts, keeping the current
+    // build, before any wholesale wipe is considered.
+    println!(
+        "gc: sweeping artifacts older than {} days (current build retained)",
+        STALE_ARTIFACT_DAYS
+    );
+    let swept = sweep_stale(root, stale_cutoff, false)?;
+    report.bytes_freed += swept.bytes_freed;
+    report.files_removed += swept.files_removed;
+    report.paths_removed.extend(swept.paths_removed);
 
     // Re-measure.
     let target_size = dir_size(&root.join("target"));
     let fuzz_target_size = dir_size(&root.join("fuzz").join("target"));
     let total = target_size + fuzz_target_size;
 
-    if total > HARD_BUDGET {
+    if total > hard {
         eprintln!(
             "gc: still over hard budget ({:.2} GB), removing compiled caches (evidence retained)",
             total as f64 / (1024.0 * 1024.0 * 1024.0)
@@ -463,6 +565,122 @@ mod tests {
         let _report = clean(&canon, false).unwrap();
         // Corpus seeds survive.
         assert!(corpus.join("seed.md").exists());
+        cleanup_tmp(&tmp);
+    }
+
+    fn age_file(path: &Path, ago: std::time::Duration) {
+        let file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - ago)
+            .unwrap();
+    }
+
+    #[test]
+    fn sweep_stale_keeps_the_current_build_and_drops_previous_ones() {
+        let tmp = temp_workspace();
+        let canon = tmp.canonicalize().unwrap();
+        // A fresh build alongside a 30-day-old one, plus a triple-profile
+        // layout and retained evidence at the target root.
+        for path in [
+            "target/debug/deps/fresh_lib.rlib",
+            "target/debug/deps/old_lib.rlib",
+            "target/debug/.fingerprint/old/mark",
+            "target/x86_64-unknown-linux-gnu/debug/old_bin",
+            "target/workbench-evidence/run/paint.png",
+        ] {
+            let file = canon.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, b"artifact").unwrap();
+        }
+        let month_ago = std::time::Duration::from_secs(30 * 24 * 3600);
+        age_file(&canon.join("target/debug/deps/old_lib.rlib"), month_ago);
+        age_file(&canon.join("target/debug/.fingerprint/old/mark"), month_ago);
+        age_file(
+            &canon.join("target/x86_64-unknown-linux-gnu/debug/old_bin"),
+            month_ago,
+        );
+
+        let cutoff = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(STALE_ARTIFACT_DAYS * 24 * 3600);
+        let report = sweep_stale(&canon, cutoff, false).unwrap();
+        assert_eq!(report.files_removed, 3);
+        assert_eq!(report.bytes_freed, 3 * "artifact".len() as u64);
+
+        // Previous builds are gone, the current build is untouched, evidence
+        // survives, and emptied directories are pruned.
+        assert!(!canon.join("target/debug/deps/old_lib.rlib").exists());
+        assert!(!canon.join("target/debug/.fingerprint/old").exists());
+        assert!(
+            !canon
+                .join("target/x86_64-unknown-linux-gnu/debug/old_bin")
+                .exists()
+        );
+        assert!(canon.join("target/debug/deps/fresh_lib.rlib").exists());
+        assert!(
+            canon.join("target/debug/deps").exists(),
+            "kept files keep their dir"
+        );
+        assert!(
+            canon
+                .join("target/workbench-evidence/run/paint.png")
+                .exists()
+        );
+        cleanup_tmp(&tmp);
+    }
+
+    #[test]
+    fn sweep_stale_dry_run_removes_nothing_but_reports_exactly() {
+        let tmp = temp_workspace();
+        let canon = tmp.canonicalize().unwrap();
+        let file = canon.join("target/debug/deps/old.rlib");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, b"artifact").unwrap();
+        age_file(&file, std::time::Duration::from_secs(60 * 24 * 3600));
+
+        let cutoff = std::time::SystemTime::now();
+        let report = sweep_stale(&canon, cutoff, true).unwrap();
+        assert!(report.dry_run);
+        assert_eq!(report.files_removed, 1);
+        assert!(file.exists(), "dry run removes nothing");
+        cleanup_tmp(&tmp);
+    }
+
+    #[test]
+    fn gc_with_sweeps_stale_before_resorting_to_the_wholesale_wipe() {
+        let tmp = temp_workspace();
+        let canon = tmp.canonicalize().unwrap();
+        for path in [
+            "target/debug/incremental/cache",
+            "target/debug/deps/old.rlib",
+            "target/debug/deps/fresh.rlib",
+        ] {
+            let file = canon.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            // The surviving artifact exceeds the hard budget below, so the
+            // second phase proves the wholesale wipe still fires after both
+            // retention tiers ran.
+            fs::write(&file, vec![b'x'; 100]).unwrap();
+        }
+        age_file(
+            &canon.join("target/debug/deps/old.rlib"),
+            std::time::Duration::from_secs(60 * 24 * 3600),
+        );
+
+        // Over the tiny soft budget but under the hard budget after the
+        // sweep: incremental caches go, stale artifacts go, the current
+        // build survives, and no wholesale wipe happens.
+        let cutoff = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(STALE_ARTIFACT_DAYS * 24 * 3600);
+        let report = gc_with(&canon, 1, 100 * 1024 * 1024, cutoff).unwrap();
+        assert!(!canon.join("target/debug/incremental").exists());
+        assert!(!canon.join("target/debug/deps/old.rlib").exists());
+        assert!(canon.join("target/debug/deps/fresh.rlib").exists());
+        assert_eq!(report.files_removed, 1);
+
+        // Still over the hard budget after both tiers: the wholesale wipe
+        // fires and compiled caches go (evidence retained, existing test).
+        let report = gc_with(&canon, 1, 10, cutoff).unwrap();
+        assert!(!canon.join("target/debug").exists());
+        assert!(report.bytes_freed > 0);
         cleanup_tmp(&tmp);
     }
 

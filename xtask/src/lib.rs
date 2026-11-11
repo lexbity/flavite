@@ -32,7 +32,17 @@ pub fn print_usage() {
         "  cov-check [--lcov <path>] [--ratchet <main-lcov>]   Check coverage floors (§10.5)"
     );
     eprintln!("  clean [--dry-run]        Full cleanup of build output (§10.10)");
-    eprintln!("  gc                       Post-gate threshold-based cleanup (§10.10)");
+    eprintln!(
+        "  gc [--stale-only] [--dry-run] [--stale-days N]   Threshold-based cleanup with retention:"
+    );
+    eprintln!("                           over budget, previous-build artifacts older than the");
+    eprintln!(
+        "                           window (default {} days) are swept before any",
+        clean::STALE_ARTIFACT_DAYS
+    );
+    eprintln!(
+        "                           wholesale wipe; --stale-only sweeps regardless of budget (§10.10)"
+    );
     eprintln!("  blake3 <file>            Print the BLAKE3 digest of a file");
     eprintln!("  setup                    Developer onboarding: tools + hook (§10.8)");
 }
@@ -52,8 +62,33 @@ pub fn run(args: &[String]) -> Result<()> {
             Ok(())
         }
         "gc" => {
+            let dry_run = args.iter().any(|a| a == "--dry-run");
+            let stale_only = args.iter().any(|a| a == "--stale-only");
+            let stale_days = args
+                .iter()
+                .position(|a| a == "--stale-days")
+                .and_then(|i| args.get(i + 1))
+                .map(|v| {
+                    v.parse::<u64>()
+                        .context("--stale-days requires a number of days")
+                })
+                .transpose()?;
+            let cutoff = |days: u64| {
+                std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 3600)
+            };
             let root = clean::find_workspace_root()?;
-            let report = clean::gc(&root)?;
+            if stale_only {
+                let days = stale_days.unwrap_or(clean::STALE_ARTIFACT_DAYS);
+                println!("gc: sweeping artifacts older than {days} days (budget-independent)");
+                clean::sweep_stale(&root, cutoff(days), dry_run)?.print();
+                return Ok(());
+            }
+            let report = match stale_days {
+                Some(days) => {
+                    clean::gc_with(&root, clean::SOFT_BUDGET, clean::HARD_BUDGET, cutoff(days))?
+                }
+                None => clean::gc(&root)?,
+            };
             if !report.paths_removed.is_empty() {
                 report.print();
             }
