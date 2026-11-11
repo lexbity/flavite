@@ -1,3 +1,0 @@
-# Gamma
-
-gamma body

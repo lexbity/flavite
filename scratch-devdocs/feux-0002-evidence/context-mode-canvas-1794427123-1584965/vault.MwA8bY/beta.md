@@ -1,3 +1,0 @@
-# Beta
-
-beta body
