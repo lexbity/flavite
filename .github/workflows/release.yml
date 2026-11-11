@@ -11,7 +11,7 @@
 #
 # Conventions (same as ci.yml): all actions pinned to full commit SHAs
 # (Dependabot maintains the pins), every job has timeout-minutes, top-level
-# permissions are contents: read (grep gate in ci.yml lint-workflows) — the
+# permissions are contents: read (grep gate in ci.yml gate-meta) — the
 # release job alone gets contents: write at job level, zizmor-audited.
 # Tools are installed from pinned releases with sha256-verified downloads
 # (zizmor pattern), never from floating tags.
