@@ -18,11 +18,11 @@ pub enum NodeTarget {
     },
     EditorContextCommand {
         target: crate::host::context_mode::EditorTarget,
-        command: flavite_editor::context::ContextCommand,
+        command: flavite_edit_context::ContextCommand,
     },
     EditorContextMenu {
         target: crate::host::context_mode::EditorTarget,
-        menu: flavite_editor::context::ContextMenu,
+        menu: flavite_edit_context::ContextMenu,
     },
     EditorContextExpand(crate::host::context_mode::EditorTarget),
     ToggleSidebar,
@@ -167,7 +167,7 @@ struct ContextControl {
 
 fn context_controls(app: &App) -> Vec<ContextControl> {
     use crate::host::context_mode::{EditorTarget, available};
-    use flavite_editor::context::{ContextCommand as C, ContextMenu};
+    use flavite_edit_context::{ContextCommand as C, ContextMenu};
     if app.dialog.is_some() || app.strip_menu.is_some() {
         return Vec::new();
     }
@@ -252,7 +252,7 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
             }
         }
         if let Some(session) = app.context_mode.session.as_ref().filter(|s| s.tab == tab)
-            && let (Some(menu), Some(target)) = (session.menu, session.menu_target)
+            && let (Some(menu), Some(target)) = (session.state.menu(), session.menu_target)
         {
             for &command in menu.commands() {
                 if let Some(bounds) = app.context_mode.bounds.get(&(tab, command.title())) {
@@ -317,7 +317,7 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
                                         .context_mode
                                         .session
                                         .as_ref()
-                                        .is_some_and(|s| s.menu.is_none())),
+                                        .is_some_and(|s| s.state.menu().is_none())),
                         },
                     );
                 }
@@ -1028,7 +1028,7 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
         if let NodeTarget::EditorContextCommand { target, command } = &control.target
             && let Some(view) = app.note_editor_view(target.tab)
             && let Some(effect) =
-                flavite_editor::context::effect::plan(&view.text, target.selection, *command)
+                flavite_edit_context::effect::plan(&view.text, target.selection, *command)
         {
             node.set_description(effect.accessible_description());
         }
@@ -1050,7 +1050,7 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
                 .session
                 .as_ref()
                 .map_or("Editor commands".into(), |s| {
-                    format!("Context Mode · {}", s.mode.label())
+                    format!("Context Mode · {}", s.state.mode().label())
                 }),
         );
         toolbar.set_children(context_children);

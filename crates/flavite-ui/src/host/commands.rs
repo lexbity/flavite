@@ -454,14 +454,14 @@ pub fn ui_specs(overrides: &std::collections::BTreeMap<String, String>) -> Vec<C
             )
         })
         .chain(
-            flavite_editor::context::ContextCommand::ALL
+            flavite_edit_context::ContextCommand::ALL
                 .iter()
                 .filter(|command| {
                     command.id().starts_with("editor.")
                         || matches!(
                             command,
-                            flavite_editor::context::ContextCommand::LineStart
-                                | flavite_editor::context::ContextCommand::LineEnd
+                            flavite_edit_context::ContextCommand::LineStart
+                                | flavite_edit_context::ContextCommand::LineEnd
                         )
                 })
                 .map(|command| {
@@ -920,7 +920,7 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
             id,
             "workspace.caret_start_line" | "workspace.caret_end_line"
         ))
-        && let Some(command) = flavite_editor::context::ContextCommand::ALL
+        && let Some(command) = flavite_edit_context::ContextCommand::ALL
             .iter()
             .find(|c| c.id() == id)
         && let Some(target) =
@@ -1354,7 +1354,7 @@ pub fn available(app: &App, id: &str) -> bool {
             "workspace.caret_start_line" | "workspace.caret_end_line"
         )
     {
-        return flavite_editor::context::ContextCommand::ALL
+        return flavite_edit_context::ContextCommand::ALL
             .iter()
             .find(|c| c.id() == id)
             .is_some_and(|command| {

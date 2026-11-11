@@ -2,8 +2,11 @@
 
 use crate::app::{App, Message};
 use flavite_api::{Invocation, Origin};
+use flavite_edit_context::{
+    ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event, menu_key, reduce,
+};
 use flavite_editor::{
-    context::{ContextCommand, ContextMenu, ContextMode},
+    context::{native_code, native_modifiers},
     input::CapturedInput,
     keymap::KeyAction,
 };
@@ -56,12 +59,11 @@ pub struct ContextSession {
     pub tab: TabId,
     incarnation: u64,
     buffer: u64,
-    pub mode: ContextMode,
-    pub menu: Option<ContextMenu>,
+    /// The pure statechart state (mode, menu, selection, message). Every
+    /// mutation goes through `flavite_edit_context` — this host only
+    /// classifies admission, forwards events and interprets effects.
+    pub state: ContextState,
     pub menu_target: Option<EditorTarget>,
-    pub selected: usize,
-    pub message: String,
-    pub attention: bool,
 }
 
 #[derive(Debug, Default)]
@@ -88,22 +90,35 @@ impl ContextHost {
         self.session
             .as_ref()
             .filter(|s| s.tab == tab)
-            .map_or(ContextMode::Off, |s| s.mode)
+            .map_or(ContextMode::Off, |s| s.state.mode())
     }
 
     pub fn notice(&mut self, text: impl Into<String>) {
         if let Some(session) = &mut self.session {
-            session.message = text.into();
-            session.attention = true;
+            session.state.set_message(text, true);
         }
     }
 
     pub fn feedback(&mut self, text: impl Into<String>) {
         if let Some(session) = &mut self.session {
-            session.message = text.into();
-            session.attention = false;
+            session.state.set_message(text, false);
         }
     }
+}
+
+/// Execute pure statechart effects against the app, in returned order.
+/// Returns the focus task if one was requested.
+fn run_effects(app: &mut App, tab: TabId, effects: Vec<Effect>) -> Option<Task<Message>> {
+    let mut task = None;
+    for effect in effects {
+        match effect {
+            Effect::SealTypingGroup => seal(app, tab),
+            Effect::ClearPreview => app.context_mode.clear_preview(),
+            Effect::FocusEditor => task = Some(focus(app, tab)),
+            Effect::InvalidateHistory => super::editor_history::invalidate(app),
+        }
+    }
+    task
 }
 
 pub(crate) fn valid(app: &App, target: EditorTarget, selection: bool) -> bool {
@@ -147,9 +162,9 @@ pub fn preview_command(app: &App, tab: TabId) -> Option<ContextCommand> {
         && source == target
     {
         command
-    } else if let Some(menu) = session.menu {
-        *menu.commands().get(session.selected)?
-    } else if session.mode == ContextMode::Command {
+    } else if let Some(command) = session.state.menu_command() {
+        command
+    } else if session.state.mode() == ContextMode::Command {
         ContextCommand::Delete
     } else {
         return None;
@@ -160,7 +175,7 @@ pub fn preview_command(app: &App, tab: TabId) -> Option<ContextCommand> {
 pub fn effect_caption(app: &App, tab: TabId) -> Option<String> {
     let session = app.context_mode.session.as_ref().filter(|s| s.tab == tab)?;
     let target = EditorTarget::capture(app, tab)?;
-    if session.menu.is_none()
+    if session.state.menu().is_none()
         && !app
             .context_mode
             .preview
@@ -170,7 +185,7 @@ pub fn effect_caption(app: &App, tab: TabId) -> Option<String> {
     }
     let command = preview_command(app, tab)?;
     let view = app.note_editor_view(tab)?;
-    flavite_editor::context::effect::plan(&view.text, target.selection, command)
+    flavite_edit_context::effect::plan(&view.text, target.selection, command)
         .map(|effect| effect.description(command))
 }
 
@@ -295,7 +310,7 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
     if modifiers.control() || modifiers.alt() || modifiers.logo() {
         return None;
     }
-    if let Some(menu) = s.menu {
+    if let Some(menu) = s.state.menu() {
         let message = match key {
             Key::Named(Named::ArrowDown) => ContextMessage::MenuMove(true),
             Key::Named(Named::ArrowUp) => ContextMessage::MenuMove(false),
@@ -304,7 +319,8 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
                 let Physical::Code(code) = physical_key else {
                     return None;
                 };
-                let command = flavite_editor::context::menu_key(menu, *code, *modifiers);
+                let command = native_code(*code)
+                    .and_then(|code| menu_key(menu, code, native_modifiers(*modifiers)));
                 if *repeat {
                     return None;
                 }
@@ -361,10 +377,20 @@ pub fn reconcile(app: &mut App) {
         .as_ref()
         .and_then(|s| s.menu_target)
         .is_some_and(|target| !valid(app, target, true));
-    if stale_menu && let Some(s) = &mut app.context_mode.session {
-        s.menu = None;
-        s.menu_target = None;
-        s.message = "Source changed; choose the command again".into();
+    if stale_menu {
+        let effects = app
+            .context_mode
+            .session
+            .as_mut()
+            .map(|s| {
+                s.menu_target = None;
+                reduce(&mut s.state, &Event::MenuTargetInvalid)
+            })
+            .unwrap_or_default();
+        debug_assert!(
+            effects.is_empty(),
+            "MenuTargetInvalid carries no effects by contract"
+        );
     }
     super::editor_history::reconcile(app);
 }
@@ -388,7 +414,7 @@ pub fn selection_changed(app: &mut App, tab: TabId) {
     if app.context_mode.mode(tab).active() {
         seal(app, tab);
         if let Some(s) = &mut app.context_mode.session {
-            s.menu = None;
+            s.state.external_selection_changed();
         }
     }
 }
@@ -400,8 +426,7 @@ pub fn native_key(
     target: EditorTarget,
     mut key: flavite_editor::context::ContextKey,
 ) -> Task<Message> {
-    use flavite_editor::context::{command_key, menu_key, motion_key};
-    use iced::keyboard::key::Code;
+    use flavite_edit_context::{command_key, menu_key, motion_key};
     if !valid(app, target, true)
         || app.context_mode.history.open
         || too_narrow(app, target.tab)
@@ -431,7 +456,12 @@ pub fn native_key(
                 run(app, target, command)
             };
         }
-        if let Some(menu) = app.context_mode.session.as_ref().and_then(|s| s.menu) {
+        if let Some(menu) = app
+            .context_mode
+            .session
+            .as_ref()
+            .and_then(|s| s.state.menu())
+        {
             match key.input.action {
                 KeyAction::Down => return handle(app, ContextMessage::MenuMove(true)),
                 KeyAction::Up => return handle(app, ContextMessage::MenuMove(false)),
@@ -456,13 +486,13 @@ pub fn native_key(
                     run(app, target, command)
                 };
             }
-            let menu = if key.modifiers.control() || key.modifiers.alt() || key.modifiers.logo() {
+            let menu = if key.modifiers.control || key.modifiers.alt || key.modifiers.logo {
                 None
             } else {
                 match code {
-                    Code::KeyV => Some(ContextMenu::Select),
-                    Code::KeyG => Some(ContextMenu::Go),
-                    Code::KeyT => Some(ContextMenu::Type),
+                    flavite_edit_context::KeyCode::KeyV => Some(ContextMenu::Select),
+                    flavite_edit_context::KeyCode::KeyG => Some(ContextMenu::Go),
+                    flavite_edit_context::KeyCode::KeyT => Some(ContextMenu::Type),
                     _ => None,
                 }
             };
@@ -473,8 +503,8 @@ pub fn native_key(
                     handle(app, ContextMessage::OpenMenu(target, menu))
                 };
             }
-            if let Some(action) = motion_key(code, key.modifiers) {
-                key.input.action = action;
+            if let Some(motion) = motion_key(code, key.modifiers) {
+                key.input.action = flavite_editor::context::motion_action(motion);
             }
         }
         if !matches!(
@@ -590,44 +620,52 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
         }
         ContextMessage::CloseMenu(tab) => {
             app.context_mode.preview = None;
-            if let Some(s) = app.context_mode.session.as_mut().filter(|s| s.tab == tab) {
-                s.menu = None;
-                s.menu_target = None;
-            }
-            focus(app, tab)
+            let task = app
+                .context_mode
+                .session
+                .as_mut()
+                .filter(|s| s.tab == tab)
+                .map(|s| {
+                    s.menu_target = None;
+                    reduce(&mut s.state, &Event::CloseMenu)
+                })
+                .map(|effects| run_effects(app, tab, effects))
+                .unwrap_or_default();
+            task.unwrap_or_else(|| focus(app, tab))
         }
         ContextMessage::MenuMove(forward) => {
             app.context_mode.preview = None;
-            if let Some(s) = &mut app.context_mode.session
-                && let Some(menu) = s.menu
-            {
-                let n = menu.commands().len();
-                s.selected = if forward {
-                    (s.selected + 1) % n
-                } else {
-                    (s.selected + n - 1) % n
-                };
+            let scrolled = app.context_mode.session.as_mut().map(|s| {
+                let selected = s.state.menu_move(forward);
+                let tab = s.tab;
                 // Keep the selected row visible in the bounded overflow card.
                 // Aligning it near the middle also works after wraparound.
-                return iced::widget::operation::scroll_to(
-                    menu_scroll_id(s.tab),
-                    iced::widget::scrollable::AbsoluteOffset {
-                        x: None,
-                        y: Some(
-                            (s.selected as f32 * 34.2 * app.appearance.metrics().scale
-                                - 150.0 * app.appearance.metrics().scale)
-                                .max(0.0),
-                        ),
-                    },
-                );
+                (
+                    tab,
+                    iced::widget::operation::scroll_to(
+                        menu_scroll_id(tab),
+                        iced::widget::scrollable::AbsoluteOffset {
+                            x: None,
+                            y: Some(
+                                (selected as f32 * 34.2 * app.appearance.metrics().scale
+                                    - 150.0 * app.appearance.metrics().scale)
+                                    .max(0.0),
+                            ),
+                        },
+                    ),
+                )
+            });
+            if let Some((tab, scroll)) = scrolled {
+                let _ = run_effects(app, tab, vec![Effect::ClearPreview]);
+                return scroll;
             }
             Task::none()
         }
         ContextMessage::MenuPick => {
             if let Some(s) = &app.context_mode.session
-                && let (Some(menu), Some(target)) = (s.menu, s.menu_target)
+                && let (Some(command), Some(target)) = (s.state.menu_command(), s.menu_target)
             {
-                return run(app, target, menu.commands()[s.selected]);
+                return run(app, target, command);
             }
             Task::none()
         }
@@ -636,13 +674,16 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
                 && valid(app, target, true)
                 && app.context_mode.mode(target.tab).active()
             {
-                app.context_mode.preview = None;
-                seal(app, target.tab);
-                if let Some(s) = &mut app.context_mode.session {
-                    s.menu = Some(menu);
-                    s.menu_target = Some(target);
-                    s.selected = 0;
-                }
+                let effects = app
+                    .context_mode
+                    .session
+                    .as_mut()
+                    .map(|s| {
+                        s.menu_target = Some(target);
+                        reduce(&mut s.state, &Event::OpenMenu(menu))
+                    })
+                    .unwrap_or_default();
+                let _ = run_effects(app, target.tab, effects);
             }
             Task::none()
         }
@@ -702,12 +743,8 @@ fn enter(app: &mut App, target: EditorTarget) {
         tab: target.tab,
         incarnation: target.incarnation,
         buffer: target.buffer,
-        mode: ContextMode::Command,
-        menu: None,
+        state: ContextState::activated(),
         menu_target: None,
-        selected: 0,
-        message: "Select text, then act · i types · Esc returns to commands".into(),
-        attention: false,
     });
 }
 
@@ -754,16 +791,14 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
                 ),
             );
         }
-        super::editor_history::invalidate(app);
-        if let Some(s) = &mut app.context_mode.session {
-            if s.menu.take().is_none() {
-                s.mode = ContextMode::Command;
-            }
-            s.message = "Commands · exit with ✕ or the toggle shortcut".into();
-            s.attention = false;
-        }
-        seal(app, target.tab);
-        return focus(app, target.tab);
+        let effects = app
+            .context_mode
+            .session
+            .as_mut()
+            .map(|s| reduce(&mut s.state, &Event::Escape))
+            .unwrap_or_default();
+        let task = run_effects(app, target.tab, effects);
+        return task.unwrap_or_else(|| focus(app, target.tab));
     }
     seal(app, target.tab);
     super::editor_history::invalidate(app);
@@ -776,10 +811,8 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         return Task::none();
     }
     if let Some(s) = &mut app.context_mode.session {
-        s.menu = None;
         s.menu_target = None;
-        s.message = command.title().into();
-        s.attention = false;
+        let _ = reduce(&mut s.state, &Event::RunAdmitted(command));
     }
     match command {
         History => {
@@ -837,7 +870,7 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         SelectAll => select(app, target, 0, text.len()),
         SelectLine => select(app, target, line_start, line_with_break),
         SelectWord => {
-            let (a, b) = flavite_editor::context::word_bounds(text, head);
+            let (a, b) = flavite_edit_context::word_bounds(text, head);
             select(app, target, a, b);
         }
         Collapse => select(app, target, head, head),
@@ -857,8 +890,7 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             edit = Some((KeyAction::Newline, String::new()));
         }
         Cut | Copy | Delete | Change => {
-            let Some(effect) =
-                flavite_editor::context::effect::plan(text, target.selection, command)
+            let Some(effect) = flavite_edit_context::effect::plan(text, target.selection, command)
             else {
                 app.context_mode
                     .notice("Selection changed; place the caret again");
@@ -887,8 +919,7 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             enter(app, target);
         }
         if let Some(s) = &mut app.context_mode.session {
-            s.mode = ContextMode::Typing;
-            s.message = "Typing · click or move to reposition · Esc returns to commands".into();
+            let _ = reduce(&mut s.state, &Event::EnterTyping);
         }
     }
     let task = edit.map_or_else(Task::none, |(action, text)| {

@@ -1556,12 +1556,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "flavite-edit-context"
+version = "0.1.0"
+dependencies = [
+ "flavite-syntax",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "flavite-editor"
 version = "0.1.0"
 dependencies = [
  "cosmic-text",
  "flavite-api",
  "flavite-buffer",
+ "flavite-edit-context",
  "flavite-editor",
  "flavite-syntax",
  "iced",
@@ -1696,6 +1705,7 @@ dependencies = [
  "chrono",
  "flavite-api",
  "flavite-buffer",
+ "flavite-edit-context",
  "flavite-editor",
  "flavite-fs",
  "flavite-graph",

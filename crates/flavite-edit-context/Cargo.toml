@@ -1,0 +1,16 @@
+[package]
+name = "flavite-edit-context"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Context Mode's pure vocabulary, physical grammar, statechart, and effect planning (FEUX-0002 X02)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Grapheme/word boundary authority (the same pinned primitives flavite-syntax
+# exposes; this crate never depends on a UI toolkit).
+flavite-syntax = { path = "../flavite-syntax" }
+unicode-segmentation = { workspace = true }

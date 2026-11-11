@@ -702,12 +702,10 @@ fn apply_draft_item(
         }
         let span = flavite_syntax::Span::new(TextByte(0), TextByte(buffer.len()));
         let op = flavite_buffer::undo::EditOp::new(span, after_text);
-        let Some((new_revision, _)) =
-            buffer.apply_local_edits_with_policy(&[op], UndoPolicy::Isolated)
-        else {
-            return Err(DraftApplyError::Install);
-        };
-        applied_revision = new_revision.as_u64();
+        applied_revision = buffer
+            .apply_local_edits_with_policy(&[op], UndoPolicy::Isolated)
+            .map_err(|_| DraftApplyError::Install)
+            .map(|(revision, _)| revision.as_u64())?;
         // Durable checkpoint: the draft effect is only terminal once this
         // marker is durable (D-11).
         let note_key = crate::session::native_note_key(&ctx.root.join(&record.path), &ctx.root);
@@ -990,9 +988,9 @@ fn revert_draft_item(
         }
         let span = flavite_syntax::Span::new(TextByte(0), TextByte(buffer.len()));
         let op = flavite_buffer::undo::EditOp::new(span, before_text);
-        let Some((_, _)) = buffer.apply_local_edits_with_policy(&[op], UndoPolicy::Isolated) else {
-            return Err(RevertDraftError::Guard);
-        };
+        buffer
+            .apply_local_edits_with_policy(&[op], UndoPolicy::Isolated)
+            .map_err(|_| RevertDraftError::Guard)?;
         let note_key = crate::session::native_note_key(&ctx.root.join(&record.path), &ctx.root);
         let mut guard = ctx.recovery_writer.as_ref().map(|writer| {
             writer

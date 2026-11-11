@@ -156,8 +156,8 @@ thread_local! {
 type ContextToggle<'a> = Box<dyn Fn(&keyboard::Event) -> bool + 'a>;
 
 pub struct EditorWidget<'a, Message> {
-    context_mode: crate::context::ContextMode,
-    context_preview: Option<crate::context::ContextCommand>,
+    context_mode: flavite_edit_context::ContextMode,
+    context_preview: Option<flavite_edit_context::ContextCommand>,
     on_context: Option<Box<dyn Fn(crate::context::ContextRequest) -> Message + 'a>>,
     context_toggle: Option<ContextToggle<'a>>,
     view: EditorView,
@@ -196,7 +196,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
     /// Create an editor from an already shared, API-owned text revision.
     pub fn from_view(view: EditorView, on_action: impl Fn(EditorAction) -> Message + 'a) -> Self {
         Self {
-            context_mode: crate::context::ContextMode::Off,
+            context_mode: flavite_edit_context::ContextMode::Off,
             context_preview: None,
             on_context: None,
             context_toggle: None,
@@ -231,7 +231,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
     #[must_use]
     pub fn with_context_mode(
         mut self,
-        mode: crate::context::ContextMode,
+        mode: flavite_edit_context::ContextMode,
         on_context: impl Fn(crate::context::ContextRequest) -> Message + 'a,
     ) -> Self {
         self.context_mode = mode;
@@ -241,7 +241,10 @@ impl<'a, Message> EditorWidget<'a, Message> {
 
     /// Paint a prospective implicit range without changing editor state.
     #[must_use]
-    pub fn with_command_preview(mut self, command: Option<crate::context::ContextCommand>) -> Self {
+    pub fn with_command_preview(
+        mut self,
+        command: Option<flavite_edit_context::ContextCommand>,
+    ) -> Self {
         self.context_preview = command;
         self
     }
@@ -448,7 +451,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
         let refresh = !same_resolutions || source_changed;
         state.reconcile_view(&self.view, &self.link_resolutions, refresh);
         state.resolution_snapshot = Some(self.link_resolutions.clone());
-        if self.context_mode == crate::context::ContextMode::Command {
+        if self.context_mode == flavite_edit_context::ContextMode::Command {
             state.close_autocomplete();
             state.composition = None;
         }
@@ -1547,7 +1550,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             && let Some(effect) = self
                 .context_preview
                 .and_then(|command| {
-                    crate::context::effect::plan(
+                    flavite_edit_context::effect::plan(
                         &self.view.text,
                         (state.anchor, state.caret),
                         command,
@@ -1845,7 +1848,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     bounds: Rectangle::new(
                         Point::new(bounds.x + PAD_X + x, bounds.y + PAD_Y + y),
                         Size::new(
-                            if self.context_mode == crate::context::ContextMode::Command {
+                            if self.context_mode == flavite_edit_context::ContextMode::Command {
                                 4.0
                             } else {
                                 1.5
@@ -1927,7 +1930,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             let selection = if start < end && start <= byte && byte < end {
                 (state.anchor, state.caret)
             } else {
-                crate::context::word_bounds(&self.view.text, byte)
+                flavite_edit_context::word_bounds(&self.view.text, byte)
             };
             self.emit_context(
                 state,
@@ -1941,7 +1944,8 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             && state.composition.is_none()
             && self.on_context.is_some()
         {
-            use crate::context::{ContextCommand, ContextEvent};
+            use crate::context::ContextEvent;
+            use flavite_edit_context::ContextCommand;
             if let iced::Event::Keyboard(key_event) = event
                 && self
                     .context_toggle
@@ -1999,7 +2003,14 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     None
                 };
                 let geometry_action = physical
-                    .and_then(|code| crate::context::motion_key(code, *modifiers))
+                    .and_then(crate::context::native_code)
+                    .and_then(|code| {
+                        flavite_edit_context::motion_key(
+                            code,
+                            crate::context::native_modifiers(*modifiers),
+                        )
+                    })
+                    .map(crate::context::motion_action)
                     .filter(|a| matches!(a, KeyAction::Up | KeyAction::Down))
                     .unwrap_or(action);
                 let vertical = if matches!(
@@ -2040,8 +2051,8 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                         selection: (state.anchor, state.caret),
                         sequence: state.interaction_sequence,
                         event: crate::context::ContextEvent::Key(crate::context::ContextKey {
-                            code: physical,
-                            modifiers: *modifiers,
+                            code: physical.and_then(crate::context::native_code),
+                            modifiers: crate::context::native_modifiers(*modifiers),
                             repeat: *repeat,
                             input,
                         }),
@@ -2056,7 +2067,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         }
         match event {
             iced::Event::InputMethod(input_event) if state.focused => {
-                if self.context_mode == crate::context::ContextMode::Command {
+                if self.context_mode == flavite_edit_context::ContextMode::Command {
                     shell.capture_event();
                     return;
                 }
@@ -2253,7 +2264,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 ..
             }) if state.focused
                 && state.composition.is_none()
-                && self.context_mode != crate::context::ContextMode::Command
+                && self.context_mode != flavite_edit_context::ContextMode::Command
                 && self.execute_key(state, key, *modifiers, text.as_deref(), clipboard, shell) =>
             {
                 shell.capture_event();
@@ -2263,7 +2274,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         if self.input_enabled
             && state.focused
             && state.ime_active
-            && self.context_mode != crate::context::ContextMode::Command
+            && self.context_mode != flavite_edit_context::ContextMode::Command
         {
             let width = self.text_wrap_width(layout.bounds().width);
             let caret_byte = state.caret;

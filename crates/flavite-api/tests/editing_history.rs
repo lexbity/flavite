@@ -161,3 +161,38 @@ fn invalid_editor_records_do_not_add_text_or_history() {
         assert_eq!(page(&f.flavite, buffer), original);
     }
 }
+
+#[test]
+fn app_wide_history_budget_refuses_with_typed_code_and_zero_effects() {
+    // App-wide 512 MiB ledger, overridden to a tiny ceiling for the test.
+    let f = support::fixture_with_session(&[("a.md", ""), ("b.md", "")], |session| {
+        session.set_app_history_budget(2_600)
+    });
+    let (a, _) = f.open_note("a.md");
+    let (b, _) = f.open_note("b.md");
+
+    // First edit fits (root + projected <= ceiling).
+    insert(&f.flavite, a, 0, &"x".repeat(400), false);
+    assert_eq!(f.text(a), "x".repeat(400));
+
+    // Second edit across a second buffer would push the app-wide ledger over
+    // the ceiling: refused with the typed code before any mutation.
+    let b_before = revision(&f.flavite, b);
+    let b_page_before = page(&f.flavite, b);
+    let refused = execute(
+        &f.flavite,
+        "apply_edits",
+        json!({"buffer_id":b,"revision":b_before,
+               "ops":[{"range":[0,0],"replacement":"x".repeat(400)}],
+               "undo_policy":"isolated"}),
+    );
+    assert!(!refused.is_success());
+    assert_eq!(support::error_code(&refused), "history-limit-exceeded");
+    assert_eq!(f.text(b), "", "refused edit must not change text");
+    assert_eq!(revision(&f.flavite, b), b_before);
+    assert_eq!(page(&f.flavite, b), b_page_before);
+
+    // The refusing buffer's own state is untouched too.
+    assert_eq!(f.text(a), "x".repeat(400));
+    assert_eq!(revision(&f.flavite, a), 1);
+}

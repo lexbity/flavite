@@ -48,7 +48,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
             .context_mode
             .session
             .as_ref()
-            .is_some_and(|s| s.menu.is_some())
+            .is_some_and(|s| s.state.menu().is_some())
     {
         return crate::views::context_toolbar::overlay(app, shell);
     }

@@ -2,8 +2,9 @@
 #[path = "support/mod.rs"]
 mod support;
 
+use flavite_edit_context::{ContextCommand as Command, ContextMenu, ContextMode};
 use flavite_editor::{
-    context::{ContextCommand as Command, ContextMenu, ContextMode},
+    context::{native_code, native_modifiers},
     input::CapturedInput,
     keymap::KeyAction,
 };
@@ -118,7 +119,7 @@ fn implicit_preview_and_copy_preserve_committed_state_and_cut_uses_the_same_rang
             .len(),
         history.unwrap().entries.len()
     );
-    let effect = flavite_editor::context::effect::plan(&text.text, (4, 4), Command::Cut).unwrap();
+    let effect = flavite_edit_context::effect::plan(&text.text, (4, 4), Command::Cut).unwrap();
     run(&mut f.app, tab, Command::Cut);
     assert_eq!(
         &*f.app.note_editor_view(tab).unwrap().text,
@@ -168,8 +169,7 @@ fn preview_ownership_rejects_stale_sources_and_old_hover_exits() {
     assert_eq!(preview_command(&f.app, tab), Some(Command::Delete));
     assert!(effect_caption(&f.app, tab).is_none());
     let view = f.app.note_editor_view(tab).unwrap();
-    let effect =
-        flavite_editor::context::effect::plan(&view.text, (9, 9), Command::Delete).unwrap();
+    let effect = flavite_edit_context::effect::plan(&view.text, (9, 9), Command::Delete).unwrap();
     assert_eq!(effect.range, 7..9);
     run(&mut f.app, tab, Command::Delete);
     assert_eq!(
@@ -294,7 +294,16 @@ fn right_click_entry_and_escape_pop_one_level_without_exiting() {
         ContextMenu::Select,
     )));
     run(&mut f.app, tab, Command::Escape);
-    assert!(f.app.context_mode.session.as_ref().unwrap().menu.is_none());
+    assert!(
+        f.app
+            .context_mode
+            .session
+            .as_ref()
+            .unwrap()
+            .state
+            .menu()
+            .is_none()
+    );
     assert_eq!(f.app.context_mode.mode(tab), ContextMode::Typing);
     run(&mut f.app, tab, Command::Escape);
     assert_eq!(f.app.context_mode.mode(tab), ContextMode::Command);
@@ -467,8 +476,8 @@ fn queued_keys_resolve_current_mode_and_selection_without_waiting_for_redraw() {
         request(
             index,
             ContextEvent::Key(ContextKey {
-                code: Some(code),
-                modifiers: Modifiers::empty(),
+                code: native_code(code),
+                modifiers: native_modifiers(Modifiers::empty()),
                 repeat: false,
                 input: CapturedInput {
                     buffer: source.buffer,
@@ -683,8 +692,8 @@ fn keys_from_a_departed_editor_cannot_become_literal_text_in_a_visible_backgroun
             selection: target.selection,
             sequence,
             event: ContextEvent::Key(ContextKey {
-                code: Some(iced::keyboard::key::Code::KeyD),
-                modifiers: iced::keyboard::Modifiers::empty(),
+                code: native_code(iced::keyboard::key::Code::KeyD),
+                modifiers: native_modifiers(iced::keyboard::Modifiers::empty()),
                 repeat: false,
                 input: CapturedInput {
                     buffer: target.buffer,
@@ -807,7 +816,16 @@ fn history_popup_suspends_typing_escape_closes_it_and_exit_stays_available() {
         pending_paste,
         ContextMenu::Select,
     )));
-    assert!(f.app.context_mode.session.as_ref().unwrap().menu.is_none());
+    assert!(
+        f.app
+            .context_mode
+            .session
+            .as_ref()
+            .unwrap()
+            .state
+            .menu()
+            .is_none()
+    );
     assert!(
         f.app.context_mode.history.open,
         "queued background commands cannot dismiss an owned chooser"
@@ -978,4 +996,52 @@ fn accessible_history_restores_through_the_real_handler_and_masks_background_act
     );
     assert!(!f.app.context_mode.history.open);
     assert_eq!(f.app.context_mode.mode(tab), ContextMode::Typing);
+}
+
+#[test]
+fn history_page_reports_truncation_after_budget_eviction() {
+    // Real Session under a shrunk retained-history budget: enough isolated
+    // edits exceed the budget, eviction fires, and the history page reports
+    // truncation with the retained watermark (FEUX-0002 X01).
+    let (mut f, tab) = fixture(4117);
+    run(&mut f.app, tab, Command::Toggle);
+    f.app
+        .flavite
+        .as_ref()
+        .unwrap()
+        .set_history_budgets_for_test(40_000, 40_000, 1_000);
+    let api = f.app.flavite.as_ref().unwrap();
+    for _ in 0..90 {
+        let view = f.app.note_editor_view(tab).unwrap();
+        let result = api.execute(flavite_api::Invocation::new(
+            api.command_registry().next_request_id(),
+            "apply_edits",
+            serde_json::json!({
+                "buffer_id": view.buffer_id,
+                "revision": view.revision,
+                "ops": [{"range": [0, 0], "replacement": "x"}],
+                "undo_policy": "isolated",
+            }),
+            flavite_api::Origin::Gui,
+        ));
+        assert!(result.is_success(), "{result:?}");
+    }
+    flavite_ui::host::editor_history::reconcile(&mut f.app);
+    let page = f
+        .app
+        .context_mode
+        .history
+        .page
+        .clone()
+        .expect("history page");
+    assert!(
+        page.history_truncated,
+        "budget eviction must surface truncation (entries {})",
+        page.entries.len()
+    );
+    assert!(page.retained_watermark > 0);
+    for entry in &page.entries {
+        assert!(entry.target.node >= page.retained_watermark);
+    }
+    assert!(page.entries.iter().any(|entry| entry.current));
 }

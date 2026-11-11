@@ -27,9 +27,9 @@ case "$backend" in
     *) echo "backend must be gpu or canvas (got: $backend)" >&2; exit 2 ;;
 esac
 case "$scenario" in
-    graph-editor-loop|note-regex-replace|link-completion|reference-workspace|context-mode|context-mode-history|context-mode-feedback) ;;
-    "") echo "missing --scenario (implemented: graph-editor-loop note-regex-replace link-completion reference-workspace context-mode context-mode-history context-mode-feedback)" >&2; exit 2 ;;
-    *) echo "unsupported scenario: $scenario (implemented: graph-editor-loop note-regex-replace link-completion reference-workspace context-mode context-mode-history context-mode-feedback)" >&2; exit 2 ;;
+    graph-editor-loop|note-regex-replace|link-completion|reference-workspace|context-mode|context-mode-history|context-mode-feedback|context-mode-budget) ;;
+    "") echo "missing --scenario (implemented: graph-editor-loop note-regex-replace link-completion reference-workspace context-mode context-mode-history context-mode-feedback context-mode-budget)" >&2; exit 2 ;;
+    *) echo "unsupported scenario: $scenario (implemented: graph-editor-loop note-regex-replace link-completion reference-workspace context-mode context-mode-history context-mode-feedback context-mode-budget)" >&2; exit 2 ;;
 esac
 if [[ "$(uname -s)" != Linux ]]; then
     echo "workbench visual runner is Linux-only" >&2
@@ -138,13 +138,22 @@ trap cleanup EXIT
 
 # Short absolute data dir (instance socket SUN_LEN); hermetic per run.
 device_dir="$(mktemp -d "${TMPDIR:-/tmp}/flavite-workbench-device.XXXXXXXX")"
-env -u WAYLAND_DISPLAY WINIT_UNIX_BACKEND=x11 \
-    FLAVITE_VAULT="$vault_dir" \
-    FLAVITE_DATA_DIR="$device_dir" \
-    FLAVITE_GRAPH_BACKEND="$backend" \
-    FLAVITE_HARNESS_OUT_FD=3 \
-    FLAVITE_HARNESS_AUTOSAVE_IDLE_SECS=60 \
-    "$target_dir/debug/examples/app-demo" "$vault_dir" \
+launch_env=(
+    -u WAYLAND_DISPLAY
+    WINIT_UNIX_BACKEND=x11
+    FLAVITE_VAULT="$vault_dir"
+    FLAVITE_DATA_DIR="$device_dir"
+    FLAVITE_GRAPH_BACKEND="$backend"
+    FLAVITE_HARNESS_OUT_FD=3
+    FLAVITE_HARNESS_AUTOSAVE_IDLE_SECS=60
+)
+# FEUX-0002 X01: the budget scenario runs under a shrunk retained-history
+# budget so eviction/truncation is reachable in a real session. The scenario
+# fails (as its seeded negative) if this override is absent.
+if [[ "$scenario" == "context-mode-budget" ]]; then
+    launch_env+=(FLAVITE_HARNESS_HISTORY_BUDGET_BYTES=35000)
+fi
+env "${launch_env[@]}" "$target_dir/debug/examples/app-demo" "$vault_dir" \
     3>"$harness_log" >"$app_log" 2>&1 &
 app_pid=$!
 

@@ -1,7 +1,7 @@
 //! Shared logical geometry for painted controls and native accessibility.
 //! Theme and scale change colors/pixels, never which commands are admitted.
 
-use super::{ContextCommand as C, ContextMenu as M};
+use flavite_edit_context::{ContextCommand as C, ContextMenu as M};
 
 pub const GAP: f32 = 4.0;
 pub const STATE_WIDTH: f32 = 70.0;

@@ -7,6 +7,7 @@
 //!
 //! Every edit, undo, redo, reload, and journal patch advances the revision
 //! even if text returns to previous bytes (§4.5.2).
+use crate::budget::{Budget, EvictionReport, LimitExceeded, RESERVATION_LEASE_MS, Reservation};
 use crate::history::{
     EditKind, EditorEdit, HistoryCursor, HistoryEntry, HistoryError, HistoryPage, HistoryTarget,
     PAGE_LIMIT, TRAIL_LIMIT,
@@ -15,7 +16,7 @@ use crate::revision::Revision;
 use flavite_syntax::text::{Span, TextByte, TextSnapshot};
 use std::time::{Duration, Instant};
 
-fn wall_clock_ms() -> u64 {
+pub(crate) fn wall_clock_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -161,6 +162,12 @@ pub struct UndoNode {
     pub kind: EditKind,
     /// Unique identifier for this node.
     pub id: u64,
+    /// Whether this node was evicted to satisfy a history budget. Evicted
+    /// nodes keep their structural links (id/`/children) so surviving
+    /// chains stay traversable, but their heavy state (snapshot, editor
+    /// record, edit, children) is dropped and they are invisible to
+    /// history pages, accounting, undo/redo and restore (FEUX-0002 X01).
+    pub evicted: bool,
     /// The revision at this node.
     pub revision: Revision,
     /// The edit that led to this state (None for the root).
@@ -185,6 +192,7 @@ impl UndoNode {
             editor: None,
             kind: EditKind::Edit,
             id: 0,
+            evicted: false,
             revision,
             edit: None,
             snapshot: Some(snapshot),
@@ -209,6 +217,7 @@ impl UndoNode {
             editor: None,
             kind: EditKind::Edit,
             id,
+            evicted: false,
             revision,
             edit: Some(edit),
             snapshot: Some(snapshot),
@@ -237,7 +246,8 @@ pub struct UndoTree {
     generation: u64,
     /// A continuous run can only coalesce edits from its own editor view.
     context_origin: Option<u128>,
-    /// All nodes in the tree.
+    /// All nodes in the tree. Evicted nodes remain in place (structural
+    /// tombstone) so `id == index` holds and surviving chains traverse.
     nodes: Vec<UndoNode>,
     /// Preferred redo continuation; edits always start at `position_id`.
     preferred_tip: u64,
@@ -247,13 +257,27 @@ pub struct UndoTree {
     coalesce_window: Duration,
     /// Next node ID to assign.
     next_id: u64,
+    /// Retained-history budget (byte and node ceilings, FEUX-0002 X01).
+    budget: Budget,
+    /// Total accounted retained bytes (recomputed on every structural
+    /// change by walking retained nodes, E-12).
+    accounted_bytes: u64,
+    /// Issued reservations: byte leases for prospective nodes and restore
+    /// target protections. Both expire after the lease window.
+    reservations: Vec<Reservation>,
+    /// Next reservation id.
+    lease_nonce: u64,
+    /// Total nodes evicted since the tree (re)started.
+    evicted_total: u64,
+    /// Smallest surviving node id; ids below it were evicted.
+    retained_watermark: u64,
 }
 impl UndoTree {
     /// Create a new undo tree with a root node.
     #[must_use]
     pub fn new(snapshot: TextSnapshot) -> Self {
         let root = UndoNode::root(Revision::INITIAL, snapshot);
-        Self {
+        let mut tree = Self {
             generation: 1,
             context_origin: None,
             nodes: vec![root],
@@ -261,13 +285,28 @@ impl UndoTree {
             position_id: 0,
             coalesce_window: DEFAULT_COALESCE_WINDOW,
             next_id: 1,
-        }
+            budget: Budget::default(),
+            accounted_bytes: 0,
+            reservations: Vec::new(),
+            lease_nonce: 0,
+            evicted_total: 0,
+            retained_watermark: 0,
+        };
+        tree.reaccount();
+        tree
     }
     /// Create a new undo tree with a custom coalesce window.
     #[must_use]
     pub fn with_coalesce_window(snapshot: TextSnapshot, window: Duration) -> Self {
         let mut tree = Self::new(snapshot);
         tree.coalesce_window = window;
+        tree
+    }
+    /// Create a new undo tree with a custom history budget.
+    #[must_use]
+    pub fn with_budget(snapshot: TextSnapshot, budget: Budget) -> Self {
+        let mut tree = Self::new(snapshot);
+        tree.budget = budget;
         tree
     }
     /// Get the preferred redo tip.
@@ -305,14 +344,19 @@ impl UndoTree {
         let mut child = self.preferred_tip;
         while let Some(node) = self.get(child) {
             if node.parent_id == Some(self.position_id) {
-                return Some(child);
+                return (!node.evicted).then_some(child);
             }
             let Some(parent) = node.parent_id else {
                 break;
             };
             child = parent;
         }
-        self.position()?.children.last().copied()
+        self.position()?
+            .children
+            .iter()
+            .rev()
+            .copied()
+            .find(|id| self.get(*id).is_some_and(|node| !node.evicted))
     }
 
     /// Apply an edit and advance the tree.
@@ -426,14 +470,20 @@ impl UndoTree {
                     Span::new(TextByte(prefix), TextByte(before.len() - suffix)),
                     after[prefix..after.len() - suffix].into(),
                 );
-                if let Some(node) = self.nodes.get_mut(position_id as usize) {
+                {
+                    let node = self
+                        .nodes
+                        .get_mut(position_id as usize)
+                        .expect("position node exists");
                     node.changed_at_unix_ms = wall_clock_ms();
                     node.version += 1;
                     node.edit = Some(coalesced);
                     node.snapshot = Some(snapshot);
                     node.timestamp = Instant::now();
-                    return node.revision;
                 }
+                self.reaccount();
+                self.auto_evict_if_over_budget(wall_clock_ms());
+                return self.nodes[position_id as usize].revision;
             }
         }
         let current_node = self
@@ -456,6 +506,8 @@ impl UndoTree {
         self.nodes.push(new_node);
         self.preferred_tip = new_id;
         self.position_id = new_id;
+        self.reaccount();
+        self.auto_evict_if_over_budget(wall_clock_ms());
         new_revision
     }
     /// Preserve a save/semantic boundary without adding a document edit.
@@ -470,21 +522,22 @@ impl UndoTree {
 
     /// Undo the current edit.
     ///
-    /// Moves the position back to the parent node.
-    /// Returns the parent's revision and snapshot.
-    /// The caller (model) is responsible for advancing the revision (§4.5.2).
+    /// Moves the position back to the nearest surviving parent node
+    /// (evicted chain links are skipped). Returns the parent's revision and
+    /// snapshot. The caller (model) is responsible for advancing the
+    /// revision (§4.5.2).
     pub fn undo(&mut self) -> Option<(Revision, Option<TextSnapshot>)> {
         self.seal_current();
         let current = self.position()?;
-        if current.is_root() {
-            return None;
-        }
-        let parent_id = current.parent_id?;
-        let parent = self.nodes.get(parent_id as usize)?;
-        let snapshot = parent.snapshot.clone()?;
-        self.position_id = parent.id;
+        current.parent_id?;
+        let parent_id = self.nearest_surviving_ancestor(current.id)?;
+        let (parent_revision, snapshot) = {
+            let parent = self.survivor(parent_id)?;
+            (parent.revision, parent.snapshot.clone()?)
+        };
+        self.position_id = parent_id;
         self.generation += 1;
-        Some((parent.revision, Some(snapshot)))
+        Some((parent_revision, Some(snapshot)))
     }
     /// Redo the last undone edit.
     ///
@@ -503,7 +556,7 @@ impl UndoTree {
     }
     /// Move to a specific node.
     fn goto(&mut self, id: u64) -> bool {
-        if self.get(id).is_some() {
+        if self.survivor(id).is_some() {
             self.seal_current();
             // Keep the current continuation when jumping to its ancestor.
             // Selecting another branch must adopt that branch's continuation,
@@ -516,6 +569,9 @@ impl UndoTree {
             if ancestor != Some(id) {
                 let mut tail = id;
                 while let Some(child) = self.get(tail).and_then(|node| node.children.last()) {
+                    if self.get(*child).is_some_and(|node| node.evicted) {
+                        break;
+                    }
                     tail = *child;
                 }
                 self.preferred_tip = tail;
@@ -560,6 +616,8 @@ impl UndoTree {
             node.kind = record.kind;
             node.editor = Some(record);
         }
+        self.reaccount();
+        self.auto_evict_if_over_budget(wall_clock_ms());
         revision
     }
 
@@ -573,7 +631,7 @@ impl UndoTree {
         epoch: crate::history::HistoryEpoch,
         on_path: bool,
     ) -> Option<HistoryEntry> {
-        let node = self.get(id)?;
+        let node = self.survivor(id)?;
         Some(HistoryEntry {
             changed_at_unix_ms: node.changed_at_unix_ms,
             on_path,
@@ -603,7 +661,14 @@ impl UndoTree {
         limit: usize,
     ) -> Result<HistoryPage, HistoryError> {
         if cursor.is_some_and(|c| c.epoch != epoch || c.generation != self.generation) {
-            return Err(HistoryError::StalePage);
+            // Eviction invalidates cursors with a distinct typed error; any
+            // other generation change keeps the delivered stale-page path
+            // (FEUX-0002 X01 / E-12).
+            return Err(if self.evicted_total > 0 {
+                HistoryError::HistoryChanged
+            } else {
+                HistoryError::StalePage
+            });
         }
         let before = cursor.map_or(self.next_id, |c| c.before);
         let limit = limit.clamp(1, PAGE_LIMIT);
@@ -617,7 +682,7 @@ impl UndoTree {
             .nodes
             .iter()
             .rev()
-            .filter(|n| n.id < before)
+            .filter(|n| n.id < before && !n.evicted)
             .take(limit + 1)
             .filter_map(|n| self.entry(n.id, epoch, ancestors.contains(&n.id)))
             .collect();
@@ -630,6 +695,10 @@ impl UndoTree {
         let mut trail = Vec::new();
         let mut id = Some(self.position_id);
         while let Some(node) = id.and_then(|id| self.get(id)) {
+            if node.evicted {
+                id = node.parent_id;
+                continue;
+            }
             trail.push(
                 self.entry(node.id, epoch, true)
                     .expect("existing history node"),
@@ -650,13 +719,15 @@ impl UndoTree {
                 .redo_target()
                 .and_then(|id| self.entry(id, epoch, false)),
             next,
+            history_truncated: self.evicted_total > 0 && before > self.retained_watermark,
+            retained_watermark: self.retained_watermark,
         })
     }
 
     /// Prepare before changing the head. Tagged filesystem obligations may
     /// only be crossed by the Session's existing single-step Undo/Redo path.
     pub fn restore_snapshot(&self, target: HistoryTarget) -> Result<TextSnapshot, HistoryError> {
-        let node = self.get(target.node).ok_or(HistoryError::Expired)?;
+        let node = self.survivor(target.node).ok_or(HistoryError::Expired)?;
         if node.version != target.version {
             return Err(HistoryError::Expired);
         }
@@ -701,12 +772,20 @@ impl UndoTree {
             .map(|n| n.revision)
             .unwrap_or(Revision::INITIAL)
     }
-    /// Get the path from the root to the preferred redo tip.
+    /// Get the path from the root to the preferred redo tip (evicted chain
+    /// links are skipped).
     #[must_use]
     pub fn history(&self) -> Vec<&UndoNode> {
         let mut path = Vec::new();
         let mut preferred_tip = self.preferred_tip;
         while let Some(node) = self.nodes.get(preferred_tip as usize) {
+            if node.evicted {
+                preferred_tip = match node.parent_id {
+                    Some(id) => id,
+                    None => break,
+                };
+                continue;
+            }
             path.push(node);
             preferred_tip = match node.parent_id {
                 Some(id) => id,
@@ -733,14 +812,24 @@ impl UndoTree {
             self.preferred_tip = 0;
             self.position_id = 0;
             self.next_id = 1;
+            self.reservations.clear();
+            self.lease_nonce = 0;
+            self.evicted_total = 0;
+            self.retained_watermark = 0;
+            self.reaccount();
         }
     }
-    /// Get the depth from the root to the preferred redo tip.
+    /// Get the depth from the root to the preferred redo tip (evicted
+    /// chain links do not count).
     #[must_use]
     pub fn depth(&self) -> usize {
         let mut preferred_tip = self.preferred_tip;
         let mut depth = 0;
-        while let Some(node) = self.nodes.get(preferred_tip as usize) {
+        while let Some(node) = self.get(preferred_tip) {
+            if node.evicted {
+                preferred_tip = node.parent_id.unwrap_or(0);
+                continue;
+            }
             if node.is_root() {
                 return depth;
             }
@@ -755,6 +844,302 @@ impl Default for UndoTree {
         Self::new(TextSnapshot::from_normalized(""))
     }
 }
+
+/// A byte reservation lease returned by [`UndoTree::reserve`]. Released by
+/// [`UndoTree::release`] after the install it admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lease {
+    id: u64,
+}
+
+impl UndoTree {
+    /// The active history budget.
+    #[must_use]
+    pub fn budget(&self) -> Budget {
+        self.budget
+    }
+    /// Replace the history budget and re-account immediately.
+    pub fn set_budget(&mut self, budget: Budget) {
+        self.budget = budget;
+        self.reaccount();
+    }
+    /// Total accounted retained history bytes.
+    #[must_use]
+    pub fn accounted_bytes(&self) -> u64 {
+        self.accounted_bytes
+    }
+    /// Current accounted usage.
+    #[must_use]
+    pub fn account(&self) -> crate::budget::HistoryAccount {
+        crate::budget::HistoryAccount {
+            bytes: self.accounted_bytes,
+            nodes: self.survivor_count() as u64,
+        }
+    }
+    /// Total nodes evicted since the tree started (or was last cleared).
+    #[must_use]
+    pub fn evicted_total(&self) -> u64 {
+        self.evicted_total
+    }
+    /// Smallest surviving node id; every smaller id was evicted.
+    #[must_use]
+    pub fn retained_watermark(&self) -> u64 {
+        self.retained_watermark
+    }
+    /// The surviving node with this id, if any.
+    #[must_use]
+    fn survivor(&self, id: u64) -> Option<&UndoNode> {
+        self.get(id).filter(|node| !node.evicted)
+    }
+    fn survivor_count(&self) -> usize {
+        self.nodes.iter().filter(|node| !node.evicted).count()
+    }
+    /// Number of surviving (retained) nodes.
+    #[must_use]
+    pub fn retained_node_count(&self) -> usize {
+        self.survivor_count()
+    }
+    /// Ids of all surviving (retained) nodes, ascending. Test/diagnostic
+    /// surface for the accounting mirror.
+    #[must_use]
+    pub fn survivor_ids(&self) -> Vec<u64> {
+        self.nodes
+            .iter()
+            .filter(|node| !node.evicted)
+            .map(|node| node.id)
+            .collect()
+    }
+    /// The nearest surviving ancestor of `from` (skips evicted links).
+    fn nearest_surviving_ancestor(&self, from: u64) -> Option<u64> {
+        let mut id = from;
+        loop {
+            let parent = self.get(id)?.parent_id?;
+            if self.survivor(parent).is_some() {
+                return Some(parent);
+            }
+            id = parent;
+        }
+    }
+
+    /// Walk retained nodes and recount bytes (unique retained text
+    /// allocations + recorded selection sets + fixed metadata).
+    fn reaccount(&mut self) {
+        let mut bytes = 0u64;
+        let mut watermark = u64::MAX;
+        for node in &self.nodes {
+            if node.evicted {
+                continue;
+            }
+            watermark = watermark.min(node.id);
+            let snapshot_len = node.snapshot.as_ref().map_or(0, |s| s.text().len());
+            let replacement_len = node.edit.as_ref().map_or(0, |e| e.replacement.len());
+            let (before, after) = match &node.editor {
+                Some(record) => (&record.before[..], &record.after[..]),
+                None => (&[][..], &[][..]),
+            };
+            bytes += crate::budget::account_node(snapshot_len, replacement_len, before, after);
+        }
+        self.accounted_bytes = bytes;
+        self.retained_watermark = if watermark == u64::MAX {
+            self.next_id
+        } else {
+            watermark
+        };
+    }
+
+    /// Best-effort eviction when growth exceeded the budget without a
+    /// covering reservation (unguarded direct-tree callers). Guarded
+    /// facades reserve first, so this is a no-op for them.
+    fn auto_evict_if_over_budget(&mut self, now_ms: u64) {
+        let pending: u64 = self.reservations.iter().map(|r| r.projected).sum();
+        let over = self.accounted_bytes + pending > self.budget.max_bytes
+            || self.survivor_count() as u64 > self.budget.max_nodes;
+        if over {
+            self.evict_to_fit(0, now_ms);
+        }
+    }
+
+    /// Reserve `projected` bytes for one new node against the budget,
+    /// evicting deterministically to make room when needed. Refusal is
+    /// complete and precedes any mutation.
+    pub fn reserve(&mut self, projected: u64, now_ms: u64) -> Result<Lease, LimitExceeded> {
+        self.expire_leases(now_ms);
+        let fits = |tree: &Self| {
+            let pending: u64 = tree.reservations.iter().map(|r| r.projected).sum();
+            tree.accounted_bytes + pending + projected <= tree.budget.max_bytes
+                && (tree.survivor_count() as u64) < tree.budget.max_nodes
+        };
+        if !fits(self) {
+            self.evict_to_fit(projected, now_ms);
+        }
+        if fits(self) {
+            self.lease_nonce += 1;
+            let id = self.lease_nonce;
+            self.reservations.push(Reservation {
+                id,
+                lease_until_ms: now_ms.saturating_add(RESERVATION_LEASE_MS),
+                projected,
+                target: None,
+            });
+            Ok(Lease { id })
+        } else {
+            Err(LimitExceeded {
+                needed: projected,
+                budget: self.budget.max_bytes,
+            })
+        }
+    }
+
+    /// Release a byte reservation after its install completed.
+    pub fn release(&mut self, lease: &Lease) {
+        self.reservations.retain(|r| r.id != lease.id);
+    }
+
+    /// Protect `node` from eviction for the lease window (in-flight restore
+    /// target). Returns a token to pass to [`UndoTree::unprotect`]; the
+    /// lease window protects the target even if the token is never released.
+    pub fn protect_token(&mut self, node: u64, now_ms: u64) -> u64 {
+        self.expire_leases(now_ms);
+        self.lease_nonce += 1;
+        let id = self.lease_nonce;
+        self.reservations.push(Reservation {
+            id,
+            lease_until_ms: now_ms.saturating_add(RESERVATION_LEASE_MS),
+            projected: 0,
+            target: Some(node),
+        });
+        id
+    }
+
+    /// Release a restore-target protection token.
+    pub fn unprotect(&mut self, id: u64) {
+        self.reservations.retain(|r| r.id != id);
+    }
+
+    fn expire_leases(&mut self, now_ms: u64) {
+        self.reservations.retain(|r| r.lease_until_ms > now_ms);
+    }
+
+    /// Deterministic eviction pass: evict until the budget fits `projected`
+    /// (plus pending reservations) or no candidate remains. Order: off-path
+    /// tips oldest-first, then off-path branches, then the oldest
+    /// checkpointable prefix of the current path; never the current node,
+    /// never a protected restore target.
+    fn evict_to_fit(&mut self, projected: u64, now_ms: u64) -> EvictionReport {
+        self.expire_leases(now_ms);
+        let mut report = EvictionReport::default();
+        loop {
+            let pending: u64 = self.reservations.iter().map(|r| r.projected).sum();
+            let fits = self.accounted_bytes + pending + projected <= self.budget.max_bytes
+                && (self.survivor_count() as u64) < self.budget.max_nodes;
+            if fits {
+                break;
+            }
+            let Some(id) = self.eviction_candidate(now_ms) else {
+                break;
+            };
+            let before = self.accounted_bytes;
+            self.remove_node(id);
+            self.evicted_total += 1;
+            self.generation += 1;
+            report.evicted.push(id);
+            self.reaccount();
+            report.freed_bytes += before.saturating_sub(self.accounted_bytes);
+        }
+        report
+    }
+
+    /// The next eviction candidate, or none. Deterministic: iteration is
+    /// derived from stored sequence numbers only.
+    fn eviction_candidate(&self, now_ms: u64) -> Option<u64> {
+        let protected: std::collections::HashSet<u64> = self
+            .reservations
+            .iter()
+            .filter(|r| r.lease_until_ms > now_ms)
+            .filter_map(|r| r.target)
+            .chain(std::iter::once(self.position_id))
+            .collect();
+        let mut on_path = std::collections::HashSet::new();
+        let mut id = Some(self.position_id);
+        while let Some(node) = id.and_then(|id| self.get(id)) {
+            on_path.insert(node.id);
+            id = node.parent_id;
+        }
+        let eligible = |node: &UndoNode| {
+            !node.evicted && !on_path.contains(&node.id) && !protected.contains(&node.id)
+        };
+        // Pass 1: off-path tips (leaves), oldest first.
+        if let Some(id) = self
+            .nodes
+            .iter()
+            .filter(|n| eligible(n))
+            .filter(|n| n.is_leaf())
+            .map(|n| n.id)
+            .min()
+        {
+            return Some(id);
+        }
+        // Pass 2: off-path subtree roots (parent on path or none), oldest
+        // first. Removing the whole subtree never orphans survivors.
+        if let Some(id) = self
+            .nodes
+            .iter()
+            .filter(|n| eligible(n))
+            .filter(|n| match n.parent_id {
+                None => true,
+                Some(parent) => on_path.contains(&parent),
+            })
+            .map(|n| n.id)
+            .min()
+        {
+            return Some(id);
+        }
+        // Pass 3: oldest checkpointable prefix of the current path — never
+        // the current node, never protected.
+        self.nodes
+            .iter()
+            .filter(|n| !n.evicted && !protected.contains(&n.id))
+            .filter(|n| on_path.contains(&n.id) && n.id < self.position_id)
+            .map(|n| n.id)
+            .min()
+    }
+
+    /// Evict one node: detach from its parent, re-parent surviving children
+    /// onto its parent (keeping surviving chains connected), and drop its
+    /// heavy state. The tombstone stays in place so id-index stability and
+    /// structural traversal survive.
+    fn remove_node(&mut self, id: u64) {
+        let Some(node) = self.get(id) else {
+            return;
+        };
+        let parent_id = node.parent_id;
+        if let Some(parent) = parent_id
+            && let Some(node) = self.nodes.get_mut(parent as usize)
+        {
+            node.children.retain(|&child| child != id);
+        }
+        let children = self.nodes[id as usize].children.clone();
+        for child in children {
+            if let Some(child_node) = self.nodes.get_mut(child as usize) {
+                child_node.parent_id = parent_id;
+                if let Some(parent) = parent_id
+                    && let Some(parent_node) = self.nodes.get_mut(parent as usize)
+                    && !parent_node.children.contains(&child)
+                {
+                    parent_node.children.push(child);
+                }
+            }
+        }
+        if let Some(node) = self.nodes.get_mut(id as usize) {
+            node.evicted = true;
+            node.snapshot = None;
+            node.editor = None;
+            node.edit = None;
+            node.children.clear();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

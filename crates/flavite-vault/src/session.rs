@@ -591,6 +591,16 @@ pub enum SessionResult {
     LinkRejected {
         reason: crate::link::LinkInsertionError,
     },
+    /// The retained-history budget was exceeded; refused before any mutation
+    /// (FEUX-0002 X01 / E-12). `budget` is the ceiling that was exceeded
+    /// (per-buffer 128 MiB, or app-wide 512 MiB when `busiest_buffer` is
+    /// set, naming the buffer using the most history).
+    HistoryLimitExceeded {
+        buffer_id: BufferId,
+        needed: u64,
+        budget: u64,
+        busiest_buffer: Option<BufferId>,
+    },
 }
 
 /// Data returned from successful commands.
@@ -1097,6 +1107,11 @@ pub struct Session {
     /// an already-clean buffer) is a harmless false positive — it only
     /// arms a debounce.
     buffer_stamp_version: AtomicU64,
+    /// App-wide retained-history byte ceiling across all open buffers
+    /// (FEUX-0002 X01 / E-12). Defaults to
+    /// `flavite_buffer::budget::APP_WIDE_MAX_HISTORY_BYTES`; settable for
+    /// fault/limit tests.
+    app_history_budget: AtomicU64,
 }
 
 /// One queued semantic-link prepare job (W05).
@@ -1871,6 +1886,7 @@ impl Session {
             link_results: link_result_receiver,
             buffer_signal: Some(buffer_signal),
             buffer_stamp_version: AtomicU64::new(0),
+            app_history_budget: AtomicU64::new(flavite_buffer::budget::APP_WIDE_MAX_HISTORY_BYTES),
         };
         // Recover durable replacement jobs from the private store
         // (RFC-0006 D-11). Runs once at Session construction; never
@@ -1885,6 +1901,30 @@ impl Session {
     #[must_use]
     pub fn buffer_stamp_version(&self) -> u64 {
         self.buffer_stamp_version.load(Ordering::Acquire)
+    }
+
+    /// The app-wide retained-history byte ceiling across open buffers.
+    #[must_use]
+    pub fn app_history_budget(&self) -> u64 {
+        self.app_history_budget.load(Ordering::Acquire)
+    }
+
+    /// Replace the app-wide retained-history byte ceiling (tests, tuning).
+    pub fn set_app_history_budget(&self, bytes: u64) {
+        self.app_history_budget.store(bytes, Ordering::Release);
+    }
+
+    /// Replace the per-buffer retained-history budgets of every open buffer
+    /// and of every buffer opened afterwards (test/harness tuning; the
+    /// manager default persists for the process — FEUX-0002 X01: the
+    /// harness shrinks budgets at startup, before any note opens).
+    pub fn set_buffer_history_budgets(&self, bytes: u64, nodes: u64) {
+        let budget = flavite_buffer::budget::Budget {
+            max_bytes: bytes,
+            max_nodes: nodes,
+        };
+        let mut manager = self.buffer_manager.lock_recovering();
+        manager.set_default_history_budget(budget);
     }
 
     /// Record one stamp-relevant buffer transition: bump the version
@@ -3899,11 +3939,19 @@ impl Session {
             match buffer
                 .apply_local_edits_with_policy(&ops, flavite_buffer::undo::UndoPolicy::Isolated)
             {
-                Some((new_revision, _)) => SessionResult::Success(CommandResult::EditsApplied {
+                Ok((new_revision, _)) => SessionResult::Success(CommandResult::EditsApplied {
                     buffer_id,
                     new_revision,
                 }),
-                None => SessionResult::Error {
+                Err(flavite_buffer::model::BatchError::LimitExceeded { needed, budget }) => {
+                    SessionResult::HistoryLimitExceeded {
+                        buffer_id,
+                        needed,
+                        budget,
+                        busiest_buffer: None,
+                    }
+                }
+                Err(_) => SessionResult::Error {
                     message: "prepared batch no longer applies".into(),
                 },
             }
@@ -5575,45 +5623,93 @@ impl Session {
             };
         }
 
-        // Get the buffer and apply all edit ops
-        if let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) {
-            // Check revision first
-            if buffer.revision() != revision {
-                return SessionResult::StaleRevision {
+        // Immutable admission: existence, revision, and the app-wide history
+        // budget ledger (FEUX-0002 X01 / E-12). The projection is computed
+        // before any per-buffer mutation; a refusal names the busiest buffer.
+        let Some(buffer) = buffer_manager.get_buffer_by_id(buffer_id) else {
+            return SessionResult::Error {
+                message: format!("Buffer not found: {:?}", buffer_id),
+            };
+        };
+        if buffer.revision() != revision {
+            return SessionResult::StaleRevision {
+                buffer_id,
+                expected: revision,
+                actual: buffer.revision(),
+            };
+        }
+        if let Some(projected) = buffer.model().history_projection(&ops, editor.as_ref()) {
+            let app_ceiling = self.app_history_budget.load(Ordering::Acquire);
+            let mut app_total = 0u64;
+            let mut busiest: Option<BufferId> = None;
+            let mut peak = 0u64;
+            for open in buffer_manager.all_buffers() {
+                let bytes = open.model().history_accounted_bytes();
+                app_total = app_total.saturating_add(bytes);
+                if bytes > peak {
+                    peak = bytes;
+                    busiest = Some(open.buffer_id());
+                }
+            }
+            if app_total.saturating_add(projected) > app_ceiling {
+                return SessionResult::HistoryLimitExceeded {
                     buffer_id,
-                    expected: revision,
-                    actual: buffer.revision(),
+                    needed: projected,
+                    budget: app_ceiling,
+                    busiest_buffer: busiest,
                 };
             }
+        }
 
-            // Validate the command once and apply all positions as one
-            // authoritative Buffer transition/undo unit. `Isolated` (the
-            // default) prepares and installs one boundary candidate; the
-            // explicit typing path keeps ordinary coalescing (D-06/TD-8).
-            let new_revision = if let Some(editor) = editor {
-                match buffer.apply_recorded_edits(&ops, undo_policy, editor) {
-                    Ok(revision) => revision,
-                    Err(message) => return SessionResult::Error { message },
+        // Apply all edit ops as one authoritative Buffer transition/undo unit.
+        let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) else {
+            return SessionResult::Error {
+                message: format!("Buffer not found: {:?}", buffer_id),
+            };
+        };
+        let new_revision = if let Some(editor) = editor {
+            match buffer.apply_recorded_edits(&ops, undo_policy, editor) {
+                Ok(revision) => revision,
+                Err(error) => {
+                    return match error {
+                        flavite_buffer::model::RecordedBatchError::LimitExceeded {
+                            needed,
+                            budget,
+                        } => SessionResult::HistoryLimitExceeded {
+                            buffer_id,
+                            needed,
+                            budget,
+                            busiest_buffer: None,
+                        },
+                        other => SessionResult::Error {
+                            message: other.to_string(),
+                        },
+                    };
                 }
-            } else {
-                let Some((revision, _)) = buffer.apply_local_edits_with_policy(&ops, undo_policy)
-                else {
+            }
+        } else {
+            match buffer.apply_local_edits_with_policy(&ops, undo_policy) {
+                Ok((revision, _)) => revision,
+                Err(flavite_buffer::model::BatchError::LimitExceeded { needed, budget }) => {
+                    return SessionResult::HistoryLimitExceeded {
+                        buffer_id,
+                        needed,
+                        budget,
+                        busiest_buffer: None,
+                    };
+                }
+                Err(_) => {
                     return SessionResult::Error {
                         message: "edit ranges overlap, are out of bounds, or split UTF-8".into(),
                     };
-                };
-                revision
-            };
-
-            SessionResult::Success(CommandResult::EditsApplied {
-                buffer_id,
-                new_revision,
-            })
-        } else {
-            SessionResult::Error {
-                message: format!("Buffer not found: {:?}", buffer_id),
+                }
             }
-        }
+        };
+
+        SessionResult::Success(CommandResult::EditsApplied {
+            buffer_id,
+            new_revision,
+        })
     }
 
     /// Save a note.

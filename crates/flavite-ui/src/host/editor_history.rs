@@ -141,7 +141,7 @@ pub fn visible_entries(app: &App, source: EditorTarget) -> Vec<&HistoryEntry> {
         .context_mode
         .session
         .as_ref()
-        .is_some_and(|s| s.attention)
+        .is_some_and(|s| s.state.attention())
     {
         return Vec::new();
     }
@@ -329,7 +329,7 @@ pub fn handle(app: &mut App, message: HistoryMessage) -> Task<Message> {
                         replace.focused = false;
                     }
                     if let Some(session) = &mut app.context_mode.session {
-                        session.menu = None;
+                        let _ = session.state.close_menu();
                         session.menu_target = None;
                     }
                     let result = read(app, source, cursor);

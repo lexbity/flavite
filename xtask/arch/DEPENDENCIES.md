@@ -12,6 +12,7 @@ Generated from `cargo metadata --format-version 1 --all-features`.
 | `flavite-app` | 3 | Desktop application entry point; binary `flavite` (RFC-0003 TD-02/W13) |
 | `flavite-buffer` | 1 | EditorModel/ropey, undo tree, D7 state machine (§4.1) |
 | `flavite-cli` | 3 | Headless CLI; consumes flavite-api (D16 dogfood) (§4.1) |
+| `flavite-edit-context` | 2 | Context Mode pure vocabulary, physical grammar, statechart and effect planning (FEUX-0002 X02); toolkit-free |
 | `flavite-editor` | 3 | iced widget over EditorModel (iced permitted here and in flavite-ui only) (§4.1) |
 | `flavite-encoding` | 1 | Strict ASCII/UTF-8/UTF-16 codecs, source-format descriptors, encoded↔decoded byte maps — std-only, IO-free (RFC-0006 §6.10) |
 | `flavite-fs` | 1 | Fs trait, atomic_write, watcher, path safety; FaultFs behind feature "fault" (§4.1) |
@@ -79,6 +80,12 @@ Normal/build:
 - `flavite-settings` (normal)
 - `tracing` (normal)
 
+### `flavite-edit-context`
+
+Normal/build:
+
+- `flavite-syntax` (normal)
+
 ### `flavite-editor`
 
 Normal/build:
@@ -86,6 +93,7 @@ Normal/build:
 - `cosmic-text` (normal)
 - `flavite-api` (normal)
 - `flavite-buffer` (normal)
+- `flavite-edit-context` (normal)
 - `flavite-syntax` (normal)
 - `iced` (normal)
 - `nucleo-matcher` (normal)
@@ -170,6 +178,7 @@ Normal/build:
 - `accesskit` (normal)
 - `flavite-api` (normal)
 - `flavite-buffer` (normal)
+- `flavite-edit-context` (normal)
 - `flavite-editor` (normal)
 - `flavite-graph` (normal)
 - `flavite-settings` (normal)
@@ -258,7 +267,7 @@ UI crates (may depend on forbidden): flavite-editor, flavite-ui
 | Tier | Crates | Floor |
 |---|---|---|
 | 1 — durability-critical | flavite-fs, flavite-syntax, flavite-encoding, flavite-text-search, flavite-buffer, flavite-vault, flavite-index, flavite-workspace, flavite-graph-protocol | ≥ 90% line |
-| 2 | flavite-api, flavite-graph, flavite-theme, flavite-settings | ≥ 80% line |
+| 2 | flavite-api, flavite-graph, flavite-theme, flavite-settings, flavite-edit-context | ≥ 80% line |
 | 3 — measured, not gating | flavite-cli, flavite-editor, flavite-ui, flavite-app | reported only |
 
 Temporary floor waivers (must have a valid expiry and reason):

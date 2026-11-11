@@ -1345,6 +1345,20 @@ impl Flavite {
         &self.vault_ref
     }
 
+    /// Test/harness configuration: override the app-wide and per-buffer
+    /// retained-history budgets (FEUX-0002 X01). Production execution never
+    /// reads environment knobs; only the test-support boot path calls this.
+    pub fn set_history_budgets_for_test(
+        &self,
+        app_bytes: u64,
+        buffer_bytes: u64,
+        buffer_nodes: u64,
+    ) {
+        self.session.set_app_history_budget(app_bytes);
+        self.session
+            .set_buffer_history_budgets(buffer_bytes, buffer_nodes);
+    }
+
     /// Get the command registry.
     #[must_use]
     pub fn command_registry(&self) -> &CommandRegistry {
@@ -2064,7 +2078,8 @@ impl Flavite {
             | SessionResult::Busy
             | SessionResult::StaleRevision { .. }
             | SessionResult::Superseded { .. }
-            | SessionResult::Error { .. } => "",
+            | SessionResult::Error { .. }
+            | SessionResult::HistoryLimitExceeded { .. } => "",
         };
         match result {
             SessionResult::Success(cmd_result) => {
@@ -2403,6 +2418,27 @@ impl Flavite {
             SessionResult::Error { message } => ExecutionResult::Local(LocalResult::Error(
                 LocalError::with_request("session_error", message, request_id),
             )),
+            SessionResult::HistoryLimitExceeded {
+                buffer_id: _,
+                needed,
+                budget,
+                busiest_buffer,
+            } => {
+                let message = match busiest_buffer {
+                    Some(busy) => format!(
+                        "History memory budget exceeded app-wide: this edit needs ~{needed} bytes; the app-wide limit is {budget} bytes (buffer {} uses the most history). Save or close notes to free history memory.",
+                        busy.as_u64()
+                    ),
+                    None => format!(
+                        "History memory budget exceeded: this edit needs ~{needed} bytes; the limit is {budget} bytes. Reduce or save the note to free history memory."
+                    ),
+                };
+                ExecutionResult::Local(LocalResult::Error(LocalError::with_request(
+                    "history-limit-exceeded",
+                    message,
+                    request_id,
+                )))
+            }
             SessionResult::LinkRejected { reason } => ExecutionResult::Local(LocalResult::Error(
                 LocalError::with_request(reason.code(), reason.repair_action(), request_id),
             )),

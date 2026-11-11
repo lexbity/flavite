@@ -5,6 +5,7 @@
 //! table, and the D7 buffer state machine. Zero UI dependencies (§4.1, D14,
 //! §4.16.1).
 
+pub mod budget;
 pub mod eol;
 pub mod history;
 pub mod manager;

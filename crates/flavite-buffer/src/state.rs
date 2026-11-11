@@ -349,19 +349,19 @@ impl Buffer {
     /// Apply a batch under an explicit undo policy (RFC-0006 D-06):
     /// `Isolated` prepares and installs one boundary candidate (invalid
     /// batches change nothing), `Typing` keeps the existing coalescing
-    /// path. Returns `None` when the batch is invalid — zero state change.
+    /// path. A `BatchError` refusal is complete — zero state change.
     pub fn apply_local_edits_with_policy(
         &mut self,
         edits: &[crate::undo::EditOp],
         policy: crate::undo::UndoPolicy,
-    ) -> Option<(Revision, Option<StateTransition>)> {
-        let revision = self.model.try_apply_batch(edits, policy).ok()?;
+    ) -> Result<(Revision, Option<StateTransition>), crate::model::BatchError> {
+        let revision = self.model.try_apply_batch(edits, policy)?;
         let old_state = self.state;
         self.state = BufferState::Dirty;
         let transition = (old_state != BufferState::Dirty).then(|| {
             StateTransition::new(old_state, BufferState::Dirty, TransitionReason::LocalEdit)
         });
-        Some((revision, transition))
+        Ok((revision, transition))
     }
 
     pub fn apply_recorded_edits(
@@ -369,7 +369,7 @@ impl Buffer {
         edits: &[crate::undo::EditOp],
         policy: crate::undo::UndoPolicy,
         record: crate::history::EditorEdit,
-    ) -> Result<Revision, String> {
+    ) -> Result<Revision, crate::model::RecordedBatchError> {
         let revision = self.model.try_apply_recorded_batch(edits, policy, record)?;
         if matches!(self.state, BufferState::Clean | BufferState::Dirty) {
             self.state = BufferState::Dirty;

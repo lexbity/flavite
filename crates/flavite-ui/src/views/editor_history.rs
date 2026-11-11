@@ -122,7 +122,7 @@ pub fn strip<'a>(
                             .context_mode
                             .session
                             .as_ref()
-                            .is_some_and(|s| s.menu.is_none())
+                            .is_some_and(|s| s.state.menu().is_none())
                         && editor_history::can_restore(app, source, entry))
                     .then_some(Message::EditorHistory(HistoryMessage::Act(
                         source,
@@ -146,7 +146,7 @@ pub fn strip<'a>(
             .context_mode
             .session
             .as_ref()
-            .is_some_and(|session| session.attention);
+            .is_some_and(|session| session.state.attention());
         let caption = if attention {
             caption
         } else {
@@ -162,7 +162,7 @@ pub fn strip<'a>(
     )
     .on_double_click(Message::ContextMode(context_mode::ContextMessage::Run(
         source,
-        flavite_editor::context::ContextCommand::Exit,
+        flavite_edit_context::ContextCommand::Exit,
     )));
     detail.into()
 }
@@ -204,6 +204,17 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
     .spacing(6.0 * metrics.scale);
     if let Some(error) = &host.error {
         contents = contents.push(text(error).size(metrics.text_sm));
+    }
+    if let Some(page) = &host.page
+        && page.history_truncated
+    {
+        contents = contents.push(
+            text(format!(
+                "Earlier states removed to stay within the memory budget (oldest retained #{}).",
+                page.retained_watermark
+            ))
+            .size(metrics.text_sm),
+        );
     }
     let mut entries = column![].spacing(editor_history::ROW_SPACING * metrics.scale);
     if let Some(page) = &host.page {

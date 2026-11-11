@@ -615,7 +615,18 @@ impl App {
         #[cfg(not(feature = "ui-test-support"))]
         let config = VaultConfig::default();
         match Flavite::open_root(root, config) {
-            Ok(flavite) => app.attach_vault(flavite),
+            Ok(flavite) => {
+                // Fixture-only knob: the workbench budget scenario shrinks
+                // the retained-history budgets so truncation is reachable in
+                // a real session. Production execution never reads this.
+                #[cfg(feature = "ui-test-support")]
+                if let Ok(bytes) = std::env::var("FLAVITE_HARNESS_HISTORY_BUDGET_BYTES")
+                    && let Ok(bytes) = bytes.parse::<u64>()
+                {
+                    flavite.set_history_budgets_for_test(bytes, bytes, 500);
+                }
+                app.attach_vault(flavite)
+            }
             Err(error) => {
                 app.start.last_vault = flavite_api::read_last_vault_device().ok().flatten();
                 app.start.error = Some(format!("Could not open that vault: {error}"));
@@ -1946,7 +1957,7 @@ impl App {
                 prefix,
                 candidate,
             } => {
-                if self.context_mode.mode(tab) == flavite_editor::context::ContextMode::Command {
+                if self.context_mode.mode(tab) == flavite_edit_context::ContextMode::Command {
                     return;
                 }
                 let valid = self.valid_writing_target().is_some_and(
@@ -1977,7 +1988,7 @@ impl App {
             }
             EditorAction::Interaction(snapshot) => {
                 if snapshot.composing
-                    && self.context_mode.mode(tab) == flavite_editor::context::ContextMode::Command
+                    && self.context_mode.mode(tab) == flavite_edit_context::ContextMode::Command
                 {
                     return;
                 }
@@ -2137,8 +2148,7 @@ impl App {
             }
             edit_or_history => {
                 if crate::host::context_mode::too_narrow(self, tab)
-                    || (self.context_mode.mode(tab)
-                        == flavite_editor::context::ContextMode::Command
+                    || (self.context_mode.mode(tab) == flavite_edit_context::ContextMode::Command
                         && matches!(edit_or_history, EditorAction::Edit { .. }))
                 {
                     self.context_mode
@@ -4251,7 +4261,7 @@ impl App {
         self.palette_query.clear();
         self.palette_selected = 0;
         let editor_target = self.context_mode.palette_target.take();
-        if let Some(command) = flavite_editor::context::ContextCommand::ALL
+        if let Some(command) = flavite_edit_context::ContextCommand::ALL
             .iter()
             .find(|c| c.id() == id)
         {

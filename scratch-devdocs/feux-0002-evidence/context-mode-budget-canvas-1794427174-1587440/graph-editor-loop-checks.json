@@ -1,0 +1,15 @@
+{
+  "backend": "canvas",
+  "input_evidence": "rendered_os_input",
+  "checks": [
+    {
+      "id": "01-budget-truncation-notice.png",
+      "outcome": "pass",
+      "artifact": "01-budget-truncation-notice.png"
+    },
+    {
+      "id": "context-history-budget-truncation-restore",
+      "outcome": "pass"
+    }
+  ]
+}

@@ -182,6 +182,12 @@ pub struct HistoryPage {
     pub trail: Vec<HistoryEntry>,
     pub redo: Option<HistoryEntry>,
     pub next: Option<HistoryCursor>,
+    /// True when the queried range crosses an eviction: some states that
+    /// were created earlier than `retained_watermark` are no longer
+    /// retained (FEUX-0002 X01 / E-12).
+    pub history_truncated: bool,
+    /// Smallest surviving node id; every smaller id is evicted.
+    pub retained_watermark: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +197,10 @@ pub enum HistoryError {
     StalePage,
     JournalBoundary,
     InvalidSelections,
+    /// A cursor was invalidated by an eviction (state it pointed at was
+    /// removed to stay within the history budget). Distinct from
+    /// `StalePage` so UIs can offer a budget-aware refresh.
+    HistoryChanged,
 }
 
 impl std::fmt::Display for HistoryError {
@@ -200,6 +210,9 @@ impl std::fmt::Display for HistoryError {
             Self::StalePage => "Editing history changed; refresh the page",
             Self::JournalBoundary => "Use Undo/Redo to cross the rename transaction",
             Self::InvalidSelections => "Recorded editor selections are invalid",
+            Self::HistoryChanged => {
+                "Editing history changed; earlier states were removed to stay within the memory budget"
+            }
         })
     }
 }

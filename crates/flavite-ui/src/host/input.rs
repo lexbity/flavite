@@ -196,7 +196,7 @@ fn handle_inner(
             .notice("Pane too narrow · expand the pane to continue editing");
         return iced::Task::none();
     }
-    if app.context_mode.mode(tab) == flavite_editor::context::ContextMode::Command
+    if app.context_mode.mode(tab) == flavite_edit_context::ContextMode::Command
         && matches!(
             input.action,
             KeyAction::Insert
@@ -361,11 +361,10 @@ fn handle_inner(
                     .collect(),
             })
             .expect("history record is serializable");
-            let typing = app.context_mode.mode(tab)
-                != flavite_editor::context::ContextMode::Command
+            let typing = app.context_mode.mode(tab) != flavite_edit_context::ContextMode::Command
                 && !matches!(input.action, KeyAction::Paste | KeyAction::Cut);
             invocation.args["undo_policy"] = if typing
-                && app.context_mode.mode(tab) == flavite_editor::context::ContextMode::Typing
+                && app.context_mode.mode(tab) == flavite_edit_context::ContextMode::Typing
             {
                 serde_json::json!({"context":{"origin":format!("{:032x}",tab.raw())}})
             } else {
@@ -483,7 +482,7 @@ fn handle_inner(
         "Editing current note".into()
     };
     if let Some(session) = &mut app.context_mode.session {
-        session.attention = false;
+        session.state.clear_attention();
     }
     app.reconcile_contexts();
     app.refresh_semantics();

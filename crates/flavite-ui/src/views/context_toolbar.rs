@@ -9,10 +9,8 @@ use crate::{
         chrome::{self, Icon},
     },
 };
-use flavite_editor::context::{
-    ContextCommand, ContextMenu,
-    layout::{self, ContextLayout},
-};
+use flavite_edit_context::{ContextCommand, ContextMenu};
+use flavite_editor::context::layout::{self, ContextLayout};
 use iced::widget::{
     Space, button, column, container, mouse_area, opaque, row, scrollable, stack, text,
 };
@@ -144,13 +142,13 @@ pub fn view(app: &App, target: EditorTarget) -> Element<'_, Message> {
             .push(menu_button(app, target, ContextMenu::More));
     }
     let count = app.note_editor_view(target.tab).map_or(0, |view| {
-        flavite_editor::context::selected_characters(&view.text, target.selection)
+        flavite_edit_context::selected_characters(&view.text, target.selection)
     });
     let message = app
         .context_mode
         .session
         .as_ref()
-        .map_or("", |s| s.message.as_str());
+        .map_or("", |s| s.state.message().0);
     let max_chars = ((width - 130.0).max(40.0) / 6.5) as usize;
     let mut caption: String = message.chars().take(max_chars).collect();
     if message.chars().count() > max_chars {
@@ -184,7 +182,7 @@ fn menu_button(app: &App, target: EditorTarget, menu: ContextMenu) -> Element<'_
         .context_mode
         .session
         .as_ref()
-        .is_some_and(|s| s.menu == Some(menu));
+        .is_some_and(|s| s.state.menu() == Some(menu));
     observed(
         target.tab,
         menu.title(),
@@ -205,7 +203,7 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
     let Some(session) = &app.context_mode.session else {
         return shell;
     };
-    let Some(menu) = session.menu else {
+    let Some(menu) = session.state.menu() else {
         return shell;
     };
     let Some(target) = session.menu_target else {
@@ -250,7 +248,7 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
                 )
                 .width(Length::Fill)
                 .padding([7.0 * metrics.scale, 10.0 * metrics.scale])
-                .style(style::list_row(index == session.selected))
+                .style(style::list_row(index == session.state.selected()))
                 .on_press_maybe(
                     context_mode::available(app, target, command)
                         .then_some(Message::ContextMode(ContextMessage::Run(target, command))),

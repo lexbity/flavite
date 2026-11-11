@@ -100,6 +100,10 @@ pub struct BufferManager {
     buffer_ids: HashMap<BufferId, PathBuf>,
     /// Default coalesce window for new buffers.
     default_coalesce_window: std::time::Duration,
+    /// Retained-history budget applied to buffers created after it is set
+    /// (FEUX-0002 E-12/X01: the harness shrinks budgets at startup, before
+    /// any note opens; `None` keeps the model defaults for every buffer).
+    default_history_budget: Option<crate::budget::Budget>,
     /// Recovery interval in seconds.
     recovery_interval_secs: u64,
     /// RFC-0005 S5: monotonic counter bumped on every transition that can
@@ -128,6 +132,7 @@ impl BufferManager {
             buffers: HashMap::new(),
             buffer_ids: HashMap::new(),
             default_coalesce_window: std::time::Duration::from_millis(500),
+            default_history_budget: None,
             recovery_interval_secs: 2, // Default 2 seconds
             graph_stamp: Arc::new(AtomicU64::new(0)),
             graph_stamp_notifier: None,
@@ -141,9 +146,20 @@ impl BufferManager {
             buffers: HashMap::new(),
             buffer_ids: HashMap::new(),
             default_coalesce_window: coalesce_window,
+            default_history_budget: None,
             recovery_interval_secs: recovery_interval,
             graph_stamp: Arc::new(AtomicU64::new(0)),
             graph_stamp_notifier: None,
+        }
+    }
+
+    /// Set the retained-history budget applied to every buffer created after
+    /// this call (test/harness tuning alongside `Session`'s per-buffer
+    /// application to already-open buffers; FEUX-0002 X01).
+    pub fn set_default_history_budget(&mut self, budget: crate::budget::Budget) {
+        self.default_history_budget = Some(budget);
+        for buffer in self.buffers.values_mut() {
+            buffer.model_mut().set_history_budget(budget);
         }
     }
 
@@ -286,6 +302,9 @@ impl BufferManager {
                 buffer
                     .model_mut()
                     .set_coalesce_window(self.default_coalesce_window);
+                if let Some(budget) = self.default_history_budget {
+                    buffer.model_mut().set_history_budget(budget);
+                }
 
                 // Get buffer_id
                 let buffer_id = buffer.buffer_id();
@@ -463,6 +482,9 @@ impl BufferManager {
                 buffer
                     .model_mut()
                     .set_coalesce_window(self.default_coalesce_window);
+                if let Some(budget) = self.default_history_budget {
+                    buffer.model_mut().set_history_budget(budget);
+                }
                 let buffer_id = buffer.buffer_id();
                 self.buffer_ids.insert(buffer_id, vacant.key().clone());
                 let buffer_ref = vacant.insert(buffer);
@@ -490,6 +512,12 @@ impl BufferManager {
     #[must_use]
     pub fn all_buffers(&self) -> Vec<&Buffer> {
         self.buffers.values().collect()
+    }
+
+    /// Get all buffers, mutably.
+    #[must_use]
+    pub fn all_buffers_mut(&mut self) -> Vec<&mut Buffer> {
+        self.buffers.values_mut().collect()
     }
 
     /// Get dirty buffers.

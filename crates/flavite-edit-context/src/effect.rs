@@ -1,7 +1,9 @@
 //! The source range affected by a selection-first command. Rendering and
 //! execution ask the same planner; previewing never changes live selection.
+//! (Moved from `flavite-editor/src/context/effect.rs` in FEUX-0002 X02.)
 
-use super::ContextCommand;
+use crate::vocabulary::ContextCommand;
+use flavite_syntax::text::{TextByte, next_grapheme_boundary, prev_grapheme_boundary};
 use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +76,7 @@ pub fn plan(
     }
     for endpoint in [selection.0, selection.1] {
         if endpoint > text.len()
-            || crate::viewport::clamp_grapheme_boundary(text, endpoint) != endpoint
+            || crate::grammar::clamp_grapheme_boundary(text, endpoint) != endpoint
         {
             return None;
         }
@@ -97,12 +99,12 @@ pub fn plan(
         )
     } else if start < line_end {
         (
-            start..crate::viewport::next_grapheme_boundary(text, flavite_syntax::TextByte(start)).0,
+            start..next_grapheme_boundary(text, TextByte(start)).0,
             EffectUnit::Character,
         )
     } else if start > line_start {
         (
-            crate::viewport::prev_grapheme_boundary(text, flavite_syntax::TextByte(start)).0..start,
+            prev_grapheme_boundary(text, TextByte(start)).0..start,
             EffectUnit::Character,
         )
     } else {

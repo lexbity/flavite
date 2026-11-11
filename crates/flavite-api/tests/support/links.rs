@@ -96,6 +96,22 @@ pub struct Fixture {
 }
 
 pub fn fixture(notes: &[(&str, &str)]) -> Fixture {
+    fixture_inner(notes, |_session| {})
+}
+
+/// Like [`fixture`], but lets tests configure the real Session before the
+/// facade opens it (history budgets, etc.).
+pub fn fixture_with_session(
+    notes: &[(&str, &str)],
+    configure: impl FnOnce(&flavite_vault::session::Session),
+) -> Fixture {
+    fixture_inner(notes, configure)
+}
+
+fn fixture_inner(
+    notes: &[(&str, &str)],
+    configure: impl FnOnce(&flavite_vault::session::Session),
+) -> Fixture {
     let fs = std::sync::Arc::new(MemFs::new());
     let root = PathBuf::from("/test/semantic-links");
     fs.create_dir_all(&root).expect("vault root");
@@ -141,6 +157,7 @@ pub fn fixture(notes: &[(&str, &str)]) -> Fixture {
         },
         Some(data_dir.path().to_path_buf()),
     );
+    configure(&session);
     let mut flavite = Flavite::open(identity, session, VaultConfig::default()).expect("facade");
     // Vault-rooted stores (settings, themes, layout) live on the fixture's
     // MemFs: the vault identity root is a virtual path (RFC-0007).

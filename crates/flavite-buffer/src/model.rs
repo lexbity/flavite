@@ -23,6 +23,7 @@ use ropey::{Rope, RopeSlice};
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::budget::Budget;
 use crate::eol::EolTable;
 use crate::revision::{BaseHash, BufferId, Revision};
 use crate::undo::{EditOp, UndoTree};
@@ -157,6 +158,44 @@ pub enum BatchError {
     CharBoundary { at: usize },
     /// Two edits overlap after ordering (or two empty edits share a start).
     Overlapping { at: usize },
+    /// The retained-history budget would be exceeded. Refused before any
+    /// mutation (FEUX-0002 X01 / E-12).
+    LimitExceeded { needed: u64, budget: u64 },
+}
+
+/// Refusal of a recorded (editor-annotated) batch. The refusal happens
+/// before any state change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedBatchError {
+    /// The edit batch itself was refused.
+    Batch(BatchError),
+    /// The recorded editor metadata (origin, selections) was invalid.
+    InvalidForm(String),
+    /// The retained-history budget would be exceeded. Refused before any
+    /// mutation.
+    LimitExceeded { needed: u64, budget: u64 },
+}
+
+impl From<BatchError> for RecordedBatchError {
+    fn from(error: BatchError) -> Self {
+        match error {
+            BatchError::LimitExceeded { needed, budget } => Self::LimitExceeded { needed, budget },
+            other => Self::Batch(other),
+        }
+    }
+}
+
+impl std::fmt::Display for RecordedBatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Batch(error) => write!(f, "Invalid edit batch: {error:?}"),
+            Self::InvalidForm(message) => f.write_str(message),
+            Self::LimitExceeded { needed, budget } => write!(
+                f,
+                "History memory budget exceeded: this edit needs ~{needed} bytes; the limit is {budget} bytes. Reduce or save the note to free history memory."
+            ),
+        }
+    }
 }
 
 /// A fully prepared batch candidate (D-06/TD-7): the single combined edit
@@ -1017,24 +1056,97 @@ impl EditorModel {
         match policy {
             crate::undo::UndoPolicy::Context { origin } => {
                 let batch = self.prepare_batch(edits)?;
-                Ok(self.install_prepared_inner(batch, Some(origin)))
+                let projected = crate::budget::account_node(
+                    batch.undo_snapshot.text().len(),
+                    batch.op.replacement.len(),
+                    &[],
+                    &[],
+                );
+                let lease = self.reserve_history(projected)?;
+                let revision = self.install_prepared_inner(batch, Some(origin));
+                self.undo_tree.release(&lease);
+                Ok(revision)
             }
             crate::undo::UndoPolicy::Isolated => {
                 let batch = self.prepare_batch(edits)?;
-                Ok(self.install_prepared(batch))
+                let projected = crate::budget::account_node(
+                    batch.undo_snapshot.text().len(),
+                    batch.op.replacement.len(),
+                    &[],
+                    &[],
+                );
+                let lease = self.reserve_history(projected)?;
+                let revision = self.install_prepared(batch);
+                self.undo_tree.release(&lease);
+                Ok(revision)
             }
             crate::undo::UndoPolicy::Typing => {
                 if let Some(error) = self.batch_error(edits) {
                     return Err(error);
                 }
-                // Precondition (documented): `edits` just validated clean
-                // against this exact text, so `apply_edit_ops_inner`'s own
-                // refusal cannot trigger. That check stays in place for the
-                // other callers — the prepared-edits invariants do not
-                // weaken; this path simply pays for it once.
-                Ok(self.apply_edit_ops(edits))
+                let projected = self.history_projection(edits, None).unwrap_or(0);
+                let lease = self.reserve_history(projected)?;
+                let revision = self.apply_edit_ops(edits);
+                self.undo_tree.release(&lease);
+                Ok(revision)
             }
         }
+    }
+
+    /// Reserve history bytes for one prospective node against the buffer
+    /// budget. Refusal is complete and precedes any mutation.
+    fn reserve_history(&mut self, projected: u64) -> Result<crate::undo::Lease, BatchError> {
+        self.undo_tree
+            .reserve(projected, crate::undo::wall_clock_ms())
+            .map_err(|limit| BatchError::LimitExceeded {
+                needed: limit.needed,
+                budget: limit.budget,
+            })
+    }
+
+    /// The history bytes a batch would cost if installed as one new node:
+    /// after-snapshot text + combined replacement text + recorded selection
+    /// sets + fixed metadata. Returns `None` for an invalid/empty batch.
+    /// Used by Session for the app-wide admission check; the per-buffer
+    /// reserve uses the prepared candidate when available.
+    #[must_use]
+    pub fn history_projection(
+        &self,
+        edits: &[EditOp],
+        record: Option<&crate::history::EditorEdit>,
+    ) -> Option<u64> {
+        if edits.is_empty() {
+            return None;
+        }
+        let text = self.text();
+        let mut ordered = edits.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|edit| (edit.range.start.0, edit.range.end.0));
+        for edit in &ordered {
+            if edit.range.start.0 > edit.range.end.0 || edit.range.end.0 > text.len() {
+                return None;
+            }
+        }
+        let start = ordered[0].range.start.0;
+        let end = ordered.last().map_or(start, |edit| edit.range.end.0);
+        let mut replacement = String::new();
+        let mut cursor = start;
+        for edit in &ordered {
+            replacement.push_str(&text[cursor..edit.range.start.0]);
+            replacement.push_str(&edit.replacement);
+            cursor = edit.range.end.0;
+        }
+        replacement.push_str(&text[cursor..end]);
+        let after_len = start + replacement.len() + (text.len() - end);
+        let (before, after) = match record {
+            Some(record) => (&record.before[..], &record.after[..]),
+            None => (&[][..], &[][..]),
+        };
+        Some(crate::budget::account_node(
+            after_len,
+            replacement.len(),
+            before,
+            after,
+        ))
     }
 
     /// Validate the text and recorded selections before installing either.
@@ -1043,21 +1155,37 @@ impl EditorModel {
         edits: &[EditOp],
         policy: crate::undo::UndoPolicy,
         record: crate::history::EditorEdit,
-    ) -> Result<Revision, String> {
+    ) -> Result<Revision, RecordedBatchError> {
         let batch = self
             .prepare_batch(edits)
-            .map_err(|e| format!("Invalid edit batch: {e:?}"))?;
+            .map_err(RecordedBatchError::from)?;
         record
             .validate(self.text(), batch.undo_snapshot.text())
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| RecordedBatchError::InvalidForm(e.to_string()))?;
         if let crate::undo::UndoPolicy::Context { origin } = policy
             && u128::from_str_radix(&record.origin, 16).ok() != Some(origin)
         {
-            return Err("Recorded editor origin does not match the undo group".into());
+            return Err(RecordedBatchError::InvalidForm(
+                "Recorded editor origin does not match the undo group".into(),
+            ));
         }
+        let projected = crate::budget::account_node(
+            batch.undo_snapshot.text().len(),
+            batch.op.replacement.len(),
+            &record.before,
+            &record.after,
+        );
+        let lease = match self.reserve_history(projected) {
+            Ok(lease) => lease,
+            Err(BatchError::LimitExceeded { needed, budget }) => {
+                return Err(RecordedBatchError::LimitExceeded { needed, budget });
+            }
+            Err(_) => unreachable!("prepare succeeded; only the limit refusal remains"),
+        };
         self.apply_text_edit(&batch.op);
         self.undo_tree
             .apply_recorded(batch.op, batch.undo_snapshot, policy, record);
+        self.undo_tree.release(&lease);
         self.revision = self.revision.next();
         self.is_dirty = true;
         Ok(self.revision)
@@ -1070,6 +1198,47 @@ impl EditorModel {
     ) -> Result<crate::history::HistoryPage, crate::history::HistoryError> {
         self.undo_tree
             .history_page(self.history_epoch, cursor, limit)
+    }
+
+    /// The active retained-history budget.
+    #[must_use]
+    pub fn history_budget(&self) -> Budget {
+        self.undo_tree.budget()
+    }
+
+    /// Replace the active retained-history budget (tests, configuration).
+    pub fn set_history_budget(&mut self, budget: Budget) {
+        self.undo_tree.set_budget(budget);
+    }
+
+    /// Accounted retained-history bytes for this buffer.
+    #[must_use]
+    pub fn history_accounted_bytes(&self) -> u64 {
+        self.undo_tree.accounted_bytes()
+    }
+
+    /// Retained history node count.
+    #[must_use]
+    pub fn history_nodes(&self) -> u64 {
+        self.undo_tree.account().nodes
+    }
+
+    /// Nodes evicted since the buffer (re)started.
+    #[must_use]
+    pub fn history_evicted_total(&self) -> u64 {
+        self.undo_tree.evicted_total()
+    }
+
+    /// Smallest surviving history node id; every smaller id was evicted.
+    #[must_use]
+    pub fn history_retained_watermark(&self) -> u64 {
+        self.undo_tree.retained_watermark()
+    }
+
+    /// Ids of all surviving history nodes, ascending (test/diagnostic).
+    #[must_use]
+    pub fn history_survivor_ids(&self) -> Vec<u64> {
+        self.undo_tree.survivor_ids()
     }
 
     /// One validated head movement; never replay intermediate states or touch
@@ -1089,7 +1258,14 @@ impl EditorModel {
                 node.editor.as_ref().map(|r| r.after.clone())
             }
         });
-        // Allocate all replacement state before moving the head.
+        // Protect the restore target from budget eviction for the install
+        // window; released on completion and on every error exit.
+        let protection = self
+            .undo_tree
+            .protect_token(target.node, crate::undo::wall_clock_ms());
+        // Allocate all replacement state before moving the head. Nothing
+        // below is fallible; the lease window remains the backstop even if
+        // an unexpected panic interrupts the release.
         let text = snapshot.text().to_owned();
         let rope = Rope::from_str(&text);
         let table = EolTable::from_snapshot(&snapshot);
@@ -1104,6 +1280,7 @@ impl EditorModel {
         }
         self.revision = self.revision.next();
         self.is_dirty = self.base_hash != Some(BaseHash::from_snapshot(&snapshot));
+        self.undo_tree.unprotect(protection);
         Ok(self.revision)
     }
 

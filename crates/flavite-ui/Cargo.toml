@@ -20,6 +20,7 @@ flavite-graph = { path = "../flavite-graph" }
 flavite-api = { path = "../flavite-api" }
 flavite-buffer = { path = "../flavite-buffer" }
 flavite-editor = { path = "../flavite-editor" }
+flavite-edit-context = { path = "../flavite-edit-context" }
 # Canonical boundary primitives (TextByte coordinates) used by native input
 # admission through the editor's re-exports (RFC-0006 §4.1).
 flavite-syntax = { path = "../flavite-syntax" }

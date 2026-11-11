@@ -119,7 +119,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         app.appearance.scheme(),
         app.appearance.theme_semantic(),
     );
-    if context_mode == flavite_editor::context::ContextMode::Command {
+    if context_mode == flavite_edit_context::ContextMode::Command {
         editor_colors.selection = iced::Color {
             a: 0.4,
             ..editor_colors.autocomplete_accent
@@ -149,7 +149,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         ))
         .with_keyboard_enabled(!crate::host::note_search::blocks_typing(app, &tab)
             && !app.context_mode.history.open
-            && !app.context_mode.session.as_ref().is_some_and(|s|s.tab==tab && s.menu.is_some()))
+            && !app.context_mode.session.as_ref().is_some_and(|s|s.tab==tab && s.state.menu().is_some()))
         .with_input_intents(move |input| Message::EditorInput {
             tab,
             incarnation,
@@ -177,12 +177,12 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                         .filter(|target| crate::host::context_mode::available(
                             app,
                             *target,
-                            flavite_editor::context::ContextCommand::Toggle
+                            flavite_edit_context::ContextCommand::Toggle
                         ))
                         .map(|target| {
                             Message::ContextMode(crate::host::context_mode::ContextMessage::Run(
                                 target,
-                                flavite_editor::context::ContextCommand::Toggle,
+                                flavite_edit_context::ContextCommand::Toggle,
                             ))
                         })
                 ),
@@ -250,7 +250,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             .on_double_click(Message::ContextMode(
                 crate::host::context_mode::ContextMessage::Run(
                     target,
-                    flavite_editor::context::ContextCommand::Exit,
+                    flavite_edit_context::ContextCommand::Exit,
                 ),
             ))
             .into()
