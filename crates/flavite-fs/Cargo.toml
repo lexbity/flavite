@@ -23,7 +23,7 @@ uuid = { version = "1", features = ["v7"] }
 # lock; the dependency is Linux-only so other platforms keep an honest
 # Unsupported (never an unlink+rename emulation).
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "0.38", features = ["fs"] }
+rustix = { version = "1.1", features = ["fs"] }
 
 cap-std = "4"
 
