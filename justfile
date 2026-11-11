@@ -215,18 +215,30 @@ msrv:
 
 # Network-denied test run (§10.3, AC-26): build first, then run tests under
 # unshare with no network. A seeded connection attempt must fail the assertion.
+# Ubuntu 24.04+/26.04 block unprivileged user namespaces (AppArmor), so plain
+# `unshare -n` fails with EPERM on current GitHub runners; fall back to
+# creating the netns via passwordless sudo and dropping back to the invoking
+# user inside it with setpriv, so the tests still run unprivileged.
 network-denied:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo test --workspace --locked --no-run
     echo "=== network-denied: running tests under unshare -n ==="
-    if command -v unshare >/dev/null 2>&1; then
-        unshare -n cargo test --workspace || {
-            echo "network-denied: tests failed under network namespace"
-            exit 1
-        }
-    else
-        echo "network-denied: unshare not available, skipping (CI provides it)"
+    run_denied() {
+        if command -v unshare >/dev/null 2>&1 && unshare -n true 2>/dev/null; then
+            unshare -n cargo test --workspace
+        elif command -v sudo >/dev/null 2>&1 && sudo -n unshare -n true 2>/dev/null; then
+            sudo -n unshare -n setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups \
+                env HOME="$HOME" PATH="$PATH" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+                cargo test --workspace
+        else
+            echo "network-denied: unshare not available/permitted on this host, skipping (CI provides it)"
+            return 0
+        fi
+    }
+    if ! run_denied; then
+        echo "network-denied: tests failed under network namespace"
+        exit 1
     fi
 
 # Coverage check (§10.5): requires lcov.info from `cargo llvm-cov`.
@@ -254,6 +266,12 @@ cov-check lcov="target/llvm-cov/lcov.info":
 # prototype target). Smoke runs copy only tracked, unignored seeds into a
 # fresh corpus so the large ignored corpora never load inside a smoke window.
 # 30 s per target locally; G1 uses fuzz-smoke-ci (60 s).
+# All fuzz recipes pin --target x86_64-unknown-linux-gnu: cargo-fuzz defaults
+# to x86_64-unknown-linux-musl, but current nightlies hard-error on
+# -Zsanitizer=address with statically linked musl ("sanitizer is incompatible
+# with statically linked libc") and the musl std is not installed by the
+# minimal toolchain profile. The host gnu target is always present and
+# asan-compatible.
 fuzz-smoke:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -269,7 +287,7 @@ fuzz-smoke:
             cp "$seed" "$corpus_dir/$(basename "$seed")"
         done < <(git ls-files -z --cached --others --exclude-standard -- "corpus/$target" "seeds/$target")
         echo "=== fuzz-smoke: $target (30s) ==="
-        if ! cargo +nightly fuzz run "$target" "$corpus_dir" -- -max_total_time=30 -rss_limit_mb=4096; then
+        if ! cargo +nightly fuzz run "$target" --target x86_64-unknown-linux-gnu "$corpus_dir" -- -max_total_time=30 -rss_limit_mb=4096; then
             echo "FUZZ SMOKE FAILED: $target"
             failed=1
         fi
@@ -282,7 +300,7 @@ fuzz-build:
     #!/usr/bin/env bash
     set -euo pipefail
     cd fuzz
-    cargo +nightly fuzz build
+    cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
 
 # G1 variant: 60 s per target (§10.3).
 fuzz-smoke-ci:
@@ -300,7 +318,7 @@ fuzz-smoke-ci:
             cp "$seed" "$corpus_dir/$(basename "$seed")"
         done < <(git ls-files -z --cached --others --exclude-standard -- "corpus/$target" "seeds/$target")
         echo "=== fuzz-smoke-ci: $target (60s) ==="
-        if ! cargo +nightly fuzz run "$target" "$corpus_dir" -- -max_total_time=60 -rss_limit_mb=4096; then
+        if ! cargo +nightly fuzz run "$target" --target x86_64-unknown-linux-gnu "$corpus_dir" -- -max_total_time=60 -rss_limit_mb=4096; then
             echo "FUZZ SMOKE FAILED: $target"
             if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
                 echo "- ❌ fuzz smoke failed: \`$target\` (crash artifact in fuzz/artifacts/)" >> "$GITHUB_STEP_SUMMARY"
