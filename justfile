@@ -155,12 +155,21 @@ gate: fmt clippy test fault-tests lint-arch arch-check workspace-contracts
 fault-tests:
     cargo test -p flavite-vault --features fault --locked journal::executor
 
-# G1 — CI gate (§10.3): G0 + doc build + deny/audit/shear + coverage floors +
-# network-denied + MSRV + fuzz compile + fuzz smoke 60 s.
+# G1 — CI gate (§10.3): G0 + the three G1 extra groups below.
+# The extras are named recipes so CI runs each group on a FRESH runner with
+# its own disk budget instead of stacking every build into one target/ (the
+# single linux-extras job died with ENOSPC during `cc` linking on 2026-11-11).
+# Local `just ci-gate` runs gate + all three groups verbatim, and CI runs
+# exactly these recipes, so CI == local at the recipe level (D-9).
 # Order: cheapest, highest-signal checks first; the expensive instrumented
 # coverage build and the 60 s-per-target fuzz smoke run last, so a cheap
 # failure fails fast (audit 2026-11-08, C2/D-9).
-ci-gate: gate
+ci-gate: gate ci-extras-supply-chain ci-extras-coverage ci-extras-msrv-fuzz
+    @echo "G1 passed."
+
+# G1 extras group 1 — doc build + supply-chain metadata checks (deny/audit/
+# shear). No instrumented build; cheapest group, runs first.
+ci-extras-supply-chain:
     @echo "=== G1: doc build ==="
     just doc
     @echo "=== G1: cargo-deny ==="
@@ -169,19 +178,32 @@ ci-gate: gate
     cargo audit
     @echo "=== G1: cargo-shear ==="
     cargo shear
+
+# G1 extras group 2 — instrumented coverage build (the heaviest disk user:
+# full-workspace llvm-cov artifacts) + coverage floors + network-denied test
+# run. `just gc` between the two reclaims the instrumented build before the
+# network-denied rebuild (§10.10).
+ci-extras-coverage:
     @echo "=== G1: coverage ==="
     mkdir -p target/llvm-cov
     cargo llvm-cov --workspace --locked --lcov --output-path target/llvm-cov/lcov.info
     just cov-check
+    @echo "=== G1: reclaim disk (gc) before network-denied rebuild ==="
+    just gc
     @echo "=== G1: network-denied ==="
     just network-denied
+
+# G1 extras group 3 — MSRV check + fuzz compile + fuzz smoke 60 s/target.
+# `just gc` after the MSRV check so the fuzz workspace builds into freed space.
+ci-extras-msrv-fuzz:
     @echo "=== G1: MSRV build ==="
     just msrv
+    @echo "=== G1: reclaim disk (gc) before fuzz build ==="
+    just gc
     @echo "=== G1: fuzz build (all targets compile) ==="
     just fuzz-build
     @echo "=== G1: fuzz smoke (60 s/target) ==="
     just fuzz-smoke-ci
-    @echo "G1 passed."
 
 # Build documentation with warnings as errors (§10.4).
 doc:

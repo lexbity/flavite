@@ -3,7 +3,7 @@
 # were removed on 2026-11-09:
 #   - fuzz-long: 1 h per fuzz target, one matrix leg each (D-10/FR-10). The
 #     per-PR drift gate (`just fuzz-build`) and the 60 s/target smoke run
-#     live in ci.yml's linux-extras job.
+#     live in ci.yml's linux-extras-msrv-fuzz job.
 #   - bench-scale: the 50k-note release-mode perf gate (FR-17), home of the
 #     wall-clock tests quarantined out of the per-PR gate.
 #
