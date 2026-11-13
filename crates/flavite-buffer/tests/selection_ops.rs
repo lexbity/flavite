@@ -3,9 +3,8 @@
 //! find-char's typed no-op.
 
 use flavite_buffer::selection::{
-    FindCharError, RawSelection, SelectionSet, SetError, add_carets, containing_line,
-    find_char, flip_selections, invert_selections, rotate_primary, toggle_caret,
-    trim_selections,
+    FindCharError, RawSelection, SelectionSet, SetError, add_carets, containing_line, find_char,
+    flip_selections, invert_selections, rotate_primary, toggle_caret, trim_selections,
 };
 
 fn set_of(text: &str, members: &[(usize, usize)]) -> SelectionSet {
@@ -27,9 +26,21 @@ fn rotate_primary_advances_and_wraps() {
     let set = SelectionSet::normalize(
         text,
         vec![
-            RawSelection { id: Some(1), anchor: 0, head: 3 },
-            RawSelection { id: Some(2), anchor: 4, head: 7 },
-            RawSelection { id: Some(3), anchor: 8, head: 13 },
+            RawSelection {
+                id: Some(1),
+                anchor: 0,
+                head: 3,
+            },
+            RawSelection {
+                id: Some(2),
+                anchor: 4,
+                head: 7,
+            },
+            RawSelection {
+                id: Some(3),
+                anchor: 8,
+                head: 13,
+            },
         ],
         Some(2),
     )
@@ -70,15 +81,16 @@ fn flip_selections_swaps_direction_and_keeps_identity() {
     .0;
     let flipped = flip_selections(text, &set).unwrap();
     assert_eq!(flipped.len(), 2);
-    assert_eq!(flipped.primary_id().as_raw(), 5, "primary identity survives");
+    assert_eq!(
+        flipped.primary_id().as_raw(),
+        5,
+        "primary identity survives"
+    );
     let primary = flipped.primary();
     assert_eq!((primary.anchor(), primary.head()), (3, 0), "anchor↔head");
     // The already-backward member flips forward.
     let owned = flipped.members();
-    let other = owned
-        .iter()
-        .find(|m| m.id().as_raw() == 6)
-        .unwrap();
+    let other = owned.iter().find(|m| m.id().as_raw() == 6).unwrap();
     assert_eq!((other.anchor(), other.head()), (4, 6));
 }
 
@@ -155,7 +167,10 @@ fn toggle_caret_adds_removes_and_never_empties() {
     assert_eq!(lone.len(), 1);
     let added = toggle_caret(text, &back, 0).unwrap();
     assert_eq!(added.len(), 2);
-    assert_eq!(toggle_caret(text, &set, 99), Err(SetError::OutOfBounds { at: 99 }));
+    assert_eq!(
+        toggle_caret(text, &set, 99),
+        Err(SetError::OutOfBounds { at: 99 })
+    );
 }
 
 #[test]
@@ -184,10 +199,17 @@ fn find_char_scans_from_each_head_and_refuses_whole() {
     let text = "one two one";
     let set = set_of(text, &[(0, 0)]);
     let found = find_char(text, &set, true, 'o', false).unwrap();
-    assert_eq!(found.primary().head(), 6, "forward scan skips the head's grapheme");
+    assert_eq!(
+        found.primary().head(),
+        6,
+        "forward scan skips the head's grapheme"
+    );
     // Backward from byte 0 finds nothing: the whole command refuses.
     let error = find_char(text, &set, false, 'e', false).unwrap_err();
-    assert!(matches!(error, FindCharError::NotFound), "backward finds nothing");
+    assert!(
+        matches!(error, FindCharError::NotFound),
+        "backward finds nothing"
+    );
     // Extend keeps the anchor.
     let ranged = set_of(text, &[(4, 4)]);
     let extended = find_char(text, &ranged, true, 'o', true).unwrap();
@@ -206,5 +228,9 @@ fn containing_line_includes_the_break() {
     let text = "ab\ncd\n";
     assert_eq!(containing_line(text, 0), (0, 3));
     assert_eq!(containing_line(text, 1), (0, 3));
-    assert_eq!(containing_line(text, 4), (3, 6), "last line keeps its break");
+    assert_eq!(
+        containing_line(text, 4),
+        (3, 6),
+        "last line keeps its break"
+    );
 }

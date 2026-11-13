@@ -430,6 +430,7 @@ pub struct EditorPasteArgs {
 /// snapshot, normalize the set, plan, and dispatch through the Session
 /// single-writer apply. Zero-effect plans (no ops) consume the activation
 /// and return an unchanged revision (AC-8).
+#[allow(clippy::too_many_arguments)]
 fn handle_ticketed_edit(
     session: &Session,
     buffer_id: u64,
@@ -457,10 +458,9 @@ fn handle_ticketed_edit(
             return Err("UnknownOperation".into());
         }
     }
-    let snapshot = match session.shared_buffer_snapshot(
-        BufferId::from(buffer_id),
-        Some(Revision::new(revision)),
-    ) {
+    let snapshot = match session
+        .shared_buffer_snapshot(BufferId::from(buffer_id), Some(Revision::new(revision)))
+    {
         Ok(snapshot) => snapshot,
         Err(error) => {
             session.complete_editor_operation(&operation, Outcome::Cancelled);
@@ -670,8 +670,7 @@ pub(crate) fn handle_select_word(
         .members()
         .iter()
         .map(|member| {
-            let (anchor, head) =
-                flavite_edit_context::word_bounds(&snapshot.text, member.head());
+            let (anchor, head) = flavite_edit_context::word_bounds(&snapshot.text, member.head());
             RawSelection {
                 id: Some(member.id().as_raw()),
                 anchor,
@@ -802,12 +801,8 @@ pub(crate) fn handle_toggle_caret(
     let args: EditorToggleCaretArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
     let set = normalize_set(&snapshot.text, &args.selections)?;
-    let toggled = flavite_buffer::selection::toggle_caret(
-        &snapshot.text,
-        &set,
-        args.position,
-    )
-    .map_err(|error| error.to_string())?;
+    let toggled = flavite_buffer::selection::toggle_caret(&snapshot.text, &set, args.position)
+        .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &toggled))
 }
 
@@ -922,14 +917,9 @@ pub(crate) fn handle_find_char(
     };
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
     let set = normalize_set(&snapshot.text, &args.selections)?;
-    let found = flavite_buffer::selection::find_char(
-        &snapshot.text,
-        &set,
-        forward,
-        target,
-        args.extend,
-    )
-    .map_err(|error| error.to_string())?;
+    let found =
+        flavite_buffer::selection::find_char(&snapshot.text, &set, forward, target, args.extend)
+            .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &found))
 }
 
@@ -944,19 +934,12 @@ pub struct EditorAddCaretsArgs {
     positions: Vec<usize>,
 }
 
-fn handle_add_carets(
-    session: &Session,
-    invocation: &Invocation,
-) -> Result<SessionResult, String> {
+fn handle_add_carets(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
     let args: EditorAddCaretsArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
     let set = normalize_set(&snapshot.text, &args.selections)?;
-    let merged = flavite_buffer::selection::add_carets(
-        &snapshot.text,
-        &set,
-        &args.positions,
-    )
-    .map_err(|error| error.to_string())?;
+    let merged = flavite_buffer::selection::add_carets(&snapshot.text, &set, &args.positions)
+        .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &merged))
 }
 
@@ -994,7 +977,11 @@ pub(crate) fn handle_rotate_primary(
     let forward = match args.direction.as_str() {
         "next" => true,
         "previous" => false,
-        other => return Err(format!("direction must be `next` or `previous`, got {other}")),
+        other => {
+            return Err(format!(
+                "direction must be `next` or `previous`, got {other}"
+            ));
+        }
     };
     let rotated = flavite_buffer::selection::rotate_primary(&set, forward);
     Ok(selections_changed(args.buffer_id, args.revision, &rotated))
@@ -1015,6 +1002,15 @@ macro_rules! selection_only_set_op {
     };
 }
 
-selection_only_set_op!(handle_flip_selections, flavite_buffer::selection::flip_selections);
-selection_only_set_op!(handle_trim_selections, flavite_buffer::selection::trim_selections);
-selection_only_set_op!(handle_invert_selections, flavite_buffer::selection::invert_selections);
+selection_only_set_op!(
+    handle_flip_selections,
+    flavite_buffer::selection::flip_selections
+);
+selection_only_set_op!(
+    handle_trim_selections,
+    flavite_buffer::selection::trim_selections
+);
+selection_only_set_op!(
+    handle_invert_selections,
+    flavite_buffer::selection::invert_selections
+);

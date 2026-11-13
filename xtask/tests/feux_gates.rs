@@ -423,6 +423,205 @@ fn x03_gate_passes_clean_tree_and_rejects_kernel_forgery() {
     );
 }
 
+fn seed_x04_inputs(root: &Path) {
+    seed_x03_inputs(root);
+    // Presence targets for the X04 surface.
+    seed_file(
+        root,
+        "crates/flavite-editor/src/selections.rs",
+        "pub struct EditorSelections {}\npub fn escape_collapse() {}\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-editor/tests/multi_selection.rs",
+        "// editor multi-selection oracle\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/tests/multi_selection.rs",
+        "// ui multi-selection tests\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/src/host/editor_clipboard.rs",
+        "// clipboard seam\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/src/views/note.rs",
+        "fn footer() { let member_count = 1; }\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/src/views/context_toolbar.rs",
+        "fn caption() { let member_count = 1; }\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/src/accessibility/tree.rs",
+        "fn describe() { let _ = \"{} selections, primary {} to {}\"; }\n",
+    );
+    // Widget live state: no single anchor/caret field access, but the
+    // set-backed state and the viewport-window member loop exist.
+    seed_file(
+        root,
+        "crates/flavite-editor/src/widget.rs",
+        "pub struct EditorWidget { selections: EditorSelections }\npub fn draw() { let visible_members = 0; }\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/src/style/tokens.rs",
+        "pub const selection_muted: u8 = 0;\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/src/app.rs",
+        "const LINK_GUARD: &str = \"Choose one caret to insert a link\";\n",
+    );
+    // The X03 per-file selection-version gates still hold; workspace input
+    // carries the canonical committed set.
+    seed_file(
+        root,
+        "crates/flavite-workspace/src/input.rs",
+        "pub struct EditorInteraction { pub selection_version: u64 }\n",
+    );
+}
+
+#[test]
+fn x04_gate_passes_clean_tree_and_rejects_single_selection_regressions() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_x04_inputs(temp.path());
+    let clean = run_gate(temp.path(), "X04");
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // Resurrected single-selection live-state access in the widget fails.
+    seed_file(
+        temp.path(),
+        "crates/flavite-editor/src/widget.rs",
+        "pub struct EditorWidget { selections: EditorSelections }\npub fn draw() { let _ = state.caret; }\n",
+    );
+    assert!(!run_gate(temp.path(), "X04").status.success());
+    seed_file(
+        temp.path(),
+        "crates/flavite-editor/src/widget.rs",
+        "pub struct EditorWidget { selections: EditorSelections }\npub fn draw() { let visible_members = 0; }\n",
+    );
+
+    // An inline clipboard effect outside the seam fails.
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/src/host/context_mode.rs",
+        "fn run() { let _ = iced::clipboard::read(); }\n",
+    );
+    assert!(!run_gate(temp.path(), "X04").status.success());
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/src/host/context_mode.rs",
+        "pub selection_version: u64,\n",
+    );
+
+    // A second regex engine in the planner fails.
+    seed_file(
+        temp.path(),
+        "crates/flavite-buffer/src/commands.rs",
+        "fn plan() { let _ = regex::Regex::new(\"a\"); }\n",
+    );
+    assert!(!run_gate(temp.path(), "X04").status.success());
+    seed_file(
+        temp.path(),
+        "crates/flavite-buffer/src/commands.rs",
+        "pub fn plan() {}\n",
+    );
+
+    // Removing the muted channel fails presence.
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/src/style/tokens.rs",
+        "pub const accent: u8 = 0;\n",
+    );
+    assert!(!run_gate(temp.path(), "X04").status.success());
+}
+
+fn seed_x05_inputs(root: &Path) {
+    seed_x04_inputs(root);
+    seed_file(
+        root,
+        "crates/flavite-ui/tests/editor_catalog.rs",
+        "fn seeded_missing_row_fails_the_enumeration() {}\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-edit-context/tests/transitions.rs",
+        "// transition matrix\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-buffer/tests/selection_ops.rs",
+        "// selection ops\n",
+    );
+    seed_file(
+        root,
+        "scripts/tests/workbench/context_mode_setops.py",
+        "import common\n",
+    );
+    // Session state carries AwaitChar.
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/session.rs",
+        "pub fn reduce() {}\npub enum Event {}\npub enum Effect {}\npub struct AwaitChar {}\n",
+    );
+}
+
+#[test]
+fn x05_gate_passes_clean_tree_and_rejects_a_second_regex_engine() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_x05_inputs(temp.path());
+    let clean = run_gate(temp.path(), "X05");
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // A regex engine sneaking into the editor fails.
+    seed_file(
+        temp.path(),
+        "crates/flavite-editor/src/widget.rs",
+        "use regex::Regex;\npub struct EditorWidget { selections: EditorSelections }\npub fn draw() { let visible_members = 0; }\n",
+    );
+    assert!(!run_gate(temp.path(), "X05").status.success());
+    seed_file(
+        temp.path(),
+        "crates/flavite-editor/src/widget.rs",
+        "pub struct EditorWidget { selections: EditorSelections }\npub fn draw() { let visible_members = 0; }\n",
+    );
+
+    // Losing AwaitChar fails presence.
+    seed_file(
+        temp.path(),
+        "crates/flavite-edit-context/src/session.rs",
+        "pub fn reduce() {}\npub enum Event {}\npub enum Effect {}\n",
+    );
+    assert!(!run_gate(temp.path(), "X05").status.success());
+    seed_file(
+        temp.path(),
+        "crates/flavite-edit-context/src/session.rs",
+        "pub fn reduce() {}\npub enum Event {}\npub enum Effect {}\npub struct AwaitChar {}\n",
+    );
+
+    // Losing the enumeration gate fails presence.
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/tests/editor_catalog.rs",
+        "// no enumeration\n",
+    );
+    assert!(!run_gate(temp.path(), "X05").status.success());
+}
+
 #[test]
 fn feux_gate_rejects_unknown_or_unimplemented_slices() {
     let temp = tempfile::tempdir().unwrap();
@@ -432,7 +631,7 @@ fn feux_gate_rejects_unknown_or_unimplemented_slices() {
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown slice"));
     // Future phases are not yet implemented: requiring them is a hard
     // failure, never a silent pass.
-    let future = run_gate(temp.path(), "X04");
+    let future = run_gate(temp.path(), "X06");
     assert!(!future.status.success());
     assert!(String::from_utf8_lossy(&future.stderr).contains("not implemented yet"));
 }

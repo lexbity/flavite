@@ -42,9 +42,8 @@ fn action(
                 *app.appearance.metrics(),
                 icon,
                 command.title(),
-                context_mode::available(app, target.clone(), command).then_some({
-                    Message::ContextMode(ContextMessage::Run(target, command))
-                }),
+                context_mode::available(app, target.clone(), command)
+                    .then_some(Message::ContextMode(ContextMessage::Run(target, command))),
             ),
         ),
     )
@@ -77,9 +76,14 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
         / metrics.scale;
     let mode = app.context_mode.mode(target.tab);
     let plan = ContextLayout::new(width);
-    let mut actions = row![action(app, target.clone(), ContextCommand::Exit, Icon::Close)]
-        .spacing(layout::GAP * metrics.scale)
-        .align_y(alignment::Vertical::Center);
+    let mut actions = row![action(
+        app,
+        target.clone(),
+        ContextCommand::Exit,
+        Icon::Close
+    )]
+    .spacing(layout::GAP * metrics.scale)
+    .align_y(alignment::Vertical::Center);
     if plan.shows_state() {
         actions = actions.push(observed(
             target.tab,
@@ -99,8 +103,18 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
     }
     if plan.command_visible(ContextCommand::Undo) {
         actions = actions
-            .push(action(app, target.clone(), ContextCommand::Undo, Icon::Undo))
-            .push(action(app, target.clone(), ContextCommand::Redo, Icon::Redo));
+            .push(action(
+                app,
+                target.clone(),
+                ContextCommand::Undo,
+                Icon::Undo,
+            ))
+            .push(action(
+                app,
+                target.clone(),
+                ContextCommand::Redo,
+                Icon::Redo,
+            ));
     }
     if plan.command_visible(ContextCommand::Commands) {
         actions = actions.push(action(
@@ -119,7 +133,12 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
         actions = actions.push(menu_button(app, target, ContextMenu::Type));
     }
     if plan.command_visible(ContextCommand::Find) {
-        actions = actions.push(action(app, target.clone(), ContextCommand::Find, Icon::Search));
+        actions = actions.push(action(
+            app,
+            target.clone(),
+            ContextCommand::Find,
+            Icon::Search,
+        ));
     }
     if plan.command_visible(ContextCommand::History) {
         actions = actions.push(observed(
@@ -171,8 +190,7 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
         format!("{count} char{}", if count == 1 { "" } else { "s" })
     };
     let effect = context_mode::effect_caption(app, target.tab);
-    let detail =
-        crate::views::editor_history::strip(app, target.clone(), summary, caption, effect);
+    let detail = crate::views::editor_history::strip(app, target.clone(), summary, caption, effect);
     observed(
         target.tab,
         "toolbar",
@@ -188,11 +206,7 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
     )
 }
 
-fn menu_button<'a>(
-    app: &App,
-    target: &EditorTarget,
-    menu: ContextMenu,
-) -> Element<'a, Message> {
+fn menu_button<'a>(app: &App, target: &EditorTarget, menu: ContextMenu) -> Element<'a, Message> {
     let metrics = app.appearance.metrics();
     let open = app
         .context_mode

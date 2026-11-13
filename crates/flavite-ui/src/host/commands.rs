@@ -507,14 +507,21 @@ pub fn resolved_chord(
 #[must_use]
 pub fn catalog_conflicts(core_ids: &[&str]) -> Vec<String> {
     let mut conflicts = Vec::new();
+    // The `workspace.*` namespace is UI-owned; the core registry must never
+    // claim it (its commands are dispatched by the shell, not the Session).
     for core in core_ids {
-        if *core == "workspace.quick_switch" || core.starts_with("workspace.") {
+        if core.starts_with("workspace.") {
             conflicts.push((*core).to_owned());
         }
     }
+    // Duplicate ids within the UI palette are always defects. Core ids that
+    // overlap `editor.*` palette entries are NOT: FEUX-0002 E-7/§6 gives
+    // each editor command one canonical id whose executor lives in the core
+    // registry and whose palette entry routes to that same executor through
+    // `dispatch` — same feature, same id, not an ambiguity.
     let mut seen = std::collections::BTreeSet::new();
     for command in ui_specs(&Default::default()) {
-        if !seen.insert(command.id) || core_ids.contains(&command.id) {
+        if !seen.insert(command.id) {
             conflicts.push(command.id.to_owned());
         }
     }

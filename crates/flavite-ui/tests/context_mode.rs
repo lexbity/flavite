@@ -436,27 +436,23 @@ fn delayed_clipboard_cannot_mutate_after_selection_change_or_mode_exit() {
     let target = EditorTarget::capture(&f.app, tab).unwrap();
     let original = f.app.note_editor_view(tab).unwrap();
     selection(&mut f.app, tab, 4, 9);
-    let _ = f
-        .app
-        .update(Message::EditorClipboard(
-            flavite_ui::host::editor_clipboard::ClipboardMessage::ContextPaste {
-                target,
-                generation: 1,
-                text: Some("stale".into()),
-            },
-        ));
+    let _ = f.app.update(Message::EditorClipboard(
+        flavite_ui::host::editor_clipboard::ClipboardMessage::ContextPaste {
+            target,
+            generation: 1,
+            text: Some("stale".into()),
+        },
+    ));
     assert_eq!(f.app.note_editor_view(tab).unwrap().text, original.text);
     run(&mut f.app, tab, Command::Exit);
     let target = EditorTarget::capture(&f.app, tab).unwrap();
-    let _ = f
-        .app
-        .update(Message::EditorClipboard(
-            flavite_ui::host::editor_clipboard::ClipboardMessage::ContextPaste {
-                target,
-                generation: 1,
-                text: Some("stale".into()),
-            },
-        ));
+    let _ = f.app.update(Message::EditorClipboard(
+        flavite_ui::host::editor_clipboard::ClipboardMessage::ContextPaste {
+            target,
+            generation: 1,
+            text: Some("stale".into()),
+        },
+    ));
     assert_eq!(
         f.app.note_editor_view(tab).unwrap().revision,
         original.revision
@@ -816,15 +812,13 @@ fn history_popup_suspends_typing_escape_closes_it_and_exit_stays_available() {
     assert_eq!(f.app.context_mode.mode(tab), ContextMode::Typing);
     type_text(&mut f.app, tab, "not editor input");
     run(&mut f.app, tab, Command::Delete);
-    let _ = f
-        .app
-        .update(Message::EditorClipboard(
-            flavite_ui::host::editor_clipboard::ClipboardMessage::ContextPaste {
-                target: pending_paste.clone(),
-                generation: paste_generation,
-                text: Some("queued paste".into()),
-            },
-        ));
+    let _ = f.app.update(Message::EditorClipboard(
+        flavite_ui::host::editor_clipboard::ClipboardMessage::ContextPaste {
+            target: pending_paste.clone(),
+            generation: paste_generation,
+            text: Some("queued paste".into()),
+        },
+    ));
     let _ = f.app.update(Message::ContextMode(ContextMessage::OpenMenu(
         pending_paste.clone(),
         ContextMenu::Select,

@@ -915,15 +915,38 @@ fn selections_only(
             .map(|[_, a, h]| flavite_workspace::CommittedSelection::new(*a, *h))
             .collect();
         interaction.sequence += 1;
-        let Some(view) = app.note_editor_view(target.tab) else {
-            return None;
-        };
+        let view = app.note_editor_view(target.tab)?;
         if app
             .workspace
             .acknowledge_interaction(interaction, &view.text)
             .is_err()
         {
             app.input_chains.remove(&target.tab);
+        } else {
+            // The selection-only command advanced the committed interaction
+            // sequence; the acknowledged-input chain must track it or the
+            // next captured key is refused by `accepts_context` (the widget
+            // resynchronizes its sequence to the committed interaction every
+            // frame, so it can never outrun it on its own).
+            let sequence = app
+                .workspace
+                .tab(&target.tab)
+                .map_or(1, |v| v.interaction().sequence);
+            let base = app
+                .input_chains
+                .get(&target.tab)
+                .map_or(target.revision, |chain| chain.base());
+            app.input_chains.insert(
+                target.tab,
+                super::input::InputChain::new(
+                    target.incarnation,
+                    target.buffer,
+                    base,
+                    view.revision,
+                    sequence,
+                    None,
+                ),
+            );
         }
     }
     app.reconcile_contexts();
@@ -940,10 +963,12 @@ fn row_targets(app: &App, target: &EditorTarget, rows: i32) -> Result<Vec<usize>
     let Some(view) = app.note_editor_view(target.tab) else {
         return Err("Source changed; command was not applied");
     };
-    let bounds = app.editor_bounds.get(&target.tab).map_or(640.0, |b| b.width);
+    let bounds = app
+        .editor_bounds
+        .get(&target.tab)
+        .map_or(640.0, |b| b.width);
     let metrics = app.appearance.metrics();
-    let width =
-        flavite_editor::widget::wrap_width_for(bounds, metrics.editor_max_line_width());
+    let width = flavite_editor::widget::wrap_width_for(bounds, metrics.editor_max_line_width());
     let motion = VerticalMotion {
         rows,
         width,
@@ -1086,7 +1111,8 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
         }
         ContextMessage::MenuPick => {
             if let Some(s) = &app.context_mode.session
-                && let (Some(command), Some(target)) = (s.state.menu_command(), s.menu_target.clone())
+                && let (Some(command), Some(target)) =
+                    (s.state.menu_command(), s.menu_target.clone())
             {
                 return run(app, target, command);
             }
@@ -1260,43 +1286,41 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         return Task::none();
     };
     let text = &view.text;
-    // Delivered Go-menu motions and Select all stay host-side single-pair
-    // selections (they replace the set whole, which is their set-aware
-    // semantics at every N).
-    match command {
-        SelectAll => {
-            select(app, target.clone(), 0, text.len());
-            return focus(app, target.tab);
-        }
-        LineStart => {
-            let at = text[..target.selection.1].rfind('\n').map_or(0, |i| i + 1);
-            select(app, target.clone(), at, at);
-            return focus(app, target.tab);
-        }
-        LineEnd => {
-            let at = text[target.selection.1..]
-                .find('\n')
-                .map_or(text.len(), |i| target.selection.1 + i);
-            select(app, target.clone(), at, at);
-            return focus(app, target.tab);
-        }
-        DocumentStart => {
-            select(app, target.clone(), 0, 0);
-            return focus(app, target.tab);
-        }
-        DocumentEnd => {
-            select(app, target.clone(), text.len(), text.len());
-            return focus(app, target.tab);
-        }
-        _ => {}
+    // Select all replaces the set whole at every N (set-aware by shape).
+    if command == SelectAll {
+        select(app, target.clone(), 0, text.len());
+        return focus(app, target.tab);
     }
     // Every remaining verb is set-aware through the api translation point
-    // (FEUX-0002 X04, E-1/E-6): the whole captured set rides the command.
+    // (FEUX-0002 X04/X05, E-1/E-6): the whole captured set rides the
+    // command. The Go-menu motions became `editor.move` per-member verbs.
     let typing_entry = command.enters_typing();
     let task = match command {
-        SelectAll | LineStart | LineEnd | DocumentStart | DocumentEnd => {
-            unreachable!("handled by the host-side single-pair motions")
-        }
+        SelectAll => unreachable!("handled by the host-side whole-set select"),
+        LineStart => selections_only_task(
+            app,
+            &target,
+            "editor.move",
+            serde_json::json!({"motion": "line_start"}),
+        ),
+        LineEnd => selections_only_task(
+            app,
+            &target,
+            "editor.move",
+            serde_json::json!({"motion": "line_end"}),
+        ),
+        DocumentStart => selections_only_task(
+            app,
+            &target,
+            "editor.move",
+            serde_json::json!({"motion": "doc_start"}),
+        ),
+        DocumentEnd => selections_only_task(
+            app,
+            &target,
+            "editor.move",
+            serde_json::json!({"motion": "doc_end"}),
+        ),
         SelectLine => {
             selections_only_task(app, &target, "editor.select_line", serde_json::json!({}))
         }
@@ -1304,9 +1328,12 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             selections_only_task(app, &target, "editor.select_word", serde_json::json!({}))
         }
         Collapse => selections_only_task(app, &target, "editor.collapse", serde_json::json!({})),
-        ClearSelection => {
-            selections_only_task(app, &target, "editor.clear_selection", serde_json::json!({}))
-        }
+        ClearSelection => selections_only_task(
+            app,
+            &target,
+            "editor.clear_selection",
+            serde_json::json!({}),
+        ),
         KeepPrimary => {
             selections_only_task(app, &target, "editor.keep_primary", serde_json::json!({}))
         }
@@ -1316,15 +1343,24 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             "editor.rotate_primary",
             serde_json::json!({"direction": "next"}),
         ),
-        FlipSelections => {
-            selections_only_task(app, &target, "editor.flip_selections", serde_json::json!({}))
-        }
-        TrimSelections => {
-            selections_only_task(app, &target, "editor.trim_selections", serde_json::json!({}))
-        }
-        InvertSelections => {
-            selections_only_task(app, &target, "editor.invert_selections", serde_json::json!({}))
-        }
+        FlipSelections => selections_only_task(
+            app,
+            &target,
+            "editor.flip_selections",
+            serde_json::json!({}),
+        ),
+        TrimSelections => selections_only_task(
+            app,
+            &target,
+            "editor.trim_selections",
+            serde_json::json!({}),
+        ),
+        InvertSelections => selections_only_task(
+            app,
+            &target,
+            "editor.invert_selections",
+            serde_json::json!({}),
+        ),
         AddCaretAbove | AddCaretBelow => {
             // The rows are editor-side geometry (E-9/X05): the host computes
             // per-member targets through the same layout the widget paints.
@@ -1357,12 +1393,9 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             }
             focus(app, target.tab)
         }
-        InsertStart => selections_only_task(
-            app,
-            &target,
-            "editor.insert_start",
-            serde_json::json!({}),
-        ),
+        InsertStart => {
+            selections_only_task(app, &target, "editor.insert_start", serde_json::json!({}))
+        }
         InsertEnd => selections_only_task(app, &target, "editor.insert_end", serde_json::json!({})),
         InsertLineStart => selections_only_task(
             app,
@@ -1418,13 +1451,14 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
                 }),
                 Origin::Gui,
             ));
-            let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = result
-            else {
-                app.context_mode
-                    .notice("Copy was refused; source changed");
+            let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = result else {
+                app.context_mode.notice("Copy was refused; source changed");
                 return Task::none();
             };
-            let copied = success.data["text"].as_str().unwrap_or_default().to_string();
+            let copied = success.data["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
             if copied.is_empty() {
                 app.context_mode.notice("Nothing to copy on this last line");
                 return Task::none();
@@ -1449,12 +1483,14 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
                 }),
                 Origin::Gui,
             ));
-            let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = result
-            else {
+            let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = result else {
                 app.context_mode.notice("Nothing to cut on this last line");
                 return Task::none();
             };
-            let copied = success.data["text"].as_str().unwrap_or_default().to_string();
+            let copied = success.data["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
             if copied.is_empty() {
                 app.context_mode.notice("Nothing to cut on this last line");
                 return Task::none();

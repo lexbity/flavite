@@ -166,6 +166,11 @@
     },
     {
       "from": "flavite-api",
+      "to": "flavite-edit-context",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-api",
       "to": "flavite-encoding",
       "kind": "normal"
     },

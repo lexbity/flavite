@@ -12,11 +12,13 @@ use flavite_buffer::state::BufferState;
 use flavite_editor::{
     EditorAction, EditorInteractionSnapshot as Snapshot, EditorView, EditorWidget, focus_editor,
     input::{CapturedInput, PreparedInput, prepare},
-    inspect_focused_editor, keymap::KeyAction, set_focused_editor_selection,
+    inspect_focused_editor,
+    keymap::KeyAction,
+    set_focused_editor_selection,
 };
+use iced::advanced::Widget;
 use iced::advanced::input_method::Event as ImeEvent;
 use iced::advanced::widget::Operation as _;
-use iced::advanced::Widget;
 use std::collections::HashMap;
 
 fn view(text: &str, buffer_id: u64) -> BufferView {
@@ -98,7 +100,13 @@ fn typed(
                     .map(|(id, &(anchor, head))| [id, anchor, head])
                     .collect(),
                 sequence: step as u64 + 3,
-                ..snapshot(editor_view.buffer_id, editor_view.revision, members[0].1, 0, true)
+                ..snapshot(
+                    editor_view.buffer_id,
+                    editor_view.revision,
+                    members[0].1,
+                    0,
+                    true,
+                )
             },
         );
         messages.push(action);

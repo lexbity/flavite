@@ -20,7 +20,7 @@ pub struct ContextState {
     mode: ContextMode,
     menu: Option<ContextMenu>,
     selected: usize,
-    /// The pending find-char capture; `None` outside AwaitChar. A sub-state
+    /// The pending find-char capture; `None` outside `AwaitChar`. A sub-state
     /// of Command, not a mode of its own (E-8: exactly one new state).
     await_char: Option<AwaitChar>,
     message: String,
@@ -58,7 +58,7 @@ pub enum Event {
     RunAdmitted(ContextCommand),
     /// An admitted typing-entry command begins its typing sub-state.
     EnterTyping,
-    /// An admitted find-char command begins the AwaitChar capture (§5.4.1).
+    /// An admitted find-char command begins the `AwaitChar` capture (§5.4.1).
     EnterAwaitChar(AwaitChar),
     /// Escape was admitted while no owned overlay consumed it.
     Escape,
@@ -122,21 +122,24 @@ impl ContextState {
         self.selected
     }
 
-    /// The pending find-char capture, if the statechart is in AwaitChar.
+    /// The pending find-char capture, if the statechart is in `AwaitChar`.
     #[must_use]
     pub const fn await_char(&self) -> Option<AwaitChar> {
         self.await_char
     }
 
-    /// Enter AwaitChar (§5.4.1 row 5): the state row shows the capture hint.
+    /// Enter `AwaitChar` (§5.4.1 row 5): the state row shows the capture hint.
     pub fn begin_await_char(&mut self, request: AwaitChar) {
-        debug_assert!(self.mode.active(), "AwaitChar entry requires an active mode");
+        debug_assert!(
+            self.mode.active(),
+            "AwaitChar entry requires an active mode"
+        );
         self.await_char = Some(request);
         self.message = Self::AWAIT_CHAR_HINT.into();
         self.attention = false;
     }
 
-    /// Resolve or cancel the AwaitChar capture; returns whether one was
+    /// Resolve or cancel the `AwaitChar` capture; returns whether one was
     /// pending.
     pub fn end_await_char(&mut self) -> bool {
         self.await_char.take().is_some()

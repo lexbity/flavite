@@ -2421,16 +2421,15 @@ impl App {
                         return task;
                     }
                     ContextEvent::Key(key) => {
-                        let task =
-                            crate::host::context_mode::native_key(self, target.clone(), key);
+                        let task = crate::host::context_mode::native_key(self, target.clone(), key);
                         crate::host::input::remember_context(self, target, &request);
                         return task;
                     }
-                    ContextEvent::Command(command) => {
-                        ContextMessage::Run(target.clone(), command)
-                    }
+                    ContextEvent::Command(command) => ContextMessage::Run(target.clone(), command),
                     ContextEvent::Menu(menu) => ContextMessage::OpenMenu(target.clone(), menu),
-                    ContextEvent::EnterAt(selection) => ContextMessage::EnterAt(target.clone(), selection),
+                    ContextEvent::EnterAt(selection) => {
+                        ContextMessage::EnterAt(target.clone(), selection)
+                    }
                     ContextEvent::Unbound => ContextMessage::Unbound(target.clone()),
                 };
                 let task = crate::host::context_mode::handle(self, message);
@@ -4105,19 +4104,21 @@ impl App {
             self.status = "Open a vault before inserting links".into();
             return;
         };
-        let Some((tab, incarnation, buffer_id, revision, caret)) = self.valid_writing_target()
-        else {
-            self.status = "Writing target: none — focus an editor caret to insert a link".into();
-            return;
-        };
         // Link insertion is a single-caret act (FEUX-0002 FR-9): a multi-
-        // member set has no one insertion point.
+        // member set has no one insertion point. Checked before the writing
+        // target (which only exists for single carets) so the refusal names
+        // the actual cause.
         if self
             .workspace
-            .tab(&tab)
+            .tab(&self.workspace.focused_tab())
             .is_some_and(|view| view.interaction().selections.len() > 1)
         {
             self.status = "Choose one caret to insert a link.".into();
+            return;
+        }
+        let Some((tab, incarnation, buffer_id, revision, caret)) = self.valid_writing_target()
+        else {
+            self.status = "Writing target: none — focus an editor caret to insert a link".into();
             return;
         };
         if self

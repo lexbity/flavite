@@ -196,7 +196,9 @@ impl EditorSelections {
                     })
                     .collect();
                 let hint = self.set.primary_id();
-                if let Ok((kept, _)) = SelectionSet::normalize(text, candidates, Some(hint.as_raw())) {
+                if let Ok((kept, _)) =
+                    SelectionSet::normalize(text, candidates, Some(hint.as_raw()))
+                {
                     let count = kept.len();
                     self.set = kept;
                     self.preferred_x = vec![None; count];

@@ -242,6 +242,18 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         ),
         None => state.to_owned(),
     };
+    // OFF-state count (FEUX-0002 FR-13): with Context Mode off, a
+    // surviving multi-member set is shown as a non-color count in the
+    // footer alongside the save/format state.
+    let member_count = app
+        .workspace
+        .tab(&tab)
+        .map_or(0, |view| view.interaction().selections.len());
+    let state = if !context_mode.active() && member_count > 1 {
+        format!("{member_count} selections · {state}")
+    } else {
+        state.to_owned()
+    };
     let footer = container(text(state).size(metrics.text_sm).style(style::dim_text))
         .height(24)
         .padding([4, 12]);

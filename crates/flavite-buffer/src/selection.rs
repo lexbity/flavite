@@ -356,27 +356,35 @@ impl SelectionSet {
         // Second pass: absorb carets that sit inside or on the boundary of a
         // surviving range (regardless of sweep order). Adjacent nonempty
         // ranges are untouched.
+        //
+        // The survivor ranges are sorted by `from` and disjoint, so their
+        // `to` endpoints are non-decreasing. Each caret finds its earliest
+        // containing range by two binary searches instead of a linear scan
+        // (NFR-1: no O(n²) member operations).
+        let ranges: Vec<Candidate> = merged
+            .iter()
+            .copied()
+            .filter(|&(_, a, h)| a.min(h) < a.max(h))
+            .collect();
         let mut absorbed = Vec::with_capacity(merged.len());
-        for (index, &(id, anchor, head)) in merged.iter().enumerate() {
+        for (id, anchor, head) in &merged {
             let caret = anchor.min(head) == anchor.max(head);
             if !caret {
-                absorbed.push((id, anchor, head));
+                absorbed.push((*id, *anchor, *head));
                 continue;
             }
-            let at = anchor;
-            let host = merged.iter().enumerate().find(|(other_index, other)| {
-                let (_, a, h) = **other;
-                *other_index != index && {
-                    let from = a.min(h);
-                    let to = a.max(h);
-                    from < to && at >= from && at <= to
-                }
-            });
-            if let Some((_, host)) = host {
-                let host_id = host.0;
-                remap.insert(id, host_id);
+            let at = *anchor;
+            let host = {
+                // Ranges whose `from` is at or before `at`.
+                let k = ranges.partition_point(|&(_, a, h)| a.min(h) <= at);
+                // The earliest of those whose `to` reaches `at`.
+                let j = ranges[..k].partition_point(|&(_, a, h)| a.max(h) < at);
+                (j < k).then(|| ranges[j])
+            };
+            if let Some((host_id, _, _)) = host {
+                remap.insert(*id, host_id);
             } else {
-                absorbed.push((id, anchor, head));
+                absorbed.push((*id, *anchor, *head));
             }
         }
         // Primary resolution: hint's survivor; else the last surviving member.
@@ -511,6 +519,9 @@ impl SelectionSet {
             } else {
                 (Affinity::Right, Affinity::Right)
             };
+            // O(log m) per endpoint (prefix-sum binary search in
+            // `map_endpoint`), so mapping n members through m edits is
+            // O(n log m + m) — no per-endpoint span scan (NFR-1).
             let anchor = map_endpoint(selection.anchor, edits, anchor_affinity);
             let head = map_endpoint(selection.head, edits, head_affinity);
             if selection.id == self.primary {
@@ -555,12 +566,74 @@ pub fn map_point_through_spans(
     map_endpoint(mapped, &edits, affinity)
 }
 
+/// Map many ascending endpoints through one ascending, non-overlapping span
+/// batch in a single two-pointer pass (NFR-1: O(points + spans), no
+/// per-point span scan). Each point maps with the same rule as
+/// [`map_point_through_spans`]; `points` MUST be non-decreasing.
+#[must_use]
+pub fn map_points_through_spans(
+    points: &[usize],
+    spans: &[crate::history::MovementSpan],
+    affinity: crate::positions::Affinity,
+) -> Vec<usize> {
+    let affinity = match affinity {
+        crate::positions::Affinity::Left => Affinity::Left,
+        crate::positions::Affinity::Right => Affinity::Right,
+    };
+    let mut out = Vec::with_capacity(points.len());
+    let mut shift: isize = 0;
+    let mut i = 0;
+    for &p in points {
+        // Advance every span lying entirely before `p`; accumulate deltas.
+        // A point exactly at an EMPTY span's boundary (start == end == p)
+        // is not consumed — it is the `== start` case (stick right / stay
+        // before), matching `map_endpoint`'s branch order.
+        while i < spans.len() {
+            let start = spans[i].start;
+            let end = shift_pos(spans[i].end, shift);
+            if p < end || (p == end && start == spans[i].end) {
+                break;
+            }
+            shift += spans[i].replacement_len as isize - (spans[i].end - spans[i].start) as isize;
+            i += 1;
+        }
+        let mapped = if i == spans.len() {
+            shift_pos(p, shift)
+        } else {
+            let start = shift_pos(spans[i].start, shift);
+            let end = shift_pos(spans[i].end, shift);
+            if p == start {
+                if affinity == Affinity::Right {
+                    start + spans[i].replacement_len
+                } else {
+                    shift_pos(p, shift)
+                }
+            } else if p < end {
+                if affinity == Affinity::Right {
+                    start + spans[i].replacement_len
+                } else {
+                    start
+                }
+            } else {
+                shift_pos(p, shift)
+            }
+        };
+        out.push(mapped);
+    }
+    out
+}
+
 /// Map one endpoint through an ascending, non-overlapping edit batch
 /// (§5.2). Positions strictly inside a replacement collapse to its start
 /// (left affinity) or its end (right affinity); a position exactly at an
 /// edit's start sticks right under right affinity; under left affinity it
 /// stays before the insertion. Positions at or after an edit's end shift by
 /// its delta.
+///
+/// Sequential per endpoint (the batch semantics with affinity continuation
+/// are not reducible to a simple prefix-sum binary search in the presence
+/// of deletions); batch callers that need O(n + m) whole-set mapping use
+/// [`map_points_through_spans`] or the planner's bulk collapse pass.
 #[must_use]
 fn map_endpoint(mut mapped: usize, edits: &[SpanEdit], affinity: Affinity) -> usize {
     let mut shift: isize = 0;
@@ -599,6 +672,11 @@ fn shift_pos(position: usize, delta: isize) -> usize {
 }
 
 /// Whether `at` is an extended-grapheme boundary in `text`.
+///
+/// Uses the pinned grapheme cursor's local boundary check (constant per
+/// call) rather than a whole-string scan: normalization validates every
+/// member endpoint, so an O(document) scan per endpoint would make a
+/// 10,000-member normalize quadratic in document length (NFR-1).
 #[must_use]
 pub fn is_grapheme_boundary(text: &str, at: usize) -> bool {
     if at > text.len() {
@@ -607,8 +685,13 @@ pub fn is_grapheme_boundary(text: &str, at: usize) -> bool {
     if at == 0 || at == text.len() {
         return true;
     }
-    use unicode_segmentation::UnicodeSegmentation;
-    text.grapheme_indices(true).any(|(index, _)| index == at)
+    if !text.is_char_boundary(at) {
+        return false;
+    }
+    let mut cursor = unicode_segmentation::GraphemeCursor::new(at, text.len(), true);
+    cursor
+        .is_boundary(text, 0)
+        .expect("complete text supplies grapheme context")
 }
 
 /// The `editor.toggle_caret` transform (FEUX-0002 §6, E-14 a11y/programmatic
@@ -698,7 +781,10 @@ pub fn rotate_primary(set: &SelectionSet, forward: bool) -> SelectionSet {
     let hint = set.ordered[next_position].id.as_raw();
     let candidates: Vec<RawSelection> = set.iter().map(raw_of).collect();
     let (rotated, _) = SelectionSet::canonicalize(
-        candidates.into_iter().map(|raw| (raw.id.unwrap(), raw.anchor, raw.head)).collect(),
+        candidates
+            .into_iter()
+            .map(|raw| (raw.id.unwrap(), raw.anchor, raw.head))
+            .collect(),
         Some(hint),
     )
     .expect("rotating a valid set keeps every member");
@@ -877,10 +963,9 @@ pub fn find_char(
         let found = if forward {
             // Search strictly after the grapheme at the head.
             let from =
-                flavite_syntax::text::next_grapheme_boundary(text, TextByte(head.min(text.len()))).0;
-            text[from..]
-                .find(target)
-                .map(|at| from + at)
+                flavite_syntax::text::next_grapheme_boundary(text, TextByte(head.min(text.len())))
+                    .0;
+            text[from..].find(target).map(|at| from + at)
         } else {
             let until = head.min(text.len());
             text[..until].rfind(target)
@@ -907,7 +992,10 @@ pub fn containing_line(text: &str, at: usize) -> (usize, usize) {
     let at = at.min(text.len());
     let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
     let line_end = text[at..].find('\n').map_or(text.len(), |i| at + i);
-    (line_start, (line_end + usize::from(line_end < text.len())).min(text.len()))
+    (
+        line_start,
+        (line_end + usize::from(line_end < text.len())).min(text.len()),
+    )
 }
 
 fn raw_of(member: &Selection) -> RawSelection {

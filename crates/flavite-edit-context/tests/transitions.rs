@@ -102,6 +102,60 @@ fn matrix_typing_and_run_rows_seal_and_clear_via_the_host() {
 }
 
 #[test]
+fn matrix_await_char_rows_enter_resolve_cancel_and_blur() {
+    // Entry (row 5): from Command on FindChar keys the state shows the
+    // capture hint and no effects fire.
+    let mut state = activated();
+    assert_eq!(
+        reduce(
+            &mut state,
+            &Event::EnterAwaitChar(flavite_edit_context::AwaitChar { forward: true }),
+        ),
+        vec![]
+    );
+    assert!(state.await_char().is_some());
+    assert_eq!(state.message(), (ContextState::AWAIT_CHAR_HINT, false));
+    assert_eq!(state.mode(), ContextMode::Command);
+
+    // A produced character resolves (row 6) via the host: ending the
+    // capture returns it and the message returns to the find command.
+    assert!(state.end_await_char());
+    assert!(state.await_char().is_none());
+
+    // Esc cancels (row 7): the capture is cleared, the mode stays, and
+    // the delivered Escape effects fire.
+    let mut state = activated();
+    let _ = reduce(
+        &mut state,
+        &Event::EnterAwaitChar(flavite_edit_context::AwaitChar { forward: false }),
+    );
+    let effects = reduce(&mut state, &Event::Escape);
+    assert!(effects.contains(&Effect::FocusEditor));
+    assert!(state.await_char().is_none());
+    assert_eq!(state.mode(), ContextMode::Command);
+
+    // Blur cancels to Command while retaining the mode (row 13 + §5.4.1).
+    let mut state = activated();
+    let _ = reduce(
+        &mut state,
+        &Event::EnterAwaitChar(flavite_edit_context::AwaitChar { forward: true }),
+    );
+    let effects = reduce(&mut state, &Event::Blur);
+    assert!(state.await_char().is_none());
+    assert_eq!(state.mode(), ContextMode::Command);
+    assert_eq!(effects, vec![Effect::SealTypingGroup]);
+
+    // An admitted run cancels any pending capture (menu interplay).
+    let mut state = activated();
+    let _ = reduce(
+        &mut state,
+        &Event::EnterAwaitChar(flavite_edit_context::AwaitChar { forward: true }),
+    );
+    let _ = reduce(&mut state, &Event::RunAdmitted(ContextCommand::Delete));
+    assert!(state.await_char().is_none());
+}
+
+#[test]
 fn matrix_external_and_reconcile_rows_match_delivered_semantics() {
     // External selection while active: menu closes, typing group seals.
     let mut state = activated();

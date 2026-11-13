@@ -58,8 +58,8 @@ fn control<'a>(
             .style(style::ghost())
             .on_press_maybe(
                 action.map(|action| {
-                Message::EditorHistory(HistoryMessage::Act(source.clone(), action))
-            }),
+                    Message::EditorHistory(HistoryMessage::Act(source.clone(), action))
+                }),
             ),
         move |rect| {
             Message::EditorHistory(HistoryMessage::ControlBounds(source.clone(), name, rect))

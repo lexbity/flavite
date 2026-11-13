@@ -120,14 +120,13 @@ pub fn prepare(
             }
             op => op,
         };
-        let prepared =
-            plan(text, set, &edit_operation).map_err(|_| "Selection changed; place the caret again")?;
+        let prepared = plan(text, set, &edit_operation)
+            .map_err(|_| "Selection changed; place the caret again")?;
         if prepared.ops.is_empty() {
             // Zero-effect (e.g. an empty line's Delete): no history node.
             return Ok(unchanged());
         }
-        let clipboard = (!prepared.fragments.is_empty())
-            .then(|| prepared.fragments.join("\n"));
+        let clipboard = (!prepared.fragments.is_empty()).then(|| prepared.fragments.join("\n"));
         return Ok(PreparedInput::Edit {
             action: EditorAction::Edit {
                 buffer_id: view.buffer_id,
@@ -139,7 +138,8 @@ pub fn prepare(
         });
     }
     if input.action == KeyAction::Copy {
-        let fragments = copy_fragments(text, set).map_err(|_| "Selection changed; place the caret again")?;
+        let fragments =
+            copy_fragments(text, set).map_err(|_| "Selection changed; place the caret again")?;
         return Ok(PreparedInput::Copy {
             text: fragments.join("\n"),
         });
@@ -155,11 +155,7 @@ pub fn prepare(
         let mut members = Vec::with_capacity(set.len());
         let mut preferred_x = Vec::with_capacity(set.len());
         for (index, member) in set.iter().enumerate() {
-            let sticky = input
-                .preferred_x
-                .get(index)
-                .copied()
-                .flatten();
+            let sticky = input.preferred_x.get(index).copied().flatten();
             let (at, column) =
                 crate::navigation::vertical_target(text, member.head(), *vertical, sticky);
             let anchor = if input.extend { member.anchor() } else { at };
@@ -179,9 +175,10 @@ pub fn prepare(
         });
     }
     match input.action {
-        KeyAction::Undo | KeyAction::Redo => Ok(PreparedInput::History(
-            EditorAction::history(view, input.action == KeyAction::Redo),
-        )),
+        KeyAction::Undo | KeyAction::Redo => Ok(PreparedInput::History(EditorAction::history(
+            view,
+            input.action == KeyAction::Redo,
+        ))),
         KeyAction::SelectAll => Ok(PreparedInput::Selection {
             members: vec![(0, text.len())],
         }),

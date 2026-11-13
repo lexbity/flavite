@@ -217,7 +217,10 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
                     id,
                     ContextControl {
                         id,
-                        target: NodeTarget::EditorContextCommand { target: target.clone(), command },
+                        target: NodeTarget::EditorContextCommand {
+                            target: target.clone(),
+                            command,
+                        },
                         label: command.title().into(),
                         bounds: *bounds,
                         enabled: available(app, target.clone(), command),
@@ -243,7 +246,10 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
                     id,
                     ContextControl {
                         id,
-                        target: NodeTarget::EditorContextMenu { target: target.clone(), menu },
+                        target: NodeTarget::EditorContextMenu {
+                            target: target.clone(),
+                            menu,
+                        },
                         label: format!("{} menu", menu.title()),
                         bounds: *bounds,
                         enabled: true,
@@ -261,7 +267,10 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
                         id,
                         ContextControl {
                             id,
-                            target: NodeTarget::EditorContextCommand { target: target.clone(), command },
+                            target: NodeTarget::EditorContextCommand {
+                                target: target.clone(),
+                                command,
+                            },
                             label: command.title().into(),
                             bounds: *bounds,
                             enabled: available(app, target.clone(), command),
@@ -351,7 +360,10 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
                         id,
                         ContextControl {
                             id,
-                            target: NodeTarget::EditorHistory { source: source.clone(), action },
+                            target: NodeTarget::EditorHistory {
+                                source: source.clone(),
+                                action,
+                            },
                             label: label.into(),
                             bounds: *bounds,
                             enabled: true,

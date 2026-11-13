@@ -367,6 +367,7 @@ fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() 
                     width: 500.0,
                     metrics: TypeMetrics::default(),
                 }),
+                preferred_x: Vec::new(),
             },
         });
         assert_eq!(
@@ -490,6 +491,7 @@ fn home_then_vertical_keys_ignore_the_widgets_old_column_before_redraw() {
                     width: 500.0,
                     metrics: TypeMetrics::default(),
                 }),
+                preferred_x: Vec::new(),
             },
         });
         assert_eq!(

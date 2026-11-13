@@ -109,6 +109,7 @@ active = [
     { from = "flavite-api", to = "flavite-index" },
     { from = "flavite-api", to = "flavite-buffer" },
     { from = "flavite-api", to = "flavite-syntax" },
+    { from = "flavite-api", to = "flavite-edit-context" },
     { from = "flavite-api", to = "flavite-fs" },
     # XPI themes: the facade owns installed-theme storage and typed theme
     # commands over the pure package codec; the shell consumes the codec's

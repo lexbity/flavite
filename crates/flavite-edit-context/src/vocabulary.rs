@@ -68,7 +68,9 @@ pub enum ContextCommand {
     /// Line-bounded complement (E-9).
     InvertSelections,
     /// Capture one produced character (`f`/`Shift+F`, E-8).
-    FindChar { forward: bool },
+    FindChar {
+        forward: bool,
+    },
     LineStart,
     LineEnd,
     DocumentStart,

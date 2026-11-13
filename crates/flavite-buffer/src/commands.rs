@@ -271,23 +271,17 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
         }
         EditOperation::InsertAtLineStarts(insertion) => {
             collapse = Some((
-                plan_point_insertions(
-                    &mut planned,
-                    set,
-                    insertion,
-                    |member| line_boundary(text, member.head(), true),
-                ),
+                plan_point_insertions(&mut planned, set, insertion, |member| {
+                    line_boundary(text, member.head(), true)
+                }),
                 Affinity::Right,
             ));
         }
         EditOperation::InsertAtLineEnds(insertion) => {
             collapse = Some((
-                plan_point_insertions(
-                    &mut planned,
-                    set,
-                    insertion,
-                    |member| line_boundary(text, member.head(), false),
-                ),
+                plan_point_insertions(&mut planned, set, insertion, |member| {
+                    line_boundary(text, member.head(), false)
+                }),
                 Affinity::Right,
             ));
         }
@@ -351,25 +345,26 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                     .collect(),
                 None,
             )?;
+            // Bulk two-pointer mapping (NFR-1): the carets are ascending, so
+            // one O(points + spans) pass replaces per-point span scans.
+            let points: Vec<usize> = carets
+                .members()
+                .iter()
+                .map(|member| member.anchor())
+                .collect();
+            let mapped_points = crate::selection::map_points_through_spans(
+                &points,
+                &spans,
+                positions_affinity(*affinity),
+            );
             let mapped: Vec<crate::selection::RawSelection> = carets
                 .members()
                 .iter()
-                .map(|member| {
-                    let anchor = crate::selection::map_point_through_spans(
-                        member.anchor(),
-                        &spans,
-                        positions_affinity(*affinity),
-                    );
-                    let head = crate::selection::map_point_through_spans(
-                        member.head(),
-                        &spans,
-                        positions_affinity(*affinity),
-                    );
-                    crate::selection::RawSelection {
-                        id: Some(member.id().as_raw()),
-                        anchor,
-                        head,
-                    }
+                .zip(mapped_points)
+                .map(|(member, at)| crate::selection::RawSelection {
+                    id: Some(member.id().as_raw()),
+                    anchor: at,
+                    head: at,
                 })
                 .collect();
             let (set, _) = SelectionSet::normalize(&after_text, mapped, None)?;

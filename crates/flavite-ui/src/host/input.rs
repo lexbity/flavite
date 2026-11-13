@@ -280,9 +280,10 @@ fn handle_inner(
         // preceding Home/Left/edit may not have redrawn yet, so the
         // widget's old caret is not authority. Other members keep their
         // captured columns (X04 per-member geometry).
-        let chained = app.input_chains.get(&tab).filter(|_| {
-            own_chain && app.input_chains[&tab].sequence == interaction.sequence
-        });
+        let chained = app
+            .input_chains
+            .get(&tab)
+            .filter(|_| own_chain && app.input_chains[&tab].sequence == interaction.sequence);
         if let Some(chain) = chained {
             *sticky = chain.preferred_x;
         }
@@ -302,11 +303,9 @@ fn handle_inner(
             head: selection.head,
         })
         .collect();
-    let Ok((set, _)) = flavite_buffer::selection::SelectionSet::normalize(
-        &view.text,
-        committed,
-        None,
-    ) else {
+    let Ok((set, _)) =
+        flavite_buffer::selection::SelectionSet::normalize(&view.text, committed, None)
+    else {
         app.input_chains.remove(&tab);
         app.status = "Selection changed; place the caret before continuing".into();
         return iced::Task::none();
@@ -322,6 +321,10 @@ fn handle_inner(
     let mut mutation = None;
     let mut history = false;
     let mut preferred_x: Option<f32> = None;
+    // The recorded before-set is the committed set at capture time (before
+    // any optimistic after-set replaces it) — FEUX-0002 FR-19/E-4.
+    let before_members = interaction.selections.clone();
+    let mut after_members: Option<Vec<(usize, usize)>> = None;
     match prepared {
         PreparedInput::Edit {
             action,
@@ -329,6 +332,7 @@ fn handle_inner(
             clipboard: copied,
         } => {
             mutation = Some(action);
+            after_members = Some(members.clone());
             interaction.selections = members
                 .iter()
                 .map(|&(anchor, head)| CommittedSelection::new(anchor, head))
@@ -376,17 +380,17 @@ fn handle_inner(
             invocation.args["editor"] = serde_json::to_value(EditorEdit {
                 origin: format!("{:032x}", tab.raw()),
                 kind,
-                before: interaction
-                    .selections
+                before: before_members
                     .iter()
                     .enumerate()
                     .map(|(id, s)| [id, s.anchor, s.head])
                     .collect(),
-                after: interaction
-                    .selections
+                after: after_members
+                    .as_ref()
+                    .expect("edit prepared with an after-set")
                     .iter()
                     .enumerate()
-                    .map(|(id, s)| [id, s.anchor, s.head])
+                    .map(|(id, &(anchor, head))| [id, anchor, head])
                     .collect(),
             })
             .expect("history record is serializable");

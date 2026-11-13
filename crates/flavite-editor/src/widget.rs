@@ -110,6 +110,10 @@ impl TypeMetrics {
 pub struct EditorColors {
     /// Selection highlight fill.
     pub selection: Color,
+    /// Muted selection fill for a surviving multi-member set while Context
+    /// Mode is Off (FEUX-0002 FR-13): derived from the same semantic token
+    /// with a lower alpha, never a new palette entry.
+    pub selection_muted: Color,
     /// Editor surface fill (xpi themes: the package's field color; the
     /// built-in palettes keep the shell background).
     pub background: Color,
@@ -140,6 +144,7 @@ impl Default for EditorColors {
         Self {
             background: Color::from_rgb(0.098, 0.114, 0.137),
             selection: Color::from_rgba(0.24, 0.42, 0.67, 0.55),
+            selection_muted: Color::from_rgba(0.24, 0.42, 0.67, 0.22),
             link: Color::from_rgb(0.35, 0.67, 0.98),
             link_unresolved: Color::from_rgb(0.95, 0.48, 0.43),
             link_multiple: Color::from_rgb(0.96, 0.73, 0.32),
@@ -1001,7 +1006,11 @@ impl EditorState {
         let (start, end) = Self::selection_bounds(text, byte, self.selection_unit);
         if let Some(origin) = self.mod_drag {
             // Mod-drag extends the member added at the press into a range.
-            let member = if byte < origin { (end, origin) } else { (origin, end) };
+            let member = if byte < origin {
+                (end, origin)
+            } else {
+                (origin, end)
+            };
             self.selections.set_member_at_point(text, origin, member);
             return;
         }
@@ -1502,6 +1511,14 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             .into_iter()
             .filter(|member| member.start() < visible_end && member.end() > source_start)
             .collect();
+        // OFF-state muted fill (FEUX-0002 FR-13): a surviving multi-member
+        // set renders with the muted channel while Context Mode is off; the
+        // standing count in the note chrome is the non-color redundancy.
+        let selection_fill = if !self.context_mode.active() && state.selections.len() > 1 {
+            self.colors.selection_muted
+        } else {
+            self.colors.selection
+        };
         if !visible_members.is_empty() {
             for run in &runs {
                 let line_start = source_start + line_start_byte(visible_text, run.line_i);
@@ -1524,7 +1541,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                                 border: Border::default(),
                                 ..renderer::Quad::default()
                             },
-                            Background::Color(self.colors.selection),
+                            Background::Color(selection_fill),
                         );
                     }
                 }
@@ -1542,8 +1559,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     (member.anchor(), member.head()),
                     command,
                 )
-                .filter(|effect| effect.implicit && !effect.range.is_empty())
-                else {
+                .filter(|effect| effect.implicit && !effect.range.is_empty()) else {
                     continue;
                 };
                 for rect in command_preview_rects(
@@ -2275,16 +2291,15 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 ) && !modifiers.control()
                     && !modifiers.alt()
                     && !modifiers.logo();
-                if completion_control && self.autocomplete_key(state, &key, shell) {
-                    shell.capture_event();
-                    shell.request_redraw();
-                } else if matches!(key, Key::Named(Named::Escape))
+                let escape_collapse = matches!(key, Key::Named(Named::Escape))
                     && !completion_control
                     && self.context_mode == flavite_edit_context::ContextMode::Off
                     && !modifiers.control()
                     && !modifiers.alt()
                     && !modifiers.logo()
-                    && state.selections.escape_collapse(&self.view.text)
+                    && state.selections.escape_collapse(&self.view.text);
+                if (completion_control && self.autocomplete_key(state, key, shell))
+                    || escape_collapse
                 {
                     shell.capture_event();
                     shell.request_redraw();

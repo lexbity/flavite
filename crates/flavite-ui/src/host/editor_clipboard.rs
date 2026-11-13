@@ -33,7 +33,6 @@ pub enum ClipboardMessage {
 }
 
 /// Read the clipboard for a Context Mode paste (generation-guarded).
-#[must_use]
 pub fn read_for_context_paste(target: EditorTarget, generation: u64) -> Task<Message> {
     iced::clipboard::read().map(move |text| {
         Message::EditorClipboard(ClipboardMessage::ContextPaste {
@@ -46,7 +45,6 @@ pub fn read_for_context_paste(target: EditorTarget, generation: u64) -> Task<Mes
 
 /// Read the clipboard for a captured typing intent (the widget never reads
 /// the platform clipboard; the intent arrives with empty paste text).
-#[must_use]
 pub fn read_for_typing(tab: TabId, incarnation: u64, input: CapturedInput) -> Task<Message> {
     iced::clipboard::read().map(move |text| {
         Message::EditorClipboard(ClipboardMessage::TypingPaste {
@@ -59,7 +57,6 @@ pub fn read_for_typing(tab: TabId, incarnation: u64, input: CapturedInput) -> Ta
 }
 
 /// Write to the clipboard (the join already happened at the copy source).
-#[must_use]
 pub fn write(text: String) -> Task<Message> {
     iced::clipboard::write(text).map(|()| Message::Pump)
 }
@@ -81,9 +78,7 @@ pub fn handle(app: &mut App, message: ClipboardMessage) -> Task<Message> {
                 return Task::none();
             }
             match text {
-                Some(paste) if !paste.is_empty() => {
-                    super::context_mode::paste(app, target, paste)
-                }
+                Some(paste) if !paste.is_empty() => super::context_mode::paste(app, target, paste),
                 _ => {
                     app.context_mode.notice("Clipboard is empty");
                     super::context_mode::focus(app, target.tab)

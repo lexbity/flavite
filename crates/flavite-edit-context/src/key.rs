@@ -81,4 +81,3 @@ pub enum Motion {
     PreviousWord,
     NextWordEnd,
 }
-

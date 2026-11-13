@@ -34,7 +34,10 @@ impl Motion {
     /// Whether this motion needs editor-computed per-member target bytes.
     #[must_use]
     pub const fn is_visual(self) -> bool {
-        matches!(self, Self::LineUp | Self::LineDown | Self::PageUp | Self::PageDown)
+        matches!(
+            self,
+            Self::LineUp | Self::LineDown | Self::PageUp | Self::PageDown
+        )
     }
 }
 
@@ -153,9 +156,9 @@ fn head_target(
         Motion::LineEnd => text[head..].find('\n').map_or(text.len(), |at| head + at),
         Motion::DocStart => 0,
         Motion::DocEnd => text.len(),
-        Motion::LineUp | Motion::LineDown | Motion::PageUp | Motion::PageDown => unreachable!(
-            "visual motions take caller-supplied targets and never reach head_target"
-        ),
+        Motion::LineUp | Motion::LineDown | Motion::PageUp | Motion::PageDown => {
+            unreachable!("visual motions take caller-supplied targets and never reach head_target")
+        }
     }
 }
 

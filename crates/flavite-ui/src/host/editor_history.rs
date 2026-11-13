@@ -285,9 +285,15 @@ pub fn handle(app: &mut App, message: HistoryMessage) -> Task<Message> {
         }
         HistoryMessage::Act(source, action) => {
             if action == HistoryAction::Close {
-                if app.context_mode.history.target.as_ref().is_some_and(|target| {
-                    target.tab == source.tab && target.incarnation == source.incarnation
-                }) {
+                if app
+                    .context_mode
+                    .history
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| {
+                        target.tab == source.tab && target.incarnation == source.incarnation
+                    })
+                {
                     app.context_mode.history.open = false;
                 }
                 return context_mode::resume_focus(app);

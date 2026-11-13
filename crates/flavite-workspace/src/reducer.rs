@@ -588,12 +588,13 @@ impl WorkspaceState {
         // pointer commits, passive movement mappings, and selection-only
         // commands all land through this acknowledgement, while
         // sequence-only updates (focus, scroll) leave it untouched.
-        interaction.selection_version = current
-            .interaction()
-            .selection_version
-            .wrapping_add(u64::from(
-                interaction.selections != current.interaction().selections,
-            ));
+        interaction.selection_version =
+            current
+                .interaction()
+                .selection_version
+                .wrapping_add(u64::from(
+                    interaction.selections != current.interaction().selections,
+                ));
         let focused = interaction.focused;
         // Blur/scroll acknowledgements may advance the interaction sequence
         // without changing the remembered caret. Preserve existing authority

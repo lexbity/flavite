@@ -8,3 +8,4 @@ cc adc02184c4b45744348102bd5f5f5cf0868e7b6bd7a52083a10087187a575a86 # shrinks to
 cc 2a97e7ebc0205765fc403380aeb8c742e4dc6f5e1f5deb0c937c35556dff65e1 # shrinks to text = "aaaaaaaaaaaaaaaaaaaa", count = 7, seed = 4033461043889068905
 cc 1c6ac47b8a9832be29697775c46a7931e9f6f9d068ed9099dfb44a31b2d1754e # shrinks to text = "a", count = 3, seed = 557959341015755263
 cc 622d15a4463cf4f286b9bd6ec0ed47d70385352d1f1f5d364b683628a7512eba # shrinks to text = "aaaaaaaaa", count = 9, seed = 16312373030221082887
+cc ec9ae5cf4d1c195f4a44e906c086f329f787236769bad98e2be158bfcbd44e72 # shrinks to text = "", count = 1, seed = 0

@@ -186,15 +186,87 @@ run_x03_gates() {
     gate assert_present 'MovementSpan' "$root/crates/flavite-buffer/src/history.rs"
 }
 
+run_x04_gates() {
+    run_x03_gates
+    # X04 artifacts exist with real content.
+    local file
+    for file in \
+        crates/flavite-editor/src/selections.rs \
+        crates/flavite-editor/tests/multi_selection.rs \
+        crates/flavite-ui/tests/multi_selection.rs \
+        crates/flavite-ui/src/host/editor_clipboard.rs \
+        crates/flavite-ui/src/views/note.rs \
+        crates/flavite-ui/src/views/context_toolbar.rs \
+        crates/flavite-ui/src/accessibility/tree.rs; do
+        gate assert_nonempty "$root/$file"
+    done
+    # The widget's live state is a set; no single anchor/caret field access
+    # remains on the live state (transient operation structs may carry their
+    # own parameters; the editor state itself must not).
+    gate assert_absent 'state\.(caret|anchor)\b' "$root/crates/flavite-editor/src/widget.rs"
+    gate assert_present 'selections: EditorSelections' "$root/crates/flavite-editor/src/widget.rs"
+    # Mutations route on the whole committed set, never `.first()`.
+    gate assert_absent 'interaction\.selections\.first\(' "$root/crates/flavite-ui/src"
+    # No inline OS-clipboard effects outside the seam (settings' path-copy
+    # is a different surface; the seam itself owns the iced calls).
+    gate assert_absent 'iced::clipboard::(read|write)|iced::Clipboard' \
+        "$root/crates/flavite-editor/src" \
+        "$root/crates/flavite-ui/src/host/context_mode.rs" \
+        "$root/crates/flavite-ui/src/views"
+    # No second regex engine sneaks into editor or planner paths (X04 gate).
+    gate assert_absent 'Regex::new|regex::Regex' \
+        "$root/crates/flavite-editor/src" \
+        "$root/crates/flavite-buffer/src/commands.rs"
+    # N-rendering: viewport-window member loop + primary caret distinction.
+    gate assert_present 'visible_members' "$root/crates/flavite-editor/src/widget.rs"
+    # OFF-state: muted fill channel + non-color count + Esc collapse.
+    gate assert_present 'selection_muted' \
+        "$root/crates/flavite-editor/src/widget.rs" \
+        "$root/crates/flavite-ui/src/style/tokens.rs"
+    gate assert_present 'member_count' \
+        "$root/crates/flavite-ui/src/views/note.rs" \
+        "$root/crates/flavite-ui/src/views/context_toolbar.rs"
+    gate assert_present 'escape_collapse' "$root/crates/flavite-editor/src/selections.rs"
+    # Link insertion refuses at N>1 with the specified message (FR-9).
+    gate assert_present 'Choose one caret to insert a link' "$root/crates/flavite-ui/src/app.rs"
+    # a11y N-selection description.
+    gate assert_present 'selections, primary' "$root/crates/flavite-ui/src/accessibility/tree.rs"
+}
+
+run_x05_gates() {
+    run_x04_gates
+    # X05 artifacts exist with real content.
+    local file
+    for file in \
+        crates/flavite-ui/tests/editor_catalog.rs \
+        crates/flavite-edit-context/tests/transitions.rs \
+        crates/flavite-buffer/tests/selection_ops.rs \
+        scripts/tests/workbench/context_mode_setops.py; do
+        gate assert_nonempty "$root/$file"
+    done
+    # AwaitChar is the one new statechart state (E-8).
+    gate assert_present 'AwaitChar' "$root/crates/flavite-edit-context/src/session.rs"
+    # Find-char is a scan, never a second regex engine (newline-index
+    # scanning for line geometry is not a matcher).
+    gate assert_absent 'Regex::new|regex::Regex' \
+        "$root/crates/flavite-editor/src" \
+        "$root/crates/flavite-edit-context/src"
+    # The catalogue enumeration gate exists (NFR-12).
+    gate assert_present 'seeded_missing_row_fails_the_enumeration' \
+        "$root/crates/flavite-ui/tests/editor_catalog.rs"
+}
+
 case "$slice" in
     X01) run_x01_gates ;;
     X02) run_x02_gates ;;
     X03) run_x03_gates ;;
-    X04|X05|X06|X07|X08)
-        echo "phase ${slice} is not implemented yet; the cumulative gate stops at X03" >&2
+    X04) run_x04_gates ;;
+    X05) run_x05_gates ;;
+    X06|X07|X08)
+        echo "phase ${slice} is not implemented yet; the cumulative gate stops at X05" >&2
         exit 2
         ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03)" >&2; exit 2 ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then
