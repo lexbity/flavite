@@ -400,7 +400,7 @@ mod tests {
         );
         assert_eq!(
             state.menu_command(),
-            Some(ContextCommand::InvertSelections),
+            Some(ContextCommand::SplitSelection),
             "wrap backward lands on the last row"
         );
 

@@ -1316,6 +1316,18 @@ impl Flavite {
                 crate::editor_commands::handle_invert_selections,
             ),
             (
+                "editor.select_matches",
+                "Select all matches of a query",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectMatchesArgs>(),
+                crate::editor_commands::handle_select_matches,
+            ),
+            (
+                "editor.split_selection",
+                "Select the gaps between matches",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectMatchesArgs>(),
+                crate::editor_commands::handle_split_selection,
+            ),
+            (
                 "buffer.history_page",
                 "List editing history",
                 ArgSchema::typed::<EditingHistoryArgs>(),
@@ -2112,6 +2124,8 @@ impl Flavite {
             | "editor.flip_selections"
             | "editor.trim_selections"
             | "editor.invert_selections"
+            | "editor.select_matches"
+            | "editor.split_selection"
             | "editor.issue_operation"
             | "editor.cancel_operation" => invocation
                 .args
@@ -2174,6 +2188,8 @@ impl Flavite {
                 | "editor.flip_selections"
                 | "editor.trim_selections"
                 | "editor.invert_selections"
+                | "editor.select_matches"
+                | "editor.split_selection"
                 | "editor.issue_operation"
                 | "editor.cancel_operation"
         ) {
@@ -2294,6 +2310,9 @@ impl Flavite {
                 "text.prepare_replace"
             }
             SessionResult::Success(crate::session::CommandResult::Found { .. }) => "text.find",
+            SessionResult::Success(crate::session::CommandResult::MatchesCollected { .. }) => {
+                "editor.select_matches"
+            }
             SessionResult::Success(crate::session::CommandResult::SourceFindStarted { .. }) => {
                 "source_find.start"
             }
@@ -2601,6 +2620,24 @@ impl Flavite {
                             "total_matches": total_matches,
                             "next_offset": next_offset,
                             "truncated": truncated,
+                        })
+                    }
+                    crate::session::CommandResult::MatchesCollected {
+                        buffer_id,
+                        revision,
+                        spans,
+                        total_matches,
+                        zero_width_count,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "revision": revision.as_u64(),
+                            "spans": spans
+                                .into_iter()
+                                .map(|(start, end)| [start, end])
+                                .collect::<Vec<[u64; 2]>>(),
+                            "total_matches": total_matches,
+                            "zero_width_count": zero_width_count,
                         })
                     }
                     crate::session::CommandResult::SourceFindStarted {

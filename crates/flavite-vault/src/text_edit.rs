@@ -582,7 +582,7 @@ fn matcher_error(error: flavite_text_search::matcher::MatchError) -> PrepareErro
 /// Map a helper error to the typed prepare error. Deadline is its own
 /// outcome (S03/§6.2); transport-shaped failures keep a stable reason code
 /// so the UI offers the repair and literal matching stays available.
-fn worker_error(error: crate::text_worker::TextWorkerError) -> PrepareError {
+pub(crate) fn worker_error(error: crate::text_worker::TextWorkerError) -> PrepareError {
     use crate::text_worker::TextWorkerError as Worker;
     match error {
         Worker::Failure(flavite_text_search::protocol::FailureCode::Pattern) => {

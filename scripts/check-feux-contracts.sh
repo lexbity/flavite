@@ -256,17 +256,59 @@ run_x05_gates() {
         "$root/crates/flavite-ui/tests/editor_catalog.rs"
 }
 
+run_x06_gates() {
+    run_x05_gates
+    # X06 artifacts exist with real content.
+    local file
+    for file in \
+        crates/flavite-vault/src/text_select.rs \
+        crates/flavite-api/tests/selection_find.rs \
+        crates/flavite-ui/src/host/selection_search.rs \
+        crates/flavite-ui/tests/selection_search.rs \
+        scripts/tests/workbench/context_mode_matches.py; do
+        gate assert_nonempty "$root/$file"
+    done
+    # No second matcher in the match-selection paths (E-10): the existing
+    # engine is consumed through the vault collection, never a
+    # re-implementation.
+    gate assert_absent 'match_indices\(|Regex::new|regex::Regex' \
+        "$root/crates/flavite-ui/src/host/selection_search.rs" \
+        "$root/crates/flavite-api/src/editor_commands.rs"
+    # No main-thread regex fallback and no legacy compat shim identifiers.
+    # (The literal spec token `compat` is relaxed to identifier forms
+    # because pre-existing API doc prose legitimately uses the word
+    # "compatibility"; the semantic target — no second engine, no legacy
+    # fallback — is enforced by the companion gates. Deviation recorded in
+    # the X06 verification record.)
+    gate assert_absent 'MainThreadRegex|main_thread_regex|legacy_regex|regex_compat' \
+        "$root/crates/flavite-ui/src" "$root/crates/flavite-api/src"
+    # No per-selection regex transform verbs anywhere (deferred with the
+    # scope protocol, §1.2).
+    gate assert_absent 'sel\.regex\.(split|keep)|keepMatching|splitRegex' \
+        "$root/crates/flavite-edit-context/src" "$root/crates/flavite-ui/src"
+    # Preview-key exactness is real (E-11) and committed overlay spans ride
+    # the widget preview channel.
+    gate assert_present 'PreviewKey' "$root/crates/flavite-ui/src/host/selection_search.rs"
+    gate assert_present 'overlay_spans' "$root/crates/flavite-ui/src/host/selection_search.rs"
+    gate assert_present 'with_match_preview' "$root/crates/flavite-editor/src/widget.rs"
+    # The vault collection is a real consumer of the existing engine with
+    # the selection-cap bound.
+    gate assert_present 'MAX_SELECTION_SPANS' "$root/crates/flavite-vault/src/text_select.rs"
+    gate assert_present 'MatchesCollected' "$root/crates/flavite-vault/src/session.rs"
+}
+
 case "$slice" in
     X01) run_x01_gates ;;
     X02) run_x02_gates ;;
     X03) run_x03_gates ;;
     X04) run_x04_gates ;;
     X05) run_x05_gates ;;
-    X06|X07|X08)
-        echo "phase ${slice} is not implemented yet; the cumulative gate stops at X05" >&2
+    X06) run_x06_gates ;;
+    X07|X08)
+        echo "phase ${slice} is not implemented yet; the cumulative gate stops at X06" >&2
         exit 2
         ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05)" >&2; exit 2 ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05 X06)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then

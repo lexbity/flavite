@@ -79,6 +79,8 @@ pub struct App {
     /// RFC-0006 S01: per-view literal find/replace state and match pages.
     pub(crate) catalog_host: crate::host::catalog::CatalogHost,
     pub note_search: crate::host::note_search::NoteSearchHost,
+    /// FEUX-0002 X06: match-driven selection drafts/previews (E-10/E-11).
+    pub selection_search: crate::host::selection_search::SelectionSearchHost,
     /// RFC-0006 §6.10: per-tab pending encoding decisions and repairs.
     pub encoding: crate::host::encoding::EncodingHost,
     pub input_chains: BTreeMap<TabId, crate::host::input::InputChain>,
@@ -273,6 +275,8 @@ pub enum Message {
     Encoding(crate::host::encoding::EncodingMessage),
     /// RFC-0006 S01: literal find/replace host messages.
     NoteSearch(crate::host::note_search::NoteSearchMessage),
+    /// FEUX-0002 X06: match-selection host messages.
+    SelectionSearch(crate::host::selection_search::SelectionSearchMessage),
     ToggleNoteMode(TabId),
     RetryReading(TabId),
     ToggleSourcePreview(TabId),
@@ -663,6 +667,7 @@ impl App {
             reading: crate::host::reading::ReadingHost::default(),
             catalog_host: crate::host::catalog::CatalogHost::default(),
             note_search: crate::host::note_search::NoteSearchHost::default(),
+            selection_search: crate::host::selection_search::SelectionSearchHost::default(),
             replace: crate::host::replace::ReplaceHost::default(),
             replace_operations: crate::host::operations::OperationsHost::default(),
             encoding: crate::host::encoding::EncodingHost::default(),
@@ -2454,6 +2459,9 @@ impl App {
             Message::NoteSearch(message) => {
                 return crate::host::note_search::handle(self, message);
             }
+            Message::SelectionSearch(message) => {
+                return crate::host::selection_search::handle(self, message);
+            }
             message @ (Message::ToggleNoteMode(_)
             | Message::RetryReading(_)
             | Message::ToggleSourcePreview(_)
@@ -3768,6 +3776,9 @@ impl App {
         if crate::host::note_search::completion(self, &completion) {
             return;
         }
+        if crate::host::selection_search::completion(self, &completion) {
+            return;
+        }
         if self.replace.observe(&completion) {
             return;
         }
@@ -4744,6 +4755,7 @@ mod tests {
             reading: crate::host::reading::ReadingHost::default(),
             catalog_host: crate::host::catalog::CatalogHost::default(),
             note_search: crate::host::note_search::NoteSearchHost::default(),
+            selection_search: crate::host::selection_search::SelectionSearchHost::default(),
             replace: crate::host::replace::ReplaceHost::default(),
             replace_operations: crate::host::operations::OperationsHost::default(),
             encoding: crate::host::encoding::EncodingHost::default(),

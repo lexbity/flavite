@@ -175,6 +175,9 @@ type ContextToggle<'a> = Box<dyn Fn(&keyboard::Event) -> bool + 'a>;
 pub struct EditorWidget<'a, Message> {
     context_mode: flavite_edit_context::ContextMode,
     context_preview: Option<flavite_edit_context::ContextCommand>,
+    /// Match-selection draft overlay (FEUX-0002 X06/E-11): outline-only,
+    /// never a committed representation.
+    match_preview: Option<Arc<[(usize, usize)]>>,
     on_context: Option<Box<dyn Fn(crate::context::ContextRequest) -> Message + 'a>>,
     context_toggle: Option<ContextToggle<'a>>,
     view: EditorView,
@@ -215,6 +218,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
         Self {
             context_mode: flavite_edit_context::ContextMode::Off,
             context_preview: None,
+            match_preview: None,
             on_context: None,
             context_toggle: None,
             view,
@@ -263,6 +267,14 @@ impl<'a, Message> EditorWidget<'a, Message> {
         command: Option<flavite_edit_context::ContextCommand>,
     ) -> Self {
         self.context_preview = command;
+        self
+    }
+
+    /// Paint a match-selection draft overlay (FEUX-0002 E-11): outline-only
+    /// spans that never mutate the committed set. `None` clears it.
+    #[must_use]
+    pub fn with_match_preview(mut self, spans: Option<Arc<[(usize, usize)]>>) -> Self {
+        self.match_preview = spans;
         self
     }
 
@@ -1590,6 +1602,32 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 }
             }
         }
+        if let Some(spans) = &self.match_preview {
+            // Match-selection draft overlay (FEUX-0002 X06/E-11): outline-
+            // only, viewport-bounded, never a committed representation.
+            for rect in
+                match_preview_rects(visible_text, source_start, &runs, spans, self.type_metrics)
+            {
+                let rect = Rectangle::new(
+                    Point::new(bounds.x + PAD_X + rect.x, bounds.y + PAD_Y + rect.y),
+                    rect.size(),
+                );
+                if let Some(rect) = rect.intersection(&clip) {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: rect,
+                            border: Border {
+                                color: self.colors.text,
+                                width: 1.0,
+                                ..Border::default()
+                            },
+                            ..renderer::Quad::default()
+                        },
+                        Background::Color(Color::TRANSPARENT),
+                    );
+                }
+            }
+        }
         // Use the semantic scanner for link decorations. No markdown parser or
         // second link grammar is embedded in the widget. Spans intersecting
         // each line are collected once per line, not once per glyph.
@@ -2574,6 +2612,84 @@ fn command_preview_rects(
     result
 }
 
+/// Outline rects for a match-selection draft overlay (FEUX-0002 E-11).
+/// `spans` must be sorted ascending; only spans intersecting the visible
+/// source window cost work (partition-point per run, then per-glyph tests),
+/// so paint scales with the viewport, never with N.
+fn match_preview_rects(
+    visible: &str,
+    source_start: usize,
+    runs: &[cosmic_text::LayoutRun<'_>],
+    spans: &[(usize, usize)],
+    metrics: TypeMetrics,
+) -> Vec<Rectangle> {
+    let mut result = Vec::new();
+    for run in runs {
+        let line_start = source_start + line_start_byte(visible, run.line_i);
+        let line_end = line_start + run.text.len();
+        let first = spans.partition_point(|&(_, end)| end <= line_start);
+        let last = spans.partition_point(|&(start, _)| start < line_end);
+        let active = &spans[first..last];
+        if active.is_empty() {
+            continue;
+        }
+        let mut covered: Vec<(f32, f32)> = Vec::new();
+        for glyph in run.glyphs {
+            let glyph_start = line_start + glyph.start;
+            let glyph_end = line_start + glyph.end;
+            if active
+                .iter()
+                .any(|&(start, end)| glyph_end > start && glyph_start < end)
+            {
+                covered.push((glyph.x, glyph.x + glyph.w.max(1.0)));
+            }
+        }
+        if covered.is_empty() {
+            continue;
+        }
+        covered.sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
+        let mut merged: Option<(f32, f32)> = None;
+        for (left, right) in covered {
+            if let Some((_, end)) = &mut merged
+                && left <= *end + 0.5
+            {
+                *end = end.max(right);
+            } else {
+                if let Some((start, end)) = merged {
+                    result.push(Rectangle::new(
+                        Point::new(start, run.line_top),
+                        Size::new(end - start, metrics.line_height),
+                    ));
+                }
+                merged = Some((left, right));
+            }
+        }
+        if let Some((start, end)) = merged {
+            result.push(Rectangle::new(
+                Point::new(start, run.line_top),
+                Size::new(end - start, metrics.line_height),
+            ));
+        }
+    }
+    // Newlines have no glyph; a covered newline still gets a visible cell.
+    for (local, ch) in visible.char_indices() {
+        if ch == '\n' {
+            let absolute = source_start + local;
+            if spans
+                .iter()
+                .any(|&(start, end)| absolute >= start && absolute < end)
+            {
+                let (x, y) = caret_position(runs, visible, local);
+                result.push(Rectangle::new(
+                    Point::new(x, y),
+                    Size::new(metrics.font_size * 0.6, metrics.line_height),
+                ));
+            }
+        }
+    }
+    result
+}
+
 pub(crate) fn caret_position(
     runs: &[cosmic_text::LayoutRun<'_>],
     text: &str,
@@ -2663,6 +2779,41 @@ mod tests {
             rects.iter().any(|rect| rect.y > 0.0),
             "a wrapped line's outline follows its actual rows"
         );
+    }
+
+    #[test]
+    fn match_preview_outlines_cover_their_spans_and_stay_viewport_bounded() {
+        let text = "TODO one\nTODO two\n";
+        let metrics = TypeMetrics::default();
+        let shaped = shape_text(text, 300.0, metrics);
+        let runs = shaped.layout_runs().collect::<Vec<_>>();
+        let spans = [(0, 4), (9, 13)];
+        let rects = match_preview_rects(text, 0, &runs, &spans, metrics);
+        assert!(!rects.is_empty());
+        // Every glyph inside a span has a covering outline; glyphs outside
+        // spans never do.
+        for run in &runs {
+            let line_start = line_start_byte(text, run.line_i);
+            for glyph in run.glyphs {
+                let center = Point::new(
+                    glyph.x + glyph.w / 2.0,
+                    run.line_top + metrics.line_height / 2.0,
+                );
+                let inside = spans.iter().any(|&(start, end)| {
+                    line_start + glyph.end > start && line_start + glyph.start < end
+                });
+                assert_eq!(
+                    rects.iter().any(|rect| rect.contains(center)),
+                    inside,
+                    "glyph at {}",
+                    line_start + glyph.start
+                );
+            }
+        }
+        // Off-screen spans produce no primitives.
+        assert!(match_preview_rects(text, 100, &runs, &[(0, 4)], metrics).is_empty());
+        // An empty list never paints.
+        assert!(match_preview_rects(text, 0, &runs, &[], metrics).is_empty());
     }
     use iced::advanced::widget::Operation as _;
 

@@ -1014,3 +1014,160 @@ selection_only_set_op!(
     handle_invert_selections,
     flavite_buffer::selection::invert_selections
 );
+
+// ---- FEUX-0002 X06: match-driven selection (E-10/E-11) ----
+
+/// The shared query argument for `editor.select_matches` /
+/// `editor.split_selection` (§5.9): literal or regex, case flag.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatchQueryArg {
+    pub text: String,
+    #[serde(default)]
+    pub regex: bool,
+    #[serde(default)]
+    pub case_sensitive: bool,
+}
+
+/// Both match-driven selection commands share one wire shape: a draft
+/// (`apply` omitted/false) requests collection and returns the candidate
+/// spans as a read-only outcome; an apply (`apply: true`) installs the
+/// supplied candidate spans as one canonical set through the selection-only
+/// path (no ticket, no history node, `selection_version` bump).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorSelectMatchesArgs {
+    buffer_id: u64,
+    revision: u64,
+    selections: SelectionSetArg,
+    query: MatchQueryArg,
+    #[serde(default)]
+    apply: bool,
+    /// Canonical candidate spans (half-open byte ranges) echoed back on
+    /// apply. Refused when absent on apply or present on draft.
+    #[serde(default)]
+    spans: Option<Vec<(usize, usize)>>,
+}
+
+fn decode_mode(regex: bool) -> flavite_text_search::matcher::MatchMode {
+    if regex {
+        flavite_text_search::matcher::MatchMode::Regex
+    } else {
+        flavite_text_search::matcher::MatchMode::Literal
+    }
+}
+
+/// `editor.select_matches`: draft collection (async, through the existing
+/// `text.find` engine) or atomic apply of the candidate spans.
+pub(crate) fn handle_select_matches(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    handle_match_selection(session, invocation, true)
+}
+
+/// `editor.split_selection`: the Kakoune `S` complement — draft collection
+/// or atomic apply of the gaps between the candidate matches.
+pub(crate) fn handle_split_selection(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    handle_match_selection(session, invocation, false)
+}
+
+fn handle_match_selection(
+    session: &Session,
+    invocation: &Invocation,
+    select: bool,
+) -> Result<SessionResult, String> {
+    let args: EditorSelectMatchesArgs = decode(invocation)?;
+    let buffer_id = BufferId::from(args.buffer_id);
+    // Both paths validate the committed set against the live snapshot; a
+    // stale capture is refused before any collection or install.
+    let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+    normalize_set(&snapshot.text, &args.selections)?;
+    let mode = decode_mode(args.query.regex);
+    if !args.apply {
+        if args.spans.is_some() {
+            return Err("spans only apply to an apply".into());
+        }
+        if args.query.text.len() > flavite_text_search::matcher::PATTERN_MAX_BYTES {
+            return Err("query is too long".into());
+        }
+        return Ok(session.execute(SessionCommand::SelectMatches {
+            request_id: invocation.request_id,
+            request: flavite_vault::text_select::SelectMatchesRequest {
+                buffer_id,
+                revision: Revision::new(args.revision),
+                query: args.query.text,
+                mode,
+                case_sensitive: args.query.case_sensitive,
+                whole_word: false,
+            },
+        }));
+    }
+    let Some(spans) = args.spans else {
+        return Err("apply needs the candidate spans".into());
+    };
+    if select {
+        apply_select_matches(&snapshot.text, &spans, args.buffer_id, args.revision)
+    } else {
+        apply_split_selection(&snapshot.text, &spans, args.buffer_id, args.revision)
+    }
+}
+
+/// The select apply: refuse zero-width and oversize with observed counts;
+/// otherwise canonicalize the spans into the new set (E-10).
+fn apply_select_matches(
+    text: &str,
+    spans: &[(usize, usize)],
+    buffer_id: u64,
+    revision: u64,
+) -> Result<SessionResult, String> {
+    if spans.is_empty() {
+        return Err("NoMatches".into());
+    }
+    let zero_width = spans.iter().filter(|&&(start, end)| start == end).count();
+    if zero_width > 0 {
+        return Err(format!("ZeroWidthMatches {zero_width}"));
+    }
+    if spans.len() > flavite_buffer::selection::MAX_SELECTIONS {
+        return Err(format!("TooManySelections {}", spans.len()));
+    }
+    let set = flavite_buffer::selection::selection_set_from_spans(text, spans, None)
+        .map_err(|error| error.to_string())?;
+    Ok(selections_changed(buffer_id, revision, &set))
+}
+
+/// The split apply: canonicalize spans first, compute the document-wide
+/// gaps, refuse an empty gap set (`NoGaps`), then install the gap set.
+fn apply_split_selection(
+    text: &str,
+    spans: &[(usize, usize)],
+    buffer_id: u64,
+    revision: u64,
+) -> Result<SessionResult, String> {
+    if spans.is_empty() {
+        return Err("NoMatches".into());
+    }
+    if spans.len() > flavite_buffer::selection::MAX_SELECTIONS {
+        return Err(format!("TooManySelections {}", spans.len()));
+    }
+    let set = flavite_buffer::selection::selection_set_from_spans(text, spans, None)
+        .map_err(|error| error.to_string())?;
+    let members: Vec<(usize, usize)> = set
+        .members()
+        .into_iter()
+        .map(|member| (member.start(), member.end()))
+        .collect();
+    let gaps = flavite_buffer::selection::split_gaps(text, &members);
+    if gaps.is_empty() {
+        return Err("NoGaps".into());
+    }
+    if gaps.len() > flavite_buffer::selection::MAX_SELECTIONS {
+        return Err(format!("TooManySelections {}", gaps.len()));
+    }
+    let gap_set = flavite_buffer::selection::selection_set_from_spans(text, &gaps, None)
+        .map_err(|error| error.to_string())?;
+    Ok(selections_changed(buffer_id, revision, &gap_set))
+}

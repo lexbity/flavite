@@ -31,6 +31,7 @@ pub mod session;
 pub mod source_leases;
 pub mod sync;
 pub mod text_edit;
+pub mod text_select;
 pub mod text_worker;
 pub mod tokens;
 pub mod types;

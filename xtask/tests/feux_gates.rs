@@ -622,6 +622,89 @@ fn x05_gate_passes_clean_tree_and_rejects_a_second_regex_engine() {
     assert!(!run_gate(temp.path(), "X05").status.success());
 }
 
+fn seed_x06_inputs(root: &Path) {
+    seed_x05_inputs(root);
+    seed_file(
+        root,
+        "crates/flavite-vault/src/text_select.rs",
+        "pub const MAX_SELECTION_SPANS: usize = 10001;\npub fn collect_matches() {}\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-api/tests/selection_find.rs",
+        "// selection_find\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/src/host/selection_search.rs",
+        "pub struct PreviewKey {}\npub fn overlay_spans() {}\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/tests/selection_search.rs",
+        "// selection_search\n",
+    );
+    seed_file(
+        root,
+        "scripts/tests/workbench/context_mode_matches.py",
+        "import common\n",
+    );
+    // Session carries the MatchesCollected outcome (the X01 app-wide budget
+    // presence is preserved so the cumulative gates stay green); the edit-
+    // context session keeps the AwaitChar state the X05 gates require.
+    seed_file(
+        root,
+        "crates/flavite-vault/src/session.rs",
+        "pub const APP_WIDE_MAX_HISTORY_BYTES: u64 = 1;\npub struct MatchesCollected {}\npub fn text_select_matches() {}\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-editor/src/widget.rs",
+        "pub struct EditorWidget { selections: EditorSelections }\npub fn with_match_preview() {}\npub fn draw() { let visible_members = 0; }\n",
+    );
+}
+
+#[test]
+fn x06_gate_passes_clean_tree_and_rejects_a_second_matcher() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_x06_inputs(temp.path());
+    let clean = run_gate(temp.path(), "X06");
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // A second matcher sneaking into the selection-search host fails.
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/src/host/selection_search.rs",
+        "use regex::Regex;\npub struct PreviewKey {}\npub fn overlay_spans() { let _ = Regex::new(\"\"); }\n",
+    );
+    assert!(!run_gate(temp.path(), "X06").status.success());
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/src/host/selection_search.rs",
+        "pub struct PreviewKey {}\npub fn overlay_spans() {}\n",
+    );
+
+    // Losing the preview-key presence fails.
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/src/host/selection_search.rs",
+        "pub fn overlay_spans() {}\n",
+    );
+    assert!(!run_gate(temp.path(), "X06").status.success());
+
+    // Losing the vault collection presence fails.
+    seed_file(
+        temp.path(),
+        "crates/flavite-vault/src/text_select.rs",
+        "// no collection\n",
+    );
+    assert!(!run_gate(temp.path(), "X06").status.success());
+}
+
 #[test]
 fn feux_gate_rejects_unknown_or_unimplemented_slices() {
     let temp = tempfile::tempdir().unwrap();
@@ -631,7 +714,7 @@ fn feux_gate_rejects_unknown_or_unimplemented_slices() {
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown slice"));
     // Future phases are not yet implemented: requiring them is a hard
     // failure, never a silent pass.
-    let future = run_gate(temp.path(), "X06");
+    let future = run_gate(temp.path(), "X07");
     assert!(!future.status.success());
     assert!(String::from_utf8_lossy(&future.stderr).contains("not implemented yet"));
 }

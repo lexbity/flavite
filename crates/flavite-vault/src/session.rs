@@ -460,6 +460,12 @@ pub enum SessionCommand {
         request_id: u64,
         request: crate::text_edit::FindRequest,
     },
+    /// Document-wide match collection for match-driven selection (FEUX-0002
+    /// E-10): one worker job per collection, read-only.
+    SelectMatches {
+        request_id: u64,
+        request: crate::text_select::SelectMatchesRequest,
+    },
     /// Install one prepared replacement as one isolated Undo unit (D-06).
     /// Consumed plans replay the same result during the retry window.
     ApplyReplace {
@@ -775,6 +781,17 @@ pub enum CommandResult {
         total_matches: u64,
         next_offset: Option<u64>,
         truncated: bool,
+    },
+    /// A document-wide match collection completed (FEUX-0002 E-10): revision-
+    /// bound ascending spans for match-driven selection, the exact match
+    /// total, and the exact zero-width hit count. Read-only — no mutation
+    /// authority; selection building/refusal belongs to the api layer.
+    MatchesCollected {
+        buffer_id: BufferId,
+        revision: Revision,
+        spans: Vec<(u64, u64)>,
+        total_matches: u64,
+        zero_width_count: u64,
     },
     /// A vault source-find session started (RFC-0006 S07): frozen scope,
     /// exact totals, typed exclusions and the first page.
@@ -1175,6 +1192,9 @@ struct TextJob {
 enum TextWork {
     Prepare(crate::text_edit::ReplaceRequest),
     Find(crate::text_edit::FindRequest),
+    /// Document-wide match collection for `editor.select_matches` /
+    /// `editor.split_selection` (FEUX-0002 E-10).
+    SelectMatches(crate::text_select::SelectMatchesRequest),
 }
 
 /// One finished preparation awaiting registry installation or completion
@@ -1191,6 +1211,12 @@ enum TextOutcomeMessage {
         buffer_id: BufferId,
         revision: Revision,
         outcome: Result<crate::text_edit::FindOutcome, crate::text_edit::PrepareError>,
+    },
+    SelectMatches {
+        request_id: u64,
+        buffer_id: BufferId,
+        revision: Revision,
+        outcome: Result<crate::text_select::MatchCollectionOutcome, crate::text_edit::PrepareError>,
     },
 }
 
@@ -1676,6 +1702,16 @@ impl Session {
                                     revision: request.revision,
                                     outcome: crate::text_edit::prepare_find(&job.text, &request),
                                 },
+                                TextWork::SelectMatches(request) => {
+                                    TextOutcomeMessage::SelectMatches {
+                                        request_id: job.request_id,
+                                        buffer_id: request.buffer_id,
+                                        revision: request.revision,
+                                        outcome: crate::text_select::collect_matches(
+                                            &job.text, &request,
+                                        ),
+                                    }
+                                }
                             };
                             // Sending only fails when the Session is gone;
                             // the result is then unobservable by construction.
@@ -2538,6 +2574,10 @@ impl Session {
                 request_id,
                 request,
             } => self.text_find(request_id, request),
+            SessionCommand::SelectMatches {
+                request_id,
+                request,
+            } => self.text_select_matches(request_id, request),
             SessionCommand::ApplyReplace {
                 buffer_id,
                 revision,
@@ -3847,6 +3887,46 @@ impl Session {
                         request_id,
                         text,
                         work: TextWork::Find(request),
+                    })
+                    .is_ok() =>
+            {
+                self.pending_text.lock_recovering().insert(request_id);
+                SessionResult::Pending { request_id }
+            }
+            _ => SessionResult::Error {
+                message: "find workers are unavailable".into(),
+            },
+        }
+    }
+
+    /// Admit one document-wide match collection (FEUX-0002 E-10): the same
+    /// snapshot admission and bounded worker pool as find; read-only. An
+    /// empty literal query is Idle and never dispatched.
+    fn text_select_matches(
+        &self,
+        request_id: u64,
+        request: crate::text_select::SelectMatchesRequest,
+    ) -> SessionResult {
+        use flavite_text_search::matcher::MatchMode;
+        if request.query.is_empty() && request.mode == MatchMode::Literal {
+            return SessionResult::Error {
+                message: crate::text_edit::IDLE_QUERY.to_owned(),
+            };
+        }
+        let text = match self.snapshot_for_revision(request.buffer_id, request.revision) {
+            Ok(text) => text,
+            Err(result) => return result,
+        };
+        if self.text_queue_full() {
+            return SessionResult::Busy;
+        }
+        match &self.text_jobs {
+            Some(jobs)
+                if jobs
+                    .send(TextJob {
+                        request_id,
+                        text,
+                        work: TextWork::SelectMatches(request),
                     })
                     .is_ok() =>
             {
@@ -5308,6 +5388,38 @@ impl Session {
                                 total_matches: found.total_matches,
                                 next_offset: found.next_offset,
                                 truncated: found.truncated,
+                            })
+                        }
+                        Err(error) => SessionResult::Error {
+                            message: error.message(),
+                        },
+                    };
+                    (request_id, result)
+                }
+                TextOutcomeMessage::SelectMatches {
+                    request_id,
+                    buffer_id,
+                    revision,
+                    outcome,
+                } => {
+                    let result = match outcome {
+                        Ok(collected) => {
+                            let spans = collected
+                                .spans
+                                .into_iter()
+                                .map(|(start, end)| {
+                                    (
+                                        u64::try_from(start).unwrap_or(u64::MAX),
+                                        u64::try_from(end).unwrap_or(u64::MAX),
+                                    )
+                                })
+                                .collect();
+                            SessionResult::Success(CommandResult::MatchesCollected {
+                                buffer_id,
+                                revision,
+                                spans,
+                                total_matches: collected.total_matches,
+                                zero_width_count: collected.zero_width_count,
                             })
                         }
                         Err(error) => SessionResult::Error {

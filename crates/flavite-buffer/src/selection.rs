@@ -15,7 +15,7 @@
 //! - Never empty; at most [`MAX_SELECTIONS`] members; endpoints validated
 //!   against the current text (bounds + extended-grapheme boundaries).
 
-use flavite_syntax::text::TextByte;
+use flavite_syntax::text::{TextByte, next_grapheme_boundary, prev_grapheme_boundary};
 use std::collections::HashMap;
 
 /// Maximum number of members in one canonical selection set (D-4).
@@ -985,6 +985,87 @@ pub fn find_char(
     Ok(found)
 }
 
+/// Expand `(start, end)` outward to the containing extended-grapheme
+/// clusters (FEUX-0002 X06). Match spans are scalar-aligned; selections must
+/// be grapheme-aligned, so a span whose endpoint splits a cluster widens to
+/// cover it whole. Endpoints already on boundaries are unchanged.
+#[must_use]
+pub fn grapheme_expand(text: &str, start: usize, end: usize) -> (usize, usize) {
+    let start = if is_grapheme_boundary(text, start) {
+        start
+    } else {
+        prev_grapheme_boundary(text, TextByte(start)).0
+    };
+    let end = if is_grapheme_boundary(text, end) {
+        end
+    } else {
+        next_grapheme_boundary(text, TextByte(end)).0
+    };
+    (start, end)
+}
+
+/// Build a canonical selection set from raw document-wide match spans
+/// (FEUX-0002 E-10). Spans may be unsorted or overlapping; each is expanded
+/// to grapheme boundaries, and normalization merges collisions
+/// deterministically. The cap is enforced with the observed count.
+///
+/// # Errors
+///
+/// [`SetError::TooMany`] when more than [`MAX_SELECTIONS`] spans are
+/// supplied, [`SetError::OutOfBounds`] on any endpoint outside `text`,
+/// [`SetError::Empty`] for zero spans.
+pub fn selection_set_from_spans(
+    text: &str,
+    spans: &[(usize, usize)],
+    primary_hint: Option<u32>,
+) -> Result<SelectionSet, SetError> {
+    if spans.len() > MAX_SELECTIONS {
+        return Err(SetError::TooMany {
+            observed: spans.len(),
+        });
+    }
+    let candidates: Vec<RawSelection> = spans
+        .iter()
+        .enumerate()
+        .map(|(index, &(start, end))| {
+            if start > text.len() || end > text.len() {
+                return Err(SetError::OutOfBounds {
+                    at: if start > text.len() { start } else { end },
+                });
+            }
+            let (start, end) = grapheme_expand(text, start, end);
+            Ok(RawSelection {
+                id: u32::try_from(index).ok(),
+                anchor: start,
+                head: end,
+            })
+        })
+        .collect::<Result<Vec<_>, SetError>>()?;
+    SelectionSet::normalize(text, candidates, primary_hint).map(|(set, _)| set)
+}
+
+/// The gaps *between* consecutive matches across the whole document
+/// (FEUX-0002 E-10 `split_selection`): leading/trailing gaps are included
+/// only when nonempty; adjacent matches produce no gap; zero-length gaps are
+/// never constructed. Spans must be sorted ascending and non-overlapping
+/// (the matcher's guarantee); the caller validates them.
+#[must_use]
+pub fn split_gaps(text: &str, spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut gaps = Vec::new();
+    let mut cursor = 0usize;
+    for &(start, end) in spans {
+        debug_assert!(start >= cursor, "split_gaps requires ascending spans");
+        if start > cursor {
+            gaps.push((cursor, start));
+        }
+        cursor = end.max(cursor);
+    }
+    if cursor < text.len() {
+        gaps.push((cursor, text.len()));
+    }
+    gaps
+}
+
 /// The delivered `editor.select_line` range: the line containing `at`
 /// including its line break when one follows.
 #[must_use]
@@ -1261,5 +1342,70 @@ mod tests {
             bad_primary.validate_against(text),
             Err(SetError::InvalidPrimary)
         ));
+    }
+
+    // ---- FEUX-0002 X06: match-span set construction (E-10) ----
+
+    #[test]
+    fn selection_set_from_spans_expands_grapheme_boundaries_and_merges() {
+        // "é" is decomposed (e + combining acute): a literal match of "e"
+        // lands mid-grapheme and must widen to the whole cluster.
+        // Decomposed "é" (e + combining acute U+0301, two bytes) so a
+        // literal match of "e" lands mid-grapheme and must widen to the
+        // whole cluster. Bytes: a 0, e 1, U+0301 2..4, space 4, b 5,
+        // space 6, e 7, U+0301 8..10.
+        let text = "a\u{65}\u{301} b \u{65}\u{301}";
+        let (set, _) = SelectionSet::normalize(text, vec![raw(1, 4), raw(7, 10)], None).unwrap();
+        assert_eq!(set.len(), 2);
+        assert_eq!((set.members()[0].start(), set.members()[0].end()), (1, 4));
+        assert_eq!((set.members()[1].start(), set.members()[1].end()), (7, 10));
+        let from_spans = selection_set_from_spans(text, &[(1, 2), (2, 3), (7, 8)], None)
+            .expect("expands and merges");
+        assert_eq!(from_spans.len(), set.len());
+        for (left, right) in from_spans.members().iter().zip(set.members()) {
+            assert_eq!(
+                (left.start(), left.end(), left.anchor(), left.head()),
+                (right.start(), right.end(), right.anchor(), right.head())
+            );
+        }
+    }
+
+    #[test]
+    fn selection_set_from_spans_refuses_cap_and_bounds() {
+        let text = "abcdefghij";
+        let spans: Vec<(usize, usize)> = (0..MAX_SELECTIONS + 1)
+            .map(|i| (i.min(8), i.min(8) + 1))
+            .collect();
+        assert!(matches!(
+            selection_set_from_spans(text, &spans, None),
+            Err(SetError::TooMany { observed }) if observed == MAX_SELECTIONS + 1
+        ));
+        assert!(matches!(
+            selection_set_from_spans(text, &[(0, 2), (9, 100)], None),
+            Err(SetError::OutOfBounds { at: 100 })
+        ));
+        assert!(matches!(
+            selection_set_from_spans(text, &[], None),
+            Err(SetError::Empty)
+        ));
+    }
+
+    #[test]
+    fn split_gaps_never_builds_zero_length_gaps() {
+        let text = "xxaxxbxx";
+        // Matches [0,2] and [3,5]: gaps are (2,3) and (5,8).
+        assert_eq!(split_gaps(text, &[(0, 2), (3, 5)]), vec![(2, 3), (5, 8)]);
+        // Adjacent matches produce no gap between them.
+        assert_eq!(split_gaps(text, &[(0, 2), (2, 3), (3, 5)]), vec![(5, 8)]);
+        // Leading/trailing gaps included only when nonempty.
+        assert_eq!(split_gaps(text, &[(0, 2)]), vec![(2, 8)]);
+        assert_eq!(split_gaps(text, &[(2, 8)]), vec![(0, 2)]);
+        // A match covering the whole document yields no gaps (NoGaps).
+        assert!(split_gaps(text, &[(0, 8)]).is_empty());
+        // Zero-width matches at every scalar: character gaps, never empty.
+        let spans: Vec<(usize, usize)> = (0..=text.len()).map(|i| (i, i)).collect();
+        let gaps = split_gaps(text, &spans);
+        assert_eq!(gaps.len(), text.len());
+        assert!(gaps.iter().all(|&(start, end)| start < end));
     }
 }

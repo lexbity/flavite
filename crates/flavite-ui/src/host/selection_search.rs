@@ -1,0 +1,592 @@
+//! Match-driven selection host (FEUX-0002 E-10/E-11, X06): `editor.select_
+//! matches` / `editor.split_selection` with a preview overlay.
+//!
+//! One host owns the per-view query row, the draft collections (through the
+//! existing `text.find` engine), and the overlay set that paints as an
+//! outline channel without touching the committed set. Drafts are correlated
+//! by an exact [`PreviewKey`]: a stale or out-of-order completion is
+//! rejected by key equality, and a committed change, mode exit or query
+//! edit invalidates the overlay. Apply revalidates the key, runs the
+//! selection-only apply through the api, and installs the returned canonical
+//! set (no ticket, no history node, `selection_version` bump).
+
+use crate::app::{App, Message};
+use crate::host::context_mode::EditorTarget;
+use flavite_api::{ExecutionResult, Invocation, LocalResult, Origin};
+use flavite_workspace::TabId;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+/// The maximum query length (the engine's pattern bound, NFR-8).
+const MAX_QUERY_BYTES: usize = 8192;
+
+/// Which machine the row drives: direct match selection or gap selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyKind {
+    Select,
+    Split,
+}
+
+impl ApplyKind {
+    /// The canonical api command id (one executor per verb, §6).
+    const fn command_id(self) -> &'static str {
+        match self {
+            Self::Select => "editor.select_matches",
+            Self::Split => "editor.split_selection",
+        }
+    }
+}
+
+/// The exact identity a draft is collected under (E-11 §5.7). A completion
+/// is accepted only when every component still matches; any committed
+/// change, mode generation bump, query edit, or selection-version bump
+/// invalidates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewKey {
+    pub view_token: u128,
+    pub mode_generation: u64,
+    pub buffer_id: u64,
+    pub revision: u64,
+    pub selection_version: u64,
+    pub query_version: u64,
+}
+
+impl PreviewKey {
+    /// The current key for `tab`, if the view is live.
+    fn current(app: &App, tab: TabId) -> Option<Self> {
+        let view = app.note_editor_view(tab)?;
+        let interaction = app.workspace.tab(&tab)?.interaction();
+        Some(Self {
+            view_token: tab.raw(),
+            mode_generation: app.context_mode.generation(),
+            buffer_id: view.buffer_id,
+            revision: view.revision,
+            selection_version: interaction.selection_version,
+            query_version: app
+                .selection_search
+                .tabs
+                .get(&tab)
+                .map_or(0, |state| state.query_version),
+        })
+    }
+}
+
+/// The accepted overlay candidate: canonical spans plus the exact totals
+/// from the collection.
+#[derive(Debug, Clone)]
+pub struct Overlay {
+    pub key: PreviewKey,
+    pub spans: Arc<[(usize, usize)]>,
+    pub total_matches: u64,
+    pub zero_width_count: u64,
+}
+
+/// Per-view match-selection row state.
+#[derive(Debug)]
+pub struct SelectionSearchState {
+    pub kind: ApplyKind,
+    pub query_input: iced::widget::text_editor::Content,
+    pub query: String,
+    pub regex: bool,
+    pub case_sensitive: bool,
+    /// The in-flight draft request, if any.
+    pub pending: Option<u64>,
+    /// Bumped on every query/option edit; completions carry it.
+    pub query_version: u64,
+    pub overlay: Option<Overlay>,
+    pub error: Option<String>,
+}
+
+impl SelectionSearchState {
+    fn new(kind: ApplyKind) -> Self {
+        Self {
+            kind,
+            query_input: iced::widget::text_editor::Content::new(),
+            query: String::new(),
+            regex: false,
+            case_sensitive: false,
+            pending: None,
+            query_version: 0,
+            overlay: None,
+            error: None,
+        }
+    }
+}
+
+impl Default for SelectionSearchState {
+    fn default() -> Self {
+        Self::new(ApplyKind::Select)
+    }
+}
+
+/// Host state: one row per tab plus draft request correlation.
+#[derive(Debug, Default)]
+pub struct SelectionSearchHost {
+    pub tabs: BTreeMap<TabId, SelectionSearchState>,
+    requests: BTreeMap<u64, (TabId, PreviewKey)>,
+}
+
+impl SelectionSearchHost {
+    pub(crate) fn detach(&mut self, tab: TabId) {
+        self.tabs.remove(&tab);
+        self.requests.retain(|_, (owner, _)| *owner != tab);
+    }
+}
+
+/// Messages owned by the match-selection host.
+#[derive(Debug, Clone)]
+pub enum SelectionSearchMessage {
+    Open {
+        tab: TabId,
+        kind: ApplyKind,
+    },
+    Close(TabId),
+    DraftAction {
+        tab: TabId,
+        action: iced::widget::text_editor::Action,
+    },
+    ToggleRegex(TabId),
+    ToggleCase(TabId),
+    Apply(TabId),
+}
+
+/// Handle one match-selection message.
+pub fn handle(app: &mut App, message: SelectionSearchMessage) -> iced::Task<Message> {
+    match message {
+        SelectionSearchMessage::Open { tab, kind } => {
+            // A fresh row always starts from the live target; the focus
+            // moves to the query input.
+            {
+                let state = app.selection_search.tabs.entry(tab).or_default();
+                if state.kind != kind {
+                    *state = SelectionSearchState::new(kind);
+                }
+                state.error = None;
+            }
+            request_collection(app, tab);
+            app.refresh_semantics();
+            iced::widget::operation::focus(query_id(tab))
+        }
+        SelectionSearchMessage::Close(tab) => {
+            let _ = app.selection_search.tabs.remove(&tab);
+            app.selection_search
+                .requests
+                .retain(|_, (owner, _)| *owner != tab);
+            app.refresh_semantics();
+            iced::Task::none()
+        }
+        SelectionSearchMessage::DraftAction { tab, action } => {
+            let mut changed = false;
+            {
+                let Some(state) = app.selection_search.tabs.get_mut(&tab) else {
+                    return iced::Task::none();
+                };
+                let before = state.query_input.text();
+                if let iced::widget::text_editor::Action::Edit(
+                    iced::widget::text_editor::Edit::Paste(value),
+                ) = &action
+                    && value.len() > MAX_QUERY_BYTES
+                {
+                    return iced::Task::none();
+                }
+                state.query_input.perform(action);
+                let text = state.query_input.text();
+                if text.len() > MAX_QUERY_BYTES {
+                    state.query_input = iced::widget::text_editor::Content::with_text(&before);
+                    return iced::Task::none();
+                }
+                if state.query != text {
+                    state.query = text;
+                    state.query_version = state.query_version.wrapping_add(1);
+                    state.pending = None;
+                    state.overlay = None;
+                    state.error = None;
+                    changed = true;
+                }
+            }
+            if changed {
+                request_collection(app, tab);
+            }
+            app.refresh_semantics();
+            iced::Task::none()
+        }
+        SelectionSearchMessage::ToggleRegex(tab) => {
+            let mut changed = false;
+            if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+                state.regex = !state.regex;
+                state.query_version = state.query_version.wrapping_add(1);
+                state.pending = None;
+                state.overlay = None;
+                state.error = None;
+                changed = true;
+            }
+            if changed {
+                request_collection(app, tab);
+            }
+            app.refresh_semantics();
+            iced::Task::none()
+        }
+        SelectionSearchMessage::ToggleCase(tab) => {
+            let mut changed = false;
+            if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+                state.case_sensitive = !state.case_sensitive;
+                state.query_version = state.query_version.wrapping_add(1);
+                state.pending = None;
+                state.overlay = None;
+                state.error = None;
+                changed = true;
+            }
+            if changed {
+                request_collection(app, tab);
+            }
+            app.refresh_semantics();
+            iced::Task::none()
+        }
+        SelectionSearchMessage::Apply(tab) => apply(app, tab),
+    }
+}
+
+/// The current overlay spans for the widget preview, only while the key
+/// still matches the live view (the outline never paints stale drafts).
+#[must_use]
+pub fn overlay_spans(app: &App, tab: TabId) -> Option<Arc<[(usize, usize)]>> {
+    let state = app.selection_search.tabs.get(&tab)?;
+    let overlay = state.overlay.as_ref()?;
+    let current = PreviewKey::current(app, tab)?;
+    if current != overlay.key {
+        return None;
+    }
+    Some(overlay.spans.clone())
+}
+
+/// Whether Apply is enabled: an overlay exists and is still key-fresh.
+#[must_use]
+pub fn apply_enabled(app: &App, tab: TabId) -> bool {
+    let Some(state) = app.selection_search.tabs.get(&tab) else {
+        return false;
+    };
+    let Some(overlay) = state.overlay.as_ref() else {
+        return false;
+    };
+    PreviewKey::current(app, tab).as_ref() == Some(&overlay.key)
+}
+
+/// The caption for the toolbar detail line while a row is open.
+#[must_use]
+pub fn caption(app: &App, tab: TabId) -> Option<String> {
+    let state = app.selection_search.tabs.get(&tab)?;
+    if let Some(error) = &state.error {
+        return Some(error.clone());
+    }
+    if state.pending.is_some() {
+        return Some("Collecting matches…".to_owned());
+    }
+    let overlay = state.overlay.as_ref()?;
+    let total = overlay.total_matches;
+    Some(match state.kind {
+        ApplyKind::Select => format!("{total} match{}", if total == 1 { "" } else { "es" }),
+        ApplyKind::Split => {
+            let gaps = overlay.spans.len();
+            format!("{gaps} gap{}", if gaps == 1 { "" } else { "s" })
+        }
+    })
+}
+
+/// Admit a draft through the bounded core worker. An old completion is
+/// accepted only while query/options/revision/version still match exactly.
+fn request_collection(app: &mut App, tab: TabId) {
+    let Some(state) = app.selection_search.tabs.get(&tab) else {
+        return;
+    };
+    if state.query.is_empty() && !state.regex {
+        // Idle, not a match-everywhere search (D-05): clear any stale
+        // overlay.
+        if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+            state.pending = None;
+            state.overlay = None;
+            state.error = None;
+        }
+        return;
+    }
+    let Some(target) = EditorTarget::capture(app, tab) else {
+        return;
+    };
+    let Some(view) = app.note_editor_view(tab) else {
+        return;
+    };
+    let Some(key) = PreviewKey::current(app, tab) else {
+        return;
+    };
+    if app
+        .selection_search
+        .tabs
+        .get(&tab)
+        .is_some_and(|s| s.overlay.as_ref().is_some_and(|overlay| overlay.key == key))
+    {
+        return;
+    }
+    let Some(api) = app.flavite.as_ref() else {
+        return;
+    };
+    let query = app
+        .selection_search
+        .tabs
+        .get(&tab)
+        .map(|s| s.query.clone())
+        .unwrap_or_default();
+    let (regex, case_sensitive) = app
+        .selection_search
+        .tabs
+        .get(&tab)
+        .map(|s| (s.regex, s.case_sensitive))
+        .unwrap_or((false, false));
+    let kind = app
+        .selection_search
+        .tabs
+        .get(&tab)
+        .map(|s| s.kind)
+        .unwrap_or(ApplyKind::Select);
+    let request_id = api.command_registry().next_request_id();
+    let result = api.execute(Invocation::new(
+        request_id,
+        kind.command_id(),
+        serde_json::json!({
+            "buffer_id": view.buffer_id,
+            "revision": view.revision,
+            "selections": target.selections_json(),
+            "query": {
+                "text": query,
+                "regex": regex,
+                "case_sensitive": case_sensitive,
+            },
+        }),
+        Origin::Gui,
+    ));
+    match result {
+        ExecutionResult::Pending { request_id } => {
+            app.operations.accept(request_id, "selection.find");
+            app.selection_search.requests.insert(request_id, (tab, key));
+            if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+                state.pending = Some(request_id);
+                state.error = None;
+            }
+        }
+        ExecutionResult::Local(LocalResult::Success(success)) => {
+            install_collection(app, tab, &key, &success.data);
+        }
+        ExecutionResult::Local(LocalResult::Error(error)) => {
+            if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+                state.pending = None;
+                state.overlay = None;
+                state.error = Some(error.message.clone());
+            }
+        }
+        ExecutionResult::Rejected(rejected) => {
+            if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+                state.pending = None;
+                state.overlay = None;
+                state.error = Some(
+                    rejected
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "Match collection was refused".into()),
+                );
+            }
+        }
+        _ => {
+            if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+                state.pending = None;
+                state.overlay = None;
+                state.error = Some("Match collection could not be admitted; retry".into());
+            }
+        }
+    }
+}
+
+/// Install a completed collection when the key still matches exactly.
+fn install_collection(app: &mut App, tab: TabId, key: &PreviewKey, data: &serde_json::Value) {
+    let current = PreviewKey::current(app, tab);
+    let Some(view) = app.note_editor_view(tab) else {
+        return;
+    };
+    let Some(raw_spans) = data.get("spans").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    if current.as_ref() != Some(key) {
+        // Stale or out-of-order: reject by exact key match (E-11).
+        if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+            state.pending = None;
+            state.overlay = None;
+        }
+        return;
+    }
+    let mut spans = Vec::with_capacity(raw_spans.len());
+    for raw in raw_spans {
+        let Some(pair) = raw.as_array() else {
+            return;
+        };
+        if pair.len() != 2 {
+            return;
+        }
+        let (Some(start), Some(end)) = (pair[0].as_u64(), pair[1].as_u64()) else {
+            return;
+        };
+        let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
+            return;
+        };
+        if start > end
+            || end > view.text.len()
+            || !view.text.is_char_boundary(start)
+            || !view.text.is_char_boundary(end)
+        {
+            return;
+        }
+        spans.push((start, end));
+    }
+    let total_matches = data
+        .get("total_matches")
+        .and_then(serde_json::Value::as_u64);
+    let zero_width_count = data
+        .get("zero_width_count")
+        .and_then(serde_json::Value::as_u64);
+    let (Some(total_matches), Some(zero_width_count)) = (total_matches, zero_width_count) else {
+        return;
+    };
+    if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+        state.pending = None;
+        state.error = None;
+        state.overlay = Some(Overlay {
+            key: key.clone(),
+            spans: Arc::from(spans.into_boxed_slice()),
+            total_matches,
+            zero_width_count,
+        });
+    }
+}
+
+/// Apply the overlay: revalidate the key, then run the selection-only apply
+/// through the api (the same install path as every selection-only verb).
+fn apply(app: &mut App, tab: TabId) -> iced::Task<Message> {
+    let Some(target) = EditorTarget::capture(app, tab) else {
+        return iced::Task::none();
+    };
+    let Some(state) = app.selection_search.tabs.get(&tab) else {
+        return iced::Task::none();
+    };
+    let Some(overlay) = state.overlay.clone() else {
+        app.context_mode.notice("Collect matches before applying");
+        return iced::Task::none();
+    };
+    let current = PreviewKey::current(app, tab);
+    if current.as_ref() != Some(&overlay.key) {
+        // The preview is stale: re-collect instead of applying a stale set.
+        request_collection(app, tab);
+        app.context_mode
+            .notice("Source changed — collecting matches again");
+        return iced::Task::none();
+    }
+    let query = state.query.clone();
+    let regex = state.regex;
+    let case_sensitive = state.case_sensitive;
+    let kind = state.kind;
+    let spans: Vec<(usize, usize)> = overlay.spans.to_vec();
+    let installed = crate::host::context_mode::selections_only(
+        app,
+        &target,
+        kind.command_id(),
+        serde_json::json!({
+            "query": {
+                "text": query,
+                "regex": regex,
+                "case_sensitive": case_sensitive,
+            },
+            "apply": true,
+            "spans": spans,
+        }),
+    );
+    if installed.is_some() {
+        // The committed set replaced the overlay; the row stays open for a
+        // refined query.
+        if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+            state.overlay = None;
+            state.error = None;
+        }
+        app.refresh_semantics();
+    }
+    iced::Task::none()
+}
+
+/// Route one completion; returns whether it belonged to selection search.
+pub fn completion(app: &mut App, completion: &flavite_api::OperationCompletion) -> bool {
+    let Some((tab, key)) = app.selection_search.requests.remove(&completion.request_id) else {
+        return false;
+    };
+    if app.workspace.tab(&tab).is_none() {
+        return true;
+    }
+    let Some(state) = app.selection_search.tabs.get_mut(&tab) else {
+        return true;
+    };
+    if state.pending != Some(completion.request_id) {
+        return true;
+    }
+    state.pending = None;
+    match &completion.result {
+        ExecutionResult::Local(LocalResult::Success(success)) => {
+            install_collection(app, tab, &key, &success.data);
+        }
+        ExecutionResult::Local(LocalResult::Error(error)) => {
+            state.overlay = None;
+            state.error = Some(error.message.clone());
+        }
+        ExecutionResult::Rejected(rejected) => {
+            state.overlay = None;
+            state.error = Some(
+                rejected
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "Match collection was refused".into()),
+            );
+        }
+        _ => {
+            state.overlay = None;
+            state.error = Some("Match collection is stale; search again".into());
+        }
+    }
+    true
+}
+
+/// The query input widget id (focus target).
+#[must_use]
+pub fn query_id(tab: TabId) -> iced::widget::Id {
+    iced::widget::Id::from(format!("selection-search-{:032x}", tab.raw()))
+}
+
+/// Key-binding parity with the find bar: Enter applies, Escape closes.
+pub fn draft_binding(
+    tab: TabId,
+    key: iced::widget::text_editor::KeyPress,
+) -> Option<iced::widget::text_editor::Binding<crate::app::Message>> {
+    use iced::keyboard::{Key, key::Named};
+    use iced::widget::text_editor::Binding;
+    if !matches!(
+        key.status,
+        iced::widget::text_editor::Status::Focused { .. }
+    ) {
+        return None;
+    }
+    if key.key == Key::Named(Named::Enter) {
+        if key.modifiers.alt() {
+            return Some(Binding::Enter);
+        }
+        return Some(Binding::Custom(crate::app::Message::SelectionSearch(
+            SelectionSearchMessage::Apply(tab),
+        )));
+    }
+    if key.key == Key::Named(Named::Escape) {
+        return Some(Binding::Custom(crate::app::Message::SelectionSearch(
+            SelectionSearchMessage::Close(tab),
+        )));
+    }
+    None
+}

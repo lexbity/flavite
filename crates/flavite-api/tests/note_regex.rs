@@ -130,3 +130,56 @@ fn text_find_continuation_pages_every_match_in_ordinal_order() {
         (0..600).map(|index| (index * 2) as u64).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn match_selection_use_leaves_text_find_untouched() {
+    // FEUX-0002 X06 regression: the match-driven selection consumer shares
+    // the engine but never changes the delivered `text.find` surface.
+    let fixture = support::fixture(&[("notes/a.md", "TODO one\nTODO two\n")]);
+    let (buffer_id, revision) = fixture.open_note("notes/a.md");
+    let request_id = support::next_id(&fixture.flavite);
+    let result = fixture.flavite.execute(Invocation::new(
+        request_id,
+        "editor.select_matches",
+        serde_json::json!({
+            "buffer_id": buffer_id,
+            "revision": revision,
+            "selections": {"primary": 0, "items": [[0, 0, 0]]},
+            "query": {"text": "TODO", "regex": false, "case_sensitive": false},
+        }),
+        Origin::Gui,
+    ));
+    let completed = match result {
+        ExecutionResult::Pending { request_id } => fixture.flavite.wait_for_operation(request_id),
+        other => other,
+    };
+    let data = match completed {
+        ExecutionResult::Local(LocalResult::Success(success)) => success.data,
+        other => panic!("expected collection, got {other:?}"),
+    };
+    assert_eq!(data["total_matches"].as_u64(), Some(2));
+
+    // `text.find` still pages exactly as before.
+    let request_id = support::next_id(&fixture.flavite);
+    let result = fixture.flavite.execute(Invocation::new(
+        request_id,
+        "text.find",
+        serde_json::json!({
+            "buffer_id": buffer_id,
+            "revision": revision,
+            "query": "TODO",
+            "mode": "literal",
+        }),
+        Origin::Gui,
+    ));
+    let completed = match result {
+        ExecutionResult::Pending { request_id } => fixture.flavite.wait_for_operation(request_id),
+        other => other,
+    };
+    let data = match completed {
+        ExecutionResult::Local(LocalResult::Success(success)) => success.data,
+        other => panic!("expected find page, got {other:?}"),
+    };
+    assert_eq!(data["total_matches"].as_u64(), Some(2));
+    assert_eq!(data["spans"].as_array().map(Vec::len), Some(2));
+}

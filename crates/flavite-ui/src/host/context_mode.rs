@@ -391,6 +391,9 @@ fn exit(app: &mut App) {
                 super::note_search::NoteSearchMessage::FindClose(session.tab),
             );
         }
+        // Match-selection drafts are context-mode owned (E-11): mode exit
+        // cancels the collection and discards the overlay.
+        app.selection_search.detach(session.tab);
         app.palette_open = false;
         app.picker = Default::default();
     }
@@ -870,7 +873,7 @@ pub(crate) fn paste(app: &mut App, target: EditorTarget, text: String) -> Task<M
 /// A selection-only command over the whole live set (no ticket, no history
 /// node): run the api verb and install the returned canonical set. Returns
 /// the installed triples so callers can chain typing entry.
-fn selections_only(
+pub(crate) fn selections_only(
     app: &mut App,
     target: &EditorTarget,
     api_id: &'static str,
@@ -1291,6 +1294,21 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         select(app, target.clone(), 0, text.len());
         return focus(app, target.tab);
     }
+    // Match-driven selection (FEUX-0002 X06): opens the owned query row;
+    // drafts overlay an outline set and Apply installs it (E-10/E-11).
+    if let Some(kind) = match command {
+        SelectMatches => Some(super::selection_search::ApplyKind::Select),
+        SplitSelection => Some(super::selection_search::ApplyKind::Split),
+        _ => None,
+    } {
+        return super::selection_search::handle(
+            app,
+            super::selection_search::SelectionSearchMessage::Open {
+                tab: target.tab,
+                kind,
+            },
+        );
+    }
     // Every remaining verb is set-aware through the api translation point
     // (FEUX-0002 X04/X05, E-1/E-6): the whole captured set rides the
     // command. The Go-menu motions became `editor.move` per-member verbs.
@@ -1511,7 +1529,8 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             install_receipt(app, &target, cut.as_ref().expect("cut success"));
             write.chain(focus(app, target.tab))
         }
-        Toggle | Exit | Escape | Paste | Undo | Redo | Commands | Find | Replace | History => {
+        Toggle | Exit | Escape | Paste | Undo | Redo | Commands | Find | Replace | History
+        | SelectMatches | SplitSelection => {
             unreachable!("handled before planning")
         }
     };
