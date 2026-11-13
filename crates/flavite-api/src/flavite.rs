@@ -587,6 +587,22 @@ const READ_NOTES_COMMAND_IDS: &[&str] = &[
     "editor.keep_primary",
     "editor.collapse",
     "editor.clear_selection",
+    "editor.select_word",
+    "editor.select_line",
+    "editor.copy",
+    "editor.insert_start",
+    "editor.insert_end",
+    "editor.insert_line_start",
+    "editor.insert_line_end",
+    "editor.toggle_caret",
+    "editor.move",
+    "editor.find_char",
+    "editor.add_caret_above",
+    "editor.add_caret_below",
+    "editor.rotate_primary",
+    "editor.flip_selections",
+    "editor.trim_selections",
+    "editor.invert_selections",
 ];
 
 /// Stable token for one notice presentation acknowledgement.
@@ -1172,6 +1188,132 @@ impl Flavite {
                 "Clear selection",
                 ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
                 crate::editor_commands::handle_clear_selection,
+            ),
+            (
+                "editor.change",
+                "Change selection",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_editor_change,
+            ),
+            (
+                "editor.cut",
+                "Cut selection",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_editor_cut,
+            ),
+            (
+                "editor.paste",
+                "Paste to every selection",
+                ArgSchema::typed::<crate::editor_commands::EditorPasteArgs>(),
+                crate::editor_commands::handle_editor_paste,
+            ),
+            (
+                "editor.copy",
+                "Copy selection",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_editor_copy,
+            ),
+            (
+                "editor.select_word",
+                "Select word",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_select_word,
+            ),
+            (
+                "editor.select_line",
+                "Select line",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_select_line,
+            ),
+            (
+                "editor.insert_start",
+                "Type before selection",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_insert_start,
+            ),
+            (
+                "editor.insert_end",
+                "Type after selection",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_insert_end,
+            ),
+            (
+                "editor.insert_line_start",
+                "Type at line start",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_insert_line_start,
+            ),
+            (
+                "editor.insert_line_end",
+                "Type at line end",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_insert_line_end,
+            ),
+            (
+                "editor.open_above",
+                "Open line above",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_open_above,
+            ),
+            (
+                "editor.open_below",
+                "Open line below",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_open_below,
+            ),
+            (
+                "editor.toggle_caret",
+                "Toggle caret at position",
+                ArgSchema::typed::<crate::editor_commands::EditorToggleCaretArgs>(),
+                crate::editor_commands::handle_toggle_caret,
+            ),
+            (
+                "editor.move",
+                "Move every selection",
+                ArgSchema::typed::<crate::editor_commands::EditorMoveArgs>(),
+                crate::editor_commands::handle_editor_move,
+            ),
+            (
+                "editor.find_char",
+                "Find one character from every selection",
+                ArgSchema::typed::<crate::editor_commands::EditorFindCharArgs>(),
+                crate::editor_commands::handle_find_char,
+            ),
+            (
+                "editor.add_caret_above",
+                "Add caret on the row above",
+                ArgSchema::typed::<crate::editor_commands::EditorAddCaretsArgs>(),
+                crate::editor_commands::handle_add_caret_above,
+            ),
+            (
+                "editor.add_caret_below",
+                "Add caret on the row below",
+                ArgSchema::typed::<crate::editor_commands::EditorAddCaretsArgs>(),
+                crate::editor_commands::handle_add_caret_below,
+            ),
+            (
+                "editor.rotate_primary",
+                "Rotate the primary selection",
+                ArgSchema::typed::<crate::editor_commands::EditorRotateArgs>(),
+                crate::editor_commands::handle_rotate_primary,
+            ),
+            (
+                "editor.flip_selections",
+                "Flip every selection",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_flip_selections,
+            ),
+            (
+                "editor.trim_selections",
+                "Trim every selection",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_trim_selections,
+            ),
+            (
+                "editor.invert_selections",
+                "Invert selections line-bounded",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_invert_selections,
             ),
             (
                 "buffer.history_page",
@@ -1946,9 +2088,30 @@ impl Flavite {
             | "note.convert_encoding"
             | "text.apply_replace"
             | "editor.delete"
+            | "editor.change"
+            | "editor.cut"
+            | "editor.paste"
+            | "editor.open_above"
+            | "editor.open_below"
+            | "editor.copy"
             | "editor.keep_primary"
             | "editor.collapse"
             | "editor.clear_selection"
+            | "editor.select_word"
+            | "editor.select_line"
+            | "editor.insert_start"
+            | "editor.insert_end"
+            | "editor.insert_line_start"
+            | "editor.insert_line_end"
+            | "editor.toggle_caret"
+            | "editor.move"
+            | "editor.find_char"
+            | "editor.add_caret_above"
+            | "editor.add_caret_below"
+            | "editor.rotate_primary"
+            | "editor.flip_selections"
+            | "editor.trim_selections"
+            | "editor.invert_selections"
             | "editor.issue_operation"
             | "editor.cancel_operation" => invocation
                 .args
@@ -1987,9 +2150,30 @@ impl Flavite {
                 | "note.convert_encoding"
                 | "text.apply_replace"
                 | "editor.delete"
+                | "editor.change"
+                | "editor.cut"
+                | "editor.paste"
+                | "editor.open_above"
+                | "editor.open_below"
+                | "editor.copy"
                 | "editor.keep_primary"
                 | "editor.collapse"
                 | "editor.clear_selection"
+                | "editor.select_word"
+                | "editor.select_line"
+                | "editor.insert_start"
+                | "editor.insert_end"
+                | "editor.insert_line_start"
+                | "editor.insert_line_end"
+                | "editor.toggle_caret"
+                | "editor.move"
+                | "editor.find_char"
+                | "editor.add_caret_above"
+                | "editor.add_caret_below"
+                | "editor.rotate_primary"
+                | "editor.flip_selections"
+                | "editor.trim_selections"
+                | "editor.invert_selections"
                 | "editor.issue_operation"
                 | "editor.cancel_operation"
         ) {
@@ -2055,6 +2239,9 @@ impl Flavite {
             }) => "editor.cancel_operation",
             SessionResult::Success(crate::session::CommandResult::SelectionsChanged { .. }) => {
                 "editor.selections_changed"
+            }
+            SessionResult::Success(crate::session::CommandResult::TextCopied { .. }) => {
+                "editor.copy"
             }
             SessionResult::Success(crate::session::CommandResult::LinkPrepared { .. }) => {
                 "link.prepare"
@@ -2266,6 +2453,17 @@ impl Flavite {
                             "buffer_id": buffer_id.as_u64(),
                             "revision": revision.as_u64(),
                             "selections": selections,
+                        })
+                    }
+                    crate::session::CommandResult::TextCopied {
+                        buffer_id,
+                        revision,
+                        text,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "revision": revision.as_u64(),
+                            "text": text,
                         })
                     }
                     crate::session::CommandResult::NoteSaved {

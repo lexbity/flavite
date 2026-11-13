@@ -73,6 +73,7 @@ fn type_text(app: &mut App, tab: TabId, text: &str) {
             extend: false,
             document_boundary: false,
             vertical: None,
+            preferred_x: Vec::new(),
         },
     });
 }
@@ -145,24 +146,24 @@ fn preview_ownership_rejects_stale_sources_and_old_hover_exits() {
     run(&mut f.app, tab, Command::Toggle);
     let old = EditorTarget::capture(&f.app, tab).unwrap();
     let _ = f.app.update(Message::ContextMode(ContextMessage::Preview(
-        old,
+        old.clone(),
         Command::Copy,
         true,
     )));
     let _ = f.app.update(Message::ContextMode(ContextMessage::Preview(
-        old,
+        old.clone(),
         Command::Cut,
         true,
     )));
     let _ = f.app.update(Message::ContextMode(ContextMessage::Preview(
-        old,
+        old.clone(),
         Command::Copy,
         false,
     )));
     assert_eq!(preview_command(&f.app, tab), Some(Command::Cut));
     selection(&mut f.app, tab, 9, 9);
     let _ = f.app.update(Message::ContextMode(ContextMessage::Preview(
-        old,
+        old.clone(),
         Command::Copy,
         true,
     )));
@@ -280,7 +281,7 @@ fn right_click_entry_and_escape_pop_one_level_without_exiting() {
     let target = EditorTarget::capture(&f.app, tab).unwrap();
     let _ = f.app.update(Message::ContextMode(ContextMessage::EnterAt(
         target,
-        (4, 9),
+        vec![(4, 9)],
     )));
     assert_eq!(f.app.context_mode.mode(tab), ContextMode::Command);
     assert_eq!(
@@ -437,21 +438,25 @@ fn delayed_clipboard_cannot_mutate_after_selection_change_or_mode_exit() {
     selection(&mut f.app, tab, 4, 9);
     let _ = f
         .app
-        .update(Message::ContextMode(ContextMessage::PasteReady(
-            target,
-            1,
-            Some("stale".into()),
-        )));
+        .update(Message::EditorClipboard(
+            flavite_ui::host::editor_clipboard::ClipboardMessage::ContextPaste {
+                target,
+                generation: 1,
+                text: Some("stale".into()),
+            },
+        ));
     assert_eq!(f.app.note_editor_view(tab).unwrap().text, original.text);
     run(&mut f.app, tab, Command::Exit);
     let target = EditorTarget::capture(&f.app, tab).unwrap();
     let _ = f
         .app
-        .update(Message::ContextMode(ContextMessage::PasteReady(
-            target,
-            1,
-            Some("stale".into()),
-        )));
+        .update(Message::EditorClipboard(
+            flavite_ui::host::editor_clipboard::ClipboardMessage::ContextPaste {
+                target,
+                generation: 1,
+                text: Some("stale".into()),
+            },
+        ));
     assert_eq!(
         f.app.note_editor_view(tab).unwrap().revision,
         original.revision
@@ -469,6 +474,7 @@ fn queued_keys_resolve_current_mode_and_selection_without_waiting_for_redraw() {
         buffer: source.buffer,
         revision: source.revision,
         selection: source.selection,
+        selections: vec![source.selection],
         sequence: sequence + index,
         event,
     };
@@ -488,6 +494,7 @@ fn queued_keys_resolve_current_mode_and_selection_without_waiting_for_redraw() {
                     extend: false,
                     document_boundary: false,
                     vertical: None,
+                    preferred_x: Vec::new(),
                 },
             }),
         )
@@ -565,7 +572,7 @@ fn undersized_pane_suspends_edits_without_losing_mode_or_selection() {
     assert!(flavite_ui::host::context_mode::too_narrow(&f.app, tab));
     assert!(!flavite_ui::host::context_mode::available(
         &f.app,
-        target,
+        target.clone(),
         Command::Delete
     ));
     assert!(flavite_ui::host::context_mode::available(
@@ -621,7 +628,7 @@ fn composition_commit_acknowledges_caret_and_joins_the_explicit_typing_group() {
         let _ = f.app.update(Message::EditorAction {
             tab,
             incarnation: f.app.notes.incarnation(tab).unwrap(),
-            action: flavite_editor::EditorAction::Interaction(preedit),
+            action: flavite_editor::EditorAction::Interaction(preedit.clone()),
         });
         let target = EditorTarget::capture(&f.app, tab).unwrap();
         let sequence = preedit.sequence + 1;
@@ -632,6 +639,7 @@ fn composition_commit_acknowledges_caret_and_joins_the_explicit_typing_group() {
                 buffer: target.buffer,
                 revision: target.revision,
                 selection: target.selection,
+                selections: vec![target.selection],
                 sequence,
                 event: ContextEvent::Commit(CapturedInput {
                     buffer: target.buffer,
@@ -642,6 +650,7 @@ fn composition_commit_acknowledges_caret_and_joins_the_explicit_typing_group() {
                     extend: false,
                     document_boundary: false,
                     vertical: None,
+                    preferred_x: Vec::new(),
                 }),
             },
         });
@@ -690,6 +699,7 @@ fn keys_from_a_departed_editor_cannot_become_literal_text_in_a_visible_backgroun
             buffer: target.buffer,
             revision: target.revision,
             selection: target.selection,
+            selections: vec![target.selection],
             sequence,
             event: ContextEvent::Key(ContextKey {
                 code: native_code(iced::keyboard::key::Code::KeyD),
@@ -704,6 +714,7 @@ fn keys_from_a_departed_editor_cannot_become_literal_text_in_a_visible_backgroun
                     extend: false,
                     document_boundary: false,
                     vertical: None,
+                    preferred_x: Vec::new(),
                 },
             }),
         },
@@ -807,13 +818,15 @@ fn history_popup_suspends_typing_escape_closes_it_and_exit_stays_available() {
     run(&mut f.app, tab, Command::Delete);
     let _ = f
         .app
-        .update(Message::ContextMode(ContextMessage::PasteReady(
-            pending_paste,
-            paste_generation,
-            Some("queued paste".into()),
-        )));
+        .update(Message::EditorClipboard(
+            flavite_ui::host::editor_clipboard::ClipboardMessage::ContextPaste {
+                target: pending_paste.clone(),
+                generation: paste_generation,
+                text: Some("queued paste".into()),
+            },
+        ));
     let _ = f.app.update(Message::ContextMode(ContextMessage::OpenMenu(
-        pending_paste,
+        pending_paste.clone(),
         ContextMenu::Select,
     )));
     assert!(

@@ -11,12 +11,16 @@ use iced::keyboard::{Modifiers as NativeModifiers, key::Code};
 
 pub mod layout;
 
-/// Native editor context intents carry the exact source and visible selection.
+/// Native editor context intents carry the exact source and the whole live
+/// selection set (FEUX-0002 X04: `selection` is the primary pair kept for
+/// captions; `selections` is the canonical set snapshot).
 #[derive(Debug, Clone)]
 pub struct ContextRequest {
     pub buffer: u64,
     pub revision: u64,
     pub selection: (usize, usize),
+    /// The whole live set as `(anchor, head)` pairs in canonical order.
+    pub selections: Vec<(usize, usize)>,
     pub sequence: u64,
     pub event: ContextEvent,
 }
@@ -25,7 +29,9 @@ pub struct ContextRequest {
 pub enum ContextEvent {
     Command(flavite_edit_context::ContextCommand),
     Menu(flavite_edit_context::ContextMenu),
-    EnterAt((usize, usize)),
+    /// Right-click entry: the resolved selection set (kept when the press
+    /// landed inside any member, replaced by word bounds otherwise, E-14).
+    EnterAt(Vec<(usize, usize)>),
     Unbound,
     /// Interpret in acknowledged host mode, rather than the last drawn mode.
     Key(ContextKey),
@@ -94,6 +100,7 @@ pub const fn motion_action(motion: Motion) -> KeyAction {
         Motion::Up => KeyAction::Up,
         Motion::Down => KeyAction::Down,
         Motion::NextWord => KeyAction::NextWord,
+        Motion::NextWordEnd => KeyAction::NextWordEnd,
         Motion::PreviousWord => KeyAction::PreviousWord,
     }
 }

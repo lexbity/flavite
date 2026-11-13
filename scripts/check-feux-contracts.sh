@@ -169,9 +169,10 @@ run_x03_gates() {
         "$root/crates/flavite-buffer/src/selection.rs"
     # No raw public undo jump.
     gate assert_absent 'pub fn goto\b' "$root/crates/flavite-buffer/src/undo.rs"
-    # No app-side re-implementation of normalization: the UI and editor never
-    # call the algebra (api translates).
-    gate assert_absent 'normalize\(' \
+    # No app-side re-implementation of normalization: nobody DEFINES the
+    # algebra outside `flavite-buffer` (X04's widget live set CALLS the
+    # canonical implementation — that is the whole point of E-1).
+    gate assert_absent 'fn normalize\(' \
         "$root/crates/flavite-ui/src" "$root/crates/flavite-editor/src"
     # Per-view selection version (workspace data + the GUI target that
     # validates it, FEUX-001 §5.4's split) and the ticket ledger exist.

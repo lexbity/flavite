@@ -190,7 +190,7 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
                 id,
                 ContextControl {
                     id,
-                    target: NodeTarget::EditorContextExpand(target),
+                    target: NodeTarget::EditorContextExpand(target.clone()),
                     label: "Expand pane".into(),
                     bounds: *bounds,
                     enabled: true,
@@ -217,10 +217,10 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
                     id,
                     ContextControl {
                         id,
-                        target: NodeTarget::EditorContextCommand { target, command },
+                        target: NodeTarget::EditorContextCommand { target: target.clone(), command },
                         label: command.title().into(),
                         bounds: *bounds,
-                        enabled: available(app, target, command),
+                        enabled: available(app, target.clone(), command),
                     },
                 );
             }
@@ -243,7 +243,7 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
                     id,
                     ContextControl {
                         id,
-                        target: NodeTarget::EditorContextMenu { target, menu },
+                        target: NodeTarget::EditorContextMenu { target: target.clone(), menu },
                         label: format!("{} menu", menu.title()),
                         bounds: *bounds,
                         enabled: true,
@@ -252,7 +252,7 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
             }
         }
         if let Some(session) = app.context_mode.session.as_ref().filter(|s| s.tab == tab)
-            && let (Some(menu), Some(target)) = (session.state.menu(), session.menu_target)
+            && let (Some(menu), Some(target)) = (session.state.menu(), session.menu_target.clone())
         {
             for &command in menu.commands() {
                 if let Some(bounds) = app.context_mode.bounds.get(&(tab, command.title())) {
@@ -261,10 +261,10 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
                         id,
                         ContextControl {
                             id,
-                            target: NodeTarget::EditorContextCommand { target, command },
+                            target: NodeTarget::EditorContextCommand { target: target.clone(), command },
                             label: command.title().into(),
                             bounds: *bounds,
-                            enabled: available(app, target, command),
+                            enabled: available(app, target.clone(), command),
                         },
                     );
                 }
@@ -284,7 +284,7 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
             let entries: Vec<_> = if host.open {
                 page.entries.iter().collect()
             } else {
-                editor_history::visible_entries(app, source)
+                editor_history::visible_entries(app, source.clone())
             };
             for entry in entries {
                 if let Some(bounds) =
@@ -302,7 +302,7 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
                         ContextControl {
                             id,
                             target: NodeTarget::EditorHistory {
-                                source,
+                                source: source.clone(),
                                 action: HistoryAction::Restore(entry.target),
                             },
                             label: format!(
@@ -311,7 +311,7 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
                                 editor_history::entry_status(entry)
                             ),
                             bounds: *bounds,
-                            enabled: editor_history::can_restore(app, source, entry)
+                            enabled: editor_history::can_restore(app, source.clone(), entry)
                                 && (host.open
                                     || app
                                         .context_mode
@@ -351,7 +351,7 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
                         id,
                         ContextControl {
                             id,
-                            target: NodeTarget::EditorHistory { source, action },
+                            target: NodeTarget::EditorHistory { source: source.clone(), action },
                             label: label.into(),
                             bounds: *bounds,
                             enabled: true,
@@ -932,6 +932,16 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
                         anchor: position(snapshot.selection.0),
                         focus: position(snapshot.selection.1),
                     });
+                    // N-selection description (FEUX-0002 X04): the count is
+                    // non-color redundancy for screen-reader users.
+                    if snapshot.selections.len() > 1 {
+                        editor.set_description(format!(
+                            "{} selections, primary {} to {}",
+                            snapshot.selections.len(),
+                            snapshot.selection.0,
+                            snapshot.selection.1,
+                        ));
+                    }
                     if snapshot.focused {
                         focus = id;
                     }

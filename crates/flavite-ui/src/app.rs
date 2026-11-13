@@ -266,6 +266,9 @@ pub enum Message {
         incarnation: u64,
         input: flavite_editor::input::CapturedInput,
     },
+    /// Clipboard reads resume interpretation at the effect boundary (X04
+    /// clipboard seam).
+    EditorClipboard(crate::host::editor_clipboard::ClipboardMessage),
     /// RFC-0006 §6.10: typed encoding decisions routed to the encoding host.
     Encoding(crate::host::encoding::EncodingMessage),
     /// RFC-0006 S01: literal find/replace host messages.
@@ -1475,6 +1478,12 @@ impl App {
             revision: view.revision,
             caret: selection.head,
             selection: (selection.anchor, selection.head),
+            selections: logical
+                .selections
+                .iter()
+                .enumerate()
+                .map(|(id, selection)| [id, selection.anchor, selection.head])
+                .collect(),
             viewport_anchor: logical.viewport_anchor,
             focused: logical.focused,
             composing: logical.composition == flavite_workspace::CompositionState::Active,
@@ -2011,15 +2020,26 @@ impl App {
                         "Editor input was stale; the current caret state was restored".into();
                     return;
                 }
-                let selection = flavite_workspace::CommittedSelection::new(
-                    snapshot.selection.0,
-                    snapshot.selection.1,
-                );
+                let members: Vec<flavite_workspace::CommittedSelection> = snapshot
+                    .selections
+                    .iter()
+                    .map(|&[_, anchor, head]| {
+                        flavite_workspace::CommittedSelection::new(anchor, head)
+                    })
+                    .collect();
+                let members = if members.is_empty() {
+                    vec![flavite_workspace::CommittedSelection::new(
+                        snapshot.selection.0,
+                        snapshot.selection.1,
+                    )]
+                } else {
+                    members
+                };
                 if snapshot.focused
                     && self
                         .workspace
                         .tab(&tab)
-                        .is_some_and(|v| v.interaction().selections != [selection])
+                        .is_some_and(|v| v.interaction().selections != members)
                 {
                     crate::host::context_mode::selection_changed(self, tab);
                 }
@@ -2033,7 +2053,7 @@ impl App {
                 interaction.buffer_id = Some(snapshot.buffer_id);
                 interaction.revision = snapshot.revision;
                 interaction.sequence = snapshot.sequence;
-                interaction.selections = vec![selection];
+                interaction.selections = members;
                 interaction.viewport_anchor = snapshot.viewport_anchor;
                 interaction.composition = if snapshot.composing {
                     flavite_workspace::CompositionState::Active
@@ -2375,6 +2395,7 @@ impl App {
                     buffer: request.buffer,
                     revision: request.revision,
                     selection: request.selection,
+                    selections: request.selections.clone(),
                     selection_version: self
                         .workspace
                         .tab(&tab)
@@ -2394,19 +2415,23 @@ impl App {
                 };
                 let message = match request.event.clone() {
                     ContextEvent::Commit(input) => {
-                        let task = crate::host::input::commit_composition(self, target, input);
+                        let task =
+                            crate::host::input::commit_composition(self, target.clone(), input);
                         crate::host::input::remember_context(self, target, &request);
                         return task;
                     }
                     ContextEvent::Key(key) => {
-                        let task = crate::host::context_mode::native_key(self, target, key);
+                        let task =
+                            crate::host::context_mode::native_key(self, target.clone(), key);
                         crate::host::input::remember_context(self, target, &request);
                         return task;
                     }
-                    ContextEvent::Command(command) => ContextMessage::Run(target, command),
-                    ContextEvent::Menu(menu) => ContextMessage::OpenMenu(target, menu),
-                    ContextEvent::EnterAt(selection) => ContextMessage::EnterAt(target, selection),
-                    ContextEvent::Unbound => ContextMessage::Unbound(target),
+                    ContextEvent::Command(command) => {
+                        ContextMessage::Run(target.clone(), command)
+                    }
+                    ContextEvent::Menu(menu) => ContextMessage::OpenMenu(target.clone(), menu),
+                    ContextEvent::EnterAt(selection) => ContextMessage::EnterAt(target.clone(), selection),
+                    ContextEvent::Unbound => ContextMessage::Unbound(target.clone()),
                 };
                 let task = crate::host::context_mode::handle(self, message);
                 if !matches!(request.event, ContextEvent::EnterAt(_)) {
@@ -2419,6 +2444,9 @@ impl App {
                 incarnation,
                 input,
             } => return crate::host::input::handle(self, tab, incarnation, input),
+            Message::EditorClipboard(message) => {
+                return crate::host::editor_clipboard::handle(self, message);
+            }
             Message::Encoding(message) => {
                 let task = crate::host::encoding::handle(self, message);
                 self.refresh_semantics();
@@ -4080,6 +4108,16 @@ impl App {
         let Some((tab, incarnation, buffer_id, revision, caret)) = self.valid_writing_target()
         else {
             self.status = "Writing target: none — focus an editor caret to insert a link".into();
+            return;
+        };
+        // Link insertion is a single-caret act (FEUX-0002 FR-9): a multi-
+        // member set has no one insertion point.
+        if self
+            .workspace
+            .tab(&tab)
+            .is_some_and(|view| view.interaction().selections.len() > 1)
+        {
+            self.status = "Choose one caret to insert a link.".into();
             return;
         };
         if self

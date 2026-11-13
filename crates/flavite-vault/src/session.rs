@@ -666,6 +666,13 @@ pub enum CommandResult {
         revision: Revision,
         selections: Vec<[usize; 3]>,
     },
+    /// The D-11 copy fragments joined with LF in document order (X04); the
+    /// host clipboard seam writes this at the effect boundary.
+    TextCopied {
+        buffer_id: BufferId,
+        revision: Revision,
+        text: String,
+    },
     /// A semantic link plan was prepared (W05).
     LinkPrepared {
         /// The prepared plan exposed to the host.

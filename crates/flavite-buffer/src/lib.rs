@@ -11,6 +11,7 @@ pub mod eol;
 pub mod history;
 pub mod manager;
 pub mod model;
+pub mod motion;
 pub mod positions;
 pub mod recovery;
 pub mod revision;

@@ -561,7 +561,7 @@ impl WorkspaceState {
     /// invalid for the current text, or a focused caret has no buffer identity.
     pub fn acknowledge_interaction(
         &mut self,
-        interaction: crate::input::EditorInteraction,
+        mut interaction: crate::input::EditorInteraction,
         text: &str,
     ) -> Result<(), &'static str> {
         let tab = interaction.tab;
@@ -583,6 +583,17 @@ impl WorkspaceState {
         if interaction.revision < current.interaction().revision {
             return Err("interaction revision is stale");
         }
+        // The committed-selection version is owned here: bumped exactly once
+        // per committed set change (FEUX-0002 E-5, §5.6) — receipts,
+        // pointer commits, passive movement mappings, and selection-only
+        // commands all land through this acknowledgement, while
+        // sequence-only updates (focus, scroll) leave it untouched.
+        interaction.selection_version = current
+            .interaction()
+            .selection_version
+            .wrapping_add(u64::from(
+                interaction.selections != current.interaction().selections,
+            ));
         let focused = interaction.focused;
         // Blur/scroll acknowledgements may advance the interaction sequence
         // without changing the remembered caret. Preserve existing authority

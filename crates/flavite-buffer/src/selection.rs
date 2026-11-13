@@ -15,6 +15,7 @@
 //! - Never empty; at most [`MAX_SELECTIONS`] members; endpoints validated
 //!   against the current text (bounds + extended-grapheme boundaries).
 
+use flavite_syntax::text::TextByte;
 use std::collections::HashMap;
 
 /// Maximum number of members in one canonical selection set (D-4).
@@ -608,6 +609,323 @@ pub fn is_grapheme_boundary(text: &str, at: usize) -> bool {
     }
     use unicode_segmentation::UnicodeSegmentation;
     text.grapheme_indices(true).any(|(index, _)| index == at)
+}
+
+/// The `editor.toggle_caret` transform (FEUX-0002 §6, E-14 a11y/programmatic
+/// parity with Mod-click): a caret at `at` is added, or the member that
+/// contains `at` is removed. A caret at a range edge counts as inside for
+/// removal (boundary carets are absorbed), the last member is never
+/// removed, and normalization absorbs duplicate points.
+///
+/// # Errors
+///
+/// [`SetError`] when `at` is out of bounds, off a grapheme boundary, or the
+/// result would be empty.
+pub fn toggle_caret(text: &str, set: &SelectionSet, at: usize) -> Result<SelectionSet, SetError> {
+    if at > text.len() {
+        return Err(SetError::OutOfBounds { at });
+    }
+    if !is_grapheme_boundary(text, at) {
+        return Err(SetError::NotGraphemeBoundary { at });
+    }
+    let containing = set
+        .iter()
+        .find(|member| member.start() <= at && at <= member.end())
+        .map(|member| member.id());
+    if let Some(id) = containing {
+        // Removing never empties the set: a lone member is kept.
+        if set.len() == 1 {
+            return Ok(set.clone());
+        }
+        let candidates: Vec<RawSelection> = set
+            .iter()
+            .filter(|member| member.id() != id)
+            .map(raw_of)
+            .collect();
+        let hint = set.primary_id();
+        let (next, _) = normalize_with_hint_fallback(text, candidates, hint)?;
+        return Ok(next);
+    }
+    add_carets(text, set, &[at])
+}
+
+/// Add one caret per point, merged into `set` through normalization (the
+/// `editor.add_caret_above`/`below` pure half: the host supplies
+/// layout-computed positions, this validates and merges).
+///
+/// # Errors
+///
+/// [`SetError`] on invalid points or exceeding [`MAX_SELECTIONS`] (with the
+/// observed count).
+pub fn add_carets(
+    text: &str,
+    set: &SelectionSet,
+    points: &[usize],
+) -> Result<SelectionSet, SetError> {
+    let mut candidates: Vec<RawSelection> = set.iter().map(raw_of).collect();
+    let hint = set.primary_id();
+    for &at in points {
+        if at > text.len() {
+            return Err(SetError::OutOfBounds { at });
+        }
+        if !is_grapheme_boundary(text, at) {
+            return Err(SetError::NotGraphemeBoundary { at });
+        }
+        candidates.push(RawSelection {
+            id: None,
+            anchor: at,
+            head: at,
+        });
+    }
+    let (next, _) = normalize_with_hint_fallback(text, candidates, hint)?;
+    Ok(next)
+}
+
+/// `editor.rotate_primary` (E-9): the primary advances to the next (`true`)
+/// or previous member in canonical set order, wrapping. Selection-only.
+#[must_use]
+pub fn rotate_primary(set: &SelectionSet, forward: bool) -> SelectionSet {
+    let position = set
+        .iter()
+        .position(|member| member.id() == set.primary_id())
+        .unwrap_or(0);
+    let count = set.len();
+    let next_position = if forward {
+        (position + 1) % count
+    } else {
+        (position + count - 1) % count
+    };
+    let hint = set.ordered[next_position].id.as_raw();
+    let candidates: Vec<RawSelection> = set.iter().map(raw_of).collect();
+    let (rotated, _) = SelectionSet::canonicalize(
+        candidates.into_iter().map(|raw| (raw.id.unwrap(), raw.anchor, raw.head)).collect(),
+        Some(hint),
+    )
+    .expect("rotating a valid set keeps every member");
+    rotated
+}
+
+/// `editor.flip_selections` (E-9): swap anchor and head on every member,
+/// direction-preserving for the set's primary identity (the id travels with
+/// its member through normalization).
+///
+/// # Errors
+///
+/// [`SetError`] when the set is invalid against the text.
+pub fn flip_selections(text: &str, set: &SelectionSet) -> Result<SelectionSet, SetError> {
+    let candidates: Vec<RawSelection> = set
+        .iter()
+        .map(|member| RawSelection {
+            id: Some(member.id().as_raw()),
+            anchor: member.head(),
+            head: member.anchor(),
+        })
+        .collect();
+    let (flipped, _) = normalize_with_hint_fallback(text, candidates, set.primary_id())?;
+    Ok(flipped)
+}
+
+/// `editor.trim_selections` (E-9): trim Unicode whitespace from each
+/// range's edges; a fully-whitespace (or empty) member becomes a caret at
+/// the trim position.
+///
+/// # Errors
+///
+/// [`SetError`] when the set is invalid against the text.
+pub fn trim_selections(text: &str, set: &SelectionSet) -> Result<SelectionSet, SetError> {
+    let mut candidates = Vec::with_capacity(set.len());
+    for member in set.iter() {
+        let mut start = member.start();
+        let mut end = member.end();
+        while start < end
+            && let Some(c) = text[start..].chars().next()
+            && c.is_whitespace()
+        {
+            start += c.len_utf8();
+        }
+        while end > start
+            && let Some(c) = text[..end].chars().next_back()
+            && c.is_whitespace()
+        {
+            end -= c.len_utf8();
+        }
+        candidates.push(RawSelection {
+            id: Some(member.id().as_raw()),
+            anchor: start,
+            head: end,
+        });
+    }
+    let (trimmed, _) = normalize_with_hint_fallback(text, candidates, set.primary_id())?;
+    Ok(trimmed)
+}
+
+/// `editor.invert_selections` (E-9, line-bounded complement): for every
+/// line intersecting the current set, the unselected spans of that line
+/// (excluding its line break) become the new set. Fully-selected lines
+/// contribute nothing; inter-line newlines are never selected. Refused —
+/// before materializing — when the result would exceed the cap, or when no
+/// unselected text remains (a set is never empty).
+///
+/// # Errors
+///
+/// [`SetError::TooMany`] with the observed span count, or
+/// [`SetError::Empty`] when every intersected line is fully selected.
+pub fn invert_selections(text: &str, set: &SelectionSet) -> Result<SelectionSet, SetError> {
+    set.validate_against(text)?;
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut line_start = 0usize;
+    while line_start <= text.len() {
+        let line_end = text[line_start..]
+            .find('\n')
+            .map_or(text.len(), |at| line_start + at);
+        // Only lines intersecting the set participate.
+        let intersects = set
+            .iter()
+            .any(|member| member.start() <= line_end && line_start <= member.end());
+        if intersects {
+            let mut cursor = line_start;
+            for member in set.iter() {
+                // Clamp to the line; members entirely past it contribute no
+                // gap beyond the line end.
+                let member_start = member.start().max(line_start).min(line_end);
+                let member_end = member.end().max(line_start).min(line_end);
+                if member_end <= cursor {
+                    continue;
+                }
+                if member_start > cursor {
+                    spans.push((cursor, member_start));
+                }
+                cursor = cursor.max(member_end);
+            }
+            if cursor < line_end {
+                spans.push((cursor, line_end));
+            }
+        }
+        if line_end == text.len() {
+            break;
+        }
+        line_start = line_end + 1;
+    }
+    if spans.len() > MAX_SELECTIONS {
+        return Err(SetError::TooMany {
+            observed: spans.len(),
+        });
+    }
+    if spans.is_empty() {
+        return Err(SetError::Empty);
+    }
+    let candidates: Vec<RawSelection> = spans
+        .into_iter()
+        .map(|(start, end)| RawSelection {
+            id: None,
+            anchor: start,
+            head: end,
+        })
+        .collect();
+    let hint = set.primary_id();
+    let (inverted, _) = normalize_with_hint_fallback(text, candidates, hint)?;
+    Ok(inverted)
+}
+
+/// Typed find-char refusal (FEUX-0002 X05, E-8): the whole command is a
+/// no-op when any member has no match in its direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FindCharError {
+    /// No match from at least one member's head.
+    NotFound,
+    /// The set or a produced endpoint is invalid.
+    Set(SetError),
+}
+
+impl From<SetError> for FindCharError {
+    fn from(error: SetError) -> Self {
+        Self::Set(error)
+    }
+}
+
+impl std::fmt::Display for FindCharError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "character not found"),
+            Self::Set(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for FindCharError {}
+
+/// `editor.find_char` (E-8): scan from each member's head in `direction`
+/// for one occurrence of `target` (a scan for a literal `char`, never a
+/// regex); the head lands on the found character's first byte. `extend`
+/// keeps each anchor. The whole command refuses (`NotFound`, set
+/// unchanged) when any member finds nothing.
+///
+/// # Errors
+///
+/// [`FindCharError::NotFound`] or [`FindCharError::Set`].
+pub fn find_char(
+    text: &str,
+    set: &SelectionSet,
+    forward: bool,
+    target: char,
+    extend: bool,
+) -> Result<SelectionSet, FindCharError> {
+    set.validate_against(text)?;
+    let mut candidates = Vec::with_capacity(set.len());
+    for member in set.iter() {
+        let head = member.head();
+        let found = if forward {
+            // Search strictly after the grapheme at the head.
+            let from =
+                flavite_syntax::text::next_grapheme_boundary(text, TextByte(head.min(text.len()))).0;
+            text[from..]
+                .find(target)
+                .map(|at| from + at)
+        } else {
+            let until = head.min(text.len());
+            text[..until].rfind(target)
+        };
+        let Some(at) = found else {
+            return Err(FindCharError::NotFound);
+        };
+        let anchor = if extend { member.anchor() } else { at };
+        candidates.push(RawSelection {
+            id: Some(member.id().as_raw()),
+            anchor,
+            head: at,
+        });
+    }
+    let hint = set.primary_id();
+    let (found, _) = normalize_with_hint_fallback(text, candidates, hint)?;
+    Ok(found)
+}
+
+/// The delivered `editor.select_line` range: the line containing `at`
+/// including its line break when one follows.
+#[must_use]
+pub fn containing_line(text: &str, at: usize) -> (usize, usize) {
+    let at = at.min(text.len());
+    let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = text[at..].find('\n').map_or(text.len(), |i| at + i);
+    (line_start, (line_end + usize::from(line_end < text.len())).min(text.len()))
+}
+
+fn raw_of(member: &Selection) -> RawSelection {
+    RawSelection {
+        id: Some(member.id().as_raw()),
+        anchor: member.anchor(),
+        head: member.head(),
+    }
+}
+
+/// Normalize keeping the current primary when its member survives
+/// normalization; otherwise the canonical fallback (last survivor) applies.
+fn normalize_with_hint_fallback(
+    text: &str,
+    candidates: Vec<RawSelection>,
+    hint: SelectionId,
+) -> Result<(SelectionSet, IdRemap), SetError> {
+    SelectionSet::normalize(text, candidates, Some(hint.as_raw()))
 }
 
 #[cfg(test)]

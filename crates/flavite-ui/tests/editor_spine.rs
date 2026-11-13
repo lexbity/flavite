@@ -142,6 +142,7 @@ fn passive_view_maps_once_and_stateale_selection_version_refuses() {
         buffer: f.app.note_editor_view(tab_a).unwrap().buffer_id,
         revision: f.app.note_editor_view(tab_a).unwrap().revision,
         selection: (0, 0),
+        selections: vec![(0, 0)],
         selection_version: 999_999,
     };
     let text_before = f.app.note_editor_view(tab_a).unwrap().text.clone();

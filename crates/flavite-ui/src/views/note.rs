@@ -174,11 +174,13 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                     Icon::Commands,
                     "Context Mode",
                     crate::host::context_mode::EditorTarget::capture(app, tab)
-                        .filter(|target| crate::host::context_mode::available(
-                            app,
-                            *target,
-                            flavite_edit_context::ContextCommand::Toggle
-                        ))
+                        .filter(|target| {
+                            crate::host::context_mode::available(
+                                app,
+                                target.clone(),
+                                flavite_edit_context::ContextCommand::Toggle,
+                            )
+                        })
                         .map(|target| {
                             Message::ContextMode(crate::host::context_mode::ContextMessage::Run(
                                 target,
@@ -327,7 +329,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
     let meta: Element<'a, Message> = if context_mode.active() {
         crate::host::context_mode::EditorTarget::capture(app, tab).map_or_else(
             || meta.into(),
-            |target| crate::views::context_toolbar::view(app, target),
+            |target| crate::views::context_toolbar::view(app, &target),
         )
     } else {
         meta.into()

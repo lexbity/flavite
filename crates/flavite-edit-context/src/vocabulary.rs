@@ -54,6 +54,21 @@ pub enum ContextCommand {
     SelectLine,
     Collapse,
     ClearSelection,
+    /// Drop every member but the primary (FEUX-0002 E-9).
+    KeepPrimary,
+    /// One caret per member on the adjacent visual row (host-computed).
+    AddCaretAbove,
+    AddCaretBelow,
+    /// The primary advances to the next/previous member.
+    RotatePrimary,
+    /// Swap anchor and head on every member.
+    FlipSelections,
+    /// Whitespace-trim each member's edges.
+    TrimSelections,
+    /// Line-bounded complement (E-9).
+    InvertSelections,
+    /// Capture one produced character (`f`/`Shift+F`, E-8).
+    FindChar { forward: bool },
     LineStart,
     LineEnd,
     DocumentStart,
@@ -87,6 +102,13 @@ impl ContextCommand {
         Self::SelectLine,
         Self::Collapse,
         Self::ClearSelection,
+        Self::KeepPrimary,
+        Self::AddCaretAbove,
+        Self::AddCaretBelow,
+        Self::RotatePrimary,
+        Self::FlipSelections,
+        Self::TrimSelections,
+        Self::InvertSelections,
         Self::LineStart,
         Self::LineEnd,
         Self::DocumentStart,
@@ -123,6 +145,14 @@ impl ContextCommand {
             // FEUX-0002 E-7: the delivered ID is reassigned to the single-
             // caret meaning; collapse-to-heads keeps its own ID.
             Self::ClearSelection => "editor.clear_selection",
+            Self::KeepPrimary => "editor.keep_primary",
+            Self::AddCaretAbove => "editor.add_caret_above",
+            Self::AddCaretBelow => "editor.add_caret_below",
+            Self::RotatePrimary => "editor.rotate_primary",
+            Self::FlipSelections => "editor.flip_selections",
+            Self::TrimSelections => "editor.trim_selections",
+            Self::InvertSelections => "editor.invert_selections",
+            Self::FindChar { .. } => "editor.find_char",
             Self::LineStart => "workspace.caret_start_line",
             Self::LineEnd => "workspace.caret_end_line",
             Self::DocumentStart => "workspace.caret_start",
@@ -158,6 +188,15 @@ impl ContextCommand {
             Self::SelectLine => "Select line",
             Self::Collapse => "Collapse selections",
             Self::ClearSelection => "Clear selection",
+            Self::KeepPrimary => "Keep primary selection",
+            Self::AddCaretAbove => "Add caret on row above",
+            Self::AddCaretBelow => "Add caret on row below",
+            Self::RotatePrimary => "Rotate primary selection",
+            Self::FlipSelections => "Flip selections",
+            Self::TrimSelections => "Trim selections",
+            Self::InvertSelections => "Invert selections",
+            Self::FindChar { forward: true } => "Find character forward",
+            Self::FindChar { forward: false } => "Find character backward",
             Self::LineStart => "Line start",
             Self::LineEnd => "Line end",
             Self::DocumentStart => "Document start",
@@ -216,6 +255,8 @@ impl ContextCommand {
             Self::Delete => "KeyD",
             Self::SelectLine => "KeyX",
             Self::Collapse => "Semicolon",
+            Self::FindChar { forward: true } => "KeyF",
+            Self::FindChar { forward: false } => "Shift+KeyF",
             _ => "",
         }
     }
@@ -257,7 +298,20 @@ impl ContextMenu {
     pub const fn commands(self) -> &'static [ContextCommand] {
         use ContextCommand as C;
         match self {
-            Self::Select => &[C::SelectWord, C::SelectLine, C::SelectAll, C::Collapse],
+            Self::Select => &[
+                C::SelectWord,
+                C::SelectLine,
+                C::SelectAll,
+                C::Collapse,
+                C::ClearSelection,
+                C::KeepPrimary,
+                C::AddCaretAbove,
+                C::AddCaretBelow,
+                C::RotatePrimary,
+                C::FlipSelections,
+                C::TrimSelections,
+                C::InvertSelections,
+            ],
             Self::Go => &[C::LineStart, C::LineEnd, C::DocumentStart, C::DocumentEnd],
             Self::Type => &[
                 C::InsertStart,
@@ -286,6 +340,14 @@ impl ContextMenu {
                 C::SelectLine,
                 C::SelectAll,
                 C::Collapse,
+                C::ClearSelection,
+                C::KeepPrimary,
+                C::AddCaretAbove,
+                C::AddCaretBelow,
+                C::RotatePrimary,
+                C::FlipSelections,
+                C::TrimSelections,
+                C::InvertSelections,
                 C::LineStart,
                 C::LineEnd,
                 C::DocumentStart,

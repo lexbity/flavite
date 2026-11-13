@@ -7,16 +7,16 @@
 //! never overwrite a newer host acknowledgement or move document text.
 
 use flavite_api::BufferView;
+use flavite_buffer::selection::{RawSelection, SelectionSet};
 use flavite_buffer::state::BufferState;
 use flavite_editor::{
     EditorAction, EditorInteractionSnapshot as Snapshot, EditorView, EditorWidget, focus_editor,
-    inspect_focused_editor, set_focused_editor_selection,
+    input::{CapturedInput, PreparedInput, prepare},
+    inspect_focused_editor, keymap::KeyAction, set_focused_editor_selection,
 };
-use iced::advanced::clipboard::Null as Clipboard;
 use iced::advanced::input_method::Event as ImeEvent;
 use iced::advanced::widget::Operation as _;
-use iced::advanced::{Shell, Widget};
-use iced::keyboard::{Key, Modifiers, key::Named};
+use iced::advanced::Widget;
 use std::collections::HashMap;
 
 fn view(text: &str, buffer_id: u64) -> BufferView {
@@ -38,30 +38,71 @@ fn snapshot(buffer_id: u64, revision: u64, caret: usize, sequence: u64, focused:
         revision,
         caret,
         selection: (caret, caret),
+        selections: Vec::new(),
         viewport_anchor: 0,
         focused,
         composing: false,
     }
 }
 
+/// The host-side interpretation of one captured key intent (X04/X05: the
+/// widget publishes [`CapturedInput`]; this mirrors the host pipeline —
+/// prepare through the planner, then the acknowledgment installs the
+/// after-set members exactly as a receipt does).
 fn typed(
-    widget: &EditorWidget<EditorAction>,
+    editor_view: &EditorView,
     state: &mut flavite_editor::widget::EditorState,
+    text: &str,
     input: &str,
 ) -> Vec<EditorAction> {
     let mut messages = Vec::new();
-    let mut shell = Shell::new(&mut messages);
-    for character in input.chars() {
-        widget.execute_key(
-            state,
-            &Key::Character(character.to_string().into()),
-            Modifiers::empty(),
-            Some(&character.to_string()),
-            &mut Clipboard,
-            &mut shell,
+    for (step, character) in input.chars().enumerate() {
+        let captured = CapturedInput {
+            buffer: editor_view.buffer_id,
+            observed_revision: editor_view.revision,
+            sequence: step as u64 + 2,
+            action: KeyAction::Insert,
+            text: character.to_string(),
+            extend: false,
+            document_boundary: false,
+            vertical: None,
+            preferred_x: Vec::new(),
+        };
+        let set = SelectionSet::normalize(
+            &editor_view.text,
+            vec![RawSelection {
+                id: None,
+                anchor: state.selection().0,
+                head: state.selection().1,
+            }],
+            None,
+        )
+        .unwrap()
+        .0;
+        let PreparedInput::Edit {
+            action,
+            members,
+            clipboard: _,
+        } = prepare(editor_view, &set, &captured).unwrap()
+        else {
+            panic!("typed input prepares an edit");
+        };
+        // The acknowledgment round trip: the after-set installs through the
+        // public restore path (same buffer/revision, newer sequence).
+        state.restore_interaction(
+            text,
+            Snapshot {
+                selections: members
+                    .iter()
+                    .enumerate()
+                    .map(|(id, &(anchor, head))| [id, anchor, head])
+                    .collect(),
+                sequence: step as u64 + 3,
+                ..snapshot(editor_view.buffer_id, editor_view.revision, members[0].1, 0, true)
+            },
         );
+        messages.push(action);
     }
-    drop(shell);
     messages
 }
 
@@ -103,12 +144,11 @@ fn delayed_acknowledgement_installs_and_lower_sequences_are_rejected() {
 fn typed_edits_are_revision_guarded_and_stale_actions_fail_conversion() {
     let buffer = view("hello", 12);
     let editor_view = EditorView::from(&buffer);
-    let widget = EditorWidget::new(&buffer, |action| action);
     let mut state = EditorWidget::<EditorAction>::state_for_test();
     state.reconcile(&editor_view, &HashMap::new());
     state.restore_interaction("hello", snapshot(12, 11, 2, 1, true));
 
-    let messages = typed(&widget, &mut state, "é漢");
+    let messages = typed(&editor_view, &mut state, "hello", "é漢");
     assert_eq!(messages.len(), 2, "one guarded edit per input event");
     let (_, revision, edits) = messages[0].as_edit().expect("edit action");
     assert_eq!(revision, 11);
@@ -286,27 +326,45 @@ fn crlf_positions_and_newline_edits_stay_byte_exact() {
     let text = "alpha\r\nbeta";
     let buffer = view(text, 12);
     let editor_view = EditorView::from(&buffer);
-    let widget = EditorWidget::<EditorAction>::new(&buffer, |action| action);
     let mut state = EditorWidget::<EditorAction>::state_for_test();
     state.reconcile(&editor_view, &HashMap::new());
     // Caret after "alpha\r\n" is byte 7 (CR at 5, LF at 6).
     state.restore_interaction(text, snapshot(12, 11, 7, 1, true));
     assert_eq!(state.caret(), 7);
 
-    let mut messages = Vec::new();
-    let mut shell = Shell::new(&mut messages);
-    widget.execute_key(
-        &mut state,
-        &Key::Named(Named::Enter),
-        Modifiers::empty(),
+    let captured = CapturedInput {
+        buffer: 12,
+        observed_revision: 11,
+        sequence: 2,
+        action: KeyAction::Newline,
+        text: String::new(),
+        extend: false,
+        document_boundary: false,
+        vertical: None,
+        preferred_x: Vec::new(),
+    };
+    let set = SelectionSet::normalize(
+        text,
+        vec![RawSelection {
+            id: None,
+            anchor: 7,
+            head: 7,
+        }],
         None,
-        &mut Clipboard,
-        &mut shell,
-    );
-    drop(shell);
-    assert_eq!(messages.len(), 1);
-    let (_, revision, edits) = messages[0].as_edit().expect("newline edit");
+    )
+    .unwrap()
+    .0;
+    let PreparedInput::Edit {
+        action,
+        members,
+        clipboard: _,
+    } = prepare(&editor_view, &set, &captured).unwrap()
+    else {
+        panic!("newline prepares an edit");
+    };
+    let (_, revision, edits) = action.as_edit().expect("newline edit");
     assert_eq!(revision, 11);
     assert_eq!(edits[0].range.start.0, 7);
     assert_eq!(edits[0].replacement, "\n");
+    assert_eq!(members, vec![(8, 8)]);
 }

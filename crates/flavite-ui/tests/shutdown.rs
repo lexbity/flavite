@@ -119,6 +119,7 @@ fn type_into(app: &mut App, tab: TabId, text: &str) {
             revision: view.revision,
             caret: view.text.len(),
             selection: (view.text.len(), view.text.len()),
+            selections: vec![[0, view.text.len(), view.text.len()]],
             viewport_anchor: 0,
             focused: true,
             composing: false,
@@ -136,6 +137,7 @@ fn type_into(app: &mut App, tab: TabId, text: &str) {
             extend: false,
             document_boundary: false,
             vertical: None,
+            preferred_x: Vec::new(),
         },
     });
 }
@@ -506,6 +508,7 @@ fn composition_blocks_quit() {
             revision: view.revision,
             caret: 0,
             selection: (0, 0),
+            selections: vec![[0, 0, 0]],
             viewport_anchor: 0,
             focused: true,
             composing: true,

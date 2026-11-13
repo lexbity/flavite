@@ -13,6 +13,7 @@ flavite-encoding = { path = "../flavite-encoding", features = ["serde"] }
 flavite-text-search = { path = "../flavite-text-search" }
 flavite-index = { path = "../flavite-index" }
 flavite-buffer = { path = "../flavite-buffer" }
+flavite-edit-context = { path = "../flavite-edit-context" }
 flavite-syntax = { path = "../flavite-syntax" }
 # TD-12 (W07): the graph index bridge consumes the CPU graph crate's plain
 # DTOs and publishes its base frames. The dependency points one way only —

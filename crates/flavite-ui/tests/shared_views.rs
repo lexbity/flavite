@@ -78,6 +78,7 @@ fn acknowledge_caret_with_anchor(
             revision: view.revision,
             caret: byte,
             selection: (byte, byte),
+            selections: vec![[0, byte, byte]],
             viewport_anchor,
             focused: true,
             composing: false,
@@ -295,21 +296,25 @@ fn blur_acknowledgements_preserve_only_an_unchanged_authorized_caret() {
     let mut blur = app.editor_interaction_snapshot(tab).unwrap();
     blur.sequence += 1;
     blur.focused = false;
+    let blur_sequence = blur.sequence;
     let incarnation = app.notes.incarnation(tab).unwrap();
     let _ = app.update(Message::EditorAction {
         tab,
         incarnation,
-        action: EditorAction::Interaction(blur),
+        action: EditorAction::Interaction(blur.clone()),
     });
     let _ = app.update(Message::Pump);
     let retained = app.workspace.writing_target().unwrap();
     assert_eq!(retained.tab, original.tab);
     assert_eq!(retained.revision, original.revision);
     assert_eq!(retained.caret_text_byte, 2);
-    assert_eq!(retained.interaction_sequence, blur.sequence);
+    assert_eq!(retained.interaction_sequence, blur_sequence);
     // A changed selection while unfocused does not silently reauthorize it.
-    blur.sequence += 1;
+    let mut blur = app.editor_interaction_snapshot(tab).unwrap();
+    blur.sequence = blur_sequence + 1;
+    blur.focused = false;
     blur.selection = (3, 3);
+    blur.selections = vec![[0, 3, 3]];
     blur.caret = 3;
     let _ = app.update(Message::EditorAction {
         tab,
@@ -361,7 +366,6 @@ fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() 
                     rows,
                     width: 500.0,
                     metrics: TypeMetrics::default(),
-                    preferred_x: Some(0.0),
                 }),
             },
         });
@@ -387,6 +391,7 @@ fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() 
             extend: false,
             document_boundary: false,
             vertical: None,
+            preferred_x: Vec::new(),
         },
     });
     assert_eq!(
@@ -405,6 +410,7 @@ fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() 
             extend: false,
             document_boundary: false,
             vertical: None,
+            preferred_x: Vec::new(),
         },
     });
     assert_eq!(
@@ -458,6 +464,7 @@ fn home_then_vertical_keys_ignore_the_widgets_old_column_before_redraw() {
             extend: false,
             document_boundary: true,
             vertical: None,
+            preferred_x: Vec::new(),
         },
     });
     for (sequence, action, rows, expected) in [
@@ -482,7 +489,6 @@ fn home_then_vertical_keys_ignore_the_widgets_old_column_before_redraw() {
                     rows,
                     width: 500.0,
                     metrics: TypeMetrics::default(),
-                    preferred_x: Some(1000.0),
                 }),
             },
         });

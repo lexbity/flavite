@@ -173,15 +173,15 @@ pub fn reconcile(app: &mut App) {
     let Some(target) = EditorTarget::capture(app, session.tab) else {
         return;
     };
-    if app.context_mode.history.open && app.context_mode.history.target != Some(target) {
+    if app.context_mode.history.open && app.context_mode.history.target.as_ref() != Some(&target) {
         app.context_mode.history.open = false;
         app.context_mode
             .notice("Source changed; editing history was closed");
     }
-    if app.context_mode.history.key == Some(key(target)) {
+    if app.context_mode.history.key == Some(key(target.clone())) {
         return;
     }
-    let result = read(app, target, None);
+    let result = read(app, target.clone(), None);
     let host = &mut app.context_mode.history;
     host.key = Some(key(target));
     host.selected = 0;
@@ -202,7 +202,7 @@ pub fn can_restore(app: &App, source: EditorTarget, entry: &HistoryEntry) -> boo
     !entry.current
         && entry.selection_count.is_none_or(|count| count == 1)
         && entry.restorable
-        && context_mode::valid(app, source, true)
+        && context_mode::valid(app, source.clone(), true)
         && !app.has_composition()
         && !context_mode::too_narrow(app, source.tab)
         && app.flavite.as_ref().is_some_and(|api| !api.is_read_only())
@@ -271,7 +271,7 @@ pub fn handle(app: &mut App, message: HistoryMessage) -> Task<Message> {
         HistoryMessage::Pick => {
             let host = &app.context_mode.history;
             if let (Some(source), Some(entry)) = (
-                host.target,
+                host.target.clone(),
                 host.page
                     .as_ref()
                     .and_then(|page| page.entries.get(host.selected)),
@@ -285,14 +285,14 @@ pub fn handle(app: &mut App, message: HistoryMessage) -> Task<Message> {
         }
         HistoryMessage::Act(source, action) => {
             if action == HistoryAction::Close {
-                if app.context_mode.history.target.is_some_and(|target| {
+                if app.context_mode.history.target.as_ref().is_some_and(|target| {
                     target.tab == source.tab && target.incarnation == source.incarnation
                 }) {
                     app.context_mode.history.open = false;
                 }
                 return context_mode::resume_focus(app);
             }
-            if !context_mode::valid(app, source, true)
+            if !context_mode::valid(app, source.clone(), true)
                 || !app.context_mode.mode(source.tab).active()
                 || app.has_composition()
                 || app.dialog.is_some()
@@ -332,9 +332,9 @@ pub fn handle(app: &mut App, message: HistoryMessage) -> Task<Message> {
                         let _ = session.state.close_menu();
                         session.menu_target = None;
                     }
-                    let result = read(app, source, cursor);
+                    let result = read(app, source.clone(), cursor);
                     let host = &mut app.context_mode.history;
-                    host.key = Some(key(source));
+                    host.key = Some(key(source.clone()));
                     host.target = Some(source);
                     host.open = true;
                     host.selected = 0;
@@ -376,7 +376,7 @@ fn restore(app: &mut App, source: EditorTarget, target: HistoryTarget) -> Task<M
             .notice("Editing-history state expired; refresh history");
         return Task::none();
     };
-    if !can_restore(app, source, &entry) {
+    if !can_restore(app, source.clone(), &entry) {
         app.context_mode.notice(if entry.restorable {
             "Restore is unavailable for this source"
         } else {
@@ -481,7 +481,9 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
         return None;
     }
     let message = match key {
-        Key::Named(Named::Escape) => HistoryMessage::Act(host.target?, HistoryAction::Close),
+        Key::Named(Named::Escape) => {
+            HistoryMessage::Act(host.target.clone()?, HistoryAction::Close)
+        }
         Key::Named(Named::ArrowDown) => HistoryMessage::Move(true),
         Key::Named(Named::ArrowUp) => HistoryMessage::Move(false),
         Key::Named(Named::Enter) if !repeat => HistoryMessage::Pick,

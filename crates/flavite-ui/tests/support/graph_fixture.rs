@@ -116,6 +116,7 @@ pub fn open_note(app: &mut App, name: &str) -> TabId {
             revision: view.revision,
             caret: 0,
             selection: (0, 0),
+            selections: vec![[0, 0, 0]],
             viewport_anchor: 0,
             focused: true,
             composing: false,

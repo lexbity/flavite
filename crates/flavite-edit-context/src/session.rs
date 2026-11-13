@@ -20,6 +20,9 @@ pub struct ContextState {
     mode: ContextMode,
     menu: Option<ContextMenu>,
     selected: usize,
+    /// The pending find-char capture; `None` outside AwaitChar. A sub-state
+    /// of Command, not a mode of its own (E-8: exactly one new state).
+    await_char: Option<AwaitChar>,
     message: String,
     attention: bool,
 }
@@ -36,6 +39,15 @@ pub enum EscapeOutcome {
     StayedCommand,
 }
 
+/// The pending find-char request while the statechart waits for one
+/// produced character (FEUX-0002 E-8, §5.4.1). The host resolves it from
+/// the next key event carrying produced text; nothing times out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AwaitChar {
+    /// `f` searches forward from each head; `Shift+F` backward.
+    pub forward: bool,
+}
+
 /// Statechart events the host forwards after its admission classification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -46,6 +58,8 @@ pub enum Event {
     RunAdmitted(ContextCommand),
     /// An admitted typing-entry command begins its typing sub-state.
     EnterTyping,
+    /// An admitted find-char command begins the AwaitChar capture (§5.4.1).
+    EnterAwaitChar(AwaitChar),
     /// Escape was admitted while no owned overlay consumed it.
     Escape,
     /// An admitted menu key opens a menu.
@@ -90,6 +104,7 @@ impl ContextState {
     pub const TYPING_HINT: &str = "Typing · click or move to reposition · Esc returns to commands";
     pub const ESC_HINT: &str = "Commands · exit with ✕ or the toggle shortcut";
     pub const UNBOUND: &str = "No command on this key · choose a menu or Type";
+    pub const AWAIT_CHAR_HINT: &str = "Waiting for character…";
     pub const MENU_TARGET_STALE: &str = "Source changed; choose the command again";
 
     #[must_use]
@@ -105,6 +120,26 @@ impl ContextState {
     #[must_use]
     pub const fn selected(&self) -> usize {
         self.selected
+    }
+
+    /// The pending find-char capture, if the statechart is in AwaitChar.
+    #[must_use]
+    pub const fn await_char(&self) -> Option<AwaitChar> {
+        self.await_char
+    }
+
+    /// Enter AwaitChar (§5.4.1 row 5): the state row shows the capture hint.
+    pub fn begin_await_char(&mut self, request: AwaitChar) {
+        debug_assert!(self.mode.active(), "AwaitChar entry requires an active mode");
+        self.await_char = Some(request);
+        self.message = Self::AWAIT_CHAR_HINT.into();
+        self.attention = false;
+    }
+
+    /// Resolve or cancel the AwaitChar capture; returns whether one was
+    /// pending.
+    pub fn end_await_char(&mut self) -> bool {
+        self.await_char.take().is_some()
     }
 
     /// The current message and whether it demands attention (an error
@@ -169,6 +204,8 @@ impl ContextState {
     pub fn escape(&mut self) -> EscapeOutcome {
         if self.menu.take().is_some() {
             EscapeOutcome::PoppedMenu
+        } else if self.await_char.take().is_some() {
+            EscapeOutcome::StayedCommand
         } else if self.mode == ContextMode::Typing {
             self.mode = ContextMode::Command;
             EscapeOutcome::LeftTyping
@@ -181,6 +218,7 @@ impl ContextState {
     pub fn admit_run(&mut self, command: ContextCommand) {
         self.menu = None;
         self.selected = 0;
+        self.await_char = None;
         self.message = command.title().into();
         self.attention = false;
     }
@@ -232,6 +270,10 @@ pub fn reduce(state: &mut ContextState, event: &Event) -> Vec<Effect> {
             state.begin_typing();
             Vec::new()
         }
+        Event::EnterAwaitChar(request) => {
+            state.begin_await_char(*request);
+            Vec::new()
+        }
         Event::Escape => {
             let effects = vec![Effect::InvalidateHistory];
             let _outcome = state.escape();
@@ -268,6 +310,9 @@ pub fn reduce(state: &mut ContextState, event: &Event) -> Vec<Effect> {
             Vec::new()
         }
         Event::Blur => {
+            // Blur suspends the mode but cancels the AwaitChar capture
+            // (§5.4.1: suspend retains the mode, cancels to Command).
+            state.await_char = None;
             if state.mode.active() {
                 vec![Effect::SealTypingGroup]
             } else {
@@ -341,7 +386,8 @@ mod tests {
         );
         assert_eq!(state.selected(), 1);
         assert_eq!(state.menu_command(), Some(ContextCommand::SelectLine));
-        for _ in 0..3 {
+        let rows = ContextMenu::Select.commands().len() - 1;
+        for _ in 0..rows {
             let _ = reduce(&mut state, &Event::MenuMove(true));
         }
         assert_eq!(state.selected(), 0, "wrap forward lands on the first row");
@@ -351,7 +397,7 @@ mod tests {
         );
         assert_eq!(
             state.menu_command(),
-            Some(ContextCommand::Collapse),
+            Some(ContextCommand::InvertSelections),
             "wrap backward lands on the last row"
         );
 

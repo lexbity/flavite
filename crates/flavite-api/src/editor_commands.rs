@@ -393,3 +393,628 @@ pub struct EditorSelectionOnlyArgs {
     revision: u64,
     selections: SelectionSetArg,
 }
+
+// ---- FEUX-0002 X04/X05: the set-aware verb family ----
+//
+// Every remaining catalogue verb translates through this module: ticketed
+// mutating verbs share one snapshot→normalize→plan→ApplyEdits path, and the
+// selection-only family validates through the canonical buffer constructors.
+// The api is the sole translation point (E-1); no handler re-implements the
+// algebra.
+
+/// Ticketed mutating verb arguments (`editor.change`, `editor.cut`,
+/// `editor.open_above`, `editor.open_below`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorMutateArgs {
+    buffer_id: u64,
+    revision: u64,
+    operation: OperationArg,
+    origin: EditorOriginArg,
+    selections: SelectionSetArg,
+}
+
+/// `editor.paste` adds the broadcast clipboard text.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorPasteArgs {
+    buffer_id: u64,
+    revision: u64,
+    operation: OperationArg,
+    origin: EditorOriginArg,
+    selections: SelectionSetArg,
+    text: String,
+}
+
+/// The shared ticketed mutating path: admit the ticket, take the frozen
+/// snapshot, normalize the set, plan, and dispatch through the Session
+/// single-writer apply. Zero-effect plans (no ops) consume the activation
+/// and return an unchanged revision (AC-8).
+fn handle_ticketed_edit(
+    session: &Session,
+    buffer_id: u64,
+    revision: u64,
+    op: OperationArg,
+    origin: EditorOriginArg,
+    selections: SelectionSetArg,
+    edit_operation: flavite_buffer::commands::EditOperation,
+    kind: flavite_buffer::history::EditKind,
+) -> Result<SessionResult, String> {
+    let operation = op.decode(buffer_id)?;
+    validate_origin(&origin)?;
+    match session.admit_editor_operation(&operation) {
+        flavite_vault::editor_receipts::TicketStatus::Pending => {}
+        flavite_vault::editor_receipts::TicketStatus::AlreadyApplied => {
+            return Err("AlreadyApplied".into());
+        }
+        flavite_vault::editor_receipts::TicketStatus::Cancelled => {
+            return Err("Cancelled".into());
+        }
+        flavite_vault::editor_receipts::TicketStatus::Retired => {
+            return Err("ReceiptExpired".into());
+        }
+        flavite_vault::editor_receipts::TicketStatus::Unknown => {
+            return Err("UnknownOperation".into());
+        }
+    }
+    let snapshot = match session.shared_buffer_snapshot(
+        BufferId::from(buffer_id),
+        Some(Revision::new(revision)),
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            session.complete_editor_operation(&operation, Outcome::Cancelled);
+            return Err(match error {
+                flavite_vault::session::BufferSnapshotError::NotFound(_) => {
+                    "Buffer not found".to_string()
+                }
+                flavite_vault::session::BufferSnapshotError::Stale { expected, actual } => {
+                    format!("StaleRevision: expected {expected}, current {actual}")
+                }
+            });
+        }
+    };
+    let text = snapshot.text;
+    let set = match normalize_set(&text, &selections) {
+        Ok(set) => set,
+        Err(error) => {
+            session.complete_editor_operation(&operation, Outcome::Cancelled);
+            return Err(error);
+        }
+    };
+    let prepared = match flavite_buffer::commands::plan(&text, &set, &edit_operation) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            session.complete_editor_operation(&operation, Outcome::Cancelled);
+            return Err(error.to_string());
+        }
+    };
+    if prepared.ops.is_empty() {
+        // Zero-effect: no history node, no revision bump (AC-8).
+        session.complete_editor_operation(&operation, Outcome::Applied);
+        return Ok(SessionResult::Success(
+            crate::session::CommandResult::EditsApplied {
+                buffer_id: BufferId::from(buffer_id),
+                new_revision: Revision::new(revision),
+                movement: Some(flavite_buffer::history::HistoryMovement {
+                    selections: Some(triples(&set)),
+                    spans: Vec::new(),
+                    truncated: false,
+                }),
+                after_selections: Some(triples(&set)),
+            },
+        ));
+    }
+    let record = flavite_buffer::history::EditorEdit {
+        origin: origin.view.clone(),
+        kind,
+        before: triples(&set),
+        after: triples(&prepared.after_set),
+    };
+    Ok(session.execute(SessionCommand::ApplyEdits {
+        buffer_id: BufferId::from(buffer_id),
+        revision: Revision::new(revision),
+        ops: prepared.ops,
+        undo_policy: flavite_buffer::undo::UndoPolicy::Context {
+            origin: parse_origin(&origin.view)?,
+        },
+        editor: Some(record),
+        operation: Some(operation),
+    }))
+}
+
+/// `editor.change`: delete each member's D-11 effective range; the host
+/// enters typing after the receipt.
+pub(crate) fn handle_editor_change(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::Delete,
+        flavite_buffer::history::EditKind::Change,
+    )
+}
+
+/// `editor.cut`: the D-11 cut ranges delete atomically; the fragments rode
+/// the earlier `editor.copy` resolution at the host clipboard seam.
+pub(crate) fn handle_editor_cut(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::Cut,
+        flavite_buffer::history::EditKind::Cut,
+    )
+}
+
+/// `editor.paste`: broadcast one string to every member (`Typing` op: ranges
+/// replace whole, carets receive insertions).
+pub(crate) fn handle_editor_paste(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorPasteArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::Typing(args.text.replace("\r\n", "\n")),
+        flavite_buffer::history::EditKind::Paste,
+    )
+}
+
+/// `editor.open_above`/`editor.open_below`: open one line per unique head
+/// line; the host enters typing after the receipt.
+fn open_line(
+    session: &Session,
+    invocation: &Invocation,
+    above: bool,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    let kind = if above {
+        flavite_buffer::history::EditKind::OpenAbove
+    } else {
+        flavite_buffer::history::EditKind::OpenBelow
+    };
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::OpenLine { above },
+        kind,
+    )
+}
+
+pub(crate) fn handle_open_above(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    open_line(session, invocation, true)
+}
+
+pub(crate) fn handle_open_below(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    open_line(session, invocation, false)
+}
+
+/// `editor.copy`: the D-11 copy fragments joined with LF in document order
+/// (§5.3). Read-only; the host owns the clipboard write at the seam.
+pub(crate) fn handle_editor_copy(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorSelectionOnlyArgs = decode(invocation)?;
+    let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let fragments = flavite_buffer::commands::copy_fragments(&snapshot.text, &set)
+        .map_err(|error| error.to_string())?;
+    Ok(SessionResult::Success(
+        crate::session::CommandResult::TextCopied {
+            buffer_id: BufferId::from(args.buffer_id),
+            revision: Revision::new(args.revision),
+            text: fragments.join("\n"),
+        },
+    ))
+}
+
+/// Shared snapshot fetch for the selection-only family.
+fn shared_snapshot(
+    session: &Session,
+    buffer_id: u64,
+    revision: u64,
+) -> Result<flavite_vault::session::SharedBufferSnapshot, String> {
+    session
+        .shared_buffer_snapshot(BufferId::from(buffer_id), Some(Revision::new(revision)))
+        .map_err(|error| match error {
+            flavite_vault::session::BufferSnapshotError::NotFound(_) => {
+                "Buffer not found".to_string()
+            }
+            flavite_vault::session::BufferSnapshotError::Stale { expected, actual } => {
+                format!("StaleRevision: expected {expected}, current {actual}")
+            }
+        })
+}
+
+/// `editor.select_word`: each member selects its containing word (grammar
+/// word bounds), merged through normalization.
+pub(crate) fn handle_select_word(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorSelectionOnlyArgs = decode(invocation)?;
+    let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let candidates: Vec<RawSelection> = set
+        .members()
+        .iter()
+        .map(|member| {
+            let (anchor, head) =
+                flavite_edit_context::word_bounds(&snapshot.text, member.head());
+            RawSelection {
+                id: Some(member.id().as_raw()),
+                anchor,
+                head,
+            }
+        })
+        .collect();
+    let hint = set.primary_id().as_raw();
+    let (selected, _) = SelectionSet::normalize(&snapshot.text, candidates, Some(hint))
+        .map_err(|error| error.to_string())?;
+    Ok(selections_changed(args.buffer_id, args.revision, &selected))
+}
+
+/// `editor.select_line`: each member selects its containing line including
+/// its line break, merged.
+pub(crate) fn handle_select_line(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorSelectionOnlyArgs = decode(invocation)?;
+    let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let candidates: Vec<RawSelection> = set
+        .members()
+        .iter()
+        .map(|member| {
+            let (anchor, head) =
+                flavite_buffer::selection::containing_line(&snapshot.text, member.head());
+            RawSelection {
+                id: Some(member.id().as_raw()),
+                anchor,
+                head,
+            }
+        })
+        .collect();
+    let hint = set.primary_id().as_raw();
+    let (selected, _) = SelectionSet::normalize(&snapshot.text, candidates, Some(hint))
+        .map_err(|error| error.to_string())?;
+    Ok(selections_changed(args.buffer_id, args.revision, &selected))
+}
+
+/// The `editor.insert_*` family: a zero-effect plan collapses every member
+/// onto the requested boundary; the returned set is the typing entry state.
+fn insert_at(
+    session: &Session,
+    invocation: &Invocation,
+    edit_operation: flavite_buffer::commands::EditOperation,
+) -> Result<SessionResult, String> {
+    let args: EditorSelectionOnlyArgs = decode(invocation)?;
+    let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let prepared = flavite_buffer::commands::plan(&snapshot.text, &set, &edit_operation)
+        .map_err(|error| error.to_string())?;
+    Ok(selections_changed(
+        args.buffer_id,
+        args.revision,
+        &prepared.after_set,
+    ))
+}
+
+pub(crate) fn handle_insert_start(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    insert_at(
+        session,
+        invocation,
+        flavite_buffer::commands::EditOperation::InsertAtStarts(String::new()),
+    )
+}
+
+pub(crate) fn handle_insert_end(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    insert_at(
+        session,
+        invocation,
+        flavite_buffer::commands::EditOperation::InsertAtEnds(String::new()),
+    )
+}
+
+pub(crate) fn handle_insert_line_start(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    insert_at(
+        session,
+        invocation,
+        flavite_buffer::commands::EditOperation::InsertAtLineStarts(String::new()),
+    )
+}
+
+pub(crate) fn handle_insert_line_end(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    insert_at(
+        session,
+        invocation,
+        flavite_buffer::commands::EditOperation::InsertAtLineEnds(String::new()),
+    )
+}
+
+/// Which boundary the `editor.insert_*` family collapses onto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtPosition {
+    Starts,
+    Ends,
+    LineStarts,
+    LineEnds,
+}
+
+/// `editor.toggle_caret`: a11y/programmatic parity with Mod-click (E-14).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorToggleCaretArgs {
+    buffer_id: u64,
+    revision: u64,
+    selections: SelectionSetArg,
+    position: usize,
+}
+
+pub(crate) fn handle_toggle_caret(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorToggleCaretArgs = decode(invocation)?;
+    let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let toggled = flavite_buffer::selection::toggle_caret(
+        &snapshot.text,
+        &set,
+        args.position,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(selections_changed(args.buffer_id, args.revision, &toggled))
+}
+
+// ---- X05: motions, find-char, and the pure set-op family ----
+
+/// The `editor.move` motion vocabulary (§6).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionArg {
+    CharLeft,
+    CharRight,
+    LineUp,
+    LineDown,
+    WordNext,
+    WordPrev,
+    WordEnd,
+    LineStart,
+    LineEnd,
+    DocStart,
+    DocEnd,
+    PageUp,
+    PageDown,
+}
+
+impl From<MotionArg> for flavite_buffer::motion::Motion {
+    fn from(arg: MotionArg) -> Self {
+        match arg {
+            MotionArg::CharLeft => Self::CharLeft,
+            MotionArg::CharRight => Self::CharRight,
+            MotionArg::LineUp => Self::LineUp,
+            MotionArg::LineDown => Self::LineDown,
+            MotionArg::WordNext => Self::WordNext,
+            MotionArg::WordPrev => Self::WordPrev,
+            MotionArg::WordEnd => Self::WordEnd,
+            MotionArg::LineStart => Self::LineStart,
+            MotionArg::LineEnd => Self::LineEnd,
+            MotionArg::DocStart => Self::DocStart,
+            MotionArg::DocEnd => Self::DocEnd,
+            MotionArg::PageUp => Self::PageUp,
+            MotionArg::PageDown => Self::PageDown,
+        }
+    }
+}
+
+/// `editor.move {motion, extend, positions}`: one typed motion per member.
+/// Visual motions (line up/down, page up/down) carry editor-computed target
+/// heads; text-pure motions compute here and refuse supplied positions.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorMoveArgs {
+    buffer_id: u64,
+    revision: u64,
+    selections: SelectionSetArg,
+    motion: MotionArg,
+    #[serde(default)]
+    extend: bool,
+    #[serde(default)]
+    positions: Option<Vec<usize>>,
+}
+
+pub(crate) fn handle_editor_move(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMoveArgs = decode(invocation)?;
+    let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let motion: flavite_buffer::motion::Motion = args.motion.into();
+    let positions = match (motion.is_visual(), &args.positions) {
+        (true, Some(positions)) => Some(positions.as_slice()),
+        (true, None) => {
+            return Err("visual motions need one target position per selection".into());
+        }
+        (false, Some(_)) => {
+            return Err("positions only apply to visual motions".into());
+        }
+        (false, None) => None,
+    };
+    let moved = flavite_buffer::motion::apply(&snapshot.text, &set, motion, args.extend, positions)
+        .map_err(|error| error.to_string())?;
+    Ok(selections_changed(args.buffer_id, args.revision, &moved))
+}
+
+/// `editor.find_char {direction, char, extend}`: scan for one literal char
+/// per member (E-8); no match on any member is a typed no-op.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorFindCharArgs {
+    buffer_id: u64,
+    revision: u64,
+    selections: SelectionSetArg,
+    direction: String,
+    char: String,
+    #[serde(default)]
+    extend: bool,
+}
+
+pub(crate) fn handle_find_char(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorFindCharArgs = decode(invocation)?;
+    let forward = match args.direction.as_str() {
+        "fwd" => true,
+        "back" => false,
+        other => return Err(format!("direction must be `fwd` or `back`, got {other}")),
+    };
+    let mut chars = args.char.chars();
+    let (target, extra) = (chars.next(), chars.next());
+    let Some(target) = target.filter(|_| extra.is_none()) else {
+        return Err("char must be exactly one character".into());
+    };
+    let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let found = flavite_buffer::selection::find_char(
+        &snapshot.text,
+        &set,
+        forward,
+        target,
+        args.extend,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(selections_changed(args.buffer_id, args.revision, &found))
+}
+
+/// `editor.add_caret_above`/`below`: the host computes the visual-row target
+/// heads (layout is editor-side); the pure half validates and merges.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorAddCaretsArgs {
+    buffer_id: u64,
+    revision: u64,
+    selections: SelectionSetArg,
+    positions: Vec<usize>,
+}
+
+fn handle_add_carets(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorAddCaretsArgs = decode(invocation)?;
+    let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let merged = flavite_buffer::selection::add_carets(
+        &snapshot.text,
+        &set,
+        &args.positions,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(selections_changed(args.buffer_id, args.revision, &merged))
+}
+
+pub(crate) fn handle_add_caret_above(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    handle_add_carets(session, invocation)
+}
+
+pub(crate) fn handle_add_caret_below(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    handle_add_carets(session, invocation)
+}
+
+/// `editor.rotate_primary {direction}`: selection-only primary advance.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorRotateArgs {
+    buffer_id: u64,
+    revision: u64,
+    selections: SelectionSetArg,
+    direction: String,
+}
+
+pub(crate) fn handle_rotate_primary(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorRotateArgs = decode(invocation)?;
+    let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let forward = match args.direction.as_str() {
+        "next" => true,
+        "previous" => false,
+        other => return Err(format!("direction must be `next` or `previous`, got {other}")),
+    };
+    let rotated = flavite_buffer::selection::rotate_primary(&set, forward);
+    Ok(selections_changed(args.buffer_id, args.revision, &rotated))
+}
+
+macro_rules! selection_only_set_op {
+    ($name:ident, $method:expr) => {
+        pub(crate) fn $name(
+            session: &Session,
+            invocation: &Invocation,
+        ) -> Result<SessionResult, String> {
+            let args: EditorSelectionOnlyArgs = decode(invocation)?;
+            let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+            let set = normalize_set(&snapshot.text, &args.selections)?;
+            let next = $method(&snapshot.text, &set).map_err(|error| error.to_string())?;
+            Ok(selections_changed(args.buffer_id, args.revision, &next))
+        }
+    };
+}
+
+selection_only_set_op!(handle_flip_selections, flavite_buffer::selection::flip_selections);
+selection_only_set_op!(handle_trim_selections, flavite_buffer::selection::trim_selections);
+selection_only_set_op!(handle_invert_selections, flavite_buffer::selection::invert_selections);

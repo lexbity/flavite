@@ -17,5 +17,5 @@ pub mod vocabulary;
 
 pub use grammar::{command_key, menu_key, motion_key, selected_characters, word_bounds};
 pub use key::{KeyCode, Modifiers, Motion};
-pub use session::{ContextState, Effect, EscapeOutcome, Event, reduce};
+pub use session::{AwaitChar, ContextState, Effect, EscapeOutcome, Event, reduce};
 pub use vocabulary::{ContextCommand, ContextMenu, ContextMode};

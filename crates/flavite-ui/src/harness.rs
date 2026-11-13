@@ -268,7 +268,12 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                         "buffer": buffer_view.as_ref().map(|view| view.buffer_id),
                         "revision": buffer_view.as_ref().map(|view| view.revision),
                         "buffer_text": buffer_view.as_ref().map(|view| view.text.to_string()),
-                        "selection": interaction.selections.first().map(|selection| [selection.anchor, selection.head]),
+                        "selection_count": interaction.selections.len(),
+                        "selections": interaction
+                            .selections
+                            .iter()
+                            .map(|selection| [selection.anchor, selection.head])
+                            .collect::<Vec<_>>(),
                         "editor_bounds": app.editor_bounds.get(tab).map(|r| [r.x,r.y,r.width,r.height]),
                         "incarnation": interaction.incarnation,
                         "interaction_focused": interaction.focused,

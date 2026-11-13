@@ -297,6 +297,7 @@ impl App {
         });
         snapshot.sequence = snapshot.sequence.saturating_add(1);
         snapshot.selection = (anchor, head);
+        snapshot.selections = vec![[0, anchor, head]];
         snapshot.caret = head;
         snapshot.focused = true;
         self.workspace.release_editor_focus(Some(tab));
