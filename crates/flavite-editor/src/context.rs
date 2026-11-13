@@ -64,6 +64,7 @@ pub fn native_code(code: Code) -> Option<KeyCode> {
         Code::KeyJ => KeyCode::KeyJ,
         Code::KeyK => KeyCode::KeyK,
         Code::KeyL => KeyCode::KeyL,
+        Code::KeyF => KeyCode::KeyF,
         Code::KeyO => KeyCode::KeyO,
         Code::KeyP => KeyCode::KeyP,
         Code::KeyT => KeyCode::KeyT,
@@ -102,5 +103,63 @@ pub const fn motion_action(motion: Motion) -> KeyAction {
         Motion::NextWord => KeyAction::NextWord,
         Motion::NextWordEnd => KeyAction::NextWordEnd,
         Motion::PreviousWord => KeyAction::PreviousWord,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flavite_edit_context::{Modifiers, command_key};
+
+    /// Every grammar key identity converts from a native physical code
+    /// (FEUX-0002 E-8/R9): the conversion boundary covers the whole
+    /// advertised physical vocabulary, so `f`/`Shift+F` and every other
+    /// binding reach the grammar on real hardware.
+    #[test]
+    fn native_converter_covers_the_whole_grammar_vocabulary() {
+        let all = [
+            (Code::KeyA, KeyCode::KeyA),
+            (Code::KeyB, KeyCode::KeyB),
+            (Code::KeyC, KeyCode::KeyC),
+            (Code::KeyD, KeyCode::KeyD),
+            (Code::KeyE, KeyCode::KeyE),
+            (Code::KeyF, KeyCode::KeyF),
+            (Code::KeyG, KeyCode::KeyG),
+            (Code::KeyH, KeyCode::KeyH),
+            (Code::KeyI, KeyCode::KeyI),
+            (Code::KeyJ, KeyCode::KeyJ),
+            (Code::KeyK, KeyCode::KeyK),
+            (Code::KeyL, KeyCode::KeyL),
+            (Code::KeyO, KeyCode::KeyO),
+            (Code::KeyP, KeyCode::KeyP),
+            (Code::KeyT, KeyCode::KeyT),
+            (Code::KeyU, KeyCode::KeyU),
+            (Code::KeyV, KeyCode::KeyV),
+            (Code::KeyW, KeyCode::KeyW),
+            (Code::KeyX, KeyCode::KeyX),
+            (Code::KeyY, KeyCode::KeyY),
+            (Code::Semicolon, KeyCode::Semicolon),
+            (Code::Slash, KeyCode::Slash),
+        ];
+        for (native, grammar) in all {
+            assert_eq!(
+                native_code(native),
+                Some(grammar),
+                "{native:?} must convert"
+            );
+        }
+    }
+
+    #[test]
+    fn native_f_reaches_the_find_char_grammar() {
+        let code = native_code(Code::KeyF).expect("KeyF converts");
+        assert_eq!(
+            command_key(code, Modifiers::EMPTY),
+            Some(flavite_edit_context::ContextCommand::FindChar { forward: true })
+        );
+        assert_eq!(
+            command_key(code, Modifiers::SHIFT),
+            Some(flavite_edit_context::ContextCommand::FindChar { forward: false })
+        );
     }
 }

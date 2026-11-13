@@ -27,9 +27,9 @@ case "$backend" in
     *) echo "backend must be gpu or canvas (got: $backend)" >&2; exit 2 ;;
 esac
 case "$scenario" in
-    graph-editor-loop|note-regex-replace|link-completion|reference-workspace|context-mode|context-mode-history|context-mode-feedback|context-mode-budget|context-mode-multiselect|context-mode-setops|context-mode-matches|context-mode-failures) ;;
-    "") echo "missing --scenario (implemented: graph-editor-loop note-regex-replace link-completion reference-workspace context-mode context-mode-history context-mode-feedback context-mode-budget context-mode-multiselect context-mode-setops context-mode-matches context-mode-failures)" >&2; exit 2 ;;
-    *) echo "unsupported scenario: $scenario (implemented: graph-editor-loop note-regex-replace link-completion reference-workspace context-mode context-mode-history context-mode-feedback context-mode-budget context-mode-multiselect context-mode-setops context-mode-matches context-mode-failures)" >&2; exit 2 ;;
+    graph-editor-loop|note-regex-replace|link-completion|reference-workspace|context-mode|context-mode-history|context-mode-feedback|context-mode-budget|context-mode-multiselect|context-mode-setops|context-mode-matches|context-mode-failures|context-workbench-acceptance|probe-find|probe-menu-open|probe-menu-kb) ;;
+    "") echo "missing --scenario (implemented: graph-editor-loop note-regex-replace link-completion reference-workspace context-mode context-mode-history context-mode-feedback context-mode-budget context-mode-multiselect context-mode-setops context-mode-matches context-mode-failures context-workbench-acceptance probe-find probe-menu-open probe-menu-kb)" >&2; exit 2 ;;
+    *) echo "unsupported scenario: $scenario (implemented: graph-editor-loop note-regex-replace link-completion reference-workspace context-mode context-mode-history context-mode-feedback context-mode-budget context-mode-multiselect context-mode-setops context-mode-matches context-mode-failures context-workbench-acceptance probe-find probe-menu-open probe-menu-kb)" >&2; exit 2 ;;
 esac
 if [[ "$(uname -s)" != Linux ]]; then
     echo "workbench visual runner is Linux-only" >&2

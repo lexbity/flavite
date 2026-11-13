@@ -61,6 +61,9 @@ pub enum EscapeOutcome {
     PoppedMenu,
     /// Typing ended; the mode is Command.
     LeftTyping,
+    /// Command Escape with more than one member: the host keeps the primary
+    /// (row 10's multi-selection recovery); the mode is unchanged.
+    KeptPrimary,
     /// No menu and not typing: the mode is unchanged.
     StayedCommand,
 }
@@ -86,8 +89,10 @@ pub enum Event {
     EnterTyping,
     /// An admitted find-char command begins the `AwaitChar` capture (§5.4.1).
     EnterAwaitChar(AwaitChar),
-    /// Escape was admitted while no owned overlay consumed it.
-    Escape,
+    /// Escape was admitted while no owned overlay consumed it. The host
+    /// supplies the live selection cardinality: Command Escape with more
+    /// than one member keeps the primary (§5.4 row 10).
+    Escape { selections: usize },
     /// An admitted menu key opens a menu.
     OpenMenu(ContextMenu),
     /// The menu closes (focus returns to the editor).
@@ -117,6 +122,10 @@ pub enum Effect {
     /// (FEUX-0002 E-15, X07). Emitted at most once per 30 s; the host
     /// renders the banner with Exit Context Mode and Open history actions.
     ShowBurstHint,
+    /// Command Escape with more than one member (§5.4 row 10): the host
+    /// runs `editor.keep_primary` so the user can discard additional
+    /// targets before ordinary typing.
+    KeepPrimary,
 }
 
 impl ContextState {
@@ -233,8 +242,10 @@ impl ContextState {
     }
 
     /// Escape pops exactly one level: a menu first, then typing, and at
-    /// Command it stays (the host shows the exit hint, FEUX-0002 §5.4).
-    pub fn escape(&mut self) -> EscapeOutcome {
+    /// Command it stays — keeping the primary when the set has more than
+    /// one member (§5.4 row 10: the multi-selection recovery). The host
+    /// shows the exit hint in every Command outcome.
+    pub fn escape(&mut self, selections: usize) -> EscapeOutcome {
         if self.menu.take().is_some() {
             EscapeOutcome::PoppedMenu
         } else if self.await_char.take().is_some() {
@@ -242,6 +253,8 @@ impl ContextState {
         } else if self.mode == ContextMode::Typing {
             self.mode = ContextMode::Command;
             EscapeOutcome::LeftTyping
+        } else if selections > 1 {
+            EscapeOutcome::KeptPrimary
         } else {
             EscapeOutcome::StayedCommand
         }
@@ -320,12 +333,16 @@ pub fn reduce(
             state.begin_await_char(*request);
             Vec::new()
         }
-        Event::Escape => {
+        Event::Escape { selections } => {
             let effects = vec![Effect::InvalidateHistory];
-            let _outcome = state.escape();
+            let outcome = state.escape(*selections);
             // Delivered Escape: invalidate history, pop, show the exit hint,
-            // seal, refocus — regardless of which level was popped.
+            // seal, refocus — regardless of which level was popped. Row 10
+            // adds the keep-primary recovery for a multi-member set.
             let mut effects = effects;
+            if outcome == EscapeOutcome::KeptPrimary {
+                effects.push(Effect::KeepPrimary);
+            }
             effects.push(Effect::SealTypingGroup);
             effects.push(Effect::FocusEditor);
             state.set_message(ContextState::ESC_HINT, false);
@@ -445,7 +462,7 @@ mod tests {
         // Menu open: pops the menu, mode untouched, seal + refocus effects.
         let mut state = ContextState::activated();
         state.open_menu(ContextMenu::Select);
-        let effects = r(&mut state, &Event::Escape, 0, false);
+        let effects = r(&mut state, &Event::Escape { selections: 1 }, 0, false);
         assert!(effects.contains(&Effect::InvalidateHistory));
         assert!(effects.contains(&Effect::SealTypingGroup));
         assert!(effects.contains(&Effect::FocusEditor));
@@ -456,7 +473,7 @@ mod tests {
         // Typing: leaves typing (no menu to pop).
         let mut state = ContextState::activated();
         let _ = r(&mut state, &Event::EnterTyping, 0, false);
-        assert_eq!(r(&mut state, &Event::Escape, 0, false), {
+        assert_eq!(r(&mut state, &Event::Escape { selections: 1 }, 0, false), {
             let mut expected = vec![Effect::InvalidateHistory];
             expected.push(Effect::SealTypingGroup);
             expected.push(Effect::FocusEditor);
@@ -466,7 +483,7 @@ mod tests {
 
         // At Command: stays; the hint is the deliverable.
         let mut state = ContextState::activated();
-        let _ = r(&mut state, &Event::Escape, 0, false);
+        let _ = r(&mut state, &Event::Escape { selections: 1 }, 0, false);
         assert_eq!(state.mode(), ContextMode::Command);
         assert_eq!(state.message(), (ContextState::ESC_HINT, false));
     }
@@ -539,7 +556,7 @@ mod tests {
         let _ = r(&mut state, &Event::EnterTyping, 0, false);
         assert_eq!(state.mode(), ContextMode::Typing);
         assert_eq!(state.message(), (ContextState::TYPING_HINT, false));
-        let _ = r(&mut state, &Event::Escape, 0, false);
+        let _ = r(&mut state, &Event::Escape { selections: 1 }, 0, false);
         assert_eq!(state.mode(), ContextMode::Command);
     }
 

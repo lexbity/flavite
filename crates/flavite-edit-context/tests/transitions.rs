@@ -33,7 +33,7 @@ fn matrix_escape_row_pops_menu_then_typing_then_stays() {
     // Menu open (delivered: pop the menu, mode untouched).
     let mut state = activated();
     let _ = r(&mut state, &Event::OpenMenu(ContextMenu::Select), 0, false);
-    let effects = r(&mut state, &Event::Escape, 0, false);
+    let effects = r(&mut state, &Event::Escape { selections: 1 }, 0, false);
     assert_eq!(
         effects,
         vec![
@@ -48,7 +48,7 @@ fn matrix_escape_row_pops_menu_then_typing_then_stays() {
     // Typing (delivered: leave typing, same effect list).
     let mut state = activated();
     let _ = r(&mut state, &Event::EnterTyping, 0, false);
-    let effects = r(&mut state, &Event::Escape, 0, false);
+    let effects = r(&mut state, &Event::Escape { selections: 1 }, 0, false);
     assert_eq!(
         effects,
         vec![
@@ -61,7 +61,7 @@ fn matrix_escape_row_pops_menu_then_typing_then_stays() {
 
     // Command (delivered: stay; hint is the deliverable).
     let mut state = activated();
-    let _ = r(&mut state, &Event::Escape, 0, false);
+    let _ = r(&mut state, &Event::Escape { selections: 1 }, 0, false);
     assert_eq!(state.mode(), ContextMode::Command);
     assert_eq!(state.message(), (ContextState::ESC_HINT, false));
 }
@@ -144,7 +144,7 @@ fn matrix_await_char_rows_enter_resolve_cancel_and_blur() {
         0,
         false,
     );
-    let effects = r(&mut state, &Event::Escape, 0, false);
+    let effects = r(&mut state, &Event::Escape { selections: 1 }, 0, false);
     assert!(effects.contains(&Effect::FocusEditor));
     assert!(state.await_char().is_none());
     assert_eq!(state.mode(), ContextMode::Command);
@@ -212,4 +212,42 @@ fn matrix_external_and_reconcile_rows_match_delivered_semantics() {
         vec![Effect::SealTypingGroup]
     );
     assert_eq!(state.mode(), ContextMode::Typing);
+}
+
+#[test]
+fn command_escape_with_multiple_members_keeps_the_primary() {
+    // §5.4 row 10: Command Escape with N>1 keeps the primary (the
+    // multi-selection recovery) and stays in Command; the host interprets
+    // `Effect::KeepPrimary` as `editor.keep_primary`.
+    let mut state = activated();
+    let effects = r(&mut state, &Event::Escape { selections: 2 }, 0, false);
+    assert_eq!(
+        effects,
+        vec![
+            Effect::InvalidateHistory,
+            Effect::KeepPrimary,
+            Effect::SealTypingGroup,
+            Effect::FocusEditor
+        ]
+    );
+    assert_eq!(state.mode(), ContextMode::Command);
+    assert_eq!(state.menu(), None);
+
+    // A single member keeps the delivered behavior (no keep-primary).
+    let mut state = activated();
+    let effects = r(&mut state, &Event::Escape { selections: 1 }, 0, false);
+    assert!(!effects.contains(&Effect::KeepPrimary));
+
+    // Typing Escape never reduces the set (row 9), whatever N is.
+    let mut state = activated();
+    let _ = r(&mut state, &Event::EnterTyping, 0, false);
+    let effects = r(&mut state, &Event::Escape { selections: 3 }, 0, false);
+    assert!(!effects.contains(&Effect::KeepPrimary));
+    assert_eq!(state.mode(), ContextMode::Command);
+
+    // A menu Escape pops the menu only; keep-primary is not emitted.
+    let mut state = activated();
+    let _ = r(&mut state, &Event::OpenMenu(ContextMenu::Select), 0, false);
+    let effects = r(&mut state, &Event::Escape { selections: 2 }, 0, false);
+    assert!(!effects.contains(&Effect::KeepPrimary));
 }

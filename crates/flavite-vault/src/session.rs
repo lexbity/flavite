@@ -666,11 +666,14 @@ pub enum CommandResult {
         operation: crate::editor_receipts::OperationId,
     },
     /// A selection-only command produced a new canonical set (no history
-    /// node, no revision bump).
+    /// node, no revision bump). `primary` is the index into `selections`
+    /// of the primary member (FEUX-0002 E-4/FR-4): primary identity is
+    /// explicit in every set-bearing handoff.
     SelectionsChanged {
         buffer_id: BufferId,
         revision: Revision,
         selections: Vec<[usize; 3]>,
+        primary: usize,
     },
     /// The D-11 copy fragments joined with LF in document order (X04); the
     /// host clipboard seam writes this at the effect boundary.
@@ -5812,6 +5815,14 @@ impl Session {
         if let Some(path) = buffer_manager.path_for_id(buffer_id)
             && self.leased_by_replace(path)
         {
+            // Every admitted activation reaches a terminal outcome on every
+            // return path (E-5/NFR-13): a refusal here must not leak a
+            // pending ticket into the per-buffer cap.
+            if let Some(op) = operation {
+                self.editor_operations
+                    .lock_recovering()
+                    .complete(&op, crate::editor_receipts::Outcome::Cancelled);
+            }
             return SessionResult::ActionRequired {
                 code: "replacement-in-progress",
                 data: Some(path.display().to_string()),
@@ -5822,11 +5833,21 @@ impl Session {
         // budget ledger (FEUX-0002 X01 / E-12). The projection is computed
         // before any per-buffer mutation; a refusal names the busiest buffer.
         let Some(buffer) = buffer_manager.get_buffer_by_id(buffer_id) else {
+            if let Some(op) = operation {
+                self.editor_operations
+                    .lock_recovering()
+                    .complete(&op, crate::editor_receipts::Outcome::Cancelled);
+            }
             return SessionResult::Error {
                 message: format!("Buffer not found: {:?}", buffer_id),
             };
         };
         if buffer.revision() != revision {
+            if let Some(op) = operation {
+                self.editor_operations
+                    .lock_recovering()
+                    .complete(&op, crate::editor_receipts::Outcome::Cancelled);
+            }
             return SessionResult::StaleRevision {
                 buffer_id,
                 expected: revision,
@@ -5847,6 +5868,11 @@ impl Session {
                 }
             }
             if app_total.saturating_add(projected) > app_ceiling {
+                if let Some(op) = operation {
+                    self.editor_operations
+                        .lock_recovering()
+                        .complete(&op, crate::editor_receipts::Outcome::Cancelled);
+                }
                 return SessionResult::HistoryLimitExceeded {
                     buffer_id,
                     needed: projected,
@@ -5954,6 +5980,7 @@ impl Session {
                     selections: after.clone(),
                     spans,
                     truncated,
+                    primary: buffer.model().history_position_primary(),
                 }),
                 after,
             )
@@ -8099,6 +8126,7 @@ mod tests {
                 kind: flavite_buffer::history::EditKind::Typing,
                 before: vec![[0, 0, 0]],
                 after: vec![[0, 1, 1]],
+                primary: 0,
             }),
             operation: None,
         }) {

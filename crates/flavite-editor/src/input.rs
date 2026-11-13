@@ -24,6 +24,12 @@ pub struct CapturedInput {
     /// capture time (X04: vertical motion keeps per-member columns; missing
     /// entries mean "no sticky column").
     pub preferred_x: Vec<Option<f32>>,
+    /// The clipboard stage of this intent already completed at the host
+    /// clipboard seam (X04/T-10): a Paste carries the acquired text and a
+    /// Cut's write finished, so interpretation proceeds to the guarded
+    /// mutation instead of re-acquiring. A fresh widget capture is always
+    /// `false`.
+    pub clipboard_acquired: bool,
 }
 
 #[derive(Debug)]
@@ -33,20 +39,35 @@ pub enum PreparedInput {
         /// After-set members for the optimistic pre-receipt caret install
         /// (already validated against the after-text by the planner).
         members: Vec<(usize, usize)>,
+        /// Index into `members` of the primary member (FEUX-0002 E-4/FR-4:
+        /// primary identity survives every planned edit).
+        primary: usize,
         /// Cut text (fragments joined with LF in document order, §5.3).
         clipboard: Option<String>,
     },
     History(EditorAction),
     Selection {
         members: Vec<(usize, usize)>,
+        /// Index into `members` of the primary member.
+        primary: usize,
     },
     VerticalSelection {
         members: Vec<(usize, usize)>,
+        /// Index into `members` of the primary member.
+        primary: usize,
         preferred_x: Vec<Option<f32>>,
     },
     Copy {
         text: String,
     },
+}
+
+/// The index within `set` of the primary member.
+fn primary_index(set: &SelectionSet) -> usize {
+    set.members()
+        .iter()
+        .position(|member| member.id() == set.primary_id())
+        .unwrap_or(0)
 }
 
 /// The member pairs of a canonical set (host translation shape).
@@ -109,6 +130,7 @@ pub fn prepare(
     let text = &view.text;
     let unchanged = || PreparedInput::Selection {
         members: member_pairs(set),
+        primary: primary_index(set),
     };
     if let Some(edit_operation) = operation_of(input.action, input.text.as_str()) {
         let edit_operation = match edit_operation {
@@ -127,13 +149,15 @@ pub fn prepare(
             return Ok(unchanged());
         }
         let clipboard = (!prepared.fragments.is_empty()).then(|| prepared.fragments.join("\n"));
+        let after_set = &prepared.after_set;
         return Ok(PreparedInput::Edit {
             action: EditorAction::Edit {
                 buffer_id: view.buffer_id,
                 expected_revision: view.revision,
                 edits: prepared.ops,
             },
-            members: member_pairs(&prepared.after_set),
+            primary: primary_index(after_set),
+            members: member_pairs(after_set),
             clipboard,
         });
     }
@@ -162,8 +186,10 @@ pub fn prepare(
             members.push((anchor, at));
             preferred_x.push(Some(column));
         }
+        let primary = primary_index(set);
         return Ok(PreparedInput::VerticalSelection {
             members,
+            primary,
             preferred_x,
         });
     }
@@ -171,6 +197,7 @@ pub fn prepare(
         let moved = motion::apply(text, set, motion, input.extend, None)
             .map_err(|_| "Selection changed; place the caret again")?;
         return Ok(PreparedInput::Selection {
+            primary: primary_index(&moved),
             members: member_pairs(&moved),
         });
     }
@@ -181,6 +208,7 @@ pub fn prepare(
         ))),
         KeyAction::SelectAll => Ok(PreparedInput::Selection {
             members: vec![(0, text.len())],
+            primary: 0,
         }),
         _ => Err("Unsupported input"),
     }
@@ -212,6 +240,7 @@ mod tests {
             document_boundary: false,
             vertical: None,
             preferred_x: Vec::new(),
+            clipboard_acquired: false,
         }
     }
 
@@ -232,6 +261,7 @@ mod tests {
             PreparedInput::Edit {
                 action,
                 members,
+                primary: _,
                 clipboard,
             } => (action, members, clipboard),
             other => panic!("expected an edit, got {other:?}"),
@@ -257,7 +287,7 @@ mod tests {
         let mut key = input(KeyAction::NextWord);
         key.extend = true;
         let set = set_of(&view.text, &[(0, 4)]);
-        let PreparedInput::Selection { members } = prepare(&view, &set, &key).unwrap() else {
+        let PreparedInput::Selection { members, .. } = prepare(&view, &set, &key).unwrap() else {
             panic!("selection");
         };
         assert_eq!(members, vec![(0, 9)]);
@@ -335,6 +365,7 @@ mod tests {
         let set = set_of(&view.text, &[(0, 0), (13, 13)]);
         let PreparedInput::VerticalSelection {
             members,
+            primary: _,
             preferred_x,
         } = prepare(&view, &set, &key).unwrap()
         else {
@@ -350,7 +381,7 @@ mod tests {
         let view = view();
         let key = input(KeyAction::Backspace);
         let set = set_of(&view.text, &[(0, 0)]);
-        let PreparedInput::Selection { members } = prepare(&view, &set, &key).unwrap() else {
+        let PreparedInput::Selection { members, .. } = prepare(&view, &set, &key).unwrap() else {
             panic!("selection");
         };
         assert_eq!(members, vec![(0, 0)]);

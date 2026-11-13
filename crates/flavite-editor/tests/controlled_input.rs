@@ -41,6 +41,7 @@ fn snapshot(buffer_id: u64, revision: u64, caret: usize, sequence: u64, focused:
         caret,
         selection: (caret, caret),
         selections: Vec::new(),
+        primary: 0,
         viewport_anchor: 0,
         focused,
         composing: false,
@@ -69,6 +70,7 @@ fn typed(
             document_boundary: false,
             vertical: None,
             preferred_x: Vec::new(),
+            clipboard_acquired: false,
         };
         let set = SelectionSet::normalize(
             &editor_view.text,
@@ -84,6 +86,7 @@ fn typed(
         let PreparedInput::Edit {
             action,
             members,
+            primary: _,
             clipboard: _,
         } = prepare(editor_view, &set, &captured).unwrap()
         else {
@@ -350,6 +353,7 @@ fn crlf_positions_and_newline_edits_stay_byte_exact() {
         document_boundary: false,
         vertical: None,
         preferred_x: Vec::new(),
+        clipboard_acquired: false,
     };
     let set = SelectionSet::normalize(
         text,
@@ -365,6 +369,7 @@ fn crlf_positions_and_newline_edits_stay_byte_exact() {
     let PreparedInput::Edit {
         action,
         members,
+        primary: _,
         clipboard: _,
     } = prepare(&editor_view, &set, &captured).unwrap()
     else {

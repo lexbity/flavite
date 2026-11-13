@@ -1486,13 +1486,24 @@ impl App {
     pub fn editor_interaction_snapshot(&self, tab: TabId) -> Option<EditorInteractionSnapshot> {
         let view = self.note_editor_view(tab)?;
         let logical = self.workspace.tab(&tab)?.interaction();
-        let selection = logical.selections.first().copied().unwrap_or_default();
+        let selection = logical
+            .selections
+            .get(
+                logical
+                    .primary
+                    .min(logical.selections.len().saturating_sub(1)),
+            )
+            .copied()
+            .unwrap_or_default();
         Some(EditorInteractionSnapshot {
             sequence: logical.sequence,
             buffer_id: view.buffer_id,
             revision: view.revision,
             caret: selection.head,
             selection: (selection.anchor, selection.head),
+            primary: logical
+                .primary
+                .min(logical.selections.len().saturating_sub(1)),
             selections: logical
                 .selections
                 .iter()
@@ -2419,6 +2430,11 @@ impl App {
                     revision: request.revision,
                     selection: request.selection,
                     selections: request.selections.clone(),
+                    primary: self.workspace.tab(&tab).map_or(0, |v| {
+                        v.interaction()
+                            .primary
+                            .min(request.selections.len().saturating_sub(1))
+                    }),
                     selection_version: self
                         .workspace
                         .tab(&tab)

@@ -75,6 +75,50 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
                 crate::host::note_search::NoteSearchMessage::FindClose(tab),
             ))
         }
+        NodeTarget::SelectionSearchQuery(tab)
+            if app.is_tab_visible(tab) && app.selection_search.tabs.contains_key(&tab) =>
+        {
+            match (request.action, request.data) {
+                (Action::SetValue, Some(ActionData::Value(value))) => {
+                    Some(Message::SelectionSearch(
+                        crate::host::selection_search::SelectionSearchMessage::DraftAction {
+                            tab,
+                            action: iced::widget::text_editor::Action::Edit(
+                                iced::widget::text_editor::Edit::Paste(std::sync::Arc::new(
+                                    value.into(),
+                                )),
+                            ),
+                        },
+                    ))
+                }
+                (Action::Focus, _) => Some(Message::SelectionSearch(
+                    crate::host::selection_search::SelectionSearchMessage::Open {
+                        tab,
+                        kind: crate::host::selection_search::ApplyKind::Select,
+                    },
+                )),
+                _ => None,
+            }
+        }
+        NodeTarget::SelectionSearchCommand(tab, command)
+            if request.action == Action::Click && app.is_tab_visible(tab) =>
+        {
+            Some(match command {
+                "apply" => Message::SelectionSearch(
+                    crate::host::selection_search::SelectionSearchMessage::Apply(tab),
+                ),
+                "close" => Message::SelectionSearch(
+                    crate::host::selection_search::SelectionSearchMessage::Close(tab),
+                ),
+                "regex" => Message::SelectionSearch(
+                    crate::host::selection_search::SelectionSearchMessage::ToggleRegex(tab),
+                ),
+                "case" => Message::SelectionSearch(
+                    crate::host::selection_search::SelectionSearchMessage::ToggleCase(tab),
+                ),
+                _ => return None,
+            })
+        }
         NodeTarget::ReplaceInput(tab)
             if app.is_tab_visible(tab) && app.note_search.replaces.contains_key(&tab) =>
         {

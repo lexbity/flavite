@@ -74,6 +74,7 @@ fn type_text(app: &mut App, tab: TabId, text: &str) {
             document_boundary: false,
             vertical: None,
             preferred_x: Vec::new(),
+            clipboard_acquired: false,
         },
     });
 }
@@ -122,6 +123,20 @@ fn implicit_preview_and_copy_preserve_committed_state_and_cut_uses_the_same_rang
     );
     let effect = flavite_edit_context::effect::plan(&text.text, (4, 4), Command::Cut).unwrap();
     run(&mut f.app, tab, Command::Cut);
+    // Clipboard ordering (§5.5): the scheduled clipboard write does not
+    // delete the source. The deletion happens only after the write
+    // completes and the seam revalidates the source (FEUX-0002 E-16).
+    assert_eq!(
+        f.app.note_editor_view(tab).unwrap().text.as_ref(),
+        text.text.as_ref(),
+        "the cut must not delete before the clipboard write completed"
+    );
+    let _ = f.app.update(Message::EditorClipboard(
+        flavite_ui::host::editor_clipboard::ClipboardMessage::CutReady {
+            target: EditorTarget::capture(&f.app, tab).unwrap(),
+            generation: f.app.context_mode.generation(),
+        },
+    ));
     assert_eq!(
         &*f.app.note_editor_view(tab).unwrap().text,
         &format!(
@@ -491,6 +506,7 @@ fn queued_keys_resolve_current_mode_and_selection_without_waiting_for_redraw() {
                     document_boundary: false,
                     vertical: None,
                     preferred_x: Vec::new(),
+                    clipboard_acquired: false,
                 },
             }),
         )
@@ -647,6 +663,7 @@ fn composition_commit_acknowledges_caret_and_joins_the_explicit_typing_group() {
                     document_boundary: false,
                     vertical: None,
                     preferred_x: Vec::new(),
+                    clipboard_acquired: false,
                 }),
             },
         });
@@ -711,6 +728,7 @@ fn keys_from_a_departed_editor_cannot_become_literal_text_in_a_visible_backgroun
                     document_boundary: false,
                     vertical: None,
                     preferred_x: Vec::new(),
+                    clipboard_acquired: false,
                 },
             }),
         },

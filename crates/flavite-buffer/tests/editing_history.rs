@@ -39,6 +39,7 @@ fn edit(model: &mut EditorModel, at: usize, value: &str, kind: EditKind) {
         kind,
         before: vec![[0, at, at]],
         after: vec![[0, at + value.len(), at + value.len()]],
+        primary: 0,
     };
     model
         .try_apply_recorded_batch(
@@ -173,6 +174,7 @@ fn invalid_recorded_graphemes_refuse_before_any_text_or_history_change() {
             kind: EditKind::Typing,
             before: vec![[0, 1, 1]],
             after: vec![[0, 1, 1]],
+            primary: 0,
         },
     );
     assert!(result.is_err());
@@ -219,6 +221,7 @@ fn epochs_isolate_buffers_and_invalid_origins_are_atomic() {
                     kind: EditKind::Typing,
                     before: vec![[0, 0, 0]],
                     after: vec![[0, 1, 1]],
+                    primary: 0,
                 },
             )
             .is_err()

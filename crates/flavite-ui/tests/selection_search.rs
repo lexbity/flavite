@@ -8,10 +8,12 @@
 mod support;
 
 use flavite_edit_context::ContextCommand as Command;
+use flavite_ui::accessibility::program::FlaviteProgram;
 use flavite_ui::app::{App, Message};
 use flavite_ui::host::context_mode::{ContextMessage, EditorTarget};
 use flavite_ui::host::selection_search::{SelectionSearchMessage, overlay_spans};
 use flavite_workspace::{LayoutAction, NoteLocator, TabId};
+use iced::Program;
 use std::time::{Duration, Instant};
 
 const BODY: &str = "TODO one\nTODO two\nplain text\n";
@@ -289,4 +291,46 @@ fn mode_exit_cancels_the_row_and_discards_the_overlay() {
         "mode exit cancels the row"
     );
     assert_eq!(committed_members(&f.app, tab), vec![(0, 0)]);
+}
+
+/// The query row must render *independently* of the find bar (E-11):
+/// opening the match-selection row while find is closed still publishes
+/// the row in the semantic tree. This guards against nesting the row in
+/// the find-open conditional (a native-only rendering regression).
+#[test]
+fn query_row_renders_without_the_find_bar() {
+    let (mut f, tab) = fixture(2211);
+    run(&mut f.app, tab, Command::SelectMatches);
+    pump_until(&mut f.app, |app| {
+        app.selection_search.tabs.contains_key(&tab)
+    });
+    for _ in 0..5 {
+        let _ = f.app.update(Message::Pump);
+    }
+    let update = FlaviteProgram
+        .accessibility_tree(&f.app, iced_winit::program::core::window::Id::unique())
+        .expect("the shell publishes a semantic tree");
+    let labels: Vec<String> = update
+        .nodes
+        .iter()
+        .filter_map(|(_, node)| {
+            let mut text = String::new();
+            if let Some(label) = node.label() {
+                text.push_str(label);
+            }
+            if let Some(value) = node.value() {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(value);
+            }
+            (!text.is_empty()).then_some(text)
+        })
+        .collect();
+    assert!(
+        labels.iter().any(|l| l.contains("Select matches")
+            || l.contains("Split on matches")
+            || l.contains("Alt+Enter")),
+        "query row must render without the find bar; labels={labels:?}"
+    );
 }

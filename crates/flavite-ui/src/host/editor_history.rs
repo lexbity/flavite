@@ -200,8 +200,11 @@ pub fn reconcile(app: &mut App) {
 }
 
 pub fn can_restore(app: &App, source: EditorTarget, entry: &HistoryEntry) -> bool {
+    // Valid, retained multi-selection states restore like any other state
+    // (FR-18/FR-19): the recorded set rides the movement receipt and the
+    // primary member is explicit. There is no single-selection admission
+    // restriction.
     !entry.current
-        && entry.selection_count.is_none_or(|count| count == 1)
         && entry.restorable
         && context_mode::valid(app, source.clone(), true)
         && !app.has_composition()
@@ -497,6 +500,13 @@ fn restore(app: &mut App, source: EditorTarget, target: HistoryTarget) -> Task<M
         } else {
             super::input::map_selections(&view.text, &interaction.selections, &movement)
         };
+        // The restored set's primary member is explicit in the movement
+        // receipt (E-4/FR-4); a mapped/clamped set keeps this view's own
+        // primary when the cardinality allows.
+        interaction.primary = movement
+            .primary
+            .filter(|&primary| primary < interaction.selections.len())
+            .unwrap_or_else(|| interaction.primary.min(interaction.selections.len() - 1));
         interaction.revision = view.revision;
         interaction.sequence += 1;
         interaction.viewport_anchor = super::input::map_history_point(

@@ -317,6 +317,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
                     document_boundary: false,
                     vertical: None,
                     preferred_x: Vec::new(),
+                    clipboard_acquired: false,
                 }),
             }));
             shell.capture_event();
@@ -737,6 +738,9 @@ pub struct EditorInteractionSnapshot {
     /// FEUX-0002 X04: the primary pair above stays for single-selection
     /// consumers).
     pub selections: Vec<[usize; 3]>,
+    /// Index into `selections` of the primary member (canonical order and
+    /// "primary first" cannot both be implicit; FEUX-0002 E-4/FR-4).
+    pub primary: usize,
     pub viewport_anchor: usize,
     pub focused: bool,
     pub composing: bool,
@@ -778,13 +782,20 @@ pub fn inspect_focused_editor()
             let Some(revision) = state.revision else {
                 return;
             };
+            let triples = state.selections.set().to_triples();
+            let primary_id = state.selections.primary_id().as_raw();
+            let primary = triples
+                .iter()
+                .position(|triple| triple[0] == primary_id as usize)
+                .unwrap_or(0);
             self.0 = Some(EditorInteractionSnapshot {
                 sequence: state.interaction_sequence,
                 buffer_id,
                 revision,
                 caret: state.selections.caret(),
                 selection: state.selection(),
-                selections: state.selections.set().to_triples(),
+                selections: triples,
+                primary,
                 viewport_anchor: 0,
                 focused: true,
                 composing: state.is_composing(),
@@ -1118,13 +1129,19 @@ impl EditorState {
     }
 
     fn interaction_snapshot(&self, text: Option<&str>) -> Option<EditorInteractionSnapshot> {
+        let triples = self.selections.set().to_triples();
+        let primary_id = self.selections.primary_id().as_raw();
         Some(EditorInteractionSnapshot {
             sequence: self.interaction_sequence,
             buffer_id: self.buffer_id?,
             revision: self.revision?,
             caret: self.selections.caret(),
             selection: self.selection(),
-            selections: self.selections.set().to_triples(),
+            primary: triples
+                .iter()
+                .position(|triple| triple[0] == primary_id as usize)
+                .unwrap_or(0),
+            selections: triples,
             viewport_anchor: text.map_or(0, |text| line_start_byte(text, self.viewport.first_line)),
             focused: self.focused,
             composing: self.is_composing(),
@@ -1141,8 +1158,9 @@ impl EditorState {
         {
             return;
         }
-        // Restore the whole acknowledged set (X04); the primary pair stays
-        // authoritative for consumers predating multi-member support.
+        // Restore the whole acknowledged set (X04) with its primary member
+        // (E-4/FR-4); the primary pair stays authoritative for consumers
+        // predating multi-member support.
         let members: Vec<(usize, usize)> = if interaction.selections.is_empty() {
             vec![(
                 clamp_char_boundary(text, interaction.selection.0),
@@ -1160,7 +1178,8 @@ impl EditorState {
                 })
                 .collect()
         };
-        self.selections.replace_with(text, &members, 0);
+        self.selections
+            .replace_with(text, &members, interaction.primary);
         self.viewport.first_line = text[..interaction.viewport_anchor.min(text.len())]
             .bytes()
             .filter(|byte| *byte == b'\n')
@@ -2098,6 +2117,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     document_boundary: modifiers.command() || modifiers.control(),
                     vertical,
                     preferred_x: state.selections.preferred_x_all(),
+                    clipboard_acquired: false,
                 };
                 if let Some(context) = &self.on_context {
                     shell.publish(context(crate::context::ContextRequest {
@@ -2323,10 +2343,14 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 // its navigation keys; plain-edit Escape collapses the set
                 // (D-6 via E-14: additional selections first, then a range to
                 // its head). Both are selection-local; nothing here types.
-                let completion_control = matches!(
-                    key,
-                    Key::Named(Named::Enter | Named::ArrowUp | Named::ArrowDown | Named::Escape)
-                ) && !modifiers.control()
+                let completion_control = state.autocomplete_start.is_some()
+                    && matches!(
+                        key,
+                        Key::Named(
+                            Named::Enter | Named::ArrowUp | Named::ArrowDown | Named::Escape
+                        )
+                    )
+                    && !modifiers.control()
                     && !modifiers.alt()
                     && !modifiers.logo();
                 let escape_collapse = matches!(key, Key::Named(Named::Escape))
@@ -2828,6 +2852,7 @@ mod tests {
             caret: at,
             selection: (at, at),
             selections: vec![[0, at.min(at), at]],
+            primary: 0,
             viewport_anchor: 0,
             focused,
             composing: false,
@@ -2986,6 +3011,7 @@ mod tests {
                 caret,
                 selection: (caret, caret),
                 selections: vec![[0, caret, caret]],
+                primary: 0,
                 viewport_anchor: 0,
                 focused: true,
                 composing: false,
@@ -3510,6 +3536,7 @@ mod tests {
             caret,
             selection: (caret, caret),
             selections: vec![[0, caret, caret]],
+            primary: 0,
             viewport_anchor: 0,
             focused: true,
             composing: false,

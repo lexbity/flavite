@@ -2467,11 +2467,13 @@ impl Flavite {
                         buffer_id,
                         revision,
                         selections,
+                        primary,
                     } => {
                         serde_json::json!({
                             "buffer_id": buffer_id.as_u64(),
                             "revision": revision.as_u64(),
                             "selections": selections,
+                            "primary": primary,
                         })
                     }
                     crate::session::CommandResult::TextCopied {

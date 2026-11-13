@@ -17,18 +17,22 @@ use std::collections::BTreeMap;
 
 /// A control captures its editor identity and selection set, not global
 /// focus. The whole committed set rides along (FEUX-0002 X04, E-5): `selection`
-/// stays the primary pair (the first canonical member) for captions and
-/// single-range effects.
+/// stays the primary pair for captions and single-range effects, and
+/// `primary` names that member by its index in `selections` (E-4/FR-4:
+/// canonical order and "primary first" cannot both be implicit, so the
+/// primary is explicit in every capture).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorTarget {
     pub tab: TabId,
     pub incarnation: u64,
     pub buffer: u64,
     pub revision: u64,
-    /// The primary pair (first canonical member).
+    /// The primary pair.
     pub selection: (usize, usize),
     /// Every committed member as `(anchor, head)` pairs in canonical order.
     pub selections: Vec<(usize, usize)>,
+    /// Index into `selections` of the primary member.
+    pub primary: usize,
     /// Monotonic committed-selection version at capture time (FEUX-0002
     /// E-5): mutations fail on mismatch even when the revision matches.
     pub selection_version: u64,
@@ -44,7 +48,8 @@ impl EditorTarget {
             .iter()
             .map(|selection| (selection.anchor, selection.head))
             .collect();
-        let selection = *selections.first()?;
+        let primary = interaction.primary.min(selections.len().saturating_sub(1));
+        let selection = *selections.get(primary)?;
         Some(Self {
             tab,
             incarnation: app.notes.incarnation(tab)?,
@@ -52,15 +57,18 @@ impl EditorTarget {
             revision: view.revision,
             selection,
             selections,
+            primary,
             selection_version: interaction.selection_version,
         })
     }
 
-    /// Wire form for the api selection-set argument: canonical triples.
+    /// Wire form for the api selection-set argument: canonical triples with
+    /// an explicit primary hint. Members carry their index as id, so the
+    /// hint resolves to exactly the captured primary member.
     #[must_use]
     pub fn selections_json(&self) -> serde_json::Value {
         serde_json::json!({
-            "primary": 0,
+            "primary": self.primary,
             "items": self
                 .selections
                 .iter()
@@ -170,6 +178,13 @@ fn run_effects(app: &mut App, tab: TabId, effects: Vec<Effect>) -> Option<Task<M
             Effect::ShowBurstHint => {
                 app.diagnostics.show_burst_hint();
                 diag(app, tab, EventKind::BurstHint, Outcome::Shown, None);
+            }
+            Effect::KeepPrimary => {
+                // §5.4 row 10: Command Escape with more than one member
+                // keeps the primary (the multi-selection recovery).
+                if let Some(target) = EditorTarget::capture(app, tab) {
+                    selections_only(app, &target, "editor.keep_primary", serde_json::json!({}));
+                }
             }
         }
     }
@@ -334,6 +349,7 @@ pub fn resume_focus(app: &App) -> Task<Message> {
         || app.dialog.is_some()
         || app.strip_menu.is_some()
         || super::note_search::blocks_typing(app, &s.tab)
+        || super::selection_search::blocks_typing(app, &s.tab)
     {
         return Task::none();
     }
@@ -355,6 +371,7 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
         || app.strip_menu.is_some()
         || app.has_composition()
         || super::note_search::blocks_typing(app, &s.tab)
+        || super::selection_search::blocks_typing(app, &s.tab)
     {
         return None;
     }
@@ -513,6 +530,7 @@ pub fn native_key(
         || app.strip_menu.is_some()
         || app.dialog.is_some()
         || super::note_search::blocks_typing(app, &target.tab)
+        || super::selection_search::blocks_typing(app, &target.tab)
         || app.has_composition()
     {
         return Task::none();
@@ -723,7 +741,7 @@ fn install_pairs(app: &mut App, target: &EditorTarget, pairs: &[(usize, usize)])
 /// delta, and install the receipt's exact after-set on the requesting view.
 /// The committed version bump itself belongs to the workspace reducer (once
 /// per committed set change).
-fn kernel_mutate(
+pub(crate) fn kernel_mutate(
     app: &mut App,
     target: &EditorTarget,
     api_id: &'static str,
@@ -820,7 +838,11 @@ fn kernel_mutate(
 /// Interpret a mutating receipt: map passive views once, install the exact
 /// after-set on the requesting view, and keep the acknowledged-input chain
 /// resolvable against the new revision.
-fn install_receipt(app: &mut App, target: &EditorTarget, success: &flavite_api::LocalSuccess) {
+pub(crate) fn install_receipt(
+    app: &mut App,
+    target: &EditorTarget,
+    success: &flavite_api::LocalSuccess,
+) {
     let new_revision = success.data["revision"].as_u64().unwrap_or(target.revision);
     let movement = serde_json::from_value::<flavite_buffer::history::HistoryMovement>(
         success.data["movement"].clone(),
@@ -829,6 +851,7 @@ fn install_receipt(app: &mut App, target: &EditorTarget, success: &flavite_api::
         selections: None,
         spans: Vec::new(),
         truncated: false,
+        primary: None,
     });
     let after_triples: Vec<[usize; 3]> =
         serde_json::from_value(success.data["after_selections"].clone()).unwrap_or_default();
@@ -841,8 +864,9 @@ fn install_receipt(app: &mut App, target: &EditorTarget, success: &flavite_api::
         new_revision,
         &movement,
     );
-    // Install the exact after-set on the requesting view; the workspace
-    // reducer bumps the selection version exactly once per committed change.
+    // Install the exact after-set on the requesting view; the primary
+    // member rides the receipt (E-4/FR-4) and the workspace reducer bumps
+    // the selection version exactly once per committed change.
     if let Some(mut interaction) = app
         .workspace
         .tab(&target.tab)
@@ -854,6 +878,13 @@ fn install_receipt(app: &mut App, target: &EditorTarget, success: &flavite_api::
             .collect();
         if !next_selections.is_empty() {
             interaction.selections = next_selections;
+        }
+        if let Some(primary) = movement.primary
+            && primary < interaction.selections.len()
+        {
+            interaction.primary = primary;
+        } else {
+            interaction.primary = interaction.primary.min(interaction.selections.len() - 1);
         }
         interaction.revision = new_revision;
         interaction.sequence += 1;
@@ -982,6 +1013,13 @@ pub(crate) fn selections_only(
     );
     let triples: Vec<[usize; 3]> =
         serde_json::from_value(success.data["selections"].clone()).ok()?;
+    // The canonical primary identity rides the response (E-4/FR-4): the
+    // member whose id matches keeps the primary, whatever its position.
+    let primary_id = success.data["primary"].as_u64().unwrap_or(0) as usize;
+    let primary = triples
+        .iter()
+        .position(|triple| triple[0] == primary_id)
+        .unwrap_or(0);
     // Install the canonical set; the reducer bumps the version on change.
     if let Some(mut interaction) = app
         .workspace
@@ -992,6 +1030,7 @@ pub(crate) fn selections_only(
             .iter()
             .map(|[_, a, h]| flavite_workspace::CommittedSelection::new(*a, *h))
             .collect();
+        interaction.primary = primary.min(interaction.selections.len().saturating_sub(1));
         interaction.sequence += 1;
         let view = app.note_editor_view(target.tab)?;
         if app
@@ -1104,6 +1143,7 @@ fn input(app: &mut App, target: EditorTarget, action: KeyAction, text: String) -
         document_boundary: false,
         vertical: None,
         preferred_x: Vec::new(),
+        clipboard_acquired: false,
     };
     super::input::handle(app, target.tab, target.incarnation, captured)
 }
@@ -1313,7 +1353,16 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             .context_mode
             .session
             .as_mut()
-            .map(|s| reduce(&mut s.state, &Event::Escape, now_ms, burst_enabled))
+            .map(|s| {
+                reduce(
+                    &mut s.state,
+                    &Event::Escape {
+                        selections: target.selections.len(),
+                    },
+                    now_ms,
+                    burst_enabled,
+                )
+            })
             .unwrap_or_default();
         let task = run_effects(app, target.tab, effects);
         return task.unwrap_or_else(|| focus(app, target.tab));
@@ -1582,9 +1631,10 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         }
         Cut => {
             // Clipboard ordering (§5.5): the fragments are resolved before
-            // the delete, the write is issued first, and a source change
-            // between the two stages refuses the cut with its honest
-            // message.
+            // anything else; the clipboard write runs to completion, and
+            // only the seam's revalidated completion performs the one
+            // guarded deletion. A refused or failed write never deletes
+            // the source (E-16, AC-8).
             let Some(api) = &app.flavite else {
                 return Task::none();
             };
@@ -1610,21 +1660,8 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
                 app.context_mode.notice("Nothing to cut on this last line");
                 return Task::none();
             }
-            let write = super::editor_clipboard::write(copied.clone());
-            let cut = kernel_mutate(
-                app,
-                &target,
-                "editor.cut",
-                serde_json::json!({}),
-                "Cut was refused; source changed",
-            );
-            if cut.is_none() {
-                app.context_mode
-                    .notice("Copied; cut was not applied because the source changed");
-                return write;
-            }
-            install_receipt(app, &target, cut.as_ref().expect("cut success"));
-            write.chain(focus(app, target.tab))
+            let generation = app.context_mode.generation;
+            return super::editor_clipboard::write_for_cut(target, generation, copied);
         }
         Toggle | Exit | Escape | Paste | Undo | Redo | Commands | Find | Replace | History
         | SelectMatches | SplitSelection => {

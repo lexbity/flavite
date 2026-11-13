@@ -79,6 +79,15 @@ fn triples(set: &SelectionSet) -> Vec<[usize; 3]> {
     set.to_triples()
 }
 
+/// The index within `set` of the primary member (FEUX-0002 E-4/FR-4):
+/// primary identity is explicit in every set-bearing handoff.
+fn primary_index(set: &SelectionSet) -> usize {
+    set.members()
+        .iter()
+        .position(|member| member.id() == set.primary_id())
+        .unwrap_or(0)
+}
+
 /// `editor.issue_operation`: allocate one Session-issued operation ticket.
 /// Non-mutating; the pending cap (32 per buffer) is enforced.
 pub(crate) fn handle_issue_operation(
@@ -207,6 +216,7 @@ pub(crate) fn handle_editor_delete(
                     selections: Some(triples(&set)),
                     spans: Vec::new(),
                     truncated: false,
+                    primary: Some(primary_index(&set)),
                 }),
                 after_selections: Some(triples(&set)),
             },
@@ -217,6 +227,7 @@ pub(crate) fn handle_editor_delete(
         kind,
         before: triples(&set),
         after: triples(&prepared.after_set),
+        primary: primary_index(&prepared.after_set),
     };
     Ok(session.execute(SessionCommand::ApplyEdits {
         buffer_id: BufferId::from(args.buffer_id),
@@ -343,6 +354,7 @@ fn selections_changed(buffer_id: u64, revision: u64, set: &SelectionSet) -> Sess
         buffer_id: BufferId::from(buffer_id),
         revision: Revision::new(revision),
         selections: triples(set),
+        primary: primary_index(set),
     })
 }
 
@@ -500,6 +512,7 @@ fn handle_ticketed_edit(
                     selections: Some(triples(&set)),
                     spans: Vec::new(),
                     truncated: false,
+                    primary: Some(primary_index(&set)),
                 }),
                 after_selections: Some(triples(&set)),
             },
@@ -510,6 +523,7 @@ fn handle_ticketed_edit(
         kind,
         before: triples(&set),
         after: triples(&prepared.after_set),
+        primary: primary_index(&prepared.after_set),
     };
     Ok(session.execute(SessionCommand::ApplyEdits {
         buffer_id: BufferId::from(buffer_id),
@@ -936,10 +950,19 @@ pub struct EditorAddCaretsArgs {
 
 fn handle_add_carets(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
     let args: EditorAddCaretsArgs = decode(invocation)?;
+    eprintln!("[add_carets] positions={:?}", args.positions);
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
     let set = normalize_set(&snapshot.text, &args.selections)?;
     let merged = flavite_buffer::selection::add_carets(&snapshot.text, &set, &args.positions)
         .map_err(|error| error.to_string())?;
+    eprintln!(
+        "[add_carets] merged={:?}",
+        merged
+            .members()
+            .iter()
+            .map(|m| (m.start(), m.end()))
+            .collect::<Vec<_>>()
+    );
     Ok(selections_changed(args.buffer_id, args.revision, &merged))
 }
 

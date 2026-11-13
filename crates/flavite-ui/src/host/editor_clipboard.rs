@@ -30,6 +30,21 @@ pub enum ClipboardMessage {
         input: CapturedInput,
         text: Option<String>,
     },
+    /// A Context Mode cut's clipboard write completed. The source is
+    /// revalidated here, before the one guarded deletion (§5.5): a stale
+    /// or refused write can never delete the source text.
+    CutReady {
+        target: EditorTarget,
+        generation: u64,
+    },
+    /// A plain (or typing-mode) cut's clipboard write completed; the
+    /// captured intent resumes interpretation and performs its guarded
+    /// deletion without writing again.
+    CutCompleted {
+        tab: TabId,
+        incarnation: u64,
+        input: CapturedInput,
+    },
 }
 
 /// Read the clipboard for a Context Mode paste (generation-guarded).
@@ -59,6 +74,35 @@ pub fn read_for_typing(tab: TabId, incarnation: u64, input: CapturedInput) -> Ta
 /// Write to the clipboard (the join already happened at the copy source).
 pub fn write(text: String) -> Task<Message> {
     iced::clipboard::write(text).map(|()| Message::Pump)
+}
+
+/// Write the clipboard for a Context Mode cut and resume at the effect
+/// boundary: the deletion runs only after this write completed and the
+/// source was revalidated (§5.5 / E-16).
+pub fn write_for_cut(target: EditorTarget, generation: u64, text: String) -> Task<Message> {
+    iced::clipboard::write(text).map(move |()| {
+        Message::EditorClipboard(ClipboardMessage::CutReady {
+            target: target.clone(),
+            generation,
+        })
+    })
+}
+
+/// Write the clipboard for a plain/typing cut and resume the captured
+/// intent's guarded mutation (§5.5 / E-16).
+pub fn write_for_cut_resume(
+    tab: TabId,
+    incarnation: u64,
+    input: CapturedInput,
+    text: String,
+) -> Task<Message> {
+    iced::clipboard::write(text).map(move |()| {
+        Message::EditorClipboard(ClipboardMessage::CutCompleted {
+            tab,
+            incarnation,
+            input: input.clone(),
+        })
+    })
 }
 
 /// Interpret one clipboard read at the effect boundary.
@@ -104,6 +148,45 @@ pub fn handle(app: &mut App, message: ClipboardMessage) -> Task<Message> {
             // An empty clipboard stays a no-op paste (§5.5): interpretation
             // proceeds with empty text and collapses to a selection ack.
             input.text = text.unwrap_or_default();
+            // The clipboard stage is complete: interpret the acquired text,
+            // never re-acquire (FR-8/FR-9).
+            input.clipboard_acquired = true;
+            super::input::handle(app, tab, incarnation, input)
+        }
+        ClipboardMessage::CutReady { target, generation } => {
+            const NOT_APPLIED: &str = "Copied; cut was not applied because the source changed";
+            // The clipboard write completed. Revalidate the source and the
+            // committed set/version, then perform the one guarded deletion;
+            // staleness keeps the text and reports honestly (§5.5, AC-8).
+            if generation != app.context_mode.generation()
+                || !super::context_mode::valid(app, target.clone(), true)
+            {
+                app.status = NOT_APPLIED.into();
+                app.context_mode.notice(NOT_APPLIED);
+                return Task::none();
+            }
+            match super::context_mode::kernel_mutate(
+                app,
+                &target,
+                "editor.cut",
+                serde_json::json!({}),
+                "Cut was refused; source changed",
+            ) {
+                Some(success) => {
+                    super::context_mode::install_receipt(app, &target, &success);
+                    super::context_mode::focus(app, target.tab)
+                }
+                None => Task::none(),
+            }
+        }
+        ClipboardMessage::CutCompleted {
+            tab,
+            incarnation,
+            mut input,
+        } => {
+            // The clipboard write completed; the same captured intent resumes
+            // with the guarded mutation and never writes again.
+            input.clipboard_acquired = true;
             super::input::handle(app, tab, incarnation, input)
         }
     }

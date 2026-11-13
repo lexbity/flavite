@@ -388,3 +388,76 @@ fn transitions_beyond_the_span_limit_publish_truncated_movement() {
     let expected: Vec<String> = (0..299).map(|_| " ".to_string()).collect();
     assert_eq!(view.text, expected.join(""));
 }
+
+#[test]
+fn history_budget_refusals_do_not_exhaust_operation_tickets() {
+    // FEUX-0002 R5: every admitted activation reaches a terminal outcome on
+    // every return path, so refusals never leak pending tickets into the
+    // per-buffer cap (E-5/E-16, NFR-13).
+    let f = support::fixture_with_session(&[("note.md", "one\ntwo\n")], |session| {
+        session.set_app_history_budget(0);
+    });
+    let buffer = open_note(&f, "note.md");
+    let before = revision(&f.flavite, buffer);
+    let args = |operation: Value| {
+        json!({
+            "buffer_id": buffer,
+            "revision": before,
+            "operation": operation,
+            "origin": {"view": format!("{:032x}", 1), "incarnation": 1},
+            "selections": {"primary": 0, "items": items(&[(0, 3)])},
+        })
+    };
+    for _ in 0..32 {
+        let op = issue_operation(&f.flavite, buffer);
+        let refused = execute(&f.flavite, "editor.delete", args(op));
+        assert!(!refused.is_success(), "the shrunken budget must refuse");
+    }
+    // Tickets never piled up: issuing still works after restoring the
+    // ordinary budget, and the refused edits left text/revision untouched.
+    f.flavite
+        .set_history_budgets_for_test(512 * 1024 * 1024, 128 * 1024 * 1024, 10_000);
+    let op = issue_operation(&f.flavite, buffer);
+    let applied = execute(&f.flavite, "editor.delete", args(op));
+    assert!(
+        applied.is_success(),
+        "ticketed editing must work again: {applied:?}"
+    );
+    assert_eq!(f.text(buffer), "\ntwo\n");
+    assert_eq!(revision(&f.flavite, buffer), before + 1);
+}
+
+#[test]
+fn rotate_then_keep_primary_keeps_the_rotated_member() {
+    // FEUX-0002 R7: primary identity survives the UI/API handoff — the
+    // rotated primary rides `SelectionsChanged` and the next command's
+    // hint resolves to it (E-4, FR-4/FR-5/FR-7).
+    let f = support::fixture(&[("note.md", "one\ntwo\nthird\n")]);
+    let buffer = open_note(&f, "note.md");
+    // Members at 0 and 10; the primary is the first member.
+    let selections = json!({"primary": 0, "items": items(&[(0, 0), (10, 10)])});
+    let rotated = data(execute(
+        &f.flavite,
+        "editor.rotate_primary",
+        json!({"buffer_id": buffer, "revision": revision(&f.flavite, buffer), "selections": selections, "direction": "next"}),
+    ));
+    // The response names the new primary (the second member's id).
+    assert_eq!(rotated["primary"], json!(1));
+    let triples = rotated["selections"].as_array().unwrap().clone();
+    assert_eq!(triples.len(), 2);
+
+    // keep_primary with the rotated primary retains the second member.
+    let kept = data(execute(
+        &f.flavite,
+        "editor.keep_primary",
+        json!({
+            "buffer_id": buffer,
+            "revision": revision(&f.flavite, buffer),
+            "selections": {"primary": rotated["primary"], "items": triples},
+        }),
+    ));
+    let kept_items = kept["selections"].as_array().unwrap();
+    assert_eq!(kept_items.len(), 1);
+    assert_eq!(kept_items[0][1], json!(10), "the second member is kept");
+    assert_eq!(kept["primary"], json!(0));
+}

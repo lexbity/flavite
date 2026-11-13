@@ -96,6 +96,9 @@ pub struct SelectionSearchState {
     pub query_version: u64,
     pub overlay: Option<Overlay>,
     pub error: Option<String>,
+    /// The row is the keyboard owner while open (mirrors the find bar's
+    /// `focused` deferral: Context Mode must not interpret printable keys).
+    pub focused: bool,
 }
 
 impl SelectionSearchState {
@@ -110,6 +113,7 @@ impl SelectionSearchState {
             query_version: 0,
             overlay: None,
             error: None,
+            focused: true,
         }
     }
 }
@@ -124,6 +128,10 @@ impl Default for SelectionSearchState {
 #[derive(Debug, Default)]
 pub struct SelectionSearchHost {
     pub tabs: BTreeMap<TabId, SelectionSearchState>,
+    /// A row opened while an overlay is tearing down may miss the focus
+    /// operation's first pass; focus again when the row's mounted bounds
+    /// arrive (the `Bounds` message is the mount signal).
+    pub pending_focus: Option<TabId>,
     requests: BTreeMap<u64, (TabId, PreviewKey)>,
 }
 
@@ -149,6 +157,12 @@ pub enum SelectionSearchMessage {
     ToggleRegex(TabId),
     ToggleCase(TabId),
     Apply(TabId),
+    /// The mounted row rectangle; also the mount signal for the deferred
+    /// focus of the query input.
+    Bounds {
+        tab: TabId,
+        rect: iced::Rectangle,
+    },
 }
 
 /// Record one diagnostics outcome for the match-collection path (X07).
@@ -178,7 +192,10 @@ pub fn handle(app: &mut App, message: SelectionSearchMessage) -> iced::Task<Mess
             }
             request_collection(app, tab);
             app.refresh_semantics();
-            iced::widget::operation::focus(query_id(tab))
+            // Focus the input immediately AND when its mounted bounds land
+            // (opening through a closing overlay can miss the first pass).
+            app.selection_search.pending_focus = Some(tab);
+            focus_query_editor(app, tab)
         }
         SelectionSearchMessage::Close(tab) => {
             diag(app, tab, EventKind::MatchCollect, Outcome::Cancelled, None);
@@ -257,6 +274,17 @@ pub fn handle(app: &mut App, message: SelectionSearchMessage) -> iced::Task<Mess
             iced::Task::none()
         }
         SelectionSearchMessage::Apply(tab) => apply(app, tab),
+        SelectionSearchMessage::Bounds { tab, rect: _ } => {
+            if app.selection_search.pending_focus == Some(tab) {
+                app.selection_search.pending_focus = None;
+                app.selection_search
+                    .tabs
+                    .get(&tab)
+                    .map_or(iced::Task::none(), |_| focus_query_editor(app, tab))
+            } else {
+                iced::Task::none()
+            }
+        }
     }
 }
 
@@ -610,6 +638,24 @@ fn diag_completion_error(app: &mut App, tab: TabId, message: &str) {
         EventKind::MatchRefused
     };
     diag(app, tab, kind, Outcome::Refused, None);
+}
+
+/// Whether the row owns keyboard input (Context Mode defers printable keys
+/// while it is open, exactly like the find bar).
+#[must_use]
+pub fn blocks_typing(app: &App, tab: &TabId) -> bool {
+    app.selection_search
+        .tabs
+        .get(tab)
+        .is_some_and(|state| state.focused)
+}
+
+/// Focus the query input via the low-level focusable operation (the same
+/// path the find bar uses to restore/clear focus).
+fn focus_query_editor(_app: &App, tab: TabId) -> iced::Task<Message> {
+    iced::advanced::widget::operate(iced::advanced::widget::operation::focusable::focus(
+        query_id(tab),
+    ))
 }
 
 /// The query input widget id (focus target).

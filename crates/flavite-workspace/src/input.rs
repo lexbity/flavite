@@ -72,6 +72,12 @@ pub struct EditorInteraction {
     /// Bounded selections in canonical order (canonical output; the algebra
     /// lives in `flavite-buffer::selection`).
     pub selections: Vec<CommittedSelection>,
+    /// Index into `selections` of the primary member. Canonical order and
+    /// "primary first" cannot both be implicit, so the primary is explicit
+    /// committed data (FEUX-0002 E-4/FR-4): `rotate_primary` changes it, and
+    /// every set-bearing handoff (targets, receipts, widget resync) carries
+    /// it.
+    pub primary: usize,
     /// First visible text byte used to restore the viewport after reparenting.
     pub viewport_anchor: usize,
     /// Composition is transient but visible to layout admission.
@@ -92,6 +98,7 @@ impl EditorInteraction {
             sequence: 0,
             selection_version: 0,
             selections: vec![CommittedSelection::caret(0)],
+            primary: 0,
             viewport_anchor: 0,
             composition: CompositionState::Idle,
             focused: false,
@@ -114,6 +121,9 @@ impl EditorInteraction {
         }
         if self.selections.is_empty() {
             return Err("interaction must contain at least one selection");
+        }
+        if self.primary >= self.selections.len() {
+            return Err("interaction primary selection is out of range");
         }
         if self.viewport_anchor > text_len
             || self

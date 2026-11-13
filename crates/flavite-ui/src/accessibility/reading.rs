@@ -133,6 +133,70 @@ pub fn project(app: &App) -> Projection {
                 out.roots.push(id);
             }
         }
+        if let Some(search) = app.selection_search.tabs.get(tab) {
+            // FEUX-0002 X06: the owned match-selection row participates in
+            // the semantic tree with its controls (FR-24). It renders
+            // independently of the find bar.
+            let row_title = match search.kind {
+                crate::host::selection_search::ApplyKind::Select => "Select matches…",
+                crate::host::selection_search::ApplyKind::Split => "Split on matches…",
+            };
+            let query_id = node_id("selection-search-query", tab.raw());
+            let mut query = Node::new(Role::MultilineTextInput);
+            query.set_label(row_title);
+            query.set_value(search.query.clone());
+            query.add_action(Action::Focus);
+            query.add_action(Action::SetValue);
+            out.actions
+                .insert(query_id, NodeTarget::SelectionSearchQuery(*tab));
+            out.push(query_id, query);
+            out.roots.push(query_id);
+            for (command, label, active) in [
+                ("regex", "Toggle regex matching", search.regex),
+                (
+                    "case",
+                    "Toggle case sensitive matching",
+                    search.case_sensitive,
+                ),
+            ] {
+                let id = node_id(&("selection-search-".to_owned() + command), tab.raw());
+                let mut node = Node::new(Role::Button);
+                node.set_label(label);
+                node.set_toggled(accesskit::Toggled::from(active));
+                node.add_action(Action::Click);
+                out.actions
+                    .insert(id, NodeTarget::SelectionSearchCommand(*tab, command));
+                out.push(id, node);
+                out.roots.push(id);
+            }
+            let apply_id = node_id("selection-search-apply", tab.raw());
+            let mut apply = Node::new(Role::Button);
+            apply.set_label(format!("Apply {row_title}"));
+            if crate::host::selection_search::apply_enabled(app, *tab) {
+                apply.add_action(Action::Click);
+            } else {
+                apply.set_disabled();
+            }
+            out.actions
+                .insert(apply_id, NodeTarget::SelectionSearchCommand(*tab, "apply"));
+            out.push(apply_id, apply);
+            out.roots.push(apply_id);
+            let close_id = node_id("selection-search-close", tab.raw());
+            let mut close = Node::new(Role::Button);
+            close.set_label("Close match selection");
+            close.add_action(Action::Click);
+            out.actions
+                .insert(close_id, NodeTarget::SelectionSearchCommand(*tab, "close"));
+            out.push(close_id, close);
+            out.roots.push(close_id);
+            if let Some(error) = &search.error {
+                let error_id = node_id("selection-search-error", tab.raw());
+                let mut error_node = Node::new(Role::Label);
+                error_node.set_label(format!("Match selection error: {error}"));
+                out.push(error_id, error_node);
+                out.roots.push(error_id);
+            }
+        }
         if let Some(replace) = app.note_search.replaces.get(tab) {
             // RFC-0006 S01: replacement controls ride the same catalog, so
             // native input and AT act on exactly the mounted rows.

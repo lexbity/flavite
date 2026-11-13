@@ -93,9 +93,12 @@ impl EditKind {
     }
 }
 
-/// The current editor's ordered selections, primary first. This is a recorded
-/// value, not ownership of live selections in another view. Members are
-/// `[id, anchor, head]` triples in canonical order (FEUX-0002 §5.1).
+/// The current editor's ordered selections. This is a recorded value, not
+/// ownership of live selections in another view. Members are `[id, anchor,
+/// head]` triples in canonical order (FEUX-0002 §5.1); `primary` names the
+/// primary member by its index in `after` — canonical order and "primary
+/// first" cannot both be implicit, so primary identity is explicit
+/// (FEUX-0002 E-4 / FR-4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EditorEdit {
@@ -103,6 +106,9 @@ pub struct EditorEdit {
     pub kind: EditKind,
     pub before: Vec<[usize; 3]>,
     pub after: Vec<[usize; 3]>,
+    /// Index into `after` of the primary member (default: the first member).
+    #[serde(default)]
+    pub primary: usize,
 }
 
 impl EditorEdit {
@@ -113,6 +119,9 @@ impl EditorEdit {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
+            return Err(HistoryError::InvalidSelections);
+        }
+        if self.primary >= self.after.len() {
             return Err(HistoryError::InvalidSelections);
         }
         validate_selections(before, &self.before)?;
@@ -243,12 +252,17 @@ pub const MAX_MOVEMENT_SPANS: usize = 256;
 /// The exact source-free transform of one transition for passive views of
 /// the same buffer: an ordered list of non-overlapping deltas in pre-change
 /// coordinates. `selections` is the requesting view's exact recorded
-/// after-set (never approximated); passive views map through `spans`, or
-/// clamp with a visible notice when `truncated` (the transition exceeded
+/// after-set (never approximated); `primary` is the index into
+/// `selections` of that set's primary member, so primary identity survives
+/// every receipt round trip (FR-4/FR-7). Passive views map through `spans`,
+/// or clamp with a visible notice when `truncated` (the transition exceeded
 /// [`MAX_MOVEMENT_SPANS`] or its edit chain is not fully derivable).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryMovement {
     pub selections: Option<Vec<[usize; 3]>>,
     pub spans: Vec<MovementSpan>,
     pub truncated: bool,
+    /// Index into `selections` of the primary member (absent when unknown).
+    #[serde(default)]
+    pub primary: Option<usize>,
 }

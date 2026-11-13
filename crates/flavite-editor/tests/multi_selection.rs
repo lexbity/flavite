@@ -41,6 +41,7 @@ fn captured(action: KeyAction, text: &str) -> CapturedInput {
         document_boundary: false,
         vertical: None,
         preferred_x: Vec::new(),
+        clipboard_acquired: false,
     }
 }
 
@@ -167,6 +168,7 @@ fn typed_text_lands_at_every_member_and_collapses_to_carets() {
     let PreparedInput::Edit {
         action,
         members,
+        primary: _,
         clipboard: _,
     } = prepared
     else {
@@ -188,6 +190,7 @@ fn cut_collapses_members_and_joins_fragments_in_document_order() {
     let PreparedInput::Edit {
         action,
         members,
+        primary: _,
         clipboard,
     } = prepared
     else {

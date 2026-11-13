@@ -131,6 +131,10 @@ pub struct PreparedBatch {
     /// The after-state snapshot recorded as the isolated Undo node, carrying
     /// text, spliced EOL state and the descriptor.
     pub undo_snapshot: TextSnapshot,
+    /// The original per-op batch geometry in pre-change coordinates
+    /// (FEUX-0002 E-13): retained on the undo node so movement across the
+    /// transition maps carets in unchanged gaps exactly.
+    pub spans: Vec<crate::selection::SpanEdit>,
 }
 
 /// Splice an EOL table from `old_text` to `new_text`: unchanged prefix and
@@ -947,6 +951,16 @@ impl EditorModel {
         Ok(PreparedBatch {
             op: combined,
             undo_snapshot,
+            spans: ordered
+                .iter()
+                .map(|edit| {
+                    crate::selection::SpanEdit::new(
+                        edit.range.start.0,
+                        edit.range.end.0,
+                        edit.replacement.len(),
+                    )
+                })
+                .collect(),
         })
     }
 
@@ -963,12 +977,12 @@ impl EditorModel {
         context_origin: Option<u128>,
     ) -> Revision {
         self.apply_text_edit(&batch.op);
-        if let Some(origin) = context_origin {
-            self.undo_tree
-                .apply_context(batch.op, batch.undo_snapshot, origin);
-        } else {
-            self.undo_tree.apply_boundary(batch.op, batch.undo_snapshot);
-        }
+        let policy = match context_origin {
+            Some(origin) => crate::undo::UndoPolicy::Context { origin },
+            None => crate::undo::UndoPolicy::Isolated,
+        };
+        self.undo_tree
+            .apply_batch(batch.op, batch.undo_snapshot, policy, &batch.spans);
         let revision = self.revision.next();
         self.revision = revision;
         self.is_dirty = true;
@@ -1119,7 +1133,7 @@ impl EditorModel {
         };
         self.apply_text_edit(&batch.op);
         self.undo_tree
-            .apply_recorded(batch.op, batch.undo_snapshot, policy, record);
+            .apply_recorded(batch.op, batch.undo_snapshot, policy, record, &batch.spans);
         self.undo_tree.release(&lease);
         self.revision = self.revision.next();
         self.is_dirty = true;
@@ -1186,11 +1200,21 @@ impl EditorModel {
             return Err(crate::history::HistoryError::Expired);
         }
         let snapshot = self.undo_tree.restore_snapshot(target)?;
-        let selections = self.undo_tree.get(target.node).and_then(|node| {
+        let target_node = self.undo_tree.get(target.node);
+        let selections = target_node.and_then(|node| {
             if node.is_root() {
                 Some(vec![[0, 0, 0]])
             } else {
                 node.editor.as_ref().map(|r| r.after.clone())
+            }
+        });
+        // The restored set's primary member is explicit in the record
+        // (FEUX-0002 E-4/FR-4); the root state's primary is its only member.
+        let primary = target_node.and_then(|node| {
+            if node.is_root() {
+                Some(0)
+            } else {
+                node.editor.as_ref().map(|r| r.primary)
             }
         });
         // The movement delta for passive views is derived from the transition
@@ -1208,7 +1232,7 @@ impl EditorModel {
         let text = snapshot.text().to_owned();
         let rope = Rope::from_str(&text);
         let table = EolTable::from_snapshot(&snapshot);
-        self.set_history_movement(spans, truncated, selections);
+        self.set_history_movement(spans, truncated, selections, primary);
         self.undo_tree.restore_position(target.node);
         self.text = text;
         self.rope = rope;
@@ -1228,11 +1252,16 @@ impl EditorModel {
         spans: Vec<crate::history::MovementSpan>,
         truncated: bool,
         selections: Option<Vec<[usize; 3]>>,
+        primary: Option<usize>,
     ) {
         self.history_movement = Some(crate::history::HistoryMovement {
             selections,
             spans,
             truncated,
+            // The requesting view's exact primary index when the recorded
+            // set carries it (undo records do not: the UI keeps its own
+            // primary member when it survives).
+            primary,
         });
     }
 
@@ -1263,6 +1292,16 @@ impl EditorModel {
         self.undo_tree.position_selections()
     }
 
+    /// The recorded after-set's primary member index (FEUX-0002 FR-4): the
+    /// primary identity recorded with the current node's editor edit.
+    #[must_use]
+    pub fn history_position_primary(&self) -> Option<usize> {
+        self.undo_tree
+            .position()
+            .and_then(|node| node.editor.as_ref())
+            .map(|record| record.primary)
+    }
+
     /// The snapshot text of a retained history node (diagnostic/test).
     #[must_use]
     pub fn history_node_text(&self, id: u64) -> Option<String> {
@@ -1286,7 +1325,7 @@ impl EditorModel {
         if let Some((_node_rev, Some(snapshot))) = result {
             let to = self.undo_tree.position_id();
             let (spans, truncated) = self.undo_tree.transition_spans(from, to);
-            self.set_history_movement(spans, truncated, selections);
+            self.set_history_movement(spans, truncated, selections, None);
             let new_text = snapshot.text().to_string();
             self.rope = Rope::from_str(&new_text);
             self.text = new_text;
@@ -1319,7 +1358,12 @@ impl EditorModel {
         if let Some((_node_rev, Some(snapshot))) = result {
             let to = self.undo_tree.position_id();
             let (spans, truncated) = self.undo_tree.transition_spans(from, to);
-            self.set_history_movement(spans, truncated, self.undo_tree.position_selections());
+            self.set_history_movement(
+                spans,
+                truncated,
+                self.undo_tree.position_selections(),
+                self.history_position_primary(),
+            );
             let new_text = snapshot.text().to_string();
             self.rope = Rope::from_str(&new_text);
             self.text = new_text;

@@ -120,6 +120,7 @@ fn type_into(app: &mut App, tab: TabId, text: &str) {
             caret: view.text.len(),
             selection: (view.text.len(), view.text.len()),
             selections: vec![[0, view.text.len(), view.text.len()]],
+            primary: 0,
             viewport_anchor: 0,
             focused: true,
             composing: false,
@@ -138,6 +139,7 @@ fn type_into(app: &mut App, tab: TabId, text: &str) {
             document_boundary: false,
             vertical: None,
             preferred_x: Vec::new(),
+            clipboard_acquired: false,
         },
     });
 }
@@ -509,6 +511,7 @@ fn composition_blocks_quit() {
             caret: 0,
             selection: (0, 0),
             selections: vec![[0, 0, 0]],
+            primary: 0,
             viewport_anchor: 0,
             focused: true,
             composing: true,

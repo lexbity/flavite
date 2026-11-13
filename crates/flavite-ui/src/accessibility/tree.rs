@@ -35,6 +35,11 @@ pub enum NodeTarget {
         forward: bool,
     },
     FindClose(flavite_workspace::TabId),
+    /// FEUX-0002 X06: match-selection query input (Focus/SetValue).
+    SelectionSearchQuery(flavite_workspace::TabId),
+    /// FEUX-0002 X06: match-selection row controls ("apply"/"close"/
+    /// "regex"/"case").
+    SelectionSearchCommand(flavite_workspace::TabId, &'static str),
     /// RFC-0006 S01: replacement controls from the same catalog.
     ReplaceInput(flavite_workspace::TabId),
     ReplaceNext(flavite_workspace::TabId),

@@ -587,13 +587,17 @@ impl WorkspaceState {
         // per committed set change (FEUX-0002 E-5, §5.6) — receipts,
         // pointer commits, passive movement mappings, and selection-only
         // commands all land through this acknowledgement, while
-        // sequence-only updates (focus, scroll) leave it untouched.
+        // sequence-only updates (focus, scroll) leave it untouched. The
+        // primary member is part of the committed set: rotate_primary
+        // changes it and bumps the version even when every pair is
+        // unchanged.
         interaction.selection_version =
             current
                 .interaction()
                 .selection_version
                 .wrapping_add(u64::from(
-                    interaction.selections != current.interaction().selections,
+                    interaction.selections != current.interaction().selections
+                        || interaction.primary != current.interaction().primary,
                 ));
         let focused = interaction.focused;
         // Blur/scroll acknowledgements may advance the interaction sequence

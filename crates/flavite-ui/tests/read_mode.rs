@@ -302,6 +302,7 @@ fn rapid_captured_input_is_interpreted_in_order_without_replaying_after_another_
             caret: at,
             selection: (at, at),
             selections: vec![[0, at, at]],
+            primary: 0,
             viewport_anchor: 0,
             focused: true,
             composing: false,
@@ -332,6 +333,7 @@ fn rapid_captured_input_is_interpreted_in_order_without_replaying_after_another_
                 document_boundary: false,
                 vertical: None,
                 preferred_x: Vec::new(),
+                clipboard_acquired: false,
             },
         });
     }
@@ -360,6 +362,7 @@ fn rapid_captured_input_is_interpreted_in_order_without_replaying_after_another_
             document_boundary: false,
             vertical: None,
             preferred_x: Vec::new(),
+            clipboard_acquired: false,
         },
     });
     assert_eq!(app.note_state_text(tab).unwrap(), before);

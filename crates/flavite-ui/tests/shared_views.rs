@@ -79,6 +79,7 @@ fn acknowledge_caret_with_anchor(
             caret: byte,
             selection: (byte, byte),
             selections: vec![[0, byte, byte]],
+            primary: 0,
             viewport_anchor,
             focused: true,
             composing: false,
@@ -368,6 +369,7 @@ fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() 
                     metrics: TypeMetrics::default(),
                 }),
                 preferred_x: Vec::new(),
+                clipboard_acquired: false,
             },
         });
         assert_eq!(
@@ -393,6 +395,7 @@ fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() 
             document_boundary: false,
             vertical: None,
             preferred_x: Vec::new(),
+            clipboard_acquired: false,
         },
     });
     assert_eq!(
@@ -412,6 +415,7 @@ fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() 
             document_boundary: false,
             vertical: None,
             preferred_x: Vec::new(),
+            clipboard_acquired: false,
         },
     });
     assert_eq!(
@@ -466,6 +470,7 @@ fn home_then_vertical_keys_ignore_the_widgets_old_column_before_redraw() {
             document_boundary: true,
             vertical: None,
             preferred_x: Vec::new(),
+            clipboard_acquired: false,
         },
     });
     for (sequence, action, rows, expected) in [
@@ -492,6 +497,7 @@ fn home_then_vertical_keys_ignore_the_widgets_old_column_before_redraw() {
                     metrics: TypeMetrics::default(),
                 }),
                 preferred_x: Vec::new(),
+                clipboard_acquired: false,
             },
         });
         assert_eq!(

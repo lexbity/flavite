@@ -78,6 +78,7 @@ fn publish_members(app: &mut App, tab: TabId, members: &[(usize, usize)]) {
             .enumerate()
             .map(|(id, &(anchor, head))| [id, anchor, head])
             .collect(),
+        primary: 0,
         viewport_anchor: 0,
         focused: true,
         composing: false,
@@ -215,16 +216,32 @@ fn cut_collapses_every_member_and_a_stale_target_is_a_zero_effect_refusal() {
     // A target captured BEFORE the cut is stale after it lands.
     let stale = EditorTarget::capture(&f.app, tab).unwrap();
     run(&mut f.app, tab, Command::Cut);
+    // Clipboard ordering (\u{a7}5.5): the write completion revalidates the
+    // source before the deletion. Until then the text is untouched.
+    assert_eq!(
+        &*f.app.note_editor_view(tab).unwrap().text,
+        "one caf\u{e9}\nsecond line\nthird row\n",
+        "the cut must not delete before the clipboard write completed"
+    );
+    let _ = f
+        .app
+        .update(Message::EditorClipboard(ClipboardMessage::CutReady {
+            target: EditorTarget::capture(&f.app, tab).unwrap(),
+            generation: f.app.context_mode.generation(),
+        }));
 
     // D-11 cut of two carets takes each containing line including its break.
     assert_eq!(&*f.app.note_editor_view(tab).unwrap().text, "third row\n");
 
-    // Replaying the stale target is a zero-effect refusal.
+    // Replaying the stale target through the revalidated seam is a
+    // zero-effect refusal: the source no longer matches the capture.
     let text_before = f.app.note_editor_view(tab).unwrap().text.clone();
-    let _ = f.app.update(Message::ContextMode(ContextMessage::Run(
-        stale,
-        Command::Cut,
-    )));
+    let _ = f
+        .app
+        .update(Message::EditorClipboard(ClipboardMessage::CutReady {
+            target: stale,
+            generation: f.app.context_mode.generation(),
+        }));
     assert_eq!(f.app.note_editor_view(tab).unwrap().text, text_before);
 }
 
@@ -258,6 +275,7 @@ fn selection_only_command_keeps_the_acknowledged_input_chain_current() {
                 metrics: flavite_editor::TypeMetrics::default(),
             }),
             preferred_x: vec![Some(0.0), Some(0.0)],
+            clipboard_acquired: false,
         },
     });
     assert!(
@@ -420,5 +438,209 @@ fn passive_view_maps_once_for_a_multi_member_edit() {
     assert_eq!(
         f.app.editor_interaction_snapshot(tab_b).unwrap().selection,
         (0, 1)
+    );
+}
+
+#[test]
+fn rotate_then_keep_primary_keeps_the_rotated_member() {
+    // FEUX-0002 R7: primary identity survives the host handoffs — capture,
+    // selections wire form, the kernel response, and the committed
+    // interaction (E-4, FR-4/FR-5/FR-7).
+    let (mut f, tab) = fixture(5060);
+    publish_members(&mut f.app, tab, &[(0, 0), (10, 10)]);
+    run(&mut f.app, tab, Command::Toggle);
+    assert_eq!(
+        f.app.workspace.tab(&tab).unwrap().interaction().primary,
+        0,
+        "the first member starts as the primary"
+    );
+    run(&mut f.app, tab, Command::RotatePrimary);
+    assert_eq!(
+        f.app.workspace.tab(&tab).unwrap().interaction().primary,
+        1,
+        "the rotated primary is the second member"
+    );
+    assert_eq!(
+        f.app.workspace.tab(&tab).unwrap().interaction().selections,
+        f.app.workspace.tab(&tab).unwrap().interaction().selections,
+    );
+    // Only the primary changed, so the committed selection version moved.
+    let rotated_members = committed_members(&f.app, tab);
+    assert_eq!(rotated_members, vec![(0, 0), (10, 10)]);
+    run(&mut f.app, tab, Command::KeepPrimary);
+    assert_eq!(committed_members(&f.app, tab), vec![(10, 10)]);
+}
+
+#[test]
+fn command_escape_keeps_only_primary_when_n_exceeds_one() {
+    // FEUX-0002 R10 / §5.4 row 10: Command Escape with N>1 keeps the
+    // primary so the user can discard additional targets before typing.
+    use flavite_edit_context::ContextMode;
+    let (mut f, tab) = fixture(5070);
+    publish_members(&mut f.app, tab, &[(0, 0), (10, 10)]);
+    run(&mut f.app, tab, Command::Toggle);
+    assert_eq!(f.app.context_mode.mode(tab), ContextMode::Command);
+    run(&mut f.app, tab, Command::Escape);
+    assert_eq!(
+        f.app.context_mode.mode(tab),
+        ContextMode::Command,
+        "Escape stays in Command"
+    );
+    assert_eq!(
+        committed_members(&f.app, tab),
+        vec![(0, 0)],
+        "the primary member survives"
+    );
+}
+
+#[test]
+fn ime_commit_lands_at_the_primary_only() {
+    // FEUX-0002 R6 / FR-20: a composition commit joins Typing at the
+    // primary caret only; the other member is retained and mapped without
+    // receiving composed text.
+    use flavite_edit_context::ContextMode;
+    use flavite_editor::context::{ContextEvent, ContextRequest};
+    use flavite_editor::input::CapturedInput;
+    use flavite_editor::keymap::KeyAction;
+    let (mut f, tab) = fixture(5080);
+    publish_members(&mut f.app, tab, &[(0, 0), (10, 10)]);
+    run(&mut f.app, tab, Command::Toggle);
+    run(&mut f.app, tab, Command::InsertStart);
+    assert_eq!(f.app.context_mode.mode(tab), ContextMode::Typing);
+    let target = EditorTarget::capture(&f.app, tab).unwrap();
+    let sequence = f.app.workspace.tab(&tab).unwrap().interaction().sequence + 1;
+    let _ = f.app.update(Message::ContextNative {
+        tab,
+        incarnation: target.incarnation,
+        request: ContextRequest {
+            buffer: target.buffer,
+            revision: target.revision,
+            selection: target.selection,
+            selections: target.selections.clone(),
+            sequence,
+            event: ContextEvent::Commit(CapturedInput {
+                buffer: target.buffer,
+                observed_revision: target.revision,
+                sequence,
+                action: KeyAction::Insert,
+                text: "X".into(),
+                extend: false,
+                document_boundary: false,
+                vertical: None,
+                preferred_x: Vec::new(),
+                clipboard_acquired: false,
+            }),
+        },
+    });
+    assert_eq!(
+        &*f.app.note_editor_view(tab).unwrap().text,
+        "Xone café\nsecond line\nthird row\n",
+        "the composed text lands at the primary only"
+    );
+    let members = committed_members(&f.app, tab);
+    assert_eq!(members.len(), 2, "the second member is retained");
+    assert_eq!(
+        members[0],
+        (1, 1),
+        "the primary caret sticks right of the insertion"
+    );
+    assert_eq!(
+        members[1],
+        (11, 11),
+        "the second member shifts by the delta"
+    );
+}
+
+#[test]
+fn multi_selection_history_state_is_restorable() {
+    // FEUX-0002 R8 / FR-18/FR-19: a valid, retained multi-selection state
+    // is restorable through the shipped history admission control.
+    let (mut f, tab) = fixture(5100);
+    publish_members(&mut f.app, tab, &[(0, 0), (10, 10)]);
+    run(&mut f.app, tab, Command::Toggle);
+    run(&mut f.app, tab, Command::Delete);
+    let _ = f.app.update(Message::ContextMode(ContextMessage::Run(
+        EditorTarget::capture(&f.app, tab).unwrap(),
+        Command::Undo,
+    )));
+    // After the undo, the newest entry (the batch delete) is a non-current
+    // two-selection state.
+    let source = EditorTarget::capture(&f.app, tab).unwrap();
+    let page = f.app.context_mode.history.page.clone().unwrap();
+    let entry = page
+        .entries
+        .iter()
+        .find(|entry| {
+            !entry.current
+                && entry.restorable
+                && entry.selection_count.is_some_and(|count| count > 1)
+        })
+        .unwrap_or_else(|| panic!("a two-selection history entry must exist"));
+    assert!(
+        flavite_ui::host::editor_history::can_restore(&f.app, source, entry),
+        "the multi-selection state must pass admission"
+    );
+}
+
+#[test]
+fn completed_typing_paste_installs_the_acquired_text_without_reacquiring() {
+    // FEUX-0002 R2 / FR-8/FR-9: a delivered TypingPaste completion applies
+    // the prepared edit; it never loops back into clipboard acquisition.
+    use flavite_editor::input::CapturedInput;
+    use flavite_editor::keymap::KeyAction;
+    let (mut f, tab) = fixture(5110);
+    run(&mut f.app, tab, Command::Toggle);
+    let target = EditorTarget::capture(&f.app, tab).unwrap();
+    let sequence = f.app.workspace.tab(&tab).unwrap().interaction().sequence + 1;
+    let _ = f
+        .app
+        .update(Message::EditorClipboard(ClipboardMessage::TypingPaste {
+            tab,
+            incarnation: target.incarnation,
+            input: CapturedInput {
+                buffer: target.buffer,
+                observed_revision: target.revision,
+                sequence,
+                action: KeyAction::Paste,
+                text: String::new(),
+                extend: false,
+                document_boundary: false,
+                vertical: None,
+                preferred_x: Vec::new(),
+                clipboard_acquired: false,
+            },
+            text: Some("X".into()),
+        }));
+    assert_eq!(
+        &*f.app.note_editor_view(tab).unwrap().text,
+        "Xone café\nsecond line\nthird row\n",
+        "the completed paste installs the clipboard text"
+    );
+    // An empty clipboard read terminates as a no-op.
+    let view = f.app.note_editor_view(tab).unwrap();
+    let sequence = f.app.workspace.tab(&tab).unwrap().interaction().sequence + 1;
+    let _ = f
+        .app
+        .update(Message::EditorClipboard(ClipboardMessage::TypingPaste {
+            tab,
+            incarnation: target.incarnation,
+            input: CapturedInput {
+                buffer: view.buffer_id,
+                observed_revision: view.revision,
+                sequence,
+                action: KeyAction::Paste,
+                text: String::new(),
+                extend: false,
+                document_boundary: false,
+                vertical: None,
+                preferred_x: Vec::new(),
+                clipboard_acquired: false,
+            },
+            text: None,
+        }));
+    assert_eq!(
+        &*f.app.note_editor_view(tab).unwrap().text,
+        "Xone café\nsecond line\nthird row\n",
+        "an empty clipboard stays a no-op"
     );
 }

@@ -88,6 +88,7 @@ fn refusal_before_mutation_leaves_text_revision_and_history_byte_identical() {
         kind: flavite_buffer::history::EditKind::Typing,
         before: vec![[0, 0, 0]],
         after: vec![[0, 4096, 4096]],
+        primary: 0,
     };
     let recorded_error = model
         .try_apply_recorded_batch(
@@ -505,4 +506,41 @@ fn manager_default_budget_reaches_buffers_opened_after_it_is_set() {
         .open_note("fresh.md".into(), content, Default::default())
         .expect("fixture decodes");
     assert_eq!(buffer.model().history_budget(), Budget::default());
+}
+
+#[test]
+fn oversized_refusal_preserves_existing_history() {
+    // FEUX-0002 R4: a refusal is zero-effect — the feasibility plan is
+    // computed before any eviction is committed, so a refused edit can
+    // never discard retained recovery state (X01, FR-17/FR-22, AC-14).
+    let mut model = model_with_budget(10_000, 10_000);
+    append_isolated(&mut model, 64);
+    assert_eq!(model.history_survivor_ids().len(), 2, "root + one edit");
+    let before_ids = model.history_survivor_ids();
+    let before_account = model.history_accounted_bytes();
+
+    let error = model
+        .try_apply_batch(
+            &[EditOp::new(
+                Span::new(TextByte(0), TextByte(0)),
+                "x".repeat(20_000),
+            )],
+            UndoPolicy::Isolated,
+        )
+        .expect_err("an edit that cannot fit even after eviction is refused");
+    assert!(matches!(
+        error,
+        flavite_buffer::model::BatchError::LimitExceeded { needed, .. } if needed > 10_000
+    ));
+    assert_eq!(
+        model.history_survivor_ids(),
+        before_ids,
+        "refusal must not evict existing history"
+    );
+    assert_eq!(model.history_accounted_bytes(), before_account);
+    assert_eq!(model.history_evicted_total(), 0);
+
+    // The budget still accepts ordinary edits after the refusal.
+    append_isolated(&mut model, 64);
+    assert_eq!(model.history_survivor_ids().len(), 3);
 }

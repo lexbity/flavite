@@ -335,6 +335,38 @@ run_x07_gates() {
         "$root/crates/flavite-ui/src/host/editor_diagnostics.rs"
 }
 
+run_x08_gates() {
+    run_x07_gates
+    # X08 artifacts exist with real content (the release gate is the
+    # acceptance scenario plus the user-facing feature document).
+    local file
+    for file in \
+        scripts/tests/workbench/context_workbench_acceptance.py \
+        docs/APP-FEATURES.md; do
+        gate assert_nonempty "$root/$file"
+    done
+    # No compatibility surfaces anywhere in the touched crates (FR-23):
+    # aliases, legacy keymaps, and deprecated ID shims are forbidden.
+    gate assert_absent 'deprecatedIds|command_aliases|shortcut_aliases|legacy_keymap|legacy_chrome' \
+        "$root/crates/flavite-api/src" \
+        "$root/crates/flavite-ui/src" \
+        "$root/crates/flavite-settings/src" \
+        "$root/crates/flavite-edit-context/src"
+    # No placeholder code remains in any FEUX-0002 production path (AC-18).
+    gate assert_absent 'TODO|todo!\(|unimplemented!\(' \
+        "$root/crates/flavite-buffer/src/selection.rs" \
+        "$root/crates/flavite-buffer/src/budget.rs" \
+        "$root/crates/flavite-edit-context/src" \
+        "$root/crates/flavite-ui/src/host/context_mode.rs" \
+        "$root/crates/flavite-ui/src/host/selection_search.rs" \
+        "$root/crates/flavite-ui/src/host/editor_diagnostics.rs" \
+        "$root/crates/flavite-ui/src/views/context_toolbar.rs"
+    # The protocol crate never exists, anywhere — final sweep including
+    # docs (E-1; the X03 gate scans the same roots; X08 keeps the fence).
+    gate assert_absent 'flavite-edit-protocol' \
+        "$root/Cargo.toml" "$root/Cargo.lock" "$root/crates" "$root/docs"
+}
+
 case "$slice" in
     X01) run_x01_gates ;;
     X02) run_x02_gates ;;
@@ -343,11 +375,8 @@ case "$slice" in
     X05) run_x05_gates ;;
     X06) run_x06_gates ;;
     X07) run_x07_gates ;;
-    X08)
-        echo "phase X08 is not implemented yet; the cumulative gate stops at X07" >&2
-        exit 2
-        ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05 X06 X07)" >&2; exit 2 ;;
+    X08) run_x08_gates ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05 X06 X07 X08)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then

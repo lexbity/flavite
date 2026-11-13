@@ -481,67 +481,6 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         if !find_status.is_empty() {
             content = content.push(text(find_status).size(12));
         }
-        if let Some(search) = app.selection_search.tabs.get(&tab) {
-            // FEUX-0002 X06: the owned match-selection query row (E-11)
-            // reuses the delivered find-input ownership patterns.
-            let row_title = match search.kind {
-                crate::host::selection_search::ApplyKind::Select => "Select matches…",
-                crate::host::selection_search::ApplyKind::Split => "Split on matches…",
-            };
-            let caption = crate::host::selection_search::caption(app, tab);
-            let apply_enabled = crate::host::selection_search::apply_enabled(app, tab);
-            content =
-                content.push(
-                    container(
-                        row![
-                        text(row_title).size(12),
-                        text_editor(&search.query_input)
-                            .id(crate::host::selection_search::query_id(tab))
-                            .placeholder("Query · Alt+Enter inserts a newline")
-                            .height(64)
-                            .on_action(move |action| Message::SelectionSearch(
-                                crate::host::selection_search::SelectionSearchMessage::DraftAction {
-                                    tab,
-                                    action,
-                                }
-                            ))
-                            .key_binding(move |key| {
-                                crate::host::selection_search::draft_binding(tab, key)
-                            }),
-                        button(if search.regex { "Regex" } else { "Literal" })
-                            .style(style::ghost())
-                            .on_press(Message::SelectionSearch(
-                                crate::host::selection_search::SelectionSearchMessage::ToggleRegex(
-                                    tab,
-                                ),
-                            )),
-                        button(if search.case_sensitive { "Aa" } else { "aA" })
-                            .style(style::ghost())
-                            .on_press(Message::SelectionSearch(
-                                crate::host::selection_search::SelectionSearchMessage::ToggleCase(
-                                    tab,
-                                ),
-                            )),
-                        button("Apply")
-                            .style(style::ghost())
-                            .on_press_maybe(apply_enabled.then_some(Message::SelectionSearch(
-                                crate::host::selection_search::SelectionSearchMessage::Apply(tab),
-                            ))),
-                        button("Close")
-                            .style(style::ghost())
-                            .on_press(Message::SelectionSearch(
-                                crate::host::selection_search::SelectionSearchMessage::Close(tab),
-                            )),
-                        text(caption.unwrap_or_default()).size(12),
-                    ]
-                        .spacing(8),
-                    )
-                    .padding(8),
-                );
-            if let Some(error) = &search.error {
-                content = content.push(text(error).size(12));
-            }
-        }
         if let Some(replace) = app.note_search.replaces.get(&tab) {
             let status = if let Some(error) = &replace.last_error {
                 error.clone()
@@ -588,6 +527,72 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                 )
                 .padding(8),
             );
+        }
+    }
+    if let Some(search) = app.selection_search.tabs.get(&tab) {
+        // FEUX-0002 X06: the owned match-selection query row (E-11)
+        // renders independently of the find bar (it is not nested in the
+        // find-open conditional; E-11's "owned row" is note-level UI).
+        let row_title = match search.kind {
+            crate::host::selection_search::ApplyKind::Select => "Select matches…",
+            crate::host::selection_search::ApplyKind::Split => "Split on matches…",
+        };
+        let caption = crate::host::selection_search::caption(app, tab);
+        let apply_enabled = crate::host::selection_search::apply_enabled(app, tab);
+        content = content.push(bounds::observe(
+            container(
+                row![
+                        text(row_title).size(12),
+                        text_editor(&search.query_input)
+                            .id(crate::host::selection_search::query_id(tab))
+                            .placeholder("Query · Alt+Enter inserts a newline")
+                            .height(64)
+                            .on_action(move |action| Message::SelectionSearch(
+                                crate::host::selection_search::SelectionSearchMessage::DraftAction {
+                                    tab,
+                                    action,
+                                }
+                            ))
+                            .key_binding(move |key| {
+                                crate::host::selection_search::draft_binding(tab, key)
+                            }),
+                        button(if search.regex { "Regex" } else { "Literal" })
+                            .style(style::ghost())
+                            .on_press(Message::SelectionSearch(
+                                crate::host::selection_search::SelectionSearchMessage::ToggleRegex(
+                                    tab,
+                                ),
+                            )),
+                        button(if search.case_sensitive { "Aa" } else { "aA" })
+                            .style(style::ghost())
+                            .on_press(Message::SelectionSearch(
+                                crate::host::selection_search::SelectionSearchMessage::ToggleCase(
+                                    tab,
+                                ),
+                            )),
+                        button("Apply")
+                            .style(style::ghost())
+                            .on_press_maybe(apply_enabled.then_some(Message::SelectionSearch(
+                                crate::host::selection_search::SelectionSearchMessage::Apply(tab),
+                            ))),
+                        button("Close")
+                            .style(style::ghost())
+                            .on_press(Message::SelectionSearch(
+                                crate::host::selection_search::SelectionSearchMessage::Close(tab),
+                            )),
+                        text(caption.unwrap_or_default()).size(12),
+                    ]
+                .spacing(8),
+            )
+            .padding(8),
+            move |rect| {
+                Message::SelectionSearch(
+                    crate::host::selection_search::SelectionSearchMessage::Bounds { tab, rect },
+                )
+            },
+        ));
+        if let Some(error) = &search.error {
+            content = content.push(text(error).size(12));
         }
     }
     content

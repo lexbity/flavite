@@ -93,6 +93,7 @@ fn editor_latency_probe() {
                     document_boundary: false,
                     vertical: None,
                     preferred_x: Vec::new(),
+                    clipboard_acquired: false,
                 },
             }));
             assert!(

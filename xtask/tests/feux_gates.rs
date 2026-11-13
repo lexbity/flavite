@@ -806,6 +806,78 @@ fn x07_gate_passes_clean_tree_and_rejects_diagnostics_regressions() {
     assert!(!run_gate(temp.path(), "X07").status.success());
 }
 
+fn seed_x08_inputs(root: &Path) {
+    seed_x07_inputs(root);
+    seed_file(
+        root,
+        "scripts/tests/workbench/context_workbench_acceptance.py",
+        "import common\n",
+    );
+    seed_file(root, "docs/APP-FEATURES.md", "# Flavite Features\n");
+}
+
+#[test]
+fn x08_gate_passes_clean_tree_and_rejects_compat_surfaces() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_x08_inputs(temp.path());
+    let clean = run_gate(temp.path(), "X08");
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // A compatibility alias surface fails the gate.
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/src/host/aliases.rs",
+        "pub const deprecatedIds: &str = \"editor.old\";\n",
+    );
+    assert!(!run_gate(temp.path(), "X08").status.success());
+    fs::remove_file(temp.path().join("crates/flavite-ui/src/host/aliases.rs")).unwrap();
+
+    // A legacy keymap shim fails.
+    seed_file(
+        temp.path(),
+        "crates/flavite-settings/src/legacy.rs",
+        "pub fn legacy_keymap() {}\n",
+    );
+    assert!(!run_gate(temp.path(), "X08").status.success());
+    fs::remove_file(temp.path().join("crates/flavite-settings/src/legacy.rs")).unwrap();
+
+    // A placeholder in the production selection path fails.
+    seed_file(
+        temp.path(),
+        "crates/flavite-buffer/src/selection.rs",
+        "pub const MAX_SELECTIONS: usize = 10000;\n// TODO: implement\n",
+    );
+    assert!(!run_gate(temp.path(), "X08").status.success());
+    seed_file(
+        temp.path(),
+        "crates/flavite-buffer/src/selection.rs",
+        "pub const MAX_SELECTIONS: usize = 10000;\n",
+    );
+
+    // The protocol crate is forbidden everywhere, including docs.
+    seed_file(temp.path(), "docs/protocol.md", "flavite-edit-protocol\n");
+    assert!(!run_gate(temp.path(), "X08").status.success());
+    fs::remove_file(temp.path().join("docs/protocol.md")).unwrap();
+
+    // Losing the acceptance scenario fails presence.
+    fs::remove_file(
+        temp.path()
+            .join("scripts/tests/workbench/context_workbench_acceptance.py"),
+    )
+    .unwrap();
+    let missing = run_gate(temp.path(), "X08");
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("missing/empty"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
 #[test]
 fn feux_gate_rejects_unknown_or_unimplemented_slices() {
     let temp = tempfile::tempdir().unwrap();
@@ -813,9 +885,12 @@ fn feux_gate_rejects_unknown_or_unimplemented_slices() {
     let unknown = run_gate(temp.path(), "X99");
     assert!(!unknown.status.success());
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown slice"));
-    // Future phases are not yet implemented: requiring them is a hard
-    // failure, never a silent pass.
-    let future = run_gate(temp.path(), "X08");
-    assert!(!future.status.success());
-    assert!(String::from_utf8_lossy(&future.stderr).contains("not implemented yet"));
+    // X08 is implemented: on a seeded clean tree it passes.
+    seed_x08_inputs(temp.path());
+    let x08 = run_gate(temp.path(), "X08");
+    assert!(
+        x08.status.success(),
+        "{}",
+        String::from_utf8_lossy(&x08.stderr)
+    );
 }
