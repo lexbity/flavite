@@ -8,7 +8,8 @@
 //! here as it ships; the ring is process-local and cleared on exit.
 //!
 //! The burst-hint banner state also lives here (host-owned UI state); the
-//! pure session decides when to show it ([`Effect::ShowBurstHint`]).
+//! pure session decides when to show it
+//! ([`flavite_edit_context::Effect::ShowBurstHint`]).
 
 use crate::app::{App, Message};
 use flavite_edit_context::ContextMode;
@@ -141,8 +142,9 @@ pub struct DiagnosticsHost {
     next_view_seq: u32,
     view_seqs: BTreeMap<TabId, u32>,
     /// Whether the burst-hint banner is visible. The pure session decides
-    /// when to emit [`Effect::ShowBurstHint`]; this is the rendered banner
-    /// state, cleared on dismiss, mode exit, or the banner buttons.
+    /// when to emit [`flavite_edit_context::Effect::ShowBurstHint`]; this is
+    /// the rendered banner state, cleared on dismiss, mode exit, or the
+    /// banner buttons.
     pub burst_hint: bool,
 }
 
@@ -235,7 +237,7 @@ impl DiagnosticsHost {
     }
 
     /// Show the burst-hint banner (the pure session emitted
-    /// [`Effect::ShowBurstHint`]).
+    /// [`flavite_edit_context::Effect::ShowBurstHint`]).
     pub fn show_burst_hint(&mut self) {
         self.burst_hint = true;
     }
