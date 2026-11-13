@@ -10,6 +10,7 @@
 pub mod actor;
 pub mod channels;
 pub mod coalesce;
+pub mod editor_receipts;
 pub mod encoding;
 pub mod history;
 pub mod identity;
@@ -30,6 +31,7 @@ pub mod session;
 pub mod source_leases;
 pub mod sync;
 pub mod text_edit;
+pub mod text_select;
 pub mod text_worker;
 pub mod tokens;
 pub mod types;

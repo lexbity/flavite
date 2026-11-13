@@ -310,6 +310,10 @@ pub fn editor_colors(scheme: Scheme) -> flavite_editor::EditorColors {
                     a: 0.45,
                     ..palette.primary
                 },
+                selection_muted: iced::Color {
+                    a: 0.18,
+                    ..palette.primary
+                },
                 link: palette.primary,
                 link_unresolved: palette.danger,
                 link_multiple: palette.warning,

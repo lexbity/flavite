@@ -148,6 +148,10 @@ pub const UI_COMMANDS: &[UiCommand] = &[
         title: "Use writing layout",
     },
     UiCommand {
+        id: "editor.diagnostics_export",
+        title: "Copy diagnostics (content-free)",
+    },
+    UiCommand {
         id: "workspace.toggle_sidebar",
         title: "Toggle notes sidebar",
     },
@@ -507,14 +511,21 @@ pub fn resolved_chord(
 #[must_use]
 pub fn catalog_conflicts(core_ids: &[&str]) -> Vec<String> {
     let mut conflicts = Vec::new();
+    // The `workspace.*` namespace is UI-owned; the core registry must never
+    // claim it (its commands are dispatched by the shell, not the Session).
     for core in core_ids {
-        if *core == "workspace.quick_switch" || core.starts_with("workspace.") {
+        if core.starts_with("workspace.") {
             conflicts.push((*core).to_owned());
         }
     }
+    // Duplicate ids within the UI palette are always defects. Core ids that
+    // overlap `editor.*` palette entries are NOT: FEUX-0002 E-7/§6 gives
+    // each editor command one canonical id whose executor lives in the core
+    // registry and whose palette entry routes to that same executor through
+    // `dispatch` — same feature, same id, not an ambiguity.
     let mut seen = std::collections::BTreeSet::new();
     for command in ui_specs(&Default::default()) {
-        if !seen.insert(command.id) || core_ids.contains(&command.id) {
+        if !seen.insert(command.id) {
             conflicts.push(command.id.to_owned());
         }
     }
@@ -914,6 +925,12 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
     if app.shutdown.is_some() {
         app.status = "Quitting: resolve the quit (decide or cancel) first".into();
         return iced::Task::none();
+    }
+    if id == "editor.diagnostics_export" {
+        return super::editor_diagnostics::handle(
+            app,
+            super::editor_diagnostics::DiagnosticsMessage::Export,
+        );
     }
     if (id.starts_with("editor.")
         || matches!(
@@ -1348,6 +1365,11 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
 /// still recheck every accepted action.
 #[must_use]
 pub fn available(app: &App, id: &str) -> bool {
+    if id == "editor.diagnostics_export" {
+        // The explicit export action is always available with a vault open;
+        // it copies the bounded content-free ring, never auto-exports.
+        return app.flavite.is_some();
+    }
     if id.starts_with("editor.")
         || matches!(
             id,

@@ -34,7 +34,7 @@ fn observed<'a>(
         ),
         move |rect| {
             Message::EditorHistory(HistoryMessage::Bounds {
-                source,
+                source: source.clone(),
                 generation,
                 node,
                 popup,
@@ -57,9 +57,13 @@ fn control<'a>(
             .padding([4.0 * metrics.scale, 8.0 * metrics.scale])
             .style(style::ghost())
             .on_press_maybe(
-                action.map(|action| Message::EditorHistory(HistoryMessage::Act(source, action))),
+                action.map(|action| {
+                    Message::EditorHistory(HistoryMessage::Act(source.clone(), action))
+                }),
             ),
-        move |rect| Message::EditorHistory(HistoryMessage::ControlBounds(source, name, rect)),
+        move |rect| {
+            Message::EditorHistory(HistoryMessage::ControlBounds(source.clone(), name, rect))
+        },
     )
 }
 
@@ -77,7 +81,7 @@ pub fn strip<'a>(
     ]
     .spacing(layout::CHIP_GAP * metrics.scale)
     .align_y(alignment::Vertical::Center);
-    let visible = editor_history::visible_entries(app, source);
+    let visible = editor_history::visible_entries(app, source.clone());
     if !visible.is_empty() {
         for entry in visible {
             let full = format!(
@@ -123,15 +127,15 @@ pub fn strip<'a>(
                             .session
                             .as_ref()
                             .is_some_and(|s| s.state.menu().is_none())
-                        && editor_history::can_restore(app, source, entry))
+                        && editor_history::can_restore(app, source.clone(), entry))
                     .then_some(Message::EditorHistory(HistoryMessage::Act(
-                        source,
+                        source.clone(),
                         HistoryAction::Restore(entry.target),
                     ))),
                 );
             content = content.push(observed(
                 app,
-                source,
+                source.clone(),
                 entry,
                 false,
                 tooltip(
@@ -172,7 +176,7 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
     if !host.open {
         return shell;
     }
-    let Some(source) = host.target else {
+    let Some(source) = host.target.clone() else {
         return shell;
     };
     let metrics = *app.appearance.metrics();
@@ -188,7 +192,7 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
         Space::new().width(Length::Fill),
         control(
             app,
-            source,
+            source.clone(),
             "history-close",
             "Close",
             Some(HistoryAction::Close)
@@ -236,13 +240,15 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
             .height(editor_history::ROW_HEIGHT * metrics.scale)
             .padding([5.0 * metrics.scale, 8.0 * metrics.scale])
             .style(style::list_row(index == host.selected))
-            .on_press_maybe(editor_history::can_restore(app, source, entry).then_some(
-                Message::EditorHistory(HistoryMessage::Act(
-                    source,
-                    HistoryAction::Restore(entry.target),
-                )),
-            ));
-            entries = entries.push(observed(app, source, entry, true, item));
+            .on_press_maybe(
+                editor_history::can_restore(app, source.clone(), entry).then_some({
+                    Message::EditorHistory(HistoryMessage::Act(
+                        source.clone(),
+                        HistoryAction::Restore(entry.target),
+                    ))
+                }),
+            );
+            entries = entries.push(observed(app, source.clone(), entry, true, item));
         }
     }
     let height = (app.window_size().height - y - 125.0 * metrics.scale)
@@ -259,7 +265,7 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
     contents = contents.push(row![
         control(
             app,
-            source,
+            source.clone(),
             "history-refresh",
             "Newest",
             Some(HistoryAction::Refresh)
@@ -267,7 +273,7 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
         Space::new().width(Length::Fill),
         control(
             app,
-            source,
+            source.clone(),
             "history-next",
             "Older states",
             host.page
@@ -280,8 +286,13 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
         .width(width)
         .padding(metrics.spacing)
         .style(style::palette_card);
+    let card_source = source.clone();
     let card = bounds::observe(card, move |rect| {
-        Message::EditorHistory(HistoryMessage::ControlBounds(source, "history-card", rect))
+        Message::EditorHistory(HistoryMessage::ControlBounds(
+            card_source.clone(),
+            "history-card",
+            rect,
+        ))
     });
     let composed = stack![
         shell,
@@ -289,7 +300,7 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
             button(Space::new().width(Length::Fill).height(Length::Fill))
                 .style(style::menu_backdrop)
                 .on_press(Message::EditorHistory(HistoryMessage::Act(
-                    source,
+                    source.clone(),
                     HistoryAction::Close
                 )))
         ),

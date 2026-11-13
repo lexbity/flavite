@@ -37,6 +37,7 @@ Normal/build:
 
 - `blake3` (normal)
 - `flavite-buffer` (normal)
+- `flavite-edit-context` (normal)
 - `flavite-encoding` (normal)
 - `flavite-fs` (normal)
 - `flavite-graph` (normal)

@@ -20,90 +20,13 @@ use flavite_encoding::{
 };
 use flavite_syntax::text::{Span, TextByte, TextSnapshot};
 use ropey::{Rope, RopeSlice};
-use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::budget::Budget;
 use crate::eol::EolTable;
 use crate::revision::{BaseHash, BufferId, Revision};
+use crate::selection::{RawSelection, Selection, SelectionSet};
 use crate::undo::{EditOp, UndoTree};
-
-/// A selection range in TextByte coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Selection {
-    /// Anchor position (where the selection started).
-    pub anchor: TextByte,
-    /// Head position (where the selection ended).
-    pub head: TextByte,
-}
-
-impl Selection {
-    /// Create a new selection from anchor to head.
-    #[must_use]
-    pub fn new(anchor: TextByte, head: TextByte) -> Self {
-        Self { anchor, head }
-    }
-
-    /// Create a collapsed selection (caret) at a position.
-    #[must_use]
-    pub fn caret(at: TextByte) -> Self {
-        Self {
-            anchor: at,
-            head: at,
-        }
-    }
-
-    /// Check if this is a collapsed selection (caret).
-    #[must_use]
-    pub fn is_caret(&self) -> bool {
-        self.anchor == self.head
-    }
-
-    /// Get the start of the selection (min of anchor and head).
-    #[must_use]
-    pub fn start(&self) -> TextByte {
-        TextByte(std::cmp::min(self.anchor.0, self.head.0))
-    }
-
-    /// Get the end of the selection (max of anchor and head).
-    #[must_use]
-    pub fn end(&self) -> TextByte {
-        TextByte(std::cmp::max(self.anchor.0, self.head.0))
-    }
-
-    /// Get the span of the selection.
-    #[must_use]
-    pub fn span(&self) -> Span<TextByte> {
-        Span::new(self.start(), self.end())
-    }
-
-    /// Check if the selection contains a position.
-    #[must_use]
-    pub fn contains(&self, pos: TextByte) -> bool {
-        let start = self.start().0;
-        let end = self.end().0;
-        pos.0 >= start && pos.0 <= end
-    }
-
-    /// Move both anchor and head by an offset.
-    #[must_use]
-    pub fn offset(self, by: i64) -> Self {
-        let shift = |position: usize| {
-            if by >= 0 {
-                position.saturating_add(by as usize)
-            } else {
-                let magnitude = usize::try_from(by.unsigned_abs()).unwrap_or(usize::MAX);
-                position.saturating_sub(magnitude)
-            }
-        };
-        let new_anchor = shift(self.anchor.0);
-        let new_head = shift(self.head.0);
-        Self {
-            anchor: TextByte(new_anchor),
-            head: TextByte(new_head),
-        }
-    }
-}
 
 /// The headless editor model.
 ///
@@ -122,9 +45,9 @@ pub struct EditorModel {
     /// more than one internal chunk, so text must never be read back
     /// through the rope.
     rope: Rope,
-    /// Multi-selection: map from selection index to selection.
-    /// The "primary" selection is always at index 0.
-    selections: HashMap<usize, Selection>,
+    /// Multi-selection: the canonical committed set (FEUX-0002 E-4).
+    /// `None` means the default single caret at offset 0.
+    selections: Option<SelectionSet>,
     /// The undo tree for edit history.
     undo_tree: UndoTree,
     /// Per-line EOL information.
@@ -208,6 +131,10 @@ pub struct PreparedBatch {
     /// The after-state snapshot recorded as the isolated Undo node, carrying
     /// text, spliced EOL state and the descriptor.
     pub undo_snapshot: TextSnapshot,
+    /// The original per-op batch geometry in pre-change coordinates
+    /// (FEUX-0002 E-13): retained on the undo node so movement across the
+    /// transition maps carets in unchanged gaps exactly.
+    pub spans: Vec<crate::selection::SpanEdit>,
 }
 
 /// Splice an EOL table from `old_text` to `new_text`: unchanged prefix and
@@ -455,7 +382,7 @@ impl EditorModel {
             buffer_id: BufferId::new(),
             text,
             rope,
-            selections: HashMap::new(),
+            selections: None,
             undo_tree: UndoTree::new(snapshot.clone()),
             eol_table,
             source_format,
@@ -477,23 +404,35 @@ impl EditorModel {
         let (prefix, suffix) = common_text_edges(&old_text, &new_text);
         let old_middle_end = old_text.len().saturating_sub(suffix);
         let new_middle_end = new_text.len().saturating_sub(suffix);
-        for selection in self.selections.values_mut() {
-            selection.anchor = map_position(
-                selection.anchor,
-                prefix,
-                old_middle_end,
-                new_middle_end,
-                old_text.len(),
-                &new_text,
-            );
-            selection.head = map_position(
-                selection.head,
-                prefix,
-                old_middle_end,
-                new_middle_end,
-                old_text.len(),
-                &new_text,
-            );
+        if let Some(set) = self.selections.take() {
+            let candidates = set
+                .members()
+                .into_iter()
+                .map(|selection| RawSelection {
+                    id: Some(selection.id().as_raw()),
+                    anchor: map_position(
+                        TextByte(selection.anchor()),
+                        prefix,
+                        old_middle_end,
+                        new_middle_end,
+                        old_text.len(),
+                        &new_text,
+                    )
+                    .0,
+                    head: map_position(
+                        TextByte(selection.head()),
+                        prefix,
+                        old_middle_end,
+                        new_middle_end,
+                        old_text.len(),
+                        &new_text,
+                    )
+                    .0,
+                })
+                .collect();
+            if let Ok((mapped, _)) = SelectionSet::normalize(&new_text, candidates, None) {
+                self.selections = Some(mapped);
+            }
         }
         self.rope = Rope::from_str(snapshot.text());
         self.text = new_text;
@@ -1012,6 +951,16 @@ impl EditorModel {
         Ok(PreparedBatch {
             op: combined,
             undo_snapshot,
+            spans: ordered
+                .iter()
+                .map(|edit| {
+                    crate::selection::SpanEdit::new(
+                        edit.range.start.0,
+                        edit.range.end.0,
+                        edit.replacement.len(),
+                    )
+                })
+                .collect(),
         })
     }
 
@@ -1028,12 +977,12 @@ impl EditorModel {
         context_origin: Option<u128>,
     ) -> Revision {
         self.apply_text_edit(&batch.op);
-        if let Some(origin) = context_origin {
-            self.undo_tree
-                .apply_context(batch.op, batch.undo_snapshot, origin);
-        } else {
-            self.undo_tree.apply_boundary(batch.op, batch.undo_snapshot);
-        }
+        let policy = match context_origin {
+            Some(origin) => crate::undo::UndoPolicy::Context { origin },
+            None => crate::undo::UndoPolicy::Isolated,
+        };
+        self.undo_tree
+            .apply_batch(batch.op, batch.undo_snapshot, policy, &batch.spans);
         let revision = self.revision.next();
         self.revision = revision;
         self.is_dirty = true;
@@ -1184,7 +1133,7 @@ impl EditorModel {
         };
         self.apply_text_edit(&batch.op);
         self.undo_tree
-            .apply_recorded(batch.op, batch.undo_snapshot, policy, record);
+            .apply_recorded(batch.op, batch.undo_snapshot, policy, record, &batch.spans);
         self.undo_tree.release(&lease);
         self.revision = self.revision.next();
         self.is_dirty = true;
@@ -1251,13 +1200,27 @@ impl EditorModel {
             return Err(crate::history::HistoryError::Expired);
         }
         let snapshot = self.undo_tree.restore_snapshot(target)?;
-        let selections = self.undo_tree.get(target.node).and_then(|node| {
+        let target_node = self.undo_tree.get(target.node);
+        let selections = target_node.and_then(|node| {
             if node.is_root() {
-                Some(vec![[0, 0]])
+                Some(vec![[0, 0, 0]])
             } else {
                 node.editor.as_ref().map(|r| r.after.clone())
             }
         });
+        // The restored set's primary member is explicit in the record
+        // (FEUX-0002 E-4/FR-4); the root state's primary is its only member.
+        let primary = target_node.and_then(|node| {
+            if node.is_root() {
+                Some(0)
+            } else {
+                node.editor.as_ref().map(|r| r.primary)
+            }
+        });
+        // The movement delta for passive views is derived from the transition
+        // (position → target) before the head moves.
+        let from = self.undo_tree.position_id();
+        let (spans, truncated) = self.undo_tree.transition_spans(from, target.node);
         // Protect the restore target from budget eviction for the install
         // window; released on completion and on every error exit.
         let protection = self
@@ -1269,7 +1232,7 @@ impl EditorModel {
         let text = snapshot.text().to_owned();
         let rope = Rope::from_str(&text);
         let table = EolTable::from_snapshot(&snapshot);
-        self.set_history_movement(&snapshot, selections);
+        self.set_history_movement(spans, truncated, selections, primary);
         self.undo_tree.restore_position(target.node);
         self.text = text;
         self.rope = rope;
@@ -1286,17 +1249,19 @@ impl EditorModel {
 
     fn set_history_movement(
         &mut self,
-        snapshot: &TextSnapshot,
-        selections: Option<Vec<[usize; 2]>>,
+        spans: Vec<crate::history::MovementSpan>,
+        truncated: bool,
+        selections: Option<Vec<[usize; 3]>>,
+        primary: Option<usize>,
     ) {
-        let (prefix, suffix) = common_text_edges(self.text(), snapshot.text());
         self.history_movement = Some(crate::history::HistoryMovement {
             selections,
-            change: crate::history::HistoryChange {
-                start: prefix,
-                end: self.text.len() - suffix,
-                inserted: snapshot.text().len() - prefix - suffix,
-            },
+            spans,
+            truncated,
+            // The requesting view's exact primary index when the recorded
+            // set carries it (undo records do not: the UI keeps its own
+            // primary member when it survives).
+            primary,
         });
     }
 
@@ -1305,17 +1270,62 @@ impl EditorModel {
         self.history_movement.as_ref()
     }
 
+    /// The undo tree's current position (node id).
+    #[must_use]
+    pub fn history_position_id(&self) -> u64 {
+        self.undo_tree.position_id()
+    }
+
+    /// The exact movement spans for a transition (`from` → `to` node ids).
+    #[must_use]
+    pub fn history_transition_spans(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> (Vec<crate::history::MovementSpan>, bool) {
+        self.undo_tree.transition_spans(from, to)
+    }
+
+    /// The recorded after-set of the current position (triples).
+    #[must_use]
+    pub fn history_position_selections(&self) -> Option<Vec<[usize; 3]>> {
+        self.undo_tree.position_selections()
+    }
+
+    /// The recorded after-set's primary member index (FEUX-0002 FR-4): the
+    /// primary identity recorded with the current node's editor edit.
+    #[must_use]
+    pub fn history_position_primary(&self) -> Option<usize> {
+        self.undo_tree
+            .position()
+            .and_then(|node| node.editor.as_ref())
+            .map(|record| record.primary)
+    }
+
+    /// The snapshot text of a retained history node (diagnostic/test).
+    #[must_use]
+    pub fn history_node_text(&self, id: u64) -> Option<String> {
+        self.undo_tree
+            .get(id)
+            .filter(|node| !node.evicted)
+            .and_then(|node| node.snapshot.as_ref())
+            .map(|snapshot| snapshot.text().to_string())
+    }
+
     /// Undo the last edit.
     ///
     /// Returns the new revision and whether the undo was successful.
     /// Every undo advances the revision (§4.5.2).
     pub fn undo(&mut self) -> Option<Revision> {
         let selections = self.undo_tree.undo_selections();
+        let from = self.undo_tree.position_id();
         let transition = self.undo_tree.undo_edit();
         let result = self.undo_tree.undo();
 
         if let Some((_node_rev, Some(snapshot))) = result {
-            self.set_history_movement(&snapshot, selections);
+            let to = self.undo_tree.position_id();
+            let (spans, truncated) = self.undo_tree.transition_spans(from, to);
+            self.set_history_movement(spans, truncated, selections, None);
             let new_text = snapshot.text().to_string();
             self.rope = Rope::from_str(&new_text);
             self.text = new_text;
@@ -1342,10 +1352,18 @@ impl EditorModel {
     /// Every redo advances the revision (§4.5.2).
     pub fn redo(&mut self) -> Option<Revision> {
         let transition = self.undo_tree.redo_edit();
+        let from = self.undo_tree.position_id();
         let result = self.undo_tree.redo();
 
         if let Some((_node_rev, Some(snapshot))) = result {
-            self.set_history_movement(&snapshot, self.undo_tree.position_selections());
+            let to = self.undo_tree.position_id();
+            let (spans, truncated) = self.undo_tree.transition_spans(from, to);
+            self.set_history_movement(
+                spans,
+                truncated,
+                self.undo_tree.position_selections(),
+                self.history_position_primary(),
+            );
             let new_text = snapshot.text().to_string();
             self.rope = Rope::from_str(&new_text);
             self.text = new_text;
@@ -1375,48 +1393,89 @@ impl EditorModel {
         self.undo_tree.redo_edit().into_iter().collect()
     }
 
-    /// Get the primary selection.
+    /// Get the primary selection (canonical member), or the default caret at
+    /// offset 0 when no committed set exists.
     #[must_use]
     pub fn primary_selection(&self) -> Selection {
         self.selections
-            .get(&0)
-            .copied()
-            .unwrap_or_else(|| Selection::caret(TextByte(0)))
+            .as_ref()
+            .map(|set| *set.primary())
+            .unwrap_or_else(|| {
+                Selection::from_parts(crate::selection::SelectionId::from_raw(0), 0, 0)
+            })
     }
 
-    /// Set the primary selection.
-    pub fn set_primary_selection(&mut self, selection: Selection) {
-        self.selections.insert(0, selection);
+    /// Set the committed set from canonical members (FEUX-0002 E-4). The
+    /// set must validate against the current text.
+    pub fn set_selections(&mut self, set: SelectionSet) {
+        debug_assert!(set.validate_against(self.text()).is_ok());
+        self.selections = Some(set);
     }
 
-    /// Add a selection.
-    pub fn add_selection(&mut self, selection: Selection) -> usize {
-        let id = self.selections.len();
-        self.selections.insert(id, selection);
-        id
+    /// Replace the committed set with one canonical member.
+    pub fn set_primary_selection(&mut self, anchor: usize, head: usize) {
+        let candidates = vec![RawSelection {
+            id: None,
+            anchor,
+            head,
+        }];
+        if let Ok((set, _)) = SelectionSet::normalize(self.text(), candidates, None) {
+            self.selections = Some(set);
+        }
     }
 
-    /// Remove a selection by ID.
-    pub fn remove_selection(&mut self, id: usize) -> bool {
-        self.selections.remove(&id).is_some()
+    /// Add a member to the committed set (canonical normalization merges).
+    pub fn add_selection(&mut self, anchor: usize, head: usize) {
+        let mut candidates: Vec<RawSelection> = self
+            .selections
+            .as_ref()
+            .map(|set| {
+                set.members()
+                    .into_iter()
+                    .map(|selection| RawSelection {
+                        id: Some(selection.id().as_raw()),
+                        anchor: selection.anchor(),
+                        head: selection.head(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        candidates.push(RawSelection {
+            id: None,
+            anchor,
+            head,
+        });
+        if let Ok((set, _)) = SelectionSet::normalize(self.text(), candidates, None) {
+            self.selections = Some(set);
+        }
     }
 
     /// Clear all selections except the primary.
     pub fn clear_secondary_selections(&mut self) {
-        self.selections.retain(|&k, _| k == 0);
+        if let Some(set) = &self.selections {
+            let primary = set.primary();
+            self.set_primary_selection(primary.anchor(), primary.head());
+        }
     }
 
-    /// Get all selections.
+    /// Get all committed selections in canonical order.
     #[must_use]
     pub fn selections(&self) -> Vec<Selection> {
-        self.selections.values().cloned().collect()
+        self.selections
+            .as_ref()
+            .map(|set| set.members())
+            .unwrap_or_else(|| {
+                vec![Selection::from_parts(
+                    crate::selection::SelectionId::from_raw(0),
+                    0,
+                    0,
+                )]
+            })
     }
 
     /// Select all text.
     pub fn select_all(&mut self) {
-        let start = TextByte(0);
-        let end = TextByte(self.len());
-        self.set_primary_selection(Selection::new(start, end));
+        self.set_primary_selection(0, self.len());
     }
 
     /// Get the EOL table.
@@ -2052,18 +2111,18 @@ mod tests {
         let mut model = EditorModel::from_text("hello world");
 
         // Set primary selection
-        model.set_primary_selection(Selection::new(TextByte(0), TextByte(5)));
+        model.set_primary_selection(0, 5);
         let sel = model.primary_selection();
-        assert_eq!(sel.start(), TextByte(0));
-        assert_eq!(sel.end(), TextByte(5));
+        assert_eq!(sel.start(), 0);
+        assert_eq!(sel.end(), 5);
         assert!(!sel.is_caret());
 
         // Caret selection
-        model.set_primary_selection(Selection::caret(TextByte(5)));
+        model.set_primary_selection(5, 5);
         let sel = model.primary_selection();
         assert!(sel.is_caret());
-        assert_eq!(sel.start(), TextByte(5));
-        assert_eq!(sel.end(), TextByte(5));
+        assert_eq!(sel.start(), 5);
+        assert_eq!(sel.end(), 5);
     }
 
     #[test]
@@ -2071,8 +2130,8 @@ mod tests {
         let mut model = EditorModel::from_text("hello");
         model.select_all();
         let sel = model.primary_selection();
-        assert_eq!(sel.start(), TextByte(0));
-        assert_eq!(sel.end(), TextByte(5));
+        assert_eq!(sel.start(), 0);
+        assert_eq!(sel.end(), 5);
     }
 
     #[test]
@@ -2138,26 +2197,20 @@ mod tests {
         assert_eq!(model.line_end(0), TextByte(2));
         assert_eq!(model.line_end(1), TextByte(4));
         assert_eq!(model.line_at(TextByte(2)), 1);
-        assert_eq!(model.primary_selection(), Selection::caret(TextByte(0)));
-
-        let reversed = Selection::new(TextByte(4), TextByte(1));
-        assert!(!reversed.is_caret());
-        assert_eq!(reversed.start(), TextByte(1));
-        assert_eq!(reversed.end(), TextByte(4));
-        assert_eq!(reversed.span(), Span::new(TextByte(1), TextByte(4)));
-        assert!(reversed.contains(TextByte(1)) && reversed.contains(TextByte(4)));
-        assert!(!reversed.contains(TextByte(5)));
-        assert_eq!(reversed.offset(-9), Selection::caret(TextByte(0)));
+        assert_eq!(model.primary_selection().head(), 0);
+        assert_eq!(model.primary_selection().anchor(), 0);
 
         model.set_base_hash(BaseHash::from_bytes([9; 32]));
         model.set_dirty(true);
-        model.set_primary_selection(reversed);
-        model.add_selection(Selection::caret(TextByte(2)));
+        model.set_primary_selection(4, 1);
+        model.add_selection(2, 2);
         model.replace_snapshot(TextSnapshot::new(b"fresh\n").unwrap());
         assert_eq!(model.text(), "fresh\n");
         assert_eq!(model.revision(), Revision::new(1));
         assert!(!model.is_dirty());
-        assert_eq!(model.selections().len(), 2);
+        // The caret at 2 is absorbed into the range [1, 4) by canonical
+        // normalization, so the set stays a single member.
+        assert_eq!(model.selections().len(), 1);
         assert!(model.base_hash().is_some());
     }
 

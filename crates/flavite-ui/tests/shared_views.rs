@@ -9,7 +9,7 @@ use flavite_ui::app::{App, Message};
 use flavite_vault::actor::VaultActorBuilder;
 use flavite_vault::channels::ChannelSet;
 use flavite_vault::session::Session;
-use flavite_workspace::{LayoutAction, Selection, TabId};
+use flavite_workspace::{CommittedSelection, LayoutAction, TabId};
 use std::time::{Duration, Instant};
 
 fn fixture() -> (App, MemFs, tempfile::TempDir) {
@@ -78,6 +78,8 @@ fn acknowledge_caret_with_anchor(
             revision: view.revision,
             caret: byte,
             selection: (byte, byte),
+            selections: vec![[0, byte, byte]],
+            primary: 0,
             viewport_anchor,
             focused: true,
             composing: false,
@@ -116,11 +118,11 @@ fn split_views_share_revision_text_and_history_but_keep_independent_carets() {
     assert!(std::sync::Arc::ptr_eq(&first_view.text, &second_view.text));
     assert_eq!(
         app.workspace.tab(&first).unwrap().interaction().selections,
-        vec![Selection::caret(1)]
+        vec![CommittedSelection::caret(1)]
     );
     assert_eq!(
         app.workspace.tab(&second).unwrap().interaction().selections,
-        vec![Selection::caret(7)]
+        vec![CommittedSelection::caret(7)]
     );
     assert_eq!(
         app.workspace
@@ -217,11 +219,11 @@ fn split_views_share_revision_text_and_history_but_keep_independent_carets() {
     assert_eq!(bytes, b"alpha\nbeta\n");
     assert_eq!(
         app.workspace.tab(&first).unwrap().interaction().selections,
-        vec![Selection::caret(1)]
+        vec![CommittedSelection::caret(1)]
     );
     assert_eq!(
         app.workspace.tab(&second).unwrap().interaction().selections,
-        vec![Selection::caret(7)]
+        vec![CommittedSelection::caret(7)]
     );
 
     // Closing one view does not release the shared Session buffer.
@@ -295,21 +297,25 @@ fn blur_acknowledgements_preserve_only_an_unchanged_authorized_caret() {
     let mut blur = app.editor_interaction_snapshot(tab).unwrap();
     blur.sequence += 1;
     blur.focused = false;
+    let blur_sequence = blur.sequence;
     let incarnation = app.notes.incarnation(tab).unwrap();
     let _ = app.update(Message::EditorAction {
         tab,
         incarnation,
-        action: EditorAction::Interaction(blur),
+        action: EditorAction::Interaction(blur.clone()),
     });
     let _ = app.update(Message::Pump);
     let retained = app.workspace.writing_target().unwrap();
     assert_eq!(retained.tab, original.tab);
     assert_eq!(retained.revision, original.revision);
     assert_eq!(retained.caret_text_byte, 2);
-    assert_eq!(retained.interaction_sequence, blur.sequence);
+    assert_eq!(retained.interaction_sequence, blur_sequence);
     // A changed selection while unfocused does not silently reauthorize it.
-    blur.sequence += 1;
+    let mut blur = app.editor_interaction_snapshot(tab).unwrap();
+    blur.sequence = blur_sequence + 1;
+    blur.focused = false;
     blur.selection = (3, 3);
+    blur.selections = vec![[0, 3, 3]];
     blur.caret = 3;
     let _ = app.update(Message::EditorAction {
         tab,
@@ -361,13 +367,14 @@ fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() 
                     rows,
                     width: 500.0,
                     metrics: TypeMetrics::default(),
-                    preferred_x: Some(0.0),
                 }),
+                preferred_x: Vec::new(),
+                clipboard_acquired: false,
             },
         });
         assert_eq!(
             app.workspace.tab(&tab).unwrap().interaction().selections,
-            vec![Selection::caret(expected)]
+            vec![CommittedSelection::caret(expected)]
         );
         assert_eq!(
             app.note_editor_view(tab).unwrap().revision,
@@ -387,6 +394,8 @@ fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() 
             extend: false,
             document_boundary: false,
             vertical: None,
+            preferred_x: Vec::new(),
+            clipboard_acquired: false,
         },
     });
     assert_eq!(
@@ -405,6 +414,8 @@ fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() 
             extend: false,
             document_boundary: false,
             vertical: None,
+            preferred_x: Vec::new(),
+            clipboard_acquired: false,
         },
     });
     assert_eq!(
@@ -458,6 +469,8 @@ fn home_then_vertical_keys_ignore_the_widgets_old_column_before_redraw() {
             extend: false,
             document_boundary: true,
             vertical: None,
+            preferred_x: Vec::new(),
+            clipboard_acquired: false,
         },
     });
     for (sequence, action, rows, expected) in [
@@ -482,13 +495,14 @@ fn home_then_vertical_keys_ignore_the_widgets_old_column_before_redraw() {
                     rows,
                     width: 500.0,
                     metrics: TypeMetrics::default(),
-                    preferred_x: Some(1000.0),
                 }),
+                preferred_x: Vec::new(),
+                clipboard_acquired: false,
             },
         });
         assert_eq!(
             app.workspace.tab(&tab).unwrap().interaction().selections,
-            vec![Selection::caret(expected)]
+            vec![CommittedSelection::caret(expected)]
         );
         assert_eq!(app.note_editor_view(tab).unwrap().text, view.text);
     }

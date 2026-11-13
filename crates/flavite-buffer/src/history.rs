@@ -1,12 +1,13 @@
 //! Revision-bound editing history. Saved note snapshots are a separate API.
 
+use crate::selection::MAX_SELECTIONS;
 use serde::{Deserialize, Serialize};
 
 pub const PAGE_LIMIT: usize = 100;
 pub const TRAIL_LIMIT: usize = 12;
-/// The mounted editor currently renders one selection. Refuse metadata it
-/// cannot faithfully restore; the canonical multi-selection slice raises this.
-pub const RECORDED_SELECTION_LIMIT: usize = 1;
+/// Recorded editor metadata can carry a full canonical selection set
+/// (FEUX-0002 E-4/E-12); the single-selection slice is retired.
+pub const RECORDED_SELECTION_LIMIT: usize = MAX_SELECTIONS;
 
 /// Buffer-history incarnation. It never repeats when a new process happens
 /// to allocate the same numeric buffer/node IDs as an earlier process.
@@ -92,15 +93,22 @@ impl EditKind {
     }
 }
 
-/// The current editor's ordered selections, primary first. This is a recorded
-/// value, not ownership of live selections in another view.
+/// The current editor's ordered selections. This is a recorded value, not
+/// ownership of live selections in another view. Members are `[id, anchor,
+/// head]` triples in canonical order (FEUX-0002 §5.1); `primary` names the
+/// primary member by its index in `after` — canonical order and "primary
+/// first" cannot both be implicit, so primary identity is explicit
+/// (FEUX-0002 E-4 / FR-4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EditorEdit {
     pub origin: String,
     pub kind: EditKind,
-    pub before: Vec<[usize; 2]>,
-    pub after: Vec<[usize; 2]>,
+    pub before: Vec<[usize; 3]>,
+    pub after: Vec<[usize; 3]>,
+    /// Index into `after` of the primary member (default: the first member).
+    #[serde(default)]
+    pub primary: usize,
 }
 
 impl EditorEdit {
@@ -113,16 +121,23 @@ impl EditorEdit {
         {
             return Err(HistoryError::InvalidSelections);
         }
+        if self.primary >= self.after.len() {
+            return Err(HistoryError::InvalidSelections);
+        }
         validate_selections(before, &self.before)?;
         validate_selections(after, &self.after)
     }
 }
 
-pub fn validate_selections(text: &str, selections: &[[usize; 2]]) -> Result<(), HistoryError> {
+pub fn validate_selections(text: &str, selections: &[[usize; 3]]) -> Result<(), HistoryError> {
     if selections.is_empty() || selections.len() > RECORDED_SELECTION_LIMIT {
         return Err(HistoryError::InvalidSelections);
     }
-    let mut endpoints = selections.iter().flatten().copied().collect::<Vec<_>>();
+    let mut endpoints = selections
+        .iter()
+        .flat_map(|triple| &triple[1..])
+        .copied()
+        .collect::<Vec<_>>();
     endpoints.sort_unstable();
     endpoints.dedup();
     use unicode_segmentation::UnicodeSegmentation;
@@ -219,16 +234,35 @@ impl std::fmt::Display for HistoryError {
 
 impl std::error::Error for HistoryError {}
 
-/// An exact source-free transform for passive views of the same buffer.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryChange {
+/// One movement span: a replaced range in the coordinates of the text before
+/// the transition, expressed as the replacement length it contributes
+/// (FEUX-0002 E-13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MovementSpan {
     pub start: usize,
     pub end: usize,
-    pub inserted: usize,
+    pub replacement_len: usize,
 }
 
+/// Maximum number of spans a movement delta may carry before passive views
+/// must clamp instead of guessing (E-13).
+pub const MAX_MOVEMENT_SPANS: usize = 256;
+
+/// The exact source-free transform of one transition for passive views of
+/// the same buffer: an ordered list of non-overlapping deltas in pre-change
+/// coordinates. `selections` is the requesting view's exact recorded
+/// after-set (never approximated); `primary` is the index into
+/// `selections` of that set's primary member, so primary identity survives
+/// every receipt round trip (FR-4/FR-7). Passive views map through `spans`,
+/// or clamp with a visible notice when `truncated` (the transition exceeded
+/// [`MAX_MOVEMENT_SPANS`] or its edit chain is not fully derivable).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryMovement {
-    pub selections: Option<Vec<[usize; 2]>>,
-    pub change: HistoryChange,
+    pub selections: Option<Vec<[usize; 3]>>,
+    pub spans: Vec<MovementSpan>,
+    pub truncated: bool,
+    /// Index into `selections` of the primary member (absent when unknown).
+    #[serde(default)]
+    pub primary: Option<usize>,
 }

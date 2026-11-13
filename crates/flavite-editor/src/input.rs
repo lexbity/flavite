@@ -1,57 +1,15 @@
-//! Raw input captured in event order, interpreted against acknowledged host text.
-//! No speculative text buffer/history is kept in a widget between redraws.
-use flavite_syntax::TextByte;
+//! Raw input captured in event order, interpreted against acknowledged host
+//! text. No speculative text buffer/history is kept in a widget between
+//! redraws. Interpretation is set-aware (FEUX-0002 X04): every key action is
+//! planned per member through the canonical `flavite-buffer` planner, which
+//! is the only mutation semantic; this module only translates key actions to
+//! planner operations and visual-movement targets.
+use flavite_buffer::commands::{EditOperation, copy_fragments, plan};
+use flavite_buffer::motion::{self, Motion};
+use flavite_buffer::selection::SelectionSet;
 
 use crate::{EditorAction, EditorView, keymap::KeyAction};
 
-/// Resolve the right-affinity caret over three borrowed edit chunks. Joining
-/// emoji/combining sequences must not leave a caret inside a grapheme, and a
-/// large note must not be copied merely to decide this boundary.
-fn post_edit_caret(
-    before: &str,
-    start: usize,
-    end: usize,
-    replacement: &str,
-) -> Result<usize, &'static str> {
-    use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
-    let at = start + replacement.len();
-    let len = before.len() - (end - start) + replacement.len();
-    if at == len {
-        return Ok(at);
-    }
-    let chunks = [
-        (0, &before[..start]),
-        (start, replacement),
-        (at, &before[end..]),
-    ];
-    let provide = |cursor: &mut GraphemeCursor, wanted| {
-        let Some((base, chunk)) = chunks
-            .iter()
-            .rev()
-            .find(|(base, chunk)| *base < wanted && wanted <= base + chunk.len())
-        else {
-            return Err("Cannot resolve edit grapheme context");
-        };
-        cursor.provide_context(&chunk[..wanted - base], *base);
-        Ok(())
-    };
-    let mut cursor = GraphemeCursor::new(at, len, true);
-    loop {
-        match cursor.is_boundary(chunks[2].1, at) {
-            Ok(true) => return Ok(at),
-            Ok(false) => break,
-            Err(GraphemeIncomplete::PreContext(wanted)) => provide(&mut cursor, wanted)?,
-            Err(_) => return Err("Cannot resolve edit grapheme boundary"),
-        }
-    }
-    loop {
-        match cursor.next_boundary(chunks[2].1, at) {
-            Ok(boundary) => return Ok(boundary.unwrap_or(len)),
-            Err(GraphemeIncomplete::PreContext(wanted)) => provide(&mut cursor, wanted)?,
-            Err(_) => return Err("Cannot resolve edit grapheme boundary"),
-        }
-    }
-}
 #[derive(Debug, Clone, PartialEq)]
 pub struct CapturedInput {
     pub buffer: u64,
@@ -62,223 +20,204 @@ pub struct CapturedInput {
     pub extend: bool,
     pub document_boundary: bool,
     pub vertical: Option<crate::navigation::VerticalMotion>,
+    /// Sticky visual column per member, parallel to the selection set at
+    /// capture time (X04: vertical motion keeps per-member columns; missing
+    /// entries mean "no sticky column").
+    pub preferred_x: Vec<Option<f32>>,
+    /// The clipboard stage of this intent already completed at the host
+    /// clipboard seam (X04/T-10): a Paste carries the acquired text and a
+    /// Cut's write finished, so interpretation proceeds to the guarded
+    /// mutation instead of re-acquiring. A fresh widget capture is always
+    /// `false`.
+    pub clipboard_acquired: bool,
 }
+
 #[derive(Debug)]
 pub enum PreparedInput {
     Edit {
         action: EditorAction,
-        caret: usize,
+        /// After-set members for the optimistic pre-receipt caret install
+        /// (already validated against the after-text by the planner).
+        members: Vec<(usize, usize)>,
+        /// Index into `members` of the primary member (FEUX-0002 E-4/FR-4:
+        /// primary identity survives every planned edit).
+        primary: usize,
+        /// Cut text (fragments joined with LF in document order, §5.3).
         clipboard: Option<String>,
     },
     History(EditorAction),
     Selection {
-        anchor: usize,
-        head: usize,
+        members: Vec<(usize, usize)>,
+        /// Index into `members` of the primary member.
+        primary: usize,
     },
     VerticalSelection {
-        anchor: usize,
-        head: usize,
-        preferred_x: f32,
+        members: Vec<(usize, usize)>,
+        /// Index into `members` of the primary member.
+        primary: usize,
+        preferred_x: Vec<Option<f32>>,
     },
-    Copy(String),
+    Copy {
+        text: String,
+    },
 }
+
+/// The index within `set` of the primary member.
+fn primary_index(set: &SelectionSet) -> usize {
+    set.members()
+        .iter()
+        .position(|member| member.id() == set.primary_id())
+        .unwrap_or(0)
+}
+
+/// The member pairs of a canonical set (host translation shape).
+#[must_use]
+pub fn member_pairs(set: &SelectionSet) -> Vec<(usize, usize)> {
+    set.members()
+        .iter()
+        .map(|member| (member.anchor(), member.head()))
+        .collect()
+}
+
+/// The key action's planner operation over the whole set. Copy, history,
+/// SelectAll, and motions are handled directly in [`prepare`].
+fn operation_of(action: KeyAction, text: &str) -> Option<EditOperation> {
+    match action {
+        KeyAction::Insert | KeyAction::Newline | KeyAction::Paste => {
+            let mut normalized = text.replace("\r\n", "\n");
+            if action == KeyAction::Newline {
+                normalized = "\n".into();
+            }
+            Some(EditOperation::Typing(normalized))
+        }
+        KeyAction::Backspace => Some(EditOperation::Backspace),
+        KeyAction::BackspaceWord => Some(EditOperation::BackspaceWord),
+        KeyAction::Delete => Some(EditOperation::ForwardDelete),
+        KeyAction::DeleteWord => Some(EditOperation::ForwardDeleteWord),
+        KeyAction::Cut => Some(EditOperation::Cut),
+        _ => None,
+    }
+}
+
+/// The buffer motion for a horizontal (non-visual) key action.
+fn motion_of(action: KeyAction, document_boundary: bool) -> Option<Motion> {
+    match action {
+        KeyAction::Previous => Some(Motion::CharLeft),
+        KeyAction::Next => Some(Motion::CharRight),
+        KeyAction::PreviousWord => Some(Motion::WordPrev),
+        KeyAction::NextWord => Some(Motion::WordNext),
+        KeyAction::NextWordEnd => Some(Motion::WordEnd),
+        KeyAction::Home if document_boundary => Some(Motion::DocStart),
+        KeyAction::Home => Some(Motion::LineStart),
+        KeyAction::End if document_boundary => Some(Motion::DocEnd),
+        KeyAction::End => Some(Motion::LineEnd),
+        _ => None,
+    }
+}
+
 /// Build positions only from the current authoritative snapshot and per-view
-/// selection. The host must first validate this capture's origin/revision chain.
+/// selection set. The host must first validate this capture's origin/revision
+/// chain. Every mutation derives its edits from the canonical planner.
+///
+/// # Errors
+///
+/// A static message when the action is unsupported.
 pub fn prepare(
     view: &EditorView,
-    selection: (usize, usize),
+    set: &SelectionSet,
     input: &CapturedInput,
 ) -> Result<PreparedInput, &'static str> {
     let text = &view.text;
-    let (anchor, head) = selection;
-    if !text.is_char_boundary(anchor) || !text.is_char_boundary(head) {
-        return Err("Selection changed; place the caret again");
-    }
-    let (start, end) = (anchor.min(head), anchor.max(head));
-    let previous = |at: usize| crate::viewport::prev_grapheme_boundary(text, TextByte(at)).0;
-    let next = |at: usize| crate::viewport::next_grapheme_boundary(text, TextByte(at)).0;
-    let replace = |from,
-                   to,
-                   replacement: String,
-                   clipboard: Option<String>|
-     -> Result<PreparedInput, &'static str> {
-        if from == to && replacement.is_empty() {
-            Ok(clipboard.map_or(
-                PreparedInput::Selection { anchor, head },
-                PreparedInput::Copy,
-            ))
-        } else {
-            Ok(PreparedInput::Edit {
-                caret: post_edit_caret(text, from, to, &replacement)?,
-                action: EditorAction::replace(view, from, to, replacement),
-                clipboard,
-            })
-        }
+    let unchanged = || PreparedInput::Selection {
+        members: member_pairs(set),
+        primary: primary_index(set),
     };
-    if input.action == KeyAction::Paste && input.text.is_empty() {
-        return Ok(PreparedInput::Selection { anchor, head });
+    if let Some(edit_operation) = operation_of(input.action, input.text.as_str()) {
+        let edit_operation = match edit_operation {
+            // Paste with an empty clipboard is a no-op (§5.5).
+            EditOperation::Typing(ref insertion)
+                if insertion.is_empty() && input.action == KeyAction::Paste =>
+            {
+                return Ok(unchanged());
+            }
+            op => op,
+        };
+        let prepared = plan(text, set, &edit_operation)
+            .map_err(|_| "Selection changed; place the caret again")?;
+        if prepared.ops.is_empty() {
+            // Zero-effect (e.g. an empty line's Delete): no history node.
+            return Ok(unchanged());
+        }
+        let clipboard = (!prepared.fragments.is_empty()).then(|| prepared.fragments.join("\n"));
+        let after_set = &prepared.after_set;
+        return Ok(PreparedInput::Edit {
+            action: EditorAction::Edit {
+                buffer_id: view.buffer_id,
+                expected_revision: view.revision,
+                edits: prepared.ops,
+            },
+            primary: primary_index(after_set),
+            members: member_pairs(after_set),
+            clipboard,
+        });
     }
-    Ok(match input.action {
-        KeyAction::Insert | KeyAction::Newline | KeyAction::Paste => replace(
-            start,
-            end,
-            if input.action == KeyAction::Newline {
-                "\n".into()
-            } else {
-                input.text.replace("\r\n", "\n")
-            },
-            None,
-        )?,
-        KeyAction::Backspace | KeyAction::BackspaceWord => replace(
-            if start != end {
-                start
-            } else if input.action == KeyAction::BackspaceWord {
-                crate::viewport::prev_word_boundary(text, TextByte(start)).0
-            } else {
-                previous(start)
-            },
-            end,
-            String::new(),
-            None,
-        )?,
-        KeyAction::Delete | KeyAction::DeleteWord => replace(
-            start,
-            if start != end {
-                end
-            } else if input.action == KeyAction::DeleteWord {
-                crate::viewport::next_word_boundary(text, TextByte(end)).0
-            } else {
-                next(end)
-            },
-            String::new(),
-            None,
-        )?,
-        KeyAction::Cut => replace(start, end, String::new(), Some(text[start..end].into()))?,
-        KeyAction::Copy => PreparedInput::Copy(text[start..end].into()),
-        KeyAction::Undo | KeyAction::Redo => {
-            PreparedInput::History(EditorAction::history(view, input.action == KeyAction::Redo))
+    if input.action == KeyAction::Copy {
+        let fragments =
+            copy_fragments(text, set).map_err(|_| "Selection changed; place the caret again")?;
+        return Ok(PreparedInput::Copy {
+            text: fragments.join("\n"),
+        });
+    }
+    if matches!(
+        input.action,
+        KeyAction::Up | KeyAction::Down | KeyAction::PageUp | KeyAction::PageDown
+    ) {
+        let vertical = input
+            .vertical
+            .as_ref()
+            .ok_or("Vertical navigation needs editor geometry")?;
+        let mut members = Vec::with_capacity(set.len());
+        let mut preferred_x = Vec::with_capacity(set.len());
+        for (index, member) in set.iter().enumerate() {
+            let sticky = input.preferred_x.get(index).copied().flatten();
+            let (at, column) =
+                crate::navigation::vertical_target(text, member.head(), *vertical, sticky);
+            let anchor = if input.extend { member.anchor() } else { at };
+            members.push((anchor, at));
+            preferred_x.push(Some(column));
         }
-        KeyAction::SelectAll => PreparedInput::Selection {
-            anchor: 0,
-            head: text.len(),
-        },
-        KeyAction::Up | KeyAction::Down | KeyAction::PageUp | KeyAction::PageDown => {
-            let motion = input
-                .vertical
-                .ok_or("Vertical navigation needs editor geometry")?;
-            let (at, preferred_x) = crate::navigation::vertical_target(text, head, motion);
-            PreparedInput::VerticalSelection {
-                anchor: if input.extend { anchor } else { at },
-                head: at,
-                preferred_x,
-            }
-        }
-        KeyAction::Previous
-        | KeyAction::Next
-        | KeyAction::PreviousWord
-        | KeyAction::NextWord
-        | KeyAction::Home
-        | KeyAction::End => {
-            let at = match input.action {
-                KeyAction::Previous if start != end && !input.extend => start,
-                KeyAction::Next if start != end && !input.extend => end,
-                KeyAction::Previous => previous(head),
-                KeyAction::Next => next(head),
-                KeyAction::PreviousWord => {
-                    crate::viewport::prev_word_boundary(text, TextByte(head)).0
-                }
-                KeyAction::NextWord => crate::viewport::next_word_boundary(text, TextByte(head)).0,
-                KeyAction::Home if input.document_boundary => 0,
-                KeyAction::End if input.document_boundary => text.len(),
-                KeyAction::Home => text[..head].rfind('\n').map_or(0, |at| at + 1),
-                KeyAction::End => text[head..].find('\n').map_or(text.len(), |at| head + at),
-                _ => head,
-            };
-            PreparedInput::Selection {
-                anchor: if input.extend { anchor } else { at },
-                head: at,
-            }
-        }
-        KeyAction::Ignore => return Err("Unsupported input"),
-    })
+        let primary = primary_index(set);
+        return Ok(PreparedInput::VerticalSelection {
+            members,
+            primary,
+            preferred_x,
+        });
+    }
+    if let Some(motion) = motion_of(input.action, input.document_boundary) {
+        let moved = motion::apply(text, set, motion, input.extend, None)
+            .map_err(|_| "Selection changed; place the caret again")?;
+        return Ok(PreparedInput::Selection {
+            primary: primary_index(&moved),
+            members: member_pairs(&moved),
+        });
+    }
+    match input.action {
+        KeyAction::Undo | KeyAction::Redo => Ok(PreparedInput::History(EditorAction::history(
+            view,
+            input.action == KeyAction::Redo,
+        ))),
+        KeyAction::SelectAll => Ok(PreparedInput::Selection {
+            members: vec![(0, text.len())],
+            primary: 0,
+        }),
+        _ => Err("Unsupported input"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn chunked_edit_carets_match_a_whole_string_unicode_oracle() {
-        use unicode_segmentation::UnicodeSegmentation;
-        let parts = [
-            "", "a", "\u{301}", "👩", "\u{200d}", "💻", "🇦", "🇧", "\r", "\n",
-        ];
-        let samples: Vec<_> = parts
-            .iter()
-            .flat_map(|a| parts.iter().map(move |b| format!("{a}{b}")))
-            .collect();
-        for before in &samples {
-            let endpoints: Vec<_> = before
-                .char_indices()
-                .map(|(at, _)| at)
-                .chain(std::iter::once(before.len()))
-                .collect();
-            for &start in &endpoints {
-                for &end in endpoints.iter().filter(|&&end| end >= start) {
-                    for replacement in &samples {
-                        let after =
-                            format!("{}{}{}", &before[..start], replacement, &before[end..]);
-                        let at = start + replacement.len();
-                        let expected = after
-                            .grapheme_indices(true)
-                            .map(|(at, _)| at)
-                            .chain(std::iter::once(after.len()))
-                            .find(|&boundary| boundary >= at)
-                            .unwrap();
-                        assert_eq!(
-                            post_edit_caret(before, start, end, replacement),
-                            Ok(expected),
-                            "{before:?}[{start}..{end}] = {replacement:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn edit_caret_obeys_graphemes_that_join_across_chunk_boundaries() {
-        for (text, start, end, replacement, expected) in [
-            ("\u{301}x", 0, 0, "a", 3),
-            ("👩💻", 4, 4, "\u{200d}", 11),
-            ("🇦x🇧", 4, 5, "", 8),
-            ("word", 0, 0, "A", 1),
-        ] {
-            assert_eq!(
-                post_edit_caret(text, start, end, replacement).unwrap(),
-                expected
-            );
-            let after = format!("{}{}{}", &text[..start], replacement, &text[end..]);
-            use unicode_segmentation::UnicodeSegmentation;
-            assert!(
-                expected == after.len()
-                    || after.grapheme_indices(true).any(|(at, _)| at == expected)
-            );
-        }
-    }
-
-    #[test]
-    fn clipboard_newlines_are_normalized_before_caret_and_history_are_planned() {
-        let view = view();
-        let mut key = input(KeyAction::Paste);
-        key.text = "a\r\nb\rc".into();
-        let PreparedInput::Edit { action, caret, .. } = prepare(&view, (0, 0), &key).unwrap()
-        else {
-            panic!("edit");
-        };
-        assert_eq!(caret, 5);
-        assert_eq!(action.as_edit().unwrap().2[0].replacement, "a\nb\rc");
-    }
+    use flavite_buffer::selection::RawSelection;
 
     fn view() -> EditorView {
         EditorView {
@@ -300,7 +239,46 @@ mod tests {
             extend: false,
             document_boundary: false,
             vertical: None,
+            preferred_x: Vec::new(),
+            clipboard_acquired: false,
         }
+    }
+
+    fn set_of(text: &str, members: &[(usize, usize)]) -> SelectionSet {
+        let raw: Vec<RawSelection> = members
+            .iter()
+            .map(|&(anchor, head)| RawSelection {
+                id: None,
+                anchor,
+                head,
+            })
+            .collect();
+        SelectionSet::normalize(text, raw, None).unwrap().0
+    }
+
+    fn edit_of(prepared: PreparedInput) -> (EditorAction, Vec<(usize, usize)>, Option<String>) {
+        match prepared {
+            PreparedInput::Edit {
+                action,
+                members,
+                primary: _,
+                clipboard,
+            } => (action, members, clipboard),
+            other => panic!("expected an edit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clipboard_newlines_are_normalized_before_the_planner_runs() {
+        let view = view();
+        let mut key = input(KeyAction::Paste);
+        key.text = "a\r\nb\rc".into();
+        let set = set_of(&view.text, &[(0, 0)]);
+        let (action, members, clipboard) = edit_of(prepare(&view, &set, &key).unwrap());
+        assert_eq!(members, vec![(5, 5)]);
+        assert!(clipboard.is_none());
+        let (_, _, edits) = action.as_edit().unwrap();
+        assert_eq!(edits[0].replacement, "a\nb\rc");
     }
 
     #[test]
@@ -308,27 +286,72 @@ mod tests {
         let view = view();
         let mut key = input(KeyAction::NextWord);
         key.extend = true;
-        assert!(matches!(
-            prepare(&view, (0, 4), &key).unwrap(),
-            PreparedInput::Selection { anchor: 0, head: 9 }
-        ));
-        key.action = KeyAction::BackspaceWord;
-        let PreparedInput::Edit { action, caret, .. } = prepare(&view, (9, 9), &key).unwrap()
-        else {
-            panic!("edit")
+        let set = set_of(&view.text, &[(0, 4)]);
+        let PreparedInput::Selection { members, .. } = prepare(&view, &set, &key).unwrap() else {
+            panic!("selection");
         };
-        assert_eq!(caret, 4);
+        assert_eq!(members, vec![(0, 9)]);
+        key.action = KeyAction::BackspaceWord;
+        let set = set_of(&view.text, &[(9, 9)]);
+        let (action, members, _) = edit_of(prepare(&view, &set, &key).unwrap());
+        assert_eq!(members, vec![(4, 4)]);
         let (_, _, edits) = action.as_edit().unwrap();
         assert_eq!((edits[0].range.start.0, edits[0].range.end.0), (4, 9));
         // An existing selection takes precedence over the word modifier.
-        let PreparedInput::Edit { action, .. } = prepare(&view, (0, 3), &key).unwrap() else {
-            panic!("edit")
-        };
+        let set = set_of(&view.text, &[(0, 3)]);
+        let (action, _, _) = edit_of(prepare(&view, &set, &key).unwrap());
         assert_eq!(action.as_edit().unwrap().2[0].range.end.0, 3);
     }
 
     #[test]
-    fn vertical_selection_is_prepared_from_the_current_caret() {
+    fn typing_lands_on_every_member_of_the_set_in_one_batch() {
+        let view = view();
+        let mut key = input(KeyAction::Insert);
+        key.text = "_".into();
+        let set = set_of(&view.text, &[(0, 0), (4, 6)]);
+        let (action, members, _) = edit_of(prepare(&view, &set, &key).unwrap());
+        let (_, _, edits) = action.as_edit().unwrap();
+        assert_eq!(edits.len(), 2, "one atomic batch");
+        assert_eq!((edits[0].range.start.0, edits[0].range.end.0), (0, 0));
+        assert_eq!((edits[1].range.start.0, edits[1].range.end.0), (4, 6));
+        // Each member collapses past its own insertion (stick right).
+        assert_eq!(members, vec![(1, 1), (6, 6)]);
+    }
+
+    #[test]
+    fn backspace_across_members_merges_post_delete_collisions() {
+        let view = view();
+        let key = input(KeyAction::Backspace);
+        // Two carets on one line, both backspacing onto the same point.
+        let set = set_of(&view.text, &[(1, 1), (2, 2)]);
+        let (_, members, _) = edit_of(prepare(&view, &set, &key).unwrap());
+        assert_eq!(members, vec![(0, 0)], "collided carets merge");
+    }
+
+    #[test]
+    fn cut_joins_fragments_with_lf_in_document_order() {
+        let view = view();
+        let key = input(KeyAction::Cut);
+        let set = set_of(&view.text, &[(0, 3), (14, 19)]);
+        let (_, members, clipboard) = edit_of(prepare(&view, &set, &key).unwrap());
+        assert_eq!(clipboard.as_deref(), Some("one\nthree"));
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0], (0, 0), "the first caret lands at its cut start");
+    }
+
+    #[test]
+    fn copy_joins_fragments_with_lf_in_document_order() {
+        let view = view();
+        let key = input(KeyAction::Copy);
+        let set = set_of(&view.text, &[(0, 3), (14, 19)]);
+        let PreparedInput::Copy { text } = prepare(&view, &set, &key).unwrap() else {
+            panic!("copy");
+        };
+        assert_eq!(text, "one\nthree");
+    }
+
+    #[test]
+    fn vertical_selection_is_prepared_per_member() {
         let view = view();
         let mut key = input(KeyAction::Down);
         key.extend = true;
@@ -336,24 +359,31 @@ mod tests {
             rows: 1,
             width: 500.0,
             metrics: crate::TypeMetrics::default(),
-            preferred_x: Some(0.0),
         });
-        assert!(matches!(
-            prepare(&view, (0, 0), &key).unwrap(),
-            PreparedInput::VerticalSelection {
-                anchor: 0,
-                head: 10,
-                ..
-            }
-        ));
-        assert!(matches!(
-            prepare(&view, (0, 10), &key).unwrap(),
-            PreparedInput::VerticalSelection {
-                anchor: 0,
-                head: 10,
-                ..
-            }
-        ));
-        assert!(prepare(&view, (usize::MAX, 0), &key).is_err());
+        key.preferred_x = vec![Some(0.0), Some(0.0)];
+        // The second caret sits on the second line (after the 雪 grapheme).
+        let set = set_of(&view.text, &[(0, 0), (13, 13)]);
+        let PreparedInput::VerticalSelection {
+            members,
+            primary: _,
+            preferred_x,
+        } = prepare(&view, &set, &key).unwrap()
+        else {
+            panic!("vertical");
+        };
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0], (0, 10));
+        assert_eq!(preferred_x.len(), 2);
+    }
+
+    #[test]
+    fn zero_effect_deletes_change_nothing() {
+        let view = view();
+        let key = input(KeyAction::Backspace);
+        let set = set_of(&view.text, &[(0, 0)]);
+        let PreparedInput::Selection { members, .. } = prepare(&view, &set, &key).unwrap() else {
+            panic!("selection");
+        };
+        assert_eq!(members, vec![(0, 0)]);
     }
 }

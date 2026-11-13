@@ -399,6 +399,7 @@ fn handle_edits(session: &Session, invocation: &Invocation) -> Result<SessionRes
         ops,
         undo_policy,
         editor: args.editor,
+        operation: None,
     }))
 }
 fn handle_undo(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
@@ -581,6 +582,27 @@ const READ_NOTES_COMMAND_IDS: &[&str] = &[
     "replace.select",
     "replace.status",
     "replace.job_status",
+    "editor.issue_operation",
+    "editor.cancel_operation",
+    "editor.keep_primary",
+    "editor.collapse",
+    "editor.clear_selection",
+    "editor.select_word",
+    "editor.select_line",
+    "editor.copy",
+    "editor.insert_start",
+    "editor.insert_end",
+    "editor.insert_line_start",
+    "editor.insert_line_end",
+    "editor.toggle_caret",
+    "editor.move",
+    "editor.find_char",
+    "editor.add_caret_above",
+    "editor.add_caret_below",
+    "editor.rotate_primary",
+    "editor.flip_selections",
+    "editor.trim_selections",
+    "editor.invert_selections",
 ];
 
 /// Stable token for one notice presentation acknowledgement.
@@ -1130,6 +1152,180 @@ impl Flavite {
                 "Close editor typing group",
                 ArgSchema::typed::<BufferRevisionArgs>(),
                 handle_seal_undo_group,
+            ),
+            (
+                "editor.issue_operation",
+                "Issue an editor operation ticket",
+                ArgSchema::typed::<crate::editor_commands::IssueOperationArgs>(),
+                crate::editor_commands::handle_issue_operation,
+            ),
+            (
+                "editor.cancel_operation",
+                "Cancel a pending editor operation",
+                ArgSchema::typed::<crate::editor_commands::CancelOperationArgs>(),
+                crate::editor_commands::handle_cancel_operation,
+            ),
+            (
+                "editor.delete",
+                "Delete selection",
+                ArgSchema::typed::<crate::editor_commands::EditorDeleteArgs>(),
+                crate::editor_commands::handle_editor_delete,
+            ),
+            (
+                "editor.keep_primary",
+                "Keep primary selection",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_keep_primary,
+            ),
+            (
+                "editor.collapse",
+                "Collapse selections to carets",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_collapse,
+            ),
+            (
+                "editor.clear_selection",
+                "Clear selection",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_clear_selection,
+            ),
+            (
+                "editor.change",
+                "Change selection",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_editor_change,
+            ),
+            (
+                "editor.cut",
+                "Cut selection",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_editor_cut,
+            ),
+            (
+                "editor.paste",
+                "Paste to every selection",
+                ArgSchema::typed::<crate::editor_commands::EditorPasteArgs>(),
+                crate::editor_commands::handle_editor_paste,
+            ),
+            (
+                "editor.copy",
+                "Copy selection",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_editor_copy,
+            ),
+            (
+                "editor.select_word",
+                "Select word",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_select_word,
+            ),
+            (
+                "editor.select_line",
+                "Select line",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_select_line,
+            ),
+            (
+                "editor.insert_start",
+                "Type before selection",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_insert_start,
+            ),
+            (
+                "editor.insert_end",
+                "Type after selection",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_insert_end,
+            ),
+            (
+                "editor.insert_line_start",
+                "Type at line start",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_insert_line_start,
+            ),
+            (
+                "editor.insert_line_end",
+                "Type at line end",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_insert_line_end,
+            ),
+            (
+                "editor.open_above",
+                "Open line above",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_open_above,
+            ),
+            (
+                "editor.open_below",
+                "Open line below",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_open_below,
+            ),
+            (
+                "editor.toggle_caret",
+                "Toggle caret at position",
+                ArgSchema::typed::<crate::editor_commands::EditorToggleCaretArgs>(),
+                crate::editor_commands::handle_toggle_caret,
+            ),
+            (
+                "editor.move",
+                "Move every selection",
+                ArgSchema::typed::<crate::editor_commands::EditorMoveArgs>(),
+                crate::editor_commands::handle_editor_move,
+            ),
+            (
+                "editor.find_char",
+                "Find one character from every selection",
+                ArgSchema::typed::<crate::editor_commands::EditorFindCharArgs>(),
+                crate::editor_commands::handle_find_char,
+            ),
+            (
+                "editor.add_caret_above",
+                "Add caret on the row above",
+                ArgSchema::typed::<crate::editor_commands::EditorAddCaretsArgs>(),
+                crate::editor_commands::handle_add_caret_above,
+            ),
+            (
+                "editor.add_caret_below",
+                "Add caret on the row below",
+                ArgSchema::typed::<crate::editor_commands::EditorAddCaretsArgs>(),
+                crate::editor_commands::handle_add_caret_below,
+            ),
+            (
+                "editor.rotate_primary",
+                "Rotate the primary selection",
+                ArgSchema::typed::<crate::editor_commands::EditorRotateArgs>(),
+                crate::editor_commands::handle_rotate_primary,
+            ),
+            (
+                "editor.flip_selections",
+                "Flip every selection",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_flip_selections,
+            ),
+            (
+                "editor.trim_selections",
+                "Trim every selection",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_trim_selections,
+            ),
+            (
+                "editor.invert_selections",
+                "Invert selections line-bounded",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectionOnlyArgs>(),
+                crate::editor_commands::handle_invert_selections,
+            ),
+            (
+                "editor.select_matches",
+                "Select all matches of a query",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectMatchesArgs>(),
+                crate::editor_commands::handle_select_matches,
+            ),
+            (
+                "editor.split_selection",
+                "Select the gaps between matches",
+                ArgSchema::typed::<crate::editor_commands::EditorSelectMatchesArgs>(),
+                crate::editor_commands::handle_split_selection,
             ),
             (
                 "buffer.history_page",
@@ -1902,7 +2098,36 @@ impl Flavite {
             | "buffer.restore_state"
             | "buffer.redo"
             | "note.convert_encoding"
-            | "text.apply_replace" => invocation
+            | "text.apply_replace"
+            | "editor.delete"
+            | "editor.change"
+            | "editor.cut"
+            | "editor.paste"
+            | "editor.open_above"
+            | "editor.open_below"
+            | "editor.copy"
+            | "editor.keep_primary"
+            | "editor.collapse"
+            | "editor.clear_selection"
+            | "editor.select_word"
+            | "editor.select_line"
+            | "editor.insert_start"
+            | "editor.insert_end"
+            | "editor.insert_line_start"
+            | "editor.insert_line_end"
+            | "editor.toggle_caret"
+            | "editor.move"
+            | "editor.find_char"
+            | "editor.add_caret_above"
+            | "editor.add_caret_below"
+            | "editor.rotate_primary"
+            | "editor.flip_selections"
+            | "editor.trim_selections"
+            | "editor.invert_selections"
+            | "editor.select_matches"
+            | "editor.split_selection"
+            | "editor.issue_operation"
+            | "editor.cancel_operation" => invocation
                 .args
                 .get("buffer_id")
                 .and_then(serde_json::Value::as_u64)
@@ -1938,6 +2163,35 @@ impl Flavite {
                 | "buffer.redo"
                 | "note.convert_encoding"
                 | "text.apply_replace"
+                | "editor.delete"
+                | "editor.change"
+                | "editor.cut"
+                | "editor.paste"
+                | "editor.open_above"
+                | "editor.open_below"
+                | "editor.copy"
+                | "editor.keep_primary"
+                | "editor.collapse"
+                | "editor.clear_selection"
+                | "editor.select_word"
+                | "editor.select_line"
+                | "editor.insert_start"
+                | "editor.insert_end"
+                | "editor.insert_line_start"
+                | "editor.insert_line_end"
+                | "editor.toggle_caret"
+                | "editor.move"
+                | "editor.find_char"
+                | "editor.add_caret_above"
+                | "editor.add_caret_below"
+                | "editor.rotate_primary"
+                | "editor.flip_selections"
+                | "editor.trim_selections"
+                | "editor.invert_selections"
+                | "editor.select_matches"
+                | "editor.split_selection"
+                | "editor.issue_operation"
+                | "editor.cancel_operation"
         ) {
             return actual_source.and_then(|id| self.session.buffer_path(id));
         }
@@ -1993,6 +2247,18 @@ impl Flavite {
             SessionResult::Success(crate::session::CommandResult::EditsApplied { .. }) => {
                 "apply_edits"
             }
+            SessionResult::Success(crate::session::CommandResult::OperationIssued { .. }) => {
+                "editor.issue_operation"
+            }
+            SessionResult::Success(crate::session::CommandResult::OperationCancelled {
+                ..
+            }) => "editor.cancel_operation",
+            SessionResult::Success(crate::session::CommandResult::SelectionsChanged { .. }) => {
+                "editor.selections_changed"
+            }
+            SessionResult::Success(crate::session::CommandResult::TextCopied { .. }) => {
+                "editor.copy"
+            }
             SessionResult::Success(crate::session::CommandResult::LinkPrepared { .. }) => {
                 "link.prepare"
             }
@@ -2044,6 +2310,9 @@ impl Flavite {
                 "text.prepare_replace"
             }
             SessionResult::Success(crate::session::CommandResult::Found { .. }) => "text.find",
+            SessionResult::Success(crate::session::CommandResult::MatchesCollected { .. }) => {
+                "editor.select_matches"
+            }
             SessionResult::Success(crate::session::CommandResult::SourceFindStarted { .. }) => {
                 "source_find.start"
             }
@@ -2157,10 +2426,65 @@ impl Flavite {
                     crate::session::CommandResult::EditsApplied {
                         buffer_id,
                         new_revision,
+                        movement,
+                        after_selections,
                     } => {
                         serde_json::json!({
                             "buffer_id": buffer_id.as_u64(),
                             "revision": new_revision.as_u64(),
+                            "movement": movement,
+                            "after_selections": after_selections,
+                        })
+                    }
+                    crate::session::CommandResult::OperationIssued {
+                        buffer_id,
+                        operation,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "operation": {
+                                "buffer_incarnation": operation.buffer_incarnation,
+                                "sequence": operation.sequence,
+                                "ticket": hex::encode(operation.ticket.to_be_bytes()),
+                            },
+                        })
+                    }
+                    crate::session::CommandResult::OperationCancelled {
+                        buffer_id,
+                        operation,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "cancelled": true,
+                            "operation": {
+                                "buffer_incarnation": operation.buffer_incarnation,
+                                "sequence": operation.sequence,
+                                "ticket": hex::encode(operation.ticket.to_be_bytes()),
+                            },
+                        })
+                    }
+                    crate::session::CommandResult::SelectionsChanged {
+                        buffer_id,
+                        revision,
+                        selections,
+                        primary,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "revision": revision.as_u64(),
+                            "selections": selections,
+                            "primary": primary,
+                        })
+                    }
+                    crate::session::CommandResult::TextCopied {
+                        buffer_id,
+                        revision,
+                        text,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "revision": revision.as_u64(),
+                            "text": text,
                         })
                     }
                     crate::session::CommandResult::NoteSaved {
@@ -2298,6 +2622,24 @@ impl Flavite {
                             "total_matches": total_matches,
                             "next_offset": next_offset,
                             "truncated": truncated,
+                        })
+                    }
+                    crate::session::CommandResult::MatchesCollected {
+                        buffer_id,
+                        revision,
+                        spans,
+                        total_matches,
+                        zero_width_count,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "revision": revision.as_u64(),
+                            "spans": spans
+                                .into_iter()
+                                .map(|(start, end)| [start, end])
+                                .collect::<Vec<[u64; 2]>>(),
+                            "total_matches": total_matches,
+                            "zero_width_count": zero_width_count,
                         })
                     }
                     crate::session::CommandResult::SourceFindStarted {
@@ -3329,6 +3671,7 @@ mod tests {
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
+            operation: None,
         });
         assert!(matches!(
             flavite.get_buffer_view(buffer_id, Some(Revision::new(initial.revision))),
@@ -3574,6 +3917,7 @@ mod tests {
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
+            operation: None,
         });
         fs.write_new(&root.join(".external"), b"external").unwrap();
         fs.rename_replace(&root.join(".external"), &root.join("note.md"))
@@ -4075,6 +4419,8 @@ mod tests {
             CommandResult::EditsApplied {
                 buffer_id: buffer,
                 new_revision: revision,
+                movement: None,
+                after_selections: None,
             },
             CommandResult::NoteSaved {
                 buffer_id: buffer,

@@ -86,6 +86,8 @@ fn acknowledge_sequence(
             revision: view.revision,
             caret,
             selection: (anchor, caret),
+            selections: vec![[0, anchor, caret]],
+            primary: 0,
             viewport_anchor: 0,
             focused,
             composing: false,

@@ -137,6 +137,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         .with_colors(editor_colors)
         .with_context_mode(context_mode,move |request| Message::ContextNative { tab,incarnation,request })
         .with_command_preview(crate::host::context_mode::preview_command(app, tab))
+        .with_match_preview(crate::host::selection_search::overlay_spans(app, tab))
         .with_context_toggle(move |event| matches!(event,iced::keyboard::Event::KeyPressed {key,modifiers,..}
             if app.settings.capture.is_none() && app.appearance.chord_command(key,modifiers)==Some("editor.context_toggle")))
         .with_candidates(app.editor_candidates().clone())
@@ -174,11 +175,13 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                     Icon::Commands,
                     "Context Mode",
                     crate::host::context_mode::EditorTarget::capture(app, tab)
-                        .filter(|target| crate::host::context_mode::available(
-                            app,
-                            *target,
-                            flavite_edit_context::ContextCommand::Toggle
-                        ))
+                        .filter(|target| {
+                            crate::host::context_mode::available(
+                                app,
+                                target.clone(),
+                                flavite_edit_context::ContextCommand::Toggle,
+                            )
+                        })
                         .map(|target| {
                             Message::ContextMode(crate::host::context_mode::ContextMessage::Run(
                                 target,
@@ -239,6 +242,18 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             if format.bom() { "+bom" } else { "" }
         ),
         None => state.to_owned(),
+    };
+    // OFF-state count (FEUX-0002 FR-13): with Context Mode off, a
+    // surviving multi-member set is shown as a non-color count in the
+    // footer alongside the save/format state.
+    let member_count = app
+        .workspace
+        .tab(&tab)
+        .map_or(0, |view| view.interaction().selections.len());
+    let state = if !context_mode.active() && member_count > 1 {
+        format!("{member_count} selections · {state}")
+    } else {
+        state.to_owned()
     };
     let footer = container(text(state).size(metrics.text_sm).style(style::dim_text))
         .height(24)
@@ -327,7 +342,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
     let meta: Element<'a, Message> = if context_mode.active() {
         crate::host::context_mode::EditorTarget::capture(app, tab).map_or_else(
             || meta.into(),
-            |target| crate::views::context_toolbar::view(app, target),
+            |target| crate::views::context_toolbar::view(app, &target),
         )
     } else {
         meta.into()
@@ -512,6 +527,72 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                 )
                 .padding(8),
             );
+        }
+    }
+    if let Some(search) = app.selection_search.tabs.get(&tab) {
+        // FEUX-0002 X06: the owned match-selection query row (E-11)
+        // renders independently of the find bar (it is not nested in the
+        // find-open conditional; E-11's "owned row" is note-level UI).
+        let row_title = match search.kind {
+            crate::host::selection_search::ApplyKind::Select => "Select matches…",
+            crate::host::selection_search::ApplyKind::Split => "Split on matches…",
+        };
+        let caption = crate::host::selection_search::caption(app, tab);
+        let apply_enabled = crate::host::selection_search::apply_enabled(app, tab);
+        content = content.push(bounds::observe(
+            container(
+                row![
+                        text(row_title).size(12),
+                        text_editor(&search.query_input)
+                            .id(crate::host::selection_search::query_id(tab))
+                            .placeholder("Query · Alt+Enter inserts a newline")
+                            .height(64)
+                            .on_action(move |action| Message::SelectionSearch(
+                                crate::host::selection_search::SelectionSearchMessage::DraftAction {
+                                    tab,
+                                    action,
+                                }
+                            ))
+                            .key_binding(move |key| {
+                                crate::host::selection_search::draft_binding(tab, key)
+                            }),
+                        button(if search.regex { "Regex" } else { "Literal" })
+                            .style(style::ghost())
+                            .on_press(Message::SelectionSearch(
+                                crate::host::selection_search::SelectionSearchMessage::ToggleRegex(
+                                    tab,
+                                ),
+                            )),
+                        button(if search.case_sensitive { "Aa" } else { "aA" })
+                            .style(style::ghost())
+                            .on_press(Message::SelectionSearch(
+                                crate::host::selection_search::SelectionSearchMessage::ToggleCase(
+                                    tab,
+                                ),
+                            )),
+                        button("Apply")
+                            .style(style::ghost())
+                            .on_press_maybe(apply_enabled.then_some(Message::SelectionSearch(
+                                crate::host::selection_search::SelectionSearchMessage::Apply(tab),
+                            ))),
+                        button("Close")
+                            .style(style::ghost())
+                            .on_press(Message::SelectionSearch(
+                                crate::host::selection_search::SelectionSearchMessage::Close(tab),
+                            )),
+                        text(caption.unwrap_or_default()).size(12),
+                    ]
+                .spacing(8),
+            )
+            .padding(8),
+            move |rect| {
+                Message::SelectionSearch(
+                    crate::host::selection_search::SelectionSearchMessage::Bounds { tab, rect },
+                )
+            },
+        ));
+        if let Some(error) = &search.error {
+            content = content.push(text(error).size(12));
         }
     }
     content

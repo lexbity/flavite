@@ -36,13 +36,13 @@ fn action(
         target.tab,
         command.id(),
         previewable(
-            target,
+            target.clone(),
             command,
             chrome::icon_button(
                 *app.appearance.metrics(),
                 icon,
                 command.title(),
-                context_mode::available(app, target, command)
+                context_mode::available(app, target.clone(), command)
                     .then_some(Message::ContextMode(ContextMessage::Run(target, command))),
             ),
         ),
@@ -56,7 +56,9 @@ fn previewable<'a>(
 ) -> Element<'a, Message> {
     mouse_area(content)
         .on_enter(Message::ContextMode(ContextMessage::Preview(
-            target, command, true,
+            target.clone(),
+            command,
+            true,
         )))
         .on_exit(Message::ContextMode(ContextMessage::Preview(
             target, command, false,
@@ -65,7 +67,7 @@ fn previewable<'a>(
 }
 
 /// The mode bar replaces the ordinary note header while active.
-pub fn view(app: &App, target: EditorTarget) -> Element<'_, Message> {
+pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
     let metrics = *app.appearance.metrics();
     let width = app
         .editor_bounds
@@ -74,9 +76,14 @@ pub fn view(app: &App, target: EditorTarget) -> Element<'_, Message> {
         / metrics.scale;
     let mode = app.context_mode.mode(target.tab);
     let plan = ContextLayout::new(width);
-    let mut actions = row![action(app, target, ContextCommand::Exit, Icon::Close)]
-        .spacing(layout::GAP * metrics.scale)
-        .align_y(alignment::Vertical::Center);
+    let mut actions = row![action(
+        app,
+        target.clone(),
+        ContextCommand::Exit,
+        Icon::Close
+    )]
+    .spacing(layout::GAP * metrics.scale)
+    .align_y(alignment::Vertical::Center);
     if plan.shows_state() {
         actions = actions.push(observed(
             target.tab,
@@ -91,18 +98,28 @@ pub fn view(app: &App, target: EditorTarget) -> Element<'_, Message> {
             (ContextCommand::Copy, Icon::Copy),
             (ContextCommand::Paste, Icon::Paste),
         ] {
-            actions = actions.push(action(app, target, command, icon));
+            actions = actions.push(action(app, target.clone(), command, icon));
         }
     }
     if plan.command_visible(ContextCommand::Undo) {
         actions = actions
-            .push(action(app, target, ContextCommand::Undo, Icon::Undo))
-            .push(action(app, target, ContextCommand::Redo, Icon::Redo));
+            .push(action(
+                app,
+                target.clone(),
+                ContextCommand::Undo,
+                Icon::Undo,
+            ))
+            .push(action(
+                app,
+                target.clone(),
+                ContextCommand::Redo,
+                Icon::Redo,
+            ));
     }
     if plan.command_visible(ContextCommand::Commands) {
         actions = actions.push(action(
             app,
-            target,
+            target.clone(),
             ContextCommand::Commands,
             Icon::Commands,
         ));
@@ -116,7 +133,12 @@ pub fn view(app: &App, target: EditorTarget) -> Element<'_, Message> {
         actions = actions.push(menu_button(app, target, ContextMenu::Type));
     }
     if plan.command_visible(ContextCommand::Find) {
-        actions = actions.push(action(app, target, ContextCommand::Find, Icon::Search));
+        actions = actions.push(action(
+            app,
+            target.clone(),
+            ContextCommand::Find,
+            Icon::Search,
+        ));
     }
     if plan.command_visible(ContextCommand::History) {
         actions = actions.push(observed(
@@ -127,12 +149,15 @@ pub fn view(app: &App, target: EditorTarget) -> Element<'_, Message> {
                 .width(layout::command_width(ContextCommand::History) * metrics.scale)
                 .style(style::ghost())
                 .on_press_maybe(
-                    context_mode::available(app, target, ContextCommand::History).then_some(
-                        Message::EditorHistory(crate::host::editor_history::HistoryMessage::Act(
-                            target,
-                            crate::host::editor_history::HistoryAction::Open,
-                        )),
-                    ),
+                    context_mode::available(app, target.clone(), ContextCommand::History)
+                        .then_some({
+                            Message::EditorHistory(
+                                crate::host::editor_history::HistoryMessage::Act(
+                                    target.clone(),
+                                    crate::host::editor_history::HistoryAction::Open,
+                                ),
+                            )
+                        }),
                 ),
         ));
     }
@@ -141,6 +166,9 @@ pub fn view(app: &App, target: EditorTarget) -> Element<'_, Message> {
             .push(Space::new().width(Length::Fill))
             .push(menu_button(app, target, ContextMenu::More));
     }
+    // The count caption: primary characters at N=1, "N selections" once the
+    // set grows (FEUX-0002 X04/D-18; non-color redundancy).
+    let member_count = target.selections.len();
     let count = app.note_editor_view(target.tab).map_or(0, |view| {
         flavite_edit_context::selected_characters(&view.text, target.selection)
     });
@@ -154,29 +182,88 @@ pub fn view(app: &App, target: EditorTarget) -> Element<'_, Message> {
     if message.chars().count() > max_chars {
         caption.push('…');
     }
-    let summary = if count == 0 {
+    let summary = if member_count > 1 {
+        format!("{member_count} selections")
+    } else if count == 0 {
         "Caret".into()
     } else {
         format!("{count} char{}", if count == 1 { "" } else { "s" })
     };
     let effect = context_mode::effect_caption(app, target.tab);
-    let detail = crate::views::editor_history::strip(app, target, summary, caption, effect);
+    let detail = crate::views::editor_history::strip(app, target.clone(), summary, caption, effect);
+    let mut rows: Vec<Element<'_, Message>> = vec![
+        container(actions)
+            .height(36.0 * metrics.scale)
+            .align_y(alignment::Vertical::Center)
+            .into(),
+    ];
+    // The burst hint (FEUX-0002 E-15, X07): non-blocking, dismissible,
+    // offers only Exit Context Mode and Open history — never an undo
+    // action (shared-buffer edits make that promise false).
+    if app.diagnostics.burst_hint {
+        rows.push(
+            container(
+                row![
+                    text(
+                        "Several edits in quick succession — exit Context Mode or review editing history",
+                    )
+                    .size(metrics.text_sm),
+                    Space::new().width(Length::Fill),
+                    observed(
+                        target.tab,
+                        "burst-exit",
+                        button(text("Exit Context Mode").size(metrics.text_sm))
+                            .padding([3.0 * metrics.scale, 6.0 * metrics.scale])
+                            .style(style::ghost())
+                            .on_press(Message::EditorDiagnostics(
+                                crate::host::editor_diagnostics::DiagnosticsMessage::ExitContextMode(
+                                    target.tab,
+                                ),
+                            )),
+                    ),
+                    observed(
+                        target.tab,
+                        "burst-history",
+                        button(text("Open history").size(metrics.text_sm))
+                            .padding([3.0 * metrics.scale, 6.0 * metrics.scale])
+                            .style(style::ghost())
+                            .on_press(Message::EditorDiagnostics(
+                                crate::host::editor_diagnostics::DiagnosticsMessage::OpenHistory(
+                                    target.tab,
+                                ),
+                            )),
+                    ),
+                    observed(
+                        target.tab,
+                        "burst-dismiss",
+                        button(text("✕").size(metrics.text_sm))
+                            .padding([3.0 * metrics.scale, 5.0 * metrics.scale])
+                            .style(style::ghost())
+                            .on_press(Message::EditorDiagnostics(
+                                crate::host::editor_diagnostics::DiagnosticsMessage::DismissBurstHint,
+                            )),
+                    ),
+                ]
+                .spacing(6.0 * metrics.scale)
+                .align_y(alignment::Vertical::Center),
+            )
+            .padding([3.0 * metrics.scale, 0.0])
+            .width(Length::Fill)
+            .into(),
+        );
+    }
+    rows.push(detail);
     observed(
         target.tab,
         "toolbar",
-        container(column![
-            container(actions)
-                .height(36.0 * metrics.scale)
-                .align_y(alignment::Vertical::Center),
-            detail
-        ])
-        .padding([0.0, 6.0 * metrics.scale])
-        .width(Length::Fill)
-        .style(style::toolbar),
+        container(column(rows))
+            .padding([0.0, 6.0 * metrics.scale])
+            .width(Length::Fill)
+            .style(style::toolbar),
     )
 }
 
-fn menu_button(app: &App, target: EditorTarget, menu: ContextMenu) -> Element<'_, Message> {
+fn menu_button<'a>(app: &App, target: &EditorTarget, menu: ContextMenu) -> Element<'a, Message> {
     let metrics = app.appearance.metrics();
     let open = app
         .context_mode
@@ -193,7 +280,7 @@ fn menu_button(app: &App, target: EditorTarget, menu: ContextMenu) -> Element<'_
             .on_press(Message::ContextMode(if open {
                 ContextMessage::CloseMenu(target.tab)
             } else {
-                ContextMessage::OpenMenu(target, menu)
+                ContextMessage::OpenMenu(target.clone(), menu)
             })),
     )
 }
@@ -206,7 +293,7 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
     let Some(menu) = session.state.menu() else {
         return shell;
     };
-    let Some(target) = session.menu_target else {
+    let Some(target) = session.menu_target.clone() else {
         return shell;
     };
     let Some(anchor) = app
@@ -234,7 +321,7 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
             target.tab,
             command.title(),
             previewable(
-                target,
+                target.clone(),
                 command,
                 button(
                     row![
@@ -250,8 +337,9 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
                 .padding([7.0 * metrics.scale, 10.0 * metrics.scale])
                 .style(style::list_row(index == session.state.selected()))
                 .on_press_maybe(
-                    context_mode::available(app, target, command)
-                        .then_some(Message::ContextMode(ContextMessage::Run(target, command))),
+                    context_mode::available(app, target.clone(), command).then_some({
+                        Message::ContextMode(ContextMessage::Run(target.clone(), command))
+                    }),
                 ),
             ),
         ));

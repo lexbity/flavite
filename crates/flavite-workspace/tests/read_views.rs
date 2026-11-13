@@ -48,7 +48,7 @@ fn mode_change_preserves_identity_selection_anchor_and_has_no_implicit_target() 
     input.revision = 3;
     input.sequence = 1;
     input.focused = true;
-    input.selections = vec![Selection::caret(2)];
+    input.selections = vec![CommittedSelection::caret(2)];
     input.viewport_anchor = 1;
     state.acknowledge_interaction(input, "abc").unwrap();
     assert!(state.writing_target().is_some());
@@ -65,7 +65,7 @@ fn mode_change_preserves_identity_selection_anchor_and_has_no_implicit_target() 
     assert!(!state.tab(&tab).unwrap().interaction().focused);
     assert_eq!(
         state.tab(&tab).unwrap().interaction().selections,
-        [Selection::caret(2)]
+        [CommittedSelection::caret(2)]
     );
     assert_eq!(state.tab(&tab).unwrap().interaction().viewport_anchor, 1);
     let revision = state.revision();
@@ -159,7 +159,7 @@ fn scrolling_keeps_exact_insertion_authority_but_find_selection_invalidates_it()
     input.buffer_id = Some(9);
     input.revision = 2;
     input.focused = true;
-    input.selections = vec![Selection::caret(1)];
+    input.selections = vec![CommittedSelection::caret(1)];
     state.acknowledge_interaction(input, "a\nb\nc").unwrap();
     let target = state.writing_target().unwrap();
     state.set_content_anchor(tab, 4, "a\nb\nc").unwrap();

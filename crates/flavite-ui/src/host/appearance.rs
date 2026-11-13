@@ -236,6 +236,16 @@ impl AppearanceHost {
         }
     }
 
+    /// Whether the Context-Mode burst hint is enabled (FEUX-0002 E-15).
+    /// The pure statechart receives this as `burst_enabled`; disabling it
+    /// suppresses the hint entirely.
+    #[must_use]
+    pub fn burst_hint_enabled(&self) -> bool {
+        self.value("editor.burst_hint_enabled")
+            .as_bool()
+            .unwrap_or(true)
+    }
+
     /// Whether the collapsible vault navigator is open.
     #[must_use]
     pub fn sidebar_open(&self) -> bool {

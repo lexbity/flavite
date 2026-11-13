@@ -2,11 +2,12 @@
 
 use super::context_mode::{self, EditorTarget};
 use crate::app::{App, Message};
+use crate::host::editor_diagnostics::{EventKind, ModeEnum as DiagMode, Outcome};
 use flavite_api::{ExecutionResult, Invocation, LocalResult, Origin};
 use flavite_buffer::history::{
     HistoryCursor, HistoryEntry, HistoryMovement, HistoryPage, HistoryTarget,
 };
-use flavite_workspace::Selection;
+use flavite_workspace::CommittedSelection;
 use iced::{Rectangle, Task};
 use std::collections::BTreeMap;
 
@@ -173,15 +174,15 @@ pub fn reconcile(app: &mut App) {
     let Some(target) = EditorTarget::capture(app, session.tab) else {
         return;
     };
-    if app.context_mode.history.open && app.context_mode.history.target != Some(target) {
+    if app.context_mode.history.open && app.context_mode.history.target.as_ref() != Some(&target) {
         app.context_mode.history.open = false;
         app.context_mode
             .notice("Source changed; editing history was closed");
     }
-    if app.context_mode.history.key == Some(key(target)) {
+    if app.context_mode.history.key == Some(key(target.clone())) {
         return;
     }
-    let result = read(app, target, None);
+    let result = read(app, target.clone(), None);
     let host = &mut app.context_mode.history;
     host.key = Some(key(target));
     host.selected = 0;
@@ -199,10 +200,13 @@ pub fn reconcile(app: &mut App) {
 }
 
 pub fn can_restore(app: &App, source: EditorTarget, entry: &HistoryEntry) -> bool {
+    // Valid, retained multi-selection states restore like any other state
+    // (FR-18/FR-19): the recorded set rides the movement receipt and the
+    // primary member is explicit. There is no single-selection admission
+    // restriction.
     !entry.current
-        && entry.selection_count.is_none_or(|count| count == 1)
         && entry.restorable
-        && context_mode::valid(app, source, true)
+        && context_mode::valid(app, source.clone(), true)
         && !app.has_composition()
         && !context_mode::too_narrow(app, source.tab)
         && app.flavite.as_ref().is_some_and(|api| !api.is_read_only())
@@ -271,7 +275,7 @@ pub fn handle(app: &mut App, message: HistoryMessage) -> Task<Message> {
         HistoryMessage::Pick => {
             let host = &app.context_mode.history;
             if let (Some(source), Some(entry)) = (
-                host.target,
+                host.target.clone(),
                 host.page
                     .as_ref()
                     .and_then(|page| page.entries.get(host.selected)),
@@ -285,14 +289,20 @@ pub fn handle(app: &mut App, message: HistoryMessage) -> Task<Message> {
         }
         HistoryMessage::Act(source, action) => {
             if action == HistoryAction::Close {
-                if app.context_mode.history.target.is_some_and(|target| {
-                    target.tab == source.tab && target.incarnation == source.incarnation
-                }) {
+                if app
+                    .context_mode
+                    .history
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| {
+                        target.tab == source.tab && target.incarnation == source.incarnation
+                    })
+                {
                     app.context_mode.history.open = false;
                 }
                 return context_mode::resume_focus(app);
             }
-            if !context_mode::valid(app, source, true)
+            if !context_mode::valid(app, source.clone(), true)
                 || !app.context_mode.mode(source.tab).active()
                 || app.has_composition()
                 || app.dialog.is_some()
@@ -332,22 +342,65 @@ pub fn handle(app: &mut App, message: HistoryMessage) -> Task<Message> {
                         let _ = session.state.close_menu();
                         session.menu_target = None;
                     }
-                    let result = read(app, source, cursor);
-                    let host = &mut app.context_mode.history;
-                    host.key = Some(key(source));
-                    host.target = Some(source);
-                    host.open = true;
-                    host.selected = 0;
-                    match result {
-                        Ok(page) => {
-                            host.page = Some(page);
-                            host.error = None;
-                        }
-                        Err(error) => {
-                            host.error = Some(error);
+                    let result = read(app, source.clone(), cursor);
+                    let mode = DiagMode::from(app.context_mode.mode(source.tab));
+                    let source_tab = source.tab;
+                    let mut refused = false;
+                    {
+                        let host = &mut app.context_mode.history;
+                        host.key = Some(key(source.clone()));
+                        host.target = Some(source);
+                        host.open = true;
+                        host.selected = 0;
+                        match result {
+                            Ok(page) => {
+                                host.page = Some(page);
+                                host.error = None;
+                            }
+                            Err(error) => {
+                                host.error = Some(error);
+                                refused = true;
+                            }
                         }
                     }
-                    trim_bounds(host);
+                    let truncated = app
+                        .context_mode
+                        .history
+                        .page
+                        .as_ref()
+                        .is_some_and(|page| page.history_truncated);
+                    if refused {
+                        app.diagnostics.record(
+                            Some(source_tab),
+                            mode,
+                            EventKind::HistoryRefusal,
+                            Outcome::Refused,
+                            None,
+                            None,
+                        );
+                    } else {
+                        if truncated {
+                            // Visible truncation: eviction reached the
+                            // queried range (E-12).
+                            app.diagnostics.record(
+                                Some(source_tab),
+                                mode,
+                                EventKind::HistoryEvict,
+                                Outcome::Ready,
+                                None,
+                                None,
+                            );
+                        }
+                        app.diagnostics.record(
+                            Some(source_tab),
+                            mode,
+                            EventKind::HistoryPage,
+                            Outcome::Started,
+                            None,
+                            None,
+                        );
+                    }
+                    trim_bounds(&mut app.context_mode.history);
                     Task::none()
                 }
                 HistoryAction::Restore(target) => restore(app, source, target),
@@ -376,7 +429,7 @@ fn restore(app: &mut App, source: EditorTarget, target: HistoryTarget) -> Task<M
             .notice("Editing-history state expired; refresh history");
         return Task::none();
     };
-    if !can_restore(app, source, &entry) {
+    if !can_restore(app, source.clone(), &entry) {
         app.context_mode.notice(if entry.restorable {
             "Restore is unavailable for this source"
         } else {
@@ -397,6 +450,14 @@ fn restore(app: &mut App, source: EditorTarget, target: HistoryTarget) -> Task<M
         app.context_mode
             .notice("Editing-history state changed or restore was refused; refresh history");
         app.context_mode.history.key = None;
+        app.diagnostics.record(
+            Some(source.tab),
+            DiagMode::from(app.context_mode.mode(source.tab)),
+            EventKind::HistoryRestore,
+            Outcome::Refused,
+            None,
+            None,
+        );
         return Task::none();
     };
     let Ok(movement) = serde_json::from_value::<HistoryMovement>(success.data["movement"].clone())
@@ -423,21 +484,35 @@ fn restore(app: &mut App, source: EditorTarget, target: HistoryTarget) -> Task<M
     {
         app.workspace.release_editor_focus(Some(source.tab));
         interaction.focused = true;
-        interaction.selections = movement.selections.map_or_else(
-            || super::input::map_selections(&view.text, &interaction.selections, &movement.change),
-            |items| {
-                items
-                    .into_iter()
-                    .map(|[a, h]| Selection::new(a, h))
-                    .collect()
-            },
-        );
+        interaction.selections = if let Some(items) = movement.selections.clone() {
+            items
+                .into_iter()
+                .map(|[_, a, h]| CommittedSelection::new(a, h))
+                .collect()
+        } else if movement.truncated {
+            let clamp =
+                |at: usize| flavite_editor::viewport::clamp_grapheme_boundary(&view.text, at);
+            interaction
+                .selections
+                .iter()
+                .map(|s| CommittedSelection::new(clamp(s.anchor), clamp(s.head)))
+                .collect()
+        } else {
+            super::input::map_selections(&view.text, &interaction.selections, &movement)
+        };
+        // The restored set's primary member is explicit in the movement
+        // receipt (E-4/FR-4); a mapped/clamped set keeps this view's own
+        // primary when the cardinality allows.
+        interaction.primary = movement
+            .primary
+            .filter(|&primary| primary < interaction.selections.len())
+            .unwrap_or_else(|| interaction.primary.min(interaction.selections.len() - 1));
         interaction.revision = view.revision;
         interaction.sequence += 1;
         interaction.viewport_anchor = super::input::map_history_point(
             &view.text,
             interaction.viewport_anchor,
-            &movement.change,
+            &movement,
             flavite_buffer::Affinity::Left,
         );
         let _ = app
@@ -451,6 +526,14 @@ fn restore(app: &mut App, source: EditorTarget, target: HistoryTarget) -> Task<M
     app.context_mode.history.open = false;
     app.context_mode.history.key = None;
     app.context_mode.feedback("Editing state restored");
+    app.diagnostics.record(
+        Some(source.tab),
+        DiagMode::from(app.context_mode.mode(source.tab)),
+        EventKind::HistoryRestore,
+        Outcome::Applied,
+        None,
+        None,
+    );
     app.reconcile_contexts();
     context_mode::resume_focus(app)
 }
@@ -474,7 +557,9 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
         return None;
     }
     let message = match key {
-        Key::Named(Named::Escape) => HistoryMessage::Act(host.target?, HistoryAction::Close),
+        Key::Named(Named::Escape) => {
+            HistoryMessage::Act(host.target.clone()?, HistoryAction::Close)
+        }
         Key::Named(Named::ArrowDown) => HistoryMessage::Move(true),
         Key::Named(Named::ArrowUp) => HistoryMessage::Move(false),
         Key::Named(Named::Enter) if !repeat => HistoryMessage::Pick,

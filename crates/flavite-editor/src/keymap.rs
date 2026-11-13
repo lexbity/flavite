@@ -15,6 +15,8 @@ pub enum KeyAction {
     PreviousWord,
     /// Move to the next word boundary.
     NextWord,
+    /// Move to the end of the current or next word (the `e` motion, X05).
+    NextWordEnd,
     /// Move up one visual row.
     Up,
     /// Move down one visual row.

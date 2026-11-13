@@ -224,6 +224,78 @@ def capture(window, output, name, checks):
     raise AssertionError(f"capture appears blank after waiting for paint: {name}")
 
 
+def type_into_selection_row(window, harness, text, kind):
+    """Type `text` into the open selection-search row, verifying the
+    keystrokes actually land in the query input (the row's focus task is
+    asynchronous after Open; under synthetic input they can leak into the
+    editor instead). Recovers by closing and reopening the row via the
+    palette, and undoes any leaked keystrokes. Returns True on success."""
+    command_id = "editor.select_matches" if kind == "select" else "editor.split_selection"
+    for attempt in range(3):
+        time.sleep(0.5)
+        before_text = snapshot(harness).get("focused_text")
+        # Send key events directly to the app window (bypasses X input
+        # focus; winit event loop delivers them as window events).
+        run("xdotool", "key", "--window", window, "--clearmodifiers", *[f"{c}" for c in text])
+        end = time.monotonic() + 5
+        while time.monotonic() < end:
+            value = snapshot(harness)
+            state = next(
+                (t.get("selection_search") for t in tabs(value) if t.get("selection_search") is not None),
+                None,
+            )
+            if state and state.get("query") == text:
+                return True
+            if not state or (value.get("context_mode") or {}).get("state") != "COMMAND":
+                break  # leaked into the editor
+            time.sleep(0.05)
+        # Recover: pop any typing group, close the row, undo leaked text,
+        # and reopen the row fresh.
+        key("Escape")
+        time.sleep(0.15)
+        key("Escape")
+        end = time.monotonic() + 5
+        while time.monotonic() < end:
+            value = snapshot(harness)
+            state = next(
+                (t.get("selection_search") for t in tabs(value) if t.get("selection_search") is not None),
+                None,
+            )
+            if state is None:
+                break
+            time.sleep(0.05)
+        if (snapshot(harness).get("context_mode") or {}).get("state") != "COMMAND":
+            key("Escape")
+        key("u")  # Command-mode undo: revert the leaked typing, if any
+        time.sleep(0.15)
+        key("ctrl+shift+p")
+        end = time.monotonic() + 5
+        while time.monotonic() < end:
+            if snapshot(harness).get("palette_open"):
+                break
+            time.sleep(0.05)
+        key("ctrl+a")
+        type_text(command_id)
+        key("Return")
+        end = time.monotonic() + 5
+        while time.monotonic() < end:
+            value = snapshot(harness)
+            if not value.get("palette_open"):
+                break
+            time.sleep(0.05)
+        end = time.monotonic() + 5
+        while time.monotonic() < end:
+            value = snapshot(harness)
+            state = next(
+                (t.get("selection_search") for t in tabs(value) if t.get("selection_search") is not None),
+                None,
+            )
+            if state and state.get("kind") == kind:
+                break
+            time.sleep(0.05)
+    return False
+
+
 def finish(output, checks, backend):
     (output / "graph-editor-loop-checks.json").write_text(
         json.dumps(

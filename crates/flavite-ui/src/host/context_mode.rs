@@ -1,7 +1,8 @@
 //! Target-bound Context Mode controls over the existing editor input and API.
 
 use crate::app::{App, Message};
-use flavite_api::{Invocation, Origin};
+use crate::host::editor_diagnostics::{EventKind, ModeEnum as DiagMode, Outcome};
+use flavite_api::{ExecutionResult, Invocation, Origin};
 use flavite_edit_context::{
     ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event, menu_key, reduce,
 };
@@ -14,27 +15,66 @@ use flavite_workspace::{LayoutAction, TabId};
 use iced::{Rectangle, Task};
 use std::collections::BTreeMap;
 
-/// A control captures its editor identity and selection, not global focus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A control captures its editor identity and selection set, not global
+/// focus. The whole committed set rides along (FEUX-0002 X04, E-5): `selection`
+/// stays the primary pair for captions and single-range effects, and
+/// `primary` names that member by its index in `selections` (E-4/FR-4:
+/// canonical order and "primary first" cannot both be implicit, so the
+/// primary is explicit in every capture).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorTarget {
     pub tab: TabId,
     pub incarnation: u64,
     pub buffer: u64,
     pub revision: u64,
+    /// The primary pair.
     pub selection: (usize, usize),
+    /// Every committed member as `(anchor, head)` pairs in canonical order.
+    pub selections: Vec<(usize, usize)>,
+    /// Index into `selections` of the primary member.
+    pub primary: usize,
+    /// Monotonic committed-selection version at capture time (FEUX-0002
+    /// E-5): mutations fail on mismatch even when the revision matches.
+    pub selection_version: u64,
 }
 
 impl EditorTarget {
     #[must_use]
     pub fn capture(app: &App, tab: TabId) -> Option<Self> {
         let view = app.note_editor_view(tab)?;
-        let selection = app.editor_interaction_snapshot(tab)?.selection;
+        let interaction = app.workspace.tab(&tab)?.interaction();
+        let selections: Vec<(usize, usize)> = interaction
+            .selections
+            .iter()
+            .map(|selection| (selection.anchor, selection.head))
+            .collect();
+        let primary = interaction.primary.min(selections.len().saturating_sub(1));
+        let selection = *selections.get(primary)?;
         Some(Self {
             tab,
             incarnation: app.notes.incarnation(tab)?,
             buffer: view.buffer_id,
             revision: view.revision,
             selection,
+            selections,
+            primary,
+            selection_version: interaction.selection_version,
+        })
+    }
+
+    /// Wire form for the api selection-set argument: canonical triples with
+    /// an explicit primary hint. Members carry their index as id, so the
+    /// hint resolves to exactly the captured primary member.
+    #[must_use]
+    pub fn selections_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "primary": self.primary,
+            "items": self
+                .selections
+                .iter()
+                .enumerate()
+                .map(|(id, (anchor, head))| serde_json::json!([id, anchor, head]))
+                .collect::<Vec<_>>(),
         })
     }
 }
@@ -43,12 +83,13 @@ impl EditorTarget {
 pub enum ContextMessage {
     Preview(EditorTarget, ContextCommand, bool),
     Run(EditorTarget, ContextCommand),
-    EnterAt(EditorTarget, (usize, usize)),
+    /// Right-click entry carrying the resolved selection set (kept or
+    /// word-replaced per E-14).
+    EnterAt(EditorTarget, Vec<(usize, usize)>),
     OpenMenu(EditorTarget, ContextMenu),
     CloseMenu(TabId),
     MenuMove(bool),
     MenuPick,
-    PasteReady(EditorTarget, u64, Option<String>),
     Unbound(EditorTarget),
     Bounds(TabId, &'static str, Rectangle),
     ExpandPane(EditorTarget),
@@ -106,6 +147,24 @@ impl ContextHost {
     }
 }
 
+/// Record one diagnostics outcome for the view (FEUX-0002 X07). The ring is
+/// content-free by schema; only enums and counts reach it.
+fn diag(app: &mut App, tab: TabId, kind: EventKind, outcome: Outcome, count: Option<u32>) {
+    app.diagnostics.record(
+        Some(tab),
+        DiagMode::from(app.context_mode.mode(tab)),
+        kind,
+        outcome,
+        count,
+        None,
+    );
+}
+
+/// The clock and burst setting the pure statechart needs (X07).
+fn chart_inputs(app: &App) -> (u64, bool) {
+    (app.now_ms(), app.appearance.burst_hint_enabled())
+}
+
 /// Execute pure statechart effects against the app, in returned order.
 /// Returns the focus task if one was requested.
 fn run_effects(app: &mut App, tab: TabId, effects: Vec<Effect>) -> Option<Task<Message>> {
@@ -116,6 +175,17 @@ fn run_effects(app: &mut App, tab: TabId, effects: Vec<Effect>) -> Option<Task<M
             Effect::ClearPreview => app.context_mode.clear_preview(),
             Effect::FocusEditor => task = Some(focus(app, tab)),
             Effect::InvalidateHistory => super::editor_history::invalidate(app),
+            Effect::ShowBurstHint => {
+                app.diagnostics.show_burst_hint();
+                diag(app, tab, EventKind::BurstHint, Outcome::Shown, None);
+            }
+            Effect::KeepPrimary => {
+                // §5.4 row 10: Command Escape with more than one member
+                // keeps the primary (the multi-selection recovery).
+                if let Some(target) = EditorTarget::capture(app, tab) {
+                    selections_only(app, &target, "editor.keep_primary", serde_json::json!({}));
+                }
+            }
         }
     }
     task
@@ -131,7 +201,19 @@ pub(crate) fn valid(app: &App, target: EditorTarget, selection: bool) -> bool {
         && (!selection
             || app
                 .editor_interaction_snapshot(target.tab)
-                .is_some_and(|s| s.selection == target.selection))
+                .is_some_and(|s| {
+                    let committed: Vec<(usize, usize)> = s
+                        .selections
+                        .iter()
+                        .map(|[_, anchor, head]| (*anchor, *head))
+                        .collect();
+                    committed == target.selections && s.selection == target.selection
+                }))
+        && (!selection
+            || app
+                .workspace
+                .tab(&target.tab)
+                .is_some_and(|tab| tab.interaction().selection_version == target.selection_version))
 }
 
 #[must_use]
@@ -158,7 +240,7 @@ pub fn preview_command(app: &App, tab: TabId) -> Option<ContextCommand> {
         return None;
     }
     let target = EditorTarget::capture(app, tab)?;
-    let command = if let Some((source, command)) = app.context_mode.preview
+    let command = if let Some((source, command)) = app.context_mode.preview.clone()
         && source == target
     {
         command
@@ -179,7 +261,8 @@ pub fn effect_caption(app: &App, tab: TabId) -> Option<String> {
         && !app
             .context_mode
             .preview
-            .is_some_and(|(source, _)| source == target)
+            .as_ref()
+            .is_some_and(|(source, _)| *source == target)
     {
         return None;
     }
@@ -203,7 +286,7 @@ pub fn available(app: &App, target: EditorTarget, command: ContextCommand) -> bo
     {
         return false;
     }
-    valid(app, target, false)
+    valid(app, target.clone(), false)
         && !app.has_composition()
         && app.dialog.is_none()
         && app.shutdown.is_none()
@@ -239,7 +322,7 @@ pub fn menu_scroll_id(tab: TabId) -> iced::widget::Id {
     iced::widget::Id::from(format!("context-menu-{:032x}", tab.raw()))
 }
 
-fn focus(app: &App, tab: TabId) -> Task<Message> {
+pub(crate) fn focus(app: &App, tab: TabId) -> Task<Message> {
     let (Some(view), Some(bounds)) = (
         app.note_editor_view(tab),
         app.editor_bounds.get(&tab).copied(),
@@ -266,6 +349,7 @@ pub fn resume_focus(app: &App) -> Task<Message> {
         || app.dialog.is_some()
         || app.strip_menu.is_some()
         || super::note_search::blocks_typing(app, &s.tab)
+        || super::selection_search::blocks_typing(app, &s.tab)
     {
         return Task::none();
     }
@@ -287,6 +371,7 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
         || app.strip_menu.is_some()
         || app.has_composition()
         || super::note_search::blocks_typing(app, &s.tab)
+        || super::selection_search::blocks_typing(app, &s.tab)
     {
         return None;
     }
@@ -324,8 +409,8 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
                 if *repeat {
                     return None;
                 }
-                command.map_or(ContextMessage::Unbound(target), |command| {
-                    ContextMessage::Run(s.menu_target.unwrap_or(target), command)
+                command.map_or(ContextMessage::Unbound(target.clone()), |command| {
+                    ContextMessage::Run(s.menu_target.clone().unwrap_or(target), command)
                 })
             }
         };
@@ -336,6 +421,7 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
 
 fn exit(app: &mut App) {
     app.context_mode.clear_preview();
+    app.diagnostics.clear_burst_hint();
     app.context_mode.history = Default::default();
     app.context_mode.capture = None;
     if let Some(session) = app.context_mode.session.take() {
@@ -346,6 +432,9 @@ fn exit(app: &mut App) {
                 super::note_search::NoteSearchMessage::FindClose(session.tab),
             );
         }
+        // Match-selection drafts are context-mode owned (E-11): mode exit
+        // cancels the collection and discards the overlay.
+        app.selection_search.detach(session.tab);
         app.palette_open = false;
         app.picker = Default::default();
     }
@@ -375,16 +464,22 @@ pub fn reconcile(app: &mut App) {
         .context_mode
         .session
         .as_ref()
-        .and_then(|s| s.menu_target)
+        .and_then(|s| s.menu_target.clone())
         .is_some_and(|target| !valid(app, target, true));
     if stale_menu {
+        let (now_ms, burst_enabled) = chart_inputs(app);
         let effects = app
             .context_mode
             .session
             .as_mut()
             .map(|s| {
                 s.menu_target = None;
-                reduce(&mut s.state, &Event::MenuTargetInvalid)
+                reduce(
+                    &mut s.state,
+                    &Event::MenuTargetInvalid,
+                    now_ms,
+                    burst_enabled,
+                )
             })
             .unwrap_or_default();
         debug_assert!(
@@ -427,7 +522,7 @@ pub fn native_key(
     mut key: flavite_editor::context::ContextKey,
 ) -> Task<Message> {
     use flavite_edit_context::{command_key, menu_key, motion_key};
-    if !valid(app, target, true)
+    if !valid(app, target.clone(), true)
         || app.context_mode.history.open
         || too_narrow(app, target.tab)
         || app.palette_open
@@ -435,12 +530,68 @@ pub fn native_key(
         || app.strip_menu.is_some()
         || app.dialog.is_some()
         || super::note_search::blocks_typing(app, &target.tab)
+        || super::selection_search::blocks_typing(app, &target.tab)
         || app.has_composition()
     {
         return Task::none();
     }
     let mode = app.context_mode.mode(target.tab);
     if mode.active() {
+        // AwaitChar capture (FEUX-0002 E-8, §5.4.1): the first event with
+        // produced text resolves the find-char; Esc cancels through the
+        // session's escape pop; menu keys cancel then process; Dead and
+        // modifier-only events are never published here at all.
+        if let Some(request) = app
+            .context_mode
+            .session
+            .as_ref()
+            .and_then(|s| s.state.await_char())
+        {
+            let produced = key
+                .input
+                .text
+                .chars()
+                .next()
+                .filter(|_| !key.input.text.is_empty())
+                .filter(|_| !key.input.text.chars().nth(1).is_some());
+            if let Some(produced) = produced {
+                let extend = key.modifiers.shift;
+                if let Some(s) = &mut app.context_mode.session {
+                    s.state.end_await_char();
+                }
+                let extra = serde_json::json!({
+                    "direction": if request.forward { "fwd" } else { "back" },
+                    "char": produced.to_string(),
+                    "extend": extend,
+                });
+                let installed = selections_only(app, &target, "editor.find_char", extra);
+                return if installed.is_some() {
+                    focus(app, target.tab)
+                } else {
+                    Task::none()
+                };
+            }
+            // A menu key cancels the capture and processes the menu; every
+            // other non-character key is ignored (the capture stays).
+            if let Some(code) = key.code
+                && !key.modifiers.control
+                && !key.modifiers.alt
+                && !key.modifiers.logo
+                && matches!(
+                    code,
+                    flavite_edit_context::KeyCode::KeyV
+                        | flavite_edit_context::KeyCode::KeyG
+                        | flavite_edit_context::KeyCode::KeyT
+                )
+            {
+                if let Some(s) = &mut app.context_mode.session {
+                    s.state.end_await_char();
+                }
+                // Fall through to the delivered menu handling below.
+            } else {
+                return Task::none();
+            }
+        }
         let clipboard = match key.input.action {
             KeyAction::Copy => Some(ContextCommand::Copy),
             KeyAction::Cut => Some(ContextCommand::Cut),
@@ -513,6 +664,7 @@ pub fn native_key(
                 | KeyAction::Next
                 | KeyAction::PreviousWord
                 | KeyAction::NextWord
+                | KeyAction::NextWordEnd
                 | KeyAction::Up
                 | KeyAction::Down
                 | KeyAction::PageUp
@@ -548,17 +700,427 @@ fn select(app: &mut App, target: EditorTarget, anchor: usize, head: usize) {
     app.context_mode.internal_selection = false;
 }
 
-fn input(app: &mut App, target: EditorTarget, action: KeyAction, text: String) -> Task<Message> {
-    input_command(app, target, action, text, None)
+/// Install a caller-supplied canonical set on the requesting view (the
+/// pointer/right-click entry path); the reducer bumps the committed version
+/// when the set changed. Returns whether the set was installed.
+fn install_pairs(app: &mut App, target: &EditorTarget, pairs: &[(usize, usize)]) -> bool {
+    if pairs.is_empty() {
+        return false;
+    }
+    let Some(mut interaction) = app
+        .workspace
+        .tab(&target.tab)
+        .map(|v| v.interaction().clone())
+    else {
+        return false;
+    };
+    interaction.selections = pairs
+        .iter()
+        .map(|&(anchor, head)| flavite_workspace::CommittedSelection::new(anchor, head))
+        .collect();
+    interaction.sequence += 1;
+    let Some(view) = app.note_editor_view(target.tab) else {
+        return false;
+    };
+    if app
+        .workspace
+        .acknowledge_interaction(interaction, &view.text)
+        .is_err()
+    {
+        app.input_chains.remove(&target.tab);
+        return false;
+    }
+    app.reconcile_contexts();
+    app.refresh_semantics();
+    true
 }
 
-fn input_command(
+/// The shared ticketed mutating path (FEUX-0002 X03/X04, E-5): issue an
+/// operation ticket, run one planner-backed `editor.*` verb through the
+/// Session single-writer path, map passive views once via the movement
+/// delta, and install the receipt's exact after-set on the requesting view.
+/// The committed version bump itself belongs to the workspace reducer (once
+/// per committed set change).
+pub(crate) fn kernel_mutate(
     app: &mut App,
-    target: EditorTarget,
-    action: KeyAction,
-    text: String,
-    semantic: Option<super::input::CommandIntent>,
+    target: &EditorTarget,
+    api_id: &'static str,
+    mut args: serde_json::Value,
+    refused: &'static str,
+) -> Option<flavite_api::LocalSuccess> {
+    let Some(api) = &app.flavite else {
+        return None;
+    };
+    let issue = Invocation::new(
+        api.command_registry().next_request_id(),
+        "editor.issue_operation",
+        serde_json::json!({"buffer_id": target.buffer}),
+        Origin::Gui,
+    );
+    let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = api.execute(issue)
+    else {
+        app.context_mode.notice("Operation could not be started");
+        diag(
+            app,
+            target.tab,
+            EventKind::OperationRefused,
+            Outcome::Refused,
+            Some(target.selections.len() as u32),
+        );
+        return None;
+    };
+    let Some(operation) = success.data.get("operation").cloned() else {
+        app.context_mode.notice("Operation could not be started");
+        diag(
+            app,
+            target.tab,
+            EventKind::OperationRefused,
+            Outcome::Refused,
+            Some(target.selections.len() as u32),
+        );
+        return None;
+    };
+    let object = args.as_object_mut().expect("mutation args are an object");
+    object.insert("buffer_id".into(), serde_json::json!(target.buffer));
+    object.insert("revision".into(), serde_json::json!(target.revision));
+    object.insert("operation".into(), operation);
+    object.insert(
+        "origin".into(),
+        serde_json::json!({
+            "view": format!("{:032x}", target.tab.raw()),
+            "incarnation": target.incarnation,
+        }),
+    );
+    object.insert("selections".into(), target.selections_json());
+    let result = api.execute(Invocation::new(
+        api.command_registry().next_request_id(),
+        api_id,
+        args,
+        Origin::Gui,
+    ));
+    let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = result else {
+        let message = match &result {
+            ExecutionResult::Rejected(rejected) => rejected
+                .message
+                .clone()
+                .unwrap_or_else(|| refused.to_string()),
+            ExecutionResult::Local(flavite_api::LocalResult::Error(error)) => {
+                if error.code == "read_only_non_applicable" {
+                    return None;
+                }
+                error.message.clone()
+            }
+            _ => refused.to_string(),
+        };
+        app.context_mode.notice(&message);
+        // Classify the terminal outcome: duplicate delivery and retired
+        // replays are distinct outcomes, not generic refusals (E-5).
+        let (kind, outcome) = crate::host::editor_diagnostics::classify_error(&message);
+        diag(
+            app,
+            target.tab,
+            kind,
+            outcome,
+            Some(target.selections.len() as u32),
+        );
+        return None;
+    };
+    diag(
+        app,
+        target.tab,
+        EventKind::OperationApplied,
+        Outcome::Applied,
+        Some(target.selections.len() as u32),
+    );
+    Some(success)
+}
+
+/// Interpret a mutating receipt: map passive views once, install the exact
+/// after-set on the requesting view, and keep the acknowledged-input chain
+/// resolvable against the new revision.
+pub(crate) fn install_receipt(
+    app: &mut App,
+    target: &EditorTarget,
+    success: &flavite_api::LocalSuccess,
+) {
+    let new_revision = success.data["revision"].as_u64().unwrap_or(target.revision);
+    let movement = serde_json::from_value::<flavite_buffer::history::HistoryMovement>(
+        success.data["movement"].clone(),
+    )
+    .unwrap_or(flavite_buffer::history::HistoryMovement {
+        selections: None,
+        spans: Vec::new(),
+        truncated: false,
+        primary: None,
+    });
+    let after_triples: Vec<[usize; 3]> =
+        serde_json::from_value(success.data["after_selections"].clone()).unwrap_or_default();
+    // Map passive views once (movement spans; clamp on truncation).
+    super::input::apply_history_movement(
+        app,
+        target.tab,
+        target.buffer,
+        target.revision,
+        new_revision,
+        &movement,
+    );
+    // Install the exact after-set on the requesting view; the primary
+    // member rides the receipt (E-4/FR-4) and the workspace reducer bumps
+    // the selection version exactly once per committed change.
+    if let Some(mut interaction) = app
+        .workspace
+        .tab(&target.tab)
+        .map(|v| v.interaction().clone())
+    {
+        let next_selections: Vec<flavite_workspace::CommittedSelection> = after_triples
+            .iter()
+            .map(|[_, a, h]| flavite_workspace::CommittedSelection::new(*a, *h))
+            .collect();
+        if !next_selections.is_empty() {
+            interaction.selections = next_selections;
+        }
+        if let Some(primary) = movement.primary
+            && primary < interaction.selections.len()
+        {
+            interaction.primary = primary;
+        } else {
+            interaction.primary = interaction.primary.min(interaction.selections.len() - 1);
+        }
+        interaction.revision = new_revision;
+        interaction.sequence += 1;
+        interaction.viewport_anchor = interaction.viewport_anchor.min(
+            app.note_editor_view(target.tab)
+                .map_or(0, |view| view.text.len()),
+        );
+        let Some(view) = app.note_editor_view(target.tab) else {
+            return;
+        };
+        if app
+            .workspace
+            .acknowledge_interaction(interaction, &view.text)
+            .is_err()
+        {
+            app.input_chains.remove(&target.tab);
+        }
+    }
+    app.workspace.invalidate_writing_target(target.buffer);
+    app.linking.invalidate_if_source_changed(None);
+    // Maintain the acknowledged-input chain so queued native keys still
+    // resolve against the new revision (same contract as handle_inner).
+    let sequence = app
+        .workspace
+        .tab(&target.tab)
+        .map_or(1, |v| v.interaction().sequence);
+    let base = app
+        .input_chains
+        .get(&target.tab)
+        .map_or(target.revision, |chain| chain.base());
+    app.input_chains.insert(
+        target.tab,
+        super::input::InputChain::new(
+            target.incarnation,
+            target.buffer,
+            base,
+            new_revision,
+            sequence,
+            None,
+        ),
+    );
+    if let Some(session) = &mut app.context_mode.session {
+        session.state.clear_attention();
+    }
+    app.reconcile_contexts();
+    app.refresh_semantics();
+}
+
+/// A ticketed mutating verb through the kernel path, ending in focus.
+fn kernel_task(
+    app: &mut App,
+    target: &EditorTarget,
+    api_id: &'static str,
+    args: serde_json::Value,
+    refused: &'static str,
 ) -> Task<Message> {
+    match kernel_mutate(app, target, api_id, args, refused) {
+        Some(success) => {
+            install_receipt(app, target, &success);
+            focus(app, target.tab)
+        }
+        None => Task::none(),
+    }
+}
+
+/// A ticketed paste: the one clipboard string broadcasts to every member
+/// through the planner's `Typing` operation (`editor.paste`).
+pub(crate) fn paste(app: &mut App, target: EditorTarget, text: String) -> Task<Message> {
+    kernel_task(
+        app,
+        &target,
+        "editor.paste",
+        serde_json::json!({"text": text}),
+        "Paste was refused; source changed",
+    )
+}
+
+/// A selection-only command over the whole live set (no ticket, no history
+/// node): run the api verb and install the returned canonical set. Returns
+/// the installed triples so callers can chain typing entry.
+pub(crate) fn selections_only(
+    app: &mut App,
+    target: &EditorTarget,
+    api_id: &'static str,
+    mut extra: serde_json::Value,
+) -> Option<Vec<[usize; 3]>> {
+    let Some(api) = &app.flavite else {
+        return None;
+    };
+    let object = extra.as_object_mut().expect("selection args are an object");
+    object.insert("buffer_id".into(), serde_json::json!(target.buffer));
+    object.insert("revision".into(), serde_json::json!(target.revision));
+    object.insert("selections".into(), target.selections_json());
+    let result = api.execute(Invocation::new(
+        api.command_registry().next_request_id(),
+        api_id,
+        extra,
+        Origin::Gui,
+    ));
+    let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = result else {
+        let message = match &result {
+            ExecutionResult::Rejected(rejected) => rejected.message.clone(),
+            ExecutionResult::Local(flavite_api::LocalResult::Error(error)) => {
+                Some(error.message.clone())
+            }
+            _ => None,
+        };
+        if let Some(message) = message {
+            app.context_mode.notice(message);
+        }
+        diag(
+            app,
+            target.tab,
+            EventKind::SelectionOp,
+            Outcome::Refused,
+            Some(target.selections.len() as u32),
+        );
+        return None;
+    };
+    diag(
+        app,
+        target.tab,
+        EventKind::SelectionOp,
+        Outcome::Applied,
+        Some(target.selections.len() as u32),
+    );
+    let triples: Vec<[usize; 3]> =
+        serde_json::from_value(success.data["selections"].clone()).ok()?;
+    // The canonical primary identity rides the response (E-4/FR-4): the
+    // member whose id matches keeps the primary, whatever its position.
+    let primary_id = success.data["primary"].as_u64().unwrap_or(0) as usize;
+    let primary = triples
+        .iter()
+        .position(|triple| triple[0] == primary_id)
+        .unwrap_or(0);
+    // Install the canonical set; the reducer bumps the version on change.
+    if let Some(mut interaction) = app
+        .workspace
+        .tab(&target.tab)
+        .map(|v| v.interaction().clone())
+    {
+        interaction.selections = triples
+            .iter()
+            .map(|[_, a, h]| flavite_workspace::CommittedSelection::new(*a, *h))
+            .collect();
+        interaction.primary = primary.min(interaction.selections.len().saturating_sub(1));
+        interaction.sequence += 1;
+        let view = app.note_editor_view(target.tab)?;
+        if app
+            .workspace
+            .acknowledge_interaction(interaction, &view.text)
+            .is_err()
+        {
+            app.input_chains.remove(&target.tab);
+        } else {
+            // The selection-only command advanced the committed interaction
+            // sequence; the acknowledged-input chain must track it or the
+            // next captured key is refused by `accepts_context` (the widget
+            // resynchronizes its sequence to the committed interaction every
+            // frame, so it can never outrun it on its own).
+            let sequence = app
+                .workspace
+                .tab(&target.tab)
+                .map_or(1, |v| v.interaction().sequence);
+            let base = app
+                .input_chains
+                .get(&target.tab)
+                .map_or(target.revision, |chain| chain.base());
+            app.input_chains.insert(
+                target.tab,
+                super::input::InputChain::new(
+                    target.incarnation,
+                    target.buffer,
+                    base,
+                    view.revision,
+                    sequence,
+                    None,
+                ),
+            );
+        }
+    }
+    app.reconcile_contexts();
+    app.refresh_semantics();
+    Some(triples)
+}
+
+/// Per-member head targets on the adjacent visual row (X05 `add_caret_
+/// above/below`): computed through the same shaping the widget paints, with
+/// the host's own wrap width and type metrics. Refuses when any member's
+/// row does not exist (the whole command is refused, E-9).
+fn row_targets(app: &App, target: &EditorTarget, rows: i32) -> Result<Vec<usize>, &'static str> {
+    use flavite_editor::navigation::{VerticalMotion, vertical_target};
+    let Some(view) = app.note_editor_view(target.tab) else {
+        return Err("Source changed; command was not applied");
+    };
+    let bounds = app
+        .editor_bounds
+        .get(&target.tab)
+        .map_or(640.0, |b| b.width);
+    let metrics = app.appearance.metrics();
+    let width = flavite_editor::widget::wrap_width_for(bounds, metrics.editor_max_line_width());
+    let motion = VerticalMotion {
+        rows,
+        width,
+        metrics: metrics.editor_type(),
+    };
+    let mut positions = Vec::with_capacity(target.selections.len());
+    for &(_, head) in &target.selections {
+        let (at, _) = vertical_target(&view.text, head, motion, None);
+        if at == head {
+            return Err(if rows < 0 {
+                "No row above to add a caret on"
+            } else {
+                "No row below to add a caret on"
+            });
+        }
+        positions.push(at);
+    }
+    Ok(positions)
+}
+
+/// A selection-only verb, ending in focus.
+fn selections_only_task(
+    app: &mut App,
+    target: &EditorTarget,
+    api_id: &'static str,
+    extra: serde_json::Value,
+) -> Task<Message> {
+    if selections_only(app, target, api_id, extra).is_some() {
+        focus(app, target.tab)
+    } else {
+        Task::none()
+    }
+}
+
+fn input(app: &mut App, target: EditorTarget, action: KeyAction, text: String) -> Task<Message> {
     let Some(view) = app.note_editor_view(target.tab) else {
         return Task::none();
     };
@@ -580,12 +1142,10 @@ fn input_command(
         extend: false,
         document_boundary: false,
         vertical: None,
+        preferred_x: Vec::new(),
+        clipboard_acquired: false,
     };
-    if let Some(intent) = semantic {
-        super::input::handle_command(app, target.tab, target.incarnation, captured, intent)
-    } else {
-        super::input::handle(app, target.tab, target.incarnation, captured)
-    }
+    super::input::handle(app, target.tab, target.incarnation, captured)
 }
 
 /// Execute every toolbar/accelerator/palette action through one target guard.
@@ -593,18 +1153,24 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
     match message {
         ContextMessage::Preview(source, command, entered) => {
             if entered
-                && valid(app, source, true)
+                && valid(app, source.clone(), true)
                 && app.context_mode.mode(source.tab).active()
                 && !app.context_mode.history.open
             {
                 app.context_mode.preview = Some((source, command));
-            } else if !entered && app.context_mode.preview == Some((source, command)) {
+            } else if !entered
+                && app
+                    .context_mode
+                    .preview
+                    .as_ref()
+                    .is_some_and(|(held, held_command)| *held == source && *held_command == command)
+            {
                 app.context_mode.preview = None;
             }
             Task::none()
         }
         ContextMessage::ExpandPane(target) => {
-            if valid(app, target, true) && too_narrow(app, target.tab) {
+            if valid(app, target.clone(), true) && too_narrow(app, target.tab) {
                 super::commands::dispatch(app, "workspace.maximize_group")
             } else {
                 Task::none()
@@ -620,6 +1186,7 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
         }
         ContextMessage::CloseMenu(tab) => {
             app.context_mode.preview = None;
+            let (now_ms, burst_enabled) = chart_inputs(app);
             let task = app
                 .context_mode
                 .session
@@ -627,7 +1194,7 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
                 .filter(|s| s.tab == tab)
                 .map(|s| {
                     s.menu_target = None;
-                    reduce(&mut s.state, &Event::CloseMenu)
+                    reduce(&mut s.state, &Event::CloseMenu, now_ms, burst_enabled)
                 })
                 .map(|effects| run_effects(app, tab, effects))
                 .unwrap_or_default();
@@ -663,7 +1230,8 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
         }
         ContextMessage::MenuPick => {
             if let Some(s) = &app.context_mode.session
-                && let (Some(command), Some(target)) = (s.state.menu_command(), s.menu_target)
+                && let (Some(command), Some(target)) =
+                    (s.state.menu_command(), s.menu_target.clone())
             {
                 return run(app, target, command);
             }
@@ -671,16 +1239,17 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
         }
         ContextMessage::OpenMenu(target, menu) => {
             if !app.context_mode.history.open
-                && valid(app, target, true)
+                && valid(app, target.clone(), true)
                 && app.context_mode.mode(target.tab).active()
             {
+                let (now_ms, burst_enabled) = chart_inputs(app);
                 let effects = app
                     .context_mode
                     .session
                     .as_mut()
                     .map(|s| {
-                        s.menu_target = Some(target);
-                        reduce(&mut s.state, &Event::OpenMenu(menu))
+                        s.menu_target = Some(target.clone());
+                        reduce(&mut s.state, &Event::OpenMenu(menu), now_ms, burst_enabled)
                     })
                     .unwrap_or_default();
                 let _ = run_effects(app, target.tab, effects);
@@ -694,31 +1263,12 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
             }
             Task::none()
         }
-        ContextMessage::PasteReady(target, generation, content) => {
-            if generation != app.context_mode.generation
-                || !valid(app, target, true)
-                || app.context_mode.history.open
-            {
-                app.context_mode
-                    .notice("Source changed; paste was not applied");
-                return Task::none();
-            }
-            match content {
-                Some(text) if !text.is_empty() => {
-                    input(app, target, KeyAction::Paste, text).chain(focus(app, target.tab))
-                }
-                _ => {
-                    app.context_mode.notice("Clipboard is empty");
-                    focus(app, target.tab)
-                }
-            }
-        }
         ContextMessage::EnterAt(target, selection) => {
-            if !valid(app, target, false) || app.has_composition() || app.dialog.is_some() {
+            if !valid(app, target.clone(), false) || app.has_composition() || app.dialog.is_some() {
                 return Task::none();
             }
-            select(app, target, selection.0, selection.1);
-            enter(app, target);
+            install_pairs(app, &target, &selection);
+            enter(app, target.clone());
             focus(app, target.tab)
         }
         ContextMessage::Run(target, command) => run(app, target, command),
@@ -733,7 +1283,7 @@ fn enter(app: &mut App, target: EditorTarget) {
     }
     seal(app, target.tab);
     super::editor_history::invalidate(app);
-    if !valid(app, target, false) {
+    if !valid(app, target.clone(), false) {
         app.context_mode
             .notice("Source changed; command was not applied");
         return;
@@ -763,14 +1313,21 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         exit(app);
         return focus(app, target.tab);
     }
-    if !available(app, target, command)
-        || !valid(app, target, true)
+    if !available(app, target.clone(), command)
+        || !valid(app, target.clone(), true)
         || app.palette_open
         || app.picker.open
         || app.strip_menu.is_some()
     {
         app.context_mode
             .notice("Source changed or command unavailable; choose it again");
+        diag(
+            app,
+            target.tab,
+            EventKind::OperationRefused,
+            Outcome::Refused,
+            Some(target.selections.len() as u32),
+        );
         return Task::none();
     }
     if command == Toggle {
@@ -778,7 +1335,7 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             expected_revision,
             tab: target.tab,
         });
-        enter(app, target);
+        enter(app, target.clone());
         return focus(app, target.tab);
     }
     if command == Escape {
@@ -791,11 +1348,21 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
                 ),
             );
         }
+        let (now_ms, burst_enabled) = chart_inputs(app);
         let effects = app
             .context_mode
             .session
             .as_mut()
-            .map(|s| reduce(&mut s.state, &Event::Escape))
+            .map(|s| {
+                reduce(
+                    &mut s.state,
+                    &Event::Escape {
+                        selections: target.selections.len(),
+                    },
+                    now_ms,
+                    burst_enabled,
+                )
+            })
             .unwrap_or_default();
         let task = run_effects(app, target.tab, effects);
         return task.unwrap_or_else(|| focus(app, target.tab));
@@ -805,15 +1372,24 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
     if command != History {
         app.context_mode.history.open = false;
     }
-    if !valid(app, target, true) {
+    if !valid(app, target.clone(), true) {
         app.context_mode
             .notice("Source changed; command was not applied");
         return Task::none();
     }
-    if let Some(s) = &mut app.context_mode.session {
+    let (now_ms, burst_enabled) = chart_inputs(app);
+    let effects = if let Some(s) = &mut app.context_mode.session {
         s.menu_target = None;
-        let _ = reduce(&mut s.state, &Event::RunAdmitted(command));
-    }
+        reduce(
+            &mut s.state,
+            &Event::RunAdmitted(command),
+            now_ms,
+            burst_enabled,
+        )
+    } else {
+        Vec::new()
+    };
+    let _ = run_effects(app, target.tab, effects);
     match command {
         History => {
             return super::editor_history::handle(
@@ -835,14 +1411,12 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         }
         Paste => {
             let generation = app.context_mode.generation;
-            return iced::clipboard::read().map(move |text| {
-                Message::ContextMode(ContextMessage::PasteReady(target, generation, text))
-            });
+            return super::editor_clipboard::read_for_context_paste(target.clone(), generation);
         }
         Undo | Redo => {
             return input(
                 app,
-                target,
+                target.clone(),
                 if command == Undo {
                     KeyAction::Undo
                 } else {
@@ -857,92 +1431,251 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
     let Some(view) = app.note_editor_view(target.tab) else {
         return Task::none();
     };
-    let (anchor, head) = target.selection;
-    let (start, end) = (anchor.min(head), anchor.max(head));
     let text = &view.text;
-    let line_start = text[..head].rfind('\n').map_or(0, |i| i + 1);
-    let line_end = text[head..].find('\n').map_or(text.len(), |i| head + i);
-    let line_with_break = (line_end + usize::from(line_end < text.len())).min(text.len());
-    let mut edit = None;
-    let mut caret_after = None;
-    let mut effective_selection = None;
-    match command {
-        SelectAll => select(app, target, 0, text.len()),
-        SelectLine => select(app, target, line_start, line_with_break),
+    // Select all replaces the set whole at every N (set-aware by shape).
+    if command == SelectAll {
+        select(app, target.clone(), 0, text.len());
+        return focus(app, target.tab);
+    }
+    // Match-driven selection (FEUX-0002 X06): opens the owned query row;
+    // drafts overlay an outline set and Apply installs it (E-10/E-11).
+    if let Some(kind) = match command {
+        SelectMatches => Some(super::selection_search::ApplyKind::Select),
+        SplitSelection => Some(super::selection_search::ApplyKind::Split),
+        _ => None,
+    } {
+        return super::selection_search::handle(
+            app,
+            super::selection_search::SelectionSearchMessage::Open {
+                tab: target.tab,
+                kind,
+            },
+        );
+    }
+    // Every remaining verb is set-aware through the api translation point
+    // (FEUX-0002 X04/X05, E-1/E-6): the whole captured set rides the
+    // command. The Go-menu motions became `editor.move` per-member verbs.
+    let typing_entry = command.enters_typing();
+    let task = match command {
+        SelectAll => unreachable!("handled by the host-side whole-set select"),
+        LineStart => selections_only_task(
+            app,
+            &target,
+            "editor.move",
+            serde_json::json!({"motion": "line_start"}),
+        ),
+        LineEnd => selections_only_task(
+            app,
+            &target,
+            "editor.move",
+            serde_json::json!({"motion": "line_end"}),
+        ),
+        DocumentStart => selections_only_task(
+            app,
+            &target,
+            "editor.move",
+            serde_json::json!({"motion": "doc_start"}),
+        ),
+        DocumentEnd => selections_only_task(
+            app,
+            &target,
+            "editor.move",
+            serde_json::json!({"motion": "doc_end"}),
+        ),
+        SelectLine => {
+            selections_only_task(app, &target, "editor.select_line", serde_json::json!({}))
+        }
         SelectWord => {
-            let (a, b) = flavite_edit_context::word_bounds(text, head);
-            select(app, target, a, b);
+            selections_only_task(app, &target, "editor.select_word", serde_json::json!({}))
         }
-        Collapse => select(app, target, head, head),
-        LineStart | InsertLineStart => select(app, target, line_start, line_start),
-        LineEnd | InsertLineEnd => select(app, target, line_end, line_end),
-        DocumentStart => select(app, target, 0, 0),
-        DocumentEnd => select(app, target, text.len(), text.len()),
-        InsertStart => select(app, target, start, start),
-        InsertEnd => select(app, target, end, end),
-        OpenAbove => {
-            effective_selection = Some([line_start, line_start]);
-            edit = Some((KeyAction::Newline, String::new()));
-            caret_after = Some(line_start);
+        Collapse => selections_only_task(app, &target, "editor.collapse", serde_json::json!({})),
+        ClearSelection => selections_only_task(
+            app,
+            &target,
+            "editor.clear_selection",
+            serde_json::json!({}),
+        ),
+        KeepPrimary => {
+            selections_only_task(app, &target, "editor.keep_primary", serde_json::json!({}))
         }
-        OpenBelow => {
-            effective_selection = Some([line_end, line_end]);
-            edit = Some((KeyAction::Newline, String::new()));
-        }
-        Cut | Copy | Delete | Change => {
-            let Some(effect) = flavite_edit_context::effect::plan(text, target.selection, command)
-            else {
-                app.context_mode
-                    .notice("Selection changed; place the caret again");
-                return Task::none();
-            };
-            if !effect.range.is_empty() {
-                effective_selection = Some([effect.range.start, effect.range.end]);
-                edit = Some((
-                    match command {
-                        Cut => KeyAction::Cut,
-                        Copy => KeyAction::Copy,
-                        _ => KeyAction::Delete,
+        RotatePrimary => selections_only_task(
+            app,
+            &target,
+            "editor.rotate_primary",
+            serde_json::json!({"direction": "next"}),
+        ),
+        FlipSelections => selections_only_task(
+            app,
+            &target,
+            "editor.flip_selections",
+            serde_json::json!({}),
+        ),
+        TrimSelections => selections_only_task(
+            app,
+            &target,
+            "editor.trim_selections",
+            serde_json::json!({}),
+        ),
+        InvertSelections => selections_only_task(
+            app,
+            &target,
+            "editor.invert_selections",
+            serde_json::json!({}),
+        ),
+        AddCaretAbove | AddCaretBelow => {
+            // The rows are editor-side geometry (E-9/X05): the host computes
+            // per-member targets through the same layout the widget paints.
+            let rows = if command == AddCaretAbove { -1 } else { 1 };
+            match row_targets(app, &target, rows) {
+                Ok(positions) => selections_only_task(
+                    app,
+                    &target,
+                    if rows < 0 {
+                        "editor.add_caret_above"
+                    } else {
+                        "editor.add_caret_below"
                     },
-                    String::new(),
-                ));
-            } else if command != Change {
-                app.context_mode.notice(effect.description(command));
+                    serde_json::json!({ "positions": positions }),
+                ),
+                Err(message) => {
+                    app.context_mode.notice(message);
+                    Task::none()
+                }
             }
         }
-        Toggle | Exit | Escape | Paste | Undo | Redo | Commands | Find | Replace | History => {
+        FindChar { forward } => {
+            // E-8: entry opens the one new statechart state; the next
+            // produced character resolves it (native_key intercepts).
+            let (now_ms, burst_enabled) = chart_inputs(app);
+            if let Some(s) = &mut app.context_mode.session {
+                let _ = reduce(
+                    &mut s.state,
+                    &Event::EnterAwaitChar(flavite_edit_context::AwaitChar { forward }),
+                    now_ms,
+                    burst_enabled,
+                );
+            }
+            focus(app, target.tab)
+        }
+        InsertStart => {
+            selections_only_task(app, &target, "editor.insert_start", serde_json::json!({}))
+        }
+        InsertEnd => selections_only_task(app, &target, "editor.insert_end", serde_json::json!({})),
+        InsertLineStart => selections_only_task(
+            app,
+            &target,
+            "editor.insert_line_start",
+            serde_json::json!({}),
+        ),
+        InsertLineEnd => selections_only_task(
+            app,
+            &target,
+            "editor.insert_line_end",
+            serde_json::json!({}),
+        ),
+        OpenAbove => kernel_task(
+            app,
+            &target,
+            "editor.open_above",
+            serde_json::json!({}),
+            "Open above was refused; source changed",
+        ),
+        OpenBelow => kernel_task(
+            app,
+            &target,
+            "editor.open_below",
+            serde_json::json!({}),
+            "Open below was refused; source changed",
+        ),
+        Delete => kernel_task(
+            app,
+            &target,
+            "editor.delete",
+            serde_json::json!({"kind": "delete"}),
+            "Delete was refused; source changed",
+        ),
+        Change => kernel_task(
+            app,
+            &target,
+            "editor.change",
+            serde_json::json!({}),
+            "Change was refused; source changed",
+        ),
+        Copy => {
+            let Some(api) = &app.flavite else {
+                return Task::none();
+            };
+            let result = api.execute(Invocation::new(
+                api.command_registry().next_request_id(),
+                "editor.copy",
+                serde_json::json!({
+                    "buffer_id": target.buffer,
+                    "revision": target.revision,
+                    "selections": target.selections_json(),
+                }),
+                Origin::Gui,
+            ));
+            let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = result else {
+                app.context_mode.notice("Copy was refused; source changed");
+                return Task::none();
+            };
+            let copied = success.data["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if copied.is_empty() {
+                app.context_mode.notice("Nothing to copy on this last line");
+                return Task::none();
+            }
+            super::editor_clipboard::write(copied)
+        }
+        Cut => {
+            // Clipboard ordering (§5.5): the fragments are resolved before
+            // anything else; the clipboard write runs to completion, and
+            // only the seam's revalidated completion performs the one
+            // guarded deletion. A refused or failed write never deletes
+            // the source (E-16, AC-8).
+            let Some(api) = &app.flavite else {
+                return Task::none();
+            };
+            let result = api.execute(Invocation::new(
+                api.command_registry().next_request_id(),
+                "editor.copy",
+                serde_json::json!({
+                    "buffer_id": target.buffer,
+                    "revision": target.revision,
+                    "selections": target.selections_json(),
+                }),
+                Origin::Gui,
+            ));
+            let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = result else {
+                app.context_mode.notice("Nothing to cut on this last line");
+                return Task::none();
+            };
+            let copied = success.data["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if copied.is_empty() {
+                app.context_mode.notice("Nothing to cut on this last line");
+                return Task::none();
+            }
+            let generation = app.context_mode.generation;
+            return super::editor_clipboard::write_for_cut(target, generation, copied);
+        }
+        Toggle | Exit | Escape | Paste | Undo | Redo | Commands | Find | Replace | History
+        | SelectMatches | SplitSelection => {
             unreachable!("handled before planning")
         }
-    }
-    if command.enters_typing() {
+    };
+    if typing_entry {
         if !app.context_mode.mode(target.tab).active() {
             enter(app, target);
         }
+        let (now_ms, burst_enabled) = chart_inputs(app);
         if let Some(s) = &mut app.context_mode.session {
-            let _ = reduce(&mut s.state, &Event::EnterTyping);
+            let _ = reduce(&mut s.state, &Event::EnterTyping, now_ms, burst_enabled);
         }
     }
-    let task = edit.map_or_else(Task::none, |(action, text)| {
-        use flavite_buffer::history::EditKind;
-        let kind = match command {
-            Change => EditKind::Change,
-            OpenAbove => EditKind::OpenAbove,
-            OpenBelow => EditKind::OpenBelow,
-            Cut => EditKind::Cut,
-            _ => EditKind::Delete,
-        };
-        input_command(
-            app,
-            target,
-            action,
-            text,
-            Some(super::input::CommandIntent {
-                kind,
-                before: [anchor, head],
-                after: caret_after.map(|at| [at, at]),
-                effective_selection,
-            }),
-        )
-    });
-    task.chain(focus(app, target.tab))
+    task
 }

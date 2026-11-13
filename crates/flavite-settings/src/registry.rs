@@ -94,6 +94,17 @@ impl SettingRegistry {
                 Apply::Live,
                 false,
             ),
+            SettingDescriptor::new(
+                "editor.burst_hint_enabled",
+                "Editor",
+                "Burst Hint",
+                "Suggest exiting Context Mode after a rapid sequence of destructive actions",
+                SettingKind::Bool,
+                SettingValue::Bool(true),
+                Visibility::Visible,
+                Apply::Live,
+                false,
+            ),
             // Links settings
             SettingDescriptor::new(
                 "links.prefer_stable_links",
@@ -290,9 +301,10 @@ mod tests {
 
     #[test]
     fn test_builtins_count() {
-        // RFC-0007 D-04 specifies 16 descriptors (15 visible + 1 hidden)
+        // RFC-0007 D-04 specifies 16 descriptors (15 visible + 1 hidden);
+        // FEUX-0002 X07 adds the typed `editor.burst_hint_enabled` bool.
         let descriptors = SettingRegistry::builtins();
-        assert_eq!(descriptors.len(), 16);
+        assert_eq!(descriptors.len(), 17);
     }
 
     #[test]
@@ -322,8 +334,8 @@ mod tests {
     fn test_builtins_visible_count() {
         let registry = SettingRegistry::with_builtins();
         let visible = registry.visible();
-        // 15 visible + 1 hidden = 16 total
-        assert_eq!(visible.len(), 15);
+        // 16 visible + 1 hidden = 17 total (X07 burst-hint bool visible)
+        assert_eq!(visible.len(), 16);
     }
 
     #[test]
@@ -361,7 +373,7 @@ mod tests {
             found_ids.push(d.id);
         }
 
-        // All 16 IDs from D-04
+        // All D-04 IDs plus the X07 burst-hint bool
         let expected_ids = vec![
             "appearance.theme",
             "appearance.theme_package",
@@ -369,6 +381,7 @@ mod tests {
             "appearance.reduced_motion",
             "editor.font_size",
             "editor.line_width",
+            "editor.burst_hint_enabled",
             "links.prefer_stable_links",
             "sidebar.open",
             "sidebar.width",

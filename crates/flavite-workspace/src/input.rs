@@ -6,16 +6,19 @@
 
 use crate::ids::TabId;
 
-/// One selection in UTF-8 byte coordinates.
+/// One committed selection in UTF-8 byte coordinates: canonical *data*
+/// (directed anchor/head), never algebra. The canonical values and their
+/// merge/boundary rules live in `flavite-buffer::selection`; this record is
+/// the workspace's plain output shape (FEUX-0002 E-4, T-4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct Selection {
+pub struct CommittedSelection {
     /// Anchor end of the selection.
     pub anchor: usize,
     /// Active caret end of the selection.
     pub head: usize,
 }
 
-impl Selection {
+impl CommittedSelection {
     /// Create a selection or collapsed caret.
     #[must_use]
     pub const fn new(anchor: usize, head: usize) -> Self {
@@ -35,16 +38,6 @@ impl Selection {
     #[must_use]
     pub const fn is_caret(self) -> bool {
         self.anchor == self.head
-    }
-
-    /// Ordered byte range.
-    #[must_use]
-    pub const fn range(self) -> (usize, usize) {
-        if self.anchor <= self.head {
-            (self.anchor, self.head)
-        } else {
-            (self.head, self.anchor)
-        }
     }
 }
 
@@ -72,8 +65,19 @@ pub struct EditorInteraction {
     pub revision: u64,
     /// Monotonic interaction sequence assigned by the host.
     pub sequence: u64,
-    /// Bounded selections. The host rejects excess entries before storing.
-    pub selections: Vec<Selection>,
+    /// Monotonic version of the committed selection set. Bumped exactly once
+    /// per committed set change; captured into editor targets and revalidated
+    /// at admission even when the revision is unchanged (FEUX-0002 E-5).
+    pub selection_version: u64,
+    /// Bounded selections in canonical order (canonical output; the algebra
+    /// lives in `flavite-buffer::selection`).
+    pub selections: Vec<CommittedSelection>,
+    /// Index into `selections` of the primary member. Canonical order and
+    /// "primary first" cannot both be implicit, so the primary is explicit
+    /// committed data (FEUX-0002 E-4/FR-4): `rotate_primary` changes it, and
+    /// every set-bearing handoff (targets, receipts, widget resync) carries
+    /// it.
+    pub primary: usize,
     /// First visible text byte used to restore the viewport after reparenting.
     pub viewport_anchor: usize,
     /// Composition is transient but visible to layout admission.
@@ -92,7 +96,9 @@ impl EditorInteraction {
             buffer_id: None,
             revision: 0,
             sequence: 0,
-            selections: vec![Selection::caret(0)],
+            selection_version: 0,
+            selections: vec![CommittedSelection::caret(0)],
+            primary: 0,
             viewport_anchor: 0,
             composition: CompositionState::Idle,
             focused: false,
@@ -103,7 +109,7 @@ impl EditorInteraction {
     ///
     /// # Errors
     /// Returns an error when the acknowledgement belongs to a replaced view,
-    /// has an invalid selection count, or contains an out-of-range byte offset.
+    /// has an empty selection set, or contains an out-of-range byte offset.
     pub fn validate(
         &self,
         tab: TabId,
@@ -113,8 +119,11 @@ impl EditorInteraction {
         if self.tab != tab || self.incarnation != incarnation {
             return Err("interaction belongs to a replaced view");
         }
-        if self.selections.is_empty() || self.selections.len() > 256 {
-            return Err("interaction must contain 1..=256 selections");
+        if self.selections.is_empty() {
+            return Err("interaction must contain at least one selection");
+        }
+        if self.primary >= self.selections.len() {
+            return Err("interaction primary selection is out of range");
         }
         if self.viewport_anchor > text_len
             || self
@@ -124,6 +133,18 @@ impl EditorInteraction {
         {
             return Err("interaction byte position is outside the current text");
         }
+        // Canonical-order invariant (debug builds): sorted by span, non-
+        // overlapping. The algebra is not re-implemented here; this only
+        // verifies the committed shape (FEUX-0002 E-4/FR-5).
+        debug_assert!(
+            self.selections.windows(2).all(|pair| {
+                let (a, b) = (&pair[0], &pair[1]);
+                let a_span = (a.anchor.min(a.head), a.anchor.max(a.head));
+                let b_span = (b.anchor.min(b.head), b.anchor.max(b.head));
+                a_span < b_span && a_span.1 <= b_span.0
+            }),
+            "committed selections must be canonically ordered"
+        );
         Ok(())
     }
 }
@@ -146,10 +167,9 @@ mod tests {
 
     #[test]
     fn selection_range_is_ordered_and_caret_is_collapsed() {
-        let selection = Selection::new(9, 3);
-        assert_eq!(selection.range(), (3, 9));
+        let selection = CommittedSelection::new(9, 3);
         assert!(!selection.is_caret());
-        assert!(Selection::caret(4).is_caret());
+        assert!(CommittedSelection::caret(4).is_caret());
     }
 
     #[test]
@@ -161,7 +181,7 @@ mod tests {
             state.validate(tab, 3, 10),
             Err("interaction belongs to a replaced view")
         );
-        state.selections[0] = Selection::caret(11);
+        state.selections[0] = CommittedSelection::caret(11);
         assert_eq!(
             state.validate(tab, 2, 10),
             Err("interaction byte position is outside the current text")

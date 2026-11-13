@@ -281,7 +281,7 @@ mod tests {
         let mut interaction = crate::input::EditorInteraction::new(tab, 1);
         interaction.sequence = 1;
         interaction.focused = true;
-        interaction.selections = vec![crate::input::Selection::caret(0)];
+        interaction.selections = vec![crate::input::CommittedSelection::caret(0)];
         interaction.buffer_id = Some(1);
         interaction.revision = 1;
         state

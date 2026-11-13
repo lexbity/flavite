@@ -561,7 +561,7 @@ impl WorkspaceState {
     /// invalid for the current text, or a focused caret has no buffer identity.
     pub fn acknowledge_interaction(
         &mut self,
-        interaction: crate::input::EditorInteraction,
+        mut interaction: crate::input::EditorInteraction,
         text: &str,
     ) -> Result<(), &'static str> {
         let tab = interaction.tab;
@@ -583,6 +583,22 @@ impl WorkspaceState {
         if interaction.revision < current.interaction().revision {
             return Err("interaction revision is stale");
         }
+        // The committed-selection version is owned here: bumped exactly once
+        // per committed set change (FEUX-0002 E-5, §5.6) — receipts,
+        // pointer commits, passive movement mappings, and selection-only
+        // commands all land through this acknowledgement, while
+        // sequence-only updates (focus, scroll) leave it untouched. The
+        // primary member is part of the committed set: rotate_primary
+        // changes it and bumps the version even when every pair is
+        // unchanged.
+        interaction.selection_version =
+            current
+                .interaction()
+                .selection_version
+                .wrapping_add(u64::from(
+                    interaction.selections != current.interaction().selections
+                        || interaction.primary != current.interaction().primary,
+                ));
         let focused = interaction.focused;
         // Blur/scroll acknowledgements may advance the interaction sequence
         // without changing the remembered caret. Preserve existing authority
@@ -597,7 +613,9 @@ impl WorkspaceState {
                     && target.interaction_sequence == current.interaction().sequence
                     && interaction.composition == crate::input::CompositionState::Idle
                     && interaction.selections
-                        == [crate::input::Selection::caret(target.caret_text_byte)]
+                        == [crate::input::CommittedSelection::caret(
+                            target.caret_text_byte,
+                        )]
             })
             .map(|mut target| {
                 target.interaction_sequence = interaction.sequence;
@@ -675,7 +693,7 @@ impl WorkspaceState {
             .sequence
             .checked_add(1)
             .ok_or("interaction sequence exhausted")?;
-        next.selections = vec![crate::input::Selection::caret(caret)];
+        next.selections = vec![crate::input::CommittedSelection::caret(caret)];
         let sequence = next.sequence;
         view.set_interaction(next);
         self.writing_target = Some(crate::input::WritingTarget {
@@ -813,7 +831,10 @@ impl WorkspaceState {
                 && Some(target.buffer_id) == interaction.buffer_id
                 && target.revision == interaction.revision
                 && target.interaction_sequence == previous_sequence
-                && interaction.selections == [crate::Selection::caret(target.caret_text_byte)]
+                && interaction.selections
+                    == [crate::input::CommittedSelection::caret(
+                        target.caret_text_byte,
+                    )]
             {
                 target.interaction_sequence = interaction.sequence;
             } else {
@@ -842,7 +863,7 @@ impl WorkspaceState {
         self.set_content_anchor(tab, start, text)?;
         let session = self.tabs.get_mut(&tab).ok_or("Missing view")?;
         let mut interaction = session.interaction().clone();
-        interaction.selections = vec![crate::Selection::new(start, end)];
+        interaction.selections = vec![crate::input::CommittedSelection::new(start, end)];
         interaction.revision = revision;
         session.set_interaction(interaction);
         if self.writing_target.is_some_and(|target| target.tab == tab) {

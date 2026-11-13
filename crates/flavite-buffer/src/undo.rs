@@ -13,6 +13,7 @@ use crate::history::{
     PAGE_LIMIT, TRAIL_LIMIT,
 };
 use crate::revision::Revision;
+use crate::selection::SpanEdit;
 use flavite_syntax::text::{Span, TextByte, TextSnapshot};
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,28 @@ pub(crate) fn wall_clock_ms() -> u64 {
         .ok()
         .and_then(|time| u64::try_from(time.as_millis()).ok())
         .unwrap_or(0)
+}
+
+/// Shift a byte offset by a signed length delta, saturating at zero.
+fn shift_usize(position: usize, delta: isize) -> usize {
+    if delta >= 0 {
+        position.saturating_add(delta as usize)
+    } else {
+        position.saturating_sub((-delta) as usize)
+    }
+}
+
+/// The accounted bytes of one retained node (budget.rs `account_node` over
+/// the node's own state; shared by `reaccount` and the reservation
+/// feasibility plan).
+fn node_accounted_bytes(node: &UndoNode) -> u64 {
+    let snapshot_len = node.snapshot.as_ref().map_or(0, |s| s.text().len());
+    let replacement_len = node.edit.as_ref().map_or(0, |e| e.replacement.len());
+    let (before, after) = match &node.editor {
+        Some(record) => (&record.before[..], &record.after[..]),
+        None => (&[][..], &[][..]),
+    };
+    crate::budget::account_node(snapshot_len, replacement_len, before, after)
 }
 /// Default time window for coalescing consecutive edits into a single undo group.
 ///
@@ -160,6 +183,14 @@ pub struct UndoNode {
     pub version: u64,
     pub editor: Option<EditorEdit>,
     pub kind: EditKind,
+    /// The original per-op batch geometry (E-13): when this node's edit is a
+    /// collapsed batch (several disjoint ops installed as one combined
+    /// edit), the ordered original spans are retained in pre-change
+    /// coordinates so undo/redo/restore movement maps carets in unchanged
+    /// gaps exactly instead of treating them as replacement-interior points.
+    /// `None` for single edits and for coalesced merges (whose edit is
+    /// recomputed from the before/after diff and is already exact).
+    pub batch_spans: Option<Vec<SpanEdit>>,
     /// Unique identifier for this node.
     pub id: u64,
     /// Whether this node was evicted to satisfy a history budget. Evicted
@@ -191,6 +222,7 @@ impl UndoNode {
             version: 1,
             editor: None,
             kind: EditKind::Edit,
+            batch_spans: None,
             id: 0,
             evicted: false,
             revision,
@@ -216,6 +248,7 @@ impl UndoNode {
             version: 1,
             editor: None,
             kind: EditKind::Edit,
+            batch_spans: None,
             id,
             evicted: false,
             revision,
@@ -357,6 +390,136 @@ impl UndoTree {
             .rev()
             .copied()
             .find(|id| self.get(*id).is_some_and(|node| !node.evicted))
+    }
+
+    /// The ordered movement spans for one transition from `from` to `to`
+    /// (both surviving node ids), expressed in the coordinates of the text
+    /// before each step. Up-steps (child → parent) contribute the inverse of
+    /// the child's edit; down-steps contribute the child's forward edit.
+    /// Returns `(spans, truncated)`: `truncated` is true when the transition
+    /// crosses an evicted chain link (edits unavailable) or exceeds
+    /// [`crate::history::MAX_MOVEMENT_SPANS`] — passive views must clamp
+    /// instead of guessing (FEUX-0002 E-13).
+    pub fn transition_spans(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> (Vec<crate::history::MovementSpan>, bool) {
+        use crate::history::MovementSpan;
+        // Ancestor set of `to`.
+        let mut ancestors = std::collections::HashSet::new();
+        let mut node = Some(to);
+        while let Some(id) = node {
+            ancestors.insert(id);
+            node = self.get(id).and_then(|n| n.parent_id);
+        }
+        // Climb from `from` to the LCA.
+        let mut up: Vec<u64> = Vec::new();
+        let mut current = from;
+        let mut lca = None;
+        while let Some(id) = Some(current) {
+            if ancestors.contains(&id) {
+                lca = Some(id);
+                break;
+            }
+            let Some(parent) = self.get(id).and_then(|n| n.parent_id) else {
+                return (Vec::new(), true);
+            };
+            up.push(id);
+            current = parent;
+        }
+        let Some(lca) = lca else {
+            return (Vec::new(), true);
+        };
+        // Descend from the LCA to `to`.
+        let mut down: Vec<u64> = Vec::new();
+        let mut current = lca;
+        while current != to {
+            let Some(child) = self.get(current).and_then(|n| {
+                n.children.iter().copied().find(|c| {
+                    self.get(*c).is_some_and(|cnode| {
+                        !cnode.evicted && {
+                            let mut a = Some(*c);
+                            while let Some(x) = a {
+                                if x == to {
+                                    return true;
+                                }
+                                a = self.get(x).and_then(|n| n.parent_id);
+                            }
+                            false
+                        }
+                    })
+                })
+            }) else {
+                return (Vec::new(), true);
+            };
+            down.push(child);
+            current = child;
+        }
+        let mut spans = Vec::with_capacity(up.len() + down.len());
+        for id in up {
+            let Some(node) = self.get(id) else {
+                return (Vec::new(), true);
+            };
+            // Up-step (child → parent): the inverse of the child's edit. A
+            // collapsed batch inverts per original op (each expressed in the
+            // node's after-frame), so carets in unchanged gaps map exactly
+            // instead of collapsing onto the combined replacement's edge
+            // (FEUX-0002 E-13 / FR-18).
+            if let Some(batch) = &node.batch_spans {
+                let mut shift: isize = 0;
+                for span in batch {
+                    let start = shift_usize(span.start, shift);
+                    spans.push(MovementSpan {
+                        start,
+                        end: start + span.replacement_len,
+                        replacement_len: span.end - span.start,
+                    });
+                    shift += span.replacement_len as isize - (span.end - span.start) as isize;
+                }
+                continue;
+            }
+            let Some(edit) = &node.edit else {
+                return (Vec::new(), true);
+            };
+            // Inverse: {start, start + replacement_len, end - start}.
+            let len = edit.replacement.len();
+            spans.push(MovementSpan {
+                start: edit.range.start.0,
+                end: edit.range.start.0 + len,
+                replacement_len: edit.range.end.0 - edit.range.start.0,
+            });
+        }
+        for id in down {
+            let Some(node) = self.get(id) else {
+                return (Vec::new(), true);
+            };
+            // Down-step (parent → child): the forward edit. A collapsed
+            // batch contributes its original per-op spans, which are
+            // ascending and non-overlapping in the parent's frame.
+            if let Some(batch) = &node.batch_spans {
+                for span in batch {
+                    spans.push(MovementSpan {
+                        start: span.start,
+                        end: span.end,
+                        replacement_len: span.replacement_len,
+                    });
+                }
+                continue;
+            }
+            let Some(edit) = &node.edit else {
+                return (Vec::new(), true);
+            };
+            spans.push(MovementSpan {
+                start: edit.range.start.0,
+                end: edit.range.end.0,
+                replacement_len: edit.replacement.len(),
+            });
+        }
+        if spans.len() > crate::history::MAX_MOVEMENT_SPANS {
+            return (Vec::new(), true);
+        }
+        (spans, false)
     }
 
     /// Apply an edit and advance the tree.
@@ -585,13 +748,18 @@ impl UndoTree {
     }
 
     /// Install an editor edit and its source-free history record together.
+    /// `spans` is the original batch geometry (E-13); it rides only a fresh
+    /// node — a coalesced install recomputed its edit from the before/after
+    /// diff, which is already exact.
     pub fn apply_recorded(
         &mut self,
         edit: EditOp,
         snapshot: TextSnapshot,
         policy: UndoPolicy,
         record: EditorEdit,
+        spans: &[SpanEdit],
     ) -> Revision {
+        let node_before = self.next_id;
         if self
             .position()
             .and_then(|n| n.editor.as_ref())
@@ -609,9 +777,11 @@ impl UndoTree {
                 self.apply_with_coalescing(edit, snapshot, true, false)
             }
         };
+        self.install_batch_spans(node_before, spans);
         let node = &mut self.nodes[self.position_id as usize];
         if let Some(previous) = &mut node.editor {
             previous.after = record.after;
+            previous.primary = record.primary;
         } else {
             node.kind = record.kind;
             node.editor = Some(record);
@@ -619,6 +789,49 @@ impl UndoTree {
         self.reaccount();
         self.auto_evict_if_over_budget(wall_clock_ms());
         revision
+    }
+
+    /// Install one prepared batch under `policy`, retaining the original
+    /// per-op geometry on a fresh node (E-13).
+    pub fn apply_batch(
+        &mut self,
+        edit: EditOp,
+        snapshot: TextSnapshot,
+        policy: UndoPolicy,
+        spans: &[SpanEdit],
+    ) -> Revision {
+        let node_before = self.next_id;
+        let revision = match policy {
+            UndoPolicy::Isolated => self.apply_boundary(edit, snapshot),
+            UndoPolicy::Context { origin } => {
+                // Unannotated batches cannot extend a recorded editor
+                // operation (same guard as `apply_context`).
+                if self.position().is_some_and(|node| node.editor.is_some()) {
+                    self.seal_current();
+                }
+                self.apply_context_inner(edit, snapshot, origin)
+            }
+            UndoPolicy::Typing => {
+                if self.context_origin.is_some() {
+                    self.seal_current();
+                }
+                self.apply_with_coalescing(edit, snapshot, true, false)
+            }
+        };
+        self.install_batch_spans(node_before, spans);
+        revision
+    }
+
+    /// Retain the batch geometry when the install created a fresh node. A
+    /// single-span batch is already the node's own edit; a coalesced install
+    /// must never inherit stale geometry.
+    fn install_batch_spans(&mut self, node_before: u64, spans: &[SpanEdit]) {
+        if self.next_id != node_before
+            && spans.len() > 1
+            && let Some(node) = self.nodes.get_mut(self.position_id as usize)
+        {
+            node.batch_spans = Some(spans.to_vec());
+        }
     }
 
     fn segment(&self, id: u64) -> Option<u64> {
@@ -742,21 +955,27 @@ impl UndoTree {
     }
 
     #[must_use]
-    pub fn position_selections(&self) -> Option<Vec<[usize; 2]>> {
+    pub fn position_selections(&self) -> Option<Vec<[usize; 3]>> {
         let node = self.position()?;
         if node.is_root() {
-            Some(vec![[0, 0]])
+            Some(vec![[0, 0, 0]])
         } else {
             node.editor.as_ref().map(|record| record.after.clone())
         }
     }
 
     #[must_use]
-    pub fn undo_selections(&self) -> Option<Vec<[usize; 2]>> {
+    pub fn undo_selections(&self) -> Option<Vec<[usize; 3]>> {
         self.position()?
             .editor
             .as_ref()
             .map(|record| record.before.clone())
+    }
+
+    /// The current tree position (node id).
+    #[must_use]
+    pub fn position_id(&self) -> u64 {
+        self.position_id
     }
     /// Get the preferred redo tip's revision, not the live buffer revision.
     #[must_use]
@@ -931,13 +1150,7 @@ impl UndoTree {
                 continue;
             }
             watermark = watermark.min(node.id);
-            let snapshot_len = node.snapshot.as_ref().map_or(0, |s| s.text().len());
-            let replacement_len = node.edit.as_ref().map_or(0, |e| e.replacement.len());
-            let (before, after) = match &node.editor {
-                Some(record) => (&record.before[..], &record.after[..]),
-                None => (&[][..], &[][..]),
-            };
-            bytes += crate::budget::account_node(snapshot_len, replacement_len, before, after);
+            bytes += node_accounted_bytes(node);
         }
         self.accounted_bytes = bytes;
         self.retained_watermark = if watermark == u64::MAX {
@@ -961,7 +1174,10 @@ impl UndoTree {
 
     /// Reserve `projected` bytes for one new node against the budget,
     /// evicting deterministically to make room when needed. Refusal is
-    /// complete and precedes any mutation.
+    /// complete and precedes any mutation: an infeasible reservation is
+    /// detected *before* any eviction is committed, so a refused edit
+    /// leaves the existing history graph byte-identical (X01 zero-effect
+    /// refusal, FR-17/FR-22).
     pub fn reserve(&mut self, projected: u64, now_ms: u64) -> Result<Lease, LimitExceeded> {
         self.expire_leases(now_ms);
         let fits = |tree: &Self| {
@@ -969,6 +1185,12 @@ impl UndoTree {
             tree.accounted_bytes + pending + projected <= tree.budget.max_bytes
                 && (tree.survivor_count() as u64) < tree.budget.max_nodes
         };
+        if !fits(self) && !self.reservation_feasible(projected, now_ms) {
+            return Err(LimitExceeded {
+                needed: projected,
+                budget: self.budget.max_bytes,
+            });
+        }
         if !fits(self) {
             self.evict_to_fit(projected, now_ms);
         }
@@ -988,6 +1210,43 @@ impl UndoTree {
                 budget: self.budget.max_bytes,
             })
         }
+    }
+
+    /// Whether an eviction plan that fits `projected` exists at all. The
+    /// deterministic pass can eventually evict every survivor except the
+    /// current node and live restore-target protections, so the plan exists
+    /// exactly when evicting that maximal set would fit. Pure: no mutation.
+    fn reservation_feasible(&self, projected: u64, now_ms: u64) -> bool {
+        let pending: u64 = self.reservations.iter().map(|r| r.projected).sum();
+        let mut floor_bytes = 0u64;
+        let mut floor_nodes = 0u64;
+        for node in &self.nodes {
+            if node.evicted {
+                continue;
+            }
+            let protected = node.id == self.position_id
+                || self
+                    .reservations
+                    .iter()
+                    .any(|r| r.lease_until_ms > now_ms && r.target == Some(node.id));
+            if protected {
+                floor_nodes += 1;
+                floor_bytes += node_accounted_bytes(node);
+            }
+        }
+        let freeable_bytes = self.accounted_bytes.saturating_sub(floor_bytes);
+        let removable_nodes = u64::try_from(self.survivor_count())
+            .unwrap_or(u64::MAX)
+            .saturating_sub(floor_nodes);
+        self.accounted_bytes
+            .saturating_sub(freeable_bytes)
+            .saturating_add(pending)
+            .saturating_add(projected)
+            <= self.budget.max_bytes
+            && u64::try_from(self.survivor_count())
+                .unwrap_or(u64::MAX)
+                .saturating_sub(removable_nodes)
+                < self.budget.max_nodes
     }
 
     /// Release a byte reservation after its install completed.
@@ -1135,6 +1394,7 @@ impl UndoTree {
             node.snapshot = None;
             node.editor = None;
             node.edit = None;
+            node.batch_spans = None;
             node.children.clear();
         }
     }

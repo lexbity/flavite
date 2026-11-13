@@ -89,11 +89,12 @@ pub struct EvictionReport {
     pub freed_bytes: u64,
 }
 
-/// Recorded selection-set bytes: each `[usize; 2]` member costs its two
-/// 8-byte endpoints plus 8 bytes of fixed per-selection metadata (E-12).
+/// Recorded selection-set bytes: each `[usize; 3]` member (`[id, anchor,
+/// head]`) costs its three 8-byte fields plus 8 bytes of fixed per-selection
+/// metadata (FEUX-0002 E-12).
 #[must_use]
-pub fn selection_bytes(selections: &[[usize; 2]]) -> u64 {
-    selections.len() as u64 * (2 * 8 + 8)
+pub fn selection_bytes(selections: &[[usize; 3]]) -> u64 {
+    selections.len() as u64 * (3 * 8 + 8)
 }
 
 /// Account one retained node: fixed metadata + the node's own snapshot text
@@ -103,8 +104,8 @@ pub fn selection_bytes(selections: &[[usize; 2]]) -> u64 {
 pub fn account_node(
     snapshot_text_len: usize,
     replacement_len: usize,
-    before: &[[usize; 2]],
-    after: &[[usize; 2]],
+    before: &[[usize; 3]],
+    after: &[[usize; 3]],
 ) -> u64 {
     METADATA_BYTES_PER_NODE
         + snapshot_text_len as u64

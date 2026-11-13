@@ -50,6 +50,7 @@ pub enum KeyCode {
     KeyC,
     KeyD,
     KeyE,
+    KeyF,
     KeyG,
     KeyH,
     KeyI,
@@ -78,4 +79,5 @@ pub enum Motion {
     Down,
     NextWord,
     PreviousWord,
+    NextWordEnd,
 }

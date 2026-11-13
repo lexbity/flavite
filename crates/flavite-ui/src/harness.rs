@@ -263,12 +263,31 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                             "pending": replace.pending.is_some(),
                             "error": replace.last_error,
                         })),
+                        "selection_search": app.selection_search.tabs.get(tab).map(|search|serde_json::json!({
+                            "kind": match search.kind {
+                                crate::host::selection_search::ApplyKind::Select => "select",
+                                crate::host::selection_search::ApplyKind::Split => "split",
+                            },
+                            "query": search.query,
+                            "regex": search.regex,
+                            "case_sensitive": search.case_sensitive,
+                            "pending": search.pending.is_some(),
+                            "overlay_matches": search.overlay.as_ref().map_or(0, |overlay| overlay.spans.len()),
+                            "total_matches": search.overlay.as_ref().map_or(0, |overlay| overlay.total_matches),
+                            "zero_width": search.overlay.as_ref().map_or(0, |overlay| overlay.zero_width_count),
+                            "error": search.error,
+                        })),
                         "viewport_anchor": interaction.viewport_anchor,
                         "active": *tab == state.active(),
                         "buffer": buffer_view.as_ref().map(|view| view.buffer_id),
                         "revision": buffer_view.as_ref().map(|view| view.revision),
                         "buffer_text": buffer_view.as_ref().map(|view| view.text.to_string()),
-                        "selection": interaction.selections.first().map(|selection| [selection.anchor, selection.head]),
+                        "selection_count": interaction.selections.len(),
+                        "selections": interaction
+                            .selections
+                            .iter()
+                            .map(|selection| [selection.anchor, selection.head])
+                            .collect::<Vec<_>>(),
                         "editor_bounds": app.editor_bounds.get(tab).map(|r| [r.x,r.y,r.width,r.height]),
                         "incarnation": interaction.incarnation,
                         "interaction_focused": interaction.focused,
@@ -390,6 +409,11 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
             "bounds":app.context_mode.bounds.iter().filter(|((tab,_),_)|*tab==session.tab)
                 .map(|((_,name),r)|(*name,[r.x,r.y,r.width,r.height])).collect::<std::collections::BTreeMap<_,_>>()
         })),
+        "diagnostics": serde_json::json!({
+            "burst_hint": app.diagnostics.burst_hint,
+            "events": app.diagnostics.event_count(),
+            "dropped": app.diagnostics.dropped(),
+        }),
         "document_anchor": app.workspace.document_anchor().map(|tab| tab.to_string()),
         "writing_target": writing_target,
         "graph_service": graph_service,

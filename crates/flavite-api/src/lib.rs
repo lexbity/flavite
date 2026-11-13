@@ -27,6 +27,7 @@ pub mod capability;
 pub mod command;
 pub mod doctor;
 pub mod documents;
+pub mod editor_commands;
 pub mod event;
 pub mod flavite;
 pub mod graph_mirror;

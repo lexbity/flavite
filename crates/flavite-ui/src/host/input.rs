@@ -8,7 +8,7 @@ use flavite_editor::{
     input::{CapturedInput, PreparedInput},
     keymap::KeyAction,
 };
-use flavite_workspace::{CompositionState, Selection, TabId};
+use flavite_workspace::{CommittedSelection, CompositionState, TabId};
 #[derive(Debug)]
 pub struct InputChain {
     incarnation: u64,
@@ -17,6 +17,32 @@ pub struct InputChain {
     revision: u64,
     sequence: u64,
     preferred_x: Option<f32>,
+}
+
+impl InputChain {
+    /// Construct one chain entry (host/context-mode shared path).
+    pub(crate) fn new(
+        incarnation: u64,
+        buffer: u64,
+        base: u64,
+        revision: u64,
+        sequence: u64,
+        preferred_x: Option<f32>,
+    ) -> Self {
+        Self {
+            incarnation,
+            buffer,
+            base,
+            revision,
+            sequence,
+            preferred_x,
+        }
+    }
+
+    /// The chain base revision.
+    pub(crate) const fn base(&self) -> u64 {
+        self.base
+    }
 }
 
 /// Native event sequence and host interaction sequence are separate: one
@@ -39,7 +65,7 @@ fn context_chain(
         let current = super::context_mode::EditorTarget::capture(app, tab);
         chain.target.tab == tab
             && chain.target.incarnation == incarnation
-            && current == Some(chain.target)
+            && current.as_ref() == Some(&chain.target)
             && chain.target.buffer == request.buffer
             && request.revision >= chain.base
             && request.revision <= chain.target.revision
@@ -141,26 +167,7 @@ pub fn handle(
     incarnation: u64,
     input: CapturedInput,
 ) -> iced::Task<Message> {
-    handle_inner(app, tab, incarnation, input, false, None)
-}
-
-/// A toolbar verb plans an effective range without publishing a speculative
-/// selection. Its history records the actual committed before-selection.
-pub struct CommandIntent {
-    pub kind: flavite_buffer::history::EditKind,
-    pub before: [usize; 2],
-    pub after: Option<[usize; 2]>,
-    pub effective_selection: Option<[usize; 2]>,
-}
-
-pub fn handle_command(
-    app: &mut App,
-    tab: TabId,
-    incarnation: u64,
-    input: CapturedInput,
-    intent: CommandIntent,
-) -> iced::Task<Message> {
-    handle_inner(app, tab, incarnation, input, false, Some(intent))
+    handle_inner(app, tab, incarnation, input, false)
 }
 
 pub fn commit_composition(
@@ -180,7 +187,7 @@ pub fn commit_composition(
         .interaction()
         .sequence
         .saturating_add(1);
-    handle_inner(app, target.tab, target.incarnation, input, true, None)
+    handle_inner(app, target.tab, target.incarnation, input, true)
 }
 
 fn handle_inner(
@@ -189,7 +196,6 @@ fn handle_inner(
     incarnation: u64,
     mut input: CapturedInput,
     composition_commit: bool,
-    command_intent: Option<CommandIntent>,
 ) -> iced::Task<Message> {
     if super::context_mode::too_narrow(app, tab) {
         app.context_mode
@@ -225,10 +231,13 @@ fn handle_inner(
     let Some(view) = app.note_editor_view(tab) else {
         return iced::Task::none();
     };
-    let Some(session) = app.workspace.tab(&tab) else {
-        return iced::Task::none();
+    let interaction = {
+        let Some(session) = app.workspace.tab(&tab) else {
+            return iced::Task::none();
+        };
+        session.interaction().clone()
     };
-    let mut interaction = session.interaction().clone();
+    let mut interaction = interaction;
     let own_chain = app.input_chains.get(&tab).is_some_and(|chain| {
         chain.incarnation == incarnation
             && chain.buffer == input.buffer
@@ -249,7 +258,6 @@ fn handle_inner(
     if composition_commit {
         interaction.composition = CompositionState::Idle;
     }
-    let selection = interaction.selections.first().copied().unwrap_or_default();
     if matches!(
         input.action,
         KeyAction::Previous
@@ -266,23 +274,70 @@ fn handle_inner(
     ) {
         super::context_mode::selection_changed(app, tab);
     }
-    if let Some(motion) = input.vertical.as_mut() {
-        // Geometry is captured by the widget, but the sticky column belongs
-        // to the acknowledged input chain. A preceding Home/Left/edit may
-        // not have redrawn yet, so the widget's old caret is not authority.
-        motion.preferred_x = app
+    if let Some(sticky) = input.preferred_x.get_mut(0) {
+        // Geometry is captured by the widget, but the primary member's
+        // sticky column belongs to the acknowledged input chain. A
+        // preceding Home/Left/edit may not have redrawn yet, so the
+        // widget's old caret is not authority. Other members keep their
+        // captured columns (X04 per-member geometry).
+        let chained = app
             .input_chains
             .get(&tab)
-            .filter(|chain| own_chain && chain.sequence == interaction.sequence)
-            .and_then(|chain| chain.preferred_x);
+            .filter(|_| own_chain && app.input_chains[&tab].sequence == interaction.sequence);
+        if let Some(chain) = chained {
+            *sticky = chain.preferred_x;
+        }
     }
-    let effective = command_intent
-        .as_ref()
-        .and_then(|intent| intent.effective_selection)
-        .map_or((selection.anchor, selection.head), |[anchor, head]| {
-            (anchor, head)
-        });
-    let prepared = match flavite_editor::input::prepare(&view, effective, &input) {
+    // A paste reads at the clipboard seam: the intent parks here and
+    // resumes through ClipboardMessage::TypingPaste with the text (X04).
+    // A resumed intent carries its acquired text and proceeds directly
+    // (FR-8/FR-9): acquisition and completed paste are distinct stages.
+    if input.action == KeyAction::Paste && !input.clipboard_acquired {
+        return super::editor_clipboard::read_for_typing(tab, incarnation, input);
+    }
+    // The whole committed set plans the action (FEUX-0002 X04, E-6).
+    let committed: Vec<flavite_buffer::selection::RawSelection> = interaction
+        .selections
+        .iter()
+        .enumerate()
+        .map(|(id, selection)| flavite_buffer::selection::RawSelection {
+            id: Some(id as u32),
+            anchor: selection.anchor,
+            head: selection.head,
+        })
+        .collect();
+    let Ok((set, _)) = flavite_buffer::selection::SelectionSet::normalize(
+        &view.text,
+        committed,
+        Some(
+            interaction
+                .primary
+                .min(interaction.selections.len().saturating_sub(1)) as u32,
+        ),
+    ) else {
+        app.input_chains.remove(&tab);
+        app.status = "Selection changed; place the caret before continuing".into();
+        return iced::Task::none();
+    };
+    // FR-20: an IME commit joins Typing at the primary caret only; the
+    // other members are retained and mapped through the same batch.
+    let planning_set = if composition_commit {
+        let primary = set.primary();
+        flavite_buffer::selection::SelectionSet::normalize(
+            &view.text,
+            vec![flavite_buffer::selection::RawSelection {
+                id: Some(primary.id().as_raw()),
+                anchor: primary.anchor(),
+                head: primary.head(),
+            }],
+            Some(primary.id().as_raw()),
+        )
+        .map(|(planning, _)| planning)
+        .unwrap_or_else(|_| set.clone())
+    } else {
+        set.clone()
+    };
+    let prepared = match flavite_editor::input::prepare(&view, &planning_set, &input) {
         Ok(prepared) => prepared,
         Err(message) => {
             app.status = message.into();
@@ -292,45 +347,93 @@ fn handle_inner(
     let mut clipboard = None;
     let mut mutation = None;
     let mut history = false;
-    let mut preferred_x = None;
+    let mut preferred_x: Option<f32> = None;
+    let mut primary = 0usize;
+    // The recorded before-set is the committed set at capture time (before
+    // any optimistic after-set replaces it) — FEUX-0002 FR-19/E-4.
+    let before_members = interaction.selections.clone();
+    let mut after_members: Option<Vec<(usize, usize)>> = None;
     match prepared {
         PreparedInput::Edit {
             action,
-            caret,
+            members,
+            primary: prepared_primary,
             clipboard: copied,
         } => {
+            let members = if composition_commit {
+                let edits = action
+                    .as_edit()
+                    .map(|(_, _, edits)| edits)
+                    .unwrap_or_default();
+                match composition_after_set(&view.text, &set, &members, edits) {
+                    Some((after, primary_index)) => {
+                        primary = primary_index;
+                        after
+                    }
+                    None => {
+                        primary = prepared_primary;
+                        members
+                    }
+                }
+            } else {
+                primary = prepared_primary;
+                members
+            };
             mutation = Some(action);
-            interaction.selections = vec![Selection::caret(caret)];
-            if let Some(after) = command_intent.as_ref().and_then(|intent| intent.after) {
-                interaction.selections = vec![Selection::new(after[0], after[1])];
-            }
+            after_members = Some(members.clone());
+            interaction.selections = members
+                .iter()
+                .map(|&(anchor, head)| CommittedSelection::new(anchor, head))
+                .collect();
+            interaction.primary = primary;
             clipboard = copied;
         }
         PreparedInput::History(action) => {
             mutation = Some(action);
             history = true;
         }
-        PreparedInput::Selection { anchor, head } => {
-            interaction.selections = vec![Selection::new(anchor, head)]
+        PreparedInput::Selection {
+            members,
+            primary: prepared_primary,
+        } => {
+            primary = prepared_primary;
+            interaction.selections = members
+                .iter()
+                .map(|&(anchor, head)| CommittedSelection::new(anchor, head))
+                .collect();
+            interaction.primary = primary;
         }
         PreparedInput::VerticalSelection {
-            anchor,
-            head,
-            preferred_x: x,
+            members,
+            primary: prepared_primary,
+            preferred_x: columns,
         } => {
-            interaction.selections = vec![Selection::new(anchor, head)];
-            preferred_x = Some(x);
+            primary = prepared_primary;
+            interaction.selections = members
+                .iter()
+                .map(|&(anchor, head)| CommittedSelection::new(anchor, head))
+                .collect();
+            interaction.primary = primary;
+            preferred_x = columns.first().copied().flatten();
         }
-        PreparedInput::Copy(copied) => clipboard = Some(copied),
+        PreparedInput::Copy { text } => clipboard = Some(text),
     }
     if let Some(action) = mutation {
-        let edit_change = action.as_edit().and_then(|(_, _, edits)| {
-            (edits.len() == 1).then(|| flavite_buffer::history::HistoryChange {
-                start: edits[0].range.start.0,
-                end: edits[0].range.end.0,
-                inserted: edits[0].replacement.len(),
-            })
-        });
+        // §5.5 clipboard ordering for the ordinary cut: the clipboard write
+        // completes before the guarded deletion, which resumes through
+        // ClipboardMessage::CutCompleted with the same captured intent.
+        if input.action == KeyAction::Cut
+            && !input.clipboard_acquired
+            && clipboard.as_deref().is_some_and(|text| !text.is_empty())
+        {
+            let cut_text = clipboard.expect("cut prepared with clipboard text");
+            return super::editor_clipboard::write_for_cut_resume(
+                tab,
+                incarnation,
+                input,
+                cut_text,
+            );
+        }
         let Some(api) = &app.flavite else {
             return iced::Task::none();
         };
@@ -348,17 +451,20 @@ fn handle_inner(
             };
             invocation.args["editor"] = serde_json::to_value(EditorEdit {
                 origin: format!("{:032x}", tab.raw()),
-                kind: command_intent.as_ref().map_or(kind, |intent| intent.kind),
-                before: vec![
-                    command_intent
-                        .as_ref()
-                        .map_or([selection.anchor, selection.head], |intent| intent.before),
-                ],
-                after: interaction
-                    .selections
+                kind,
+                before: before_members
                     .iter()
-                    .map(|s| [s.anchor, s.head])
+                    .enumerate()
+                    .map(|(id, s)| [id, s.anchor, s.head])
                     .collect(),
+                after: after_members
+                    .as_ref()
+                    .expect("edit prepared with an after-set")
+                    .iter()
+                    .enumerate()
+                    .map(|(id, &(anchor, head))| [id, anchor, head])
+                    .collect(),
+                primary,
             })
             .expect("history record is serializable");
             let typing = app.context_mode.mode(tab) != flavite_edit_context::ContextMode::Command
@@ -374,55 +480,99 @@ fn handle_inner(
         let result = api.execute(invocation);
         if !result.is_success() {
             app.input_chains.remove(&tab);
-            app.status = "Input rejected; source changed or is unavailable".into();
-            app.context_mode
-                .notice("Input rejected; source changed or is unavailable");
+            if input.action == KeyAction::Cut {
+                // Clipboard ordering (§5.5): the copy landed, the cut did
+                // not.
+                app.status = "Copied; cut was not applied because the source changed".into();
+                app.context_mode
+                    .notice("Copied; cut was not applied because the source changed");
+            } else {
+                app.status = "Input rejected; source changed or is unavailable".into();
+                app.context_mode
+                    .notice("Input rejected; source changed or is unavailable");
+            }
             return iced::Task::none();
         }
-        if let Some(change) = edit_change
-            && let Some(current) = app.note_editor_view(tab)
+        if let flavite_api::ExecutionResult::Local(flavite_api::LocalResult::Success(success)) =
+            &result
         {
-            apply_history_movement(
-                app,
-                tab,
-                view.buffer_id,
-                view.revision,
-                current.revision,
-                &flavite_buffer::history::HistoryMovement {
-                    selections: None,
-                    change,
-                },
-            );
-        }
-        if history
-            && let flavite_api::ExecutionResult::Local(flavite_api::LocalResult::Success(success)) =
-                &result
-            && let Some(value) = success
+            // One movement receipt covers the whole batch (E-13): map
+            // passive views once, then install the exact after-set (or map
+            // when the receipt carries none).
+            let movement = success
                 .data
                 .get("movement")
                 .filter(|value| !value.is_null())
-            && let Ok(movement) =
-                serde_json::from_value::<flavite_buffer::history::HistoryMovement>(value.clone())
-        {
-            let Some(current) = app.note_editor_view(tab) else {
-                return iced::Task::none();
-            };
-            apply_history_movement(
-                app,
-                tab,
-                view.buffer_id,
-                view.revision,
-                current.revision,
-                &movement,
-            );
-            if let Some(selections) = movement.selections {
-                interaction.selections = selections
-                    .into_iter()
-                    .map(|[a, h]| Selection::new(a, h))
-                    .collect();
-            } else {
-                interaction.selections =
-                    map_selections(&current.text, &interaction.selections, &movement.change);
+                .and_then(|value| {
+                    serde_json::from_value::<flavite_buffer::history::HistoryMovement>(
+                        value.clone(),
+                    )
+                    .ok()
+                });
+            let after = success
+                .data
+                .get("after_selections")
+                .filter(|value| !value.is_null())
+                .and_then(|value| serde_json::from_value::<Vec<[usize; 3]>>(value.clone()).ok());
+            if let Some(current) = app.note_editor_view(tab) {
+                if let Some(movement) = &movement {
+                    apply_history_movement(
+                        app,
+                        tab,
+                        view.buffer_id,
+                        view.revision,
+                        current.revision,
+                        movement,
+                    );
+                }
+                if let Some(after) = after {
+                    interaction.selections = after
+                        .iter()
+                        .map(|[_, a, h]| CommittedSelection::new(*a, *h))
+                        .collect();
+                } else if let Some(movement) = &movement {
+                    if let Some(selections) = &movement.selections {
+                        // The exact recorded set rides the receipt (X03/X04).
+                        interaction.selections = selections
+                            .iter()
+                            .map(|[_, a, h]| CommittedSelection::new(*a, *h))
+                            .collect();
+                    } else if movement.truncated {
+                        // MovementTooComplex: clamp to the document and let
+                        // the user re-place the caret; never guess
+                        // (FEUX-0002 E-13).
+                        interaction.selections = interaction
+                            .selections
+                            .iter()
+                            .map(|s| {
+                                let clamp = |at: usize| {
+                                    flavite_editor::viewport::clamp_grapheme_boundary(
+                                        &current.text,
+                                        at,
+                                    )
+                                };
+                                CommittedSelection::new(clamp(s.anchor), clamp(s.head))
+                            })
+                            .collect();
+                        app.context_mode
+                            .notice("Source changed; selections approximated");
+                    } else {
+                        interaction.selections =
+                            map_selections(&current.text, &interaction.selections, movement);
+                    }
+                }
+                // The primary member rides the receipt (E-4/FR-4); when the
+                // receipt does not name one, keep the current member when it
+                // survives the new set's cardinality.
+                let receipt_primary = movement
+                    .as_ref()
+                    .and_then(|movement| movement.primary)
+                    .filter(|&primary| primary < interaction.selections.len());
+                interaction.primary = receipt_primary.unwrap_or_else(|| {
+                    interaction
+                        .primary
+                        .min(interaction.selections.len().saturating_sub(1))
+                });
             }
         }
         app.workspace.invalidate_writing_target(view.buffer_id);
@@ -486,25 +636,99 @@ fn handle_inner(
     }
     app.reconcile_contexts();
     app.refresh_semantics();
-    clipboard.map_or_else(iced::Task::none, iced::clipboard::write)
+    // The clipboard write for a resumed cut already completed at the seam.
+    if input.clipboard_acquired {
+        clipboard = None;
+    }
+    clipboard.map_or_else(iced::Task::none, super::editor_clipboard::write)
+}
+
+/// The composition commit's after-set (FR-20): the composed text landed at
+/// the primary member only, so every other member is retained and mapped
+/// through the primary's edit batch, then re-normalized against the
+/// after-text. Returns the member pairs and the primary index.
+fn composition_after_set(
+    text: &str,
+    set: &flavite_buffer::selection::SelectionSet,
+    primary_after: &[(usize, usize)],
+    edits: &[flavite_buffer::undo::EditOp],
+) -> Option<(Vec<(usize, usize)>, usize)> {
+    use flavite_buffer::selection::{RawSelection, map_point_through_spans};
+    let &(anchor, head) = primary_after.first()?;
+    let edit = edits.first()?;
+    let after_text = edit.apply(text);
+    let span = [flavite_buffer::history::MovementSpan {
+        start: edit.range.start.0,
+        end: edit.range.end.0,
+        replacement_len: edit.replacement.len(),
+    }];
+    // The primary keeps id 0; every other member gets a fresh distinct id
+    // so the primary hint resolves exactly and merge survivors stay
+    // deterministic.
+    let mut candidates = Vec::with_capacity(set.len());
+    for (index, member) in set.iter().enumerate() {
+        if member.id() == set.primary_id() {
+            candidates.push(RawSelection {
+                id: Some(0),
+                anchor,
+                head,
+            });
+            continue;
+        }
+        let (anchor_affinity, head_affinity) = if member.anchor() < member.head() {
+            (
+                flavite_buffer::Affinity::Left,
+                flavite_buffer::Affinity::Right,
+            )
+        } else if member.anchor() > member.head() {
+            (
+                flavite_buffer::Affinity::Right,
+                flavite_buffer::Affinity::Left,
+            )
+        } else {
+            (
+                flavite_buffer::Affinity::Right,
+                flavite_buffer::Affinity::Right,
+            )
+        };
+        candidates.push(RawSelection {
+            id: Some(index as u32 + 1),
+            anchor: map_point_through_spans(member.anchor(), &span, anchor_affinity),
+            head: map_point_through_spans(member.head(), &span, head_affinity),
+        });
+    }
+    let (after_set, _) =
+        flavite_buffer::selection::SelectionSet::normalize(&after_text, candidates, Some(0))
+            .ok()?;
+    let primary_index = after_set
+        .members()
+        .iter()
+        .position(|member| member.id() == after_set.primary_id())
+        .unwrap_or(0);
+    let members = after_set
+        .members()
+        .iter()
+        .map(|member| (member.anchor(), member.head()))
+        .collect();
+    Some((members, primary_index))
 }
 
 pub fn map_selections(
     text: &str,
-    selections: &[Selection],
-    change: &flavite_buffer::history::HistoryChange,
-) -> Vec<Selection> {
-    let point = |at, affinity| map_history_point(text, at, change, affinity);
+    selections: &[CommittedSelection],
+    movement: &flavite_buffer::history::HistoryMovement,
+) -> Vec<CommittedSelection> {
+    let point = |at, affinity| map_history_point(text, at, movement, affinity);
     selections
         .iter()
         .map(|s| {
             use flavite_buffer::Affinity::{Left, Right};
             if s.anchor < s.head {
-                Selection::new(point(s.anchor, Left), point(s.head, Right))
+                CommittedSelection::new(point(s.anchor, Left), point(s.head, Right))
             } else if s.anchor > s.head {
-                Selection::new(point(s.anchor, Right), point(s.head, Left))
+                CommittedSelection::new(point(s.anchor, Right), point(s.head, Left))
             } else {
-                Selection::caret(point(s.head, Right))
+                CommittedSelection::caret(point(s.head, Right))
             }
         })
         .collect()
@@ -513,14 +737,10 @@ pub fn map_selections(
 pub fn map_history_point(
     text: &str,
     at: usize,
-    change: &flavite_buffer::history::HistoryChange,
+    movement: &flavite_buffer::history::HistoryMovement,
     affinity: flavite_buffer::Affinity,
 ) -> usize {
-    let mapped = flavite_buffer::positions::map_through_replacement(
-        at,
-        flavite_buffer::TextEdit::new(change.start, change.end, change.inserted),
-        affinity,
-    );
+    let mapped = flavite_buffer::selection::map_point_through_spans(at, &movement.spans, affinity);
     let floor = flavite_editor::viewport::clamp_grapheme_boundary(text, mapped);
     if affinity == flavite_buffer::Affinity::Right && floor < mapped.min(text.len()) {
         flavite_editor::viewport::next_grapheme_boundary(text, flavite_syntax::TextByte(floor)).0
@@ -551,14 +771,32 @@ pub fn apply_history_movement(
             if interaction.buffer_id != Some(buffer) || interaction.revision != before {
                 return None;
             }
-            interaction.selections =
-                map_selections(&view.text, &interaction.selections, &movement.change);
+            if movement.truncated {
+                // MovementTooComplex: clamp, never guess. The notice is
+                // published by the initiating view's handler; the passive
+                // view only avoids stale coordinates.
+                let clamp =
+                    |at: usize| flavite_editor::viewport::clamp_grapheme_boundary(&view.text, at);
+                interaction.selections = interaction
+                    .selections
+                    .iter()
+                    .map(|s| CommittedSelection::new(clamp(s.anchor), clamp(s.head)))
+                    .collect();
+            } else {
+                interaction.selections =
+                    map_selections(&view.text, &interaction.selections, movement);
+            }
+            // The mapped set may have merged members: keep this view's own
+            // primary member when its cardinality allows (E-4/FR-4). The
+            // receipt's primary index belongs to the initiating view's
+            // after-set, not to this passive mapping.
+            interaction.primary = interaction.primary.min(interaction.selections.len() - 1);
             interaction.revision = after;
             interaction.sequence += 1;
             interaction.viewport_anchor = map_history_point(
                 &view.text,
                 interaction.viewport_anchor,
-                &movement.change,
+                movement,
                 flavite_buffer::Affinity::Left,
             );
             Some(interaction)

@@ -2,10 +2,10 @@
 
 use flavite_api::CompletionCandidate;
 
-use crate::input::PreparedInput;
 use crate::keymap::{KeyAction, key_action};
 use crate::links::{LinkResolution, LinkSpan, match_candidates, resolve_link, scan_note};
 use crate::navigation::VerticalMotion;
+use crate::selections::EditorSelections;
 use crate::surface::{EditorAction, EditorSurface, EditorView, LinkNavigation};
 use crate::viewport::{Viewport, clamp_char_boundary};
 use cosmic_text::{Attrs, Buffer as ShapingBuffer, FontSystem, Metrics, Shaping};
@@ -30,6 +30,18 @@ use std::time::{Duration, Instant};
 const FONT_SIZE: f32 = 16.0;
 const LINE_HEIGHT: f32 = 22.0;
 const PAD_X: f32 = 12.0;
+
+/// The host's own wrap-width computation for layout-dependent commands
+/// (`editor.add_caret_above/below` row targets, X05): identical to the
+/// widget's wrap width so both sides agree on visual rows.
+#[must_use]
+pub fn wrap_width_for(bounds_width: f32, max_line_width: Option<f32>) -> f32 {
+    let available = (bounds_width - PAD_X * 2.0).max(1.0);
+    match max_line_width {
+        Some(max) => available.min(max.max(1.0)),
+        None => available,
+    }
+}
 const PAD_Y: f32 = 10.0;
 /// Scrollbar thumb width in logical pixels.
 const SCROLLBAR_WIDTH: f32 = 8.0;
@@ -98,6 +110,10 @@ impl TypeMetrics {
 pub struct EditorColors {
     /// Selection highlight fill.
     pub selection: Color,
+    /// Muted selection fill for a surviving multi-member set while Context
+    /// Mode is Off (FEUX-0002 FR-13): derived from the same semantic token
+    /// with a lower alpha, never a new palette entry.
+    pub selection_muted: Color,
     /// Editor surface fill (xpi themes: the package's field color; the
     /// built-in palettes keep the shell background).
     pub background: Color,
@@ -128,6 +144,7 @@ impl Default for EditorColors {
         Self {
             background: Color::from_rgb(0.098, 0.114, 0.137),
             selection: Color::from_rgba(0.24, 0.42, 0.67, 0.55),
+            selection_muted: Color::from_rgba(0.24, 0.42, 0.67, 0.22),
             link: Color::from_rgb(0.35, 0.67, 0.98),
             link_unresolved: Color::from_rgb(0.95, 0.48, 0.43),
             link_multiple: Color::from_rgb(0.96, 0.73, 0.32),
@@ -158,6 +175,9 @@ type ContextToggle<'a> = Box<dyn Fn(&keyboard::Event) -> bool + 'a>;
 pub struct EditorWidget<'a, Message> {
     context_mode: flavite_edit_context::ContextMode,
     context_preview: Option<flavite_edit_context::ContextCommand>,
+    /// Match-selection draft overlay (FEUX-0002 X06/E-11): outline-only,
+    /// never a committed representation.
+    match_preview: Option<Arc<[(usize, usize)]>>,
     on_context: Option<Box<dyn Fn(crate::context::ContextRequest) -> Message + 'a>>,
     context_toggle: Option<ContextToggle<'a>>,
     view: EditorView,
@@ -198,6 +218,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
         Self {
             context_mode: flavite_edit_context::ContextMode::Off,
             context_preview: None,
+            match_preview: None,
             on_context: None,
             context_toggle: None,
             view,
@@ -249,6 +270,14 @@ impl<'a, Message> EditorWidget<'a, Message> {
         self
     }
 
+    /// Paint a match-selection draft overlay (FEUX-0002 E-11): outline-only
+    /// spans that never mutate the committed set. `None` clears it.
+    #[must_use]
+    pub fn with_match_preview(mut self, spans: Option<Arc<[(usize, usize)]>>) -> Self {
+        self.match_preview = spans;
+        self
+    }
+
     fn emit_context(
         &self,
         state: &mut EditorState,
@@ -260,7 +289,8 @@ impl<'a, Message> EditorWidget<'a, Message> {
             shell.publish(callback(crate::context::ContextRequest {
                 buffer: self.view.buffer_id,
                 revision: self.view.revision,
-                selection: (state.anchor, state.caret),
+                selection: (state.selections.anchor(), state.selections.caret()),
+                selections: state.selections.pairs(),
                 sequence: state.interaction_sequence,
                 event,
             }));
@@ -274,7 +304,8 @@ impl<'a, Message> EditorWidget<'a, Message> {
             shell.publish(callback(crate::context::ContextRequest {
                 buffer: self.view.buffer_id,
                 revision: self.view.revision,
-                selection: (state.anchor, state.caret),
+                selection: (state.selections.anchor(), state.selections.caret()),
+                selections: state.selections.pairs(),
                 sequence: state.interaction_sequence,
                 event: crate::context::ContextEvent::Commit(crate::input::CapturedInput {
                     buffer: self.view.buffer_id,
@@ -285,6 +316,8 @@ impl<'a, Message> EditorWidget<'a, Message> {
                     extend: false,
                     document_boundary: false,
                     vertical: None,
+                    preferred_x: Vec::new(),
+                    clipboard_acquired: false,
                 }),
             }));
             shell.capture_event();
@@ -318,11 +351,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
     /// preference caps the text column; the pane width bounds it below.
     #[must_use]
     pub(crate) fn text_wrap_width(&self, bounds_width: f32) -> f32 {
-        let available = (bounds_width - PAD_X * 2.0).max(1.0);
-        match self.max_line_width {
-            Some(max) => available.min(max.max(1.0)),
-            None => available,
-        }
+        wrap_width_for(bounds_width, self.max_line_width)
     }
 
     /// Supply an indexed title/alias snapshot for in-memory autocomplete.
@@ -439,7 +468,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
             state.type_metrics = self.type_metrics;
             state.viewport.line_height = self.type_metrics.line_height;
             state.shaping = None;
-            state.preferred_x = None;
+            state.selections.clear_preferred_x();
         }
         // Resolver verdicts are immutable snapshots. Reuse them on focus and
         // selection redraws; a new source revision always reapplies verdicts.
@@ -455,7 +484,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
             state.close_autocomplete();
             state.composition = None;
         }
-        if let Some(interaction) = self.initial_interaction {
+        if let Some(interaction) = self.initial_interaction.clone() {
             if source_changed && !state.controlled_pending && interaction.sequence > 0 {
                 // Pointer release/blur events can have a larger local sequence
                 // while still naming the old text. A new acknowledged source
@@ -470,18 +499,19 @@ impl<'a, Message> EditorWidget<'a, Message> {
                 && interaction.sequence > state.controlled_ack
             {
                 let captured_sequence = state.interaction_sequence;
-                state.interaction_sequence = interaction.sequence.saturating_sub(1);
+                let incoming_sequence = interaction.sequence;
+                state.interaction_sequence = incoming_sequence.saturating_sub(1);
                 state.restore_interaction(&self.view.text, interaction);
                 state.interaction_sequence = state.interaction_sequence.max(captured_sequence);
-                state.controlled_ack = interaction.sequence;
-                state.controlled_pending = interaction.sequence < captured_sequence;
+                state.controlled_ack = incoming_sequence;
+                state.controlled_pending = incoming_sequence < captured_sequence;
                 if self
                     .view
                     .text
-                    .get(..state.caret)
+                    .get(..state.selections.caret())
                     .is_some_and(|text| text.ends_with("[["))
                 {
-                    state.open_autocomplete(state.caret - 2);
+                    state.open_autocomplete(state.selections.caret() - 2);
                 }
             } else {
                 state.restore_interaction(&self.view.text, interaction);
@@ -490,180 +520,80 @@ impl<'a, Message> EditorWidget<'a, Message> {
         state.refresh_completion(&self.view.text);
     }
 
-    /// Headless key dispatch through the real keymap; used by the runtime
-    /// event loop and by controlled-input tests.
-    pub fn execute_key(
+    /// The widget-owned autocomplete interception (the single captured-intent
+    /// contract leaves no other keyboard interpretation here: every other key
+    /// publishes a [`crate::input::CapturedInput`] for the host to interpret).
+    /// Returns whether the key was consumed by the popup.
+    fn autocomplete_key(
         &self,
         state: &mut EditorState,
         key: &Key,
-        modifiers: Modifiers,
-        text: Option<&str>,
-        clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
     ) -> bool {
-        if state.autocomplete_start.is_some() {
-            match key {
-                Key::Named(Named::Escape) => {
-                    state.close_autocomplete();
-                    return true;
-                }
-                Key::Named(Named::ArrowUp) => {
-                    state.autocomplete_selected = state.autocomplete_selected.saturating_sub(1);
-                    return true;
-                }
-                Key::Named(Named::ArrowDown) => {
-                    let count = autocomplete_count(self, state);
-                    state.autocomplete_selected = state
-                        .autocomplete_selected
-                        .saturating_add(1)
-                        .min(count.saturating_sub(1));
-                    return true;
-                }
-                Key::Named(Named::Enter) => {
-                    let matches = state.candidate_matches(&self.candidates);
-                    if let Some(candidate) = matches.get(state.autocomplete_selected) {
-                        let start = state.autocomplete_start.unwrap_or(state.caret);
-                        self.emit(
-                            shell,
-                            EditorAction::Complete {
-                                buffer_id: self.view.buffer_id,
-                                expected_revision: self.view.revision,
-                                start,
-                                end: state.caret,
-                                prefix: self.view.text[start..state.caret].to_owned(),
-                                candidate: (*candidate).clone(),
-                            },
-                        );
-                    } else if state.autocomplete_selected == matches.len()
-                        && !state.autocomplete_query.trim().is_empty()
-                    {
-                        let start = state.autocomplete_start.unwrap_or(state.caret);
-                        let target = state.autocomplete_query.trim().to_owned();
-                        self.emit(
-                            shell,
-                            EditorAction::open_link(
-                                &self.view,
-                                LinkNavigation {
-                                    target,
-                                    alias: None,
-                                    anchor: None,
-                                    by_id: false,
-                                    span: flavite_syntax::text::Span::new(
-                                        flavite_syntax::TextByte(start),
-                                        flavite_syntax::TextByte(state.caret),
-                                    ),
-                                    create_if_unresolved: true,
-                                },
-                            ),
-                        );
-                    }
-                    state.close_autocomplete();
-                    state.ensure_caret_visible(&self.view.text);
-                    return true;
-                }
-                _ => {}
+        if state.autocomplete_start.is_none() {
+            return false;
+        }
+        match key {
+            Key::Named(Named::Escape) => {
+                state.close_autocomplete();
+                true
             }
-        }
-        let action = key_action(key, modifiers, text);
-        if action == KeyAction::Ignore {
-            return false;
-        }
-        let (start, end) = state.selection();
-        // Vertical motion keeps the sticky column; every other action drops it.
-        let vertical = if matches!(
-            action,
-            KeyAction::Up | KeyAction::Down | KeyAction::PageUp | KeyAction::PageDown
-        ) {
-            Some(state.vertical_motion(action, state.text_width))
-        } else {
-            state.preferred_x = None;
-            None
-        };
-        let pasted = if action == KeyAction::Paste {
-            clipboard
-                .read(iced::advanced::clipboard::Kind::Standard)
-                .unwrap_or_default()
-        } else {
-            text.unwrap_or_default().to_owned()
-        };
-        let captured = crate::input::CapturedInput {
-            buffer: self.view.buffer_id,
-            observed_revision: self.view.revision,
-            sequence: state.interaction_sequence,
-            action,
-            text: pasted,
-            extend: modifiers.shift(),
-            document_boundary: modifiers.command() || modifiers.control(),
-            vertical,
-        };
-        let Ok(prepared) =
-            crate::input::prepare(&self.view, (state.anchor, state.caret), &captured)
-        else {
-            return false;
-        };
-        match prepared {
-            PreparedInput::Edit {
-                action: edit,
-                caret,
-                clipboard: cut,
-            } => {
-                if let Some(cut) = cut {
-                    clipboard.write(iced::advanced::clipboard::Kind::Standard, cut);
-                }
-                self.emit(shell, edit);
-                state.caret = caret;
-                state.anchor = caret;
-                if state.autocomplete_start.is_some()
-                    && matches!(
-                        action,
-                        KeyAction::Backspace
-                            | KeyAction::BackspaceWord
-                            | KeyAction::Delete
-                            | KeyAction::DeleteWord
-                    )
+            Key::Named(Named::ArrowUp) => {
+                state.autocomplete_selected = state.autocomplete_selected.saturating_sub(1);
+                true
+            }
+            Key::Named(Named::ArrowDown) => {
+                let count = autocomplete_count(self, state);
+                state.autocomplete_selected = state
+                    .autocomplete_selected
+                    .saturating_add(1)
+                    .min(count.saturating_sub(1));
+                true
+            }
+            Key::Named(Named::Enter) => {
+                let matches = state.candidate_matches(&self.candidates);
+                if let Some(candidate) = matches.get(state.autocomplete_selected) {
+                    let start = state.autocomplete_start.unwrap_or(state.selections.caret());
+                    self.emit(
+                        shell,
+                        EditorAction::Complete {
+                            buffer_id: self.view.buffer_id,
+                            expected_revision: self.view.revision,
+                            start,
+                            end: state.selections.caret(),
+                            prefix: self.view.text[start..state.selections.caret()].to_owned(),
+                            candidate: (*candidate).clone(),
+                        },
+                    );
+                } else if state.autocomplete_selected == matches.len()
+                    && !state.autocomplete_query.trim().is_empty()
                 {
-                    state.autocomplete_query.pop();
-                    state.autocomplete_selected = 0;
+                    let start = state.autocomplete_start.unwrap_or(state.selections.caret());
+                    let target = state.autocomplete_query.trim().to_owned();
+                    self.emit(
+                        shell,
+                        EditorAction::open_link(
+                            &self.view,
+                            LinkNavigation {
+                                target,
+                                alias: None,
+                                anchor: None,
+                                by_id: false,
+                                span: flavite_syntax::text::Span::new(
+                                    flavite_syntax::TextByte(start),
+                                    flavite_syntax::TextByte(state.selections.caret()),
+                                ),
+                                create_if_unresolved: true,
+                            },
+                        ),
+                    );
                 }
-                if action == KeyAction::Insert {
-                    let replacement = captured.text.as_str();
-                    if replacement == "[" && start == end {
-                        if state.caret >= 2
-                            && self.view.text.get(state.caret - 2..state.caret - 1) == Some("[")
-                        {
-                            state.open_autocomplete(state.caret - 2);
-                        } else if state.autocomplete_start.is_some() {
-                            state.autocomplete_query.push('[');
-                            state.autocomplete_selected = 0;
-                        }
-                    } else if state.autocomplete_start.is_some() {
-                        state.autocomplete_query.push_str(replacement);
-                        state.autocomplete_selected = 0;
-                    }
-                }
+                state.close_autocomplete();
+                state.ensure_caret_visible(&self.view.text);
+                true
             }
-            PreparedInput::History(edit) => self.emit(shell, edit),
-            PreparedInput::Selection { anchor, head } => {
-                state.anchor = anchor;
-                state.caret = head;
-            }
-            PreparedInput::VerticalSelection {
-                anchor,
-                head,
-                preferred_x,
-            } => {
-                state.anchor = anchor;
-                state.caret = head;
-                state.preferred_x = Some(preferred_x);
-            }
-            PreparedInput::Copy(content) => {
-                if !content.is_empty() {
-                    clipboard.write(iced::advanced::clipboard::Kind::Standard, content);
-                }
-            }
+            _ => false,
         }
-        state.ensure_caret_visible(&self.view.text);
-        true
     }
 }
 
@@ -681,8 +611,7 @@ pub struct EditorState {
     line_text_len: usize,
     resolutions_present: bool,
     resolution_snapshot: Option<Arc<HashMap<String, LinkResolution>>>,
-    caret: usize,
-    anchor: usize,
+    selections: EditorSelections,
     focused: bool,
     ime_active: bool,
     selecting: bool,
@@ -710,11 +639,13 @@ pub struct EditorState {
     /// thumb. `Some` while the left button holds the thumb.
     scroll_drag: Option<ScrollDrag>,
     /// Sticky visual column for consecutive vertical movements.
-    preferred_x: Option<f32>,
     text_width: f32,
     last_click: Option<mouse::Click>,
     selection_unit: SelectionUnit,
     selection_origin: (usize, usize),
+    /// The press byte of a Mod-added member while a Mod drag extends it
+    /// (E-14); transient geometry, never a second committed representation.
+    mod_drag: Option<usize>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -796,13 +727,20 @@ impl std::fmt::Debug for ShapingCache {
 /// Host-visible per-view interaction state needed by accessibility and
 /// composition-aware workspace commands. The text itself remains owned by the
 /// revisioned buffer view and is not copied into widget state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorInteractionSnapshot {
     pub sequence: u64,
     pub buffer_id: u64,
     pub revision: u64,
     pub caret: usize,
     pub selection: (usize, usize),
+    /// Every live member as `[id, anchor, head]` triples (canonical order;
+    /// FEUX-0002 X04: the primary pair above stays for single-selection
+    /// consumers).
+    pub selections: Vec<[usize; 3]>,
+    /// Index into `selections` of the primary member (canonical order and
+    /// "primary first" cannot both be implicit; FEUX-0002 E-4/FR-4).
+    pub primary: usize,
     pub viewport_anchor: usize,
     pub focused: bool,
     pub composing: bool,
@@ -844,12 +782,20 @@ pub fn inspect_focused_editor()
             let Some(revision) = state.revision else {
                 return;
             };
+            let triples = state.selections.set().to_triples();
+            let primary_id = state.selections.primary_id().as_raw();
+            let primary = triples
+                .iter()
+                .position(|triple| triple[0] == primary_id as usize)
+                .unwrap_or(0);
             self.0 = Some(EditorInteractionSnapshot {
                 sequence: state.interaction_sequence,
                 buffer_id,
                 revision,
-                caret: state.caret,
+                caret: state.selections.caret(),
                 selection: state.selection(),
+                selections: triples,
+                primary,
                 viewport_anchor: 0,
                 focused: true,
                 composing: state.is_composing(),
@@ -859,7 +805,7 @@ pub fn inspect_focused_editor()
         fn finish(
             &self,
         ) -> iced::advanced::widget::operation::Outcome<Option<EditorInteractionSnapshot>> {
-            iced::advanced::widget::operation::Outcome::Some(self.0)
+            iced::advanced::widget::operation::Outcome::Some(self.0.clone())
         }
     }
 
@@ -912,8 +858,11 @@ pub fn set_focused_editor_selection(
             {
                 return;
             }
-            state.anchor = self.anchor;
-            state.caret = self.focus;
+            // Offsets were validated by the host against the current text;
+            // the caret may sit past the local view until its refresh.
+            state
+                .selections
+                .replace_beyond_text(&[(self.anchor, self.focus)], 0);
             state.focused = true;
             state.ime_active = true;
             self.result = state.interaction_snapshot(None);
@@ -922,7 +871,7 @@ pub fn set_focused_editor_selection(
         fn finish(
             &self,
         ) -> iced::advanced::widget::operation::Outcome<Option<EditorInteractionSnapshot>> {
-            iced::advanced::widget::operation::Outcome::Some(self.result)
+            iced::advanced::widget::operation::Outcome::Some(self.result.clone())
         }
     }
 
@@ -988,7 +937,7 @@ pub fn focus_editor(
         fn finish(
             &self,
         ) -> iced::advanced::widget::operation::Outcome<Option<EditorInteractionSnapshot>> {
-            iced::advanced::widget::operation::Outcome::Some(self.result)
+            iced::advanced::widget::operation::Outcome::Some(self.result.clone())
         }
     }
 
@@ -1036,8 +985,21 @@ impl EditorState {
         }
     }
 
-    fn select_click(&mut self, text: &str, byte: usize, kind: mouse::click::Kind, extend: bool) {
-        self.preferred_x = None;
+    /// The pointer press vocabulary (FEUX-0002 E-14): a plain click replaces
+    /// the set with the unit selection; a Mod click toggles a caret at the
+    /// position (removal absorbs boundary carets; the last member is never
+    /// removed, and a Mod drag then extends the added member into a range);
+    /// Shift extends the primary member's head; double/triple select the
+    /// word/line (as an added member under Mod).
+    fn select_click(
+        &mut self,
+        text: &str,
+        byte: usize,
+        kind: mouse::click::Kind,
+        extend: bool,
+        toggle: bool,
+    ) {
+        self.selections.clear_preferred_x();
         self.close_autocomplete();
         self.selection_unit = match kind {
             mouse::click::Kind::Single => SelectionUnit::Character,
@@ -1045,26 +1007,58 @@ impl EditorState {
             mouse::click::Kind::Triple => SelectionUnit::Line,
         };
         let (start, end) = Self::selection_bounds(text, byte, self.selection_unit);
-        if extend {
-            self.move_to(byte, true);
+        if toggle {
             self.selection_unit = SelectionUnit::Character;
-            self.selection_origin = (self.anchor, self.anchor);
-        } else {
-            self.anchor = start;
-            self.caret = end;
-            self.selection_origin = (start, end);
+            let added = self.selections.toggle_member(text, byte, (start, end));
+            // A removal must not start a drag-add; an addition extends.
+            self.mod_drag = added.then_some(byte);
+            self.selection_origin = (byte, byte);
+            return;
         }
+        if extend {
+            self.move_to(text, byte, true);
+            self.selection_unit = SelectionUnit::Character;
+            self.selection_origin = (self.selections.anchor(), self.selections.anchor());
+            return;
+        }
+        self.selections.replace_with(text, &[(start, end)], 0);
+        self.selection_origin = (start, end);
     }
 
     fn extend_pointer_selection(&mut self, text: &str, byte: usize) {
         let (start, end) = Self::selection_bounds(text, byte, self.selection_unit);
+        if let Some(origin) = self.mod_drag {
+            // Mod-drag extends the member added at the press into a range.
+            let member = if byte < origin {
+                (end, origin)
+            } else {
+                (origin, end)
+            };
+            self.selections.set_member_at_point(text, origin, member);
+            return;
+        }
         let (origin_start, origin_end) = self.selection_origin;
         if byte < origin_start {
-            self.anchor = origin_end;
-            self.caret = start;
+            self.selections
+                .replace_with(text, &[(origin_end, start)], 0);
         } else {
-            self.anchor = origin_start;
-            self.caret = end;
+            self.selections
+                .replace_with(text, &[(origin_start, end)], 0);
+        }
+    }
+
+    /// Move the primary member's head (the delivered extend rule), keeping
+    /// every other member of the set.
+    fn move_to(&mut self, text: &str, byte: usize, extend: bool) {
+        let anchor = if extend {
+            self.selections.anchor()
+        } else {
+            byte
+        };
+        if self.selections.len() == 1 {
+            self.selections.replace_with(text, &[(anchor, byte)], 0);
+        } else {
+            self.selections.move_primary_head(text, anchor, byte);
         }
     }
 
@@ -1081,7 +1075,6 @@ impl EditorState {
             rows,
             width,
             metrics: self.type_metrics,
-            preferred_x: self.preferred_x,
         }
     }
 
@@ -1110,16 +1103,17 @@ impl EditorState {
         matches
     }
 
-    /// Caret byte offset.
+    /// Caret byte offset (the primary member's head).
     #[must_use]
     pub fn caret(&self) -> usize {
-        self.caret
+        self.selections.caret()
     }
 
-    /// Current selection in normalized TextByte coordinates.
+    /// Current primary selection in normalized TextByte coordinates.
     #[must_use]
     pub fn selection(&self) -> (usize, usize) {
-        (self.caret.min(self.anchor), self.caret.max(self.anchor))
+        let member = self.selections.primary();
+        (member.start(), member.end())
     }
 
     /// Whether an IME owns the current input sequence. Hosts use this to
@@ -1135,12 +1129,19 @@ impl EditorState {
     }
 
     fn interaction_snapshot(&self, text: Option<&str>) -> Option<EditorInteractionSnapshot> {
+        let triples = self.selections.set().to_triples();
+        let primary_id = self.selections.primary_id().as_raw();
         Some(EditorInteractionSnapshot {
             sequence: self.interaction_sequence,
             buffer_id: self.buffer_id?,
             revision: self.revision?,
-            caret: self.caret,
+            caret: self.selections.caret(),
             selection: self.selection(),
+            primary: triples
+                .iter()
+                .position(|triple| triple[0] == primary_id as usize)
+                .unwrap_or(0),
+            selections: triples,
             viewport_anchor: text.map_or(0, |text| line_start_byte(text, self.viewport.first_line)),
             focused: self.focused,
             composing: self.is_composing(),
@@ -1157,8 +1158,28 @@ impl EditorState {
         {
             return;
         }
-        self.anchor = clamp_char_boundary(text, interaction.selection.0);
-        self.caret = clamp_char_boundary(text, interaction.selection.1);
+        // Restore the whole acknowledged set (X04) with its primary member
+        // (E-4/FR-4); the primary pair stays authoritative for consumers
+        // predating multi-member support.
+        let members: Vec<(usize, usize)> = if interaction.selections.is_empty() {
+            vec![(
+                clamp_char_boundary(text, interaction.selection.0),
+                clamp_char_boundary(text, interaction.selection.1),
+            )]
+        } else {
+            interaction
+                .selections
+                .iter()
+                .map(|[_, anchor, head]| {
+                    (
+                        clamp_char_boundary(text, *anchor),
+                        clamp_char_boundary(text, *head),
+                    )
+                })
+                .collect()
+        };
+        self.selections
+            .replace_with(text, &members, interaction.primary);
         self.viewport.first_line = text[..interaction.viewport_anchor.min(text.len())]
             .bytes()
             .filter(|byte| *byte == b'\n')
@@ -1172,7 +1193,7 @@ impl EditorState {
         if self.focused && self.text_width > 0.0 {
             self.ensure_caret_visible(text);
         }
-        self.last_ensured_caret = self.caret;
+        self.last_ensured_caret = self.selections.caret();
     }
 
     /// Feed one platform input-method event through the controlled
@@ -1219,8 +1240,8 @@ impl EditorState {
                 if committed.is_empty() {
                     return None;
                 }
-                self.caret = start + committed.len();
-                self.anchor = self.caret;
+                let after = start + committed.len();
+                self.selections.replace_beyond_text(&[(after, after)], 0);
                 self.ensure_caret_visible(&view.text);
                 Some(EditorAction::replace(view, start, end, committed.clone()))
             }
@@ -1252,22 +1273,15 @@ impl EditorState {
             return;
         };
         let query = text
-            .get(start..self.caret)
+            .get(start..self.selections.caret())
             .and_then(|prefix| prefix.strip_prefix("[["));
-        if self.anchor == self.caret
+        if self.selections.anchor() == self.selections.caret()
             && let Some(query) = query
             && !query.contains(['[', ']', '\n', '\r', '|', '#'])
         {
             self.autocomplete_query = query.into();
         } else {
             self.close_autocomplete();
-        }
-    }
-
-    fn move_to(&mut self, byte: usize, extend: bool) {
-        self.caret = byte;
-        if !extend {
-            self.anchor = byte;
         }
     }
 
@@ -1313,8 +1327,7 @@ impl EditorState {
             }
         }
         self.resolutions_present = !link_resolutions.is_empty();
-        self.caret = clamp_char_boundary(&view.text, self.caret);
-        self.anchor = clamp_char_boundary(&view.text, self.anchor);
+        self.selections.clamp(&view.text);
         self.viewport.line_height = self.type_metrics.line_height;
         self.viewport.first_line = self
             .viewport
@@ -1323,14 +1336,14 @@ impl EditorState {
         // Only re-anchor the viewport when the caret moved. Running this
         // every frame would snap the view back to the caret and cancel any
         // wheel or scrollbar scroll away from it.
-        if self.caret != self.last_ensured_caret {
+        if self.selections.caret() != self.last_ensured_caret {
             self.ensure_caret_visible(&view.text);
-            self.last_ensured_caret = self.caret;
+            self.last_ensured_caret = self.selections.caret();
         }
     }
 
     fn ensure_caret_visible(&mut self, text: &str) {
-        let caret = self.caret.min(text.len());
+        let caret = self.selections.caret().min(text.len());
         let line = if self.has_line_index(text) {
             self.line_starts
                 .partition_point(|start| *start <= caret)
@@ -1390,9 +1403,9 @@ impl EditorState {
         width: f32,
         extend: bool,
     ) {
-        self.preferred_x = None;
+        self.selections.clear_preferred_x();
         let byte = self.hit_test_cached(text, revision, self.viewport, x, y, width);
-        self.move_to(byte, extend);
+        self.move_to(text, byte, extend);
     }
 
     /// Shape the visible viewport once per (revision, text, viewport, width)
@@ -1519,14 +1532,34 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             let runs = local_buffer.layout_runs().collect::<Vec<_>>();
             (hoisted_visible.as_str(), start, runs)
         };
-        let (selection_start, selection_end) = state.selection();
-        if selection_start < selection_end {
+        // Viewport-window painting of every member (FEUX-0002 X04, FR-13):
+        // members whose range lies outside the visible source window cost
+        // nothing, so paint scales with the viewport, not with N.
+        let visible_end = source_start + visible_text.len();
+        let visible_members: Vec<_> = state
+            .selections
+            .members()
+            .into_iter()
+            .filter(|member| member.start() < visible_end && member.end() > source_start)
+            .collect();
+        // OFF-state muted fill (FEUX-0002 FR-13): a surviving multi-member
+        // set renders with the muted channel while Context Mode is off; the
+        // standing count in the note chrome is the non-color redundancy.
+        let selection_fill = if !self.context_mode.active() && state.selections.len() > 1 {
+            self.colors.selection_muted
+        } else {
+            self.colors.selection
+        };
+        if !visible_members.is_empty() {
             for run in &runs {
                 let line_start = source_start + line_start_byte(visible_text, run.line_i);
                 for glyph in run.glyphs {
                     let glyph_start = line_start + glyph.start;
                     let glyph_end = line_start + glyph.end;
-                    if glyph_end > selection_start && glyph_start < selection_end {
+                    let hit = visible_members
+                        .iter()
+                        .any(|member| glyph_end > member.start() && glyph_start < member.end());
+                    if hit {
                         renderer.fill_quad(
                             renderer::Quad {
                                 bounds: Rectangle::new(
@@ -1539,7 +1572,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                                 border: Border::default(),
                                 ..renderer::Quad::default()
                             },
-                            Background::Color(self.colors.selection),
+                            Background::Color(selection_fill),
                         );
                     }
                 }
@@ -1547,24 +1580,53 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         }
         if self.context_mode.active()
             && state.composition.is_none()
-            && let Some(effect) = self
-                .context_preview
-                .and_then(|command| {
-                    flavite_edit_context::effect::plan(
-                        &self.view.text,
-                        (state.anchor, state.caret),
-                        command,
-                    )
-                })
-                .filter(|effect| effect.implicit && !effect.range.is_empty())
+            && let Some(command) = self.context_preview
         {
-            for rect in command_preview_rects(
-                visible_text,
-                source_start,
-                &runs,
-                effect.range,
-                self.type_metrics,
-            ) {
+            // The implicit-effect outline generalizes to every member before
+            // a destructive invocation (FEUX-0002 X04, E-6).
+            for member in state.selections.members() {
+                let Some(effect) = flavite_edit_context::effect::plan(
+                    &self.view.text,
+                    (member.anchor(), member.head()),
+                    command,
+                )
+                .filter(|effect| effect.implicit && !effect.range.is_empty()) else {
+                    continue;
+                };
+                for rect in command_preview_rects(
+                    visible_text,
+                    source_start,
+                    &runs,
+                    effect.range,
+                    self.type_metrics,
+                ) {
+                    let rect = Rectangle::new(
+                        Point::new(bounds.x + PAD_X + rect.x, bounds.y + PAD_Y + rect.y),
+                        rect.size(),
+                    );
+                    if let Some(rect) = rect.intersection(&clip) {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: rect,
+                                border: Border {
+                                    color: self.colors.text,
+                                    width: 1.5,
+                                    ..Border::default()
+                                },
+                                ..renderer::Quad::default()
+                            },
+                            Background::Color(Color::TRANSPARENT),
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(spans) = &self.match_preview {
+            // Match-selection draft overlay (FEUX-0002 X06/E-11): outline-
+            // only, viewport-bounded, never a committed representation.
+            for rect in
+                match_preview_rects(visible_text, source_start, &runs, spans, self.type_metrics)
+            {
                 let rect = Rectangle::new(
                     Point::new(bounds.x + PAD_X + rect.x, bounds.y + PAD_Y + rect.y),
                     rect.size(),
@@ -1575,7 +1637,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                             bounds: rect,
                             border: Border {
                                 color: self.colors.text,
-                                width: 1.5,
+                                width: 1.0,
                                 ..Border::default()
                             },
                             ..renderer::Quad::default()
@@ -1767,7 +1829,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             let has_create = !state.autocomplete_query.trim().is_empty();
             if !matches.is_empty() || has_create {
                 let row_count = matches.len() + usize::from(has_create);
-                let line = self.view.text[..state.caret.min(self.view.text.len())]
+                let line = self.view.text[..state.selections.caret().min(self.view.text.len())]
                     .matches('\n')
                     .count();
                 let popup = Rectangle::new(
@@ -1837,30 +1899,37 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 }
             }
         }
-        if state.focused
-            && state.caret >= source_start
-            && state.caret <= source_start + visible_text.len()
-        {
-            let local_caret = state.caret.saturating_sub(source_start);
-            let (x, y) = caret_position(&runs, visible_text, local_caret);
-            renderer.fill_quad(
-                renderer::Quad {
-                    bounds: Rectangle::new(
-                        Point::new(bounds.x + PAD_X + x, bounds.y + PAD_Y + y),
-                        Size::new(
-                            if self.context_mode == flavite_edit_context::ContextMode::Command {
-                                4.0
-                            } else {
-                                1.5
-                            },
-                            self.type_metrics.line_height,
+        if state.focused {
+            // Every member's head paints a caret; the primary keeps the
+            // delivered Command 4 px rule (X04: primary thick, others
+            // standard). Only heads inside the visible window paint.
+            let primary = state.selections.primary_id();
+            for member in state.selections.members() {
+                if member.head() < source_start || member.head() > source_start + visible_text.len()
+                {
+                    continue;
+                }
+                let local_caret = member.head().saturating_sub(source_start);
+                let (x, y) = caret_position(&runs, visible_text, local_caret);
+                let width = if member.id() == primary
+                    && self.context_mode == flavite_edit_context::ContextMode::Command
+                {
+                    4.0
+                } else {
+                    1.5
+                };
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: Rectangle::new(
+                            Point::new(bounds.x + PAD_X + x, bounds.y + PAD_Y + y),
+                            Size::new(width, self.type_metrics.line_height),
                         ),
-                    ),
-                    border: Border::default(),
-                    ..renderer::Quad::default()
-                },
-                Background::Color(self.colors.autocomplete_accent),
-            );
+                        border: Border::default(),
+                        ..renderer::Quad::default()
+                    },
+                    Background::Color(self.colors.autocomplete_accent),
+                );
+            }
         }
     }
 
@@ -1899,7 +1968,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _renderer: &iced::Renderer,
-        clipboard: &mut dyn Clipboard,
+        _clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
@@ -1926,11 +1995,19 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 position.y - PAD_Y,
                 self.text_wrap_width(layout.bounds().width),
             );
-            let (start, end) = state.selection();
-            let selection = if start < end && start <= byte && byte < end {
-                (state.anchor, state.caret)
+            // D-9 against the whole set (E-14): a press inside any member
+            // keeps the set; anything else resolves the word under the
+            // pointer (or a plain caret).
+            let inside = state
+                .selections
+                .members()
+                .iter()
+                .any(|member| member.start() <= byte && byte <= member.end());
+            let selection = if inside {
+                state.selections.pairs()
             } else {
-                flavite_edit_context::word_bounds(&self.view.text, byte)
+                let (a, b) = flavite_edit_context::word_bounds(&self.view.text, byte);
+                vec![(a, b)]
             };
             self.emit_context(
                 state,
@@ -2022,16 +2099,12 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                         self.text_wrap_width(layout.bounds().width),
                     ))
                 } else {
-                    state.preferred_x = None;
+                    state.selections.clear_preferred_x();
                     None
                 };
-                let committed = if action == KeyAction::Paste {
-                    clipboard
-                        .read(iced::advanced::clipboard::Kind::Standard)
-                        .unwrap_or_default()
-                } else {
-                    text.clone().unwrap_or_default().to_string()
-                };
+                // The produced text only; clipboard reads happen at the host
+                // clipboard seam (FEUX-0002 X04, T-10).
+                let committed = text.clone().unwrap_or_default().to_string();
                 state.interaction_sequence = state.interaction_sequence.saturating_add(1);
                 state.controlled_pending = true;
                 let input = crate::input::CapturedInput {
@@ -2043,12 +2116,15 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     extend: modifiers.shift(),
                     document_boundary: modifiers.command() || modifiers.control(),
                     vertical,
+                    preferred_x: state.selections.preferred_x_all(),
+                    clipboard_acquired: false,
                 };
                 if let Some(context) = &self.on_context {
                     shell.publish(context(crate::context::ContextRequest {
                         buffer: self.view.buffer_id,
                         revision: self.view.revision,
-                        selection: (state.anchor, state.caret),
+                        selection: (state.selections.anchor(), state.selections.caret()),
+                        selections: state.selections.pairs(),
                         sequence: state.interaction_sequence,
                         event: crate::context::ContextEvent::Key(crate::context::ContextKey {
                             code: physical.and_then(crate::context::native_code),
@@ -2163,6 +2239,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                             byte,
                             click.kind(),
                             state.modifiers.shift(),
+                            state.modifiers.command() || state.modifiers.control(),
                         );
                     }
                     shell.capture_event();
@@ -2223,6 +2300,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     shell.capture_event();
                 }
                 state.selecting = false;
+                state.mod_drag = None;
                 if state.scroll_drag.take().is_some() {
                     shell.capture_event();
                     shell.request_redraw();
@@ -2257,17 +2335,37 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 shell.request_redraw();
             }
             iced::Event::Mouse(mouse::Event::ButtonPressed(_)) => {}
-            iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                key,
-                modifiers,
-                text,
-                ..
-            }) if state.focused
-                && state.composition.is_none()
-                && self.context_mode != flavite_edit_context::ContextMode::Command
-                && self.execute_key(state, key, *modifiers, text.as_deref(), clipboard, shell) =>
+            iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. })
+                if state.focused && state.composition.is_none() =>
             {
-                shell.capture_event();
+                // Widget-owned interceptions only (X04/X05: one captured-intent
+                // path for everything else). The autocomplete popup consumes
+                // its navigation keys; plain-edit Escape collapses the set
+                // (D-6 via E-14: additional selections first, then a range to
+                // its head). Both are selection-local; nothing here types.
+                let completion_control = state.autocomplete_start.is_some()
+                    && matches!(
+                        key,
+                        Key::Named(
+                            Named::Enter | Named::ArrowUp | Named::ArrowDown | Named::Escape
+                        )
+                    )
+                    && !modifiers.control()
+                    && !modifiers.alt()
+                    && !modifiers.logo();
+                let escape_collapse = matches!(key, Key::Named(Named::Escape))
+                    && !completion_control
+                    && self.context_mode == flavite_edit_context::ContextMode::Off
+                    && !modifiers.control()
+                    && !modifiers.alt()
+                    && !modifiers.logo()
+                    && state.selections.escape_collapse(&self.view.text);
+                if (completion_control && self.autocomplete_key(state, key, shell))
+                    || escape_collapse
+                {
+                    shell.capture_event();
+                    shell.request_redraw();
+                }
             }
             _ => {}
         }
@@ -2277,7 +2375,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             && self.context_mode != flavite_edit_context::ContextMode::Command
         {
             let width = self.text_wrap_width(layout.bounds().width);
-            let caret_byte = state.caret;
+            let caret_byte = state.selections.caret();
             let (x, y) = {
                 let (buffer, visible, source_start) =
                     state.shaped(&self.view.text, self.view.revision, state.viewport, width);
@@ -2538,6 +2636,84 @@ fn command_preview_rects(
     result
 }
 
+/// Outline rects for a match-selection draft overlay (FEUX-0002 E-11).
+/// `spans` must be sorted ascending; only spans intersecting the visible
+/// source window cost work (partition-point per run, then per-glyph tests),
+/// so paint scales with the viewport, never with N.
+fn match_preview_rects(
+    visible: &str,
+    source_start: usize,
+    runs: &[cosmic_text::LayoutRun<'_>],
+    spans: &[(usize, usize)],
+    metrics: TypeMetrics,
+) -> Vec<Rectangle> {
+    let mut result = Vec::new();
+    for run in runs {
+        let line_start = source_start + line_start_byte(visible, run.line_i);
+        let line_end = line_start + run.text.len();
+        let first = spans.partition_point(|&(_, end)| end <= line_start);
+        let last = spans.partition_point(|&(start, _)| start < line_end);
+        let active = &spans[first..last];
+        if active.is_empty() {
+            continue;
+        }
+        let mut covered: Vec<(f32, f32)> = Vec::new();
+        for glyph in run.glyphs {
+            let glyph_start = line_start + glyph.start;
+            let glyph_end = line_start + glyph.end;
+            if active
+                .iter()
+                .any(|&(start, end)| glyph_end > start && glyph_start < end)
+            {
+                covered.push((glyph.x, glyph.x + glyph.w.max(1.0)));
+            }
+        }
+        if covered.is_empty() {
+            continue;
+        }
+        covered.sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
+        let mut merged: Option<(f32, f32)> = None;
+        for (left, right) in covered {
+            if let Some((_, end)) = &mut merged
+                && left <= *end + 0.5
+            {
+                *end = end.max(right);
+            } else {
+                if let Some((start, end)) = merged {
+                    result.push(Rectangle::new(
+                        Point::new(start, run.line_top),
+                        Size::new(end - start, metrics.line_height),
+                    ));
+                }
+                merged = Some((left, right));
+            }
+        }
+        if let Some((start, end)) = merged {
+            result.push(Rectangle::new(
+                Point::new(start, run.line_top),
+                Size::new(end - start, metrics.line_height),
+            ));
+        }
+    }
+    // Newlines have no glyph; a covered newline still gets a visible cell.
+    for (local, ch) in visible.char_indices() {
+        if ch == '\n' {
+            let absolute = source_start + local;
+            if spans
+                .iter()
+                .any(|&(start, end)| absolute >= start && absolute < end)
+            {
+                let (x, y) = caret_position(runs, visible, local);
+                result.push(Rectangle::new(
+                    Point::new(x, y),
+                    Size::new(metrics.font_size * 0.6, metrics.line_height),
+                ));
+            }
+        }
+    }
+    result
+}
+
 pub(crate) fn caret_position(
     runs: &[cosmic_text::LayoutRun<'_>],
     text: &str,
@@ -2628,6 +2804,41 @@ mod tests {
             "a wrapped line's outline follows its actual rows"
         );
     }
+
+    #[test]
+    fn match_preview_outlines_cover_their_spans_and_stay_viewport_bounded() {
+        let text = "TODO one\nTODO two\n";
+        let metrics = TypeMetrics::default();
+        let shaped = shape_text(text, 300.0, metrics);
+        let runs = shaped.layout_runs().collect::<Vec<_>>();
+        let spans = [(0, 4), (9, 13)];
+        let rects = match_preview_rects(text, 0, &runs, &spans, metrics);
+        assert!(!rects.is_empty());
+        // Every glyph inside a span has a covering outline; glyphs outside
+        // spans never do.
+        for run in &runs {
+            let line_start = line_start_byte(text, run.line_i);
+            for glyph in run.glyphs {
+                let center = Point::new(
+                    glyph.x + glyph.w / 2.0,
+                    run.line_top + metrics.line_height / 2.0,
+                );
+                let inside = spans.iter().any(|&(start, end)| {
+                    line_start + glyph.end > start && line_start + glyph.start < end
+                });
+                assert_eq!(
+                    rects.iter().any(|rect| rect.contains(center)),
+                    inside,
+                    "glyph at {}",
+                    line_start + glyph.start
+                );
+            }
+        }
+        // Off-screen spans produce no primitives.
+        assert!(match_preview_rects(text, 100, &runs, &[(0, 4)], metrics).is_empty());
+        // An empty list never paints.
+        assert!(match_preview_rects(text, 0, &runs, &[], metrics).is_empty());
+    }
     use iced::advanced::widget::Operation as _;
 
     #[test]
@@ -2640,6 +2851,8 @@ mod tests {
             sequence,
             caret: at,
             selection: (at, at),
+            selections: vec![[0, at.min(at), at]],
+            primary: 0,
             viewport_anchor: 0,
             focused,
             composing: false,
@@ -2656,17 +2869,17 @@ mod tests {
             .with_initial_interaction(snapshot(restored.revision, 41, 4, true));
         widget.synchronize(&mut state);
         assert!(state.focused);
-        assert_eq!(state.caret, 4);
+        assert_eq!(state.selections.caret(), 4);
         assert_eq!(
             state.interaction_sequence, 100,
             "native sequence cannot go backwards"
         );
-        state.caret = 6;
-        state.anchor = 6;
+        state.selections.replace_with("xyabcdef", &[(6, 6)], 0);
         state.focused = false;
         widget.synchronize(&mut state);
         assert_eq!(
-            state.caret, 6,
+            state.selections.caret(),
+            6,
             "resolver-only refresh cannot overwrite newer pointer state"
         );
         assert!(!state.focused);
@@ -2676,18 +2889,18 @@ mod tests {
     fn word_and_line_clicks_extend_as_units_in_both_directions() {
         let text = "one café three\nnext line\n";
         let mut state = EditorState::default();
-        state.select_click(text, 6, mouse::click::Kind::Double, false);
+        state.select_click(text, 6, mouse::click::Kind::Double, false, false);
         assert_eq!(state.selection(), (4, 9));
         state.extend_pointer_selection(text, 11);
         assert_eq!(state.selection(), (4, 15));
         state.extend_pointer_selection(text, 1);
         assert_eq!(state.selection(), (0, 9));
-        state.select_click(text, 6, mouse::click::Kind::Triple, false);
+        state.select_click(text, 6, mouse::click::Kind::Triple, false, false);
         assert_eq!(state.selection(), (0, 16));
         state.extend_pointer_selection(text, 18);
         assert_eq!(state.selection(), (0, text.len()));
-        state.select_click(text, 2, mouse::click::Kind::Single, false);
-        state.select_click(text, 18, mouse::click::Kind::Single, true);
+        state.select_click(text, 2, mouse::click::Kind::Single, false, false);
+        state.select_click(text, 18, mouse::click::Kind::Single, true, false);
         assert_eq!(state.selection(), (2, 18));
     }
 
@@ -2702,18 +2915,18 @@ mod tests {
             "[[target#heading",
         ] {
             state.open_autocomplete(0);
-            state.caret = text.len();
-            state.anchor = state.caret;
+            state
+                .selections
+                .replace_with(text, &[(text.len(), text.len())], 0);
             state.refresh_completion(text);
             assert!(state.autocomplete_start.is_none(), "{text:?}");
         }
         state.open_autocomplete(0);
-        state.caret = 5;
-        state.anchor = 5;
+        state.selections.replace_with("[[café", &[(5, 5)], 0);
         state.refresh_completion("[[café");
         // A caret at a UTF-8 scalar boundary inside the target remains valid.
         assert_eq!(state.autocomplete_query, "caf");
-        state.anchor = 0;
+        state.selections.replace_with("[[café", &[(0, 0)], 0);
         state.refresh_completion("[[café");
         assert!(state.autocomplete_start.is_none());
     }
@@ -2797,6 +3010,8 @@ mod tests {
                 revision: view.revision,
                 caret,
                 selection: (caret, caret),
+                selections: vec![[0, caret, caret]],
+                primary: 0,
                 viewport_anchor: 0,
                 focused: true,
                 composing: false,
@@ -2806,7 +3021,7 @@ mod tests {
             state.viewport.first_line, 0,
             "sidebar docking must not scroll a fresh one-row viewport to the caret"
         );
-        assert_eq!(state.caret(), caret);
+        assert_eq!(state.selections.caret(), caret);
     }
 
     fn long_view(lines: usize) -> EditorView {
@@ -2837,10 +3052,11 @@ mod tests {
         assert_eq!(state.viewport.first_line, 100);
 
         // Moving the caret re-anchors around the caret again.
-        state.caret = "line 150\n".len() * 150;
+        let far = "line 150\n".len() * 150;
+        state.selections.replace_with(&view.text, &[(far, far)], 0);
         state.reconcile(&view, &HashMap::new());
         assert!(state.viewport.first_line >= 140);
-        assert_eq!(state.last_ensured_caret, state.caret);
+        assert_eq!(state.last_ensured_caret, state.selections.caret());
     }
 
     #[test]
@@ -2982,11 +3198,8 @@ mod tests {
     #[test]
     fn ime_preedit_is_transient_and_commit_emits_one_edit() {
         let view = EditorView::from(&test_view("hello", 12));
-        let mut state = EditorState {
-            caret: 2,
-            anchor: 2,
-            ..EditorState::default()
-        };
+        let mut state = EditorState::default();
+        state.selections.replace_with("hello", &[(2, 2)], 0);
         assert_eq!(
             state.input_method_event(&view, &input_method::Event::Opened),
             None
@@ -3015,7 +3228,7 @@ mod tests {
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].range, Span::new(TextByte(2), TextByte(2)));
         assert_eq!(edits[0].replacement, "日本語");
-        assert_eq!(state.caret(), 2 + "日本語".len());
+        assert_eq!(state.selections.caret(), 2 + "日本語".len());
         assert!(!state.is_composing());
     }
 
@@ -3023,12 +3236,11 @@ mod tests {
     fn cancelled_ime_composition_never_changes_the_document() {
         let view = EditorView::from(&test_view("hello", 12));
         let mut state = EditorState {
-            caret: 3,
-            anchor: 3,
             focused: true,
             ime_active: true,
             ..EditorState::default()
         };
+        state.selections.replace_with("hello", &[(3, 3)], 0);
         state.input_method_event(&view, &input_method::Event::Opened);
         state.input_method_event(
             &view,
@@ -3041,7 +3253,7 @@ mod tests {
         );
         assert!(!state.is_composing());
         assert!(state.ime_active);
-        assert_eq!(state.caret(), 3);
+        assert_eq!(state.selections.caret(), 3);
 
         // Switching the input method back on while the editor retains focus
         // must start a new composition without a second pointer click.
@@ -3058,7 +3270,7 @@ mod tests {
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].range, Span::new(TextByte(3), TextByte(3)));
         assert_eq!(edits[0].replacement, "仮名");
-        assert_eq!(state.caret(), 3 + "仮名".len());
+        assert_eq!(state.selections.caret(), 3 + "仮名".len());
         assert!(!state.is_composing());
     }
 
@@ -3068,8 +3280,11 @@ mod tests {
         let mut state = EditorState {
             buffer_id: Some(view.buffer_id),
             revision: Some(view.revision),
-            caret: 2,
-            anchor: 1,
+            selections: {
+                let mut s = EditorSelections::default();
+                s.replace_with("text", &[(1, 2)], 0);
+                s
+            },
             focused: true,
             composition: Some(Composition {
                 start: 2,
@@ -3100,11 +3315,10 @@ mod tests {
         let mut state = EditorState {
             buffer_id: Some(view.buffer_id),
             revision: Some(view.revision),
-            caret: 2,
-            anchor: 2,
             focused: false,
             ..EditorState::default()
         };
+        state.selections.replace_with("text", &[(2, 2)], 0);
         let mut operation = set_focused_editor_selection(view.buffer_id, view.revision, 1, 4);
         operation.custom(None, Rectangle::with_size(Size::ZERO), &mut state);
         assert_eq!(state.selection(), (1, 4));
@@ -3136,11 +3350,10 @@ mod tests {
         let mut state = EditorState {
             buffer_id: Some(view.buffer_id),
             revision: Some(view.revision),
-            caret: 3,
-            anchor: 1,
             focused: false,
             ..EditorState::default()
         };
+        state.selections.replace_with("text", &[(3, 1)], 0);
         let mut stale = focus_editor(view.buffer_id, view.revision + 1, None);
         stale.custom(None, Rectangle::with_size(Size::ZERO), &mut state);
         assert!(!state.focused);
@@ -3184,24 +3397,15 @@ mod tests {
             CompletionCandidate::new("notes/inbox", "Inbox"),
             CompletionCandidate::new("Ideas", "Ideas"),
         ]));
-        let mut state = EditorState {
-            caret: view.text.len(),
-            anchor: view.text.len(),
-            ..EditorState::default()
-        };
+        let mut state = EditorState::default();
+        state
+            .selections
+            .replace_with(&view.text, &[(view.text.len(), view.text.len())], 0);
         state.open_autocomplete(0);
         state.autocomplete_query = "In".into();
-        let mut clipboard = iced::advanced::clipboard::Null;
         let mut messages = Vec::new();
         let mut shell = Shell::new(&mut messages);
-        assert!(widget.execute_key(
-            &mut state,
-            &Key::Named(Named::Enter),
-            Modifiers::empty(),
-            None,
-            &mut clipboard,
-            &mut shell,
-        ));
+        assert!(widget.autocomplete_key(&mut state, &Key::Named(Named::Enter), &mut shell));
         drop(shell);
         assert_eq!(messages.len(), 1);
         assert!(matches!(&messages[0], EditorAction::Complete {
@@ -3209,7 +3413,7 @@ mod tests {
             prefix, candidate,
         } if prefix == "[[In" && candidate.target == "notes/inbox"));
         assert_eq!(
-            state.caret(),
+            state.selections.caret(),
             4,
             "completion waits for the semantic acknowledgement"
         );
@@ -3221,26 +3425,17 @@ mod tests {
         let view = test_view("[[New", 103);
         let widget = EditorWidget::new(&view, |action| action)
             .with_candidates(Arc::from([CompletionCandidate::new("Ideas", "Ideas")]));
-        let mut state = EditorState {
-            caret: view.text.len(),
-            anchor: view.text.len(),
-            ..EditorState::default()
-        };
+        let mut state = EditorState::default();
+        state
+            .selections
+            .replace_with(&view.text, &[(view.text.len(), view.text.len())], 0);
         state.open_autocomplete(0);
         state.autocomplete_query = "New note".into();
         state.autocomplete_selected = 0; // no matching notes, so the create row is selected
-        let mut clipboard = iced::advanced::clipboard::Null;
         let mut messages = Vec::new();
         let mut shell = Shell::new(&mut messages);
 
-        assert!(widget.execute_key(
-            &mut state,
-            &Key::Named(Named::Enter),
-            Modifiers::empty(),
-            None,
-            &mut clipboard,
-            &mut shell,
-        ));
+        assert!(widget.autocomplete_key(&mut state, &Key::Named(Named::Enter), &mut shell));
         drop(shell);
 
         assert_eq!(messages.len(), 1);
@@ -3340,6 +3535,8 @@ mod tests {
             revision: view.revision,
             caret,
             selection: (caret, caret),
+            selections: vec![[0, caret, caret]],
+            primary: 0,
             viewport_anchor: 0,
             focused: true,
             composing: false,
@@ -3381,131 +3578,44 @@ mod tests {
     }
 
     #[test]
-    fn headless_key_dispatch_emits_one_revision_guarded_edit() {
-        let view = test_view("hello", 91);
-        let widget = EditorWidget::new(&view, |action| action);
+    fn pointer_toggle_and_escape_collapse_follow_the_set_vocabulary() {
+        // E-14 pointer vocabulary + D-6 Escape collapse, exercised through
+        // the same state methods the event path uses.
+        let text = "one two three";
         let mut state = EditorWidget::<EditorAction>::state_for_test();
-        state.focused = true;
-        state.caret = 2;
-        state.anchor = 2;
-        let mut clipboard = iced::advanced::clipboard::Null;
-        let mut messages = Vec::new();
-        let mut shell = Shell::new(&mut messages);
-
-        assert!(widget.execute_key(
-            &mut state,
-            &Key::Character("x".into()),
-            Modifiers::empty(),
-            Some("é"),
-            &mut clipboard,
-            &mut shell,
-        ));
-        drop(shell);
-
-        assert_eq!(state.caret(), 4);
-        assert_eq!(messages.len(), 1);
-        assert!(matches!(
-            messages[0],
-            EditorAction::Edit {
-                buffer_id: 91,
-                expected_revision: 11,
-                ..
-            }
-        ));
-        let (_, _, edits) = messages[0].as_edit().expect("edit action");
-        assert_eq!(edits[0].range, Span::new(TextByte(2), TextByte(2)));
-        assert_eq!(edits[0].replacement, "é");
+        state.select_click(text, 1, mouse::click::Kind::Single, false, false);
+        assert_eq!(state.selection(), (1, 1));
+        // Mod-click adds a second caret; the primary stays first (canonical
+        // order), and a second toggle on the same spot removes it again.
+        assert!(state.selections.toggle_member(text, 5, (5, 5)), "added");
+        assert_eq!(state.selections.len(), 2);
+        assert!(!state.selections.toggle_member(text, 5, (5, 5)), "removed");
+        assert_eq!(state.selections.len(), 1);
+        // The last member is never removed by a toggle.
+        assert!(!state.selections.toggle_member(text, 1, (1, 1)));
+        assert_eq!(state.selections.len(), 1);
+        // Escape collapse: a range folds to its head; a caret is a no-op.
+        state.select_click(text, 4, mouse::click::Kind::Double, false, false);
+        assert_eq!(state.selection(), (4, 7));
+        assert!(state.selections.escape_collapse(text));
+        assert_eq!(state.selection(), (7, 7));
+        assert!(!state.selections.escape_collapse(text));
     }
 
     #[test]
-    fn consecutive_input_before_view_refresh_emits_one_edit_then_waits() {
-        let view = test_view("x", 92);
-        let widget = EditorWidget::new(&view, |action| action);
+    fn escape_collapse_drops_additional_members_first() {
+        let text = "one two three";
         let mut state = EditorWidget::<EditorAction>::state_for_test();
-        state.focused = true;
-        state.caret = 1;
-        state.anchor = 1;
-        let mut clipboard = iced::advanced::clipboard::Null;
-        let mut messages = Vec::new();
-        {
-            let mut shell = Shell::new(&mut messages);
-            widget.execute_key(
-                &mut state,
-                &Key::Character("a".into()),
-                Modifiers::empty(),
-                Some("a"),
-                &mut clipboard,
-                &mut shell,
-            );
-        }
-
-        assert_eq!(messages.len(), 1);
-        assert_eq!(
-            messages[0].as_edit().unwrap().2[0].range,
-            Span::new(TextByte(1), TextByte(1))
-        );
-        assert_eq!(state.caret(), 2);
-        assert_eq!(state.selection(), (2, 2));
-        // The caret now runs ahead of the acknowledged "x" snapshot, so the
-        // shared interpreter refuses the next capture until the host
-        // acknowledges and refreshes the view ("place the caret again").
-        {
-            let mut shell = Shell::new(&mut messages);
-            assert!(!widget.execute_key(
-                &mut state,
-                &Key::Character("b".into()),
-                Modifiers::empty(),
-                Some("b"),
-                &mut clipboard,
-                &mut shell,
-            ));
-        }
-        assert_eq!(messages.len(), 1);
-        assert_eq!(state.caret(), 2);
-        assert_eq!(state.selection(), (2, 2));
-    }
-
-    #[test]
-    fn headless_selection_and_history_use_session_actions() {
-        let view = test_view("one\ntwo", 18);
-        let widget = EditorWidget::new(&view, |action| action);
-        let mut state = EditorWidget::<EditorAction>::state_for_test();
-        state.focused = true;
-        let mut clipboard = iced::advanced::clipboard::Null;
-        let mut messages = Vec::new();
-        let mut shell = Shell::new(&mut messages);
-
-        widget.execute_key(
-            &mut state,
-            &Key::Character("a".into()),
-            Modifiers::CTRL,
-            None,
-            &mut clipboard,
-            &mut shell,
-        );
-        drop(shell);
-        assert_eq!(state.selection(), (0, view.text.len()));
-
-        let mut messages = Vec::new();
-        let mut shell = Shell::new(&mut messages);
-        widget.execute_key(
-            &mut state,
-            &Key::Character("z".into()),
-            Modifiers::CTRL,
-            None,
-            &mut clipboard,
-            &mut shell,
-        );
-        drop(shell);
-        assert_eq!(messages.len(), 1);
-        assert!(matches!(
-            messages[0],
-            EditorAction::History {
-                buffer_id: 18,
-                direction: crate::surface::HistoryDirection::Undo,
-                ..
-            }
-        ));
+        state.select_click(text, 0, mouse::click::Kind::Double, false, false);
+        assert!(state.selections.toggle_member(text, 8, (8, 8)));
+        assert_eq!(state.selections.len(), 2);
+        // First Escape: additional members drop, the primary range stays.
+        assert!(state.selections.escape_collapse(text));
+        assert_eq!(state.selections.len(), 1);
+        assert_eq!(state.selection(), (0, 3));
+        // Second Escape: the remaining range folds to its head.
+        assert!(state.selections.escape_collapse(text));
+        assert_eq!(state.selection(), (3, 3));
     }
 
     #[test]
@@ -3541,7 +3651,7 @@ mod tests {
         };
 
         state.place_caret_from_point(text, 0, target.x + 0.1, 1.0, 300.0, false);
-        assert_eq!(state.caret(), expected_byte);
+        assert_eq!(state.selections.caret(), expected_byte);
         assert_eq!(state.selection(), (expected_byte, expected_byte));
         state.place_caret_from_point(text, 0, first_run.glyphs[1].x + 0.1, 1.0, 300.0, true);
         assert_eq!(
@@ -3561,10 +3671,9 @@ mod tests {
         };
         let mut state = EditorState {
             buffer_id: Some(old.buffer_id),
-            caret: 8,
-            anchor: 4,
             ..EditorState::default()
         };
+        state.selections.replace_with("long text", &[(8, 4)], 0);
 
         let shorter_same_buffer = EditorView {
             revision: 3,
@@ -3581,7 +3690,7 @@ mod tests {
         };
         state.focused = true;
         state.reconcile(&reopened, &HashMap::new());
-        assert_eq!(state.caret(), 0);
+        assert_eq!(state.selections.caret(), 0);
         assert_eq!(state.selection(), (0, 0));
         assert!(!state.focused);
     }
@@ -3594,20 +3703,22 @@ mod tests {
 
     #[test]
     fn caret_motion_scrolls_the_viewport_to_keep_the_caret_visible() {
+        let text = "one\ntwo\nthree\nfour\nfive";
         let mut state = EditorState {
-            caret: 0,
             viewport: Viewport {
                 visible_lines: 3,
                 ..Viewport::default()
             },
             ..EditorState::default()
         };
-        state.caret = "one\ntwo\nthree\nfour\nfive".len();
-        state.ensure_caret_visible("one\ntwo\nthree\nfour\nfive");
+        state
+            .selections
+            .replace_with(text, &[(text.len(), text.len())], 0);
+        state.ensure_caret_visible(text);
         assert_eq!(state.viewport.first_line, 2);
 
-        state.caret = 0;
-        state.ensure_caret_visible("one\ntwo\nthree\nfour\nfive");
+        state.selections.replace_with(text, &[(0, 0)], 0);
+        state.ensure_caret_visible(text);
         assert_eq!(state.viewport.first_line, 0);
     }
 }

@@ -79,6 +79,14 @@ pub struct App {
     /// RFC-0006 S01: per-view literal find/replace state and match pages.
     pub(crate) catalog_host: crate::host::catalog::CatalogHost,
     pub note_search: crate::host::note_search::NoteSearchHost,
+    /// FEUX-0002 X06: match-driven selection drafts/previews (E-10/E-11).
+    pub selection_search: crate::host::selection_search::SelectionSearchHost,
+    /// FEUX-0002 X07: the content-free diagnostics ring and the burst-hint
+    /// banner state (E-15).
+    pub diagnostics: crate::host::editor_diagnostics::DiagnosticsHost,
+    /// The monotonic clock for the pure statechart's burst window (X07).
+    /// Injected here so every host call forwards a coherent `now_ms`.
+    started_at: std::time::Instant,
     /// RFC-0006 §6.10: per-tab pending encoding decisions and repairs.
     pub encoding: crate::host::encoding::EncodingHost,
     pub input_chains: BTreeMap<TabId, crate::host::input::InputChain>,
@@ -266,10 +274,17 @@ pub enum Message {
         incarnation: u64,
         input: flavite_editor::input::CapturedInput,
     },
+    /// Clipboard reads resume interpretation at the effect boundary (X04
+    /// clipboard seam).
+    EditorClipboard(crate::host::editor_clipboard::ClipboardMessage),
     /// RFC-0006 §6.10: typed encoding decisions routed to the encoding host.
     Encoding(crate::host::encoding::EncodingMessage),
     /// RFC-0006 S01: literal find/replace host messages.
     NoteSearch(crate::host::note_search::NoteSearchMessage),
+    /// FEUX-0002 X06: match-selection host messages.
+    SelectionSearch(crate::host::selection_search::SelectionSearchMessage),
+    /// FEUX-0002 X07: diagnostics ring and burst-hint host messages.
+    EditorDiagnostics(crate::host::editor_diagnostics::DiagnosticsMessage),
     ToggleNoteMode(TabId),
     RetryReading(TabId),
     ToggleSourcePreview(TabId),
@@ -660,6 +675,9 @@ impl App {
             reading: crate::host::reading::ReadingHost::default(),
             catalog_host: crate::host::catalog::CatalogHost::default(),
             note_search: crate::host::note_search::NoteSearchHost::default(),
+            selection_search: crate::host::selection_search::SelectionSearchHost::default(),
+            diagnostics: crate::host::editor_diagnostics::DiagnosticsHost::default(),
+            started_at: std::time::Instant::now(),
             replace: crate::host::replace::ReplaceHost::default(),
             replace_operations: crate::host::operations::OperationsHost::default(),
             encoding: crate::host::encoding::EncodingHost::default(),
@@ -1468,13 +1486,30 @@ impl App {
     pub fn editor_interaction_snapshot(&self, tab: TabId) -> Option<EditorInteractionSnapshot> {
         let view = self.note_editor_view(tab)?;
         let logical = self.workspace.tab(&tab)?.interaction();
-        let selection = logical.selections.first().copied().unwrap_or_default();
+        let selection = logical
+            .selections
+            .get(
+                logical
+                    .primary
+                    .min(logical.selections.len().saturating_sub(1)),
+            )
+            .copied()
+            .unwrap_or_default();
         Some(EditorInteractionSnapshot {
             sequence: logical.sequence,
             buffer_id: view.buffer_id,
             revision: view.revision,
             caret: selection.head,
             selection: (selection.anchor, selection.head),
+            primary: logical
+                .primary
+                .min(logical.selections.len().saturating_sub(1)),
+            selections: logical
+                .selections
+                .iter()
+                .enumerate()
+                .map(|(id, selection)| [id, selection.anchor, selection.head])
+                .collect(),
             viewport_anchor: logical.viewport_anchor,
             focused: logical.focused,
             composing: logical.composition == flavite_workspace::CompositionState::Active,
@@ -2011,13 +2046,26 @@ impl App {
                         "Editor input was stale; the current caret state was restored".into();
                     return;
                 }
-                let selection =
-                    flavite_workspace::Selection::new(snapshot.selection.0, snapshot.selection.1);
+                let members: Vec<flavite_workspace::CommittedSelection> = snapshot
+                    .selections
+                    .iter()
+                    .map(|&[_, anchor, head]| {
+                        flavite_workspace::CommittedSelection::new(anchor, head)
+                    })
+                    .collect();
+                let members = if members.is_empty() {
+                    vec![flavite_workspace::CommittedSelection::new(
+                        snapshot.selection.0,
+                        snapshot.selection.1,
+                    )]
+                } else {
+                    members
+                };
                 if snapshot.focused
                     && self
                         .workspace
                         .tab(&tab)
-                        .is_some_and(|v| v.interaction().selections != [selection])
+                        .is_some_and(|v| v.interaction().selections != members)
                 {
                     crate::host::context_mode::selection_changed(self, tab);
                 }
@@ -2031,7 +2079,7 @@ impl App {
                 interaction.buffer_id = Some(snapshot.buffer_id);
                 interaction.revision = snapshot.revision;
                 interaction.sequence = snapshot.sequence;
-                interaction.selections = vec![selection];
+                interaction.selections = members;
                 interaction.viewport_anchor = snapshot.viewport_anchor;
                 interaction.composition = if snapshot.composing {
                     flavite_workspace::CompositionState::Active
@@ -2328,6 +2376,14 @@ impl App {
         crate::host::open_intents::open(self, intent);
     }
 
+    /// The monotonic millisecond clock for the pure statechart's burst
+    /// window (X07). Injected once per App; the host forwards it to
+    /// [`flavite_edit_context::reduce`] on every event.
+    #[must_use]
+    pub fn now_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+
     /// Apply one host event.
     pub fn update(&mut self, message: Message) -> Task<Message> {
         // A raw pointer message that changed nothing observable (the
@@ -2373,6 +2429,16 @@ impl App {
                     buffer: request.buffer,
                     revision: request.revision,
                     selection: request.selection,
+                    selections: request.selections.clone(),
+                    primary: self.workspace.tab(&tab).map_or(0, |v| {
+                        v.interaction()
+                            .primary
+                            .min(request.selections.len().saturating_sub(1))
+                    }),
+                    selection_version: self
+                        .workspace
+                        .tab(&tab)
+                        .map_or(0, |v| v.interaction().selection_version),
                 };
                 let target = if matches!(request.event, ContextEvent::EnterAt(_)) {
                     captured
@@ -2388,19 +2454,22 @@ impl App {
                 };
                 let message = match request.event.clone() {
                     ContextEvent::Commit(input) => {
-                        let task = crate::host::input::commit_composition(self, target, input);
+                        let task =
+                            crate::host::input::commit_composition(self, target.clone(), input);
                         crate::host::input::remember_context(self, target, &request);
                         return task;
                     }
                     ContextEvent::Key(key) => {
-                        let task = crate::host::context_mode::native_key(self, target, key);
+                        let task = crate::host::context_mode::native_key(self, target.clone(), key);
                         crate::host::input::remember_context(self, target, &request);
                         return task;
                     }
-                    ContextEvent::Command(command) => ContextMessage::Run(target, command),
-                    ContextEvent::Menu(menu) => ContextMessage::OpenMenu(target, menu),
-                    ContextEvent::EnterAt(selection) => ContextMessage::EnterAt(target, selection),
-                    ContextEvent::Unbound => ContextMessage::Unbound(target),
+                    ContextEvent::Command(command) => ContextMessage::Run(target.clone(), command),
+                    ContextEvent::Menu(menu) => ContextMessage::OpenMenu(target.clone(), menu),
+                    ContextEvent::EnterAt(selection) => {
+                        ContextMessage::EnterAt(target.clone(), selection)
+                    }
+                    ContextEvent::Unbound => ContextMessage::Unbound(target.clone()),
                 };
                 let task = crate::host::context_mode::handle(self, message);
                 if !matches!(request.event, ContextEvent::EnterAt(_)) {
@@ -2413,6 +2482,9 @@ impl App {
                 incarnation,
                 input,
             } => return crate::host::input::handle(self, tab, incarnation, input),
+            Message::EditorClipboard(message) => {
+                return crate::host::editor_clipboard::handle(self, message);
+            }
             Message::Encoding(message) => {
                 let task = crate::host::encoding::handle(self, message);
                 self.refresh_semantics();
@@ -2420,6 +2492,12 @@ impl App {
             }
             Message::NoteSearch(message) => {
                 return crate::host::note_search::handle(self, message);
+            }
+            Message::SelectionSearch(message) => {
+                return crate::host::selection_search::handle(self, message);
+            }
+            Message::EditorDiagnostics(message) => {
+                return crate::host::editor_diagnostics::handle(self, message);
             }
             message @ (Message::ToggleNoteMode(_)
             | Message::RetryReading(_)
@@ -3735,6 +3813,9 @@ impl App {
         if crate::host::note_search::completion(self, &completion) {
             return;
         }
+        if crate::host::selection_search::completion(self, &completion) {
+            return;
+        }
         if self.replace.observe(&completion) {
             return;
         }
@@ -4071,6 +4152,18 @@ impl App {
             self.status = "Open a vault before inserting links".into();
             return;
         };
+        // Link insertion is a single-caret act (FEUX-0002 FR-9): a multi-
+        // member set has no one insertion point. Checked before the writing
+        // target (which only exists for single carets) so the refusal names
+        // the actual cause.
+        if self
+            .workspace
+            .tab(&self.workspace.focused_tab())
+            .is_some_and(|view| view.interaction().selections.len() > 1)
+        {
+            self.status = "Choose one caret to insert a link.".into();
+            return;
+        }
         let Some((tab, incarnation, buffer_id, revision, caret)) = self.valid_writing_target()
         else {
             self.status = "Writing target: none — focus an editor caret to insert a link".into();
@@ -4699,6 +4792,9 @@ mod tests {
             reading: crate::host::reading::ReadingHost::default(),
             catalog_host: crate::host::catalog::CatalogHost::default(),
             note_search: crate::host::note_search::NoteSearchHost::default(),
+            selection_search: crate::host::selection_search::SelectionSearchHost::default(),
+            diagnostics: crate::host::editor_diagnostics::DiagnosticsHost::default(),
+            started_at: std::time::Instant::now(),
             replace: crate::host::replace::ReplaceHost::default(),
             replace_operations: crate::host::operations::OperationsHost::default(),
             encoding: crate::host::encoding::EncodingHost::default(),

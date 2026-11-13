@@ -33,6 +33,8 @@ pub fn command_key(code: KeyCode, modifiers: Modifiers) -> Option<C> {
         (KeyCode::Semicolon, true) => C::Commands,
         (KeyCode::Slash, false) => C::Find,
         (KeyCode::Slash, true) => C::Replace,
+        (KeyCode::KeyF, false) => C::FindChar { forward: true },
+        (KeyCode::KeyF, true) => C::FindChar { forward: false },
         _ => return None,
     })
 }
@@ -49,6 +51,7 @@ pub fn motion_key(code: KeyCode, modifiers: Modifiers) -> Option<Motion> {
         KeyCode::KeyK => Motion::Up,
         KeyCode::KeyL => Motion::Next,
         KeyCode::KeyW => Motion::NextWord,
+        KeyCode::KeyE => Motion::NextWordEnd,
         KeyCode::KeyB => Motion::PreviousWord,
         _ => return None,
     })

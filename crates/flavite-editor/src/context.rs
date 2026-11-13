@@ -11,12 +11,16 @@ use iced::keyboard::{Modifiers as NativeModifiers, key::Code};
 
 pub mod layout;
 
-/// Native editor context intents carry the exact source and visible selection.
+/// Native editor context intents carry the exact source and the whole live
+/// selection set (FEUX-0002 X04: `selection` is the primary pair kept for
+/// captions; `selections` is the canonical set snapshot).
 #[derive(Debug, Clone)]
 pub struct ContextRequest {
     pub buffer: u64,
     pub revision: u64,
     pub selection: (usize, usize),
+    /// The whole live set as `(anchor, head)` pairs in canonical order.
+    pub selections: Vec<(usize, usize)>,
     pub sequence: u64,
     pub event: ContextEvent,
 }
@@ -25,7 +29,9 @@ pub struct ContextRequest {
 pub enum ContextEvent {
     Command(flavite_edit_context::ContextCommand),
     Menu(flavite_edit_context::ContextMenu),
-    EnterAt((usize, usize)),
+    /// Right-click entry: the resolved selection set (kept when the press
+    /// landed inside any member, replaced by word bounds otherwise, E-14).
+    EnterAt(Vec<(usize, usize)>),
     Unbound,
     /// Interpret in acknowledged host mode, rather than the last drawn mode.
     Key(ContextKey),
@@ -58,6 +64,7 @@ pub fn native_code(code: Code) -> Option<KeyCode> {
         Code::KeyJ => KeyCode::KeyJ,
         Code::KeyK => KeyCode::KeyK,
         Code::KeyL => KeyCode::KeyL,
+        Code::KeyF => KeyCode::KeyF,
         Code::KeyO => KeyCode::KeyO,
         Code::KeyP => KeyCode::KeyP,
         Code::KeyT => KeyCode::KeyT,
@@ -94,6 +101,65 @@ pub const fn motion_action(motion: Motion) -> KeyAction {
         Motion::Up => KeyAction::Up,
         Motion::Down => KeyAction::Down,
         Motion::NextWord => KeyAction::NextWord,
+        Motion::NextWordEnd => KeyAction::NextWordEnd,
         Motion::PreviousWord => KeyAction::PreviousWord,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flavite_edit_context::{Modifiers, command_key};
+
+    /// Every grammar key identity converts from a native physical code
+    /// (FEUX-0002 E-8/R9): the conversion boundary covers the whole
+    /// advertised physical vocabulary, so `f`/`Shift+F` and every other
+    /// binding reach the grammar on real hardware.
+    #[test]
+    fn native_converter_covers_the_whole_grammar_vocabulary() {
+        let all = [
+            (Code::KeyA, KeyCode::KeyA),
+            (Code::KeyB, KeyCode::KeyB),
+            (Code::KeyC, KeyCode::KeyC),
+            (Code::KeyD, KeyCode::KeyD),
+            (Code::KeyE, KeyCode::KeyE),
+            (Code::KeyF, KeyCode::KeyF),
+            (Code::KeyG, KeyCode::KeyG),
+            (Code::KeyH, KeyCode::KeyH),
+            (Code::KeyI, KeyCode::KeyI),
+            (Code::KeyJ, KeyCode::KeyJ),
+            (Code::KeyK, KeyCode::KeyK),
+            (Code::KeyL, KeyCode::KeyL),
+            (Code::KeyO, KeyCode::KeyO),
+            (Code::KeyP, KeyCode::KeyP),
+            (Code::KeyT, KeyCode::KeyT),
+            (Code::KeyU, KeyCode::KeyU),
+            (Code::KeyV, KeyCode::KeyV),
+            (Code::KeyW, KeyCode::KeyW),
+            (Code::KeyX, KeyCode::KeyX),
+            (Code::KeyY, KeyCode::KeyY),
+            (Code::Semicolon, KeyCode::Semicolon),
+            (Code::Slash, KeyCode::Slash),
+        ];
+        for (native, grammar) in all {
+            assert_eq!(
+                native_code(native),
+                Some(grammar),
+                "{native:?} must convert"
+            );
+        }
+    }
+
+    #[test]
+    fn native_f_reaches_the_find_char_grammar() {
+        let code = native_code(Code::KeyF).expect("KeyF converts");
+        assert_eq!(
+            command_key(code, Modifiers::EMPTY),
+            Some(flavite_edit_context::ContextCommand::FindChar { forward: true })
+        );
+        assert_eq!(
+            command_key(code, Modifiers::SHIFT),
+            Some(flavite_edit_context::ContextCommand::FindChar { forward: false })
+        );
     }
 }
