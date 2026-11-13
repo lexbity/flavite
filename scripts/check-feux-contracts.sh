@@ -297,6 +297,44 @@ run_x06_gates() {
     gate assert_present 'MatchesCollected' "$root/crates/flavite-vault/src/session.rs"
 }
 
+run_x07_gates() {
+    run_x06_gates
+    # X07 artifacts exist with real content.
+    local file
+    for file in \
+        crates/flavite-ui/src/host/editor_diagnostics.rs \
+        crates/flavite-ui/tests/editor_diagnostics.rs \
+        crates/flavite-ui/tests/editor_failures.rs \
+        crates/flavite-edit-context/tests/burst.rs \
+        scripts/tests/workbench/context_mode_failures.py; do
+        gate assert_nonempty "$root/$file"
+    done
+    # No sleeps in the new host paths or the pure statechart (E-15).
+    gate assert_absent 'std::thread::sleep|tokio::time::sleep' \
+        "$root/crates/flavite-ui/src/host/editor_diagnostics.rs" \
+        "$root/crates/flavite-ui/src/host/context_mode.rs" \
+        "$root/crates/flavite-edit-context/src"
+    # No network surface in diagnostics (NFR-10; just network-denied).
+    gate assert_absent 'reqwest|TcpStream|UdpSocket|https?://' \
+        "$root/crates/flavite-ui/src/host/editor_diagnostics.rs"
+    # The ring schema never names content fields: content-free by design,
+    # and the seeded-token scan proves the emit paths cannot leak.
+    gate assert_absent 'buffer_text|clipboard_text|query_source|file_path|typed_chars' \
+        "$root/crates/flavite-ui/src/host/editor_diagnostics.rs"
+    # The burst hint offers Exit / Open-history only — never an undo action
+    # (FEUX-001 D-22: shared-buffer edits make that promise false).
+    gate assert_absent 'undo_burst|Undo burst' \
+        "$root/crates/flavite-ui/src" \
+        "$root/crates/flavite-edit-context/src"
+    # The burst thresholds emit the effect, and the typed setting exists.
+    gate assert_present 'ShowBurstHint' "$root/crates/flavite-edit-context/src/session.rs"
+    gate assert_present 'BURST_WINDOW_MS' "$root/crates/flavite-edit-context/src/session.rs"
+    gate assert_present 'BURST_SUPPRESS_MS' "$root/crates/flavite-edit-context/src/session.rs"
+    gate assert_present 'burst_hint_enabled' "$root/crates/flavite-settings/src/registry.rs"
+    gate assert_present 'MAX_DIAGNOSTIC_EVENTS' \
+        "$root/crates/flavite-ui/src/host/editor_diagnostics.rs"
+}
+
 case "$slice" in
     X01) run_x01_gates ;;
     X02) run_x02_gates ;;
@@ -304,11 +342,12 @@ case "$slice" in
     X04) run_x04_gates ;;
     X05) run_x05_gates ;;
     X06) run_x06_gates ;;
-    X07|X08)
-        echo "phase ${slice} is not implemented yet; the cumulative gate stops at X06" >&2
+    X07) run_x07_gates ;;
+    X08)
+        echo "phase X08 is not implemented yet; the cumulative gate stops at X07" >&2
         exit 2
         ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05 X06)" >&2; exit 2 ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05 X06 X07)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then

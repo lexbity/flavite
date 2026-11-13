@@ -8,9 +8,15 @@ use flavite_edit_context::{
     ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event, reduce,
 };
 
+/// Drive the public statechart with the deterministic test clock and the
+/// burst hint disabled (the burst matrix has its own suite).
+fn r(state: &mut ContextState, event: &Event, now_ms: u64, enabled: bool) -> Vec<Effect> {
+    reduce(state, event, now_ms, enabled)
+}
+
 fn activated() -> ContextState {
     let mut state = ContextState::default();
-    let _ = reduce(&mut state, &Event::Activate);
+    let _ = r(&mut state, &Event::Activate, 0, false);
     state
 }
 
@@ -26,8 +32,8 @@ fn activate_creates_the_delivered_command_state() {
 fn matrix_escape_row_pops_menu_then_typing_then_stays() {
     // Menu open (delivered: pop the menu, mode untouched).
     let mut state = activated();
-    let _ = reduce(&mut state, &Event::OpenMenu(ContextMenu::Select));
-    let effects = reduce(&mut state, &Event::Escape);
+    let _ = r(&mut state, &Event::OpenMenu(ContextMenu::Select), 0, false);
+    let effects = r(&mut state, &Event::Escape, 0, false);
     assert_eq!(
         effects,
         vec![
@@ -41,8 +47,8 @@ fn matrix_escape_row_pops_menu_then_typing_then_stays() {
 
     // Typing (delivered: leave typing, same effect list).
     let mut state = activated();
-    let _ = reduce(&mut state, &Event::EnterTyping);
-    let effects = reduce(&mut state, &Event::Escape);
+    let _ = r(&mut state, &Event::EnterTyping, 0, false);
+    let effects = r(&mut state, &Event::Escape, 0, false);
     assert_eq!(
         effects,
         vec![
@@ -55,7 +61,7 @@ fn matrix_escape_row_pops_menu_then_typing_then_stays() {
 
     // Command (delivered: stay; hint is the deliverable).
     let mut state = activated();
-    let _ = reduce(&mut state, &Event::Escape);
+    let _ = r(&mut state, &Event::Escape, 0, false);
     assert_eq!(state.mode(), ContextMode::Command);
     assert_eq!(state.message(), (ContextState::ESC_HINT, false));
 }
@@ -64,25 +70,25 @@ fn matrix_escape_row_pops_menu_then_typing_then_stays() {
 fn matrix_menu_rows_open_cycle_and_close_with_delivered_effects() {
     let mut state = activated();
     assert_eq!(
-        reduce(&mut state, &Event::OpenMenu(ContextMenu::Type)),
+        r(&mut state, &Event::OpenMenu(ContextMenu::Type), 0, false),
         vec![Effect::ClearPreview, Effect::SealTypingGroup]
     );
     assert_eq!(state.selected(), 0);
     assert_eq!(state.menu_command(), Some(ContextCommand::InsertStart));
 
     assert_eq!(
-        reduce(&mut state, &Event::MenuMove(true)),
+        r(&mut state, &Event::MenuMove(true), 0, false),
         vec![Effect::ClearPreview]
     );
     assert_eq!(state.selected(), 1);
     // Wrap backward from row 1 lands on the last row of the Type menu.
-    let _ = reduce(&mut state, &Event::MenuMove(false));
-    let _ = reduce(&mut state, &Event::MenuMove(false));
+    let _ = r(&mut state, &Event::MenuMove(false), 0, false);
+    let _ = r(&mut state, &Event::MenuMove(false), 0, false);
     assert_eq!(state.selected(), 6);
     assert_eq!(state.menu_command(), Some(ContextCommand::Change));
 
     assert_eq!(
-        reduce(&mut state, &Event::CloseMenu),
+        r(&mut state, &Event::CloseMenu, 0, false),
         vec![Effect::ClearPreview, Effect::FocusEditor]
     );
     assert_eq!(state.menu(), None);
@@ -91,11 +97,16 @@ fn matrix_menu_rows_open_cycle_and_close_with_delivered_effects() {
 #[test]
 fn matrix_typing_and_run_rows_seal_and_clear_via_the_host() {
     let mut state = activated();
-    let _ = reduce(&mut state, &Event::RunAdmitted(ContextCommand::Delete));
+    let _ = r(
+        &mut state,
+        &Event::RunAdmitted(ContextCommand::Delete),
+        0,
+        false,
+    );
     assert_eq!(state.message(), ("Delete selection", false));
     assert_eq!(state.menu(), None);
 
-    let effects = reduce(&mut state, &Event::EnterTyping);
+    let effects = r(&mut state, &Event::EnterTyping, 0, false);
     assert!(effects.is_empty());
     assert_eq!(state.mode(), ContextMode::Typing);
     assert_eq!(state.message(), (ContextState::TYPING_HINT, false));
@@ -107,9 +118,11 @@ fn matrix_await_char_rows_enter_resolve_cancel_and_blur() {
     // capture hint and no effects fire.
     let mut state = activated();
     assert_eq!(
-        reduce(
+        r(
             &mut state,
             &Event::EnterAwaitChar(flavite_edit_context::AwaitChar { forward: true }),
+            0,
+            false,
         ),
         vec![]
     );
@@ -125,33 +138,44 @@ fn matrix_await_char_rows_enter_resolve_cancel_and_blur() {
     // Esc cancels (row 7): the capture is cleared, the mode stays, and
     // the delivered Escape effects fire.
     let mut state = activated();
-    let _ = reduce(
+    let _ = r(
         &mut state,
         &Event::EnterAwaitChar(flavite_edit_context::AwaitChar { forward: false }),
+        0,
+        false,
     );
-    let effects = reduce(&mut state, &Event::Escape);
+    let effects = r(&mut state, &Event::Escape, 0, false);
     assert!(effects.contains(&Effect::FocusEditor));
     assert!(state.await_char().is_none());
     assert_eq!(state.mode(), ContextMode::Command);
 
     // Blur cancels to Command while retaining the mode (row 13 + §5.4.1).
     let mut state = activated();
-    let _ = reduce(
+    let _ = r(
         &mut state,
         &Event::EnterAwaitChar(flavite_edit_context::AwaitChar { forward: true }),
+        0,
+        false,
     );
-    let effects = reduce(&mut state, &Event::Blur);
+    let effects = r(&mut state, &Event::Blur, 0, false);
     assert!(state.await_char().is_none());
     assert_eq!(state.mode(), ContextMode::Command);
     assert_eq!(effects, vec![Effect::SealTypingGroup]);
 
     // An admitted run cancels any pending capture (menu interplay).
     let mut state = activated();
-    let _ = reduce(
+    let _ = r(
         &mut state,
         &Event::EnterAwaitChar(flavite_edit_context::AwaitChar { forward: true }),
+        0,
+        false,
     );
-    let _ = reduce(&mut state, &Event::RunAdmitted(ContextCommand::Delete));
+    let _ = r(
+        &mut state,
+        &Event::RunAdmitted(ContextCommand::Delete),
+        0,
+        false,
+    );
     assert!(state.await_char().is_none());
 }
 
@@ -159,29 +183,32 @@ fn matrix_await_char_rows_enter_resolve_cancel_and_blur() {
 fn matrix_external_and_reconcile_rows_match_delivered_semantics() {
     // External selection while active: menu closes, typing group seals.
     let mut state = activated();
-    let _ = reduce(&mut state, &Event::OpenMenu(ContextMenu::Go));
+    let _ = r(&mut state, &Event::OpenMenu(ContextMenu::Go), 0, false);
     assert_eq!(
-        reduce(&mut state, &Event::ExternalSelectionChanged),
+        r(&mut state, &Event::ExternalSelectionChanged, 0, false),
         vec![Effect::SealTypingGroup]
     );
     assert_eq!(state.menu(), None);
 
     // Off: the row is inert.
     let mut state = ContextState::default();
-    assert_eq!(reduce(&mut state, &Event::ExternalSelectionChanged), vec![]);
+    assert_eq!(
+        r(&mut state, &Event::ExternalSelectionChanged, 0, false),
+        vec![]
+    );
 
     // Stale menu target: menu closes with the retype notice.
     let mut state = activated();
-    let _ = reduce(&mut state, &Event::OpenMenu(ContextMenu::More));
-    assert_eq!(reduce(&mut state, &Event::MenuTargetInvalid), vec![]);
+    let _ = r(&mut state, &Event::OpenMenu(ContextMenu::More), 0, false);
+    assert_eq!(r(&mut state, &Event::MenuTargetInvalid, 0, false), vec![]);
     assert_eq!(state.menu(), None);
     assert_eq!(state.message(), (ContextState::MENU_TARGET_STALE, false));
 
     // Blur seals while active and never leaves the mode.
     let mut state = activated();
-    let _ = reduce(&mut state, &Event::EnterTyping);
+    let _ = r(&mut state, &Event::EnterTyping, 0, false);
     assert_eq!(
-        reduce(&mut state, &Event::Blur),
+        r(&mut state, &Event::Blur, 0, false),
         vec![Effect::SealTypingGroup]
     );
     assert_eq!(state.mode(), ContextMode::Typing);

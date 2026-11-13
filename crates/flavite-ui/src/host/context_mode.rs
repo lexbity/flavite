@@ -1,6 +1,7 @@
 //! Target-bound Context Mode controls over the existing editor input and API.
 
 use crate::app::{App, Message};
+use crate::host::editor_diagnostics::{EventKind, ModeEnum as DiagMode, Outcome};
 use flavite_api::{ExecutionResult, Invocation, Origin};
 use flavite_edit_context::{
     ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event, menu_key, reduce,
@@ -138,6 +139,24 @@ impl ContextHost {
     }
 }
 
+/// Record one diagnostics outcome for the view (FEUX-0002 X07). The ring is
+/// content-free by schema; only enums and counts reach it.
+fn diag(app: &mut App, tab: TabId, kind: EventKind, outcome: Outcome, count: Option<u32>) {
+    app.diagnostics.record(
+        Some(tab),
+        DiagMode::from(app.context_mode.mode(tab)),
+        kind,
+        outcome,
+        count,
+        None,
+    );
+}
+
+/// The clock and burst setting the pure statechart needs (X07).
+fn chart_inputs(app: &App) -> (u64, bool) {
+    (app.now_ms(), app.appearance.burst_hint_enabled())
+}
+
 /// Execute pure statechart effects against the app, in returned order.
 /// Returns the focus task if one was requested.
 fn run_effects(app: &mut App, tab: TabId, effects: Vec<Effect>) -> Option<Task<Message>> {
@@ -148,6 +167,10 @@ fn run_effects(app: &mut App, tab: TabId, effects: Vec<Effect>) -> Option<Task<M
             Effect::ClearPreview => app.context_mode.clear_preview(),
             Effect::FocusEditor => task = Some(focus(app, tab)),
             Effect::InvalidateHistory => super::editor_history::invalidate(app),
+            Effect::ShowBurstHint => {
+                app.diagnostics.show_burst_hint();
+                diag(app, tab, EventKind::BurstHint, Outcome::Shown, None);
+            }
         }
     }
     task
@@ -381,6 +404,7 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
 
 fn exit(app: &mut App) {
     app.context_mode.clear_preview();
+    app.diagnostics.clear_burst_hint();
     app.context_mode.history = Default::default();
     app.context_mode.capture = None;
     if let Some(session) = app.context_mode.session.take() {
@@ -426,13 +450,19 @@ pub fn reconcile(app: &mut App) {
         .and_then(|s| s.menu_target.clone())
         .is_some_and(|target| !valid(app, target, true));
     if stale_menu {
+        let (now_ms, burst_enabled) = chart_inputs(app);
         let effects = app
             .context_mode
             .session
             .as_mut()
             .map(|s| {
                 s.menu_target = None;
-                reduce(&mut s.state, &Event::MenuTargetInvalid)
+                reduce(
+                    &mut s.state,
+                    &Event::MenuTargetInvalid,
+                    now_ms,
+                    burst_enabled,
+                )
             })
             .unwrap_or_default();
         debug_assert!(
@@ -712,10 +742,24 @@ fn kernel_mutate(
     let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = api.execute(issue)
     else {
         app.context_mode.notice("Operation could not be started");
+        diag(
+            app,
+            target.tab,
+            EventKind::OperationRefused,
+            Outcome::Refused,
+            Some(target.selections.len() as u32),
+        );
         return None;
     };
     let Some(operation) = success.data.get("operation").cloned() else {
         app.context_mode.notice("Operation could not be started");
+        diag(
+            app,
+            target.tab,
+            EventKind::OperationRefused,
+            Outcome::Refused,
+            Some(target.selections.len() as u32),
+        );
         return None;
     };
     let object = args.as_object_mut().expect("mutation args are an object");
@@ -750,9 +794,26 @@ fn kernel_mutate(
             }
             _ => refused.to_string(),
         };
-        app.context_mode.notice(message);
+        app.context_mode.notice(&message);
+        // Classify the terminal outcome: duplicate delivery and retired
+        // replays are distinct outcomes, not generic refusals (E-5).
+        let (kind, outcome) = crate::host::editor_diagnostics::classify_error(&message);
+        diag(
+            app,
+            target.tab,
+            kind,
+            outcome,
+            Some(target.selections.len() as u32),
+        );
         return None;
     };
+    diag(
+        app,
+        target.tab,
+        EventKind::OperationApplied,
+        Outcome::Applied,
+        Some(target.selections.len() as u32),
+    );
     Some(success)
 }
 
@@ -903,8 +964,22 @@ pub(crate) fn selections_only(
         if let Some(message) = message {
             app.context_mode.notice(message);
         }
+        diag(
+            app,
+            target.tab,
+            EventKind::SelectionOp,
+            Outcome::Refused,
+            Some(target.selections.len() as u32),
+        );
         return None;
     };
+    diag(
+        app,
+        target.tab,
+        EventKind::SelectionOp,
+        Outcome::Applied,
+        Some(target.selections.len() as u32),
+    );
     let triples: Vec<[usize; 3]> =
         serde_json::from_value(success.data["selections"].clone()).ok()?;
     // Install the canonical set; the reducer bumps the version on change.
@@ -1071,6 +1146,7 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
         }
         ContextMessage::CloseMenu(tab) => {
             app.context_mode.preview = None;
+            let (now_ms, burst_enabled) = chart_inputs(app);
             let task = app
                 .context_mode
                 .session
@@ -1078,7 +1154,7 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
                 .filter(|s| s.tab == tab)
                 .map(|s| {
                     s.menu_target = None;
-                    reduce(&mut s.state, &Event::CloseMenu)
+                    reduce(&mut s.state, &Event::CloseMenu, now_ms, burst_enabled)
                 })
                 .map(|effects| run_effects(app, tab, effects))
                 .unwrap_or_default();
@@ -1126,13 +1202,14 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
                 && valid(app, target.clone(), true)
                 && app.context_mode.mode(target.tab).active()
             {
+                let (now_ms, burst_enabled) = chart_inputs(app);
                 let effects = app
                     .context_mode
                     .session
                     .as_mut()
                     .map(|s| {
                         s.menu_target = Some(target.clone());
-                        reduce(&mut s.state, &Event::OpenMenu(menu))
+                        reduce(&mut s.state, &Event::OpenMenu(menu), now_ms, burst_enabled)
                     })
                     .unwrap_or_default();
                 let _ = run_effects(app, target.tab, effects);
@@ -1204,6 +1281,13 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
     {
         app.context_mode
             .notice("Source changed or command unavailable; choose it again");
+        diag(
+            app,
+            target.tab,
+            EventKind::OperationRefused,
+            Outcome::Refused,
+            Some(target.selections.len() as u32),
+        );
         return Task::none();
     }
     if command == Toggle {
@@ -1224,11 +1308,12 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
                 ),
             );
         }
+        let (now_ms, burst_enabled) = chart_inputs(app);
         let effects = app
             .context_mode
             .session
             .as_mut()
-            .map(|s| reduce(&mut s.state, &Event::Escape))
+            .map(|s| reduce(&mut s.state, &Event::Escape, now_ms, burst_enabled))
             .unwrap_or_default();
         let task = run_effects(app, target.tab, effects);
         return task.unwrap_or_else(|| focus(app, target.tab));
@@ -1243,10 +1328,19 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             .notice("Source changed; command was not applied");
         return Task::none();
     }
-    if let Some(s) = &mut app.context_mode.session {
+    let (now_ms, burst_enabled) = chart_inputs(app);
+    let effects = if let Some(s) = &mut app.context_mode.session {
         s.menu_target = None;
-        let _ = reduce(&mut s.state, &Event::RunAdmitted(command));
-    }
+        reduce(
+            &mut s.state,
+            &Event::RunAdmitted(command),
+            now_ms,
+            burst_enabled,
+        )
+    } else {
+        Vec::new()
+    };
+    let _ = run_effects(app, target.tab, effects);
     match command {
         History => {
             return super::editor_history::handle(
@@ -1403,10 +1497,13 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         FindChar { forward } => {
             // E-8: entry opens the one new statechart state; the next
             // produced character resolves it (native_key intercepts).
+            let (now_ms, burst_enabled) = chart_inputs(app);
             if let Some(s) = &mut app.context_mode.session {
                 let _ = reduce(
                     &mut s.state,
                     &Event::EnterAwaitChar(flavite_edit_context::AwaitChar { forward }),
+                    now_ms,
+                    burst_enabled,
                 );
             }
             focus(app, target.tab)
@@ -1538,8 +1635,9 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         if !app.context_mode.mode(target.tab).active() {
             enter(app, target);
         }
+        let (now_ms, burst_enabled) = chart_inputs(app);
         if let Some(s) = &mut app.context_mode.session {
-            let _ = reduce(&mut s.state, &Event::EnterTyping);
+            let _ = reduce(&mut s.state, &Event::EnterTyping, now_ms, burst_enabled);
         }
     }
     task

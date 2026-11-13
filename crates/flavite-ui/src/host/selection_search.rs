@@ -12,6 +12,7 @@
 
 use crate::app::{App, Message};
 use crate::host::context_mode::EditorTarget;
+use crate::host::editor_diagnostics::{EventKind, ModeEnum as DiagMode, Outcome};
 use flavite_api::{ExecutionResult, Invocation, LocalResult, Origin};
 use flavite_workspace::TabId;
 use std::collections::BTreeMap;
@@ -150,6 +151,18 @@ pub enum SelectionSearchMessage {
     Apply(TabId),
 }
 
+/// Record one diagnostics outcome for the match-collection path (X07).
+fn diag(app: &mut App, tab: TabId, kind: EventKind, outcome: Outcome, count: Option<u32>) {
+    app.diagnostics.record(
+        Some(tab),
+        DiagMode::from(app.context_mode.mode(tab)),
+        kind,
+        outcome,
+        count,
+        None,
+    );
+}
+
 /// Handle one match-selection message.
 pub fn handle(app: &mut App, message: SelectionSearchMessage) -> iced::Task<Message> {
     match message {
@@ -168,6 +181,7 @@ pub fn handle(app: &mut App, message: SelectionSearchMessage) -> iced::Task<Mess
             iced::widget::operation::focus(query_id(tab))
         }
         SelectionSearchMessage::Close(tab) => {
+            diag(app, tab, EventKind::MatchCollect, Outcome::Cancelled, None);
             let _ = app.selection_search.tabs.remove(&tab);
             app.selection_search
                 .requests
@@ -370,6 +384,7 @@ fn request_collection(app: &mut App, tab: TabId) {
                 state.pending = Some(request_id);
                 state.error = None;
             }
+            diag(app, tab, EventKind::MatchCollect, Outcome::Started, None);
         }
         ExecutionResult::Local(LocalResult::Success(success)) => {
             install_collection(app, tab, &key, &success.data);
@@ -380,6 +395,7 @@ fn request_collection(app: &mut App, tab: TabId) {
                 state.overlay = None;
                 state.error = Some(error.message.clone());
             }
+            diag(app, tab, EventKind::MatchRefused, Outcome::Refused, None);
         }
         ExecutionResult::Rejected(rejected) => {
             if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
@@ -392,6 +408,7 @@ fn request_collection(app: &mut App, tab: TabId) {
                         .unwrap_or_else(|| "Match collection was refused".into()),
                 );
             }
+            diag(app, tab, EventKind::MatchRefused, Outcome::Refused, None);
         }
         _ => {
             if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
@@ -399,6 +416,7 @@ fn request_collection(app: &mut App, tab: TabId) {
                 state.overlay = None;
                 state.error = Some("Match collection could not be admitted; retry".into());
             }
+            diag(app, tab, EventKind::MatchRefused, Outcome::Refused, None);
         }
     }
 }
@@ -462,6 +480,13 @@ fn install_collection(app: &mut App, tab: TabId, key: &PreviewKey, data: &serde_
             zero_width_count,
         });
     }
+    diag(
+        app,
+        tab,
+        EventKind::MatchPreview,
+        Outcome::Ready,
+        u32::try_from(total_matches).ok(),
+    );
 }
 
 /// Apply the overlay: revalidate the key, then run the selection-only apply
@@ -512,6 +537,21 @@ fn apply(app: &mut App, tab: TabId) -> iced::Task<Message> {
             state.error = None;
         }
         app.refresh_semantics();
+        diag(
+            app,
+            tab,
+            EventKind::MatchCommit,
+            Outcome::Applied,
+            u32::try_from(spans.len()).ok(),
+        );
+    } else {
+        diag(
+            app,
+            tab,
+            EventKind::MatchRefused,
+            Outcome::Refused,
+            u32::try_from(spans.len()).ok(),
+        );
     }
     iced::Task::none()
 }
@@ -538,6 +578,7 @@ pub fn completion(app: &mut App, completion: &flavite_api::OperationCompletion) 
         ExecutionResult::Local(LocalResult::Error(error)) => {
             state.overlay = None;
             state.error = Some(error.message.clone());
+            diag_completion_error(app, tab, &error.message);
         }
         ExecutionResult::Rejected(rejected) => {
             state.overlay = None;
@@ -547,13 +588,28 @@ pub fn completion(app: &mut App, completion: &flavite_api::OperationCompletion) 
                     .clone()
                     .unwrap_or_else(|| "Match collection was refused".into()),
             );
+            let message = state.error.clone().unwrap_or_default();
+            diag_completion_error(app, tab, &message);
         }
         _ => {
             state.overlay = None;
             state.error = Some("Match collection is stale; search again".into());
+            diag(app, tab, EventKind::MatchRefused, Outcome::Refused, None);
         }
     }
     true
+}
+
+/// Classify a collection failure: regex-worker unavailability is its own
+/// typed outcome (actionable, literal paths unaffected), everything else is
+/// a refusal.
+fn diag_completion_error(app: &mut App, tab: TabId, message: &str) {
+    let kind = if message.contains("regex helper") || message.contains("regex is unavailable") {
+        EventKind::WorkerUnavailable
+    } else {
+        EventKind::MatchRefused
+    };
+    diag(app, tab, kind, Outcome::Refused, None);
 }
 
 /// The query input widget id (focus target).

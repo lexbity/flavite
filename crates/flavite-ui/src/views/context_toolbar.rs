@@ -191,18 +191,75 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
     };
     let effect = context_mode::effect_caption(app, target.tab);
     let detail = crate::views::editor_history::strip(app, target.clone(), summary, caption, effect);
+    let mut rows: Vec<Element<'_, Message>> = vec![
+        container(actions)
+            .height(36.0 * metrics.scale)
+            .align_y(alignment::Vertical::Center)
+            .into(),
+    ];
+    // The burst hint (FEUX-0002 E-15, X07): non-blocking, dismissible,
+    // offers only Exit Context Mode and Open history — never an undo
+    // action (shared-buffer edits make that promise false).
+    if app.diagnostics.burst_hint {
+        rows.push(
+            container(
+                row![
+                    text(
+                        "Several edits in quick succession — exit Context Mode or review editing history",
+                    )
+                    .size(metrics.text_sm),
+                    Space::new().width(Length::Fill),
+                    observed(
+                        target.tab,
+                        "burst-exit",
+                        button(text("Exit Context Mode").size(metrics.text_sm))
+                            .padding([3.0 * metrics.scale, 6.0 * metrics.scale])
+                            .style(style::ghost())
+                            .on_press(Message::EditorDiagnostics(
+                                crate::host::editor_diagnostics::DiagnosticsMessage::ExitContextMode(
+                                    target.tab,
+                                ),
+                            )),
+                    ),
+                    observed(
+                        target.tab,
+                        "burst-history",
+                        button(text("Open history").size(metrics.text_sm))
+                            .padding([3.0 * metrics.scale, 6.0 * metrics.scale])
+                            .style(style::ghost())
+                            .on_press(Message::EditorDiagnostics(
+                                crate::host::editor_diagnostics::DiagnosticsMessage::OpenHistory(
+                                    target.tab,
+                                ),
+                            )),
+                    ),
+                    observed(
+                        target.tab,
+                        "burst-dismiss",
+                        button(text("✕").size(metrics.text_sm))
+                            .padding([3.0 * metrics.scale, 5.0 * metrics.scale])
+                            .style(style::ghost())
+                            .on_press(Message::EditorDiagnostics(
+                                crate::host::editor_diagnostics::DiagnosticsMessage::DismissBurstHint,
+                            )),
+                    ),
+                ]
+                .spacing(6.0 * metrics.scale)
+                .align_y(alignment::Vertical::Center),
+            )
+            .padding([3.0 * metrics.scale, 0.0])
+            .width(Length::Fill)
+            .into(),
+        );
+    }
+    rows.push(detail);
     observed(
         target.tab,
         "toolbar",
-        container(column![
-            container(actions)
-                .height(36.0 * metrics.scale)
-                .align_y(alignment::Vertical::Center),
-            detail
-        ])
-        .padding([0.0, 6.0 * metrics.scale])
-        .width(Length::Fill)
-        .style(style::toolbar),
+        container(column(rows))
+            .padding([0.0, 6.0 * metrics.scale])
+            .width(Length::Fill)
+            .style(style::toolbar),
     )
 }
 

@@ -14,6 +14,7 @@ pub mod context_mode;
 pub mod dialogs;
 pub mod documents;
 pub mod editor_clipboard;
+pub mod editor_diagnostics;
 pub mod editor_history;
 pub mod encoding;
 pub mod env;

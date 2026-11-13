@@ -2,6 +2,7 @@
 
 use super::context_mode::{self, EditorTarget};
 use crate::app::{App, Message};
+use crate::host::editor_diagnostics::{EventKind, ModeEnum as DiagMode, Outcome};
 use flavite_api::{ExecutionResult, Invocation, LocalResult, Origin};
 use flavite_buffer::history::{
     HistoryCursor, HistoryEntry, HistoryMovement, HistoryPage, HistoryTarget,
@@ -339,21 +340,64 @@ pub fn handle(app: &mut App, message: HistoryMessage) -> Task<Message> {
                         session.menu_target = None;
                     }
                     let result = read(app, source.clone(), cursor);
-                    let host = &mut app.context_mode.history;
-                    host.key = Some(key(source.clone()));
-                    host.target = Some(source);
-                    host.open = true;
-                    host.selected = 0;
-                    match result {
-                        Ok(page) => {
-                            host.page = Some(page);
-                            host.error = None;
-                        }
-                        Err(error) => {
-                            host.error = Some(error);
+                    let mode = DiagMode::from(app.context_mode.mode(source.tab));
+                    let source_tab = source.tab;
+                    let mut refused = false;
+                    {
+                        let host = &mut app.context_mode.history;
+                        host.key = Some(key(source.clone()));
+                        host.target = Some(source);
+                        host.open = true;
+                        host.selected = 0;
+                        match result {
+                            Ok(page) => {
+                                host.page = Some(page);
+                                host.error = None;
+                            }
+                            Err(error) => {
+                                host.error = Some(error);
+                                refused = true;
+                            }
                         }
                     }
-                    trim_bounds(host);
+                    let truncated = app
+                        .context_mode
+                        .history
+                        .page
+                        .as_ref()
+                        .is_some_and(|page| page.history_truncated);
+                    if refused {
+                        app.diagnostics.record(
+                            Some(source_tab),
+                            mode,
+                            EventKind::HistoryRefusal,
+                            Outcome::Refused,
+                            None,
+                            None,
+                        );
+                    } else {
+                        if truncated {
+                            // Visible truncation: eviction reached the
+                            // queried range (E-12).
+                            app.diagnostics.record(
+                                Some(source_tab),
+                                mode,
+                                EventKind::HistoryEvict,
+                                Outcome::Ready,
+                                None,
+                                None,
+                            );
+                        }
+                        app.diagnostics.record(
+                            Some(source_tab),
+                            mode,
+                            EventKind::HistoryPage,
+                            Outcome::Started,
+                            None,
+                            None,
+                        );
+                    }
+                    trim_bounds(&mut app.context_mode.history);
                     Task::none()
                 }
                 HistoryAction::Restore(target) => restore(app, source, target),
@@ -403,6 +447,14 @@ fn restore(app: &mut App, source: EditorTarget, target: HistoryTarget) -> Task<M
         app.context_mode
             .notice("Editing-history state changed or restore was refused; refresh history");
         app.context_mode.history.key = None;
+        app.diagnostics.record(
+            Some(source.tab),
+            DiagMode::from(app.context_mode.mode(source.tab)),
+            EventKind::HistoryRestore,
+            Outcome::Refused,
+            None,
+            None,
+        );
         return Task::none();
     };
     let Ok(movement) = serde_json::from_value::<HistoryMovement>(success.data["movement"].clone())
@@ -464,6 +516,14 @@ fn restore(app: &mut App, source: EditorTarget, target: HistoryTarget) -> Task<M
     app.context_mode.history.open = false;
     app.context_mode.history.key = None;
     app.context_mode.feedback("Editing state restored");
+    app.diagnostics.record(
+        Some(source.tab),
+        DiagMode::from(app.context_mode.mode(source.tab)),
+        EventKind::HistoryRestore,
+        Outcome::Applied,
+        None,
+        None,
+    );
     app.reconcile_contexts();
     context_mode::resume_focus(app)
 }

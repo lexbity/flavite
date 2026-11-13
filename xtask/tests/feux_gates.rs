@@ -705,6 +705,107 @@ fn x06_gate_passes_clean_tree_and_rejects_a_second_matcher() {
     assert!(!run_gate(temp.path(), "X06").status.success());
 }
 
+fn seed_x07_inputs(root: &Path) {
+    seed_x06_inputs(root);
+    seed_file(
+        root,
+        "crates/flavite-ui/src/host/editor_diagnostics.rs",
+        "pub const MAX_DIAGNOSTIC_EVENTS: usize = 1000;\npub fn show_burst_hint() {}\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/tests/editor_diagnostics.rs",
+        "// diagnostics integration\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/tests/editor_failures.rs",
+        "// failures integration\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-edit-context/tests/burst.rs",
+        "// burst matrix\n",
+    );
+    seed_file(
+        root,
+        "scripts/tests/workbench/context_mode_failures.py",
+        "import common\n",
+    );
+    // The pure session carries the burst thresholds and the effect; the
+    // settings registry the typed disable; the host the ring bound.
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/session.rs",
+        "pub fn reduce() {}\npub enum Event {}\npub enum Effect { ShowBurstHint }\npub struct AwaitChar {}\npub const BURST_WINDOW_MS: u64 = 1500;\npub const BURST_SUPPRESS_MS: u64 = 30000;\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-settings/src/registry.rs",
+        "pub fn burst_hint_enabled() {}\n",
+    );
+}
+
+#[test]
+fn x07_gate_passes_clean_tree_and_rejects_diagnostics_regressions() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_x07_inputs(temp.path());
+    let clean = run_gate(temp.path(), "X07");
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // The ring host must exist (presence gate).
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/src/host/editor_diagnostics.rs",
+        "// no ring\n",
+    );
+    assert!(!run_gate(temp.path(), "X07").status.success());
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/src/host/editor_diagnostics.rs",
+        "pub const MAX_DIAGNOSTIC_EVENTS: usize = 1000;\npub fn show_burst_hint() {}\n",
+    );
+
+    // A hidden undo action in the hint surface is forbidden (the hint may
+    // only offer Exit / Open history).
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/src/views/context_toolbar.rs",
+        "pub fn view() { let _ = \"Undo burst\"; }\n",
+    );
+    assert!(!run_gate(temp.path(), "X07").status.success());
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/src/views/context_toolbar.rs",
+        "pub fn view() {}\n",
+    );
+
+    // A sleep in the diagnostics host fails its absence gate.
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/src/host/editor_diagnostics.rs",
+        "pub fn export() { std::thread::sleep(std::time::Duration::from_millis(1)); }\n",
+    );
+    assert!(!run_gate(temp.path(), "X07").status.success());
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/src/host/editor_diagnostics.rs",
+        "pub const MAX_DIAGNOSTIC_EVENTS: usize = 1000;\npub fn show_burst_hint() {}\n",
+    );
+
+    // Losing the burst threshold presence fails.
+    seed_file(
+        temp.path(),
+        "crates/flavite-edit-context/src/session.rs",
+        "pub fn reduce() {}\npub enum Event {}\npub enum Effect {}\npub struct AwaitChar {}\n",
+    );
+    assert!(!run_gate(temp.path(), "X07").status.success());
+}
+
 #[test]
 fn feux_gate_rejects_unknown_or_unimplemented_slices() {
     let temp = tempfile::tempdir().unwrap();
@@ -714,7 +815,7 @@ fn feux_gate_rejects_unknown_or_unimplemented_slices() {
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown slice"));
     // Future phases are not yet implemented: requiring them is a hard
     // failure, never a silent pass.
-    let future = run_gate(temp.path(), "X07");
+    let future = run_gate(temp.path(), "X08");
     assert!(!future.status.success());
     assert!(String::from_utf8_lossy(&future.stderr).contains("not implemented yet"));
 }

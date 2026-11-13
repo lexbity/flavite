@@ -81,6 +81,12 @@ pub struct App {
     pub note_search: crate::host::note_search::NoteSearchHost,
     /// FEUX-0002 X06: match-driven selection drafts/previews (E-10/E-11).
     pub selection_search: crate::host::selection_search::SelectionSearchHost,
+    /// FEUX-0002 X07: the content-free diagnostics ring and the burst-hint
+    /// banner state (E-15).
+    pub diagnostics: crate::host::editor_diagnostics::DiagnosticsHost,
+    /// The monotonic clock for the pure statechart's burst window (X07).
+    /// Injected here so every host call forwards a coherent `now_ms`.
+    started_at: std::time::Instant,
     /// RFC-0006 §6.10: per-tab pending encoding decisions and repairs.
     pub encoding: crate::host::encoding::EncodingHost,
     pub input_chains: BTreeMap<TabId, crate::host::input::InputChain>,
@@ -277,6 +283,8 @@ pub enum Message {
     NoteSearch(crate::host::note_search::NoteSearchMessage),
     /// FEUX-0002 X06: match-selection host messages.
     SelectionSearch(crate::host::selection_search::SelectionSearchMessage),
+    /// FEUX-0002 X07: diagnostics ring and burst-hint host messages.
+    EditorDiagnostics(crate::host::editor_diagnostics::DiagnosticsMessage),
     ToggleNoteMode(TabId),
     RetryReading(TabId),
     ToggleSourcePreview(TabId),
@@ -668,6 +676,8 @@ impl App {
             catalog_host: crate::host::catalog::CatalogHost::default(),
             note_search: crate::host::note_search::NoteSearchHost::default(),
             selection_search: crate::host::selection_search::SelectionSearchHost::default(),
+            diagnostics: crate::host::editor_diagnostics::DiagnosticsHost::default(),
+            started_at: std::time::Instant::now(),
             replace: crate::host::replace::ReplaceHost::default(),
             replace_operations: crate::host::operations::OperationsHost::default(),
             encoding: crate::host::encoding::EncodingHost::default(),
@@ -2355,6 +2365,14 @@ impl App {
         crate::host::open_intents::open(self, intent);
     }
 
+    /// The monotonic millisecond clock for the pure statechart's burst
+    /// window (X07). Injected once per App; the host forwards it to
+    /// [`flavite_edit_context::reduce`] on every event.
+    #[must_use]
+    pub fn now_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+
     /// Apply one host event.
     pub fn update(&mut self, message: Message) -> Task<Message> {
         // A raw pointer message that changed nothing observable (the
@@ -2461,6 +2479,9 @@ impl App {
             }
             Message::SelectionSearch(message) => {
                 return crate::host::selection_search::handle(self, message);
+            }
+            Message::EditorDiagnostics(message) => {
+                return crate::host::editor_diagnostics::handle(self, message);
             }
             message @ (Message::ToggleNoteMode(_)
             | Message::RetryReading(_)
@@ -4756,6 +4777,8 @@ mod tests {
             catalog_host: crate::host::catalog::CatalogHost::default(),
             note_search: crate::host::note_search::NoteSearchHost::default(),
             selection_search: crate::host::selection_search::SelectionSearchHost::default(),
+            diagnostics: crate::host::editor_diagnostics::DiagnosticsHost::default(),
+            started_at: std::time::Instant::now(),
             replace: crate::host::replace::ReplaceHost::default(),
             replace_operations: crate::host::operations::OperationsHost::default(),
             encoding: crate::host::encoding::EncodingHost::default(),

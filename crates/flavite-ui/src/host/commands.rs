@@ -148,6 +148,10 @@ pub const UI_COMMANDS: &[UiCommand] = &[
         title: "Use writing layout",
     },
     UiCommand {
+        id: "editor.diagnostics_export",
+        title: "Copy diagnostics (content-free)",
+    },
+    UiCommand {
         id: "workspace.toggle_sidebar",
         title: "Toggle notes sidebar",
     },
@@ -922,6 +926,12 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
         app.status = "Quitting: resolve the quit (decide or cancel) first".into();
         return iced::Task::none();
     }
+    if id == "editor.diagnostics_export" {
+        return super::editor_diagnostics::handle(
+            app,
+            super::editor_diagnostics::DiagnosticsMessage::Export,
+        );
+    }
     if (id.starts_with("editor.")
         || matches!(
             id,
@@ -1355,6 +1365,11 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
 /// still recheck every accepted action.
 #[must_use]
 pub fn available(app: &App, id: &str) -> bool {
+    if id == "editor.diagnostics_export" {
+        // The explicit export action is always available with a vault open;
+        // it copies the bounded content-free ring, never auto-exports.
+        return app.flavite.is_some();
+    }
     if id.starts_with("editor.")
         || matches!(
             id,

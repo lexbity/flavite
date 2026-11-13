@@ -81,6 +81,16 @@ pub fn handle(app: &mut App, message: ClipboardMessage) -> Task<Message> {
                 Some(paste) if !paste.is_empty() => super::context_mode::paste(app, target, paste),
                 _ => {
                     app.context_mode.notice("Clipboard is empty");
+                    app.diagnostics.record(
+                        Some(target.tab),
+                        crate::host::editor_diagnostics::ModeEnum::from(
+                            app.context_mode.mode(target.tab),
+                        ),
+                        crate::host::editor_diagnostics::EventKind::OperationRefused,
+                        crate::host::editor_diagnostics::Outcome::Refused,
+                        Some(0),
+                        None,
+                    );
                     super::context_mode::focus(app, target.tab)
                 }
             }

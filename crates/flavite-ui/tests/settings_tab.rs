@@ -151,7 +151,11 @@ fn category_selection_narrows_and_all_restores() {
     let rows = settings::rows(app, tab);
     assert_eq!(
         rows.iter().map(|row| row.id).collect::<Vec<_>>(),
-        vec!["editor.font_size", "editor.line_width"]
+        vec![
+            "editor.font_size",
+            "editor.line_width",
+            "editor.burst_hint_enabled",
+        ]
     );
     let _ = app.update(Message::Settings(SettingsMessage::CategorySelect {
         tab,
