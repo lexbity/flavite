@@ -11,7 +11,7 @@
 //! the current node, never an admitted restore's target.
 //!
 //! The lease clock is always passed in as wall-clock milliseconds so fault
-//! tests control time; production callers use [`crate::undo::wall_clock_ms`].
+//! tests control time; production callers use `crate::undo::wall_clock_ms`.
 
 /// Default per-buffer retained-history byte budget (E-12).
 pub const DEFAULT_MAX_HISTORY_BYTES: u64 = 128 * 1024 * 1024;

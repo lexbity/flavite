@@ -546,7 +546,7 @@ impl SelectionSet {
 
 /// Map one endpoint through an ordered list of movement spans (the received
 /// [`crate::history::HistoryMovement`] delta), with the same sequential
-/// semantics as [`map_endpoint`] — each span is interpreted relative to the
+/// semantics as `map_endpoint` — each span is interpreted relative to the
 /// running position after earlier spans, so per-step native coordinates are
 /// exactly correct without flattening (FEUX-0002 E-13).
 #[must_use]
