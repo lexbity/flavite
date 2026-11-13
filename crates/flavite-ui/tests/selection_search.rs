@@ -187,6 +187,8 @@ fn split_apply_builds_gaps_and_refuses_no_gaps_with_prior_set_kept() {
                 "query": {"text": "TODO", "regex": false, "case_sensitive": false},
                 "apply": true,
                 "spans": [[0, whole]],
+                "total_matches": 1,
+                "zero_width_count": 0,
             }),
             flavite_api::Origin::Gui,
         ));
@@ -332,5 +334,31 @@ fn query_row_renders_without_the_find_bar() {
             || l.contains("Split on matches")
             || l.contains("Alt+Enter")),
         "query row must render without the find bar; labels={labels:?}"
+    );
+}
+
+#[test]
+fn a_superseded_draft_cancels_the_old_request_and_the_newest_wins() {
+    // FEUX-0002 R13/E-11: a refined draft cancels the previous collection
+    // at the source (one in-flight per view) and only the newest overlay
+    // installs — a late result of the cancelled request never paints.
+    let (mut f, tab) = fixture(9107);
+    run(&mut f.app, tab, Command::SelectMatches);
+    draft_query(&mut f.app, tab, "TODO");
+    // Refine the query without draining anything: the first request is
+    // cancelled before (or while) it runs.
+    draft_query(&mut f.app, tab, "TOD");
+    pump_until(&mut f.app, |app| overlay_spans(app, tab).is_some());
+    let spans = overlay_spans(&f.app, tab).expect("the newest draft's overlay");
+    assert!(
+        spans.iter().all(|&(start, end)| end - start == 3),
+        "the overlay is the refined query's, not the cancelled draft's: {spans:?}"
+    );
+    // The committed set stays untouched until the apply.
+    assert_eq!(committed_members(&f.app, tab), vec![(0, 0)]);
+    assert_eq!(
+        f.app.note_editor_view(tab).unwrap().text.as_ref(),
+        BODY,
+        "cancellation and supersede never mutate the text"
     );
 }

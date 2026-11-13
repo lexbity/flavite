@@ -107,6 +107,9 @@ pub enum PrepareError {
     /// The helper refused the input it was given for a reason that maps
     /// directly to a protocol code; retained verbatim for typed routing.
     Worker(crate::text_worker::TextWorkerError),
+    /// The work was cancelled before it completed (FEUX-0002 E-11): the
+    /// result is dropped at dispatch and is never observable by a caller.
+    Cancelled,
 }
 
 impl PrepareError {
@@ -158,6 +161,7 @@ impl PrepareError {
             }
             Self::OutputLimitExceeded => "replacement output exceeds its bound".to_owned(),
             Self::InvalidScope => "the frozen selection scope no longer fits the note".to_owned(),
+            Self::Cancelled => "the match collection was cancelled".to_owned(),
             Self::RegexUnavailable { reason } => {
                 format!("regex is unavailable ({reason}); literal matching still works")
             }

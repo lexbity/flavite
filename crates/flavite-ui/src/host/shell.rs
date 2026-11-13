@@ -298,6 +298,8 @@ impl App {
         snapshot.sequence = snapshot.sequence.saturating_add(1);
         snapshot.selection = (anchor, head);
         snapshot.selections = vec![[0, anchor, head]];
+        // The replacement set has exactly one member: its primary index.
+        snapshot.primary = 0;
         snapshot.caret = head;
         snapshot.focused = true;
         self.workspace.release_editor_focus(Some(tab));

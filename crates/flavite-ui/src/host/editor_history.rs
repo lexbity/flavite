@@ -142,8 +142,11 @@ pub fn visible_entries(app: &App, source: EditorTarget) -> Vec<&HistoryEntry> {
         .context_mode
         .session
         .as_ref()
-        .is_some_and(|s| s.state.attention())
+        .is_some_and(|s| s.state.attention() || s.state.await_char().is_some())
     {
+        // The attention notice and the AwaitChar capture hint are the
+        // deliverable of the detail row (§5.4.1): chips never paint over
+        // either.
         return Vec::new();
     }
     if super::context_mode::effect_caption(app, source.tab).is_some() {

@@ -149,6 +149,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             source_revision,
         ))
         .with_keyboard_enabled(!crate::host::note_search::blocks_typing(app, &tab)
+            && !crate::host::selection_search::blocks_typing(app, &tab)
             && !app.context_mode.history.open
             && !app.context_mode.session.as_ref().is_some_and(|s|s.tab==tab && s.state.menu().is_some()))
         .with_input_intents(move |input| Message::EditorInput {
@@ -543,19 +544,29 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             container(
                 row![
                         text(row_title).size(12),
-                        text_editor(&search.query_input)
-                            .id(crate::host::selection_search::query_id(tab))
-                            .placeholder("Query · Alt+Enter inserts a newline")
-                            .height(64)
-                            .on_action(move |action| Message::SelectionSearch(
-                                crate::host::selection_search::SelectionSearchMessage::DraftAction {
-                                    tab,
-                                    action,
-                                }
-                            ))
-                            .key_binding(move |key| {
-                                crate::host::selection_search::draft_binding(tab, key)
-                            }),
+                        bounds::observe(
+                            text_editor(&search.query_input)
+                                .id(crate::host::selection_search::query_id(tab))
+                                .placeholder("Query · Alt+Enter inserts a newline")
+                                .height(64)
+                                .on_action(move |action| Message::SelectionSearch(
+                                    crate::host::selection_search::SelectionSearchMessage::DraftAction {
+                                        tab,
+                                        action,
+                                    }
+                                ))
+                                .key_binding(move |key| {
+                                    crate::host::selection_search::draft_binding(tab, key)
+                                }),
+                            move |rect| {
+                                Message::SelectionSearch(
+                                    crate::host::selection_search::SelectionSearchMessage::InputBounds {
+                                        tab,
+                                        rect,
+                                    },
+                                )
+                            },
+                        ),
                         button(if search.regex { "Regex" } else { "Literal" })
                             .style(style::ghost())
                             .on_press(Message::SelectionSearch(

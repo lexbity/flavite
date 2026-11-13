@@ -34,13 +34,8 @@ def main():
     common.key("Return")
     time.sleep(0.5)
     value = common.snapshot(harness)
-    print(f"PROBE enter: menu={value.get('context_mode', {}).get('menu')} msg={value.get('context_mode', {}).get('message')} sel={selections(value)}")
+    print(f"PROBE enter: menu={value.get('context_mode', {}).get('menu')} msg={value.get('context_mode', {}).get('message')} sel={common.selections(value)}")
     common.finish(output, [{"id": "probe-menu-kb", "outcome": "pass"}], backend)
-
-
-def selections(s):
-    editor = next(t for t in common.tabs(s) if t.get("selection_count") is not None)
-    return editor["selection_count"]
 
 
 if __name__ == "__main__":

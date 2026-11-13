@@ -132,6 +132,25 @@ pub(crate) fn handle_cancel_operation(
     }
 }
 
+/// `editor.cancel_selection`: cancel one pending match collection (E-11).
+/// Non-mutating; the worker stops and the dropped outcome never reaches a
+/// caller.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelSelectionArgs {
+    request_id: u64,
+}
+
+pub(crate) fn handle_cancel_selection(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: CancelSelectionArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::TextCancel {
+        request_id: args.request_id,
+    }))
+}
+
 /// `editor.delete`: the planner-backed, ticketed delete over the canonical
 /// selection set (FEUX-0002 X03 proof verb). Runs entirely through the
 /// Session single-writer path; zero-effect no-ops (empty line) return an
@@ -1056,7 +1075,10 @@ pub struct MatchQueryArg {
 /// (`apply` omitted/false) requests collection and returns the candidate
 /// spans as a read-only outcome; an apply (`apply: true`) installs the
 /// supplied candidate spans as one canonical set through the selection-only
-/// path (no ticket, no history node, `selection_version` bump).
+/// path (no ticket, no history node, `selection_version` bump). An apply
+/// must carry the collection's exact observed totals (`total_matches`,
+/// `zero_width_count`): the candidate span list is capped at the selection
+/// bound, so only the totals prove the exact observed counts (E-10/R13).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EditorSelectMatchesArgs {
@@ -1070,6 +1092,12 @@ pub struct EditorSelectMatchesArgs {
     /// apply. Refused when absent on apply or present on draft.
     #[serde(default)]
     spans: Option<Vec<(usize, usize)>>,
+    /// The collection's exact match total (required on apply).
+    #[serde(default)]
+    total_matches: Option<u64>,
+    /// The collection's exact zero-width hit count (required on apply).
+    #[serde(default)]
+    zero_width_count: Option<u64>,
 }
 
 fn decode_mode(regex: bool) -> flavite_text_search::matcher::MatchMode {
@@ -1132,49 +1160,83 @@ fn handle_match_selection(
     let Some(spans) = args.spans else {
         return Err("apply needs the candidate spans".into());
     };
+    // The exact observed totals are the apply's authority (E-10/R13): the
+    // span list is capped at the selection bound, so a truncated apply
+    // without them would report a dishonest count.
+    let Some(total_matches) = args.total_matches else {
+        return Err("apply needs the exact match total".into());
+    };
+    let Some(zero_width_count) = args.zero_width_count else {
+        return Err("apply needs the exact zero-width count".into());
+    };
     if select {
-        apply_select_matches(&snapshot.text, &spans, args.buffer_id, args.revision)
+        apply_select_matches(
+            &snapshot.text,
+            &spans,
+            total_matches,
+            zero_width_count,
+            args.buffer_id,
+            args.revision,
+        )
     } else {
-        apply_split_selection(&snapshot.text, &spans, args.buffer_id, args.revision)
+        apply_split_selection(
+            &snapshot.text,
+            &spans,
+            total_matches,
+            args.buffer_id,
+            args.revision,
+        )
     }
 }
 
-/// The select apply: refuse zero-width and oversize with observed counts;
-/// otherwise canonicalize the spans into the new set (E-10).
+/// The select apply: refuse zero-width and oversize with the collection's
+/// exact observed counts; otherwise canonicalize the spans into the new set
+/// (E-10). Within the cap the collector materializes every span, so the
+/// apply additionally proves the span list is the complete collection.
 fn apply_select_matches(
     text: &str,
     spans: &[(usize, usize)],
+    total_matches: u64,
+    zero_width_count: u64,
     buffer_id: u64,
     revision: u64,
 ) -> Result<SessionResult, String> {
-    if spans.is_empty() {
+    if total_matches == 0 || spans.is_empty() {
         return Err("NoMatches".into());
     }
-    let zero_width = spans.iter().filter(|&&(start, end)| start == end).count();
-    if zero_width > 0 {
-        return Err(format!("ZeroWidthMatches {zero_width}"));
+    if zero_width_count > 0 {
+        return Err(format!("ZeroWidthMatches {zero_width_count}"));
     }
-    if spans.len() > flavite_buffer::selection::MAX_SELECTIONS {
-        return Err(format!("TooManySelections {}", spans.len()));
+    if total_matches > flavite_buffer::selection::MAX_SELECTIONS as u64 {
+        return Err(format!("TooManySelections {total_matches}"));
+    }
+    if spans.len() as u64 != total_matches {
+        return Err("collection spans do not match the observed total".into());
     }
     let set = flavite_buffer::selection::selection_set_from_spans(text, spans, None)
         .map_err(|error| error.to_string())?;
     Ok(selections_changed(buffer_id, revision, &set))
 }
 
-/// The split apply: canonicalize spans first, compute the document-wide
-/// gaps, refuse an empty gap set (`NoGaps`), then install the gap set.
+/// The split apply: refuse an oversize match set with the exact observed
+/// count (a truncated span list cannot derive exact gaps), canonicalize,
+/// compute the document-wide gaps, refuse an empty gap set (`NoGaps`), then
+/// install the gap set.
 fn apply_split_selection(
     text: &str,
     spans: &[(usize, usize)],
+    total_matches: u64,
     buffer_id: u64,
     revision: u64,
 ) -> Result<SessionResult, String> {
-    if spans.is_empty() {
+    if total_matches == 0 || spans.is_empty() {
         return Err("NoMatches".into());
     }
-    if spans.len() > flavite_buffer::selection::MAX_SELECTIONS {
-        return Err(format!("TooManySelections {}", spans.len()));
+    if total_matches > flavite_buffer::selection::MAX_SELECTIONS as u64 {
+        return Err(format!("TooManySelections {total_matches}"));
+    }
+    if spans.len() as u64 != total_matches {
+        return Err("collection spans do not match the observed total".into());
     }
     let set = flavite_buffer::selection::selection_set_from_spans(text, spans, None)
         .map_err(|error| error.to_string())?;

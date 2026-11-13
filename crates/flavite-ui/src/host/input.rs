@@ -53,6 +53,25 @@ pub struct ContextCapture {
     base: u64,
     sequence: u64,
     acknowledged: u64,
+    /// Identity of the last handled request (E-5 duplicate delivery): the
+    /// sequence alone cannot prove a replay — two live widget states for
+    /// one view can publish a reused sequence — so a duplicate is the same
+    /// request *content* delivered again, never merely a colliding number.
+    last: Option<RequestFingerprint>,
+}
+
+/// Identity of one handled context request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestFingerprint {
+    sequence: u64,
+    tag: String,
+}
+
+fn request_fingerprint(request: &flavite_editor::context::ContextRequest) -> RequestFingerprint {
+    RequestFingerprint {
+        sequence: request.sequence,
+        tag: format!("{:?}", request.event),
+    }
 }
 
 fn context_chain(
@@ -115,6 +134,7 @@ pub fn remember_context(
             .unwrap()
             .interaction()
             .sequence,
+        last: Some(request_fingerprint(request)),
     });
 }
 
@@ -127,17 +147,37 @@ pub fn accepts_context(
     incarnation: u64,
     request: &flavite_editor::context::ContextRequest,
 ) -> bool {
+    accepts_context_inner(app, tab, incarnation, request)
+}
+
+fn accepts_context_inner(
+    app: &App,
+    tab: TabId,
+    incarnation: u64,
+    request: &flavite_editor::context::ContextRequest,
+) -> bool {
     let (Some(view), Some(session)) = (app.note_editor_view(tab), app.workspace.tab(&tab)) else {
         return false;
     };
     if app.notes.incarnation(tab) != Some(incarnation) || request.buffer != view.buffer_id {
         return false;
     }
+    // Duplicate delivery / stale replay (E-5): a request strictly older
+    // than the last handled one is a replay and is refused. A request at
+    // exactly the last handled sequence is refused only when it is the
+    // SAME request delivered again; two live widget states for one view
+    // publish independent counters and can reuse the last sequence for a
+    // genuinely new key, and its different content is what admits it.
     if app.context_mode.capture.as_ref().is_some_and(|chain| {
         chain.target.tab == tab
             && chain.target.incarnation == incarnation
             && chain.target.buffer == request.buffer
-            && request.sequence <= chain.sequence
+            && (request.sequence < chain.sequence
+                || (request.sequence == chain.sequence
+                    && chain
+                        .last
+                        .as_ref()
+                        .is_some_and(|fingerprint| fingerprint == &request_fingerprint(request))))
     }) {
         return false;
     }

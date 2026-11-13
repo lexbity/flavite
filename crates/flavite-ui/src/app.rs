@@ -2080,6 +2080,11 @@ impl App {
                 interaction.revision = snapshot.revision;
                 interaction.sequence = snapshot.sequence;
                 interaction.selections = members;
+                // The widget's primary member rides the snapshot (E-4/FR-4);
+                // clamped when a shrunken set cannot name it.
+                interaction.primary = snapshot
+                    .primary
+                    .min(interaction.selections.len().saturating_sub(1));
                 interaction.viewport_anchor = snapshot.viewport_anchor;
                 interaction.composition = if snapshot.composing {
                     flavite_workspace::CompositionState::Active

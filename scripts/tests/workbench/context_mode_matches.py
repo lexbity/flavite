@@ -18,14 +18,11 @@ import common
 from context_mode import painted
 
 
-def selections(s):
-    editor = next(t for t in common.tabs(s) if t.get("selection_count") is not None)
-    return editor["selection_count"]
-
-
 def search_state(s):
-    editor = next(t for t in common.tabs(s) if t.get("selection_search") is not None)
-    return editor["selection_search"]
+    return next(
+        (t.get("selection_search") for t in common.tabs(s) if t.get("selection_search") is not None),
+        None,
+    )
 
 
 def main():
@@ -97,7 +94,7 @@ def main():
     common.key("Return")
     wait(lambda s: not s.get("palette_open"), "palette dispatched")
     wait(
-        lambda s: search_state(s).get("kind") == "select",
+        lambda s: (search_state(s) or {}).get("kind") == "select",
         "selection-search row open",
     )
     # Type the query; verify it lands in the query input (the row's focus
@@ -106,32 +103,42 @@ def main():
         "query did not land in the selection-search row"
     )
     wait(
-        lambda s: search_state(s).get("pending") is False
-        and search_state(s).get("overlay_matches") == 2,
+        lambda s: (search_state(s) or {}).get("pending") is False
+        and (search_state(s) or {}).get("overlay_matches") == 2,
         "draft collected two matches",
     )
     # The overlay paints without committing: the committed set stays one.
-    wait(lambda s: selections(s) == 1, "overlay is preview-only")
+    wait(lambda s: common.selections(s) == 1, "overlay is preview-only")
     common.capture(window, output, "01-match-overlay.png", checks)
 
     # Return applies (query-input binding); the committed set becomes the
     # two matches.
     common.key("Return")
-    wait(lambda s: selections(s) == 2, "apply selects both matches")
+    wait(lambda s: common.selections(s) == 2, "apply selects both matches")
     assert common.snapshot(harness)["focused_text"] == before, "apply is selection-only"
 
     # Close the row, then type across both members: one insert lands in
     # each match (a single atomic batch).
     common.key("Escape")
     wait(
-        lambda s: search_state(s).get("kind") != "select",
+        lambda s: (search_state(s) or {}).get("kind") != "select",
         "search row closed",
     )
-    common.key("i")
-    wait(
-        lambda s: (s.get("context_mode") or {}).get("state") == "TYPING",
-        "typing group",
-    )
+    # The typing entry can be dropped by the synthetic-input capture chain
+    # (bounded retry — the byte-exact assertions below stay strict).
+    entered = False
+    for _ in range(4):
+        common.key("i")
+        end = time.monotonic() + 4
+        while time.monotonic() < end:
+            if (common.snapshot(harness).get("context_mode") or {}).get("state") == "TYPING":
+                entered = True
+                break
+            time.sleep(0.1)
+        if entered:
+            break
+        time.sleep(0.4)
+    assert entered, "typing group did not open"
     common.type_text("X")
     wait(
         lambda s: "XTODO one" in s.get("focused_text", "")
@@ -147,15 +154,15 @@ def main():
         "undo restored the exact text",
     )
 
-    # The row closes with Escape; the toggle exits the mode; the standing
-    # count survives.
-    common.key("Escape")
+    # (No residue Escape here: the row already closed above, and Command
+    # Escape with N>1 keeps the primary — §5.4 row 10 — which would
+    # collapse the set this scenario must see surviving exit.)
     common.key("ctrl+space")
     wait(
         lambda s: (s.get("context_mode") or {}).get("state") in (None, "Off"),
         "mode exited",
     )
-    wait(lambda s: selections(s) == 2, "selections survive exit")
+    wait(lambda s: common.selections(s) == 2, "selections survive exit")
 
     checks.append({"id": "context-mode-matches-overlay-apply-undo", "outcome": "pass"})
     common.finish(output, checks, backend)

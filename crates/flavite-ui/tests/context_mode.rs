@@ -1076,3 +1076,80 @@ fn history_page_reports_truncation_after_budget_eviction() {
     }
     assert!(page.entries.iter().any(|entry| entry.current));
 }
+
+#[test]
+fn a_new_key_at_the_last_sequence_is_admitted_while_its_duplicate_is_refused() {
+    // FEUX-0002 R14: two live widget states for one view publish
+    // independent capture counters and can reuse the last handled
+    // sequence. That is not a replay: a NEW request at the last sequence
+    // (different content) is admitted, while the exact request delivered
+    // again is refused as a duplicate (E-5).
+    use flavite_edit_context::{ContextCommand as Command, ContextMode};
+    use flavite_editor::context::{ContextEvent, ContextKey, ContextRequest};
+    use iced::keyboard::{Modifiers, key::Code};
+    let (mut f, tab) = fixture(3114);
+    let source = EditorTarget::capture(&f.app, tab).unwrap();
+    let sequence = f.app.workspace.tab(&tab).unwrap().interaction().sequence;
+    let request = |index, event| ContextRequest {
+        buffer: source.buffer,
+        revision: source.revision,
+        selection: source.selection,
+        selections: vec![source.selection],
+        sequence: sequence + index,
+        event,
+    };
+    let key = |index, code, text: &str| {
+        request(
+            index,
+            ContextEvent::Key(ContextKey {
+                code: native_code(code),
+                modifiers: native_modifiers(Modifiers::empty()),
+                repeat: false,
+                input: CapturedInput {
+                    buffer: source.buffer,
+                    observed_revision: source.revision,
+                    sequence: sequence + index,
+                    action: KeyAction::Insert,
+                    text: text.into(),
+                    extend: false,
+                    document_boundary: false,
+                    vertical: None,
+                    preferred_x: Vec::new(),
+                    clipboard_acquired: false,
+                },
+            }),
+        )
+    };
+    let send = |app: &mut App, request| {
+        let _ = app.update(Message::ContextNative {
+            tab,
+            incarnation: source.incarnation,
+            request,
+        });
+    };
+    send(
+        &mut f.app,
+        request(1, ContextEvent::Command(Command::Toggle)),
+    );
+    send(&mut f.app, key(2, Code::KeyI, "i"));
+    assert!(f.app.context_mode.mode(tab) == ContextMode::Typing);
+    // The second live widget state reuses the last handled sequence (2)
+    // for a genuinely new key with different content: admitted.
+    send(&mut f.app, key(2, Code::KeyA, "X"));
+    assert!(
+        f.app
+            .note_editor_view(tab)
+            .unwrap()
+            .text
+            .starts_with("Xone"),
+        "the fresh key at a reused sequence acts"
+    );
+    // The exact same request delivered again is a duplicate: refused.
+    let before = f.app.note_editor_view(tab).unwrap();
+    send(&mut f.app, key(2, Code::KeyA, "X"));
+    assert_eq!(
+        f.app.note_editor_view(tab).unwrap().revision,
+        before.revision,
+        "the duplicate is refused"
+    );
+}

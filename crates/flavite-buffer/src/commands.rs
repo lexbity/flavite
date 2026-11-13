@@ -141,7 +141,7 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
     // through: carets stick right past their insertion, except open-above
     // whose caret stays before the inserted break (delivered O lands on the
     // new empty line). `None` means: map the members through the edits.
-    let mut collapse: Option<(Vec<usize>, Affinity)> = None;
+    let mut collapse: Option<(Vec<CollapsePoint>, Affinity)> = None;
     match op {
         EditOperation::Delete => {
             for member in set.iter() {
@@ -247,11 +247,12 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
             collapse = Some((
                 set.iter()
                     .map(|member| {
-                        if member.is_caret() {
+                        let at = if member.is_caret() {
                             member.head()
                         } else {
                             member.start()
-                        }
+                        };
+                        (at, Some(member.id().as_raw()))
                     })
                     .collect(),
                 Affinity::Right,
@@ -337,13 +338,13 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                 text,
                 points
                     .iter()
-                    .map(|at| crate::selection::RawSelection {
-                        id: None,
-                        anchor: *at,
-                        head: *at,
+                    .map(|&(at, id)| crate::selection::RawSelection {
+                        id,
+                        anchor: at,
+                        head: at,
                     })
                     .collect(),
-                None,
+                Some(set.primary_id().as_raw()),
             )?;
             // Bulk two-pointer mapping (NFR-1): the carets are ascending, so
             // one O(points + spans) pass replaces per-point span scans.
@@ -367,7 +368,12 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                     head: at,
                 })
                 .collect();
-            let (set, _) = SelectionSet::normalize(&after_text, mapped, None)?;
+            // The primary identity travels with its member through both
+            // normalizations: the default (last survivor) would silently
+            // move the primary to the set's end on every collapse batch
+            // (FEUX-0002 E-4/FR-4).
+            let (set, _) =
+                SelectionSet::normalize(&after_text, mapped, Some(carets.primary_id().as_raw()))?;
             set
         }
         None => {
@@ -440,6 +446,11 @@ fn positions_affinity(affinity: Affinity) -> crate::positions::Affinity {
     }
 }
 
+/// One collapse-point insertion: the byte offset plus the contributing
+/// member's id (identity travels with the member through both
+/// normalizations, FEUX-0002 E-4/FR-4).
+type CollapsePoint = (usize, Option<u32>);
+
 /// Plan point insertions: one `PlannedEdit` per unique insertion point
 /// (dedup identical points — duplicate members merge into one insertion and
 /// their collapse carets re-normalize into one member). Returns the unique
@@ -450,21 +461,28 @@ fn plan_point_insertions(
     set: &SelectionSet,
     insertion: &str,
     point_of: impl Fn(&crate::selection::Selection) -> usize,
-) -> Vec<usize> {
-    let mut points = std::collections::BTreeSet::new();
+) -> Vec<(usize, Option<u32>)> {
+    // Duplicate points merge into one insertion; the merged member keeps
+    // the earliest (smallest) id, matching the normalization survivor rule.
+    let mut points: std::collections::BTreeMap<usize, u32> = std::collections::BTreeMap::new();
     for member in set.iter() {
-        points.insert(point_of(member));
+        let at = point_of(member);
+        let id = member.id().as_raw();
+        points
+            .entry(at)
+            .and_modify(|kept| *kept = (*kept).min(id))
+            .or_insert(id);
     }
     if !insertion.is_empty() {
-        for at in &points {
+        for &at in points.keys() {
             planned.push(PlannedEdit {
-                start: *at,
-                end: *at,
+                start: at,
+                end: at,
                 replacement: insertion.to_string(),
             });
         }
     }
-    points.into_iter().collect()
+    points.into_iter().map(|(at, id)| (at, Some(id))).collect()
 }
 
 /// The line start (`true`) or line end (`false`) byte of the line containing
@@ -937,5 +955,37 @@ mod tests {
         let trailing = "one\n";
         let fragments = copy_fragments(trailing, &set_of(trailing, 4)).unwrap();
         assert!(fragments.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod collapse_primary_tests {
+    use super::*;
+    use crate::selection::RawSelection;
+
+    #[test]
+    fn typing_preserves_the_primary_member_identity() {
+        // FEUX-0002 R14/E-4: a collapse-op batch keeps the input set's
+        // primary member — the after-set's primary never silently moves to
+        // the last survivor.
+        let text = "# Alpha\n\nalpha body\none\ntwo\nthree\nfour";
+        let raw: Vec<RawSelection> = [(0usize, 0usize), (8, 8), (9, 9), (20, 20)]
+            .iter()
+            .enumerate()
+            .map(|(id, &(anchor, head))| RawSelection {
+                id: Some(id as u32),
+                anchor,
+                head,
+            })
+            .collect();
+        let (set, _) = SelectionSet::normalize(text, raw, Some(0)).unwrap();
+        assert_eq!(set.primary().head(), 0, "the first member is primary");
+        let prepared = plan(text, &set, &EditOperation::Typing("!".into())).unwrap();
+        assert_eq!(prepared.after_set.len(), 4);
+        assert_eq!(
+            prepared.after_set.primary().head(),
+            1,
+            "the primary is the first member's mapped caret, not the last"
+        );
     }
 }

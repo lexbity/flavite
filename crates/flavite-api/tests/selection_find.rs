@@ -52,6 +52,8 @@ fn apply(
             "query": {"text": "TODO", "regex": false, "case_sensitive": false},
             "apply": true,
             "spans": spans,
+            "total_matches": spans.len() as u64,
+            "zero_width_count": spans.iter().filter(|&&(a, b)| a == b).count() as u64,
         }),
         Origin::Gui,
     ))
@@ -205,6 +207,8 @@ fn apply_split_selection_builds_the_gaps_and_refuses_no_gaps_atomically() {
             "query": {"text": "xTODOxTODOx", "regex": false, "case_sensitive": false},
             "apply": true,
             "spans": [[0, 11]],
+            "total_matches": 1,
+            "zero_width_count": 0,
         }),
         Origin::Gui,
     ));
@@ -228,6 +232,8 @@ fn select_apply_refuses_zero_width_spans_with_the_observed_count() {
             "query": {"text": "a*", "regex": true, "case_sensitive": false},
             "apply": true,
             "spans": [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4]],
+            "total_matches": 5,
+            "zero_width_count": 5,
         }),
         Origin::Gui,
     ));
@@ -250,12 +256,15 @@ fn select_apply_refuses_oversize_with_the_observed_count() {
             "query": {"text": "a", "regex": false, "case_sensitive": false},
             "apply": true,
             "spans": spans,
+            "total_matches": 10_010,
+            "zero_width_count": 0,
         }),
         Origin::Gui,
     ));
     assert_eq!(
         message_of(&result).as_deref(),
-        Some("TooManySelections 10001")
+        Some("TooManySelections 10010"),
+        "the refusal names the exact observed total, not the truncated span count"
     );
     assert_eq!(fixture.text(buffer_id), "a".repeat(10_010));
 }
@@ -382,4 +391,108 @@ fn worst_case_10k_member_payload_fits_the_ceiling() {
         bytes.len(),
         flavite_api::command::MAX_INVOCATION_PAYLOAD_BYTES
     );
+}
+
+#[test]
+fn oversize_collection_applies_refuse_with_the_exact_observed_total() {
+    // FEUX-0002 R13: the draft counts every match exactly (here 10,042)
+    // while shipping at most the selection-bound spans; the apply refusal
+    // must carry the observed total, never the truncated span count.
+    let fixture = support::fixture(&[("notes/a.md", "ab".repeat(10_042).as_str())]);
+    let (buffer_id, revision) = fixture.open_note("notes/a.md");
+    let request_id = support::next_id(&fixture.flavite);
+    let pending = fixture.flavite.execute(Invocation::new(
+        request_id,
+        "editor.select_matches",
+        serde_json::json!({
+            "buffer_id": buffer_id,
+            "revision": revision,
+            "selections": {"primary": 0, "items": [[0, 0, 0]]},
+            "query": {"text": "ab", "regex": false, "case_sensitive": false},
+        }),
+        Origin::Gui,
+    ));
+    let ExecutionResult::Pending { request_id } = pending else {
+        panic!("the oversized draft dispatches to the worker");
+    };
+    let completion = fixture.flavite.wait_for_operation(request_id);
+    let ExecutionResult::Local(LocalResult::Success(success)) = completion else {
+        panic!("the oversized draft completes");
+    };
+    let data = success.data;
+    assert_eq!(data["total_matches"].as_u64(), Some(10_042));
+    assert_eq!(
+        data["spans"].as_array().map(Vec::len),
+        Some(10_001),
+        "the span list stops at the selection bound"
+    );
+    // Apply the exact draft result: the refusal names 10,042.
+    let spans: Vec<[u64; 2]> = data["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pair| [pair[0].as_u64().unwrap(), pair[1].as_u64().unwrap()])
+        .collect();
+    let apply = fixture.flavite.execute(Invocation::new(
+        support::next_id(&fixture.flavite),
+        "editor.select_matches",
+        serde_json::json!({
+            "buffer_id": buffer_id,
+            "revision": revision,
+            "selections": {"primary": 0, "items": [[0, 0, 0]]},
+            "query": {"text": "ab", "regex": false, "case_sensitive": false},
+            "apply": true,
+            "spans": spans,
+            "total_matches": data["total_matches"],
+            "zero_width_count": data["zero_width_count"],
+        }),
+        Origin::Gui,
+    ));
+    assert_eq!(
+        message_of(&apply).as_deref(),
+        Some("TooManySelections 10042")
+    );
+    assert_eq!(fixture.text(buffer_id), "ab".repeat(10_042));
+}
+
+#[test]
+fn apply_without_the_exact_totals_is_refused() {
+    // The totals are the apply's authority; a spans-only apply cannot prove
+    // an exact observed count and is refused (R13).
+    let fixture = support::fixture(&[("notes/a.md", "TODO\n")]);
+    let (buffer_id, revision) = fixture.open_note("notes/a.md");
+    let result = fixture.flavite.execute(Invocation::new(
+        support::next_id(&fixture.flavite),
+        "editor.select_matches",
+        serde_json::json!({
+            "buffer_id": buffer_id,
+            "revision": revision,
+            "selections": {"primary": 0, "items": [[0, 0, 0]]},
+            "query": {"text": "TODO", "regex": false, "case_sensitive": false},
+            "apply": true,
+            "spans": [[0, 4]],
+        }),
+        Origin::Gui,
+    ));
+    assert_eq!(
+        message_of(&result).as_deref(),
+        Some("apply needs the exact match total")
+    );
+}
+
+#[test]
+fn cancelling_an_unknown_collection_is_a_typed_refusal() {
+    let fixture = support::fixture(&[("notes/a.md", "TODO\n")]);
+    let (buffer_id, _) = fixture.open_note("notes/a.md");
+    let result = fixture.flavite.execute(Invocation::new(
+        support::next_id(&fixture.flavite),
+        "editor.cancel_selection",
+        serde_json::json!({"request_id": 987_654}),
+        Origin::Gui,
+    ));
+    assert_eq!(
+        message_of(&result).as_deref(),
+        Some("UnknownSelectionCollection")
+    );
+    assert_eq!(fixture.text(buffer_id), "TODO\n");
 }

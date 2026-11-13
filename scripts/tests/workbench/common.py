@@ -66,6 +66,16 @@ def tabs(value):
     return [t for g in value.get("groups", []) for t in g["tabs"]]
 
 
+def selections(value):
+    """The focused editor's committed selection count (R14 validator fix):
+    the *active* tab, never an inactive strip tab — every tab carries a
+    `selection_count`, so an unfixed first-match can read the empty New
+    tab while the real editor holds a multi-selection set."""
+    editors = [t for t in tabs(value) if t.get("selection_count") is not None]
+    active = [t for t in editors if t.get("active")]
+    return (active or editors)[0]["selection_count"]
+
+
 def graph(value):
     return next((t for t in tabs(value) if t["load"] == "graph" and t["active"]), {})
 
@@ -224,6 +234,22 @@ def capture(window, output, name, checks):
     raise AssertionError(f"capture appears blank after waiting for paint: {name}")
 
 
+def click_selection_row_input(window, harness):
+    """One real pointer press on the mounted query input (the synthetic
+    focus operation does not stick for this input under the runtime, so the
+    gesture a real user makes — clicking the field — is reproduced)."""
+    value = snapshot(harness)
+    state = next(
+        (t.get("selection_search") for t in tabs(value) if t.get("selection_search") is not None),
+        None,
+    )
+    bounds = state and state.get("input_bounds")
+    if not bounds:
+        return False
+    click_rect(window, harness, bounds)
+    return True
+
+
 def type_into_selection_row(window, harness, text, kind):
     """Type `text` into the open selection-search row, verifying the
     keystrokes actually land in the query input (the row's focus task is
@@ -234,6 +260,8 @@ def type_into_selection_row(window, harness, text, kind):
     for attempt in range(3):
         time.sleep(0.5)
         before_text = snapshot(harness).get("focused_text")
+        click_selection_row_input(window, harness)
+        time.sleep(0.2)
         # Send key events directly to the app window (bypasses X input
         # focus; winit event loop delivers them as window events).
         run("xdotool", "key", "--window", window, "--clearmodifiers", *[f"{c}" for c in text])

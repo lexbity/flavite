@@ -54,6 +54,13 @@ impl OperationPump {
         self.labels.get(&request_id).map(String::as_str)
     }
 
+    /// Retire a pending entry whose work was cancelled at the source
+    /// (E-11): no completion will ever arrive for it.
+    pub fn cancel(&mut self, request_id: u64) {
+        self.pending.remove(&request_id);
+        self.labels.remove(&request_id);
+    }
+
     /// Ingest one drained batch of completions, retiring matching pending
     /// entries. The caller drains the Session once and routes completions
     /// to every interested surface.

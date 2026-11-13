@@ -49,7 +49,9 @@ pub const MAX_SELECTION_SPANS: usize = MAX_SELECTIONS + 1;
 /// Collect every match of `request` against `text` (FEUX-0002 §5.7).
 ///
 /// Literal matches run in-process on this worker; regex matches run in the
-/// isolated helper (D-14) — never as a silent in-process fallback.
+/// isolated helper (D-14) — never as a silent in-process fallback. A cancelled
+/// collection stops at the next match boundary and reports
+/// [`PrepareError::Cancelled`]; the dispatch drops the outcome (E-11).
 ///
 /// # Errors
 ///
@@ -58,11 +60,14 @@ pub const MAX_SELECTION_SPANS: usize = MAX_SELECTIONS + 1;
 pub fn collect_matches(
     text: &str,
     request: &SelectMatchesRequest,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<MatchCollectionOutcome, crate::text_edit::PrepareError> {
     use crate::text_edit::PrepareError;
+    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(PrepareError::Cancelled);
+    }
     match request.mode {
         MatchMode::Regex => {
-            let cancelled = std::sync::atomic::AtomicBool::new(false);
             let run = crate::text_worker::run_match(
                 &crate::text_worker::HelperRequest {
                     kind: RequestKind::Find,
@@ -78,7 +83,7 @@ pub fn collect_matches(
                     max_output: 0,
                     template_raw: "",
                 },
-                &cancelled,
+                cancelled,
             )
             .map_err(crate::text_edit::worker_error)?;
             // The helper proved the exact total over the complete scan; the
@@ -125,10 +130,14 @@ pub fn collect_matches(
             .map_err(matcher_error)?;
             // Count every match for the exact total (budget exceeded is a
             // typed refusal, never a silent stop); ship at most the
-            // selection-bound spans.
+            // selection-bound spans. A cancelled collection stops at the
+            // next match boundary (E-11).
             let mut spans = Vec::new();
             let mut total = 0u64;
             for item in matcher.iter_matches(text, None).map_err(matcher_error)? {
+                if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(PrepareError::Cancelled);
+                }
                 let hit = item.map_err(matcher_error)?;
                 total = total.saturating_add(1);
                 if spans.len() < MAX_SELECTION_SPANS {
@@ -182,7 +191,12 @@ mod tests {
     #[test]
     fn literal_collection_reports_spans_total_and_zero_width() {
         let text = "TODO one\nTODO two\nTODO";
-        let outcome = collect_matches(text, &literal("TODO")).expect("collection");
+        let outcome = collect_matches(
+            text,
+            &literal("TODO"),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("collection");
         assert_eq!(outcome.spans, vec![(0, 4), (9, 13), (18, 22)]);
         assert_eq!(outcome.total_matches, 3);
         assert_eq!(outcome.zero_width_count, 0);
@@ -191,7 +205,12 @@ mod tests {
     #[test]
     fn literal_collection_counts_beyond_the_selection_cap_without_materializing() {
         let text = "a".repeat(MAX_SELECTIONS + 42);
-        let outcome = collect_matches(&text, &literal("a")).expect("collection");
+        let outcome = collect_matches(
+            &text,
+            &literal("a"),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("collection");
         assert_eq!(outcome.total_matches, (MAX_SELECTIONS + 42) as u64);
         assert_eq!(outcome.spans.len(), MAX_SELECTION_SPANS);
     }
@@ -201,13 +220,23 @@ mod tests {
         // Literal matching cannot produce zero-width spans (a literal is
         // nonempty by the EmptyQuery guard), so the regex path owns zero
         // width; the literal path still reports zero.
-        let outcome = collect_matches("abc", &literal("a")).expect("collection");
+        let outcome = collect_matches(
+            "abc",
+            &literal("a"),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("collection");
         assert_eq!(outcome.zero_width_count, 0);
     }
 
     #[test]
     fn empty_literal_query_is_idle() {
-        let error = collect_matches("abc", &literal("")).expect_err("idle");
+        let error = collect_matches(
+            "abc",
+            &literal(""),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect_err("idle");
         assert!(matches!(
             error,
             crate::text_edit::PrepareError::Matcher(
@@ -219,7 +248,12 @@ mod tests {
     #[test]
     fn matches_are_ascending_and_scalar_aligned() {
         let text = "éé éé";
-        let outcome = collect_matches(text, &literal("é")).expect("collection");
+        let outcome = collect_matches(
+            text,
+            &literal("é"),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("collection");
         assert_eq!(outcome.spans, vec![(0, 2), (2, 4), (5, 7), (7, 9)]);
         assert_eq!(outcome.total_matches, 4);
     }
@@ -229,7 +263,33 @@ mod tests {
         // A literal match never lands mid-scalar; the spans are exactly the
         // matched bytes (the grapheme expansion happens at set build time).
         let text = "é";
-        let outcome = collect_matches(text, &literal("é")).expect("collection");
+        let outcome = collect_matches(
+            text,
+            &literal("é"),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("collection");
         assert_eq!(outcome.spans, vec![(0, 2)]);
+    }
+
+    #[test]
+    fn cancelled_collection_stops_without_results() {
+        use crate::text_edit::PrepareError;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancelled = AtomicBool::new(true);
+        let error = collect_matches("TODO", &literal("TODO"), &cancelled)
+            .expect_err("a cancelled collection never returns results");
+        assert!(matches!(error, PrepareError::Cancelled));
+        // A collection cancelled mid-scan reports Cancelled, not a partial
+        // count.
+        let cancelled = AtomicBool::new(false);
+        let text = "a".repeat(2_048);
+        let error = {
+            cancelled.store(true, Ordering::Release);
+            // The pre-scan check sees the flag before any match is counted.
+            collect_matches(&text, &literal("a"), &cancelled)
+        }
+        .expect_err("cancelled before the scan");
+        assert!(matches!(error, PrepareError::Cancelled));
     }
 }

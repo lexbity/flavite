@@ -28,14 +28,15 @@ import time
 import common
 
 
-def selections(s):
-    editor = next(t for t in common.tabs(s) if t.get("selection_count") is not None)
-    return editor["selection_count"]
-
-
 def search_state(s):
-    editor = next(t for t in common.tabs(s) if t.get("selection_search") is not None)
-    return editor["selection_search"]
+    return next(
+        (t.get("selection_search") for t in common.tabs(s) if t.get("selection_search") is not None),
+        None,
+    )
+
+
+def s_snapshot(harness):
+    return common.snapshot(harness)
 
 
 def mode(s):
@@ -191,6 +192,24 @@ def main():
         time.sleep(0.04)
     assert "editor.copy" in cut and "editor.paste" in cut, "toolbar copy/paste controls not rendered"
     time.sleep(0.5)
+    # The expected clipboard is computed from the live committed members:
+    # each caret contributes its containing line including its break, and
+    # the fragments join with LF — so a wrong copy or a wrong broadcast
+    # breaks the byte-exact paste check below.
+    value = common.snapshot(harness)
+    copy_members = next(
+        (t["selections"] for t in common.tabs(value)
+         if t.get("active") and t.get("selection_count") is not None)
+    )
+    edited_now = value["focused_text"]
+
+    def containing_line(at):
+        start = edited_now.rfind("\n", 0, at) + 1
+        end = edited_now.find("\n", at)
+        end = len(edited_now) if end == -1 else end + 1
+        return edited_now[start:end]
+
+    clipboard = "\n".join(containing_line(head) for (_, head) in copy_members)
     for _ in range(4):
         common.key("y")  # copy: fragments join with LF
         time.sleep(0.4)
@@ -225,9 +244,7 @@ def main():
 
     # --- paste broadcast (second undo node) ---
     common.key("p")
-    # Copy joined the containing lines of the three carets with LF:
-    # "# Alpha\n" + "\n" + "alpha body\n".
-    pasted = "# Alpha\n\n\nalpha body\n" + edited
+    pasted = clipboard + edited
     press_until(
         harness,
         "p",
@@ -235,12 +252,13 @@ def main():
         "paste broadcast inserted once",
     )
 
-    # --- match-selection surface (X06): palette opens the query row and
-    # the row paints. Query entry is environment-limited (recorded); the
-    # collection/apply semantics are proven by the headless suites.
+    # --- match selection (X06): real query entry into the owned row, the
+    # preview overlay, and the atomic Apply. The committed count is derived
+    # from the deterministic fixture text, so the negative is real: a stale
+    # or partial install breaks the exact equality.
     palette_run(harness, "editor.select_matches")
     wait(
-        lambda s: search_state(s).get("kind") == "select",
+        lambda s: (search_state(s) or {}).get("kind") == "select",
         "selection-search row open",
     )
     deadline = time.monotonic() + 15
@@ -249,19 +267,85 @@ def main():
         image = output / "paint-searchrow.png"
         common.run("import", "-window", window, str(image))
         last = common.run("tesseract", str(image), "stdout", "-l", "afr", "--psm", "6")
-        if "Alt+Enter" in last.replace("\n", " "):
+        # "Alt+Enter" OCRs unreliably (the + mangles); the placeholder's
+        # tail survives OCR and proves the row paints.
+        if "inserts a newline" in last.replace("\n", " "):
             break
         time.sleep(0.05)
-    assert "Alt+Enter" in last.replace("\n", " "), f"search row not painted; OCR={last!r}"
+    assert "inserts a newline" in last.replace("\n", " "), f"search row not painted; OCR={last!r}"
     common.capture(window, output, "02-searchrow.png", checks)
-    common.key("Escape")
-    wait(lambda s: search_state(s).get("kind") != "select", "search row closed")
 
-    # --- undo twice: paste node, then the typing node ---
-    common.key("u")
-    wait(lambda s: s.get("focused_text") == edited, "undo reverts the paste")
-    common.key("u")
-    wait(lambda s: s.get("focused_text") == original, "undo reverts the typing batch")
+    # The row owns keyboard input: the query is typed into the row itself
+    # (executed, not recorded as environment-limited).
+    assert common.click_selection_row_input(window, harness), (
+        "the query input's mounted bounds are known"
+    )
+    time.sleep(0.2)
+    common.type_text("alpha")
+    wait(
+        lambda s: (search_state(s) or {}).get("query") == "alpha",
+        "query entry landed in the owned row",
+    )
+    wait(
+        lambda s: (search_state(s) or {}).get("pending") is False
+        and (search_state(s) or {}).get("overlay_matches", 0) > 0,
+        "collection drained into an overlay",
+    )
+    # The row's default is case-insensitive: "# Alpha" matches too.
+    expected_matches = pasted.lower().count("alpha")
+    wait(
+        lambda s: (search_state(s) or {}).get("total_matches") == expected_matches,
+        f"the exact observed total is {expected_matches}",
+    )
+    common.key("Return")
+    wait(
+        lambda s: common.selections(s) == expected_matches,
+        "Apply installs exactly the observed matches",
+    )
+    # Negative (double apply): a second Enter with the consumed overlay must
+    # be a zero-effect refusal — the committed count cannot change.
+    common.key("Return")
+    time.sleep(0.6)
+    assert common.selections(s_snapshot(harness)) == expected_matches, (
+        "a double apply must not install twice"
+    )
+    common.key("Escape")
+    wait(lambda s: (search_state(s) or {}).get("kind") != "select", "select row closed")
+
+    # --- split (the Kakoune S complement): gaps between the same matches,
+    # through the same owned row ---
+    palette_run(harness, "editor.split_selection")
+    wait(
+        lambda s: (search_state(s) or {}).get("kind") == "split",
+        "split row open",
+    )
+    assert common.click_selection_row_input(window, harness), (
+        "the split query input's mounted bounds are known"
+    )
+    time.sleep(0.2)
+    common.type_text("alpha")
+    wait(
+        lambda s: (search_state(s) or {}).get("query") == "alpha"
+        and (search_state(s) or {}).get("pending") is False,
+        "split query entered and collected",
+    )
+    lowered = pasted.lower()
+    leading = lowered.startswith("alpha")
+    trailing = lowered.endswith("alpha")
+    expected_gaps = expected_matches + 1 - int(leading) - int(trailing)
+    common.key("Return")
+    wait(
+        lambda s: common.selections(s) == expected_gaps,
+        f"split installs exactly the {expected_gaps} gaps",
+    )
+    common.key("Escape")
+    wait(lambda s: (search_state(s) or {}).get("kind") != "split", "split row closed")
+
+    # --- undo twice: paste node, then the typing node (each press is
+    # retried while the target text is not yet reached — the byte-exact
+    # equality stays the deliverable) ---
+    press_until(harness, "u", lambda s: s.get("focused_text") == edited, "undo reverts the paste")
+    press_until(harness, "u", lambda s: s.get("focused_text") == original, "undo reverts the typing batch")
 
     # --- chip restore with the recorded selection ---
     palette_run(harness, "editor.history")
@@ -280,12 +364,18 @@ def main():
     chip_node = max(entry["target"]["node"] for entry in candidates)
     bounds = history.get("bounds") or {}
     assert str(chip_node) in bounds, f"chip bound missing for node {chip_node}: {bounds}"
+    # The negative: the restore must not write anything to disk. Record the
+    # disk immediately before the click and require byte-identical content
+    # after (whatever the autosave state is).
+    disk_before = (vault / "alpha.md").read_text()
     common.click_rect(window, harness, bounds[str(chip_node)])
     wait(
-        lambda s: s.get("focused_text") == edited and selections(s) == 3,
+        lambda s: s.get("focused_text") == edited and common.selections(s) == 3,
         "chip restore brings back text and the recorded selection",
     )
-    assert (vault / "alpha.md").read_text() == original, "restore leaves the disk baseline alone"
+    assert (vault / "alpha.md").read_text() == disk_before, (
+        "restore leaves the disk baseline alone"
+    )
 
     # --- Exit stays above the chooser (hidden-Exit negative) ---
     palette_run(harness, "editor.history")
@@ -305,7 +395,21 @@ def main():
     while time.monotonic() < deadline:
         image = output / "paint-offstate.png"
         common.run("import", "-window", window, str(image))
-        last = common.run("tesseract", str(image), "stdout", "-l", "afr", "--psm", "6")
+        # The count lives in the note footer; OCR the bottom strip only —
+        # the whole-window pass mangles the small footer text.
+        common.run(
+            "python3", "-c",
+            "import sys; from PIL import Image, ImageOps; "
+            f"img = Image.open({str(image)!r}); "
+            "strip = img.crop((0, img.height - 70, img.width // 2, img.height - 20))"
+            ".convert('L'); "
+            "ImageOps.invert(strip).resize((strip.width * 3, strip.height * 3))"
+            f".save({str(output / 'paint-offstate-footer.png')!r})",
+        )
+        last = common.run(
+            "tesseract", str(output / "paint-offstate-footer.png"),
+            "stdout", "-l", "afr", "--psm", "6",
+        )
         if "selections" in last.replace("\n", " "):
             break
         time.sleep(0.05)

@@ -15,18 +15,13 @@ import common
 from context_mode import painted
 
 
-def selections(s):
-    editor = next(t for t in common.tabs(s) if t.get("selection_count") is not None)
-    return editor["selection_count"]
-
-
 def settled(harness, count, label):
     """Two consecutive snapshots at `count` prove the publish frame landed
     before the next menu opens (the toolbar captures its target per frame)."""
     end = time.monotonic() + 15
     previous = None
     while time.monotonic() < end:
-        current = selections(common.snapshot(harness))
+        current = common.selections(common.snapshot(harness))
         if current == count and previous == count:
             return
         previous = current
@@ -54,14 +49,20 @@ def menu_click(harness, wait, label, row):
     for _ in range(row):
         common.key("Down")
     common.key("Return")
-    common.key("Escape")
-    previous = None
+    # The dispatch closes the menu. Only a *residue* menu needs the Escape,
+    # and it is guarded: Command Escape with N>1 keeps the primary (FEUX-
+    # 0002 §5.4 row 10), so a blind Escape would collapse the freshly
+    # built set instead of just closing a stuck menu.
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        closed = (common.snapshot(harness).get("context_mode") or {}).get("menu") is None
-        if closed and previous:
+        if (common.snapshot(harness).get("context_mode") or {}).get("menu") is None:
             return
-        previous = closed
+        time.sleep(0.04)
+    common.key("Escape")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if (common.snapshot(harness).get("context_mode") or {}).get("menu") is None:
+            return
         time.sleep(0.04)
     raise AssertionError(f"{label}: menu overlay never closed")
 
@@ -116,7 +117,7 @@ def main():
     # Build the set: 1 -> 2 -> 3 -> 4 members via Add caret on row below.
     for expected in (2, 3, 4):
         menu_click(harness, wait, "Add caret on row below", 7)
-        wait(lambda s, e=expected: selections(s) == e, f"{expected} selections")
+        wait(lambda s, e=expected: common.selections(s) == e, f"{expected} selections")
         settled(harness, expected, f"{expected} selections settled")
 
     # Type across every member in one atomic batch.
@@ -128,14 +129,14 @@ def main():
     common.type_text("X")
     common.key("Escape")
     value = wait(
-        lambda s: "Xone" in s.get("focused_text", "") and selections(s) == 4,
+        lambda s: "Xone" in s.get("focused_text", "") and common.selections(s) == 4,
         "typing landed on all four members",
     )
 
     # Exit mode: the set survives with the OFF-state count (FR-13).
     common.key("ctrl+space")
     wait(lambda s: s.get("context_mode") is None, "mode exit")
-    wait(lambda s: selections(s) == 4, "set retained after exit")
+    wait(lambda s: common.selections(s) == 4, "set retained after exit")
 
     # Paint: the note footer shows the non-color count (whole-window OCR).
     deadline = time.monotonic() + 20
@@ -154,7 +155,7 @@ def main():
     # E-14). The embedded negative: if collapse is broken, the count stays
     # 4 and this wait times out.
     common.key("Escape")
-    wait(lambda s: selections(s) == 1, "Escape collapsed the additional selections")
+    wait(lambda s: common.selections(s) == 1, "Escape collapsed the additional selections")
 
     checks.append({"id": "context-mode-multiselect-build-type-exit-collapse", "outcome": "pass"})
     common.finish(output, checks, backend)

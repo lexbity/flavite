@@ -1938,6 +1938,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
     }
 
     fn state(&self) -> iced::advanced::widget::tree::State {
+        eprintln!("[diag] FRESH EditorState created");
         let mut state = EditorState::default();
         self.synchronize(&mut state);
         iced::advanced::widget::tree::State::new(state)

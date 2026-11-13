@@ -570,6 +570,14 @@ pub fn map_point_through_spans(
 /// batch in a single two-pointer pass (NFR-1: O(points + spans), no
 /// per-point span scan). Each point maps with the same rule as
 /// [`map_point_through_spans`]; `points` MUST be non-decreasing.
+///
+/// The consumption test stays in the RAW pre-edit frame for both the point
+/// and the spans: a span lies strictly before a point when the point is at
+/// or past its raw end (past its raw start for an empty insertion). The
+/// shifted frame is used only for the mapped value — comparing a raw point
+/// against a shifted extent would break the loop early whenever an earlier
+/// insertion shifts an empty span onto a later point's offset, collapsing
+/// two distinct carets into one (the R14 native multiselect defect).
 #[must_use]
 pub fn map_points_through_spans(
     points: &[usize],
@@ -584,16 +592,10 @@ pub fn map_points_through_spans(
     let mut shift: isize = 0;
     let mut i = 0;
     for &p in points {
-        // Advance every span lying entirely before `p`; accumulate deltas.
-        // A point exactly at an EMPTY span's boundary (start == end == p)
-        // is not consumed — it is the `== start` case (stick right / stay
-        // before), matching `map_endpoint`'s branch order.
-        while i < spans.len() {
-            let start = spans[i].start;
-            let end = shift_pos(spans[i].end, shift);
-            if p < end || (p == end && start == spans[i].end) {
-                break;
-            }
+        // Consume every span strictly before `p` in the raw frame.
+        while i < spans.len()
+            && (p > spans[i].end || (spans[i].start == spans[i].end && p > spans[i].start))
+        {
             shift += spans[i].replacement_len as isize - (spans[i].end - spans[i].start) as isize;
             i += 1;
         }
@@ -601,20 +603,18 @@ pub fn map_points_through_spans(
             shift_pos(p, shift)
         } else {
             let start = shift_pos(spans[i].start, shift);
-            let end = shift_pos(spans[i].end, shift);
-            if p == start {
-                if affinity == Affinity::Right {
-                    start + spans[i].replacement_len
-                } else {
-                    shift_pos(p, shift)
-                }
-            } else if p < end {
+            if p == spans[i].start || (p > spans[i].start && p < spans[i].end) {
+                // The point is at (boundary) or inside the span: right
+                // affinity lands past the replacement, left affinity stays
+                // at/before its start.
                 if affinity == Affinity::Right {
                     start + spans[i].replacement_len
                 } else {
                     start
                 }
             } else {
+                // The point is before this span's raw start: no further
+                // span applies.
                 shift_pos(p, shift)
             }
         };
@@ -1407,5 +1407,59 @@ mod tests {
         let gaps = split_gaps(text, &spans);
         assert_eq!(gaps.len(), text.len());
         assert!(gaps.iter().all(|&(start, end)| start < end));
+    }
+}
+
+#[cfg(test)]
+mod bulk_mapping_tests {
+    use super::*;
+    use crate::history::MovementSpan;
+
+    use crate::positions::Affinity;
+
+    fn spans(list: &[(usize, usize, usize)]) -> Vec<MovementSpan> {
+        list.iter()
+            .map(|&(start, end, replacement_len)| MovementSpan {
+                start,
+                end,
+                replacement_len,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn points_after_empty_insertions_keep_their_own_targets() {
+        // FEUX-0002 R14: carets at {0, 8, 9, 20} typing "X" — the shifted
+        // empty insertion at 8 lands on the raw offset of the NEXT point
+        // (9); the bulk mapper must not stop there, or carets 8 and 9
+        // collapse onto one member and a four-caret typing batch loses a
+        // member.
+        let spans = spans(&[(0, 0, 1), (8, 8, 1), (9, 9, 1), (20, 20, 1)]);
+        let mapped = map_points_through_spans(&[0, 8, 9, 20], &spans, Affinity::Right);
+        assert_eq!(mapped, vec![1, 10, 12, 24]);
+    }
+
+    #[test]
+    fn bulk_mapping_agrees_with_the_single_point_mapper() {
+        // The two-pointer pass and the sequential single-point mapper are
+        // two implementations of one rule: they must agree on every point
+        // of an ascending batch.
+        let text = "# Alpha\n\nalpha body\none\ntwo\nthree\nfour";
+        let batch: Vec<(usize, usize, usize)> = vec![(0, 0, 1), (8, 8, 1), (9, 9, 1), (20, 20, 1)];
+        let spans = spans(&batch);
+        let mut points: Vec<usize> = (0..=text.len()).collect();
+        points.extend([8, 9, 10, 11, 12, 20, 21, 23, 24]);
+        points.sort_unstable();
+        points.dedup();
+        for affinity in [Affinity::Left, Affinity::Right] {
+            let bulk = map_points_through_spans(&points, &spans, affinity);
+            for (point, mapped) in points.iter().zip(&bulk) {
+                let single = map_point_through_spans(*point, &spans, affinity);
+                assert_eq!(
+                    *mapped, single,
+                    "bulk and single-point mapping disagree at {point} ({affinity:?})"
+                );
+            }
+        }
     }
 }

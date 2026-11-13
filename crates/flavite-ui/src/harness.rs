@@ -276,6 +276,9 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                             "total_matches": search.overlay.as_ref().map_or(0, |overlay| overlay.total_matches),
                             "zero_width": search.overlay.as_ref().map_or(0, |overlay| overlay.zero_width_count),
                             "error": search.error,
+                            "input_bounds": search
+                                .input_bounds
+                                .map(|r| [r.x, r.y, r.width, r.height]),
                         })),
                         "viewport_anchor": interaction.viewport_anchor,
                         "active": *tab == state.active(),

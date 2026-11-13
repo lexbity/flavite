@@ -239,6 +239,12 @@ pub fn preview_command(app: &App, tab: TabId) -> Option<ContextCommand> {
     {
         return None;
     }
+    // §5.4.1: while `AwaitChar` captures, the state row shows the capture
+    // hint — the Command-mode default preview (Delete) must not paint over
+    // it, and the next key resolves find-char, not a delete.
+    if session.state.await_char().is_some() {
+        return None;
+    }
     let target = EditorTarget::capture(app, tab)?;
     let command = if let Some((source, command)) = app.context_mode.preview.clone()
         && source == target
@@ -433,7 +439,9 @@ fn exit(app: &mut App) {
             );
         }
         // Match-selection drafts are context-mode owned (E-11): mode exit
-        // cancels the collection and discards the overlay.
+        // cancels the in-flight collection at the source and discards the
+        // overlay.
+        super::selection_search::cancel_tab(app, session.tab);
         app.selection_search.detach(session.tab);
         app.palette_open = false;
         app.picker = Default::default();
@@ -558,6 +566,11 @@ pub fn native_key(
                 let extend = key.modifiers.shift;
                 if let Some(s) = &mut app.context_mode.session {
                     s.state.end_await_char();
+                    // The capture hint must not outlive the capture: the
+                    // resolved command names the outcome (§5.4.1).
+                    s.state.admit_run(ContextCommand::FindChar {
+                        forward: request.forward,
+                    });
                 }
                 let extra = serde_json::json!({
                     "direction": if request.forward { "fwd" } else { "back" },

@@ -466,6 +466,9 @@ pub enum SessionCommand {
         request_id: u64,
         request: crate::text_select::SelectMatchesRequest,
     },
+    /// Cancel one pending match collection (E-11): the worker stops, the
+    /// result is dropped, and no completion is recorded.
+    TextCancel { request_id: u64 },
     /// Install one prepared replacement as one isolated Undo unit (D-06).
     /// Consumed plans replay the same result during the retry window.
     ApplyReplace {
@@ -796,6 +799,9 @@ pub enum CommandResult {
         total_matches: u64,
         zero_width_count: u64,
     },
+    /// A pending match collection was cancelled (FEUX-0002 E-11): its
+    /// outcome is dropped and no completion is recorded for it.
+    SelectionCollectionCancelled { request_id: u64 },
     /// A vault source-find session started (RFC-0006 S07): frozen scope,
     /// exact totals, typed exclusions and the first page.
     SourceFindStarted {
@@ -1135,6 +1141,10 @@ pub struct Session {
     /// drain: `wait_for_operation` needs them to stay reported as in
     /// flight until the text worker's completion lands).
     pending_text: Mutex<HashSet<u64>>,
+    /// In-flight match-collection cancellation flags keyed by request id
+    /// (E-11): `TextCancel` sets the flag, the worker stops (skipping or
+    /// polling mid-scan), and the dispatch drops the outcome.
+    text_cancels: Mutex<HashMap<u64, Arc<AtomicBool>>>,
     /// RFC-0006 S08: per-note source leases (non-replacing; D-10).
     leases: Arc<crate::source_leases::SourceLeaseRegistry>,
     /// RFC-0006 S08: durable replacement jobs by job id.
@@ -1189,6 +1199,9 @@ struct TextJob {
     request_id: u64,
     text: std::sync::Arc<str>,
     work: TextWork,
+    /// Set when the request is cancelled (E-11): the worker skips the job
+    /// or stops mid-scan, and the dispatch drops the outcome.
+    cancelled: std::sync::Arc<AtomicBool>,
 }
 
 /// Which prepare computation a queued job performs.
@@ -1221,6 +1234,9 @@ enum TextOutcomeMessage {
         revision: Revision,
         outcome: Result<crate::text_select::MatchCollectionOutcome, crate::text_edit::PrepareError>,
     },
+    /// The job was cancelled before (or while) it ran; its outcome is
+    /// dropped and no completion is recorded (E-11).
+    Cancelled { request_id: u64 },
 }
 
 /// One queued vault source-find or replacement-preview job (RFC-0006
@@ -1692,6 +1708,15 @@ impl Session {
                     .spawn(move || {
                         // Workers exit when the Session drops the job sender.
                         while let Ok(job) = jobs.recv() {
+                            if job.cancelled.load(Ordering::Acquire) {
+                                // The request was cancelled before the job
+                                // started; the dispatch drops this marker
+                                // and records nothing (E-11).
+                                let _ = results.send(TextOutcomeMessage::Cancelled {
+                                    request_id: job.request_id,
+                                });
+                                continue;
+                            }
                             let message = match job.work {
                                 TextWork::Prepare(request) => TextOutcomeMessage::Prepare {
                                     request_id: job.request_id,
@@ -1711,7 +1736,9 @@ impl Session {
                                         buffer_id: request.buffer_id,
                                         revision: request.revision,
                                         outcome: crate::text_select::collect_matches(
-                                            &job.text, &request,
+                                            &job.text,
+                                            &request,
+                                            &job.cancelled,
                                         ),
                                     }
                                 }
@@ -1916,6 +1943,7 @@ impl Session {
             preview_counter: AtomicU64::new(0),
             pending_replace: Mutex::new(HashSet::new()),
             pending_text: Mutex::new(HashSet::new()),
+            text_cancels: Mutex::new(HashMap::new()),
             leases: Arc::new(crate::source_leases::SourceLeaseRegistry::new()),
             replace_jobs_map: Mutex::new(HashMap::new()),
             active_apply: Mutex::new(None),
@@ -2581,6 +2609,7 @@ impl Session {
                 request_id,
                 request,
             } => self.text_select_matches(request_id, request),
+            SessionCommand::TextCancel { request_id } => self.text_cancel(request_id),
             SessionCommand::ApplyReplace {
                 buffer_id,
                 revision,
@@ -3852,6 +3881,7 @@ impl Session {
                         request_id,
                         text,
                         work: TextWork::Prepare(request),
+                        cancelled: Arc::new(AtomicBool::new(false)),
                     })
                     .is_ok() =>
             {
@@ -3890,6 +3920,7 @@ impl Session {
                         request_id,
                         text,
                         work: TextWork::Find(request),
+                        cancelled: Arc::new(AtomicBool::new(false)),
                     })
                     .is_ok() =>
             {
@@ -3923,6 +3954,7 @@ impl Session {
         if self.text_queue_full() {
             return SessionResult::Busy;
         }
+        let cancelled = Arc::new(AtomicBool::new(false));
         match &self.text_jobs {
             Some(jobs)
                 if jobs
@@ -3930,16 +3962,40 @@ impl Session {
                         request_id,
                         text,
                         work: TextWork::SelectMatches(request),
+                        cancelled: cancelled.clone(),
                     })
                     .is_ok() =>
             {
                 self.pending_text.lock_recovering().insert(request_id);
+                self.text_cancels
+                    .lock_recovering()
+                    .insert(request_id, cancelled);
                 SessionResult::Pending { request_id }
             }
             _ => SessionResult::Error {
                 message: "find workers are unavailable".into(),
             },
         }
+    }
+
+    /// Cancel one pending match collection (FEUX-0002 E-11): the worker
+    /// stops (or skips), the dispatch drops the outcome, and no completion
+    /// is recorded. Cancelling a terminal/unknown request is a typed
+    /// refusal.
+    fn text_cancel(&self, request_id: u64) -> SessionResult {
+        let Some(flag) = self
+            .text_cancels
+            .lock_recovering()
+            .get(&request_id)
+            .cloned()
+        else {
+            return SessionResult::Error {
+                message: "UnknownSelectionCollection".into(),
+            };
+        };
+        flag.store(true, Ordering::Release);
+        self.pending_text.lock_recovering().remove(&request_id);
+        SessionResult::Success(CommandResult::SelectionCollectionCancelled { request_id })
     }
 
     /// Shared admission guard: at most [`TEXT_QUEUE_MAX`] text jobs may be
@@ -5318,6 +5374,12 @@ impl Session {
     fn pump_text_completions(&self) {
         while let Ok(message) = self.text_results.try_recv() {
             let (request_id, result) = match message {
+                TextOutcomeMessage::Cancelled { request_id } => {
+                    // The job was cancelled before it ran; no completion is
+                    // recorded (E-11).
+                    self.text_cancels.lock_recovering().remove(&request_id);
+                    continue;
+                }
                 TextOutcomeMessage::Prepare {
                     request_id,
                     buffer_id,
@@ -5432,6 +5494,13 @@ impl Session {
                     (request_id, result)
                 }
             };
+            // A cancel that raced the outcome drops the result: the
+            // activation never reaches a caller (E-11).
+            if let Some(flag) = self.text_cancels.lock_recovering().remove(&request_id)
+                && flag.load(Ordering::Acquire)
+            {
+                continue;
+            }
             self.pending_text.lock_recovering().remove(&request_id);
             self.record_completion(request_id, result);
         }
@@ -9936,6 +10005,58 @@ mod tests {
             watch.recv_timeout(Duration::from_secs(1)),
             Some(()),
             "the edit wake lands inside the debounce window"
+        );
+    }
+
+    #[test]
+    fn text_cancel_sets_the_flag_clears_pending_and_refuses_replays() {
+        // FEUX-0002 E-11/R13: cancelling an in-flight collection marks it at
+        // the source; the worker stops, the dispatch drops the outcome, and
+        // no completion is ever recorded for the request.
+        let (session, _fs, _temp) = test_session();
+        let request_id = 7_777u64;
+        let flag = Arc::new(AtomicBool::new(false));
+        session.pending_text.lock_recovering().insert(request_id);
+        session
+            .text_cancels
+            .lock_recovering()
+            .insert(request_id, flag.clone());
+        let result = session.execute(SessionCommand::TextCancel { request_id });
+        match result {
+            SessionResult::Success(CommandResult::SelectionCollectionCancelled {
+                request_id: id,
+            }) => assert_eq!(id, request_id),
+            other => panic!("the cancel must succeed: {other:?}"),
+        }
+        assert!(flag.load(Ordering::Acquire), "the worker flag is set");
+        assert!(
+            !session.pending_text.lock_recovering().contains(&request_id),
+            "no completion is ever recorded"
+        );
+        // A replay before the marker dispatch is idempotent: the request
+        // stays cancelled.
+        assert!(matches!(
+            session.execute(SessionCommand::TextCancel { request_id }),
+            SessionResult::Success(
+                CommandResult::SelectionCollectionCancelled {
+                    request_id: replayed
+                }
+            ) if replayed == request_id
+        ));
+        // Once the outcome channel is drained (dispatch removed the flag),
+        // the request is terminal and a further cancel is a typed unknown.
+        session.text_cancels.lock_recovering().remove(&request_id);
+        assert!(matches!(
+            session.execute(SessionCommand::TextCancel { request_id }),
+            SessionResult::Error { .. }
+        ));
+        session.pump();
+        assert!(
+            session
+                .drain_operation_completions()
+                .iter()
+                .all(|completion| completion.request_id != request_id),
+            "a cancelled collection never delivers a completion"
         );
     }
 }

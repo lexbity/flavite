@@ -13,18 +13,13 @@ import common
 from context_mode import painted
 
 
-def selections(s):
-    editor = next(t for t in common.tabs(s) if t.get("selection_count") is not None)
-    return editor["selection_count"]
-
-
 def settled(harness, count, label):
     """Two consecutive snapshots at `count` prove the publish frame landed
     before the next menu opens (the toolbar captures its target per frame)."""
     end = time.monotonic() + 15
     previous = None
     while time.monotonic() < end:
-        current = selections(common.snapshot(harness))
+        current = common.selections(common.snapshot(harness))
         if current == count and previous == count:
             return
         previous = current
@@ -52,14 +47,20 @@ def menu_click(harness, wait, label, row):
     for _ in range(row):
         common.key("Down")
     common.key("Return")
-    common.key("Escape")
-    previous = None
+    # The dispatch closes the menu. Only a *residue* menu needs the Escape,
+    # and it is guarded: Command Escape with N>1 keeps the primary (FEUX-
+    # 0002 §5.4 row 10), so a blind Escape would collapse the freshly
+    # built set instead of just closing a stuck menu.
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        closed = (common.snapshot(harness).get("context_mode") or {}).get("menu") is None
-        if closed and previous:
+        if (common.snapshot(harness).get("context_mode") or {}).get("menu") is None:
             return
-        previous = closed
+        time.sleep(0.04)
+    common.key("Escape")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if (common.snapshot(harness).get("context_mode") or {}).get("menu") is None:
+            return
         time.sleep(0.04)
     raise AssertionError(f"{label}: menu overlay never closed")
 
@@ -112,22 +113,22 @@ def main():
     # Build 3 members.
     for expected in (2, 3):
         menu_click(harness, wait, "Add caret on row below", 7)
-        wait(lambda s, e=expected: selections(s) == e, f"{expected} selections")
+        wait(lambda s, e=expected: common.selections(s) == e, f"{expected} selections")
         settled(harness, expected, f"{expected} selections settled")
 
     # Collapse: every range -> caret at head (here all carets stay).
     menu_click(harness, wait, "Collapse selections", 3)
-    wait(lambda s: selections(s) == 3, "collapse keeps heads at N>1")
+    wait(lambda s: common.selections(s) == 3, "collapse keeps heads at N>1")
 
     # Clear selection: one caret at the primary head (E-7 distinction).
     menu_click(harness, wait, "Clear selection", 4)
-    wait(lambda s: selections(s) == 1, "clear collapses to one caret")
+    wait(lambda s: common.selections(s) == 1, "clear collapses to one caret")
     text_after_clear = common.snapshot(harness)["focused_text"]
 
     # Rebuild to 3 for find-char.
     for expected in (2, 3):
         menu_click(harness, wait, "Add caret on row below", 7)
-        wait(lambda s, e=expected: selections(s) == e, f"rebuild {expected}")
+        wait(lambda s, e=expected: common.selections(s) == e, f"rebuild {expected}")
         settled(harness, expected, f"rebuild {expected} settled")
 
     # Find-char: `f` opens AwaitChar; OCR the capture hint.
@@ -147,16 +148,25 @@ def main():
         "find-char cancelled",
     )
     assert common.snapshot(harness)["focused_text"] == before
-    assert selections(common.snapshot(harness)) == 3
+    assert common.selections(common.snapshot(harness)) == 3
 
-    # `f` then a produced character resolves: 'r' exists at 4 (in
-    # "# Alpha") and at 32 (in "three") after the heads at 0, 8, 9, so
-    # the members move to {4, 32} — selection-only, no text mutation.
+    # `f` then a produced character resolves: the expected members are
+    # computed from the live committed heads and the fixture text (the
+    # first match strictly after each head, duplicates merged), so the
+    # negative is real: a resolve that mutates text or misplaces a member
+    # breaks the exact equality.
+    value = common.snapshot(harness)
+    heads = [head for (_, head) in next(
+        (t["selections"] for t in common.tabs(value)
+         if t.get("active") and t.get("selection_count") is not None))]
+    targets = sorted({before.find("e", head + 1) for head in heads} - {-1})
+    assert targets, "the fixture must contain the find-char target"
     common.key("f")
-    common.type_text("r")
+    common.type_text("e")
     wait(
-        lambda s: selections(s) == 2 and s.get("focused_text") == before,
-        "find-char resolved without text mutation",
+        lambda s: common.selections(s) == len(targets)
+        and s.get("focused_text") == before,
+        f"find-char resolved to {targets} without text mutation",
     )
 
     checks.append({"id": "context-mode-setops-collapse-clear-findchar", "outcome": "pass"})

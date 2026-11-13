@@ -584,6 +584,7 @@ const READ_NOTES_COMMAND_IDS: &[&str] = &[
     "replace.job_status",
     "editor.issue_operation",
     "editor.cancel_operation",
+    "editor.cancel_selection",
     "editor.keep_primary",
     "editor.collapse",
     "editor.clear_selection",
@@ -1164,6 +1165,12 @@ impl Flavite {
                 "Cancel a pending editor operation",
                 ArgSchema::typed::<crate::editor_commands::CancelOperationArgs>(),
                 crate::editor_commands::handle_cancel_operation,
+            ),
+            (
+                "editor.cancel_selection",
+                "Cancel a pending match collection",
+                ArgSchema::typed::<crate::editor_commands::CancelSelectionArgs>(),
+                crate::editor_commands::handle_cancel_selection,
             ),
             (
                 "editor.delete",
@@ -2313,6 +2320,9 @@ impl Flavite {
             SessionResult::Success(crate::session::CommandResult::MatchesCollected { .. }) => {
                 "editor.select_matches"
             }
+            SessionResult::Success(
+                crate::session::CommandResult::SelectionCollectionCancelled { .. },
+            ) => "editor.cancel_selection",
             SessionResult::Success(crate::session::CommandResult::SourceFindStarted { .. }) => {
                 "source_find.start"
             }
@@ -2640,6 +2650,12 @@ impl Flavite {
                                 .collect::<Vec<[u64; 2]>>(),
                             "total_matches": total_matches,
                             "zero_width_count": zero_width_count,
+                        })
+                    }
+                    crate::session::CommandResult::SelectionCollectionCancelled { request_id } => {
+                        serde_json::json!({
+                            "cancelled": true,
+                            "request_id": request_id,
                         })
                     }
                     crate::session::CommandResult::SourceFindStarted {

@@ -96,6 +96,10 @@ pub struct SelectionSearchState {
     pub query_version: u64,
     pub overlay: Option<Overlay>,
     pub error: Option<String>,
+    /// The mounted query input's rectangle (the pointer-focus target for
+    /// real OS input; the synthetic focus operation does not stick for this
+    /// input under the runtime).
+    pub input_bounds: Option<iced::Rectangle>,
     /// The row is the keyboard owner while open (mirrors the find bar's
     /// `focused` deferral: Context Mode must not interpret printable keys).
     pub focused: bool,
@@ -113,6 +117,7 @@ impl SelectionSearchState {
             query_version: 0,
             overlay: None,
             error: None,
+            input_bounds: None,
             focused: true,
         }
     }
@@ -163,6 +168,11 @@ pub enum SelectionSearchMessage {
         tab: TabId,
         rect: iced::Rectangle,
     },
+    /// The mounted query input's rectangle (pointer-focus target).
+    InputBounds {
+        tab: TabId,
+        rect: iced::Rectangle,
+    },
 }
 
 /// Record one diagnostics outcome for the match-collection path (X07).
@@ -199,14 +209,30 @@ pub fn handle(app: &mut App, message: SelectionSearchMessage) -> iced::Task<Mess
         }
         SelectionSearchMessage::Close(tab) => {
             diag(app, tab, EventKind::MatchCollect, Outcome::Cancelled, None);
-            let _ = app.selection_search.tabs.remove(&tab);
-            app.selection_search
-                .requests
-                .retain(|_, (owner, _)| *owner != tab);
+            cancel_tab(app, tab);
             app.refresh_semantics();
+            // The row's query input owned the runtime focus; once the row is
+            // gone that focus is stale and every following keystroke would
+            // vanish with it. Restore the editor exactly like FindClose.
+            if let Some(view) = app.note_editor_view(tab)
+                && let Some(bounds) = app.editor_bounds.get(&tab).copied()
+            {
+                return iced::advanced::widget::operate(
+                    iced::advanced::widget::operation::focusable::unfocus(),
+                )
+                .chain(
+                    iced::advanced::widget::operate(flavite_editor::focus_editor(
+                        view.buffer_id,
+                        view.revision,
+                        Some(bounds),
+                    ))
+                    .map(|_| crate::app::Message::Pump),
+                );
+            }
             iced::Task::none()
         }
         SelectionSearchMessage::DraftAction { tab, action } => {
+            eprintln!("[diag] row action {action:?}");
             let mut changed = false;
             {
                 let Some(state) = app.selection_search.tabs.get_mut(&tab) else {
@@ -229,7 +255,6 @@ pub fn handle(app: &mut App, message: SelectionSearchMessage) -> iced::Task<Mess
                 if state.query != text {
                     state.query = text;
                     state.query_version = state.query_version.wrapping_add(1);
-                    state.pending = None;
                     state.overlay = None;
                     state.error = None;
                     changed = true;
@@ -246,7 +271,6 @@ pub fn handle(app: &mut App, message: SelectionSearchMessage) -> iced::Task<Mess
             if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
                 state.regex = !state.regex;
                 state.query_version = state.query_version.wrapping_add(1);
-                state.pending = None;
                 state.overlay = None;
                 state.error = None;
                 changed = true;
@@ -262,7 +286,6 @@ pub fn handle(app: &mut App, message: SelectionSearchMessage) -> iced::Task<Mess
             if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
                 state.case_sensitive = !state.case_sensitive;
                 state.query_version = state.query_version.wrapping_add(1);
-                state.pending = None;
                 state.overlay = None;
                 state.error = None;
                 changed = true;
@@ -274,6 +297,12 @@ pub fn handle(app: &mut App, message: SelectionSearchMessage) -> iced::Task<Mess
             iced::Task::none()
         }
         SelectionSearchMessage::Apply(tab) => apply(app, tab),
+        SelectionSearchMessage::InputBounds { tab, rect } => {
+            if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+                state.input_bounds = Some(rect);
+            }
+            iced::Task::none()
+        }
         SelectionSearchMessage::Bounds { tab, rect: _ } => {
             if app.selection_search.pending_focus == Some(tab) {
                 app.selection_search.pending_focus = None;
@@ -334,15 +363,57 @@ pub fn caption(app: &App, tab: TabId) -> Option<String> {
     })
 }
 
-/// Admit a draft through the bounded core worker. An old completion is
-/// accepted only while query/options/revision/version still match exactly.
+/// Cancel one in-flight collection at the source (E-11): the Session stops
+/// the worker job and drops its outcome; the UI retires its correlation
+/// state. A cancelled request never delivers a completion.
+fn cancel_collection(app: &mut App, request_id: u64) {
+    if let Some(api) = app.flavite.as_ref() {
+        let _ = api.execute(Invocation::new(
+            api.command_registry().next_request_id(),
+            "editor.cancel_selection",
+            serde_json::json!({"request_id": request_id}),
+            Origin::Gui,
+        ));
+    }
+    app.selection_search.requests.remove(&request_id);
+    app.operations.cancel(request_id);
+}
+
+/// Cancel every pending collection owned by `tab` and drop its row state
+/// (mode exit / view teardown).
+pub(crate) fn cancel_tab(app: &mut App, tab: TabId) {
+    let pending = app
+        .selection_search
+        .tabs
+        .get(&tab)
+        .and_then(|state| state.pending);
+    if let Some(request_id) = pending {
+        cancel_collection(app, request_id);
+    }
+    app.selection_search.tabs.remove(&tab);
+    app.selection_search
+        .requests
+        .retain(|_, (owner, _)| *owner != tab);
+}
+
+/// Admit a draft through the bounded core worker. At most one collection is
+/// in flight per view (E-11): a new draft cancels the previous request at
+/// the source instead of leaving it running behind a stale overlay.
 fn request_collection(app: &mut App, tab: TabId) {
+    let superseded = app
+        .selection_search
+        .tabs
+        .get(&tab)
+        .and_then(|state| state.pending);
     let Some(state) = app.selection_search.tabs.get(&tab) else {
         return;
     };
     if state.query.is_empty() && !state.regex {
         // Idle, not a match-everywhere search (D-05): clear any stale
         // overlay.
+        if let Some(request_id) = superseded {
+            cancel_collection(app, request_id);
+        }
         if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
             state.pending = None;
             state.overlay = None;
@@ -351,14 +422,41 @@ fn request_collection(app: &mut App, tab: TabId) {
         return;
     }
     let Some(target) = EditorTarget::capture(app, tab) else {
+        if let Some(request_id) = superseded {
+            cancel_collection(app, request_id);
+        }
+        if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+            state.pending = None;
+        }
         return;
     };
     let Some(view) = app.note_editor_view(tab) else {
+        if let Some(request_id) = superseded {
+            cancel_collection(app, request_id);
+        }
+        if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+            state.pending = None;
+        }
         return;
     };
     let Some(key) = PreviewKey::current(app, tab) else {
+        if let Some(request_id) = superseded {
+            cancel_collection(app, request_id);
+        }
+        if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+            state.pending = None;
+        }
         return;
     };
+    // E-11: superseding a draft cancels the old request; the fresh overlay
+    // check runs after the cancel so a completed previous collection's
+    // overlay (key-fresh) still short-circuits without re-collecting.
+    if let Some(request_id) = superseded {
+        cancel_collection(app, request_id);
+        if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+            state.pending = None;
+        }
+    }
     if app
         .selection_search
         .tabs
@@ -543,6 +641,11 @@ fn apply(app: &mut App, tab: TabId) -> iced::Task<Message> {
     let case_sensitive = state.case_sensitive;
     let kind = state.kind;
     let spans: Vec<(usize, usize)> = overlay.spans.to_vec();
+    // The exact observed totals ride the apply (E-10/R13): the span list is
+    // capped, so the totals are the authority for oversize/zero-width
+    // refusals.
+    let total_matches = overlay.total_matches;
+    let zero_width_count = overlay.zero_width_count;
     let installed = crate::host::context_mode::selections_only(
         app,
         &target,
@@ -555,6 +658,8 @@ fn apply(app: &mut App, tab: TabId) -> iced::Task<Message> {
             },
             "apply": true,
             "spans": spans,
+            "total_matches": total_matches,
+            "zero_width_count": zero_width_count,
         }),
     );
     if installed.is_some() {
@@ -653,9 +758,10 @@ pub fn blocks_typing(app: &App, tab: &TabId) -> bool {
 /// Focus the query input via the low-level focusable operation (the same
 /// path the find bar uses to restore/clear focus).
 fn focus_query_editor(_app: &App, tab: TabId) -> iced::Task<Message> {
-    iced::advanced::widget::operate(iced::advanced::widget::operation::focusable::focus(
-        query_id(tab),
-    ))
+    // The same runtime-level focus the find bar uses: the low-level
+    // focusable operation does not stick for the query input under the
+    // real runtime (the row then never receives a keystroke).
+    iced::widget::operation::focus(query_id(tab))
 }
 
 /// The query input widget id (focus target).
@@ -664,7 +770,10 @@ pub fn query_id(tab: TabId) -> iced::widget::Id {
     iced::widget::Id::from(format!("selection-search-{:032x}", tab.raw()))
 }
 
-/// Key-binding parity with the find bar: Enter applies, Escape closes.
+/// Key-binding parity with the find bar: Enter applies, Escape closes,
+/// and every other key falls through to the text editor's own bindings —
+/// a custom binding that returns `None` makes iced DROP the key entirely,
+/// which silently disabled all query entry into a focused input (R14).
 pub fn draft_binding(
     tab: TabId,
     key: iced::widget::text_editor::KeyPress,
@@ -690,5 +799,5 @@ pub fn draft_binding(
             SelectionSearchMessage::Close(tab),
         )));
     }
-    None
+    Binding::from_key_press(key)
 }
