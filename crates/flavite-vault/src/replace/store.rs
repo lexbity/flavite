@@ -295,10 +295,14 @@ impl ReplaceStore {
     /// Remove a preview job tree (expiry/forget). Idempotent.
     pub fn remove_job(&self, io: &dyn OpStoreIo, job_id: &str) -> Result<(), StoreError> {
         // S07 removes only the known files of a sealed preview; directory
-        // removal is best-effort and never touches unknown content.
+        // removal is best-effort and never touches unknown content. A
+        // manifest that is missing, corrupt, or from another engine version
+        // must not leak the tree: the removal proceeds without the
+        // known-payload list, and the manifest/directory cleanup below
+        // still deletes everything it can.
         let dir = self.base.join(job_id);
         let manifest = self.manifest_path(job_id);
-        let sealed = self.read_manifest(io, job_id)?;
+        let sealed = self.read_manifest(io, job_id).unwrap_or(None);
         if let Some(manifest) = sealed {
             for note in &manifest.notes {
                 let _ = io.remove(&self.payload_path(job_id, &note.before.hash));

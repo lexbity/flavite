@@ -61,7 +61,7 @@ fn api_execute(
 ) -> serde_json::Value {
     let request_id = api.command_registry().next_request_id();
     let result = api.execute(editor_operations_fixture::admit(
-        &api,
+        api,
         Invocation::new(request_id, id, args, Origin::Cli),
     ));
     let result = match result {

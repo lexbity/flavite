@@ -97,7 +97,7 @@ fn next_id(flavite: &Flavite) -> u64 {
 
 fn command(flavite: &Flavite, id: &'static str, args: serde_json::Value) -> ExecutionResult {
     flavite.execute(editor_operations_fixture::admit(
-        &flavite,
+        flavite,
         Invocation::new(next_id(flavite), id, args, Origin::Gui),
     ))
 }

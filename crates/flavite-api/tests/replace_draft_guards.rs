@@ -11,7 +11,7 @@ use flavite_api::{ExecutionResult, Flavite, LocalResult, Origin, command::Invoca
 fn execute(flavite: &Flavite, id: &'static str, args: serde_json::Value) -> ExecutionResult {
     let request_id = flavite.command_registry().next_request_id();
     let result = flavite.execute(editor_operations_fixture::admit(
-        &flavite,
+        flavite,
         Invocation::new(request_id, id, args, Origin::Gui),
     ));
     match result {

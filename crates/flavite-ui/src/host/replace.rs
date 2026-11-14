@@ -213,7 +213,7 @@ impl ReplaceTabState {
         applied > 0
             && matches!(
                 job.phase.as_str(),
-                "completed" | "partial" | "cancelled" | "paused"
+                "completed" | "partial" | "cancelled" | "paused" | "needs-recovery"
             )
     }
 
@@ -1312,6 +1312,17 @@ impl ReplaceHost {
     }
 
     fn handle_job_response(&mut self, tab: flavite_workspace::TabId, result: ExecutionResult) {
+        // A refused command leaves no backend work behind: the cancel latch
+        // must release, and an apply that never created a job must drop the
+        // optimistic "applying" view or the panel latches permanently.
+        fn refused(state: &mut ReplaceTabState, was_job_action: bool, message: String) {
+            state.job_action_request = None;
+            state.cancel_requested = false;
+            if !was_job_action {
+                state.job = None;
+            }
+            state.error = Some(message);
+        }
         match result {
             ExecutionResult::Pending { request_id } => {
                 self.job_requests.insert(request_id, tab);
@@ -1319,8 +1330,8 @@ impl ReplaceHost {
             ExecutionResult::Local(LocalResult::Success(success)) => {
                 if let Some(state) = self.tabs.get_mut(&tab) {
                     state.job_action_request = None;
+                    state.cancel_requested = false;
                     if let Some(status) = success.data.get("status") {
-                        state.cancel_requested = false;
                         state.apply_job_status(status.clone());
                     }
                     let job_id = success
@@ -1338,14 +1349,16 @@ impl ReplaceHost {
             }
             ExecutionResult::Local(LocalResult::Error(error)) => {
                 if let Some(state) = self.tabs.get_mut(&tab) {
-                    state.job_action_request = None;
-                    state.error = Some(error.message);
+                    let was_job_action = state.job_action_request.is_some();
+                    refused(state, was_job_action, error.message);
                 }
             }
             ExecutionResult::Rejected(rejected) => {
                 if let Some(state) = self.tabs.get_mut(&tab) {
-                    state.job_action_request = None;
-                    state.error = Some(
+                    let was_job_action = state.job_action_request.is_some();
+                    refused(
+                        state,
+                        was_job_action,
                         rejected
                             .message
                             .unwrap_or_else(|| "Replacement job was refused".into()),
@@ -1354,14 +1367,22 @@ impl ReplaceHost {
             }
             ExecutionResult::ActionRequired { code, .. } => {
                 if let Some(state) = self.tabs.get_mut(&tab) {
-                    state.job_action_request = None;
-                    state.error = Some(format!("Replacement job needs attention: {code}"));
+                    let was_job_action = state.job_action_request.is_some();
+                    refused(
+                        state,
+                        was_job_action,
+                        format!("Replacement job needs attention: {code}"),
+                    );
                 }
             }
             _ => {
                 if let Some(state) = self.tabs.get_mut(&tab) {
-                    state.job_action_request = None;
-                    state.error = Some("Replacement job result is stale".into());
+                    let was_job_action = state.job_action_request.is_some();
+                    refused(
+                        state,
+                        was_job_action,
+                        "Replacement job result is stale".into(),
+                    );
                 }
             }
         }

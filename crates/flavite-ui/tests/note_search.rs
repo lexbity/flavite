@@ -140,7 +140,7 @@ fn duplicate_views_keep_independent_find_state_and_rescan_after_edits() {
     let api = app.flavite.as_ref().unwrap();
     assert!(
         api.execute(editor_operations_fixture::admit(
-            &api,
+            api,
             flavite_api::Invocation::new(
                 api.command_registry().next_request_id(),
                 "apply_edits",

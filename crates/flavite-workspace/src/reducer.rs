@@ -943,6 +943,18 @@ impl WorkspaceState {
         }
     }
 
+    /// Retire the writing target when its owning tab was reconciled to a
+    /// revision it did not author. A passive movement mapping acknowledges
+    /// the view with its stored focus state, so the reducer would otherwise
+    /// re-create the authority the other-origin edit just invalidated
+    /// (D-04/D-07: authority comes from user input, never from a
+    /// host-driven reconciliation).
+    pub fn invalidate_writing_target_for_tab(&mut self, tab: TabId) {
+        if self.writing_target.is_some_and(|target| target.tab == tab) {
+            self.writing_target = None;
+        }
+    }
+
     /// Replace a view incarnation before its keyed runtime is released.
     /// Existing interaction coordinates are intentionally invalidated.
     ///

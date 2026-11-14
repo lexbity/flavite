@@ -235,7 +235,7 @@ fn open_via_api(flavite: &Flavite, path: &Path, policy: Option<&str>) -> Executi
     }
     let request_id = flavite.command_registry().next_request_id();
     flavite.execute(editor_operations_fixture::admit(
-        &flavite,
+        flavite,
         Invocation::new(request_id, "note.open", args, Origin::Gui),
     ))
 }
@@ -310,7 +310,7 @@ fn same_path_opens_coalesce_into_one_buffer_with_per_caller_results() {
         .get_buffer_view(flavite_buffer::BufferId::from(buffer_a), None)
         .expect("buffer view");
     let edit = flavite.execute(editor_operations_fixture::admit(
-        &flavite,
+        flavite,
         Invocation::with_preconditions(
             edit_request,
             "apply_edits",

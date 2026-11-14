@@ -1045,7 +1045,7 @@ fn history_page_reports_truncation_after_budget_eviction() {
     for _ in 0..90 {
         let view = f.app.note_editor_view(tab).unwrap();
         let result = api.execute(editor_operations_fixture::admit(
-            &api,
+            api,
             flavite_api::Invocation::new(
                 api.command_registry().next_request_id(),
                 "apply_edits",

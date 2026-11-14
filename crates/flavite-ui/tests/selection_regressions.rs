@@ -120,7 +120,7 @@ fn session_rejects_old_view_versions_for_edits_and_history_without_host_guards()
     let target = EditorTarget::capture(app, tab).unwrap();
     let api = app.flavite.as_ref().unwrap();
     let page = api.execute(editor_operations_fixture::admit(
-        &api,
+        api,
         Invocation::new(
             api.command_registry().next_request_id(),
             "buffer.history_page",
@@ -165,7 +165,7 @@ fn session_rejects_old_view_versions_for_edits_and_history_without_host_guards()
             args["target"] = history_target.clone();
         }
         let result = api.execute(editor_operations_fixture::admit(
-            &api,
+            api,
             Invocation::new(
                 api.command_registry().next_request_id(),
                 command,

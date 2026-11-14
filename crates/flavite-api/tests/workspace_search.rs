@@ -20,7 +20,7 @@ fn save(flavite: &Flavite, path: &str) {
         serde_json::json!(flavite.vault_ref().root.join(path)),
         flavite_api::Origin::Gui,
     );
-    let result = flavite.execute(editor_operations_fixture::admit(&flavite, invocation));
+    let result = flavite.execute(editor_operations_fixture::admit(flavite, invocation));
     match result {
         flavite_api::ExecutionResult::Pending { request_id } => {
             let completion = flavite.wait_for_operation(request_id);

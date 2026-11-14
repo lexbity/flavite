@@ -153,7 +153,7 @@ fn self_target_and_stale_acknowledgement_are_honest_refusals() {
     assert!(matches!(app.linking.state(), GestureState::Inserted { .. }));
     let view = app.note_editor_view(tab).unwrap();
     let api = app.flavite.as_ref().unwrap();
-    assert!(api.execute(editor_operations_fixture::admit(&api, flavite_api::Invocation::new(
+    assert!(api.execute(editor_operations_fixture::admit(api, flavite_api::Invocation::new(
         api.command_registry().next_request_id(), "apply_edits",
         serde_json::json!({"buffer_id":view.buffer_id,"revision":view.revision,"ops":[{"range":[0,0],"replacement":"prefix "}]}),
         flavite_api::Origin::Gui,

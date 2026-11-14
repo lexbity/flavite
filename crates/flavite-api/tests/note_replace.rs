@@ -18,7 +18,7 @@ fn prepare(
 ) -> ExecutionResult {
     let request_id = flavite.command_registry().next_request_id();
     let result = flavite.execute(editor_operations_fixture::admit(
-        &flavite,
+        flavite,
         Invocation::new(
             request_id,
             "text.prepare_replace",
@@ -58,7 +58,7 @@ fn prepared_plan(result: &ExecutionResult) -> (String, u64) {
 fn apply(flavite: &Flavite, buffer_id: u64, revision: u64, plan_id: &str) -> ExecutionResult {
     let request_id = flavite.command_registry().next_request_id();
     let result = flavite.execute(editor_operations_fixture::admit(
-        &flavite,
+        flavite,
         Invocation::new(
             request_id,
             "text.apply_replace",
@@ -143,7 +143,7 @@ fn stale_revision_across_the_worker_barrier_has_zero_effect() {
     // Change the revision while the plan exists (the worker barrier ran).
     let request_id = flavite.command_registry().next_request_id();
     let _ = flavite.execute(editor_operations_fixture::admit(
-        &flavite,
+        flavite,
         Invocation::new(
             request_id,
             "apply_edits",
@@ -213,7 +213,7 @@ fn empty_query_is_idle_and_invalid_scopes_are_refused_with_zero_effect() {
     // Out-of-bounds scope: typed refusal, zero effects.
     let request_id = flavite.command_registry().next_request_id();
     let result = flavite.execute(editor_operations_fixture::admit(
-        &flavite,
+        flavite,
         Invocation::new(
             request_id,
             "text.prepare_replace",

@@ -482,10 +482,6 @@ pub enum Message {
         target: crate::host::replace::PreviewTarget,
         selection: crate::host::replace::SelectAction,
     },
-    ReplaceOpenNote {
-        tab: TabId,
-        path: String,
-    },
     /// RFC-0006 S08: apply the sealed preview (frozen selection).
     ReplaceApply {
         tab: TabId,
@@ -1919,16 +1915,15 @@ impl App {
                             .tab(tab)
                             .is_some_and(|view| view.interaction().buffer_id.is_none())
                         && let Some(api) = &self.flavite
-                    {
-                        if let Err(error) = api.initialize_editor_view(
+                        && let Err(error) = api.initialize_editor_view(
                             &mut self.workspace,
                             *tab,
                             view.buffer_id,
                             view.revision,
                             &view.text,
-                        ) {
-                            self.status = error.into();
-                        }
+                        )
+                    {
+                        self.status = error.into();
                     }
                 }
                 Effect::ContextRebound { .. } => {}
@@ -3244,13 +3239,6 @@ impl App {
             }
             Message::ReplaceFocusTab { tab } => {
                 self.status = format!("Replacement job on tab {}", tab.raw());
-            }
-            Message::ReplaceOpenNote { path, .. } => {
-                if let Ok(locator) =
-                    flavite_workspace::NoteLocator::from_relative(std::path::Path::new(&path))
-                {
-                    self.open_intent(crate::host::open_intents::OpenIntent::reuse(locator, None));
-                }
             }
             // ---- W10: History view ----
             Message::HistoryRefresh { tab } => {

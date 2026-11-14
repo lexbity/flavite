@@ -556,7 +556,7 @@ fn handle_ticketed_edit(
             origin: parse_origin(&origin.view)?,
         }),
         editor: Some(record),
-        operation: operation,
+        operation,
     }))
 }
 

@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 fn execute(api: &Flavite, command: &'static str, args: Value) -> ExecutionResult {
     api.execute(editor_operations_fixture::admit(
-        &api,
+        api,
         Invocation::new(support::next_id(api), command, args, Origin::Gui),
     ))
 }

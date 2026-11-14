@@ -128,7 +128,7 @@ fn typed_status_and_read_only_policy_reject_misleading_callers() {
     flavite.set_read_only(true);
     let attempt = |request: u64, preconditions: Preconditions, args: serde_json::Value| {
         flavite.execute(editor_operations_fixture::admit(
-            &flavite,
+            flavite,
             Invocation::with_preconditions(
                 request,
                 "apply_edits",

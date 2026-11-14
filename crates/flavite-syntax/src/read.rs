@@ -318,10 +318,20 @@ pub fn task_patch(
     let range =
         find(&document.nodes, start, expected).ok_or("Task changed; refresh before editing")?;
     let raw = text.get(range.clone()).ok_or("Invalid task span")?;
-    if !matches!(raw, "[ ]" | "[x]" | "[X]") {
+    // The parser's task span carries the list item's leading indentation
+    // (tabs survive normalization), and its unchecked marker may hold any
+    // ASCII whitespace the scanner accepts (` `, `\t`, `\x0b`, `\x0c`);
+    // the patchable span is exactly the bracketed marker inside it.
+    let trimmed = raw.trim_start();
+    if !matches!(
+        trimmed,
+        "[ ]" | "[\t]" | "[\u{b}]" | "[\u{c}]" | "[x]" | "[X]"
+    ) {
         return Err("Invalid task marker".into());
     }
-    Ok((range, if expected { "[ ]" } else { "[x]" }.into()))
+    let marker_start = range.start + (raw.len() - trimmed.len());
+    let marker_range = marker_start..marker_start + trimmed.len();
+    Ok((marker_range, if expected { "[ ]" } else { "[x]" }.into()))
 }
 /// Normalize bytes consistently with editor/index coordinates.
 pub fn normalized(bytes: &[u8]) -> Result<String, String> {

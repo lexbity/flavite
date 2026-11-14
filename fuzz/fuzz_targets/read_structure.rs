@@ -27,10 +27,19 @@ fuzz_target!(|data: &[u8]| {
                 let (range, replacement) =
                     read::task_patch(&edited, node.range.start, !checked).unwrap();
                 edited.replace_range(range.clone(), &replacement);
-                assert_eq!(
-                    edited[range.start..range.end].to_ascii_lowercase(),
-                    text[range.start..range.end].to_ascii_lowercase()
-                );
+                // Patches are canonicalizing: the round trip lands on the
+                // canonical marker for the original state (`[x]` for the
+                // checked `x`/`X`, `[ ]` for any whitespace interior the
+                // scanner accepts), never on the raw original bytes.
+                let original = &text[range.start..range.end];
+                let canonical = if original.as_bytes()[1] == b'x'
+                    || original.as_bytes()[1] == b'X'
+                {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                assert_eq!(&edited[range.start..range.end], canonical);
             }
         }
     }

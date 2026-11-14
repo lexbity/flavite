@@ -773,6 +773,12 @@ pub fn reconcile_buffer_revisions(app: &mut App) {
         {
             app.input_chains.remove(&tab);
         }
+        // The acknowledgement carries the view's stored focus, so the reducer
+        // re-created writing authority at the foreign revision. A passive
+        // reconciliation never grants caret authority (the restore path
+        // invalidates for the same reason); typing re-establishes it through
+        // the normal acknowledged-input path.
+        app.workspace.invalidate_writing_target_for_tab(tab);
     }
 }
 

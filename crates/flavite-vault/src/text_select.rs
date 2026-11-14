@@ -51,7 +51,8 @@ pub const MAX_SELECTION_SPANS: usize = MAX_SELECTIONS + 1;
 /// Literal matches run in-process on this worker; regex matches run in the
 /// isolated helper (D-14) — never as a silent in-process fallback. A cancelled
 /// collection stops at the next match boundary and reports
-/// [`PrepareError::Cancelled`]; the dispatch drops the outcome (E-11).
+/// [`crate::text_edit::PrepareError::Cancelled`]; the dispatch drops the
+/// outcome (E-11).
 ///
 /// # Errors
 ///

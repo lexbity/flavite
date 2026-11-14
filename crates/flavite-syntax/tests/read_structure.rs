@@ -110,3 +110,44 @@ fn task_coordinates_do_not_renormalize_preserved_carriage_returns_or_bom_content
     assert_eq!(snapshot.text(), "\u{feff}\r\ncontent");
     assert_eq!(snapshot.source(), snapshot.text().as_bytes());
 }
+#[test]
+fn task_patch_narrows_the_marker_inside_whitespace_prefixed_task_spans() {
+    // The parser's task span carries the list item's leading whitespace;
+    // tabs between the list marker and the brackets survive normalization.
+    let source = "-\t\t[X] done\n";
+    let doc = read::parse_normalized(source).unwrap();
+    let mut nodes = Vec::new();
+    walk(&doc.nodes, &mut nodes);
+    let task = nodes
+        .iter()
+        .find(|n| n.kind == ReadKind::Task(true))
+        .unwrap();
+    let (range, patch) = read::task_patch(source, task.range.start, true).unwrap();
+    assert_eq!(&source[range.clone()], "[X]");
+    assert_eq!(patch, "[ ]");
+    let mut toggled = source.to_owned();
+    toggled.replace_range(range.clone(), &patch);
+    assert!(toggled.starts_with("-\t\t[ ] done\n"));
+    let (range, patch) = read::task_patch(&toggled, task.range.start, false).unwrap();
+    assert_eq!(&toggled[range], "[ ]");
+    assert_eq!(patch, "[x]");
+}
+#[test]
+fn task_patch_accepts_every_marker_the_parser_scans() {
+    // pulldown scans unchecked markers with ` `, `\t`, `\x0b`, `\x0c`.
+    for interior in [" ", "\t", "\u{b}", "\u{c}"] {
+        let source = format!("- [{interior}] task\n");
+        let doc = read::parse_normalized(&source).unwrap();
+        let mut nodes = Vec::new();
+        walk(&doc.nodes, &mut nodes);
+        let task = nodes
+            .iter()
+            .find(|n| n.kind == ReadKind::Task(false))
+            .unwrap();
+        let (range, patch) = read::task_patch(&source, task.range.start, false).unwrap();
+        assert_eq!(patch, "[x]");
+        let mut toggled = source.clone();
+        toggled.replace_range(range, &patch);
+        assert!(toggled.contains("[x]"));
+    }
+}

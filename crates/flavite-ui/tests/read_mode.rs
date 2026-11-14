@@ -86,7 +86,7 @@ fn same_tab_read_mode_current_dirty_text_guarded_task_undo_and_independent_dupli
     let api = app.flavite.as_ref().unwrap();
     assert!(
         api.execute(editor_operations_fixture::admit(
-            &api,
+            api,
             flavite_api::Invocation::new(
                 api.command_registry().next_request_id(),
                 "buffer.undo",
@@ -349,7 +349,7 @@ fn rapid_captured_input_is_interpreted_in_order_without_replaying_after_another_
     let current = api
         .get_shared_buffer_view(view.buffer_id.into(), None)
         .unwrap();
-    assert!(api.execute(editor_operations_fixture::admit(&api, flavite_api::Invocation::new(api.command_registry().next_request_id(),"apply_edits",serde_json::json!({"buffer_id":view.buffer_id,"revision":current.revision,"ops":[{"range":[0,0],"replacement":"other origin\n"}]}),flavite_api::Origin::Gui))).is_success());
+    assert!(api.execute(editor_operations_fixture::admit(api, flavite_api::Invocation::new(api.command_registry().next_request_id(),"apply_edits",serde_json::json!({"buffer_id":view.buffer_id,"revision":current.revision,"ops":[{"range":[0,0],"replacement":"other origin\n"}]}),flavite_api::Origin::Gui))).is_success());
     let before = app.note_state_text(tab).unwrap();
     sequence += 1;
     let _ = app.update(Message::EditorInput {

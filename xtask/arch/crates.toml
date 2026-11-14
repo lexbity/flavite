@@ -94,6 +94,7 @@ active = [
     # FEUX-0002 X02: Context Mode's pure layer lives below the widget and the
     # shell; both consume it. It uses only syntax's pinned boundary
     # primitives — no toolkit, no editor back-edge.
+    { from = "flavite-edit-context", to = "flavite-buffer" },
     { from = "flavite-edit-context", to = "flavite-syntax" },
     { from = "flavite-editor", to = "flavite-edit-context" },
     { from = "flavite-ui", to = "flavite-edit-context" },

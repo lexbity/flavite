@@ -329,7 +329,7 @@ fn edit_buffer(app: &mut App, tab: TabId, replacement: &str) {
         }),
         flavite_api::Origin::Gui,
     );
-    let result = flavite.execute(editor_operations_fixture::admit(&flavite, invocation));
+    let result = flavite.execute(editor_operations_fixture::admit(flavite, invocation));
     assert!(matches!(
         result,
         flavite_api::ExecutionResult::Local(flavite_api::LocalResult::Success(_))
