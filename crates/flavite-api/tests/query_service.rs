@@ -245,7 +245,17 @@ fn closed_request_tokens_are_drained_and_dropped_without_revival() {
         .expect("admitted");
     // Both queries settle fully before the drain, so the supersede rule is
     // observed deterministically: the map held only the newest token.
-    let remaining = served(&flavite);
+    // Draining on the first ready outcome would race the second worker and
+    // could serve the older token alone, so wait for the newest token.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let remaining = loop {
+        assert!(Instant::now() < deadline, "query never served");
+        let outcomes = flavite.query_service().drain();
+        if outcomes.iter().any(|outcome| outcome.token == second) {
+            break outcomes;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
     let tokens: Vec<_> = remaining.iter().map(|outcome| outcome.token).collect();
     assert!(
         tokens.contains(&second),

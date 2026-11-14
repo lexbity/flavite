@@ -2624,8 +2624,11 @@ impl App {
             Message::SidebarFilter(value) => {
                 crate::host::file_browser::filter_changed(self, None, &value);
                 self.sidebar_filter = value;
+                // Rows no longer matching the filter vanish; their reported
+                // rectangles (folder: and note:) must go with them or scripted
+                // and a11y clicks hit stale rects.
                 self.sidebar_bounds
-                    .retain(|key, _| !key.starts_with("note:"));
+                    .retain(|key, _| !key.starts_with("note:") && !key.starts_with("folder:"));
             }
             Message::SidebarControlBounds(key, rect) => {
                 self.sidebar_bounds.insert(key, rect);
@@ -3176,6 +3179,9 @@ impl App {
                 } else {
                     self.notes_filters.remove(&tab);
                 }
+                let scoped = format!("tree{}:", tab.raw());
+                self.sidebar_bounds
+                    .retain(|key, _| !key.starts_with(&scoped));
             }
             // ---- W10: Search view ----
             Message::SearchQuery { tab, value } => self.search.edited(tab, value),

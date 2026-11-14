@@ -65,11 +65,20 @@ impl FileBrowser {
         }
     }
     fn enqueue(&mut self, path: PathBuf, cursor: Option<DirectoryCursor>) {
-        if !self.queue.iter().any(|(queued, _)| queued == &path)
-            && !self
-                .pending
-                .as_ref()
-                .is_some_and(|(_, queued, _)| queued == &path)
+        // A queued initial page must not silently swallow a later explicit
+        // "Load more" for the same folder: the requests differ by cursor, so
+        // dedupe on the request kind (initial page vs continuation). A
+        // refresh clearing the queue keeps this honest — it re-enqueues
+        // everything it needs.
+        let continuation = cursor.is_some();
+        if !self.queue.iter().any(|(queued, queued_cursor)| {
+            queued == &path && queued_cursor.is_some() == continuation
+        }) && !self
+            .pending
+            .as_ref()
+            .is_some_and(|(_, queued, pending_continuation)| {
+                queued == &path && *pending_continuation == continuation
+            })
         {
             self.queue.push_back((path, cursor));
         }
@@ -230,7 +239,15 @@ pub fn pump(app: &mut App) {
 
 pub fn observe(app: &mut App, outcome: &QueryOutcome) -> bool {
     if let Some(owner) = app.file_browser.attachment.remove(&outcome.token) {
-        if owner.is_none_or(|tab| app.workspace.tab(&tab).is_some()) {
+        // A result bound to a replaced view is stale: its incarnation no
+        // longer matches, so the opener must not fire (a replaced tab drops
+        // silently, like the graph inspector).
+        let live = owner.is_none_or(|tab| {
+            app.workspace
+                .tab(&tab)
+                .is_some_and(|view| view.interaction().incarnation == outcome.token.incarnation)
+        });
+        if live {
             app.status = match &outcome.result {
                 ContextQueryResult::AttachmentOpen(Ok(path)) => {
                     if super::reading::spawn_os(path.as_os_str()).is_ok() {
@@ -239,6 +256,7 @@ pub fn observe(app: &mut App, outcome: &QueryOutcome) -> bool {
                         "Could not open local file".into()
                     }
                 }
+                ContextQueryResult::AttachmentOpen(Err(reason)) => reason.clone(),
                 _ => "This file cannot be opened; use a supported local document".into(),
             };
         }
@@ -420,10 +438,35 @@ pub fn handle(app: &mut App, message: BrowserMessage) -> iced::Task<Message> {
                     }
                 }
                 Some(_) => {
-                    if let Some(api) = &app.flavite {
+                    // One attachment activation per owner at a time, and none
+                    // colliding with a reading/graph open for the same view:
+                    // same-identity results supersede each other in the
+                    // query service and would strand a pending token.
+                    let already_opening = app
+                        .file_browser
+                        .attachment
+                        .values()
+                        .any(|held| *held == owner)
+                        || owner.is_some_and(|tab| {
+                            app.reading
+                                .attachment_opens
+                                .values()
+                                .any(|(held, _)| *held == tab)
+                                || app.graph.attachment_open_pending(tab)
+                        });
+                    if already_opening {
+                        app.status = "An attachment is already opening".into();
+                    } else if let Some(api) = &app.flavite {
+                        // Bind the view's live incarnation so a result from a
+                        // replaced view is recognized as stale in observe.
+                        let incarnation = owner.map_or(1, |tab| {
+                            app.workspace
+                                .tab(&tab)
+                                .map_or(0, |view| view.interaction().incarnation)
+                        });
                         match api.query_service().submit(
                             owner.map_or(QUERY_OWNER, TabId::raw),
-                            1,
+                            incarnation,
                             0,
                             QueryPayload::AttachmentOpen { path },
                         ) {

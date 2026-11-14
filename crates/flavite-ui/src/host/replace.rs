@@ -350,6 +350,25 @@ pub struct ReplaceHost {
     pending_preview_closes: Vec<String>,
 }
 
+/// Best-effort session closes queued while the vault is unreachable must not
+/// grow with every edit; the oldest are dropped (they would be stale anyway
+/// once the vault returns).
+const MAX_PENDING_CLOSES: usize = 256;
+
+fn push_find_close(pending: &mut Vec<String>, finder: String) {
+    if pending.len() >= MAX_PENDING_CLOSES {
+        pending.remove(0);
+    }
+    pending.push(finder);
+}
+
+fn push_preview_close(pending: &mut Vec<String>, preview: String) {
+    if pending.len() >= MAX_PENDING_CLOSES {
+        pending.remove(0);
+    }
+    pending.push(preview);
+}
+
 impl ReplaceHost {
     pub fn validate_job(&mut self, tab: flavite_workspace::TabId, job_id: &str) -> bool {
         let state = self.tabs.entry(tab).or_default();
@@ -407,17 +426,41 @@ impl ReplaceHost {
         }
     }
 
+    /// Close the tab's live finder and preview sessions without touching
+    /// its query or results: the panel switched to indexed results or out
+    /// of view, and a session no longer on screen must not keep consuming
+    /// a frozen snapshot or a live-finder slot (D-07). In-flight outcomes
+    /// are rejected by the epoch bump.
+    pub fn release_live(&mut self, tab: flavite_workspace::TabId) {
+        let (finder, preview) = {
+            let state = self.tabs.entry(tab).or_default();
+            let taken = (state.finder.take(), state.preview_id.take());
+            state.epoch = state.epoch.wrapping_add(1);
+            state.updating = false;
+            state.error = None;
+            state.clear_find();
+            state.clear_preview();
+            taken
+        };
+        if let Some(preview) = preview {
+            push_preview_close(&mut self.pending_preview_closes, preview);
+        }
+        if let Some(finder) = finder {
+            push_find_close(&mut self.pending_find_closes, finder);
+        }
+    }
+
     /// Record an edited field; outcomes from older epochs are rejected on
     /// arrival.
     pub fn edited(&mut self, tab: flavite_workspace::TabId, field: ReplaceField, value: String) {
         let state = self.tabs.entry(tab).or_default();
         if let Some(preview) = state.preview_id.take() {
-            self.pending_preview_closes.push(preview);
+            push_preview_close(&mut self.pending_preview_closes, preview);
         }
         if field != ReplaceField::Replacement
             && let Some(finder) = state.finder.take()
         {
-            self.pending_find_closes.push(finder);
+            push_find_close(&mut self.pending_find_closes, finder);
         }
         state.epoch = state.epoch.wrapping_add(1);
         state.edited_at = Some(Instant::now());
@@ -445,10 +488,10 @@ impl ReplaceHost {
     pub fn toggle(&mut self, tab: flavite_workspace::TabId, flag: ReplaceFlag) {
         let state = self.tabs.entry(tab).or_default();
         if let Some(preview) = state.preview_id.take() {
-            self.pending_preview_closes.push(preview);
+            push_preview_close(&mut self.pending_preview_closes, preview);
         }
         if let Some(finder) = state.finder.take() {
-            self.pending_find_closes.push(finder);
+            push_find_close(&mut self.pending_find_closes, finder);
         }
         match flag {
             ReplaceFlag::Regex => state.regex = !state.regex,
@@ -468,7 +511,7 @@ impl ReplaceHost {
     pub fn set_mode(&mut self, tab: flavite_workspace::TabId, mode: ReplacePanelMode) {
         let state = self.tabs.entry(tab).or_default();
         if let Some(finder) = state.finder.take() {
-            self.pending_find_closes.push(finder);
+            push_find_close(&mut self.pending_find_closes, finder);
         }
         state.clear_find();
         state.mode = mode;
@@ -828,7 +871,7 @@ impl ReplaceHost {
                         .get("finder_id")
                         .and_then(serde_json::Value::as_str)
                 {
-                    self.pending_find_closes.push(finder.to_owned());
+                    push_find_close(&mut self.pending_find_closes, finder.to_owned());
                 }
                 return true;
             }
@@ -914,7 +957,7 @@ impl ReplaceHost {
                         .get("preview_id")
                         .and_then(serde_json::Value::as_str)
                 {
-                    self.pending_preview_closes.push(preview.to_owned());
+                    push_preview_close(&mut self.pending_preview_closes, preview.to_owned());
                 }
                 return true;
             }

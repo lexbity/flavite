@@ -22,7 +22,6 @@ pub struct DirectoryCursor {
 pub struct DirectoryPage {
     pub entries: Arc<[DirectoryEntry]>,
     pub next: Option<DirectoryCursor>,
-    pub total: usize,
 }
 
 pub(crate) fn list(
@@ -64,6 +63,5 @@ pub(crate) fn list(
             offset: end,
             digest,
         }),
-        total: entries.len(),
     })
 }

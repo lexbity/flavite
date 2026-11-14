@@ -133,6 +133,18 @@ pub struct SearchHost {
     pending_closes: Vec<SearchSessionId>,
 }
 
+/// Best-effort session closes queued while the vault is unreachable must not
+/// grow with every edit; the oldest are dropped (they would be stale anyway
+/// once the vault returns).
+const MAX_PENDING_CLOSES: usize = 256;
+
+fn push_close(pending: &mut Vec<SearchSessionId>, session: SearchSessionId) {
+    if pending.len() >= MAX_PENDING_CLOSES {
+        pending.remove(0);
+    }
+    pending.push(session);
+}
+
 impl SearchHost {
     /// The render state for one tab (its own state, or the shared empty
     /// default before the first edit).
@@ -161,7 +173,7 @@ impl SearchHost {
         if let Some(state) = self.tabs.remove(&tab)
             && let Some(session) = state.session
         {
-            self.pending_closes.push(session);
+            push_close(&mut self.pending_closes, session);
         }
         self.requests.retain(|_, (owner, _)| *owner != tab);
     }
@@ -175,10 +187,23 @@ impl SearchHost {
         state.edited_at = Some(Instant::now());
         state.query_epoch = state.query_epoch.wrapping_add(1);
         if let Some(session) = state.session.take() {
-            self.pending_closes.push(session);
+            push_close(&mut self.pending_closes, session);
         }
         state.clear_results();
         state.updating = false;
+    }
+
+    /// Close the tab's live search session without touching its query or
+    /// results: the panel switched away from indexed mode, and a session no
+    /// longer on screen must not keep consuming a frozen snapshot (D-07).
+    pub fn release_session(&mut self, tab: TabId) {
+        if let Some(state) = self.tabs.get_mut(&tab) {
+            state.query_epoch = state.query_epoch.wrapping_add(1);
+            if let Some(session) = state.session.take() {
+                push_close(&mut self.pending_closes, session);
+            }
+            state.updating = false;
+        }
     }
 
     /// Switch the query grammar; re-admits the current query.
@@ -194,7 +219,7 @@ impl SearchHost {
             state.edited_at = Some(Instant::now() - SEARCH_DEBOUNCE);
             state.query_epoch = state.query_epoch.wrapping_add(1);
             if let Some(session) = state.session.take() {
-                self.pending_closes.push(session);
+                push_close(&mut self.pending_closes, session);
             }
             state.clear_results();
         }
@@ -322,7 +347,7 @@ impl SearchHost {
             state.edited_at = Some(Instant::now() - SEARCH_DEBOUNCE);
             state.query_epoch = state.query_epoch.wrapping_add(1);
             if let Some(session) = state.session.take() {
-                self.pending_closes.push(session);
+                push_close(&mut self.pending_closes, session);
             }
             state.clear_results();
         }

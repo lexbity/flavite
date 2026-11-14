@@ -108,10 +108,16 @@ fn content<'a>(
             })
             .style(style::list_row(selected || active))
             .on_press(message(action));
-        let key = if entry.entry.directory {
-            format!("folder:{}", path.display())
-        } else {
-            format!("note:{}", path.display())
+        // Sidebar rows keep the plain script-contract keys; a docked tree
+        // scopes its keys by tab so the two surfaces never overwrite each
+        // other's reported rectangles.
+        let key = match owner {
+            None if entry.entry.directory => format!("folder:{}", path.display()),
+            None => format!("note:{}", path.display()),
+            Some(tab) if entry.entry.directory => {
+                format!("tree{}:folder:{}", tab.raw(), path.display())
+            }
+            Some(tab) => format!("tree{}:note:{}", tab.raw(), path.display()),
         };
         list = list.push(bounds::observe_named(
             control,

@@ -94,7 +94,14 @@ pub fn handle(app: &mut App, action: VaultSearchMessage) -> iced::Task<Message> 
         }
         VaultSearchMessage::Sidebar(search) => {
             app.vault_search.sidebar = search;
-            app.set_sidebar_open(true);
+            if search {
+                app.set_sidebar_open(true);
+            } else {
+                // Hiding the workbench releases its live sessions; the query
+                // and result state survives for when it is shown again.
+                app.replace.release_live(SIDEBAR_SEARCH);
+                app.search.release_session(SIDEBAR_SEARCH);
+            }
         }
         VaultSearchMessage::Mode(tab, indexed) => {
             let query = if indexed {
@@ -104,10 +111,14 @@ pub fn handle(app: &mut App, action: VaultSearchMessage) -> iced::Task<Message> 
             };
             app.vault_search.indexed.insert(tab, indexed);
             if indexed {
+                // The source panel's live finder/preview release their
+                // sessions; its state survives for the switch back.
+                app.replace.release_live(tab);
                 app.search.edited(tab, query);
             } else {
                 app.replace
                     .edited(tab, super::replace::ReplaceField::Query, query);
+                app.search.release_session(tab);
             }
         }
         VaultSearchMessage::Dock(tab) => {
@@ -118,35 +129,47 @@ pub fn handle(app: &mut App, action: VaultSearchMessage) -> iced::Task<Message> 
             {
                 return iced::Task::none();
             }
-            // Replace the old panel's live search only when a real tool is docked.
-            app.replace.detach(SIDEBAR_SEARCH, app.flavite.as_ref());
-            app.search.detach(SIDEBAR_SEARCH);
-            transfer(app, tab, SIDEBAR_SEARCH);
+            // The layout transactions commit before any state moves: a
+            // refused dispatch must leave the live search exactly where it
+            // was, not stranded in a panel nobody can reach.
+            let mut committed = true;
             if let Some(group) = app.workspace.group_of(tab) {
                 if app
                     .workspace
                     .group(&group)
                     .is_some_and(|group| group.tabs().len() == 1)
                 {
-                    app.dispatch_layout(|expected_revision| LayoutAction::OpenEmpty {
-                        expected_revision,
-                        group,
-                    });
+                    committed &=
+                        app.dispatch_layout_result(|expected_revision| LayoutAction::OpenEmpty {
+                            expected_revision,
+                            group,
+                        });
                 }
-                app.dispatch_layout(|expected_revision| LayoutAction::CloseTab {
-                    expected_revision,
-                    tab,
-                });
+                if committed {
+                    committed &=
+                        app.dispatch_layout_result(|expected_revision| LayoutAction::CloseTab {
+                            expected_revision,
+                            tab,
+                        });
+                }
             }
+            if !committed {
+                return iced::Task::none();
+            }
+            // Replace the old panel's live search only when a real tool is docked.
+            app.replace.detach(SIDEBAR_SEARCH, app.flavite.as_ref());
+            app.search.detach(SIDEBAR_SEARCH);
+            transfer(app, tab, SIDEBAR_SEARCH);
             app.vault_search.sidebar = true;
             app.set_sidebar_open(true);
         }
         VaultSearchMessage::Undock => {
-            if let Some(group) = app.navigation_group() {
-                app.dispatch_layout(|expected_revision| LayoutAction::OpenReplace {
+            if let Some(group) = app.navigation_group()
+                && app.dispatch_layout_result(|expected_revision| LayoutAction::OpenReplace {
                     expected_revision,
                     group,
-                });
+                })
+            {
                 let tab = app.workspace.focused_tab();
                 transfer(app, SIDEBAR_SEARCH, tab);
                 app.set_sidebar_open(false);
@@ -165,9 +188,11 @@ pub fn handle(app: &mut App, action: VaultSearchMessage) -> iced::Task<Message> 
                 return iced::Task::none();
             }
             let Ok(path) = NoteLocator::from_relative(std::path::Path::new(&path)) else {
+                app.status = "Search result path is no longer valid; refresh vault search".into();
                 return iced::Task::none();
             };
             let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
+                app.status = "Search match is no longer addressable; refresh vault search".into();
                 return iced::Task::none();
             };
             app.open_intent(super::open_intents::OpenIntent::reuse(

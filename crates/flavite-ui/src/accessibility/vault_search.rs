@@ -227,7 +227,7 @@ pub(crate) fn controls(app: &App) -> Vec<Control> {
             ),
             (
                 "drafts",
-                "Include unsaved notes",
+                "Include unsaved drafts of saved notes",
                 ReplaceFlag::IncludeDrafts,
                 state.include_drafts,
             ),

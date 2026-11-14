@@ -191,7 +191,7 @@ pub(crate) fn content(app: &App, tab: TabId) -> Element<'_, Message> {
         tab,
         "drafts",
         checkbox(state.include_drafts)
-            .label("Include unsaved notes")
+            .label("Include unsaved drafts of saved notes")
             .on_toggle(move |_| Message::ReplaceToggle {
                 tab,
                 flag: ReplaceFlag::IncludeDrafts,
@@ -221,7 +221,7 @@ pub(crate) fn content(app: &App, tab: TabId) -> Element<'_, Message> {
             if state.include_drafts {
                 "saved notes and unsaved drafts"
             } else {
-                "saved notes; unsaved notes excluded"
+                "saved notes; unsaved drafts excluded"
             }
             .to_owned(),
         );

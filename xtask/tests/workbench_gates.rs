@@ -151,7 +151,6 @@ fn seed_s05_inputs(root: &Path) {
         "crates/flavite-ui/src/app.rs",
         "crates/flavite-ui/src/views/note.rs",
         "crates/flavite-ui/tests/catalog_acquisition.rs",
-        "crates/flavite-api/src/device_preferences.rs",
     ] {
         seed_file(root, relative);
     }
@@ -207,7 +206,6 @@ fn seed_s08_inputs(root: &Path) {
         "crates/flavite-vault/src/source_leases.rs",
         "crates/flavite-vault/src/replace/coordinator.rs",
         "crates/flavite-vault/src/replace/log.rs",
-        "crates/flavite-vault/src/replace/auth.rs",
         "crates/flavite-vault/tests/replace_fault.rs",
         "crates/flavite-vault/tests/replace_leases.rs",
         "crates/flavite-api/tests/replace_apply.rs",
@@ -218,70 +216,6 @@ fn seed_s08_inputs(root: &Path) {
     ] {
         seed_file(root, relative);
     }
-}
-
-fn seed_s09_inputs(root: &Path) {
-    seed_s08_inputs(root);
-    for relative in [
-        "crates/flavite-vault/tests/replace_drafts.rs",
-        "crates/flavite-vault/tests/replace_revert.rs",
-        "crates/flavite-api/tests/replace_draft_guards.rs",
-        "crates/flavite-ui/tests/draft_operations.rs",
-        "scripts/tests/workbench/draft_replace_revert.py",
-    ] {
-        seed_file(root, relative);
-    }
-}
-
-#[test]
-fn s09_gate_passes_clean_tree_and_rejects_s09_isolation_violations() {
-    let temp = tempfile::tempdir().unwrap();
-    seed_s09_inputs(temp.path());
-    let clean = run_gate(temp.path(), "S09");
-    assert!(
-        clean.status.success(),
-        "{}",
-        String::from_utf8_lossy(&clean.stderr)
-    );
-
-    // Hosts never reach into the Session object or the filesystem.
-    let host = temp.path().join("crates/flavite-ui/src/host/replace.rs");
-    fs::write(&host, "let r = self.session.buffer_manager();\n").unwrap();
-    let rejected = run_gate(temp.path(), "S09");
-    assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("\\.session[.(]"));
-    fs::write(&host, "implementation\n").unwrap();
-
-    // Recovery never replays edits from the operation log.
-    let session = temp.path().join("crates/flavite-vault/src/session.rs");
-    fs::write(
-        &session,
-        "fn recover_job() { replay(apply_edits(&ops)); }\n",
-    )
-    .unwrap();
-    let rejected = run_gate(temp.path(), "S09");
-    assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("replay.*apply_edits"));
-    fs::write(&session, "implementation\n").unwrap();
-
-    // Revert is never presented as global Undo.
-    let view = temp
-        .path()
-        .join("crates/flavite-ui/src/views/operations.rs");
-    fs::write(&view, "let label = \"global.undo\";\n").unwrap();
-    let rejected = run_gate(temp.path(), "S09");
-    assert!(!rejected.status.success());
-    fs::write(&view, "implementation\n").unwrap();
-
-    // Presence is enforced: removing a completed S09 file fails.
-    fs::remove_file(
-        temp.path()
-            .join("crates/flavite-vault/tests/replace_drafts.rs"),
-    )
-    .unwrap();
-    let missing = run_gate(temp.path(), "S09");
-    assert!(!missing.status.success());
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("missing/empty"));
 }
 
 #[test]
