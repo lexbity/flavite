@@ -119,6 +119,7 @@ fn preview_all(session: &Session, query: &str, replacement: &str) -> (u128, u64)
         session.execute(SessionCommand::ReplacePreviewPrepare {
             request_id: rid(),
             request: flavite_vault::replace::preview::PreviewRequest {
+                folder: None,
                 query: query.to_owned(),
                 replacement: replacement.to_owned(),
                 mode: flavite_text_search::matcher::MatchMode::Literal,
@@ -224,7 +225,16 @@ fn edit(session: &Session, buffer_id: u64, revision: u64, ops: Vec<flavite_buffe
             ops,
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
-            operation: None,
+            operation: session
+                .issue_editor_operation(
+                    buffer_id.into(),
+                    session
+                        .shared_buffer_snapshot(buffer_id.into(), None)
+                        .map(|snapshot| snapshot.revision)
+                        .unwrap_or(flavite_buffer::revision::Revision::new(revision)),
+                    None,
+                )
+                .expect("fixture activation"),
         }),
     );
     match expect_success(result, "edit") {
@@ -239,6 +249,17 @@ fn undo(session: &Session, buffer_id: u64, revision: u64) -> u64 {
         session.execute(SessionCommand::Undo {
             buffer_id: buffer_id.into(),
             revision: flavite_buffer::revision::Revision::new(revision),
+
+            operation: session
+                .issue_editor_operation(
+                    buffer_id.into(),
+                    session
+                        .shared_buffer_snapshot(buffer_id.into(), None)
+                        .map(|snapshot| snapshot.revision)
+                        .unwrap_or(flavite_buffer::revision::Revision::new(revision)),
+                    None,
+                )
+                .expect("fixture activation"),
         }),
     );
     match expect_success(result, "undo") {
@@ -374,6 +395,7 @@ fn draft_revert_restores_before_text_with_lineage_guard() {
             h.session.execute(SessionCommand::ReplacePreviewPrepare {
                 request_id: rid(),
                 request: flavite_vault::replace::preview::PreviewRequest {
+                    folder: None,
                     query: "alpha".to_owned(),
                     replacement: "X".to_owned(),
                     mode: flavite_text_search::matcher::MatchMode::Literal,
@@ -447,6 +469,7 @@ fn draft_revert_conservatively_skips_later_typing_even_if_text_identical() {
             h.session.execute(SessionCommand::ReplacePreviewPrepare {
                 request_id: rid(),
                 request: flavite_vault::replace::preview::PreviewRequest {
+                    folder: None,
                     query: "alpha".to_owned(),
                     replacement: "X".to_owned(),
                     mode: flavite_text_search::matcher::MatchMode::Literal,

@@ -109,6 +109,8 @@ pub struct EditorEdit {
     /// Index into `after` of the primary member (default: the first member).
     #[serde(default)]
     pub primary: usize,
+    /// Index into `before` of the primary member.
+    pub before_primary: usize,
 }
 
 impl EditorEdit {
@@ -121,7 +123,7 @@ impl EditorEdit {
         {
             return Err(HistoryError::InvalidSelections);
         }
-        if self.primary >= self.after.len() {
+        if self.primary >= self.after.len() || self.before_primary >= self.before.len() {
             return Err(HistoryError::InvalidSelections);
         }
         validate_selections(before, &self.before)?;
@@ -130,29 +132,20 @@ impl EditorEdit {
 }
 
 pub fn validate_selections(text: &str, selections: &[[usize; 3]]) -> Result<(), HistoryError> {
-    if selections.is_empty() || selections.len() > RECORDED_SELECTION_LIMIT {
-        return Err(HistoryError::InvalidSelections);
-    }
-    let mut endpoints = selections
+    let candidates = selections
         .iter()
-        .flat_map(|triple| &triple[1..])
-        .copied()
-        .collect::<Vec<_>>();
-    endpoints.sort_unstable();
-    endpoints.dedup();
-    use unicode_segmentation::UnicodeSegmentation;
-    let boundaries = text
-        .grapheme_indices(true)
-        .map(|(at, _)| at)
-        .chain(std::iter::once(text.len()));
-    let mut boundaries = boundaries.peekable();
-    for at in endpoints {
-        while boundaries.peek().is_some_and(|boundary| *boundary < at) {
-            boundaries.next();
-        }
-        if boundaries.peek() != Some(&at) {
-            return Err(HistoryError::InvalidSelections);
-        }
+        .map(|&[id, anchor, head]| {
+            Ok(crate::selection::RawSelection {
+                id: Some(u32::try_from(id).map_err(|_| HistoryError::InvalidSelections)?),
+                anchor,
+                head,
+            })
+        })
+        .collect::<Result<Vec<_>, HistoryError>>()?;
+    let (set, _) = crate::selection::SelectionSet::normalize(text, candidates, None)
+        .map_err(|_| HistoryError::InvalidSelections)?;
+    if set.to_triples() != selections {
+        return Err(HistoryError::InvalidSelections);
     }
     Ok(())
 }
@@ -261,8 +254,34 @@ pub const MAX_MOVEMENT_SPANS: usize = 256;
 pub struct HistoryMovement {
     pub selections: Option<Vec<[usize; 3]>>,
     pub spans: Vec<MovementSpan>,
+    /// Exclusive end of each simultaneous batch in `spans`. Required: the
+    /// final end equals the span count; each step owns its coordinate frame.
+    pub step_ends: Vec<usize>,
     pub truncated: bool,
     /// Index into `selections` of the primary member (absent when unknown).
     #[serde(default)]
     pub primary: Option<usize>,
+}
+
+impl HistoryMovement {
+    #[must_use]
+    pub fn valid_frames(&self) -> bool {
+        let mut start = 0;
+        for &end in &self.step_ends {
+            if end <= start || end > self.spans.len() {
+                return false;
+            }
+            if self.spans[start..end].iter().any(|s| s.start > s.end) {
+                return false;
+            }
+            if self.spans[start..end]
+                .windows(2)
+                .any(|p| p[0].end > p[1].start)
+            {
+                return false;
+            }
+            start = end;
+        }
+        start == self.spans.len()
+    }
 }

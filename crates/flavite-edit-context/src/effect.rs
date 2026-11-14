@@ -3,7 +3,6 @@
 //! (Moved from `flavite-editor/src/context/effect.rs` in FEUX-0002 X02.)
 
 use crate::vocabulary::ContextCommand;
-use flavite_syntax::text::{TextByte, next_grapheme_boundary, prev_grapheme_boundary};
 use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,25 +89,17 @@ pub fn plan(
             unit: EffectUnit::Selection,
         });
     }
-    let line_start = text[..start].rfind('\n').map_or(0, |at| at + 1);
-    let line_end = text[start..].find('\n').map_or(text.len(), |at| start + at);
     let (range, unit) = if matches!(command, Copy | Cut) {
         (
-            line_start..(line_end + usize::from(line_end < text.len())),
+            flavite_buffer::commands::line_range(text, start)?,
             EffectUnit::Line,
         )
-    } else if start < line_end {
-        (
-            start..next_grapheme_boundary(text, TextByte(start)).0,
-            EffectUnit::Character,
-        )
-    } else if start > line_start {
-        (
-            prev_grapheme_boundary(text, TextByte(start)).0..start,
-            EffectUnit::Character,
-        )
     } else {
-        (start..start, EffectUnit::Character)
+        (
+            flavite_buffer::commands::delete_range(text, start)
+                .map_or(start..start, |(from, to)| from..to),
+            EffectUnit::Character,
+        )
     };
     Some(CommandEffect {
         range,
@@ -117,10 +108,67 @@ pub fn plan(
     })
 }
 
+/// Implicit previews use the same ranges as editing and draw duplicate
+/// containing lines once. Callers pass only their visible canonical window.
+#[must_use]
+pub fn implicit_ranges(
+    text: &str,
+    members: &[flavite_buffer::selection::Selection],
+    command: ContextCommand,
+) -> Vec<Range<usize>> {
+    let mut result = Vec::new();
+    let mut line_cache: Option<Range<usize>> = None;
+    for member in members.iter().filter(|member| member.is_caret()) {
+        let range = if matches!(command, ContextCommand::Copy | ContextCommand::Cut)
+            && let Some(range) = line_cache
+                .as_ref()
+                .filter(|range| range.contains(&member.head()))
+        {
+            range.clone()
+        } else {
+            let Some(effect) = plan(text, (member.anchor(), member.head()), command)
+                .filter(|effect| effect.implicit && !effect.range.is_empty())
+            else {
+                continue;
+            };
+            if effect.unit == EffectUnit::Line {
+                line_cache = Some(effect.range.clone());
+            }
+            effect.range
+        };
+        if result.last() != Some(&range) {
+            result.push(range);
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use unicode_segmentation::UnicodeSegmentation;
+
+    #[test]
+    fn duplicate_line_previews_use_one_effect_for_many_carets() {
+        let text = "x".repeat(10_000);
+        let raw = (0..10_000)
+            .map(|index| flavite_buffer::selection::RawSelection {
+                id: Some(u32::try_from(index).unwrap()),
+                anchor: index,
+                head: index,
+            })
+            .collect();
+        let (set, _) =
+            flavite_buffer::selection::SelectionSet::normalize(&text, raw, Some(0)).unwrap();
+        assert_eq!(
+            implicit_ranges(&text, set.members(), ContextCommand::Cut),
+            vec![0..10_000]
+        );
+        assert_eq!(
+            implicit_ranges(&text, set.members(), ContextCommand::Copy),
+            vec![0..10_000]
+        );
+    }
 
     #[test]
     fn implicit_ranges_preserve_graphemes_and_never_delete_a_line_break() {

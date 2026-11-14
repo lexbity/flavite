@@ -72,7 +72,7 @@ fn fixture() -> (Session, u64) {
 fn issued_operation_applies_once_and_replays_refuse() {
     let (session, buffer) = fixture();
     let op = session
-        .issue_editor_operation(BufferId::from(buffer))
+        .issue_editor_operation(BufferId::from(buffer), Revision::new(0), None)
         .unwrap();
     let edit = flavite_buffer::undo::EditOp::new(
         flavite_syntax::text::Span::new(
@@ -87,7 +87,7 @@ fn issued_operation_applies_once_and_replays_refuse() {
         ops: vec![edit.clone()],
         undo_policy: flavite_buffer::undo::UndoPolicy::Isolated,
         editor: None,
-        operation: Some(op),
+        operation: op,
     });
     assert!(
         matches!(
@@ -105,14 +105,12 @@ fn issued_operation_applies_once_and_replays_refuse() {
         ops: vec![edit],
         undo_policy: flavite_buffer::undo::UndoPolicy::Isolated,
         editor: None,
-        operation: Some(op),
+        operation: op,
     });
-    assert!(
-        matches!(
-            second,
-            flavite_vault::session::SessionResult::Error { ref message } if message == "AlreadyApplied"
-        ),
-        "duplicate must be refused: {second:?}"
+    assert_eq!(
+        format!("{second:?}"),
+        format!("{first:?}"),
+        "duplicate returns the original receipt"
     );
 }
 
@@ -120,7 +118,7 @@ fn issued_operation_applies_once_and_replays_refuse() {
 fn cancelled_operation_reports_cancelled_and_unknown_is_refused() {
     let (session, buffer) = fixture();
     let op = session
-        .issue_editor_operation(BufferId::from(buffer))
+        .issue_editor_operation(BufferId::from(buffer), Revision::new(0), None)
         .unwrap();
     assert!(session.cancel_editor_operation(&op));
     let edit = flavite_buffer::undo::EditOp::new(
@@ -136,7 +134,7 @@ fn cancelled_operation_reports_cancelled_and_unknown_is_refused() {
         ops: vec![edit],
         undo_policy: flavite_buffer::undo::UndoPolicy::Isolated,
         editor: None,
-        operation: Some(op),
+        operation: op,
     });
     assert!(
         matches!(
@@ -148,6 +146,8 @@ fn cancelled_operation_reports_cancelled_and_unknown_is_refused() {
 
     let forged = OperationId {
         buffer_id: buffer,
+        revision: 0,
+        view: None,
         buffer_incarnation: 1,
         sequence: 99,
         ticket: 0xdead_beef,
@@ -158,7 +158,7 @@ fn cancelled_operation_reports_cancelled_and_unknown_is_refused() {
         ops: Vec::new(),
         undo_policy: flavite_buffer::undo::UndoPolicy::Isolated,
         editor: None,
-        operation: Some(forged),
+        operation: forged,
     });
     assert!(
         matches!(
@@ -168,4 +168,59 @@ fn cancelled_operation_reports_cancelled_and_unknown_is_refused() {
         "forged must be unknown: {result:?}"
     );
     let _ = Outcome::Applied;
+}
+
+#[test]
+fn cancellation_and_install_share_one_linearization_turn() {
+    use flavite_vault::editor_receipts::TicketStatus;
+    use flavite_vault::session::SessionResult;
+    use std::sync::{Arc, Barrier};
+    let (session, buffer) = fixture();
+    let session = Arc::new(session);
+    let buffer_id = BufferId::from(buffer);
+    for _ in 0..100 {
+        let before = session.shared_buffer_snapshot(buffer_id, None).unwrap();
+        let op = session
+            .issue_editor_operation(buffer_id, before.revision, None)
+            .unwrap();
+        let gate = Arc::new(Barrier::new(2));
+        let cancel = {
+            let session = session.clone();
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                gate.wait();
+                session.cancel_editor_operation(&op)
+            })
+        };
+        gate.wait();
+        let result = session.execute(SessionCommand::ApplyEdits {
+            buffer_id,
+            revision: before.revision,
+            ops: vec![flavite_buffer::undo::EditOp::new(
+                flavite_syntax::text::Span::new(
+                    flavite_syntax::text::TextByte(0),
+                    flavite_syntax::text::TextByte(0),
+                ),
+                "X".into(),
+            )],
+            undo_policy: flavite_buffer::undo::UndoPolicy::Isolated,
+            editor: None,
+            operation: op,
+        });
+        let cancelled = cancel.join().unwrap();
+        let after = session.shared_buffer_snapshot(buffer_id, None).unwrap();
+        if cancelled {
+            assert!(matches!(result,SessionResult::Error {ref message} if message == "Cancelled"));
+            assert_eq!(after.text, before.text);
+            assert_eq!(after.revision, before.revision);
+            assert_eq!(session.admit_editor_operation(&op), TicketStatus::Cancelled);
+        } else {
+            assert!(matches!(result, SessionResult::Success(_)), "{result:?}");
+            assert_eq!(after.text.len(), before.text.len() + 1);
+            assert_eq!(
+                session.admit_editor_operation(&op),
+                TicketStatus::AlreadyApplied
+            );
+        }
+    }
 }

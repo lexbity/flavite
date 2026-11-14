@@ -232,7 +232,6 @@ pub fn handle(app: &mut App, message: SelectionSearchMessage) -> iced::Task<Mess
             iced::Task::none()
         }
         SelectionSearchMessage::DraftAction { tab, action } => {
-            eprintln!("[diag] row action {action:?}");
             let mut changed = false;
             {
                 let Some(state) = app.selection_search.tabs.get_mut(&tab) else {

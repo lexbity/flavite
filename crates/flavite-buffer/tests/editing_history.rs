@@ -35,6 +35,7 @@ fn history_display_time_belongs_to_the_edit_and_not_to_head_navigation() {
 
 fn edit(model: &mut EditorModel, at: usize, value: &str, kind: EditKind) {
     let record = EditorEdit {
+        before_primary: 0,
         origin: format!("{:032x}", 1),
         kind,
         before: vec![[0, at, at]],
@@ -170,6 +171,7 @@ fn invalid_recorded_graphemes_refuse_before_any_text_or_history_change() {
         &[EditOp::new(Span::new(TextByte(0), TextByte(0)), "z".into())],
         UndoPolicy::Typing,
         EditorEdit {
+            before_primary: 0,
             origin: "1".repeat(32),
             kind: EditKind::Typing,
             before: vec![[0, 1, 1]],
@@ -217,6 +219,7 @@ fn epochs_isolate_buffers_and_invalid_origins_are_atomic() {
                 &[EditOp::new(Span::new(TextByte(0), TextByte(0)), "A".into())],
                 UndoPolicy::Context { origin: 2 },
                 EditorEdit {
+                    before_primary: 0,
                     origin: format!("{:032x}", 1),
                     kind: EditKind::Typing,
                     before: vec![[0, 0, 0]],

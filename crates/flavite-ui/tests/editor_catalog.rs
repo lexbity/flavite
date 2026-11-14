@@ -151,3 +151,22 @@ fn seeded_missing_row_fails_the_enumeration() {
         "fabricated id must not pre-exist in the context catalog"
     );
 }
+
+#[test]
+fn captured_input_commands_are_executable_and_do_not_create_empty_palette_controls() {
+    let f = support::ui_fixture(7011, "/test/catalog-input", &[]);
+    let registry = f.app.flavite.as_ref().unwrap().command_registry();
+    let palette = f.app.palette_snapshot();
+    for id in [
+        "editor.type",
+        "editor.backspace",
+        "editor.forward_delete",
+        "editor.newline",
+    ] {
+        assert!(registry.get_spec(id).is_some(), "{id}");
+        assert!(
+            !palette.iter().any(|spec| spec.id == id),
+            "{id} needs captured input arguments"
+        );
+    }
+}

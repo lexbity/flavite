@@ -172,6 +172,10 @@ pub enum VaultActorMsg {
         path: std::path::PathBuf,
         reply: Sender<VaultActorResp>,
     },
+    ListDirectory {
+        path: PathBuf,
+        reply: Sender<VaultActorResp>,
+    },
     ValidateAttachmentOpen {
         path: PathBuf,
         reply: Sender<VaultActorResp>,
@@ -328,6 +332,7 @@ pub enum VaultActorMsg {
 /// Responses from the VaultActor.
 #[derive(Debug, Clone)]
 pub enum VaultActorResp {
+    Directory(Result<Vec<flavite_fs::DirEntry>, String>),
     ValidatedAttachment(Result<PathBuf, String>),
     GraphPaths(Result<Vec<PathBuf>, String>),
     /// Reconcile completed.
@@ -649,6 +654,21 @@ impl VaultActorHandle {
             VaultActorResp::HistoryBytes(result) => result,
             VaultActorResp::Error(error) => Err(error),
             _ => Err("unexpected history-read response".to_owned()),
+        }
+    }
+
+    /// Enumerate one contained directory through the filesystem owner.
+    pub fn list_directory(&self, path: PathBuf) -> Result<Vec<flavite_fs::DirEntry>, String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::ListDirectory { path, reply })
+            .map_err(|_| "Directory worker unavailable")?;
+        match response
+            .recv()
+            .map_err(|_| "Directory worker unavailable")?
+        {
+            VaultActorResp::Directory(result) => result,
+            _ => Err("Unexpected directory response".into()),
         }
     }
 
@@ -1585,6 +1605,22 @@ impl VaultActor {
                 }
                 let _ = self.resp_sender.try_send(VaultActorResp::Ack);
                 // Shutdown will happen when the channel is dropped
+            }
+            VaultActorMsg::ListDirectory { path, reply } => {
+                let result = (|| {
+                    self.fs
+                        .validate_in_root(&self.identity.root, &path)
+                        .map_err(|e| e.to_string())?;
+                    if self.fs.is_placeholder(&path).map_err(|e| e.to_string())? {
+                        return Err("Download this folder locally first".into());
+                    }
+                    let entries = self.fs.read_dir(&path).map_err(|e| e.to_string())?;
+                    if entries.len() > 100_000 {
+                        return Err("Directory exceeds the 100,000-entry limit".into());
+                    }
+                    Ok(entries)
+                })();
+                let _ = reply.try_send(VaultActorResp::Directory(result));
             }
             VaultActorMsg::ValidateAttachmentOpen { path, reply } => {
                 let result = (|| {

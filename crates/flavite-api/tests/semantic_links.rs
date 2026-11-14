@@ -76,11 +76,14 @@ fn prepare_commit_undo_redo_and_target_immutability() {
     );
 
     // One undo removes it; redo restores it.
-    let undo = fixture.flavite.execute(Invocation::new(
-        next_id(&fixture.flavite),
-        "buffer.undo",
-        serde_json::json!({ "buffer_id": buffer_id, "revision": new_revision }),
-        Origin::Gui,
+    let undo = fixture.flavite.execute(editor_operations_fixture::admit(
+        &fixture.flavite,
+        Invocation::new(
+            next_id(&fixture.flavite),
+            "buffer.undo",
+            serde_json::json!({ "buffer_id": buffer_id, "revision": new_revision }),
+            Origin::Gui,
+        ),
     ));
     assert!(undo.is_success(), "undo: {undo:?}");
     assert_eq!(fixture.text(buffer_id), "Hello world.\n");
@@ -88,11 +91,14 @@ fn prepare_commit_undo_redo_and_target_immutability() {
         .flavite
         .get_buffer_view(flavite_buffer::BufferId::from(buffer_id), None)
         .expect("view");
-    let redo = fixture.flavite.execute(Invocation::new(
-        next_id(&fixture.flavite),
-        "buffer.redo",
-        serde_json::json!({ "buffer_id": buffer_id, "revision": view.revision }),
-        Origin::Gui,
+    let redo = fixture.flavite.execute(editor_operations_fixture::admit(
+        &fixture.flavite,
+        Invocation::new(
+            next_id(&fixture.flavite),
+            "buffer.redo",
+            serde_json::json!({ "buffer_id": buffer_id, "revision": view.revision }),
+            Origin::Gui,
+        ),
     ));
     assert!(redo.is_success(), "redo: {redo:?}");
     assert_eq!(fixture.text(buffer_id), "Hello [[target]]world.\n");
@@ -115,21 +121,24 @@ fn same_title_notes_need_explicit_paths_and_stems_are_ambiguous() {
 
     // The bare stem is refused: the app never guesses between same titles.
     let request_id = next_id(&fixture.flavite);
-    let result = fixture.flavite.execute(Invocation::with_preconditions(
-        request_id,
-        "link.prepare",
-        serde_json::json!({
-            "intent": { "client": fixture.client, "sequence": 2 },
-            "source": { "buffer_id": buffer_id, "revision": revision + 1, "caret": 6 },
-            "target_path": "Emergence",
-            "expected_target": {"epoch":1,"entity_id":0,"native_path":[]},
-            "stable_link_policy": "disabled",
-        }),
-        Origin::Gui,
-        Preconditions::new()
-            .with_buffer_id(buffer_id)
-            .with_revision(revision + 1)
-            .requires_write(),
+    let result = fixture.flavite.execute(editor_operations_fixture::admit(
+        &fixture.flavite,
+        Invocation::with_preconditions(
+            request_id,
+            "link.prepare",
+            serde_json::json!({
+                "intent": { "client": fixture.client, "sequence": 2 },
+                "source": { "buffer_id": buffer_id, "revision": revision + 1, "caret": 6 },
+                "target_path": "Emergence",
+                "expected_target": {"epoch":1,"entity_id":0,"native_path":[]},
+                "stable_link_policy": "disabled",
+            }),
+            Origin::Gui,
+            Preconditions::new()
+                .with_buffer_id(buffer_id)
+                .with_revision(revision + 1)
+                .requires_write(),
+        ),
     ));
     let pending = match result {
         ExecutionResult::Pending { request_id } => request_id,
@@ -183,15 +192,18 @@ fn stale_source_after_edit_rejects_with_zero_mutation() {
     let (sequence, plan_id, _) = fixture.prepare(1, buffer_id, revision, 6, "target.md");
 
     // The source moves while the plan is held (confirmation window).
-    let edit = fixture.flavite.execute(Invocation::new(
-        next_id(&fixture.flavite),
-        "apply_edits",
-        serde_json::json!({
-            "buffer_id": buffer_id,
-            "revision": revision,
-            "ops": [{ "range": [0, 0], "replacement": "PREFIX " }]
-        }),
-        Origin::Gui,
+    let edit = fixture.flavite.execute(editor_operations_fixture::admit(
+        &fixture.flavite,
+        Invocation::new(
+            next_id(&fixture.flavite),
+            "apply_edits",
+            serde_json::json!({
+                "buffer_id": buffer_id,
+                "revision": revision,
+                "ops": [{ "range": [0, 0], "replacement": "PREFIX " }]
+            }),
+            Origin::Gui,
+        ),
     ));
     assert!(edit.is_success());
 
@@ -249,17 +261,20 @@ fn plugin_origin_without_capabilities_is_denied_and_read_only_vaults_refuse() {
     let (buffer_id, revision) = fixture.open_note("source.md");
 
     // A plugin origin without the declared capability is denied up front.
-    let denied = fixture.flavite.execute(Invocation::new(
-        next_id(&fixture.flavite),
-        "link.prepare",
-        serde_json::json!({
-            "intent": { "client": fixture.client, "sequence": 1 },
-            "source": { "buffer_id": buffer_id, "revision": revision, "caret": 6 },
-            "target_path": "target.md",
-            "expected_target": fixture.flavite.link_target_identity("target.md").unwrap(),
-            "stable_link_policy": "disabled",
-        }),
-        Origin::Plugin,
+    let denied = fixture.flavite.execute(editor_operations_fixture::admit(
+        &fixture.flavite,
+        Invocation::new(
+            next_id(&fixture.flavite),
+            "link.prepare",
+            serde_json::json!({
+                "intent": { "client": fixture.client, "sequence": 1 },
+                "source": { "buffer_id": buffer_id, "revision": revision, "caret": 6 },
+                "target_path": "target.md",
+                "expected_target": fixture.flavite.link_target_identity("target.md").unwrap(),
+                "stable_link_policy": "disabled",
+            }),
+            Origin::Plugin,
+        ),
     ));
     assert!(matches!(
         &denied,
@@ -268,17 +283,20 @@ fn plugin_origin_without_capabilities_is_denied_and_read_only_vaults_refuse() {
 
     // Read-only enforcement is unconditional for both commands (TD-17).
     fixture.flavite.set_read_only(true);
-    let prepare = fixture.flavite.execute(Invocation::new(
-        next_id(&fixture.flavite),
-        "link.prepare",
-        serde_json::json!({
-            "intent": { "client": fixture.client, "sequence": 1 },
-            "source": { "buffer_id": buffer_id, "revision": revision, "caret": 6 },
-            "target_path": "target.md",
-            "expected_target": fixture.flavite.link_target_identity("target.md").unwrap(),
-            "stable_link_policy": "disabled",
-        }),
-        Origin::Gui,
+    let prepare = fixture.flavite.execute(editor_operations_fixture::admit(
+        &fixture.flavite,
+        Invocation::new(
+            next_id(&fixture.flavite),
+            "link.prepare",
+            serde_json::json!({
+                "intent": { "client": fixture.client, "sequence": 1 },
+                "source": { "buffer_id": buffer_id, "revision": revision, "caret": 6 },
+                "target_path": "target.md",
+                "expected_target": fixture.flavite.link_target_identity("target.md").unwrap(),
+                "stable_link_policy": "disabled",
+            }),
+            Origin::Gui,
+        ),
     ));
     assert!(
         matches!(
@@ -287,14 +305,17 @@ fn plugin_origin_without_capabilities_is_denied_and_read_only_vaults_refuse() {
         ),
         "link.prepare must be read-only rejected: {prepare:?}"
     );
-    let insert = fixture.flavite.execute(Invocation::new(
-        next_id(&fixture.flavite),
-        "link.insert",
-        serde_json::json!({
-            "intent": { "client": fixture.client, "sequence": 1 },
-            "plan_id": 1,
-        }),
-        Origin::Gui,
+    let insert = fixture.flavite.execute(editor_operations_fixture::admit(
+        &fixture.flavite,
+        Invocation::new(
+            next_id(&fixture.flavite),
+            "link.insert",
+            serde_json::json!({
+                "intent": { "client": fixture.client, "sequence": 1 },
+                "plan_id": 1,
+            }),
+            Origin::Gui,
+        ),
     ));
     assert!(
         matches!(
@@ -313,19 +334,22 @@ fn raw_edit_shape_is_rejected_with_an_explicit_pointer() {
         ("target.md", "Target note.\n"),
     ]);
     let (buffer_id, revision) = fixture.open_note("source.md");
-    let rejected = fixture.flavite.execute(Invocation::with_preconditions(
-        next_id(&fixture.flavite),
-        "link.insert",
-        serde_json::json!({
-            "buffer_id": buffer_id,
-            "revision": revision,
-            "ops": [{ "range": [0, 0], "replacement": "[[target]]" }]
-        }),
-        Origin::Gui,
-        Preconditions::new()
-            .with_buffer_id(buffer_id)
-            .with_revision(revision)
-            .requires_write(),
+    let rejected = fixture.flavite.execute(editor_operations_fixture::admit(
+        &fixture.flavite,
+        Invocation::with_preconditions(
+            next_id(&fixture.flavite),
+            "link.insert",
+            serde_json::json!({
+                "buffer_id": buffer_id,
+                "revision": revision,
+                "ops": [{ "range": [0, 0], "replacement": "[[target]]" }]
+            }),
+            Origin::Gui,
+            Preconditions::new()
+                .with_buffer_id(buffer_id)
+                .with_revision(revision)
+                .requires_write(),
+        ),
     ));
     match &rejected {
         ExecutionResult::Rejected(rejected) => {
@@ -344,3 +368,6 @@ fn raw_edit_shape_is_rejected_with_an_explicit_pointer() {
 fn api_version_is_0_2_0_for_the_semantic_surface() {
     assert_eq!(API_VERSION, "0.2.0");
 }
+
+#[path = "support/editor_operations.rs"]
+mod editor_operations_fixture;

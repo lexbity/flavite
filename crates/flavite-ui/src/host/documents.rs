@@ -11,14 +11,15 @@ use flavite_workspace::NoteLocator;
 use std::collections::BTreeMap;
 
 /// Host state behind one view lease on a document.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ViewLease {
     /// Process-local resource generation, invalidating late editor events.
     pub incarnation: u64,
+    capture_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Host state behind one opened or opening document.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 struct DocumentEntry {
     /// The Session buffer once the open completed.
     buffer: Option<u64>,
@@ -83,7 +84,13 @@ impl DocumentRegistry {
         self.next_incarnation = self.next_incarnation.saturating_add(1).max(1);
         let incarnation = self.next_incarnation;
         let entry = self.documents.entry(locator.clone()).or_default();
-        let fresh = entry.leases.insert(tab, ViewLease { incarnation });
+        let fresh = entry.leases.insert(
+            tab,
+            ViewLease {
+                incarnation,
+                capture_sequence: Default::default(),
+            },
+        );
         debug_assert!(fresh.is_none(), "a fresh tab cannot already hold a lease");
         let decision = if entry.buffer.is_some() {
             AttachDecision::Ready
@@ -208,6 +215,19 @@ impl DocumentRegistry {
     #[must_use]
     pub fn incarnation(&self, tab: flavite_workspace::TabId) -> Option<u64> {
         self.state(&tab).map(|state| state.incarnation)
+    }
+
+    /// One event counter for the entire view lease, surviving widget remounts.
+    pub fn capture_sequence(
+        &self,
+        tab: flavite_workspace::TabId,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
+        self.documents.values().find_map(|entry| {
+            entry
+                .leases
+                .get(&tab)
+                .map(|lease| lease.capture_sequence.clone())
+        })
     }
 
     /// The locator a tab displays.

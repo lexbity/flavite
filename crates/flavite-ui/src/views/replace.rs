@@ -3,7 +3,7 @@
 //! Rendering only: host state lives in [`crate::host::replace`]. The view
 //! makes the source/full-text distinction explicit, shows the frozen
 //! scope, truncated scope, typed exclusions and exact totals, and exposes
-//! sealed-preview candidates (before/after hashes) with selection.
+//! sealed-preview candidates with readable changes and note selection.
 
 use crate::app::{App, Message};
 use crate::host::replace::{
@@ -18,13 +18,39 @@ use iced::{Element, Length};
 /// Input widget id prefix for semantic tests.
 pub const REPLACE_INPUT_ID_PREFIX: &str = "replace-input-";
 
-fn input_id(tab: TabId, suffix: &str) -> iced::widget::Id {
+pub fn input_id(tab: TabId, suffix: &str) -> iced::widget::Id {
     iced::widget::Id::from(format!("{REPLACE_INPUT_ID_PREFIX}{}{suffix}", tab.raw()))
+}
+
+pub(crate) fn observed_control<'a>(
+    app: &App,
+    tab: TabId,
+    name: impl Into<String>,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let name = name.into();
+    let generation = app.replace.view_state(tab).frame_generation();
+    crate::workspace::bounds::observe_named(
+        input,
+        format!(
+            "vault-search-{tab}-{name}-{}-{:?}",
+            app.replace.view_state(tab).frame_generation(),
+            app.window_size()
+        ),
+        move |rect| {
+            Message::VaultSearch(crate::host::vault_search::VaultSearchMessage::Bounds(
+                tab,
+                name.clone(),
+                generation,
+                rect,
+            ))
+        },
+    )
 }
 
 /// Render the Replace view for one tab.
 #[allow(clippy::too_many_lines)]
-pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
+pub(crate) fn content(app: &App, tab: TabId) -> Element<'_, Message> {
     let metrics = app.appearance.metrics();
     let state = app.replace.view_state(tab);
     let query = state.query.clone();
@@ -61,68 +87,116 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
         .on_press(message)
     };
 
-    let mut controls = column![
-        row![
-            text_input("Find in saved note source…", &query)
-                .id(input_id(tab, "-query"))
-                .on_input(move |value| Message::ReplaceEdit {
-                    tab,
-                    field: ReplaceField::Query,
-                    value,
-                })
-                .on_submit(Message::ReplaceSubmitNow { tab })
-                .padding(tab_strip::chip_padding())
-                .size(metrics.text_sm)
-                .width(Length::Fill),
-            toggle(
-                "Regex",
-                state.regex,
-                Message::ReplaceToggle {
-                    tab,
-                    flag: ReplaceFlag::Regex
-                }
-            ),
-            toggle(
-                "Aa",
-                state.case_sensitive,
-                Message::ReplaceToggle {
-                    tab,
-                    flag: ReplaceFlag::CaseSensitive
-                }
-            ),
-            toggle(
-                "Word",
-                state.whole_word,
-                Message::ReplaceToggle {
-                    tab,
-                    flag: ReplaceFlag::WholeWord
-                }
-            ),
-        ]
-        .spacing(metrics.spacing_sm),
-    ];
+    let mut controls = column![observed_control(
+        app,
+        tab,
+        "query",
+        text_input("Find in Markdown source…", &query)
+            .id(input_id(tab, "-query"))
+            .on_input(move |value| Message::ReplaceEdit {
+                tab,
+                field: ReplaceField::Query,
+                value
+            })
+            .on_submit(if state.mode == ReplacePanelMode::Preview {
+                Message::ReplaceRunPreview { tab }
+            } else {
+                Message::ReplaceSubmitNow { tab }
+            })
+            .padding(tab_strip::chip_padding())
+            .size(metrics.text_sm)
+            .width(Length::Fill)
+    )]
+    .spacing(metrics.spacing_sm);
     if state.mode == ReplacePanelMode::Preview {
-        controls = controls.push(
-            text_input("Replacement text (literal; $1/$0 in regex)", &replacement)
+        controls = controls.push(observed_control(
+            app,
+            tab,
+            "replacement",
+            text_input("Replace with… ($1 in regex)", &replacement)
                 .id(input_id(tab, "-replacement"))
                 .on_input(move |value| Message::ReplaceEdit {
                     tab,
                     field: ReplaceField::Replacement,
                     value,
                 })
+                .on_submit(Message::ReplaceRunPreview { tab })
                 .padding(tab_strip::chip_padding())
                 .size(metrics.text_sm)
                 .width(Length::Fill),
-        );
-        controls = controls.push(
-            checkbox(state.include_drafts)
-                .label("Include unsaved drafts")
-                .on_toggle(move |_| Message::ReplaceToggle {
-                    tab,
-                    flag: ReplaceFlag::IncludeDrafts,
-                }),
-        );
+        ));
     }
+    controls = controls.push(
+        row![
+            observed_control(
+                app,
+                tab,
+                "regex",
+                toggle(
+                    "Regex",
+                    state.regex,
+                    Message::ReplaceToggle {
+                        tab,
+                        flag: ReplaceFlag::Regex
+                    }
+                )
+            ),
+            observed_control(
+                app,
+                tab,
+                "case",
+                toggle(
+                    "Aa",
+                    state.case_sensitive,
+                    Message::ReplaceToggle {
+                        tab,
+                        flag: ReplaceFlag::CaseSensitive
+                    }
+                )
+            ),
+            observed_control(
+                app,
+                tab,
+                "word",
+                toggle(
+                    "Word",
+                    state.whole_word,
+                    Message::ReplaceToggle {
+                        tab,
+                        flag: ReplaceFlag::WholeWord
+                    }
+                )
+            ),
+        ]
+        .spacing(metrics.spacing_sm)
+        .wrap(),
+    );
+    controls = controls.push(observed_control(
+        app,
+        tab,
+        "folder",
+        text_input("Folder (empty = whole vault)", &state.folder)
+            .id(input_id(tab, "-folder"))
+            .on_input(move |value| Message::ReplaceEdit {
+                tab,
+                field: ReplaceField::Folder,
+                value,
+            })
+            .padding(tab_strip::chip_padding())
+            .size(metrics.text_sm)
+            .width(Length::Fill),
+    ));
+    controls = controls.push(observed_control(
+        app,
+        tab,
+        "drafts",
+        checkbox(state.include_drafts)
+            .label("Include unsaved notes")
+            .on_toggle(move |_| Message::ReplaceToggle {
+                tab,
+                flag: ReplaceFlag::IncludeDrafts,
+            }),
+    ));
     let status = if state.updating {
         String::from(if state.mode == ReplacePanelMode::Preview {
             "Preparing sealed preview…"
@@ -143,28 +217,30 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
         if !state.exclusions.is_empty() {
             parts.push(format!("excluded: {}", state.exclusions.len()));
         }
-        parts.push("saved content only — unsaved edits are not scanned".to_owned());
+        parts.push(
+            if state.include_drafts {
+                "saved notes and unsaved drafts"
+            } else {
+                "saved notes; unsaved notes excluded"
+            }
+            .to_owned(),
+        );
         parts.join(" · ")
     } else if let Some(plan) = &state.plan {
         format!(
-            "Sealed preview · {} matched notes · {} matches · {} excluded ({} drafts) · {} payload bytes · expires {}",
-            plan.matched_notes,
-            plan.matches,
-            plan.excluded,
-            plan.drafts,
-            plan.payload_bytes,
-            plan.expires_at_unix_ms,
+            "Review {} matches in {} notes · {} excluded ({} unsaved)",
+            plan.matches, plan.matched_notes, plan.excluded, plan.drafts,
         )
     } else {
         String::from(
-            "Source matching covers serialized Markdown source — code blocks, frontmatter and link targets included. Vault Find/Replace reads saved notes only.",
+            "Find and replace cover Markdown source, including code blocks, frontmatter and link targets. Unsaved notes are included only when enabled.",
         )
     };
 
     let mut body = column![].spacing(2);
     if state.mode == ReplacePanelMode::Find {
         for result in &state.rows {
-            body = body.push(find_row(*metrics, tab, result));
+            body = body.push(find_row(app, tab, state, result));
         }
         if state.rows.is_empty() && state.error.is_none() && !state.updating {
             body = body.push(
@@ -178,7 +254,7 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
         }
     } else {
         for candidate in &state.candidates {
-            body = body.push(candidate_row(*metrics, tab, state, candidate));
+            body = body.push(candidate_row(app, tab, state, candidate));
         }
         if state.candidates.is_empty() && state.error.is_none() && !state.updating {
             body = body.push(
@@ -187,88 +263,121 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
         }
     }
 
+    if state.earlier_results_removed {
+        body = body.push(
+            text("Showing the most recent 2,000 matches. Refresh to return to the beginning.")
+                .size(metrics.text_sm)
+                .style(style::dim_text),
+        );
+    }
     let mut actions = row![
-        mode_button("Find", ReplacePanelMode::Find),
-        mode_button("Preview", ReplacePanelMode::Preview),
-        Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
+        observed_control(
+            app,
+            tab,
+            "mode-find",
+            mode_button("Find", ReplacePanelMode::Find)
+        ),
+        observed_control(
+            app,
+            tab,
+            "mode-replace",
+            mode_button("Replace", ReplacePanelMode::Preview)
+        ),
+        Space::new().width(8),
     ]
     .spacing(metrics.spacing_sm);
     match state.mode {
         ReplacePanelMode::Find => {
             if state.has_next() {
-                actions = actions.push(
+                actions = actions.push(observed_control(
+                    app,
+                    tab,
+                    "next",
                     button(text("Next page"))
                         .padding(tab_strip::chip_padding())
                         .style(style::ghost())
                         .on_press(Message::ReplaceNextPage { tab }),
-                );
+                ));
             }
-            actions = actions.push(
+            actions = actions.push(observed_control(
+                app,
+                tab,
+                "find",
                 button(text("Find in vault"))
                     .padding(tab_strip::chip_padding())
                     .style(style::ghost())
                     .on_press(Message::ReplaceSubmitNow { tab }),
-            );
+            ));
         }
         ReplacePanelMode::Preview => {
-            actions = actions.push(
+            actions = actions.push(observed_control(
+                app,
+                tab,
+                "run-preview",
                 button(text("Run preview"))
                     .padding(tab_strip::chip_padding())
                     .style(style::ghost())
                     .on_press(Message::ReplaceRunPreview { tab }),
-            );
+            ));
             if state.preview_id.is_some() {
-                actions = actions.push(
+                actions = actions.push(observed_control(
+                    app,
+                    tab,
+                    "select-all",
                     button(text("Select all"))
                         .padding(tab_strip::chip_padding())
                         .style(style::ghost())
                         .on_press(Message::ReplaceSelect {
+                            target: state.preview_target().expect("sealed preview control"),
                             tab,
                             selection: SelectAction::All,
                         }),
-                );
-                actions = actions.push(
+                ));
+                actions = actions.push(observed_control(
+                    app,
+                    tab,
+                    "select-none",
                     button(text("Select none"))
                         .padding(tab_strip::chip_padding())
                         .style(style::ghost())
                         .on_press(Message::ReplaceSelect {
+                            target: state.preview_target().expect("sealed preview control"),
                             tab,
                             selection: SelectAction::None,
                         }),
-                );
+                ));
             }
         }
     }
     if state.mode == ReplacePanelMode::Preview
         && state.selection_ready
         && let Some(plan) = &state.plan
-        && let Some(revision) = plan.selection_revision
+        && plan.selection_revision.is_some()
     {
         actions = actions.push(
-            text(format!(
-                "Selection rev {revision} · {} notes",
-                state.selected_count()
-            ))
-            .size(metrics.text_sm)
-            .style(style::dim_text),
+            text(format!("{} notes selected", state.selected_count()))
+                .size(metrics.text_sm)
+                .style(style::dim_text),
         );
         if state.can_apply() {
-            actions = actions.push(
+            actions = actions.push(observed_control(
+                app,
+                tab,
+                "apply",
                 button(text("Apply"))
                     .padding(tab_strip::chip_padding())
                     .style(style::list_row(true))
-                    .on_press(Message::ReplaceApply { tab }),
-            );
+                    .on_press(Message::ReplaceApply {
+                        tab,
+                        target: state.preview_target().expect("selected preview control"),
+                    }),
+            ));
         }
     }
     if let Some(job) = &state.job {
         let mut job_line = format!(
-            "Job {} · {} · saved {} · conflicts {} · stale {}",
-            &job.job_id[..8],
-            job.phase,
-            job.saved,
-            job.conflicts,
-            job.stale
+            "Replacement · {} · saved {} · conflicts {} · stale {}",
+            job.phase, job.saved, job.conflicts, job.stale
         );
         if job.applied_drafts > 0 {
             job_line.push_str(&format!(" · drafts applied {}", job.applied_drafts));
@@ -288,31 +397,61 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
         }
         actions = actions.push(text(job_line).size(metrics.text_sm).style(style::dim_text));
         if state.can_cancel() {
-            actions = actions.push(
+            actions = actions.push(observed_control(
+                app,
+                tab,
+                "cancel",
                 button(text("Cancel"))
                     .padding(tab_strip::chip_padding())
                     .style(style::ghost())
-                    .on_press(Message::ReplaceCancel { tab }),
-            );
-            if matches!(
-                job.phase.as_str(),
-                "paused" | "partial" | "cancelled" | "applying"
-            ) {
-                actions = actions.push(
-                    button(text("Resume"))
-                        .padding(tab_strip::chip_padding())
-                        .style(style::ghost())
-                        .on_press(Message::ReplaceResume { tab }),
-                );
-            }
+                    .on_press(Message::ReplaceCancel {
+                        tab,
+                        job_id: state
+                            .job
+                            .as_ref()
+                            .expect("visible job control")
+                            .job_id
+                            .clone(),
+                    }),
+            ));
+        }
+        if state.can_resume() {
+            actions = actions.push(observed_control(
+                app,
+                tab,
+                "resume",
+                button(text("Resume"))
+                    .padding(tab_strip::chip_padding())
+                    .style(style::ghost())
+                    .on_press(Message::ReplaceResume {
+                        tab,
+                        job_id: state
+                            .job
+                            .as_ref()
+                            .expect("visible job control")
+                            .job_id
+                            .clone(),
+                    }),
+            ));
         }
         if state.can_revert() {
-            actions = actions.push(
+            actions = actions.push(observed_control(
+                app,
+                tab,
+                "revert",
                 button(text("Revert"))
                     .padding(tab_strip::chip_padding())
                     .style(style::list_row(true))
-                    .on_press(Message::ReplaceRevert { tab }),
-            );
+                    .on_press(Message::ReplaceRevert {
+                        tab,
+                        job_id: state
+                            .job
+                            .as_ref()
+                            .expect("visible job control")
+                            .job_id
+                            .clone(),
+                    }),
+            ));
         }
     }
 
@@ -325,7 +464,7 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
                 .height(Length::Fill)
                 .padding(metrics.spacing_sm)
                 .style(style::card),
-            actions,
+            actions.wrap(),
         ]
         .spacing(metrics.spacing_sm),
     )
@@ -337,53 +476,84 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
 }
 
 fn find_row(
-    metrics: crate::style::Metrics,
+    app: &App,
     tab: TabId,
+    state: &crate::host::replace::ReplaceTabState,
     result: &FindRowView,
 ) -> Element<'static, Message> {
-    let open = Message::ReplaceOpenNote {
+    let metrics = app.appearance.metrics();
+    let closed = state.collapsed.contains(&result.path);
+    let mut body = column![observed_control(
+        app,
         tab,
-        path: result.path.clone(),
-    };
-    let mut body = column![
-        text(if result.title.is_empty() {
-            result.path.clone()
-        } else {
-            format!("{} — {}", result.title, result.path)
-        }),
-        text(format!("{} match(es)", result.note_matches))
-            .size(metrics.text_sm)
-            .style(style::dim_text),
-    ]
-    .spacing(2);
-    let preview: Vec<String> = result
-        .matches
-        .iter()
-        .take(24)
-        .map(|(start, end)| format!("{start}–{end}"))
-        .collect();
-    if !preview.is_empty() {
-        body = body.push(
-            text(preview.join(" "))
-                .size(metrics.text_sm)
-                .style(style::dim_text),
-        );
-    }
-    button(body)
+        format!("group:{}", result.ordinal),
+        button(text(format!(
+            "{} {} · {} matches{}",
+            if closed { "▸" } else { "▾" },
+            result.path,
+            result.note_matches,
+            if result.source_kind == "draft" {
+                " · unsaved"
+            } else {
+                ""
+            }
+        )))
         .width(Length::Fill)
-        .padding(iced::Padding {
-            top: 6.0,
-            bottom: 6.0,
-            left: 10.0,
-            right: 10.0,
+        .style(style::ghost())
+        .on_press(Message::ReplaceCollapse {
+            tab,
+            path: result.path.clone()
         })
-        .style(style::list_row(false))
-        .on_press(open)
-        .into()
+    )]
+    .spacing(2);
+    if !closed {
+        for hit in &result.contexts {
+            let accent = style::accent_text(&app.appearance.theme())
+                .color
+                .unwrap_or(iced::Color::WHITE);
+            let label = row![
+                text(format!("{}:{}", hit.line, hit.column))
+                    .size(metrics.text_sm)
+                    .style(style::dim_text),
+                iced::widget::rich_text::<(), Message, iced::Theme, iced::Renderer>([
+                    iced::widget::span(hit.before.clone()),
+                    iced::widget::span(if hit.matched.is_empty() {
+                        "│".into()
+                    } else {
+                        hit.matched.clone()
+                    })
+                    .color(accent),
+                    iced::widget::span(hit.after.clone())
+                ])
+                .size(metrics.text_sm)
+                .font(iced::Font::MONOSPACE),
+            ]
+            .spacing(metrics.spacing_sm);
+            body = body.push(observed_control(
+                app,
+                tab,
+                format!("match:{}:{}", result.ordinal, hit.start),
+                button(label)
+                    .width(Length::Fill)
+                    .style(style::ghost())
+                    .on_press(Message::VaultSearch(
+                        crate::host::vault_search::VaultSearchMessage::OpenMatch {
+                            owner: tab,
+                            finder: state.finder.clone().unwrap_or_default(),
+                            path: result.path.clone(),
+                            hash: result.content_hash.clone(),
+                            start: hit.start,
+                            end: hit.end,
+                        },
+                    )),
+            ));
+        }
+    }
+    container(body).width(Length::Fill).padding(4).into()
 }
 
 fn candidate_row(
-    _metrics: crate::style::Metrics,
+    app: &App,
     tab: TabId,
     state: &crate::host::replace::ReplaceTabState,
     candidate: &CandidateView,
@@ -404,23 +574,82 @@ fn candidate_row(
         label.push_str(" · NoChange");
     }
     let native = candidate.path_native.clone();
-    let checkbox = checkbox(selected)
-        .label(label)
-        .on_toggle(move |_| Message::ReplaceSelect {
+    let target = state
+        .preview_target()
+        .expect("candidate belongs to a sealed preview");
+    let selected_keys: Vec<_> = state
+        .selected
+        .iter()
+        .filter(|(_, selected)| **selected)
+        .map(|(path, _)| path.clone())
+        .collect();
+    let checkbox = checkbox(selected).label(label).on_toggle(move |on| {
+        let mut keys = selected_keys.clone();
+        keys.retain(|key| key != &native);
+        if on {
+            keys.push(native.clone());
+        }
+        Message::ReplaceSelect {
+            target: target.clone(),
             tab,
-            selection: SelectAction::Keys(vec![native.clone()]),
-        });
+            selection: SelectAction::Keys(keys),
+        }
+    });
     let mut detail = column![
-        checkbox,
-        text(format!(
-            "before {} · after {}",
-            &candidate.before_hash[..8],
-            &candidate.after_hash[..8]
-        ))
-        .size(10),
+        observed_control(
+            app,
+            tab,
+            format!("candidate:{}", candidate.item_id),
+            checkbox
+        ),
+        observed_control(
+            app,
+            tab,
+            format!("inspect:{}", candidate.item_id),
+            button(text(if state.inspected.contains(&candidate.item_id) {
+                "Hide changes"
+            } else {
+                "Inspect changes"
+            }))
+            .style(style::ghost())
+            .on_press(Message::ReplaceInspect {
+                tab,
+                item_id: candidate.item_id
+            })
+        )
     ]
-    .spacing(2);
-    detail = detail.push(Space::new().height(4.0));
+    .spacing(4);
+    if state.inspected.contains(&candidate.item_id) {
+        match state.diffs.get(&candidate.item_id) {
+            Some(Ok(diff)) => {
+                detail = detail.push(
+                    text(format!(
+                        "From line {}{}",
+                        diff.first_line,
+                        if diff.truncated {
+                            " · excerpt; additional text omitted"
+                        } else {
+                            ""
+                        }
+                    ))
+                    .size(11),
+                );
+                detail = detail.push(
+                    text(format!("− {}", diff.before.replace('\n', "\n− ")))
+                        .font(iced::Font::MONOSPACE)
+                        .size(12),
+                );
+                detail = detail.push(
+                    text(format!("+ {}", diff.after.replace('\n', "\n+ ")))
+                        .font(iced::Font::MONOSPACE)
+                        .size(12)
+                        .style(style::accent_text),
+                );
+            }
+            Some(Err(error)) => detail = detail.push(text(error.clone()).size(12)),
+            None => detail = detail.push(text("Loading sealed changes…").size(12)),
+        }
+    }
     container(detail)
         .width(Length::Fill)
         .padding(iced::Padding {

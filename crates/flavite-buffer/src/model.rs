@@ -407,7 +407,7 @@ impl EditorModel {
         if let Some(set) = self.selections.take() {
             let candidates = set
                 .members()
-                .into_iter()
+                .iter()
                 .map(|selection| RawSelection {
                     id: Some(selection.id().as_raw()),
                     anchor: map_position(
@@ -1010,7 +1010,7 @@ impl EditorModel {
                     batch.op.replacement.len(),
                     &[],
                     &[],
-                );
+                ) + crate::budget::movement_bytes(batch.spans.len());
                 let lease = self.reserve_history(projected)?;
                 let revision = self.install_prepared_inner(batch, Some(origin));
                 self.undo_tree.release(&lease);
@@ -1023,7 +1023,7 @@ impl EditorModel {
                     batch.op.replacement.len(),
                     &[],
                     &[],
-                );
+                ) + crate::budget::movement_bytes(batch.spans.len());
                 let lease = self.reserve_history(projected)?;
                 let revision = self.install_prepared(batch);
                 self.undo_tree.release(&lease);
@@ -1090,12 +1090,10 @@ impl EditorModel {
             Some(record) => (&record.before[..], &record.after[..]),
             None => (&[][..], &[][..]),
         };
-        Some(crate::budget::account_node(
-            after_len,
-            replacement.len(),
-            before,
-            after,
-        ))
+        Some(
+            crate::budget::account_node(after_len, replacement.len(), before, after)
+                + crate::budget::movement_bytes(edits.len()),
+        )
     }
 
     /// Validate the text and recorded selections before installing either.
@@ -1123,7 +1121,7 @@ impl EditorModel {
             batch.op.replacement.len(),
             &record.before,
             &record.after,
-        );
+        ) + crate::budget::movement_bytes(batch.spans.len());
         let lease = match self.reserve_history(projected) {
             Ok(lease) => lease,
             Err(BatchError::LimitExceeded { needed, budget }) => {
@@ -1220,7 +1218,7 @@ impl EditorModel {
         // The movement delta for passive views is derived from the transition
         // (position → target) before the head moves.
         let from = self.undo_tree.position_id();
-        let (spans, truncated) = self.undo_tree.transition_spans(from, target.node);
+        let (spans, step_ends, truncated) = self.undo_tree.transition_spans(from, target.node);
         // Protect the restore target from budget eviction for the install
         // window; released on completion and on every error exit.
         let protection = self
@@ -1232,7 +1230,7 @@ impl EditorModel {
         let text = snapshot.text().to_owned();
         let rope = Rope::from_str(&text);
         let table = EolTable::from_snapshot(&snapshot);
-        self.set_history_movement(spans, truncated, selections, primary);
+        self.set_history_movement(spans, step_ends, truncated, selections, primary);
         self.undo_tree.restore_position(target.node);
         self.text = text;
         self.rope = rope;
@@ -1250,6 +1248,7 @@ impl EditorModel {
     fn set_history_movement(
         &mut self,
         spans: Vec<crate::history::MovementSpan>,
+        step_ends: Vec<usize>,
         truncated: bool,
         selections: Option<Vec<[usize; 3]>>,
         primary: Option<usize>,
@@ -1257,6 +1256,7 @@ impl EditorModel {
         self.history_movement = Some(crate::history::HistoryMovement {
             selections,
             spans,
+            step_ends,
             truncated,
             // The requesting view's exact primary index when the recorded
             // set carries it (undo records do not: the UI keeps its own
@@ -1282,7 +1282,7 @@ impl EditorModel {
         &self,
         from: u64,
         to: u64,
-    ) -> (Vec<crate::history::MovementSpan>, bool) {
+    ) -> (Vec<crate::history::MovementSpan>, Vec<usize>, bool) {
         self.undo_tree.transition_spans(from, to)
     }
 
@@ -1317,6 +1317,11 @@ impl EditorModel {
     /// Returns the new revision and whether the undo was successful.
     /// Every undo advances the revision (§4.5.2).
     pub fn undo(&mut self) -> Option<Revision> {
+        let primary = self
+            .undo_tree
+            .position()
+            .and_then(|n| n.editor.as_ref())
+            .map(|r| r.before_primary);
         let selections = self.undo_tree.undo_selections();
         let from = self.undo_tree.position_id();
         let transition = self.undo_tree.undo_edit();
@@ -1324,8 +1329,8 @@ impl EditorModel {
 
         if let Some((_node_rev, Some(snapshot))) = result {
             let to = self.undo_tree.position_id();
-            let (spans, truncated) = self.undo_tree.transition_spans(from, to);
-            self.set_history_movement(spans, truncated, selections, None);
+            let (spans, step_ends, truncated) = self.undo_tree.transition_spans(from, to);
+            self.set_history_movement(spans, step_ends, truncated, selections, primary);
             let new_text = snapshot.text().to_string();
             self.rope = Rope::from_str(&new_text);
             self.text = new_text;
@@ -1357,9 +1362,10 @@ impl EditorModel {
 
         if let Some((_node_rev, Some(snapshot))) = result {
             let to = self.undo_tree.position_id();
-            let (spans, truncated) = self.undo_tree.transition_spans(from, to);
+            let (spans, step_ends, truncated) = self.undo_tree.transition_spans(from, to);
             self.set_history_movement(
                 spans,
+                step_ends,
                 truncated,
                 self.undo_tree.position_selections(),
                 self.history_position_primary(),
@@ -1431,7 +1437,7 @@ impl EditorModel {
             .as_ref()
             .map(|set| {
                 set.members()
-                    .into_iter()
+                    .iter()
                     .map(|selection| RawSelection {
                         id: Some(selection.id().as_raw()),
                         anchor: selection.anchor(),
@@ -1463,7 +1469,7 @@ impl EditorModel {
     pub fn selections(&self) -> Vec<Selection> {
         self.selections
             .as_ref()
-            .map(|set| set.members())
+            .map(|set| set.members().to_vec())
             .unwrap_or_else(|| {
                 vec![Selection::from_parts(
                     crate::selection::SelectionId::from_raw(0),

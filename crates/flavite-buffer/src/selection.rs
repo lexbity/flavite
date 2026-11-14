@@ -255,8 +255,12 @@ impl SelectionSet {
         }
         let mut seen = Vec::with_capacity(candidates.len());
         let mut assigned_ids = std::collections::HashMap::with_capacity(candidates.len());
-        let max_existing = candidates.iter().filter_map(|c| c.id).max().unwrap_or(0);
-        let mut synthetic_next = max_existing.saturating_add(1);
+        let reserved: std::collections::HashSet<_> = candidates
+            .iter()
+            .filter_map(|candidate| candidate.id)
+            .collect();
+        let max_existing = reserved.iter().copied().max().unwrap_or(0);
+        let mut synthetic_next = max_existing.checked_add(1).unwrap_or(1);
         for candidate in candidates {
             for endpoint in [candidate.anchor, candidate.head] {
                 if endpoint > text.len() {
@@ -276,20 +280,69 @@ impl SelectionSet {
                     assigned_ids.insert(id, id);
                     id
                 }
-                Some(_) => {
+                Some(_) | None => {
+                    while reserved.contains(&synthetic_next)
+                        || assigned_ids.contains_key(&synthetic_next)
+                    {
+                        synthetic_next = synthetic_next.checked_add(1).unwrap_or(0);
+                    }
                     let id = synthetic_next;
-                    synthetic_next += 1;
-                    id
-                }
-                None => {
-                    let id = synthetic_next;
-                    synthetic_next += 1;
+                    assigned_ids.insert(id, id);
+                    synthetic_next = synthetic_next.checked_add(1).unwrap_or(0);
                     id
                 }
             };
             seen.push((id, candidate.anchor, candidate.head));
         }
         Self::canonicalize(seen, primary_hint)
+    }
+
+    /// Edits can join graphemes across a former boundary. Trusted mapped
+    /// endpoints round outwards against the after-text; carets stick right.
+    /// Untrusted incoming sets continue to use strict `normalize`.
+    pub(crate) fn normalize_mapped(
+        text: &str,
+        mut candidates: Vec<RawSelection>,
+        primary_hint: Option<u32>,
+    ) -> Result<(Self, IdRemap), SetError> {
+        if candidates.len() > MAX_SELECTIONS {
+            return Err(SetError::TooMany {
+                observed: candidates.len(),
+            });
+        }
+        let mut boundaries: Option<Vec<usize>> = None;
+        for member in &mut candidates {
+            let caret = member.anchor == member.head;
+            let forward = member.anchor < member.head;
+            for (point, right) in [
+                (&mut member.anchor, caret || !forward),
+                (&mut member.head, caret || forward),
+            ] {
+                if *point > text.len() {
+                    return Err(SetError::OutOfBounds { at: *point });
+                }
+                if !text.is_char_boundary(*point) {
+                    return Err(SetError::NotGraphemeBoundary { at: *point });
+                }
+                if is_grapheme_boundary(text, *point) {
+                    continue;
+                }
+                use unicode_segmentation::UnicodeSegmentation;
+                let index = boundaries.get_or_insert_with(|| {
+                    text.grapheme_indices(true)
+                        .map(|(at, _)| at)
+                        .chain(std::iter::once(text.len()))
+                        .collect()
+                });
+                let next = index.partition_point(|&at| at < *point);
+                *point = if right {
+                    index[next]
+                } else {
+                    index[next.saturating_sub(1)]
+                };
+            }
+        }
+        Self::normalize(text, candidates, primary_hint)
     }
 
     /// The pure span algebra: sort, merge, absorb, assign the primary.
@@ -299,9 +352,17 @@ impl SelectionSet {
         primary_hint: Option<u32>,
     ) -> Result<(Self, IdRemap), SetError> {
         // Sort by geometric span, then by id (deterministic tie-break).
-        candidates.sort_by_key(|&(id, anchor, head)| (anchor.min(head), anchor.max(head), id));
+        let key =
+            |&(id, anchor, head): &(u32, usize, usize)| (anchor.min(head), anchor.max(head), id);
+        if !candidates
+            .windows(2)
+            .all(|pair| key(&pair[0]) <= key(&pair[1]))
+        {
+            candidates.sort_by_key(key);
+        }
         let mut remap = IdRemap::default();
         let mut merged: Vec<Candidate> = Vec::with_capacity(candidates.len());
+        let mut group_members = Vec::new();
         for (id, anchor, head) in candidates {
             let from = anchor.min(head);
             let to = anchor.max(head);
@@ -321,7 +382,11 @@ impl SelectionSet {
                     // smaller id; two equal carets keep the smaller id. The
                     // union span takes the direction of the survivor source.
                     let (survivor, src_anchor, src_head) = if !last_caret && !caret {
-                        (last_id.min(id), last_anchor, last_head)
+                        if id < last_id {
+                            (id, anchor, head)
+                        } else {
+                            (last_id, last_anchor, last_head)
+                        }
                     } else if !last_caret {
                         (last_id, last_anchor, last_head)
                     } else if !caret {
@@ -334,39 +399,43 @@ impl SelectionSet {
                     } else {
                         (new_to, new_from)
                     };
-                    if survivor != last_id {
-                        for value in remap.map.values_mut() {
-                            if *value == last_id {
-                                *value = survivor;
-                            }
-                        }
-                        remap.insert(last_id, survivor);
-                    }
-                    if id != survivor {
-                        remap.insert(id, survivor);
-                    }
                     *last = (survivor, new_anchor, new_head);
                     placed = true;
                 }
             }
             if !placed {
+                if let Some(&(survivor, ..)) = merged.last() {
+                    for old in group_members.drain(..) {
+                        if old != survivor {
+                            remap.insert(old, survivor);
+                        }
+                    }
+                }
                 merged.push((id, anchor, head));
+            }
+            group_members.push(id);
+        }
+        if let Some(&(survivor, ..)) = merged.last() {
+            for old in group_members {
+                if old != survivor {
+                    remap.insert(old, survivor);
+                }
             }
         }
         // Second pass: absorb carets that sit inside or on the boundary of a
         // surviving range (regardless of sweep order). Adjacent nonempty
         // ranges are untouched.
         //
-        // The survivor ranges are sorted by `from` and disjoint, so their
-        // `to` endpoints are non-decreasing. Each caret finds its earliest
-        // containing range by two binary searches instead of a linear scan
-        // (NFR-1: no O(n²) member operations).
+        // Carets and ranges share document order, so one advancing range
+        // cursor finds the earliest host in linear time.
         let ranges: Vec<Candidate> = merged
             .iter()
             .copied()
             .filter(|&(_, a, h)| a.min(h) < a.max(h))
             .collect();
         let mut absorbed = Vec::with_capacity(merged.len());
+        let mut caret_hosts = std::collections::HashMap::new();
+        let mut range_index = 0;
         for (id, anchor, head) in &merged {
             let caret = anchor.min(head) == anchor.max(head);
             if !caret {
@@ -374,18 +443,31 @@ impl SelectionSet {
                 continue;
             }
             let at = *anchor;
-            let host = {
-                // Ranges whose `from` is at or before `at`.
-                let k = ranges.partition_point(|&(_, a, h)| a.min(h) <= at);
-                // The earliest of those whose `to` reaches `at`.
-                let j = ranges[..k].partition_point(|&(_, a, h)| a.max(h) < at);
-                (j < k).then(|| ranges[j])
-            };
+            while ranges
+                .get(range_index)
+                .is_some_and(|&(_, a, h)| a.max(h) < at)
+            {
+                range_index += 1;
+            }
+            let host = ranges
+                .get(range_index)
+                .copied()
+                .filter(|&(_, a, h)| a.min(h) <= at && at <= a.max(h));
             if let Some((host_id, _, _)) = host {
-                remap.insert(*id, host_id);
+                caret_hosts.insert(*id, host_id);
             } else {
                 absorbed.push((*id, *anchor, *head));
             }
+        }
+        // Resolve each merged group's final caret host once. Rewriting every
+        // preceding alias whenever a smaller survivor arrives is quadratic.
+        for survivor in remap.map.values_mut() {
+            if let Some(host) = caret_hosts.get(survivor) {
+                *survivor = *host;
+            }
+        }
+        for (caret, host) in caret_hosts {
+            remap.insert(caret, host);
         }
         // Primary resolution: hint's survivor; else the last surviving member.
         let primary = if let Some(hint) = primary_hint {
@@ -464,10 +546,10 @@ impl SelectionSet {
         self.ordered.iter()
     }
 
-    /// All members in canonical order (owned).
+    /// Borrow all members in canonical order.
     #[must_use]
-    pub fn members(&self) -> Vec<Selection> {
-        self.ordered.clone()
+    pub fn members(&self) -> &[Selection] {
+        &self.ordered
     }
 
     /// Member count.
@@ -509,26 +591,35 @@ impl SelectionSet {
     /// does this); mapping itself is pure coordinate algebra.
     #[must_use]
     pub fn map_through(&self, edits: &[SpanEdit]) -> (Self, IdRemap) {
-        let mut candidates = Vec::with_capacity(self.ordered.len());
-        let mut hint = None;
-        for selection in &self.ordered {
-            let (anchor_affinity, head_affinity) = if selection.anchor < selection.head {
-                (Affinity::Left, Affinity::Right)
-            } else if selection.anchor > selection.head {
-                (Affinity::Right, Affinity::Left)
-            } else {
-                (Affinity::Right, Affinity::Right)
-            };
-            // O(log m) per endpoint (prefix-sum binary search in
-            // `map_endpoint`), so mapping n members through m edits is
-            // O(n log m + m) — no per-endpoint span scan (NFR-1).
-            let anchor = map_endpoint(selection.anchor, edits, anchor_affinity);
-            let head = map_endpoint(selection.head, edits, head_affinity);
-            if selection.id == self.primary {
-                hint = Some(selection.id.as_raw());
-            }
-            candidates.push((selection.id.as_raw(), anchor, head));
-        }
+        let spans: Vec<_> = edits
+            .iter()
+            .map(|e| crate::history::MovementSpan {
+                start: e.start,
+                end: e.end,
+                replacement_len: e.replacement_len,
+            })
+            .collect();
+        let starts: Vec<_> = self.ordered.iter().map(|s| s.start()).collect();
+        let ends: Vec<_> = self.ordered.iter().map(|s| s.end()).collect();
+        let starts = map_points_through_spans(&starts, &spans, crate::positions::Affinity::Left);
+        let ends = map_points_through_spans(&ends, &spans, crate::positions::Affinity::Right);
+        let candidates = self
+            .ordered
+            .iter()
+            .zip(starts)
+            .zip(ends)
+            .map(|((s, start), end)| {
+                let (anchor, head) = if s.is_caret() {
+                    (end, end)
+                } else if s.anchor() < s.head() {
+                    (start, end)
+                } else {
+                    (end, start)
+                };
+                (s.id.as_raw(), anchor, head)
+            })
+            .collect();
+        let hint = Some(self.primary.as_raw());
         let (set, remap) = Self::canonicalize(candidates, hint)
             .expect("mapping a valid set keeps at least one member");
         (set, remap)
@@ -544,11 +635,8 @@ impl SelectionSet {
     }
 }
 
-/// Map one endpoint through an ordered list of movement spans (the received
-/// [`crate::history::HistoryMovement`] delta), with the same sequential
-/// semantics as `map_endpoint` — each span is interpreted relative to the
-/// running position after earlier spans, so per-step native coordinates are
-/// exactly correct without flattening (FEUX-0002 E-13).
+/// Map one endpoint through a simultaneous batch in pre-edit coordinates.
+/// Successive history steps must use [`map_movement`] to preserve frames.
 #[must_use]
 pub fn map_point_through_spans(
     mapped: usize,
@@ -594,7 +682,7 @@ pub fn map_points_through_spans(
     for &p in points {
         // Consume every span strictly before `p` in the raw frame.
         while i < spans.len()
-            && (p > spans[i].end || (spans[i].start == spans[i].end && p > spans[i].start))
+            && (p >= spans[i].end && (spans[i].start != spans[i].end || p > spans[i].start))
         {
             shift += spans[i].replacement_len as isize - (spans[i].end - spans[i].start) as isize;
             i += 1;
@@ -635,32 +723,43 @@ pub fn map_points_through_spans(
 /// of deletions); batch callers that need O(n + m) whole-set mapping use
 /// [`map_points_through_spans`] or the planner's bulk collapse pass.
 #[must_use]
-fn map_endpoint(mut mapped: usize, edits: &[SpanEdit], affinity: Affinity) -> usize {
-    let mut shift: isize = 0;
+fn map_endpoint(point: usize, edits: &[SpanEdit], affinity: Affinity) -> usize {
+    let mut delta: isize = 0;
     for edit in edits {
-        let start = shift_pos(edit.start, shift);
-        let end = shift_pos(edit.end, shift);
-        if mapped < start {
-            continue;
+        if point < edit.start {
+            break;
         }
-        if mapped == start {
-            if affinity == Affinity::Right {
-                return start + edit.replacement_len;
-            }
-            // Left affinity stays before the insertion; later edits still
-            // apply relative to this offset.
-        } else if mapped < end {
-            return if affinity == Affinity::Right {
-                start + edit.replacement_len
-            } else {
-                start
-            };
-        } else {
-            mapped = shift_pos(mapped, edit.delta());
+        if point == edit.start || point < edit.end {
+            return shift_pos(edit.start, delta)
+                + if affinity == Affinity::Right {
+                    edit.replacement_len
+                } else {
+                    0
+                };
         }
-        shift += edit.delta();
+        delta += edit.delta();
     }
-    mapped
+    shift_pos(point, delta)
+}
+
+/// Map a receipt's framed batches in transition order. Each batch uses its
+/// own pre-change coordinates; offsets from earlier steps are never added
+/// to a later step's coordinates a second time.
+#[must_use]
+pub fn map_movement(
+    mut point: usize,
+    movement: &crate::history::HistoryMovement,
+    affinity: crate::positions::Affinity,
+) -> usize {
+    if !movement.valid_frames() {
+        return point;
+    }
+    let mut start = 0;
+    for &end in &movement.step_ends {
+        point = map_point_through_spans(point, &movement.spans[start..end], affinity);
+        start = end;
+    }
+    point
 }
 
 fn shift_pos(position: usize, delta: isize) -> usize {

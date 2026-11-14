@@ -644,3 +644,131 @@ fn completed_typing_paste_installs_the_acquired_text_without_reacquiring() {
         "an empty clipboard stays a no-op"
     );
 }
+
+fn large_input_fixture(seed: u64) -> (support::UiFixture, TabId, Vec<usize>) {
+    let line = "0123456789abcdefé漢\n";
+    let text = line.repeat(1024 * 1024 / line.len() + 1);
+    let mut f = support::ui_fixture(
+        seed,
+        "/test/large-input",
+        &[support::SeedNote {
+            components: &["note.md"],
+            body: &text,
+        }],
+    );
+    let group = f.app.focused_group().unwrap();
+    f.app
+        .dispatch_layout(|expected_revision| LayoutAction::OpenNote {
+            expected_revision,
+            group,
+            locator: NoteLocator::from_components(["note.md"]).unwrap(),
+        });
+    let tab = f.app.workspace.focused_tab();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while f.app.note_editor_view(tab).is_none() {
+        assert!(Instant::now() < deadline);
+        let _ = f.app.update(Message::Pump);
+        std::thread::yield_now();
+    }
+    (
+        f,
+        tab,
+        (0..10_000).map(|index| index * line.len()).collect(),
+    )
+}
+fn input_character(app: &mut App, tab: TabId, insert: bool) {
+    let view = app.note_editor_view(tab).unwrap();
+    let _ = app.update(Message::EditorInput {
+        tab,
+        incarnation: app.notes.incarnation(tab).unwrap(),
+        input: flavite_editor::input::CapturedInput {
+            buffer: view.buffer_id,
+            observed_revision: view.revision,
+            sequence: app.workspace.tab(&tab).unwrap().interaction().sequence + 1,
+            action: if insert {
+                flavite_editor::keymap::KeyAction::Insert
+            } else {
+                flavite_editor::keymap::KeyAction::Backspace
+            },
+            text: if insert { "X".into() } else { String::new() },
+            extend: false,
+            document_boundary: false,
+            vertical: None,
+            preferred_x: Vec::new(),
+            clipboard_acquired: false,
+        },
+    });
+}
+#[test]
+fn ordinary_typing_at_ten_thousand_carets_fits_the_request_limit() {
+    let (mut f, tab, positions) = large_input_fixture(5110);
+    let before = f.app.note_editor_view(tab).unwrap().text;
+    publish_members(
+        &mut f.app,
+        tab,
+        &positions.iter().map(|&at| (at, at)).collect::<Vec<_>>(),
+    );
+    input_character(&mut f.app, tab, true);
+    assert_eq!(
+        f.app.note_editor_view(tab).unwrap().text.len(),
+        before.len() + 10_000,
+        "{}",
+        f.app.status
+    );
+    assert_eq!(committed_members(&f.app, tab).len(), 10_000);
+    input_character(&mut f.app, tab, false);
+    assert_eq!(
+        f.app.note_editor_view(tab).unwrap().text,
+        before,
+        "{}",
+        f.app.status
+    );
+    assert_eq!(
+        committed_members(&f.app, tab),
+        positions.iter().map(|&at| (at, at)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+#[ignore = "release App/API/Session p95 measurements, 1000 transitions per cardinality"]
+fn ordinary_input_end_to_end_latency() {
+    if cfg!(debug_assertions) {
+        panic!("run with --release");
+    }
+    for count in [100, 1_000, 10_000] {
+        let (mut f, tab, positions) = large_input_fixture(5200 + count as u64);
+        let before = f.app.note_editor_view(tab).unwrap().text;
+        publish_members(
+            &mut f.app,
+            tab,
+            &positions[..count]
+                .iter()
+                .map(|&at| (at, at))
+                .collect::<Vec<_>>(),
+        );
+        let mut samples = Vec::with_capacity(1000);
+        for index in 0..1000 {
+            let start = Instant::now();
+            input_character(&mut f.app, tab, index % 2 == 0);
+            samples.push(start.elapsed());
+            assert_eq!(
+                f.app.note_editor_view(tab).unwrap().text.len(),
+                before.len() + if index % 2 == 0 { count } else { 0 },
+                "{}",
+                f.app.status
+            );
+        }
+        samples.sort_unstable();
+        println!(
+            "App/API/Session note_bytes={} selections={count} samples=1000 p50_us={} p95_us={}",
+            before.len(),
+            samples[499].as_micros(),
+            samples[949].as_micros()
+        );
+        if std::env::var_os("FLAVITE_REFERENCE_PERF").is_some() {
+            assert!(
+                samples[949] <= Duration::from_micros(if count <= 100 { 16_700 } else { 100_000 })
+            );
+        }
+    }
+}

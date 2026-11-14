@@ -9,11 +9,9 @@ use flavite_api::{ExecutionResult, Flavite, Invocation, LocalResult, Origin};
 use serde_json::{Value, json};
 
 fn execute(api: &Flavite, command: &'static str, args: Value) -> ExecutionResult {
-    api.execute(Invocation::new(
-        support::next_id(api),
-        command,
-        args,
-        Origin::Gui,
+    api.execute(editor_operations_fixture::admit(
+        &api,
+        Invocation::new(support::next_id(api), command, args, Origin::Gui),
     ))
 }
 
@@ -33,7 +31,11 @@ fn open_note(f: &support::Fixture, name: &str) -> u64 {
 }
 
 fn issue_operation(api: &Flavite, buffer: u64) -> Value {
-    let result = execute(api, "editor.issue_operation", json!({"buffer_id": buffer}));
+    let result = execute(
+        api,
+        "editor.issue_operation",
+        json!({"buffer_id": buffer, "revision":revision(api,buffer)}),
+    );
     let value = data(result);
     value["operation"].clone()
 }
@@ -74,7 +76,11 @@ fn ticket_lifecycle_issue_admit_dedup_cancel_and_retirement() {
     let first = execute(&f.flavite, "editor.delete", args.clone());
     assert!(first.is_success(), "delete failed: {first:?}");
     let second = execute(&f.flavite, "editor.delete", args.clone());
-    assert_eq!(message_of(&second).as_deref(), Some("AlreadyApplied"));
+    assert_eq!(
+        data(second),
+        data(first),
+        "duplicate returns the original receipt"
+    );
 
     // Cancel before install yields Cancelled on a later delivery.
     let op2 = issue_operation(&f.flavite, buffer);
@@ -460,4 +466,97 @@ fn rotate_then_keep_primary_keeps_the_rotated_member() {
     assert_eq!(kept_items.len(), 1);
     assert_eq!(kept_items[0][1], json!(10), "the second member is kept");
     assert_eq!(kept["primary"], json!(0));
+}
+
+#[path = "support/editor_operations.rs"]
+mod editor_operations_fixture;
+
+#[test]
+fn rejected_read_only_activations_release_their_pending_slots() {
+    let mut f = support::fixture(&[("note.md", "abc")]);
+    let buffer = open_note(&f, "note.md");
+    f.flavite.set_read_only(true);
+    for _ in 0..100 {
+        let operation = f
+            .flavite
+            .issue_editor_operation(buffer, revision(&f.flavite, buffer), None)
+            .unwrap();
+        let result = execute(
+            &f.flavite,
+            "apply_edits",
+            json!({"buffer_id":buffer,"revision":revision(&f.flavite,buffer),"operation":operation,"ops":[{"range":[0,0],"replacement":"WRONG"}]}),
+        );
+        assert!(matches!(result, ExecutionResult::Rejected(_)));
+    }
+    assert_eq!(f.text(buffer), "abc");
+}
+
+#[test]
+fn ordinary_edits_and_history_require_an_explicit_issued_operation() {
+    let f = support::fixture(&[("note.md", "abc")]);
+    let buffer = open_note(&f, "note.md");
+    // Deliberately bypass fixture issuance to exercise the public schemas.
+    for command in [
+        "apply_edits",
+        "buffer.undo",
+        "buffer.redo",
+        "buffer.restore_state",
+    ] {
+        let mut args = json!({"buffer_id":buffer,"revision":revision(&f.flavite,buffer)});
+        if command == "apply_edits" {
+            args["ops"] = json!([{"range":[0,0],"replacement":"WRONG"}]);
+        }
+        if command == "buffer.restore_state" {
+            args["target"] = json!({"epoch":1,"node":0,"version":0});
+        }
+        let result = f.flavite.execute(Invocation::new(
+            support::next_id(&f.flavite),
+            command,
+            args,
+            Origin::Gui,
+        ));
+        assert!(
+            matches!(result,ExecutionResult::Rejected(ref rejected) if rejected.reason==flavite_api::RejectionReason::InvalidArgs),
+            "{command}: {result:?}"
+        );
+    }
+    assert_eq!(f.text(buffer), "abc");
+}
+
+#[test]
+fn ordinary_input_catalogue_has_real_plans_and_write_availability() {
+    for (command, caret, expected) in [
+        ("editor.type", 0, "Zé\nx"),
+        ("editor.backspace", 3, "éx"),
+        ("editor.forward_delete", 0, "\nx"),
+        ("editor.newline", 0, "\né\nx"),
+    ] {
+        let mut f = support::fixture(&[("note.md", "é\nx")]);
+        let buffer = open_note(&f, "note.md");
+        let args = |api: &Flavite| {
+            let revision = revision(api, buffer);
+            let operation = api.issue_editor_operation(buffer, revision, None).unwrap();
+            let mut args = json!({"buffer_id":buffer,"revision":revision,"operation":operation,"origin":{"view":format!("{:032x}",1),"incarnation":1},"selections":{"primary":0,"items":[[0,caret,caret]]},"undo_policy":"typing"});
+            if command == "editor.type" {
+                args["text"] = json!("Z");
+            }
+            args
+        };
+        assert!(
+            f.flavite
+                .command_registry()
+                .get_spec(command)
+                .unwrap()
+                .requires_write
+        );
+        let result = execute(&f.flavite, command, args(&f.flavite));
+        assert!(result.is_success(), "{command}: {result:?}");
+        assert_eq!(f.text(buffer), expected);
+        f.flavite.set_read_only(true);
+        let result = execute(&f.flavite, command, args(&f.flavite));
+        assert!(
+            matches!(result,ExecutionResult::Rejected(ref result) if result.reason==flavite_api::RejectionReason::ReadOnly)
+        );
+        assert_eq!(f.text(buffer), expected);
+    }
 }

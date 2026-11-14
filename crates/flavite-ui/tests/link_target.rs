@@ -153,11 +153,11 @@ fn self_target_and_stale_acknowledgement_are_honest_refusals() {
     assert!(matches!(app.linking.state(), GestureState::Inserted { .. }));
     let view = app.note_editor_view(tab).unwrap();
     let api = app.flavite.as_ref().unwrap();
-    assert!(api.execute(flavite_api::Invocation::new(
+    assert!(api.execute(editor_operations_fixture::admit(&api, flavite_api::Invocation::new(
         api.command_registry().next_request_id(), "apply_edits",
         serde_json::json!({"buffer_id":view.buffer_id,"revision":view.revision,"ops":[{"range":[0,0],"replacement":"prefix "}]}),
         flavite_api::Origin::Gui,
-    )).is_success());
+    ))).is_success());
     let _ = app.update(Message::Pump);
     assert!(
         app.valid_writing_target().is_none(),
@@ -249,3 +249,6 @@ fn picker_insert_places_one_link_at_the_acknowledged_caret() {
         "a changed caret while unfocused must not silently reauthorize"
     );
 }
+
+#[path = "../../flavite-api/tests/support/editor_operations.rs"]
+mod editor_operations_fixture;

@@ -39,6 +39,20 @@ pub struct EditorTarget {
 }
 
 impl EditorTarget {
+    pub(crate) fn issue_operation(
+        &self,
+        api: &flavite_api::Flavite,
+    ) -> Result<flavite_api::editor_commands::OperationArg, String> {
+        api.issue_editor_operation(
+            self.buffer,
+            self.revision,
+            Some(flavite_api::editor_commands::EditorViewArg {
+                view: format!("{:032x}", self.tab.raw()),
+                incarnation: self.incarnation,
+                selection_version: self.selection_version,
+            }),
+        )
+    }
     #[must_use]
     pub fn capture(app: &App, tab: TabId) -> Option<Self> {
         let view = app.note_editor_view(tab)?;
@@ -318,6 +332,9 @@ pub(crate) fn seal(app: &App, tab: TabId) {
 
 pub fn window_blurred(app: &mut App) {
     if let Some(session) = &app.context_mode.session {
+        if let Some(api) = &app.flavite {
+            api.cancel_editor_view_operations(session.tab.raw());
+        }
         seal(app, session.tab);
     }
     app.context_mode.capture = None;
@@ -328,23 +345,30 @@ pub fn menu_scroll_id(tab: TabId) -> iced::widget::Id {
     iced::widget::Id::from(format!("context-menu-{:032x}", tab.raw()))
 }
 
-pub(crate) fn focus(app: &App, tab: TabId) -> Task<Message> {
+pub(crate) fn focus(app: &mut App, tab: TabId) -> Task<Message> {
     let (Some(view), Some(bounds)) = (
         app.note_editor_view(tab),
         app.editor_bounds.get(&tab).copied(),
     ) else {
         return Task::none();
     };
-    iced::advanced::widget::operate(flavite_editor::focus_editor(
-        view.buffer_id,
-        view.revision,
-        Some(bounds),
-    ))
-    .map(|_| Message::Pump)
+    if let Some(session) = app.workspace.tab(&tab)
+        && !session.interaction().focused
+    {
+        let mut interaction = session.interaction().clone();
+        interaction.focused = true;
+        interaction.sequence = interaction.sequence.saturating_add(1);
+        let _ = app.acknowledge_editor_interaction(interaction, &view.text);
+    }
+    iced::advanced::widget::operate(iced::advanced::widget::operation::focusable::unfocus())
+        .chain(iced::advanced::widget::operate(
+            flavite_editor::focus_editor(view.buffer_id, view.revision, Some(bounds)),
+        ))
+        .map(|_| Message::Pump)
 }
 
 /// Restore native editor focus after dismissing one of its owned overlays.
-pub fn resume_focus(app: &App) -> Task<Message> {
+pub fn resume_focus(app: &mut App) -> Task<Message> {
     let Some(s) = &app.context_mode.session else {
         return Task::none();
     };
@@ -359,7 +383,8 @@ pub fn resume_focus(app: &App) -> Task<Message> {
     {
         return Task::none();
     }
-    focus(app, s.tab)
+    let tab = s.tab;
+    focus(app, tab)
 }
 
 /// Only ignored native keys reach this path; the editor captures its own keys.
@@ -431,6 +456,9 @@ fn exit(app: &mut App) {
     app.context_mode.history = Default::default();
     app.context_mode.capture = None;
     if let Some(session) = app.context_mode.session.take() {
+        if let Some(api) = &app.flavite {
+            api.cancel_editor_view_operations(session.tab.raw());
+        }
         seal(app, session.tab);
         if app.note_search.finds.contains_key(&session.tab) {
             let _ = super::note_search::handle(
@@ -691,13 +719,14 @@ pub fn native_key(
     }
     key.input.buffer = target.buffer;
     key.input.observed_revision = target.revision;
-    key.input.sequence = app
-        .workspace
-        .tab(&target.tab)
-        .unwrap()
-        .interaction()
-        .sequence
-        .saturating_add(1);
+    key.input.sequence = key.input.sequence.max(
+        app.workspace
+            .tab(&target.tab)
+            .unwrap()
+            .interaction()
+            .sequence
+            .saturating_add(1),
+    );
     super::input::handle(app, target.tab, target.incarnation, key.input)
 }
 
@@ -736,8 +765,7 @@ fn install_pairs(app: &mut App, target: &EditorTarget, pairs: &[(usize, usize)])
         return false;
     };
     if app
-        .workspace
-        .acknowledge_interaction(interaction, &view.text)
+        .acknowledge_editor_interaction(interaction, &view.text)
         .is_err()
     {
         app.input_chains.remove(&target.tab);
@@ -767,7 +795,7 @@ pub(crate) fn kernel_mutate(
     let issue = Invocation::new(
         api.command_registry().next_request_id(),
         "editor.issue_operation",
-        serde_json::json!({"buffer_id": target.buffer}),
+        serde_json::json!({"buffer_id": target.buffer,"revision":target.revision,"view":{"view":format!("{:032x}",target.tab.raw()),"incarnation":target.incarnation,"selection_version":target.selection_version}}),
         Origin::Gui,
     );
     let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = api.execute(issue)
@@ -863,11 +891,13 @@ pub(crate) fn install_receipt(
     .unwrap_or(flavite_buffer::history::HistoryMovement {
         selections: None,
         spans: Vec::new(),
+        step_ends: Vec::new(),
         truncated: false,
         primary: None,
     });
     let after_triples: Vec<[usize; 3]> =
-        serde_json::from_value(success.data["after_selections"].clone()).unwrap_or_default();
+        serde_json::from_value(success.data["after_selections"].clone())
+            .unwrap_or_else(|_| movement.selections.clone().unwrap_or_default());
     // Map passive views once (movement spans; clamp on truncation).
     super::input::apply_history_movement(
         app,
@@ -891,6 +921,27 @@ pub(crate) fn install_receipt(
             .collect();
         if !next_selections.is_empty() {
             interaction.selections = next_selections;
+        } else if let Some(view) = app.note_editor_view(target.tab) {
+            interaction.selections = if movement.truncated || !movement.valid_frames() {
+                interaction
+                    .selections
+                    .iter()
+                    .map(|selection| {
+                        flavite_workspace::CommittedSelection::new(
+                            flavite_editor::viewport::clamp_grapheme_boundary(
+                                &view.text,
+                                selection.anchor,
+                            ),
+                            flavite_editor::viewport::clamp_grapheme_boundary(
+                                &view.text,
+                                selection.head,
+                            ),
+                        )
+                    })
+                    .collect()
+            } else {
+                super::input::map_selections(&view.text, &interaction.selections, &movement)
+            };
         }
         if let Some(primary) = movement.primary
             && primary < interaction.selections.len()
@@ -909,8 +960,7 @@ pub(crate) fn install_receipt(
             return;
         };
         if app
-            .workspace
-            .acknowledge_interaction(interaction, &view.text)
+            .acknowledge_editor_interaction(interaction, &view.text)
             .is_err()
         {
             app.input_chains.remove(&target.tab);
@@ -1047,8 +1097,7 @@ pub(crate) fn selections_only(
         interaction.sequence += 1;
         let view = app.note_editor_view(target.tab)?;
         if app
-            .workspace
-            .acknowledge_interaction(interaction, &view.text)
+            .acknowledge_editor_interaction(interaction, &view.text)
             .is_err()
         {
             app.input_chains.remove(&target.tab);
@@ -1193,6 +1242,11 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
             if app.context_mode.mode(tab).active()
                 || (name == ContextCommand::Toggle.id() && super::reading::is_edit(app, tab))
             {
+                if name == "toolbar" && app.context_mode.bounds.get(&(tab, name)) != Some(&rect) {
+                    app.context_mode
+                        .bounds
+                        .retain(|(held_tab, _), _| *held_tab != tab);
+                }
                 app.context_mode.bounds.insert((tab, name), rect);
             }
             Task::none()
@@ -1344,10 +1398,12 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         return Task::none();
     }
     if command == Toggle {
-        app.dispatch_layout(|expected_revision| LayoutAction::ActivateTab {
-            expected_revision,
-            tab: target.tab,
-        });
+        if app.workspace.focused_tab() != target.tab {
+            app.dispatch_layout(|expected_revision| LayoutAction::ActivateTab {
+                expected_revision,
+                tab: target.tab,
+            });
+        }
         enter(app, target.clone());
         return focus(app, target.tab);
     }
@@ -1640,7 +1696,11 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
                 app.context_mode.notice("Nothing to copy on this last line");
                 return Task::none();
             }
-            super::editor_clipboard::write(copied)
+            super::editor_clipboard::write_for_context_copy(
+                target.clone(),
+                app.context_mode.generation(),
+                copied,
+            )
         }
         Cut => {
             // Clipboard ordering (§5.5): the fragments are resolved before

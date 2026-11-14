@@ -443,10 +443,17 @@ fn restore(app: &mut App, source: EditorTarget, target: HistoryTarget) -> Task<M
     let Some(api) = &app.flavite else {
         return Task::none();
     };
+    let operation = match source.issue_operation(api) {
+        Ok(operation) => operation,
+        Err(error) => {
+            app.context_mode.notice(error);
+            return Task::none();
+        }
+    };
     let result = api.execute(Invocation::new(
         api.command_registry().next_request_id(),
         "buffer.restore_state",
-        serde_json::json!({"buffer_id":source.buffer,"revision":source.revision,"target":target}),
+        serde_json::json!({"buffer_id":source.buffer,"revision":source.revision,"target":target,"operation":operation}),
         Origin::Gui,
     ));
     let ExecutionResult::Local(LocalResult::Success(success)) = result else {
@@ -518,9 +525,7 @@ fn restore(app: &mut App, source: EditorTarget, target: HistoryTarget) -> Task<M
             &movement,
             flavite_buffer::Affinity::Left,
         );
-        let _ = app
-            .workspace
-            .acknowledge_interaction(interaction, &view.text);
+        let _ = app.acknowledge_editor_interaction(interaction, &view.text);
     }
     app.workspace.invalidate_writing_target(source.buffer);
     app.linking.invalidate_if_source_changed(None);

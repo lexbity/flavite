@@ -132,6 +132,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             action,
         })
         .with_view_key(tab.raw(), incarnation)
+        .with_capture_sequence(app.notes.capture_sequence(tab).expect("attached view owns a capture sequence"))
         .with_type_metrics(app.appearance.metrics().editor_type())
         .with_max_line_width(app.appearance.metrics().editor_max_line_width())
         .with_colors(editor_colors)

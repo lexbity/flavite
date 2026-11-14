@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// What a native action on a semantic node routes to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeTarget {
+    VaultSearch(NodeId),
     EditorHistory {
         source: crate::host::context_mode::EditorTarget,
         action: crate::host::editor_history::HistoryAction,
@@ -25,6 +26,11 @@ pub enum NodeTarget {
         menu: flavite_edit_context::ContextMenu,
     },
     EditorContextExpand(crate::host::context_mode::EditorTarget),
+    BrowserEntry {
+        owner: crate::host::file_browser::Owner,
+        path: std::path::PathBuf,
+        directory: bool,
+    },
     ToggleSidebar,
     SidebarToTab,
     SidebarFilter,
@@ -155,10 +161,10 @@ fn split_node_id(split: flavite_workspace::SplitId) -> NodeId {
     node_id("split", split.raw())
 }
 
-fn note_node_id(path: &std::path::Path) -> NodeId {
+fn browser_node_id(owner: crate::host::file_browser::Owner, path: &std::path::Path) -> NodeId {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
+    ("vault-browser", owner, path).hash(&mut hasher);
     NodeId(hasher.finish())
 }
 
@@ -423,6 +429,9 @@ pub fn build_node_map(app: &App) -> BTreeMap<NodeId, NodeTarget> {
         }
         return map;
     }
+    for control in super::vault_search::controls(app) {
+        map.insert(control.id, NodeTarget::VaultSearch(control.id));
+    }
     if collapsed(app) {
         for group in app.workspace.group_order() {
             map.insert(
@@ -433,7 +442,7 @@ pub fn build_node_map(app: &App) -> BTreeMap<NodeId, NodeTarget> {
     }
     map.insert(node_id("quick-switch", 0), NodeTarget::OpenPicker);
     map.insert(node_id("sidebar-toggle", 0), NodeTarget::ToggleSidebar);
-    if app.sidebar_open() {
+    if app.sidebar_open() && !app.vault_search.sidebar {
         map.insert(node_id("sidebar-filter", 0), NodeTarget::SidebarFilter);
         map.insert(node_id("sidebar-detach", 0), NodeTarget::SidebarToTab);
     }
@@ -493,8 +502,15 @@ pub fn build_node_map(app: &App) -> BTreeMap<NodeId, NodeTarget> {
             );
         }
     }
-    for (path, id) in visible_catalog(app) {
-        map.insert(id, NodeTarget::OpenNote(path));
+    for (owner, item, id) in visible_browser(app) {
+        map.insert(
+            id,
+            NodeTarget::BrowserEntry {
+                owner,
+                path: item.entry.path,
+                directory: item.entry.directory,
+            },
+        );
     }
     for (tab, rows) in graph_rows(app) {
         for row in rows {
@@ -607,27 +623,45 @@ fn collapsed(app: &App) -> bool {
         )
 }
 
-fn visible_catalog(app: &App) -> Vec<(std::path::PathBuf, NodeId)> {
-    let notes_tab_visible = app.workspace.tabs().any(|(tab, v)| {
-        app.is_tab_visible(*tab) && matches!(v.kind(), flavite_workspace::ViewKind::Notes)
-    });
-    if !notes_tab_visible && app.sidebar_open() {
-        return app
-            .note_candidates()
-            .matches(&app.sidebar_filter)
-            .iter()
-            .take(500)
-            .map(|entry| (entry.entry.path.clone(), note_node_id(&entry.entry.path)))
-            .collect();
+fn visible_browser(
+    app: &App,
+) -> Vec<(
+    crate::host::file_browser::Owner,
+    crate::host::file_browser::TreeRow,
+    NodeId,
+)> {
+    let mut owners: Vec<_> = app
+        .workspace
+        .tabs()
+        .filter(|(tab, view)| {
+            app.is_tab_visible(**tab) && matches!(view.kind(), flavite_workspace::ViewKind::Notes)
+        })
+        .map(|(tab, _)| Some(*tab))
+        .collect();
+    if app.sidebar_open() && !app.vault_search.sidebar {
+        owners.push(None);
     }
-    if !notes_tab_visible {
-        return vec![];
+    let mut result = Vec::new();
+    for owner in owners {
+        let filter = owner.map_or(app.sidebar_filter.as_str(), |tab| app.notes_filter(tab));
+        let rows = app.file_browser.rows(owner, filter);
+        let row_height = 30.0 * app.appearance.metrics().scale;
+        let scroll = app
+            .file_browser
+            .views
+            .get(&owner)
+            .map_or(0.0, |view| view.scroll);
+        let start = ((scroll / row_height) as usize)
+            .saturating_sub(4)
+            .min(rows.len());
+        let end =
+            (start + (app.window_size().height / row_height).ceil() as usize + 12).min(rows.len());
+        result.extend(rows[start..end].iter().cloned().map(|row| {
+            let id = browser_node_id(owner, &row.entry.path);
+            (owner, row, id)
+        }));
     }
-    app.catalog()
-        .iter()
-        .take(500)
-        .map(|e| (e.path.clone(), note_node_id(&e.path)))
-        .collect()
+    result
 }
 
 #[must_use]
@@ -702,7 +736,7 @@ pub fn position_byte(
     None
 }
 
-fn semantic_bounds(rect: iced::Rectangle) -> Rect {
+pub(super) fn semantic_bounds(rect: iced::Rectangle) -> Rect {
     Rect {
         x0: f64::from(rect.x),
         y0: f64::from(rect.y),
@@ -841,7 +875,7 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
             nodes.push((id, button));
             window_children.push(id);
         }
-        if app.sidebar_open() {
+        if app.sidebar_open() && !app.vault_search.sidebar {
             let id = node_id("sidebar-filter", 0);
             let mut filter = Node::new(Role::TextInput);
             filter.set_label("Filter notes");
@@ -975,6 +1009,10 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
         {
             focus = node_id("find-query", app.workspace.focused_tab().raw());
         }
+        for control in super::vault_search::controls(app) {
+            window_children.push(control.id);
+            nodes.push((control.id, control.node));
+        }
         let reading = super::reading::project(app);
         nodes.extend(reading.nodes);
         window_children.extend(reading.roots);
@@ -993,11 +1031,57 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
             nodes.push((id, node));
             window_children.push(id);
         }
-        for (path, id) in visible_catalog(app) {
-            let mut node = Node::new(Role::ListItem);
-            node.set_label(path.display().to_string());
+        let browser_rows = visible_browser(app);
+        let mut browser_roots: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        let mut browser_nodes = BTreeMap::new();
+        for (owner, item, id) in &browser_rows {
+            let mut node = Node::new(Role::TreeItem);
+            node.set_label(
+                item.entry
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            node.set_level(item.depth + 1);
+            node.set_selected(
+                app.file_browser
+                    .views
+                    .get(owner)
+                    .is_some_and(|view| view.selected.as_ref() == Some(&item.entry.path)),
+            );
+            if item.entry.directory {
+                node.set_expanded(item.expanded);
+                node.add_action(Action::Expand);
+                node.add_action(Action::Collapse);
+            }
             node.add_action(Action::Click);
-            nodes.push((id, node));
+            node.add_action(Action::Focus);
+            browser_nodes.insert(*id, node);
+        }
+        for (owner, item, id) in &browser_rows {
+            let parent = item
+                .entry
+                .path
+                .parent()
+                .map(|path| browser_node_id(*owner, path));
+            if let Some(parent) = parent.and_then(|parent| browser_nodes.get_mut(&parent)) {
+                parent.push_child(*id);
+            } else {
+                browser_roots.entry(*owner).or_default().push(*id);
+            }
+        }
+        nodes.extend(browser_nodes);
+        for (owner, children) in browser_roots {
+            let id = node_id(
+                "vault-file-tree",
+                owner.map_or(0, flavite_workspace::TabId::raw),
+            );
+            let mut tree = Node::new(Role::Tree);
+            tree.set_label("Vault files");
+            tree.set_children(children);
+            nodes.push((id, tree));
             window_children.push(id);
         }
         let can_insert = app.valid_writing_target().is_some();

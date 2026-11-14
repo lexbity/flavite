@@ -1536,6 +1536,7 @@ dependencies = [
 name = "flavite-edit-context"
 version = "0.1.0"
 dependencies = [
+ "flavite-buffer",
  "flavite-syntax",
  "unicode-segmentation",
 ]

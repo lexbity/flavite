@@ -83,7 +83,10 @@ fn next_id(flavite: &Flavite) -> u64 {
 }
 
 fn command(flavite: &Flavite, id: &'static str, args: serde_json::Value) -> ExecutionResult {
-    flavite.execute(Invocation::new(next_id(flavite), id, args, Origin::Gui))
+    flavite.execute(editor_operations_fixture::admit(
+        &flavite,
+        Invocation::new(next_id(flavite), id, args, Origin::Gui),
+    ))
 }
 
 /// Pump until the admitted operation reaches a terminal result.
@@ -338,3 +341,6 @@ fn buffer_view_exposes_utf16le_bom_descriptor() {
     );
     assert_eq!(buffer_view.text, "u16 view\n");
 }
+
+#[path = "support/editor_operations.rs"]
+mod editor_operations_fixture;

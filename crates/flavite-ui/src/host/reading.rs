@@ -764,7 +764,7 @@ fn anchor_byte(doc: &ReadSnapshot, anchor: &str) -> Option<usize> {
         .find(|h| h.title.eq_ignore_ascii_case(anchor))
         .map(|h| h.byte)
 }
-fn spawn_os(target: &std::ffi::OsStr) -> Result<(), String> {
+pub(crate) fn spawn_os(target: &std::ffi::OsStr) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     let result = std::process::Command::new("xdg-open").arg(target).spawn();
     #[cfg(target_os = "macos")]

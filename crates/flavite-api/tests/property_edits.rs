@@ -4,11 +4,9 @@ mod support;
 use flavite_api::{ExecutionResult, Invocation, Origin, Preconditions};
 use support::*;
 fn edit(f: &Fixture, command: &'static str, args: serde_json::Value) -> ExecutionResult {
-    let result = f.flavite.execute(Invocation::new(
-        next_id(&f.flavite),
-        command,
-        args,
-        Origin::Gui,
+    let result = f.flavite.execute(editor_operations_fixture::admit(
+        &f.flavite,
+        Invocation::new(next_id(&f.flavite), command, args, Origin::Gui),
     ));
     match result {
         ExecutionResult::Pending { request_id } => f.flavite.wait_for_operation(request_id),
@@ -31,11 +29,14 @@ fn guarded_property_patch_preserves_crlf_bom_comments_quotes_and_standalone_undo
         f.text(id)
             .contains("title: 'New''s 雪'  # inline\ncount: 3\n")
     );
-    let saved = f.flavite.execute(Invocation::new(
-        next_id(&f.flavite),
-        "note.save",
-        serde_json::json!(f.root.join("a.md")),
-        Origin::Gui,
+    let saved = f.flavite.execute(editor_operations_fixture::admit(
+        &f.flavite,
+        Invocation::new(
+            next_id(&f.flavite),
+            "note.save",
+            serde_json::json!(f.root.join("a.md")),
+            Origin::Gui,
+        ),
     ));
     let ExecutionResult::Pending { request_id } = saved else {
         panic!("save not admitted")
@@ -97,20 +98,26 @@ fn invalid_yaml_stale_task_read_only_and_forged_source_never_mutate() {
     assert_eq!(f.text(id), current);
     let revision = f.flavite.get_buffer_view(id.into(), None).unwrap().revision;
     let args = serde_json::json!({"buffer_id":id,"revision":revision,"start":start,"checked":true});
-    let denied = f.flavite.execute(Invocation::new(
-        next_id(&f.flavite),
-        "task.toggle",
-        args.clone(),
-        Origin::Plugin,
+    let denied = f.flavite.execute(editor_operations_fixture::admit(
+        &f.flavite,
+        Invocation::new(
+            next_id(&f.flavite),
+            "task.toggle",
+            args.clone(),
+            Origin::Plugin,
+        ),
     ));
     assert!(!denied.is_success());
     f.flavite.set_read_only(true);
-    let bypass = f.flavite.execute(Invocation::with_preconditions(
-        next_id(&f.flavite),
-        "task.toggle",
-        args,
-        Origin::Gui,
-        Preconditions::default(),
+    let bypass = f.flavite.execute(editor_operations_fixture::admit(
+        &f.flavite,
+        Invocation::with_preconditions(
+            next_id(&f.flavite),
+            "task.toggle",
+            args,
+            Origin::Gui,
+            Preconditions::default(),
+        ),
     ));
     assert!(!bypass.is_success());
     assert_eq!(f.text(id), current);
@@ -139,9 +146,9 @@ fn link_and_structure_completions_keep_distinct_public_request_identities() {
     let (buffer, revision) = f.open_note("a.md");
     let link_request = 2;
     let property_request = 10_000;
-    let link = f.flavite.execute(Invocation::new(link_request,"link.prepare",serde_json::json!({"intent":{"client":f.client,"sequence":1},"source":{"buffer_id":buffer,"revision":revision,"caret":f.text(buffer).len()},"target_path":"b.md","expected_target":f.flavite.link_target_identity("b.md").unwrap(),"stable_link_policy":"disabled"}),Origin::Gui));
+    let link = f.flavite.execute(editor_operations_fixture::admit(&f.flavite, Invocation::new(link_request,"link.prepare",serde_json::json!({"intent":{"client":f.client,"sequence":1},"source":{"buffer_id":buffer,"revision":revision,"caret":f.text(buffer).len()},"target_path":"b.md","expected_target":f.flavite.link_target_identity("b.md").unwrap(),"stable_link_policy":"disabled"}),Origin::Gui)));
     assert!(link.is_pending(), "{link:?}");
-    let property = f.flavite.execute(Invocation::new(property_request,"property.set",serde_json::json!({"buffer_id":buffer,"revision":revision,"key":"count","value":{"type":"number","value":"2"}}),Origin::Gui));
+    let property = f.flavite.execute(editor_operations_fixture::admit(&f.flavite, Invocation::new(property_request,"property.set",serde_json::json!({"buffer_id":buffer,"revision":revision,"key":"count","value":{"type":"number","value":"2"}}),Origin::Gui)));
     assert!(property.is_pending(), "{property:?}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut outcomes = std::collections::BTreeMap::new();
@@ -160,3 +167,6 @@ fn link_and_structure_completions_keep_distinct_public_request_identities() {
     );
     assert!(f.text(buffer).contains("count: 2"));
 }
+
+#[path = "support/editor_operations.rs"]
+mod editor_operations_fixture;

@@ -17,14 +17,14 @@ use iced::{Element, Length};
 /// Input widget id prefix for semantic tests.
 pub const SEARCH_INPUT_ID_PREFIX: &str = "search-input-";
 
-fn input_id(tab: TabId) -> iced::widget::Id {
+pub(crate) fn input_id(tab: TabId) -> iced::widget::Id {
     iced::widget::Id::from(format!("{SEARCH_INPUT_ID_PREFIX}{}", tab.raw()))
 }
 
 /// Render the Search view for one tab. The input renders even before the
 /// first edit so the view is immediately usable after opening.
 #[allow(clippy::too_many_lines)]
-pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
+pub(crate) fn content(app: &App, tab: TabId) -> Element<'_, Message> {
     let metrics = app.appearance.metrics();
     let state = app.search.view_state(tab);
     let query = state.query.clone();

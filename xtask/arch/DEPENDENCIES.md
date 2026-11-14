@@ -85,6 +85,7 @@ Normal/build:
 
 Normal/build:
 
+- `flavite-buffer` (normal)
 - `flavite-syntax` (normal)
 
 ### `flavite-editor`

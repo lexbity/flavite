@@ -234,7 +234,10 @@ fn open_via_api(flavite: &Flavite, path: &Path, policy: Option<&str>) -> Executi
         args["policy"] = serde_json::json!(policy);
     }
     let request_id = flavite.command_registry().next_request_id();
-    flavite.execute(Invocation::new(request_id, "note.open", args, Origin::Gui))
+    flavite.execute(editor_operations_fixture::admit(
+        &flavite,
+        Invocation::new(request_id, "note.open", args, Origin::Gui),
+    ))
 }
 
 /// Pump completions until `wanted` terminal results arrive or the deadline
@@ -306,18 +309,21 @@ fn same_path_opens_coalesce_into_one_buffer_with_per_caller_results() {
     let view = flavite
         .get_buffer_view(flavite_buffer::BufferId::from(buffer_a), None)
         .expect("buffer view");
-    let edit = flavite.execute(Invocation::with_preconditions(
-        edit_request,
-        "apply_edits",
-        serde_json::json!({
-            "buffer_id": buffer_a,
-            "revision": view.revision,
-            "ops": [{ "range": [6, 6], "replacement": " edited" }],
-        }),
-        Origin::Gui,
-        flavite_api::Preconditions::new()
-            .with_buffer_id(buffer_a)
-            .with_revision(view.revision),
+    let edit = flavite.execute(editor_operations_fixture::admit(
+        &flavite,
+        Invocation::with_preconditions(
+            edit_request,
+            "apply_edits",
+            serde_json::json!({
+                "buffer_id": buffer_a,
+                "revision": view.revision,
+                "ops": [{ "range": [6, 6], "replacement": " edited" }],
+            }),
+            Origin::Gui,
+            flavite_api::Preconditions::new()
+                .with_buffer_id(buffer_a)
+                .with_revision(view.revision),
+        ),
     ));
     assert!(
         edit.is_success(),
@@ -520,3 +526,6 @@ fn multi_chunk_note_opens_with_its_full_text() {
         .expect("buffer view");
     assert_eq!(view.text, text, "the shared view carries the full text");
 }
+
+#[path = "support/editor_operations.rs"]
+mod editor_operations_fixture;

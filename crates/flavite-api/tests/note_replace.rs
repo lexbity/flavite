@@ -17,16 +17,19 @@ fn prepare(
     _scope: Option<(usize, usize)>,
 ) -> ExecutionResult {
     let request_id = flavite.command_registry().next_request_id();
-    let result = flavite.execute(Invocation::new(
-        request_id,
-        "text.prepare_replace",
-        serde_json::json!({
-            "buffer_id": buffer_id,
-            "revision": revision,
-            "query": query,
-            "replacement": replacement,
-        }),
-        Origin::Gui,
+    let result = flavite.execute(editor_operations_fixture::admit(
+        &flavite,
+        Invocation::new(
+            request_id,
+            "text.prepare_replace",
+            serde_json::json!({
+                "buffer_id": buffer_id,
+                "revision": revision,
+                "query": query,
+                "replacement": replacement,
+            }),
+            Origin::Gui,
+        ),
     ));
     match result {
         ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
@@ -54,15 +57,18 @@ fn prepared_plan(result: &ExecutionResult) -> (String, u64) {
 
 fn apply(flavite: &Flavite, buffer_id: u64, revision: u64, plan_id: &str) -> ExecutionResult {
     let request_id = flavite.command_registry().next_request_id();
-    let result = flavite.execute(Invocation::new(
-        request_id,
-        "text.apply_replace",
-        serde_json::json!({
-            "buffer_id": buffer_id,
-            "revision": revision,
-            "plan_id": plan_id,
-        }),
-        Origin::Gui,
+    let result = flavite.execute(editor_operations_fixture::admit(
+        &flavite,
+        Invocation::new(
+            request_id,
+            "text.apply_replace",
+            serde_json::json!({
+                "buffer_id": buffer_id,
+                "revision": revision,
+                "plan_id": plan_id,
+            }),
+            Origin::Gui,
+        ),
     ));
     match result {
         ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
@@ -136,16 +142,19 @@ fn stale_revision_across_the_worker_barrier_has_zero_effect() {
     ));
     // Change the revision while the plan exists (the worker barrier ran).
     let request_id = flavite.command_registry().next_request_id();
-    let _ = flavite.execute(Invocation::new(
-        request_id,
-        "apply_edits",
-        serde_json::json!({
-            "buffer_id": buffer_id,
-            "revision": revision,
-            "ops": [{"range": [0, 0], "replacement": "prefix "}],
-            "undo_policy": "typing",
-        }),
-        Origin::Gui,
+    let _ = flavite.execute(editor_operations_fixture::admit(
+        &flavite,
+        Invocation::new(
+            request_id,
+            "apply_edits",
+            serde_json::json!({
+                "buffer_id": buffer_id,
+                "revision": revision,
+                "ops": [{"range": [0, 0], "replacement": "prefix "}],
+                "undo_policy": "typing",
+            }),
+            Origin::Gui,
+        ),
     ));
     let applied = apply(flavite, buffer_id, revision, &plan_id);
     let ExecutionResult::Rejected(rejected) = applied else {
@@ -203,17 +212,20 @@ fn empty_query_is_idle_and_invalid_scopes_are_refused_with_zero_effect() {
     );
     // Out-of-bounds scope: typed refusal, zero effects.
     let request_id = flavite.command_registry().next_request_id();
-    let result = flavite.execute(Invocation::new(
-        request_id,
-        "text.prepare_replace",
-        serde_json::json!({
-            "buffer_id": buffer_id,
-            "revision": revision,
-            "query": "abc",
-            "replacement": "X",
-            "scope": [0, 9999],
-        }),
-        Origin::Gui,
+    let result = flavite.execute(editor_operations_fixture::admit(
+        &flavite,
+        Invocation::new(
+            request_id,
+            "text.prepare_replace",
+            serde_json::json!({
+                "buffer_id": buffer_id,
+                "revision": revision,
+                "query": "abc",
+                "replacement": "X",
+                "scope": [0, 9999],
+            }),
+            Origin::Gui,
+        ),
     ));
     let result = match result {
         ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
@@ -223,3 +235,6 @@ fn empty_query_is_idle_and_invalid_scopes_are_refused_with_zero_effect() {
     let (text, _) = view(flavite, buffer_id);
     assert_eq!(text, "abc\n", "zero note effects");
 }
+
+#[path = "support/editor_operations.rs"]
+mod editor_operations_fixture;

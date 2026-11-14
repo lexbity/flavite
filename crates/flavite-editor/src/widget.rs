@@ -188,6 +188,7 @@ pub struct EditorWidget<'a, Message> {
     on_interaction: Option<Box<dyn Fn(EditorInteractionSnapshot) -> Message + 'a>>,
     initial_interaction: Option<EditorInteractionSnapshot>,
     view_key: Option<(u128, u64)>,
+    capture_sequence: Option<Arc<std::sync::atomic::AtomicU64>>,
     input_enabled: bool,
     keyboard_enabled: bool,
     on_input_intent: Option<Box<dyn Fn(crate::input::CapturedInput) -> Message + 'a>>,
@@ -229,6 +230,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
             on_interaction: None,
             initial_interaction: None,
             view_key: None,
+            capture_sequence: None,
             input_enabled: true,
             keyboard_enabled: true,
             on_input_intent: None,
@@ -239,6 +241,32 @@ impl<'a, Message> EditorWidget<'a, Message> {
             colors: EditorColors::default(),
             _message: PhantomData,
         }
+    }
+
+    /// Use the lease-owned sequence across remounted widgets of this view.
+    #[must_use]
+    pub fn with_capture_sequence(mut self, sequence: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.capture_sequence = Some(sequence);
+        self
+    }
+
+    fn advance_capture(&self, state: &mut EditorState) {
+        let floor = state
+            .interaction_sequence
+            .max(self.initial_interaction.as_ref().map_or(0, |s| s.sequence));
+        state.interaction_sequence = self.capture_sequence.as_ref().map_or_else(
+            || floor.saturating_add(1),
+            |sequence| {
+                use std::sync::atomic::Ordering;
+                sequence
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                        Some(old.max(floor).saturating_add(1))
+                    })
+                    .unwrap()
+                    .max(floor)
+                    .saturating_add(1)
+            },
+        );
     }
 
     /// Set the semantic chrome colors from the host's active scheme (W11).
@@ -285,7 +313,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
         shell: &mut Shell<'_, Message>,
     ) {
         if let Some(callback) = &self.on_context {
-            state.interaction_sequence = state.interaction_sequence.saturating_add(1);
+            self.advance_capture(state);
             shell.publish(callback(crate::context::ContextRequest {
                 buffer: self.view.buffer_id,
                 revision: self.view.revision,
@@ -1532,16 +1560,29 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             let runs = local_buffer.layout_runs().collect::<Vec<_>>();
             (hoisted_visible.as_str(), start, runs)
         };
-        // Viewport-window painting of every member (FEUX-0002 X04, FR-13):
-        // members whose range lies outside the visible source window cost
-        // nothing, so paint scales with the viewport, not with N.
-        let visible_end = source_start + visible_text.len();
-        let visible_members: Vec<_> = state
-            .selections
-            .members()
+        // Bound selection work by the physical rows being painted, even
+        // when one logical line wraps far below the viewport.
+        let paint_height = (bounds.height - PAD_Y * 2.0).max(0.0);
+        let runs: Vec<_> = runs
             .into_iter()
-            .filter(|member| member.start() < visible_end && member.end() > source_start)
+            .filter(|run| {
+                run.line_top < paint_height && run.line_top + self.type_metrics.line_height > 0.0
+            })
             .collect();
+        let visible_end = source_start
+            + runs
+                .iter()
+                .map(|run| {
+                    let start = line_start_byte(visible_text, run.line_i);
+                    let end = run.glyphs.iter().map(|glyph| glyph.end).max().unwrap_or(0);
+                    start + end
+                })
+                .max()
+                .unwrap_or(0);
+        let paint_text = &visible_text[..visible_end
+            .saturating_sub(source_start)
+            .min(visible_text.len())];
+        let visible_members = paint_members(state.selections.members(), source_start, visible_end);
         // OFF-state muted fill (FEUX-0002 FR-13): a surviving multi-member
         // set renders with the muted channel while Context Mode is off; the
         // standing count in the note chrome is the non-color redundancy.
@@ -1556,9 +1597,10 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 for glyph in run.glyphs {
                     let glyph_start = line_start + glyph.start;
                     let glyph_end = line_start + glyph.end;
-                    let hit = visible_members
-                        .iter()
-                        .any(|member| glyph_end > member.start() && glyph_start < member.end());
+                    let at = visible_members.partition_point(|member| member.end() <= glyph_start);
+                    let hit = visible_members.get(at).is_some_and(|member| {
+                        glyph_end > member.start() && glyph_start < member.end()
+                    });
                     if hit {
                         renderer.fill_quad(
                             renderer::Quad {
@@ -1584,22 +1626,14 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         {
             // The implicit-effect outline generalizes to every member before
             // a destructive invocation (FEUX-0002 X04, E-6).
-            for member in state.selections.members() {
-                let Some(effect) = flavite_edit_context::effect::plan(
-                    &self.view.text,
-                    (member.anchor(), member.head()),
-                    command,
-                )
-                .filter(|effect| effect.implicit && !effect.range.is_empty()) else {
-                    continue;
-                };
-                for rect in command_preview_rects(
-                    visible_text,
-                    source_start,
-                    &runs,
-                    effect.range,
-                    self.type_metrics,
-                ) {
+            for range in flavite_edit_context::effect::implicit_ranges(
+                &self.view.text,
+                visible_members,
+                command,
+            ) {
+                for rect in
+                    command_preview_rects(paint_text, source_start, &runs, range, self.type_metrics)
+                {
                     let rect = Rectangle::new(
                         Point::new(bounds.x + PAD_X + rect.x, bounds.y + PAD_Y + rect.y),
                         rect.size(),
@@ -1625,7 +1659,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             // Match-selection draft overlay (FEUX-0002 X06/E-11): outline-
             // only, viewport-bounded, never a committed representation.
             for rect in
-                match_preview_rects(visible_text, source_start, &runs, spans, self.type_metrics)
+                match_preview_rects(paint_text, source_start, &runs, spans, self.type_metrics)
             {
                 let rect = Rectangle::new(
                     Point::new(bounds.x + PAD_X + rect.x, bounds.y + PAD_Y + rect.y),
@@ -1775,7 +1809,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         if let Some(composition) = &state.composition
             && !composition.preedit.is_empty()
             && composition.start >= source_start
-            && composition.start <= source_start + visible_text.len()
+            && composition.start <= visible_end
         {
             let local_start = composition.start - source_start;
             let (x, y) = caret_position(&runs, visible_text, local_start);
@@ -1904,9 +1938,8 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             // delivered Command 4 px rule (X04: primary thick, others
             // standard). Only heads inside the visible window paint.
             let primary = state.selections.primary_id();
-            for member in state.selections.members() {
-                if member.head() < source_start || member.head() > source_start + visible_text.len()
-                {
+            for member in visible_members {
+                if member.head() < source_start || member.head() > visible_end {
                     continue;
                 }
                 let local_caret = member.head().saturating_sub(source_start);
@@ -1938,7 +1971,6 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
     }
 
     fn state(&self) -> iced::advanced::widget::tree::State {
-        eprintln!("[diag] FRESH EditorState created");
         let mut state = EditorState::default();
         self.synchronize(&mut state);
         iced::advanced::widget::tree::State::new(state)
@@ -2106,7 +2138,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 // The produced text only; clipboard reads happen at the host
                 // clipboard seam (FEUX-0002 X04, T-10).
                 let committed = text.clone().unwrap_or_default().to_string();
-                state.interaction_sequence = state.interaction_sequence.saturating_add(1);
+                self.advance_capture(state);
                 state.controlled_pending = true;
                 let input = crate::input::CapturedInput {
                     buffer: self.view.buffer_id,
@@ -2154,7 +2186,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     && self.on_context.is_some()
                 {
                     state.composition = None;
-                    state.interaction_sequence = state.interaction_sequence.saturating_add(1);
+                    self.advance_capture(state);
                     state.controlled_pending = true;
                     self.emit_context_commit(state, text, shell);
                     return;
@@ -2417,7 +2449,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 || state.interaction_snapshot(Some(&self.view.text)) != before_interaction)
             && publish_due
             && let Some(snapshot) = {
-                state.interaction_sequence = state.interaction_sequence.saturating_add(1);
+                self.advance_capture(state);
                 state.interaction_snapshot(Some(&self.view.text))
             }
         {
@@ -2715,6 +2747,19 @@ fn match_preview_rects(
     result
 }
 
+/// The canonical intervals have monotonically ordered starts and ends.
+/// Two binary searches select the paint window without cloning or scanning
+/// offscreen members. Boundary carets are included for caret painting.
+fn paint_members(
+    members: &[flavite_buffer::selection::Selection],
+    start: usize,
+    end: usize,
+) -> &[flavite_buffer::selection::Selection] {
+    let first = members.partition_point(|member| member.end() < start);
+    let last = members.partition_point(|member| member.start() <= end);
+    &members[first..last]
+}
+
 pub(crate) fn caret_position(
     runs: &[cosmic_text::LayoutRun<'_>],
     text: &str,
@@ -2804,6 +2849,50 @@ mod tests {
             rects.iter().any(|rect| rect.y > 0.0),
             "a wrapped line's outline follows its actual rows"
         );
+    }
+
+    #[test]
+    fn paint_window_borrows_only_visible_members_at_every_cardinality() {
+        let source = "abcdefghi\n".repeat(10_000);
+        let metrics = TypeMetrics::default();
+        let visible = &source[..49];
+        let shaped = shape_text(visible, 300.0, metrics);
+        let runs = shaped.layout_runs().collect::<Vec<_>>();
+        let mut observed = None;
+        for count in [100, 1_000, 10_000] {
+            let raw = (0..count)
+                .map(|index| flavite_buffer::selection::RawSelection {
+                    id: Some(index as u32),
+                    anchor: index * 10,
+                    head: index * 10,
+                })
+                .collect();
+            let (set, _) =
+                flavite_buffer::selection::SelectionSet::normalize(&source, raw, Some(0)).unwrap();
+            let members = paint_members(set.members(), 0, 49);
+            assert_eq!(members.len(), 5);
+            assert!(
+                std::ptr::eq(members.as_ptr(), set.members().as_ptr()),
+                "paint borrows rather than clones the set"
+            );
+            let ranges = flavite_edit_context::effect::implicit_ranges(
+                &source,
+                members,
+                flavite_edit_context::ContextCommand::Cut,
+            );
+            let primitives: usize = ranges
+                .into_iter()
+                .map(|range| command_preview_rects(visible, 0, &runs, range, metrics).len())
+                .sum();
+            assert!(primitives > 0);
+            if let Some(previous) = observed {
+                assert_eq!(
+                    primitives, previous,
+                    "offscreen selections add no primitives"
+                );
+            }
+            observed = Some(primitives);
+        }
     }
 
     #[test]

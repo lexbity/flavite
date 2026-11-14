@@ -209,7 +209,12 @@ fn workspace_with_navigation(app: &App) -> Element<'_, Message> {
     let navigator = column![
         container(
             row![
-                text("Notes").size(metrics.text),
+                text(if app.vault_search.sidebar {
+                    "Vault search"
+                } else {
+                    "Files"
+                })
+                .size(metrics.text),
                 Space::new().width(Length::Fill),
                 chrome::icon_button(
                     metrics,
@@ -221,7 +226,7 @@ fn workspace_with_navigation(app: &App) -> Element<'_, Message> {
                     chrome::icon_button(
                         metrics,
                         Icon::SplitRight,
-                        "Open notes as a tab",
+                        "Open file browser as a tab",
                         Some(Message::SidebarToTab)
                     ),
                     |rect| Message::SidebarControlBounds("detach".into(), rect)
@@ -238,7 +243,24 @@ fn workspace_with_navigation(app: &App) -> Element<'_, Message> {
         .height(metrics.tab_height)
         .padding([0, 8]),
         rule::horizontal(1),
-        crate::views::notes::sidebar(app),
+        row![
+            button(text("Files").size(metrics.text_sm))
+                .style(style::list_row(!app.vault_search.sidebar))
+                .on_press(Message::VaultSearch(
+                    crate::host::vault_search::VaultSearchMessage::Sidebar(false)
+                )),
+            button(text("Search").size(metrics.text_sm))
+                .style(style::list_row(app.vault_search.sidebar))
+                .on_press(Message::VaultSearch(
+                    crate::host::vault_search::VaultSearchMessage::Sidebar(true)
+                )),
+        ]
+        .spacing(4),
+        if app.vault_search.sidebar {
+            crate::views::vault_search::view(app, crate::host::vault_search::SIDEBAR_SEARCH)
+        } else {
+            crate::views::notes::sidebar(app)
+        },
     ]
     .width(app.sidebar_width())
     .height(Length::Fill);
@@ -551,8 +573,7 @@ fn active_view(app: &App, tab: TabId) -> Element<'_, Message> {
     match session.kind() {
         ViewKind::Empty => new_tab(app),
         ViewKind::Notes => crate::views::notes::view(app, tab),
-        ViewKind::Search => crate::views::search::view(app, tab),
-        ViewKind::Replace => crate::views::replace::view(app, tab),
+        ViewKind::Search | ViewKind::Replace => crate::views::vault_search::view(app, tab),
         ViewKind::Settings => crate::views::settings::view(app, tab),
         ViewKind::History(locator) => crate::views::history::view(app, tab, locator),
         ViewKind::Note(note) => crate::views::note::view(app, tab, note.load(), note.locator()),

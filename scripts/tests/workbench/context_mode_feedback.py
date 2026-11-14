@@ -56,7 +56,7 @@ def main():
     common.key("ctrl+Home")
     common.key("ctrl+space")
     common.key("i")
-    value = wait(lambda s: mode(s).get("state") == "TYPING" and note(s)["selection"] == [0, 0], "typing baseline")
+    value = wait(lambda s: mode(s).get("state") == "TYPING" and note(s)["selections"][note(s).get("primary", 0)] == [0, 0], "typing baseline")
     painted(window, harness, output, "TYPING")
     original = value["focused_text"]
     revision = note(value)["revision"]
@@ -69,12 +69,12 @@ def main():
     # Exclude the caret at x+12..16. Only an actual drawn border around '#'
     # can change these pixels; a harness range by itself cannot pass this.
     assert changed_pixels(baseline, character, value, (x+17, y+8, 10, 26)) >= 12
-    assert note(value)["selection"] == [0, 0]
+    assert note(value)["selections"][note(value).get("primary", 0)] == [0, 0]
     assert note(value)["revision"] == revision
     wide = ["editor.context_exit", "state", "editor.cut", "editor.copy", "editor.paste",
             "buffer.undo", "buffer.redo", "workspace.command_palette", "Select", "Go", "Type",
             "workspace.find", "editor.history", "More"]
-    value = wait(lambda s: all(name in mode(s).get("bounds", {}) for name in wide), "all wide controls observed")
+    value = wait(lambda s: all(name in mode(s).get("bounds", {}) for name in wide) and mode(s)["bounds"]["buffer.undo"][0] > mode(s)["bounds"]["editor.paste"][0], "all wide controls mounted at current geometry")
     geometry(value, wide)
 
     copy_rect = mode(value)["bounds"]["editor.copy"]
@@ -85,7 +85,7 @@ def main():
     value = painted(window, harness, output, "Copy outlined line")
     line = common.capture(window, output, "03-line-outline.png", checks)
     assert changed_pixels(character, line, value, (x+28, y+8, 85, 26)) >= 30
-    assert note(value)["selection"] == [0, 0] and note(value)["revision"] == revision
+    assert note(value)["selections"][note(value).get("primary", 0)] == [0, 0] and note(value)["revision"] == revision
     assert value["focused_text"] == original
 
     # Copy's effective range never becomes a committed selection. Pasting at
@@ -93,13 +93,13 @@ def main():
     common.key("i")
     value = wait(lambda s: mode(s).get("state") == "TYPING", "typing retained for toolbar Copy")
     common.click_rect(window, harness, mode(value)["bounds"]["editor.copy"])
-    value = wait(lambda s: s.get("status") == "Copied selection" or mode(s).get("message") == "Copy", "Copy completed")
-    assert note(value)["selection"] == [0, 0] and note(value)["revision"] == revision
+    value = wait(lambda s: s.get("status") == "Copied selection" and note(s).get("interaction_focused"), "Copy completed and restored editor focus")
+    assert note(value)["selections"][note(value).get("primary", 0)] == [0, 0] and note(value)["revision"] == revision
     assert mode(value)["state"] == "TYPING"
     common.key("ctrl+v")
     wait(lambda s: s.get("focused_text") == first_line+original, "real clipboard line pasted at preserved caret")
     common.key("ctrl+z")
-    wait(lambda s: s.get("focused_text") == original and note(s)["selection"] == [0, 0], "paste undo restores caret")
+    wait(lambda s: s.get("focused_text") == original and note(s)["selections"][note(s).get("primary", 0)] == [0, 0], "paste undo restores caret")
     common.key("Escape")
     common.key("End")
     common.key("d")
@@ -110,7 +110,7 @@ def main():
     wait(lambda s: s.get("focused_text") == original[len(first_line):], "Cut uses the displayed line rule")
     common.key("u")
     value = wait(lambda s: s.get("focused_text") == original, "cut undo")
-    assert note(value)["selection"] == [len(first_line)-1, len(first_line)-1]
+    assert note(value)["selections"][note(value).get("primary", 0)] == [len(first_line)-1, len(first_line)-1]
 
     common.palette(harness, "editor.history")
     value = wait(lambda s: mode(s).get("history", {}).get("open"), "editing history opened")

@@ -16,7 +16,7 @@ use support::{SeedNote, ui_fixture};
 
 use std::time::Instant;
 
-fn seed() -> Vec<SeedNote> {
+fn seed() -> Vec<SeedNote<'static>> {
     vec![SeedNote {
         components: &["settings.md"],
         body: "# Settings\n\nUnchanged body.\n",
@@ -245,7 +245,7 @@ use flavite_ui::host::appearance::AppearanceHost;
 use flavite_ui::style::Scheme;
 use support::reopen_facade;
 
-fn seed_for_reopen() -> Vec<SeedNote> {
+fn seed_for_reopen() -> Vec<SeedNote<'static>> {
     vec![SeedNote {
         components: &["reopen.md"],
         body: "# Reopen\n\nbody\n",

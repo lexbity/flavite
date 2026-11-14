@@ -89,6 +89,73 @@ pub struct PreparedEdit {
     pub fragments: Vec<String>,
 }
 
+/// IME text replaces the primary only; every other member maps through
+/// that single edit. This is the same planner and canonical mapping algebra.
+pub fn plan_primary_typing(
+    text: &str,
+    set: &SelectionSet,
+    insertion: String,
+) -> Result<PreparedEdit, PlanError> {
+    set.validate_against(text)?;
+    let primary = set.primary();
+    let (only, _) = SelectionSet::normalize(
+        text,
+        vec![crate::selection::RawSelection {
+            id: Some(primary.id().as_raw()),
+            anchor: primary.anchor(),
+            head: primary.head(),
+        }],
+        Some(primary.id().as_raw()),
+    )?;
+    let mut prepared = plan(text, &only, &EditOperation::Typing(insertion))?;
+    if prepared.ops.is_empty() {
+        prepared.after_set = set.clone();
+        return Ok(prepared);
+    }
+    let spans: Vec<_> = prepared
+        .edits
+        .iter()
+        .map(|edit| crate::history::MovementSpan {
+            start: edit.start,
+            end: edit.end,
+            replacement_len: edit.replacement_len,
+        })
+        .collect();
+    let exact = prepared.after_set.primary();
+    let candidates = set
+        .iter()
+        .map(|member| {
+            let (anchor, head) = if member.id() == primary.id() {
+                (exact.anchor(), exact.head())
+            } else {
+                let (a, h) = if member.anchor() < member.head() {
+                    (Affinity::Left, Affinity::Right)
+                } else if member.anchor() > member.head() {
+                    (Affinity::Right, Affinity::Left)
+                } else {
+                    (Affinity::Right, Affinity::Right)
+                };
+                (
+                    crate::selection::map_point_through_spans(member.anchor(), &spans, a),
+                    crate::selection::map_point_through_spans(member.head(), &spans, h),
+                )
+            };
+            crate::selection::RawSelection {
+                id: Some(member.id().as_raw()),
+                anchor,
+                head,
+            }
+        })
+        .collect();
+    prepared.after_set = SelectionSet::normalize(
+        &prepared.after_text,
+        candidates,
+        Some(primary.id().as_raw()),
+    )?
+    .0;
+    Ok(prepared)
+}
+
 /// Typed planning refusal. Zero state changes on any error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
@@ -372,8 +439,11 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
             // normalizations: the default (last survivor) would silently
             // move the primary to the set's end on every collapse batch
             // (FEUX-0002 E-4/FR-4).
-            let (set, _) =
-                SelectionSet::normalize(&after_text, mapped, Some(carets.primary_id().as_raw()))?;
+            let (set, _) = SelectionSet::normalize_mapped(
+                &after_text,
+                mapped,
+                Some(carets.primary_id().as_raw()),
+            )?;
             set
         }
         None => {
@@ -381,6 +451,19 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
             set
         }
     };
+    let after_set = SelectionSet::normalize_mapped(
+        &after_text,
+        after_set
+            .iter()
+            .map(|member| crate::selection::RawSelection {
+                id: Some(member.id().as_raw()),
+                anchor: member.anchor(),
+                head: member.head(),
+            })
+            .collect(),
+        Some(after_set.primary_id().as_raw()),
+    )?
+    .0;
     after_set.validate_against(&after_text)?;
     let fragments = match op {
         EditOperation::Cut => planned
@@ -403,19 +486,40 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
 /// duplicate containing lines merge; an empty last line's caret is a no-op.
 /// `Copy` (via [`copy_fragments`]) and `EditOperation::Cut` share this one
 /// implementation.
+/// The containing logical line, including its newline. Invalid input has
+/// no effective range. Copy/Cut planning and their previews share this.
+#[must_use]
+pub fn line_range(text: &str, at: usize) -> Option<std::ops::Range<usize>> {
+    if at > text.len() || !is_grapheme_boundary(text, at) {
+        return None;
+    }
+    let start = text[..at].rfind('\n').map_or(0, |at| at + 1);
+    let end = text[at..]
+        .find('\n')
+        .map_or(text.len(), |offset| at + offset + 1);
+    Some(start..end)
+}
+
 fn cut_ranges(text: &str, set: &SelectionSet) -> Vec<(usize, usize)> {
     let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(set.len());
+    let mut line_cache: Option<std::ops::Range<usize>> = None;
     for member in set.iter() {
         if !member.is_caret() {
             ranges.push((member.start(), member.end()));
             continue;
         }
         let at = member.head();
-        let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
-        let line_end = text[at..].find('\n').map_or(text.len(), |i| at + i);
-        let end = (line_end + usize::from(line_end < text.len())).min(text.len());
-        if end > line_start {
-            ranges.push((line_start, end));
+        let range = if let Some(range) = line_cache.as_ref().filter(|range| range.contains(&at)) {
+            range.clone()
+        } else {
+            let Some(range) = line_range(text, at) else {
+                continue;
+            };
+            line_cache = Some(range.clone());
+            range
+        };
+        if !range.is_empty() {
+            ranges.push((range.start, range.end));
         }
     }
     ranges.sort_unstable();
@@ -504,9 +608,10 @@ fn line_boundary(text: &str, at: usize, start: bool) -> usize {
 /// D-11 empty policy: following grapheme; at EOL/EOF the preceding
 /// non-newline grapheme when the caret is not at the start of its line; a
 /// caret at the start of its line (including an empty line) is a no-op.
-fn delete_range(text: &str, at: usize) -> Option<(usize, usize)> {
-    debug_assert!(at <= text.len());
-    debug_assert!(is_grapheme_boundary(text, at));
+pub fn delete_range(text: &str, at: usize) -> Option<(usize, usize)> {
+    if at > text.len() || !is_grapheme_boundary(text, at) {
+        return None;
+    }
     if text.is_empty() {
         return None;
     }

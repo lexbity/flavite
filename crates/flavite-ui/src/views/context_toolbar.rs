@@ -12,18 +12,26 @@ use crate::{
 use flavite_edit_context::{ContextCommand, ContextMenu};
 use flavite_editor::context::layout::{self, ContextLayout};
 use iced::widget::{
-    Space, button, column, container, mouse_area, opaque, row, scrollable, stack, text,
+    Space, button, column, container, mouse_area, opaque, row, scrollable, stack, text, tooltip,
 };
 use iced::{Element, Length, alignment};
 
 fn observed<'a>(
+    app: &App,
     tab: flavite_workspace::TabId,
     name: &'static str,
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    bounds::observe(content, move |rect| {
-        Message::ContextMode(ContextMessage::Bounds(tab, name, rect))
-    })
+    bounds::observe_named(
+        content,
+        format!(
+            "context-{tab}-{name}-{:?}-{:?}-{:?}",
+            app.editor_bounds.get(&tab),
+            app.window_size(),
+            app.context_mode.mode(tab)
+        ),
+        move |rect| Message::ContextMode(ContextMessage::Bounds(tab, name, rect)),
+    )
 }
 
 fn action(
@@ -33,17 +41,26 @@ fn action(
     icon: Icon,
 ) -> Element<'_, Message> {
     observed(
+        app,
         target.tab,
         command.id(),
         previewable(
             target.clone(),
             command,
-            chrome::icon_button(
-                *app.appearance.metrics(),
-                icon,
-                command.title(),
-                context_mode::available(app, target.clone(), command)
-                    .then_some(Message::ContextMode(ContextMessage::Run(target, command))),
+            tooltip(
+                button(chrome::icon(*app.appearance.metrics(), icon))
+                    .width(app.appearance.metrics().icon_target)
+                    .height(app.appearance.metrics().icon_target)
+                    .padding(4)
+                    .style(style::toolbar_button)
+                    .on_press_maybe(
+                        context_mode::available(app, target.clone(), command)
+                            .then_some(Message::ContextMode(ContextMessage::Run(target, command))),
+                    ),
+                container(text(command.title()).size(app.appearance.metrics().text_sm))
+                    .padding(6)
+                    .style(style::card),
+                tooltip::Position::Top,
             ),
         ),
     )
@@ -86,6 +103,7 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
     .align_y(alignment::Vertical::Center);
     if plan.shows_state() {
         actions = actions.push(observed(
+            app,
             target.tab,
             "state",
             container(text(mode.label()).size(metrics.text_sm))
@@ -142,6 +160,7 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
     }
     if plan.command_visible(ContextCommand::History) {
         actions = actions.push(observed(
+            app,
             target.tab,
             ContextCommand::History.id(),
             button(text("History").size(metrics.text_sm))
@@ -210,6 +229,7 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
                     .size(metrics.text_sm),
                     Space::new().width(Length::Fill),
                     observed(
+                        app,
                         target.tab,
                         "burst-exit",
                         button(text("Exit Context Mode").size(metrics.text_sm))
@@ -222,6 +242,7 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
                             )),
                     ),
                     observed(
+                        app,
                         target.tab,
                         "burst-history",
                         button(text("Open history").size(metrics.text_sm))
@@ -234,6 +255,7 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
                             )),
                     ),
                     observed(
+                        app,
                         target.tab,
                         "burst-dismiss",
                         button(text("✕").size(metrics.text_sm))
@@ -254,6 +276,7 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
     }
     rows.push(detail);
     observed(
+        app,
         target.tab,
         "toolbar",
         container(column(rows))
@@ -271,6 +294,7 @@ fn menu_button<'a>(app: &App, target: &EditorTarget, menu: ContextMenu) -> Eleme
         .as_ref()
         .is_some_and(|s| s.state.menu() == Some(menu));
     observed(
+        app,
         target.tab,
         menu.title(),
         button(text(format!("{} ▾", menu.title())).size(metrics.text_sm))
@@ -318,6 +342,7 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
     .spacing(2.0 * metrics.scale);
     for (index, &command) in menu.commands().iter().enumerate() {
         entries = entries.push(observed(
+            app,
             target.tab,
             command.title(),
             previewable(

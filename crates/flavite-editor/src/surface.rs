@@ -143,47 +143,6 @@ impl LinkNavigation {
 }
 
 impl EditorAction {
-    /// Convert to the Session's authoritative mutation command.
-    #[must_use]
-    pub fn into_session_command(self) -> flavite_api::session::SessionCommand {
-        match self {
-            Self::History {
-                buffer_id,
-                expected_revision,
-                direction,
-            } => {
-                if direction == HistoryDirection::Redo {
-                    flavite_api::session::SessionCommand::Redo {
-                        buffer_id: buffer_id.into(),
-                        revision: flavite_buffer::revision::Revision::new(expected_revision),
-                    }
-                } else {
-                    flavite_api::session::SessionCommand::Undo {
-                        buffer_id: buffer_id.into(),
-                        revision: flavite_buffer::revision::Revision::new(expected_revision),
-                    }
-                }
-            }
-            Self::Edit {
-                buffer_id,
-                expected_revision,
-                edits,
-            } => flavite_api::session::SessionCommand::ApplyEdits {
-                buffer_id: buffer_id.into(),
-                revision: flavite_buffer::revision::Revision::new(expected_revision),
-                ops: edits,
-                // Ordinary captured typing: the explicit typing policy keeps
-                // the established coalescing rules (D-06/TD-8).
-                undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
-                editor: None,
-                operation: None,
-            },
-            Self::Complete { .. } | Self::Navigate { .. } | Self::Interaction(_) => {
-                unreachable!("non-mutation editor action has no Session command")
-            }
-        }
-    }
-
     /// Turn an activated link into the common API command after the host has
     /// resolved its raw target through the vault index.
     #[must_use]

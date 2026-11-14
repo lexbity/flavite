@@ -311,7 +311,9 @@ impl ContextRegistry {
             },
             // Search pages (W10) are routed to the search host before the
             // context registry; they never repaint a context tool.
-            QueryResult::Search { .. } => return false,
+            QueryResult::Search { .. }
+            | QueryResult::Directory(_)
+            | QueryResult::ReplacementDiff(_) => return false,
         };
         true
     }

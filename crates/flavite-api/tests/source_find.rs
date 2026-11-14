@@ -11,7 +11,10 @@ use flavite_fs::Fs;
 
 fn execute(flavite: &Flavite, id: &'static str, args: serde_json::Value) -> ExecutionResult {
     let request_id = flavite.command_registry().next_request_id();
-    let result = flavite.execute(Invocation::new(request_id, id, args, Origin::Gui));
+    let result = flavite.execute(editor_operations_fixture::admit(
+        &flavite,
+        Invocation::new(request_id, id, args, Origin::Gui),
+    ));
     match result {
         ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
         other => other,
@@ -247,3 +250,6 @@ fn anonymous_unknown_args_are_rejected() {
     };
     assert_eq!(rejected.reason, flavite_api::RejectionReason::InvalidArgs);
 }
+
+#[path = "support/editor_operations.rs"]
+mod editor_operations_fixture;

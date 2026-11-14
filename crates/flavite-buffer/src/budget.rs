@@ -113,3 +113,10 @@ pub fn account_node(
         + selection_bytes(before)
         + selection_bytes(after)
 }
+
+/// Heap space for one exact movement batch, including its outer Vec slot.
+#[must_use]
+pub fn movement_bytes(spans: usize) -> u64 {
+    std::mem::size_of::<Vec<crate::selection::SpanEdit>>() as u64
+        + spans as u64 * std::mem::size_of::<crate::selection::SpanEdit>() as u64
+}

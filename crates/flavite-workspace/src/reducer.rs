@@ -551,6 +551,31 @@ impl WorkspaceState {
         self.tabs.get(id)
     }
 
+    /// Bind a newly opened view's initial data without consuming a native
+    /// input sequence. Selection validation belongs to the API caller.
+    ///
+    /// # Errors
+    /// Refuses missing, non-note, or already initialized views.
+    pub fn initialize_editor_buffer(
+        &mut self,
+        tab: TabId,
+        buffer: u64,
+        revision: u64,
+    ) -> Result<(), &'static str> {
+        let view = self.tabs.get_mut(&tab).ok_or("View closed")?;
+        if !matches!(view.kind(), ViewKind::Note(_)) {
+            return Err("Not a note view");
+        }
+        let mut state = view.interaction().clone();
+        if state.buffer_id.is_some() || state.sequence != 0 {
+            return Err("View already initialized");
+        }
+        state.buffer_id = Some(buffer);
+        state.revision = revision;
+        view.set_interaction(state);
+        Ok(())
+    }
+
     /// Acknowledge host-visible editor input for a note view. This updates
     /// logical input state without changing the structural layout revision.
     /// The widget event must match the current tab incarnation and advance

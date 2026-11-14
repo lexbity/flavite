@@ -18,6 +18,18 @@ pub fn matching_commands(flavite: &Flavite, query: &str) -> Vec<CommandSpec> {
 /// behavior easy to test.
 #[must_use]
 pub fn matching_specs(specs: Vec<CommandSpec>, query: &str) -> Vec<CommandSpec> {
+    // These catalogue commands consume produced text or captured deletion
+    // intent. Keyboard input supplies their arguments; they are not palette
+    // controls that could run with an empty argument object.
+    let specs: Vec<_> = specs
+        .into_iter()
+        .filter(|spec| {
+            !matches!(
+                spec.id,
+                "editor.type" | "editor.backspace" | "editor.forward_delete" | "editor.newline"
+            )
+        })
+        .collect();
     let needle = query.trim();
     if needle.is_empty() {
         return specs;

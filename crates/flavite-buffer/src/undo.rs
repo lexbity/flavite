@@ -45,6 +45,12 @@ fn node_accounted_bytes(node: &UndoNode) -> u64 {
         None => (&[][..], &[][..]),
     };
     crate::budget::account_node(snapshot_len, replacement_len, before, after)
+        + node.movement_steps.capacity() as u64 * std::mem::size_of::<Vec<SpanEdit>>() as u64
+        + node
+            .movement_steps
+            .iter()
+            .map(|s| s.capacity() as u64 * std::mem::size_of::<SpanEdit>() as u64)
+            .sum::<u64>()
 }
 /// Default time window for coalescing consecutive edits into a single undo group.
 ///
@@ -183,14 +189,11 @@ pub struct UndoNode {
     pub version: u64,
     pub editor: Option<EditorEdit>,
     pub kind: EditKind,
-    /// The original per-op batch geometry (E-13): when this node's edit is a
-    /// collapsed batch (several disjoint ops installed as one combined
-    /// edit), the ordered original spans are retained in pre-change
-    /// coordinates so undo/redo/restore movement maps carets in unchanged
-    /// gaps exactly instead of treating them as replacement-interior points.
-    /// `None` for single edits and for coalesced merges (whose edit is
-    /// recomputed from the before/after diff and is already exact).
-    pub batch_spans: Option<Vec<SpanEdit>>,
+    /// Ordered simultaneous batches, each in its own pre-step coordinates.
+    /// Coalescing appends a step; undo reverses the walk and inverts each
+    /// batch. Geometry beyond the receipt bound is explicitly truncated.
+    pub movement_steps: Vec<Vec<SpanEdit>>,
+    pub movement_truncated: bool,
     /// Unique identifier for this node.
     pub id: u64,
     /// Whether this node was evicted to satisfy a history budget. Evicted
@@ -222,7 +225,8 @@ impl UndoNode {
             version: 1,
             editor: None,
             kind: EditKind::Edit,
-            batch_spans: None,
+            movement_steps: Vec::new(),
+            movement_truncated: false,
             id: 0,
             evicted: false,
             revision,
@@ -248,7 +252,12 @@ impl UndoNode {
             version: 1,
             editor: None,
             kind: EditKind::Edit,
-            batch_spans: None,
+            movement_steps: vec![vec![SpanEdit::new(
+                edit.range.start.0,
+                edit.range.end.0,
+                edit.replacement.len(),
+            )]],
+            movement_truncated: false,
             id,
             evicted: false,
             revision,
@@ -404,7 +413,7 @@ impl UndoTree {
         &self,
         from: u64,
         to: u64,
-    ) -> (Vec<crate::history::MovementSpan>, bool) {
+    ) -> (Vec<crate::history::MovementSpan>, Vec<usize>, bool) {
         use crate::history::MovementSpan;
         // Ancestor set of `to`.
         let mut ancestors = std::collections::HashSet::new();
@@ -423,13 +432,13 @@ impl UndoTree {
                 break;
             }
             let Some(parent) = self.get(id).and_then(|n| n.parent_id) else {
-                return (Vec::new(), true);
+                return (Vec::new(), Vec::new(), true);
             };
             up.push(id);
             current = parent;
         }
         let Some(lca) = lca else {
-            return (Vec::new(), true);
+            return (Vec::new(), Vec::new(), true);
         };
         // Descend from the LCA to `to`.
         let mut down: Vec<u64> = Vec::new();
@@ -451,75 +460,54 @@ impl UndoTree {
                     })
                 })
             }) else {
-                return (Vec::new(), true);
+                return (Vec::new(), Vec::new(), true);
             };
             down.push(child);
             current = child;
         }
-        let mut spans = Vec::with_capacity(up.len() + down.len());
-        for id in up {
-            let Some(node) = self.get(id) else {
-                return (Vec::new(), true);
-            };
-            // Up-step (child → parent): the inverse of the child's edit. A
-            // collapsed batch inverts per original op (each expressed in the
-            // node's after-frame), so carets in unchanged gaps map exactly
-            // instead of collapsing onto the combined replacement's edge
-            // (FEUX-0002 E-13 / FR-18).
-            if let Some(batch) = &node.batch_spans {
-                let mut shift: isize = 0;
-                for span in batch {
-                    let start = shift_usize(span.start, shift);
-                    spans.push(MovementSpan {
-                        start,
-                        end: start + span.replacement_len,
-                        replacement_len: span.end - span.start,
-                    });
-                    shift += span.replacement_len as isize - (span.end - span.start) as isize;
+        let mut spans = Vec::new();
+        let mut step_ends = Vec::new();
+        for (ids, inverse) in [(up, true), (down, false)] {
+            for id in ids {
+                let Some(node) = self.get(id).filter(|n| !n.evicted && !n.movement_truncated)
+                else {
+                    return (Vec::new(), Vec::new(), true);
+                };
+                let steps: Vec<_> = if inverse {
+                    node.movement_steps.iter().rev().collect()
+                } else {
+                    node.movement_steps.iter().collect()
+                };
+                for step in steps {
+                    let mut shift: isize = 0;
+                    for span in step {
+                        let item = if inverse {
+                            let start = shift_usize(span.start, shift);
+                            MovementSpan {
+                                start,
+                                end: start + span.replacement_len,
+                                replacement_len: span.end - span.start,
+                            }
+                        } else {
+                            MovementSpan {
+                                start: span.start,
+                                end: span.end,
+                                replacement_len: span.replacement_len,
+                            }
+                        };
+                        shift += span.replacement_len as isize - (span.end - span.start) as isize;
+                        spans.push(item);
+                    }
+                    if spans.len() > crate::history::MAX_MOVEMENT_SPANS {
+                        return (Vec::new(), Vec::new(), true);
+                    }
+                    if !step.is_empty() {
+                        step_ends.push(spans.len());
+                    }
                 }
-                continue;
             }
-            let Some(edit) = &node.edit else {
-                return (Vec::new(), true);
-            };
-            // Inverse: {start, start + replacement_len, end - start}.
-            let len = edit.replacement.len();
-            spans.push(MovementSpan {
-                start: edit.range.start.0,
-                end: edit.range.start.0 + len,
-                replacement_len: edit.range.end.0 - edit.range.start.0,
-            });
         }
-        for id in down {
-            let Some(node) = self.get(id) else {
-                return (Vec::new(), true);
-            };
-            // Down-step (parent → child): the forward edit. A collapsed
-            // batch contributes its original per-op spans, which are
-            // ascending and non-overlapping in the parent's frame.
-            if let Some(batch) = &node.batch_spans {
-                for span in batch {
-                    spans.push(MovementSpan {
-                        start: span.start,
-                        end: span.end,
-                        replacement_len: span.replacement_len,
-                    });
-                }
-                continue;
-            }
-            let Some(edit) = &node.edit else {
-                return (Vec::new(), true);
-            };
-            spans.push(MovementSpan {
-                start: edit.range.start.0,
-                end: edit.range.end.0,
-                replacement_len: edit.replacement.len(),
-            });
-        }
-        if spans.len() > crate::history::MAX_MOVEMENT_SPANS {
-            return (Vec::new(), true);
-        }
-        (spans, false)
+        (spans, step_ends, false)
     }
 
     /// Apply an edit and advance the tree.
@@ -579,6 +567,7 @@ impl UndoTree {
         allow_coalescing: bool,
         continuous: bool,
     ) -> Revision {
+        let step = SpanEdit::new(edit.range.start.0, edit.range.end.0, edit.replacement.len());
         self.generation += 1;
         let branched = self.position_id != self.preferred_tip;
         let position_id = self.position_id;
@@ -640,6 +629,16 @@ impl UndoTree {
                         .expect("position node exists");
                     node.changed_at_unix_ms = wall_clock_ms();
                     node.version += 1;
+                    if !node.movement_truncated {
+                        node.movement_steps.reserve_exact(1);
+                        node.movement_steps.push(vec![step]);
+                        if node.movement_steps.iter().map(Vec::len).sum::<usize>()
+                            > crate::history::MAX_MOVEMENT_SPANS
+                        {
+                            node.movement_steps = Vec::new();
+                            node.movement_truncated = true;
+                        }
+                    }
                     node.edit = Some(coalesced);
                     node.snapshot = Some(snapshot);
                     node.timestamp = Instant::now();
@@ -759,7 +758,6 @@ impl UndoTree {
         record: EditorEdit,
         spans: &[SpanEdit],
     ) -> Revision {
-        let node_before = self.next_id;
         if self
             .position()
             .and_then(|n| n.editor.as_ref())
@@ -777,7 +775,7 @@ impl UndoTree {
                 self.apply_with_coalescing(edit, snapshot, true, false)
             }
         };
-        self.install_batch_spans(node_before, spans);
+        self.install_batch_geometry(spans);
         let node = &mut self.nodes[self.position_id as usize];
         if let Some(previous) = &mut node.editor {
             previous.after = record.after;
@@ -792,7 +790,7 @@ impl UndoTree {
     }
 
     /// Install one prepared batch under `policy`, retaining the original
-    /// per-op geometry on a fresh node (E-13).
+    /// per-op geometry for each step, including coalesced steps (E-13).
     pub fn apply_batch(
         &mut self,
         edit: EditOp,
@@ -800,7 +798,6 @@ impl UndoTree {
         policy: UndoPolicy,
         spans: &[SpanEdit],
     ) -> Revision {
-        let node_before = self.next_id;
         let revision = match policy {
             UndoPolicy::Isolated => self.apply_boundary(edit, snapshot),
             UndoPolicy::Context { origin } => {
@@ -818,20 +815,28 @@ impl UndoTree {
                 self.apply_with_coalescing(edit, snapshot, true, false)
             }
         };
-        self.install_batch_spans(node_before, spans);
+        self.install_batch_geometry(spans);
         revision
     }
 
-    /// Retain the batch geometry when the install created a fresh node. A
-    /// single-span batch is already the node's own edit; a coalesced install
-    /// must never inherit stale geometry.
-    fn install_batch_spans(&mut self, node_before: u64, spans: &[SpanEdit]) {
-        if self.next_id != node_before
-            && spans.len() > 1
-            && let Some(node) = self.nodes.get_mut(self.position_id as usize)
-        {
-            node.batch_spans = Some(spans.to_vec());
+    /// Replace the just-installed step's contiguous text diff with its exact
+    /// disjoint geometry. Earlier coalesced steps retain their own frames.
+    fn install_batch_geometry(&mut self, spans: &[SpanEdit]) {
+        if let Some(node) = self.nodes.get_mut(self.position_id as usize) {
+            if node.movement_truncated {
+                return;
+            }
+            if let Some(last) = node.movement_steps.last_mut() {
+                *last = spans.to_vec();
+            }
+            if node.movement_steps.iter().map(Vec::len).sum::<usize>()
+                > crate::history::MAX_MOVEMENT_SPANS
+            {
+                node.movement_steps = Vec::new();
+                node.movement_truncated = true;
+            }
         }
+        self.reaccount();
     }
 
     fn segment(&self, id: u64) -> Option<u64> {
@@ -1381,6 +1386,8 @@ impl UndoTree {
         for child in children {
             if let Some(child_node) = self.nodes.get_mut(child as usize) {
                 child_node.parent_id = parent_id;
+                child_node.movement_steps = Vec::new();
+                child_node.movement_truncated = true;
                 if let Some(parent) = parent_id
                     && let Some(parent_node) = self.nodes.get_mut(parent as usize)
                     && !parent_node.children.contains(&child)
@@ -1394,7 +1401,8 @@ impl UndoTree {
             node.snapshot = None;
             node.editor = None;
             node.edit = None;
-            node.batch_spans = None;
+            node.movement_steps = Vec::new();
+            node.movement_truncated = true;
             node.children.clear();
         }
     }

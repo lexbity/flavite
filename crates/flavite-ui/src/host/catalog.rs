@@ -98,6 +98,7 @@ pub(crate) fn poll(app: &mut App) {
             generation: prepared.provenance.generation,
             truncated: prepared.truncated,
         };
+        app.file_browser.refresh();
         app.link_verdict_requests.clear();
         app.link_verdicts.clear();
         app.run_pending_restore();

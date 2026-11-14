@@ -121,6 +121,7 @@ struct EditOpArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApplyEditsArgs {
+    operation: crate::editor_commands::OperationArg,
     buffer_id: u64,
     revision: u64,
     ops: Vec<EditOpArgs>,
@@ -135,7 +136,7 @@ struct ApplyEditsArgs {
 /// Wire form of the undo policy (§6.1: explicit snake_case discriminants).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-enum UndoPolicyArg {
+pub(crate) enum UndoPolicyArg {
     Isolated,
     Typing,
     Context { origin: String },
@@ -361,22 +362,10 @@ fn handle_link_insert(session: &Session, invocation: &Invocation) -> Result<Sess
     }))
 }
 
-fn handle_edits(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
-    let args: ApplyEditsArgs = decode(invocation)?;
-    use flavite_buffer::undo::EditOp;
-    use flavite_syntax::text::{Span, TextByte};
-    let ops = args
-        .ops
-        .into_iter()
-        .map(|op| {
-            EditOp::new(
-                Span::new(TextByte(op.range.0), TextByte(op.range.1)),
-                op.replacement,
-            )
-        })
-        .collect();
-    // Absent field = Isolated (D-06 default).
-    let undo_policy = match args.undo_policy.unwrap_or(UndoPolicyArg::Isolated) {
+pub(crate) fn decode_undo_policy(
+    value: Option<UndoPolicyArg>,
+) -> Result<flavite_buffer::undo::UndoPolicy, String> {
+    let policy = match value.unwrap_or(UndoPolicyArg::Isolated) {
         UndoPolicyArg::Isolated => flavite_buffer::undo::UndoPolicy::Isolated,
         UndoPolicyArg::Typing => flavite_buffer::undo::UndoPolicy::Typing,
         UndoPolicyArg::Context { origin } => {
@@ -393,20 +382,48 @@ fn handle_edits(session: &Session, invocation: &Invocation) -> Result<SessionRes
             }
         }
     };
+    Ok(policy)
+}
+
+fn handle_edits(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
+    let args: ApplyEditsArgs = decode(invocation)?;
+    use flavite_buffer::undo::EditOp;
+    use flavite_syntax::text::{Span, TextByte};
+    let ops = args
+        .ops
+        .into_iter()
+        .map(|op| {
+            EditOp::new(
+                Span::new(TextByte(op.range.0), TextByte(op.range.1)),
+                op.replacement,
+            )
+        })
+        .collect();
+    // Absent field = Isolated (D-06 default).
+    let undo_policy = decode_undo_policy(args.undo_policy)?;
     Ok(session.execute(SessionCommand::ApplyEdits {
         buffer_id: BufferId::from(args.buffer_id),
         revision: Revision::new(args.revision),
         ops,
         undo_policy,
         editor: args.editor,
-        operation: None,
+        operation: args.operation.decode(args.buffer_id)?,
     }))
 }
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryOperationArgs {
+    buffer_id: u64,
+    revision: u64,
+    operation: crate::editor_commands::OperationArg,
+}
+
 fn handle_undo(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
-    let args: BufferRevisionArgs = decode(invocation)?;
+    let args: HistoryOperationArgs = decode(invocation)?;
     Ok(session.execute(SessionCommand::Undo {
         buffer_id: BufferId::from(args.buffer_id),
         revision: Revision::new(args.revision),
+        operation: args.operation.decode(args.buffer_id)?,
     }))
 }
 fn handle_seal_undo_group(
@@ -446,6 +463,7 @@ fn handle_editing_history(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RestoreEditingStateArgs {
+    operation: crate::editor_commands::OperationArg,
     buffer_id: u64,
     revision: u64,
     target: flavite_buffer::history::HistoryTarget,
@@ -460,13 +478,15 @@ fn handle_restore_editing_state(
         buffer_id: args.buffer_id.into(),
         revision: Revision::new(args.revision),
         target: args.target,
+        operation: args.operation.decode(args.buffer_id)?,
     }))
 }
 fn handle_redo(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
-    let args: BufferRevisionArgs = decode(invocation)?;
+    let args: HistoryOperationArgs = decode(invocation)?;
     Ok(session.execute(SessionCommand::Redo {
         buffer_id: BufferId::from(args.buffer_id),
         revision: Revision::new(args.revision),
+        operation: args.operation.decode(args.buffer_id)?,
     }))
 }
 fn handle_reconcile(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
@@ -581,6 +601,7 @@ const READ_NOTES_COMMAND_IDS: &[&str] = &[
     "replace.preview",
     "replace.select",
     "replace.status",
+    "replace.preview_close",
     "replace.job_status",
     "editor.issue_operation",
     "editor.cancel_operation",
@@ -1083,6 +1104,12 @@ impl Flavite {
                 crate::replace::handle_replace_preview,
             ),
             (
+                "replace.preview_close",
+                "Release a replacement preview",
+                ArgSchema::typed::<crate::replace::ReplacePreviewCloseArgs>(),
+                crate::replace::handle_preview_close,
+            ),
+            (
                 "replace.select",
                 "Select preview notes",
                 ArgSchema::typed::<crate::replace::ReplaceSelectArgs>(),
@@ -1171,6 +1198,30 @@ impl Flavite {
                 "Cancel a pending match collection",
                 ArgSchema::typed::<crate::editor_commands::CancelSelectionArgs>(),
                 crate::editor_commands::handle_cancel_selection,
+            ),
+            (
+                "editor.type",
+                "Type at selections",
+                ArgSchema::typed::<crate::editor_commands::EditorTypeArgs>(),
+                crate::editor_commands::handle_editor_type,
+            ),
+            (
+                "editor.backspace",
+                "Backspace at selections",
+                ArgSchema::typed::<crate::editor_commands::EditorKeyInputArgs>(),
+                crate::editor_commands::handle_editor_backspace,
+            ),
+            (
+                "editor.forward_delete",
+                "Delete forward at selections",
+                ArgSchema::typed::<crate::editor_commands::EditorKeyInputArgs>(),
+                crate::editor_commands::handle_editor_forward_delete,
+            ),
+            (
+                "editor.newline",
+                "Newline at selections",
+                ArgSchema::typed::<crate::editor_commands::EditorKeyInputArgs>(),
+                crate::editor_commands::handle_editor_newline,
             ),
             (
                 "editor.delete",
@@ -1349,13 +1400,13 @@ impl Flavite {
             (
                 "buffer.undo",
                 "Undo",
-                ArgSchema::typed::<BufferRevisionArgs>(),
+                ArgSchema::typed::<HistoryOperationArgs>(),
                 handle_undo,
             ),
             (
                 "buffer.redo",
                 "Redo",
-                ArgSchema::typed::<BufferRevisionArgs>(),
+                ArgSchema::typed::<HistoryOperationArgs>(),
                 handle_redo,
             ),
             (
@@ -1939,7 +1990,26 @@ impl Flavite {
         // `&'static str`: the id outlives the moved invocation.
         #[cfg(debug_assertions)]
         let command_id = invocation.command_id;
+        let activation = invocation
+            .args
+            .get("buffer_id")
+            .and_then(serde_json::Value::as_u64)
+            .zip(invocation.args.get("operation"))
+            .and_then(|(buffer, raw)| {
+                crate::editor_commands::OperationArg::deserialize(raw)
+                    .ok()?
+                    .decode(buffer)
+                    .ok()
+            });
         let result = self.execute_turn(invocation);
+        // A rejected activation is consumed too; repeated denial/schema
+        // failures must not leak all 32 pending slots.
+        if !result.is_success()
+            && !matches!(result, ExecutionResult::Pending { .. })
+            && let Some(operation) = activation
+        {
+            self.session.cancel_editor_operation(&operation);
+        }
         // NFR-10: debug builds measure every host turn; release pays nothing.
         #[cfg(debug_assertions)]
         turn_budget::observe(command_id, turn_started);
@@ -2002,6 +2072,23 @@ impl Flavite {
         if invocation.command_id.starts_with("settings.") {
             // Settings commands need the facade-owned settings store.
             return crate::settings_cmds::execute_settings_command(self, &invocation);
+        }
+        // Replays retain their original completion even after text or view
+        // state advances. Capability and vault policy checks still apply.
+        if self
+            .command_registry
+            .get_spec(invocation.command_id)
+            .is_some_and(|spec| spec.requires_write)
+            && let Some(buffer) = invocation
+                .args
+                .get("buffer_id")
+                .and_then(serde_json::Value::as_u64)
+            && let Some(raw) = invocation.args.get("operation")
+            && let Ok(operation) = crate::editor_commands::OperationArg::deserialize(raw)
+            && let Ok(operation) = operation.decode(buffer)
+            && let Some(receipt) = self.session.replay_editor_operation(&operation)
+        {
+            return self.convert_session_result(receipt, invocation.request_id);
         }
         if let Some(buffer_id) = invocation.preconditions.buffer_id {
             let revision = invocation.preconditions.expected_revision;
@@ -2106,6 +2193,10 @@ impl Flavite {
             | "buffer.redo"
             | "note.convert_encoding"
             | "text.apply_replace"
+            | "editor.type"
+            | "editor.backspace"
+            | "editor.forward_delete"
+            | "editor.newline"
             | "editor.delete"
             | "editor.change"
             | "editor.cut"
@@ -2170,6 +2261,10 @@ impl Flavite {
                 | "buffer.redo"
                 | "note.convert_encoding"
                 | "text.apply_replace"
+                | "editor.type"
+                | "editor.backspace"
+                | "editor.forward_delete"
+                | "editor.newline"
                 | "editor.delete"
                 | "editor.change"
                 | "editor.cut"
@@ -2329,6 +2424,9 @@ impl Flavite {
             SessionResult::Success(crate::session::CommandResult::SourceFindPaged { .. }) => {
                 "source_find.page"
             }
+            SessionResult::Success(crate::session::CommandResult::ReplacePreviewClosed) => {
+                "replace.preview_close"
+            }
             SessionResult::Success(crate::session::CommandResult::SourceFindClosed) => {
                 "source_find.close"
             }
@@ -2427,10 +2525,11 @@ impl Flavite {
                     crate::session::CommandResult::HistoryRestored {
                         buffer_id,
                         new_revision,
+                        movement,
                     } => {
                         serde_json::json!({
                             "buffer_id": buffer_id.as_u64(),
-                            "revision": new_revision.as_u64(),
+                            "revision": new_revision.as_u64(), "movement":movement,
                         })
                     }
                     crate::session::CommandResult::EditsApplied {
@@ -2453,6 +2552,8 @@ impl Flavite {
                         serde_json::json!({
                             "buffer_id": buffer_id.as_u64(),
                             "operation": {
+                                "revision": operation.revision,
+                                "view": operation.view.map(|view| serde_json::json!({"view":format!("{:032x}",view.view),"incarnation":view.incarnation,"selection_version":view.selection_version})),
                                 "buffer_incarnation": operation.buffer_incarnation,
                                 "sequence": operation.sequence,
                                 "ticket": hex::encode(operation.ticket.to_be_bytes()),
@@ -2467,6 +2568,8 @@ impl Flavite {
                             "buffer_id": buffer_id.as_u64(),
                             "cancelled": true,
                             "operation": {
+                                "revision": operation.revision,
+                                "view": operation.view.map(|view| serde_json::json!({"view":format!("{:032x}",view.view),"incarnation":view.incarnation,"selection_version":view.selection_version})),
                                 "buffer_incarnation": operation.buffer_incarnation,
                                 "sequence": operation.sequence,
                                 "ticket": hex::encode(operation.ticket.to_be_bytes()),
@@ -2692,7 +2795,10 @@ impl Flavite {
                             "page": crate::replace::find_page_json(&page),
                         })
                     }
-                    crate::session::CommandResult::SourceFindClosed => serde_json::Value::Null,
+                    crate::session::CommandResult::SourceFindClosed
+                    | crate::session::CommandResult::ReplacePreviewClosed => {
+                        serde_json::Value::Null
+                    }
                     crate::session::CommandResult::ReplacePreviewSealed {
                         preview_id,
                         manifest,
@@ -3528,11 +3634,9 @@ mod tests {
                 .is_err()
         );
 
-        let result = flavite.execute(Invocation::new(
-            71,
-            "note.rename",
-            valid,
-            crate::Origin::Plugin,
+        let result = flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::new(71, "note.rename", valid, crate::Origin::Plugin),
         ));
         assert!(matches!(
             result,
@@ -3687,7 +3791,18 @@ mod tests {
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
-            operation: None,
+            operation: flavite
+                .session
+                .issue_editor_operation(
+                    buffer_id,
+                    flavite
+                        .session
+                        .shared_buffer_snapshot(buffer_id, None)
+                        .map(|snapshot| snapshot.revision)
+                        .unwrap_or(Revision::new(initial.revision)),
+                    None,
+                )
+                .expect("fixture activation"),
         });
         assert!(matches!(
             flavite.get_buffer_view(buffer_id, Some(Revision::new(initial.revision))),
@@ -3792,11 +3907,9 @@ mod tests {
             "pad": "x".repeat(crate::command::MAX_INVOCATION_PAYLOAD_BYTES + 1),
             "path": root.join("note.md").to_string_lossy(),
         });
-        let rejected = flavite.execute(Invocation::new(
-            90,
-            "note.save",
-            oversized,
-            crate::Origin::Gui,
+        let rejected = flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::new(90, "note.save", oversized, crate::Origin::Gui),
         ));
         assert!(
             matches!(
@@ -3933,7 +4046,18 @@ mod tests {
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
-            operation: None,
+            operation: flavite
+                .session
+                .issue_editor_operation(
+                    buffer_id.into(),
+                    flavite
+                        .session
+                        .shared_buffer_snapshot(buffer_id.into(), None)
+                        .map(|snapshot| snapshot.revision)
+                        .unwrap_or(Revision::new(view.revision)),
+                    None,
+                )
+                .expect("fixture activation"),
         });
         fs.write_new(&root.join(".external"), b"external").unwrap();
         fs.rename_replace(&root.join(".external"), &root.join("note.md"))
@@ -3978,8 +4102,11 @@ mod tests {
 
         let (mut flavite, root, _temp) = test_flavite();
         let denied = flavite.execute(
-            Invocation::new(9, "note.open", serde_json::json!("note.md"), Origin::Plugin)
-                .with_capabilities(Vec::new()),
+            editor_operations_fixture::admit(
+                &flavite,
+                Invocation::new(9, "note.open", serde_json::json!("note.md"), Origin::Plugin),
+            )
+            .with_capabilities(Vec::new()),
         );
         assert!(matches!(
             denied,
@@ -3990,11 +4117,14 @@ mod tests {
             })
         ));
         let scoped_denial = flavite.execute(
-            Invocation::new(
-                10,
-                "note.save",
-                serde_json::json!("outside.md"),
-                Origin::Plugin,
+            editor_operations_fixture::admit(
+                &flavite,
+                Invocation::new(
+                    10,
+                    "note.save",
+                    serde_json::json!("outside.md"),
+                    Origin::Plugin,
+                ),
             )
             .with_capabilities(vec![crate::Capability::WriteNotes {
                 scope: crate::WriteScope::PathPrefix("notes".into()),
@@ -4008,11 +4138,9 @@ mod tests {
                 ..
             })
         ));
-        let rejected = flavite.execute(Invocation::new(
-            1,
-            "write:note.save",
-            serde_json::Value::Null,
-            Origin::Gui,
+        let rejected = flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::new(1, "write:note.save", serde_json::Value::Null, Origin::Gui),
         ));
         assert!(matches!(
             rejected,
@@ -4023,11 +4151,14 @@ mod tests {
             })
         ));
         flavite.set_read_only(true);
-        let rejected = flavite.execute(Invocation::new(
-            2,
-            "note.save",
-            serde_json::to_value(root.join("note.md")).unwrap(),
-            Origin::Gui,
+        let rejected = flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::new(
+                2,
+                "note.save",
+                serde_json::to_value(root.join("note.md")).unwrap(),
+                Origin::Gui,
+            ),
         ));
         assert!(matches!(
             rejected,
@@ -4038,11 +4169,14 @@ mod tests {
         ));
         flavite.set_read_only(false);
 
-        let invalid = flavite.execute(Invocation::new(
-            3,
-            "note.open",
-            serde_json::json!({"bad": true}),
-            Origin::Cli,
+        let invalid = flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::new(
+                3,
+                "note.open",
+                serde_json::json!({"bad": true}),
+                Origin::Cli,
+            ),
         ));
         assert!(matches!(
             invalid,
@@ -4053,11 +4187,9 @@ mod tests {
             })
         ));
 
-        let unknown = flavite.execute(Invocation::new(
-            4,
-            "does_not_exist",
-            serde_json::Value::Null,
-            Origin::Plugin,
+        let unknown = flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::new(4, "does_not_exist", serde_json::Value::Null, Origin::Plugin),
         ));
         assert!(matches!(
             unknown,
@@ -4068,11 +4200,14 @@ mod tests {
             })
         ));
 
-        let opened = match flavite.execute(Invocation::new(
-            5,
-            "note.open",
-            serde_json::to_value(root.join("note.md")).unwrap(),
-            Origin::Gui,
+        let opened = match flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::new(
+                5,
+                "note.open",
+                serde_json::to_value(root.join("note.md")).unwrap(),
+                Origin::Gui,
+            ),
         )) {
             result @ ExecutionResult::Local(_) => result,
             ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
@@ -4080,11 +4215,14 @@ mod tests {
         };
         let data = opened.into_success().unwrap().data;
         let buffer_id = data["buffer_id"].as_u64().unwrap();
-        let closed = flavite.execute(Invocation::new(
-            6,
-            "note.close",
-            serde_json::json!({ "path": root.join("note.md"), "policy": "clean" }),
-            Origin::Gui,
+        let closed = flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::new(
+                6,
+                "note.close",
+                serde_json::json!({ "path": root.join("note.md"), "policy": "clean" }),
+                Origin::Gui,
+            ),
         ));
         assert!(closed.is_success());
         assert!(matches!(
@@ -4099,11 +4237,14 @@ mod tests {
         use crate::types::Origin;
 
         let (flavite, root, _temp) = test_flavite();
-        let opened = match flavite.execute(Invocation::new(
-            10,
-            "note.open",
-            serde_json::to_value(root.join("note.md")).unwrap(),
-            Origin::Gui,
+        let opened = match flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::new(
+                10,
+                "note.open",
+                serde_json::to_value(root.join("note.md")).unwrap(),
+                Origin::Gui,
+            ),
         )) {
             result @ ExecutionResult::Local(_) => result,
             ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
@@ -4113,24 +4254,30 @@ mod tests {
         let id = opened["buffer_id"].as_u64().unwrap();
         let revision = opened["revision"].as_u64().unwrap();
 
-        let applied = flavite.execute(Invocation::new(
-            11,
-            "apply_edits",
-            serde_json::json!({
-                "buffer_id": id,
-                "revision": revision,
-                "ops": [{"range": [5, 5], "replacement": "!"}]
-            }),
-            Origin::Gui,
+        let applied = flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::new(
+                11,
+                "apply_edits",
+                serde_json::json!({
+                    "buffer_id": id,
+                    "revision": revision,
+                    "ops": [{"range": [5, 5], "replacement": "!"}]
+                }),
+                Origin::Gui,
+            ),
         ));
         let applied = applied.into_success().unwrap().data;
         assert_eq!(applied["revision"].as_u64().unwrap(), revision + 1);
 
-        let undone = flavite.execute(Invocation::new(
-            12,
-            "buffer.undo",
-            serde_json::json!({ "buffer_id": id, "revision": applied["revision"] }),
-            Origin::Gui,
+        let undone = flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::new(
+                12,
+                "buffer.undo",
+                serde_json::json!({ "buffer_id": id, "revision": applied["revision"] }),
+                Origin::Gui,
+            ),
         ));
         let undone = undone.into_success().expect("undo succeeds").data;
         assert_eq!(
@@ -4141,11 +4288,14 @@ mod tests {
             "hello"
         );
 
-        let redone = flavite.execute(Invocation::new(
-            13,
-            "buffer.redo",
-            serde_json::json!({ "buffer_id": id, "revision": undone["revision"] }),
-            Origin::Gui,
+        let redone = flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::new(
+                13,
+                "buffer.redo",
+                serde_json::json!({ "buffer_id": id, "revision": undone["revision"] }),
+                Origin::Gui,
+            ),
         ));
         assert!(redone.is_success(), "redo failed: {redone:?}");
         assert_eq!(
@@ -4156,11 +4306,14 @@ mod tests {
             "hello!"
         );
 
-        let reconciled = flavite.execute(Invocation::new(
-            14,
-            "vault.reconcile",
-            serde_json::json!({"scope": "full", "mode": "verify"}),
-            Origin::Cli,
+        let reconciled = flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::new(
+                14,
+                "vault.reconcile",
+                serde_json::json!({"scope": "full", "mode": "verify"}),
+                Origin::Cli,
+            ),
         ));
         assert!(matches!(
             reconciled,
@@ -4186,11 +4339,14 @@ mod tests {
         let (flavite, _root, _temp) = test_flavite();
         await_initial_reconcile(&flavite);
 
-        let request_id = match flavite.execute(Invocation::new(
-            45,
-            "vault.reconcile",
-            serde_json::json!({"scope": "full", "mode": "verify"}),
-            Origin::Cli,
+        let request_id = match flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::new(
+                45,
+                "vault.reconcile",
+                serde_json::json!({"scope": "full", "mode": "verify"}),
+                Origin::Cli,
+            ),
         )) {
             ExecutionResult::Pending { request_id } => request_id,
             other => panic!("expected a pending reconcile: {other:?}"),
@@ -4301,11 +4457,14 @@ mod tests {
         // (b) Already-drained id: real pending op, drained away, then wait.
         use crate::command::Invocation;
         use crate::types::Origin;
-        let request_id = match flavite.execute(Invocation::new(
-            46,
-            "vault.reconcile",
-            serde_json::json!({"scope": "full", "mode": "verify"}),
-            Origin::Cli,
+        let request_id = match flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::new(
+                46,
+                "vault.reconcile",
+                serde_json::json!({"scope": "full", "mode": "verify"}),
+                Origin::Cli,
+            ),
         )) {
             ExecutionResult::Pending { request_id } => request_id,
             other => panic!("expected a pending reconcile: {other:?}"),
@@ -4360,11 +4519,14 @@ mod tests {
         await_initial_reconcile(&flavite);
         let note = root.join("note.md");
 
-        let opened = match flavite.execute(Invocation::new(
-            50,
-            "note.open",
-            serde_json::to_value(&note).unwrap(),
-            Origin::Gui,
+        let opened = match flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::new(
+                50,
+                "note.open",
+                serde_json::to_value(&note).unwrap(),
+                Origin::Gui,
+            ),
         )) {
             result @ ExecutionResult::Local(_) => result,
             ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
@@ -4377,11 +4539,9 @@ mod tests {
         // active flight, #2 the coalesced queued successor, #3 replaces the
         // queued slot — recording `Superseded{#2 by #3}` synchronously.
         for id in 51..=53 {
-            match flavite.execute(Invocation::new(
-                id,
-                "note.save",
-                note_value.clone(),
-                Origin::Gui,
+            match flavite.execute(editor_operations_fixture::admit(
+                &flavite,
+                Invocation::new(id, "note.save", note_value.clone(), Origin::Gui),
             )) {
                 ExecutionResult::Pending { request_id } => {
                     assert_eq!(request_id, id, "api request id is the invocation id");
@@ -4525,3 +4685,7 @@ mod tests {
         assert_eq!(converted.data["disk_hash"].as_str().unwrap().len(), 64);
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/editor_operations.rs"]
+mod editor_operations_fixture;

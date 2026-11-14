@@ -46,7 +46,7 @@ fn wait(
 }
 fn edit(f: &Fixture, id: u64, body: &str) -> u64 {
     let view = f.flavite.get_buffer_view(id.into(), None).unwrap();
-    let result = f.flavite.execute(Invocation::new(next_id(&f.flavite), "apply_edits", serde_json::json!({"buffer_id":id,"revision":view.revision,"ops":[{"range":[0,view.text.len()],"replacement":body}]}), Origin::Gui));
+    let result = f.flavite.execute(editor_operations_fixture::admit(&f.flavite, Invocation::new(next_id(&f.flavite), "apply_edits", serde_json::json!({"buffer_id":id,"revision":view.revision,"ops":[{"range":[0,view.text.len()],"replacement":body}]}), Origin::Gui)));
     let ExecutionResult::Local(LocalResult::Success(result)) = result else {
         panic!("edit failed: {result:?}");
     };
@@ -96,11 +96,14 @@ fn dirty_replacement_survives_unrelated_generation_save_later_edit_and_undo() {
     reconcile(&f.flavite);
     let frame = wait(&f, |frame| frame.projection().saved.nodes.len() == 4);
     assert_eq!(edges(&frame), vec![("a.md".into(), "c.md".into())]);
-    let save = f.flavite.execute(Invocation::new(
-        next_id(&f.flavite),
-        "note.save",
-        serde_json::json!(f.root.join("a.md")),
-        Origin::Gui,
+    let save = f.flavite.execute(editor_operations_fixture::admit(
+        &f.flavite,
+        Invocation::new(
+            next_id(&f.flavite),
+            "note.save",
+            serde_json::json!(f.root.join("a.md")),
+            Origin::Gui,
+        ),
     ));
     let ExecutionResult::Pending { request_id } = save else {
         panic!("save: {save:?}");
@@ -116,21 +119,27 @@ fn dirty_replacement_survives_unrelated_generation_save_later_edit_and_undo() {
     let view = f.flavite.get_buffer_view(id.into(), None).unwrap();
     assert!(
         f.flavite
-            .execute(Invocation::new(
-                next_id(&f.flavite),
-                "buffer.undo",
-                serde_json::json!({"buffer_id":id,"revision":view.revision}),
-                Origin::Gui
+            .execute(editor_operations_fixture::admit(
+                &f.flavite,
+                Invocation::new(
+                    next_id(&f.flavite),
+                    "buffer.undo",
+                    serde_json::json!({"buffer_id":id,"revision":view.revision}),
+                    Origin::Gui
+                )
             ))
             .is_success()
     );
     let frame = wait(&f, |frame| frame.publication().edge_count() == 1);
     assert_eq!(edges(&frame), vec![("a.md".into(), "c.md".into())]);
-    let save = f.flavite.execute(Invocation::new(
-        next_id(&f.flavite),
-        "note.save",
-        serde_json::json!(f.root.join("a.md")),
-        Origin::Gui,
+    let save = f.flavite.execute(editor_operations_fixture::admit(
+        &f.flavite,
+        Invocation::new(
+            next_id(&f.flavite),
+            "note.save",
+            serde_json::json!(f.root.join("a.md")),
+            Origin::Gui,
+        ),
     ));
     if let ExecutionResult::Pending { request_id } = save {
         assert!(f.flavite.wait_for_operation(request_id).is_success());
@@ -263,11 +272,14 @@ fn failed_parse_is_unavailable_and_new_unindexed_source_has_an_ephemeral_identit
         1,
         "saved history is retained separately"
     );
-    let open = f.flavite.execute(Invocation::new(
-        next_id(&f.flavite),
-        "note.open",
-        serde_json::json!({"path":f.root.join("new.md"),"policy":"create_if_missing"}),
-        Origin::Gui,
+    let open = f.flavite.execute(editor_operations_fixture::admit(
+        &f.flavite,
+        Invocation::new(
+            next_id(&f.flavite),
+            "note.open",
+            serde_json::json!({"path":f.root.join("new.md"),"policy":"create_if_missing"}),
+            Origin::Gui,
+        ),
     ));
     if let ExecutionResult::Pending { request_id } = open {
         assert!(f.flavite.wait_for_operation(request_id).is_success());
@@ -291,3 +303,6 @@ fn failed_parse_is_unavailable_and_new_unindexed_source_has_an_ephemeral_identit
         "opening/overlay does not create a saved file"
     );
 }
+
+#[path = "support/editor_operations.rs"]
+mod editor_operations_fixture;

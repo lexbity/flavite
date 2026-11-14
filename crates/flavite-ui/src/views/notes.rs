@@ -1,257 +1,227 @@
-//! The Notes view (W10): the vault note list with folder grouping and an
-//! in-memory filter, moved out of the W02 shell and de-duplicated with the
-//! picker matcher service. Catalog rows come from the bounded API snapshot;
-//! no filesystem or index access happens here.
-
-use crate::app::{App, Message};
-use crate::picker;
-use crate::style;
-use crate::workspace::tab_strip;
+//! A shared, lazy vault file tree; directory reads run through the API worker.
+use crate::{
+    app::{App, Message},
+    host::file_browser::{BrowserMessage, Owner},
+    style,
+    workspace::{bounds, tab_strip},
+};
 use flavite_workspace::TabId;
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
-use iced::{Element, Length, alignment};
+use iced::{
+    Element, Length, alignment,
+    widget::{Space, button, column, container, row, scrollable, text, text_input},
+};
 
-/// Filter input widget id for semantic tests.
 pub const NOTES_FILTER_ID_PREFIX: &str = "notes-filter-";
-
-fn filter_id(tab: TabId) -> iced::widget::Id {
-    iced::widget::Id::from(format!("{NOTES_FILTER_ID_PREFIX}{}", tab.raw()))
+pub fn scroll_id(owner: Owner) -> iced::widget::Id {
+    iced::widget::Id::from(format!("file-tree-{owner:?}"))
 }
 
-/// Render the Notes list for one tab. `group` is where picked notes open.
 pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
     content(
         app,
-        app.notes_filter(tab).to_owned(),
-        filter_id(tab),
-        move |value| Message::NotesFilter { tab, value },
         Some(tab),
+        app.notes_filter(tab).to_owned(),
+        iced::widget::Id::from(format!("{NOTES_FILTER_ID_PREFIX}{}", tab.raw())),
     )
 }
-
-/// The same catalog and note-opening intents in the collapsible navigator.
 pub fn sidebar(app: &App) -> Element<'_, Message> {
     content(
         app,
+        None,
         app.sidebar_filter.clone(),
         iced::widget::Id::new("sidebar-notes-filter"),
-        Message::SidebarFilter,
-        None,
     )
+}
+fn message(action: BrowserMessage) -> Message {
+    Message::FileBrowser(action)
 }
 
 fn content<'a>(
     app: &'a App,
+    owner: Owner,
     filter: String,
-    id: iced::widget::Id,
-    on_input: impl Fn(String) -> Message + 'a,
-    tab: Option<TabId>,
+    input_id: iced::widget::Id,
 ) -> Element<'a, Message> {
-    let compact = tab.is_none();
     let metrics = app.appearance.metrics();
-    if let Some(error) = app.catalog_error() {
-        return container(
-            column![
-                text("Notes unavailable").size(metrics.heading),
-                text(error.to_owned()).style(style::dim_text),
-                button(text("Retry"))
-                    .padding(tab_strip::chip_padding())
-                    .style(style::action())
-                    .on_press(Message::RefreshCatalog),
-            ]
-            .spacing(metrics.spacing_sm),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(metrics.spacing_lg)
-        .style(style::content)
-        .into();
+    let rows = app.file_browser.rows(owner, &filter);
+    let state = app.file_browser.views.get(&owner);
+    let row_height = 30.0 * metrics.scale;
+    let start = ((state.map_or(0.0, |s| s.scroll) / row_height) as usize)
+        .saturating_sub(4)
+        .min(rows.len());
+    let end =
+        (start + (app.window_size().height / row_height).ceil() as usize + 12).min(rows.len());
+    let mut list = column![Space::new().height(start as f32 * row_height)].spacing(0);
+    for entry in &rows[start..end] {
+        let path = entry.entry.path.clone();
+        let basename = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let selected = state.is_some_and(|state| state.selected.as_ref() == Some(&path));
+        let title = app
+            .catalog()
+            .iter()
+            .find(|note| note.path == path)
+            .map(|note| note.title.as_str())
+            .filter(|title| *title != basename && !title.is_empty());
+        let active = app
+            .workspace
+            .document_anchor()
+            .and_then(|tab| app.notes.locator_of(tab))
+            .is_some_and(|locator| {
+                locator.components().iter().collect::<std::path::PathBuf>() == path
+            });
+        let glyph = if entry.entry.directory {
+            if entry.expanded { "▾" } else { "▸" }
+        } else if active {
+            "●"
+        } else {
+            "·"
+        };
+        let label = row![
+            text(glyph).size(metrics.text),
+            text(basename)
+                .size(metrics.text)
+                .wrapping(iced::widget::text::Wrapping::None),
+            Space::new().width(Length::Fill),
+            text(title.unwrap_or("").to_owned())
+                .size(metrics.text_sm)
+                .style(style::dim_text)
+        ]
+        .spacing(metrics.spacing_sm)
+        .align_y(alignment::Vertical::Center);
+        let action = if entry.entry.directory {
+            BrowserMessage::Toggle(owner, path.clone())
+        } else {
+            BrowserMessage::Open(owner, path.clone())
+        };
+        let control = button(label)
+            .height(row_height)
+            .width(Length::Fill)
+            .padding(iced::Padding {
+                top: 2.0,
+                bottom: 2.0,
+                left: 8.0 + entry.depth as f32 * 16.0 * metrics.scale,
+                right: 8.0,
+            })
+            .style(style::list_row(selected || active))
+            .on_press(message(action));
+        let key = if entry.entry.directory {
+            format!("folder:{}", path.display())
+        } else {
+            format!("note:{}", path.display())
+        };
+        list = list.push(bounds::observe_named(
+            control,
+            format!("tree-{owner:?}-{key}-{filter}"),
+            move |rect| Message::SidebarControlBounds(key.clone(), rect),
+        ));
     }
-    if app.catalog().is_empty()
-        && matches!(
-            app.catalog_status(),
-            crate::app::CatalogStatus::Loading | crate::app::CatalogStatus::Empty
-        )
-    {
-        // Ticketed acquisition in flight (RFC-0004 W-D): honest loading
-        // text over the existing empty-state pattern, never a blank list.
-        return container(
-            column![
-                text("Notes").size(metrics.heading),
-                text("Indexing notes…").style(style::dim_text),
-            ]
-            .spacing(metrics.spacing_sm),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(metrics.spacing_lg)
-        .style(style::content)
-        .into();
-    }
-    let candidates = app.note_candidates();
-    let total = candidates.all().len();
-    let matched: std::sync::Arc<[crate::picker::NoteCandidate]> = candidates.matches(&filter);
-    let shown = matched.len();
-
-    // Group by parent directory in canonical path order; the catalog is
-    // already sorted, so folders arrive contiguously.
-    let mut list = column![].spacing(2);
-    let mut current_folder: Option<String> = None;
-    const MAX_ROWS: usize = 500;
-    let mut rendered = 0usize;
-    for candidate in matched.iter() {
-        if rendered >= MAX_ROWS {
-            break;
+    list = list.push(Space::new().height((rows.len() - end) as f32 * row_height));
+    // Directory paging is explicit; no first-500 cutoff makes files unreachable.
+    let mut paging = column![].spacing(metrics.spacing_sm);
+    for (path, directory) in &app.file_browser.directories {
+        let visible =
+            path.as_os_str().is_empty() || state.is_some_and(|s| s.expanded.contains(path));
+        if visible && let Some(error) = &directory.error {
+            paging = paging.push(text(error.clone()).style(style::dim_text));
         }
-        let folder = candidate
-            .path()
-            .to_string()
-            .rsplit_once('/')
-            .map_or_else(String::new, |(parent, _)| parent.to_owned());
-        if current_folder.as_deref() != Some(folder.as_str()) {
-            current_folder = Some(folder.clone());
-            list = list.push(
-                row![
-                    crate::workspace::chrome::icon(*metrics, crate::workspace::chrome::Icon::Notes),
-                    text(if folder.is_empty() {
-                        "Vault root".to_owned()
+        if visible && directory.next.is_some() {
+            paging = paging.push(
+                button(text(format!(
+                    "Load more in {}",
+                    if path.as_os_str().is_empty() {
+                        "vault root".into()
                     } else {
-                        folder
-                    })
-                    .size(metrics.text_sm)
-                    .style(style::dim_text),
-                ]
-                .spacing(metrics.spacing_sm)
-                .padding(iced::Padding {
-                    top: 4.0,
-                    bottom: 2.0,
-                    left: 0.0,
-                    right: 0.0,
-                }),
+                        path.display().to_string()
+                    }
+                )))
+                .on_press(message(BrowserMessage::More(path.clone())))
+                .style(style::ghost()),
             );
         }
-        list = list.push(note_row(*metrics, candidate, compact, &filter));
-        rendered += 1;
     }
-    if shown > rendered {
+    if rows.is_empty() {
         list = list.push(
-            text(format!("{shown} notes match; showing the first {rendered}"))
-                .size(metrics.text_sm)
-                .style(style::dim_text),
-        );
-    }
-    if shown == 0 {
-        list = list.push(
-            text(if total == 0 {
-                "This vault has no notes yet. Create one from the File menu."
+            text(if app.file_browser.directories.is_empty() {
+                "Loading vault folders…"
+            } else if filter.is_empty() {
+                "This folder has no visible files."
             } else {
-                "No notes match this filter."
+                "No loaded files or indexed notes match."
             })
             .style(style::dim_text),
         );
     }
-
+    if let Some(error) = app
+        .file_browser
+        .directories
+        .get(std::path::Path::new(""))
+        .and_then(|dir| dir.error.as_ref())
+    {
+        list = list.push(text(error.clone()).style(style::dim_text));
+    }
     let mut heading = row![
-        text(format!("{total} notes")).size(metrics.text_lg),
+        text(if owner.is_none() {
+            "Vault root"
+        } else {
+            "Files"
+        })
+        .size(metrics.text_lg),
         Space::new().width(Length::Fill),
+        button(text("Reveal"))
+            .on_press(message(BrowserMessage::Reveal(owner)))
+            .style(style::ghost()),
         button(text("Refresh"))
-            .padding(tab_strip::chip_padding())
+            .on_press(message(BrowserMessage::Refresh))
             .style(style::ghost())
-            .on_press(Message::RefreshCatalog)
     ]
-    .spacing(metrics.spacing)
+    .spacing(metrics.spacing_sm)
     .align_y(alignment::Vertical::Center);
-    if let Some(tab) = tab {
+    if let Some(tab) = owner {
         heading = heading.push(crate::workspace::chrome::icon_button(
             *metrics,
             crate::workspace::chrome::Icon::Sidebar,
-            "Move Notes into the sidebar",
+            "Move file browser into the sidebar",
             Some(Message::NotesToSidebar(tab)),
         ));
     }
-    let input: Element<'a, Message> = text_input("Filter notes…", &filter)
-        .id(id)
-        .on_input(on_input)
+    let input = text_input("Filter notes and loaded files…", &filter)
+        .id(input_id)
+        .on_input(move |value| {
+            owner.map_or(Message::SidebarFilter(value.clone()), |tab| {
+                Message::NotesFilter { tab, value }
+            })
+        })
         .padding(tab_strip::chip_padding())
-        .size(metrics.text_sm)
-        .into();
-    let input = if compact {
-        crate::workspace::bounds::observe(input, |rect| {
+        .size(metrics.text_sm);
+    let input: Element<'a, Message> = if owner.is_none() {
+        bounds::observe(input, |rect| {
             Message::SidebarControlBounds("filter".into(), rect)
         })
     } else {
-        input
+        input.into()
     };
     container(
         column![
             heading,
             input,
-            iced::Element::from(if compact {
-                Space::new().height(0).into()
-            } else {
-                Element::from(
-                    text("Pick a note to open it")
-                        .size(metrics.text_sm)
-                        .style(style::dim_text),
-                )
-            }),
-            container(scrollable(list).height(Length::Fill))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .padding(metrics.spacing_sm)
-                .style(style::content),
+            scrollable(list)
+                .id(scroll_id(owner))
+                .on_scroll(move |viewport| message(BrowserMessage::Scroll(
+                    owner,
+                    viewport.absolute_offset().y
+                )))
+                .height(Length::Fill),
+            paging
         ]
         .spacing(metrics.spacing_sm),
     )
+    .padding(metrics.spacing_lg)
     .width(Length::Fill)
     .height(Length::Fill)
-    .padding(metrics.spacing_lg)
     .style(style::content)
     .into()
-}
-
-/// One selectable note row (title plus native path), shared by grouping.
-/// The row owns its content, so it can outlive the candidate snapshot.
-fn note_row(
-    metrics: crate::style::Metrics,
-    candidate: &picker::NoteCandidate,
-    compact: bool,
-    filter: &str,
-) -> Element<'static, Message> {
-    let label: Element<'static, Message> = if compact {
-        text(candidate.title().to_owned())
-            .size(metrics.text)
-            .wrapping(iced::widget::text::Wrapping::None)
-            .into()
-    } else {
-        row![
-            text(candidate.title().to_owned()).width(Length::Fill),
-            text(candidate.path().to_string())
-                .size(metrics.text_sm)
-                .style(style::dim_text)
-        ]
-        .spacing(metrics.spacing)
-        .into()
-    };
-    let element: Element<'static, Message> = button(label)
-        .width(Length::Fill)
-        .padding(iced::Padding {
-            top: 6.0,
-            bottom: 6.0,
-            left: 10.0,
-            right: 10.0,
-        })
-        .style(style::list_row(false))
-        .on_press(Message::OpenIntent(
-            crate::host::open_intents::OpenIntent::reuse(candidate.locator.clone(), None),
-        ))
-        .into();
-    if compact {
-        let key = format!("note:{}", candidate.path());
-        crate::workspace::bounds::observe_named(element, format!("{key}:{filter}"), move |rect| {
-            Message::SidebarControlBounds(key.clone(), rect)
-        })
-    } else {
-        element
-    }
 }

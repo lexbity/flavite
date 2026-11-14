@@ -1,4 +1,3 @@
-use flavite_api::session::SessionCommand;
 use flavite_editor::{EditorAction, EditorSurface, EditorView, LinkNavigation};
 use flavite_syntax::text::{Span, TextByte};
 use std::path::PathBuf;
@@ -35,36 +34,21 @@ fn surface_trait_is_implementable_without_iced() {
 }
 
 #[test]
-fn edits_become_revision_guarded_session_commands() {
-    let action = EditorAction::replace(&view(), 5, 5, "!".into());
-    match action.into_session_command() {
-        SessionCommand::ApplyEdits {
-            buffer_id,
-            revision,
-            ops,
-            undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
-            editor: None,
-            operation: None,
-        } => {
-            assert_eq!(buffer_id.as_u64(), 42);
-            assert_eq!(revision.as_u64(), 7);
-            assert_eq!(ops[0].range, Span::new(TextByte(5), TextByte(5)));
-            assert_eq!(ops[0].replacement, "!");
-        }
-        other => panic!("expected ApplyEdits, got {other:?}"),
-    }
-}
-
-#[test]
-fn history_actions_remain_typed_session_commands() {
-    let undo = EditorAction::history(&view(), false).into_session_command();
-    let redo = EditorAction::history(&view(), true).into_session_command();
-    assert!(
-        matches!(undo, SessionCommand::Undo { buffer_id, revision } if buffer_id.as_u64() == 42 && revision.as_u64() == 7)
-    );
-    assert!(
-        matches!(redo, SessionCommand::Redo { buffer_id, revision } if buffer_id.as_u64() == 42 && revision.as_u64() == 7)
-    );
+fn edits_and_history_become_revision_guarded_api_invocations() {
+    let edit = EditorAction::replace(&view(), 5, 5, "!".into())
+        .into_invocation(1)
+        .unwrap();
+    assert_eq!(edit.command_id, "apply_edits");
+    assert_eq!(edit.preconditions.expected_revision, Some(7));
+    assert_eq!(edit.args["ops"][0]["range"], serde_json::json!([5, 5]));
+    let undo = EditorAction::history(&view(), false)
+        .into_invocation(2)
+        .unwrap();
+    assert_eq!(undo.command_id, "buffer.undo");
+    let redo = EditorAction::history(&view(), true)
+        .into_invocation(3)
+        .unwrap();
+    assert_eq!(redo.command_id, "buffer.redo");
 }
 
 #[test]

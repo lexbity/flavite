@@ -60,7 +60,10 @@ fn api_execute(
     args: serde_json::Value,
 ) -> serde_json::Value {
     let request_id = api.command_registry().next_request_id();
-    let result = api.execute(Invocation::new(request_id, id, args, Origin::Cli));
+    let result = api.execute(editor_operations_fixture::admit(
+        &api,
+        Invocation::new(request_id, id, args, Origin::Cli),
+    ));
     let result = match result {
         flavite_api::ExecutionResult::Pending { request_id } => api.wait_for_operation(request_id),
         other => other,
@@ -129,6 +132,7 @@ fn prepare_draft_preview(app: &mut App, tab: TabId) {
             .is_some_and(|state| !state.updating && state.preview_id.is_some())
     });
     let _ = app.update(Message::ReplaceSelect {
+        target: app.replace.view_state(tab).preview_target().unwrap(),
         tab,
         selection: flavite_ui::host::replace::SelectAction::All,
     });
@@ -165,7 +169,10 @@ fn draft_apply_and_revert_flow_through_app_pump() {
         })
     );
 
-    let _ = f.app.update(Message::ReplaceApply { tab });
+    let _ = f.app.update(Message::ReplaceApply {
+        target: f.app.replace.view_state(tab).preview_target().unwrap(),
+        tab,
+    });
     wait(&mut f.app, |app| {
         app.replace.tabs.get(&tab).is_some_and(|state| {
             state
@@ -194,7 +201,18 @@ fn draft_apply_and_revert_flow_through_app_pump() {
 
     // Revert through the app: both item classes restore.
     assert!(f.app.replace.tabs[&tab].can_revert());
-    let _ = f.app.update(Message::ReplaceRevert { tab });
+    let _ = f.app.update(Message::ReplaceRevert {
+        job_id: f
+            .app
+            .replace
+            .view_state(tab)
+            .job
+            .as_ref()
+            .unwrap()
+            .job_id
+            .clone(),
+        tab,
+    });
     wait(&mut f.app, |app| {
         app.replace.tabs.get(&tab).is_some_and(|state| {
             state.job.as_ref().is_some_and(|job| {
@@ -220,3 +238,6 @@ fn draft_apply_and_revert_flow_through_app_pump() {
         b"alpha one\n"
     );
 }
+
+#[path = "../../flavite-api/tests/support/editor_operations.rs"]
+mod editor_operations_fixture;

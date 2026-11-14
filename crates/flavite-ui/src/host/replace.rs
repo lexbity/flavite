@@ -8,7 +8,7 @@
 //! through ReadNotes facade commands; nothing here ever applies a
 //! replacement (Apply is S08).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use flavite_api::{ExecutionResult, Invocation, LocalResult, OperationCompletion, Origin};
@@ -34,6 +34,9 @@ pub enum ReplacePanelMode {
 /// One find row (presentation projection).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FindRowView {
+    pub content_hash: String,
+    pub source_kind: String,
+    pub contexts: Vec<flavite_api::MatchContext>,
     pub ordinal: u64,
     pub path: String,
     pub title: String,
@@ -70,6 +73,13 @@ pub struct CandidateView {
     pub source_kind: String,
 }
 
+/// The exact sealed preview and selection shown by a mounted control.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewTarget {
+    pub id: String,
+    pub selection_revision: u64,
+}
+
 /// One durable replacement job summary (RFC-0006 S08/S09).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct JobView {
@@ -97,10 +107,15 @@ pub struct ReplaceTabState {
     pub regex: bool,
     pub case_sensitive: bool,
     pub whole_word: bool,
+    pub folder: String,
+    pub collapsed: BTreeSet<String>,
+    pub diffs: BTreeMap<u64, Result<flavite_api::ReplacementDiff, String>>,
+    pub inspected: BTreeSet<u64>,
     /// Opt-in draft inclusion (RFC-0006 S09/D-09).
     pub include_drafts: bool,
     edited_at: Option<Instant>,
     epoch: u64,
+    paint_generation: u64,
     sequence: u64,
     pub updating: bool,
     pub error: Option<String>,
@@ -112,6 +127,7 @@ pub struct ReplaceTabState {
     pub truncated_scope: bool,
     pub exclusions: Vec<(String, String)>,
     pub rows: Vec<FindRowView>,
+    pub earlier_results_removed: bool,
     next_note_index: Option<u64>,
     next_match_offset: Option<u64>,
     /// Sealed preview.
@@ -124,24 +140,59 @@ pub struct ReplaceTabState {
     pending_selection: Option<SelectAction>,
     /// RFC-0006 S08: durable job bound to this tab's preview.
     pub job: Option<JobView>,
+    pub cancel_requested: bool,
     /// The in-flight apply/cancel/resume action id.
     job_action_request: Option<u64>,
 }
 
 impl ReplaceTabState {
+    pub const fn frame_generation(&self) -> u64 {
+        self.paint_generation
+    }
+    pub fn geometry_changed(&mut self) {
+        self.paint_generation = self.paint_generation.wrapping_add(1);
+    }
+
+    pub fn preview_target(&self) -> Option<PreviewTarget> {
+        Some(PreviewTarget {
+            id: self.preview_id.clone()?,
+            selection_revision: self
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.selection_revision)
+                .unwrap_or(0),
+        })
+    }
+
     /// Whether a durable apply may run (sealed + selected + idle).
     #[must_use]
     pub fn can_apply(&self) -> bool {
         self.preview_id.is_some()
             && self.selection_ready
-            && self.job.is_none()
+            && self.job.as_ref().is_none_or(|job| {
+                Some(&job.job_id) != self.preview_id.as_ref()
+                    && !matches!(job.phase.as_str(), "ready" | "applying")
+            })
             && self.job_action_request.is_none()
     }
 
     /// Whether cancel/resume is available.
     #[must_use]
     pub fn can_cancel(&self) -> bool {
-        self.job_action_request.is_none() && self.job.is_some()
+        self.job_action_request.is_none()
+            && !self.cancel_requested
+            && self
+                .job
+                .as_ref()
+                .is_some_and(|job| matches!(job.phase.as_str(), "ready" | "applying"))
+    }
+
+    pub fn can_resume(&self) -> bool {
+        self.job_action_request.is_none()
+            && self
+                .job
+                .as_ref()
+                .is_some_and(|job| matches!(job.phase.as_str(), "partial" | "cancelled" | "paused"))
     }
 
     /// Whether a guarded Revert is available: the job finished (or paused/
@@ -162,7 +213,7 @@ impl ReplaceTabState {
         applied > 0
             && matches!(
                 job.phase.as_str(),
-                "completed" | "partial" | "cancelled" | "paused" | "needs-recovery"
+                "completed" | "partial" | "cancelled" | "paused"
             )
     }
 
@@ -233,7 +284,9 @@ impl ReplaceTabState {
     }
 
     fn clear_find(&mut self) {
+        self.geometry_changed();
         self.rows.clear();
+        self.earlier_results_removed = false;
         self.snapshot = None;
         self.total_notes = None;
         self.total_matches = None;
@@ -244,14 +297,16 @@ impl ReplaceTabState {
     }
 
     fn clear_preview(&mut self) {
+        self.geometry_changed();
         self.preview_id = None;
         self.plan = None;
         self.candidates.clear();
         self.selected.clear();
         self.selection_ready = false;
         self.pending_selection = None;
-        self.job = None;
-        self.job_action_request = None;
+        // A new query must not hide the last durable job's progress/revert.
+        self.diffs.clear();
+        self.inspected.clear();
     }
 
     /// Apply a completed selection to the candidate flags.
@@ -268,6 +323,9 @@ impl ReplaceTabState {
                 }
             }
             SelectAction::Keys(keys) => {
+                for selected in self.selected.values_mut() {
+                    *selected = false;
+                }
                 for key in keys {
                     if let Some(selected) = self.selected.get_mut(key) {
                         *selected = true;
@@ -287,9 +345,34 @@ pub struct ReplaceHost {
     select_requests: BTreeMap<u64, flavite_workspace::TabId>,
     /// RFC-0006 S08: job command requests (apply/cancel/resume/status).
     job_requests: BTreeMap<u64, flavite_workspace::TabId>,
+    diff_requests: BTreeMap<flavite_api::RequestToken, (flavite_workspace::TabId, String, u64)>,
+    pending_find_closes: Vec<String>,
+    pending_preview_closes: Vec<String>,
 }
 
 impl ReplaceHost {
+    pub fn validate_job(&mut self, tab: flavite_workspace::TabId, job_id: &str) -> bool {
+        let state = self.tabs.entry(tab).or_default();
+        if state.job.as_ref().is_some_and(|job| job.job_id == job_id) {
+            return true;
+        }
+        state.error = Some("Replacement job changed; choose this action again".into());
+        false
+    }
+
+    pub fn validate_preview(
+        &mut self,
+        tab: flavite_workspace::TabId,
+        target: &PreviewTarget,
+    ) -> bool {
+        let state = self.tabs.entry(tab).or_default();
+        if state.preview_target().as_ref() == Some(target) {
+            return true;
+        }
+        state.error = Some("Preview changed; review it before choosing this action again".into());
+        false
+    }
+
     /// The render state for one tab (its own or the shared default).
     #[must_use]
     pub fn view_state(&self, tab: flavite_workspace::TabId) -> &ReplaceTabState {
@@ -311,8 +394,6 @@ impl ReplaceHost {
         let Some(state) = self.tabs.remove(&tab) else {
             return;
         };
-        self.find_requests.retain(|_, (owner, _)| *owner != tab);
-        self.preview_requests.retain(|_, (owner, _)| *owner != tab);
         self.select_requests.retain(|_, owner| *owner != tab);
         self.job_requests.retain(|_, owner| *owner != tab);
         let Some(api) = flavite else {
@@ -322,9 +403,7 @@ impl ReplaceHost {
             submit_close(api, "source_find.close", finder);
         }
         if let Some(preview) = state.preview_id {
-            // Preview close drops the live session reference; the store TTL
-            // sweeps the spool. (No close command in S07.)
-            let _ = preview;
+            submit_preview_close(api, preview);
         }
     }
 
@@ -332,6 +411,14 @@ impl ReplaceHost {
     /// arrival.
     pub fn edited(&mut self, tab: flavite_workspace::TabId, field: ReplaceField, value: String) {
         let state = self.tabs.entry(tab).or_default();
+        if let Some(preview) = state.preview_id.take() {
+            self.pending_preview_closes.push(preview);
+        }
+        if field != ReplaceField::Replacement
+            && let Some(finder) = state.finder.take()
+        {
+            self.pending_find_closes.push(finder);
+        }
         state.epoch = state.epoch.wrapping_add(1);
         state.edited_at = Some(Instant::now());
         state.updating = false;
@@ -346,12 +433,23 @@ impl ReplaceHost {
                 state.replacement = value;
                 state.clear_preview();
             }
+            ReplaceField::Folder => {
+                state.folder = value;
+                state.clear_find();
+                state.clear_preview();
+            }
         }
     }
 
     /// Toggle regex/case/whole-word; re-admits the current query.
     pub fn toggle(&mut self, tab: flavite_workspace::TabId, flag: ReplaceFlag) {
         let state = self.tabs.entry(tab).or_default();
+        if let Some(preview) = state.preview_id.take() {
+            self.pending_preview_closes.push(preview);
+        }
+        if let Some(finder) = state.finder.take() {
+            self.pending_find_closes.push(finder);
+        }
         match flag {
             ReplaceFlag::Regex => state.regex = !state.regex,
             ReplaceFlag::CaseSensitive => state.case_sensitive = !state.case_sensitive,
@@ -369,7 +467,14 @@ impl ReplaceHost {
     /// Switch the panel mode.
     pub fn set_mode(&mut self, tab: flavite_workspace::TabId, mode: ReplacePanelMode) {
         let state = self.tabs.entry(tab).or_default();
+        if let Some(finder) = state.finder.take() {
+            self.pending_find_closes.push(finder);
+        }
+        state.clear_find();
         state.mode = mode;
+        if mode == ReplacePanelMode::Find {
+            state.edited_at = Some(Instant::now() - REPLACE_DEBOUNCE);
+        }
     }
 
     /// Submit the focused query immediately.
@@ -381,6 +486,14 @@ impl ReplaceHost {
 
     /// Submit due find searches (only in Find mode; preview runs explicitly).
     pub fn admit_due(&mut self, flavite: Option<&flavite_api::Flavite>) {
+        if let Some(api) = flavite {
+            for preview in std::mem::take(&mut self.pending_preview_closes) {
+                submit_preview_close(api, preview);
+            }
+            for finder in std::mem::take(&mut self.pending_find_closes) {
+                submit_close(api, "source_find.close", finder);
+            }
+        }
         let due: Vec<flavite_workspace::TabId> = self
             .tabs
             .iter()
@@ -406,7 +519,14 @@ impl ReplaceHost {
         let Some(api) = flavite else {
             return;
         };
-        let (query, regex, case_sensitive, whole_word, epoch) = {
+        if let Some(finder) = self
+            .tabs
+            .get_mut(&tab)
+            .and_then(|state| state.finder.take())
+        {
+            submit_close(api, "source_find.close", finder);
+        }
+        let (query, regex, case_sensitive, whole_word, folder, include_drafts, epoch) = {
             let Some(state) = self.tabs.get_mut(&tab) else {
                 return;
             };
@@ -432,6 +552,8 @@ impl ReplaceHost {
                 state.regex,
                 state.case_sensitive,
                 state.whole_word,
+                state.folder.clone(),
+                state.include_drafts,
                 state.epoch,
             )
         };
@@ -444,6 +566,8 @@ impl ReplaceHost {
                 "mode": if regex { "regex" } else { "literal" },
                 "case_sensitive": case_sensitive,
                 "whole_word": whole_word,
+                "folder": if folder.trim().is_empty() { None } else { Some(folder) },
+                "include_drafts": include_drafts,
             }),
             Origin::Gui,
         ));
@@ -535,7 +659,14 @@ impl ReplaceHost {
         let Some(api) = flavite else {
             return;
         };
-        let (query, replacement, regex, case_sensitive, whole_word, include_drafts, epoch) = {
+        if let Some(preview) = self
+            .tabs
+            .get_mut(&tab)
+            .and_then(|state| state.preview_id.take())
+        {
+            submit_preview_close(api, preview);
+        }
+        let (query, replacement, regex, case_sensitive, whole_word, include_drafts, folder, epoch) = {
             let Some(state) = self.tabs.get_mut(&tab) else {
                 return;
             };
@@ -565,6 +696,7 @@ impl ReplaceHost {
                 state.case_sensitive,
                 state.whole_word,
                 state.include_drafts,
+                state.folder.clone(),
                 state.epoch,
             )
         };
@@ -579,6 +711,7 @@ impl ReplaceHost {
                 "case_sensitive": case_sensitive,
                 "whole_word": whole_word,
                 "include_drafts": include_drafts,
+                "folder": if folder.trim().is_empty() { None } else { Some(folder) },
             }),
             Origin::Gui,
         ));
@@ -688,12 +821,19 @@ impl ReplaceHost {
     /// Route one drained completion; true when it belonged to replace.
     pub fn observe(&mut self, completion: &OperationCompletion) -> bool {
         if let Some((tab, epoch)) = self.find_requests.remove(&completion.request_id) {
-            let Some(state) = self.tabs.get_mut(&tab) else {
-                return true;
-            };
-            if epoch != state.epoch {
+            if self.tabs.get(&tab).is_none_or(|state| epoch != state.epoch) {
+                if let ExecutionResult::Local(LocalResult::Success(success)) = &completion.result
+                    && let Some(finder) = success
+                        .data
+                        .get("finder_id")
+                        .and_then(serde_json::Value::as_str)
+                {
+                    self.pending_find_closes.push(finder.to_owned());
+                }
                 return true;
             }
+            let state = self.tabs.get_mut(&tab).expect("live request owner");
+            state.geometry_changed();
             match &completion.result {
                 ExecutionResult::Local(LocalResult::Success(success)) => {
                     let data = &success.data;
@@ -767,12 +907,19 @@ impl ReplaceHost {
             return true;
         }
         if let Some((tab, epoch)) = self.preview_requests.remove(&completion.request_id) {
-            let Some(state) = self.tabs.get_mut(&tab) else {
-                return true;
-            };
-            if epoch != state.epoch {
+            if self.tabs.get(&tab).is_none_or(|state| epoch != state.epoch) {
+                if let ExecutionResult::Local(LocalResult::Success(success)) = &completion.result
+                    && let Some(preview) = success
+                        .data
+                        .get("preview_id")
+                        .and_then(serde_json::Value::as_str)
+                {
+                    self.pending_preview_closes.push(preview.to_owned());
+                }
                 return true;
             }
+            let state = self.tabs.get_mut(&tab).expect("live preview owner");
+            state.geometry_changed();
             match &completion.result {
                 ExecutionResult::Local(LocalResult::Success(success)) => {
                     let data = &success.data;
@@ -907,6 +1054,7 @@ impl ReplaceHost {
                 return true;
             };
             state.updating = false;
+            state.geometry_changed();
             match &completion.result {
                 ExecutionResult::Local(LocalResult::Success(success)) => {
                     let data = &success.data;
@@ -989,13 +1137,24 @@ impl ReplaceHost {
             ExecutionResult::Pending { request_id } => {
                 self.job_requests.insert(request_id, tab);
                 if let Some(state) = self.tabs.get_mut(&tab) {
-                    state.job_action_request = Some(request_id);
+                    state.job_action_request = None;
+                    state.cancel_requested = false;
+                    state.geometry_changed();
+                    state.job = Some(JobView {
+                        job_id: preview_id.clone(),
+                        phase: "applying".into(),
+                        selected: state.selected_count() as u64,
+                        ..JobView::default()
+                    });
                     state.error = None;
                 }
             }
             ExecutionResult::Local(LocalResult::Success(success)) => {
                 if let Some(state) = self.tabs.get_mut(&tab) {
-                    state.apply_job_status(success.data.get("status").cloned().unwrap_or_default());
+                    if let Some(status) = success.data.get("status") {
+                        state.cancel_requested = false;
+                        state.apply_job_status(status.clone());
+                    }
                     if let Some(job) = &mut state.job
                         && let Some(job_id) = success
                             .data
@@ -1093,7 +1252,7 @@ impl ReplaceHost {
             let Some(state) = self.tabs.get_mut(&tab) else {
                 return;
             };
-            if !state.can_cancel() {
+            if !state.can_resume() {
                 return;
             }
             let Some(job_id) = state.job.as_ref().map(|job| job.job_id.clone()) else {
@@ -1137,6 +1296,7 @@ impl ReplaceHost {
                 return;
             };
             state.job_action_request = Some(u64::MAX);
+            state.cancel_requested = true;
             job_id
         };
         let request_id = api.command_registry().next_request_id();
@@ -1159,7 +1319,10 @@ impl ReplaceHost {
             ExecutionResult::Local(LocalResult::Success(success)) => {
                 if let Some(state) = self.tabs.get_mut(&tab) {
                     state.job_action_request = None;
-                    state.apply_job_status(success.data.get("status").cloned().unwrap_or_default());
+                    if let Some(status) = success.data.get("status") {
+                        state.cancel_requested = false;
+                        state.apply_job_status(status.clone());
+                    }
                     let job_id = success
                         .data
                         .get("job_id")
@@ -1205,9 +1368,103 @@ impl ReplaceHost {
     }
 }
 
+impl ReplaceHost {
+    pub fn inspect(
+        &mut self,
+        tab: flavite_workspace::TabId,
+        item_id: u64,
+        api: Option<&flavite_api::Flavite>,
+    ) {
+        let Some(state) = self.tabs.get_mut(&tab) else {
+            return;
+        };
+        state.geometry_changed();
+        if !state.inspected.insert(item_id) {
+            state.inspected.remove(&item_id);
+            return;
+        }
+        if state.diffs.contains_key(&item_id) {
+            return;
+        }
+        let (Some(api), Some(preview)) = (api, state.preview_id.clone()) else {
+            return;
+        };
+        let Ok(preview_id) = u128::from_str_radix(&preview, 16) else {
+            return;
+        };
+        match api.query_service().submit(
+            tab.raw(),
+            1,
+            state.epoch,
+            flavite_api::QueryPayload::ReplacementDiff {
+                preview_id,
+                item_id,
+            },
+        ) {
+            Ok(token) => {
+                self.diff_requests.insert(token, (tab, preview, item_id));
+            }
+            Err(_) => {
+                state.diffs.insert(
+                    item_id,
+                    Err("Preview service busy; collapse and inspect again".into()),
+                );
+            }
+        }
+    }
+    pub fn observe_query(&mut self, outcome: &flavite_api::QueryOutcome) -> bool {
+        let Some((tab, preview, item)) = self.diff_requests.remove(&outcome.token) else {
+            return false;
+        };
+        if let Some(state) = self.tabs.get_mut(&tab)
+            && state.preview_id.as_ref() == Some(&preview)
+        {
+            state.geometry_changed();
+            let result = match &outcome.result {
+                flavite_api::ContextQueryResult::ReplacementDiff(result) => result.clone(),
+                _ => Err("Replacement preview unavailable".into()),
+            };
+            if state.diffs.len() >= 200 {
+                state.diffs.pop_first();
+            }
+            state.diffs.insert(item, result);
+        }
+        true
+    }
+    pub fn transfer(&mut self, from: flavite_workspace::TabId, to: flavite_workspace::TabId) {
+        if let Some(state) = self.tabs.remove(&from) {
+            self.tabs.insert(to, state);
+        }
+        for (owner, _) in self
+            .find_requests
+            .values_mut()
+            .chain(self.preview_requests.values_mut())
+        {
+            if *owner == from {
+                *owner = to;
+            }
+        }
+        for owner in self
+            .select_requests
+            .values_mut()
+            .chain(self.job_requests.values_mut())
+        {
+            if *owner == from {
+                *owner = to;
+            }
+        }
+        for (owner, _, _) in self.diff_requests.values_mut() {
+            if *owner == from {
+                *owner = to;
+            }
+        }
+    }
+}
+
 /// Which edited field changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplaceField {
+    Folder,
     Query,
     Replacement,
 }
@@ -1249,6 +1506,15 @@ fn submit_close(api: &flavite_api::Flavite, command: &'static str, id: String) {
     ));
 }
 
+fn submit_preview_close(api: &flavite_api::Flavite, id: String) {
+    let _ = api.execute(Invocation::new(
+        api.command_registry().next_request_id(),
+        "replace.preview_close",
+        serde_json::json!({"preview_id": id}),
+        Origin::Gui,
+    ));
+}
+
 /// Install a find page (append-once by ordinal; replay never duplicates).
 fn install_find_page(state: &mut ReplaceTabState, page: Option<&serde_json::Value>) {
     let Some(page) = page else {
@@ -1261,6 +1527,9 @@ fn install_find_page(state: &mut ReplaceTabState, page: Option<&serde_json::Valu
             rows.iter()
                 .filter_map(|row| {
                     Some(FindRowView {
+                        content_hash: row.get("content_hash")?.as_str()?.to_owned(),
+                        source_kind: row.get("source_kind")?.as_str()?.to_owned(),
+                        contexts: serde_json::from_value(row.get("contexts")?.clone()).ok()?,
                         ordinal: row.get("ordinal")?.as_u64()?,
                         path: row.get("path")?.as_str()?.to_owned(),
                         title: row.get("title")?.as_str()?.to_owned(),
@@ -1281,19 +1550,32 @@ fn install_find_page(state: &mut ReplaceTabState, page: Option<&serde_json::Valu
                 .collect()
         })
         .unwrap_or_default();
-    let first_ordinal = rows.first().map(|row| row.ordinal);
-    if let Some(ordinal) = first_ordinal {
-        // Append once: if the first new row's ordinal already exists, this
-        // is a replayed page.
-        if state
-            .rows
-            .last()
-            .is_some_and(|last| last.ordinal >= ordinal)
-        {
-            return;
+    for row in rows {
+        if let Some(existing) = state.rows.iter_mut().find(|old| old.ordinal == row.ordinal) {
+            let mut seen: BTreeSet<_> = existing.matches.iter().copied().collect();
+            for (span, context) in row.matches.into_iter().zip(row.contexts) {
+                if seen.insert(span) {
+                    existing.matches.push(span);
+                    existing.contexts.push(context);
+                }
+            }
+        } else {
+            state.rows.push(row);
         }
     }
-    state.rows.extend(rows);
+    let mut count: usize = state.rows.iter().map(|row| row.contexts.len()).sum();
+    while count > 2_000 {
+        let excess = count - 2_000;
+        let first = &mut state.rows[0];
+        let remove = excess.min(first.contexts.len());
+        first.contexts.drain(..remove);
+        first.matches.drain(..remove);
+        count -= remove;
+        if first.contexts.is_empty() {
+            state.rows.remove(0);
+        }
+        state.earlier_results_removed = true;
+    }
     state.next_note_index = page
         .get("next_note_index")
         .and_then(serde_json::Value::as_u64);
@@ -1372,7 +1654,7 @@ mod tests {
             "exclusions": [ { "path": "d.md", "reason": "dirty_buffer" } ],
             "page": {
                 "rows": [
-                    { "ordinal": 0, "path": "a.md", "title": "A", "note_matches": 2,
+                    { "ordinal": 0, "path": "a.md", "title": "A", "note_matches": 2, "content_hash": "", "source_kind": "saved", "contexts": [],
                       "matches": [[0,1],[2,3]] }
                 ],
                 "next_note_index": 1,

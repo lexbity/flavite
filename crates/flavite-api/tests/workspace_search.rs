@@ -20,7 +20,7 @@ fn save(flavite: &Flavite, path: &str) {
         serde_json::json!(flavite.vault_ref().root.join(path)),
         flavite_api::Origin::Gui,
     );
-    let result = flavite.execute(invocation);
+    let result = flavite.execute(editor_operations_fixture::admit(&flavite, invocation));
     match result {
         flavite_api::ExecutionResult::Pending { request_id } => {
             let completion = flavite.wait_for_operation(request_id);
@@ -91,7 +91,8 @@ fn search_reflects_saved_content_immediately_after_save() {
         }),
         flavite_api::Origin::Gui,
     );
-    f.flavite.execute(invocation);
+    f.flavite
+        .execute(editor_operations_fixture::admit(&f.flavite, invocation));
     save(&f.flavite, "alpha.md");
     let result = search_once(&f.flavite, "lazy dog", 10);
     let ContextQueryResult::Search { items, .. } = result else {
@@ -115,7 +116,10 @@ fn dirty_edits_are_absent_from_saved_search() {
         }),
         flavite_api::Origin::Gui,
     );
-    match f.flavite.execute(invocation) {
+    match f
+        .flavite
+        .execute(editor_operations_fixture::admit(&f.flavite, invocation))
+    {
         flavite_api::ExecutionResult::Local(flavite_api::LocalResult::Success(_)) => {}
         other => panic!("edit not applied: {other:?}"),
     }
@@ -303,3 +307,6 @@ fn has_more_is_true_exactly_when_a_limit_plus_one_row_exists() {
         );
     }
 }
+
+#[path = "support/editor_operations.rs"]
+mod editor_operations_fixture;

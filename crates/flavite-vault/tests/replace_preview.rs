@@ -129,6 +129,8 @@ fn find_start(session: &Session, query: &str) -> SessionResult {
         session.execute(SessionCommand::SourceFindStart {
             request_id: rid(),
             request: flavite_vault::replace::preview::SourceFindRequest {
+                folder: None,
+                include_drafts: false,
                 query: query.to_owned(),
                 mode: flavite_text_search::matcher::MatchMode::Literal,
                 case_sensitive: false,
@@ -159,6 +161,7 @@ fn preview(session: &Session, query: &str, replacement: &str) -> SessionResult {
         session.execute(SessionCommand::ReplacePreviewPrepare {
             request_id: rid(),
             request: flavite_vault::replace::preview::PreviewRequest {
+                folder: None,
                 query: query.to_owned(),
                 replacement: replacement.to_owned(),
                 mode: flavite_text_search::matcher::MatchMode::Literal,
@@ -209,7 +212,17 @@ fn source_find_freezes_scope_and_excludes_dirty_buffers() {
                 )],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
-                operation: None,
+                operation: h
+                    .session
+                    .issue_editor_operation(
+                        buffer_id,
+                        h.session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(revision),
+                        None,
+                    )
+                    .expect("fixture activation"),
             }),
         ),
         "dirty edit",
@@ -391,7 +404,17 @@ fn draft_inclusion_is_an_explicit_opt_in_and_clean_lineage_is_recorded() {
                 )],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
-                operation: None,
+                operation: h
+                    .session
+                    .issue_editor_operation(
+                        buffer_id,
+                        h.session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(revision),
+                        None,
+                    )
+                    .expect("fixture activation"),
             }),
         ),
         "dirty edit",
@@ -405,6 +428,7 @@ fn draft_inclusion_is_an_explicit_opt_in_and_clean_lineage_is_recorded() {
         h.session.execute(SessionCommand::ReplacePreviewPrepare {
             request_id: rid(),
             request: flavite_vault::replace::preview::PreviewRequest {
+                folder: None,
                 query: "alpha".to_owned(),
                 replacement: "X".to_owned(),
                 mode: flavite_text_search::matcher::MatchMode::Literal,
@@ -533,6 +557,7 @@ fn preview_without_helper_is_refused_typed_for_regex() {
         h.session.execute(SessionCommand::ReplacePreviewPrepare {
             request_id: rid(),
             request: flavite_vault::replace::preview::PreviewRequest {
+                folder: None,
                 query: "al.*a".to_owned(),
                 replacement: "X".to_owned(),
                 mode: flavite_text_search::matcher::MatchMode::Regex,

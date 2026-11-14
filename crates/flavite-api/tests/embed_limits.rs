@@ -44,7 +44,7 @@ fn current_dirty_source_recursive_embeds_cycles_and_remote_exclusions() {
         ("b.md", "# B\n![[a]]\n"),
     ]);
     let (id, revision) = f.open_note("a.md");
-    assert!(f.flavite.execute(flavite_api::Invocation::new(next_id(&f.flavite),"apply_edits",serde_json::json!({"buffer_id":id,"revision":revision,"ops":[{"range":[0,0],"replacement":"unsaved\n"}]}),flavite_api::Origin::Gui)).is_success());
+    assert!(f.flavite.execute(editor_operations_fixture::admit(&f.flavite, flavite_api::Invocation::new(next_id(&f.flavite),"apply_edits",serde_json::json!({"buffer_id":id,"revision":revision,"ops":[{"range":[0,0],"replacement":"unsaved\n"}]}),flavite_api::Origin::Gui))).is_success());
     let revision = f.flavite.get_buffer_view(id.into(), None).unwrap().revision;
     let doc = read(&f, "a.md", Some((id, revision)));
     assert!(doc.unsaved);
@@ -187,3 +187,6 @@ fn retained_read_results_share_a_hard_reservation_and_release_their_credit_on_dr
     assert_eq!(f.flavite.query_service().read_memory_reserved_bytes(), 0);
     assert!(read(&f, "a.md", None).text.len() == text.len());
 }
+
+#[path = "support/editor_operations.rs"]
+mod editor_operations_fixture;

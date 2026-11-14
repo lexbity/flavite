@@ -164,7 +164,16 @@ fn session_refuses_save_edit_and_rename_on_a_leased_source() {
         )],
         undo_policy: flavite_buffer::undo::UndoPolicy::Isolated,
         editor: None,
-        operation: None,
+        operation: session
+            .issue_editor_operation(
+                buffer_id,
+                session
+                    .shared_buffer_snapshot(buffer_id, None)
+                    .map(|snapshot| snapshot.revision)
+                    .unwrap_or(opened_revision),
+                None,
+            )
+            .expect("fixture activation"),
     });
     assert!(
         matches!(

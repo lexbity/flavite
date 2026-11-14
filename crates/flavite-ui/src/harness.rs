@@ -286,6 +286,7 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
                         "revision": buffer_view.as_ref().map(|view| view.revision),
                         "buffer_text": buffer_view.as_ref().map(|view| view.text.to_string()),
                         "selection_count": interaction.selections.len(),
+                        "primary": interaction.primary,
                         "selections": interaction
                             .selections
                             .iter()
@@ -446,6 +447,30 @@ pub fn semantic_snapshot(app: &App) -> serde_json::Value {
     snapshot["menu_bar_visible"] = app.menu_bar_visible.into();
     snapshot["sidebar_open"] = app.sidebar_open().into();
     snapshot["sidebar_filter"] = app.sidebar_filter.clone().into();
+    snapshot["vault_search_sidebar"] = app.vault_search.sidebar.into();
+    let search_owners: std::collections::BTreeSet<_> = app
+        .replace
+        .tabs
+        .keys()
+        .copied()
+        .chain(app.vault_search.bounds.keys().map(|(tab, _)| *tab))
+        .collect();
+    snapshot["vault_search_states"] = serde_json::json!(search_owners.iter().map(|tab| { let state = app.replace.view_state(*tab); serde_json::json!({
+        "tab": tab.to_string(), "query": state.query, "folder": state.folder, "replacement": state.replacement,
+        "mode": format!("{:?}", state.mode), "updating": state.updating, "error": state.error,
+        "notes": state.total_notes, "matches": state.total_matches, "sealed": state.preview_id.is_some(),
+        "selected": state.selected_count(),
+        "rows": state.rows.iter().map(|row| serde_json::json!({"ordinal": row.ordinal, "path": row.path, "contexts": row.contexts})).collect::<Vec<_>>(),
+        "candidates": state.candidates.iter().map(|candidate| serde_json::json!({"item": candidate.item_id, "path": candidate.path})).collect::<Vec<_>>(),
+        "diffs": state.diffs.iter().map(|(item, diff)| match diff { Ok(diff) => serde_json::json!({"item": item, "before": diff.before, "after": diff.after, "truncated": diff.truncated}), Err(error) => serde_json::json!({"item": item, "error": error}) }).collect::<Vec<_>>(),
+        "job": state.job.as_ref().map(|job| serde_json::json!({"phase": job.phase, "saved": job.saved, "reverted": job.reverted, "conflicts": job.conflicts})),
+        "bounds": app.vault_search.bounds.iter().filter(|((owner, _), _)| owner == tab).map(|((_, name), r)| (name.clone(), [r.x,r.y,r.width,r.height])).collect::<std::collections::BTreeMap<_,_>>(),
+    })}).collect::<Vec<_>>());
+    snapshot["file_browser"] = serde_json::json!({
+        "root_loaded": app.file_browser.directories.contains_key(std::path::Path::new("")),
+        "sidebar_rows": app.file_browser.rows(None, &app.sidebar_filter).iter().map(|row| serde_json::json!({"path": row.entry.path, "directory": row.entry.directory, "expanded": row.expanded, "depth": row.depth})).collect::<Vec<_>>(),
+        "views": app.file_browser.views.iter().map(|(owner, view)| serde_json::json!({"tab": owner.map(|tab| tab.to_string()), "expanded": view.expanded, "selected": view.selected, "scroll": view.scroll})).collect::<Vec<_>>(),
+    });
     snapshot["sidebar_bounds"] = serde_json::json!(
         app.sidebar_bounds
             .iter()

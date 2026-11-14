@@ -33,6 +33,8 @@ pub enum QueryPurpose {
     Search,
     /// Ticketed note-catalog acquisition (RFC-0004 W-D/D9).
     Catalog,
+    Directory,
+    ReplacementDiff(u64),
     /// Exact link-resolution verdicts for one immutable editor revision.
     LinkVerdicts,
 }
@@ -60,6 +62,15 @@ pub struct RequestToken {
 /// without leaking locator types across the facade boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryPayload {
+    ReplacementDiff {
+        preview_id: u128,
+        item_id: u64,
+    },
+    Directory {
+        path: PathBuf,
+        cursor: Option<crate::DirectoryCursor>,
+        limit: usize,
+    },
     Anchor {
         buffer_id: u64,
         revision: u64,
@@ -169,6 +180,8 @@ pub struct SearchResultRow {
 /// Typed outcome of one query slot.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContextQueryResult {
+    ReplacementDiff(Result<crate::ReplacementDiff, String>),
+    Directory(Result<crate::DirectoryPage, String>),
     Anchor {
         buffer_id: u64,
         revision: u64,
@@ -501,6 +514,10 @@ impl QueryService {
                 | QueryPayload::SearchPage { .. }
                 | QueryPayload::SearchClose { .. } => QueryPurpose::Search,
                 QueryPayload::Catalog { .. } => QueryPurpose::Catalog,
+                QueryPayload::Directory { .. } => QueryPurpose::Directory,
+                QueryPayload::ReplacementDiff { item_id, .. } => {
+                    QueryPurpose::ReplacementDiff(*item_id)
+                }
                 QueryPayload::LinkVerdicts { .. } => QueryPurpose::LinkVerdicts,
                 _ => QueryPurpose::Context,
             },
@@ -591,6 +608,22 @@ fn execute(
     search_sessions: &Arc<crate::search_sessions::SearchSessionService>,
 ) -> ContextQueryResult {
     match payload {
+        QueryPayload::ReplacementDiff {
+            preview_id,
+            item_id,
+        } => {
+            ContextQueryResult::ReplacementDiff(session.inspect_replacement(*preview_id, *item_id))
+        }
+        QueryPayload::Directory {
+            path,
+            cursor,
+            limit,
+        } => ContextQueryResult::Directory(crate::browser::list(
+            session,
+            path,
+            cursor.as_ref(),
+            *limit,
+        )),
         QueryPayload::Anchor {
             buffer_id,
             revision,

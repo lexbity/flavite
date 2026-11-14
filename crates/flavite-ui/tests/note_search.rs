@@ -139,15 +139,18 @@ fn duplicate_views_keep_independent_find_state_and_rescan_after_edits() {
     let view = app.note_editor_view(second).unwrap();
     let api = app.flavite.as_ref().unwrap();
     assert!(
-        api.execute(flavite_api::Invocation::new(
-            api.command_registry().next_request_id(),
-            "apply_edits",
-            serde_json::json!({
-                "buffer_id": view.buffer_id,
-                "revision": view.revision,
-                "ops": [{ "range": [0, 0], "replacement": "xalpha " }],
-            }),
-            flavite_api::Origin::Gui,
+        api.execute(editor_operations_fixture::admit(
+            &api,
+            flavite_api::Invocation::new(
+                api.command_registry().next_request_id(),
+                "apply_edits",
+                serde_json::json!({
+                    "buffer_id": view.buffer_id,
+                    "revision": view.revision,
+                    "ops": [{ "range": [0, 0], "replacement": "xalpha " }],
+                }),
+                flavite_api::Origin::Gui,
+            )
         ))
         .is_success()
     );
@@ -431,3 +434,6 @@ fn empty_query_is_idle_without_counts_or_navigation() {
     assert_eq!(before, after, "no navigation happened");
     assert_eq!(app.note_search.finds[&tab].index, 0);
 }
+
+#[path = "../../flavite-api/tests/support/editor_operations.rs"]
+mod editor_operations_fixture;

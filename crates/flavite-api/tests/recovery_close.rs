@@ -96,7 +96,10 @@ fn next_id(flavite: &Flavite) -> u64 {
 }
 
 fn command(flavite: &Flavite, id: &'static str, args: serde_json::Value) -> ExecutionResult {
-    flavite.execute(Invocation::new(next_id(flavite), id, args, Origin::Gui))
+    flavite.execute(editor_operations_fixture::admit(
+        &flavite,
+        Invocation::new(next_id(flavite), id, args, Origin::Gui),
+    ))
 }
 
 /// Pump until the admitted operation reaches a terminal result.
@@ -765,3 +768,6 @@ mod fault_injected {
         );
     }
 }
+
+#[path = "support/editor_operations.rs"]
+mod editor_operations_fixture;

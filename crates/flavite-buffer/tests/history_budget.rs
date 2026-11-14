@@ -84,6 +84,7 @@ fn refusal_before_mutation_leaves_text_revision_and_history_byte_identical() {
 
     // Recorded (editor-annotated) path refuses the same way.
     let record = flavite_buffer::history::EditorEdit {
+        before_primary: 0,
         origin: format!("{:032x}", 1),
         kind: flavite_buffer::history::EditKind::Typing,
         before: vec![[0, 0, 0]],
@@ -423,8 +424,10 @@ fn accounted_bytes_match_an_independent_oracle_under_random_ops() {
                         Some(record) => (&record.before[..], &record.after[..]),
                         None => (&[][..], &[][..]),
                     };
-                    let sel = (before.len() + after.len()) as u64 * 24;
-                    512 + snap_len + repl_len + sel
+                    let sel = (before.len() + after.len()) as u64 * 32;
+                    let geometry = node.movement_steps.capacity() as u64 * 24
+                        + node.movement_steps.iter().map(|step| step.capacity() as u64 * 24).sum::<u64>();
+                    512 + snap_len + repl_len + sel + geometry
                 })
                 .sum();
             proptest::prop_assert_eq!(tree.accounted_bytes(), expected);
@@ -453,7 +456,7 @@ fn coalescing_fresh_accounting_and_no_eviction_of_the_merged_node() {
     assert_eq!(tree.current().unwrap().version, 2);
     assert!(tree.survivor_ids().contains(&current));
     // Root (512) + merged node (512 fixed + "ab" snapshot + "ab" replacement).
-    let expected = 512 + 512 + 2 + 2;
+    let expected = 512 + 512 + 2 + 2 + 2 * (24 + 24);
     assert_eq!(tree.accounted_bytes(), expected);
 }
 

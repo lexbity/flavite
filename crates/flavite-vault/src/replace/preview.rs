@@ -37,6 +37,8 @@ const CANCEL_CHECK_INTERVAL: usize = 16;
 /// One vault source-find request (S07).
 #[derive(Debug, Clone)]
 pub struct SourceFindRequest {
+    pub folder: Option<PathBuf>,
+    pub include_drafts: bool,
     /// Literal or regex query. Empty literal is Idle (refused).
     pub query: String,
     /// Match mode (D-05).
@@ -49,6 +51,7 @@ pub struct SourceFindRequest {
 /// until S09; `include_drafts` must remain false in S07.
 #[derive(Debug, Clone)]
 pub struct PreviewRequest {
+    pub folder: Option<PathBuf>,
     pub query: String,
     pub replacement: String,
     pub mode: MatchMode,
@@ -179,7 +182,23 @@ impl PreviewCtx {
 
 /// Frozen note-catalog enumeration (D-08): one snapshot, ordered by native
 /// identity; later-created notes are excluded and marked truncated.
-fn enumerate_scope(ctx: &PreviewCtx, cancelled: &AtomicBool) -> Result<ScopeScan, PreviewError> {
+fn enumerate_scope(
+    ctx: &PreviewCtx,
+    cancelled: &AtomicBool,
+    folder: Option<&Path>,
+) -> Result<ScopeScan, PreviewError> {
+    if folder.is_some_and(|path| {
+        path.components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            || path
+                .components()
+                .next()
+                .is_some_and(|c| c.as_os_str() == ".flavite")
+    }) {
+        return Err(PreviewError::InvalidInput(
+            "folder must be inside the vault",
+        ));
+    }
     let mut entries = Vec::new();
     let mut after = None;
     let mut scope: Option<ScopeVersion> = None;
@@ -207,6 +226,9 @@ fn enumerate_scope(ctx: &PreviewCtx, cancelled: &AtomicBool) -> Result<ScopeScan
             _ => {}
         }
         for entry in page.items {
+            if folder.is_some_and(|folder| !Path::new(&entry.path).starts_with(folder)) {
+                continue;
+            }
             if entries.len() >= MAX_SCOPE_NOTES {
                 truncated = true;
                 break;
@@ -556,6 +578,8 @@ pub struct FindNoteRecord {
     pub match_count: u64,
     /// Spool file name for this note's spans (within the finder's spans dir).
     pub spans_file: String,
+    pub content_hash: String,
+    pub source_kind: SourceKind,
 }
 
 /// Complete vault source-find outcome.
@@ -592,20 +616,21 @@ pub fn run_find(
     cancelled: &AtomicBool,
 ) -> Result<SourceFindOutcome, PreviewError> {
     let matcher = matcher_for(request, MAX_SOURCE_MATCHES as usize)?;
-    let scan = enumerate_scope(ctx, cancelled)?;
+    let scan = enumerate_scope(ctx, cancelled, request.folder.as_deref())?;
     let open = open_buffer_map(ctx);
     let spans_dir = source_find_base(&ctx.root).join(finder_id).join("spans");
     io.mkdir_all(&spans_dir).map_err(PreviewError::Io)?;
     let mut notes = Vec::new();
     let mut exclusions = Vec::new();
     let mut total_matches = 0u64;
+    let mut retained_source_bytes = 0usize;
     for (index, entry) in scan.entries.iter().enumerate() {
         if index % CANCEL_CHECK_INTERVAL == 0
             && cancelled.load(std::sync::atomic::Ordering::Relaxed)
         {
             return Err(PreviewError::Cancelled);
         }
-        let read = match read_note(ctx, entry, &open, false) {
+        let read = match read_note(ctx, entry, &open, request.include_drafts) {
             Ok(read) => read,
             Err(exclusion) => {
                 exclusions.push(exclusion);
@@ -635,12 +660,33 @@ pub fn run_find(
                 .map_err(PreviewError::Io)?;
             continue;
         }
+        retained_source_bytes = retained_source_bytes.saturating_add(read.snapshot.text().len());
+        if retained_source_bytes > 128 * 1024 * 1024 {
+            return Err(PreviewError::LimitExceeded {
+                kind: "find source bytes",
+                observed: retained_source_bytes as u64,
+                limit: 128 * 1024 * 1024,
+            });
+        }
+        io.write_new(
+            &spans_dir.join(format!("{file}.text")),
+            read.snapshot.text().as_bytes(),
+        )
+        .map_err(PreviewError::Io)?;
         notes.push(FindNoteRecord {
             ordinal: u64::try_from(index).unwrap_or(u64::MAX),
             path: entry.path.clone(),
             title: entry.title.clone(),
             match_count: count,
             spans_file: file,
+            content_hash: blake3::hash(read.snapshot.text().as_bytes())
+                .to_hex()
+                .to_string(),
+            source_kind: if read.draft.is_some() {
+                SourceKind::Draft
+            } else {
+                SourceKind::Saved
+            },
         });
     }
     Ok(SourceFindOutcome {
@@ -667,6 +713,8 @@ fn compute_note_ops(
     if request.mode == MatchMode::Regex {
         let run = run_helper(
             &SourceFindRequest {
+                folder: request.folder.clone(),
+                include_drafts: request.include_drafts,
                 query: request.query.clone(),
                 mode: request.mode,
                 case_sensitive: request.case_sensitive,
@@ -716,6 +764,24 @@ fn compute_note_ops(
     }
 }
 
+/// Release only the generated files of a source-finder spool. Directory
+/// removal is not part of the filesystem's file-remove contract.
+pub(crate) fn cleanup_find(root: &Path, finder_id: &str, io: &dyn OpStoreIo) {
+    let directory = source_find_base(root).join(finder_id).join("spans");
+    if let Ok(Some(names)) = io.list_dir(&directory) {
+        for name in names {
+            let number = name
+                .strip_suffix(".bin.text")
+                .or_else(|| name.strip_suffix(".bin"));
+            if number.is_some_and(|number| {
+                number.len() == 8 && number.bytes().all(|b| b.is_ascii_digit())
+            }) {
+                let _ = io.remove(&directory.join(name));
+            }
+        }
+    }
+}
+
 /// Run a vault replacement preview: full scan, exact output computation and
 /// a sealed manifest with content-addressed before/after payloads. The
 /// preview never applies anything; a failure leaves inspection explicitly
@@ -729,6 +795,8 @@ pub fn run_preview(
     cancelled: &AtomicBool,
 ) -> Result<PreviewManifest, PreviewError> {
     let find_request = SourceFindRequest {
+        folder: request.folder.clone(),
+        include_drafts: request.include_drafts,
         query: request.query.clone(),
         mode: request.mode,
         case_sensitive: request.case_sensitive,
@@ -759,7 +827,7 @@ pub fn run_preview(
             cancelled,
         )?;
     }
-    let scan = enumerate_scope(ctx, cancelled)?;
+    let scan = enumerate_scope(ctx, cancelled, request.folder.as_deref())?;
     let open = open_buffer_map(ctx);
     let mut notes = Vec::new();
     let mut exclusions = Vec::new();
@@ -876,12 +944,19 @@ pub fn run_preview(
     }
     let matched = notes.iter().filter(|n| !n.no_change).count() as u64;
     let now_ms = unix_ms_now();
+    let mut digest = blake3::Hasher::new();
+    digest.update(&matcher.digest().to_le_bytes());
+    digest.update(&template.digest().to_le_bytes());
+    digest.update(&[u8::from(request.include_drafts)]);
+    if let Some(folder) = &request.folder {
+        digest.update(folder.as_os_str().as_encoded_bytes());
+    }
     let manifest = PreviewManifest {
         schema: super::plan::PREVIEW_SCHEMA_VERSION,
         engine_version: ENGINE_VERSION,
         job_id: job_id.to_owned(),
         vault_uuid: ctx.vault_uuid.to_string(),
-        plan_digest: hex::encode((matcher.digest() ^ template.digest()).to_be_bytes()),
+        plan_digest: digest.finalize().to_hex().to_string(),
         scope_version: scan.scope,
         source_policy: "disk_with_explicit_drafts".to_owned(),
         state: "ready".to_owned(),
@@ -979,6 +1054,8 @@ mod tests {
     #[test]
     fn invalid_regex_pattern_is_a_typed_matcher_fault() {
         let request = SourceFindRequest {
+            folder: None,
+            include_drafts: false,
             query: "(".to_owned(),
             mode: MatchMode::Regex,
             case_sensitive: false,
@@ -991,6 +1068,8 @@ mod tests {
     #[test]
     fn empty_literal_is_idle() {
         let request = SourceFindRequest {
+            folder: None,
+            include_drafts: false,
             query: String::new(),
             mode: MatchMode::Literal,
             case_sensitive: false,
@@ -1028,6 +1107,7 @@ mod tests {
         // request and sealed into the manifest; the engine-level behavior
         // is exercised through real Session preview tests.
         let request = PreviewRequest {
+            folder: None,
             query: "x".into(),
             replacement: "y".into(),
             mode: MatchMode::Literal,
@@ -1038,6 +1118,7 @@ mod tests {
         assert!(request.include_drafts);
         assert!(
             !PreviewRequest {
+                folder: None,
                 include_drafts: false,
                 ..request
             }

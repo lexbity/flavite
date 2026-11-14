@@ -50,16 +50,19 @@ fn fixture() -> PageFixture {
     ]);
     // Dirty the dirty note through the real session so exclusions show.
     let (buffer_id, revision) = f.open_note("notes/dirty.md");
-    let _ = f.flavite.execute(flavite_api::command::Invocation::new(
-        support::next_id(&f.flavite),
-        "apply_edits",
-        serde_json::json!({
-            "buffer_id": buffer_id,
-            "revision": revision,
-            "ops": [{"range": [0, 0], "replacement": "prefix "}],
-            "undo_policy": "typing",
-        }),
-        flavite_api::Origin::Gui,
+    let _ = f.flavite.execute(editor_operations_fixture::admit(
+        &f.flavite,
+        flavite_api::command::Invocation::new(
+            support::next_id(&f.flavite),
+            "apply_edits",
+            serde_json::json!({
+                "buffer_id": buffer_id,
+                "revision": revision,
+                "ops": [{"range": [0, 0], "replacement": "prefix "}],
+                "undo_policy": "typing",
+            }),
+            flavite_api::Origin::Gui,
+        ),
     ));
     PageFixture {
         app: App::from_flavite(f.flavite),
@@ -71,7 +74,7 @@ fn fixture() -> PageFixture {
 fn open_replace(app: &mut App) -> TabId {
     let group = app.focused_group().unwrap();
     let before = app.workspace.group(&group).unwrap().tabs().len();
-    let _ = app.update(Message::RunHostCommand("workspace.open_replace_view"));
+    let _ = app.update(Message::RunHostCommand("workspace.open_search_view"));
     wait(app, |app| {
         app.workspace
             .group(&group)
@@ -146,6 +149,7 @@ fn preview_seals_and_selection_records_a_revision() {
     // Select the candidate by native key.
     let key = state.candidates[0].path_native.clone();
     let _ = f.app.update(Message::ReplaceSelect {
+        target: f.app.replace.view_state(tab).preview_target().unwrap(),
         tab,
         selection: flavite_ui::host::replace::SelectAction::Keys(vec![key]),
     });
@@ -159,3 +163,6 @@ fn preview_seals_and_selection_records_a_revision() {
     assert_eq!(state.plan.as_ref().unwrap().selection_revision, Some(1));
     assert_eq!(state.selected_count(), 1);
 }
+
+#[path = "../../flavite-api/tests/support/editor_operations.rs"]
+mod editor_operations_fixture;

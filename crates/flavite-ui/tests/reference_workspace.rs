@@ -64,11 +64,23 @@ fn sidebar_filter_and_tab_placement_preserve_the_graph_and_expose_native_actions
             .values()
             .any(|target| matches!(target, NodeTarget::SidebarFilter))
     );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !app.a11y_nodes.values().any(
+        |target| matches!(target,NodeTarget::BrowserEntry {path,..} if path.ends_with("beta.md")),
+    ) {
+        assert!(Instant::now() < deadline, "tree did not load");
+        let _ = app.update(Message::Pump);
+        std::thread::yield_now();
+    }
     let notes: Vec<_> = app
         .a11y_nodes
         .values()
         .filter_map(|target| match target {
-            NodeTarget::OpenNote(path) => Some(path),
+            NodeTarget::BrowserEntry {
+                path,
+                directory: false,
+                ..
+            } => Some(path),
             _ => None,
         })
         .collect();

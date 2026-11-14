@@ -61,6 +61,17 @@ fn undo_child_process() {
     let undo = session.execute(SessionCommand::Undo {
         buffer_id,
         revision,
+
+        operation: session
+            .issue_editor_operation(
+                buffer_id,
+                session
+                    .shared_buffer_snapshot(buffer_id, None)
+                    .map(|snapshot| snapshot.revision)
+                    .unwrap_or(revision),
+                None,
+            )
+            .expect("fixture activation"),
     });
     assert!(
         matches!(

@@ -25,11 +25,13 @@ scenarios=()
 backend="gpu"
 jobs=4
 worker_scenario=""
+worker_status=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --worker)
             worker_scenario="$2"
-            shift 2
+            worker_status="$3"
+            shift 3
             ;;
         --scenario)
             IFS=',' read -ra parts <<< "$2"
@@ -52,7 +54,7 @@ if (( ${#scenarios[@]} == 0 )); then
 fi
 for scenario in "${scenarios[@]}"; do
     case "$scenario" in
-        graph-editor-loop|note-regex-replace|link-completion|reference-workspace|context-mode|context-mode-history|context-mode-feedback|context-mode-budget|context-mode-multiselect|context-mode-setops|context-mode-matches|context-mode-failures|context-workbench-acceptance|probe-find|probe-menu-open|probe-menu-kb) ;;
+        graph-editor-loop|note-regex-replace|link-completion|reference-workspace|context-mode|context-mode-history|context-mode-feedback|context-mode-budget|context-mode-multiselect|context-mode-setops|context-mode-matches|context-mode-failures|context-workbench-acceptance|file-browser|vault-search|probe-find|probe-menu-open|probe-menu-kb) ;;
         *) echo "unsupported scenario: $scenario (implemented: graph-editor-loop note-regex-replace link-completion reference-workspace context-mode context-mode-history context-mode-feedback context-mode-budget context-mode-multiselect context-mode-setops context-mode-matches context-mode-failures context-workbench-acceptance probe-find probe-menu-open probe-menu-kb)" >&2; exit 2 ;;
     esac
 done
@@ -77,7 +79,7 @@ for tool in xdotool import identify python3; do
 done
 needs_ocr=0
 for scenario in "${scenarios[@]}"; do
-    if [[ "$scenario" == context-mode* ]]; then
+    if [[ "$scenario" == context-mode* || "$scenario" == context-workbench-acceptance || "$scenario" == file-browser || "$scenario" == vault-search ]]; then
         needs_ocr=1
     fi
 done
@@ -107,19 +109,26 @@ target_dir="${CARGO_TARGET_DIR:-target}"
 evidence_dir="$target_dir/workbench-evidence"
 mkdir -p "$evidence_dir"
 
-# The binary is built ONCE for the whole batch (and a no-op incremental
-# build in worker mode): every scenario reuses it, so a parallel sweep pays
-# the rebuild once instead of once per scenario, and N concurrent
-# `cargo build`s never contend on the cargo lock.
-cargo build -p flavite-ui --example app-demo --features ui-test-support
-for scenario in "${scenarios[@]}"; do
-    if [[ "$scenario" == "note-regex-replace" ]]; then
-        cargo build -p flavite-text-search-worker
-        cp "$target_dir/debug/flavite-text-search-worker" \
-           "$target_dir/debug/examples/flavite-text-search-worker"
-        break
+# Build once in the parent; workers use this exact artifact.
+if [[ -z "$worker_scenario" ]]; then
+    export FLAVITE_NATIVE_SOURCE_DIGEST
+    export FLAVITE_NATIVE_BUILD_HEAD
+    FLAVITE_NATIVE_SOURCE_DIGEST="$(python3 scripts/lib/source_fingerprint.py)"
+    FLAVITE_NATIVE_BUILD_HEAD="$(git rev-parse HEAD)"
+    cargo build -p flavite-ui --example app-demo --features ui-test-support
+    for scenario in "${scenarios[@]}"; do
+        case "$scenario" in
+            note-regex-replace|context-mode-matches|context-mode-failures|context-workbench-acceptance)
+                cargo build -p flavite-text-search-worker
+                cp "$target_dir/debug/flavite-text-search-worker" "$target_dir/debug/examples/flavite-text-search-worker"
+                break ;;
+        esac
+    done
+    if [[ "$(python3 scripts/lib/source_fingerprint.py)" != "$FLAVITE_NATIVE_SOURCE_DIGEST" ]]; then
+        echo "Sources changed during the native build; rerun acceptance on a fixed snapshot" >&2
+        exit 1
     fi
-done
+fi
 
 # One scenario end to end. Runs as a background subshell: its own Xvfb
 # window, vault, data dir, evidence dir and run log; the EXIT trap tears the
@@ -128,6 +137,7 @@ run_scenario() {
     local scenario="$1" backend="$2"
     local run_id="${scenario}-${backend}-$(date +%s)-$BASHPID"
     local run_dir="$evidence_dir/$run_id"
+    worker_run_dir="$run_dir"
     mkdir -p "$run_dir"
 
     # Disposable fixture vault and fixture-only OS-data root (hermetic per
@@ -166,10 +176,13 @@ PY
     # own copy, so concurrent scenarios stay isolated.
     window_id=""
     app_pid=""
-    scenario_status=0
+    scenario_status=1
     device_dir=""
 
     cleanup() {
+        local exit_status=$?
+        trap - EXIT
+        if (( exit_status != 0 )); then scenario_status=$exit_status; fi
         if [[ -n "$window_id" ]]; then
             xdotool windowclose "$window_id" 2>/dev/null || true
         fi
@@ -182,7 +195,7 @@ PY
             wait "$app_pid" 2>/dev/null || true
         fi
         rm -rf "$device_dir" 2>/dev/null || true
-        echo "$scenario_status" >"$evidence_dir/status-$scenario"
+        printf '%s\n%s\n' "$scenario_status" "$worker_run_dir" >"$worker_status"
     }
     trap cleanup EXIT
 
@@ -261,30 +274,25 @@ sys.exit(1)
     # is kept in the run dir (concurrent children must not interleave).
     python3 "scripts/tests/workbench/${scenario//-/_}.py" \
         "$window_id" "$harness_log" "$run_dir" "$vault_dir" "$backend" \
-        2>&1 | tee "$run_dir/run.log" || scenario_status=$?
+        2>&1 | tee "$run_dir/run.log" && scenario_status=0 || scenario_status=$?
 
     if (( scenario_status != 0 )); then
         echo "workbench scenario $scenario ($backend) FAILED: $run_dir (log: $run_dir/run.log)" >&2
         return "$scenario_status"
     fi
 
+    scenario_status=1
     # Evidence manifest (§11): HEAD, lock hash and the dirty-source digest
     # using the existing visual-runner algorithm, stamped on pass only.
     python3 - "$run_dir" "$scenario" "$backend" <<'PY'
-import hashlib, json, pathlib, subprocess, sys
+import json, os, pathlib, subprocess, sys
+sys.path.insert(0, "scripts/lib")
+from source_fingerprint import fingerprint
 run_dir, scenario, backend = sys.argv[1:4]
-h = hashlib.sha256()
-paths = set(subprocess.check_output(["git", "ls-files", "-co", "--exclude-standard", "-z"]).split(b"\0"))
-for raw in sorted(p for p in paths if p):
-    path = pathlib.Path(raw.decode())
-    if not path.is_file() or not (
-        str(path).startswith(("crates/", "vendor/", "scripts/", ".github/"))
-        or str(path) in ("Cargo.lock", "Cargo.toml", "justfile")
-    ):
-        continue
-    data = path.read_bytes()
-    h.update(raw + b"\0" + str(len(data)).encode() + b"\0" + data)
+source_digest = fingerprint()
+assert source_digest == os.environ["FLAVITE_NATIVE_SOURCE_DIGEST"], "Sources changed during native acceptance"
 build = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+assert build == os.environ["FLAVITE_NATIVE_BUILD_HEAD"], "HEAD changed during native acceptance"
 lock = subprocess.check_output(["cargo", "xtask", "blake3", "Cargo.lock"], text=True)
 lock = [line for line in lock.split() if len(line.strip()) == 64][-1].strip()
 pathlib.Path(run_dir, "provenance.json").write_text(
@@ -293,7 +301,7 @@ pathlib.Path(run_dir, "provenance.json").write_text(
             "schema": 1,
             "build": build,
             "lock_blake3": lock,
-            "worktree_sha256": h.hexdigest(),
+            "worktree_sha256": source_digest,
             "scenario": scenario,
             "platform": "linux",
             "render_backend": backend,
@@ -306,6 +314,7 @@ pathlib.Path(run_dir, "provenance.json").write_text(
 )
 PY
 
+    scenario_status=0
     echo "workbench scenario $scenario ($backend) passed: $run_dir"
 }
 
@@ -321,6 +330,9 @@ fi
 # display fight over the X focus and lose typed keystrokes. Statuses land in
 # per-scenario status files (a `wait -n` limiter would reap a job whose
 # status the summary then cannot read).
+batch_dir="$(mktemp -d "$evidence_dir/batch.XXXXXXXX")"
+pids=()
+status_paths=()
 first=1
 for scenario in "${scenarios[@]}"; do
     while (( $(jobs -rp | wc -l) >= jobs )); do
@@ -334,23 +346,53 @@ for scenario in "${scenarios[@]}"; do
     else
         sleep 3
     fi
+    status_path="$batch_dir/${#pids[@]}.status"
+    status_paths+=("$status_path")
     echo "[dispatch] $scenario"
     xvfb-run -a -s "-screen 0 ${FLAVITE_VISUAL_SCREEN:-2560x1600x24}" \
-        bash "$0" --worker "$scenario" --backend "$backend" &
+        bash "$0" --worker "$scenario" "$status_path" --backend "$backend" &
+    pids+=("$!")
 done
-wait
-
 overall=0
-for scenario in "${scenarios[@]}"; do
-    st=1
-    if [[ -f "$evidence_dir/status-$scenario" ]]; then
-        st="$(<"$evidence_dir/status-$scenario")"
+for index in "${!pids[@]}"; do
+    child_status=0
+    wait "${pids[$index]}" || child_status=$?
+    status_path="${status_paths[$index]}"
+    if (( child_status != 0 )) || [[ ! -f "$status_path" ]]; then
+        echo "[summary] FAIL ${scenarios[$index]} (worker exit $child_status or missing status)" >&2
+        overall=1
+        continue
     fi
-    if [[ "$st" != "0" ]]; then
-        echo "[summary] FAIL $scenario" >&2
+    mapfile -t worker_result < "$status_path"
+    if (( ${#worker_result[@]} != 2 )) || [[ "${worker_result[0]}" != "0" ]]; then
+        echo "[summary] FAIL ${scenarios[$index]} (invalid or unsuccessful worker status)" >&2
+        overall=1
+        continue
+    fi
+    if ! python3 - "${worker_result[1]}" "${scenarios[$index]}" "$backend" <<'PY_MANIFEST'
+import json, os, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+try:
+    manifest = json.loads((root / "provenance.json").read_text())
+    fixture = json.loads((root / "expected-fixture.json").read_text())
+    assert manifest["scenario"] == fixture["scenario"] == sys.argv[2]
+    assert manifest["render_backend"] == sys.argv[3]
+    assert manifest["input_evidence"] == "rendered_os_input"
+    assert manifest["worktree_sha256"] == os.environ["FLAVITE_NATIVE_SOURCE_DIGEST"]
+    assert manifest["build"] == os.environ["FLAVITE_NATIVE_BUILD_HEAD"]
+except (OSError, ValueError, KeyError, AssertionError) as error:
+    print(f"Missing or inconsistent native provenance: {error}", file=sys.stderr)
+    sys.exit(1)
+PY_MANIFEST
+    then
+        echo "[summary] FAIL ${scenarios[$index]} (provenance)" >&2
         overall=1
     fi
 done
+if [[ "$(python3 scripts/lib/source_fingerprint.py)" != "$FLAVITE_NATIVE_SOURCE_DIGEST" ]] || [[ "$(git rev-parse HEAD)" != "$FLAVITE_NATIVE_BUILD_HEAD" ]]; then
+    echo "[summary] FAIL sources changed during this native batch" >&2
+    overall=1
+fi
 if (( overall == 0 )); then
     echo "[summary] all ${#scenarios[@]} scenario(s) passed"
 fi

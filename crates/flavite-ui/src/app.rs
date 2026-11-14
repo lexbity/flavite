@@ -148,6 +148,8 @@ pub struct App {
     /// Open/width truth lives in the device preferences; the preview here is
     /// the live drag width before its commit.
     pub sidebar_filter: String,
+    pub vault_search: crate::host::vault_search::VaultSearchHost,
+    pub file_browser: crate::host::file_browser::FileBrowser,
     pub sidebar_bounds: BTreeMap<String, iced::Rectangle>,
     pub resizing_sidebar: bool,
     sidebar_width_preview: Option<f32>,
@@ -196,6 +198,16 @@ pub struct App {
 /// workspace model or the host catalog.
 #[derive(Debug, Clone)]
 pub enum Message {
+    VaultSearch(crate::host::vault_search::VaultSearchMessage),
+    ReplaceInspect {
+        tab: TabId,
+        item_id: u64,
+    },
+    ReplaceCollapse {
+        tab: TabId,
+        path: String,
+    },
+    FileBrowser(crate::host::file_browser::BrowserMessage),
     EditorHistory(crate::host::editor_history::HistoryMessage),
     ContextMode(crate::host::context_mode::ContextMessage),
     ContextNative {
@@ -467,6 +479,7 @@ pub enum Message {
     },
     ReplaceSelect {
         tab: TabId,
+        target: crate::host::replace::PreviewTarget,
         selection: crate::host::replace::SelectAction,
     },
     ReplaceOpenNote {
@@ -476,18 +489,22 @@ pub enum Message {
     /// RFC-0006 S08: apply the sealed preview (frozen selection).
     ReplaceApply {
         tab: TabId,
+        target: crate::host::replace::PreviewTarget,
     },
     /// RFC-0006 S08: cancel the durable job.
     ReplaceCancel {
         tab: TabId,
+        job_id: String,
     },
     /// RFC-0006 S08: resume the durable job.
     ReplaceResume {
         tab: TabId,
+        job_id: String,
     },
     /// RFC-0006 S09: start a guarded Revert action epoch for the job.
     ReplaceRevert {
         tab: TabId,
+        job_id: String,
     },
     /// Focus the Replace tab owning a durable job.
     ReplaceFocusTab {
@@ -708,6 +725,8 @@ impl App {
             named_layouts: Vec::new(),
             picker: Picker::default(),
             sidebar_filter: String::new(),
+            file_browser: Default::default(),
+            vault_search: Default::default(),
             sidebar_bounds: BTreeMap::new(),
             resizing_sidebar: false,
             sidebar_width_preview: None,
@@ -1872,6 +1891,9 @@ impl App {
                     }
                 }
                 Effect::ViewDetached { tab, .. } => {
+                    if let Some(api) = &self.flavite {
+                        api.release_editor_view(tab.raw());
+                    }
                     self.input_chains.remove(tab);
                     self.notes.detach(*tab);
                     self.contexts.detach(*tab);
@@ -1881,11 +1903,34 @@ impl App {
                     self.history.detach(*tab);
                     self.nav.detach(*tab);
                     self.notes_filters.remove(tab);
+                    self.file_browser.views.remove(&Some(*tab));
+                    if self.file_browser.focused == Some(Some(*tab)) {
+                        self.file_browser.focused = None;
+                    }
                     if let Some(api) = self.flavite.as_ref() {
                         api.graph_release_scope(tab.raw());
                     }
                 }
-                Effect::NoteLoadChanged { .. } => {}
+                Effect::NoteLoadChanged { tab, load } => {
+                    if *load == flavite_workspace::NoteLoad::Ready
+                        && let Some(view) = self.note_editor_view(*tab)
+                        && self
+                            .workspace
+                            .tab(tab)
+                            .is_some_and(|view| view.interaction().buffer_id.is_none())
+                        && let Some(api) = &self.flavite
+                    {
+                        if let Err(error) = api.initialize_editor_view(
+                            &mut self.workspace,
+                            *tab,
+                            view.buffer_id,
+                            view.revision,
+                            &view.text,
+                        ) {
+                            self.status = error.into();
+                        }
+                    }
+                }
                 Effect::ContextRebound { .. } => {}
             }
         }
@@ -2101,9 +2146,7 @@ impl App {
                     }
                     self.workspace.release_editor_focus(Some(tab));
                 }
-                if let Err(error) = self
-                    .workspace
-                    .acknowledge_interaction(interaction, &current.text)
+                if let Err(error) = self.acknowledge_editor_interaction(interaction, &current.text)
                 {
                     self.status = format!("Editor state was not accepted: {error}");
                 } else {
@@ -2236,12 +2279,26 @@ impl App {
                     return;
                 };
                 let request_id = flavite.command_registry().next_request_id();
-                let Some(invocation) = edit_or_history.into_invocation(request_id) else {
+                let Some(target) = crate::host::context_mode::EditorTarget::capture(self, tab)
+                else {
+                    return;
+                };
+                let operation = match target.issue_operation(flavite) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        self.status = error;
+                        return;
+                    }
+                };
+                let Some(mut invocation) = edit_or_history.into_invocation(request_id) else {
                     self.status = "Editor action could not be routed".into();
                     return;
                 };
+                invocation.args["operation"] =
+                    serde_json::to_value(operation).expect("operation DTO");
                 match flavite.execute(invocation) {
                     ExecutionResult::Local(LocalResult::Success(success)) => {
+                        crate::host::context_mode::install_receipt(self, &target, &success);
                         let revision = success
                             .data
                             .get("revision")
@@ -2396,9 +2453,14 @@ impl App {
         // must not rebuild the accessibility map; the editor widget
         // redraws its own selection.
         let pointer_only = matches!(message, Message::Mouse(_));
-        let geometry_only = matches!(message, Message::SidebarControlBounds(..));
+        let geometry_only = matches!(
+            message,
+            Message::SidebarControlBounds(..)
+                | Message::VaultSearch(crate::host::vault_search::VaultSearchMessage::Bounds(..))
+        );
         self.pointer_feedback = false;
         let task = self.update_inner(message);
+        crate::host::input::reconcile_buffer_revisions(self);
         crate::host::context_mode::reconcile(self);
         if !geometry_only && (!pointer_only || self.pointer_feedback) {
             self.refresh_semantics();
@@ -2548,6 +2610,16 @@ impl App {
                 }
             }
             Message::MenuClose => self.strip_menu = None,
+            Message::VaultSearch(action) => {
+                let task = crate::host::vault_search::handle(self, action);
+                self.refresh_semantics();
+                return task;
+            }
+            Message::FileBrowser(message) => {
+                let task = crate::host::file_browser::handle(self, message);
+                self.refresh_semantics();
+                return task;
+            }
             Message::ToggleSidebar => self.toggle_sidebar(),
             Message::SidebarResizeBegin => {
                 if !self.has_composition() {
@@ -2555,6 +2627,7 @@ impl App {
                 }
             }
             Message::SidebarFilter(value) => {
+                crate::host::file_browser::filter_changed(self, None, &value);
                 self.sidebar_filter = value;
                 self.sidebar_bounds
                     .retain(|key, _| !key.starts_with("note:"));
@@ -2563,6 +2636,11 @@ impl App {
                 self.sidebar_bounds.insert(key, rect);
             }
             Message::SidebarToTab => {
+                if self.vault_search.sidebar {
+                    return self.update(Message::VaultSearch(
+                        crate::host::vault_search::VaultSearchMessage::Undock,
+                    ));
+                }
                 if let Some(group) = self.navigation_group() {
                     self.dispatch_layout(|expected_revision| LayoutAction::OpenNotes {
                         expected_revision,
@@ -2570,7 +2648,20 @@ impl App {
                     });
                     self.notes_filters
                         .insert(self.workspace.focused_tab(), self.sidebar_filter.clone());
+                    let owner = Some(self.workspace.focused_tab());
+                    self.file_browser.transfer(None, owner);
                     self.set_sidebar_open(false);
+                    return iced::widget::operation::scroll_to(
+                        crate::views::notes::scroll_id(owner),
+                        iced::widget::scrollable::AbsoluteOffset {
+                            x: 0.0,
+                            y: self
+                                .file_browser
+                                .views
+                                .get(&owner)
+                                .map_or(0.0, |view| view.scroll),
+                        },
+                    );
                 }
             }
             Message::NotesToSidebar(tab) => {
@@ -2581,6 +2672,7 @@ impl App {
                     && let Some(group) = self.workspace.group_of(tab)
                 {
                     self.sidebar_filter = self.notes_filter(tab).to_owned();
+                    self.file_browser.transfer(Some(tab), None);
                     if self
                         .workspace
                         .group(&group)
@@ -2596,6 +2688,15 @@ impl App {
                         tab,
                     });
                     self.set_sidebar_open(true);
+                    let y = self
+                        .file_browser
+                        .views
+                        .get(&None)
+                        .map_or(0.0, |view| view.scroll);
+                    return iced::widget::operation::scroll_to(
+                        crate::views::notes::scroll_id(None),
+                        iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
+                    );
                 }
             }
             Message::CancelGesture => {
@@ -3058,7 +3159,7 @@ impl App {
             }
             Message::PickerPick(index) => return self.run_picker_selection(index),
             Message::RunHostCommand(id) => return host_commands::dispatch(self, id),
-            Message::RunCoreCommand(id) => self.run_core_command(id),
+            Message::RunCoreCommand(id) => return self.run_core_command(id),
             Message::RefreshCatalog => self.request_catalog_refresh(),
             Message::TopMenu(menu) => {
                 // The standard menu bar never interrupts composition (D-03).
@@ -3075,6 +3176,7 @@ impl App {
             // ---- W10: Notes view ----
             Message::NotesFilter { tab, value } => {
                 if self.workspace.tab(&tab).is_some() {
+                    crate::host::file_browser::filter_changed(self, Some(tab), &value);
                     self.notes_filters.insert(tab, value);
                 } else {
                     self.notes_filters.remove(&tab);
@@ -3089,6 +3191,16 @@ impl App {
             Message::SearchRefresh { tab } => self.search.refresh(tab),
             Message::SearchSetMode { tab, mode } => self.search.set_mode(tab, mode),
             // ---- RFC-0006 S07: vault source Find / replacement preview ----
+            Message::ReplaceInspect { tab, item_id } => {
+                self.replace.inspect(tab, item_id, self.flavite.as_ref())
+            }
+            Message::ReplaceCollapse { tab, path } => {
+                let state = self.replace.tabs.entry(tab).or_default();
+                state.geometry_changed();
+                if !state.collapsed.insert(path.clone()) {
+                    state.collapsed.remove(&path);
+                }
+            }
             Message::ReplaceEdit { tab, field, value } => {
                 self.replace.edited(tab, field, value);
             }
@@ -3101,20 +3213,34 @@ impl App {
             Message::ReplaceRunPreview { tab } => {
                 self.replace.run_preview(tab, self.flavite.as_ref())
             }
-            Message::ReplaceSelect { tab, selection } => {
-                self.replace.select(tab, selection, self.flavite.as_ref());
+            Message::ReplaceSelect {
+                tab,
+                target,
+                selection,
+            } => {
+                if self.replace.validate_preview(tab, &target) {
+                    self.replace.select(tab, selection, self.flavite.as_ref());
+                }
             }
-            Message::ReplaceApply { tab } => {
-                self.replace.apply(tab, self.flavite.as_ref());
+            Message::ReplaceApply { tab, target } => {
+                if self.replace.validate_preview(tab, &target) {
+                    self.replace.apply(tab, self.flavite.as_ref());
+                }
             }
-            Message::ReplaceCancel { tab } => {
-                self.replace.cancel_job(tab, self.flavite.as_ref());
+            Message::ReplaceCancel { tab, job_id } => {
+                if self.replace.validate_job(tab, &job_id) {
+                    self.replace.cancel_job(tab, self.flavite.as_ref());
+                }
             }
-            Message::ReplaceResume { tab } => {
-                self.replace.resume_job(tab, self.flavite.as_ref());
+            Message::ReplaceResume { tab, job_id } => {
+                if self.replace.validate_job(tab, &job_id) {
+                    self.replace.resume_job(tab, self.flavite.as_ref());
+                }
             }
-            Message::ReplaceRevert { tab } => {
-                self.replace.revert_job(tab, self.flavite.as_ref());
+            Message::ReplaceRevert { tab, job_id } => {
+                if self.replace.validate_job(tab, &job_id) {
+                    self.replace.revert_job(tab, self.flavite.as_ref());
+                }
             }
             Message::ReplaceFocusTab { tab } => {
                 self.status = format!("Replacement job on tab {}", tab.raw());
@@ -3579,7 +3705,10 @@ impl App {
                 .tabs
                 .keys()
                 .copied()
-                .filter(|tab| self.workspace.tab(tab).is_none())
+                .filter(|tab| {
+                    *tab != crate::host::vault_search::SIDEBAR_SEARCH
+                        && self.workspace.tab(tab).is_none()
+                })
                 .collect();
             for tab in closed {
                 self.replace.detach(tab, self.flavite.as_ref());
@@ -3598,6 +3727,12 @@ impl App {
                     && outcome.token.context_tab == flavite_api::CATALOG_CONTEXT_TAB
                 {
                     self.apply_catalog_outcome(&outcome.result);
+                    continue;
+                }
+                if crate::host::file_browser::observe(self, &outcome) {
+                    continue;
+                }
+                if self.replace.observe_query(&outcome) {
                     continue;
                 }
                 if self.observe_link_verdicts(&outcome) {
@@ -3651,6 +3786,8 @@ impl App {
         // Graph frames, pins, geometry pairing, and camera commits (§W07).
         crate::host::graph::pump(self);
         crate::host::occurrences::pump(self);
+        crate::host::file_browser::pump(self);
+        crate::host::vault_search::pump(self);
     }
 
     fn admit_link_verdict_queries(&mut self) {
@@ -4269,17 +4406,59 @@ impl App {
         }
     }
 
-    fn run_core_command(&mut self, command_id: &'static str) {
+    pub(crate) fn acknowledge_editor_interaction(
+        &mut self,
+        interaction: flavite_workspace::EditorInteraction,
+        text: &str,
+    ) -> Result<(), &'static str> {
+        self.flavite
+            .as_ref()
+            .ok_or("Vault unavailable")?
+            .acknowledge_editor_interaction(&mut self.workspace, interaction, text)
+    }
+
+    fn run_core_command(&mut self, command_id: &'static str) -> Task<Message> {
+        if matches!(command_id, "buffer.undo" | "buffer.redo") {
+            let tab = self.workspace.focused_tab();
+            let Some(target) = crate::host::context_mode::EditorTarget::capture(self, tab) else {
+                return Task::none();
+            };
+            let sequence = self
+                .workspace
+                .tab(&tab)
+                .map_or(1, |view| view.interaction().sequence.saturating_add(1));
+            return crate::host::input::handle(
+                self,
+                tab,
+                target.incarnation,
+                flavite_editor::input::CapturedInput {
+                    buffer: target.buffer,
+                    observed_revision: target.revision,
+                    sequence,
+                    action: if command_id == "buffer.undo" {
+                        flavite_editor::keymap::KeyAction::Undo
+                    } else {
+                        flavite_editor::keymap::KeyAction::Redo
+                    },
+                    text: String::new(),
+                    extend: false,
+                    document_boundary: false,
+                    vertical: None,
+                    preferred_x: Vec::new(),
+                    clipboard_acquired: false,
+                },
+            );
+        }
         let Some(flavite) = &self.flavite else {
             self.status = "Open a vault before running commands".into();
-            return;
+            return Task::none();
         };
         let args = match command_id {
             "note.save" => {
                 let focused = self.workspace.focused_tab();
                 let Some(state) = self.notes.state(&focused) else {
                     self.status = format!("{command_id} requires a note tab");
-                    return;
+                    return Task::none();
                 };
                 serde_json::json!(state.locator.to_path(&self.root))
             }
@@ -4287,20 +4466,9 @@ impl App {
                 // Palette close goes through the full W12 decision path.
                 let focused = self.workspace.focused_tab();
                 let _ = self.request_close_tab(focused);
-                return;
+                return Task::none();
             }
             "vault.reconcile" => serde_json::json!({ "scope": "full", "mode": "fast" }),
-            "buffer.undo" | "buffer.redo" => {
-                let focused = self.workspace.focused_tab();
-                let Some(view) = self.note_editor_view(focused) else {
-                    self.status = format!("{command_id} requires an open note");
-                    return;
-                };
-                serde_json::json!({
-                    "buffer_id": view.buffer_id,
-                    "revision": view.revision,
-                })
-            }
             _ => serde_json::Value::Null,
         };
         let request_id = flavite.command_registry().next_request_id();
@@ -4336,6 +4504,7 @@ impl App {
                 self.status = format!("{command_id} rejected: {:?}", rejected.reason);
             }
         }
+        Task::none()
     }
 
     /// The combined catalog snapshot for the palette: core specs plus the
@@ -4378,8 +4547,8 @@ impl App {
             return host_commands::dispatch(self, command.id)
                 .chain(crate::host::context_mode::resume_focus(self));
         }
-        self.run_core_command(id);
-        crate::host::context_mode::resume_focus(self)
+        self.run_core_command(id)
+            .chain(crate::host::context_mode::resume_focus(self))
     }
 
     /// Fuzzy-matched catalog entries for the picker.
@@ -4830,6 +4999,8 @@ mod tests {
             named_layouts: Vec::new(),
             picker: Picker::default(),
             sidebar_filter: String::new(),
+            file_browser: Default::default(),
+            vault_search: Default::default(),
             sidebar_bounds: BTreeMap::new(),
             resizing_sidebar: false,
             sidebar_width_preview: None,
@@ -4912,7 +5083,7 @@ mod tests {
         let focused = app.workspace.focused_tab();
         assert_eq!(
             app.workspace.tab(&focused).map(|session| session.title()),
-            Some("Notes".into())
+            Some("Files".into())
         );
     }
 

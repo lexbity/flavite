@@ -298,13 +298,14 @@ impl ReplaceStore {
         // removal is best-effort and never touches unknown content.
         let dir = self.base.join(job_id);
         let manifest = self.manifest_path(job_id);
-        let _ = io.remove(&manifest);
-        if let Ok(Some(manifest)) = self.read_manifest(io, job_id) {
+        let sealed = self.read_manifest(io, job_id)?;
+        if let Some(manifest) = sealed {
             for note in &manifest.notes {
                 let _ = io.remove(&self.payload_path(job_id, &note.before.hash));
                 let _ = io.remove(&self.payload_path(job_id, &note.after.hash));
             }
         }
+        let _ = io.remove(&manifest);
         let _ = io.remove(&dir.join("payloads"));
         let _ = io.remove(&dir);
         Ok(())

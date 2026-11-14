@@ -144,6 +144,18 @@ impl SearchHost {
         }
     }
 
+    /// Move a live search without restarting its frozen session or requests.
+    pub fn transfer(&mut self, from: TabId, to: TabId) {
+        if let Some(state) = self.tabs.remove(&from) {
+            self.tabs.insert(to, state);
+        }
+        for (owner, _) in self.requests.values_mut() {
+            if *owner == from {
+                *owner = to;
+            }
+        }
+    }
+
     /// Drop the state of a closed tab; its session is queued for close.
     pub fn detach(&mut self, tab: TabId) {
         if let Some(state) = self.tabs.remove(&tab)

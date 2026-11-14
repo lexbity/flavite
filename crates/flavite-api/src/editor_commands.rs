@@ -10,12 +10,14 @@ use flavite_buffer::revision::{BufferId, Revision};
 use flavite_buffer::selection::{RawSelection, SelectionSet};
 use flavite_vault::editor_receipts::{OperationId, Outcome};
 use flavite_vault::session::{Session, SessionCommand, SessionResult};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Wire form of a Session-issued operation ticket.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationArg {
+    pub revision: u64,
+    pub view: Option<EditorViewArg>,
     pub buffer_incarnation: u64,
     pub sequence: u64,
     /// Hex-encoded 128-bit ticket.
@@ -32,6 +34,8 @@ impl OperationArg {
             .map_err(|_| "operation ticket must be 32 hex characters")?;
         Ok(OperationId {
             buffer_id,
+            revision: self.revision,
+            view: self.view.as_ref().map(EditorViewArg::decode).transpose()?,
             buffer_incarnation: self.buffer_incarnation,
             sequence: self.sequence,
             ticket: u128::from_be_bytes(bytes),
@@ -40,7 +44,7 @@ impl OperationArg {
 }
 
 /// Wire form of the initiating editor view.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EditorOriginArg {
     /// 32-hex view token (tab identity).
@@ -48,8 +52,26 @@ pub struct EditorOriginArg {
     pub incarnation: u64,
 }
 
+/// A committed editor view captured when issuing an activation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorViewArg {
+    pub view: String,
+    pub incarnation: u64,
+    pub selection_version: u64,
+}
+impl EditorViewArg {
+    fn decode(&self) -> Result<flavite_vault::editor_receipts::EditorViewStamp, String> {
+        Ok(flavite_vault::editor_receipts::EditorViewStamp {
+            view: parse_origin(&self.view)?,
+            incarnation: self.incarnation,
+            selection_version: self.selection_version,
+        })
+    }
+}
+
 /// Wire form of a canonical selection set.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelectionSetArg {
     /// Id of the intended primary member (hint only).
@@ -61,15 +83,19 @@ pub struct SelectionSetArg {
 
 /// Decode a selection set and normalize it against `text`.
 fn normalize_set(text: &str, args: &SelectionSetArg) -> Result<SelectionSet, String> {
-    let candidates: Vec<RawSelection> = args
+    let candidates = args
         .items
         .iter()
-        .map(|triple| RawSelection {
-            id: u32::try_from(triple[0]).ok(),
-            anchor: triple[1],
-            head: triple[2],
+        .map(|triple| {
+            Ok(RawSelection {
+                id: Some(
+                    u32::try_from(triple[0]).map_err(|_| "Selection id exceeds 32-bit bounds")?,
+                ),
+                anchor: triple[1],
+                head: triple[2],
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
     SelectionSet::normalize(text, candidates, args.primary)
         .map(|(set, _)| set)
         .map_err(|error| error.to_string())
@@ -88,6 +114,19 @@ fn primary_index(set: &SelectionSet) -> usize {
         .unwrap_or(0)
 }
 
+fn validate_operation_origin(
+    operation: &OperationId,
+    origin: &EditorOriginArg,
+) -> Result<(), String> {
+    validate_origin(origin)?;
+    if operation.view.is_some_and(|stamp| {
+        format!("{:032x}", stamp.view) != origin.view || stamp.incarnation != origin.incarnation
+    }) {
+        return Err("UnknownOperation: origin differs from issued target".into());
+    }
+    Ok(())
+}
+
 /// `editor.issue_operation`: allocate one Session-issued operation ticket.
 /// Non-mutating; the pending cap (32 per buffer) is enforced.
 pub(crate) fn handle_issue_operation(
@@ -95,7 +134,11 @@ pub(crate) fn handle_issue_operation(
     invocation: &Invocation,
 ) -> Result<SessionResult, String> {
     let args: IssueOperationArgs = decode(invocation)?;
-    match session.issue_editor_operation(BufferId::from(args.buffer_id)) {
+    match session.issue_editor_operation(
+        BufferId::from(args.buffer_id),
+        Revision::new(args.revision),
+        args.view.as_ref().map(EditorViewArg::decode).transpose()?,
+    ) {
         Some(op) => Ok(SessionResult::Success(
             crate::session::CommandResult::OperationIssued {
                 buffer_id: BufferId::from(args.buffer_id),
@@ -161,23 +204,11 @@ pub(crate) fn handle_editor_delete(
 ) -> Result<SessionResult, String> {
     let args: EditorDeleteArgs = decode(invocation)?;
     let op = args.operation.decode(args.buffer_id)?;
-    validate_origin(&args.origin)?;
+    validate_operation_origin(&op, &args.origin)?;
     // Ticket admission happens before any snapshot/revision work so duplicate
     // delivery replays the terminal outcome regardless of the buffer state.
-    match session.admit_editor_operation(&op) {
-        flavite_vault::editor_receipts::TicketStatus::Pending => {}
-        flavite_vault::editor_receipts::TicketStatus::AlreadyApplied => {
-            return Err("AlreadyApplied".into());
-        }
-        flavite_vault::editor_receipts::TicketStatus::Cancelled => {
-            return Err("Cancelled".into());
-        }
-        flavite_vault::editor_receipts::TicketStatus::Retired => {
-            return Err("ReceiptExpired".into());
-        }
-        flavite_vault::editor_receipts::TicketStatus::Unknown => {
-            return Err("UnknownOperation".into());
-        }
+    if let Some(replay) = session.replay_editor_operation(&op) {
+        return Ok(replay);
     }
     let snapshot = match session.shared_buffer_snapshot(
         BufferId::from(args.buffer_id),
@@ -223,25 +254,9 @@ pub(crate) fn handle_editor_delete(
             return Err(format!("kind must be `delete` or `backspace`, got {other}"));
         }
     };
-    if prepared.ops.is_empty() {
-        // Zero-effect: no history node, no revision bump (AC-8). The
-        // activation is still consumed terminally.
-        session.complete_editor_operation(&op, Outcome::Applied);
-        return Ok(SessionResult::Success(
-            crate::session::CommandResult::EditsApplied {
-                buffer_id: BufferId::from(args.buffer_id),
-                new_revision: Revision::new(args.revision),
-                movement: Some(flavite_buffer::history::HistoryMovement {
-                    selections: Some(triples(&set)),
-                    spans: Vec::new(),
-                    truncated: false,
-                    primary: Some(primary_index(&set)),
-                }),
-                after_selections: Some(triples(&set)),
-            },
-        ));
-    }
+
     let record = flavite_buffer::history::EditorEdit {
+        before_primary: primary_index(&set),
         origin: args.origin.view.clone(),
         kind,
         before: triples(&set),
@@ -256,7 +271,7 @@ pub(crate) fn handle_editor_delete(
             origin: parse_origin(&args.origin.view)?,
         },
         editor: Some(record),
-        operation: Some(op),
+        operation: op,
     }))
 }
 
@@ -284,7 +299,7 @@ pub(crate) fn handle_keep_primary(
     let primary_id = set.primary_id().as_raw();
     let kept = set
         .members()
-        .into_iter()
+        .iter()
         .map(|member| RawSelection {
             id: Some(member.id().as_raw()),
             anchor: member.anchor(),
@@ -320,7 +335,7 @@ pub(crate) fn handle_collapse(
     let set = normalize_set(&snapshot.text, &args.selections)?;
     let carets = set
         .members()
-        .into_iter()
+        .iter()
         .map(|member| RawSelection {
             id: Some(member.id().as_raw()),
             anchor: member.head(),
@@ -396,6 +411,8 @@ fn parse_origin(view: &str) -> Result<u128, String> {
 #[serde(deny_unknown_fields)]
 pub struct IssueOperationArgs {
     buffer_id: u64,
+    revision: u64,
+    view: Option<EditorViewArg>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -438,6 +455,7 @@ pub struct EditorSelectionOnlyArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EditorMutateArgs {
+    undo_policy: Option<crate::flavite::UndoPolicyArg>,
     buffer_id: u64,
     revision: u64,
     operation: OperationArg,
@@ -449,6 +467,7 @@ pub struct EditorMutateArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EditorPasteArgs {
+    undo_policy: Option<crate::flavite::UndoPolicyArg>,
     buffer_id: u64,
     revision: u64,
     operation: OperationArg,
@@ -471,23 +490,13 @@ fn handle_ticketed_edit(
     selections: SelectionSetArg,
     edit_operation: flavite_buffer::commands::EditOperation,
     kind: flavite_buffer::history::EditKind,
+    undo_policy: Option<flavite_buffer::undo::UndoPolicy>,
+    primary_only: bool,
 ) -> Result<SessionResult, String> {
     let operation = op.decode(buffer_id)?;
-    validate_origin(&origin)?;
-    match session.admit_editor_operation(&operation) {
-        flavite_vault::editor_receipts::TicketStatus::Pending => {}
-        flavite_vault::editor_receipts::TicketStatus::AlreadyApplied => {
-            return Err("AlreadyApplied".into());
-        }
-        flavite_vault::editor_receipts::TicketStatus::Cancelled => {
-            return Err("Cancelled".into());
-        }
-        flavite_vault::editor_receipts::TicketStatus::Retired => {
-            return Err("ReceiptExpired".into());
-        }
-        flavite_vault::editor_receipts::TicketStatus::Unknown => {
-            return Err("UnknownOperation".into());
-        }
+    validate_operation_origin(&operation, &origin)?;
+    if let Some(replay) = session.replay_editor_operation(&operation) {
+        return Ok(replay);
     }
     let snapshot = match session
         .shared_buffer_snapshot(BufferId::from(buffer_id), Some(Revision::new(revision)))
@@ -513,31 +522,26 @@ fn handle_ticketed_edit(
             return Err(error);
         }
     };
-    let prepared = match flavite_buffer::commands::plan(&text, &set, &edit_operation) {
+    let planned = if primary_only {
+        match edit_operation {
+            flavite_buffer::commands::EditOperation::Typing(text_to_insert) => {
+                flavite_buffer::commands::plan_primary_typing(&text, &set, text_to_insert)
+            }
+            _ => return Err("Primary-only input requires text".into()),
+        }
+    } else {
+        flavite_buffer::commands::plan(&text, &set, &edit_operation)
+    };
+    let prepared = match planned {
         Ok(prepared) => prepared,
         Err(error) => {
             session.complete_editor_operation(&operation, Outcome::Cancelled);
             return Err(error.to_string());
         }
     };
-    if prepared.ops.is_empty() {
-        // Zero-effect: no history node, no revision bump (AC-8).
-        session.complete_editor_operation(&operation, Outcome::Applied);
-        return Ok(SessionResult::Success(
-            crate::session::CommandResult::EditsApplied {
-                buffer_id: BufferId::from(buffer_id),
-                new_revision: Revision::new(revision),
-                movement: Some(flavite_buffer::history::HistoryMovement {
-                    selections: Some(triples(&set)),
-                    spans: Vec::new(),
-                    truncated: false,
-                    primary: Some(primary_index(&set)),
-                }),
-                after_selections: Some(triples(&set)),
-            },
-        ));
-    }
+
     let record = flavite_buffer::history::EditorEdit {
+        before_primary: primary_index(&set),
         origin: origin.view.clone(),
         kind,
         before: triples(&set),
@@ -548,11 +552,11 @@ fn handle_ticketed_edit(
         buffer_id: BufferId::from(buffer_id),
         revision: Revision::new(revision),
         ops: prepared.ops,
-        undo_policy: flavite_buffer::undo::UndoPolicy::Context {
+        undo_policy: undo_policy.unwrap_or(flavite_buffer::undo::UndoPolicy::Context {
             origin: parse_origin(&origin.view)?,
-        },
+        }),
         editor: Some(record),
-        operation: Some(operation),
+        operation: operation,
     }))
 }
 
@@ -572,6 +576,10 @@ pub(crate) fn handle_editor_change(
         args.selections,
         flavite_buffer::commands::EditOperation::Delete,
         flavite_buffer::history::EditKind::Change,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
     )
 }
 
@@ -591,6 +599,10 @@ pub(crate) fn handle_editor_cut(
         args.selections,
         flavite_buffer::commands::EditOperation::Cut,
         flavite_buffer::history::EditKind::Cut,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
     )
 }
 
@@ -610,6 +622,127 @@ pub(crate) fn handle_editor_paste(
         args.selections,
         flavite_buffer::commands::EditOperation::Typing(args.text.replace("\r\n", "\n")),
         flavite_buffer::history::EditKind::Paste,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+/// Ordinary input sends its set once; plans and recorded after-sets are
+/// derived here rather than repeating O(N) edits and metadata on the wire.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorTypeArgs {
+    buffer_id: u64,
+    revision: u64,
+    operation: OperationArg,
+    origin: EditorOriginArg,
+    selections: SelectionSetArg,
+    text: String,
+    #[serde(default)]
+    primary_only: bool,
+    undo_policy: crate::flavite::UndoPolicyArg,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorKeyInputArgs {
+    buffer_id: u64,
+    revision: u64,
+    operation: OperationArg,
+    origin: EditorOriginArg,
+    selections: SelectionSetArg,
+    #[serde(default)]
+    word: bool,
+    undo_policy: crate::flavite::UndoPolicyArg,
+}
+pub(crate) fn handle_editor_type(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorTypeArgs = decode(invocation)?;
+    let policy = crate::flavite::decode_undo_policy(Some(args.undo_policy))?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::Typing(args.text.replace("\r\n", "\n")),
+        flavite_buffer::history::EditKind::Typing,
+        Some(policy),
+        args.primary_only,
+    )
+}
+pub(crate) fn handle_editor_backspace(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorKeyInputArgs = decode(invocation)?;
+    let policy = crate::flavite::decode_undo_policy(Some(args.undo_policy))?;
+    let operation = if args.word {
+        flavite_buffer::commands::EditOperation::BackspaceWord
+    } else {
+        flavite_buffer::commands::EditOperation::Backspace
+    };
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        operation,
+        flavite_buffer::history::EditKind::Backspace,
+        Some(policy),
+        false,
+    )
+}
+pub(crate) fn handle_editor_forward_delete(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorKeyInputArgs = decode(invocation)?;
+    let policy = crate::flavite::decode_undo_policy(Some(args.undo_policy))?;
+    let operation = if args.word {
+        flavite_buffer::commands::EditOperation::ForwardDeleteWord
+    } else {
+        flavite_buffer::commands::EditOperation::ForwardDelete
+    };
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        operation,
+        flavite_buffer::history::EditKind::Delete,
+        Some(policy),
+        false,
+    )
+}
+pub(crate) fn handle_editor_newline(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorKeyInputArgs = decode(invocation)?;
+    if args.word {
+        return Err("Word applies only to deletion".into());
+    }
+    let policy = crate::flavite::decode_undo_policy(Some(args.undo_policy))?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::Typing("\n".into()),
+        flavite_buffer::history::EditKind::Typing,
+        Some(policy),
+        false,
     )
 }
 
@@ -635,6 +768,10 @@ fn open_line(
         args.selections,
         flavite_buffer::commands::EditOperation::OpenLine { above },
         kind,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
     )
 }
 
@@ -1242,7 +1379,7 @@ fn apply_split_selection(
         .map_err(|error| error.to_string())?;
     let members: Vec<(usize, usize)> = set
         .members()
-        .into_iter()
+        .iter()
         .map(|member| (member.start(), member.end()))
         .collect();
     let gaps = flavite_buffer::selection::split_gaps(text, &members);
@@ -1255,4 +1392,123 @@ fn apply_split_selection(
     let gap_set = flavite_buffer::selection::selection_set_from_spans(text, &gaps, None)
         .map_err(|error| error.to_string())?;
     Ok(selections_changed(buffer_id, revision, &gap_set))
+}
+
+impl crate::Flavite {
+    pub fn editor_movement(
+        &self,
+        buffer: u64,
+        before: u64,
+        after: u64,
+    ) -> Option<flavite_buffer::history::HistoryMovement> {
+        self.session
+            .editor_movement(buffer.into(), Revision::new(before), Revision::new(after))
+    }
+    /// Issue explicit activation authority. A view stamp is required for UI
+    /// edits; headless callers bind the buffer revision without a view.
+    pub fn issue_editor_operation(
+        &self,
+        buffer_id: u64,
+        revision: u64,
+        view: Option<EditorViewArg>,
+    ) -> Result<OperationArg, String> {
+        let stamp = view.as_ref().map(EditorViewArg::decode).transpose()?;
+        let op = self
+            .session
+            .issue_editor_operation(buffer_id.into(), Revision::new(revision), stamp)
+            .ok_or("Operation target changed or pending limit reached")?;
+        Ok(OperationArg {
+            revision: op.revision,
+            view,
+            buffer_incarnation: op.buffer_incarnation,
+            sequence: op.sequence,
+            ticket: hex::encode(op.ticket.to_be_bytes()),
+        })
+    }
+
+    /// Initial committed data is validated like every later commit, while
+    /// sequence zero remains available for the first native capture.
+    pub fn initialize_editor_view(
+        &self,
+        workspace: &mut flavite_workspace::WorkspaceState,
+        tab: flavite_workspace::TabId,
+        buffer: u64,
+        revision: u64,
+        text: &str,
+    ) -> Result<(), &'static str> {
+        let interaction = workspace.tab(&tab).ok_or("View closed")?.interaction();
+        let candidates = interaction
+            .selections
+            .iter()
+            .enumerate()
+            .map(|(id, selection)| RawSelection {
+                id: Some(id as u32),
+                anchor: selection.anchor,
+                head: selection.head,
+            })
+            .collect();
+        SelectionSet::normalize(text, candidates, Some(interaction.primary as u32))
+            .map_err(|_| "Invalid initial selection set")?;
+        let stamp = flavite_vault::editor_receipts::EditorViewStamp {
+            view: tab.raw(),
+            incarnation: interaction.incarnation,
+            selection_version: interaction.selection_version,
+        };
+        workspace.initialize_editor_buffer(tab, buffer, revision)?;
+        self.session
+            .commit_editor_view(buffer.into(), Revision::new(revision), stamp);
+        Ok(())
+    }
+
+    /// Commit view selections through the canonical algebra before exposing
+    /// the version to Session admission. Workspace stores only validated data.
+    pub fn acknowledge_editor_interaction(
+        &self,
+        workspace: &mut flavite_workspace::WorkspaceState,
+        mut interaction: flavite_workspace::EditorInteraction,
+        text: &str,
+    ) -> Result<(), &'static str> {
+        let primary = u32::try_from(interaction.primary).map_err(|_| "Invalid primary")?;
+        let candidates = interaction
+            .selections
+            .iter()
+            .enumerate()
+            .map(|(id, selection)| RawSelection {
+                id: Some(id as u32),
+                anchor: selection.anchor,
+                head: selection.head,
+            })
+            .collect();
+        let (set, _) = SelectionSet::normalize(text, candidates, Some(primary))
+            .map_err(|_| "Invalid canonical selection set")?;
+        interaction.primary = primary_index(&set);
+        interaction.selections = set
+            .members()
+            .iter()
+            .map(|selection| {
+                flavite_workspace::CommittedSelection::new(selection.anchor(), selection.head())
+            })
+            .collect();
+        let tab = interaction.tab;
+        workspace.acknowledge_interaction(interaction, text)?;
+        let interaction = workspace.tab(&tab).ok_or("View closed")?.interaction();
+        if let Some(buffer) = interaction.buffer_id {
+            self.session.commit_editor_view(
+                buffer.into(),
+                Revision::new(interaction.revision),
+                flavite_vault::editor_receipts::EditorViewStamp {
+                    view: tab.raw(),
+                    incarnation: interaction.incarnation,
+                    selection_version: interaction.selection_version,
+                },
+            );
+        }
+        Ok(())
+    }
+    pub fn cancel_editor_view_operations(&self, view: u128) {
+        self.session.cancel_editor_view_operations(view);
+    }
+    pub fn release_editor_view(&self, view: u128) {
+        self.session.release_editor_view(view);
+    }
 }

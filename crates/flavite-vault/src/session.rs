@@ -315,11 +315,16 @@ pub enum SessionCommand {
         edit: crate::properties::StructureEdit,
     },
     /// Open a note.
-    OpenNote { path: PathBuf, policy: OpenPolicy },
+    OpenNote {
+        path: PathBuf,
+        policy: OpenPolicy,
+    },
     /// Create a new empty note file and open it (W10). The command fails
     /// when the path already exists; creation runs on the open workers and
     /// the actor, never under the driving turn.
-    CreateNote { path: PathBuf },
+    CreateNote {
+        path: PathBuf,
+    },
     /// Close a note.
     CloseNote {
         path: PathBuf,
@@ -338,10 +343,8 @@ pub enum SessionCommand {
         undo_policy: flavite_buffer::undo::UndoPolicy,
         /// Validated selection metadata installed in the same edit turn.
         editor: Option<flavite_buffer::history::EditorEdit>,
-        /// Session-issued operation ticket (FEUX-0002 E-5). When present,
-        /// the activation is admitted against the ledger; duplicates and
-        /// retired replays are refused with typed outcomes.
-        operation: Option<crate::editor_receipts::OperationId>,
+        /// Mandatory Session-issued activation authority.
+        operation: crate::editor_receipts::OperationId,
     },
     EditingHistory {
         buffer_id: BufferId,
@@ -353,6 +356,7 @@ pub enum SessionCommand {
         buffer_id: BufferId,
         revision: Revision,
         target: flavite_buffer::history::HistoryTarget,
+        operation: crate::editor_receipts::OperationId,
     },
     /// Apply a user-reviewed three-way merge to the exact buffer and disk
     /// versions represented by its preview.
@@ -364,7 +368,9 @@ pub enum SessionCommand {
         merged_bytes: Vec<u8>,
     },
     /// Save a note.
-    SaveNote { path: PathBuf },
+    SaveNote {
+        path: PathBuf,
+    },
     /// Trigger a reconcile.
     Reconcile {
         scope: ReconcileScope,
@@ -380,11 +386,13 @@ pub enum SessionCommand {
     Undo {
         buffer_id: BufferId,
         revision: Revision,
+        operation: crate::editor_receipts::OperationId,
     },
     /// Redo an edit.
     Redo {
         buffer_id: BufferId,
         revision: Revision,
+        operation: crate::editor_receipts::OperationId,
     },
     /// Resolve a conflict.
     ResolveConflict {
@@ -392,15 +400,23 @@ pub enum SessionCommand {
         resolution: ConflictResolution,
     },
     /// Restore the recovery snapshot for a note after explicit user choice.
-    RestoreRecovery { path: PathBuf },
+    RestoreRecovery {
+        path: PathBuf,
+    },
     /// Discard the recovery snapshot for a note after explicit user choice.
-    DiscardRecovery { path: PathBuf },
+    DiscardRecovery {
+        path: PathBuf,
+    },
     /// Durably checkpoint one dirty buffer's recovery snapshot now and
     /// return a revision-bound receipt (W12).
-    FlushRecovery { path: PathBuf },
+    FlushRecovery {
+        path: PathBuf,
+    },
     /// Snapshot the buffer's unsaved edits into local history, drop them,
     /// and reload from disk as one explicit destructive action (W12).
-    DiscardEdits { path: PathBuf },
+    DiscardEdits {
+        path: PathBuf,
+    },
     /// Replace an open buffer's content with a local-history snapshot as one
     /// guarded, undoable edit (W10). The note must already be open: restore
     /// never mutates disk and never opens notes implicitly.
@@ -468,7 +484,9 @@ pub enum SessionCommand {
     },
     /// Cancel one pending match collection (E-11): the worker stops, the
     /// result is dropped, and no completion is recorded.
-    TextCancel { request_id: u64 },
+    TextCancel {
+        request_id: u64,
+    },
     /// Install one prepared replacement as one isolated Undo unit (D-06).
     /// Consumed plans replay the same result during the retry window.
     ApplyReplace {
@@ -491,7 +509,9 @@ pub enum SessionCommand {
         page_len: usize,
     },
     /// Close a finder session and drop its spool (S07).
-    SourceFindClose { finder_id: u128 },
+    SourceFindClose {
+        finder_id: u128,
+    },
     /// Prepare and seal a replacement preview (S07/D-09): full scan, exact
     /// serialized outputs, sealed manifest + content-addressed payloads.
     /// Read-only; nothing is applied.
@@ -506,7 +526,12 @@ pub enum SessionCommand {
         selected: ReplaceSelection,
     },
     /// Report a sealed preview's status and totals (S07).
-    ReplaceStatus { preview_id: u128 },
+    ReplaceStatus {
+        preview_id: u128,
+    },
+    ReplacePreviewClose {
+        preview_id: u128,
+    },
     /// Apply a sealed preview under a frozen selection revision
     /// (RFC-0006 S08/D-10). The first Apply freezes the selection; a
     /// different revision is SelectionLocked. `idempotency_key` is a
@@ -519,7 +544,9 @@ pub enum SessionCommand {
     },
     /// Stop admission of the next item; an item past its durable intent
     /// point finishes.
-    ReplaceCancel { job_id: u128 },
+    ReplaceCancel {
+        job_id: u128,
+    },
     /// Explicitly resume a paused/partial/cancelled job (fresh grants are
     /// rechecked per item; untouched items run with unchanged guards).
     ReplaceResume {
@@ -537,7 +564,9 @@ pub enum SessionCommand {
         idempotency_key: u128,
     },
     /// Current job status and totals.
-    ReplaceJobStatus { job_id: u128 },
+    ReplaceJobStatus {
+        job_id: u128,
+    },
 }
 
 /// Which notes a preview selection names (S07/D-09). Selection is a local
@@ -709,7 +738,9 @@ pub enum CommandResult {
         generation: Generation,
     },
     /// Reconcile completed.
-    ReconcileComplete { summary: ReconcileSummary },
+    ReconcileComplete {
+        summary: ReconcileSummary,
+    },
     /// A journaled rename and its indexed link patches completed.
     NoteRenamed {
         txn_id: String,
@@ -744,12 +775,15 @@ pub enum CommandResult {
     },
     /// Unsaved edits were snapshotted into local history and reloaded
     /// from disk (W12 explicit discard).
-    EditsDiscarded { buffer_id: BufferId },
+    EditsDiscarded {
+        buffer_id: BufferId,
+    },
     /// A local-history snapshot replaced the open buffer content as one
     /// guarded, undoable edit (W10). Nothing was written to disk.
     HistoryRestored {
         buffer_id: BufferId,
         new_revision: Revision,
+        movement: flavite_buffer::history::HistoryMovement,
     },
     /// A note's bounded local-history listing (W10).
     NoteHistory {
@@ -801,7 +835,9 @@ pub enum CommandResult {
     },
     /// A pending match collection was cancelled (FEUX-0002 E-11): its
     /// outcome is dropped and no completion is recorded for it.
-    SelectionCollectionCancelled { request_id: u64 },
+    SelectionCollectionCancelled {
+        request_id: u64,
+    },
     /// A vault source-find session started (RFC-0006 S07): frozen scope,
     /// exact totals, typed exclusions and the first page.
     SourceFindStarted {
@@ -820,6 +856,7 @@ pub enum CommandResult {
     },
     /// A source-find session was closed and its spool dropped (S07).
     SourceFindClosed,
+    ReplacePreviewClosed,
     /// A replacement preview was sealed (S07/D-09): the plan is ready and
     /// non-applying; selection is a separate command.
     ReplacePreviewSealed {
@@ -843,7 +880,9 @@ pub enum CommandResult {
         totals: crate::replace::JobTotals,
     },
     /// A durable replacement job was cancelled (S08).
-    ReplaceCancelled { job_id: u128 },
+    ReplaceCancelled {
+        job_id: u128,
+    },
     /// Current durable job status (S08).
     ReplaceJobStatus {
         job_id: u128,
@@ -876,6 +915,9 @@ pub struct SourceFindPageData {
 /// One find row: a note with a page of its matches.
 #[derive(Debug, Clone)]
 pub struct MatchRow {
+    pub content_hash: String,
+    pub source_kind: crate::replace::SourceKind,
+    pub contexts: Vec<crate::replace::context::MatchContext>,
     /// Note ordinal (ascending native order).
     pub ordinal: u64,
     /// Portable vault-relative path.
@@ -1178,6 +1220,10 @@ pub struct Session {
     app_history_budget: AtomicU64,
     /// Editor operation tickets and terminal receipts (FEUX-0002 E-5).
     editor_operations: Mutex<crate::editor_receipts::ReceiptLedger>,
+    editor_movements:
+        Mutex<HashMap<BufferId, (Revision, Revision, flavite_buffer::history::HistoryMovement)>>,
+    editor_views:
+        Mutex<HashMap<u128, (BufferId, Revision, crate::editor_receipts::EditorViewStamp)>>,
 }
 
 /// One queued semantic-link prepare job (W05).
@@ -1788,6 +1834,13 @@ impl Session {
                                         &crate::replace::ActorOpStoreIo::new(ctx.actor.clone()),
                                         &cancelled,
                                     );
+                                    if outcome.is_err() {
+                                        crate::replace::preview::cleanup_find(
+                                            &ctx.root,
+                                            &hex::encode(finder_id.to_be_bytes()),
+                                            &crate::replace::ActorOpStoreIo::new(ctx.actor.clone()),
+                                        );
+                                    }
                                     ReplaceOutcomeMessage::Find {
                                         request_id: job.request_id,
                                         finder_id,
@@ -1991,6 +2044,8 @@ impl Session {
             buffer_stamp_version: AtomicU64::new(0),
             app_history_budget: AtomicU64::new(flavite_buffer::budget::APP_WIDE_MAX_HISTORY_BYTES),
             editor_operations: Mutex::new(crate::editor_receipts::ReceiptLedger::new()),
+            editor_views: Mutex::new(HashMap::new()),
+            editor_movements: Mutex::new(HashMap::new()),
         };
         // Recover durable replacement jobs from the private store
         // (RFC-0006 D-11). Runs once at Session construction; never
@@ -2059,11 +2114,179 @@ impl Session {
     /// whether to continue or restart.
     pub fn execute(&self, command: SessionCommand) -> SessionResult {
         let _turn = self.driving_turn.lock_recovering();
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.execute_turn(command)))
-        {
+        let activation = match &command {
+            SessionCommand::ApplyEdits {
+                buffer_id,
+                revision,
+                operation,
+                ..
+            }
+            | SessionCommand::Undo {
+                buffer_id,
+                revision,
+                operation,
+            }
+            | SessionCommand::Redo {
+                buffer_id,
+                revision,
+                operation,
+            }
+            | SessionCommand::RestoreEditingState {
+                buffer_id,
+                revision,
+                operation,
+                ..
+            } => Some((*buffer_id, *revision, *operation)),
+            _ => None,
+        };
+        let transition_source = activation
+            .map(|(buffer, revision, _)| (buffer, revision))
+            .or(match &command {
+                SessionCommand::RestoreHistory {
+                    buffer_id,
+                    revision,
+                    ..
+                } => Some((*buffer_id, *revision)),
+                _ => None,
+            });
+        if let Some((buffer, revision, op)) = activation {
+            if let Some(replay) = self.replay_editor_operation(&op) {
+                return replay;
+            }
+            if op.buffer_id == buffer.as_u64() && op.revision != revision.as_u64() {
+                let result = SessionResult::StaleRevision {
+                    buffer_id: buffer,
+                    expected: revision,
+                    actual: Revision::new(op.revision),
+                };
+                self.editor_operations
+                    .lock_recovering()
+                    .record_receipt(&op, &result);
+                return result;
+            }
+            let origin_mismatch = op.view.is_some_and(|stamp|match &command {
+                SessionCommand::ApplyEdits {editor,undo_policy,..} => editor.as_ref().is_some_and(|record|record.origin!=format!("{:032x}",stamp.view)) || matches!(undo_policy,flavite_buffer::undo::UndoPolicy::Context {origin} if *origin!=stamp.view),
+                _=>false,
+            });
+            let refusal = if op.buffer_id != buffer.as_u64() || origin_mismatch {
+                Some("UnknownOperation")
+            } else if op.revision != revision.as_u64() {
+                Some("StaleRevision")
+            } else if op.view.is_some_and(|stamp| {
+                self.editor_views.lock_recovering().get(&stamp.view)
+                    != Some(&(buffer, revision, stamp))
+            }) {
+                Some("StaleSelectionVersion")
+            } else {
+                None
+            };
+            if let Some(message) = refusal {
+                let result = SessionResult::Error {
+                    message: message.into(),
+                };
+                self.editor_operations
+                    .lock_recovering()
+                    .record_receipt(&op, &result);
+                return result;
+            }
+        }
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.execute_turn(command)
+        })) {
             Ok(result) => result,
             Err(payload) => self.record_contained_panic(&payload, "execute"),
+        };
+        if let (Some((buffer, before)), SessionResult::Success(success)) =
+            (transition_source, &result)
+        {
+            let transition = match success {
+                CommandResult::EditsApplied {
+                    new_revision,
+                    movement,
+                    ..
+                }
+                | CommandResult::UndoPerformed {
+                    new_revision,
+                    movement,
+                    ..
+                }
+                | CommandResult::RedoPerformed {
+                    new_revision,
+                    movement,
+                    ..
+                } => movement.as_ref().map(|movement| (*new_revision, movement)),
+                CommandResult::EditingStateRestored {
+                    revision, movement, ..
+                } => Some((*revision, movement)),
+                CommandResult::HistoryRestored {
+                    new_revision,
+                    movement,
+                    ..
+                } => Some((*new_revision, movement)),
+                _ => None,
+            };
+            if let Some((after, movement)) = transition
+                && after != before
+            {
+                // Keep only one bounded delta per live buffer, with no view
+                // selections or source bytes. Missing intermediate transitions
+                // explicitly require host resynchronization.
+                self.editor_movements.lock_recovering().insert(
+                    buffer,
+                    (
+                        before,
+                        after,
+                        flavite_buffer::history::HistoryMovement {
+                            spans: movement.spans.clone(),
+                            step_ends: movement.step_ends.clone(),
+                            truncated: movement.truncated,
+                            selections: None,
+                            primary: None,
+                        },
+                    ),
+                );
+            }
         }
+        if let Some((_, _, op)) = activation {
+            self.editor_operations
+                .lock_recovering()
+                .record_receipt(&op, &result);
+        }
+        result
+    }
+
+    pub fn editor_movement(
+        &self,
+        buffer: BufferId,
+        before: Revision,
+        after: Revision,
+    ) -> Option<flavite_buffer::history::HistoryMovement> {
+        let movements = self.editor_movements.lock_recovering();
+        let (from, to, movement) = movements.get(&buffer)?;
+        (*from == before && *to == after).then(|| movement.clone())
+    }
+
+    /// Pending operations have no replay. All terminal paths return their
+    /// original receipt or a typed cancellation/expiry refusal.
+    pub fn replay_editor_operation(
+        &self,
+        op: &crate::editor_receipts::OperationId,
+    ) -> Option<SessionResult> {
+        let ledger = self.editor_operations.lock_recovering();
+        if let Some(receipt) = ledger.receipt(op) {
+            return Some(receipt);
+        }
+        use crate::editor_receipts::TicketStatus;
+        let message = match ledger.admit(op) {
+            TicketStatus::Pending => return None,
+            TicketStatus::AlreadyApplied => "AlreadyApplied",
+            TicketStatus::Cancelled => "Cancelled",
+            TicketStatus::Retired => "ReceiptExpired",
+            TicketStatus::Unknown => "UnknownOperation",
+        };
+        Some(SessionResult::Error {
+            message: message.into(),
+        })
     }
 
     fn execute_turn(&self, command: SessionCommand) -> SessionResult {
@@ -2549,8 +2772,8 @@ impl Session {
                 ops,
                 undo_policy,
                 editor,
-                operation,
-            } => self.apply_edits(buffer_id, revision, ops, undo_policy, editor, operation),
+                operation: _,
+            } => self.apply_edits(buffer_id, revision, ops, undo_policy, editor),
             SessionCommand::EditingHistory {
                 buffer_id,
                 revision,
@@ -2561,6 +2784,7 @@ impl Session {
                 buffer_id,
                 revision,
                 target,
+                operation: _,
             } => self.restore_editing_state(buffer_id, revision, target),
             SessionCommand::ApplyMerge {
                 path,
@@ -2577,10 +2801,12 @@ impl Session {
             SessionCommand::Undo {
                 buffer_id,
                 revision,
+                operation: _,
             } => self.undo(buffer_id, revision),
             SessionCommand::Redo {
                 buffer_id,
                 revision,
+                operation: _,
             } => self.redo(buffer_id, revision),
             SessionCommand::ResolveConflict { path, resolution } => {
                 self.resolve_conflict(path, resolution)
@@ -2635,6 +2861,9 @@ impl Session {
                 selected,
             } => self.replace_select(preview_id, selected),
             SessionCommand::ReplaceStatus { preview_id } => self.replace_status(preview_id),
+            SessionCommand::ReplacePreviewClose { preview_id } => {
+                self.replace_preview_close(preview_id)
+            }
             SessionCommand::ReplaceApply {
                 request_id,
                 preview_id,
@@ -3051,7 +3280,6 @@ impl Session {
             Revision::new(plan.source.revision),
             vec![edit],
             flavite_buffer::undo::UndoPolicy::Isolated,
-            None,
             None,
         );
         let result = match applied {
@@ -4492,10 +4720,36 @@ impl Session {
     /// Reclaim expired source sessions on access.
     fn sweep_source_sessions(&self) {
         let now = crate::replace::preview::unix_ms_now();
-        let mut finders = self.finders.lock_recovering();
-        finders.retain(|_, entry| entry.expires_at_unix_ms > now);
-        let mut previews = self.previews.lock_recovering();
-        previews.retain(|_, entry| entry.expires_at_unix_ms > now);
+        let expired = {
+            let mut finders = self.finders.lock_recovering();
+            let expired: Vec<_> = finders
+                .iter()
+                .filter(|(_, entry)| entry.expires_at_unix_ms <= now)
+                .map(|(&id, _)| id)
+                .collect();
+            for id in &expired {
+                finders.remove(id);
+            }
+            expired
+        };
+        for id in expired {
+            crate::replace::preview::cleanup_find(
+                &self.identity.root,
+                &hex::encode(id.to_be_bytes()),
+                &crate::replace::ActorOpStoreIo::new(self.actor.clone()),
+            );
+        }
+        let expired = {
+            let previews = self.previews.lock_recovering();
+            previews
+                .iter()
+                .filter(|(_, entry)| entry.expires_at_unix_ms <= now)
+                .map(|(&id, _)| id)
+                .collect::<Vec<_>>()
+        };
+        for id in expired {
+            let _ = self.replace_preview_close(id);
+        }
     }
 
     /// Admit one vault source find (S07): read-only, frozen scope, exact
@@ -4577,11 +4831,11 @@ impl Session {
     fn source_find_close(&self, finder_id: u128) -> SessionResult {
         let removed = self.finders.lock_recovering().remove(&finder_id);
         if removed.is_some() {
-            let base = crate::replace::preview::source_find_base(&self.identity.root)
-                .join(hex::encode(finder_id.to_be_bytes()));
-            let io = crate::replace::ActorOpStoreIo::new(self.actor.clone());
-            let _ = io.remove(&base.join("spans"));
-            let _ = io.remove(&base);
+            crate::replace::preview::cleanup_find(
+                &self.identity.root,
+                &hex::encode(finder_id.to_be_bytes()),
+                &crate::replace::ActorOpStoreIo::new(self.actor.clone()),
+            );
         }
         SessionResult::Success(CommandResult::SourceFindClosed)
     }
@@ -4686,6 +4940,68 @@ impl Session {
             selection_revision: revision,
             selection_digest: digest,
         })
+    }
+
+    fn replace_preview_close(&self, preview_id: u128) -> SessionResult {
+        let removed = self.previews.lock_recovering().remove(&preview_id);
+        // Durable jobs retain their sealed objects for resume and revert.
+        if removed.is_some()
+            && !self
+                .replace_jobs_map
+                .lock_recovering()
+                .contains_key(&preview_id)
+        {
+            let store = crate::replace::ReplaceStore::new(&self.identity.root);
+            let _ = store.remove_job(
+                &crate::replace::ActorOpStoreIo::new(self.actor.clone()),
+                &hex::encode(preview_id.to_be_bytes()),
+            );
+        }
+        SessionResult::Success(CommandResult::ReplacePreviewClosed)
+    }
+
+    /// Inspect sealed payloads on a query worker, outside the driving turn.
+    pub fn inspect_replacement(
+        &self,
+        preview_id: u128,
+        item_id: u64,
+    ) -> Result<crate::replace::context::ReplacementDiff, String> {
+        let manifest = self
+            .previews
+            .lock_recovering()
+            .get(&preview_id)
+            .map(|entry| entry.manifest.clone())
+            .ok_or("Replacement preview expired; prepare it again")?;
+        if manifest.expires_at_unix_ms < crate::replace::preview::unix_ms_now() {
+            return Err("Replacement preview expired; prepare it again".into());
+        }
+        let note = manifest
+            .notes
+            .iter()
+            .find(|note| note.item_id == item_id)
+            .ok_or("Note is outside this preview")?;
+        let store = crate::replace::ReplaceStore::new(&self.identity.root);
+        let io = crate::replace::ActorOpStoreIo::new(self.actor.clone());
+        let encoding = flavite_encoding::FileEncoding::from_code(&note.format.encoding)
+            .ok_or("Invalid preview encoding")?;
+        let format = flavite_encoding::SourceFormat::new(encoding, note.format.bom)
+            .map_err(|e| e.to_string())?;
+        let read = |reference| -> Result<String, String> {
+            let bytes = store
+                .read_payload(&io, &manifest.job_id, reference)
+                .map_err(|e| e.to_string())?
+                .ok_or("Preview payload is missing")?;
+            flavite_syntax::text::TextSnapshot::with_policy(
+                &bytes,
+                flavite_encoding::DecodePolicy::Explicit(format),
+            )
+            .map(|snapshot| snapshot.text().to_owned())
+            .map_err(|e| e.to_string())
+        };
+        Ok(crate::replace::context::diff(
+            &read(&note.before)?,
+            &read(&note.after)?,
+        ))
     }
 
     /// Report the current status of a sealed preview (S07).
@@ -5187,7 +5503,21 @@ impl Session {
                 let end = u64::from_le_bytes(chunk[8..].try_into().expect("8 bytes"));
                 matches.push((start, end));
             }
+            let frozen = io
+                .read_capped(
+                    &base.join(format!("{}.text", record.spans_file)),
+                    (flavite_index::MAX_NOTE_BYTES as u64).saturating_mul(4),
+                )?
+                .ok_or("Find source snapshot is missing")?;
+            if blake3::hash(&frozen).to_hex().as_str() != record.content_hash {
+                return Err("Find source snapshot checksum mismatch".into());
+            }
+            let frozen = std::str::from_utf8(&frozen).map_err(|_| "Find snapshot is not UTF-8")?;
+            let contexts = crate::replace::context::excerpts(frozen, &matches)?;
             rows.push(MatchRow {
+                content_hash: record.content_hash.clone(),
+                source_kind: record.source_kind,
+                contexts,
                 ordinal: record.ordinal,
                 path: record.path.clone(),
                 title: record.title.clone(),
@@ -5215,9 +5545,9 @@ impl Session {
             None
         };
         Ok(SourceFindPageData {
-            note_index: cursor_note,
+            note_index,
             note_total: u64::try_from(entry.notes.len()).unwrap_or(u64::MAX),
-            match_offset: cursor_match,
+            match_offset,
             rows,
             next_note_index,
             next_match_offset: (cursor_match > 0).then_some(cursor_match),
@@ -5652,6 +5982,7 @@ impl Session {
             self.editor_operations
                 .lock_recovering()
                 .close_buffer(_buffer_id.as_u64());
+            self.editor_movements.lock_recovering().remove(&_buffer_id);
 
             SessionResult::Success(CommandResult::NoteClosed)
         } else {
@@ -5850,36 +6181,7 @@ impl Session {
         ops: Vec<EditOp>,
         undo_policy: flavite_buffer::undo::UndoPolicy,
         editor: Option<flavite_buffer::history::EditorEdit>,
-        operation: Option<crate::editor_receipts::OperationId>,
     ) -> SessionResult {
-        // Ticket admission (FEUX-0002 E-5): pending proceeds; duplicates and
-        // retired replays are refused with typed outcomes; any consumed
-        // activation completes terminally on every exit path.
-        if let Some(op) = operation {
-            match self.editor_operations.lock_recovering().admit(&op) {
-                crate::editor_receipts::TicketStatus::Pending => {}
-                crate::editor_receipts::TicketStatus::AlreadyApplied => {
-                    return SessionResult::Error {
-                        message: "AlreadyApplied".into(),
-                    };
-                }
-                crate::editor_receipts::TicketStatus::Cancelled => {
-                    return SessionResult::Error {
-                        message: "Cancelled".into(),
-                    };
-                }
-                crate::editor_receipts::TicketStatus::Retired => {
-                    return SessionResult::Error {
-                        message: "ReceiptExpired".into(),
-                    };
-                }
-                crate::editor_receipts::TicketStatus::Unknown => {
-                    return SessionResult::Error {
-                        message: "UnknownOperation".into(),
-                    };
-                }
-            }
-        }
         let mut buffer_manager = self.buffer_manager.lock_recovering();
         if let Some(path) = buffer_manager.path_for_id(buffer_id)
             && self.leased_by_replace(path)
@@ -5887,11 +6189,6 @@ impl Session {
             // Every admitted activation reaches a terminal outcome on every
             // return path (E-5/NFR-13): a refusal here must not leak a
             // pending ticket into the per-buffer cap.
-            if let Some(op) = operation {
-                self.editor_operations
-                    .lock_recovering()
-                    .complete(&op, crate::editor_receipts::Outcome::Cancelled);
-            }
             return SessionResult::ActionRequired {
                 code: "replacement-in-progress",
                 data: Some(path.display().to_string()),
@@ -5902,26 +6199,40 @@ impl Session {
         // budget ledger (FEUX-0002 X01 / E-12). The projection is computed
         // before any per-buffer mutation; a refusal names the busiest buffer.
         let Some(buffer) = buffer_manager.get_buffer_by_id(buffer_id) else {
-            if let Some(op) = operation {
-                self.editor_operations
-                    .lock_recovering()
-                    .complete(&op, crate::editor_receipts::Outcome::Cancelled);
-            }
             return SessionResult::Error {
                 message: format!("Buffer not found: {:?}", buffer_id),
             };
         };
         if buffer.revision() != revision {
-            if let Some(op) = operation {
-                self.editor_operations
-                    .lock_recovering()
-                    .complete(&op, crate::editor_receipts::Outcome::Cancelled);
-            }
             return SessionResult::StaleRevision {
                 buffer_id,
                 expected: revision,
                 actual: buffer.revision(),
             };
+        }
+        if ops.is_empty() {
+            let (selections, primary) = if let Some(record) = &editor {
+                if let Err(error) = record.validate(buffer.text(), buffer.text()) {
+                    return SessionResult::Error {
+                        message: error.to_string(),
+                    };
+                }
+                (Some(record.after.clone()), Some(record.primary))
+            } else {
+                (None, None)
+            };
+            return SessionResult::Success(CommandResult::EditsApplied {
+                buffer_id,
+                new_revision: revision,
+                after_selections: selections.clone(),
+                movement: Some(flavite_buffer::history::HistoryMovement {
+                    selections,
+                    primary,
+                    spans: Vec::new(),
+                    step_ends: Vec::new(),
+                    truncated: false,
+                }),
+            });
         }
         if let Some(projected) = buffer.model().history_projection(&ops, editor.as_ref()) {
             let app_ceiling = self.app_history_budget.load(Ordering::Acquire);
@@ -5937,11 +6248,6 @@ impl Session {
                 }
             }
             if app_total.saturating_add(projected) > app_ceiling {
-                if let Some(op) = operation {
-                    self.editor_operations
-                        .lock_recovering()
-                        .complete(&op, crate::editor_receipts::Outcome::Cancelled);
-                }
                 return SessionResult::HistoryLimitExceeded {
                     buffer_id,
                     needed: projected,
@@ -5953,26 +6259,18 @@ impl Session {
 
         // Apply all edit ops as one authoritative Buffer transition/undo unit.
         let Some(buffer) = buffer_manager.get_buffer_by_id_mut(buffer_id) else {
-            if let Some(op) = operation {
-                self.editor_operations
-                    .lock_recovering()
-                    .complete(&op, crate::editor_receipts::Outcome::Cancelled);
-            }
             return SessionResult::Error {
                 message: format!("Buffer not found: {:?}", buffer_id),
             };
         };
 
-        let recorded = editor.is_some();
+        let recorded_after = editor
+            .as_ref()
+            .map(|editor| (editor.after.clone(), editor.primary));
         let new_revision = if let Some(editor) = editor {
             match buffer.apply_recorded_edits(&ops, undo_policy, editor) {
                 Ok(revision) => revision,
                 Err(error) => {
-                    if let Some(op) = operation {
-                        self.editor_operations
-                            .lock_recovering()
-                            .complete(&op, crate::editor_receipts::Outcome::Cancelled);
-                    }
                     return match error {
                         flavite_buffer::model::RecordedBatchError::LimitExceeded {
                             needed,
@@ -5993,11 +6291,6 @@ impl Session {
             match buffer.apply_local_edits_with_policy(&ops, undo_policy) {
                 Ok((revision, _)) => revision,
                 Err(flavite_buffer::model::BatchError::LimitExceeded { needed, budget }) => {
-                    if let Some(op) = operation {
-                        self.editor_operations
-                            .lock_recovering()
-                            .complete(&op, crate::editor_receipts::Outcome::Cancelled);
-                    }
                     return SessionResult::HistoryLimitExceeded {
                         buffer_id,
                         needed,
@@ -6006,56 +6299,44 @@ impl Session {
                     };
                 }
                 Err(_) => {
-                    if let Some(op) = operation {
-                        self.editor_operations
-                            .lock_recovering()
-                            .complete(&op, crate::editor_receipts::Outcome::Cancelled);
-                    }
                     return SessionResult::Error {
                         message: "edit ranges overlap, are out of bounds, or split UTF-8".into(),
                     };
                 }
             }
         };
-        if let Some(op) = operation {
-            self.editor_operations
-                .lock_recovering()
-                .complete(&op, crate::editor_receipts::Outcome::Applied);
-        }
         // For recorded editor edits, the receipt carries the exact movement
         // delta and the recorded after-set. The delta is derived from THIS
         // transition's actual edits (E-13): a batch of disjoint ops yields
         // one span per op — the tree stores the batch as one combined node
         // edit (D-06), which is the right truth for undo/restore walk
         // receipts but not for mapping one apply receipt.
-        let (movement, after_selections) = if recorded {
-            let after = buffer.model().history_position_selections();
-            let mut spans: Vec<flavite_buffer::history::MovementSpan> = ops
-                .iter()
-                .map(|op| flavite_buffer::history::MovementSpan {
-                    start: op.range.start.0,
-                    end: op.range.end.0,
-                    replacement_len: op.replacement.len(),
-                })
-                .collect();
-            let truncated = if spans.len() > flavite_buffer::history::MAX_MOVEMENT_SPANS {
-                spans.clear();
-                true
+        let (after, primary) =
+            recorded_after.map_or((None, None), |(set, primary)| (Some(set), Some(primary)));
+        let mut spans: Vec<flavite_buffer::history::MovementSpan> = ops
+            .iter()
+            .map(|op| flavite_buffer::history::MovementSpan {
+                start: op.range.start.0,
+                end: op.range.end.0,
+                replacement_len: op.replacement.len(),
+            })
+            .collect();
+        let truncated = spans.len() > flavite_buffer::history::MAX_MOVEMENT_SPANS;
+        if truncated {
+            spans.clear();
+        }
+        let movement = Some(flavite_buffer::history::HistoryMovement {
+            selections: after.clone(),
+            step_ends: if spans.is_empty() {
+                Vec::new()
             } else {
-                false
-            };
-            (
-                Some(flavite_buffer::history::HistoryMovement {
-                    selections: after.clone(),
-                    spans,
-                    truncated,
-                    primary: buffer.model().history_position_primary(),
-                }),
-                after,
-            )
-        } else {
-            (None, None)
-        };
+                vec![spans.len()]
+            },
+            spans,
+            truncated,
+            primary,
+        });
+        let after_selections = after;
 
         SessionResult::Success(CommandResult::EditsApplied {
             buffer_id,
@@ -6340,15 +6621,59 @@ impl Session {
     pub fn issue_editor_operation(
         &self,
         buffer_id: BufferId,
+        revision: Revision,
+        view: Option<crate::editor_receipts::EditorViewStamp>,
     ) -> Option<crate::editor_receipts::OperationId> {
+        let _turn = self.driving_turn.lock_recovering();
+        if self
+            .buffer_manager
+            .lock_recovering()
+            .get_buffer_by_id(buffer_id)?
+            .revision()
+            != revision
+        {
+            return None;
+        }
+        if let Some(stamp) = view
+            && self.editor_views.lock_recovering().get(&stamp.view)
+                != Some(&(buffer_id, revision, stamp))
+        {
+            return None;
+        }
         self.editor_operations
             .lock_recovering()
-            .issue(buffer_id.as_u64())
+            .issue(buffer_id.as_u64(), revision.as_u64(), view)
+    }
+
+    /// Mirror canonical committed view output for admission, never UI behavior.
+    pub fn commit_editor_view(
+        &self,
+        buffer_id: BufferId,
+        revision: Revision,
+        stamp: crate::editor_receipts::EditorViewStamp,
+    ) {
+        let _turn = self.driving_turn.lock_recovering();
+        self.editor_views
+            .lock_recovering()
+            .insert(stamp.view, (buffer_id, revision, stamp));
+    }
+
+    pub fn release_editor_view(&self, view: u128) {
+        let _turn = self.driving_turn.lock_recovering();
+        self.editor_views.lock_recovering().remove(&view);
+        self.editor_operations.lock_recovering().cancel_view(view);
+    }
+
+    pub fn cancel_editor_view_operations(&self, view: u128) {
+        let _turn = self.driving_turn.lock_recovering();
+        self.editor_operations.lock_recovering().cancel_view(view);
     }
 
     /// Cancel a pending editor operation (host-initiated). Returns whether a
     /// pending operation was consumed; a terminal operation reports `false`.
     pub fn cancel_editor_operation(&self, op: &crate::editor_receipts::OperationId) -> bool {
+        // Installation and cancellation linearize on the same Session turn.
+        let _turn = self.driving_turn.lock_recovering();
         self.editor_operations.lock_recovering().cancel(op)
     }
 
@@ -7246,6 +7571,7 @@ impl Session {
         // coordinates; the replacement is normalized UTF-8.
         buffer.model_mut().seal_undo_group();
         let end = buffer.model().text().len();
+        let inserted = text.len();
         let mut op = EditOp::new(
             flavite_syntax::text::Span::new(
                 flavite_syntax::text::TextByte(0),
@@ -7260,6 +7586,17 @@ impl Session {
             Some((new_revision, _)) => SessionResult::Success(CommandResult::HistoryRestored {
                 buffer_id,
                 new_revision,
+                movement: flavite_buffer::history::HistoryMovement {
+                    spans: vec![flavite_buffer::history::MovementSpan {
+                        start: 0,
+                        end,
+                        replacement_len: inserted,
+                    }],
+                    step_ends: vec![1],
+                    truncated: false,
+                    selections: None,
+                    primary: None,
+                },
             }),
             None => SessionResult::Error {
                 message: "history snapshot could not be applied".into(),
@@ -7493,6 +7830,40 @@ impl Session {
     #[must_use]
     pub fn uuid(&self) -> Uuid {
         self.identity.uuid
+    }
+
+    /// Read one real vault directory; traversal and internal storage are refused.
+    pub fn list_directory(&self, relative: &Path) -> Result<Vec<flavite_fs::DirEntry>, String> {
+        if relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            || relative
+                .components()
+                .next()
+                .is_some_and(|c| c.as_os_str() == ".flavite")
+        {
+            return Err("Choose a folder inside the vault".into());
+        }
+        let directory = self.identity.root.join(relative);
+        let entries = self.actor.list_directory(directory.clone())?;
+        let mut contained = Vec::with_capacity(entries.len());
+        for mut entry in entries {
+            if entry.path.parent() != Some(directory.as_path())
+                || entry.name != entry.path.file_name().unwrap_or_default()
+            {
+                return Err("Directory contains an invalid entry identity".into());
+            }
+            entry.path = entry
+                .path
+                .strip_prefix(&self.identity.root)
+                .map_err(|_| "Directory escaped the vault")?
+                .to_path_buf();
+            if relative.as_os_str().is_empty() && entry.name == ".flavite" {
+                continue;
+            }
+            contained.push(entry);
+        }
+        Ok(contained)
     }
 
     /// Get the vault root.
@@ -8191,13 +8562,23 @@ mod tests {
             ops: vec![EditOp::new(Span::new(TextByte(0), TextByte(0)), "A".into())],
             undo_policy: flavite_buffer::undo::UndoPolicy::Context { origin: 1 },
             editor: Some(flavite_buffer::history::EditorEdit {
+                before_primary: 0,
                 origin: format!("{:032x}", 1),
                 kind: flavite_buffer::history::EditKind::Typing,
                 before: vec![[0, 0, 0]],
                 after: vec![[0, 1, 1]],
                 primary: 0,
             }),
-            operation: None,
+            operation: session
+                .issue_editor_operation(
+                    buffer_id,
+                    session
+                        .shared_buffer_snapshot(buffer_id, None)
+                        .map(|snapshot| snapshot.revision)
+                        .unwrap_or(revision),
+                    None,
+                )
+                .expect("fixture activation"),
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -8222,7 +8603,17 @@ mod tests {
             session.execute(SessionCommand::RestoreEditingState {
                 buffer_id,
                 revision: changed,
-                target
+                target,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(changed),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::Success(CommandResult::EditingStateRestored { .. })
         ));
@@ -8261,7 +8652,16 @@ mod tests {
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
-            operation: None,
+            operation: session
+                .issue_editor_operation(
+                    buffer_id,
+                    session
+                        .shared_buffer_snapshot(buffer_id, None)
+                        .map(|snapshot| snapshot.revision)
+                        .unwrap_or(revision),
+                    None,
+                )
+                .expect("fixture activation"),
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -8282,7 +8682,16 @@ mod tests {
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
-            operation: None,
+            operation: session
+                .issue_editor_operation(
+                    buffer_id,
+                    session
+                        .shared_buffer_snapshot(buffer_id, None)
+                        .map(|snapshot| snapshot.revision)
+                        .unwrap_or(first_revision),
+                    None,
+                )
+                .expect("fixture activation"),
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -8302,7 +8711,16 @@ mod tests {
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
-            operation: None,
+            operation: session
+                .issue_editor_operation(
+                    buffer_id,
+                    session
+                        .shared_buffer_snapshot(buffer_id, None)
+                        .map(|snapshot| snapshot.revision)
+                        .unwrap_or(second_revision),
+                    None,
+                )
+                .expect("fixture activation"),
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -8388,7 +8806,16 @@ mod tests {
             ops: vec![edit],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
-            operation: None,
+            operation: session
+                .issue_editor_operation(
+                    buffer_id,
+                    session
+                        .shared_buffer_snapshot(buffer_id, None)
+                        .map(|snapshot| snapshot.revision)
+                        .unwrap_or(revision),
+                    None,
+                )
+                .expect("fixture activation"),
         });
         assert!(matches!(
             edited,
@@ -8401,7 +8828,16 @@ mod tests {
                 ops: vec![],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
-                operation: None,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::StaleRevision { .. }
         ));
@@ -8416,6 +8852,16 @@ mod tests {
             session.execute(SessionCommand::Undo {
                 buffer_id,
                 revision,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::StaleRevision { .. }
         ));
@@ -8423,6 +8869,16 @@ mod tests {
             session.execute(SessionCommand::Undo {
                 buffer_id,
                 revision: edited_revision,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(edited_revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::Success(CommandResult::UndoPerformed { .. })
         ));
@@ -8437,6 +8893,16 @@ mod tests {
             session.execute(SessionCommand::Redo {
                 buffer_id,
                 revision: edited_revision,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(edited_revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::StaleRevision { .. }
         ));
@@ -8444,6 +8910,16 @@ mod tests {
             session.execute(SessionCommand::Redo {
                 buffer_id,
                 revision: undone_revision,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(undone_revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::Success(CommandResult::RedoPerformed { .. })
         ));
@@ -8533,7 +9009,16 @@ mod tests {
                 )],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
-                operation: None,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
@@ -8619,7 +9104,16 @@ mod tests {
                 ops: vec![EditOp::new(Span::new(TextByte(5), TextByte(5)), "!".into())],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
-                operation: None,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
@@ -8657,7 +9151,16 @@ mod tests {
                 )],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
-                operation: None,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
@@ -8741,6 +9244,16 @@ mod tests {
         let undo = session.execute(SessionCommand::Undo {
             buffer_id,
             revision: patched_revision,
+            operation: session
+                .issue_editor_operation(
+                    buffer_id,
+                    session
+                        .shared_buffer_snapshot(buffer_id, None)
+                        .map(|snapshot| snapshot.revision)
+                        .unwrap_or(patched_revision),
+                    None,
+                )
+                .expect("fixture activation"),
         });
         assert!(
             matches!(
@@ -8750,12 +9263,13 @@ mod tests {
             "{undo:?}"
         );
         assert!(matches!(
-            session.execute(SessionCommand::Redo {
-                buffer_id,
-                revision: patched_revision.next(),
-            }),
-            SessionResult::Error { message } if message == "redo-after-cancel"
-        ));
+                    session.execute(SessionCommand::Redo {
+                        buffer_id,
+                        revision: patched_revision.next(),
+         operation: session.issue_editor_operation(buffer_id, session.shared_buffer_snapshot(buffer_id, None).map(|snapshot| snapshot.revision).unwrap_or(patched_revision.next()), None).expect("fixture activation"),
+        }),
+                    SessionResult::Error { message } if message == "redo-after-cancel"
+                ));
         let current = session.buffer_manager.lock().unwrap();
         assert_eq!(
             current.get_buffer_by_id(buffer_id).unwrap().text(),
@@ -9200,7 +9714,16 @@ mod tests {
                 )],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
-                operation: None,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
@@ -9464,20 +9987,49 @@ mod tests {
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
-            operation: None,
+            operation: session
+                .issue_editor_operation(
+                    buffer_id,
+                    session
+                        .shared_buffer_snapshot(buffer_id, None)
+                        .map(|snapshot| snapshot.revision)
+                        .unwrap_or(revision),
+                    None,
+                )
+                .expect("fixture activation"),
         });
         assert!(matches!(bad_edit, SessionResult::Error { .. }));
         assert!(matches!(
             session.execute(SessionCommand::Undo {
                 buffer_id,
-                revision
+                revision,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::Error { .. }
         ));
         assert!(matches!(
             session.execute(SessionCommand::Redo {
                 buffer_id,
-                revision
+                revision,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::Error { .. }
         ));
@@ -9488,7 +10040,16 @@ mod tests {
             ops: vec![EditOp::new(Span::new(TextByte(5), TextByte(5)), "!".into())],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
-            operation: None,
+            operation: session
+                .issue_editor_operation(
+                    buffer_id,
+                    session
+                        .shared_buffer_snapshot(buffer_id, None)
+                        .map(|snapshot| snapshot.revision)
+                        .unwrap_or(revision),
+                    None,
+                )
+                .expect("fixture activation"),
         });
         let dirty_revision = match changed {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
@@ -9513,7 +10074,16 @@ mod tests {
                 ops: vec![],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
-                operation: None,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::StaleRevision { .. }
         ));
@@ -9576,7 +10146,16 @@ mod tests {
                 )],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
-                operation: None,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::Success(_)
         ));
@@ -9703,14 +10282,34 @@ mod tests {
         assert!(matches!(
             session.execute(SessionCommand::Undo {
                 buffer_id,
-                revision
+                revision,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::Error { .. }
         ));
         assert!(matches!(
             session.execute(SessionCommand::Redo {
                 buffer_id,
-                revision
+                revision,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::Error { .. }
         ));
@@ -9721,7 +10320,16 @@ mod tests {
                 ops: vec![],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
-                operation: None,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(Revision::new(revision.as_u64() + 1)),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::StaleRevision { .. }
         ));
@@ -9785,7 +10393,16 @@ mod tests {
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
-            operation: None,
+            operation: session
+                .issue_editor_operation(
+                    buffer_id,
+                    session
+                        .shared_buffer_snapshot(buffer_id, None)
+                        .map(|snapshot| snapshot.revision)
+                        .unwrap_or(revision),
+                    None,
+                )
+                .expect("fixture activation"),
         });
         session
             .buffer_manager()
@@ -9858,7 +10475,16 @@ mod tests {
             )],
             undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
             editor: None,
-            operation: None,
+            operation: session
+                .issue_editor_operation(
+                    buffer_id,
+                    session
+                        .shared_buffer_snapshot(buffer_id, None)
+                        .map(|snapshot| snapshot.revision)
+                        .unwrap_or(revision),
+                    None,
+                )
+                .expect("fixture activation"),
         });
         let new_revision = match applied {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
@@ -9906,7 +10532,16 @@ mod tests {
                 )],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
-                operation: None,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(current_revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
@@ -9997,7 +10632,16 @@ mod tests {
                 ops: vec![EditOp::new(Span::new(TextByte(5), TextByte(5)), "!".into())],
                 undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
                 editor: None,
-                operation: None,
+                operation: session
+                    .issue_editor_operation(
+                        buffer_id,
+                        session
+                            .shared_buffer_snapshot(buffer_id, None)
+                            .map(|snapshot| snapshot.revision)
+                            .unwrap_or(revision),
+                        None
+                    )
+                    .expect("fixture activation"),
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));

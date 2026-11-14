@@ -18,6 +18,7 @@ pub mod editor_diagnostics;
 pub mod editor_history;
 pub mod encoding;
 pub mod env;
+pub mod file_browser;
 pub mod graph;
 pub mod linking;
 pub mod navigation;
@@ -32,6 +33,7 @@ pub mod selection_search;
 pub mod settings;
 pub mod shell;
 pub mod shutdown;
+pub mod vault_search;
 
 pub mod reading;
 

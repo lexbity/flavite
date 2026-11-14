@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 const NOTE: &str = "appearance.md";
 
-fn seed() -> Vec<SeedNote> {
+fn seed() -> Vec<SeedNote<'static>> {
     vec![SeedNote {
         components: &[NOTE],
         body: "# Appearance\n\nUnchanged body.\n",

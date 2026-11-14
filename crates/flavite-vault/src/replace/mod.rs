@@ -6,6 +6,7 @@
 //! revision (D-09). Destructive Apply/Cancel/Resume/Revert/forget are
 //! S08/S11 commands and are never exposed here.
 
+pub mod context;
 pub mod coordinator;
 pub mod log;
 pub mod plan;

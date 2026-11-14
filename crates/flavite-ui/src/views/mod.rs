@@ -18,6 +18,7 @@ pub mod preview;
 pub mod replace;
 pub mod search;
 pub mod settings;
+pub mod vault_search;
 
 use crate::app::Message;
 use crate::style::{self, Metrics};

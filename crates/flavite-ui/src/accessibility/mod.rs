@@ -4,6 +4,7 @@ pub mod program;
 pub mod reading;
 pub(crate) mod text;
 pub mod tree;
+pub(crate) mod vault_search;
 
 pub use tree::NodeTarget;
 
@@ -22,6 +23,7 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
     }
     let target = app.a11y_nodes.get(&request.target_node)?.clone();
     match target {
+        NodeTarget::VaultSearch(id) => vault_search::route(app, id, request),
         NodeTarget::EditorHistory { source, action } if request.action == Action::Click => {
             Some(Message::EditorHistory(
                 crate::host::editor_history::HistoryMessage::Act(source, action),
@@ -259,6 +261,28 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
                     None,
                 )),
             ),
+            NodeTarget::BrowserEntry {
+                owner,
+                path,
+                directory,
+            } => {
+                use crate::host::file_browser::BrowserMessage;
+                let expanded = app
+                    .file_browser
+                    .views
+                    .get(&owner)
+                    .is_some_and(|view| view.expanded.contains(&path));
+                let action = match request.action {
+                    Action::Focus => BrowserMessage::Select(owner, path),
+                    Action::Expand if directory && !expanded => BrowserMessage::Toggle(owner, path),
+                    Action::Collapse if directory && expanded => {
+                        BrowserMessage::Toggle(owner, path)
+                    }
+                    Action::Click => BrowserMessage::Open(owner, path),
+                    _ => return None,
+                };
+                Some(Message::FileBrowser(action))
+            }
             NodeTarget::OpenPicker => Some(Message::PickerOpen),
             NodeTarget::ToggleSidebar => Some(Message::ToggleSidebar),
             NodeTarget::SidebarToTab => Some(Message::SidebarToTab),

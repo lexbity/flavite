@@ -32,6 +32,9 @@ impl Fs for SharedFs {
     fn read_capped(&self, path: &Path, max: u64) -> Result<Vec<u8>> {
         self.0.read_capped(path, max)
     }
+    fn read_capped_in_root(&self, root: &Path, relative: &Path, max: u64) -> Result<Vec<u8>> {
+        self.0.read_capped_in_root(root, relative, max)
+    }
     fn metadata(&self, path: &Path) -> Result<Metadata> {
         self.0.metadata(path)
     }
@@ -77,11 +80,11 @@ impl Fs for SharedFs {
 }
 
 /// One note to seed into the fixture vault.
-pub struct SeedNote {
+pub struct SeedNote<'a> {
     /// Vault-relative path components.
-    pub components: &'static [&'static str],
+    pub components: &'a [&'a str],
     /// Note body.
-    pub body: &'static str,
+    pub body: &'a str,
 }
 
 /// A fully assembled vault stack: real Session/index, MemFs contents, and
@@ -118,47 +121,9 @@ pub fn ui_fixture_with_identity(
     identity: flavite_api::VaultIdentity,
     notes: &[SeedNote],
 ) -> UiFixture {
-    use flavite_api::VaultConfig;
-    use flavite_buffer::manager::BufferManager;
-    use flavite_index::IndexActor;
-    use flavite_ui::app::App;
-    use flavite_vault::actor::VaultActorBuilder;
-    use flavite_vault::channels::ChannelSet;
-    use flavite_vault::session::Session;
-
-    let fs = std::sync::Arc::new(MemFs::new());
-    let root_path = identity.root.clone();
-    fs.create_dir_all(&root_path).expect("vault root");
-    for note in notes {
-        let path = root_path.join(note.components.iter().collect::<PathBuf>());
-        if let Some(parent) = path.parent() {
-            fs.create_dir_all(parent).expect("note directory");
-        }
-        fs.write_new(&path, note.body.as_bytes()).expect("note");
-    }
-    let cache = tempfile::tempdir().expect("cache dir");
-    let db = cache.path().join("fixture-index.sqlite3");
-    drop(flavite_index::open_or_init(&db).expect("index"));
-    let actor = VaultActorBuilder::new()
-        .with_fs(Box::new(SharedFs(fs.clone())) as Box<dyn Fs + Send + Sync>)
-        .with_identity(identity.clone())
-        .with_index(IndexActor::new(&db, 1).expect("index actor"))
-        .build()
-        .expect("actor")
-        .start()
-        .expect("start");
-    let channels = ChannelSet::new();
-    let _session = Session::new(
-        identity.clone(),
-        actor,
-        BufferManager::new(),
-        channels.pulse,
-        channels.notice,
-        VaultConfig::default(),
-    );
     let (flavite, fs, cache) = vault_stack(seed, identity, notes);
     UiFixture {
-        app: App::from_flavite(flavite),
+        app: flavite_ui::app::App::from_flavite(flavite),
         fs,
         cache,
     }
@@ -171,7 +136,7 @@ pub fn ui_fixture_with_identity(
 /// Panics on fixture plumbing failures.
 #[must_use]
 pub fn vault_stack(
-    seed: u64,
+    _seed: u64,
     identity: flavite_api::VaultIdentity,
     notes: &[SeedNote],
 ) -> (
@@ -208,16 +173,17 @@ pub fn vault_stack(
         .start()
         .expect("start");
     let channels = ChannelSet::new();
-    let session = Session::new(
+    let session = Session::new_with_data_dir(
         identity.clone(),
         actor,
         BufferManager::new(),
         channels.pulse,
         channels.notice,
         VaultConfig::default(),
+        Some(cache.path().join("device")),
     );
     let mut flavite = Flavite::open(identity, session, VaultConfig::default()).expect("facade");
-    flavite.set_user_state_root_for_test(PathBuf::from(format!("/test/ui-fixture-device/{seed}")));
+    flavite.set_user_state_root_for_test(cache.path().join("device"));
     // Vault-rooted stores (settings, themes, layout) live on the fixture's
     // MemFs too: the vault identity root is a virtual path, and persistence
     // through the vault must be exercised hermetically (RFC-0007).

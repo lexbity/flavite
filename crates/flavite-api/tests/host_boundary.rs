@@ -90,7 +90,9 @@ impl Fixture {
             serde_json::json!({ "path": self.root.join(name), "policy": "existing_only" }),
             Origin::Gui,
         );
-        let result = self.flavite.execute(invocation);
+        let result = self
+            .flavite
+            .execute(editor_operations_fixture::admit(&self.flavite, invocation));
         let request_id = match result {
             ExecutionResult::Pending { request_id } => request_id,
             other => panic!("expected pending open, got {other:?}"),
@@ -125,12 +127,15 @@ fn typed_status_and_read_only_policy_reject_misleading_callers() {
     let flavite = &mut fixture.flavite;
     flavite.set_read_only(true);
     let attempt = |request: u64, preconditions: Preconditions, args: serde_json::Value| {
-        flavite.execute(Invocation::with_preconditions(
-            request,
-            "apply_edits",
-            args,
-            Origin::Gui,
-            preconditions,
+        flavite.execute(editor_operations_fixture::admit(
+            &flavite,
+            Invocation::with_preconditions(
+                request,
+                "apply_edits",
+                args,
+                Origin::Gui,
+                preconditions,
+            ),
         ))
     };
     let edit_args = serde_json::json!({
@@ -239,14 +244,24 @@ fn notice_flood_observes_every_id_without_auto_ack_and_saves_still_finish() {
         }),
         Origin::Gui,
     );
-    assert!(fixture.flavite.execute(invocation).is_success());
+    assert!(
+        fixture
+            .flavite
+            .execute(editor_operations_fixture::admit(
+                &fixture.flavite,
+                invocation
+            ))
+            .is_success()
+    );
     let save = Invocation::new(
         4,
         "note.save",
         serde_json::json!(fixture.root.join("a.md")),
         Origin::Gui,
     );
-    let result = fixture.flavite.execute(save);
+    let result = fixture
+        .flavite
+        .execute(editor_operations_fixture::admit(&fixture.flavite, save));
     let ExecutionResult::Pending { request_id } = result else {
         panic!("save must be admitted: {result:?}");
     };
@@ -276,7 +291,10 @@ fn stalled_open_reader_does_not_block_unrelated_edits_undo_and_saves() {
         serde_json::json!({ "path": fixture.root.join("slow.md"), "policy": "existing_only" }),
         Origin::Gui,
     );
-    let slow_request = match fixture.flavite.execute(slow_open) {
+    let slow_request = match fixture.flavite.execute(editor_operations_fixture::admit(
+        &fixture.flavite,
+        slow_open,
+    )) {
         ExecutionResult::Pending { request_id } => request_id,
         other => panic!("slow open must be admitted: {other:?}"),
     };
@@ -293,7 +311,9 @@ fn stalled_open_reader_does_not_block_unrelated_edits_undo_and_saves() {
         }),
         Origin::Gui,
     );
-    let edit_result = fixture.flavite.execute(edit);
+    let edit_result = fixture
+        .flavite
+        .execute(editor_operations_fixture::admit(&fixture.flavite, edit));
     assert!(
         edit_result.is_success(),
         "edit must succeed: {edit_result:?}"
@@ -304,7 +324,12 @@ fn stalled_open_reader_does_not_block_unrelated_edits_undo_and_saves() {
         serde_json::json!({ "buffer_id": buffer_a, "revision": revision_a + 1 }),
         Origin::Gui,
     );
-    assert!(fixture.flavite.execute(undo).is_success());
+    assert!(
+        fixture
+            .flavite
+            .execute(editor_operations_fixture::admit(&fixture.flavite, undo))
+            .is_success()
+    );
     let view = fixture
         .flavite
         .get_buffer_view(flavite_buffer::BufferId::from(buffer_a), None)
@@ -317,14 +342,22 @@ fn stalled_open_reader_does_not_block_unrelated_edits_undo_and_saves() {
         serde_json::json!({ "buffer_id": buffer_a, "revision": revision_a + 2 }),
         Origin::Gui,
     );
-    assert!(fixture.flavite.execute(redo).is_success());
+    assert!(
+        fixture
+            .flavite
+            .execute(editor_operations_fixture::admit(&fixture.flavite, redo))
+            .is_success()
+    );
     let save = Invocation::new(
         9,
         "note.save",
         serde_json::json!(fixture.root.join("a.md")),
         Origin::Gui,
     );
-    let ExecutionResult::Pending { request_id } = fixture.flavite.execute(save) else {
+    let ExecutionResult::Pending { request_id } = fixture
+        .flavite
+        .execute(editor_operations_fixture::admit(&fixture.flavite, save))
+    else {
         panic!("save must be admitted while a reader is stalled");
     };
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -363,3 +396,6 @@ fn stalled_open_reader_does_not_block_unrelated_edits_undo_and_saves() {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[path = "support/editor_operations.rs"]
+mod editor_operations_fixture;

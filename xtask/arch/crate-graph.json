@@ -291,6 +291,11 @@
     },
     {
       "from": "flavite-edit-context",
+      "to": "flavite-buffer",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-edit-context",
       "to": "flavite-syntax",
       "kind": "normal"
     },

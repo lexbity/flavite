@@ -23,6 +23,11 @@
 //! `flavite-ui` MUST talk to the core only through this API. The CLI
 //! is migrated to use this API as the dogfooding proof.
 
+#[cfg(test)]
+extern crate self as flavite_api;
+
+pub mod browser;
+pub use browser::{DirectoryCursor, DirectoryEntry, DirectoryPage};
 pub mod capability;
 pub mod command;
 pub mod doctor;
@@ -59,6 +64,7 @@ pub use properties::*;
 pub mod queries;
 pub mod query_service;
 pub mod replace;
+pub use flavite_vault::replace::context::{MatchContext, ReplacementDiff};
 pub mod result;
 pub mod search_sessions;
 pub mod themes;

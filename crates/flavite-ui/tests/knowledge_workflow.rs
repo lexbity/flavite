@@ -329,7 +329,7 @@ fn edit_buffer(app: &mut App, tab: TabId, replacement: &str) {
         }),
         flavite_api::Origin::Gui,
     );
-    let result = flavite.execute(invocation);
+    let result = flavite.execute(editor_operations_fixture::admit(&flavite, invocation));
     assert!(matches!(
         result,
         flavite_api::ExecutionResult::Local(flavite_api::LocalResult::Success(_))
@@ -383,11 +383,14 @@ fn w12_crash_child_seeds_and_parks() {
     )
     .expect("child vault opens");
     let path = root.join("alpha.md");
-    let opened = flavite.execute(flavite_api::Invocation::new(
-        flavite.command_registry().next_request_id(),
-        "note.open",
-        serde_json::json!({ "path": path, "policy": "existing_only" }),
-        flavite_api::Origin::Gui,
+    let opened = flavite.execute(editor_operations_fixture::admit(
+        &flavite,
+        flavite_api::Invocation::new(
+            flavite.command_registry().next_request_id(),
+            "note.open",
+            serde_json::json!({ "path": path, "policy": "existing_only" }),
+            flavite_api::Origin::Gui,
+        ),
     ));
     let request = match opened {
         flavite_api::ExecutionResult::Pending { request_id } => request_id,
@@ -407,7 +410,7 @@ fn w12_crash_child_seeds_and_parks() {
         .as_u64()
         .expect("child buffer id");
     let view = flavite.get_buffer_view(buffer.into(), None).expect("view");
-    let edited = flavite.execute(flavite_api::Invocation::new(
+    let edited = flavite.execute(editor_operations_fixture::admit(&flavite, flavite_api::Invocation::new(
         flavite.command_registry().next_request_id(),
         "apply_edits",
         serde_json::json!({
@@ -416,7 +419,7 @@ fn w12_crash_child_seeds_and_parks() {
             "ops": [{ "range": [0, view.text.len()], "replacement": "# Alpha\n\ncrash draft\n\nSee [[b]].\n" }],
         }),
         flavite_api::Origin::Gui,
-    ));
+    )));
     assert!(edited.is_success(), "child edit admitted: {edited:?}");
 
     // The recovery worker checkpoints within ~100ms of the edit; wait for
@@ -518,11 +521,14 @@ fn crash_recovery_matches_the_recovered_note_in_the_workspace() {
     )
     .expect("parent vault opens");
     let path = root.join("alpha.md");
-    let opened = flavite.execute(flavite_api::Invocation::new(
-        flavite.command_registry().next_request_id(),
-        "note.open",
-        serde_json::json!({ "path": path, "policy": "existing_only" }),
-        flavite_api::Origin::Gui,
+    let opened = flavite.execute(editor_operations_fixture::admit(
+        &flavite,
+        flavite_api::Invocation::new(
+            flavite.command_registry().next_request_id(),
+            "note.open",
+            serde_json::json!({ "path": path, "policy": "existing_only" }),
+            flavite_api::Origin::Gui,
+        ),
     ));
     let request = match opened {
         flavite_api::ExecutionResult::Pending { request_id } => request_id,
@@ -558,11 +564,14 @@ fn crash_recovery_matches_the_recovered_note_in_the_workspace() {
     }
     assert!(offered, "the retained recovery copy was never offered");
 
-    let restored = flavite.execute(flavite_api::Invocation::new(
-        flavite.command_registry().next_request_id(),
-        "recovery.restore",
-        serde_json::json!({ "path": path }),
-        flavite_api::Origin::Gui,
+    let restored = flavite.execute(editor_operations_fixture::admit(
+        &flavite,
+        flavite_api::Invocation::new(
+            flavite.command_registry().next_request_id(),
+            "recovery.restore",
+            serde_json::json!({ "path": path }),
+            flavite_api::Origin::Gui,
+        ),
     ));
     assert!(restored.is_success(), "restore succeeds: {restored:?}");
     let restored_success = restored.into_success().expect("restore success data");
@@ -581,11 +590,14 @@ fn crash_recovery_matches_the_recovered_note_in_the_workspace() {
         "a restore never writes the disk"
     );
 
-    let saved = flavite.execute(flavite_api::Invocation::new(
-        flavite.command_registry().next_request_id(),
-        "note.save",
-        serde_json::json!(path),
-        flavite_api::Origin::Gui,
+    let saved = flavite.execute(editor_operations_fixture::admit(
+        &flavite,
+        flavite_api::Invocation::new(
+            flavite.command_registry().next_request_id(),
+            "note.save",
+            serde_json::json!(path),
+            flavite_api::Origin::Gui,
+        ),
     ));
     let save = match saved {
         flavite_api::ExecutionResult::Pending { request_id } => {
@@ -612,11 +624,14 @@ fn crash_recovery_matches_the_recovered_note_in_the_workspace() {
 
     // Reconcile publishes the saved topology; the recovered link is an
     // edge from alpha to b in the saved graph projection.
-    let reconciled = flavite.execute(flavite_api::Invocation::new(
-        flavite.command_registry().next_request_id(),
-        "vault.reconcile",
-        serde_json::json!({ "scope": "full", "mode": "verify" }),
-        flavite_api::Origin::Gui,
+    let reconciled = flavite.execute(editor_operations_fixture::admit(
+        &flavite,
+        flavite_api::Invocation::new(
+            flavite.command_registry().next_request_id(),
+            "vault.reconcile",
+            serde_json::json!({ "scope": "full", "mode": "verify" }),
+            flavite_api::Origin::Gui,
+        ),
     ));
     let reconcile = match reconciled {
         flavite_api::ExecutionResult::Pending { request_id } => {
@@ -662,3 +677,6 @@ fn crash_recovery_matches_the_recovered_note_in_the_workspace() {
         "the recovered note's link reaches the saved graph projection"
     );
 }
+
+#[path = "../../flavite-api/tests/support/editor_operations.rs"]
+mod editor_operations_fixture;

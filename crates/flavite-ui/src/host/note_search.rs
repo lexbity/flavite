@@ -257,7 +257,7 @@ pub fn handle(app: &mut App, message: NoteSearchMessage) -> iced::Task<crate::ap
                 input.revision = view.revision;
                 input.sequence = input.sequence.saturating_add(1);
                 input.focused = false;
-                let _ = app.workspace.acknowledge_interaction(input, &view.text);
+                let _ = app.acknowledge_editor_interaction(input, &view.text);
             }
             let captured_scope = app.note_editor_view(tab).and_then(|view| {
                 app.workspace
@@ -337,7 +337,7 @@ pub fn handle(app: &mut App, message: NoteSearchMessage) -> iced::Task<crate::ap
                 input.revision = view.revision;
                 input.sequence = input.sequence.saturating_add(1);
                 input.focused = false;
-                let _ = app.workspace.acknowledge_interaction(input, &view.text);
+                let _ = app.acknowledge_editor_interaction(input, &view.text);
             }
             // The replace row rides on the find row and inherits its query,
             // so both rows always act on the same visible query.

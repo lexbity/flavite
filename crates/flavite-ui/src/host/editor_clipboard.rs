@@ -16,6 +16,14 @@ use super::context_mode::EditorTarget;
 /// Clipboard outcomes resume interpretation at the effect boundary.
 #[derive(Debug, Clone)]
 pub enum ClipboardMessage {
+    WriteChecked {
+        verified: bool,
+    },
+    CutWriteFailed,
+    CopyReady {
+        target: EditorTarget,
+        generation: u64,
+    },
     /// A Context Mode paste read completed.
     ContextPaste {
         target: EditorTarget,
@@ -71,36 +79,66 @@ pub fn read_for_typing(tab: TabId, incarnation: u64, input: CapturedInput) -> Ta
     })
 }
 
-/// Write to the clipboard (the join already happened at the copy source).
-pub fn write(text: String) -> Task<Message> {
-    iced::clipboard::write(text).map(|()| Message::Pump)
+/// iced writes are effects, not value-producing tasks: a map callback on
+/// `write` never runs. Chain a read after the effect and verify the text
+/// before any destructive continuation. Other clipboard owners may win the
+/// intervening race; refusal preserves the document in that case.
+fn verified_write(text: String) -> Task<bool> {
+    iced::clipboard::write(text.clone())
+        .chain(iced::clipboard::read())
+        .map(move |actual| actual.as_deref() == Some(text.as_str()))
 }
 
-/// Write the clipboard for a Context Mode cut and resume at the effect
-/// boundary: the deletion runs only after this write completed and the
-/// source was revalidated (§5.5 / E-16).
-pub fn write_for_cut(target: EditorTarget, generation: u64, text: String) -> Task<Message> {
-    iced::clipboard::write(text).map(move |()| {
-        Message::EditorClipboard(ClipboardMessage::CutReady {
-            target: target.clone(),
-            generation,
+pub fn write(text: String) -> Task<Message> {
+    verified_write(text)
+        .map(|verified| Message::EditorClipboard(ClipboardMessage::WriteChecked { verified }))
+}
+
+pub fn write_for_context_copy(
+    target: EditorTarget,
+    generation: u64,
+    text: String,
+) -> Task<Message> {
+    verified_write(text).map(move |verified| {
+        Message::EditorClipboard(if verified {
+            ClipboardMessage::CopyReady {
+                target: target.clone(),
+                generation,
+            }
+        } else {
+            ClipboardMessage::WriteChecked { verified: false }
         })
     })
 }
 
-/// Write the clipboard for a plain/typing cut and resume the captured
-/// intent's guarded mutation (§5.5 / E-16).
+pub fn write_for_cut(target: EditorTarget, generation: u64, text: String) -> Task<Message> {
+    verified_write(text).map(move |verified| {
+        Message::EditorClipboard(if verified {
+            ClipboardMessage::CutReady {
+                target: target.clone(),
+                generation,
+            }
+        } else {
+            ClipboardMessage::CutWriteFailed
+        })
+    })
+}
+
 pub fn write_for_cut_resume(
     tab: TabId,
     incarnation: u64,
     input: CapturedInput,
     text: String,
 ) -> Task<Message> {
-    iced::clipboard::write(text).map(move |()| {
-        Message::EditorClipboard(ClipboardMessage::CutCompleted {
-            tab,
-            incarnation,
-            input: input.clone(),
+    verified_write(text).map(move |verified| {
+        Message::EditorClipboard(if verified {
+            ClipboardMessage::CutCompleted {
+                tab,
+                incarnation,
+                input: input.clone(),
+            }
+        } else {
+            ClipboardMessage::CutWriteFailed
         })
     })
 }
@@ -108,6 +146,29 @@ pub fn write_for_cut_resume(
 /// Interpret one clipboard read at the effect boundary.
 pub fn handle(app: &mut App, message: ClipboardMessage) -> Task<Message> {
     match message {
+        ClipboardMessage::WriteChecked { verified } => {
+            app.status = if verified {
+                "Copied selection"
+            } else {
+                "Clipboard write could not be verified; try Copy again"
+            }
+            .into();
+            Task::none()
+        }
+        ClipboardMessage::CutWriteFailed => {
+            app.status = "Clipboard write could not be verified; cut was not applied".into();
+            app.context_mode.notice(app.status.clone());
+            Task::none()
+        }
+        ClipboardMessage::CopyReady { target, generation } => {
+            if generation != app.context_mode.generation()
+                || !super::context_mode::valid(app, target.clone(), true)
+            {
+                return Task::none();
+            }
+            app.status = "Copied selection".into();
+            super::context_mode::focus(app, target.tab)
+        }
         ClipboardMessage::ContextPaste {
             target,
             generation,

@@ -196,7 +196,17 @@ fn utf16le_bom_open_edit_save_preserves_descriptor_and_bytes() {
         )],
         undo_policy: UndoPolicy::Isolated,
         editor: None,
-        operation: None,
+        operation: h
+            .session
+            .issue_editor_operation(
+                buffer_id,
+                h.session
+                    .shared_buffer_snapshot(buffer_id, None)
+                    .map(|snapshot| snapshot.revision)
+                    .unwrap_or(session_revision(&h.session, buffer_id)),
+                None,
+            )
+            .expect("fixture activation"),
     });
     let applied = expect_success(result, "apply edits");
     let CommandResult::EditsApplied { new_revision, .. } = applied else {
@@ -320,7 +330,17 @@ fn reopen_encoding_refuses_dirty_buffer() {
         )],
         undo_policy: UndoPolicy::Isolated,
         editor: None,
-        operation: None,
+        operation: h
+            .session
+            .issue_editor_operation(
+                buffer_id,
+                h.session
+                    .shared_buffer_snapshot(buffer_id, None)
+                    .map(|snapshot| snapshot.revision)
+                    .unwrap_or(revision),
+                None,
+            )
+            .expect("fixture activation"),
     });
     expect_success(result, "apply edits");
 

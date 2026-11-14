@@ -462,9 +462,9 @@ impl ViewSession {
     pub fn title(&self) -> String {
         match &self.kind {
             ViewKind::Empty => "New tab".into(),
-            ViewKind::Notes => "Notes".into(),
-            ViewKind::Search => "Search".into(),
-            ViewKind::Replace => "Replace".into(),
+            ViewKind::Notes => "Files".into(),
+            ViewKind::Search => "Indexed search".into(),
+            ViewKind::Replace => "Vault search".into(),
             ViewKind::History(locator) => format!("History: {}", locator.title()),
             ViewKind::Note(note) => note.locator().title().to_owned(),
             ViewKind::Graph(_) => "Graph".into(),
@@ -561,9 +561,9 @@ mod tests {
         let binding = ContextBinding::FollowDocument;
         let kinds = [
             (ViewKind::Empty, "New tab"),
-            (ViewKind::Notes, "Notes"),
-            (ViewKind::Search, "Search"),
-            (ViewKind::Replace, "Replace"),
+            (ViewKind::Notes, "Files"),
+            (ViewKind::Search, "Indexed search"),
+            (ViewKind::Replace, "Vault search"),
             (ViewKind::Settings, "Settings"),
             (ViewKind::History(locator.clone()), "History: Some note"),
             (

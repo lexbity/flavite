@@ -1044,16 +1044,19 @@ fn history_page_reports_truncation_after_budget_eviction() {
     let api = f.app.flavite.as_ref().unwrap();
     for _ in 0..90 {
         let view = f.app.note_editor_view(tab).unwrap();
-        let result = api.execute(flavite_api::Invocation::new(
-            api.command_registry().next_request_id(),
-            "apply_edits",
-            serde_json::json!({
-                "buffer_id": view.buffer_id,
-                "revision": view.revision,
-                "ops": [{"range": [0, 0], "replacement": "x"}],
-                "undo_policy": "isolated",
-            }),
-            flavite_api::Origin::Gui,
+        let result = api.execute(editor_operations_fixture::admit(
+            &api,
+            flavite_api::Invocation::new(
+                api.command_registry().next_request_id(),
+                "apply_edits",
+                serde_json::json!({
+                    "buffer_id": view.buffer_id,
+                    "revision": view.revision,
+                    "ops": [{"range": [0, 0], "replacement": "x"}],
+                    "undo_policy": "isolated",
+                }),
+                flavite_api::Origin::Gui,
+            ),
         ));
         assert!(result.is_success(), "{result:?}");
     }
@@ -1078,12 +1081,9 @@ fn history_page_reports_truncation_after_budget_eviction() {
 }
 
 #[test]
-fn a_new_key_at_the_last_sequence_is_admitted_while_its_duplicate_is_refused() {
-    // FEUX-0002 R14: two live widget states for one view publish
-    // independent capture counters and can reuse the last handled
-    // sequence. That is not a replay: a NEW request at the last sequence
-    // (different content) is admitted, while the exact request delivered
-    // again is refused as a duplicate (E-5).
+fn a_new_capture_is_admitted_while_its_duplicate_is_refused() {
+    // Captures share a lease-owned counter; a new key advances it and a
+    // replay of that identified activation cannot edit twice.
     use flavite_edit_context::{ContextCommand as Command, ContextMode};
     use flavite_editor::context::{ContextEvent, ContextKey, ContextRequest};
     use iced::keyboard::{Modifiers, key::Code};
@@ -1133,23 +1133,41 @@ fn a_new_key_at_the_last_sequence_is_admitted_while_its_duplicate_is_refused() {
     );
     send(&mut f.app, key(2, Code::KeyI, "i"));
     assert!(f.app.context_mode.mode(tab) == ContextMode::Typing);
-    // The second live widget state reuses the last handled sequence (2)
-    // for a genuinely new key with different content: admitted.
-    send(&mut f.app, key(2, Code::KeyA, "X"));
+    send(&mut f.app, key(3, Code::KeyA, "X"));
     assert!(
         f.app
             .note_editor_view(tab)
             .unwrap()
             .text
             .starts_with("Xone"),
-        "the fresh key at a reused sequence acts"
+        "the next capture acts"
     );
     // The exact same request delivered again is a duplicate: refused.
     let before = f.app.note_editor_view(tab).unwrap();
-    send(&mut f.app, key(2, Code::KeyA, "X"));
+    send(&mut f.app, key(3, Code::KeyA, "X"));
     assert_eq!(
         f.app.note_editor_view(tab).unwrap().revision,
         before.revision,
         "the duplicate is refused"
     );
 }
+
+#[test]
+fn context_toggle_preserves_a_manually_maximized_pane() {
+    let (mut fixture, tab) = fixture(38211);
+    let group = fixture.app.workspace.group_of(tab).unwrap();
+    fixture
+        .app
+        .dispatch_layout(|expected_revision| LayoutAction::ToggleMaximize {
+            expected_revision,
+            group,
+        });
+    assert_eq!(fixture.app.maximized_group(), Some(group));
+    run(&mut fixture.app, tab, Command::Toggle);
+    assert_eq!(fixture.app.maximized_group(), Some(group));
+    run(&mut fixture.app, tab, Command::Exit);
+    assert_eq!(fixture.app.maximized_group(), Some(group));
+}
+
+#[path = "../../flavite-api/tests/support/editor_operations.rs"]
+mod editor_operations_fixture;

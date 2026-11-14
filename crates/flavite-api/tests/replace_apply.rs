@@ -182,3 +182,55 @@ fn apply_without_selection_is_refused() {
     };
     assert!(error.message.contains("select notes"), "{}", error.message);
 }
+
+#[test]
+fn closing_preview_removes_unused_payloads_and_preserves_durable_revert() {
+    use flavite_fs::Fs;
+    let fixture = support::fixture(&[("notes/a.md", "alpha one\n")]);
+    let api = &fixture.flavite;
+    let store = flavite_vault::replace::ReplaceStore::new(&fixture.root);
+    let (unused, _) = preview_all(api);
+    let payloads = fixture.fs.read_dir(&store.payload_dir(&unused)).unwrap();
+    assert!(!payloads.is_empty());
+    success_data(execute(
+        api,
+        "replace.preview_close",
+        serde_json::json!({"preview_id":unused}),
+    ));
+    assert!(
+        fixture
+            .fs
+            .read_if_exists(&store.manifest_path(&unused))
+            .unwrap()
+            .is_none()
+    );
+    for payload in payloads {
+        assert!(fixture.fs.read_if_exists(&payload.path).unwrap().is_none());
+    }
+    let (used, revision) = preview_all(api);
+    let applied = success_data(execute(
+        api,
+        "replace.apply",
+        serde_json::json!({"preview_id":used,"selection_revision":revision,"idempotency_key":"a".repeat(32)}),
+    ));
+    let job = applied["job_id"].as_str().unwrap();
+    success_data(execute(
+        api,
+        "replace.preview_close",
+        serde_json::json!({"preview_id":used}),
+    ));
+    assert!(
+        fixture
+            .fs
+            .read_if_exists(&store.manifest_path(&used))
+            .unwrap()
+            .is_some()
+    );
+    let reverted = success_data(execute(
+        api,
+        "replace.revert",
+        serde_json::json!({"job_id":job,"idempotency_key":"b".repeat(32)}),
+    ));
+    assert_eq!(reverted["status"]["totals"]["reverted"], 1);
+    assert_eq!(fixture.saved_bytes("notes/a.md"), b"alpha one\n");
+}

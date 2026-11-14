@@ -10,6 +10,7 @@ description = "Context Mode's pure vocabulary, physical grammar, statechart, and
 workspace = true
 
 [dependencies]
+flavite-buffer = { path = "../flavite-buffer" }
 # Grapheme/word boundary authority (the same pinned primitives flavite-syntax
 # exposes; this crate never depends on a UI toolkit).
 flavite-syntax = { path = "../flavite-syntax" }

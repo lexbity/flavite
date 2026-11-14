@@ -17,6 +17,9 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceFindStartArgs {
+    pub folder: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub include_drafts: bool,
     /// Literal or regex query. Empty literal is Idle (typed refusal).
     pub query: String,
     /// Match mode: `literal` (default) or `regex`.
@@ -55,6 +58,7 @@ pub struct SourceFindCloseArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplacePreviewArgs {
+    pub folder: Option<std::path::PathBuf>,
     /// Literal or regex query. Empty literal is Idle.
     pub query: String,
     /// Replacement text (dollar grammar in regex mode, verbatim literal).
@@ -69,6 +73,12 @@ pub struct ReplacePreviewArgs {
     /// typed refusal.
     #[serde(default)]
     pub include_drafts: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplacePreviewCloseArgs {
+    pub preview_id: String,
 }
 
 /// Wrapper for `replace.select`.
@@ -164,6 +174,8 @@ pub(crate) fn handle_source_find_start(
     Ok(session.execute(SessionCommand::SourceFindStart {
         request_id: invocation.request_id,
         request: flavite_vault::replace::preview::SourceFindRequest {
+            folder: args.folder,
+            include_drafts: args.include_drafts,
             query: args.query,
             mode: decode_mode(args.mode.as_deref())?,
             case_sensitive: args.case_sensitive,
@@ -208,6 +220,7 @@ pub(crate) fn handle_replace_preview(
     Ok(session.execute(SessionCommand::ReplacePreviewPrepare {
         request_id: invocation.request_id,
         request: flavite_vault::replace::preview::PreviewRequest {
+            folder: args.folder,
             query: args.query,
             replacement: args.replacement,
             mode: decode_mode(args.mode.as_deref())?,
@@ -215,6 +228,17 @@ pub(crate) fn handle_replace_preview(
             whole_word: args.whole_word,
             include_drafts: args.include_drafts,
         },
+    }))
+}
+
+/// Release a preview reference, preserving durable jobs and their payloads.
+pub(crate) fn handle_preview_close(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: ReplacePreviewCloseArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::ReplacePreviewClose {
+        preview_id: decode_id(&args.preview_id)?,
     }))
 }
 
@@ -413,6 +437,9 @@ pub fn find_page_json(page: &flavite_vault::session::SourceFindPageData) -> serd
             "path": row.path,
             "title": row.title,
             "note_matches": row.note_matches,
+            "content_hash": row.content_hash,
+            "source_kind": row.source_kind,
+            "contexts": row.contexts,
             "matches": row.matches.iter().map(|(start, end)| [*start, *end]).collect::<Vec<[u64; 2]>>(),
         })).collect::<Vec<_>>(),
         "next_note_index": page.next_note_index,
@@ -512,4 +539,10 @@ pub fn preview_page_json(
             .map(preview_candidate_json)
             .collect::<Vec<_>>(),
     })
+}
+
+/// Revalidate a frozen match against the currently opened editor source.
+#[must_use]
+pub fn source_match_current(text: &str, hash: &str, start: usize, end: usize) -> bool {
+    start <= end && end <= text.len() && blake3::hash(text.as_bytes()).to_hex().as_str() == hash
 }

@@ -53,25 +53,6 @@ pub struct ContextCapture {
     base: u64,
     sequence: u64,
     acknowledged: u64,
-    /// Identity of the last handled request (E-5 duplicate delivery): the
-    /// sequence alone cannot prove a replay — two live widget states for
-    /// one view can publish a reused sequence — so a duplicate is the same
-    /// request *content* delivered again, never merely a colliding number.
-    last: Option<RequestFingerprint>,
-}
-
-/// Identity of one handled context request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RequestFingerprint {
-    sequence: u64,
-    tag: String,
-}
-
-fn request_fingerprint(request: &flavite_editor::context::ContextRequest) -> RequestFingerprint {
-    RequestFingerprint {
-        sequence: request.sequence,
-        tag: format!("{:?}", request.event),
-    }
 }
 
 fn context_chain(
@@ -134,7 +115,6 @@ pub fn remember_context(
             .unwrap()
             .interaction()
             .sequence,
-        last: Some(request_fingerprint(request)),
     });
 }
 
@@ -162,22 +142,13 @@ fn accepts_context_inner(
     if app.notes.incarnation(tab) != Some(incarnation) || request.buffer != view.buffer_id {
         return false;
     }
-    // Duplicate delivery / stale replay (E-5): a request strictly older
-    // than the last handled one is a replay and is refused. A request at
-    // exactly the last handled sequence is refused only when it is the
-    // SAME request delivered again; two live widget states for one view
-    // publish independent counters and can reuse the last sequence for a
-    // genuinely new key, and its different content is what admits it.
+    // The lease owns one strictly increasing counter across widget mounts.
+    // Reused sequence numbers are replays regardless of event contents.
     if app.context_mode.capture.as_ref().is_some_and(|chain| {
         chain.target.tab == tab
             && chain.target.incarnation == incarnation
             && chain.target.buffer == request.buffer
-            && (request.sequence < chain.sequence
-                || (request.sequence == chain.sequence
-                    && chain
-                        .last
-                        .as_ref()
-                        .is_some_and(|fingerprint| fingerprint == &request_fingerprint(request))))
+            && request.sequence <= chain.sequence
     }) {
         return false;
     }
@@ -388,11 +359,8 @@ fn handle_inner(
     let mut mutation = None;
     let mut history = false;
     let mut preferred_x: Option<f32> = None;
-    let mut primary = 0usize;
     // The recorded before-set is the committed set at capture time (before
     // any optimistic after-set replaces it) — FEUX-0002 FR-19/E-4.
-    let before_members = interaction.selections.clone();
-    let mut after_members: Option<Vec<(usize, usize)>> = None;
     match prepared {
         PreparedInput::Edit {
             action,
@@ -400,32 +368,12 @@ fn handle_inner(
             primary: prepared_primary,
             clipboard: copied,
         } => {
-            let members = if composition_commit {
-                let edits = action
-                    .as_edit()
-                    .map(|(_, _, edits)| edits)
-                    .unwrap_or_default();
-                match composition_after_set(&view.text, &set, &members, edits) {
-                    Some((after, primary_index)) => {
-                        primary = primary_index;
-                        after
-                    }
-                    None => {
-                        primary = prepared_primary;
-                        members
-                    }
-                }
-            } else {
-                primary = prepared_primary;
-                members
-            };
             mutation = Some(action);
-            after_members = Some(members.clone());
             interaction.selections = members
                 .iter()
                 .map(|&(anchor, head)| CommittedSelection::new(anchor, head))
                 .collect();
-            interaction.primary = primary;
+            interaction.primary = prepared_primary;
             clipboard = copied;
         }
         PreparedInput::History(action) => {
@@ -436,24 +384,22 @@ fn handle_inner(
             members,
             primary: prepared_primary,
         } => {
-            primary = prepared_primary;
             interaction.selections = members
                 .iter()
                 .map(|&(anchor, head)| CommittedSelection::new(anchor, head))
                 .collect();
-            interaction.primary = primary;
+            interaction.primary = prepared_primary;
         }
         PreparedInput::VerticalSelection {
             members,
             primary: prepared_primary,
             preferred_x: columns,
         } => {
-            primary = prepared_primary;
             interaction.selections = members
                 .iter()
                 .map(|&(anchor, head)| CommittedSelection::new(anchor, head))
                 .collect();
-            interaction.primary = primary;
+            interaction.primary = prepared_primary;
             preferred_x = columns.first().copied().flatten();
         }
         PreparedInput::Copy { text } => clipboard = Some(text),
@@ -477,45 +423,66 @@ fn handle_inner(
         let Some(api) = &app.flavite else {
             return iced::Task::none();
         };
+        let Some(target) = super::context_mode::EditorTarget::capture(app, tab) else {
+            return iced::Task::none();
+        };
+        let operation = match target.issue_operation(api) {
+            Ok(operation) => operation,
+            Err(error) => {
+                app.status = error;
+                return iced::Task::none();
+            }
+        };
         let mut invocation = action
             .into_invocation(api.command_registry().next_request_id())
             .expect("prepared mutation");
+        invocation.args["operation"] = serde_json::to_value(operation).expect("operation DTO");
         if invocation.command_id == "apply_edits" {
-            use flavite_buffer::history::{EditKind, EditorEdit};
-            let kind = match input.action {
-                KeyAction::Cut => EditKind::Cut,
-                KeyAction::Paste => EditKind::Paste,
-                KeyAction::Delete | KeyAction::DeleteWord => EditKind::Delete,
-                KeyAction::Backspace | KeyAction::BackspaceWord => EditKind::Backspace,
-                _ => EditKind::Typing,
+            let command = match input.action {
+                KeyAction::Insert => "editor.type",
+                KeyAction::Newline => "editor.newline",
+                KeyAction::Backspace | KeyAction::BackspaceWord => "editor.backspace",
+                KeyAction::Delete | KeyAction::DeleteWord => "editor.forward_delete",
+                KeyAction::Paste => "editor.paste",
+                KeyAction::Cut => "editor.cut",
+                _ => {
+                    app.status = "Input operation is unavailable".into();
+                    return iced::Task::none();
+                }
             };
-            invocation.args["editor"] = serde_json::to_value(EditorEdit {
-                origin: format!("{:032x}", tab.raw()),
-                kind,
-                before: before_members
-                    .iter()
-                    .enumerate()
-                    .map(|(id, s)| [id, s.anchor, s.head])
-                    .collect(),
-                after: after_members
-                    .as_ref()
-                    .expect("edit prepared with an after-set")
-                    .iter()
-                    .enumerate()
-                    .map(|(id, &(anchor, head))| [id, anchor, head])
-                    .collect(),
-                primary,
-            })
-            .expect("history record is serializable");
-            let typing = app.context_mode.mode(tab) != flavite_edit_context::ContextMode::Command
-                && !matches!(input.action, KeyAction::Paste | KeyAction::Cut);
-            invocation.args["undo_policy"] = if typing
+            let typing = !matches!(input.action, KeyAction::Paste | KeyAction::Cut);
+            let undo_policy = if typing
                 && app.context_mode.mode(tab) == flavite_edit_context::ContextMode::Typing
             {
                 serde_json::json!({"context":{"origin":format!("{:032x}",tab.raw())}})
             } else {
                 serde_json::json!(if typing { "typing" } else { "isolated" })
             };
+            let mut args = serde_json::json!({"buffer_id":target.buffer,"revision":target.revision,"operation":invocation.args["operation"],"origin":{"view":format!("{:032x}",tab.raw()),"incarnation":incarnation},"selections":target.selections_json(),"undo_policy":undo_policy});
+            if matches!(input.action, KeyAction::Insert | KeyAction::Paste) {
+                args["text"] = serde_json::json!(input.text);
+            }
+            if input.action == KeyAction::Insert {
+                args["primary_only"] = serde_json::json!(composition_commit);
+            }
+            if matches!(
+                input.action,
+                KeyAction::Backspace
+                    | KeyAction::BackspaceWord
+                    | KeyAction::Delete
+                    | KeyAction::DeleteWord
+            ) {
+                args["word"] = serde_json::json!(matches!(
+                    input.action,
+                    KeyAction::BackspaceWord | KeyAction::DeleteWord
+                ));
+            }
+            invocation = flavite_api::Invocation::new(
+                invocation.request_id,
+                command,
+                args,
+                flavite_api::Origin::Gui,
+            );
         }
         let result = api.execute(invocation);
         if !result.is_success() {
@@ -577,7 +544,7 @@ fn handle_inner(
                             .iter()
                             .map(|[_, a, h]| CommittedSelection::new(*a, *h))
                             .collect();
-                    } else if movement.truncated {
+                    } else if movement.truncated || !movement.valid_frames() {
                         // MovementTooComplex: clamp to the document and let
                         // the user re-place the caret; never guess
                         // (FEUX-0002 E-13).
@@ -633,8 +600,7 @@ fn handle_inner(
         interaction.viewport_anchor -= 1;
     }
     if app
-        .workspace
-        .acknowledge_interaction(interaction, &current.text)
+        .acknowledge_editor_interaction(interaction, &current.text)
         .is_err()
     {
         app.input_chains.remove(&tab);
@@ -687,88 +653,44 @@ fn handle_inner(
 /// the primary member only, so every other member is retained and mapped
 /// through the primary's edit batch, then re-normalized against the
 /// after-text. Returns the member pairs and the primary index.
-fn composition_after_set(
-    text: &str,
-    set: &flavite_buffer::selection::SelectionSet,
-    primary_after: &[(usize, usize)],
-    edits: &[flavite_buffer::undo::EditOp],
-) -> Option<(Vec<(usize, usize)>, usize)> {
-    use flavite_buffer::selection::{RawSelection, map_point_through_spans};
-    let &(anchor, head) = primary_after.first()?;
-    let edit = edits.first()?;
-    let after_text = edit.apply(text);
-    let span = [flavite_buffer::history::MovementSpan {
-        start: edit.range.start.0,
-        end: edit.range.end.0,
-        replacement_len: edit.replacement.len(),
-    }];
-    // The primary keeps id 0; every other member gets a fresh distinct id
-    // so the primary hint resolves exactly and merge survivors stay
-    // deterministic.
-    let mut candidates = Vec::with_capacity(set.len());
-    for (index, member) in set.iter().enumerate() {
-        if member.id() == set.primary_id() {
-            candidates.push(RawSelection {
-                id: Some(0),
-                anchor,
-                head,
-            });
-            continue;
-        }
-        let (anchor_affinity, head_affinity) = if member.anchor() < member.head() {
-            (
-                flavite_buffer::Affinity::Left,
-                flavite_buffer::Affinity::Right,
-            )
-        } else if member.anchor() > member.head() {
-            (
-                flavite_buffer::Affinity::Right,
-                flavite_buffer::Affinity::Left,
-            )
-        } else {
-            (
-                flavite_buffer::Affinity::Right,
-                flavite_buffer::Affinity::Right,
-            )
-        };
-        candidates.push(RawSelection {
-            id: Some(index as u32 + 1),
-            anchor: map_point_through_spans(member.anchor(), &span, anchor_affinity),
-            head: map_point_through_spans(member.head(), &span, head_affinity),
-        });
-    }
-    let (after_set, _) =
-        flavite_buffer::selection::SelectionSet::normalize(&after_text, candidates, Some(0))
-            .ok()?;
-    let primary_index = after_set
-        .members()
-        .iter()
-        .position(|member| member.id() == after_set.primary_id())
-        .unwrap_or(0);
-    let members = after_set
-        .members()
-        .iter()
-        .map(|member| (member.anchor(), member.head()))
-        .collect();
-    Some((members, primary_index))
-}
-
 pub fn map_selections(
     text: &str,
     selections: &[CommittedSelection],
     movement: &flavite_buffer::history::HistoryMovement,
 ) -> Vec<CommittedSelection> {
-    let point = |at, affinity| map_history_point(text, at, movement, affinity);
+    use flavite_buffer::Affinity::{Left, Right};
+    let mut starts: Vec<_> = selections.iter().map(|s| s.anchor.min(s.head)).collect();
+    let mut ends: Vec<_> = selections.iter().map(|s| s.anchor.max(s.head)).collect();
+    let mut offset = 0;
+    for &end in &movement.step_ends {
+        let spans = &movement.spans[offset..end];
+        starts = flavite_buffer::selection::map_points_through_spans(&starts, spans, Left);
+        ends = flavite_buffer::selection::map_points_through_spans(&ends, spans, Right);
+        // The left and right endpoint streams remain independently sorted.
+        // Carets use only the right stream when constructing the result.
+        offset = end;
+    }
+    let boundary = |at, affinity| {
+        let floor = flavite_editor::viewport::clamp_grapheme_boundary(text, at);
+        if affinity == Right && floor < at.min(text.len()) {
+            flavite_editor::viewport::next_grapheme_boundary(text, flavite_syntax::TextByte(floor))
+                .0
+        } else {
+            floor
+        }
+    };
     selections
         .iter()
-        .map(|s| {
-            use flavite_buffer::Affinity::{Left, Right};
-            if s.anchor < s.head {
-                CommittedSelection::new(point(s.anchor, Left), point(s.head, Right))
-            } else if s.anchor > s.head {
-                CommittedSelection::new(point(s.anchor, Right), point(s.head, Left))
+        .enumerate()
+        .map(|(i, s)| {
+            let start = boundary(starts[i], Left);
+            let end = boundary(ends[i], Right);
+            if s.anchor == s.head {
+                CommittedSelection::caret(end)
+            } else if s.anchor < s.head {
+                CommittedSelection::new(start, end)
             } else {
-                CommittedSelection::caret(point(s.head, Right))
+                CommittedSelection::new(end, start)
             }
         })
         .collect()
@@ -780,12 +702,77 @@ pub fn map_history_point(
     movement: &flavite_buffer::history::HistoryMovement,
     affinity: flavite_buffer::Affinity,
 ) -> usize {
-    let mapped = flavite_buffer::selection::map_point_through_spans(at, &movement.spans, affinity);
+    let mapped = flavite_buffer::selection::map_movement(at, movement, affinity);
     let floor = flavite_editor::viewport::clamp_grapheme_boundary(text, mapped);
     if affinity == flavite_buffer::Affinity::Right && floor < mapped.min(text.len()) {
         flavite_editor::viewport::next_grapheme_boundary(text, flavite_syntax::TextByte(floor)).0
     } else {
         floor
+    }
+}
+
+/// Foreign facade operations and durable restores can advance a buffer
+/// outside this host's synchronous edit handler. Reconcile before paint;
+/// never attach fresh revision authority to unmapped old coordinates.
+pub fn reconcile_buffer_revisions(app: &mut App) {
+    let pending: Vec<_> = app
+        .workspace
+        .tabs()
+        .filter_map(|(tab, session)| {
+            let interaction = session.interaction();
+            let view = app.note_editor_view(*tab)?;
+            (reading::is_edit(app, *tab)
+                && interaction.buffer_id == Some(view.buffer_id)
+                && interaction.revision != view.revision)
+                .then(|| (*tab, interaction.clone(), view))
+        })
+        .collect();
+    for (tab, mut interaction, view) in pending {
+        let movement = app.flavite.as_ref().and_then(|api| {
+            api.editor_movement(view.buffer_id, interaction.revision, view.revision)
+        });
+        if let Some(movement) =
+            movement.filter(|movement| !movement.truncated && movement.valid_frames())
+        {
+            interaction.selections = map_selections(&view.text, &interaction.selections, &movement);
+            interaction.viewport_anchor = map_history_point(
+                &view.text,
+                interaction.viewport_anchor,
+                &movement,
+                flavite_buffer::Affinity::Left,
+            );
+        } else {
+            interaction.selections = interaction
+                .selections
+                .iter()
+                .map(|selection| {
+                    CommittedSelection::new(
+                        flavite_editor::viewport::clamp_grapheme_boundary(
+                            &view.text,
+                            selection.anchor,
+                        ),
+                        flavite_editor::viewport::clamp_grapheme_boundary(
+                            &view.text,
+                            selection.head,
+                        ),
+                    )
+                })
+                .collect();
+            interaction.viewport_anchor = flavite_editor::viewport::clamp_grapheme_boundary(
+                &view.text,
+                interaction.viewport_anchor,
+            );
+            app.status = "Source changed; selections approximated".into();
+            app.context_mode.notice(app.status.clone());
+        }
+        interaction.revision = view.revision;
+        interaction.sequence += 1;
+        if app
+            .acknowledge_editor_interaction(interaction, &view.text)
+            .is_ok()
+        {
+            app.input_chains.remove(&tab);
+        }
     }
 }
 
@@ -811,7 +798,7 @@ pub fn apply_history_movement(
             if interaction.buffer_id != Some(buffer) || interaction.revision != before {
                 return None;
             }
-            if movement.truncated {
+            if movement.truncated || !movement.valid_frames() {
                 // MovementTooComplex: clamp, never guess. The notice is
                 // published by the initiating view's handler; the passive
                 // view only avoids stale coordinates.
@@ -843,8 +830,6 @@ pub fn apply_history_movement(
         })
         .collect();
     for interaction in mapped {
-        let _ = app
-            .workspace
-            .acknowledge_interaction(interaction, &view.text);
+        let _ = app.acknowledge_editor_interaction(interaction, &view.text);
     }
 }

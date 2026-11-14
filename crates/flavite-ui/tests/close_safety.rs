@@ -229,9 +229,19 @@ fn final_dirty_close_requires_a_decision_and_save_close_persists() {
     );
     assert!(app.closing.is_some(), "a close plan is active");
     assert_eq!(
-        app.workspace, tree_before,
-        "the workspace tree is unchanged while the dialog is open"
+        app.workspace.tree(),
+        tree_before.tree(),
+        "the layout tree is unchanged while the dialog is open"
     );
+    assert_eq!(app.workspace.revision(), tree_before.revision());
+    assert_eq!(app.workspace.group_order(), tree_before.group_order());
+    assert_eq!(app.workspace.focused_tab(), tree_before.focused_tab());
+    for (id, view) in tree_before.tabs() {
+        assert_eq!(
+            app.workspace.tab(id).map(|tab| tab.kind()),
+            Some(view.kind())
+        );
+    }
 
     let _ = app.update(Message::CloseDecision(CloseDecision::SaveClose));
     pump_until(&mut app, "save-then-close to finish", |app| {

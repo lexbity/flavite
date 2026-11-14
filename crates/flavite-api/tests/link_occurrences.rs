@@ -59,7 +59,7 @@ fn prepare(
     detail: &flavite_api::OccurrenceDetail,
     sequence: u64,
 ) -> u128 {
-    let result=f.flavite.execute(Invocation::new(next_id(&f.flavite),"link.prepare_remove",serde_json::json!({"intent":{"client":f.client,"sequence":sequence},"source":{"buffer_id":id,"revision":revision,"caret":detail.start},"target_path":"b.md","epoch":detail.epoch,"target_entity_id":detail.occurrence.edge.to.id,"target_is_attachment":detail.occurrence.edge.to.kind==flavite_graph::NodeKind::Attachment,"target_is_unresolved":detail.occurrence.edge.to.kind==flavite_graph::NodeKind::Unresolved,"start":detail.start,"end":detail.end,"expected_source":detail.exact_source}),Origin::Gui));
+    let result=f.flavite.execute(editor_operations_fixture::admit(&f.flavite, Invocation::new(next_id(&f.flavite),"link.prepare_remove",serde_json::json!({"intent":{"client":f.client,"sequence":sequence},"source":{"buffer_id":id,"revision":revision,"caret":detail.start},"target_path":"b.md","epoch":detail.epoch,"target_entity_id":detail.occurrence.edge.to.id,"target_is_attachment":detail.occurrence.edge.to.kind==flavite_graph::NodeKind::Attachment,"target_is_unresolved":detail.occurrence.edge.to.kind==flavite_graph::NodeKind::Unresolved,"start":detail.start,"end":detail.end,"expected_source":detail.exact_source}),Origin::Gui)));
     let ExecutionResult::Pending { request_id } = result else {
         panic!("prepare not admitted: {result:?}");
     };
@@ -70,11 +70,14 @@ fn prepare(
     result.data["plan_id"].as_str().unwrap().parse().unwrap()
 }
 fn commit(f: &Fixture, plan: u128, sequence: u64) -> ExecutionResult {
-    f.flavite.execute(Invocation::new(
-        next_id(&f.flavite),
-        "link.remove",
-        serde_json::json!({"intent":{"client":f.client,"sequence":sequence},"plan_id":plan}),
-        Origin::Gui,
+    f.flavite.execute(editor_operations_fixture::admit(
+        &f.flavite,
+        Invocation::new(
+            next_id(&f.flavite),
+            "link.remove",
+            serde_json::json!({"intent":{"client":f.client,"sequence":sequence},"plan_id":plan}),
+            Origin::Gui,
+        ),
     ))
 }
 #[test]
@@ -117,11 +120,14 @@ fn removes_one_saved_crlf_occurrence_keeps_other_occurrences_prose_and_reciproca
     let view = f.flavite.get_buffer_view(id.into(), None).unwrap();
     assert!(
         f.flavite
-            .execute(Invocation::new(
-                next_id(&f.flavite),
-                "buffer.undo",
-                serde_json::json!({"buffer_id":id,"revision":view.revision}),
-                Origin::Gui
+            .execute(editor_operations_fixture::admit(
+                &f.flavite,
+                Invocation::new(
+                    next_id(&f.flavite),
+                    "buffer.undo",
+                    serde_json::json!({"buffer_id":id,"revision":view.revision}),
+                    Origin::Gui
+                )
             ))
             .is_success()
     );
@@ -185,7 +191,7 @@ fn later_typing_invalidates_prepared_removal_without_deleting_another_span() {
     let detail = detail(&f, selected, frame.render_key().epoch);
     let (id, revision) = f.open_note("a.md");
     let plan = prepare(&f, id, revision, &detail, 1);
-    assert!(f.flavite.execute(Invocation::new(next_id(&f.flavite),"apply_edits",serde_json::json!({"buffer_id":id,"revision":revision,"ops":[{"range":[0,0],"replacement":"shift "}]}),Origin::Gui)).is_success());
+    assert!(f.flavite.execute(editor_operations_fixture::admit(&f.flavite, Invocation::new(next_id(&f.flavite),"apply_edits",serde_json::json!({"buffer_id":id,"revision":revision,"ops":[{"range":[0,0],"replacement":"shift "}]}),Origin::Gui))).is_success());
     let before = f.text(id);
     assert_eq!(error_code(&commit(&f, plan, 1)), "link.stale_source");
     assert_eq!(f.text(id), before);
@@ -194,18 +200,21 @@ fn later_typing_invalidates_prepared_removal_without_deleting_another_span() {
 fn insertion_and_removal_are_independent_undo_units_amid_adjacent_typing() {
     let f = fixture(&[("a.md", "Hello"), ("b.md", "B")]);
     let (id, revision) = f.open_note("a.md");
-    assert!(f.flavite.execute(Invocation::new(next_id(&f.flavite),"apply_edits",serde_json::json!({"buffer_id":id,"revision":revision,"ops":[{"range":[5,5],"replacement":"?"}]}),Origin::Gui)).is_success());
+    assert!(f.flavite.execute(editor_operations_fixture::admit(&f.flavite, Invocation::new(next_id(&f.flavite),"apply_edits",serde_json::json!({"buffer_id":id,"revision":revision,"ops":[{"range":[5,5],"replacement":"?"}]}),Origin::Gui))).is_success());
     let revision = f.flavite.get_buffer_view(id.into(), None).unwrap().revision;
     let (sequence, plan, _) = f.prepare(1, id, revision, 6, "b.md");
     assert!(f.commit(sequence, plan).is_success());
     let revision = f.flavite.get_buffer_view(id.into(), None).unwrap().revision;
     assert!(
         f.flavite
-            .execute(Invocation::new(
-                next_id(&f.flavite),
-                "buffer.undo",
-                serde_json::json!({"buffer_id":id,"revision":revision}),
-                Origin::Gui
+            .execute(editor_operations_fixture::admit(
+                &f.flavite,
+                Invocation::new(
+                    next_id(&f.flavite),
+                    "buffer.undo",
+                    serde_json::json!({"buffer_id":id,"revision":revision}),
+                    Origin::Gui
+                )
             ))
             .is_success()
     );
@@ -215,3 +224,6 @@ fn insertion_and_removal_are_independent_undo_units_amid_adjacent_typing() {
         "one undo removes only the semantic insertion"
     );
 }
+
+#[path = "support/editor_operations.rs"]
+mod editor_operations_fixture;

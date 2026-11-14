@@ -5,11 +5,9 @@ use flavite_api::{ExecutionResult, Flavite, Invocation, LocalResult, Origin};
 use serde_json::{Value, json};
 
 fn execute(api: &Flavite, command: &'static str, args: Value) -> ExecutionResult {
-    api.execute(Invocation::new(
-        support::next_id(api),
-        command,
-        args,
-        Origin::Gui,
+    api.execute(editor_operations_fixture::admit(
+        &api,
+        Invocation::new(support::next_id(api), command, args, Origin::Gui),
     ))
 }
 fn data(result: ExecutionResult) -> Value {
@@ -33,7 +31,7 @@ fn insert(api: &Flavite, buffer: u64, at: usize, value: &str, recorded: bool) {
     let mut args = json!({"buffer_id":buffer,"revision":revision(api,buffer),"ops":[{"range":[at,at],"replacement":value}],"undo_policy":"isolated"});
     if recorded {
         args["undo_policy"] = json!({"context":{"origin":format!("{:032x}",1)}});
-        args["editor"] = json!({"origin":format!("{:032x}",1),"kind":"typing","before":[[0,at,at]],"after":[[0,at+value.len(),at+value.len()]]});
+        args["editor"] = json!({"origin":format!("{:032x}",1),"kind":"typing","before_primary":0,"before":[[0,at,at]],"after":[[0,at+value.len(),at+value.len()]]});
     }
     data(execute(api, "apply_edits", args));
 }
@@ -151,9 +149,9 @@ fn invalid_editor_records_do_not_add_text_or_history() {
     let (buffer, before) = f.open_note("note.md");
     let original = page(&f.flavite, buffer);
     for record in [
-        json!({"origin":"A".repeat(32),"kind":"typing","before":[[0,0]],"after":[[1,1]]}),
-        json!({"origin":"0".repeat(32),"kind":"typing","before":[[1,1]],"after":[[1,1]]}),
-        json!({"origin":"0".repeat(32),"kind":"typing","before":[[0,0],[3,3]],"after":[[1,1],[4,4]]}),
+        json!({"origin":"A".repeat(32),"kind":"typing","before_primary":0,"before":[[0,0]],"after":[[1,1]]}),
+        json!({"origin":"0".repeat(32),"kind":"typing","before_primary":0,"before":[[1,1]],"after":[[1,1]]}),
+        json!({"origin":"0".repeat(32),"kind":"typing","before_primary":0,"before":[[0,0],[3,3]],"after":[[1,1],[4,4]]}),
     ] {
         assert!(!execute(&f.flavite,"apply_edits",json!({"buffer_id":buffer,"revision":before,"ops":[{"range":[0,0],"replacement":"A"}],"editor":record})).is_success());
         assert_eq!(revision(&f.flavite, buffer), before);
@@ -196,3 +194,6 @@ fn app_wide_history_budget_refuses_with_typed_code_and_zero_effects() {
     assert_eq!(f.text(a), "x".repeat(400));
     assert_eq!(revision(&f.flavite, a), 1);
 }
+
+#[path = "support/editor_operations.rs"]
+mod editor_operations_fixture;

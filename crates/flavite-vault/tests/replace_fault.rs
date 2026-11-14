@@ -122,6 +122,7 @@ fn preview_all(session: &Session) -> (u128, u64) {
         session.execute(SessionCommand::ReplacePreviewPrepare {
             request_id: rid(),
             request: flavite_vault::replace::preview::PreviewRequest {
+                folder: None,
                 query: "hello".to_owned(),
                 replacement: "world".to_owned(),
                 mode: flavite_text_search::matcher::MatchMode::Literal,
@@ -483,6 +484,7 @@ fn unsupported_filesystem_refuses_with_typed_outcome() {
         session.execute(SessionCommand::ReplacePreviewPrepare {
             request_id: rid(),
             request: flavite_vault::replace::preview::PreviewRequest {
+                folder: None,
                 query: "hello".to_owned(),
                 replacement: "world".to_owned(),
                 mode: flavite_text_search::matcher::MatchMode::Literal,

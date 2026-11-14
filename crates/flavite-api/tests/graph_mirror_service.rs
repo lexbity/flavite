@@ -451,16 +451,19 @@ fn stamp_only_republishes_reuse_the_snapshot_handoff() {
             .flavite
             .get_buffer_view(flavite_buffer::BufferId::from(buffer_id), None)
             .expect("buffer view");
-        let result = f.flavite.execute(Invocation::new(
-            links_fixture::next_id(&f.flavite),
-            "apply_edits",
-            serde_json::json!({
-                "buffer_id": buffer_id,
-                "revision": view.revision,
-                "ops": [{ "range": [0, view.text.len()],
-                          "replacement": format!("# Keep\nstamped edit {step}\n") }],
-            }),
-            Origin::Gui,
+        let result = f.flavite.execute(editor_operations_fixture::admit(
+            &f.flavite,
+            Invocation::new(
+                links_fixture::next_id(&f.flavite),
+                "apply_edits",
+                serde_json::json!({
+                    "buffer_id": buffer_id,
+                    "revision": view.revision,
+                    "ops": [{ "range": [0, view.text.len()],
+                              "replacement": format!("# Keep\nstamped edit {step}\n") }],
+                }),
+                Origin::Gui,
+            ),
         ));
         assert!(
             matches!(result, ExecutionResult::Local(LocalResult::Success(_))),
@@ -1171,16 +1174,19 @@ fn stamp_burst_rebuilds_the_overlay_once_within_the_debounce_budget() {
             .flavite
             .get_buffer_view(flavite_buffer::BufferId::from(buffer_id), None)
             .expect("buffer view");
-        let result = f.flavite.execute(Invocation::new(
-            links_fixture::next_id(&f.flavite),
-            "apply_edits",
-            serde_json::json!({
-                "buffer_id": buffer_id,
-                "revision": view.revision,
-                "ops": [{ "range": [0, view.text.len()],
-                          "replacement": format!("# Keep\nstamped edit {step}\n") }],
-            }),
-            Origin::Gui,
+        let result = f.flavite.execute(editor_operations_fixture::admit(
+            &f.flavite,
+            Invocation::new(
+                links_fixture::next_id(&f.flavite),
+                "apply_edits",
+                serde_json::json!({
+                    "buffer_id": buffer_id,
+                    "revision": view.revision,
+                    "ops": [{ "range": [0, view.text.len()],
+                              "replacement": format!("# Keep\nstamped edit {step}\n") }],
+                }),
+                Origin::Gui,
+            ),
         ));
         assert!(
             matches!(result, ExecutionResult::Local(LocalResult::Success(_))),
@@ -1283,16 +1289,19 @@ fn index_commit_during_typing_pumps_immediately_and_consumes_the_window() {
         .flavite
         .get_buffer_view(flavite_buffer::BufferId::from(buffer_id), None)
         .expect("view");
-    let typed = f.flavite.execute(Invocation::new(
-        links_fixture::next_id(&f.flavite),
-        "apply_edits",
-        serde_json::json!({
-            "buffer_id": buffer_id,
-            "revision": view.revision,
-            "ops": [{ "range": [0, view.text.len()],
-                      "replacement": "# A typed mid-flight\nsee [[b]]\n" }],
-        }),
-        Origin::Gui,
+    let typed = f.flavite.execute(editor_operations_fixture::admit(
+        &f.flavite,
+        Invocation::new(
+            links_fixture::next_id(&f.flavite),
+            "apply_edits",
+            serde_json::json!({
+                "buffer_id": buffer_id,
+                "revision": view.revision,
+                "ops": [{ "range": [0, view.text.len()],
+                          "replacement": "# A typed mid-flight\nsee [[b]]\n" }],
+            }),
+            Origin::Gui,
+        ),
     ));
     assert!(typed.is_success(), "edit applies: {typed:?}");
 
@@ -1397,11 +1406,14 @@ fn fixture_apply_note(f: &links_fixture::Fixture, name: &str, body: &str, _stamp
     use flavite_fs::Fs;
     f.fs.write_new(&f.root.join(name), body.as_bytes())
         .expect("fs write");
-    let result = f.flavite.execute(Invocation::new(
-        links_fixture::next_id(&f.flavite),
-        "vault.reconcile",
-        serde_json::json!({ "scope": "full", "mode": "fast" }),
-        Origin::Gui,
+    let result = f.flavite.execute(editor_operations_fixture::admit(
+        &f.flavite,
+        Invocation::new(
+            links_fixture::next_id(&f.flavite),
+            "vault.reconcile",
+            serde_json::json!({ "scope": "full", "mode": "fast" }),
+            Origin::Gui,
+        ),
     ));
     if let ExecutionResult::Pending { request_id } = result {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1420,3 +1432,6 @@ fn fixture_apply_note(f: &links_fixture::Fixture, name: &str, body: &str, _stamp
         }
     }
 }
+
+#[path = "support/editor_operations.rs"]
+mod editor_operations_fixture;

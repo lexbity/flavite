@@ -6,11 +6,9 @@ use flavite_api::{ExecutionResult, Flavite, Invocation, LocalResult, Origin};
 use serde_json::{Value, json};
 
 fn execute(api: &Flavite, command: &'static str, args: Value) -> ExecutionResult {
-    api.execute(Invocation::new(
-        support::next_id(api),
-        command,
-        args,
-        Origin::Gui,
+    api.execute(editor_operations_fixture::admit(
+        &api,
+        Invocation::new(support::next_id(api), command, args, Origin::Gui),
     ))
 }
 
@@ -146,3 +144,6 @@ fn malformed_origin_stale_edits_and_read_only_seals_have_no_effect() {
     assert!(!refused.is_success());
     assert_eq!(revision(&f.flavite, buffer), current);
 }
+
+#[path = "support/editor_operations.rs"]
+mod editor_operations_fixture;

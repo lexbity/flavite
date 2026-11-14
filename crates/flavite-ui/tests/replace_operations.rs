@@ -87,6 +87,7 @@ fn prepare_sealed_preview(app: &mut App, tab: TabId) {
             .is_some_and(|state| !state.updating && state.preview_id.is_some())
     });
     let _ = app.update(Message::ReplaceSelect {
+        target: app.replace.view_state(tab).preview_target().unwrap(),
         tab,
         selection: flavite_ui::host::replace::SelectAction::All,
     });
@@ -105,7 +106,10 @@ fn apply_completes_via_the_app_pump_and_operations_inventory_visible() {
     prepare_sealed_preview(&mut f.app, tab);
     let state = &f.app.replace.tabs[&tab];
     assert!(state.can_apply());
-    let _ = f.app.update(Message::ReplaceApply { tab });
+    let _ = f.app.update(Message::ReplaceApply {
+        target: f.app.replace.view_state(tab).preview_target().unwrap(),
+        tab,
+    });
     wait(&mut f.app, |app| {
         app.replace.tabs.get(&tab).is_some_and(|state| {
             state
@@ -136,15 +140,30 @@ fn cancel_stops_an_applying_job() {
     let mut f = fixture();
     let tab = open_replace(&mut f.app);
     prepare_sealed_preview(&mut f.app, tab);
-    let _ = f.app.update(Message::ReplaceApply { tab });
+    let _ = f.app.update(Message::ReplaceApply {
+        target: f.app.replace.view_state(tab).preview_target().unwrap(),
+        tab,
+    });
     // Cancel as soon as the job exists (it may complete first on this tiny
     // corpus; either terminal state is legal, but cancel must be accepted).
-    let _ = f.app.update(Message::ReplaceCancel { tab });
+    let _ = f.app.update(Message::ReplaceCancel {
+        job_id: f
+            .app
+            .replace
+            .view_state(tab)
+            .job
+            .as_ref()
+            .unwrap()
+            .job_id
+            .clone(),
+        tab,
+    });
     wait(&mut f.app, |app| {
-        app.replace
-            .tabs
-            .get(&tab)
-            .is_some_and(|state| state.job.is_some())
+        app.replace.tabs.get(&tab).is_some_and(|state| {
+            state.job.as_ref().is_some_and(|job| {
+                matches!(job.phase.as_str(), "completed" | "cancelled" | "partial")
+            })
+        })
     });
     let state = &f.app.replace.tabs[&tab];
     let job = state.job.as_ref().expect("job");

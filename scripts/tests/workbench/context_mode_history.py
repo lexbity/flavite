@@ -28,12 +28,12 @@ def main():
     common.click_rect(window, harness, history(value)["bounds"]["0"])
     value = wait(lambda s: s.get("focused_text") == original and history(s).get("page", {}).get("current") == 0, "chip restores initial state")
     source = next(t for t in common.tabs(value) if t["title"] == "alpha")
-    assert source["selection"] == [0, 0]
+    assert source["selections"][source.get("primary", 0)] == [0, 0]
     value = wait(lambda s: str(first_state) in history(s).get("bounds", {}), "redo chip ready")
     common.click_rect(window, harness, history(value)["bounds"][str(first_state)])
     value = wait(lambda s: s.get("focused_text") == first, "redo chip restores recorded state")
     source = next(t for t in common.tabs(value) if t["title"] == "alpha")
-    assert source["selection"] == [len(first.encode()), len(first.encode())]
+    assert source["selections"][source.get("primary", 0)] == [len(first.encode()), len(first.encode())]
     painted(window, harness, output, "COMMAND")
     common.capture(window, output, "01-history-chips.png", checks)
     common.key("i")

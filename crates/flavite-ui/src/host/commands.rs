@@ -538,6 +538,9 @@ pub fn catalog_conflicts(core_ids: &[&str]) -> Vec<String> {
 /// precedence; plain typing never triggers layout commands.
 #[must_use]
 pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
+    if let Some(message) = super::file_browser::keyboard_message(app, &event) {
+        return Some(message);
+    }
     if let Some(message) = super::editor_history::keyboard_message(app, &event) {
         return Some(message);
     }
@@ -1066,18 +1069,14 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
         // ---- W10 ----
         "workspace.open_search_view" => {
             if let Some(group) = app.navigation_group() {
-                app.dispatch_layout(|revision| LayoutAction::OpenSearch {
+                app.dispatch_layout(|revision| LayoutAction::OpenReplace {
                     expected_revision: revision,
                     group,
                 });
                 // The search input is the view's primary control; focus it so
                 // typed queries land immediately.
                 if let Some(active) = app.workspace.group(&group).map(|g| g.active()) {
-                    let id = iced::widget::Id::from(format!(
-                        "{}{}",
-                        crate::views::search::SEARCH_INPUT_ID_PREFIX,
-                        active.raw()
-                    ));
+                    let id = crate::views::replace::input_id(active, "-query");
                     return iced::widget::operation::focus(id);
                 }
             }
@@ -1090,11 +1089,9 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
                     group,
                 });
                 if let Some(active) = app.workspace.group(&group).map(|g| g.active()) {
-                    let id = iced::widget::Id::from(format!(
-                        "{}{}",
-                        crate::views::replace::REPLACE_INPUT_ID_PREFIX,
-                        active.raw()
-                    ));
+                    app.replace
+                        .set_mode(active, super::replace::ReplacePanelMode::Preview);
+                    let id = crate::views::replace::input_id(active, "-query");
                     return iced::widget::operation::focus(id);
                 }
             }

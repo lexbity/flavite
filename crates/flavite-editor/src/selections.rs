@@ -96,7 +96,7 @@ impl EditorSelections {
     }
 
     #[must_use]
-    pub fn members(&self) -> Vec<Selection> {
+    pub fn members(&self) -> &[Selection] {
         self.set.members()
     }
 
