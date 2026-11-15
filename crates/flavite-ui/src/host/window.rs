@@ -29,6 +29,12 @@ pub fn drag() -> Task<Message> {
     oldest_window().and_then(iced::window::drag::<Message>)
 }
 
+/// Begin an interactive resize from the shell's corner grip.
+pub fn resize_southeast() -> Task<Message> {
+    oldest_window()
+        .and_then(|id| iced::window::drag_resize::<Message>(id, iced::window::Direction::SouthEast))
+}
+
 /// Query whether the window is currently maximized, so the shell control can
 /// render the restore variant.
 pub fn poll_maximized() -> Task<Message> {

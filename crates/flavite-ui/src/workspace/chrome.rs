@@ -29,6 +29,8 @@ pub enum Icon {
     Maximize,
     Restore,
     Minimize,
+    /// The corner resize grip (two diagonal ridges).
+    Grip,
     Settings,
     Cut,
     Copy,
@@ -280,6 +282,13 @@ impl Widget<Message, Theme, Renderer> for Glyph {
             }
             Icon::Minimize => {
                 line(3.0, 11.0, 10.0, 1.5);
+            }
+            Icon::Grip => {
+                for i in 0_u16..4 {
+                    let at = f32::from(i);
+                    line(9.0 + at, 7.0 + at, 1.2, 1.2);
+                    line(5.0 + at, 11.0 + at, 1.2, 1.2);
+                }
             }
             Icon::Maximize => {
                 line(3.0, 3.0, 10.0, 1.0);

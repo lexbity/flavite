@@ -507,3 +507,24 @@ fn menus_leave_geometry_unchanged_and_escape_cancels_resize() {
     assert!(app.strip_menu.is_none());
     assert!(app.resizing_split.is_none());
 }
+
+#[test]
+fn tab_selection_back_forward_cycles_within_a_group() {
+    let Fixture { mut app, .. } = fixture();
+    let group = app.focused_group().unwrap();
+    let (alpha, _) = open_note(&mut app, "alpha.md");
+    let (beta, _) = open_note(&mut app, "beta.md");
+    // Opening beta activated it; Back must offer the previous selection.
+    assert!(app.tab_nav.can_go_back(group), "alpha is in Back");
+    assert!(!app.tab_nav.can_go_forward(group));
+    let _ = app.update(Message::TabNavigateBack(group));
+    assert_eq!(app.workspace.focused_tab(), alpha, "Back selects alpha");
+    assert!(app.tab_nav.can_go_forward(group));
+    let _ = app.update(Message::TabNavigateForward(group));
+    assert_eq!(app.workspace.focused_tab(), beta, "Forward restores beta");
+    assert!(app.tab_nav.can_go_back(group));
+    // A direct activation starts a new selection branch.
+    let _ = app.update(Message::ActivateTab(alpha));
+    assert!(!app.tab_nav.can_go_forward(group), "branch dropped");
+    assert_eq!(app.workspace.focused_tab(), alpha);
+}

@@ -707,10 +707,28 @@ fn status_bar(app: &App) -> Element<'_, Message> {
                 .style(style::dim_text),
         );
     }
+    // Client-side chrome (W12): the corner grip resizes the window from
+    // its bottom-right edge; decorations are off on every platform.
+    items = items.push(
+        mouse_area(
+            container(chrome::icon(metrics, Icon::Grip))
+                .width(Length::Fixed(18.0 * metrics.scale))
+                .height(Length::Fill)
+                .align_x(alignment::Horizontal::Center)
+                .align_y(alignment::Vertical::Center),
+        )
+        .interaction(iced::mouse::Interaction::ResizingDiagonallyDown)
+        .on_press(Message::WindowResizeBegin),
+    );
     container(items)
         .height(28.0 * metrics.scale)
         .width(Length::Fill)
-        .padding([0, 8])
+        .padding(iced::Padding {
+            top: 0.0,
+            bottom: 0.0,
+            left: 8.0,
+            right: 0.0,
+        })
         .clip(true)
         .style(style::status_bar)
         .into()

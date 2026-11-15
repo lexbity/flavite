@@ -455,6 +455,22 @@ pub fn start_view(app: &App) -> Element<'_, Message> {
     .width(Length::Fill)
     .align_x(alignment::Horizontal::Right)
     .padding([4, 8]);
+    // The bottom-right corner grip resizes the window (no OS decorations).
+    let grip = container(
+        mouse_area(
+            container(chrome::icon(*metrics, Icon::Grip))
+                .width(Length::Fixed(18.0 * metrics.scale))
+                .height(Length::Fixed(24.0 * metrics.scale))
+                .align_x(alignment::Horizontal::Center)
+                .align_y(alignment::Vertical::Center),
+        )
+        .interaction(iced::mouse::Interaction::ResizingDiagonallyDown)
+        .on_press(Message::WindowResizeBegin),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .align_x(alignment::Horizontal::Right)
+    .align_y(alignment::Vertical::Bottom);
     iced::widget::stack![
         mouse_area(
             container(body)
@@ -467,6 +483,7 @@ pub fn start_view(app: &App) -> Element<'_, Message> {
         .on_press(Message::WindowDrag)
         .on_double_click(Message::WindowToggleMaximize),
         controls,
+        grip,
     ]
     .into()
 }

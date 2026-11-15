@@ -33,6 +33,7 @@ pub mod selection_search;
 pub mod settings;
 pub mod shell;
 pub mod shutdown;
+pub mod tab_nav;
 pub mod vault_search;
 pub mod window;
 

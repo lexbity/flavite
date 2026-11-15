@@ -107,6 +107,8 @@ pub struct App {
     /// RFC-0006 S04: session-local open-destination memory (D-03). Never
     /// persisted; restore recomputes from acknowledged document focus.
     pub open_memory: crate::host::open_intents::OpenMemory,
+    /// Per-group tab-selection history (the tab strip's Back/Forward).
+    pub tab_nav: crate::host::tab_nav::TabSelectionNav,
     /// One modal dialog, when open (W10).
     pub dialog: Option<crate::host::dialogs::Dialog>,
     /// No-vault start screen state (FR-22).
@@ -251,6 +253,8 @@ pub enum Message {
     WindowToggleMaximize,
     /// Begin an interactive move from the shell's drag region.
     WindowDrag,
+    /// Begin an interactive resize from the shell's corner grip.
+    WindowResizeBegin,
     /// The shell's close control runs the same quit schedule as the (still
     /// delivered) OS close request.
     WindowClose,
@@ -258,6 +262,10 @@ pub enum Message {
     WindowMaximized(bool),
     /// Open a hardcoded external URL (About links) through the OS handler.
     OpenExternalUrl(String),
+    /// Tab-selection history: step the group's active-tab history back or
+    /// forward (the tab strip's Back/Forward, W10).
+    TabNavigateBack(GroupId),
+    TabNavigateForward(GroupId),
     /// A typed layout transaction.
     Layout(flavite_workspace::LayoutAction),
     /// The OS color scheme changed (W11 System theme).
@@ -719,6 +727,7 @@ impl App {
             history: crate::views::history::HistoryHost::default(),
             nav: crate::host::navigation::NavHost::default(),
             open_memory: crate::host::open_intents::OpenMemory::default(),
+            tab_nav: crate::host::tab_nav::TabSelectionNav::default(),
             dialog: None,
             start: crate::host::dialogs::StartState::default(),
             notes_filters: BTreeMap::new(),
@@ -828,6 +837,7 @@ impl App {
         // drops every remembered group/tab reference before the restore's
         // layout transactions repopulate it from acknowledged document focus.
         self.open_memory.reset();
+        self.tab_nav.reset();
         crate::host::graph::sync_hosts(self);
         self.refresh_semantics();
         // Device-local launch memory (W10): best effort, never a gate for
@@ -1205,6 +1215,34 @@ impl App {
             resolve(anchor),
             resolve(head),
         );
+    }
+
+    /// One step of the group's tab-selection history (W10): activate the
+    /// previous (or next) selected tab. The selection host already moved
+    /// its `current`, so the committed activation observes as a no-op and
+    /// never re-records.
+    fn tab_navigate(&mut self, group: GroupId, forward: bool) -> Task<Message> {
+        let live = |tab: TabId| self.workspace.tab(&tab).is_some();
+        let target = if forward {
+            self.tab_nav.go_forward(group, live)
+        } else {
+            self.tab_nav.go_back(group, live)
+        };
+        let Some(target) = target else {
+            return Task::none();
+        };
+        let committed = self.dispatch_layout_result(|revision| LayoutAction::ActivateTab {
+            expected_revision: revision,
+            tab: target,
+        });
+        if committed {
+            self.status = if forward { "Forward" } else { "Back" }.into();
+        } else {
+            // The activation refused (composition guard): undo the
+            // selection move so the stacks stay truthful.
+            self.tab_nav.undo_step(group, target, forward);
+        }
+        Task::none()
     }
 
     /// One step of per-view back/forward navigation (W10). The replacement
@@ -1734,6 +1772,9 @@ impl App {
                 // dead group/tab references drop here (merge/close/restore)
                 // and focus recency updates (D-03).
                 self.open_memory.observe(&self.workspace);
+                // The tab-selection history observes the same commits, so
+                // every activation path records uniformly (W10).
+                self.tab_nav.observe(&self.workspace);
                 self.adapter.reconcile(&self.workspace);
                 self.project_geometry();
                 let effects = commit.effects;
@@ -2880,6 +2921,9 @@ impl App {
             Message::WindowDrag => {
                 return crate::host::window::drag();
             }
+            Message::WindowResizeBegin => {
+                return crate::host::window::resize_southeast();
+            }
             Message::WindowClose => {
                 self.begin_shutdown();
             }
@@ -2888,6 +2932,12 @@ impl App {
             }
             Message::OpenExternalUrl(url) => {
                 return crate::host::reading::open_external(url);
+            }
+            Message::TabNavigateBack(group) => {
+                return self.tab_navigate(group, false);
+            }
+            Message::TabNavigateForward(group) => {
+                return self.tab_navigate(group, true);
             }
             Message::WindowEvent(iced::window::Event::Unfocused) => {
                 crate::host::context_mode::window_blurred(self);
@@ -5020,6 +5070,7 @@ mod tests {
             history: crate::views::history::HistoryHost::default(),
             nav: crate::host::navigation::NavHost::default(),
             open_memory: crate::host::open_intents::OpenMemory::default(),
+            tab_nav: crate::host::tab_nav::TabSelectionNav::default(),
             dialog: None,
             start: crate::host::dialogs::StartState::default(),
             notes_filters: BTreeMap::new(),

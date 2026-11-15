@@ -117,23 +117,24 @@ pub fn view(app: &App, group: GroupId) -> Element<'_, Message> {
         g.tabs().len(),
         active_index,
     );
-    let active_tab = g.active();
     let mut tabs = row![].spacing(0);
+    // W10: the strip's Back/Forward cycle the group's tab-selection
+    // history; per-note visit history stays on the palette commands.
     tabs = tabs.push(chrome::icon_button(
         *metrics,
         Icon::Back,
-        "Back",
-        app.nav
-            .can_go_back(active_tab)
-            .then_some(Message::NavigateBack(active_tab)),
+        "Back to the previously selected tab",
+        app.tab_nav
+            .can_go_back(group)
+            .then_some(Message::TabNavigateBack(group)),
     ));
     tabs = tabs.push(chrome::icon_button(
         *metrics,
         Icon::Forward,
-        "Forward",
-        app.nav
-            .can_go_forward(active_tab)
-            .then_some(Message::NavigateForward(active_tab)),
+        "Forward to the next selected tab",
+        app.tab_nav
+            .can_go_forward(group)
+            .then_some(Message::TabNavigateForward(group)),
     ));
     for tab in g.tabs().iter().skip(slots.start).take(slots.count) {
         tabs = tabs.push(tab_view(app, *tab, *tab == g.active(), slots.tab_width));
