@@ -538,7 +538,7 @@ mod tests {
     #[test]
     fn admitted_runs_close_menus_and_name_the_command() {
         let mut state = ContextState::activated();
-        let _ = r(&mut state, &Event::OpenMenu(ContextMenu::Type), 0, false);
+        let _ = r(&mut state, &Event::OpenMenu(ContextMenu::More), 0, false);
         let _ = r(
             &mut state,
             &Event::RunAdmitted(ContextCommand::Change),
@@ -622,12 +622,7 @@ mod tests {
 
     #[test]
     fn every_menu_lists_each_command_exactly_once() {
-        for menu in [
-            ContextMenu::Select,
-            ContextMenu::Go,
-            ContextMenu::Type,
-            ContextMenu::More,
-        ] {
+        for menu in [ContextMenu::Select, ContextMenu::Go, ContextMenu::More] {
             let commands = menu.commands();
             for (index, command) in commands.iter().enumerate() {
                 assert!(

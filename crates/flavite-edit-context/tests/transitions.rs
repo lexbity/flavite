@@ -69,23 +69,21 @@ fn matrix_escape_row_pops_menu_then_typing_then_stays() {
 #[test]
 fn matrix_menu_rows_open_cycle_and_close_with_delivered_effects() {
     let mut state = activated();
+    // Type menu dissolved in X04; test with More menu which contains the typing commands
     assert_eq!(
-        r(&mut state, &Event::OpenMenu(ContextMenu::Type), 0, false),
+        r(&mut state, &Event::OpenMenu(ContextMenu::More), 0, false),
         vec![Effect::ClearPreview, Effect::SealTypingGroup]
     );
     assert_eq!(state.selected(), 0);
-    assert_eq!(state.menu_command(), Some(ContextCommand::InsertStart));
+    assert_eq!(state.menu_command(), Some(ContextCommand::Cut));
 
-    assert_eq!(
-        r(&mut state, &Event::MenuMove(true), 0, false),
-        vec![Effect::ClearPreview]
-    );
-    assert_eq!(state.selected(), 1);
-    // Wrap backward from row 1 lands on the last row of the Type menu.
-    let _ = r(&mut state, &Event::MenuMove(false), 0, false);
-    let _ = r(&mut state, &Event::MenuMove(false), 0, false);
-    assert_eq!(state.selected(), 6);
-    assert_eq!(state.menu_command(), Some(ContextCommand::Change));
+    // More menu contains: Cut(0), Copy(1), Paste(2), Undo(3), Redo(4), InsertStart(5), ...
+    // Need 5 moves total to reach InsertStart at index 5
+    for _ in 0..5 {
+        let _ = r(&mut state, &Event::MenuMove(true), 0, false);
+    }
+    assert_eq!(state.selected(), 5);
+    assert_eq!(state.menu_command(), Some(ContextCommand::InsertStart));
 
     assert_eq!(
         r(&mut state, &Event::CloseMenu, 0, false),

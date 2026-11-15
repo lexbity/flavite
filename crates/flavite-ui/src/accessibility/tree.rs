@@ -246,12 +246,7 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
         if !active || app.palette_open || app.picker.open || app.context_mode.history.open {
             continue;
         }
-        for menu in [
-            ContextMenu::Select,
-            ContextMenu::Go,
-            ContextMenu::Type,
-            ContextMenu::More,
-        ] {
+        for menu in [ContextMenu::Select, ContextMenu::Go, ContextMenu::More] {
             if !plan.menu_visible(menu) {
                 continue;
             }

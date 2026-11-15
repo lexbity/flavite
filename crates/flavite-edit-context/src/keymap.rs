@@ -67,8 +67,6 @@ impl BindingId {
                 ContextMenu::Select => "editor.menu_select",
                 ContextMenu::Go => "editor.menu_go",
                 ContextMenu::More => "editor.menu_more",
-                // Type is being dissolved in X04, but we keep it for completeness
-                ContextMenu::Type => "editor.menu_type",
             },
         }
     }
@@ -97,7 +95,6 @@ impl BindingId {
             "editor.menu_select" => Some(BindingId::MenuOpener(ContextMenu::Select)),
             "editor.menu_go" => Some(BindingId::MenuOpener(ContextMenu::Go)),
             "editor.menu_more" => Some(BindingId::MenuOpener(ContextMenu::More)),
-            "editor.menu_type" => Some(BindingId::MenuOpener(ContextMenu::Type)),
             _ => None,
         }
     }
@@ -608,10 +605,6 @@ pub const DEFAULT_ROOT: &[(BindingId, Slot)] = &[
         BindingId::MenuOpener(ContextMenu::Go),
         Slot::bare(KeyCode::KeyG),
     ),
-    (
-        BindingId::MenuOpener(ContextMenu::Type),
-        Slot::bare(KeyCode::KeyT),
-    ),
     // Motions (14 entries: 7 bare + 7 shifted, matching grammar::motion_key exactly)
     // Note: grammar::motion_key ignores shift, so we include both variants for equivalence
     (
@@ -709,10 +702,10 @@ mod tests {
     #[test]
     fn default_keymap_is_the_normative_snapshot() {
         // Verify the DEFAULT_ROOT table contains exactly the expected bindings
-        // This is the drift gate for X02.
+        // This is the drift gate for X02/X04.
         // 20 command-key entries (18 commands + 2 find_char) + 14 motions (7 bare + 7 shifted) = 34 total
-        // Plus 3 menu openers (V, G, T) = 37 total
-        assert_eq!(DEFAULT_ROOT.len(), 37); // 20 commands + 14 motions + 3 menu openers = 37
+        // Plus 2 menu openers (V, G) = 36 total (Type menu dissolved in X04)
+        assert_eq!(DEFAULT_ROOT.len(), 36); // 20 commands + 14 motions + 2 menu openers = 36
 
         // Spot-check a few key bindings
         let has_insert_start = DEFAULT_ROOT.iter().any(|(bid, slot)| {
@@ -758,11 +751,6 @@ mod tests {
             bid.id() == "editor.menu_go" && slot.position == KeyCode::KeyG && !slot.shift
         });
         assert!(has_menu_go, "menu_go should map to bare KeyG");
-
-        let has_menu_type = DEFAULT_ROOT.iter().any(|(bid, slot)| {
-            bid.id() == "editor.menu_type" && slot.position == KeyCode::KeyT && !slot.shift
-        });
-        assert!(has_menu_type, "menu_type should map to bare KeyT");
     }
 
     #[test]

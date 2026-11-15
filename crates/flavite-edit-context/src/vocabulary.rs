@@ -251,7 +251,6 @@ impl ContextCommand {
 pub enum ContextMenu {
     Select,
     Go,
-    Type,
     More,
 }
 
@@ -261,7 +260,6 @@ impl ContextMenu {
         match self {
             Self::Select => "Select",
             Self::Go => "Go",
-            Self::Type => "Type",
             Self::More => "More",
         }
     }
@@ -287,15 +285,6 @@ impl ContextMenu {
                 C::SplitSelection,
             ],
             Self::Go => &[C::LineStart, C::LineEnd, C::DocumentStart, C::DocumentEnd],
-            Self::Type => &[
-                C::InsertStart,
-                C::InsertEnd,
-                C::InsertLineStart,
-                C::InsertLineEnd,
-                C::OpenAbove,
-                C::OpenBelow,
-                C::Change,
-            ],
             Self::More => &[
                 C::Cut,
                 C::Copy,
