@@ -1723,11 +1723,23 @@ pub(crate) fn open_node(app: &mut App, source: Option<TabId>, node: NodeId) {
             }
         }
         NodeKind::Unresolved => {
-            app.status = if unresolved_is_representable(&record) {
-                "Unresolved link target — use Create note or Locate in the selection band; navigation never creates notes".into()
+            // Activation is explicit intent, but nothing is created
+            // implicitly (D-02/FR-19): the pre-filled dialog is the
+            // confirmation step. An unrepresentable target stays an honest
+            // refusal.
+            if unresolved_is_representable(&record) {
+                let path = unresolved_create_path(&record);
+                app.dialog = path.map(|path| crate::host::dialogs::Dialog::NewNote { path });
+                if app.dialog.is_some() {
+                    app.dialog_focus_pending = true;
+                } else {
+                    app.status =
+                        "Unresolved link target — its path cannot be represented as a note".into();
+                }
             } else {
-                "Unresolved link target — its path cannot be represented as a note".into()
-            };
+                app.status =
+                    "Unresolved link target — its path cannot be represented as a note".into();
+            }
         }
         NodeKind::Note => {
             app.status = if record.binding_blocked {

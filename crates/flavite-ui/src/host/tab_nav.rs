@@ -277,4 +277,3 @@ mod tests {
         assert!(!nav.can_go_back(group()));
     }
 }
-

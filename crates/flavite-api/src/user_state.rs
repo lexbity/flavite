@@ -139,10 +139,15 @@ impl Flavite {
             .map_err(FlaviteError::UserState)?;
         match stored {
             Some(stored) => {
-                let workspace: flavite_workspace::PersistedWorkspace =
-                    serde_json::from_slice(&stored.payload).map_err(|e| {
-                        FlaviteError::UserState(UserStateError::Corrupt(e.to_string()))
-                    })?;
+                // The stored payload is the envelope-free persisted
+                // workspace. It still goes through the codec's schema
+                // migration dispatch so an older-schema file lands exactly
+                // like every other durable workspace source (v1 graph
+                // scopes re-default unresolved targets visible).
+                let value: serde_json::Value = serde_json::from_slice(&stored.payload)
+                    .map_err(|e| FlaviteError::UserState(UserStateError::Corrupt(e.to_string())))?;
+                let workspace = flavite_workspace::migrate::to_current(&value)
+                    .map_err(|e| FlaviteError::UserState(UserStateError::Corrupt(e.to_string())))?;
                 Ok(Some(StoredWorkspace {
                     generation: stored.generation,
                     workspace,

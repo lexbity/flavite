@@ -144,6 +144,40 @@ fn os_fs_validate_in_root() {
 }
 
 #[test]
+fn os_fs_validate_in_root_accepts_not_yet_created_targets() {
+    let fs = OsFs::new();
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path();
+
+    // note.create validates the target before the file exists: the leaf may
+    // be missing (and its parent directory too) while containment still holds.
+    fs.validate_in_root(root, &root.join("zz test.md")).unwrap();
+    fs.validate_in_root(root, &root.join("nested/dir/note.md"))
+        .unwrap();
+
+    // A missing leaf reached through a symlinked ancestor keeps std
+    // resolution semantics: the symlink is resolved first, then `..` — the
+    // resulting candidate escapes the root and must be refused.
+    #[cfg(unix)]
+    {
+        let outside = temp_dir.path().parent().unwrap().to_path_buf();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(outside, &link).unwrap();
+        let result = fs.validate_in_root(root, &link.join("../escaped.md"));
+        assert!(matches!(result, Err(FsError::PathEscape(_))));
+
+        // The same missing leaf *inside* the symlinked directory is also
+        // outside the root.
+        let result = fs.validate_in_root(root, &link.join("escaped.md"));
+        assert!(matches!(result, Err(FsError::PathEscape(_))));
+    }
+
+    // A `..` on a missing component chain cannot prove containment.
+    let result = fs.validate_in_root(root, &root.join("missing/../escaped.md"));
+    assert!(matches!(result, Err(FsError::PathEscape(_))));
+}
+
+#[test]
 fn os_fs_canonicalize() {
     let fs = OsFs::new();
     let temp_dir = tempdir().unwrap();

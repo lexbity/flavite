@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 /// The schema this build writes and reads.
-pub const CURRENT_SCHEMA: u32 = 1;
+pub const CURRENT_SCHEMA: u32 = 2;
 /// The oldest schema this build accepts.
 pub const MIN_SUPPORTED_SCHEMA: u32 = 1;
 /// Hard byte bound before any parsing (NFR-12: decode workspace ≤4 MiB).

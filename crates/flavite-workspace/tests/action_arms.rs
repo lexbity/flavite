@@ -1034,27 +1034,6 @@ fn interaction_acknowledgement_guards_are_total() {
     editable_ack(&mut state, note, 20, "abc");
     let target = state.writing_target().expect("target established");
     assert_eq!(target.tab, note);
-
-    // acknowledge_target_edit guards: changed target, stale revision,
-    // non-boundary caret; then a valid advance.
-    assert_eq!(
-        state.acknowledge_target_edit(target, target.revision, 1, "abc"),
-        Err("writing target changed before acknowledgement")
-    );
-    let mut changed = target;
-    changed.buffer_id = 999;
-    assert_eq!(
-        state.acknowledge_target_edit(changed, 6, 1, "abc"),
-        Err("writing target changed before acknowledgement")
-    );
-    assert_eq!(
-        state.acknowledge_target_edit(target, 1001, 1, "é"),
-        Err("acknowledged caret is not a UTF-8 boundary")
-    );
-    state
-        .acknowledge_target_edit(target, 1002, 2, "abc")
-        .unwrap();
-    assert_eq!(state.writing_target().unwrap().revision, 1002);
 }
 
 #[test]

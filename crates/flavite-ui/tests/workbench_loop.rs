@@ -595,8 +595,9 @@ fn pair_activates_while_newer_frame_pending_and_insert_refuses() {
 }
 
 /// D-02/FR-19: activating an unresolved node offers explicit Create or
-/// Locate and never creates the note; the band and the palette share the
-/// same predicate.
+/// Locate and never creates the note implicitly — activation opens the
+/// pre-filled dialog, which only a confirmed submit may act on; the band
+/// and the palette share the same predicate.
 #[test]
 fn unresolved_activation_offers_create_or_locate_and_never_creates() {
     let (mut app, fs, _cache) =
@@ -639,11 +640,15 @@ fn unresolved_activation_offers_create_or_locate_and_never_creates() {
             .is_none(),
         "activation created no file"
     );
+    let activated = match &app.dialog {
+        Some(flavite_ui::host::dialogs::Dialog::NewNote { path }) => path.clone(),
+        other => panic!("activation must offer the create dialog, got {other:?}"),
+    };
     assert!(
-        app.status.contains("Create") && app.status.contains("Locate"),
-        "the unresolved offer must be explicit: {}",
-        app.status
+        activated.contains("ghost"),
+        "activation prefills the link target: {activated}"
     );
+    app.dialog = None;
 
     let _ = app.update(Message::GraphCommand {
         tab: graph,

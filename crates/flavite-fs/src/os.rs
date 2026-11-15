@@ -122,8 +122,36 @@ impl Fs for OsFs {
 
     fn validate_in_root(&self, root: &Path, target: &Path) -> Result<()> {
         let canon_root = self.canonicalize(root)?;
-        let canon_target = self.canonicalize(target)?;
-        if canon_target.starts_with(&canon_root) {
+        // std's canonicalize requires existence, but containment must also
+        // hold for paths that do not exist yet (note.create validates the
+        // target before creating it). Canonicalize the nearest existing
+        // ancestor — which still resolves symlinked ancestors with std
+        // semantics — and keep the leaf components: `Path::file_name` never
+        // yields `.` or `..`, so the appended remainder stays lexical and
+        // cannot escape on its own.
+        let mut suffix = Vec::new();
+        let mut existing = target.to_path_buf();
+        let canonical = loop {
+            match self.canonicalize(&existing) {
+                Ok(canonical) => break canonical,
+                Err(_) if !existing.exists() => {
+                    let Some(name) = existing.file_name() else {
+                        return Err(FsError::PathEscape(target.to_path_buf()));
+                    };
+                    suffix.push(name.to_owned());
+                    match existing.parent() {
+                        Some(parent) => existing = parent.to_path_buf(),
+                        None => return Err(FsError::PathEscape(target.to_path_buf())),
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let mut candidate = canonical;
+        for name in suffix.iter().rev() {
+            candidate.push(name);
+        }
+        if candidate.starts_with(&canon_root) {
             Ok(())
         } else {
             Err(FsError::PathEscape(target.to_path_buf()))

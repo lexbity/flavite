@@ -416,7 +416,7 @@ fn schema_bounds_are_refused_before_any_structure_check() {
     future.schema = CURRENT_SCHEMA + 1;
     assert!(matches!(
         validate_workspace(&future),
-        Err(CodecError::FutureSchema { found: 2 })
+        Err(CodecError::FutureSchema { found }) if found == CURRENT_SCHEMA + 1
     ));
 }
 

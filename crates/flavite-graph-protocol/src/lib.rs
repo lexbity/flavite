@@ -54,19 +54,29 @@ pub struct Neighborhood {
     pub direction: Direction,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
 pub struct GraphScope {
-    #[serde(default)]
     pub predicate: NotePredicate,
-    #[serde(default)]
     pub neighborhood: Option<Neighborhood>,
-    #[serde(default)]
     pub include_attachments: bool,
-    #[serde(default)]
     pub include_embeds: bool,
-    #[serde(default)]
     pub show_unresolved: bool,
+}
+
+impl Default for GraphScope {
+    /// A new graph view is the whole vault as the user drew it: unresolved
+    /// link targets are links the user authored, so they render (grey) by
+    /// default and hide only through an explicit filter choice.
+    fn default() -> Self {
+        Self {
+            predicate: NotePredicate::default(),
+            neighborhood: None,
+            include_attachments: false,
+            include_embeds: false,
+            show_unresolved: true,
+        }
+    }
 }
 
 impl GraphScope {

@@ -682,54 +682,6 @@ impl WorkspaceState {
         Ok(())
     }
 
-    /// Advance the retained target after its own guarded, acknowledged edit.
-    /// Other-origin edits must use invalidation, never this authorization path.
-    ///
-    /// # Errors
-    /// Rejects changed target identities, stale revisions, composition, sequence
-    /// exhaustion, and caret positions outside UTF-8 boundaries.
-    pub fn acknowledge_target_edit(
-        &mut self,
-        expected: crate::input::WritingTarget,
-        revision: u64,
-        caret: usize,
-        text: &str,
-    ) -> Result<(), &'static str> {
-        if self.writing_target != Some(expected) || revision <= expected.revision {
-            return Err("writing target changed before acknowledgement");
-        }
-        if !text.is_char_boundary(caret) {
-            return Err("acknowledged caret is not a UTF-8 boundary");
-        }
-        let view = self
-            .tabs
-            .get_mut(&expected.tab)
-            .ok_or("target view closed")?;
-        let interaction = view.interaction();
-        if interaction.incarnation != expected.incarnation
-            || interaction.sequence != expected.interaction_sequence
-            || interaction.composition != crate::input::CompositionState::Idle
-        {
-            return Err("target interaction changed before acknowledgement");
-        }
-        let mut next = interaction.clone();
-        next.revision = revision;
-        next.sequence = next
-            .sequence
-            .checked_add(1)
-            .ok_or("interaction sequence exhausted")?;
-        next.selections = vec![crate::input::CommittedSelection::caret(caret)];
-        let sequence = next.sequence;
-        view.set_interaction(next);
-        self.writing_target = Some(crate::input::WritingTarget {
-            revision,
-            caret_text_byte: caret,
-            interaction_sequence: sequence,
-            ..expected
-        });
-        Ok(())
-    }
-
     /// Release keyboard ownership without changing document or writing context.
     /// Advancing the sequence makes controlled runtimes observe the blur.
     pub fn release_editor_focus(&mut self, except: Option<TabId>) {

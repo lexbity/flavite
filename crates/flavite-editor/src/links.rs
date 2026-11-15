@@ -228,6 +228,17 @@ mod tests {
     }
 
     #[test]
+    fn spaced_unresolved_targets_scan_as_links() {
+        // A closed wikilink whose target has no indexed note still scans as
+        // a link (the graph's grey node and the create-from-link flow both
+        // key off this payload); spaces in the target are legal.
+        let links = scan_links("# Alpha\n\nalpha body\n[[zz test]]");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].payload.target_raw, "zz test");
+        assert!(!links[0].embed);
+    }
+
+    #[test]
     fn links_and_decorations_use_shared_scanner_and_exclusions() {
         let text = "[[Ideas]] `[[code]]`\n\n```md\n[[fence]]\n```\n\n$[[math]]$ ![[diagram.png]] #topic ^block";
         let links = scan_links(text);

@@ -182,6 +182,9 @@ pub struct App {
     /// (W-D): `plan_restore` validates membership against the catalog,
     /// which is no longer synchronously available on the attach turn.
     restore_pending: bool,
+    /// A New-note dialog was opened from a task-free path; serve its input
+    /// focus on the next update turn (see `update`).
+    pub(crate) dialog_focus_pending: bool,
     pub operations: OperationPump,
     /// Completions routed past the per-pump turn budget; the next pump tick
     /// continues (NFR-08: UI event-loop work is budgeted, never lost).
@@ -771,6 +774,7 @@ impl App {
             pointer_feedback: false,
             window_geometry_dirty: true,
             restore_pending: false,
+            dialog_focus_pending: false,
             operations: OperationPump::default(),
             completion_backlog: VecDeque::new(),
             status,
@@ -2264,6 +2268,7 @@ impl App {
                         self.dialog = Some(crate::host::dialogs::offer_create_for_link(
                             &navigation.target,
                         ));
+                        self.dialog_focus_pending = true;
                     } else {
                         self.status = "Edit link: the target is not an indexed note".into();
                     }
@@ -2519,6 +2524,21 @@ impl App {
         let task = self.update_inner(message);
         crate::host::input::reconcile_buffer_revisions(self);
         crate::host::context_mode::reconcile(self);
+        // A dialog opened from a task-free path (editor Navigate, graph
+        // activation) still needs its input focused: the focus request
+        // rides this turn's task once the dialog is mounted.
+        let task = if std::mem::take(&mut self.dialog_focus_pending)
+            && matches!(
+                self.dialog,
+                Some(crate::host::dialogs::Dialog::NewNote { .. })
+            ) {
+            iced::Task::batch([
+                task,
+                iced::widget::operation::focus(crate::host::dialogs::NEW_NOTE_INPUT_ID),
+            ])
+        } else {
+            task
+        };
         if !geometry_only && (!pointer_only || self.pointer_feedback) {
             self.refresh_semantics();
         }
@@ -4287,12 +4307,32 @@ impl App {
                         .checked_add(serialized.len())
                     && let Some(view) = self.note_editor_view(target.tab)
                     && view.revision == revision
-                    && self
-                        .workspace
-                        .acknowledge_target_edit(target, revision, caret, &view.text)
-                        .is_err()
                 {
-                    self.workspace.invalidate_writing_target(target.buffer_id);
+                    // The insert landed outside the captured-input chain, so
+                    // the acknowledged interaction must be advanced here. It
+                    // goes through the full api acknowledgment — the same one
+                    // typing and pointer commits use — because that path also
+                    // commits the Session's editor-view stamp; a workspace-only
+                    // target bump would leave the next ticketed edit (typing,
+                    // undo) refused at the stale stamp.
+                    let acknowledged = self
+                        .workspace
+                        .tab(&target.tab)
+                        .map(|session| session.interaction().clone())
+                        .is_some_and(|mut interaction| {
+                            interaction.buffer_id = Some(view.buffer_id);
+                            interaction.revision = revision;
+                            interaction.sequence = interaction.sequence.saturating_add(1);
+                            interaction.selections =
+                                vec![flavite_workspace::CommittedSelection::caret(caret)];
+                            interaction.primary = 0;
+                            interaction.focused = true;
+                            self.acknowledge_editor_interaction(interaction, &view.text)
+                                .is_ok()
+                        });
+                    if !acknowledged {
+                        self.workspace.invalidate_writing_target(target.buffer_id);
+                    }
                 }
                 self.linking
                     .finish(crate::host::linking::GestureState::Inserted {
@@ -5114,6 +5154,7 @@ mod tests {
             pointer_feedback: false,
             window_geometry_dirty: true,
             restore_pending: false,
+            dialog_focus_pending: false,
             operations: OperationPump::default(),
             completion_backlog: VecDeque::new(),
             status: "Ready".into(),

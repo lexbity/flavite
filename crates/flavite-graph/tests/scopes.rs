@@ -160,6 +160,43 @@ fn default_hides_attachment_and_embed_layers_and_unknown_query_is_an_error() {
     };
     assert!(evaluate(&batch, &empty, &BTreeMap::new(), &query).is_err());
 }
+#[test]
+fn default_scope_keeps_unresolved_targets_visible_until_filtered_away() {
+    // A link to a note that does not exist must still render (grey): the
+    // default scope shows unresolved targets, and hiding them is an
+    // explicit filter choice.
+    let mut batch = fixture();
+    let mut ghost = GraphNodeRecord::note(
+        9,
+        "zz test",
+        b"zz test".to_vec(),
+        "[[zz test]]",
+        None,
+        false,
+    );
+    ghost.id = NodeId::unresolved(9);
+    batch.nodes.push(ghost);
+    batch.edges.push(GraphEdgeRecord {
+        from: NodeId::note(1),
+        to: NodeId::unresolved(9),
+        kind: EdgeKind::Link,
+    });
+    let empty = BTreeMap::new();
+    let result = evaluate(&batch, &empty, &BTreeMap::new(), &GraphScope::default()).unwrap();
+    assert!(result.nodes.contains(&NodeId::unresolved(9)));
+    let scope = GraphScope {
+        show_unresolved: false,
+        ..GraphScope::default()
+    };
+    let result = evaluate(&batch, &empty, &BTreeMap::new(), &scope).unwrap();
+    assert!(!result.nodes.contains(&NodeId::unresolved(9)));
+    assert!(
+        !result
+            .edges
+            .iter()
+            .any(|edge| edge.to == NodeId::unresolved(9))
+    );
+}
 proptest! {
  #![proptest_config(ProptestConfig::with_cases(1024))]
  #[test]
