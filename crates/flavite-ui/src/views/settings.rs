@@ -222,6 +222,9 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
         );
     }
 
+    // FEUX-0003 X07: Profiles section
+    body = body.push(profiles_section(app, metrics));
+
     container(
         column![
             row![
@@ -730,6 +733,157 @@ fn context_keys_section<'a>(app: &'a App, metrics: &crate::style::Metrics) -> El
             text(error.clone())
                 .size(metrics.text_sm)
                 .style(style::dim_text),
+        );
+    }
+
+    section.into()
+}
+
+/// FEUX-0003 X07: The profiles section: list, create, import, export, apply, delete.
+#[allow(clippy::too_many_lines)]
+fn profiles_section<'a>(app: &'a App, metrics: &crate::style::Metrics) -> Element<'a, Message> {
+    let mut section = column![
+        text("Profiles").size(metrics.text_lg),
+        text("Named, shareable settings collections. Captured from current settings; applied through the existing funnel.")
+            .size(metrics.text_sm)
+            .style(style::dim_text),
+    ]
+    .spacing(metrics.spacing_sm);
+
+    // List of profiles
+    let profiles = &app.settings.profiles;
+    if profiles.is_empty() {
+        section = section.push(
+            text("No profiles yet. Create one from your current settings.")
+                .size(metrics.text_sm)
+                .style(style::dim_text),
+        );
+    } else {
+        let mut profiles_list = column![].spacing(metrics.spacing_sm);
+        for profile in profiles {
+            let mut row = row![
+                text(profile.name().to_string()).size(metrics.text),
+                text(format!("({} bytes)", profile.bytes.len()))
+                    .size(metrics.text_sm)
+                    .style(style::dim_text),
+            ]
+            .spacing(metrics.spacing_sm)
+            .align_y(iced::alignment::Vertical::Center);
+
+            // Apply button
+            row = row.push(
+                button(text("Apply").size(metrics.text_sm))
+                    .padding(tab_strip::chip_padding())
+                    .style(style::ghost())
+                    .on_press(Message::Settings(SettingsMessage::ProfilesApply {
+                        id: profile.id.id.clone(),
+                    })),
+            );
+
+            // Export button
+            row = row.push(
+                button(text("Export").size(metrics.text_sm))
+                    .padding(tab_strip::chip_padding())
+                    .style(style::ghost())
+                    .on_press(Message::Settings(SettingsMessage::ProfilesExportPick {
+                        id: profile.id.id.clone(),
+                    })),
+            );
+
+            // Delete button
+            let deleting = app.settings.pending_profile_delete.as_deref() == Some(&profile.id.id);
+            if deleting {
+                row = row.push(
+                    text("Delete this profile?")
+                        .size(metrics.text_sm)
+                        .style(style::dim_text),
+                );
+                row = row.push(
+                    button(text("Confirm").size(metrics.text_sm))
+                        .padding(tab_strip::chip_padding())
+                        .style(style::action())
+                        .on_press(Message::Settings(SettingsMessage::ProfilesDeleteConfirm {
+                            id: profile.id.id.clone(),
+                        })),
+                );
+                row = row.push(
+                    button(text("Cancel").size(metrics.text_sm))
+                        .padding(tab_strip::chip_padding())
+                        .style(style::ghost())
+                        .on_press(Message::Settings(SettingsMessage::ProfilesDeleteCancel)),
+                );
+            } else {
+                row = row.push(
+                    button(text("Delete").size(metrics.text_sm))
+                        .padding(tab_strip::chip_padding())
+                        .style(style::ghost())
+                        .on_press(Message::Settings(SettingsMessage::ProfilesDeleteAsk {
+                            id: profile.id.id.clone(),
+                        })),
+                );
+            }
+
+            profiles_list = profiles_list.push(row);
+        }
+        section = section.push(profiles_list);
+    }
+
+    // Action buttons
+    let mut actions = row![].spacing(metrics.spacing_sm);
+
+    // Create from current
+    actions = actions.push(
+        button(text("Create from current…").size(metrics.text_sm))
+            .padding(tab_strip::chip_padding())
+            .style(style::ghost())
+            .on_press(Message::Settings(SettingsMessage::ProfilesCreate {
+                name: "New Profile".to_string(),
+            })),
+    );
+
+    // Import
+    actions = actions.push(
+        button(text("Import profile…").size(metrics.text_sm))
+            .padding(tab_strip::chip_padding())
+            .style(style::ghost())
+            .on_press(Message::Settings(SettingsMessage::ProfilesImportPick)),
+    );
+
+    // Restore backup
+    if app.settings.backup_available {
+        actions = actions.push(
+            button(text("Restore last settings backup").size(metrics.text_sm))
+                .padding(tab_strip::chip_padding())
+                .style(style::ghost())
+                .on_press(Message::Settings(SettingsMessage::RestoreBackupShortcut)),
+        );
+    }
+
+    section = section.push(actions);
+
+    // Last apply result
+    if let Some(result) = &app.settings.last_apply_result {
+        section = section.push(
+            text(format!(
+                "Applied: {} settings changed, {} pending restart",
+                result.changed, result.restart_pending
+            ))
+            .size(metrics.text_sm)
+            .style(style::dim_text),
+        );
+    }
+
+    // Profile name input for creation (when creating)
+    if !app.settings.profile_name_draft.is_empty() {
+        section = section.push(
+            text_input("Profile name", &app.settings.profile_name_draft)
+                .size(metrics.text_sm)
+                .on_input(|value| {
+                    Message::Settings(SettingsMessage::ProfilesCreateName { name: value })
+                })
+                .on_submit(Message::Settings(SettingsMessage::ProfilesCreate {
+                    name: app.settings.profile_name_draft.clone(),
+                })),
         );
     }
 

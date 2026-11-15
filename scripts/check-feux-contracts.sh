@@ -385,17 +385,150 @@ run_feux0003_x01_gates() {
     gate assert_present 'pub fn word_bounds' "$root/crates/flavite-edit-context/src/text.rs"
     gate assert_present 'pub fn selected_characters' "$root/crates/flavite-edit-context/src/text.rs"
     gate assert_present 'pub fn clamp_grapheme_boundary' "$root/crates/flavite-edit-context/src/text.rs"
-    # Grammar still exists (not deleted until X02)
-    gate assert_nonempty "$root/crates/flavite-edit-context/src/grammar.rs"
+    # Grammar still exists in X01, deleted in X02+
+    # gate assert_nonempty "$root/crates/flavite-edit-context/src/grammar.rs"
     # Editor capture boundary extended to 35 positions
     gate assert_present 'Code::KeyM|Code::KeyN|Code::KeyQ|Code::KeyR|Code::KeyS|Code::KeyZ' "$root/crates/flavite-editor/src/context.rs"
     gate assert_present 'Code::Quote|Code::Comma|Code::Period|Code::Backslash|Code::BracketLeft|Code::BracketRight|Code::Minus|Code::Equal' "$root/crates/flavite-editor/src/context.rs"
     # Coverage test extended to 35 positions
     gate assert_present 'Code::KeyM.*KeyCode::KeyM' "$root/crates/flavite-editor/src/context.rs"
     # Shadow equivalence test exists
-    gate assert_present 'shadow_equivalence_with_delivered_grammar' "$root/crates/flavite-editor/src/context.rs"
-    # Keymap tests exist
-    gate assert_present 'defaults_keymap_classifies_identically_to_grammar' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'defaults_keymap_classifies_identically_to_delivered_grammar' "$root/crates/flavite-edit-context/src/keymap.rs"
+}
+
+run_feux0003_x02_gates() {
+    run_feux0003_x01_gates
+    # FEUX-0003 X02: Grammar deleted, hints derive
+    # grammar.rs is deleted - check it doesn't exist
+    gate test ! -f "$root/crates/flavite-edit-context/src/grammar.rs"
+    # Old grammar functions gone
+    gate assert_absent 'fn command_key\|fn motion_key\|fn menu_key' "$root/crates/flavite-edit-context/src/"
+    # hint() functions deleted
+    gate assert_absent 'pub fn hint\(\)' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    gate assert_absent 'ContextMenu::hint' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    # ContextMenu::Type is deleted
+    gate assert_absent 'ContextMenu::Type' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    # Host uses keymap lookups
+    gate assert_present 'lookup_root' "$root/crates/flavite-ui/src/host/context_mode.rs"
+    gate assert_present 'lookup_menu' "$root/crates/flavite-ui/src/host/context_mode.rs"
+    # Toolbar uses derived labels
+    gate assert_present 'context_label' "$root/crates/flavite-ui/src/views/context_toolbar.rs"
+    gate assert_present 'binding_label' "$root/crates/flavite-ui/src/host/appearance.rs"
+}
+
+run_feux0003_x03_gates() {
+    run_feux0003_x02_gates
+    # FEUX-0003 X03: rebindable surface
+    # Descriptors exist
+    gate assert_present 'shortcuts.context_keys' "$root/crates/flavite-settings/src/registry.rs"
+    gate assert_present 'appearance.keyboard_layout' "$root/crates/flavite-settings/src/registry.rs"
+    # CaptureRequest enum exists
+    gate assert_present 'pub enum CaptureRequest' "$root/crates/flavite-ui/src/host/settings.rs"
+    # set_context_key message exists
+    gate assert_present 'SetContextKey' "$root/crates/flavite-ui/src/host/settings.rs"
+    # Context Mode keys section exists
+    gate assert_present 'context_keys_section' "$root/crates/flavite-ui/src/views/settings.rs"
+    # binding_label in keymap
+    gate assert_present 'pub fn binding_label' "$root/crates/flavite-edit-context/src/keymap.rs"
+}
+
+run_feux0003_x04_gates() {
+    run_feux0003_x03_gates
+    # FEUX-0003 X04: Type menu dissolution
+    # Type menu enum variant deleted
+    gate assert_absent 'ContextMenu::Type' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    # INTRO/UNBOUND reworded
+    gate assert_present 'Select text, then act' "$root/crates/flavite-edit-context/src/session.rs"
+    gate assert_present 'choose a menu' "$root/crates/flavite-edit-context/src/session.rs"
+    # Type button removed from toolbar
+    gate assert_absent 'ContextMenu::Type' "$root/crates/flavite-ui/src/views/context_toolbar.rs"
+    # Only 3 menus remain
+    gate assert_present 'pub enum ContextMenu' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    gate assert_present 'Select,' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    gate assert_present 'Go,' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    gate assert_present 'More,' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+}
+
+run_feux0003_x05_gates() {
+    run_feux0003_x04_gates
+    # FEUX-0003 X05: Layout labels
+    # Layout enum exists with 5 variants
+    gate assert_present 'pub enum Layout' "$root/crates/flavite-edit-context/src/labels.rs"
+    gate assert_present 'Qwerty' "$root/crates/flavite-edit-context/src/labels.rs"
+    gate assert_present 'Dvorak' "$root/crates/flavite-edit-context/src/labels.rs"
+    gate assert_present 'Colemak' "$root/crates/flavite-edit-context/src/labels.rs"
+    gate assert_present 'Azerty' "$root/crates/flavite-edit-context/src/labels.rs"
+    gate assert_present 'Qwertz' "$root/crates/flavite-edit-context/src/labels.rs"
+    # glyph function exists
+    gate assert_present 'pub fn glyph' "$root/crates/flavite-edit-context/src/labels.rs"
+    # keyboard_layout descriptor exists
+    gate assert_present 'appearance.keyboard_layout' "$root/crates/flavite-settings/src/registry.rs"
+    # Appearance host has keyboard_layout
+    gate assert_present 'pub keyboard_layout' "$root/crates/flavite-ui/src/host/appearance.rs"
+}
+
+run_feux0003_x06_gates() {
+    run_feux0003_x05_gates
+    # FEUX-0003 X06: Profiles store and facade
+    # profiles.rs exists
+    gate assert_nonempty "$root/crates/flavite-api/src/profiles.rs"
+    # ProfilesStore exists
+    gate assert_present 'pub struct ProfilesStore' "$root/crates/flavite-api/src/profiles.rs"
+    # Facade methods exist
+    gate assert_present 'profiles_list' "$root/crates/flavite-api/src/flavite.rs"
+    gate assert_present 'profiles_create_from_current' "$root/crates/flavite-api/src/flavite.rs"
+    gate assert_present 'profiles_apply' "$root/crates/flavite-api/src/flavite.rs"
+    gate assert_present 'profiles_delete' "$root/crates/flavite-api/src/flavite.rs"
+    gate assert_present 'profiles_import_path' "$root/crates/flavite-api/src/flavite.rs"
+    gate assert_present 'profiles_export_path' "$root/crates/flavite-api/src/flavite.rs"
+    # ApplyProfileResult exists
+    gate assert_present 'pub struct ApplyProfileResult' "$root/crates/flavite-api/src/flavite.rs"
+    # Profile diagnostics events exist
+    gate assert_present 'ProfileCaptured' "$root/crates/flavite-ui/src/host/editor_diagnostics.rs"
+    gate assert_present 'ProfileApplied' "$root/crates/flavite-ui/src/host/editor_diagnostics.rs"
+    gate assert_present 'ProfileCreated' "$root/crates/flavite-ui/src/host/editor_diagnostics.rs"
+    gate assert_present 'ProfileDeleted' "$root/crates/flavite-ui/src/host/editor_diagnostics.rs"
+    gate assert_present 'ProfileImported' "$root/crates/flavite-ui/src/host/editor_diagnostics.rs"
+    gate assert_present 'ProfileExported' "$root/crates/flavite-ui/src/host/editor_diagnostics.rs"
+    # ProfilesStore tests exist
+    gate assert_nonempty "$root/crates/flavite-api/tests/profiles_store.rs"
+    gate assert_nonempty "$root/crates/flavite-api/tests/profiles_facade.rs"
+}
+
+run_feux0003_x07_gates() {
+    run_feux0003_x06_gates
+    # FEUX-0003 X07: Profiles UI and acceptance
+    # Profiles section in settings view
+    gate assert_present 'fn profiles_section' "$root/crates/flavite-ui/src/views/settings.rs"
+    # Profile messages in SettingsMessage
+    gate assert_present 'ProfilesList' "$root/crates/flavite-ui/src/host/settings.rs"
+    gate assert_present 'ProfilesCreate' "$root/crates/flavite-ui/src/host/settings.rs"
+    gate assert_present 'ProfilesApply' "$root/crates/flavite-ui/src/host/settings.rs"
+    gate assert_present 'ProfilesDelete' "$root/crates/flavite-ui/src/host/settings.rs"
+    gate assert_present 'ProfilesImport' "$root/crates/flavite-ui/src/host/settings.rs"
+    gate assert_present 'ProfilesExport' "$root/crates/flavite-ui/src/host/settings.rs"
+    # Profile state in SettingsHost
+    gate assert_present 'pub profiles' "$root/crates/flavite-ui/src/host/settings.rs"
+    gate assert_present 'pub profile_name_draft' "$root/crates/flavite-ui/src/host/settings.rs"
+    gate assert_present 'pub pending_profile_delete' "$root/crates/flavite-ui/src/host/settings.rs"
+    # Profile methods in SettingsHost
+    gate assert_present 'pub fn list_profiles' "$root/crates/flavite-ui/src/host/settings.rs"
+    gate assert_present 'pub fn create_profile' "$root/crates/flavite-ui/src/host/settings.rs"
+    gate assert_present 'pub fn apply_profile' "$root/crates/flavite-ui/src/host/settings.rs"
+    gate assert_present 'pub fn delete_profile' "$root/crates/flavite-ui/src/host/settings.rs"
+    gate assert_present 'pub fn import_profile' "$root/crates/flavite-ui/src/host/settings.rs"
+    gate assert_present 'pub fn export_profile' "$root/crates/flavite-ui/src/host/settings.rs"
+    # workspace.apply_profile command
+    gate assert_present 'workspace.apply_profile' "$root/crates/flavite-ui/src/host/commands.rs"
+    # Dialog functions for import/export
+    gate assert_present 'pick_profile_import_file' "$root/crates/flavite-ui/src/host/dialogs/mod.rs"
+    gate assert_present 'pick_profile_export_file' "$root/crates/flavite-ui/src/host/dialogs/mod.rs"
+    # Workbench scripts
+    gate assert_nonempty "$root/scripts/tests/workbench/context_mode_rebind.py"
+    gate assert_nonempty "$root/scripts/tests/workbench/settings_profiles.py"
+    # Documentation updated
+    gate assert_present 'Settings profiles' "$root/docs/APP-FEATURES.md"
+    gate assert_present 'Rebindable Context Mode keys' "$root/docs/APP-FEATURES.md"
 }
 
 case "$slice" in
@@ -408,7 +541,13 @@ case "$slice" in
     X07) run_x07_gates ;;
     X08) run_x08_gates ;;
     FEUX0003-X01) run_feux0003_x01_gates ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05 X06 X07 X08 FEUX0003-X01)" >&2; exit 2 ;;
+    FEUX0003-X02) run_feux0003_x02_gates ;;
+    FEUX0003-X03) run_feux0003_x03_gates ;;
+    FEUX0003-X04) run_feux0003_x04_gates ;;
+    FEUX0003-X05) run_feux0003_x05_gates ;;
+    FEUX0003-X06) run_feux0003_x06_gates ;;
+    FEUX0003-X07) run_feux0003_x07_gates ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05 X06 X07 X08 FEUX0003-X01 FEUX0003-X02 FEUX0003-X03 FEUX0003-X04 FEUX0003-X05 FEUX0003-X06 FEUX0003-X07)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then

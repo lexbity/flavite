@@ -439,6 +439,10 @@ pub const UI_COMMANDS: &[UiCommand] = &[
         id: "workspace.close_group",
         title: "Close group",
     },
+    UiCommand {
+        id: "workspace.apply_profile",
+        title: "Apply profile",
+    },
 ];
 
 /// The UI portion of the host catalog, rendered as core `CommandSpec`s for
@@ -1424,6 +1428,20 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
         }
         "workspace.save_layout" => app.save_layout_now(),
         "workspace.reset_layout" => app.reset_layout(),
+        "workspace.apply_profile" => {
+            // FEUX-0003 X07: Open the Settings tab to the Profiles section
+            // If there are profiles, the user can apply from there
+            if let Some(group) = app.navigation_group() {
+                app.dispatch_layout(|revision| LayoutAction::OpenSettings {
+                    expected_revision: revision,
+                    group,
+                });
+            }
+            // List profiles to show in the Settings tab
+            if let Some(flavite) = app.flavite.as_ref() {
+                app.settings.list_profiles(flavite);
+            }
+        }
         other => app.status = format!("{other} is not a host command"),
     }
     iced::Task::none()
@@ -1586,6 +1604,10 @@ pub fn available(app: &App, id: &str) -> bool {
         | "workspace.preferences"
         | "workspace.refresh_catalog" => app.flavite.is_some(),
         "help.about" => true,
+        "workspace.apply_profile" => {
+            // FEUX-0003 X07: disabled when there are no profiles
+            !app.settings.profiles.is_empty()
+        }
         _ => true,
     }
 }

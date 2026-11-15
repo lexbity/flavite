@@ -23,6 +23,7 @@ use flavite_settings::resolve::{RegistryResolve, Resolved};
 use flavite_settings::value::SettingValue;
 use flavite_workspace::TabId;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 /// The capture request state: what kind of key capture is active.
 /// This replaces the previous `Option<String>` capture state to support
@@ -254,6 +255,42 @@ pub enum SettingsMessage {
     /// RFC-0006 S04 (D-02): acknowledge the changed graph gesture contract.
     /// Persisted through the funnel (the hidden `state.*` descriptor).
     AcknowledgeGraphActivation,
+    /// FEUX-0003 X07: List profiles.
+    ProfilesList,
+    /// FEUX-0003 X07: Create a profile from current settings.
+    ProfilesCreate { name: String },
+    /// FEUX-0003 X07: User entered a name for profile creation.
+    ProfilesCreateName { name: String },
+    /// FEUX-0003 X07: Apply a profile by id.
+    ProfilesApply { id: String },
+    /// FEUX-0003 X07: Ask before deleting a profile.
+    ProfilesDeleteAsk { id: String },
+    /// FEUX-0003 X07: Confirm profile deletion.
+    ProfilesDeleteConfirm { id: String },
+    /// FEUX-0003 X07: Cancel profile deletion.
+    ProfilesDeleteCancel,
+    /// FEUX-0003 X07: Open native dialog to pick a profile import path.
+    ProfilesImportPick,
+    /// FEUX-0003 X07: Import profile from the picked path.
+    ProfilesImportPath(std::path::PathBuf),
+    /// FEUX-0003 X07: Open native dialog to pick a profile export path.
+    ProfilesExportPick { id: String },
+    /// FEUX-0003 X07: Export profile to the picked path.
+    ProfilesExportPath {
+        id: String,
+        path: std::path::PathBuf,
+    },
+    /// FEUX-0003 X07: Restore from the last settings backup.
+    RestoreBackupShortcut,
+}
+
+/// FEUX-0003 X07: Summary of the last profile apply for the status line.
+#[derive(Debug, Clone, Default)]
+pub struct ApplyResultSummary {
+    /// Number of settings changed.
+    pub changed: usize,
+    /// Number of settings pending restart.
+    pub restart_pending: usize,
 }
 
 /// The settings host: one per app, loaded at vault attach and refreshed on
@@ -300,6 +337,16 @@ pub struct SettingsHost {
     selected: BTreeMap<TabId, String>,
     /// Per-tab selected TOC category (`None` = All).
     categories: BTreeMap<TabId, Option<String>>,
+    /// FEUX-0003 X07: The list of stored profiles.
+    pub profiles: Vec<flavite_api::profiles::StoredProfile>,
+    /// FEUX-0003 X07: The profile name draft for creation.
+    pub profile_name_draft: String,
+    /// FEUX-0003 X07: The profile id awaiting deletion confirmation.
+    pub pending_profile_delete: Option<String>,
+    /// FEUX-0003 X07: The profile id currently being exported.
+    pub exporting_profile: Option<String>,
+    /// FEUX-0003 X07: The last apply result summary.
+    pub last_apply_result: Option<ApplyResultSummary>,
 }
 
 impl SettingsHost {
@@ -488,6 +535,57 @@ impl SettingsHost {
             }
             Err(error) => Err(error.to_string()),
         }
+    }
+
+    /// FEUX-0003 X07: Load the profile list from the facade.
+    pub fn list_profiles(&mut self, flavite: &Flavite) {
+        self.profiles = flavite.profiles_list().unwrap_or_default();
+    }
+
+    /// FEUX-0003 X07: Create a profile from current settings.
+    pub fn create_profile(&mut self, flavite: &mut Flavite, name: String) -> Result<(), String> {
+        flavite
+            .profiles_create_from_current(&name)
+            .map_err(|e| e.to_string())?;
+        self.list_profiles(flavite);
+        Ok(())
+    }
+
+    /// FEUX-0003 X07: Apply a profile by id.
+    pub fn apply_profile(
+        &mut self,
+        flavite: &mut Flavite,
+        id: &str,
+    ) -> Result<ApplyResultSummary, String> {
+        let result = flavite.profiles_apply(id).map_err(|e| e.to_string())?;
+        self.load(flavite);
+        Ok(ApplyResultSummary {
+            changed: result.changed,
+            restart_pending: result.restart_pending,
+        })
+    }
+
+    /// FEUX-0003 X07: Delete a profile by id.
+    pub fn delete_profile(&mut self, flavite: &Flavite, id: &str) -> Result<(), String> {
+        flavite.profiles_delete(id).map_err(|e| e.to_string())?;
+        self.list_profiles(flavite);
+        Ok(())
+    }
+
+    /// FEUX-0003 X07: Import a profile from a path.
+    pub fn import_profile(&mut self, flavite: &Flavite, path: &Path) -> Result<(), String> {
+        flavite
+            .profiles_import_path(path)
+            .map_err(|e| e.to_string())?;
+        self.list_profiles(flavite);
+        Ok(())
+    }
+
+    /// FEUX-0003 X07: Export a profile to a path.
+    pub fn export_profile(&self, flavite: &Flavite, id: &str, path: &Path) -> Result<(), String> {
+        flavite
+            .profiles_export_path(id, path)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -728,6 +826,144 @@ pub fn handle(app: &mut App, message: SettingsMessage) -> iced::Task<Message> {
                 iced::Task::none()
             }
         },
+        SettingsMessage::ProfilesList => {
+            if let Some(flavite) = app.flavite.as_ref() {
+                app.settings.list_profiles(flavite);
+            }
+            iced::Task::none()
+        }
+        SettingsMessage::ProfilesCreate { name } => {
+            if let Some(flavite) = app.flavite.as_mut() {
+                match app.settings.create_profile(flavite, name.clone()) {
+                    Ok(_) => {
+                        app.settings.profile_name_draft.clear();
+                        app.status = format!("Profile '{name}' created");
+                    }
+                    Err(error) => {
+                        app.status = format!("Failed to create profile: {error}");
+                    }
+                }
+            }
+            iced::Task::none()
+        }
+        SettingsMessage::ProfilesCreateName { name } => {
+            app.settings.profile_name_draft = name;
+            iced::Task::none()
+        }
+        SettingsMessage::ProfilesApply { id } => {
+            if let Some(flavite) = app.flavite.as_mut() {
+                match app.settings.apply_profile(flavite, &id) {
+                    Ok(result) => {
+                        app.settings.last_apply_result = Some(result.clone());
+                        app.status = format!(
+                            "Applied profile '{}': {} settings changed, {} pending restart",
+                            id, result.changed, result.restart_pending
+                        );
+                        app.diagnostics.record(
+                            None,
+                            crate::host::editor_diagnostics::ModeEnum::Off,
+                            crate::host::editor_diagnostics::EventKind::ProfileApplied,
+                            crate::host::editor_diagnostics::Outcome::Applied,
+                            Some(result.changed as u32),
+                            None,
+                        );
+                    }
+                    Err(error) => {
+                        app.status = format!("Failed to apply profile: {error}");
+                    }
+                }
+            }
+            iced::Task::none()
+        }
+        SettingsMessage::ProfilesDeleteAsk { id } => {
+            app.settings.pending_profile_delete = Some(id);
+            app.status = "Delete this profile? Confirm on its row.".into();
+            iced::Task::none()
+        }
+        SettingsMessage::ProfilesDeleteConfirm { id: _ } => {
+            let id_to_delete = app.settings.pending_profile_delete.take();
+            if let Some(del_id) = id_to_delete
+                && let Some(flavite) = app.flavite.as_ref()
+            {
+                match app.settings.delete_profile(flavite, &del_id) {
+                    Ok(_) => {
+                        app.status = format!("Profile '{del_id}' deleted");
+                        app.diagnostics.record(
+                            None,
+                            crate::host::editor_diagnostics::ModeEnum::Off,
+                            crate::host::editor_diagnostics::EventKind::ProfileDeleted,
+                            crate::host::editor_diagnostics::Outcome::Applied,
+                            None,
+                            None,
+                        );
+                    }
+                    Err(error) => {
+                        app.status = format!("Failed to delete profile: {error}");
+                    }
+                }
+            }
+            iced::Task::none()
+        }
+        SettingsMessage::ProfilesDeleteCancel => {
+            app.settings.pending_profile_delete = None;
+            iced::Task::none()
+        }
+        SettingsMessage::ProfilesImportPick => crate::host::dialogs::pick_profile_import_file(),
+        SettingsMessage::ProfilesImportPath(path) => {
+            if let Some(flavite) = app.flavite.as_ref() {
+                match app.settings.import_profile(flavite, &path) {
+                    Ok(_) => {
+                        app.status = format!("Profile imported from {}", path.display());
+                        app.diagnostics.record(
+                            None,
+                            crate::host::editor_diagnostics::ModeEnum::Off,
+                            crate::host::editor_diagnostics::EventKind::ProfileImported,
+                            crate::host::editor_diagnostics::Outcome::Applied,
+                            None,
+                            None,
+                        );
+                    }
+                    Err(error) => {
+                        app.status = format!("Failed to import profile: {error}");
+                    }
+                }
+            }
+            iced::Task::none()
+        }
+        SettingsMessage::ProfilesExportPick { id } => {
+            crate::host::dialogs::pick_profile_export_file(id)
+        }
+        SettingsMessage::ProfilesExportPath { id, path } => {
+            if let Some(flavite) = app.flavite.as_ref() {
+                match app.settings.export_profile(flavite, &id, &path) {
+                    Ok(_) => {
+                        app.settings.exporting_profile = None;
+                        app.status = format!("Profile exported to {}", path.display());
+                        app.diagnostics.record(
+                            None,
+                            crate::host::editor_diagnostics::ModeEnum::Off,
+                            crate::host::editor_diagnostics::EventKind::ProfileExported,
+                            crate::host::editor_diagnostics::Outcome::Applied,
+                            None,
+                            None,
+                        );
+                    }
+                    Err(error) => {
+                        app.status = format!("Failed to export profile: {error}");
+                    }
+                }
+            }
+            iced::Task::none()
+        }
+        SettingsMessage::RestoreBackupShortcut => {
+            if let Some(flavite) = app.flavite.as_ref() {
+                app.settings.load(flavite);
+                app.appearance.load(flavite);
+                app.appearance.reload_theme_package(flavite);
+                app.status = "Settings restored from the last-good backup".into();
+            }
+            iced::Task::none()
+        }
     }
 }
 

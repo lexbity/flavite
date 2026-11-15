@@ -229,11 +229,110 @@ Guards:
 
 ---
 
+## Settings profiles (FEUX-0003)
+
+Profiles capture the delta from descriptor defaults for visible settings only.
+They are inert TOML documents stored under `<vault>/.flavite/profiles/` and are
+**not** live-linked: they are explicitly applied through the existing settings
+funnel (one CAS write per apply).
+
+### Profile operations
+
+| Operation | Effect |
+|---|---|
+| **Create** | Captures current resolved settings as delta from defaults; hidden keys and unknown keys are excluded |
+| **Apply** | Atomic document write: merges profile into current settings; one-frame live adoption; reports counts |
+| **Import** | Creates a profile from a TOML file (≤ 64 KiB); schema > 2 refused; unparseable refused |
+| **Export** | Writes profile TOML to a chosen path; overwrite allowed |
+| **Delete** | Removes profile from store; confirmation required |
+
+### Limits
+
+| Limit | Value |
+|---|---|
+| Maximum profiles | 64 |
+| Maximum profile size | 64 KiB |
+| Maximum profile name length | 64 bytes |
+
+### recovery
+
+Every apply creates a pre-write backup (`settings.toml.bak`). The Settings tab
+carries a persistent **"Restore last settings backup"** affordance that reloads
+the backup, byte-identical.
+
+---
+
+## Rebindable Context Mode keys (FEUX-0003)
+
+Context Mode key bindings are fully rebindable via the
+`shortcuts.context_keys` setting. The keymap is data-driven, validated as a
+whole layer, and rebuilt synchronously at every settings adoption.
+
+### Binding tokens
+
+| Token format | Meaning |
+|---|---|
+| `physical:KeyD` | Bare position (KeyD) |
+| `shift+physical:KeyD` | Shifted position (⇧D) |
+| `unbound` | Remove the binding |
+
+Position names are the 35-member vocabulary: all 26 letters plus
+`Semicolon`, `Quote`, `Comma`, `Period`, `Slash`, `Backslash`,
+`BracketLeft`, `BracketRight`, `Minus`, `Equal`.
+
+### Binding families
+
+- **Commands**: `editor.delete`, `editor.paste`, etc. (can use bare or shift)
+- **Motions**: `editor.motion.previous`, etc. (bare only; shift always means extend)
+- **Menu openers**: `editor.menu_select` (KeyV), `editor.menu_go` (KeyG) (bare only)
+- **Menu accelerators**: command ids scoped by menu (bare only)
+
+### Validation rules
+
+1. **Injectivity**: no two root bindings share the same (position, shift) slot
+2. **No shift on motions**: `shift+physical:KeyH` on a motion is a validation error
+3. **Unknown ids**: binding to a non-existent id is refused
+4. **Unknown positions**: binding to a non-admitted position is refused
+5. **Whole-layer rejection**: any violation rejects the entire user layer; effective keymap = pure default
+
+### Labels
+
+Context Mode hints derive from the effective keymap and the declared
+keyboard layout (`appearance.keyboard_layout`). Supported layouts:
+`qwerty`, `dvorak`, `colemak`, `azerty`, `qwertz`. Labels show the unshifted
+glyph for the position (e.g., on Dvorak, position KeyD renders as `e`);
+shifted bindings show `⇧` + unshifted glyph.
+
+### Layout tables
+
+Each layout maps all 35 positions to their produced glyph. The declared
+layout is user-asserted; verification from observed characters is a
+follow-on.
+
+---
+
+## Keyboard layouts (FEUX-0003)
+
+The `appearance.keyboard_layout` setting declares the physical keyboard layout
+for Context Mode hint rendering. The setting has no effect on key behavior
+— only on label display.
+
+Supported layouts: QWERTY, Dvorak, Colemak, AZERTY, QWERTZ.
+
+| Layout | Example mappings |
+|---|---|
+| QWERTY | `KeyD` → `d`, `KeyE` → `e` |
+| Dvorak | `KeyD` → `e`, `KeyE` → `.` |
+| Colemak | `KeyD` → `s`, `KeyE` → `f` |
+| AZERTY | `KeyA` → `q`, `KeyQ` → `a` |
+| QWERTZ | `KeyY` → `z`, `KeyZ` → `y` |
+
+---
+
 ## Out of scope (deferred)
 
 Registers and clipboard history, macros, `.` repeat-last-change, counts
 (`3dw`), shell pipes, LSP refactoring, surround, case/style/line
 transforms, per-selection regex split/keep/drop, rectangular/column
-selection, scoped/union selection matching across views, rebindable Context
-Mode accelerators, and mode persistence across tab switches are not shipped
+selection, and scoped/union selection matching across views are not shipped
 and are not planned in the current release horizon.

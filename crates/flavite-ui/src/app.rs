@@ -277,6 +277,10 @@ pub enum Message {
     Settings(crate::host::settings::SettingsMessage),
     /// The native theme-package dialog resolved (xpi themes).
     ThemePackagePicked(Option<std::path::PathBuf>),
+    /// FEUX-0003 X07: The native profile import dialog resolved.
+    ProfileImportPicked(Option<std::path::PathBuf>),
+    /// FEUX-0003 X07: The native profile export dialog resolved.
+    ProfileExportPicked(Option<(String, std::path::PathBuf)>),
     /// Begin a close for one tab (W12): decide or close.
     RequestCloseTab(TabId),
     /// Begin a close for a whole group (W12): plan per tab.
@@ -3451,6 +3455,22 @@ impl App {
                     return crate::host::settings::handle(
                         self,
                         crate::host::settings::SettingsMessage::ThemeInstallFromPath(path),
+                    );
+                }
+            }
+            Message::ProfileImportPicked(path) => {
+                if let Some(p) = path {
+                    return crate::host::settings::handle(
+                        self,
+                        crate::host::settings::SettingsMessage::ProfilesImportPath(p),
+                    );
+                }
+            }
+            Message::ProfileExportPicked(result) => {
+                if let Some((id, path)) = result {
+                    return crate::host::settings::handle(
+                        self,
+                        crate::host::settings::SettingsMessage::ProfilesExportPath { id, path },
                     );
                 }
             }
