@@ -2303,10 +2303,17 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 let geometry_action = physical
                     .and_then(crate::context::native_code)
                     .and_then(|code| {
-                        flavite_edit_context::motion_key(
-                            code,
-                            crate::context::native_modifiers(*modifiers),
-                        )
+                        // X02: Use inline motion check since widget doesn't have access to keymap
+                        // Vertical motions: K=Up, J=Down (bare and shifted per default keymap)
+                        match code {
+                            flavite_edit_context::KeyCode::KeyK => {
+                                Some(flavite_edit_context::Motion::Up)
+                            }
+                            flavite_edit_context::KeyCode::KeyJ => {
+                                Some(flavite_edit_context::Motion::Down)
+                            }
+                            _ => None,
+                        }
                     })
                     .map(crate::context::motion_action)
                     .filter(|a| matches!(a, KeyAction::Up | KeyAction::Down))

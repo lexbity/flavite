@@ -139,10 +139,10 @@ impl ContextState {
         }
     }
 
-    pub const INTRO: &str = "Select text, then act · i types · Esc returns to commands";
+    pub const INTRO: &str = "Select text, then act · Esc returns to commands";
     pub const TYPING_HINT: &str = "Typing · click or move to reposition · Esc returns to commands";
     pub const ESC_HINT: &str = "Commands · exit with ✕ or the toggle shortcut";
-    pub const UNBOUND: &str = "No command on this key · choose a menu or Type";
+    pub const UNBOUND: &str = "No command on this key · choose a menu";
     pub const AWAIT_CHAR_HINT: &str = "Waiting for character…";
     pub const MENU_TARGET_STALE: &str = "Source changed; choose the command again";
 

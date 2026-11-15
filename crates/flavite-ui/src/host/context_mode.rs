@@ -1393,7 +1393,7 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
         ContextMessage::Unbound(target) => {
             if valid(app, target, false) {
                 app.context_mode
-                    .notice("No command on this key · choose a menu or Type");
+                    .notice("No command on this key · choose a menu");
             }
             Task::none()
         }

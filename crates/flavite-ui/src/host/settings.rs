@@ -24,6 +24,18 @@ use flavite_settings::value::SettingValue;
 use flavite_workspace::TabId;
 use std::collections::BTreeMap;
 
+/// The capture request state: what kind of key capture is active.
+/// This replaces the previous `Option<String>` capture state to support
+/// both chord capture (for catalog shortcuts) and position capture (for
+/// Context Mode keys).
+#[derive(Debug, Clone)]
+pub enum CaptureRequest {
+    /// Capturing a chord for a catalog shortcut.
+    Chord(String),
+    /// Capturing a physical position for a Context Mode binding.
+    ContextKey(String),
+}
+
 /// Settings tab messages (RFC-0007 §4.4). Read-path messages never
 /// persist; every edit message lands in [`SettingsHost::apply`].
 #[derive(Debug, Clone)]
@@ -190,6 +202,32 @@ pub enum SettingsMessage {
         /// The captured chord string, or `None` when cancelled.
         chord: Option<String>,
     },
+    /// Begin Context Mode key capture: the next physical key press becomes the binding's token.
+    BeginContextKeyCapture {
+        /// The binding id being captured.
+        binding_id: String,
+    },
+    /// A captured physical key press, or Escape (`token: None` cancels).
+    ContextKeyCaptured {
+        /// The binding id being captured.
+        binding_id: String,
+        /// The captured token string, or `None` when cancelled.
+        token: Option<String>,
+    },
+    /// Set a Context Mode key binding override.
+    SetContextKey {
+        /// The binding id.
+        binding_id: String,
+        /// The token string (e.g., "physical:KeyD", "shift+physical:KeyD", "unbound"), or `None` to restore default.
+        token: Option<String>,
+    },
+    /// Unbind a Context Mode key binding.
+    UnbindContextKey {
+        /// The binding id to unbind.
+        binding_id: String,
+    },
+    /// Restore all Context Mode key bindings to defaults.
+    RestoreContextKeys,
     /// Open the native file dialog to pick a standard `.xpi` package.
     ThemeInstallPick,
     /// Convert and install the package at this path (the dialog result or
@@ -246,10 +284,10 @@ pub struct SettingsHost {
     /// The inline error of the last refused edit, keyed by descriptor id
     /// (rendered under the row).
     pub row_error: Option<(String, String)>,
-    /// While a shortcut row is capturing, the command id waiting for the
+    /// While a shortcut row is capturing, the capture request waiting for the
     /// next key press. Escape cancels (the keyboard router owns the
     /// interception, the state lives here).
-    pub capture: Option<String>,
+    pub capture: Option<CaptureRequest>,
     /// The theme package awaiting removal confirmation.
     pub pending_uninstall: Option<String>,
     /// Per-tab `Int` row draft texts, keyed by descriptor id.
@@ -599,7 +637,7 @@ pub fn handle(app: &mut App, message: SettingsMessage) -> iced::Task<Message> {
             SettingValue::ShortcutMap(BTreeMap::new()),
         ),
         SettingsMessage::BeginShortcutCapture { command } => {
-            app.settings.capture = Some(command.clone());
+            app.settings.capture = Some(CaptureRequest::Chord(command.clone()));
             app.status = format!("Press the new key combination for {command} (Escape cancels)");
             iced::Task::none()
         }
@@ -613,6 +651,33 @@ pub fn handle(app: &mut App, message: SettingsMessage) -> iced::Task<Message> {
                 }
             }
         }
+        SettingsMessage::BeginContextKeyCapture { binding_id } => {
+            app.settings.capture = Some(CaptureRequest::ContextKey(binding_id.clone()));
+            app.status = format!(
+                "Press the physical key for {binding_id} (Shift for shifted variant, Escape cancels)"
+            );
+            iced::Task::none()
+        }
+        SettingsMessage::ContextKeyCaptured { binding_id, token } => {
+            app.settings.capture = None;
+            match token {
+                Some(token) => app.set_context_key(&binding_id, Some(token)),
+                None => {
+                    app.appearance.keymap_error = None;
+                    iced::Task::none()
+                }
+            }
+        }
+        SettingsMessage::SetContextKey { binding_id, token } => {
+            app.set_context_key(&binding_id, token)
+        }
+        SettingsMessage::UnbindContextKey { binding_id } => {
+            app.set_context_key(&binding_id, Some("unbound".to_string()))
+        }
+        SettingsMessage::RestoreContextKeys => app.apply_setting(
+            "shortcuts.context_keys",
+            SettingValue::ShortcutMap(BTreeMap::new()),
+        ),
         SettingsMessage::ThemeInstallPick => crate::host::dialogs::pick_theme_file(),
         SettingsMessage::ThemeInstallFromPath(path) => app.install_theme_package(path),
         SettingsMessage::ThemeUninstallAsk { id, .. } => {
@@ -773,6 +838,64 @@ impl App {
         self.appearance.shortcut_error = None;
         self.apply_setting("shortcuts.overrides", SettingValue::ShortcutMap(next))
     }
+
+    /// Set a Context Mode key binding override (FEUX-0003 X03).
+    /// Validates the whole layer: a token must parse, Rule X must hold,
+    /// and there must be no collisions. On validation failure the
+    /// entire layer is refused and the first error is surfaced.
+    pub fn set_context_key(
+        &mut self,
+        binding_id: &str,
+        token: Option<String>,
+    ) -> iced::Task<Message> {
+        use flavite_edit_context::keymap::ContextKeymap;
+
+        let mut next = current_context_keys(self);
+        match token {
+            Some(text) => {
+                next.insert(binding_id.to_owned(), text);
+            }
+            None => {
+                next.remove(binding_id);
+            }
+        }
+
+        // Validate the whole layer (E-6: whole-layer rejection, no partial application)
+        match ContextKeymap::resolve(&next) {
+            Ok(_) => {
+                self.appearance.keymap_error = None;
+                self.apply_setting("shortcuts.context_keys", SettingValue::ShortcutMap(next))
+            }
+            Err(errors) => {
+                // Surface the first error
+                let message = if let Some(first) = errors.first() {
+                    first.to_string()
+                } else {
+                    "Invalid Context Mode key configuration".to_string()
+                };
+                // Count all errors
+                let count = errors.len();
+                let full_message = if count > 1 {
+                    format!("{message} ({} problems total)", count)
+                } else {
+                    message
+                };
+                self.appearance.keymap_error = Some(full_message.clone());
+                self.status = full_message;
+                iced::Task::none()
+            }
+        }
+    }
+}
+
+/// The current effective Context Mode key override map.
+fn current_context_keys(app: &App) -> BTreeMap<String, String> {
+    app.settings
+        .resolved
+        .as_ref()
+        .and_then(|resolved| resolved.get("shortcuts.context_keys"))
+        .and_then(|value| value.as_shortcut_map().cloned())
+        .unwrap_or_default()
 }
 
 impl App {
@@ -791,6 +914,36 @@ impl App {
     #[must_use]
     pub fn restore_shortcuts_message(&self) -> Message {
         Message::Settings(SettingsMessage::RestoreShortcuts)
+    }
+
+    /// The message that sets a Context Mode key binding (FEUX-0003 X03).
+    #[must_use]
+    pub fn set_context_key_message(&self, binding_id: String, token: Option<String>) -> Message {
+        Message::Settings(SettingsMessage::SetContextKey { binding_id, token })
+    }
+
+    /// The message that begins capturing a Context Mode key (FEUX-0003 X03).
+    #[must_use]
+    pub fn begin_context_key_capture_message(&self, binding_id: String) -> Message {
+        Message::Settings(SettingsMessage::BeginContextKeyCapture { binding_id })
+    }
+
+    /// The message that unbinds a Context Mode key (FEUX-0003 X03).
+    #[must_use]
+    pub fn unbind_context_key_message(&self, binding_id: String) -> Message {
+        Message::Settings(SettingsMessage::UnbindContextKey { binding_id })
+    }
+
+    /// The message that restores all Context Mode key bindings to defaults (FEUX-0003 X03).
+    #[must_use]
+    pub fn restore_context_keys_message(&self) -> Message {
+        Message::Settings(SettingsMessage::RestoreContextKeys)
+    }
+
+    /// Returns all default Context Mode binding ids (FEUX-0003 X03).
+    #[must_use]
+    pub fn context_key_binding_ids() -> Vec<&'static str> {
+        flavite_edit_context::keymap::ContextKeymap::default_binding_ids()
     }
 }
 

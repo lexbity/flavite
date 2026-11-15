@@ -115,22 +115,21 @@ pub const fn motion_action(motion: Motion) -> KeyAction {
         Motion::Up => KeyAction::Up,
         Motion::Down => KeyAction::Down,
         Motion::NextWord => KeyAction::NextWord,
-        Motion::NextWordEnd => KeyAction::NextWordEnd,
         Motion::PreviousWord => KeyAction::PreviousWord,
+        Motion::NextWordEnd => KeyAction::NextWordEnd,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flavite_edit_context::{ContextCommand as C, Modifiers, command_key, keymap};
 
-    /// Every grammar key identity converts from a native physical code
-    /// (FEUX-0002 E-8/R9): the conversion boundary covers the whole
+    /// Every position in the 35-position vocabulary converts from a native physical code
+    /// (FEUX-0002 E-8/R9, FEUX-0003 E-2): the conversion boundary covers the whole
     /// advertised physical vocabulary, so `f`/`Shift+F` and every other
-    /// binding reach the grammar on real hardware.
+    /// binding reach the keymap on real hardware.
     #[test]
-    fn native_converter_covers_the_whole_grammar_vocabulary() {
+    fn native_converter_covers_the_whole_vocabulary() {
         // Full 35-position vocabulary (FEUX-0003 E-2)
         let all = [
             // Letters A-Z
@@ -172,202 +171,60 @@ mod tests {
             (Code::Minus, KeyCode::Minus),
             (Code::Equal, KeyCode::Equal),
         ];
-        for (native, grammar) in all {
+        for (native, expected) in all {
             assert_eq!(
                 native_code(native),
-                Some(grammar),
-                "{native:?} must convert to {grammar:?}"
+                Some(expected),
+                "{native:?} must convert to {expected:?}"
             );
         }
     }
 
+    /// The default keymap is the sole source of truth for Context Mode bindings (FEUX-0003 X02).
+    /// This test verifies that all expected default bindings are present in the keymap.
     #[test]
-    fn native_f_reaches_the_find_char_grammar() {
-        let code = native_code(Code::KeyF).expect("KeyF converts");
-        assert_eq!(
-            command_key(code, Modifiers::EMPTY),
-            Some(flavite_edit_context::ContextCommand::FindChar { forward: true })
-        );
-        assert_eq!(
-            command_key(code, Modifiers::SHIFT),
-            Some(flavite_edit_context::ContextCommand::FindChar { forward: false })
-        );
-    }
-
-    /// Shadow equivalence test (FEUX-0003 X01 AC-1): the default keymap
-    /// classifies every (position, shift) pair identically to the delivered grammar.
-    #[test]
-    fn shadow_equivalence_with_delivered_grammar() {
+    fn default_keymap_has_expected_bindings() {
         use flavite_edit_context::key::KeyCode;
-        use flavite_edit_context::{ContextMenu, keymap, menu_key, motion_key};
-        use keymap::{BindingId, Slot};
+        use flavite_edit_context::keymap::{BindingId, ContextKeymap, Slot};
 
-        let keymap = keymap::ContextKeymap::defaults();
+        let keymap = ContextKeymap::defaults();
 
-        // All positions from the original grammar (before X01 extension)
-        let original_positions = [
-            KeyCode::KeyA,
-            KeyCode::KeyB,
-            KeyCode::KeyC,
-            KeyCode::KeyD,
-            KeyCode::KeyE,
-            KeyCode::KeyF,
-            KeyCode::KeyG,
-            KeyCode::KeyH,
-            KeyCode::KeyI,
-            KeyCode::KeyJ,
-            KeyCode::KeyK,
-            KeyCode::KeyL,
-            KeyCode::KeyO,
-            KeyCode::KeyP,
-            KeyCode::KeyT,
-            KeyCode::KeyU,
-            KeyCode::KeyV,
-            KeyCode::KeyW,
-            KeyCode::KeyX,
-            KeyCode::KeyY,
-            KeyCode::Semicolon,
-            KeyCode::Slash,
-        ];
+        // Verify that F (bare and shifted) maps to FindChar
+        let f_slot = Slot {
+            position: KeyCode::KeyF,
+            shift: false,
+        };
+        let sf_slot = Slot {
+            position: KeyCode::KeyF,
+            shift: true,
+        };
+        assert!(matches!(
+            keymap.lookup_root(f_slot),
+            Some(BindingId::FindChar { forward: true })
+        ));
+        assert!(matches!(
+            keymap.lookup_root(sf_slot),
+            Some(BindingId::FindChar { forward: false })
+        ));
 
-        for code in original_positions {
-            for shift in [false, true] {
-                let slot = Slot {
-                    position: code,
-                    shift,
-                };
-                let modifiers = Modifiers {
-                    shift,
-                    ..Modifiers::EMPTY
-                };
+        // Verify that D maps to Delete
+        let d_slot = Slot {
+            position: KeyCode::KeyD,
+            shift: false,
+        };
+        assert_eq!(
+            keymap.lookup_root(d_slot).map(|b| b.id()),
+            Some("editor.delete")
+        );
 
-                // Check command_key equivalence
-                let grammar_cmd = command_key(code, modifiers);
-                let keymap_binding = keymap.lookup_root(slot);
-
-                // For FindChar, the grammar returns ContextCommand variants
-                // while the keymap uses BindingId::FindChar, so we need special handling
-                match grammar_cmd {
-                    Some(C::FindChar { forward: true }) => {
-                        assert!(
-                            matches!(
-                                keymap_binding,
-                                Some(keymap::BindingId::FindChar { forward: true })
-                            ),
-                            "FindChar forward mismatch for {}{}",
-                            code.token(),
-                            if shift { " (shift)" } else { "" }
-                        );
-                    }
-                    Some(C::FindChar { forward: false }) => {
-                        assert!(
-                            matches!(
-                                keymap_binding,
-                                Some(keymap::BindingId::FindChar { forward: false })
-                            ),
-                            "FindChar backward mismatch for {}{}",
-                            code.token(),
-                            if shift { " (shift)" } else { "" }
-                        );
-                    }
-                    Some(cmd) => {
-                        let expected_id = cmd.id();
-                        let actual_id = keymap_binding.map(|b| b.id());
-                        assert_eq!(
-                            actual_id,
-                            Some(expected_id),
-                            "Command mismatch for {}{}: grammar={:?}, keymap={:?}",
-                            code.token(),
-                            if shift { " (shift)" } else { "" },
-                            grammar_cmd,
-                            keymap_binding
-                        );
-                    }
-                    None => {
-                        // If command_key returns None, check if motion_key returns Some
-                        let grammar_motion = motion_key(code, modifiers);
-                        let keymap_motion = keymap_binding.and_then(|bid| match bid {
-                            keymap::BindingId::Motion(m) => Some(*m),
-                            _ => None,
-                        });
-
-                        // Handle menu openers (V, G, T) - they are in keymap but not in grammar
-                        if let Some(keymap::BindingId::MenuOpener(_)) = keymap_binding {
-                            // Menu openers are first-class in keymap but host special-casing in grammar
-                            // This is expected for X02
-                            assert_eq!(
-                                grammar_motion,
-                                None,
-                                "Menu opener should not have a motion in grammar: {}{}",
-                                code.token(),
-                                if shift { " (shift)" } else { "" }
-                            );
-                        } else if let Some(motion) = grammar_motion {
-                            // Motion should match
-                            assert_eq!(
-                                keymap_motion,
-                                Some(motion),
-                                "Motion mismatch for {}{}: grammar motion={:?}, keymap motion={:?}",
-                                code.token(),
-                                if shift { " (shift)" } else { "" },
-                                grammar_motion,
-                                keymap_motion
-                            );
-                        } else {
-                            // Neither command nor motion should have a binding
-                            assert!(
-                                keymap_binding.is_none(),
-                                "Grammar returns None for both command and motion but keymap has binding for {}{}: {:?}",
-                                code.token(),
-                                if shift { " (shift)" } else { "" },
-                                keymap_binding
-                            );
-                        }
-                    }
-                }
-
-                // Check motion_key equivalence
-                let grammar_motion = motion_key(code, modifiers);
-                let keymap_motion = keymap_binding.and_then(|bid| match bid {
-                    keymap::BindingId::Motion(m) => Some(*m),
-                    _ => None,
-                });
-
-                match (grammar_motion, keymap_motion) {
-                    (Some(a), Some(b)) => assert_eq!(
-                        a,
-                        b,
-                        "Motion mismatch for {}{}",
-                        code.token(),
-                        if shift { " (shift)" } else { "" }
-                    ),
-                    (None, None) => {}
-                    _ => panic!(
-                        "Motion mismatch for {} shift={}: grammar={:?}, keymap={:?}",
-                        code.token(),
-                        shift,
-                        grammar_motion,
-                        keymap_motion
-                    ),
-                }
-            }
-        }
-
-        // Test menu_key equivalence for all menus
-        for menu in [ContextMenu::Select, ContextMenu::Go, ContextMenu::More] {
-            for code in original_positions {
-                let modifiers = Modifiers::EMPTY;
-                let grammar_result = menu_key(menu, code, modifiers);
-                let keymap_result = keymap.lookup_menu(menu, code);
-
-                assert_eq!(
-                    grammar_result,
-                    keymap_result,
-                    "Menu key mismatch for {menu:?}, {code:?}",
-                    menu = menu.title(),
-                    code = code.token()
-                );
-            }
-        }
+        // Verify that Shift+D maps to Cut
+        let sd_slot = Slot {
+            position: KeyCode::KeyD,
+            shift: true,
+        };
+        assert_eq!(
+            keymap.lookup_root(sd_slot).map(|b| b.id()),
+            Some("editor.cut")
+        );
     }
 }

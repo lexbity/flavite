@@ -89,6 +89,7 @@ pub enum KeyCode {
 
 impl KeyCode {
     /// Returns the canonical token name for this position (variant name).
+    #[must_use]
     pub const fn token(self) -> &'static str {
         match self {
             KeyCode::KeyA => "KeyA",
@@ -146,6 +147,7 @@ pub enum Motion {
 
 impl Motion {
     /// Returns the synthetic binding id for this motion.
+    #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
             Motion::Previous => "editor.motion.previous",
@@ -159,6 +161,7 @@ impl Motion {
     }
 
     /// Returns a stable token name for this motion variant.
+    #[must_use]
     pub const fn token(self) -> &'static str {
         match self {
             Motion::Previous => "previous",

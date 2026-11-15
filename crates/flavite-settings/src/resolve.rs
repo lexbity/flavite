@@ -244,7 +244,7 @@ mod tests {
         let doc = SettingsDoc::new(2);
         let resolved = registry.resolve(&doc);
 
-        // Should have all 17 descriptors (16 D-04 + the X07 burst-hint bool)
-        assert_eq!(resolved.all().len(), 17);
+        // Should have all 19 descriptors (16 D-04 + the X07 burst-hint bool + 2 X03 FEUX-0003)
+        assert_eq!(resolved.all().len(), 19);
     }
 }

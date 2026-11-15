@@ -132,6 +132,8 @@ pub struct AppearanceHost {
     pub last_error: Option<String>,
     /// The last shortcut-validation failure for the editor UI.
     pub shortcut_error: Option<String>,
+    /// The last keymap-validation failure for Context Mode keys.
+    pub keymap_error: Option<String>,
     /// The resolved chord table: default chords with any validated
     /// overrides applied. Rebuilt on every adoption.
     pub shortcuts: Vec<(flavite_api::Chord, &'static str)>,
@@ -163,6 +165,7 @@ impl AppearanceHost {
             system_dark: None,
             last_error: None,
             shortcut_error: None,
+            keymap_error: None,
             shortcuts: Vec::new(),
             context_keys: flavite_edit_context::ContextKeymap::defaults(),
             keyboard_layout: flavite_edit_context::labels::Layout::default(),
@@ -501,11 +504,11 @@ impl AppearanceHost {
         };
 
         // Keyboard layout for Context Mode labels (FEUX-0003 X02)
-        self.keyboard_layout = if let Some(s) = self.value("appearance.keyboard_layout").as_str() {
-            labels::Layout::parse(s).unwrap_or(labels::Layout::default())
-        } else {
-            labels::Layout::default()
-        };
+        self.keyboard_layout = self
+            .value("appearance.keyboard_layout")
+            .as_str()
+            .and_then(labels::Layout::parse)
+            .unwrap_or_default();
     }
 
     /// Resolve a keyboard event to its bound command id, if any chord

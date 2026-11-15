@@ -8,7 +8,7 @@ use flavite_fs::Fs;
 use flavite_settings::registry::SettingRegistry;
 use flavite_ui::app::{App, Message};
 use flavite_ui::host::commands;
-use flavite_ui::host::settings::SettingsMessage;
+use flavite_ui::host::settings::{CaptureRequest, SettingsMessage};
 use flavite_ui::views::settings;
 use flavite_workspace::{TabId, ViewKind};
 mod support;
@@ -623,7 +623,13 @@ fn shortcut_capture_flows_through_the_tab() {
     let _ = app.update(Message::Settings(SettingsMessage::BeginShortcutCapture {
         command: "workspace.find".into(),
     }));
-    assert_eq!(app.settings.capture.as_deref(), Some("workspace.find"));
+    assert_eq!(
+        app.settings.capture.as_ref().and_then(|c| match c {
+            CaptureRequest::Chord(s) => Some(s.as_str()),
+            _ => None,
+        }),
+        Some("workspace.find")
+    );
     assert!(
         app.status.contains("Press the new key combination"),
         "status: {}",

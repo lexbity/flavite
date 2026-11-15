@@ -571,7 +571,13 @@ fn control<'a>(
         // The dynamic kinds get dedicated sections: options resolved from
         // the theme store and the host chord catalog respectively (D-04).
         SettingKind::ThemePackage => theme_package_section(app, metrics, tab),
-        SettingKind::ShortcutMap => shortcut_section(app, metrics),
+        SettingKind::ShortcutMap => {
+            if descriptor.id == "shortcuts.context_keys" {
+                context_keys_section(app, metrics)
+            } else {
+                shortcut_section(app, metrics)
+            }
+        }
     }
 }
 
@@ -608,7 +614,10 @@ fn chord_label(app: &App, id: &str) -> String {
 fn shortcut_section<'a>(app: &'a App, metrics: &crate::style::Metrics) -> Element<'a, Message> {
     let mut section = column![].spacing(2);
     for (id, _) in crate::host::commands::DEFAULT_CHORDS {
-        let capturing = app.settings.capture.as_deref() == Some(*id);
+        let capturing = matches!(
+            app.settings.capture.as_ref(),
+            Some(crate::host::settings::CaptureRequest::Chord(c)) if c == *id
+        );
         let overridden = app.appearance.shortcut_overrides().contains_key(*id);
         let mut row = row![
             text((*id).to_owned()).size(metrics.text_sm),
@@ -647,6 +656,83 @@ fn shortcut_section<'a>(app: &'a App, metrics: &crate::style::Metrics) -> Elemen
                 .style(style::dim_text),
         );
     }
+    section.into()
+}
+
+/// The Context Mode keys section: per-binding capture for physical position tokens.
+#[allow(clippy::too_many_lines)]
+fn context_keys_section<'a>(app: &'a App, metrics: &crate::style::Metrics) -> Element<'a, Message> {
+    use flavite_edit_context::keymap::ContextKeymap;
+
+    let mut section = column![].spacing(2);
+    let binding_ids = ContextKeymap::default_binding_ids();
+
+    for id in binding_ids {
+        let capturing = matches!(
+            app.settings.capture.as_ref(),
+            Some(crate::host::settings::CaptureRequest::ContextKey(b)) if b == id
+        );
+        let overridden = app.appearance.context_key_overrides().contains_key(id);
+        let label = app.appearance.context_label(id);
+
+        let mut row = row![
+            text(id.to_owned()).size(metrics.text_sm),
+            text(label).size(metrics.text),
+        ]
+        .spacing(metrics.spacing_sm)
+        .align_y(iced::alignment::Vertical::Center);
+
+        row = row.push(
+            button(
+                text(if capturing {
+                    "Press key…".to_string()
+                } else {
+                    "Change".to_string()
+                })
+                .size(metrics.text_sm),
+            )
+            .padding(tab_strip::chip_padding())
+            .style(action_or_ghost(capturing))
+            .on_press(Message::Settings(SettingsMessage::BeginContextKeyCapture {
+                binding_id: id.to_owned(),
+            })),
+        );
+
+        if overridden {
+            row = row.push(
+                button(text("Reset").size(metrics.text_sm))
+                    .padding(tab_strip::chip_padding())
+                    .style(style::ghost())
+                    .on_press(app.set_context_key_message(id.to_owned(), None)),
+            );
+        }
+
+        // Add Unbind button for all bindings
+        row = row.push(
+            button(text("Unbind").size(metrics.text_sm))
+                .padding(tab_strip::chip_padding())
+                .style(style::ghost())
+                .on_press(app.unbind_context_key_message(id.to_owned())),
+        );
+
+        section = section.push(row);
+    }
+
+    section = section.push(
+        button(text("Restore default context keys").size(metrics.text_sm))
+            .padding(tab_strip::chip_padding())
+            .style(style::ghost())
+            .on_press(app.restore_context_keys_message()),
+    );
+
+    if let Some(error) = &app.appearance.keymap_error {
+        section = section.push(
+            text(error.clone())
+                .size(metrics.text_sm)
+                .style(style::dim_text),
+        );
+    }
+
     section.into()
 }
 

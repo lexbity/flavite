@@ -203,8 +203,7 @@ mod tests {
 
         assert!(
             missing.is_empty(),
-            "QWERTY table missing positions: {:?}",
-            missing
+            "QWERTY table missing positions: {missing:?}"
         );
     }
 

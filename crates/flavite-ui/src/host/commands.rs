@@ -538,6 +538,7 @@ pub fn catalog_conflicts(core_ids: &[&str]) -> Vec<String> {
 /// precedence; plain typing never triggers layout commands.
 #[must_use]
 pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
+    use iced::keyboard::key::Physical;
     if let Some(message) = super::file_browser::keyboard_message(app, &event) {
         return Some(message);
     }
@@ -562,49 +563,120 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
     }
     let keyboard::Event::KeyPressed {
         key,
+        physical_key,
         modifiers,
-        text,
         ..
     } = event
     else {
         return None;
     };
-    // A Preferences shortcut row is capturing: the next key press becomes
-    // that command's chord; Escape cancels (W11 collision editor).
-    if let Some(command) = app.settings.capture.clone() {
+    // A Preferences row is capturing: the next key press becomes either
+    // a chord for a catalog shortcut or a physical position for Context Mode.
+    if let Some(capture) = app.settings.capture.clone() {
         if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
-            return Some(Message::Settings(
-                crate::host::settings::SettingsMessage::ShortcutCaptured {
-                    command,
-                    chord: None,
-                },
-            ));
+            // Escape cancels any capture
+            return match capture {
+                crate::host::settings::CaptureRequest::Chord(command) => Some(Message::Settings(
+                    crate::host::settings::SettingsMessage::ShortcutCaptured {
+                        command,
+                        chord: None,
+                    },
+                )),
+                crate::host::settings::CaptureRequest::ContextKey(binding_id) => Some(
+                    Message::Settings(crate::host::settings::SettingsMessage::ContextKeyCaptured {
+                        binding_id,
+                        token: None,
+                    }),
+                ),
+            };
         }
-        let Some(token) = key_token(&key) else {
-            // Bare modifier key presses carry no key token; wait for the
-            // full combination.
-            return None;
-        };
-        let mut parts = Vec::new();
-        if modifiers.command() {
-            parts.push("Mod");
-        } else if modifiers.control() {
-            parts.push("Ctrl");
+
+        // Check for global modifiers (Ctrl/Alt/Logo) which are not allowed for Context Mode
+        let has_global_mod = modifiers.command() || modifiers.alt() || modifiers.logo();
+
+        match capture {
+            crate::host::settings::CaptureRequest::Chord(command) => {
+                // Chord capture: build the chord string
+                let Some(token) = key_token(&key) else {
+                    // Bare modifier key presses carry no key token; wait for the
+                    // full combination.
+                    return None;
+                };
+                let mut parts = Vec::new();
+                if modifiers.command() {
+                    parts.push("Mod");
+                } else if modifiers.control() {
+                    parts.push("Ctrl");
+                }
+                if modifiers.alt() {
+                    parts.push("Alt");
+                }
+                if modifiers.shift() {
+                    parts.push("Shift");
+                }
+                parts.push(token.as_str());
+                let chord = parts.join("+");
+                return Some(Message::Settings(
+                    crate::host::settings::SettingsMessage::ShortcutCaptured {
+                        command,
+                        chord: Some(chord),
+                    },
+                ));
+            }
+            crate::host::settings::CaptureRequest::ContextKey(binding_id) => {
+                // Context Mode key capture: convert to physical position token
+                // Global modifiers (Ctrl/Alt/Logo) are not allowed
+                if has_global_mod {
+                    // Return cancel message - the settings host will handle the error
+                    return Some(Message::Settings(
+                        crate::host::settings::SettingsMessage::ContextKeyCaptured {
+                            binding_id,
+                            token: None,
+                        },
+                    ));
+                }
+
+                // Get the physical key code from the event
+                let Physical::Code(phys_code) = physical_key else {
+                    // Not a physical code we can capture
+                    return Some(Message::Settings(
+                        crate::host::settings::SettingsMessage::ContextKeyCaptured {
+                            binding_id,
+                            token: None,
+                        },
+                    ));
+                };
+
+                // Convert to KeyCode using the editor's native_code
+                use flavite_editor::context::native_code;
+
+                let key_code = match native_code(phys_code) {
+                    Some(kc) => kc,
+                    None => {
+                        // Not in our vocabulary
+                        return Some(Message::Settings(
+                            crate::host::settings::SettingsMessage::ContextKeyCaptured {
+                                binding_id,
+                                token: None,
+                            },
+                        ));
+                    }
+                };
+
+                // Build the token string
+                let mut token = format!("physical:{}", key_code.token());
+                if modifiers.shift() {
+                    token = format!("shift+{}", token);
+                }
+
+                return Some(Message::Settings(
+                    crate::host::settings::SettingsMessage::ContextKeyCaptured {
+                        binding_id,
+                        token: Some(token),
+                    },
+                ));
+            }
         }
-        if modifiers.alt() {
-            parts.push("Alt");
-        }
-        if modifiers.shift() {
-            parts.push("Shift");
-        }
-        parts.push(token.as_str());
-        let chord = parts.join("+");
-        return Some(Message::Settings(
-            crate::host::settings::SettingsMessage::ShortcutCaptured {
-                command,
-                chord: Some(chord),
-            },
-        ));
     }
     // Modal dialogs take Escape (cancel) and Enter (primary action) first;
     // the submit arm routes per dialog kind (W12).
@@ -715,7 +787,6 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
     // An overlay hotkey that is also a printable character (P) must not
     // fire while the user types into a text field; overlays are the only
     // text inputs in W02, handled above.
-    let _ = text;
     None
 }
 

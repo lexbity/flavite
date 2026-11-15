@@ -1,5 +1,5 @@
-//! Context Mode's pure layer (FEUX-0002 E-2/E-3, FEUX-0003 X01): the finite command
-//! vocabulary, the physical-key grammar, the per-editor statechart, and the
+//! Context Mode's pure layer (FEUX-0002 E-2/E-3, FEUX-0003 X01-X02): the finite command
+//! vocabulary, the data-driven keymap, the per-editor statechart, and the
 //! implicit-effect planner.
 //!
 //! Everything here is a pure function of inputs. The host
@@ -7,10 +7,9 @@
 //! state, forwards events, and interprets the returned state/effect values;
 //! the widget (`flavite-editor`) captures native events and converts them to
 //! this crate's toolkit-free key identity at its boundary. There is exactly
-//! one state machine and one grammar, and nothing here reaches the app.
+//! one state machine and one keymap, and nothing here reaches the app.
 
 pub mod effect;
-pub mod grammar;
 pub mod key;
 pub mod keymap;
 pub mod labels;
@@ -18,7 +17,6 @@ pub mod session;
 pub mod text;
 pub mod vocabulary;
 
-pub use grammar::{command_key, menu_key, motion_key};
 pub use key::{KeyCode, Modifiers, Motion};
 pub use keymap::{BindingId, BindingToken, ContextKeymap, KeymapError, Slot};
 pub use labels::Layout;
