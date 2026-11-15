@@ -80,6 +80,11 @@ pub use settings_store::{
 };
 pub mod settings_cmds;
 pub use settings_cmds::*;
+pub mod profiles;
+pub use profiles::{
+    MAX_NAME_BYTES, MAX_PROFILE_BYTES, MAX_PROFILES, ProfileId, ProfilesStore, ProfilesStoreError,
+    StoredProfile,
+};
 
 // Re-export key types for convenience
 pub use capability::*;

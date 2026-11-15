@@ -695,6 +695,10 @@ pub struct Flavite {
     /// Device-local installed theme packages; `None` without an OS data
     /// directory. Theme commands run here, not on the vault session.
     pub(crate) themes: Option<crate::themes::ThemeStore>,
+    /// Vault profiles store (FEUX-0003 X06): inert TOML documents under
+    /// `<vault>/.flavite/profiles/`. Profiles are NOT live-linked; they are
+    /// explicitly applied through the settings funnel.
+    pub(crate) profiles: crate::profiles::ProfilesStore,
     /// Vault-relative user state (graph pins; W07/TD-11) behind the `Fs`.
     pub(crate) vault_user_state: flavite_vault::user_state::VaultUserStateStore,
     /// One graph base service per vault (W07/TD-12): the only graph-path
@@ -876,6 +880,10 @@ impl Flavite {
                 Box::new(flavite_fs::OsFs::new()),
                 &root,
             )),
+            profiles: crate::profiles::ProfilesStore::at_vault(
+                Box::new(flavite_fs::OsFs::new()),
+                &root,
+            ),
             vault_user_state,
             graph,
             settings_store,
@@ -1796,6 +1804,16 @@ impl Flavite {
         self.themes.as_ref()
     }
 
+    /// The vault's profiles store (`.flavite/profiles/`), always present for
+    /// an opened vault (FEUX-0003 X06). Profiles are inert TOML documents
+    /// that capture the delta from descriptor defaults for visible settings.
+    /// They are NOT live-linked; explicit apply through the settings funnel
+    /// is required.
+    #[must_use]
+    pub fn profiles(&self) -> &crate::profiles::ProfilesStore {
+        &self.profiles
+    }
+
     /// Current number of notice credits held by the host.
     #[must_use]
     pub fn outstanding_notice_count(&self) -> usize {
@@ -1954,6 +1972,217 @@ impl Flavite {
         flavite_settings::registry::SettingRegistry::builtins()
     }
 
+    // ============ FEUX-0003 X06: Profile operations ============
+
+    /// List all stored profiles (FEUX-0003 X06).
+    ///
+    /// Returns a list of all profile identities sorted by name.
+    pub fn profiles_list(&self) -> Result<Vec<crate::profiles::StoredProfile>, FlaviteError> {
+        self.profiles
+            .list()
+            .map_err(|e| FlaviteError::ProfilesError(e.to_string()))
+    }
+
+    /// Create a profile from the current resolved settings (FEUX-0003 X06).
+    ///
+    /// Captures the delta from descriptor defaults for visible descriptors only.
+    /// The profile is stored inertly; apply must be called separately.
+    ///
+    /// # Arguments
+    /// * `name` - The display name for the profile (sanitized and hashed for the id).
+    ///
+    /// # Returns
+    /// The stored profile on success.
+    pub fn profiles_create_from_current(
+        &self,
+        name: &str,
+    ) -> Result<crate::profiles::StoredProfile, FlaviteError> {
+        use flavite_settings::codec::serialize;
+
+        // Get the current resolved settings
+        let resolved_settings = self.settings_read()?;
+        let registry = flavite_settings::registry::SettingRegistry::with_builtins();
+
+        // Capture the delta using the resolved field
+        let delta_doc =
+            flavite_settings::resolve::capture_delta(&resolved_settings.resolved, &registry);
+
+        // Serialize to TOML
+        let toml_string =
+            serialize(&delta_doc).map_err(|e| FlaviteError::ProfilesParseError(e.to_string()))?;
+        let toml_bytes = toml_string.into_bytes();
+
+        // Create the profile in the store
+        self.profiles
+            .create(name, &toml_bytes)
+            .map_err(|e| FlaviteError::ProfilesError(e.to_string()))
+    }
+
+    /// Read a profile's raw bytes by id (FEUX-0003 X06).
+    pub fn profiles_read_bytes(&self, id: &str) -> Result<Vec<u8>, FlaviteError> {
+        self.profiles
+            .read_bytes(id)
+            .map_err(|e| FlaviteError::ProfilesError(e.to_string()))
+    }
+
+    /// Delete a profile by id (FEUX-0003 X06).
+    ///
+    /// # Arguments
+    /// * `id` - The internal profile id (not the display name).
+    pub fn profiles_delete(&self, id: &str) -> Result<(), FlaviteError> {
+        self.profiles
+            .delete(id)
+            .map_err(|e| FlaviteError::ProfilesError(e.to_string()))
+    }
+
+    /// Export a profile to a host path (FEUX-0003 X06).
+    ///
+    /// Copies the profile's TOML bytes to the specified path.
+    ///
+    /// # Arguments
+    /// * `id` - The internal profile id.
+    /// * `path` - The destination path on the host filesystem.
+    pub fn profiles_export_path(
+        &self,
+        id: &str,
+        path: &std::path::Path,
+    ) -> Result<(), FlaviteError> {
+        // Use the host OS filesystem for export
+        let os_fs = Box::new(flavite_fs::OsFs::new());
+        let store_with_os =
+            crate::profiles::ProfilesStore::at_root(os_fs, self.vault_ref().root.clone());
+        store_with_os
+            .export_path(id, path)
+            .map_err(|e| FlaviteError::ProfilesError(e.to_string()))
+    }
+
+    /// Import a profile from a host path (FEUX-0003 X06).
+    ///
+    /// Reads the TOML file from the host filesystem and creates a new profile.
+    /// The profile name is derived from the file stem.
+    ///
+    /// # Arguments
+    /// * `path` - The source path on the host filesystem.
+    ///
+    /// # Returns
+    /// The stored profile on success.
+    pub fn profiles_import_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<crate::profiles::StoredProfile, FlaviteError> {
+        // Use the host OS filesystem for import
+        let os_fs = Box::new(flavite_fs::OsFs::new());
+        let store_with_os =
+            crate::profiles::ProfilesStore::at_root(os_fs, self.vault_ref().root.clone());
+        store_with_os
+            .import_path(path)
+            .map_err(|e| FlaviteError::ProfilesError(e.to_string()))
+    }
+
+    /// Apply a profile to the current settings (FEUX-0003 X06/E-13).
+    ///
+    /// This is a ONE atomic CAS write through the settings funnel:
+    /// 1. Read the profile document
+    /// 2. Parse with the codec (schema > 2 -> refuse)
+    /// 3. Merge: clone current doc, set each applicable key (known-visible only;
+    ///    invalid values substituted with warnings; unknown/hidden skipped with warnings)
+    /// 4. Write once via settings_write CAS
+    /// 5. On success: re-resolve, live-apply, report counts + pending restart
+    ///
+    /// Apply is NOT undoable step-wise and has NO confirmation dialog.
+    /// Recovery is the always-visible "Restore last settings backup" affordance.
+    ///
+    /// # Arguments
+    /// * `id` - The internal profile id.
+    ///
+    /// # Returns
+    /// A result with counts of changed settings and restart-pending settings.
+    pub fn profiles_apply(&self, id: &str) -> Result<ApplyProfileResult, FlaviteError> {
+        use flavite_settings::codec::parse;
+
+        // Step 1: Read the profile bytes
+        let profile_bytes = self.profiles_read_bytes(id)?;
+
+        // Step 2: Parse the profile document
+        let profile_text = String::from_utf8(profile_bytes)
+            .map_err(|e| FlaviteError::ProfilesParseError(e.to_string()))?;
+        let parsed = parse(Some(&profile_text))
+            .map_err(|e| FlaviteError::ProfilesParseError(e.to_string()))?;
+
+        // Check schema version (must be <= 2)
+        if parsed.doc.schema > 2 {
+            return Err(FlaviteError::ProfilesSchemaNewer);
+        }
+
+        // Step 3: Get current document and generation
+        let stored_settings = self
+            .settings_store
+            .read()?
+            .ok_or(FlaviteError::ProfilesError(
+                "No settings document found".to_string(),
+            ))?;
+        let current_doc = stored_settings.doc;
+        let current_generation = stored_settings.generation;
+        let registry = flavite_settings::registry::SettingRegistry::with_builtins();
+
+        // Step 4: Merge: clone current, apply profile overrides
+        let mut merged_doc = current_doc.clone();
+        let mut changed_count = 0;
+        let mut warnings = Vec::new();
+        let mut restart_pending = 0;
+        let profile_doc = &parsed.doc;
+
+        // Apply each section/key from the profile
+        for (section, section_map) in &profile_doc.sections {
+            for (key, value) in section_map {
+                let full_key = format!("{}.{}", section, key);
+
+                // Check if this is a known descriptor
+                if let Some(descriptor) = registry.lookup(&full_key) {
+                    // Check visibility (E-12: hidden keys are never applied)
+                    if descriptor.visibility == flavite_settings::descriptor::Visibility::Hidden {
+                        warnings.push(format!("Skipping hidden key: {full_key}"));
+                        continue;
+                    }
+
+                    // Validate the value against the descriptor
+                    if let Err(validate_err) = descriptor.validate_value(value) {
+                        warnings.push(format!("Invalid value for {full_key}: {validate_err}"));
+                        // Substitute with descriptor default
+                        let default_value = descriptor.kind.default_value();
+                        let _ = merged_doc.set(&full_key, default_value, &registry);
+                        continue;
+                    }
+
+                    // Set the value
+                    let _ = merged_doc.set(&full_key, value.clone(), &registry);
+                    changed_count += 1;
+
+                    // Check if this requires restart
+                    if descriptor.apply == flavite_settings::descriptor::Apply::OnRestart {
+                        restart_pending += 1;
+                    }
+                } else {
+                    // Unknown key: preserve in stored file but skip on apply with warning
+                    warnings.push(format!("Unknown key: {full_key}"));
+                }
+            }
+        }
+
+        // Step 5: Write via CAS (using the generation we already retrieved)
+        self.settings_write(&merged_doc, current_generation)
+            .map_err(|e| FlaviteError::SettingsWriteError(e.to_string()))?;
+
+        // Re-resolve settings to apply changes
+        let _ = self.settings_read()?;
+
+        Ok(ApplyProfileResult {
+            changed: changed_count,
+            restart_pending,
+            warnings,
+        })
+    }
+
     /// Test-only seam: rewire every vault-rooted store (vault user state,
     /// theme packages, settings) onto a caller-owned `MemFs` so vault
     /// persistence is exercised hermetically — fixtures root vaults at
@@ -1969,6 +2198,7 @@ impl Flavite {
             Box::new(fs.clone()),
             &root,
         ));
+        self.profiles = crate::profiles::ProfilesStore::at_vault(Box::new(fs.clone()), &root);
         let settings_vault_store = Arc::new(flavite_vault::user_state::VaultUserStateStore::new(
             Box::new(fs.clone()),
             &root,
@@ -3416,6 +3646,22 @@ pub enum FlaviteError {
     #[error("Theme store error: {0}")]
     ThemeStore(String),
 
+    /// Profiles store error (FEUX-0003 X06).
+    #[error("Profiles store error: {0}")]
+    ProfilesError(String),
+
+    /// Profile parse error (FEUX-0003 X06).
+    #[error("Profile parse error: {0}")]
+    ProfilesParseError(String),
+
+    /// Profile schema is newer than supported (FEUX-0003 X06).
+    #[error("Profile schema version is newer than supported")]
+    ProfilesSchemaNewer,
+
+    /// Settings write error (FEUX-0003 X06).
+    #[error("Settings write error: {0}")]
+    SettingsWriteError(String),
+
     /// JSON serialization error.
     #[error("JSON error: {0}")]
     JsonError(#[from] serde_json::Error),
@@ -3435,6 +3681,17 @@ pub mod session {
 pub mod channels {
     pub use flavite_buffer::manager::NoteRef;
     pub use flavite_vault::channels::{Notice, Pulse, RenameTier};
+}
+
+/// Result of applying a profile (FEUX-0003 X06).
+#[derive(Debug, Clone)]
+pub struct ApplyProfileResult {
+    /// Number of settings changed.
+    pub changed: usize,
+    /// Number of settings requiring restart.
+    pub restart_pending: usize,
+    /// Warnings from the apply operation (unknown keys, invalid values, etc.).
+    pub warnings: Vec<String>,
 }
 
 /// Terminal completion for an asynchronous public command.
