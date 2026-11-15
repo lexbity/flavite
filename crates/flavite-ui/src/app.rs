@@ -189,6 +189,8 @@ pub struct App {
     pub notices: VecDeque<NoticePresentation>,
     reconcile_progress: Option<(u32, u32)>,
     window_size: iced::Size,
+    /// Whether the window is currently maximized (client-side chrome).
+    window_maximized: bool,
     /// Accessibility node routing map, rebuilt after every commit.
     pub a11y_nodes: BTreeMap<accesskit::NodeId, crate::accessibility::NodeTarget>,
     pub(crate) a11y_text_cache: std::cell::RefCell<crate::accessibility::text::EditorTextCache>,
@@ -244,6 +246,18 @@ pub enum Message {
     Mouse(iced::mouse::Event),
     Pump,
     WindowEvent(iced::window::Event),
+    /// Client-side window controls (the shell draws its own title bar).
+    WindowMinimize,
+    WindowToggleMaximize,
+    /// Begin an interactive move from the shell's drag region.
+    WindowDrag,
+    /// The shell's close control runs the same quit schedule as the (still
+    /// delivered) OS close request.
+    WindowClose,
+    /// The maximize-state poll that keeps the shell control's icon honest.
+    WindowMaximized(bool),
+    /// Open a hardcoded external URL (About links) through the OS handler.
+    OpenExternalUrl(String),
     /// A typed layout transaction.
     Layout(flavite_workspace::LayoutAction),
     /// The OS color scheme changed (W11 System theme).
@@ -754,6 +768,7 @@ impl App {
             notices: VecDeque::new(),
             reconcile_progress: None,
             window_size: iced::Size::new(1180.0, 760.0),
+            window_maximized: false,
             a11y_nodes: BTreeMap::new(),
             a11y_text_cache: std::cell::RefCell::default(),
             workspace,
@@ -1606,6 +1621,12 @@ impl App {
     #[must_use]
     pub const fn window_size(&self) -> iced::Size {
         self.window_size
+    }
+
+    /// Whether the window is currently maximized (client-side chrome).
+    #[must_use]
+    pub const fn window_maximized(&self) -> bool {
+        self.window_maximized
     }
 
     /// The group owning the focused tab.
@@ -2841,10 +2862,32 @@ impl App {
                 return crate::host::settings::handle(
                     self,
                     crate::host::settings::SettingsMessage::FocusGained,
-                );
+                )
+                .chain(crate::host::window::poll_maximized());
             }
             Message::WindowEvent(iced::window::Event::Resized(size)) => {
                 self.window_size = size;
+                // Maximize and unmaximize arrive as resizes; the shell
+                // control's icon follows the polled state.
+                return crate::host::window::poll_maximized();
+            }
+            Message::WindowMinimize => {
+                return crate::host::window::minimize();
+            }
+            Message::WindowToggleMaximize => {
+                return crate::host::window::toggle_maximize();
+            }
+            Message::WindowDrag => {
+                return crate::host::window::drag();
+            }
+            Message::WindowClose => {
+                self.begin_shutdown();
+            }
+            Message::WindowMaximized(maximized) => {
+                self.window_maximized = maximized;
+            }
+            Message::OpenExternalUrl(url) => {
+                return crate::host::reading::open_external(url);
             }
             Message::WindowEvent(iced::window::Event::Unfocused) => {
                 crate::host::context_mode::window_blurred(self);
@@ -5026,6 +5069,7 @@ mod tests {
             notices: VecDeque::new(),
             reconcile_progress: None,
             window_size: iced::Size::new(1180.0, 760.0),
+            window_maximized: false,
             a11y_nodes: BTreeMap::new(),
             a11y_text_cache: std::cell::RefCell::default(),
             workspace,

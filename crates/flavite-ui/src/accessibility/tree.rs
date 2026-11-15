@@ -77,6 +77,10 @@ pub enum NodeTarget {
     OpenPicker,
     /// Open the command palette.
     OpenPalette,
+    /// Client-side window controls (the shell draws its own title bar).
+    WindowMinimize,
+    WindowToggleMaximize,
+    WindowClose,
     Editor {
         tab: flavite_workspace::TabId,
         incarnation: u64,
@@ -447,6 +451,12 @@ pub fn build_node_map(app: &App) -> BTreeMap<NodeId, NodeTarget> {
         map.insert(node_id("sidebar-detach", 0), NodeTarget::SidebarToTab);
     }
     map.insert(node_id("command-palette", 0), NodeTarget::OpenPalette);
+    map.insert(node_id("window-minimize", 0), NodeTarget::WindowMinimize);
+    map.insert(
+        node_id("window-maximize", 0),
+        NodeTarget::WindowToggleMaximize,
+    );
+    map.insert(node_id("window-close", 0), NodeTarget::WindowClose);
     for group in app.workspace.group_order() {
         if let Some(g) = app.workspace.group(&group) {
             if !app.is_tab_visible(g.active()) {
@@ -868,6 +878,16 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
             (node_id("quick-switch", 0), "Quick switch"),
             (node_id("command-palette", 0), "Commands"),
             (node_id("sidebar-toggle", 0), "Toggle notes sidebar"),
+            (node_id("window-minimize", 0), "Minimize window"),
+            (
+                node_id("window-maximize", 0),
+                if app.window_maximized() {
+                    "Restore window size"
+                } else {
+                    "Maximize window"
+                },
+            ),
+            (node_id("window-close", 0), "Close window"),
         ] {
             let mut button = Node::new(Role::Button);
             button.set_label(label);

@@ -1630,31 +1630,19 @@ impl VaultActor {
                             "Download this attachment locally first".into(),
                         ));
                     }
+                    // The OS launch must only ever target a file that is
+                    // actually there: refuse missing paths up front instead
+                    // of handing them to the desktop handler.
+                    if !self.fs.exists(&path)? {
+                        return Err(flavite_fs::FsError::NotFound(path.clone()));
+                    }
                     let resolved = self.fs.canonicalize(&path)?;
                     self.fs.validate_in_root(&self.identity.root, &resolved)?;
-                    let extension = resolved
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    if !matches!(
-                        extension.as_str(),
-                        "png"
-                            | "jpg"
-                            | "jpeg"
-                            | "webp"
-                            | "gif"
-                            | "bmp"
-                            | "svg"
-                            | "pdf"
-                            | "txt"
-                            | "mp3"
-                            | "wav"
-                            | "ogg"
-                            | "mp4"
-                            | "webm"
-                            | "mov"
-                    ) {
+                    // Only classified attachments reach this path (the file
+                    // browser opens everything else as a text note); the
+                    // safe-open set is therefore exactly the attachment
+                    // classification.
+                    if flavite_index::schema::attachment_kind(&resolved).is_none() {
                         return Err(flavite_fs::FsError::Unsupported(
                             "Attachment has no supported safe open action".into(),
                         ));
@@ -2886,7 +2874,8 @@ impl VaultActor {
             && to
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
-        let attachment_rename = attachment_kind(&from).is_some() && attachment_kind(&to).is_some();
+        let attachment_rename = flavite_index::schema::attachment_kind(&from).is_some()
+            && flavite_index::schema::attachment_kind(&to).is_some();
         if !note_rename && !attachment_rename {
             return;
         }
@@ -2956,7 +2945,8 @@ impl VaultActor {
             && to
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
-        let attachment_rename = attachment_kind(&from).is_some() && attachment_kind(&to).is_some();
+        let attachment_rename = flavite_index::schema::attachment_kind(&from).is_some()
+            && flavite_index::schema::attachment_kind(&to).is_some();
         if !note_rename && !attachment_rename {
             return Err(
                 "rename source and destination must both be notes or supported attachments".into(),
@@ -3412,19 +3402,6 @@ impl VaultActor {
         }
         t2_sources
     }
-}
-
-fn attachment_kind(path: &std::path::Path) -> Option<flavite_index::schema::AttachmentKind> {
-    use flavite_index::schema::AttachmentKind as K;
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    Some(match ext.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "avif" | "bmp" | "ico" => K::Image,
-        "pdf" => K::Pdf,
-        "mp3" | "wav" | "ogg" | "flac" | "m4a" => K::Audio,
-        "mp4" | "webm" | "mov" | "mkv" => K::Video,
-        "zip" | "tar" | "gz" | "tgz" => K::Archive,
-        _ => return None,
-    })
 }
 
 fn path_observation_is_stale(last_saved_seq: u64, watermark: u64) -> bool {

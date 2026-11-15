@@ -425,11 +425,11 @@ pub fn handle(app: &mut App, message: BrowserMessage) -> iced::Task<Message> {
                 Some(entry) if entry.symlink => {
                     app.status = "Symbolic links are not opened from the vault browser".into()
                 }
-                Some(_)
-                    if path
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("md")) =>
-                {
+                Some(_) if flavite_api::attachment_kind(&path).is_none() => {
+                    // Anything the vault does not classify as a binary
+                    // attachment opens as a text note, regardless of
+                    // extension. Genuinely undecodable bytes surface the
+                    // typed encoding-choice flow when the buffer installs.
                     match NoteLocator::from_relative(&path) {
                         Ok(locator) => {
                             app.open_intent(super::open_intents::OpenIntent::reuse(locator, owner));

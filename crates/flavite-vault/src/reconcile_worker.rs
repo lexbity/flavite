@@ -356,7 +356,7 @@ fn observe_path(fs: &dyn Fs, root: &Path, path: &Path) -> PathObservation {
             incomplete,
         };
     }
-    let Some(_kind) = attachment_kind(path) else {
+    let Some(_kind) = flavite_index::schema::attachment_kind(path) else {
         return PathObservation::Skip;
     };
     let mut incomplete = false;
@@ -516,37 +516,6 @@ impl<'p> Emitter<'p> {
     fn into_result(self) -> ScanResult {
         self.result
     }
-}
-
-fn attachment_kind(path: &Path) -> Option<()> {
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    matches!(
-        extension.as_str(),
-        "png"
-            | "jpg"
-            | "jpeg"
-            | "gif"
-            | "webp"
-            | "svg"
-            | "avif"
-            | "bmp"
-            | "ico"
-            | "pdf"
-            | "mp3"
-            | "wav"
-            | "ogg"
-            | "flac"
-            | "m4a"
-            | "mp4"
-            | "webm"
-            | "mov"
-            | "mkv"
-            | "zip"
-            | "tar"
-            | "gz"
-            | "tgz"
-    )
-    .then_some(())
 }
 
 fn walk_paths(fs: &dyn Fs, root: &Path) -> (Vec<PathBuf>, bool) {

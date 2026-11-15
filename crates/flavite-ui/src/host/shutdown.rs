@@ -188,7 +188,10 @@ impl App {
     }
 }
 
-/// Close the shell's window: the oldest (and only) window.
+/// Terminate the application: stop the event loop directly. The process
+/// exits when `main` returns, taking every actor, watcher, and worker
+/// thread with it; the isolated regex helper is pipe-driven and sees stdin
+/// EOF the moment the parent dies, so no child outlives the shell.
 pub fn exit_task() -> Task<Message> {
-    iced::window::oldest().and_then(iced::window::close::<Message>)
+    iced::exit()
 }

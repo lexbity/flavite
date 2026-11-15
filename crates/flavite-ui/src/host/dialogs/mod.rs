@@ -13,11 +13,14 @@ pub mod recovery;
 
 use crate::app::{App, Message};
 use crate::style;
-use crate::workspace::tab_strip;
+use crate::workspace::chrome::Icon;
+use crate::workspace::{chrome, tab_strip};
 use flavite_workspace::NoteLocator;
 use flavite_workspace::TabId;
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
-use iced::{Element, Length};
+use iced::widget::{
+    Space, button, column, container, image, mouse_area, row, scrollable, text, text_input,
+};
+use iced::{Element, Length, alignment};
 
 /// Maximum dialog text input length (NFR-12: 8 KiB per text setting).
 const MAX_INPUT_BYTES: usize = 8192;
@@ -214,19 +217,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
             );
             dialog_card(*metrics, body)
         }
-        Dialog::About => dialog_card(
-            *metrics,
-            column![
-                text("Flavite").size(metrics.heading),
-                text(concat!(
-                    "A local-first plain-text knowledge vault.\nVersion ",
-                    env!("CARGO_PKG_VERSION"),
-                ))
-                .style(style::dim_text),
-                cancel_button(),
-            ]
-            .spacing(metrics.spacing_sm),
-        ),
+        Dialog::About => about_card(*metrics),
         Dialog::Close { tab } => close::view(app, *tab, *metrics),
         Dialog::Conflict { tab } => conflict::view(app, *tab, *metrics),
         Dialog::Merge { prepared, .. } => merge::view(prepared, *metrics),
@@ -240,6 +231,87 @@ fn cancel_button() -> iced::widget::Button<'static, Message> {
         .padding(tab_strip::chip_padding())
         .style(style::ghost())
         .on_press(Message::DialogCancel)
+}
+
+/// The flavite logo, decoded once from the packaged icon. The UI's iced
+/// build ships without image codecs, so the embedded PNG decodes through
+/// the API's bounded decoder and caches the RGBA handle.
+fn logo_handle() -> Option<&'static iced::widget::image::Handle> {
+    static HANDLE: std::sync::OnceLock<Option<iced::widget::image::Handle>> =
+        std::sync::OnceLock::new();
+    HANDLE
+        .get_or_init(|| {
+            let png = include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../packaging/icons/flavite.png"
+            ));
+            let decoded = flavite_api::decode_image(png).ok()?;
+            Some(iced::widget::image::Handle::from_rgba(
+                decoded.width,
+                decoded.height,
+                decoded.rgba.to_vec(),
+            ))
+        })
+        .as_ref()
+}
+
+/// Project constants for the About card.
+const ABOUT_WEBSITE: &str = "https://flavite.lexbytes.org";
+const ABOUT_GITHUB: &str = "https://github.com/lexbity/flavite";
+const ABOUT_LICENSE: &str = "https://github.com/lexbity/flavite/blob/main/LICENSE";
+const ABOUT_CONTRIBUTORS: &str = "https://github.com/lexbity/flavite/blob/main/AUTHORS.md";
+
+/// The About card: logo, version, license, and the project links. Every
+/// link row opens the hard-coded URL through the OS handler.
+fn about_card(metrics: style::Metrics) -> Element<'static, Message> {
+    let link = |label: &'static str, url: &'static str| {
+        button(
+            row![
+                text(label).size(metrics.text),
+                Space::new().width(Length::Fill),
+                text(url.trim_start_matches("https://"))
+                    .size(metrics.text_sm)
+                    .style(style::dim_text),
+            ]
+            .spacing(metrics.spacing)
+            .align_y(alignment::Vertical::Center),
+        )
+        .width(Length::Fill)
+        .padding(tab_strip::chip_padding())
+        .style(style::list_row(false))
+        .on_press(Message::OpenExternalUrl(url.to_owned()))
+    };
+    let mut body = column![]
+        .spacing(metrics.spacing_sm)
+        .align_x(alignment::Horizontal::Center);
+    if let Some(logo) = logo_handle() {
+        body = body.push(
+            image(logo.clone())
+                .width(Length::Fixed(96.0))
+                .height(Length::Fixed(96.0)),
+        );
+    }
+    body = body.push(text("Flavite").size(metrics.heading));
+    body = body.push(
+        text(concat!(
+            "A local-first plain-text knowledge vault.\nVersion ",
+            env!("CARGO_PKG_VERSION"),
+            " · Apache-2.0"
+        ))
+        .style(style::dim_text),
+    );
+    let mut links = column![].spacing(2);
+    for (label, url) in [
+        ("Website", ABOUT_WEBSITE),
+        ("GitHub", ABOUT_GITHUB),
+        ("License", ABOUT_LICENSE),
+        ("Contributors", ABOUT_CONTRIBUTORS),
+    ] {
+        links = links.push(link(label, url));
+    }
+    body = body.push(links);
+    body = body.push(cancel_button());
+    dialog_card(metrics, body)
 }
 
 fn dialog_card(
@@ -343,13 +415,60 @@ pub fn start_view(app: &App) -> Element<'_, Message> {
                 .on_press(Message::StartOpenVault(last)),
         );
     }
-    container(body)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .padding(metrics.spacing_lg * 4.0)
-        .style(style::content)
-        .into()
+    // The start screen owns the window before a vault exists, so it carries
+    // the client-side chrome too: controls top-right, and the whole surface
+    // as the drag region (its buttons and inputs capture their own presses).
+    let controls = container(
+        row![
+            chrome::themed_icon_button(
+                *metrics,
+                Icon::Minimize,
+                "Minimize window",
+                Some(Message::WindowMinimize),
+                None
+            ),
+            chrome::themed_icon_button(
+                *metrics,
+                if app.window_maximized() {
+                    Icon::Restore
+                } else {
+                    Icon::Maximize
+                },
+                if app.window_maximized() {
+                    "Restore window size"
+                } else {
+                    "Maximize window"
+                },
+                Some(Message::WindowToggleMaximize),
+                None
+            ),
+            chrome::themed_icon_button(
+                *metrics,
+                Icon::Close,
+                "Close window",
+                Some(Message::WindowClose),
+                None
+            ),
+        ]
+        .spacing(metrics.spacing_sm),
+    )
+    .width(Length::Fill)
+    .align_x(alignment::Horizontal::Right)
+    .padding([4, 8]);
+    iced::widget::stack![
+        mouse_area(
+            container(body)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .padding(metrics.spacing_lg * 4.0)
+                .style(style::content)
+        )
+        .on_press(Message::WindowDrag)
+        .on_double_click(Message::WindowToggleMaximize),
+        controls,
+    ]
+    .into()
 }
 
 /// Open the native file dialog for one note (W10). The portal dialog is
@@ -358,8 +477,11 @@ pub fn start_view(app: &App) -> Element<'_, Message> {
 pub fn pick_note_file() -> iced::Task<Message> {
     iced::Task::perform(
         async move {
+            // The editor opens any text file regardless of extension, so the
+            // dialog offers an all-files filter alongside the Markdown one.
             rfd::AsyncFileDialog::new()
                 .add_filter("Markdown", &["md", "markdown"])
+                .add_filter("All files", &["*"])
                 .pick_file()
                 .await
                 .and_then(|handle| handle.path().to_path_buf().into())

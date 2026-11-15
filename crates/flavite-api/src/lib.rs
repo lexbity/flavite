@@ -100,6 +100,11 @@ pub use types::*;
 // Re-export Query AST from flavite-index (D13)
 pub use flavite_index::query::Query;
 
+// The canonical binary-attachment classification; the file browser routes
+// unclassified (text) files to the editor and classified ones through the
+// safe attachment open path.
+pub use flavite_index::schema::attachment_kind;
+
 // Re-export types from vault for consumer convenience
 pub use flavite_vault::open::{Vault, vault_exists};
 pub use flavite_vault::types::{

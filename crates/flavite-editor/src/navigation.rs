@@ -4,7 +4,7 @@
 use crate::{
     TypeMetrics,
     viewport::clamp_grapheme_boundary,
-    widget::{caret_position, shape_text},
+    widget::{caret_position, shape_line_starts, shape_text},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,7 +42,13 @@ pub fn vertical_target(
     let visible = &text[start..end];
     let buffer = shape_text(visible, motion.width.max(1.0), motion.metrics);
     let runs: Vec<_> = buffer.layout_runs().collect();
-    let (x, y) = caret_position(&runs, visible, caret - start);
+    let (x, y) = caret_position(
+        &runs,
+        visible,
+        &shape_line_starts(visible),
+        caret - start,
+        0.0,
+    );
     let preferred_x = preferred_x.unwrap_or(x);
     let last_y = runs.last().map_or(0.0, |run| run.line_top);
     let target_y = (y + motion.rows as f32 * motion.metrics.line_height).clamp(0.0, last_y);
@@ -95,7 +101,7 @@ mod tests {
         let runs: Vec<_> = buffer.layout_runs().collect();
         assert!(runs.len() >= 4);
         let (next, x) = vertical_target(text, 2, motion(1, 100.0), None);
-        let (_, y) = caret_position(&runs, text, next);
+        let (_, y) = caret_position(&runs, text, &shape_line_starts(text), next, 0.0);
         assert_eq!(y, runs[1].line_top);
         assert_eq!(vertical_target(text, next, motion(-1, 100.0), Some(x)).0, 2);
         let last = text.find('\n').unwrap();

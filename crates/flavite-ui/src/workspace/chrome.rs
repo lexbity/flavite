@@ -25,7 +25,10 @@ pub enum Icon {
     Close,
     SplitRight,
     SplitDown,
+    /// Window-control glyphs (client-side chrome).
     Maximize,
+    Restore,
+    Minimize,
     Settings,
     Cut,
     Copy,
@@ -274,6 +277,24 @@ impl Widget<Message, Theme, Renderer> for Glyph {
                     line(3.0 + x, 3.0 + x, 1.5, 1.5);
                     line(12.0 - x, 3.0 + x, 1.5, 1.5);
                 }
+            }
+            Icon::Minimize => {
+                line(3.0, 11.0, 10.0, 1.5);
+            }
+            Icon::Maximize => {
+                line(3.0, 3.0, 10.0, 1.0);
+                line(3.0, 12.0, 10.0, 1.0);
+                line(3.0, 3.0, 1.0, 10.0);
+                line(12.0, 3.0, 1.0, 10.0);
+            }
+            Icon::Restore => {
+                // A back square peeking out from behind a front square.
+                line(5.0, 2.0, 8.0, 1.0);
+                line(13.0, 3.0, 1.0, 7.0);
+                line(2.0, 5.0, 8.0, 1.0);
+                line(2.0, 12.0, 8.0, 1.0);
+                line(2.0, 5.0, 1.0, 8.0);
+                line(9.0, 5.0, 1.0, 8.0);
             }
             Icon::Note => {
                 line(3.0, 1.0, 9.0, 1.0);

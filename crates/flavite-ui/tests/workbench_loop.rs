@@ -697,7 +697,7 @@ fn unresolved_activation_offers_create_or_locate_and_never_creates() {
 /// outcome is reported honestly on the owning graph tab.
 #[test]
 fn attachment_activation_uses_the_local_inspector_not_a_note_open() {
-    let (mut app, _fs, _cache) = graph_fixture::fixture_with(&[
+    let (mut app, fs, _cache) = graph_fixture::fixture_with(&[
         ("a.md", "# A\n\nmedia ![[img/movie.mkv]] here.\n"),
         ("img/movie.mkv", "fake-matroska-bytes"),
     ]);
@@ -712,6 +712,17 @@ fn attachment_activation_uses_the_local_inspector_not_a_note_open() {
     let graph = wait_graph_mounted(&mut app);
     let att = wait_record(&mut app, NodeKind::Attachment, "movie.mkv");
     let tabs_before = app.workspace.tabs().count();
+
+    // Classified attachments validate for OS open (any index-classified
+    // kind, .mkv included). To keep the completion deterministic and
+    // hermetic (a successful validation launches the OS handler), the
+    // backing file is removed from the fixture filesystem after the frame:
+    // activation still resolves through the frozen mirror — a removed node
+    // fails only after a pump — and validation then refuses the missing
+    // file honestly.
+    let attachment_path = app.root().join("img/movie.mkv");
+    fs.remove(&attachment_path)
+        .expect("fixture attachment removed");
 
     // Activation submits the existing validated-open primitive and tracks
     // it by the core-issued token; a second activation in the same
@@ -743,8 +754,9 @@ fn attachment_activation_uses_the_local_inspector_not_a_note_open() {
     );
 
     // The completion routes to the owning tab with its real result. The
-    // indexed .mkv has no safe open action, so the outcome is the honest
-    // refusal — no note tab, no document effect, no dead token.
+    // removed file has no openable bytes, so the outcome is the honest
+    // refusal — no note tab, no document effect, no OS launch, no dead
+    // token.
     wait_for(&mut app, "attachment inspector result routed", |app| {
         app.graph.attachment_opens.is_empty()
     });

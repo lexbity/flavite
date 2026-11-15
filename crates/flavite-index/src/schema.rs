@@ -155,6 +155,26 @@ impl std::str::FromStr for AttachmentKind {
     }
 }
 
+/// The binary-attachment classification by file extension: the canonical
+/// single source for every consumer. The vault scan catalogs classified
+/// files as attachments, the rename watcher detects attachment renames, the
+/// safe attachment open path admits exactly these, and the file browser
+/// opens anything unclassified as a text note regardless of extension.
+#[must_use]
+pub fn attachment_kind(path: &std::path::Path) -> Option<AttachmentKind> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "avif" | "bmp" | "ico" => {
+            AttachmentKind::Image
+        }
+        "pdf" => AttachmentKind::Pdf,
+        "mp3" | "wav" | "ogg" | "flac" | "m4a" => AttachmentKind::Audio,
+        "mp4" | "webm" | "mov" | "mkv" => AttachmentKind::Video,
+        "zip" | "tar" | "gz" | "tgz" => AttachmentKind::Archive,
+        _ => return None,
+    })
+}
+
 /// Resolution states for links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ResState {

@@ -34,6 +34,7 @@ pub mod settings;
 pub mod shell;
 pub mod shutdown;
 pub mod vault_search;
+pub mod window;
 
 pub mod reading;
 

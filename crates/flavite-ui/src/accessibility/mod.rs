@@ -284,6 +284,9 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
                 Some(Message::FileBrowser(action))
             }
             NodeTarget::OpenPicker => Some(Message::PickerOpen),
+            NodeTarget::WindowMinimize => Some(Message::WindowMinimize),
+            NodeTarget::WindowToggleMaximize => Some(Message::WindowToggleMaximize),
+            NodeTarget::WindowClose => Some(Message::WindowClose),
             NodeTarget::ToggleSidebar => Some(Message::ToggleSidebar),
             NodeTarget::SidebarToTab => Some(Message::SidebarToTab),
             NodeTarget::OpenPalette => Some(Message::PaletteOpen),

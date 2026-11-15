@@ -779,7 +779,7 @@ pub(crate) fn spawn_os(target: &std::ffi::OsStr) -> Result<(), String> {
         .spawn();
     result.map(|_| ()).map_err(|_| "OS open failed".into())
 }
-fn open_external(url: String) -> iced::Task<crate::app::Message> {
+pub(crate) fn open_external(url: String) -> iced::Task<crate::app::Message> {
     iced::Task::perform(
         async move { spawn_os(std::ffi::OsStr::new(&url)) },
         crate::app::Message::ExternalOpened,

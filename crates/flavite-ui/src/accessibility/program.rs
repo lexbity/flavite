@@ -35,12 +35,21 @@ impl program::Program for FlaviteProgram {
             // W12: the app owns the quit schedule (decisions, recovery and
             // layout flushes); the runtime must not exit behind its back.
             exit_on_close_request: false,
+            // Client-side chrome (W12): the shell draws its own title bar
+            // with minimize/maximize/close controls and a drag region, so
+            // the decorations are off on every platform.
+            decorations: false,
             ..window::Settings::default()
         })
     }
 
     fn boot(&self) -> (App, runtime::Task<Message>) {
-        (App::boot(), iced::system::theme().map(Message::SystemTheme))
+        (
+            App::boot(),
+            iced::system::theme()
+                .map(Message::SystemTheme)
+                .chain(crate::host::window::poll_maximized()),
+        )
     }
 
     fn update(&self, state: &mut App, message: Message) -> runtime::Task<Message> {

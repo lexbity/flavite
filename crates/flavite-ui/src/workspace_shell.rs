@@ -143,6 +143,14 @@ fn top_bar(app: &App) -> Element<'_, Message> {
             .style(style::top_bar_dim_text(frame_text))
             .into()
     };
+    let (maximize_icon, maximize_label) = if app.window_maximized() {
+        (Icon::Restore, "Restore window size")
+    } else {
+        (Icon::Maximize, "Maximize window")
+    };
+    // Client-side chrome (W12): the decorations are off, so the shell owns
+    // the window controls (top-right) and the bar is the drag region. The
+    // buttons capture their own presses, so the drag never fights them.
     let row = row![
         chrome::themed_icon_button(
             metrics,
@@ -167,6 +175,27 @@ fn top_bar(app: &App) -> Element<'_, Message> {
             Some(Message::PaletteOpen),
             frame_text
         ),
+        chrome::themed_icon_button(
+            metrics,
+            Icon::Minimize,
+            "Minimize window",
+            Some(Message::WindowMinimize),
+            frame_text
+        ),
+        chrome::themed_icon_button(
+            metrics,
+            maximize_icon,
+            maximize_label,
+            Some(Message::WindowToggleMaximize),
+            frame_text
+        ),
+        chrome::themed_icon_button(
+            metrics,
+            Icon::Close,
+            "Close window",
+            Some(Message::WindowClose),
+            frame_text
+        ),
     ]
     .spacing(metrics.spacing_sm)
     .align_y(alignment::Vertical::Center);
@@ -185,6 +214,9 @@ fn top_bar(app: &App) -> Element<'_, Message> {
         .into(),
         None => row.into(),
     };
+    let content = mouse_area(content)
+        .on_press(Message::WindowDrag)
+        .on_double_click(Message::WindowToggleMaximize);
     container(content)
         .width(Length::Fill)
         .height(metrics.top_bar_height)
