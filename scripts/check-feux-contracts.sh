@@ -367,6 +367,37 @@ run_x08_gates() {
         "$root/Cargo.toml" "$root/Cargo.lock" "$root/crates" "$root/docs"
 }
 
+run_feux0003_x01_gates() {
+    # FEUX-0003 X01: Position vocabulary and keymap data core
+    # 35-position vocabulary exists
+    gate assert_present 'KeyM|KeyN|KeyQ|KeyR|KeyS|KeyZ' "$root/crates/flavite-edit-context/src/key.rs"
+    gate assert_present 'Quote|Comma|Period|Backslash|BracketLeft|BracketRight|Minus|Equal' "$root/crates/flavite-edit-context/src/key.rs"
+    # New modules exist
+    gate assert_nonempty "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_nonempty "$root/crates/flavite-edit-context/src/labels.rs"
+    gate assert_nonempty "$root/crates/flavite-edit-context/src/text.rs"
+    # keymap exports exist
+    gate assert_present 'pub struct ContextKeymap' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'pub struct Slot' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'pub enum BindingId' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'pub enum Layout' "$root/crates/flavite-edit-context/src/labels.rs"
+    # Text helpers moved to text.rs
+    gate assert_present 'pub fn word_bounds' "$root/crates/flavite-edit-context/src/text.rs"
+    gate assert_present 'pub fn selected_characters' "$root/crates/flavite-edit-context/src/text.rs"
+    gate assert_present 'pub fn clamp_grapheme_boundary' "$root/crates/flavite-edit-context/src/text.rs"
+    # Grammar still exists (not deleted until X02)
+    gate assert_nonempty "$root/crates/flavite-edit-context/src/grammar.rs"
+    # Editor capture boundary extended to 35 positions
+    gate assert_present 'Code::KeyM|Code::KeyN|Code::KeyQ|Code::KeyR|Code::KeyS|Code::KeyZ' "$root/crates/flavite-editor/src/context.rs"
+    gate assert_present 'Code::Quote|Code::Comma|Code::Period|Code::Backslash|Code::BracketLeft|Code::BracketRight|Code::Minus|Code::Equal' "$root/crates/flavite-editor/src/context.rs"
+    # Coverage test extended to 35 positions
+    gate assert_present 'Code::KeyM.*KeyCode::KeyM' "$root/crates/flavite-editor/src/context.rs"
+    # Shadow equivalence test exists
+    gate assert_present 'shadow_equivalence_with_delivered_grammar' "$root/crates/flavite-editor/src/context.rs"
+    # Keymap tests exist
+    gate assert_present 'defaults_keymap_classifies_identically_to_grammar' "$root/crates/flavite-edit-context/src/keymap.rs"
+}
+
 case "$slice" in
     X01) run_x01_gates ;;
     X02) run_x02_gates ;;
@@ -376,7 +407,8 @@ case "$slice" in
     X06) run_x06_gates ;;
     X07) run_x07_gates ;;
     X08) run_x08_gates ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05 X06 X07 X08)" >&2; exit 2 ;;
+    FEUX0003-X01) run_feux0003_x01_gates ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05 X06 X07 X08 FEUX0003-X01)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then

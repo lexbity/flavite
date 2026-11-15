@@ -1,4 +1,4 @@
-//! Context Mode's pure layer (FEUX-0002 E-2/E-3): the finite command
+//! Context Mode's pure layer (FEUX-0002 E-2/E-3, FEUX-0003 X01): the finite command
 //! vocabulary, the physical-key grammar, the per-editor statechart, and the
 //! implicit-effect planner.
 //!
@@ -11,14 +11,20 @@
 
 pub mod effect;
 pub mod grammar;
+pub mod keymap;
 pub mod key;
+pub mod labels;
 pub mod session;
+pub mod text;
 pub mod vocabulary;
 
-pub use grammar::{command_key, menu_key, motion_key, selected_characters, word_bounds};
+pub use grammar::{command_key, menu_key, motion_key};
+pub use keymap::{BindingId, BindingToken, ContextKeymap, KeymapError, Slot};
 pub use key::{KeyCode, Modifiers, Motion};
+pub use labels::Layout;
 pub use session::{
     AwaitChar, BURST_MIN_ACTIVATIONS, BURST_MIN_MUTATING, BURST_SUPPRESS_MS, BURST_WINDOW_MS,
     ContextState, Effect, EscapeOutcome, Event, reduce,
 };
+pub use text::{clamp_grapheme_boundary, selected_characters, word_bounds};
 pub use vocabulary::{ContextCommand, ContextMenu, ContextMode};

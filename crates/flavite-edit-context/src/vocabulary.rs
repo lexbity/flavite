@@ -275,7 +275,7 @@ impl ContextCommand {
 }
 
 /// A toolbar menu is a flat list; commands are not duplicated as aliases.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ContextMenu {
     Select,
     Go,

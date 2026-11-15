@@ -816,6 +816,128 @@ fn seed_x08_inputs(root: &Path) {
     seed_file(root, "docs/APP-FEATURES.md", "# Flavite Features\n");
 }
 
+fn seed_feux0003_x01_inputs(root: &Path) {
+    // The checker sources the gate library relative to the repository root.
+    let lib = root.join("scripts/lib/source-gates.sh");
+    fs::create_dir_all(lib.parent().unwrap()).expect("lib parent");
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    fs::copy(repo.join("scripts/lib/source-gates.sh"), &lib).expect("copy gate library");
+
+    seed_file(
+        root,
+        "scripts/check-feux-contracts.sh",
+        "#!/usr/bin/env bash\n",
+    );
+    
+    // Seed the keymap.rs with minimal content
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/keymap.rs",
+        "pub struct ContextKeymap {} pub struct Slot {} pub enum BindingId { Command } pub enum Layout { Qwerty } pub fn defaults_keymap_classifies_identically_to_grammar() {}\n",
+    );
+    
+    // Seed labels.rs
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/labels.rs",
+        "pub enum Layout { Qwerty }\n",
+    );
+    
+    // Seed text.rs
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/text.rs",
+        "pub fn word_bounds(_: &str, _: usize) -> (usize, usize) { (0, 0) }\npub fn selected_characters(_: &str, _: (usize, usize)) -> usize { 0 }\npub fn clamp_grapheme_boundary(_: &str, _: usize) -> usize { 0 }\n",
+    );
+    
+    // Seed key.rs with the 35-position vocabulary
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/key.rs",
+        "pub enum KeyCode { KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO, KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ, Semicolon, Quote, Comma, Period, Slash, Backslash, BracketLeft, BracketRight, Minus, Equal }\npub enum Motion { Previous, Next, Up, Down, NextWord, PreviousWord, NextWordEnd }\n",
+    );
+    
+    // Seed lib.rs
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/lib.rs",
+        "pub mod key; pub mod keymap; pub mod labels; pub mod text; pub mod grammar; pub mod vocabulary; pub mod session; pub mod effect;\n",
+    );
+    
+    // Seed vocabulary.rs (needed for ContextCommand)
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/vocabulary.rs",
+        "pub enum ContextCommand { Delete, Cut } pub enum ContextMenu { Select, Go, Type, More }\n",
+    );
+    
+    // Seed session.rs (needed for reduce)
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/session.rs",
+        "pub fn reduce() {}\npub enum Event {}\npub enum Effect {}\n",
+    );
+    
+    // Seed effect.rs
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/effect.rs",
+        "// effects\n",
+    );
+    
+    // Seed grammar.rs (still exists in X01)
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/grammar.rs",
+        "pub fn command_key(_: KeyCode, _: Modifiers) -> Option<ContextCommand> { None }\npub fn motion_key(_: KeyCode, _: Modifiers) -> Option<Motion> { None }\npub fn menu_key(_: ContextMenu, _: KeyCode, _: Modifiers) -> Option<ContextCommand> { None }\n",
+    );
+    
+    // Seed context.rs in editor with extended native_code
+    seed_file(
+        root,
+        "crates/flavite-editor/src/context.rs",
+        "use iced::keyboard::key::Code;\npub fn native_code(c: Code) -> Option<KeyCode> { match c { Code::KeyM => Some(KeyCode::KeyM), Code::KeyN => Some(KeyCode::KeyN), Code::KeyQ => Some(KeyCode::KeyQ), Code::KeyR => Some(KeyCode::KeyR), Code::KeyS => Some(KeyCode::KeyS), Code::KeyZ => Some(KeyCode::KeyZ), Code::Quote => Some(KeyCode::Quote), Code::Comma => Some(KeyCode::Comma), Code::Period => Some(KeyCode::Period), Code::Backslash => Some(KeyCode::Backslash), Code::BracketLeft => Some(KeyCode::BracketLeft), Code::BracketRight => Some(KeyCode::BracketRight), Code::Minus => Some(KeyCode::Minus), Code::Equal => Some(KeyCode::Equal), _ => None } }\npub fn native_converter_covers_the_whole_grammar_vocabulary() {}\npub fn shadow_equivalence_with_delivered_grammar() {}\n",
+    );
+}
+
+#[test]
+fn feux0003_x01_gate_passes_clean_tree_and_rejects_missing_vocabulary() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_feux0003_x01_inputs(temp.path());
+    let clean = run_gate(temp.path(), "FEUX0003-X01");
+    assert!(
+        clean.status.success(),
+        "FEUX0003-X01 gate should pass on clean tree: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // Missing KeyM-KeyZ positions should fail the gate
+    seed_file(
+        temp.path(),
+        "crates/flavite-edit-context/src/key.rs",
+        "pub enum KeyCode { KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL }\npub enum Motion { Previous, Next, Up, Down, NextWord, PreviousWord, NextWordEnd }\n",
+    );
+    let missing = run_gate(temp.path(), "FEUX0003-X01");
+    assert!(
+        !missing.status.success(),
+        "FEUX0003-X01 gate should fail when 35-position vocabulary is missing: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    // Restore and test another negative: missing keymap.rs
+    seed_file(
+        temp.path(),
+        "crates/flavite-edit-context/src/key.rs",
+        "pub enum KeyCode { KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO, KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ, Semicolon, Quote, Comma, Period, Slash, Backslash, BracketLeft, BracketRight, Minus, Equal }\npub enum Motion { Previous, Next, Up, Down, NextWord, PreviousWord, NextWordEnd }\n",
+    );
+    fs::remove_file(temp.path().join("crates/flavite-edit-context/src/keymap.rs")).unwrap();
+    let missing_keymap = run_gate(temp.path(), "FEUX0003-X01");
+    assert!(
+        !missing_keymap.status.success(),
+        "FEUX0003-X01 gate should fail when keymap.rs is missing: {}",
+        String::from_utf8_lossy(&missing_keymap.stderr)
+    );
+}
+
 #[test]
 fn x08_gate_passes_clean_tree_and_rejects_compat_surfaces() {
     let temp = tempfile::tempdir().unwrap();
