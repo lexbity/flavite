@@ -43,7 +43,7 @@ impl Modifiers {
 
 /// The physical key positions the Context grammar names. Positions, not
 /// produced glyphs: an unlisted code can never resolve to a command.
-/// 
+///
 /// The full grammar-addressable set: 26 letters + 9 punctuation positions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum KeyCode {
@@ -157,7 +157,7 @@ impl Motion {
             Motion::NextWordEnd => "editor.motion.next_word_end",
         }
     }
-    
+
     /// Returns a stable token name for this motion variant.
     pub const fn token(self) -> &'static str {
         match self {

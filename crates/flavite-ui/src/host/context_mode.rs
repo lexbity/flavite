@@ -4,7 +4,7 @@ use crate::app::{App, Message};
 use crate::host::editor_diagnostics::{EventKind, ModeEnum as DiagMode, Outcome};
 use flavite_api::{ExecutionResult, Invocation, Origin};
 use flavite_edit_context::{
-    ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event, menu_key, reduce,
+    BindingId, ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event, reduce,
 };
 use flavite_editor::{
     context::{native_code, native_modifiers},
@@ -435,8 +435,40 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
                 let Physical::Code(code) = physical_key else {
                     return None;
                 };
-                let command = native_code(*code)
-                    .and_then(|code| menu_key(menu, code, native_modifiers(*modifiers)));
+                let native_mods = native_modifiers(*modifiers);
+
+                // Ctrl/Alt/Logo never enter the Context grammar
+                if native_mods.control || native_mods.alt || native_mods.logo {
+                    return None;
+                }
+
+                // Look up in keymap: try menu accelerator first, then root
+                let command = native_code(*code).and_then(|code| {
+                    let slot = flavite_edit_context::Slot {
+                        position: code,
+                        shift: native_mods.shift,
+                    };
+                    // Try menu accelerator lookup
+                    app.appearance
+                        .context_keys
+                        .lookup_menu(menu, slot.position)
+                        // Fall through to root if it's a command in this menu
+                        .or_else(|| {
+                            app.appearance.context_keys.lookup_root(slot).and_then(
+                                |bid| match bid {
+                                    BindingId::Command(cmd) => {
+                                        if menu.commands().contains(cmd) {
+                                            Some(*cmd)
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None,
+                                },
+                            )
+                        })
+                });
+
                 if *repeat {
                     return None;
                 }
@@ -557,7 +589,6 @@ pub fn native_key(
     target: EditorTarget,
     mut key: flavite_editor::context::ContextKey,
 ) -> Task<Message> {
-    use flavite_edit_context::{command_key, menu_key, motion_key};
     if !valid(app, target.clone(), true)
         || app.context_mode.history.open
         || too_narrow(app, target.tab)
@@ -663,40 +694,76 @@ pub fn native_key(
             if key.repeat {
                 return Task::none();
             }
-            let command = key
-                .code
-                .and_then(|code| menu_key(menu, code, key.modifiers));
+            let command = key.code.and_then(|code| {
+                // Look up in keymap: try menu accelerator first, then root
+                let slot = flavite_edit_context::Slot {
+                    position: code,
+                    shift: key.modifiers.shift,
+                };
+                app.appearance
+                    .context_keys
+                    .lookup_menu(menu, slot.position)
+                    // Fall through to root if it's a command in this menu
+                    .or_else(|| {
+                        app.appearance
+                            .context_keys
+                            .lookup_root(slot)
+                            .and_then(|bid| match bid {
+                                BindingId::Command(cmd) => {
+                                    if menu.commands().contains(cmd) {
+                                        Some(*cmd)
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            })
+                    })
+            });
             return command.map_or_else(Task::none, |command| run(app, target, command));
         }
     }
     if mode == ContextMode::Command {
         if let Some(code) = key.code {
-            if let Some(command) = command_key(code, key.modifiers) {
-                return if key.repeat {
-                    Task::none()
-                } else {
-                    run(app, target, command)
-                };
-            }
-            let menu = if key.modifiers.control || key.modifiers.alt || key.modifiers.logo {
-                None
+            // Ctrl/Alt/Logo never enter the Context grammar
+            if key.modifiers.control || key.modifiers.alt || key.modifiers.logo {
+                // They are handled by chord matching, not Context Mode
             } else {
-                match code {
-                    flavite_edit_context::KeyCode::KeyV => Some(ContextMenu::Select),
-                    flavite_edit_context::KeyCode::KeyG => Some(ContextMenu::Go),
-                    flavite_edit_context::KeyCode::KeyT => Some(ContextMenu::Type),
-                    _ => None,
-                }
-            };
-            if let Some(menu) = menu {
-                return if key.repeat {
-                    Task::none()
-                } else {
-                    handle(app, ContextMessage::OpenMenu(target, menu))
+                let slot = flavite_edit_context::Slot {
+                    position: code,
+                    shift: key.modifiers.shift,
                 };
-            }
-            if let Some(motion) = motion_key(code, key.modifiers) {
-                key.input.action = flavite_editor::context::motion_action(motion);
+
+                // Look up in keymap
+                if let Some(binding_id) = app.appearance.context_keys.lookup_root(slot) {
+                    match binding_id {
+                        BindingId::Command(command) => {
+                            return if key.repeat {
+                                Task::none()
+                            } else {
+                                run(app, target, *command)
+                            };
+                        }
+                        BindingId::Motion(motion) => {
+                            key.input.action = flavite_editor::context::motion_action(*motion);
+                        }
+                        BindingId::FindChar { forward } => {
+                            let command = ContextCommand::FindChar { forward: *forward };
+                            return if key.repeat {
+                                Task::none()
+                            } else {
+                                run(app, target, command)
+                            };
+                        }
+                        BindingId::MenuOpener(menu) => {
+                            return if key.repeat {
+                                Task::none()
+                            } else {
+                                handle(app, ContextMessage::OpenMenu(target, *menu))
+                            };
+                        }
+                    }
+                }
             }
         }
         if !matches!(

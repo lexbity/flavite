@@ -11,16 +11,16 @@
 
 pub mod effect;
 pub mod grammar;
-pub mod keymap;
 pub mod key;
+pub mod keymap;
 pub mod labels;
 pub mod session;
 pub mod text;
 pub mod vocabulary;
 
 pub use grammar::{command_key, menu_key, motion_key};
-pub use keymap::{BindingId, BindingToken, ContextKeymap, KeymapError, Slot};
 pub use key::{KeyCode, Modifiers, Motion};
+pub use keymap::{BindingId, BindingToken, ContextKeymap, KeymapError, Slot};
 pub use labels::Layout;
 pub use session::{
     AwaitChar, BURST_MIN_ACTIVATIONS, BURST_MIN_MUTATING, BURST_SUPPRESS_MS, BURST_WINDOW_MS,

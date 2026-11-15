@@ -352,7 +352,7 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
                     row![
                         text(command.title()).size(metrics.text),
                         Space::new().width(Length::Fill),
-                        text(menu.hint(command))
+                        text(app.appearance.context_label(command.id()))
                             .size(metrics.text_sm)
                             .style(style::dim_text)
                     ]

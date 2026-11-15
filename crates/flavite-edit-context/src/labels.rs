@@ -10,9 +10,10 @@
 use crate::key::KeyCode;
 
 /// Declared keyboard layouts supported for Context Mode labels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Layout {
     /// US QWERTY layout.
+    #[default]
     Qwerty,
     /// Dvorak layout.
     Dvorak,
@@ -63,16 +64,10 @@ impl Layout {
     }
 }
 
-impl Default for Layout {
-    fn default() -> Self {
-        Self::Qwerty
-    }
-}
-
 /// QWERTY layout glyph table (normative, complete for all 35 positions).
-/// 
+///
 /// All positions map to their unshifted US QWERTY characters.
-const QWERTY_GLYPHS: &[(KeyCode, &'static str)] = &[
+const QWERTY_GLYPHS: &[(KeyCode, &str)] = &[
     // Letters
     (KeyCode::KeyA, "a"),
     (KeyCode::KeyB, "b"),
@@ -115,25 +110,25 @@ const QWERTY_GLYPHS: &[(KeyCode, &'static str)] = &[
 
 /// Dvorak layout glyph table.
 /// Placeholder for X05 - currently empty.
-const DVORAK_GLYPHS: &[(KeyCode, &'static str)] = &[];
+const DVORAK_GLYPHS: &[(KeyCode, &str)] = &[];
 
 /// Colemak layout glyph table.
 /// Placeholder for X05 - currently empty.
-const COLEMAK_GLYPHS: &[(KeyCode, &'static str)] = &[];
+const COLEMAK_GLYPHS: &[(KeyCode, &str)] = &[];
 
 /// AZERTY layout glyph table.
 /// Placeholder for X05 - currently empty.
-const AZERTY_GLYPHS: &[(KeyCode, &'static str)] = &[];
+const AZERTY_GLYPHS: &[(KeyCode, &str)] = &[];
 
 /// QWERTZ layout glyph table.
 /// Placeholder for X05 - currently empty.
-const QWERTZ_GLYPHS: &[(KeyCode, &'static str)] = &[];
+const QWERTZ_GLYPHS: &[(KeyCode, &str)] = &[];
 
 /// Returns the unshifted glyph for a position under the given layout.
-/// 
+///
 /// Returns `None` if the position is not in the layout's table.
 /// The caller should fall back to the position's token name in this case.
-/// 
+///
 /// # Contract
 /// For all 35 positions in the vocabulary, QWERTY MUST be total.
 /// Other layouts should be total but may return None temporarily during
@@ -147,7 +142,10 @@ pub fn glyph(layout: Layout, position: KeyCode) -> Option<&'static str> {
         Layout::Azerty => AZERTY_GLYPHS,
         Layout::Qwertz => QWERTZ_GLYPHS,
     };
-    table.iter().find(|(code, _)| *code == position).map(|(_, g)| *g)
+    table
+        .iter()
+        .find(|(code, _)| *code == position)
+        .map(|(_, g)| *g)
 }
 
 #[cfg(test)]
@@ -158,25 +156,51 @@ mod tests {
     fn qwerty_table_is_total() {
         // Verify QWERTY has all 35 positions (FR-12 / AC-6 requirement).
         let all_positions = [
-            KeyCode::KeyA, KeyCode::KeyB, KeyCode::KeyC, KeyCode::KeyD,
-            KeyCode::KeyE, KeyCode::KeyF, KeyCode::KeyG, KeyCode::KeyH,
-            KeyCode::KeyI, KeyCode::KeyJ, KeyCode::KeyK, KeyCode::KeyL,
-            KeyCode::KeyM, KeyCode::KeyN, KeyCode::KeyO, KeyCode::KeyP,
-            KeyCode::KeyQ, KeyCode::KeyR, KeyCode::KeyS, KeyCode::KeyT,
-            KeyCode::KeyU, KeyCode::KeyV, KeyCode::KeyW, KeyCode::KeyX,
-            KeyCode::KeyY, KeyCode::KeyZ,
-            KeyCode::Semicolon, KeyCode::Quote, KeyCode::Comma, KeyCode::Period,
-            KeyCode::Slash, KeyCode::Backslash, KeyCode::BracketLeft,
-            KeyCode::BracketRight, KeyCode::Minus, KeyCode::Equal,
+            KeyCode::KeyA,
+            KeyCode::KeyB,
+            KeyCode::KeyC,
+            KeyCode::KeyD,
+            KeyCode::KeyE,
+            KeyCode::KeyF,
+            KeyCode::KeyG,
+            KeyCode::KeyH,
+            KeyCode::KeyI,
+            KeyCode::KeyJ,
+            KeyCode::KeyK,
+            KeyCode::KeyL,
+            KeyCode::KeyM,
+            KeyCode::KeyN,
+            KeyCode::KeyO,
+            KeyCode::KeyP,
+            KeyCode::KeyQ,
+            KeyCode::KeyR,
+            KeyCode::KeyS,
+            KeyCode::KeyT,
+            KeyCode::KeyU,
+            KeyCode::KeyV,
+            KeyCode::KeyW,
+            KeyCode::KeyX,
+            KeyCode::KeyY,
+            KeyCode::KeyZ,
+            KeyCode::Semicolon,
+            KeyCode::Quote,
+            KeyCode::Comma,
+            KeyCode::Period,
+            KeyCode::Slash,
+            KeyCode::Backslash,
+            KeyCode::BracketLeft,
+            KeyCode::BracketRight,
+            KeyCode::Minus,
+            KeyCode::Equal,
         ];
-        
+
         let mut missing = Vec::new();
         for position in all_positions {
             if glyph(Layout::Qwerty, position).is_none() {
                 missing.push(position.token());
             }
         }
-        
+
         assert!(
             missing.is_empty(),
             "QWERTY table missing positions: {:?}",
@@ -207,7 +231,12 @@ mod tests {
             Layout::Qwertz,
         ] {
             let parsed = Layout::parse(layout.id());
-            assert_eq!(parsed, Some(layout), "{} should parse and roundtrip", layout.id());
+            assert_eq!(
+                parsed,
+                Some(layout),
+                "{} should parse and roundtrip",
+                layout.id()
+            );
         }
     }
 

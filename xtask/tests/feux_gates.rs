@@ -828,70 +828,70 @@ fn seed_feux0003_x01_inputs(root: &Path) {
         "scripts/check-feux-contracts.sh",
         "#!/usr/bin/env bash\n",
     );
-    
+
     // Seed the keymap.rs with minimal content
     seed_file(
         root,
         "crates/flavite-edit-context/src/keymap.rs",
         "pub struct ContextKeymap {} pub struct Slot {} pub enum BindingId { Command } pub enum Layout { Qwerty } pub fn defaults_keymap_classifies_identically_to_grammar() {}\n",
     );
-    
+
     // Seed labels.rs
     seed_file(
         root,
         "crates/flavite-edit-context/src/labels.rs",
         "pub enum Layout { Qwerty }\n",
     );
-    
+
     // Seed text.rs
     seed_file(
         root,
         "crates/flavite-edit-context/src/text.rs",
         "pub fn word_bounds(_: &str, _: usize) -> (usize, usize) { (0, 0) }\npub fn selected_characters(_: &str, _: (usize, usize)) -> usize { 0 }\npub fn clamp_grapheme_boundary(_: &str, _: usize) -> usize { 0 }\n",
     );
-    
+
     // Seed key.rs with the 35-position vocabulary
     seed_file(
         root,
         "crates/flavite-edit-context/src/key.rs",
         "pub enum KeyCode { KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO, KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ, Semicolon, Quote, Comma, Period, Slash, Backslash, BracketLeft, BracketRight, Minus, Equal }\npub enum Motion { Previous, Next, Up, Down, NextWord, PreviousWord, NextWordEnd }\n",
     );
-    
+
     // Seed lib.rs
     seed_file(
         root,
         "crates/flavite-edit-context/src/lib.rs",
         "pub mod key; pub mod keymap; pub mod labels; pub mod text; pub mod grammar; pub mod vocabulary; pub mod session; pub mod effect;\n",
     );
-    
+
     // Seed vocabulary.rs (needed for ContextCommand)
     seed_file(
         root,
         "crates/flavite-edit-context/src/vocabulary.rs",
         "pub enum ContextCommand { Delete, Cut } pub enum ContextMenu { Select, Go, Type, More }\n",
     );
-    
+
     // Seed session.rs (needed for reduce)
     seed_file(
         root,
         "crates/flavite-edit-context/src/session.rs",
         "pub fn reduce() {}\npub enum Event {}\npub enum Effect {}\n",
     );
-    
+
     // Seed effect.rs
     seed_file(
         root,
         "crates/flavite-edit-context/src/effect.rs",
         "// effects\n",
     );
-    
+
     // Seed grammar.rs (still exists in X01)
     seed_file(
         root,
         "crates/flavite-edit-context/src/grammar.rs",
         "pub fn command_key(_: KeyCode, _: Modifiers) -> Option<ContextCommand> { None }\npub fn motion_key(_: KeyCode, _: Modifiers) -> Option<Motion> { None }\npub fn menu_key(_: ContextMenu, _: KeyCode, _: Modifiers) -> Option<ContextCommand> { None }\n",
     );
-    
+
     // Seed context.rs in editor with extended native_code
     seed_file(
         root,
@@ -929,7 +929,11 @@ fn feux0003_x01_gate_passes_clean_tree_and_rejects_missing_vocabulary() {
         "crates/flavite-edit-context/src/key.rs",
         "pub enum KeyCode { KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO, KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ, Semicolon, Quote, Comma, Period, Slash, Backslash, BracketLeft, BracketRight, Minus, Equal }\npub enum Motion { Previous, Next, Up, Down, NextWord, PreviousWord, NextWordEnd }\n",
     );
-    fs::remove_file(temp.path().join("crates/flavite-edit-context/src/keymap.rs")).unwrap();
+    fs::remove_file(
+        temp.path()
+            .join("crates/flavite-edit-context/src/keymap.rs"),
+    )
+    .unwrap();
     let missing_keymap = run_gate(temp.path(), "FEUX0003-X01");
     assert!(
         !missing_keymap.status.success(),

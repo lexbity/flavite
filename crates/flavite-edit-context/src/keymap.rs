@@ -236,7 +236,11 @@ impl std::fmt::Display for KeymapError {
             KeymapError::ShiftOnMenuAccelerator { id } => {
                 write!(f, "Shift modifier not allowed on menu accelerator '{id}'")
             }
-            KeymapError::Collision { slot, first, second } => {
+            KeymapError::Collision {
+                slot,
+                first,
+                second,
+            } => {
                 let mod_str = if slot.shift { "Shift+" } else { "" };
                 write!(
                     f,
@@ -313,7 +317,7 @@ impl ContextKeymap {
     }
 
     /// Resolve a user override map into an effective keymap.
-    /// 
+    ///
     /// The override map is binding-id -> token string.
     /// Returns Ok(keymap) or Err(list of all violations).
     pub fn resolve(
@@ -340,9 +344,7 @@ impl ContextKeymap {
             let binding_id = match BindingId::parse(id_str) {
                 Some(bid) => bid,
                 None => {
-                    errors.push(KeymapError::UnknownBinding {
-                        id: id_str.clone(),
-                    });
+                    errors.push(KeymapError::UnknownBinding { id: id_str.clone() });
                     continue;
                 }
             };
@@ -369,15 +371,11 @@ impl ContextKeymap {
                 BindingToken::Position(slot) => {
                     // Validate Rule X: no shift on motions, menu openers, or menu accelerators
                     if binding_id.is_motion() && slot.shift {
-                        errors.push(KeymapError::ShiftOnMotion {
-                            id: id_str.clone(),
-                        });
+                        errors.push(KeymapError::ShiftOnMotion { id: id_str.clone() });
                         continue;
                     }
                     if binding_id.is_menu_opener() && slot.shift {
-                        errors.push(KeymapError::ShiftOnMenuOpener {
-                            id: id_str.clone(),
-                        });
+                        errors.push(KeymapError::ShiftOnMenuOpener { id: id_str.clone() });
                         continue;
                     }
 
@@ -488,8 +486,7 @@ impl ContextKeymap {
 
         self.slot_of(binding_id)
             .map(|slot| {
-                let glyph = glyph(layout, slot.position)
-                    .unwrap_or_else(|| slot.position.token());
+                let glyph = glyph(layout, slot.position).unwrap_or_else(|| slot.position.token());
                 if slot.shift {
                     format!("⇧{glyph}")
                 } else {
@@ -515,57 +512,188 @@ impl ContextKeymap {
 /// code and will be added to this table in X02 when we cut over the host.
 pub const DEFAULT_ROOT: &[(BindingId, Slot)] = &[
     // Commands (18 entries, matching grammar::command_key exactly)
-    (BindingId::Command(ContextCommand::InsertStart), Slot::bare(KeyCode::KeyI)),
-    (BindingId::Command(ContextCommand::InsertLineStart), Slot::shifted(KeyCode::KeyI)),
-    (BindingId::Command(ContextCommand::InsertEnd), Slot::bare(KeyCode::KeyA)),
-    (BindingId::Command(ContextCommand::InsertLineEnd), Slot::shifted(KeyCode::KeyA)),
-    (BindingId::Command(ContextCommand::OpenBelow), Slot::bare(KeyCode::KeyO)),
-    (BindingId::Command(ContextCommand::OpenAbove), Slot::shifted(KeyCode::KeyO)),
-    (BindingId::Command(ContextCommand::Change), Slot::bare(KeyCode::KeyC)),
-    (BindingId::Command(ContextCommand::Delete), Slot::bare(KeyCode::KeyD)),
-    (BindingId::Command(ContextCommand::Cut), Slot::shifted(KeyCode::KeyD)),
-    (BindingId::Command(ContextCommand::Copy), Slot::bare(KeyCode::KeyY)),
-    (BindingId::Command(ContextCommand::Paste), Slot::bare(KeyCode::KeyP)),
-    (BindingId::Command(ContextCommand::Undo), Slot::bare(KeyCode::KeyU)),
-    (BindingId::Command(ContextCommand::Redo), Slot::shifted(KeyCode::KeyU)),
-    (BindingId::Command(ContextCommand::SelectLine), Slot::bare(KeyCode::KeyX)),
-    (BindingId::Command(ContextCommand::Collapse), Slot::bare(KeyCode::Semicolon)),
-    (BindingId::Command(ContextCommand::Commands), Slot::shifted(KeyCode::Semicolon)),
-    (BindingId::Command(ContextCommand::Find), Slot::bare(KeyCode::Slash)),
-    (BindingId::Command(ContextCommand::Replace), Slot::shifted(KeyCode::Slash)),
+    (
+        BindingId::Command(ContextCommand::InsertStart),
+        Slot::bare(KeyCode::KeyI),
+    ),
+    (
+        BindingId::Command(ContextCommand::InsertLineStart),
+        Slot::shifted(KeyCode::KeyI),
+    ),
+    (
+        BindingId::Command(ContextCommand::InsertEnd),
+        Slot::bare(KeyCode::KeyA),
+    ),
+    (
+        BindingId::Command(ContextCommand::InsertLineEnd),
+        Slot::shifted(KeyCode::KeyA),
+    ),
+    (
+        BindingId::Command(ContextCommand::OpenBelow),
+        Slot::bare(KeyCode::KeyO),
+    ),
+    (
+        BindingId::Command(ContextCommand::OpenAbove),
+        Slot::shifted(KeyCode::KeyO),
+    ),
+    (
+        BindingId::Command(ContextCommand::Change),
+        Slot::bare(KeyCode::KeyC),
+    ),
+    (
+        BindingId::Command(ContextCommand::Delete),
+        Slot::bare(KeyCode::KeyD),
+    ),
+    (
+        BindingId::Command(ContextCommand::Cut),
+        Slot::shifted(KeyCode::KeyD),
+    ),
+    (
+        BindingId::Command(ContextCommand::Copy),
+        Slot::bare(KeyCode::KeyY),
+    ),
+    (
+        BindingId::Command(ContextCommand::Paste),
+        Slot::bare(KeyCode::KeyP),
+    ),
+    (
+        BindingId::Command(ContextCommand::Undo),
+        Slot::bare(KeyCode::KeyU),
+    ),
+    (
+        BindingId::Command(ContextCommand::Redo),
+        Slot::shifted(KeyCode::KeyU),
+    ),
+    (
+        BindingId::Command(ContextCommand::SelectLine),
+        Slot::bare(KeyCode::KeyX),
+    ),
+    (
+        BindingId::Command(ContextCommand::Collapse),
+        Slot::bare(KeyCode::Semicolon),
+    ),
+    (
+        BindingId::Command(ContextCommand::Commands),
+        Slot::shifted(KeyCode::Semicolon),
+    ),
+    (
+        BindingId::Command(ContextCommand::Find),
+        Slot::bare(KeyCode::Slash),
+    ),
+    (
+        BindingId::Command(ContextCommand::Replace),
+        Slot::shifted(KeyCode::Slash),
+    ),
     // FindChar is represented as ContextCommand::FindChar in grammar, but we use BindingId::FindChar
-    (BindingId::FindChar { forward: true }, Slot::bare(KeyCode::KeyF)),
-    (BindingId::FindChar { forward: false }, Slot::shifted(KeyCode::KeyF)),
+    (
+        BindingId::FindChar { forward: true },
+        Slot::bare(KeyCode::KeyF),
+    ),
+    (
+        BindingId::FindChar { forward: false },
+        Slot::shifted(KeyCode::KeyF),
+    ),
+    // Menu openers (E-4: first-class root bindings replacing host special-casing)
+    (
+        BindingId::MenuOpener(ContextMenu::Select),
+        Slot::bare(KeyCode::KeyV),
+    ),
+    (
+        BindingId::MenuOpener(ContextMenu::Go),
+        Slot::bare(KeyCode::KeyG),
+    ),
+    (
+        BindingId::MenuOpener(ContextMenu::Type),
+        Slot::bare(KeyCode::KeyT),
+    ),
     // Motions (14 entries: 7 bare + 7 shifted, matching grammar::motion_key exactly)
     // Note: grammar::motion_key ignores shift, so we include both variants for equivalence
-    (BindingId::Motion(Motion::Previous), Slot::bare(KeyCode::KeyH)),
-    (BindingId::Motion(Motion::Previous), Slot::shifted(KeyCode::KeyH)),
+    (
+        BindingId::Motion(Motion::Previous),
+        Slot::bare(KeyCode::KeyH),
+    ),
+    (
+        BindingId::Motion(Motion::Previous),
+        Slot::shifted(KeyCode::KeyH),
+    ),
     (BindingId::Motion(Motion::Down), Slot::bare(KeyCode::KeyJ)),
-    (BindingId::Motion(Motion::Down), Slot::shifted(KeyCode::KeyJ)),
+    (
+        BindingId::Motion(Motion::Down),
+        Slot::shifted(KeyCode::KeyJ),
+    ),
     (BindingId::Motion(Motion::Up), Slot::bare(KeyCode::KeyK)),
     (BindingId::Motion(Motion::Up), Slot::shifted(KeyCode::KeyK)),
     (BindingId::Motion(Motion::Next), Slot::bare(KeyCode::KeyL)),
-    (BindingId::Motion(Motion::Next), Slot::shifted(KeyCode::KeyL)),
-    (BindingId::Motion(Motion::NextWord), Slot::bare(KeyCode::KeyW)),
-    (BindingId::Motion(Motion::NextWord), Slot::shifted(KeyCode::KeyW)),
-    (BindingId::Motion(Motion::NextWordEnd), Slot::bare(KeyCode::KeyE)),
-    (BindingId::Motion(Motion::NextWordEnd), Slot::shifted(KeyCode::KeyE)),
-    (BindingId::Motion(Motion::PreviousWord), Slot::bare(KeyCode::KeyB)),
-    (BindingId::Motion(Motion::PreviousWord), Slot::shifted(KeyCode::KeyB)),
+    (
+        BindingId::Motion(Motion::Next),
+        Slot::shifted(KeyCode::KeyL),
+    ),
+    (
+        BindingId::Motion(Motion::NextWord),
+        Slot::bare(KeyCode::KeyW),
+    ),
+    (
+        BindingId::Motion(Motion::NextWord),
+        Slot::shifted(KeyCode::KeyW),
+    ),
+    (
+        BindingId::Motion(Motion::NextWordEnd),
+        Slot::bare(KeyCode::KeyE),
+    ),
+    (
+        BindingId::Motion(Motion::NextWordEnd),
+        Slot::shifted(KeyCode::KeyE),
+    ),
+    (
+        BindingId::Motion(Motion::PreviousWord),
+        Slot::bare(KeyCode::KeyB),
+    ),
+    (
+        BindingId::Motion(Motion::PreviousWord),
+        Slot::shifted(KeyCode::KeyB),
+    ),
 ];
 
 /// Default menu accelerator bindings: menu -> binding id -> position.
 /// These are the accelerators that appear inside specific menus.
 pub const DEFAULT_MENUS: &[(ContextMenu, BindingId, KeyCode)] = &[
     // Select menu
-    (ContextMenu::Select, BindingId::Command(ContextCommand::SelectWord), KeyCode::KeyW),
-    (ContextMenu::Select, BindingId::Command(ContextCommand::SelectLine), KeyCode::KeyX),
-    (ContextMenu::Select, BindingId::Command(ContextCommand::SelectAll), KeyCode::KeyA),
+    (
+        ContextMenu::Select,
+        BindingId::Command(ContextCommand::SelectWord),
+        KeyCode::KeyW,
+    ),
+    (
+        ContextMenu::Select,
+        BindingId::Command(ContextCommand::SelectLine),
+        KeyCode::KeyX,
+    ),
+    (
+        ContextMenu::Select,
+        BindingId::Command(ContextCommand::SelectAll),
+        KeyCode::KeyA,
+    ),
     // Go menu
-    (ContextMenu::Go, BindingId::Command(ContextCommand::LineStart), KeyCode::KeyH),
-    (ContextMenu::Go, BindingId::Command(ContextCommand::LineEnd), KeyCode::KeyE),
-    (ContextMenu::Go, BindingId::Command(ContextCommand::DocumentStart), KeyCode::KeyT),
-    (ContextMenu::Go, BindingId::Command(ContextCommand::DocumentEnd), KeyCode::KeyB),
+    (
+        ContextMenu::Go,
+        BindingId::Command(ContextCommand::LineStart),
+        KeyCode::KeyH,
+    ),
+    (
+        ContextMenu::Go,
+        BindingId::Command(ContextCommand::LineEnd),
+        KeyCode::KeyE,
+    ),
+    (
+        ContextMenu::Go,
+        BindingId::Command(ContextCommand::DocumentStart),
+        KeyCode::KeyT,
+    ),
+    (
+        ContextMenu::Go,
+        BindingId::Command(ContextCommand::DocumentEnd),
+        KeyCode::KeyB,
+    ),
 ];
 
 #[cfg(test)]
@@ -575,11 +703,11 @@ mod tests {
     #[test]
     fn default_keymap_is_the_normative_snapshot() {
         // Verify the DEFAULT_ROOT table contains exactly the expected bindings
-        // This is the drift gate for X01.
+        // This is the drift gate for X02.
         // 20 command-key entries (18 commands + 2 find_char) + 14 motions (7 bare + 7 shifted) = 34 total
-        // The grammar allows shift on motions, so we include both variants for equivalence
-        assert_eq!(DEFAULT_ROOT.len(), 34); // 20 commands + 14 motions = 34
-        
+        // Plus 3 menu openers (V, G, T) = 37 total
+        assert_eq!(DEFAULT_ROOT.len(), 37); // 20 commands + 14 motions + 3 menu openers = 37
+
         // Spot-check a few key bindings
         let has_insert_start = DEFAULT_ROOT.iter().any(|(bid, slot)| {
             bid.id() == "editor.insert_start" && slot.position == KeyCode::KeyI && !slot.shift
@@ -607,19 +735,28 @@ mod tests {
             "editor.motion.next_word_end",
         ];
         for id in motion_ids {
-            let found = DEFAULT_ROOT.iter().any(|(bid, slot)| {
-                bid.id() == id && !slot.shift
-            });
+            let found = DEFAULT_ROOT
+                .iter()
+                .any(|(bid, slot)| bid.id() == id && !slot.shift);
             assert!(found, "Motion {} should be present and bare", id);
         }
 
-        // Menu openers (V, G) are NOT in DEFAULT_ROOT for X01 - they are host special-casing
-        // and will be added in X02 when we cut over the host. Verify they are NOT present.
-        let has_menu_select = DEFAULT_ROOT.iter().any(|(bid, _)| bid.id() == "editor.menu_select");
-        assert!(!has_menu_select, "menu_select should NOT be in DEFAULT_ROOT for X01");
+        // Menu openers (V, G, T) ARE in DEFAULT_ROOT for X02 - they are first-class root bindings
+        // replacing the host special-casing.
+        let has_menu_select = DEFAULT_ROOT.iter().any(|(bid, slot)| {
+            bid.id() == "editor.menu_select" && slot.position == KeyCode::KeyV && !slot.shift
+        });
+        assert!(has_menu_select, "menu_select should map to bare KeyV");
 
-        let has_menu_go = DEFAULT_ROOT.iter().any(|(bid, _)| bid.id() == "editor.menu_go");
-        assert!(!has_menu_go, "menu_go should NOT be in DEFAULT_ROOT for X01");
+        let has_menu_go = DEFAULT_ROOT.iter().any(|(bid, slot)| {
+            bid.id() == "editor.menu_go" && slot.position == KeyCode::KeyG && !slot.shift
+        });
+        assert!(has_menu_go, "menu_go should map to bare KeyG");
+
+        let has_menu_type = DEFAULT_ROOT.iter().any(|(bid, slot)| {
+            bid.id() == "editor.menu_type" && slot.position == KeyCode::KeyT && !slot.shift
+        });
+        assert!(has_menu_type, "menu_type should map to bare KeyT");
     }
 
     #[test]
@@ -627,70 +764,159 @@ mod tests {
         // This is the shadow equivalence test (AC-1).
         // We verify that the default keymap classifies every (position, shift) pair
         // identically to the delivered grammar.
-        
-        use crate::grammar::{command_key, menu_key, motion_key};
+        //
+        // Note: Menu openers (V, G, T) are now first-class root bindings in the keymap,
+        // but in the delivered grammar they were handled as host special-casing (not in
+        // command_key/motion_key). So for menu opener positions, we verify they map to
+        // MenuOpener binding ids and that grammar returns None.
+
+        use crate::grammar::{command_key, motion_key};
         use crate::key::Modifiers;
         use crate::vocabulary::ContextMenu;
         use ContextCommand as C;
-        
+
         let keymap = ContextKeymap::defaults();
-        
-        // Test all KeyCode variants that existed in the original grammar
+
+        // All positions from the original grammar (before X01 extension)
         let original_positions = [
-            KeyCode::KeyA, KeyCode::KeyB, KeyCode::KeyC, KeyCode::KeyD,
-            KeyCode::KeyE, KeyCode::KeyF, KeyCode::KeyG, KeyCode::KeyH,
-            KeyCode::KeyI, KeyCode::KeyJ, KeyCode::KeyK, KeyCode::KeyL,
-            KeyCode::KeyO, KeyCode::KeyP, KeyCode::KeyT, KeyCode::KeyU,
-            KeyCode::KeyV, KeyCode::KeyW, KeyCode::KeyX, KeyCode::KeyY,
-            KeyCode::Semicolon, KeyCode::Slash,
+            KeyCode::KeyA,
+            KeyCode::KeyB,
+            KeyCode::KeyC,
+            KeyCode::KeyD,
+            KeyCode::KeyE,
+            KeyCode::KeyF,
+            KeyCode::KeyG,
+            KeyCode::KeyH,
+            KeyCode::KeyI,
+            KeyCode::KeyJ,
+            KeyCode::KeyK,
+            KeyCode::KeyL,
+            KeyCode::KeyO,
+            KeyCode::KeyP,
+            KeyCode::KeyT,
+            KeyCode::KeyU,
+            KeyCode::KeyV,
+            KeyCode::KeyW,
+            KeyCode::KeyX,
+            KeyCode::KeyY,
+            KeyCode::Semicolon,
+            KeyCode::Slash,
         ];
-        
+
         for code in original_positions {
             for shift in [false, true] {
-                let slot = Slot { position: code, shift };
-                let modifiers = Modifiers { shift, ..Modifiers::EMPTY };
-                
+                let slot = Slot {
+                    position: code,
+                    shift,
+                };
+                let modifiers = Modifiers {
+                    shift,
+                    ..Modifiers::EMPTY
+                };
+
+                // Handle menu openers specially - they are MenuOpener in keymap but not in grammar
+                if code == KeyCode::KeyV && !shift {
+                    let binding = keymap.lookup_root(slot);
+                    assert!(
+                        matches!(binding, Some(BindingId::MenuOpener(ContextMenu::Select))),
+                        "KeyV should map to MenuOpener(Select)"
+                    );
+                    assert_eq!(
+                        command_key(code, modifiers),
+                        None,
+                        "Grammar command_key should return None for KeyV"
+                    );
+                    continue;
+                }
+                if code == KeyCode::KeyG && !shift {
+                    let binding = keymap.lookup_root(slot);
+                    assert!(
+                        matches!(binding, Some(BindingId::MenuOpener(ContextMenu::Go))),
+                        "KeyG should map to MenuOpener(Go)"
+                    );
+                    assert_eq!(
+                        command_key(code, modifiers),
+                        None,
+                        "Grammar command_key should return None for KeyG"
+                    );
+                    continue;
+                }
+                if code == KeyCode::KeyT && !shift {
+                    let binding = keymap.lookup_root(slot);
+                    assert!(
+                        matches!(binding, Some(BindingId::MenuOpener(ContextMenu::Type))),
+                        "KeyT should map to MenuOpener(Type)"
+                    );
+                    assert_eq!(
+                        command_key(code, modifiers),
+                        None,
+                        "Grammar command_key should return None for KeyT"
+                    );
+                    continue;
+                }
+
                 // Check command_key equivalence
                 let grammar_cmd = command_key(code, modifiers);
-                let keymap_cmd = keymap.lookup_root(slot).and_then(|bid| {
-                    match bid {
-                        BindingId::Command(c) => Some(*c),
-                        _ => None,
-                    }
+                let keymap_cmd = keymap.lookup_root(slot).and_then(|bid| match bid {
+                    BindingId::Command(c) => Some(*c),
+                    _ => None,
                 });
-                
+
                 // They should match (accounting for the fact that FindChar is split in keymap)
                 match (grammar_cmd, keymap_cmd) {
-                    (Some(C::FindChar { forward: true }), Some(C::FindChar { forward: true })) => {},
-                    (Some(C::FindChar { forward: false }), Some(C::FindChar { forward: false })) => {},
-                    (Some(a), Some(b)) => assert_eq!(a, b, "Command mismatch for {}{}", code.token(), if shift { " (shift)" } else { "" }),
-                    (None, None) => {},
+                    (Some(C::FindChar { forward: true }), Some(C::FindChar { forward: true })) => {}
+                    (
+                        Some(C::FindChar { forward: false }),
+                        Some(C::FindChar { forward: false }),
+                    ) => {}
+                    (Some(a), Some(b)) => assert_eq!(
+                        a,
+                        b,
+                        "Command mismatch for {}{}",
+                        code.token(),
+                        if shift { " (shift)" } else { "" }
+                    ),
+                    (None, None) => {}
                     _ => {
                         // This is expected for FindChar which is handled differently
                         // In the keymap, FindChar is a separate BindingId, not a ContextCommand variant
                         if grammar_cmd.map_or(false, |c| matches!(c, C::FindChar { .. })) {
                             // This is OK - FindChar is handled via BindingId::FindChar
                         } else {
-                            panic!("Mismatch for {} shift={}: grammar={:?}, keymap={:?}", 
-                                code.token(), shift, grammar_cmd, keymap_cmd);
+                            panic!(
+                                "Mismatch for {} shift={}: grammar={:?}, keymap={:?}",
+                                code.token(),
+                                shift,
+                                grammar_cmd,
+                                keymap_cmd
+                            );
                         }
                     }
                 }
-                
+
                 // Check motion_key equivalence
                 let grammar_motion = motion_key(code, modifiers);
-                let keymap_motion = keymap.lookup_root(slot).and_then(|bid| {
-                    match bid {
-                        BindingId::Motion(m) => Some(*m),
-                        _ => None,
-                    }
+                let keymap_motion = keymap.lookup_root(slot).and_then(|bid| match bid {
+                    BindingId::Motion(m) => Some(*m),
+                    _ => None,
                 });
-                
+
                 match (grammar_motion, keymap_motion) {
-                    (Some(a), Some(b)) => assert_eq!(a, b, "Motion mismatch for {}{}", code.token(), if shift { " (shift)" } else { "" }),
-                    (None, None) => {},
-                    _ => panic!("Motion mismatch for {} shift={}: grammar={:?}, keymap={:?}", 
-                        code.token(), shift, grammar_motion, keymap_motion),
+                    (Some(a), Some(b)) => assert_eq!(
+                        a,
+                        b,
+                        "Motion mismatch for {}{}",
+                        code.token(),
+                        if shift { " (shift)" } else { "" }
+                    ),
+                    (None, None) => {}
+                    _ => panic!(
+                        "Motion mismatch for {} shift={}: grammar={:?}, keymap={:?}",
+                        code.token(),
+                        shift,
+                        grammar_motion,
+                        keymap_motion
+                    ),
                 }
             }
         }
@@ -699,72 +925,93 @@ mod tests {
     #[test]
     fn resolve_accepts_rebind_and_unbound() {
         use std::collections::BTreeMap;
-        
+
         let mut overrides = BTreeMap::new();
-        
+
         // Rebind delete to KeyS
         overrides.insert("editor.delete".to_string(), "physical:KeyS".to_string());
-        
+
         let keymap = ContextKeymap::resolve(&overrides).expect("Should resolve valid rebind");
-        
+
         // Verify the rebind worked
         let slot = Slot::bare(KeyCode::KeyS);
         let binding = keymap.lookup_root(slot);
         assert!(binding.is_some(), "KeyS should have a binding");
         assert_eq!(binding.unwrap().id(), "editor.delete");
-        
+
         // Verify old position is unbound
         let old_slot = Slot::bare(KeyCode::KeyD);
-        assert!(keymap.lookup_root(old_slot).is_none(), "KeyD should be unbound");
+        assert!(
+            keymap.lookup_root(old_slot).is_none(),
+            "KeyD should be unbound"
+        );
     }
 
     #[test]
     fn resolve_rejects_unknown_binding() {
         use std::collections::BTreeMap;
-        
+
         let mut overrides = BTreeMap::new();
-        overrides.insert("editor.nonexistent".to_string(), "physical:KeyD".to_string());
-        
+        overrides.insert(
+            "editor.nonexistent".to_string(),
+            "physical:KeyD".to_string(),
+        );
+
         let result = ContextKeymap::resolve(&overrides);
         assert!(result.is_err(), "Unknown binding should be rejected");
-        
+
         let errors = result.unwrap_err();
-        assert!(errors.iter().any(|e| matches!(e, KeymapError::UnknownBinding { .. })));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, KeymapError::UnknownBinding { .. }))
+        );
     }
 
     #[test]
     fn resolve_rejects_shift_on_motion() {
         use std::collections::BTreeMap;
-        
+
         let mut overrides = BTreeMap::new();
-        overrides.insert("editor.motion.previous".to_string(), "shift+physical:KeyH".to_string());
-        
+        overrides.insert(
+            "editor.motion.previous".to_string(),
+            "shift+physical:KeyH".to_string(),
+        );
+
         let result = ContextKeymap::resolve(&overrides);
         assert!(result.is_err(), "Shift on motion should be rejected");
-        
+
         let errors = result.unwrap_err();
-        assert!(errors.iter().any(|e| matches!(e, KeymapError::ShiftOnMotion { .. })));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, KeymapError::ShiftOnMotion { .. }))
+        );
     }
 
     #[test]
     fn resolve_rejects_collision() {
         use std::collections::BTreeMap;
-        
+
         let mut overrides = BTreeMap::new();
         overrides.insert("editor.delete".to_string(), "physical:KeyD".to_string());
         overrides.insert("editor.cut".to_string(), "physical:KeyD".to_string());
-        
+
         let result = ContextKeymap::resolve(&overrides);
         assert!(result.is_err(), "Collision should be rejected");
-        
+
         let errors = result.unwrap_err();
-        assert!(errors.iter().any(|e| matches!(e, KeymapError::Collision { .. })));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, KeymapError::Collision { .. }))
+        );
     }
 
     #[test]
     fn lookup_menu_falls_through_to_root() {
         let keymap = ContextKeymap::defaults();
-        
+
         // Delete should be accessible in More menu via fall-through
         let result = keymap.lookup_menu(ContextMenu::More, KeyCode::KeyD);
         assert_eq!(result, Some(ContextCommand::Delete));
@@ -773,7 +1020,7 @@ mod tests {
     #[test]
     fn menu_accelerator_takes_precedence() {
         let keymap = ContextKeymap::defaults();
-        
+
         // In Select menu, KeyW should give SelectWord (menu accelerator), not InsertStart
         let result = keymap.lookup_menu(ContextMenu::Select, KeyCode::KeyW);
         assert_eq!(result, Some(ContextCommand::SelectWord));
@@ -782,13 +1029,13 @@ mod tests {
     #[test]
     fn binding_label_uses_glyphs() {
         use crate::labels::Layout;
-        
+
         let keymap = ContextKeymap::defaults();
-        
+
         // Delete should show as "d" in qwerty
         let label = keymap.binding_label(Layout::Qwerty, "editor.delete");
         assert_eq!(label, "d");
-        
+
         // Cut should show as "⇧d" in qwerty
         let label = keymap.binding_label(Layout::Qwerty, "editor.cut");
         assert_eq!(label, "⇧d");
@@ -798,24 +1045,54 @@ mod tests {
     fn token_parsing_covers_all_positions() {
         // Every KeyCode variant should parse from its token string
         for code in [
-            KeyCode::KeyA, KeyCode::KeyB, KeyCode::KeyC, KeyCode::KeyD,
-            KeyCode::KeyE, KeyCode::KeyF, KeyCode::KeyG, KeyCode::KeyH,
-            KeyCode::KeyI, KeyCode::KeyJ, KeyCode::KeyK, KeyCode::KeyL,
-            KeyCode::KeyM, KeyCode::KeyN, KeyCode::KeyO, KeyCode::KeyP,
-            KeyCode::KeyQ, KeyCode::KeyR, KeyCode::KeyS, KeyCode::KeyT,
-            KeyCode::KeyU, KeyCode::KeyV, KeyCode::KeyW, KeyCode::KeyX,
-            KeyCode::KeyY, KeyCode::KeyZ,
-            KeyCode::Semicolon, KeyCode::Quote, KeyCode::Comma, KeyCode::Period,
-            KeyCode::Slash, KeyCode::Backslash, KeyCode::BracketLeft,
-            KeyCode::BracketRight, KeyCode::Minus, KeyCode::Equal,
+            KeyCode::KeyA,
+            KeyCode::KeyB,
+            KeyCode::KeyC,
+            KeyCode::KeyD,
+            KeyCode::KeyE,
+            KeyCode::KeyF,
+            KeyCode::KeyG,
+            KeyCode::KeyH,
+            KeyCode::KeyI,
+            KeyCode::KeyJ,
+            KeyCode::KeyK,
+            KeyCode::KeyL,
+            KeyCode::KeyM,
+            KeyCode::KeyN,
+            KeyCode::KeyO,
+            KeyCode::KeyP,
+            KeyCode::KeyQ,
+            KeyCode::KeyR,
+            KeyCode::KeyS,
+            KeyCode::KeyT,
+            KeyCode::KeyU,
+            KeyCode::KeyV,
+            KeyCode::KeyW,
+            KeyCode::KeyX,
+            KeyCode::KeyY,
+            KeyCode::KeyZ,
+            KeyCode::Semicolon,
+            KeyCode::Quote,
+            KeyCode::Comma,
+            KeyCode::Period,
+            KeyCode::Slash,
+            KeyCode::Backslash,
+            KeyCode::BracketLeft,
+            KeyCode::BracketRight,
+            KeyCode::Minus,
+            KeyCode::Equal,
         ] {
             let token = format!("physical:{}", code.token());
             let parsed = BindingToken::parse(&token);
             assert!(parsed.is_some(), "Token {} should parse", token);
-            
+
             let token_shifted = format!("shift+physical:{}", code.token());
             let parsed_shifted = BindingToken::parse(&token_shifted);
-            assert!(parsed_shifted.is_some(), "Shifted token {} should parse", token_shifted);
+            assert!(
+                parsed_shifted.is_some(),
+                "Shifted token {} should parse",
+                token_shifted
+            );
         }
     }
 }

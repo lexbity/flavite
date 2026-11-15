@@ -9,6 +9,7 @@
 
 use crate::style::{self, Metrics, Scheme};
 use flavite_api::{Flavite, InstalledTheme};
+use flavite_edit_context::{self, labels};
 use flavite_settings::resolve::Resolved;
 use flavite_settings::value::SettingValue;
 use flavite_theme::{SemanticTheme, ThemeImage};
@@ -134,6 +135,11 @@ pub struct AppearanceHost {
     /// The resolved chord table: default chords with any validated
     /// overrides applied. Rebuilt on every adoption.
     pub shortcuts: Vec<(flavite_api::Chord, &'static str)>,
+    /// The effective Context Mode keymap: compiled-in defaults with any validated
+    /// overrides applied. Rebuilt on every adoption (FEUX-0003 X02).
+    pub context_keys: flavite_edit_context::ContextKeymap,
+    /// The declared keyboard layout for Context Mode labels (FEUX-0003 X02).
+    pub keyboard_layout: flavite_edit_context::labels::Layout,
     /// The loaded theme package, when one is selected and loads.
     pub theme_package: Option<ThemePackage>,
     /// The installed theme packages, for the Settings tab.
@@ -158,6 +164,8 @@ impl AppearanceHost {
             last_error: None,
             shortcut_error: None,
             shortcuts: Vec::new(),
+            context_keys: flavite_edit_context::ContextKeymap::defaults(),
+            keyboard_layout: flavite_edit_context::labels::Layout::default(),
             theme_package: None,
             installed_themes: Vec::new(),
             theme_error: None,
@@ -295,6 +303,15 @@ impl AppearanceHost {
     #[must_use]
     pub fn shortcut_overrides(&self) -> std::collections::BTreeMap<String, String> {
         match self.value("shortcuts.overrides") {
+            SettingValue::ShortcutMap(map) => map,
+            _ => std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Context Mode key overrides from settings (FEUX-0003 X02).
+    #[must_use]
+    pub fn context_key_overrides(&self) -> std::collections::BTreeMap<String, String> {
+        match self.value("shortcuts.context_keys") {
             SettingValue::ShortcutMap(map) => map,
             _ => std::collections::BTreeMap::new(),
         }
@@ -471,6 +488,24 @@ impl AppearanceHost {
                 Some((chord, *id))
             })
             .collect();
+
+        // Context Mode keymap: rebuild from resolved settings (FEUX-0003 X02)
+        let context_overrides = self.context_key_overrides();
+        self.context_keys = match flavite_edit_context::ContextKeymap::resolve(&context_overrides) {
+            Ok(keymap) => keymap,
+            Err(_errors) => {
+                // Whole-layer rejection: use defaults (FR-5 / E-6)
+                // Errors are surfaced via the Settings tab, not logged here
+                flavite_edit_context::ContextKeymap::defaults()
+            }
+        };
+
+        // Keyboard layout for Context Mode labels (FEUX-0003 X02)
+        self.keyboard_layout = if let Some(s) = self.value("appearance.keyboard_layout").as_str() {
+            labels::Layout::parse(s).unwrap_or(labels::Layout::default())
+        } else {
+            labels::Layout::default()
+        };
     }
 
     /// Resolve a keyboard event to its bound command id, if any chord
@@ -501,6 +536,14 @@ impl AppearanceHost {
             return Some(error.clone());
         }
         None
+    }
+
+    /// Get the binding label for a Context Mode binding id using the effective
+    /// keymap and declared layout (FEUX-0003 E-8).
+    #[must_use]
+    pub fn context_label(&self, binding_id: &str) -> String {
+        self.context_keys
+            .binding_label(self.keyboard_layout, binding_id)
     }
 }
 

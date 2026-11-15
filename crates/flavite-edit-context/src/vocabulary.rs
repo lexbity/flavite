@@ -244,34 +244,6 @@ impl ContextCommand {
                 | Self::Change
         )
     }
-
-    /// Physical-position hints; no guessed active-layout glyph is shown.
-    #[must_use]
-    pub const fn hint(self) -> &'static str {
-        match self {
-            Self::Cut => "Shift+KeyD",
-            Self::Copy => "KeyY",
-            Self::Paste => "KeyP",
-            Self::Undo => "KeyU",
-            Self::Redo => "Shift+KeyU",
-            Self::Commands => "Shift+Semicolon",
-            Self::Find => "Slash",
-            Self::Replace => "Shift+Slash",
-            Self::InsertStart => "KeyI",
-            Self::InsertEnd => "KeyA",
-            Self::InsertLineStart => "Shift+KeyI",
-            Self::InsertLineEnd => "Shift+KeyA",
-            Self::OpenAbove => "Shift+KeyO",
-            Self::OpenBelow => "KeyO",
-            Self::Change => "KeyC",
-            Self::Delete => "KeyD",
-            Self::SelectLine => "KeyX",
-            Self::Collapse => "Semicolon",
-            Self::FindChar { forward: true } => "KeyF",
-            Self::FindChar { forward: false } => "Shift+KeyF",
-            _ => "",
-        }
-    }
 }
 
 /// A toolbar menu is a flat list; commands are not duplicated as aliases.
@@ -284,18 +256,6 @@ pub enum ContextMenu {
 }
 
 impl ContextMenu {
-    #[must_use]
-    pub const fn hint(self, command: ContextCommand) -> &'static str {
-        match (self, command) {
-            (Self::Select, ContextCommand::SelectWord) => "KeyW",
-            (Self::Select, ContextCommand::SelectAll) => "KeyA",
-            (Self::Go, ContextCommand::LineStart) => "KeyH",
-            (Self::Go, ContextCommand::LineEnd) => "KeyE",
-            (Self::Go, ContextCommand::DocumentStart) => "KeyT",
-            (Self::Go, ContextCommand::DocumentEnd) => "KeyB",
-            _ => command.hint(),
-        }
-    }
     #[must_use]
     pub const fn title(self) -> &'static str {
         match self {
