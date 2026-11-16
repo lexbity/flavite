@@ -631,7 +631,8 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             None => "",
         };
         // Get the active field's error
-        let error_widget: Element<Message> = if let Some(field) = args.fields.get(args.active_field) {
+        let error_widget: Element<Message> = if let Some(field) = args.fields.get(args.active_field)
+        {
             if let Some(ref error) = field.error {
                 use iced::widget::Text;
                 Text::new(error.as_str()).size(12).into()
@@ -641,11 +642,15 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         } else {
             Space::new().width(Length::Fixed(0.0)).into()
         };
-        
+
         // Get the active field's input - use first field as fallback if active_field is out of bounds
-        let active_input = args.fields.get(args.active_field).unwrap_or_else(|| args.fields.first().expect("At least one field should exist"));
+        let active_input = args.fields.get(args.active_field).unwrap_or_else(|| {
+            args.fields
+                .first()
+                .expect("At least one field should exist")
+        });
         let active_input = &active_input.input;
-        
+
         content = content.push(bounds::observe(
             container(
                 row![
@@ -679,7 +684,9 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                             crate::host::command_args::CommandArgsMessage::Cancel(tab),
                         )),
                     // Add scope toggle for replace_regex (FEUX-0006 E-6)
-                    if args.draft.command == flavite_edit_context::vocabulary::ContextCommand::ReplaceRegex {
+                    if args.draft.command
+                        == flavite_edit_context::vocabulary::ContextCommand::ReplaceRegex
+                    {
                         let scope_label = if args.in_selections {
                             "Selections"
                         } else {
@@ -691,9 +698,7 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                                 crate::host::command_args::CommandArgsMessage::ToggleScope(tab),
                             ))
                     } else {
-                        button("")
-                            .style(style::ghost())
-                            .width(Length::Fixed(0.0))
+                        button("").style(style::ghost()).width(Length::Fixed(0.0))
                     },
                     error_widget,
                 ]

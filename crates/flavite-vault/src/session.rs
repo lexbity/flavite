@@ -1827,7 +1827,9 @@ impl Session {
                                     request_id: job.request_id,
                                     buffer_id: request.buffer_id,
                                     revision: request.revision,
-                                    outcome: crate::text_edit::prepare_replace_plan(&job.text, &request),
+                                    outcome: crate::text_edit::prepare_replace_plan(
+                                        &job.text, &request,
+                                    ),
                                 },
                                 TextWork::SelectMatches(request) => {
                                     TextOutcomeMessage::SelectMatches {

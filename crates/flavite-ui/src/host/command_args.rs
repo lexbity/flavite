@@ -28,9 +28,7 @@ pub enum FieldSpec {
         literal_only: bool,
     },
     /// Regex argument with placeholder.
-    Regex {
-        placeholder: &'static str,
-    },
+    Regex { placeholder: &'static str },
     /// Numeric argument (1..=max_value).
     Number { max_value: u32 },
 }
@@ -187,14 +185,17 @@ impl CommandArgsState {
         self.fields.iter().map(|f| f.text.clone()).collect()
     }
 
-
-
-
-
     /// Validate a single field.
     fn validate_field(&self, field_idx: usize) -> Result<Option<String>, String> {
-        let field_state = self.fields.get(field_idx).ok_or_else(|| "Field index out of bounds".to_string())?;
-        let spec = self.draft.fields.get(field_idx).ok_or_else(|| "Spec index out of bounds".to_string())?;
+        let field_state = self
+            .fields
+            .get(field_idx)
+            .ok_or_else(|| "Field index out of bounds".to_string())?;
+        let spec = self
+            .draft
+            .fields
+            .get(field_idx)
+            .ok_or_else(|| "Spec index out of bounds".to_string())?;
 
         let text = field_state.text.trim();
         if text.is_empty() {
@@ -231,7 +232,10 @@ impl CommandArgsState {
                 if text.is_empty() {
                     Err("Pattern cannot be empty".to_string())
                 } else if text.len() > PATTERN_MAX_BYTES {
-                    Err(format!("Pattern exceeds the {} KiB limit", PATTERN_MAX_BYTES / 1024))
+                    Err(format!(
+                        "Pattern exceeds the {} KiB limit",
+                        PATTERN_MAX_BYTES / 1024
+                    ))
                 } else {
                     // Compile-only validation on main thread (FEUX-0006 E-6/E-10)
                     // This is bounded by the same limits as the worker
@@ -263,8 +267,6 @@ impl CommandArgsState {
             Err(errors)
         }
     }
-
-
 }
 
 /// Compile-only regex validation (FEUX-0006 E-6, E-10).
@@ -314,7 +316,10 @@ impl CommandArgsHost {
     /// Get the in_selections flag for a tab.
     #[must_use]
     pub fn in_selections(&self, tab: TabId) -> bool {
-        self.tabs.get(&tab).map(|s| s.in_selections).unwrap_or(false)
+        self.tabs
+            .get(&tab)
+            .map(|s| s.in_selections)
+            .unwrap_or(false)
     }
 
     /// Returns true if this host is blocking typing for the given tab.
@@ -406,12 +411,8 @@ pub(crate) fn open_goto_line(app: &mut App, target: EditorTarget) {
     let draft = DraftCommand::goto_line(999_999);
     let mut state = CommandArgsState::new(draft, target.clone());
     state.fields = vec![FieldState::new()];
-    app.command_args
-        .tabs
-        .insert(target.tab, state);
+    app.command_args.tabs.insert(target.tab, state);
 }
-
-
 
 /// Handle one command-args message.
 pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message> {
@@ -432,9 +433,7 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
             let mut state = CommandArgsState::new(draft, target);
             // Initialize fields
             state.fields = vec![FieldState::new(); fields_len];
-            app.command_args
-                .tabs
-                .insert(tab, state);
+            app.command_args.tabs.insert(tab, state);
             // Close matches draft for mutual exclusion (E-11)
             app.selection_search.tabs.remove(&tab);
             app.selection_search.pending_focus = None;
@@ -535,15 +534,18 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
                                         FieldSpec::Regex { .. } | FieldSpec::Text { .. } => {
                                             // These are required for replace_regex
                                             if command == ContextCommand::ReplaceRegex {
-                                                if let Some(field_state) = state.fields.get_mut(idx) {
-                                                    field_state.error = Some("Field cannot be empty".to_string());
+                                                if let Some(field_state) = state.fields.get_mut(idx)
+                                                {
+                                                    field_state.error =
+                                                        Some("Field cannot be empty".to_string());
                                                 }
                                                 has_error = true;
                                             }
                                         }
                                         FieldSpec::Number { .. } => {
                                             if let Some(field_state) = state.fields.get_mut(idx) {
-                                                field_state.error = Some("Field cannot be empty".to_string());
+                                                field_state.error =
+                                                    Some("Field cannot be empty".to_string());
                                             }
                                             has_error = true;
                                         }
@@ -559,7 +561,8 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
                         // For ReplaceRegex, handle specially (FEUX-0006 E-5)
                         if command == ContextCommand::ReplaceRegex {
                             let pattern = values.get(0).and_then(|v| v.clone()).unwrap_or_default();
-                            let template = values.get(1).and_then(|v| v.clone()).unwrap_or_default();
+                            let template =
+                                values.get(1).and_then(|v| v.clone()).unwrap_or_default();
 
                             // Build scope spans from current selections
                             let scope_spans: Vec<(usize, usize)> = if state.in_selections {
@@ -587,17 +590,29 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
                                     }),
                                     Origin::Gui,
                                 );
-                                
+
                                 // Execute the replace_plan request
                                 match api.execute(invocation) {
-                                    flavite_api::ExecutionResult::Local(flavite_api::LocalResult::Success(success)) => {
+                                    flavite_api::ExecutionResult::Local(
+                                        flavite_api::LocalResult::Success(success),
+                                    ) => {
                                         // Extract ops from the result
                                         if let Some(plan) = success.data.get("plan") {
-                                            if let (Some(_), Some(_), Some(ops)) = (
-                                                plan.get("match_count").and_then(|v| v.as_u64()),
-                                                plan.get("output_len").and_then(|v| v.as_u64()),
-                                                plan.get("ops").and_then(|v| serde_json::from_value::<Vec<serde_json::Value>>(v.clone()).ok()),
-                                            ) {
+                                            if let (Some(_), Some(_), Some(ops)) =
+                                                (
+                                                    plan.get("match_count")
+                                                        .and_then(|v| v.as_u64()),
+                                                    plan.get("output_len").and_then(|v| v.as_u64()),
+                                                    plan.get("ops").and_then(|v| {
+                                                        serde_json::from_value::<
+                                                            Vec<serde_json::Value>,
+                                                        >(
+                                                            v.clone()
+                                                        )
+                                                        .ok()
+                                                    }),
+                                                )
+                                            {
                                                 // Now commit via apply_edits
                                                 let _ = super::context_mode::kernel_mutate(
                                                     app,
@@ -611,7 +626,7 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
                                                     }),
                                                     "Replace was refused; source changed",
                                                 );
-                                                
+
                                                 // Close the draft
                                                 app.command_args.tabs.remove(&tab);
                                             }
@@ -644,7 +659,9 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
                                         if let Ok(n) = arg.parse::<u64>() {
                                             json_args.insert(
                                                 "line".to_string(),
-                                                serde_json::Value::Number(serde_json::Number::from(n)),
+                                                serde_json::Value::Number(
+                                                    serde_json::Number::from(n),
+                                                ),
                                             );
                                         }
                                     }
@@ -789,7 +806,7 @@ mod tests {
     #[test]
     fn regex_field_validates_compile() {
         let mut state = CommandArgsState::new(DraftCommand::replace_regex(), test_target());
-        
+
         // Valid regex
         state.fields = vec![FieldState::with_text(r"a(b)?c")];
         let result = state.validate_field(0);

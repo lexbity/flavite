@@ -488,9 +488,11 @@ fn prepare_regex_plan(
         if end < start
             || end > text.len()
             || !source_bounds_valid(text, start, end)
-            || !request.scope_spans.is_empty() && !request.scope_spans.iter().any(|&(s_start, s_end)| {
-                s_start <= start && end <= s_end
-            })
+            || !request.scope_spans.is_empty()
+                && !request
+                    .scope_spans
+                    .iter()
+                    .any(|&(s_start, s_end)| s_start <= start && end <= s_end)
         {
             return Err(PrepareError::InvalidScope);
         }
@@ -561,9 +563,11 @@ fn prepare_literal_plan(
                 continue;
             }
         }
-        let expansion = template
-            .expand(&matcher, text, &hit)
-            .map_err(|_| PrepareError::Template(flavite_text_search::template::TemplateError::UnknownGroup { group: 0.to_string() }))?;
+        let expansion = template.expand(&matcher, text, &hit).map_err(|_| {
+            PrepareError::Template(flavite_text_search::template::TemplateError::UnknownGroup {
+                group: 0.to_string(),
+            })
+        })?;
         let start = hit.span.start.0;
         let end = hit.span.end.0;
         let span_len = (end - start) as u64;
