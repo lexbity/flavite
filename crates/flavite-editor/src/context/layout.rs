@@ -3,7 +3,7 @@
 
 use flavite_edit_context::{ContextCommand as C, ContextMenu as M};
 
-pub const MENUS: &[M] = &[M::Select, M::Go, M::More];
+pub const MENUS: &[M] = &[M::Select, M::Go, M::More, M::Transform, M::Lines];
 
 pub const GAP: f32 = 4.0;
 pub const STATE_WIDTH: f32 = 70.0;
@@ -53,6 +53,8 @@ impl ContextLayout {
             >= match menu {
                 M::More => 320.0,
                 M::Select | M::Go => 720.0,
+                M::Transform => 720.0,
+                M::Lines => 720.0,
             }
     }
 
@@ -77,6 +79,8 @@ pub const fn menu_width(menu: M) -> f32 {
         M::Select => 76.0,
         M::Go => 52.0,
         M::More => 64.0,
+        M::Transform => 84.0,
+        M::Lines => 60.0,
     }
 }
 

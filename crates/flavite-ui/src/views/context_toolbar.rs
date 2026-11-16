@@ -147,6 +147,11 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
             actions = actions.push(menu_button(app, target, menu));
         }
     }
+    if plan.menu_visible(ContextMenu::Transform) {
+        for menu in [ContextMenu::Transform, ContextMenu::Lines] {
+            actions = actions.push(menu_button(app, target, menu));
+        }
+    }
     if plan.command_visible(ContextCommand::Find) {
         actions = actions.push(action(
             app,

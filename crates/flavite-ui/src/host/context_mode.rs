@@ -1803,6 +1803,120 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             let generation = app.context_mode.generation;
             return super::editor_clipboard::write_for_cut(target, generation, copied);
         }
+        // FEUX-0004 X01: Transform family
+        CaseUpper => kernel_task(
+            app,
+            &target,
+            "editor.case_upper",
+            serde_json::json!({}),
+            "Uppercase was refused; source changed",
+        ),
+        CaseLower => kernel_task(
+            app,
+            &target,
+            "editor.case_lower",
+            serde_json::json!({}),
+            "Lowercase was refused; source changed",
+        ),
+        CaseSwap => kernel_task(
+            app,
+            &target,
+            "editor.case_swap",
+            serde_json::json!({}),
+            "Swap case was refused; source changed",
+        ),
+        CaseTitle => kernel_task(
+            app,
+            &target,
+            "editor.case_title",
+            serde_json::json!({}),
+            "Title case was refused; source changed",
+        ),
+        NumberInc => kernel_task(
+            app,
+            &target,
+            "editor.number_inc",
+            serde_json::json!({}),
+            "Increment was refused; source changed",
+        ),
+        NumberDec => kernel_task(
+            app,
+            &target,
+            "editor.number_dec",
+            serde_json::json!({}),
+            "Decrement was refused; source changed",
+        ),
+        NumberSequence => kernel_task(
+            app,
+            &target,
+            "editor.number_sequence",
+            serde_json::json!({}),
+            "Number sequence was refused; source changed",
+        ),
+        // FEUX-0004 X01: Lines family
+        LinesSortAsc => kernel_task(
+            app,
+            &target,
+            "editor.lines_sort_asc",
+            serde_json::json!({}),
+            "Sort lines ascending was refused; source changed",
+        ),
+        LinesSortDesc => kernel_task(
+            app,
+            &target,
+            "editor.lines_sort_desc",
+            serde_json::json!({}),
+            "Sort lines descending was refused; source changed",
+        ),
+        LinesSortNumeric => kernel_task(
+            app,
+            &target,
+            "editor.lines_sort_numeric",
+            serde_json::json!({}),
+            "Sort lines numeric was refused; source changed",
+        ),
+        LinesJoin => kernel_task(
+            app,
+            &target,
+            "editor.lines_join",
+            serde_json::json!({}),
+            "Join lines was refused; source changed",
+        ),
+        LinesDuplicate => kernel_task(
+            app,
+            &target,
+            "editor.lines_duplicate",
+            serde_json::json!({}),
+            "Duplicate lines was refused; source changed",
+        ),
+        LinesDedupe => kernel_task(
+            app,
+            &target,
+            "editor.lines_dedupe",
+            serde_json::json!({}),
+            "Deduplicate lines was refused; source changed",
+        ),
+        LinesShuffle => kernel_task(
+            app,
+            &target,
+            "editor.lines_shuffle",
+            serde_json::json!({}),
+            "Shuffle lines was refused; source changed",
+        ),
+        LinesMoveUp => kernel_task(
+            app,
+            &target,
+            "editor.lines_move_up",
+            serde_json::json!({}),
+            "Move lines up was refused; source changed",
+        ),
+        LinesMoveDown => kernel_task(
+            app,
+            &target,
+            "editor.lines_move_down",
+            serde_json::json!({}),
+            "Move lines down was refused; source changed",
+        ),
         Toggle | Exit | Escape | Paste | Undo | Redo | Commands | Find | Replace | History
         | SelectMatches | SplitSelection => {
             unreachable!("handled before planning")

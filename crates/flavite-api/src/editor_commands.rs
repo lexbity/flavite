@@ -1263,6 +1263,344 @@ pub(crate) fn handle_split_selection(
     handle_match_selection(session, invocation, false)
 }
 
+// FEUX-0004 X01: Transform family handlers
+pub(crate) fn handle_case_upper(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::CaseUpper,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_case_lower(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::CaseLower,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_case_swap(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::CaseSwap,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_case_title(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::CaseTitle,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_number_inc(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::NumberInc,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_number_dec(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::NumberDec,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_number_sequence(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::NumberSequence,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+// FEUX-0004 X01: Lines family handlers
+pub(crate) fn handle_lines_sort_asc(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesSortAsc,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_lines_sort_desc(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesSortDesc,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_lines_sort_numeric(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesSortNumeric,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_lines_join(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesJoin,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_lines_duplicate(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesDuplicate,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_lines_dedupe(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesDedupe,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_lines_shuffle(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesShuffle,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_lines_move_up(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesMoveUp,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_lines_move_down(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesMoveDown,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
 fn handle_match_selection(
     session: &Session,
     invocation: &Invocation,

@@ -79,6 +79,40 @@ pub enum ContextCommand {
     LineEnd,
     DocumentStart,
     DocumentEnd,
+    // FEUX-0004 X01: Transform family
+    /// Uppercase each character in each selection.
+    CaseUpper,
+    /// Lowercase each character in each selection.
+    CaseLower,
+    /// Swap case of each character in each selection.
+    CaseSwap,
+    /// Title-case each word in each selection (UAX #29 word boundaries).
+    CaseTitle,
+    /// Increment the first number in each selection (leading-zero width preserved).
+    NumberInc,
+    /// Decrement the first number in each selection (leading-zero width preserved).
+    NumberDec,
+    /// Replace each selection's number with its document-order index (1-based).
+    NumberSequence,
+    // FEUX-0004 X01: Lines family
+    /// Sort lines in each selection's containing line block (byte-lexicographic, stable).
+    LinesSortAsc,
+    /// Sort lines in each selection's containing line block (inverse byte-lexicographic, stable).
+    LinesSortDesc,
+    /// Sort lines in each selection's containing line block by numeric value (stable).
+    LinesSortNumeric,
+    /// Join lines in each selection's containing line block (replace newlines with single space).
+    LinesJoin,
+    /// Duplicate each selection's containing line block.
+    LinesDuplicate,
+    /// Remove duplicate lines in each selection's containing line block (byte-exact, first wins).
+    LinesDedupe,
+    /// Shuffle lines in each selection's containing line block (Fisher-Yates, splitmix64 seeded).
+    LinesShuffle,
+    /// Move each selection's containing line block up by one position.
+    LinesMoveUp,
+    /// Move each selection's containing line block down by one position.
+    LinesMoveDown,
 }
 
 impl ContextCommand {
@@ -121,6 +155,24 @@ impl ContextCommand {
         Self::LineEnd,
         Self::DocumentStart,
         Self::DocumentEnd,
+        // FEUX-0004 X01: Transform family
+        Self::CaseUpper,
+        Self::CaseLower,
+        Self::CaseSwap,
+        Self::CaseTitle,
+        Self::NumberInc,
+        Self::NumberDec,
+        Self::NumberSequence,
+        // FEUX-0004 X01: Lines family
+        Self::LinesSortAsc,
+        Self::LinesSortDesc,
+        Self::LinesSortNumeric,
+        Self::LinesJoin,
+        Self::LinesDuplicate,
+        Self::LinesDedupe,
+        Self::LinesShuffle,
+        Self::LinesMoveUp,
+        Self::LinesMoveDown,
     ];
 
     #[must_use]
@@ -167,6 +219,24 @@ impl ContextCommand {
             Self::LineEnd => "workspace.caret_end_line",
             Self::DocumentStart => "workspace.caret_start",
             Self::DocumentEnd => "workspace.caret_end",
+            // FEUX-0004 X01: Transform family
+            Self::CaseUpper => "editor.case_upper",
+            Self::CaseLower => "editor.case_lower",
+            Self::CaseSwap => "editor.case_swap",
+            Self::CaseTitle => "editor.case_title",
+            Self::NumberInc => "editor.number_inc",
+            Self::NumberDec => "editor.number_dec",
+            Self::NumberSequence => "editor.number_sequence",
+            // FEUX-0004 X01: Lines family
+            Self::LinesSortAsc => "editor.lines_sort_asc",
+            Self::LinesSortDesc => "editor.lines_sort_desc",
+            Self::LinesSortNumeric => "editor.lines_sort_numeric",
+            Self::LinesJoin => "editor.lines_join",
+            Self::LinesDuplicate => "editor.lines_duplicate",
+            Self::LinesDedupe => "editor.lines_dedupe",
+            Self::LinesShuffle => "editor.lines_shuffle",
+            Self::LinesMoveUp => "editor.lines_move_up",
+            Self::LinesMoveDown => "editor.lines_move_down",
         }
     }
 
@@ -213,6 +283,24 @@ impl ContextCommand {
             Self::LineEnd => "Line end",
             Self::DocumentStart => "Document start",
             Self::DocumentEnd => "Document end",
+            // FEUX-0004 X01: Transform family
+            Self::CaseUpper => "Uppercase",
+            Self::CaseLower => "Lowercase",
+            Self::CaseSwap => "Swap case",
+            Self::CaseTitle => "Title case",
+            Self::NumberInc => "Increment number",
+            Self::NumberDec => "Decrement number",
+            Self::NumberSequence => "Number sequence",
+            // FEUX-0004 X01: Lines family
+            Self::LinesSortAsc => "Sort lines ascending",
+            Self::LinesSortDesc => "Sort lines descending",
+            Self::LinesSortNumeric => "Sort lines numeric",
+            Self::LinesJoin => "Join lines",
+            Self::LinesDuplicate => "Duplicate lines",
+            Self::LinesDedupe => "Deduplicate lines",
+            Self::LinesShuffle => "Shuffle lines",
+            Self::LinesMoveUp => "Move lines up",
+            Self::LinesMoveDown => "Move lines down",
         }
     }
 
@@ -228,6 +316,24 @@ impl ContextCommand {
                 | Self::OpenBelow
                 | Self::Change
                 | Self::Delete
+                // FEUX-0004 X01: Transform family - all mutate
+                | Self::CaseUpper
+                | Self::CaseLower
+                | Self::CaseSwap
+                | Self::CaseTitle
+                | Self::NumberInc
+                | Self::NumberDec
+                | Self::NumberSequence
+                // FEUX-0004 X01: Lines family - all mutate
+                | Self::LinesSortAsc
+                | Self::LinesSortDesc
+                | Self::LinesSortNumeric
+                | Self::LinesJoin
+                | Self::LinesDuplicate
+                | Self::LinesDedupe
+                | Self::LinesShuffle
+                | Self::LinesMoveUp
+                | Self::LinesMoveDown
         )
     }
 
@@ -252,6 +358,9 @@ pub enum ContextMenu {
     Select,
     Go,
     More,
+    // FEUX-0004 X01: new menus
+    Transform,
+    Lines,
 }
 
 impl ContextMenu {
@@ -261,6 +370,8 @@ impl ContextMenu {
             Self::Select => "Select",
             Self::Go => "Go",
             Self::More => "More",
+            Self::Transform => "Transform",
+            Self::Lines => "Lines",
         }
     }
 
@@ -321,6 +432,28 @@ impl ContextMenu {
                 C::Replace,
                 C::Commands,
                 C::History,
+            ],
+            // FEUX-0004 X01: Transform menu
+            Self::Transform => &[
+                C::CaseUpper,
+                C::CaseLower,
+                C::CaseSwap,
+                C::CaseTitle,
+                C::NumberInc,
+                C::NumberDec,
+                C::NumberSequence,
+            ],
+            // FEUX-0004 X01: Lines menu
+            Self::Lines => &[
+                C::LinesSortAsc,
+                C::LinesSortDesc,
+                C::LinesSortNumeric,
+                C::LinesJoin,
+                C::LinesDuplicate,
+                C::LinesDedupe,
+                C::LinesShuffle,
+                C::LinesMoveUp,
+                C::LinesMoveDown,
             ],
         }
     }

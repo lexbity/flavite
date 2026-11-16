@@ -69,6 +69,40 @@ pub enum EditOperation {
     /// pushed-down (above) or new (below) line via the insertion
     /// stick-right rule.
     OpenLine { above: bool },
+    // FEUX-0004 X01: Transform family
+    /// Uppercase each character in each member's range.
+    CaseUpper,
+    /// Lowercase each character in each member's range.
+    CaseLower,
+    /// Swap the case of each character in each member's range.
+    CaseSwap,
+    /// Title-case each word in each member's range (UAX #29 word boundaries).
+    CaseTitle,
+    /// Increment the first number found in each member's range (leading-zero width preserved).
+    NumberInc,
+    /// Decrement the first number found in each member's range (leading-zero width preserved).
+    NumberDec,
+    /// Replace each member's number with its document-order index (1-based).
+    NumberSequence,
+    // FEUX-0004 X01: Lines family
+    /// Sort lines in each member's containing line block (byte-lexicographic, stable).
+    LinesSortAsc,
+    /// Sort lines in each member's containing line block (inverse byte-lexicographic, stable).
+    LinesSortDesc,
+    /// Sort lines in each member's containing line block by numeric value (stable).
+    LinesSortNumeric,
+    /// Join lines in each member's containing line block (replace newlines with single space).
+    LinesJoin,
+    /// Duplicate each member's containing line block.
+    LinesDuplicate,
+    /// Remove duplicate lines in each member's containing line block (byte-exact, first wins).
+    LinesDedupe,
+    /// Shuffle lines in each member's containing line block (Fisher-Yates, splitmix64 seeded).
+    LinesShuffle,
+    /// Move each member's containing line block up by one position.
+    LinesMoveUp,
+    /// Move each member's containing line block down by one position.
+    LinesMoveDown,
 }
 
 /// A planned edit batch.
@@ -368,6 +402,372 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                 affinity,
             ));
         }
+        // FEUX-0004 X01: Transform family
+        EditOperation::CaseUpper => {
+            for member in set.iter() {
+                let range = if member.is_caret() {
+                    // D-11: caret operates on the following grapheme
+                    if let Some(range) = delete_range(text, member.head()) {
+                        (range.0, range.1)
+                    } else {
+                        continue;
+                    }
+                } else {
+                    (member.start(), member.end())
+                };
+                let transformed = transform_case(
+                    text[range.0..range.1].chars(),
+                    |c| c.to_uppercase().collect::<String>(),
+                    range.0,
+                );
+                planned.push(PlannedEdit {
+                    start: range.0,
+                    end: range.1,
+                    replacement: transformed,
+                });
+            }
+        }
+        EditOperation::CaseLower => {
+            for member in set.iter() {
+                let range = if member.is_caret() {
+                    if let Some(range) = delete_range(text, member.head()) {
+                        (range.0, range.1)
+                    } else {
+                        continue;
+                    }
+                } else {
+                    (member.start(), member.end())
+                };
+                let transformed = transform_case(
+                    text[range.0..range.1].chars(),
+                    |c| c.to_lowercase().collect::<String>(),
+                    range.0,
+                );
+                planned.push(PlannedEdit {
+                    start: range.0,
+                    end: range.1,
+                    replacement: transformed,
+                });
+            }
+        }
+        EditOperation::CaseSwap => {
+            for member in set.iter() {
+                let range = if member.is_caret() {
+                    if let Some(range) = delete_range(text, member.head()) {
+                        (range.0, range.1)
+                    } else {
+                        continue;
+                    }
+                } else {
+                    (member.start(), member.end())
+                };
+                let transformed =
+                    transform_case(text[range.0..range.1].chars(), swap_case, range.0);
+                planned.push(PlannedEdit {
+                    start: range.0,
+                    end: range.1,
+                    replacement: transformed,
+                });
+            }
+        }
+        EditOperation::CaseTitle => {
+            // Title case: first cased char of each word upper, rest lower
+            for member in set.iter() {
+                let range = if member.is_caret() {
+                    if let Some(range) = delete_range(text, member.head()) {
+                        (range.0, range.1)
+                    } else {
+                        continue;
+                    }
+                } else {
+                    (member.start(), member.end())
+                };
+                let transformed = title_case(&text[range.0..range.1]);
+                planned.push(PlannedEdit {
+                    start: range.0,
+                    end: range.1,
+                    replacement: transformed,
+                });
+            }
+        }
+        EditOperation::NumberInc => {
+            for member in set.iter() {
+                if let Some((start, end, replacement)) = scan_and_increment_number(text, member, 1)
+                {
+                    planned.push(PlannedEdit {
+                        start,
+                        end,
+                        replacement,
+                    });
+                }
+            }
+        }
+        EditOperation::NumberDec => {
+            for member in set.iter() {
+                if let Some((start, end, replacement)) = scan_and_increment_number(text, member, -1)
+                {
+                    planned.push(PlannedEdit {
+                        start,
+                        end,
+                        replacement,
+                    });
+                }
+            }
+        }
+        EditOperation::NumberSequence => {
+            // Collect all members with their document order indices
+            let members: Vec<_> = set.iter().collect();
+            let mut indices: Vec<(usize, usize, usize)> = Vec::new(); // (member_index, start, end)
+            for (idx, member) in members.iter().enumerate() {
+                if let Some((start, end)) = find_number_range(text, member) {
+                    indices.push((idx, start, end));
+                } else {
+                    // If any member doesn't have a number, refuse the whole operation
+                    return Ok(PreparedEdit {
+                        ops: Vec::new(),
+                        edits: Vec::new(),
+                        after_text: text.to_string(),
+                        after_set: set.clone(),
+                        fragments: Vec::new(),
+                    });
+                }
+            }
+            for (idx, start, end) in indices {
+                let replacement = (idx + 1).to_string();
+                planned.push(PlannedEdit {
+                    start,
+                    end,
+                    replacement,
+                });
+            }
+        }
+        // FEUX-0004 X01: Lines family
+        EditOperation::LinesSortAsc => {
+            for member in set.iter() {
+                if let Some((block_start, block_end, lines, has_trailing_newline)) =
+                    containing_line_block(text, member)
+                {
+                    let mut sorted_lines: Vec<&str> = lines;
+                    // Stable sort by byte order
+                    sorted_lines.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+                    let replacement = sorted_lines.join("\n");
+                    // Add trailing newline if the original block ended with one
+                    let replacement = if has_trailing_newline && !replacement.ends_with('\n') {
+                        replacement + "\n"
+                    } else {
+                        replacement
+                    };
+                    planned.push(PlannedEdit {
+                        start: block_start,
+                        end: block_end,
+                        replacement,
+                    });
+                }
+            }
+        }
+        EditOperation::LinesSortDesc => {
+            for member in set.iter() {
+                if let Some((block_start, block_end, lines, has_trailing_newline)) =
+                    containing_line_block(text, member)
+                {
+                    let mut sorted_lines: Vec<&str> = lines;
+                    // Stable sort descending
+                    sorted_lines.sort_by(|a, b| b.as_bytes().cmp(a.as_bytes()));
+                    let replacement = sorted_lines.join("\n");
+                    let replacement = if has_trailing_newline && !replacement.ends_with('\n') {
+                        replacement + "\n"
+                    } else {
+                        replacement
+                    };
+                    planned.push(PlannedEdit {
+                        start: block_start,
+                        end: block_end,
+                        replacement,
+                    });
+                }
+            }
+        }
+        EditOperation::LinesSortNumeric => {
+            for member in set.iter() {
+                if let Some((block_start, block_end, lines, has_trailing_newline)) =
+                    containing_line_block(text, member)
+                {
+                    // Parse first integer from each line, sort by that
+                    let mut indexed_lines: Vec<(usize, &str)> = lines
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &line)| (i, line))
+                        .collect();
+                    indexed_lines.sort_by_key(|(_, line)| {
+                        extract_first_number(line)
+                            .map(|n| n as isize)
+                            .unwrap_or(isize::MAX)
+                    });
+                    let sorted_lines: Vec<&str> =
+                        indexed_lines.into_iter().map(|(_, line)| line).collect();
+                    // Stable: maintain original order for equal numeric values (by index)
+                    // Already done by using enumerate above
+                    let replacement = sorted_lines.join("\n");
+                    let replacement = if has_trailing_newline && !replacement.ends_with('\n') {
+                        replacement + "\n"
+                    } else {
+                        replacement
+                    };
+                    planned.push(PlannedEdit {
+                        start: block_start,
+                        end: block_end,
+                        replacement,
+                    });
+                }
+            }
+        }
+        EditOperation::LinesJoin => {
+            for member in set.iter() {
+                if let Some((block_start, block_end, lines, has_trailing_newline)) =
+                    containing_line_block(text, member)
+                {
+                    // Join with single space
+                    let replacement = lines.join(" ");
+                    // Add trailing newline if the original block ended with one
+                    let replacement = if has_trailing_newline {
+                        replacement + "\n"
+                    } else {
+                        replacement
+                    };
+                    planned.push(PlannedEdit {
+                        start: block_start,
+                        end: block_end,
+                        replacement,
+                    });
+                }
+            }
+        }
+        EditOperation::LinesDuplicate => {
+            for member in set.iter() {
+                if let Some((block_start, block_end, _lines, _has_trailing_newline)) =
+                    containing_line_block(text, member)
+                {
+                    let block_text = &text[block_start..block_end];
+                    let replacement = block_text.to_string() + block_text;
+                    planned.push(PlannedEdit {
+                        start: block_start,
+                        end: block_end,
+                        replacement,
+                    });
+                }
+            }
+        }
+        EditOperation::LinesDedupe => {
+            for member in set.iter() {
+                if let Some((block_start, block_end, lines, has_trailing_newline)) =
+                    containing_line_block(text, member)
+                {
+                    // Remove duplicates, keeping first occurrence
+                    let mut seen = std::collections::HashSet::new();
+                    let mut deduped: Vec<&str> = Vec::new();
+                    for line in lines {
+                        if !seen.contains(line) {
+                            seen.insert(line);
+                            deduped.push(line);
+                        }
+                    }
+                    let replacement = deduped.join("\n");
+                    let replacement = if has_trailing_newline && !replacement.ends_with('\n') {
+                        replacement + "\n"
+                    } else {
+                        replacement
+                    };
+                    planned.push(PlannedEdit {
+                        start: block_start,
+                        end: block_end,
+                        replacement,
+                    });
+                }
+            }
+        }
+        EditOperation::LinesShuffle => {
+            // Use splitmix64 for shuffling
+            use std::time::SystemTime;
+            let seed = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let mut rng = SplitMix64::new(seed);
+            for member in set.iter() {
+                if let Some((block_start, block_end, lines, has_trailing_newline)) =
+                    containing_line_block(text, member)
+                {
+                    let mut shuffled = lines.to_vec();
+                    fisher_yates_shuffle(&mut shuffled, &mut rng);
+                    let replacement = shuffled.join("\n");
+                    let replacement = if has_trailing_newline && !replacement.ends_with('\n') {
+                        replacement + "\n"
+                    } else {
+                        replacement
+                    };
+                    planned.push(PlannedEdit {
+                        start: block_start,
+                        end: block_end,
+                        replacement,
+                    });
+                }
+            }
+        }
+        EditOperation::LinesMoveUp => {
+            for member in set.iter() {
+                if let Some((block_start, block_end)) = containing_line_range(text, member) {
+                    // Move block up: swap with previous line block
+                    if block_start > 0 {
+                        let prev_line_start = text[..block_start].rfind('\n').map_or(0, |i| i + 1);
+                        let prev_line_end = block_start;
+                        // Swap the two blocks
+                        let this_block = text[block_start..block_end].to_string();
+                        let prev_block = text[prev_line_start..prev_line_end].to_string();
+                        // Replace prev block with this block
+                        planned.push(PlannedEdit {
+                            start: prev_line_start,
+                            end: prev_line_end,
+                            replacement: this_block.clone(),
+                        });
+                        // Replace this block with prev block
+                        planned.push(PlannedEdit {
+                            start: block_start,
+                            end: block_end,
+                            replacement: prev_block,
+                        });
+                    }
+                }
+            }
+        }
+        EditOperation::LinesMoveDown => {
+            for member in set.iter() {
+                if let Some((block_start, block_end)) = containing_line_range(text, member) {
+                    // Move block down: swap with next line block
+                    if block_end < text.len() {
+                        let next_line_start = block_end;
+                        let next_line_end = text[block_end..]
+                            .find('\n')
+                            .map_or(text.len(), |i| block_end + i + 1);
+                        if next_line_start < text.len() {
+                            let this_block = text[block_start..block_end].to_string();
+                            let next_block = text[next_line_start..next_line_end].to_string();
+                            // Replace this block with next block
+                            planned.push(PlannedEdit {
+                                start: block_start,
+                                end: block_end,
+                                replacement: next_block.clone(),
+                            });
+                            // Replace next block with this block
+                            planned.push(PlannedEdit {
+                                start: next_line_start,
+                                end: next_line_end,
+                                replacement: this_block,
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
     planned.sort_by_key(|edit| (edit.start, edit.end));
     planned.dedup_by_key(|edit| (edit.start, edit.end));
@@ -663,6 +1063,369 @@ fn apply_edits(text: &str, edits: &[PlannedEdit]) -> String {
     }
     result.push_str(&text[cursor..]);
     result
+}
+
+// FEUX-0004 X01: SplitMix64 PRNG (E-8: no rand crate dependency)
+/// A simple, fast, 64-bit PRNG suitable for shuffling.
+/// Based on splitmix64: http://xoshiro.di.unimi.it/splitmix64.c
+#[derive(Debug, Clone)]
+pub struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    #[must_use]
+    pub fn new(seed: u64) -> Self {
+        Self {
+            state: seed.wrapping_add(0x9e3779b97f4a7c15),
+        }
+    }
+
+    /// Returns a random u64 in [0, 2^64)
+    pub fn next_u64(&mut self) -> u64 {
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z = z ^ (z >> 31);
+        self.state = z;
+        z
+    }
+
+    /// Returns a random usize in [0, n)
+    pub fn next_usize(&mut self, n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        let max = usize::MAX - (usize::MAX % n);
+        loop {
+            let r = (self.next_u64() as usize) & usize::MAX;
+            if r < max {
+                return r % n;
+            }
+        }
+    }
+}
+
+/// Fisher-Yates shuffle using the given RNG.
+pub fn fisher_yates_shuffle<T>(items: &mut [T], rng: &mut SplitMix64) {
+    let len = items.len();
+    for i in (1..len).rev() {
+        let j = rng.next_usize(i + 1);
+        items.swap(i, j);
+    }
+}
+
+/// Apply a case transformation function to each character in the text.
+fn transform_case<F>(chars: std::str::Chars, transform: F, _offset: usize) -> String
+where
+    F: Fn(char) -> String,
+{
+    let mut result = String::new();
+    for c in chars {
+        result.push_str(&transform(c));
+    }
+    result
+}
+
+/// Swap the case of a single character.
+fn swap_case(c: char) -> String {
+    if c.is_uppercase() {
+        c.to_lowercase().collect()
+    } else if c.is_lowercase() {
+        c.to_uppercase().collect()
+    } else {
+        c.to_string()
+    }
+}
+
+/// Title-case a string using Unicode word boundaries.
+/// First cased character of each word is uppercased, rest are lowercased.
+fn title_case(text: &str) -> String {
+    let mut result = String::new();
+    let mut word_start = true;
+
+    for c in text.chars() {
+        // Check if this is a word boundary
+        if word_start && c.is_alphabetic() {
+            // First cased character of a word: uppercase
+            result.extend(c.to_uppercase());
+            word_start = false;
+        } else if !c.is_alphabetic() {
+            // Non-alphabetic character: mark next as word start
+            result.push(c);
+            word_start = true;
+        } else {
+            // Alphabetic but not word start: lowercase
+            result.extend(c.to_lowercase());
+        }
+    }
+    result
+}
+
+/// Find and return the containing line block for a member.
+/// Returns (start, end, lines, has_trailing_newline) where lines are the line contents without newlines.
+/// For a range member, this is the union of all lines the range touches.
+fn containing_line_block<'a>(
+    text: &'a str,
+    member: &crate::selection::Selection,
+) -> Option<(usize, usize, Vec<&'a str>, bool)> {
+    let (block_start, block_end) = containing_line_range(text, member)?;
+
+    // Check if the block ends with a newline
+    let has_trailing_newline = block_end > block_start && text.as_bytes()[block_end - 1] == b'\n';
+
+    // Extract the block text (excluding the trailing newline if present)
+    let text_end = if has_trailing_newline {
+        block_end - 1
+    } else {
+        block_end
+    };
+    let block_text = &text[block_start..text_end];
+
+    // Split by newline to get line contents (without newlines)
+    let lines: Vec<&str> = block_text.split('\n').collect();
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some((block_start, block_end, lines, has_trailing_newline))
+    }
+}
+
+/// Find and return the containing line range for a member.
+/// Returns (start, end) of the line block, where end includes the newline if present.
+fn containing_line_range(
+    text: &str,
+    member: &crate::selection::Selection,
+) -> Option<(usize, usize)> {
+    if member.is_caret() {
+        // For caret: use the containing line (includes newline)
+        let range = line_range(text, member.head())?;
+        Some((range.start, range.end))
+    } else {
+        // For range: find all lines that the range touches
+        let range = (member.start(), member.end());
+
+        // The first line is the line containing range.0
+        let first_line = line_range(text, range.0)?;
+
+        // The last line: if range.1 is at a newline position, we need to be careful
+        // If range.1 == range.0, it's an empty range (caret-like)
+        // Otherwise, the last line is the line containing range.1 - 1 (the last byte in the range)
+        // But if range.1 is at a newline, it might be the start of the next line
+        let last_line_pos = if range.1 > range.0 && range.1 <= text.len() {
+            // Try range.1 first - if it's at a newline, line_range might put it in the next line
+            // So try range.1 - 1 instead
+            if range.1 > 0 { range.1 - 1 } else { range.1 }
+        } else {
+            range.1
+        };
+
+        let last_line = line_range(text, last_line_pos)?;
+
+        // The union of first and last lines
+        let block_start = first_line.start;
+        let block_end = last_line.end;
+
+        Some((block_start, block_end))
+    }
+}
+
+/// Scan for a number in the member's range and increment/decrement it.
+/// Returns (start, end, replacement) or None if no number found.
+fn scan_and_increment_number(
+    text: &str,
+    member: &crate::selection::Selection,
+    delta: i64,
+) -> Option<(usize, usize, String)> {
+    // Find the number range in bytes
+    let (num_start, num_end) = find_number_range(text, member)?;
+
+    let num_str = &text[num_start..num_end];
+
+    // Check if it has a sign
+    let has_sign = num_str.starts_with('+') || num_str.starts_with('-');
+
+    // Extract digits (skip sign if present)
+    let digits_start = if has_sign { num_start + 1 } else { num_start };
+    let digits_str = &text[digits_start..num_end];
+
+    // Parse the number
+    let value: i64 = num_str.parse().unwrap_or(0);
+    let new_value = value.saturating_add(delta);
+
+    // Format the replacement with leading zero preservation
+    let original_width = num_end - num_start;
+    let (replacement, final_start) = if has_sign {
+        // Determine the sign character for the new value
+        let sign_char = if new_value < 0 {
+            "-"
+        } else if new_value > 0 {
+            "+"
+        } else {
+            "" // Don't show sign for zero
+        };
+        let new_abs = new_value.abs();
+        let new_str = new_abs.to_string();
+
+        // Check if we should preserve width
+        if original_width > new_str.len() + 1 {
+            let width = original_width - 1;
+            let padded = format!("{:0>width$}", new_abs, width = width);
+            (format!("{}{}", sign_char, padded), num_start)
+        } else {
+            (format!("{}{}", sign_char, new_str), num_start)
+        }
+    } else {
+        let new_str = new_value.to_string();
+        // Preserve leading zeros: if original had leading zeros and new value fits
+        if digits_str.starts_with('0') && digits_str.len() > 1 && new_str.len() < digits_str.len() {
+            let width = digits_str.len();
+            (format!("{:0>width$}", new_value, width = width), num_start)
+        } else {
+            (new_str, num_start)
+        }
+    };
+
+    Some((final_start, num_end, replacement))
+}
+
+/// Find the byte range of the first integer in the member's range.
+/// For non-empty members: leftmost maximal run [+-]?[0-9]+ inside the range.
+/// For carets: scan outward from caret within numeric word boundaries.
+/// Returns (start_byte, end_byte) of the number (including optional sign).
+fn find_number_range(text: &str, member: &crate::selection::Selection) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+
+    if member.is_caret() {
+        // For caret: scan outward from caret
+        let caret = member.head();
+        if caret >= text.len() {
+            return None;
+        }
+
+        let mut start = caret;
+        let mut end = caret;
+
+        // First, try scanning forward from caret
+        let mut pos = caret;
+        while pos < text.len()
+            && (bytes[pos] == b'+' || bytes[pos] == b'-' || bytes[pos].is_ascii_digit())
+        {
+            pos += 1;
+        }
+
+        if pos > caret {
+            // Found something forward, check if it's a valid number
+            if bytes[caret] == b'+' || bytes[caret] == b'-' {
+                // Need at least one digit after sign
+                if pos > caret + 1 {
+                    return Some((caret, pos));
+                }
+            } else {
+                // Starts with digit
+                return Some((caret, pos));
+            }
+        }
+
+        // Scan backward for sign or digit
+        while start > 0 {
+            let c = bytes[start - 1];
+            if c == b'+' || c == b'-' {
+                // Check if followed by digit
+                if start < text.len() && bytes[start].is_ascii_digit() {
+                    start -= 1;
+                    break;
+                } else {
+                    break;
+                }
+            } else if c.is_ascii_digit() {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+
+        // Scan forward for digits
+        while end < text.len() {
+            let c = bytes[end];
+            if c.is_ascii_digit() {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+
+        if end > start {
+            Some((start, end))
+        } else {
+            None
+        }
+    } else {
+        // For non-empty member: leftmost maximal run [+-]?[0-9]+ inside range
+        let range = (member.start(), member.end());
+        let mut pos = range.0;
+
+        while pos < range.1 {
+            let c = bytes[pos];
+            if c == b'+' || c == b'-' {
+                // Potential sign
+                if pos + 1 < range.1 && bytes[pos + 1].is_ascii_digit() {
+                    // Found sign + digit, scan the full number
+                    let start = pos;
+                    let mut digit_pos = pos + 1;
+                    while digit_pos < range.1 && bytes[digit_pos].is_ascii_digit() {
+                        digit_pos += 1;
+                    }
+                    return Some((start, digit_pos));
+                }
+                pos += 1;
+            } else if c.is_ascii_digit() {
+                // Found digit, scan the full number
+                let start = pos;
+                let mut digit_pos = pos;
+                while digit_pos < range.1 && bytes[digit_pos].is_ascii_digit() {
+                    digit_pos += 1;
+                }
+                return Some((start, digit_pos));
+            } else {
+                pos += 1;
+            }
+        }
+
+        None
+    }
+}
+
+/// Extract the first integer from a string.
+fn extract_first_number(line: &str) -> Option<i64> {
+    let mut chars = line.chars();
+    let mut sign = 1i64;
+
+    if let Some(c) = chars.clone().next() {
+        if c == '+' {
+            chars.next();
+        } else if c == '-' {
+            sign = -1;
+            chars.next();
+        }
+    }
+
+    let mut digits: String = String::new();
+    for c in chars {
+        if c.is_ascii_digit() {
+            digits.push(c);
+        } else {
+            break;
+        }
+    }
+
+    if digits.is_empty() {
+        None
+    } else {
+        let num: i64 = digits.parse().unwrap_or(0);
+        Some(sign * num)
+    }
 }
 
 #[cfg(test)]
@@ -1060,6 +1823,208 @@ mod tests {
         let trailing = "one\n";
         let fragments = copy_fragments(trailing, &set_of(trailing, 4)).unwrap();
         assert!(fragments.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+    use crate::selection::RawSelection;
+
+    #[test]
+    fn case_upper_transforms_ascii() {
+        let text = "hello WORLD";
+        let set = set_of(text, 0..5); // "hello"
+        let prepared = plan(text, &set, &EditOperation::CaseUpper).unwrap();
+        assert_eq!(prepared.after_text, "HELLO WORLD");
+        assert_eq!(prepared.after_set.primary().start(), 0);
+        assert_eq!(prepared.after_set.primary().end(), 5);
+    }
+
+    #[test]
+    fn case_lower_transforms_ascii() {
+        let text = "HELLO world";
+        let set = set_of(text, 0..5); // "HELLO"
+        let prepared = plan(text, &set, &EditOperation::CaseLower).unwrap();
+        assert_eq!(prepared.after_text, "hello world");
+    }
+
+    #[test]
+    fn case_swap_swaps_ascii() {
+        let text = "HeLLo";
+        let set = set_of(text, 0..5);
+        let prepared = plan(text, &set, &EditOperation::CaseSwap).unwrap();
+        assert_eq!(prepared.after_text, "hEllO");
+    }
+
+    #[test]
+    fn case_title_title_cases_words() {
+        let text = "hello world";
+        let set = set_of(text, 0..11);
+        let prepared = plan(text, &set, &EditOperation::CaseTitle).unwrap();
+        assert_eq!(prepared.after_text, "Hello World");
+    }
+
+    #[test]
+    fn number_inc_increments_single_number() {
+        let text = "The answer is 42";
+        // Select the range containing "42"
+        let set = set_of(text, 14..16);
+        let prepared = plan(text, &set, &EditOperation::NumberInc).unwrap();
+        // Should increment 42 to 43
+        assert_eq!(prepared.after_text, "The answer is 43");
+    }
+
+    #[test]
+    fn number_dec_decrements_single_number() {
+        let text = "Count: 10";
+        // Select the range containing "10"
+        let set = set_of(text, 7..9);
+        let prepared = plan(text, &set, &EditOperation::NumberDec).unwrap();
+        // Should decrement 10 to 9 (leading zero not preserved for single digit)
+        assert_eq!(prepared.after_text, "Count: 9");
+    }
+
+    #[test]
+    fn number_dec_preserves_leading_zeros() {
+        let text = "Count: 007";
+        // Select the range containing "007"
+        let set = set_of(text, 7..10);
+        let prepared = plan(text, &set, &EditOperation::NumberDec).unwrap();
+        // Should decrement 007 to 006 (preserving width)
+        assert_eq!(prepared.after_text, "Count: 006");
+    }
+
+    #[test]
+    fn number_sequence_numbers_members() {
+        let text = "a 0 b 0 c 0";
+        let set = SelectionSet::normalize(
+            text,
+            vec![
+                RawSelection {
+                    id: Some(1),
+                    anchor: 2,
+                    head: 3,
+                }, // first "0"
+                RawSelection {
+                    id: Some(2),
+                    anchor: 6,
+                    head: 7,
+                }, // second "0"
+                RawSelection {
+                    id: Some(3),
+                    anchor: 10,
+                    head: 11,
+                }, // third "0"
+            ],
+            None,
+        )
+        .unwrap()
+        .0;
+        let prepared = plan(text, &set, &EditOperation::NumberSequence).unwrap();
+        // Should replace with 1, 2, 3
+        assert_eq!(prepared.after_text, "a 1 b 2 c 3");
+    }
+
+    #[test]
+    fn lines_join_joins_with_space() {
+        let text = "line1\nline2\nline3\n";
+        // Create a set that selects all three lines
+        let set = SelectionSet::normalize(
+            text,
+            vec![RawSelection {
+                id: None,
+                anchor: 0,
+                head: 18,
+            }],
+            None,
+        )
+        .unwrap()
+        .0;
+        let prepared = plan(text, &set, &EditOperation::LinesJoin).unwrap();
+        // Join with spaces, preserving trailing newline
+        assert_eq!(prepared.after_text, "line1 line2 line3\n");
+    }
+
+    #[test]
+    fn lines_duplicate_duplicates_block() {
+        let text = "hello\nworld";
+        // Select the first line
+        let set = SelectionSet::normalize(
+            text,
+            vec![RawSelection {
+                id: None,
+                anchor: 0,
+                head: 6,
+            }],
+            None,
+        )
+        .unwrap()
+        .0;
+        let prepared = plan(text, &set, &EditOperation::LinesDuplicate).unwrap();
+        // Should duplicate "hello\n" to "hello\nhello\n"
+        assert_eq!(prepared.after_text, "hello\nhello\nworld");
+    }
+
+    #[test]
+    fn lines_dedupe_removes_duplicates() {
+        let text = "a\na\nb\na";
+        // Select all lines
+        let set = SelectionSet::normalize(
+            text,
+            vec![RawSelection {
+                id: None,
+                anchor: 0,
+                head: 7,
+            }],
+            None,
+        )
+        .unwrap()
+        .0;
+        let prepared = plan(text, &set, &EditOperation::LinesDedupe).unwrap();
+        // Remove duplicate lines, keeping first occurrence
+        assert_eq!(prepared.after_text, "a\nb");
+    }
+
+    #[test]
+    fn lines_shuffle_is_nondeterministic_but_same_length() {
+        let text = "a\nb\nc\nd";
+        // Select all lines
+        let set = SelectionSet::normalize(
+            text,
+            vec![RawSelection {
+                id: None,
+                anchor: 0,
+                head: 7,
+            }],
+            None,
+        )
+        .unwrap()
+        .0;
+        let prepared = plan(text, &set, &EditOperation::LinesShuffle).unwrap();
+        // Shuffle should keep the same length
+        assert_eq!(prepared.after_text.len(), text.len());
+        // Should still have all the same characters (as a multiset)
+        let filtered: String = prepared.after_text.chars().filter(|&c| c != '\n').collect();
+        let mut filtered_chars: Vec<char> = filtered.chars().collect();
+        let mut expected_chars: Vec<char> = "abcd".chars().collect();
+        filtered_chars.sort_unstable();
+        expected_chars.sort_unstable();
+        assert_eq!(filtered_chars, expected_chars);
+    }
+
+    fn set_of(text: &str, range: std::ops::Range<usize>) -> SelectionSet {
+        SelectionSet::normalize(
+            text,
+            vec![RawSelection {
+                id: None,
+                anchor: range.start,
+                head: range.end,
+            }],
+            None,
+        )
+        .unwrap()
+        .0
     }
 }
 

@@ -67,6 +67,8 @@ impl BindingId {
                 ContextMenu::Select => "editor.menu_select",
                 ContextMenu::Go => "editor.menu_go",
                 ContextMenu::More => "editor.menu_more",
+                ContextMenu::Transform => "editor.menu_transform",
+                ContextMenu::Lines => "editor.menu_lines",
             },
         }
     }
@@ -95,6 +97,8 @@ impl BindingId {
             "editor.menu_select" => Some(BindingId::MenuOpener(ContextMenu::Select)),
             "editor.menu_go" => Some(BindingId::MenuOpener(ContextMenu::Go)),
             "editor.menu_more" => Some(BindingId::MenuOpener(ContextMenu::More)),
+            "editor.menu_transform" => Some(BindingId::MenuOpener(ContextMenu::Transform)),
+            "editor.menu_lines" => Some(BindingId::MenuOpener(ContextMenu::Lines)),
             _ => None,
         }
     }
@@ -605,6 +609,15 @@ pub const DEFAULT_ROOT: &[(BindingId, Slot)] = &[
         BindingId::MenuOpener(ContextMenu::Go),
         Slot::bare(KeyCode::KeyG),
     ),
+    // FEUX-0004 X01: Transform and Lines menu openers (E-3: shifted openers allowed)
+    (
+        BindingId::MenuOpener(ContextMenu::Transform),
+        Slot::bare(KeyCode::KeyT),
+    ),
+    (
+        BindingId::MenuOpener(ContextMenu::Lines),
+        Slot::shifted(KeyCode::KeyT),
+    ),
     // Motions (14 entries: 7 bare + 7 shifted, matching grammar::motion_key exactly)
     // Note: grammar::motion_key ignores shift, so we include both variants for equivalence
     (
@@ -693,6 +706,88 @@ pub const DEFAULT_MENUS: &[(ContextMenu, BindingId, KeyCode)] = &[
         BindingId::Command(ContextCommand::DocumentEnd),
         KeyCode::KeyB,
     ),
+    // FEUX-0004 X01: Transform menu accelerators (E-2)
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::CaseUpper),
+        KeyCode::KeyU,
+    ),
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::CaseLower),
+        KeyCode::KeyL,
+    ),
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::CaseSwap),
+        KeyCode::KeyS,
+    ),
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::CaseTitle),
+        KeyCode::KeyT,
+    ),
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::NumberInc),
+        KeyCode::KeyN,
+    ),
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::NumberDec),
+        KeyCode::KeyD,
+    ),
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::NumberSequence),
+        KeyCode::KeyQ,
+    ),
+    // FEUX-0004 X01: Lines menu accelerators (E-2)
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesSortAsc),
+        KeyCode::KeyS,
+    ),
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesSortDesc),
+        KeyCode::KeyD,
+    ),
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesSortNumeric),
+        KeyCode::KeyN,
+    ),
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesJoin),
+        KeyCode::KeyJ,
+    ),
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesDuplicate),
+        KeyCode::KeyC,
+    ),
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesDedupe),
+        KeyCode::KeyE,
+    ),
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesShuffle),
+        KeyCode::KeyH,
+    ),
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesMoveUp),
+        KeyCode::KeyU,
+    ),
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesMoveDown),
+        KeyCode::KeyK,
+    ),
 ];
 
 #[cfg(test)]
@@ -703,9 +798,9 @@ mod tests {
     fn default_keymap_is_the_normative_snapshot() {
         // Verify the DEFAULT_ROOT table contains exactly the expected bindings
         // This is the drift gate for X02/X04.
-        // 20 command-key entries (18 commands + 2 find_char) + 14 motions (7 bare + 7 shifted) = 34 total
-        // Plus 2 menu openers (V, G) = 36 total (Type menu dissolved in X04)
-        assert_eq!(DEFAULT_ROOT.len(), 36); // 20 commands + 14 motions + 2 menu openers = 36
+        // FEUX-0004 X01: 20 command-key entries (18 commands + 2 find_char) + 14 motions (7 bare + 7 shifted) = 34 total
+        // Plus 4 menu openers (V, G, T, Shift+T) = 38 total (E-3: shifted menu openers allowed)
+        assert_eq!(DEFAULT_ROOT.len(), 38); // 20 commands + 14 motions + 4 menu openers = 38
 
         // Spot-check a few key bindings
         let has_insert_start = DEFAULT_ROOT.iter().any(|(bid, slot)| {
@@ -740,7 +835,7 @@ mod tests {
             assert!(found, "Motion {id} should be present and bare");
         }
 
-        // Menu openers (V, G, T) ARE in DEFAULT_ROOT for X02 - they are first-class root bindings
+        // Menu openers (V, G) ARE in DEFAULT_ROOT for X02 - they are first-class root bindings
         // replacing the host special-casing.
         let has_menu_select = DEFAULT_ROOT.iter().any(|(bid, slot)| {
             bid.id() == "editor.menu_select" && slot.position == KeyCode::KeyV && !slot.shift
@@ -751,9 +846,21 @@ mod tests {
             bid.id() == "editor.menu_go" && slot.position == KeyCode::KeyG && !slot.shift
         });
         assert!(has_menu_go, "menu_go should map to bare KeyG");
+
+        // FEUX-0004 X01: new menu openers (E-3: shifted openers allowed)
+        let has_menu_transform = DEFAULT_ROOT.iter().any(|(bid, slot)| {
+            bid.id() == "editor.menu_transform" && slot.position == KeyCode::KeyT && !slot.shift
+        });
+        assert!(has_menu_transform, "menu_transform should map to bare KeyT");
+
+        let has_menu_lines = DEFAULT_ROOT.iter().any(|(bid, slot)| {
+            bid.id() == "editor.menu_lines" && slot.position == KeyCode::KeyT && slot.shift
+        });
+        assert!(has_menu_lines, "menu_lines should map to Shift+KeyT");
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn defaults_keymap_classifies_identically_to_delivered_grammar() {
         // This is the shadow equivalence test (AC-1 / FR-2).
         // After X02, the keymap IS the source of truth. This test verifies the default
@@ -785,19 +892,41 @@ mod tests {
             "KeyG should map to MenuOpener(Go)"
         );
 
-        // Verify FindChar directions
-        let f_slot = Slot::bare(KeyCode::KeyF);
-        let f_binding = keymap.lookup_root(f_slot);
+        // FEUX-0004 X01: new menu openers
+        let t_slot = Slot::bare(KeyCode::KeyT);
         assert!(
-            matches!(f_binding, Some(BindingId::FindChar { forward: true })),
+            matches!(
+                keymap.lookup_root(t_slot),
+                Some(BindingId::MenuOpener(ContextMenu::Transform))
+            ),
+            "KeyT should map to MenuOpener(Transform)"
+        );
+
+        let lines_menu_slot = Slot::shifted(KeyCode::KeyT);
+        assert!(
+            matches!(
+                keymap.lookup_root(lines_menu_slot),
+                Some(BindingId::MenuOpener(ContextMenu::Lines))
+            ),
+            "Shift+KeyT should map to MenuOpener(Lines)"
+        );
+
+        // Verify FindChar directions
+        let find_forward_slot = Slot::bare(KeyCode::KeyF);
+        let find_forward_binding = keymap.lookup_root(find_forward_slot);
+        assert!(
+            matches!(
+                find_forward_binding,
+                Some(BindingId::FindChar { forward: true })
+            ),
             "KeyF should map to FindChar forward"
         );
 
-        let shift_f_slot = Slot::shifted(KeyCode::KeyF);
-        let shift_f_binding = keymap.lookup_root(shift_f_slot);
+        let find_backward_slot = Slot::shifted(KeyCode::KeyF);
+        let find_backward_binding = keymap.lookup_root(find_backward_slot);
         assert!(
             matches!(
-                shift_f_binding,
+                find_backward_binding,
                 Some(BindingId::FindChar { forward: false })
             ),
             "Shift+KeyF should map to FindChar backward"
