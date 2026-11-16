@@ -598,21 +598,18 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
                                     ) => {
                                         // Extract ops from the result
                                         if let Some(plan) = success.data.get("plan") {
-                                            if let (Some(_), Some(_), Some(ops)) =
-                                                (
-                                                    plan.get("match_count")
-                                                        .and_then(|v| v.as_u64()),
-                                                    plan.get("output_len").and_then(|v| v.as_u64()),
-                                                    plan.get("ops").and_then(|v| {
-                                                        serde_json::from_value::<
+                                            if let (Some(_), Some(_), Some(ops)) = (
+                                                plan.get("match_count").and_then(|v| v.as_u64()),
+                                                plan.get("output_len").and_then(|v| v.as_u64()),
+                                                plan.get("ops").and_then(|v| {
+                                                    serde_json::from_value::<
                                                             Vec<serde_json::Value>,
                                                         >(
                                                             v.clone()
                                                         )
                                                         .ok()
-                                                    }),
-                                                )
-                                            {
+                                                }),
+                                            ) {
                                                 // Now commit via apply_edits
                                                 let _ = super::context_mode::kernel_mutate(
                                                     app,
