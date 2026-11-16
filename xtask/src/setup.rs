@@ -100,6 +100,59 @@ fn install_ripgrep() -> Result<()> {
     Ok(())
 }
 
+/// Ensure Python Pillow is available for workbench visual pixel checks
+/// (scripts/workbench-visual-linux.sh, xtask/tests/workbench_runner.rs).
+/// Like ripgrep this is a hard Linux requirement: a missing PIL turns the
+/// workbench supervisor tests into deterministic failures on CI runners
+/// where python3-pil is not preinstalled.
+fn ensure_pillow() -> Result<()> {
+    if cfg!(target_os = "linux") {
+        // The python interpreter is the source of truth; this also covers
+        // hosts where python3-pil exists but for a different interpreter.
+        let probe = || {
+            Command::new("python3")
+                .args(["-c", "import PIL"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        };
+        if probe() {
+            println!("  ✓ python3-Pillow already installed");
+            return Ok(());
+        }
+        // Refresh apt lists first: runner images ship stale lists, and
+        // installing from them can 404 on the current archive pool (seen on
+        // ubuntu-26.04 runners for python3-pil).
+        let update = Command::new("sudo")
+            .args(["apt-get", "update"])
+            .status()
+            .context("failed to spawn apt-get update")?;
+        if !update.success() {
+            anyhow::bail!("apt-get update failed with {update}");
+        }
+        let status = Command::new("sudo")
+            .args(["apt-get", "install", "-y", "python3-pil"])
+            .status()
+            .context("failed to spawn the Pillow installer")?;
+        if !status.success() {
+            anyhow::bail!(
+                "python3-pil install failed with {status}; workbench visual pixel checks require Pillow"
+            );
+        }
+        if !probe() {
+            anyhow::bail!(
+                "python3-pil install reported success but `python3 -c 'import PIL'` still fails"
+            );
+        }
+        println!("  ✓ python3-Pillow installed and verified");
+    } else {
+        println!("  ⚠ Pillow check skipped (non-Linux host; workbench visual is Linux-only)");
+    }
+    Ok(())
+}
+
 /// Pinned cargo-binstall release used to fetch PREBUILT binaries for the
 /// cargo sub-tools. Source-compiling cargo-deny/cargo-audit/cargo-llvm-cov
 /// on every cold CI runner cost 10+ min of the gate (NFR-1), so setup
@@ -303,6 +356,10 @@ pub fn setup() -> Result<()> {
     // scripts/lib/source-gates.sh and `just lint-arch`. Hard failure if it
     // cannot be installed — a missing `rg` must never silently skip a gate.
     install_ripgrep()?;
+
+    // Pillow: workbench visual acceptance (xtask/tests/workbench_runner.rs
+    // and scripts/workbench-visual-linux.sh) requires it for pixel checks.
+    ensure_pillow()?;
 
     println!();
     println!("Setup complete. Run `just gate` to verify the workspace.");

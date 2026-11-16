@@ -81,7 +81,8 @@ jobs:
           fi
           tar -xzf goreleaser.tar.gz goreleaser
           echo "$PWD" >> "$GITHUB_PATH"
-          goreleaser --version
+          # GITHUB_PATH only affects subsequent steps; verify in-shell.
+          ./goreleaser --version
 
       - name: Install zig (pinned release, sha256-verified)
         run: |
@@ -95,7 +96,8 @@ jobs:
           fi
           tar -xJf zig.tar.xz
           echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
-          zig version
+          # GITHUB_PATH only affects subsequent steps; verify in-shell.
+          "$PWD/zig-x86_64-linux-${ZIG_VERSION}/zig" version
 
       - name: Install cargo-zigbuild (pinned, --locked)
         run: cargo install --locked cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION"
@@ -149,7 +151,8 @@ jobs:
           fi
           tar -xzf goreleaser.tar.gz goreleaser
           echo "$PWD" >> "$GITHUB_PATH"
-          goreleaser --version
+          # GITHUB_PATH only affects subsequent steps; verify in-shell.
+          ./goreleaser --version
 
       - name: Install zig (pinned release, sha256-verified)
         run: |
@@ -163,7 +166,8 @@ jobs:
           fi
           tar -xJf zig.tar.xz
           echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
-          zig version
+          # GITHUB_PATH only affects subsequent steps; verify in-shell.
+          "$PWD/zig-x86_64-linux-${ZIG_VERSION}/zig" version
 
       - name: Install cargo-zigbuild (pinned, --locked)
         run: cargo install --locked cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION"

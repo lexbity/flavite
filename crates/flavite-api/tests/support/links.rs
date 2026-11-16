@@ -158,10 +158,17 @@ fn fixture_inner(
         Some(data_dir.path().to_path_buf()),
     );
     configure(&session);
-    let mut flavite = Flavite::open(identity, session, VaultConfig::default()).expect("facade");
-    // Vault-rooted stores (settings, themes, layout) live on the fixture's
-    // MemFs: the vault identity root is a virtual path (RFC-0007).
-    flavite.set_vault_store_fs_for_test((*fs).clone());
+    // Vault-rooted stores (settings, themes, layout) are initialized on the
+    // fixture's MemFs so the virtual vault root never touches the real
+    // filesystem during construction (RFC-0007).
+    let mut flavite = Flavite::open_for_test(
+        identity,
+        session,
+        VaultConfig::default(),
+        Some(data_dir.path()),
+        (*fs).clone(),
+    )
+    .expect("facade");
     flavite.set_graph_service_for_test(db.clone(), Some(std::sync::Arc::new(generation_watch)));
     flavite.query_service().set_search_db_path(db);
     reconcile(&flavite);
