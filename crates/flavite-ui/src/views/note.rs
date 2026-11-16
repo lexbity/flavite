@@ -622,25 +622,36 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             content = content.push(text(error).size(12));
         }
     }
-    // FEUX-0004 X03: command-args draft row
+    // FEUX-0004 X03, FEUX-0006 E-6: command-args draft row
     if let Some(args) = app.command_args.tabs.get(&tab) {
         let placeholder = match args.draft.fields.get(args.active_field) {
             Some(FieldSpec::Text { placeholder, .. }) => *placeholder,
+            Some(FieldSpec::Regex { placeholder, .. }) => *placeholder,
             Some(FieldSpec::Number { .. }) => "Line number",
             None => "",
         };
-        let error_widget: Element<Message> = if let Some(ref error) = args.error {
-            use iced::widget::Text;
-            Text::new(error.as_str()).size(12).into()
+        // Get the active field's error
+        let error_widget: Element<Message> = if let Some(field) = args.fields.get(args.active_field) {
+            if let Some(ref error) = field.error {
+                use iced::widget::Text;
+                Text::new(error.as_str()).size(12).into()
+            } else {
+                Space::new().width(Length::Fixed(0.0)).into()
+            }
         } else {
             Space::new().width(Length::Fixed(0.0)).into()
         };
+        
+        // Get the active field's input - use first field as fallback if active_field is out of bounds
+        let active_input = args.fields.get(args.active_field).unwrap_or_else(|| args.fields.first().expect("At least one field should exist"));
+        let active_input = &active_input.input;
+        
         content = content.push(bounds::observe(
             container(
                 row![
                     text(args.draft.command.title()).size(12),
                     bounds::observe(
-                        text_editor(&args.input)
+                        text_editor(active_input)
                             .id(command_args_id(tab).clone())
                             .placeholder(placeholder)
                             .height(48)
@@ -667,6 +678,23 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                         .on_press(Message::CommandArgs(
                             crate::host::command_args::CommandArgsMessage::Cancel(tab),
                         )),
+                    // Add scope toggle for replace_regex (FEUX-0006 E-6)
+                    if args.draft.command == flavite_edit_context::vocabulary::ContextCommand::ReplaceRegex {
+                        let scope_label = if args.in_selections {
+                            "Selections"
+                        } else {
+                            "Document"
+                        };
+                        button(scope_label)
+                            .style(style::ghost())
+                            .on_press(Message::CommandArgs(
+                                crate::host::command_args::CommandArgsMessage::ToggleScope(tab),
+                            ))
+                    } else {
+                        button("")
+                            .style(style::ghost())
+                            .width(Length::Fixed(0.0))
+                    },
                     error_widget,
                 ]
                 .spacing(8),

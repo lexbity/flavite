@@ -26,6 +26,8 @@ flavite-edit-context = { path = "../flavite-edit-context" }
 flavite-syntax = { path = "../flavite-syntax" }
 # D-02: the shell reduces authoritative layout through the IO-free model.
 flavite-workspace = { path = "../flavite-workspace" }
+# For pattern validation (FEUX-0006 E-6, E-10)
+flavite-text-search = { path = "../flavite-text-search" }
 # XPI themes: the shell renders the codec's semantic model and decoded images.
 flavite-theme = { path = "../flavite-theme" }
 flavite-settings = { path = "../flavite-settings" }
@@ -37,6 +39,7 @@ rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "t
 # §10.4 convention: thiserror for libraries. Used for the CPU-side geometry
 # error type (`graph::instance::GeometryError`).
 thiserror = { workspace = true }
+regex = { workspace = true }
 
 [features]
 # Fixture/harness support for integration tests and the visual runner. The

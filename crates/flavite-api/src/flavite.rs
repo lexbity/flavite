@@ -1088,6 +1088,12 @@ impl Flavite {
                 crate::text_edit::handle_apply_replace,
             ),
             (
+                "text.replace_plan",
+                "Compute replace plan over scope spans (FEUX-0006 E-5)",
+                ArgSchema::typed::<crate::text_edit::ReplacePlanArgs>(),
+                crate::text_edit::handle_replace_plan,
+            ),
+            (
                 "source_find.start",
                 "Find in vault source",
                 ArgSchema::typed::<crate::replace::SourceFindStartArgs>(),
@@ -2802,6 +2808,9 @@ impl Flavite {
             SessionResult::Success(crate::session::CommandResult::ReplacePrepared { .. }) => {
                 "text.prepare_replace"
             }
+            SessionResult::Success(crate::session::CommandResult::ReplacePlan { .. }) => {
+                "text.replace_plan"
+            }
             SessionResult::Success(crate::session::CommandResult::Found { .. }) => "text.find",
             SessionResult::Success(crate::session::CommandResult::MatchesCollected { .. }) => {
                 "editor.select_matches"
@@ -3129,6 +3138,24 @@ impl Flavite {
                             "total_matches": total_matches,
                             "next_offset": next_offset,
                             "truncated": truncated,
+                        })
+                    }
+                    crate::session::CommandResult::ReplacePlan {
+                        buffer_id,
+                        revision,
+                        match_count,
+                        output_len,
+                        ops,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "revision": revision.as_u64(),
+                            "match_count": match_count,
+                            "output_len": output_len,
+                            "ops": ops
+                                .into_iter()
+                                .map(|(start, end, replacement)| serde_json::json!([start, end, replacement]))
+                                .collect::<Vec<_>>(),
                         })
                     }
                     crate::session::CommandResult::MatchesCollected {

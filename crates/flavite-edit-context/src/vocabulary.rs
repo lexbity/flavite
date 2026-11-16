@@ -102,6 +102,9 @@ pub enum ContextCommand {
     NumberDec,
     /// Replace each selection's number with its document-order index (1-based).
     NumberSequence,
+    // FEUX-0006 X03: Regex replace
+    /// Replace text matching a regex pattern across selections.
+    ReplaceRegex,
     // FEUX-0004 X03: Align command
     /// Align lines in each selection's containing line block on a literal delimiter.
     LinesAlign,
@@ -196,6 +199,8 @@ impl ContextCommand {
         Self::NumberInc,
         Self::NumberDec,
         Self::NumberSequence,
+        // FEUX-0006 X03: Regex replace
+        Self::ReplaceRegex,
         // FEUX-0004 X03: Align and Goto-line
         Self::LinesAlign,
         Self::GotoLine,
@@ -276,6 +281,8 @@ impl ContextCommand {
             Self::NumberInc => "editor.number_inc",
             Self::NumberDec => "editor.number_dec",
             Self::NumberSequence => "editor.number_sequence",
+            // FEUX-0006 X03: Regex replace
+            Self::ReplaceRegex => "editor.replace_regex",
             // FEUX-0004 X03: Align and Goto-line
             Self::LinesAlign => "editor.lines_align",
             Self::GotoLine => "editor.goto_line",
@@ -357,6 +364,8 @@ impl ContextCommand {
             Self::NumberInc => "Increment number",
             Self::NumberDec => "Decrement number",
             Self::NumberSequence => "Number sequence",
+            // FEUX-0006 X03: Regex replace
+            Self::ReplaceRegex => "Replace with regex…",
             // FEUX-0004 X03: Align and Goto-line
             Self::LinesAlign => "Align lines",
             Self::GotoLine => "Go to line…",
@@ -403,6 +412,8 @@ impl ContextCommand {
                 | Self::NumberInc
                 | Self::NumberDec
                 | Self::NumberSequence
+                // FEUX-0006 X03: Regex replace mutates
+                | Self::ReplaceRegex
                 // FEUX-0004 X03: Align mutates
                 | Self::LinesAlign
                 // FEUX-0004 X03: GotoLine does NOT mutate (selection-only)
@@ -550,6 +561,8 @@ impl ContextMenu {
                 // FEUX-0005 X02: Whitespace conversion
                 C::TabsToSpaces,
                 C::SpacesToTabs,
+                // FEUX-0006 X03: Regex replace
+                C::ReplaceRegex,
             ],
             // FEUX-0004 X01/X03: Lines menu
             Self::Lines => &[

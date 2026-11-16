@@ -79,6 +79,30 @@ pub struct ApplyReplaceArgs {
     pub plan_id: String,
 }
 
+/// Arguments for `text.replace_plan` (FEUX-0006 E-5).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplacePlanArgs {
+    pub buffer_id: u64,
+    /// The exact revision the plan is bound to.
+    pub revision: u64,
+    /// Literal or regex query.
+    pub query: String,
+    /// Match mode: `literal` (default) or `regex`.
+    pub mode: Option<String>,
+    /// Replacement text: `$` is verbatim in literal mode; the dollar
+    /// capture grammar applies in regex mode.
+    pub replacement: String,
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub whole_word: bool,
+    /// Optional frozen scope spans as half-open `TextByte` offset pairs at `revision`.
+    /// Empty vec or omitted means the whole note (FEUX-0006: multi-span scope).
+    #[serde(default)]
+    pub scope_spans: Vec<(usize, usize)>,
+}
+
 /// `text.prepare_replace` (ReadNotes): no mutation; the plan is computed on
 /// a bounded worker and expires 30 seconds after preparation.
 pub(crate) fn handle_prepare_replace(
@@ -137,6 +161,29 @@ pub(crate) fn handle_apply_replace(
         buffer_id: BufferId::from(args.buffer_id),
         revision: Revision::new(args.revision),
         plan_id,
+    }))
+}
+
+/// `text.replace_plan` (FEUX-0006 E-5): compute-only replacement plan over
+/// scope spans. ReadNotes: no mutation, no plan registry. Returns per-match
+/// ops with template expansions already applied, plus totals for preview.
+pub(crate) fn handle_replace_plan(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: ReplacePlanArgs = decode(invocation)?;
+    Ok(session.execute(SessionCommand::ReplacePlan {
+        request_id: invocation.request_id,
+        request: flavite_vault::text_edit::ReplacePlanRequest {
+            buffer_id: BufferId::from(args.buffer_id),
+            revision: Revision::new(args.revision),
+            query: args.query,
+            replacement: args.replacement,
+            case_sensitive: args.case_sensitive,
+            whole_word: args.whole_word,
+            mode: decode_mode(args.mode.as_deref())?,
+            scope_spans: args.scope_spans,
+        },
     }))
 }
 

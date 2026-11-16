@@ -2139,6 +2139,11 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             super::command_args::open_lines_align(app, target.clone());
             iced::Task::none()
         }
+        ReplaceRegex => {
+            // ReplaceRegex requires pattern and template arguments - open draft host
+            super::command_args::open_replace_regex(app, target.clone());
+            iced::Task::none()
+        }
         GotoLine => {
             // FEUX-0004 X06: GotoLine with count jumps directly (E-12)
             if let Some(line_num) = count {
