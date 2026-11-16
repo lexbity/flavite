@@ -17,7 +17,14 @@ use thiserror::Error;
 
 /// SQL-snapshot handshake budget (D-07). Timeout returns Busy; it MUST NOT
 /// include Tantivy commit or evaluation.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(50);
+///
+/// The worker side of the handshake opens its SQLite snapshot and reads the
+/// committed epoch/generation before acknowledging; on a loaded host that
+/// open+read can take tens of milliseconds (or more under scheduler
+/// starvation). The budget must be generous enough that a genuine snapshot
+/// establishment never misreports as Busy, while still far under the
+/// [`SNAPSHOT_LIFETIME`] total and never covering Tantivy work.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Total snapshot lifetime from capture establishment (D-07).
 pub const SNAPSHOT_LIFETIME: Duration = Duration::from_secs(30);

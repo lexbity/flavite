@@ -256,7 +256,7 @@ struct SessionEntry {
 pub struct SearchSessionService {
     state: std::sync::Mutex<State>,
     db_path: std::sync::RwLock<PathBuf>,
-    spool_dir: PathBuf,
+    spool_dir: std::sync::RwLock<PathBuf>,
     capture: Arc<dyn SearchCaptureProvider>,
     clock: Arc<dyn SearchClock>,
     /// One cached read-only connection for the per-page epoch probe; a
@@ -276,7 +276,7 @@ struct State {
 impl std::fmt::Debug for SearchSessionService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SearchSessionService")
-            .field("spool_dir", &self.spool_dir)
+            .field("spool_dir", &self.spool_dir())
             .finish_non_exhaustive()
     }
 }
@@ -292,21 +292,7 @@ impl SearchSessionService {
         capture: Arc<dyn SearchCaptureProvider>,
         clock: Arc<dyn SearchClock>,
     ) -> Self {
-        let _ = std::fs::create_dir_all(&spool_dir);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o700));
-        }
-        // Startup orphan sweep: no session survives a restart. Temp files
-        // (`*.spool.tmp`) are swept alongside sealed spools.
-        if let Ok(entries) = std::fs::read_dir(&spool_dir) {
-            for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().contains(".spool") {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
+        Self::prepare_spool_dir(&spool_dir);
         Self {
             state: std::sync::Mutex::new(State {
                 sessions: BTreeMap::new(),
@@ -314,21 +300,66 @@ impl SearchSessionService {
                 sealed_bytes: 0,
             }),
             db_path: std::sync::RwLock::new(db_path),
-            spool_dir,
+            spool_dir: std::sync::RwLock::new(spool_dir),
             capture,
             clock,
             epoch_probe: std::sync::Mutex::new(None),
         }
     }
 
+    /// Ensure a spool directory exists with private permissions and sweep
+    /// stale spool files from a previous run. Best-effort: a failure only
+    /// degrades the next seal, which surfaces it as a typed error.
+    fn prepare_spool_dir(spool_dir: &Path) {
+        let _ = std::fs::create_dir_all(spool_dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(spool_dir, std::fs::Permissions::from_mode(0o700));
+        }
+        // Startup orphan sweep: no session survives a restart. Temp files
+        // (`*.spool.tmp`) are swept alongside sealed spools.
+        if let Ok(entries) = std::fs::read_dir(spool_dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().contains(".spool") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    /// The current sealed-spool directory.
+    fn spool_dir(&self) -> PathBuf {
+        self.spool_dir
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Rebind the snapshot database path. The production default derives
     /// from the vault cache directory; test hosts that inject their own
     /// index database call this before the first capture.
+    ///
+    /// The sealed-spool directory follows the snapshot database: it lives
+    /// next to it (`<db-parent>/search-sessions`), so hermetic fixtures that
+    /// point the database at a temp directory never touch the host cache.
     pub fn set_db_path(&self, path: PathBuf) {
+        {
+            let mut db = self
+                .db_path
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *db = path.clone();
+        }
+        let spool_dir = path.parent().map_or_else(
+            || std::env::temp_dir().join("flavite-search-sessions"),
+            |dir| dir.join("search-sessions"),
+        );
+        Self::prepare_spool_dir(&spool_dir);
         *self
-            .db_path
+            .spool_dir
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = spool_dir;
         // A replaced database invalidates the cached probe connection.
         *self.epoch_probe.lock_recovering() = None;
     }
@@ -468,7 +499,7 @@ impl SearchSessionService {
         // Seal the spool before the session becomes visible.
         let digest = options.digest();
         let sealed = seal_spool(
-            &self.spool_dir,
+            &self.spool_dir(),
             &session_id,
             &digest,
             epoch,

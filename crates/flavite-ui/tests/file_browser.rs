@@ -120,7 +120,10 @@ fn directory_pages_reach_past_500_and_invalidate_on_external_change() {
     for expected in [400, 600, 605] {
         run(&mut f.app, Browser::More(PathBuf::new()));
         settle(&mut f.app, |app| {
-            app.file_browser.directories[Path::new("")].entries.len() == expected
+            app.file_browser
+                .directories
+                .get(Path::new(""))
+                .is_some_and(|dir| dir.entries.len() == expected)
         });
     }
     assert!(f.app.file_browser.directories[Path::new("")].next.is_none());
@@ -140,7 +143,10 @@ fn directory_pages_reach_past_500_and_invalidate_on_external_change() {
         .unwrap();
     run(&mut f.app, Browser::More(PathBuf::new()));
     settle(&mut f.app, |app| {
-        app.file_browser.directories[Path::new("")].error.is_some()
+        app.file_browser
+            .directories
+            .get(Path::new(""))
+            .is_some_and(|dir| dir.error.is_some())
     });
     assert!(
         f.app.file_browser.directories[Path::new("")]

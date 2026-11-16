@@ -4,8 +4,9 @@
 //! committed generation G and acknowledges snapshot establishment while the
 //! SQL owner holds its generation-order gate (the single-threaded actor
 //! handler); the owner then inserts the ordered `Capture(G)` queue message
-//! and releases the gate. The handshake is bounded to 50 ms and returns
-//! Busy on timeout; it never includes Tantivy commit or evaluation.
+//! and releases the gate. The handshake is bounded to `HANDSHAKE_TIMEOUT`
+//! and returns Busy on timeout; it never includes Tantivy commit or
+//! evaluation.
 
 use crate::actor::VaultActorMsg;
 use crossbeam::channel::{Receiver, Sender};
