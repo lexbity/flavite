@@ -50,6 +50,17 @@ fn search_once(flavite: &Flavite, text: &str, limit: u64) -> ContextQueryResult 
     while Instant::now() < deadline {
         let drained = service.drain();
         if let Some(outcome) = drained.into_iter().find(|outcome| outcome.token == token) {
+            if !matches!(outcome.result, ContextQueryResult::Search { .. }) {
+                eprintln!(
+                    "[dbg] search({text:?}, limit {limit}) returned non-Search: {:?}",
+                    outcome.result
+                );
+                eprintln!(
+                    "[dbg] env HOME={:?} XDG_CACHE_HOME={:?}",
+                    std::env::var_os("HOME"),
+                    std::env::var_os("XDG_CACHE_HOME")
+                );
+            }
             return outcome.result;
         }
         flavite.pump();
