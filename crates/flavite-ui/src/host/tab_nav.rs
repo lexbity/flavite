@@ -1,6 +1,6 @@
 //! Per-group tab-selection history (W10): the tab strip's Back/Forward
 //! cycle the group's previously-active tabs, browser-style. Every
-//! committed layout transaction is observed in [`App::commit`], so every
+//! committed layout transaction is observed in `App::commit`, so every
 //! activation path (tab click, quick-switch dedup, close-next activation,
 //! commands) records uniformly.
 //!
