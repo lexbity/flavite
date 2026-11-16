@@ -625,6 +625,11 @@ pub const DEFAULT_ROOT: &[(BindingId, Slot)] = &[
         BindingId::MenuOpener(ContextMenu::Surround),
         Slot::bare(KeyCode::KeyZ),
     ),
+    // FEUX-0004 X05: Repeat last command on bare Period
+    (
+        BindingId::Command(ContextCommand::RepeatLast),
+        Slot::bare(KeyCode::Period),
+    ),
     // Motions (14 entries: 7 bare + 7 shifted, matching grammar::motion_key exactly)
     // Note: grammar::motion_key ignores shift, so we include both variants for equivalence
     (
@@ -842,7 +847,8 @@ mod tests {
         // Plus 4 menu openers (V, G, T, Shift+T) = 38 total (E-3: shifted menu openers allowed)
         // FEUX-0004 X03: +1 binding (Shift+G for goto-line) = 39 total
         // FEUX-0004 X04: +1 binding (Z for surround) = 40 total
-        assert_eq!(DEFAULT_ROOT.len(), 40); // 20 commands + 14 motions + 5 menu openers + 1 (goto-line) = 40
+        // FEUX-0004 X05: +1 binding (Period for repeat_last) = 41 total
+        assert_eq!(DEFAULT_ROOT.len(), 41); // 20 commands + 14 motions + 5 menu openers + 1 (goto-line) + 1 (repeat) = 41
 
         // Spot-check a few key bindings
         let has_insert_start = DEFAULT_ROOT.iter().any(|(bid, slot)| {

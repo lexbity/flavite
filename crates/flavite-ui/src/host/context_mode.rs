@@ -1104,9 +1104,42 @@ fn kernel_task(
     args: serde_json::Value,
     refused: &'static str,
 ) -> Task<Message> {
+    // Clone args for recording after mutation
+    let args_for_record = args.clone();
     match kernel_mutate(app, target, api_id, args, refused) {
         Some(success) => {
             install_receipt(app, target, &success);
+            // FEUX-0004 X05: Record successful mutations for `.` repeat
+            // Exclude non-mutating commands and commands that shouldn't be repeated
+            let should_record = !matches!(
+                api_id,
+                // Selection-only commands (class-S)
+                "editor.select_word" | "editor.select_line" | "editor.select_all" |
+                "editor.collapse" | "editor.clear_selection" | "editor.keep_primary" |
+                "editor.add_caret_above" | "editor.add_caret_below" | "editor.rotate_primary" |
+                "editor.flip_selections" | "editor.trim_selections" | "editor.invert_selections" |
+                "editor.select_matches" | "editor.split_selection" |
+                // Non-mutating operations
+                "editor.copy" | "editor.goto_line" | "buffer.undo" | "buffer.redo" |
+                // Menu openers (not actual commands)
+                "editor.menu_select" | "editor.menu_go" | "editor.menu_more" |
+                "editor.menu_transform" | "editor.menu_lines" | "editor.menu_surround" |
+                // Repeat itself (would be recursive)
+                "editor.repeat_last"
+            );
+            
+            if should_record {
+                // Extract args as BTreeMap for recording
+                let mut args_map = std::collections::BTreeMap::new();
+                if let serde_json::Value::Object(obj) = args_for_record {
+                    for (k, v) in obj {
+                        if let serde_json::Value::String(s) = v {
+                            args_map.insert(k, s);
+                        }
+                    }
+                }
+                record_invocation(app, api_id, args_map);
+            }
             focus(app, target.tab)
         }
         None => Task::none(),
@@ -1999,6 +2032,11 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             enter_await_args(app, target.clone(), PendingCommand::SurroundChange);
             iced::Task::none()
         }
+        // FEUX-0004 X05: Repeat last command
+        RepeatLast => {
+            // Replay the last recorded invocation against the current selection set
+            replay_last(app, target.clone())
+        }
         Toggle | Exit | Escape | Paste | Undo | Redo | Commands | Find | Replace | History
         | SelectMatches | SplitSelection => {
             unreachable!("handled before planning")
@@ -2014,4 +2052,55 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         }
     }
     task
+}
+
+/// Record an invocation for `.` repeat (FEUX-0004 E-5).
+/// Called by the host after a class-E command completes successfully.
+pub(crate) fn record_invocation(
+    app: &mut App,
+    command_id: &'static str,
+    args: std::collections::BTreeMap<String, String>,
+) {
+    use flavite_edit_context::session::InvocationRecord;
+    
+    let (now_ms, burst_enabled) = chart_inputs(app);
+    if let Some(s) = &mut app.context_mode.session {
+        let record = InvocationRecord {
+            command_id,
+            args,
+        };
+        let _ = reduce(&mut s.state, &Event::Record(record), now_ms, burst_enabled);
+    }
+}
+
+/// Replay the last recorded invocation (FEUX-0004 E-5).
+/// Re-dispatches the recorded command with its arguments against the current selection set.
+fn replay_last(app: &mut App, target: EditorTarget) -> Task<Message> {
+    // Get the last recorded invocation - clone it to avoid borrow issues
+    let record = app.context_mode.session.as_ref().and_then(|s| s.state.repeat_last());
+    
+    let Some(record) = record else {
+        app.context_mode.notice("No command to repeat");
+        diag(app, target.tab, EventKind::RepeatOutcome, Outcome::NoRegister, None);
+        return focus(app, target.tab);
+    };
+    
+    // Re-dispatch the recorded command
+    // The command_id is already a &'static str, so we can use it directly
+    let api_id = record.command_id;
+    let args = serde_json::Value::Object(record.args.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect());
+    
+    // Dispatch through kernel_mutate (works for both typing and non-typing commands)
+    match kernel_mutate(app, &target, api_id, args, "Repeat was refused; source changed") {
+        Some(success) => {
+            install_receipt(app, &target, &success);
+            diag(app, target.tab, EventKind::RepeatOutcome, Outcome::Replayed, Some(target.selections.len() as u32));
+            focus(app, target.tab)
+        }
+        None => {
+            app.context_mode.notice("Repeat was refused; source changed");
+            diag(app, target.tab, EventKind::RepeatOutcome, Outcome::Refused, Some(target.selections.len() as u32));
+            Task::none()
+        }
+    }
 }

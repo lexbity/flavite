@@ -80,6 +80,19 @@ struct BurstActivation {
     mutating: bool,
 }
 
+/// Invocation record for the last executed command (FEUX-0004 E-5).
+/// Records the command id and its arguments for replay via `.`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvocationRecord {
+    /// The canonical command id (must be &'static for replay).
+    pub command_id: &'static str,
+    /// The arguments passed to the command.
+    /// For typing-entry commands, this contains the `typed_text`.
+    /// For surround commands, this contains the pair characters.
+    /// For align, this contains the delimiter.
+    pub args: std::collections::BTreeMap<String, String>,
+}
+
 /// The pure session state of one editor's Context Mode. Never persisted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextState {
@@ -98,6 +111,9 @@ pub struct ContextState {
     /// The last time a burst hint was emitted, in the same clock as
     /// `now_ms` (suppression window).
     last_burst_ms: u64,
+    /// The last recorded invocation for `.` repeat (FEUX-0004 E-5).
+    /// Lives and dies with the CM session; never persisted.
+    pub repeat_last: Option<InvocationRecord>,
 }
 
 /// What [`ContextState::escape`] resolved to (FEUX-0002 §5.4 rows 9-10 and
@@ -190,6 +206,9 @@ pub enum Event {
     /// An admitted command begins argument capture (FEUX-0004 E-6).
     /// Replaces `EnterAwaitChar` — find-char now uses `EnterAwaitArgs(FindChar { forward })`.
     EnterAwaitArgs(AwaitArgs),
+    /// Record an invocation for `.` repeat (FEUX-0004 E-5).
+    /// The host sends this after a class-E command completes successfully.
+    Record(InvocationRecord),
     /// Escape was admitted while no owned overlay consumed it. The host
     /// supplies the live selection cardinality: Command Escape with more
     /// than one member keeps the primary (§5.4 row 10).
@@ -344,6 +363,12 @@ impl ContextState {
         self.attention = attention;
     }
 
+    /// Get the last recorded invocation for `.` repeat (FEUX-0004 E-5).
+    #[must_use]
+    pub fn repeat_last(&self) -> Option<&InvocationRecord> {
+        self.repeat_last.as_ref()
+    }
+
     /// The command the open menu's selection points at.
     #[must_use]
     pub fn menu_command(&self) -> Option<ContextCommand> {
@@ -467,6 +492,10 @@ pub fn reduce(
         }
         Event::EnterAwaitArgs(args) => {
             state.begin_await_args(args.clone());
+            Vec::new()
+        }
+        Event::Record(record) => {
+            state.repeat_last = Some(record.clone());
             Vec::new()
         }
         Event::Escape { selections } => {

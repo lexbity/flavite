@@ -53,9 +53,9 @@ impl ContextLayout {
             >= match menu {
                 M::More => 320.0,
                 M::Select | M::Go => 720.0,
-                M::Transform => 720.0,
-                M::Lines => 720.0,
-                M::Surround => 720.0,
+                M::Transform => 390.0,  // FEUX-0004 E-2: Transform ≥390
+                M::Lines => 920.0,      // FEUX-0004 X01: Lines after History
+                M::Surround => 920.0,   // FEUX-0004 X04: Surround after History
             }
     }
 

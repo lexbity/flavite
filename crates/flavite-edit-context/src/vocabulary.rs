@@ -79,6 +79,9 @@ pub enum ContextCommand {
     LineEnd,
     DocumentStart,
     DocumentEnd,
+    // FEUX-0004 X05: Repeat last command
+    /// Replay the last recorded command against the current selection set.
+    RepeatLast,
     // FEUX-0004 X01: Transform family
     /// Uppercase each character in each selection.
     CaseUpper,
@@ -168,6 +171,8 @@ impl ContextCommand {
         Self::LineEnd,
         Self::DocumentStart,
         Self::DocumentEnd,
+        // FEUX-0004 X05: Repeat last command
+        Self::RepeatLast,
         // FEUX-0004 X01: Transform family
         Self::CaseUpper,
         Self::CaseLower,
@@ -239,6 +244,8 @@ impl ContextCommand {
             Self::LineEnd => "workspace.caret_end_line",
             Self::DocumentStart => "workspace.caret_start",
             Self::DocumentEnd => "workspace.caret_end",
+            // FEUX-0004 X05: Repeat last command
+            Self::RepeatLast => "editor.repeat_last",
             // FEUX-0004 X01: Transform family
             Self::CaseUpper => "editor.case_upper",
             Self::CaseLower => "editor.case_lower",
@@ -310,6 +317,8 @@ impl ContextCommand {
             Self::LineEnd => "Line end",
             Self::DocumentStart => "Document start",
             Self::DocumentEnd => "Document end",
+            // FEUX-0004 X05: Repeat last command
+            Self::RepeatLast => "Repeat last",
             // FEUX-0004 X01: Transform family
             Self::CaseUpper => "Uppercase",
             Self::CaseLower => "Lowercase",
@@ -375,6 +384,8 @@ impl ContextCommand {
                 | Self::SurroundAdd
                 | Self::SurroundChange
                 | Self::SurroundDelete
+                // FEUX-0004 X05: RepeatLast may mutate (replays a command that may mutate)
+                | Self::RepeatLast
         )
     }
 

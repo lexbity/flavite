@@ -96,6 +96,8 @@ pub enum EventKind {
     ProfileImported,
     /// Profile was exported (FEUX-0003 X06).
     ProfileExported,
+    /// A repeat-last outcome (FEUX-0004 E-5/E-14).
+    RepeatOutcome,
 }
 
 /// The outcome of the recorded event.
@@ -109,6 +111,10 @@ pub enum Outcome {
     Deduplicated,
     Expired,
     Shown,
+    /// No invocation was recorded for repeat (FEUX-0004 E-5).
+    NoRegister,
+    /// The invocation was successfully replayed (FEUX-0004 E-5).
+    Replayed,
 }
 
 /// Classify a terminal api error message into its typed outcome (E-5):

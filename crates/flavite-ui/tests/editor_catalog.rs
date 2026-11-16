@@ -80,7 +80,9 @@ fn every_mutating_and_selection_verb_has_a_core_registry_executor() {
     // in the registry (its executor) — E-7/§6 one canonical ID, one
     // executor; the host only routes, never re-implements.
     for command in ContextCommand::ALL {
-        let needs_executor = command.mutates()
+        // FEUX-0004 X05: RepeatLast is host-routed and replays recorded commands
+        let is_repeat_last = matches!(command, ContextCommand::RepeatLast);
+        let needs_executor = (command.mutates() && !is_repeat_last)
             || matches!(
                 command,
                 ContextCommand::KeepPrimary
@@ -126,6 +128,8 @@ fn every_mutating_and_selection_verb_has_a_core_registry_executor() {
         ContextCommand::DocumentStart,
         ContextCommand::DocumentEnd,
         ContextCommand::SelectAll,
+        // FEUX-0004 X05: RepeatLast is host-routed (replays recorded commands)
+        ContextCommand::RepeatLast,
     ] {
         assert!(
             !registry.contains(command.id()),
