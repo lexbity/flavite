@@ -23,12 +23,14 @@ use std::io::{Read, Write};
 use crate::matcher::{MATCH_SEMANTICS_VERSION, MatchMode};
 
 /// Version of this wire protocol; bump on any framing/message change.
+/// Version 4 adds multi-span scope support with paginated `SpanFrame` messages
+/// and consolidates the single-range `scope` field to `scope_spans`.
 /// Version 3 adds a match-ordinal continuation offset to S03 pages; older
 /// helpers are a typed protocol refusal, never a reinterpretation.
 /// Version 2 added the S03 request-kind, frozen selection scope, report cap
 /// and per-request output bound to `ToHelper::Begin`; a version-1 helper
 /// is a typed protocol refusal, never a reinterpretation of old frames.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Hard frame bound: length prefix excluded, payload never exceeds this.
 /// Parent frames and helper frames obey the same bound (§6.2).
@@ -40,6 +42,13 @@ pub const SOURCE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Matches streamed per page frame; pages keep every frame within the
 /// frame bound even with maximal expansions.
 pub const MATCHES_PER_PAGE: usize = 128;
+
+/// Maximum number of scope spans (Context Mode selection cap).
+pub const MAX_SCOPE_SPANS: usize = 10_000;
+
+/// Maximum spans per SpanFrame (to stay within FRAME_MAX_BYTES).
+/// 4000 spans * 16 bytes = 64 KiB exactly.
+pub const SPANS_PER_FRAME: usize = 4000;
 
 /// Engine identity bound at handshake: the pinned matching semantics this
 /// crate implements. The worker crate is built from this same crate, so a
@@ -129,6 +138,9 @@ pub enum FailureCode {
     Source,
     /// The request was cancelled by the parent.
     Cancelled,
+    /// The scope spans were invalid (unsorted, overlapping, out of bounds,
+    /// or exceeding the maximum count).
+    BadSpans,
 }
 
 /// What kind of work one helper request performs (§6.2: the helper is a
@@ -156,6 +168,7 @@ impl FailureCode {
             Self::Template => "template",
             Self::Source => "source",
             Self::Cancelled => "cancelled",
+            Self::BadSpans => "bad_spans",
         }
     }
 }
@@ -170,13 +183,14 @@ pub enum ToHelper {
     },
     /// Begin one match request. The pattern rides here (≤ 8 KiB); with
     /// [`RequestKind::Replace`] the template (≤ 64 KiB) arrives in its own
-    /// frame next. `scope` is the frozen selection range: matching happens
-    /// against the FULL streamed source (so whole-word boundaries use the
-    /// whole-text semantics, D-05) but only matches fully contained in the
-    /// scope are reported, never clipped. `report_matches` caps the matches
-    /// that ship in pages while the exact total is still counted; `0` means
-    /// "report every match". `max_output` bounds the expanded replacement
-    /// output before anything ships (checked arithmetic, §6.2).
+    /// frame next. `scope_spans` is the set of frozen selection ranges: matching
+    /// happens against the FULL streamed source (so whole-word boundaries use the
+    /// whole-text semantics) but only matches fully contained in one of the spans
+    /// are reported, never clipped. Empty `scope_spans` means whole source.
+    /// `report_matches` caps the matches that ship in pages while the exact
+    /// total is still counted; `0` means "report every match". `max_output`
+    /// bounds the expanded replacement output before anything ships (checked
+    /// arithmetic).
     Begin {
         request_id: u64,
         kind: RequestKind,
@@ -187,9 +201,15 @@ pub enum ToHelper {
         report_matches: u64,
         skip_matches: u64,
         max_output: u64,
-        scope: Option<(u64, u64)>,
         source_total: u64,
         pattern: Vec<u8>,
+    },
+    /// One scope span frame; multiple frames may be sent before Template,
+    /// forming the complete `scope_spans` list for the request. Spans must be
+    /// sorted, non-overlapping, with char-boundary endpoints.
+    SpanFrame {
+        request_id: u64,
+        spans: Vec<(u64, u64)>,
     },
     /// The replacement template for the request (literal or dollar).
     Template { request_id: u64, template: Vec<u8> },
@@ -431,6 +451,7 @@ impl<'a> Reader<'a> {
 
 const TAG_HANDSHAKE: u8 = 0x01;
 const TAG_BEGIN: u8 = 0x02;
+const TAG_SPAN_FRAME: u8 = 0x07;
 const TAG_TEMPLATE: u8 = 0x03;
 const TAG_SOURCE_CHUNK: u8 = 0x04;
 const TAG_END_OF_SOURCE: u8 = 0x05;
@@ -465,7 +486,6 @@ fn encode_to_helper(message: &ToHelper) -> Vec<u8> {
             report_matches,
             skip_matches,
             max_output,
-            scope,
             source_total,
             pattern,
         } => {
@@ -485,16 +505,26 @@ fn encode_to_helper(message: &ToHelper) -> Vec<u8> {
             put_u64(&mut out, *report_matches);
             put_u64(&mut out, *skip_matches);
             put_u64(&mut out, *max_output);
-            match scope {
-                None => put_u8(&mut out, 0),
-                Some((start, end)) => {
-                    put_u8(&mut out, 1);
-                    put_u64(&mut out, *start);
-                    put_u64(&mut out, *end);
-                }
-            }
             put_u64(&mut out, *source_total);
             put_bytes(&mut out, pattern);
+        }
+        ToHelper::SpanFrame { request_id, spans } => {
+            put_u8(&mut out, TAG_SPAN_FRAME);
+            put_u64(&mut out, *request_id);
+            let count = u32::try_from(spans.len()).map_err(|_| FrameError::Oversize {
+                observed: spans.len(),
+            });
+            // This is safe because we know spans.len() <= MAX_SCOPE_SPANS
+            // and MAX_SCOPE_SPANS * 16 <= FRAME_MAX_BYTES
+            if count.is_err() || spans.len() > MAX_SCOPE_SPANS {
+                // This should never happen in practice as we validate at the API boundary
+                return Vec::new();
+            }
+            put_u32(&mut out, count.unwrap());
+            for (start, end) in spans {
+                put_u64(&mut out, *start);
+                put_u64(&mut out, *end);
+            }
         }
         ToHelper::Template {
             request_id,
@@ -554,18 +584,7 @@ fn decode_to_helper(bytes: &[u8]) -> Result<ToHelper, FrameError> {
             let report_matches = reader.u64()?;
             let skip_matches = reader.u64()?;
             let max_output = reader.u64()?;
-            let scope = match reader.u8()? {
-                0 => None,
-                1 => {
-                    let start = reader.u64()?;
-                    let end = reader.u64()?;
-                    if end < start {
-                        return Err(FrameError::Malformed);
-                    }
-                    Some((start, end))
-                }
-                _ => return Err(FrameError::Malformed),
-            };
+            let source_total = reader.u64()?;
             ToHelper::Begin {
                 request_id,
                 kind,
@@ -576,8 +595,7 @@ fn decode_to_helper(bytes: &[u8]) -> Result<ToHelper, FrameError> {
                 report_matches,
                 skip_matches,
                 max_output,
-                scope,
-                source_total: reader.u64()?,
+                source_total,
                 pattern: reader.bytes()?.to_vec(),
             }
         }
@@ -587,6 +605,20 @@ fn decode_to_helper(bytes: &[u8]) -> Result<ToHelper, FrameError> {
                 request_id,
                 template: reader.bytes()?.to_vec(),
             }
+        }
+        TAG_SPAN_FRAME => {
+            let request_id = reader.u64()?;
+            let count = reader.u32()? as usize;
+            if count > MAX_SCOPE_SPANS {
+                return Err(FrameError::Malformed);
+            }
+            let mut spans = Vec::with_capacity(count);
+            for _ in 0..count {
+                let start = reader.u64()?;
+                let end = reader.u64()?;
+                spans.push((start, end));
+            }
+            ToHelper::SpanFrame { request_id, spans }
         }
         TAG_SOURCE_CHUNK => {
             let request_id = reader.u64()?;
@@ -703,6 +735,7 @@ fn failure_tag(failure: FailureCode) -> u8 {
         FailureCode::Template => 4,
         FailureCode::Source => 5,
         FailureCode::Cancelled => 6,
+        FailureCode::BadSpans => 7,
     }
 }
 
@@ -714,6 +747,7 @@ fn failure_from_tag(tag: u8) -> Result<FailureCode, FrameError> {
         4 => FailureCode::Template,
         5 => FailureCode::Source,
         6 => FailureCode::Cancelled,
+        7 => FailureCode::BadSpans,
         _ => return Err(FrameError::Malformed),
     })
 }
@@ -815,7 +849,6 @@ mod tests {
                 report_matches: 50,
                 skip_matches: 25,
                 max_output: 4096,
-                scope: Some((12, 4096)),
                 source_total: 32 * 1024 * 1024,
                 pattern: b"a(b)?c".to_vec(),
             },
@@ -829,7 +862,6 @@ mod tests {
                 report_matches: 0,
                 skip_matches: 256,
                 max_output: u64::MAX,
-                scope: None,
                 source_total: 10,
                 pattern: b"ab".to_vec(),
             },
@@ -965,11 +997,8 @@ mod tests {
     }
 
     #[test]
-    fn begin_kind_scope_and_bounds_round_trip_both_kinds() {
-        for (kind, scope) in [
-            (RequestKind::Find, None),
-            (RequestKind::Replace, Some((3u64, 9u64))),
-        ] {
+    fn begin_kind_and_bounds_round_trip_both_kinds() {
+        for kind in [RequestKind::Find, RequestKind::Replace] {
             let message = ToHelper::Begin {
                 request_id: 5,
                 kind,
@@ -980,29 +1009,44 @@ mod tests {
                 report_matches: 10,
                 skip_matches: 512,
                 max_output: 2048,
-                scope,
                 source_total: 64,
                 pattern: b"a(b)".to_vec(),
             };
             let frame = encode(&message).expect("within bounds");
             assert_eq!(decode(&frame[4..]).expect("decodes"), message);
         }
-        // A descending scope pair is malformed, never a silent empty range.
-        let mut out = vec![0x02u8];
+    }
+
+    #[test]
+    fn span_frame_round_trip() {
+        let message = ToHelper::SpanFrame {
+            request_id: 7,
+            spans: vec![(10, 20), (30, 40), (50, 60)],
+        };
+        let frame = encode(&message).expect("within bounds");
+        assert_eq!(decode(&frame[4..]).expect("decodes"), message);
+    }
+
+    #[test]
+    fn span_frame_exceeds_max_spans_is_malformed() {
+        let mut out = vec![TAG_SPAN_FRAME];
         out.extend_from_slice(&1u64.to_le_bytes()); // request id
-        out.push(1); // kind: replace
-        out.push(1); // mode: regex
-        out.push(0); // case
-        out.push(0); // word
-        out.extend_from_slice(&10u64.to_le_bytes()); // max matches
-        out.extend_from_slice(&10u64.to_le_bytes()); // report
-        out.extend_from_slice(&0u64.to_le_bytes()); // skip
-        out.extend_from_slice(&1024u64.to_le_bytes()); // max output
-        out.push(1); // scope present
-        out.extend_from_slice(&9u64.to_le_bytes()); // start
-        out.extend_from_slice(&3u64.to_le_bytes()); // end < start
-        out.extend_from_slice(&0u64.to_le_bytes()); // source total
-        out.extend_from_slice(&0u64.to_le_bytes()); // pattern length
+        out.extend_from_slice(&((MAX_SCOPE_SPANS as u32) + 1).to_le_bytes()); // count > max
         assert_eq!(decode(&out), Err(FrameError::Malformed));
+    }
+
+    #[test]
+    fn protocol_version_is_v4() {
+        assert_eq!(PROTOCOL_VERSION, 4);
+    }
+
+    #[test]
+    fn max_scope_spans_constant() {
+        assert_eq!(MAX_SCOPE_SPANS, 10_000);
+    }
+
+    #[test]
+    fn spans_per_frame_constant() {
+        assert_eq!(SPANS_PER_FRAME, 4000);
     }
 }

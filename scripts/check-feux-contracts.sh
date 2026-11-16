@@ -661,6 +661,37 @@ run_feux0005_x03_gates() {
     gate assert_present 'leading_whitespace' "$root/crates/flavite-buffer/src/commands.rs"
 }
 
+run_feux0006_x01_gates() {
+    # FEUX-0006 X01: Protocol v4 with scope_spans
+    # Protocol version is v4
+    gate assert_present 'PROTOCOL_VERSION.*= 4' "$root/crates/flavite-text-search/src/protocol.rs"
+    # SpanFrame message exists
+    gate assert_present 'ToHelper::SpanFrame' "$root/crates/flavite-text-search/src/protocol.rs"
+    # scope field removed from Begin
+    gate assert_absent 'scope: Option.*u64' "$root/crates/flavite-text-search/src/protocol.rs"
+    # scope_spans field in Begin
+    gate assert_present 'scope_spans' "$root/crates/flavite-text-search/src/protocol.rs"
+    # BadSpans failure code
+    gate assert_present 'BadSpans' "$root/crates/flavite-text-search/src/protocol.rs"
+    # Max scope spans constant
+    gate assert_present 'MAX_SCOPE_SPANS' "$root/crates/flavite-text-search/src/protocol.rs"
+    # Spans per frame constant
+    gate assert_present 'SPANS_PER_FRAME' "$root/crates/flavite-text-search/src/protocol.rs"
+    # Matcher has span filtering methods
+    gate assert_present 'find_in_spans' "$root/crates/flavite-text-search/src/matcher.rs"
+    gate assert_present 'iter_matches_spans' "$root/crates/flavite-text-search/src/matcher.rs"
+    gate assert_present 'scope_spans_digest' "$root/crates/flavite-text-search/src/matcher.rs"
+    # Worker handles scope_spans
+    gate assert_present 'scope_spans' "$root/crates/flavite-text-search-worker/src/main.rs"
+    # DTOs use scope_spans
+    gate assert_present 'scope_spans' "$root/crates/flavite-api/src/text_edit.rs"
+    gate assert_present 'scope_spans' "$root/crates/flavite-vault/src/text_edit.rs"
+    gate assert_present 'scope_spans' "$root/crates/flavite-vault/src/text_worker.rs"
+    # Old scope field removed from DTOs
+    gate assert_absent 'pub scope: Option' "$root/crates/flavite-api/src/text_edit.rs"
+    gate assert_absent 'pub scope: Option' "$root/crates/flavite-vault/src/text_edit.rs"
+}
+
 case "$slice" in
     X01) run_x01_gates ;;
     X02) run_x02_gates ;;
@@ -681,7 +712,8 @@ case "$slice" in
     FEUX0003-X05) run_feux0003_x05_gates ;;
     FEUX0003-X06) run_feux0003_x06_gates ;;
     FEUX0003-X07) run_feux0003_x07_gates ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05 X06 X07 X08 FEUX0005-X01 FEUX0004-X07 FEUX0003-X01 FEUX0003-X02 FEUX0003-X03 FEUX0003-X04 FEUX0003-X05 FEUX0003-X06 FEUX0003-X07)" >&2; exit 2 ;;
+    FEUX0006-X01) run_feux0006_x01_gates ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05 X06 X07 X08 FEUX0005-X01 FEUX0005-X02 FEUX0005-X03 FEUX0004-X07 FEUX0003-X01 FEUX0003-X02 FEUX0003-X03 FEUX0003-X04 FEUX0003-X05 FEUX0003-X06 FEUX0003-X07 FEUX0006-X01)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then

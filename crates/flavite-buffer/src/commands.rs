@@ -464,31 +464,28 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
             // FEUX-0005 E-4: Auto-indent: copy the source line's leading whitespace verbatim
             // Above: insert leading_ws + "\n" at line start, caret on new line after ws
             // Below: insert "\n" + leading_ws at line end, caret after ws
-            
+
             // Group members by unique head line to match the delivered behavior
-            let mut points: std::collections::BTreeMap<usize, (usize, usize, u32)> = std::collections::BTreeMap::new();
+            let mut points: std::collections::BTreeMap<usize, (usize, usize, u32)> =
+                std::collections::BTreeMap::new();
             for member in set.iter() {
                 let line_start = line_boundary(text, member.head(), true);
                 let line_end = line_boundary(text, member.head(), false);
-                let at = if *above {
-                    line_start
-                } else {
-                    line_end
-                };
+                let at = if *above { line_start } else { line_end };
                 let id = member.id().as_raw();
                 points
                     .entry(at)
                     .and_modify(|(_, _, kept)| *kept = (*kept).min(id))
                     .or_insert((line_start, line_end, id));
             }
-            
+
             // For each unique line, compute the leading whitespace and create the insertion
             let mut collapse_points = Vec::new();
             for (&at, (line_start, line_end, id)) in &points {
                 // Extract the line to get its leading whitespace
                 let line_text = &text[*line_start..*line_end];
                 let leading_ws = leading_whitespace(line_text);
-                
+
                 // Compute insertion text
                 let insertion = if *above {
                     // open_above: insert leading_ws + "\n" at line start
@@ -497,7 +494,7 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                     // open_below: insert "\n" + leading_ws at line end
                     format!("\n{}", leading_ws)
                 };
-                
+
                 if !insertion.is_empty() {
                     planned.push(PlannedEdit {
                         start: at,
@@ -505,14 +502,14 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                         replacement: insertion,
                     });
                 }
-                
+
                 // Collapse points: at the insertion position for both
                 // Affinity determines where the caret lands:
                 // - open_above: Affinity::Left → caret at beginning of new line
                 // - open_below: Affinity::Right → caret after the insertion (after leading_ws)
                 collapse_points.push((at, Some(*id)));
             }
-            
+
             let affinity = if *above {
                 Affinity::Left
             } else {
@@ -1143,7 +1140,7 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                         } else {
                             tabs_to_spaces_line(line, detected_unit.width)
                         };
-                        
+
                         if converted != *line {
                             any_change = true;
                         }

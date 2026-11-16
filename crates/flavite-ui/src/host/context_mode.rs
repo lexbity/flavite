@@ -1184,7 +1184,10 @@ fn kernel_task(
             // FEUX-0005 E-9: Report unit in completion message for width-consuming commands
             if matches!(
                 api_id,
-                "editor.indent" | "editor.dedent" | "editor.tabs_to_spaces" | "editor.spaces_to_tabs"
+                "editor.indent"
+                    | "editor.dedent"
+                    | "editor.tabs_to_spaces"
+                    | "editor.spaces_to_tabs"
             ) {
                 // Detect unit from the current buffer text
                 if let Some(view) = app.note_editor_view(target.tab) {
@@ -1192,8 +1195,12 @@ fn kernel_task(
                     let message = match api_id {
                         "editor.indent" => format!("Indent · unit: {}", detected_unit.display()),
                         "editor.dedent" => format!("Dedent · unit: {}", detected_unit.display()),
-                        "editor.tabs_to_spaces" => format!("Tabs → Spaces · unit: {}", detected_unit.display()),
-                        "editor.spaces_to_tabs" => format!("Spaces → Tabs · unit: {}", detected_unit.display()),
+                        "editor.tabs_to_spaces" => {
+                            format!("Tabs → Spaces · unit: {}", detected_unit.display())
+                        }
+                        "editor.spaces_to_tabs" => {
+                            format!("Spaces → Tabs · unit: {}", detected_unit.display())
+                        }
                         _ => String::new(),
                     };
                     app.context_mode.notice(&message);
@@ -2199,24 +2206,20 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             )
         }
         // FEUX-0005 X02: Whitespace conversion (E-9: unit display in message)
-        TabsToSpaces => {
-            kernel_task(
-                app,
-                &target,
-                "editor.tabs_to_spaces",
-                serde_json::json!({}),
-                "Tabs → Spaces was refused; source changed",
-            )
-        }
-        SpacesToTabs => {
-            kernel_task(
-                app,
-                &target,
-                "editor.spaces_to_tabs",
-                serde_json::json!({}),
-                "Spaces → Tabs was refused; source changed",
-            )
-        }
+        TabsToSpaces => kernel_task(
+            app,
+            &target,
+            "editor.tabs_to_spaces",
+            serde_json::json!({}),
+            "Tabs → Spaces was refused; source changed",
+        ),
+        SpacesToTabs => kernel_task(
+            app,
+            &target,
+            "editor.spaces_to_tabs",
+            serde_json::json!({}),
+            "Spaces → Tabs was refused; source changed",
+        ),
         // FEUX-0004 X05/X06: Repeat last command (count· for sequential replays)
         RepeatLast => {
             // Replay the last recorded invocation against the current selection set

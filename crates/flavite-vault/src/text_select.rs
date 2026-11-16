@@ -77,7 +77,7 @@ pub fn collect_matches(
                     mode: MatchMode::Regex,
                     case_sensitive: request.case_sensitive,
                     whole_word: request.whole_word,
-                    scope: None,
+                    scope_spans: Vec::new(),
                     max_matches: crate::text_edit::MAX_MATCHES_PER_JOB,
                     report_matches: MAX_SELECTION_SPANS,
                     skip_matches: 0,

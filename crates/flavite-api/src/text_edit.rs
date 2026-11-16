@@ -35,8 +35,10 @@ pub struct PrepareReplaceArgs {
     pub case_sensitive: bool,
     #[serde(default)]
     pub whole_word: bool,
-    /// Optional frozen scope as half-open `TextByte` offsets at `revision`.
-    pub scope: Option<(usize, usize)>,
+    /// Optional frozen scope spans as half-open `TextByte` offset pairs at `revision`.
+    /// Empty vec or omitted means the whole note (FEUX-0006: multi-span scope).
+    #[serde(default)]
+    pub scope_spans: Vec<(usize, usize)>,
 }
 
 /// Arguments for `text.find` (S03).
@@ -60,8 +62,10 @@ pub struct FindArgs {
     /// Omitted for the first page.
     #[serde(default)]
     pub offset: u64,
-    /// Optional frozen scope as half-open `TextByte` offsets at `revision`.
-    pub scope: Option<(usize, usize)>,
+    /// Optional frozen scope spans as half-open `TextByte` offset pairs at `revision`.
+    /// Empty vec or omitted means the whole note (FEUX-0006: multi-span scope).
+    #[serde(default)]
+    pub scope_spans: Vec<(usize, usize)>,
 }
 
 /// Arguments for `text.apply_replace`.
@@ -92,7 +96,7 @@ pub(crate) fn handle_prepare_replace(
             case_sensitive: args.case_sensitive,
             whole_word: args.whole_word,
             mode: decode_mode(args.mode.as_deref())?,
-            scope: args.scope,
+            scope_spans: args.scope_spans,
         },
     }))
 }
@@ -115,7 +119,7 @@ pub(crate) fn handle_find(
             case_sensitive: args.case_sensitive,
             whole_word: args.whole_word,
             offset: args.offset,
-            scope: args.scope,
+            scope_spans: args.scope_spans,
         },
     }))
 }

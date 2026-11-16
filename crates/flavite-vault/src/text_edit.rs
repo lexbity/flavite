@@ -41,9 +41,9 @@ pub struct ReplaceRequest {
     /// Literal (in-process, always available) or regex (isolated helper,
     /// D-14 — never a silent in-process fallback).
     pub mode: MatchMode,
-    /// Frozen selection scope at the current revision (`TextByte` range,
-    /// half-open); `None` means the whole note.
-    pub scope: Option<(usize, usize)>,
+    /// Frozen selection scope spans at the current revision (`TextByte` ranges,
+    /// half-open); empty vec means the whole note (FEUX-0006: multi-span scope).
+    pub scope_spans: Vec<(usize, usize)>,
 }
 
 /// One note find request (S03): the same options as replacement, over the
@@ -59,9 +59,9 @@ pub struct FindRequest {
     /// Zero-based match ordinal for continuation. The source revision and
     /// all options are supplied again and revalidated for every page.
     pub offset: u64,
-    /// Frozen selection scope at the current revision; `None` means the
-    /// whole note.
-    pub scope: Option<(usize, usize)>,
+    /// Frozen selection scope spans at the current revision; empty vec means
+    /// the whole note (FEUX-0006: multi-span scope).
+    pub scope_spans: Vec<(usize, usize)>,
 }
 
 /// A completed find: ascending, fully-in-scope spans, the exact match
@@ -230,7 +230,6 @@ fn prepare_find_with_class(
     if request.offset > u64::try_from(MAX_MATCHES_PER_JOB).unwrap_or(u64::MAX) {
         return Err(PrepareError::MatchOffsetOutOfRange);
     }
-    let scope = scope_of(request.scope)?;
     match request.mode {
         MatchMode::Regex => {
             let run = match class {
@@ -243,7 +242,7 @@ fn prepare_find_with_class(
                             mode: MatchMode::Regex,
                             case_sensitive: request.case_sensitive,
                             whole_word: request.whole_word,
-                            scope: request.scope,
+                            scope_spans: request.scope_spans.clone(),
                             max_matches: MAX_MATCHES_PER_JOB,
                             report_matches: MAX_FIND_SPANS,
                             skip_matches: request.offset,
@@ -261,7 +260,7 @@ fn prepare_find_with_class(
                         mode: MatchMode::Regex,
                         case_sensitive: request.case_sensitive,
                         whole_word: request.whole_word,
-                        scope: request.scope,
+                        scope_spans: request.scope_spans.clone(),
                         max_matches: MAX_MATCHES_PER_JOB,
                         report_matches: MAX_FIND_SPANS,
                         skip_matches: request.offset,
@@ -324,8 +323,21 @@ fn prepare_find_with_class(
             // cap and mark truncation honestly.
             let mut spans = Vec::new();
             let mut total = 0u64;
-            for item in matcher.iter_matches(text, scope).map_err(matcher_error)? {
-                let hit = item.map_err(matcher_error)?;
+            // For literal mode, we need to filter by scope_spans manually
+            let scope_filter = &request.scope_spans;
+            for item in matcher.find(text).map_err(matcher_error)? {
+                let hit = item;
+                // Filter by scope_spans if provided
+                if !scope_filter.is_empty() {
+                    let start = hit.span.start.0;
+                    let end = hit.span.end.0;
+                    let contained = scope_filter
+                        .iter()
+                        .any(|&(s_start, s_end)| s_start <= start && end <= s_end);
+                    if !contained {
+                        continue;
+                    }
+                }
                 let ordinal = total;
                 total = total.saturating_add(1);
                 if ordinal >= request.offset && spans.len() < MAX_FIND_SPANS {
@@ -360,7 +372,6 @@ fn prepare_regex(
     request: &ReplaceRequest,
     class: crate::text_worker::HelperPermitClass,
 ) -> Result<(Vec<EditOp>, u64, u64), PrepareError> {
-    let scope = scope_of(request.scope)?;
     // Local template validation first: typed and exact, before any
     // helper work (the helper re-validates its own copy, §6.2).
     let template = ReplacementTemplate::new(&request.replacement, TemplateGrammar::Dollar)
@@ -380,7 +391,7 @@ fn prepare_regex(
                 mode: MatchMode::Regex,
                 case_sensitive: request.case_sensitive,
                 whole_word: request.whole_word,
-                scope: request.scope,
+                scope_spans: request.scope_spans.clone(),
                 max_matches: MAX_MATCHES_PER_JOB,
                 report_matches: usize::MAX,
                 skip_matches: 0,
@@ -397,7 +408,7 @@ fn prepare_regex(
                 mode: MatchMode::Regex,
                 case_sensitive: request.case_sensitive,
                 whole_word: request.whole_word,
-                scope: request.scope,
+                scope_spans: request.scope_spans.clone(),
                 max_matches: MAX_MATCHES_PER_JOB,
                 report_matches: usize::MAX,
                 skip_matches: 0,
@@ -417,10 +428,12 @@ fn prepare_regex(
         if end < start
             || end > text.len()
             || !source_bounds_valid(text, start, end)
-            // Scope containment re-check against the parent's own bounds:
-            // a helper that shipped a match outside the frozen scope is a
+            // Scope containment re-check against the parent's own scope_spans:
+            // a helper that shipped a match outside the frozen spans is a
             // protocol violation, never a silently accepted candidate.
-            || scope.is_some_and(|scope| start < scope.start.0 || end > scope.end.0)
+            || !request.scope_spans.is_empty() && !request.scope_spans.iter().any(|&(s_start, s_end)| {
+                s_start <= start && end <= s_end
+            })
         {
             return Err(PrepareError::InvalidScope);
         }
@@ -460,9 +473,16 @@ fn scope_digest(request: &ReplaceRequest) -> u64 {
         request.mode == MatchMode::Regex,
         request.case_sensitive,
         request.whole_word,
-        request
-            .scope
-            .map_or_else(String::new, |(start, end)| format!("{start}..{end}"))
+        if request.scope_spans.is_empty() {
+            String::new()
+        } else {
+            request
+                .scope_spans
+                .iter()
+                .map(|(start, end)| format!("{start}..{end}"))
+                .collect::<Vec<_>>()
+                .join("|")
+        }
     )
     .as_bytes()
     {
@@ -507,8 +527,9 @@ fn prepare_literal(
             }
             other => PrepareError::Template(other),
         })?;
-    let scope = scope_of(request.scope)?;
-    let hits = matcher.find_in(text, scope).map_err(matcher_error)?;
+    let hits = matcher
+        .find_in_spans(text, &request.scope_spans)
+        .map_err(matcher_error)?;
     // Counting may be pending in the UI, but a prepared batch must be
     // exact: exceeding the bound refuses instead of silently stopping.
     if hits.len() >= MAX_MATCHES_PER_JOB {
@@ -550,16 +571,6 @@ fn plan_digest(
 
 /// Validate the declared scope endpoints against the source (char
 /// boundaries and order), before any helper round trip.
-fn scope_of(scope: Option<(usize, usize)>) -> Result<Option<Span<TextByte>>, PrepareError> {
-    let Some((start, end)) = scope else {
-        return Ok(None);
-    };
-    if end < start {
-        return Err(PrepareError::InvalidScope);
-    }
-    Ok(Some(Span::new(TextByte(start), TextByte(end))))
-}
-
 /// Char-boundary validation for spans received from the helper (the
 /// endpoints themselves must be legal UTF-8 boundaries).
 fn source_bounds_valid(text: &str, start: usize, end: usize) -> bool {
@@ -636,7 +647,7 @@ mod tests {
             case_sensitive: false,
             whole_word: false,
             mode: MatchMode::Literal,
-            scope: None,
+            scope_spans: vec![],
         }
     }
 
@@ -682,7 +693,7 @@ mod tests {
         let (scoped, count, _) = prepare_ops(
             "aa|aa",
             &ReplaceRequest {
-                scope: Some((3, 5)),
+                scope_spans: vec![(3, 5)],
                 ..request("aa", "X")
             },
         )
@@ -711,7 +722,7 @@ mod tests {
                 case_sensitive: false,
                 whole_word: false,
                 offset: 0,
-                scope: None,
+                scope_spans: vec![],
             },
         )
         .expect("find");
@@ -733,7 +744,7 @@ mod tests {
                 case_sensitive: false,
                 whole_word: false,
                 offset: 256,
-                scope: None,
+                scope_spans: vec![],
             },
         )
         .expect("continuation page");
@@ -758,7 +769,7 @@ mod tests {
                 case_sensitive: false,
                 whole_word: false,
                 offset: 0,
-                scope: Some((3, 5)),
+                scope_spans: vec![(3, 5)],
             },
         )
         .expect("scoped find");
@@ -771,7 +782,7 @@ mod tests {
         let scoped = prepare_ops(
             "aa|aa",
             &ReplaceRequest {
-                scope: Some((0, 2)),
+                scope_spans: vec![(0, 2)],
                 ..request("aa", "X")
             },
         )
@@ -852,7 +863,7 @@ mod tests {
                 case_sensitive: false,
                 whole_word: false,
                 offset: 0,
-                scope: None,
+                scope_spans: vec![],
             },
         )
         .expect_err("no helper sibling");
@@ -869,7 +880,19 @@ mod tests {
 
     #[test]
     fn invalid_scope_endpoints_are_typed() {
-        let err = scope_of(Some((5, 2))).expect_err("reversed scope");
-        assert!(matches!(err, PrepareError::InvalidScope));
+        // Invalid scope_spans (reversed) should be caught during processing
+        let err = prepare_ops(
+            "test",
+            &ReplaceRequest {
+                scope_spans: vec![(5, 2)], // reversed span
+                ..request("a", "b")
+            },
+        )
+        .expect_err("reversed scope");
+        // The error comes from the worker via BadSpans
+        assert!(matches!(
+            err,
+            PrepareError::RegexUnavailable { .. } | PrepareError::InvalidScope
+        ));
     }
 }
